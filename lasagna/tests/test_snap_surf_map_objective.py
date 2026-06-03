@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import os
 import math
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
+
+TEST_DIR = os.path.dirname(__file__)
+if TEST_DIR not in sys.path:
+	sys.path.insert(0, TEST_DIR)
 
 from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz, _result, opt_loss_snap_surf
 
@@ -1136,6 +1142,93 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 
 		self.assertTrue(torch.isfinite(pen))
 		self.assertAlmostEqual(float(pen.detach()), 0.0, places=6)
+
+	def test_map_init_objective_skips_zero_weight_training_branches(self) -> None:
+		uv = torch.stack(torch.meshgrid(torch.arange(3, dtype=torch.float32), torch.arange(3, dtype=torch.float32), indexing="ij"), dim=-1)
+		cfg = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+				subdiv=2,
+				dense_opt=True,
+				w_dist=0.0,
+				w_vec_normal=0.0,
+				w_surface_normal=0.0,
+				w_z_lift=0.0,
+				w_smooth=0.0,
+				w_bend=0.0,
+				w_jac=0.0,
+				w_metric_smooth=0.0,
+				w_area_smooth=0.0,
+				w_dense_prior=0.0,
+			),
+		)
+		with (
+			mock.patch.object(opt_loss_snap_surf, "_map_init_dense_quad_sample_tensors", wraps=opt_loss_snap_surf._map_init_dense_quad_sample_tensors) as sample_mock,
+			mock.patch.object(opt_loss_snap_surf, "_map_init_model_metric_positions", wraps=opt_loss_snap_surf._map_init_model_metric_positions) as metric_mock,
+			mock.patch.object(opt_loss_snap_surf, "_map_init_inverse_regularization_terms", wraps=opt_loss_snap_surf._map_init_inverse_regularization_terms) as inv_mock,
+			mock.patch.object(opt_loss_snap_surf, "_map_init_local_evenness_terms", wraps=opt_loss_snap_surf._map_init_local_evenness_terms) as even_mock,
+		):
+			loss, terms = opt_loss_snap_surf._map_init_objective(
+				uv_full=uv.requires_grad_(True),
+				active_quad=torch.ones(2, 2, dtype=torch.bool),
+				ext_pos=_plane_xyz(h=3, w=3, z=0.0),
+				ext_normals=_normals_2d(3, 3),
+				ext_valid=torch.ones(3, 3, dtype=torch.bool),
+				ext_quad_valid=torch.ones(2, 2, dtype=torch.bool),
+				model_xyz=_plane_xyz(h=3, w=3, z=1.0).unsqueeze(0),
+				model_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+				model_normals=_normals_3d(1, 3, 3),
+				model_depth=0,
+				sign=1,
+				cfg=cfg,
+				uv_prior=uv.detach().clone(),
+				need_stats=False,
+			)
+
+		self.assertAlmostEqual(float(loss.detach()), 0.0, places=6)
+		for key in ("dist", "vec", "norm", "turn", "smooth", "bend", "jac", "metric_smooth", "area_smooth", "prior"):
+			self.assertIn(key, terms)
+			self.assertAlmostEqual(float(terms[key].detach()), 0.0, places=6)
+		self.assertEqual(sample_mock.call_count, 0)
+		self.assertEqual(metric_mock.call_count, 0)
+		self.assertEqual(inv_mock.call_count, 0)
+		self.assertEqual(even_mock.call_count, 0)
+
+	def test_map_init_objective_zero_weight_diagnostics_still_compute_terms(self) -> None:
+		uv = torch.stack(torch.meshgrid(torch.arange(3, dtype=torch.float32), torch.arange(3, dtype=torch.float32), indexing="ij"), dim=-1)
+		uv[1, 1] = uv[1, 1] + torch.tensor([0.25, -0.15])
+		cfg = opt_loss_snap_surf.SnapSurfConfig(
+			map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+				subdiv=2,
+				w_dist=0.0,
+				w_vec_normal=0.0,
+				w_surface_normal=0.0,
+				w_smooth=0.0,
+				w_bend=0.0,
+				w_jac=0.0,
+				w_metric_smooth=0.0,
+				w_area_smooth=0.0,
+			),
+		)
+
+		_loss, terms = opt_loss_snap_surf._map_init_objective(
+			uv_full=uv,
+			active_quad=torch.ones(2, 2, dtype=torch.bool),
+			ext_pos=_plane_xyz(h=3, w=3, z=0.0),
+			ext_normals=_normals_2d(3, 3),
+			ext_valid=torch.ones(3, 3, dtype=torch.bool),
+			ext_quad_valid=torch.ones(2, 2, dtype=torch.bool),
+			model_xyz=_plane_xyz(h=3, w=3, z=1.0).unsqueeze(0),
+			model_valid=torch.ones(1, 3, 3, dtype=torch.bool),
+			model_normals=_normals_3d(1, 3, 3),
+			model_depth=0,
+			sign=1,
+			cfg=cfg,
+			need_stats=True,
+		)
+
+		self.assertGreater(float(terms["dist"].detach()), 0.0)
+		self.assertGreater(float(terms["smooth"].detach()), 0.0)
+		self.assertGreater(float(terms["metric_smooth"].detach()), 0.0)
 
 if __name__ == "__main__":
 	unittest.main()

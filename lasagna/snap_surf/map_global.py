@@ -24,7 +24,7 @@ from .legacy import (
 	_closest_point_uv_on_model_quad,
 	_huber,
 )
-from .map_fixture_io import MapFixture, _float_tif, _write_json, load_map_fixture
+from .map_fixture_io import MapFixture, _float_tif, _write_json, compare_map_tensors, load_map_fixture
 from .map_objective import (
 	_map_init_distance_multiplier,
 	_map_init_lifted_z_heading_field,
@@ -5539,6 +5539,488 @@ def _global_metrics(uv: torch.Tensor, fixture: MapFixture) -> dict[str, Any]:
 		"model_x_rms_delta": float(rms[1].detach().cpu()),
 		"model_l2_max_delta": float(max_l2.detach().cpu()),
 	}
+
+
+def _reference_map_tensors(
+	reference_dir: str | Path | None,
+	fixture: MapFixture,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
+	if reference_dir is None:
+		return fixture.reference_uv, fixture.reference_active_quad, fixture.reference_blocked_quad, str(fixture.root)
+	root = Path(reference_dir)
+	if (root / "fixture.json").exists():
+		ref_fixture = load_map_fixture(root, device=fixture.reference_uv.device)
+		return ref_fixture.reference_uv, ref_fixture.reference_active_quad, ref_fixture.reference_blocked_quad, str(root)
+	map_root = root / "map" if (root / "map" / "model_x.tif").exists() else root
+	import tifffile
+
+	model_x = torch.as_tensor(tifffile.imread(str(map_root / "model_x.tif")), device=fixture.reference_uv.device, dtype=fixture.reference_uv.dtype)
+	model_y = torch.as_tensor(tifffile.imread(str(map_root / "model_y.tif")), device=fixture.reference_uv.device, dtype=fixture.reference_uv.dtype)
+	reference_uv = torch.stack([model_y, model_x], dim=-1)
+	active_path = map_root / "active_quad.tif"
+	blocked_path = map_root / "blocked_quad.tif"
+	if active_path.exists():
+		reference_active_quad = torch.as_tensor(tifffile.imread(str(active_path)), device=fixture.reference_uv.device).bool()
+	else:
+		reference_active_quad = fixture.reference_active_quad
+	if blocked_path.exists():
+		reference_blocked_quad = torch.as_tensor(tifffile.imread(str(blocked_path)), device=fixture.reference_uv.device).bool()
+	else:
+		reference_blocked_quad = torch.zeros_like(reference_active_quad)
+	return reference_uv, reference_active_quad, reference_blocked_quad, str(root)
+
+
+def _benchmark_device_metadata(device: torch.device) -> dict[str, Any]:
+	meta: dict[str, Any] = {
+		"device": str(device),
+		"torch_version": str(torch.__version__),
+		"cuda_available": bool(torch.cuda.is_available()),
+	}
+	if device.type == "cuda":
+		idx = 0 if device.index is None else int(device.index)
+		meta.update({
+			"cuda_device_index": idx,
+			"cuda_device_name": torch.cuda.get_device_name(idx),
+			"cuda_version": torch.version.cuda,
+		})
+	return meta
+
+
+def benchmark_fixture(
+	fixture_dir: str | Path,
+	config_path: str | Path,
+	*,
+	out_dir: str | Path,
+	device: torch.device | str = "cpu",
+	reference_dir: str | Path | None = None,
+	max_model_abs_delta: float = 1.0,
+	max_model_l2_delta: float = 1.0,
+	require_mask_equal: bool = True,
+	profile_components: bool = False,
+	profile_repeats: int = 3,
+	profile_stage: str | int | None = None,
+	profiler_trace: str | Path | None = None,
+) -> dict[str, Any]:
+	device_t = torch.device(str(device))
+	out = Path(out_dir)
+	out.mkdir(parents=True, exist_ok=True)
+	if device_t.type == "cuda":
+		torch.cuda.synchronize(device_t)
+	start = time.perf_counter()
+	metrics = optimize_fixture(fixture_dir, config_path, out_dir=out, device=device_t)
+	if device_t.type == "cuda":
+		torch.cuda.synchronize(device_t)
+	elapsed_s = time.perf_counter() - start
+	fixture = load_map_fixture(fixture_dir, device=device_t)
+	fixture = _apply_external_quad_health_filter(fixture, snap_surf_config_from_global_config(parse_global_map_config(config_path)), label="benchmark")
+	import tifffile
+
+	model_x = torch.as_tensor(tifffile.imread(str(out / "model_x.tif")), device=device_t, dtype=fixture.reference_uv.dtype)
+	model_y = torch.as_tensor(tifffile.imread(str(out / "model_y.tif")), device=device_t, dtype=fixture.reference_uv.dtype)
+	rerun_uv = torch.stack([model_y, model_x], dim=-1)
+	rerun_active = _full_active_quad(fixture)
+	rerun_blocked = torch.zeros_like(rerun_active)
+	ref_uv, ref_active, ref_blocked, ref_label = _reference_map_tensors(reference_dir, fixture)
+	compare = compare_map_tensors(
+		reference_uv=ref_uv.to(device=device_t, dtype=rerun_uv.dtype),
+		reference_active_quad=ref_active.to(device=device_t).bool(),
+		reference_blocked_quad=ref_blocked.to(device=device_t).bool(),
+		rerun_uv=rerun_uv,
+		rerun_active_quad=rerun_active,
+		rerun_blocked_quad=rerun_blocked,
+	)
+	thresholds = {
+		"max_model_abs_delta": float(max_model_abs_delta),
+		"max_model_l2_delta": float(max_model_l2_delta),
+		"require_mask_equal": bool(require_mask_equal),
+	}
+	max_abs_observed = max(float(compare["model_y_max_abs_delta"]), float(compare["model_x_max_abs_delta"]))
+	passed = (
+		max_abs_observed <= float(max_model_abs_delta) and
+		float(compare["model_l2_max_delta"]) <= float(max_model_l2_delta) and
+		((not bool(require_mask_equal)) or (bool(compare["active_quad_equal"]) and bool(compare["blocked_quad_equal"])))
+	)
+	profile_rows: list[dict[str, Any]] = []
+	if bool(profile_components):
+		profile_rows = profile_fixture_components(
+			fixture_dir,
+			config_path,
+			out_dir=out,
+			device=device_t,
+			repeats=int(profile_repeats),
+			stage=profile_stage,
+			profiler_trace=profiler_trace,
+		)
+	result = {
+		"kind": "snap_surf_map_benchmark",
+		"fixture_dir": str(Path(fixture_dir)),
+		"config_path": str(Path(config_path)),
+		"out_dir": str(out),
+		"reference_dir": ref_label,
+		"elapsed_s": float(elapsed_s),
+		"device": _benchmark_device_metadata(device_t),
+		"thresholds": thresholds,
+		"passed": bool(passed),
+		"status": "pass" if bool(passed) else "fail",
+		"optimizer_metrics": metrics,
+		"map_deltas": compare,
+		"profile_components": profile_rows,
+	}
+	_write_json(out / "benchmark.json", result)
+	return result
+
+
+_PROFILE_COMPONENT_WEIGHTS: dict[str, dict[str, float]] = {
+	"dist": {"w_dist": 1.0},
+	"vec": {"w_vec_normal": 1.0},
+	"norm": {"w_surface_normal": 1.0},
+	"turn": {"w_z_lift": 1.0},
+	"smooth": {"w_smooth": 1.0},
+	"bend": {"w_bend": 1.0},
+	"jac": {"w_jac": 1.0},
+	"metric_smooth": {"w_metric_smooth": 1.0},
+	"area_smooth": {"w_area_smooth": 1.0},
+	"prior": {"w_dense_prior": 1.0},
+}
+
+
+def _profile_component_cfg(stage_cfg: SnapSurfConfig, component: str) -> SnapSurfConfig:
+	if component == "all":
+		return stage_cfg
+	zeroed = {
+		"w_dist": 0.0,
+		"w_vec_normal": 0.0,
+		"w_surface_normal": 0.0,
+		"w_z_lift": 0.0,
+		"w_smooth": 0.0,
+		"w_bend": 0.0,
+		"w_jac": 0.0,
+		"w_metric_smooth": 0.0,
+		"w_area_smooth": 0.0,
+		"w_dense_prior": 0.0,
+	}
+	zeroed.update(_PROFILE_COMPONENT_WEIGHTS[component])
+	if component != "turn":
+		zeroed["z_lift_enabled"] = bool(stage_cfg.map_init.z_lift_enabled)
+	return replace(stage_cfg, map_init=replace(stage_cfg.map_init, **zeroed))
+
+
+def _profile_stage_selected(stage: GlobalMapStageConfig, stage_idx: int, selector: str | int | None) -> bool:
+	if selector is None:
+		return True
+	if isinstance(selector, int):
+		return int(stage_idx) == int(selector)
+	raw = str(selector)
+	if raw.isdigit():
+		return int(stage_idx) == int(raw)
+	return str(stage.name) == raw
+
+
+def _snapshot_parameters(params: list[torch.nn.Parameter]) -> list[torch.Tensor]:
+	return [p.detach().clone() for p in params]
+
+
+def _assert_parameters_unchanged(params: list[torch.nn.Parameter], before: list[torch.Tensor]) -> None:
+	for i, (p, old) in enumerate(zip(params, before)):
+		if not bool(torch.equal(p.detach(), old)):
+			raise RuntimeError(f"profile changed optimizer parameter {i}")
+
+
+def _run_fixture_stage_training_step_loop(
+	*,
+	stage: GlobalMapStageConfig,
+	stage_cfg: SnapSurfConfig,
+	fixture: MapFixture,
+	affine: AffineMapModel,
+	global_model: GlobalMapModel | None,
+	level: int,
+	sample_level: int,
+	stage_active_quad: torch.Tensor,
+	stage_z_lift: dict[str, Any] | None | object,
+	params: list[torch.nn.Parameter],
+	seed_hw: torch.Tensor,
+	station_target: torch.Tensor,
+	w_station: float,
+) -> None:
+	opt = torch.optim.Adam(params, lr=float(stage.lr))
+	_capture_optimizer_target_lrs(opt)
+	lr_warmup_steps = _lr_warmup_steps(stage.args)
+	lr_autoscale = _make_lr_autoscale_state(stage.args)
+	for step in range(int(stage.steps)):
+		opt.zero_grad(set_to_none=True)
+		if "map_uv_ms" in stage.params and global_model is not None:
+			uv = global_model(active_level=int(sample_level))
+		else:
+			uv = _affine_uv_for_level(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(sample_level))
+		loss, _terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=stage_cfg,
+			level=int(sample_level),
+			z_lift=stage_z_lift,
+			need_stats=False,
+			active_quad=stage_active_quad,
+		)
+		if float(w_station) > 0.0:
+			loss = loss + float(w_station) * _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target)
+		loss.backward()
+		_apply_optimizer_lr_schedule(
+			opt,
+			step1=step + 1,
+			warmup_steps=lr_warmup_steps,
+			autoscale=lr_autoscale,
+			loss=loss,
+		)
+		opt.step()
+
+
+def _time_profile_component(
+	*,
+	component: str,
+	repeats: int,
+	uv_fn: Any,
+	params: list[torch.nn.Parameter],
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	level: int,
+	z_lift: dict[str, Any] | None | object,
+	active_quad: torch.Tensor,
+) -> dict[str, Any]:
+	times: list[float] = []
+	loss_value = 0.0
+	for _ in range(max(1, int(repeats))):
+		for p in params:
+			p.grad = None
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		start = time.perf_counter()
+		uv = uv_fn()
+		loss, terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=cfg,
+			level=int(level),
+			z_lift=z_lift,
+			need_stats=False,
+			active_quad=active_quad,
+		)
+		loss.backward()
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		times.append(time.perf_counter() - start)
+		loss_value = float(terms["loss"].detach().cpu())
+	for p in params:
+		p.grad = None
+	times_sorted = sorted(times)
+	n = len(times_sorted)
+	return {
+		"component": component,
+		"repeats": int(n),
+		"loss": float(loss_value),
+		"mean_s": float(sum(times) / max(1, len(times))),
+		"min_s": float(times_sorted[0]),
+		"median_s": float(times_sorted[n // 2]),
+		"max_s": float(times_sorted[-1]),
+	}
+
+
+def _write_profile_trace(
+	*,
+	path: str | Path,
+	uv_fn: Any,
+	params: list[torch.nn.Parameter],
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	level: int,
+	z_lift: dict[str, Any] | None | object,
+	active_quad: torch.Tensor,
+) -> None:
+	trace_path = Path(path)
+	trace_path.parent.mkdir(parents=True, exist_ok=True)
+	for p in params:
+		p.grad = None
+	activities = [torch.profiler.ProfilerActivity.CPU]
+	if fixture.model_xyz.is_cuda:
+		activities.append(torch.profiler.ProfilerActivity.CUDA)
+		torch.cuda.synchronize(fixture.model_xyz.device)
+	with torch.profiler.profile(activities=activities, record_shapes=False, profile_memory=False) as prof:
+		uv = uv_fn()
+		loss, _terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=cfg,
+			level=int(level),
+			z_lift=z_lift,
+			need_stats=False,
+			active_quad=active_quad,
+		)
+		loss.backward()
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+	prof.export_chrome_trace(str(trace_path))
+	for p in params:
+		p.grad = None
+
+
+def profile_fixture_components(
+	fixture_dir: str | Path,
+	config_path: str | Path,
+	*,
+	out_dir: str | Path,
+	device: torch.device | str = "cpu",
+	repeats: int = 3,
+	stage: str | int | None = None,
+	profiler_trace: str | Path | None = None,
+) -> list[dict[str, Any]]:
+	_PRINTED_PROGRESS_LEGENDS.clear()
+	device_t = torch.device(str(device))
+	fixture = load_map_fixture(fixture_dir, device=device_t)
+	cfg_global = parse_global_map_config(config_path)
+	base_cfg = snap_surf_config_from_global_config(cfg_global)
+	fixture = _apply_external_quad_health_filter(fixture, base_cfg, label="profile")
+	fixture_z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+	fixture_z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+	dtype = fixture.model_xyz.dtype
+	seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
+	seed_uv = _seed_model_uv(fixture, seed_hw)
+	initial_affine = _affine_from_linear(seed_hw, seed_uv, torch.eye(2, device=device_t, dtype=dtype))
+	affine = AffineMapModel(
+		ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+		device=device_t,
+		dtype=dtype,
+		initial=initial_affine,
+	)
+	global_model: GlobalMapModel | None = None
+	station_target = affine.eval_at(seed_hw).detach()
+	for stage_idx, stage_cfg_raw in enumerate(cfg_global.stages):
+		stage_cfg = _stage_loss_cfg(snap_surf_config_from_global_config(cfg_global, stage_cfg_raw), stage_cfg_raw)
+		w_station = _stage_station_weight(cfg_global, stage_cfg_raw)
+		if _is_affine_seed_quad_init(stage_cfg_raw):
+			_run_affine_seed_quad_init(
+				stage_idx=stage_idx,
+				stage=stage_cfg_raw,
+				affine=affine,
+				fixture=fixture,
+				stage_cfg=stage_cfg,
+				seed_hw=seed_hw,
+				station_target=station_target,
+				w_station=w_station,
+				progress_widths_run=_global_progress_widths(cfg_global),
+				progress_row_idx=0,
+				out_root=Path(out_dir),
+				write_objs=False,
+			)
+			continue
+		if _is_affine_init_scan(stage_cfg_raw):
+			_run_affine_multistart(
+				cfg_global=cfg_global,
+				stage=stage_cfg_raw,
+				affine=affine,
+				fixture=fixture,
+				stage_cfg=stage_cfg,
+				seed_hw=seed_hw,
+				station_target=station_target,
+				w_station=w_station,
+			)
+			continue
+		params: list[torch.nn.Parameter] = []
+		max_level = _max_supported_level(tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(stage_cfg_raw.min_scaledown))
+		level = min(int(stage_cfg_raw.min_scaledown), max_level)
+		if "affine" in stage_cfg_raw.params:
+			params.append(affine.affine)
+		if "map_uv_ms" in stage_cfg_raw.params:
+			if global_model is None:
+				levels = _max_supported_level(tuple(int(v) for v in fixture.ext_xyz.shape[:2]), max(int(stage_cfg_raw.min_scaledown), int(base_cfg.map_init.scale_levels) - 1)) + 1
+				station_target = affine.eval_at(seed_hw).detach()
+				global_model = GlobalMapModel(affine().detach(), levels=levels, factor=2)
+			level = min(level, len(global_model.map_uv_ms) - 1)
+			params.extend(list(global_model.map_uv_ms.parameters())[level:])
+		if not params:
+			continue
+		if "affine" in stage_cfg_raw.params:
+			_run_affine_multistart(
+				cfg_global=cfg_global,
+				stage=stage_cfg_raw,
+				affine=affine,
+				fixture=fixture,
+				stage_cfg=stage_cfg,
+				seed_hw=seed_hw,
+				station_target=station_target,
+				w_station=w_station,
+			)
+		stage_z_lift = _map_init_z_lift_for_fixture(
+			fixture,
+			stage_cfg,
+			sign=int(fixture.metadata.get("sign", 1) or 1),
+			external_surface_index=0,
+			mesh_epoch=0,
+			external_cache=fixture_z_lift_external_cache,
+			model_cache=fixture_z_lift_model_cache,
+		)
+		sample_level = _stage_objective_level(stage_cfg_raw, level, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
+		stage_active_quad = _level_active_quad(_full_active_quad(fixture), int(sample_level))
+		if "map_uv_ms" in stage_cfg_raw.params and global_model is not None and _profile_stage_selected(stage_cfg_raw, stage_idx, stage):
+			profile_params = list(global_model.map_uv_ms.parameters())[level:]
+			before = _snapshot_parameters([affine.affine] + list(global_model.map_uv_ms.parameters()))
+			uv_fn = lambda: global_model(active_level=int(sample_level))
+			rows: list[dict[str, Any]] = []
+			components = ["all"] + list(_PROFILE_COMPONENT_WEIGHTS.keys())
+			for component in components:
+				cfg_i = _profile_component_cfg(stage_cfg, component)
+				rows.append(_time_profile_component(
+					component=component,
+					repeats=int(repeats),
+					uv_fn=uv_fn,
+					params=profile_params,
+					fixture=fixture,
+					cfg=cfg_i,
+					level=int(sample_level),
+					z_lift=stage_z_lift,
+					active_quad=stage_active_quad,
+				))
+			if profiler_trace is not None:
+				_write_profile_trace(
+					path=profiler_trace,
+					uv_fn=uv_fn,
+					params=profile_params,
+					fixture=fixture,
+					cfg=stage_cfg,
+					level=int(sample_level),
+					z_lift=stage_z_lift,
+					active_quad=stage_active_quad,
+				)
+			_assert_parameters_unchanged([affine.affine] + list(global_model.map_uv_ms.parameters()), before)
+			out = Path(out_dir)
+			out.mkdir(parents=True, exist_ok=True)
+			payload = {
+				"kind": "snap_surf_map_component_profile",
+				"fixture_dir": str(Path(fixture_dir)),
+				"config_path": str(Path(config_path)),
+				"stage": int(stage_idx),
+				"stage_name": str(stage_cfg_raw.name),
+				"sample_level": int(sample_level),
+				"repeats": int(repeats),
+				"rows": rows,
+				"profiler_trace": None if profiler_trace is None else str(profiler_trace),
+			}
+			_write_json(out / "profile_components.json", payload)
+			return rows
+		_run_fixture_stage_training_step_loop(
+			stage=stage_cfg_raw,
+			stage_cfg=stage_cfg,
+			fixture=fixture,
+			affine=affine,
+			global_model=global_model,
+			level=level,
+			sample_level=sample_level,
+			stage_active_quad=stage_active_quad,
+			stage_z_lift=stage_z_lift,
+			params=params,
+			seed_hw=seed_hw,
+			station_target=station_target,
+			w_station=w_station,
+		)
+	raise ValueError("no map_surf_ms stage matched component profile selector")
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

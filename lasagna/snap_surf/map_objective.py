@@ -1086,6 +1086,22 @@ def _map_init_objective(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	mi = cfg.map_init
 	z = uv_full[torch.isfinite(uv_full)].sum() * 0.0 if uv_full.numel() else model_xyz.sum() * 0.0
+	train_fast = not bool(need_stats)
+	sample_dist_active = (not train_fast) or float(mi.w_dist) > 0.0
+	sample_vec_active = (not train_fast) or float(mi.w_vec_normal) > 0.0
+	sample_norm_active = (not train_fast) or float(mi.w_surface_normal) > 0.0
+	turn_term_active = (not train_fast) or (bool(mi.z_lift_enabled) and float(mi.w_z_lift) > 0.0)
+	sample_terms_active = sample_dist_active or sample_vec_active or sample_norm_active or turn_term_active
+	smooth_term_active = (not train_fast) or float(mi.w_smooth) > 0.0
+	bend_term_active = (not train_fast) or float(mi.w_bend) > 0.0
+	jac_term_active = (not train_fast) or (float(mi.w_jac) * float(w_jac_mult)) > 0.0
+	metric_term_active = (not train_fast) or float(mi.w_metric_smooth) > 0.0
+	area_term_active = (not train_fast) or float(mi.w_area_smooth) > 0.0
+	prior_term_active = (not train_fast) or (bool(mi.dense_opt) and float(mi.w_dense_prior) > 0.0 and uv_prior is not None)
+	reg_terms_active = (
+		smooth_term_active or bend_term_active or jac_term_active or
+		metric_term_active or area_term_active or prior_term_active or bool(need_stats)
+	)
 	active_quad = active_quad.bool()
 	original_quad_shape = tuple(int(v) for v in active_quad.shape)
 	crop = active_quad_crop
@@ -1140,7 +1156,7 @@ def _map_init_objective(
 	turn_loss = z
 	turn_sample_count_t = uv_full.new_zeros(())
 	turn_valid_count_t = uv_full.new_zeros(())
-	if active_quad.numel() > 0 and bool(active_quad.any().detach().cpu()):
+	if sample_terms_active and active_quad.numel() > 0 and bool(active_quad.any().detach().cpu()):
 		uv_samples, p_ext, n_ext_raw, sample_ext_ok, quad_uv_ok = _map_init_dense_quad_sample_tensors(
 			uv_full=uv_full,
 			ext_pos=ext_pos,
@@ -1201,7 +1217,7 @@ def _map_init_objective(
 		norm_values = 1.0 - c_norm
 		ext_theta_samples = None
 		ext_theta_sample_valid = None
-		if ext_coords is not None and ext_z_lift_theta is not None and ext_z_lift_valid is not None:
+		if turn_term_active and ext_coords is not None and ext_z_lift_theta is not None and ext_z_lift_valid is not None:
 			offsets = _map_init_quad_offsets(subdiv=int(mi.subdiv), device=uv_full.device, dtype=uv_full.dtype)
 			sample_ext_coords = _map_init_dense_bilerp_quad(ext_coords, offsets.to(dtype=ext_coords.dtype))
 			ext_theta_samples, ext_theta_sample_valid = _map_init_sample_external_quad_scalar_field(
@@ -1209,17 +1225,21 @@ def _map_init_objective(
 				ext_z_lift_valid,
 				sample_ext_coords,
 			)
-		turn_values, turn_valid = _map_init_z_lift_turn_values(
-			active_quad=active_quad,
-			ext_theta_lifted=ext_z_lift_theta,
-			ext_valid=ext_z_lift_valid,
-			ext_theta_samples=ext_theta_samples,
-			ext_sample_valid=ext_theta_sample_valid,
-			model_theta_lifted=model_z_lift_theta,
-			model_valid=model_z_lift_valid,
-			coords3=safe_coords,
-			cfg=mi,
-		)
+		if turn_term_active:
+			turn_values, turn_valid = _map_init_z_lift_turn_values(
+				active_quad=active_quad,
+				ext_theta_lifted=ext_z_lift_theta,
+				ext_valid=ext_z_lift_valid,
+				ext_theta_samples=ext_theta_samples,
+				ext_sample_valid=ext_theta_sample_valid,
+				model_theta_lifted=model_z_lift_theta,
+				model_valid=model_z_lift_valid,
+				coords3=safe_coords,
+				cfg=mi,
+			)
+		else:
+			turn_values = z.expand(Hq, Wq, S)
+			turn_valid = torch.zeros((Hq, Wq, S), device=uv_full.device, dtype=torch.bool)
 		active_sample = active_quad.unsqueeze(-1).expand(Hq, Wq, S)
 		base_finite = (
 			active_sample &
@@ -1242,6 +1262,14 @@ def _map_init_objective(
 			torch.isfinite(norm_values)
 		)
 		z_lift_active = (
+			turn_term_active
+			and bool(mi.z_lift_enabled)
+			and ext_z_lift_theta is not None
+			and ext_z_lift_valid is not None
+			and model_z_lift_theta is not None
+			and model_z_lift_valid is not None
+		)
+		z_lift_stats_active = (
 			bool(mi.z_lift_enabled)
 			and ext_z_lift_theta is not None
 			and ext_z_lift_valid is not None
@@ -1283,7 +1311,7 @@ def _map_init_objective(
 			model_bad_count_t = (active_quad & ~valid_quad).to(dtype=uv_full.dtype).sum()
 			loss_quad_count_t = loss_quad.to(dtype=uv_full.dtype).sum()
 			valid_quad_count_t = valid_quad.to(dtype=uv_full.dtype).sum()
-			turn_sample_count_t = finite_count_t if z_lift_active else uv_full.new_zeros(())
+			turn_sample_count_t = finite_count_t if z_lift_stats_active else uv_full.new_zeros(())
 		dist_q_all = torch.where(loss_sample, dist_values, dist_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
 		vec_q_all = torch.where(loss_sample, vec_values, vec_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
 		norm_q_all = torch.where(loss_sample, norm_values, norm_values.new_zeros(Hq, Wq, S)).sum(dim=-1) / loss_count
@@ -1306,64 +1334,89 @@ def _map_init_objective(
 		norm_loss = z
 		dist_avg = z
 
-	reg_finite, reg_quad = _map_init_regularization_masks(
-		active_quad=active_quad,
-		ext_valid=ext_vertex_valid,
-		ext_quad_valid=ext_level_quad_valid,
-		uv_finite=uv_finite,
-		cfg=mi,
-	)
+	if reg_terms_active:
+		reg_finite, reg_quad = _map_init_regularization_masks(
+			active_quad=active_quad,
+			ext_valid=ext_vertex_valid,
+			ext_quad_valid=ext_level_quad_valid,
+			uv_finite=uv_finite,
+			cfg=mi,
+		)
+		uv_safe = torch.where(reg_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
+	else:
+		reg_finite = torch.zeros_like(uv_finite, dtype=torch.bool)
+		reg_quad = torch.zeros_like(active_quad, dtype=torch.bool)
+		uv_safe = torch.where(uv_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
 	reg_count_t = reg_finite.to(dtype=uv_full.dtype).sum() if bool(need_stats) else uv_full.new_zeros(())
-	uv_safe = torch.where(reg_finite.unsqueeze(-1), uv_full, torch.zeros_like(uv_full))
-	model_metric_pos, model_metric_valid = _map_init_model_metric_positions(
-		uv_safe,
-		model_xyz=model_xyz,
-		model_valid=model_valid,
-		model_depth=model_depth,
-	)
-	model_metric_valid = model_metric_valid & reg_finite
+	metric_positions_needed = smooth_term_active or bend_term_active or metric_term_active or area_term_active
+	if metric_positions_needed:
+		model_metric_pos, model_metric_valid = _map_init_model_metric_positions(
+			uv_safe,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_depth=model_depth,
+		)
+		model_metric_valid = model_metric_valid & reg_finite
+	else:
+		model_metric_pos = torch.zeros((*uv_full.shape[:2], 3), device=uv_full.device, dtype=uv_full.dtype)
+		model_metric_valid = torch.zeros_like(uv_finite, dtype=torch.bool)
 	model_metric_safe = torch.where(
 		model_metric_valid.unsqueeze(-1),
 		model_metric_pos,
 		torch.zeros_like(model_metric_pos),
 	)
-	uv_fwd_terms = _map_init_forward_smooth_bend_terms(uv_safe, reg_finite, reg_quad, z)
-	model_raw_fwd_terms = _map_init_forward_smooth_bend_terms(model_metric_safe, model_metric_valid, reg_quad, z)
-	physical_ref2 = _map_init_reference_edge_square(
-		ext_vertex_pos,
-		torch.isfinite(ext_vertex_pos).all(dim=-1) & ext_vertex_valid,
-		reg_quad,
-		z,
-	)
-	smooth_uv_fwd_loss = uv_fwd_terms["smooth"]
-	bend_uv_fwd_loss = uv_fwd_terms["bend"]
-	smooth_model_fwd_loss = model_raw_fwd_terms["smooth"] / physical_ref2
-	bend_model_fwd_loss = model_raw_fwd_terms["bend"] / physical_ref2
+	if smooth_term_active or bend_term_active:
+		uv_fwd_terms = _map_init_forward_smooth_bend_terms(uv_safe, reg_finite, reg_quad, z)
+		model_raw_fwd_terms = _map_init_forward_smooth_bend_terms(model_metric_safe, model_metric_valid, reg_quad, z)
+		physical_ref2 = _map_init_reference_edge_square(
+			ext_vertex_pos,
+			torch.isfinite(ext_vertex_pos).all(dim=-1) & ext_vertex_valid,
+			reg_quad,
+			z,
+		)
+		smooth_uv_fwd_loss = uv_fwd_terms["smooth"] if smooth_term_active else z
+		bend_uv_fwd_loss = uv_fwd_terms["bend"] if bend_term_active else z
+		smooth_model_fwd_loss = model_raw_fwd_terms["smooth"] / physical_ref2 if smooth_term_active else z
+		bend_model_fwd_loss = model_raw_fwd_terms["bend"] / physical_ref2 if bend_term_active else z
+	else:
+		smooth_uv_fwd_loss = z
+		bend_uv_fwd_loss = z
+		smooth_model_fwd_loss = z
+		bend_model_fwd_loss = z
 	smooth_fwd_loss = smooth_uv_fwd_loss + smooth_model_fwd_loss
 	bend_fwd_loss = bend_uv_fwd_loss + bend_model_fwd_loss
 
-	jac_fwd_loss = _map_init_jacobian_penalty(
-		uv_safe,
-		reg_quad,
-		jac_margin=mi.jac_margin,
-	)
-	inv_terms = _map_init_inverse_regularization_terms(
-		uv_safe,
-		reg_quad,
-		jac_margin=mi.jac_margin,
-	)
-	even_terms = _map_init_local_evenness_terms(
-		uv_safe,
-		ext_vertex_pos,
-		reg_quad,
-		metric_pos=model_metric_pos,
-		metric_valid=model_metric_valid,
-	)
-	metric_smooth_loss = even_terms["metric_smooth"]
-	area_smooth_loss = even_terms["area_smooth"]
-	smooth_rev_loss = inv_terms["smooth"]
-	bend_rev_loss = inv_terms["bend"]
-	jac_rev_loss = inv_terms["jac"]
+	if jac_term_active:
+		jac_fwd_loss = _map_init_jacobian_penalty(
+			uv_safe,
+			reg_quad,
+			jac_margin=mi.jac_margin,
+		)
+	else:
+		jac_fwd_loss = z
+	if smooth_term_active or bend_term_active or jac_term_active or bool(need_stats):
+		inv_terms = _map_init_inverse_regularization_terms(
+			uv_safe,
+			reg_quad,
+			jac_margin=mi.jac_margin,
+		)
+	else:
+		inv_terms = {"smooth": z, "bend": z, "jac": z, "jac_min": z, "jac_bad": z}
+	if metric_term_active or area_term_active:
+		even_terms = _map_init_local_evenness_terms(
+			uv_safe,
+			ext_vertex_pos,
+			reg_quad,
+			metric_pos=model_metric_pos,
+			metric_valid=model_metric_valid,
+		)
+	else:
+		even_terms = {"metric_smooth": z, "area_smooth": z}
+	metric_smooth_loss = even_terms["metric_smooth"] if metric_term_active else z
+	area_smooth_loss = even_terms["area_smooth"] if area_term_active else z
+	smooth_rev_loss = inv_terms["smooth"] if smooth_term_active else z
+	bend_rev_loss = inv_terms["bend"] if bend_term_active else z
+	jac_rev_loss = inv_terms["jac"] if jac_term_active else z
 	smooth_loss = smooth_fwd_loss + smooth_rev_loss
 	bend_loss = bend_fwd_loss + bend_rev_loss
 	jac_loss = jac_fwd_loss + jac_rev_loss
@@ -1415,7 +1468,7 @@ def _map_init_objective(
 		jac_bad_quad_count_t = jac_bad_quad_grid.to(dtype=uv_full.dtype).sum()
 		jac_inv_bad_quad_count_t = jac_inv_bad_quad_grid.to(dtype=uv_full.dtype).sum()
 		step_bad_quad_count_t = step_bad_quad_grid.to(dtype=uv_full.dtype).sum()
-	if bool(mi.dense_opt) and uv_prior is not None:
+	if prior_term_active and bool(mi.dense_opt) and uv_prior is not None:
 		prior_finite = reg_finite & torch.isfinite(uv_prior).all(dim=-1)
 		prior_values = (uv_full - uv_prior).square().sum(dim=-1)
 		prior_loss = _map_init_masked_mean_values([(prior_values, prior_finite)], z)

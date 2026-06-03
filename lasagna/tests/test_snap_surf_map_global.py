@@ -1705,6 +1705,108 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertIn("avg_model_quad_distance", metrics["history"][-1])
 			self.assertLess(metrics["model_l2_max_delta"], 1.0)
 
+	def test_benchmark_fixture_cli_writes_json_and_passes(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=2, map_steps=2)
+
+			rc = map_global_cli.main(["benchmark-fixture", fixture_dir, cfg_path, "--out", out_dir, "--device", "cpu"])
+
+			self.assertEqual(rc, 0)
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			self.assertEqual(bench["status"], "pass")
+			self.assertTrue(bench["passed"])
+			self.assertIn("elapsed_s", bench)
+			self.assertIn("optimizer_metrics", bench)
+			self.assertEqual(bench["map_deltas"]["common_vertices"], 25)
+			self.assertEqual(bench["map_deltas"]["active_quad_diff"], 0)
+
+	def test_benchmark_fixture_cli_strict_threshold_fails(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=0)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--max-model-abs-delta",
+				"1e-12",
+				"--max-model-l2-delta",
+				"1e-12",
+			])
+
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			if rc == 0:
+				self.assertLessEqual(bench["map_deltas"]["model_l2_max_delta"], 1.0e-12)
+			else:
+				self.assertEqual(rc, 1)
+				self.assertEqual(bench["status"], "fail")
+				self.assertFalse(bench["passed"])
+
+	def test_benchmark_fixture_cli_accepts_explicit_reference_map_dir(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=2, map_steps=2)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--reference-dir",
+				os.path.join(fixture_dir, "map"),
+			])
+
+			self.assertEqual(rc, 0)
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			self.assertEqual(bench["status"], "pass")
+			self.assertEqual(bench["reference_dir"], os.path.join(fixture_dir, "map"))
+
+	def test_benchmark_fixture_cli_profiles_components_without_changing_parameters(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=1)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--profile-components",
+				"--profile-repeats",
+				"1",
+			])
+
+			self.assertEqual(rc, 0)
+			profile = json.loads(Path(out_dir, "profile_components.json").read_text(encoding="utf-8"))
+			components = {row["component"] for row in profile["rows"]}
+			self.assertIn("all", components)
+			self.assertIn("dist", components)
+			self.assertIn("jac", components)
+			for row in profile["rows"]:
+				self.assertGreaterEqual(row["mean_s"], 0.0)
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			self.assertGreaterEqual(len(bench["profile_components"]), 3)
+
 	def test_optimize_fixture_returns_full_rectangular_map(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			fixture_dir = os.path.join(tmp, "fixture")
