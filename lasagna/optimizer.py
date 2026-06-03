@@ -2029,11 +2029,7 @@ def optimize(
 				map_stage,
 				args=_resolve_snap_surf_map_fixture_export_args(map_stage.args, out_dir=out_dir),
 			)
-			_map_status_rows = 0
-			_map_status_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
-			_map_wall = time.perf_counter()
-			_map_last_step = 0
-			_map_legend_printed = False
+			_map_status_printer = snap_surf_map_global.MapRuntimeStatusPrinter(label=label, total_steps=max(0, opt_cfg.steps))
 			_map_auto_stop_info: dict[str, float] = {}
 
 			def _map_auto_stop_fn(*, history: list[float], step: int) -> bool:
@@ -2047,61 +2043,12 @@ def optimize(
 				return True
 
 			def _print_map_status(*, step: int, total: int, stats: dict[str, float]) -> None:
-				nonlocal _map_status_rows, _map_wall, _map_last_step, _map_legend_printed
-				if not _map_legend_printed:
-					print_progress_legend(
-						prefix="[optimizer]",
-						items=[
-							("step", "stage step"),
-							("sm_los", "map objective loss"),
-							("sm_dst", "map distance loss"),
-							("sm_vec", "map vector-normal loss"),
-							("sm_nrm", "map normal alignment loss"),
-							("sm_trn", "lifted z-heading loss"),
-							("sm_ts", "valid lifted z-heading samples"),
-							("sm_smp", "valid map samples"),
-							("sm_bad", "map samples rejected by validity/limits"),
-							("sm_uvb", "active quads with non-finite UV"),
-							("sm_mbd", "active quads rejected by model/sample checks"),
-							("lr", "effective map optimizer learning rate"),
-							("lr_scl", "map LR autoscale factor"),
-							("it/s", "optimizer it/s"),
-						],
-					)
-					_map_legend_printed = True
-				if _map_status_rows % 20 == 0:
-					print(
-						f"{'step':>{_map_status_width}s} {'sm_los':>8s} {'sm_dst':>8s} "
-						f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} {'sm_ts':>8s} "
-						f"{'sm_smp':>8s} {'sm_bad':>8s} {'sm_uvb':>8s} {'sm_mbd':>8s} "
-						f"{'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
-						flush=True,
-					)
-				now = time.perf_counter()
-				its = None
-				if int(step) > int(_map_last_step):
-					its = (int(step) - int(_map_last_step)) / max(1.0e-9, now - _map_wall)
-					_map_wall = now
-					_map_last_step = int(step)
-				its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
-				print(
-					f"{f'{label} {int(step)}/{int(total)}':>{_map_status_width}s} "
-					f"{format_progress_value(float(stats.get('snaps_map_loss', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_dist', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_vec', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_norm', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_sample_bad', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_uvbad', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_model_bad', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_lr', opt_cfg.lr if isinstance(opt_cfg.lr, (int, float)) else _lr_last(opt_cfg.lr)))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_lr_autoscale', 1.0))):>8s} "
-					f"{its_str}",
-					flush=True,
+				_map_status_printer.print(
+					step=int(step),
+					total=int(total),
+					stats=stats,
+					fallback_lr=float(opt_cfg.lr if isinstance(opt_cfg.lr, (int, float)) else _lr_last(opt_cfg.lr)),
 				)
-				_map_status_rows += 1
 				if progress_fn is not None:
 					_stage_total = max(1, int(total))
 					_stage_step = min(max(0, int(step)), _stage_total)

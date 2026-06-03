@@ -109,6 +109,73 @@ def _truthy_arg(value: Any) -> bool:
 	return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+class MapRuntimeStatusPrinter:
+	def __init__(self, *, label: str, total_steps: int, prefix: str = "[optimizer]") -> None:
+		self.label = str(label)
+		self.prefix = str(prefix)
+		self.width = max(16, len(f"{self.label} {max(0, int(total_steps))}/{max(0, int(total_steps))}") + 2)
+		self.rows = 0
+		self.wall = time.perf_counter()
+		self.last_step = 0
+		self.legend_printed = False
+
+	def print(self, *, step: int, total: int, stats: dict[str, float], fallback_lr: float = 0.0) -> None:
+		if not self.legend_printed:
+			print_progress_legend(
+				prefix=self.prefix,
+				items=[
+					("step", "stage step"),
+					("sm_los", "map objective loss"),
+					("sm_dst", "map distance loss"),
+					("sm_vec", "map vector-normal loss"),
+					("sm_nrm", "map normal alignment loss"),
+					("sm_trn", "lifted z-heading loss"),
+					("sm_ts", "valid lifted z-heading samples"),
+					("sm_smp", "valid map samples"),
+					("sm_bad", "map samples rejected by validity/limits"),
+					("sm_uvb", "active quads with non-finite UV"),
+					("sm_mbd", "active quads rejected by model/sample checks"),
+					("lr", "effective map optimizer learning rate"),
+					("lr_scl", "map LR autoscale factor"),
+					("it/s", "optimizer it/s"),
+				],
+			)
+			self.legend_printed = True
+		if self.rows % 20 == 0:
+			print(
+				f"{'step':>{self.width}s} {'sm_los':>8s} {'sm_dst':>8s} "
+				f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} {'sm_ts':>8s} "
+				f"{'sm_smp':>8s} {'sm_bad':>8s} {'sm_uvb':>8s} {'sm_mbd':>8s} "
+				f"{'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
+				flush=True,
+			)
+		now = time.perf_counter()
+		its = None
+		if int(step) > int(self.last_step):
+			its = (int(step) - int(self.last_step)) / max(1.0e-9, now - self.wall)
+			self.wall = now
+			self.last_step = int(step)
+		its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
+		print(
+			f"{f'{self.label} {int(step)}/{int(total)}':>{self.width}s} "
+			f"{format_progress_value(float(stats.get('snaps_map_loss', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_dist', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_vec', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_norm', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_sample_bad', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_uvbad', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_model_bad', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_lr', fallback_lr))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_lr_autoscale', 1.0))):>8s} "
+			f"{its_str}",
+			flush=True,
+		)
+		self.rows += 1
+
+
 def _obj_outputs_enabled(cfg: GlobalMapConfig, stage: GlobalMapStageConfig | None = None) -> bool:
 	keys = ("write_objs", "debug_objs", "write_debug_objs", "write_stage_objs")
 	if stage is not None:
@@ -5356,8 +5423,6 @@ def optimize_fixture(
 	runtime.cfg_global = cfg_global
 	runtime.sign = int(fixture.metadata.get("sign", 1) or 1)
 	history: list[dict[str, Any]] = []
-	progress_widths_run = _global_progress_widths(cfg_global)
-	progress_rows = 0
 	dtype = fixture.model_xyz.dtype
 	seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
 
@@ -5410,8 +5475,9 @@ def optimize_fixture(
 
 	for stage_idx, stage_raw in enumerate(cfg_global.stages):
 		stage = _stage_with_fixture_output_paths(stage_raw)
+		stage_label = stage.name or f"stage{stage_idx}"
+		status_printer = MapRuntimeStatusPrinter(label=stage_label, total_steps=int(stage.steps))
 		def _status_fn(*, step: int, total: int, stats: dict[str, float], _stage_idx: int = stage_idx, _stage: GlobalMapStageConfig = stage) -> None:
-			nonlocal progress_rows
 			params, train_level = runtime._params_for_stage(_stage)
 			_ = params
 			err = {
@@ -5420,19 +5486,12 @@ def optimize_fixture(
 				"mapping_error_samples": float(stats.get("snaps_map_samples", 0.0)),
 			}
 			terms = _progress_terms_from_stats(stats)
-			_print_global_progress(
-				row_idx=progress_rows,
-				widths=progress_widths_run,
-				stage_idx=_stage_idx,
-				iter_label=f"{int(step)}/{int(total)}",
-				lr=float(stats.get("snaps_map_lr", _stage.lr)),
-				level=int(train_level),
-				loss=float(stats.get("snaps_map_loss", 0.0)),
-				terms=terms,
-				it_s=None,
-				err=err,
+			status_printer.print(
+				step=int(step),
+				total=int(total),
+				stats=stats,
+				fallback_lr=float(_stage.lr),
 			)
-			progress_rows += 1
 			history.append({
 				"stage": _stage_idx,
 				"name": _stage.name,

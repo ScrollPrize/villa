@@ -1943,10 +1943,10 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertIn("2/3", text)
 			self.assertNotIn("1/3", text)
 			self.assertNotIn("3/3", text)
-			self.assertRegex(text, r"0/2\s+0\.0200\s+2")
-			self.assertIn("stat", text)
-			self.assertIn("station loss", text)
-			self.assertIn("dst", text)
+			self.assertRegex(text, r"stage1 0/2\s+\S+\s+\S+")
+			self.assertIn("sm_los", text)
+			self.assertIn("map objective loss", text)
+			self.assertIn("sm_dst", text)
 
 	def test_affine_multistart_prints_all_candidate_rows(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
