@@ -91,7 +91,7 @@ default_config = {
     'unattached_pcl_num_per_step': 28,
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 4.,
-    'track_num_per_step': 600,
+    'track_num_per_step': 1600,
     'track_num_points_per_step': 8,
     'normals_num_points': 2000,
     'pcl_normals_num_points': 4000,
