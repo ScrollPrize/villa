@@ -36,7 +36,7 @@ scroll_zarr_path = None
 normal_nx_zarr_path = f'{dataset_path}/normals/las_008_nx.ome.zarr'
 normal_ny_zarr_path = f'{dataset_path}/normals/las_008_ny.ome.zarr'
 normal_zarr_group = '4'
-grad_mag_zarr_path = None
+grad_mag_zarr_path = '/home/paul/projects/vesuvius-scrolls/spiral/las008_s1_full/las_008_grad_mag.ome.zarr'
 pcl_json_paths = [
     f'{dataset_path}/s1_relative_windings_fixed.json',
     f'{dataset_path}/same_winding_annotations_fixed_merged.json',
