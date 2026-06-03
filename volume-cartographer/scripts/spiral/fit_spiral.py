@@ -105,7 +105,7 @@ default_config = {
     'loss_weight_bending': 0.0,
     'loss_weight_sym_dirichlet': 10.0,
     'loss_weight_pcl_normals': 0.0,
-    'loss_weight_dense_normals': 2.e2,
+    'loss_weight_dense_normals': 2.5e2,
     'loss_weight_umbilicus': 5.,
     'loss_weight_shell_outer': 4.0,
     'loss_weight_shell_no_cross': 0.0,
