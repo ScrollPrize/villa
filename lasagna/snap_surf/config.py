@@ -75,7 +75,7 @@ class SnapSurfMapInitConfig:
 	ext_mesh_health_min_normal_dot: float = 0.0
 	ext_mesh_health_reject_radius: int = 4
 	jac_margin: float = 0.05
-	compile_objective: bool = False
+	compile_objective: bool = True
 	compile_objective_mode: str | None = None
 	fixture_export_dir: str | None = None
 	fixture_export_once: bool = True
