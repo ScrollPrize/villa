@@ -409,7 +409,6 @@ _STAGE_W_FAC_KEYS = {
 	"map_vec_normal": "vec",
 	"norm": "norm",
 	"map_surface_normal": "norm",
-	"turn": "turn",
 	"map_turn": "turn",
 	"smooth": "smooth",
 	"map_smooth": "smooth",
@@ -431,7 +430,7 @@ _GLOBAL_MAP_BASE_ALIASES = {
 	"map_dist": "w_dist",
 	"map_vec_normal": "w_vec_normal",
 	"map_surface_normal": "w_surface_normal",
-	"map_turn": "w_z_lift",
+	"map_turn": "map_turn",
 	"map_smooth": "w_smooth",
 	"map_bend": "w_bend",
 	"map_jac": "w_jac",
@@ -750,19 +749,9 @@ def _self_map_objective_for_uv(
 
 
 def parse_global_map_config(path: str | Path) -> GlobalMapConfig:
-	raw = json.loads(Path(path).read_text(encoding="utf-8"))
-	if not isinstance(raw, dict):
-		raise ValueError("global map config must be an object")
-	base = raw.get("base", {})
-	if not isinstance(base, dict):
-		raise ValueError("global map config base must be an object")
-	stages_raw = raw.get("stages", [])
-	if not isinstance(stages_raw, list):
-		raise ValueError("global map config stages must be a list")
-	stages: list[GlobalMapStageConfig] = []
-	for i, item in enumerate(stages_raw):
-		stages.append(parse_global_map_stage_item(item, index=i))
-	return GlobalMapConfig(base=dict(base), stages=tuple(stages))
+	from optimizer import load_global_map_config
+
+	return load_global_map_config(path)
 
 
 def snap_surf_config_from_global_config(cfg: GlobalMapConfig, stage: GlobalMapStageConfig | None = None) -> SnapSurfConfig:
@@ -777,6 +766,11 @@ def snap_surf_config_from_global_config(cfg: GlobalMapConfig, stage: GlobalMapSt
 		raw_map["subdiv"] = stage_args["subdiv"]
 	for key, value in stage_args.items():
 		if key == "map_init":
+			continue
+		if key == "map_z_lift":
+			raise ValueError("global map stage args: use map_turn instead of map_z_lift")
+		if key == "map_turn":
+			raw_map["map_turn"] = value
 			continue
 		if key in SnapSurfMapInitConfig.__dataclass_fields__:
 			raw_map[key] = value
@@ -5098,6 +5092,7 @@ class GlobalMapRuntime:
 		self._z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 		self._z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 		self._fixture_exports_done: set[str] = set()
+		self.last_fixture: MapFixture | None = None
 
 	def _z_lift_for_stage(
 		self,
@@ -5218,6 +5213,7 @@ class GlobalMapRuntime:
 			cache=self._external_health_cache,
 			cache_stats=cache_stats,
 		)
+		self.last_fixture = replace(fixture, metadata=dict(fixture.metadata))
 		startup_health_s = time.perf_counter() - _t_startup
 		cache_stats["health_ms"] = float(cache_stats.get("health_ms", 0.0)) + 1000.0 * float(startup_health_s)
 		stage_cfg = _stage_loss_cfg(base_cfg, stage)
@@ -5788,29 +5784,6 @@ def optimize_fixture(
 				args["debug_obj_dir"] = str(debug_dir)
 		return replace(stage, args=args)
 
-	def _term_tensor(stats: dict[str, float], key: str) -> torch.Tensor:
-		return torch.tensor(float(stats.get(key, 0.0)), device=device_t, dtype=dtype)
-
-	def _progress_terms_from_stats(stats: dict[str, float]) -> dict[str, torch.Tensor]:
-		return {
-			"dist": _term_tensor(stats, "snaps_map_dist"),
-			"vec": _term_tensor(stats, "snaps_map_vec"),
-			"norm": _term_tensor(stats, "snaps_map_norm"),
-			"turn": _term_tensor(stats, "snaps_map_turn"),
-			"turn_smp": _term_tensor(stats, "snaps_map_turn_smp"),
-			"smooth": _term_tensor(stats, "snaps_map_smooth"),
-			"bend": _term_tensor(stats, "snaps_map_bend"),
-			"jac": _term_tensor(stats, "snaps_map_jac"),
-			"metric_smooth": _term_tensor(stats, "snaps_map_metric_smooth"),
-			"area_smooth": _term_tensor(stats, "snaps_map_area_smooth"),
-			"prior": _term_tensor(stats, "snaps_map_prior"),
-			"station": _term_tensor(stats, "snaps_map_station"),
-			"samples": _term_tensor(stats, "snaps_map_samples"),
-			"sample_bad": _term_tensor(stats, "snaps_map_sample_bad"),
-			"uv_bad": _term_tensor(stats, "snaps_map_uvbad"),
-			"model_bad": _term_tensor(stats, "snaps_map_model_bad"),
-		}
-
 	for stage_idx, stage_raw in enumerate(cfg_global.stages):
 		stage = _stage_with_fixture_output_paths(stage_raw)
 		stage_label = stage.name or f"stage{stage_idx}"
@@ -5818,12 +5791,6 @@ def optimize_fixture(
 		def _status_fn(*, step: int, total: int, stats: dict[str, float], _stage_idx: int = stage_idx, _stage: GlobalMapStageConfig = stage) -> None:
 			params, train_level = runtime._params_for_stage(_stage)
 			_ = params
-			err = {
-				"avg_model_quad_distance": float(stats.get("snaps_map_avg", 0.0)),
-				"max_model_quad_distance": float(stats.get("snaps_map_max", 0.0)),
-				"mapping_error_samples": float(stats.get("snaps_map_samples", 0.0)),
-			}
-			terms = _progress_terms_from_stats(stats)
 			status_printer.print(
 				step=int(step),
 				total=int(total),
@@ -5837,8 +5804,10 @@ def optimize_fixture(
 				"params": list(_public_stage_params(_stage.params)),
 				"train_min_level": int(train_level),
 				"loss": float(stats.get("snaps_map_loss", 0.0)),
-				**err,
-				"terms": {k: float(v.detach().cpu()) for k, v in terms.items() if v.ndim == 0},
+				"avg_model_quad_distance": float(stats.get("snaps_map_avg", 0.0)),
+				"max_model_quad_distance": float(stats.get("snaps_map_max", 0.0)),
+				"mapping_error_samples": float(stats.get("snaps_map_samples", 0.0)),
+				"stats": dict(stats),
 			})
 
 		stats = runtime.run_stage(
@@ -5870,7 +5839,7 @@ def optimize_fixture(
 			_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=final_uv_stage, fixture=fixture)
 
 	final_uv = runtime._uv(active_level=0).detach()
-	if _obj_outputs_enabled(cfg_global):
+	if _obj_outputs_enabled(cfg_global) or any(_obj_outputs_enabled(cfg_global, stage) for stage in cfg_global.stages):
 		_write_map_objs(
 			out / "objs" / "final",
 			uv=final_uv,
@@ -6109,7 +6078,26 @@ def _profile_component_cfg(stage_cfg: SnapSurfConfig, component: str) -> SnapSur
 		"w_area_smooth": 0.0,
 		"w_dense_prior": 0.0,
 	}
-	zeroed.update(_PROFILE_COMPONENT_WEIGHTS[component])
+	if component.startswith("without_"):
+		removed = component.removeprefix("without_")
+		if removed not in _PROFILE_COMPONENT_WEIGHTS:
+			raise KeyError(removed)
+		enabled = {
+			"w_dist": float(stage_cfg.map_init.w_dist),
+			"w_vec_normal": float(stage_cfg.map_init.w_vec_normal),
+			"w_surface_normal": float(stage_cfg.map_init.w_surface_normal),
+			"w_z_lift": float(stage_cfg.map_init.w_z_lift),
+			"w_smooth": float(stage_cfg.map_init.w_smooth),
+			"w_bend": float(stage_cfg.map_init.w_bend),
+			"w_jac": float(stage_cfg.map_init.w_jac),
+			"w_metric_smooth": float(stage_cfg.map_init.w_metric_smooth),
+			"w_area_smooth": float(stage_cfg.map_init.w_area_smooth),
+			"w_dense_prior": float(stage_cfg.map_init.w_dense_prior),
+		}
+		enabled.update({key: 0.0 for key in _PROFILE_COMPONENT_WEIGHTS[removed]})
+		zeroed.update(enabled)
+	elif component != "none":
+		zeroed.update(_PROFILE_COMPONENT_WEIGHTS[component])
 	if component != "turn":
 		zeroed["z_lift_enabled"] = bool(stage_cfg.map_init.z_lift_enabled)
 	return replace(stage_cfg, map_init=replace(stage_cfg.map_init, **zeroed))
@@ -6134,54 +6122,6 @@ def _assert_parameters_unchanged(params: list[torch.nn.Parameter], before: list[
 	for i, (p, old) in enumerate(zip(params, before)):
 		if not bool(torch.equal(p.detach(), old)):
 			raise RuntimeError(f"profile changed optimizer parameter {i}")
-
-
-def _run_fixture_stage_training_step_loop(
-	*,
-	stage: GlobalMapStageConfig,
-	stage_cfg: SnapSurfConfig,
-	fixture: MapFixture,
-	affine: AffineMapModel,
-	global_model: GlobalMapModel | None,
-	level: int,
-	sample_level: int,
-	stage_active_quad: torch.Tensor,
-	stage_z_lift: dict[str, Any] | None | object,
-	params: list[torch.nn.Parameter],
-	seed_hw: torch.Tensor,
-	station_target: torch.Tensor,
-	w_station: float,
-) -> None:
-	opt = torch.optim.Adam(params, lr=float(stage.lr))
-	_capture_optimizer_target_lrs(opt)
-	lr_warmup_steps = _lr_warmup_steps(stage.args)
-	lr_autoscale = _make_lr_autoscale_state(stage.args)
-	for step in range(int(stage.steps)):
-		opt.zero_grad(set_to_none=True)
-		if "map_uv_ms" in stage.params and global_model is not None:
-			uv = global_model(active_level=int(sample_level))
-		else:
-			uv = _affine_uv_for_level(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(sample_level))
-		loss, _terms = _objective_for_uv(
-			uv=uv,
-			fixture=fixture,
-			cfg=stage_cfg,
-			level=int(sample_level),
-			z_lift=stage_z_lift,
-			need_stats=False,
-			active_quad=stage_active_quad,
-		)
-		if float(w_station) > 0.0:
-			loss = loss + float(w_station) * _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target, active_quad=stage_active_quad)
-		loss.backward()
-		_apply_optimizer_lr_schedule(
-			opt,
-			step1=step + 1,
-			warmup_steps=lr_warmup_steps,
-			autoscale=lr_autoscale,
-			loss=loss,
-		)
-		opt.step()
 
 
 def _time_profile_component(
@@ -6232,6 +6172,70 @@ def _time_profile_component(
 		"median_s": float(times_sorted[n // 2]),
 		"max_s": float(times_sorted[-1]),
 	}
+
+
+def _annotate_profile_percentages(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+	if not rows:
+		return rows
+	all_row = next((row for row in rows if str(row.get("component")) == "all"), rows[0])
+	none_row = next((row for row in rows if str(row.get("component")) == "none"), None)
+	by_component = {str(row.get("component")): row for row in rows}
+	bases = {key: float(all_row.get(key, 0.0)) for key in ("mean_s", "min_s", "median_s", "max_s")}
+	overheads = {key: float(none_row.get(key, 0.0)) if none_row is not None else 0.0 for key in bases}
+	for row in rows:
+		for key, base in bases.items():
+			pct_key = key[:-2] + "_pct_of_all"
+			value = float(row.get(key, 0.0))
+			row[pct_key] = 0.0 if base <= 0.0 else 100.0 * value / base
+			net_key = key[:-2] + "_net_s"
+			net_pct_key = key[:-2] + "_net_pct_of_all"
+			net_value = max(0.0, value - overheads[key])
+			net_base = max(0.0, base - overheads[key])
+			row[net_key] = net_value
+			row[net_pct_key] = 0.0 if net_base <= 0.0 else 100.0 * net_value / net_base
+	for name in _PROFILE_COMPONENT_WEIGHTS:
+		row = by_component.get(name)
+		without = by_component.get(f"without_{name}")
+		if row is None or without is None:
+			continue
+		for key, base in bases.items():
+			delta_key = key[:-2] + "_removed_delta_s"
+			delta_pct_key = key[:-2] + "_removed_pct_of_all"
+			delta = max(0.0, base - float(without.get(key, 0.0)))
+			row[delta_key] = delta
+			row[delta_pct_key] = 0.0 if base <= 0.0 else 100.0 * delta / base
+	return rows
+
+
+def _print_profile_component_table(rows: list[dict[str, Any]]) -> None:
+	if not rows:
+		return
+	columns = (
+		("component", "component", 14, "text"),
+		("mean_s", "mean_ms", 12, "ms"),
+		("mean_net_s", "single_ms", 12, "ms"),
+		("mean_net_pct_of_all", "single%", 9, "pct"),
+		("mean_removed_delta_s", "remove_ms", 12, "ms"),
+		("mean_removed_pct_of_all", "remove%", 9, "pct"),
+		("median_s", "median_ms", 12, "ms"),
+		("median_net_s", "single_md_ms", 12, "ms"),
+		("median_removed_delta_s", "remove_md_ms", 12, "ms"),
+	)
+	print("[snap_surf.map_global] component profile", flush=True)
+	print(" ".join(label.rjust(width) for _key, label, width, _kind in columns), flush=True)
+	for row in rows:
+		values: list[str] = []
+		for key, _label, width, kind in columns:
+			if kind == "text":
+				text = str(row.get(key, ""))
+			elif kind == "pct":
+				text = f"{float(row.get(key, 0.0)):.1f}%"
+			elif kind == "ms":
+				text = f"{float(row.get(key, 0.0)) * 1000.0:.3e}"
+			else:
+				text = f"{float(row.get(key, 0.0)):.6g}"
+			values.append(text.rjust(width))
+		print(" ".join(values), flush=True)
 
 
 def _write_profile_trace(
@@ -6286,150 +6290,114 @@ def profile_fixture_components(
 	device_t = torch.device(str(device))
 	fixture = load_map_fixture(fixture_dir, device=device_t)
 	cfg_global = parse_global_map_config(config_path)
-	base_cfg = snap_surf_config_from_global_config(cfg_global)
-	fixture = _apply_external_quad_health_filter(fixture, base_cfg, label="profile")
-	fixture_z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
-	fixture_z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
-	dtype = fixture.model_xyz.dtype
-	seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
-	seed_uv = _seed_model_uv(fixture, seed_hw)
-	initial_affine = _affine_from_linear(seed_hw, seed_uv, torch.eye(2, device=device_t, dtype=dtype))
-	affine = AffineMapModel(
-		ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
-		device=device_t,
-		dtype=dtype,
-		initial=initial_affine,
-	)
-	global_model: GlobalMapModel | None = None
-	station_target = affine.eval_at(seed_hw).detach()
+	seed_xyz_raw = fixture.metadata.get("seed_xyz", (0.0, 0.0, 0.0))
+	seed_xyz = tuple(float(v) for v in seed_xyz_raw[:3]) if isinstance(seed_xyz_raw, (list, tuple)) and len(seed_xyz_raw) >= 3 else None
+	runtime = GlobalMapRuntime(base=cfg_global.base, seed_xyz=seed_xyz)
+	runtime.cfg_global = cfg_global
+	runtime.sign = int(fixture.metadata.get("sign", 1) or 1)
 	for stage_idx, stage_cfg_raw in enumerate(cfg_global.stages):
-		stage_cfg = _stage_loss_cfg(snap_surf_config_from_global_config(cfg_global, stage_cfg_raw), stage_cfg_raw)
-		w_station = _stage_station_weight(cfg_global, stage_cfg_raw)
-		if _is_affine_seed_quad_init(stage_cfg_raw):
-			_run_affine_seed_quad_init(
-				stage_idx=stage_idx,
+		if not ("map_uv_ms" in stage_cfg_raw.params and _profile_stage_selected(stage_cfg_raw, stage_idx, stage)):
+			runtime.run_stage(
 				stage=stage_cfg_raw,
-				affine=affine,
-				fixture=fixture,
-				stage_cfg=stage_cfg,
-				seed_hw=seed_hw,
-				station_target=station_target,
-				w_station=w_station,
-				progress_widths_run=_global_progress_widths(cfg_global),
-				progress_row_idx=0,
-				out_root=Path(out_dir),
-				write_objs=False,
+				model_xyz=fixture.model_xyz,
+				model_normals=fixture.model_normals,
+				model_valid=fixture.model_valid,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_normals=fixture.ext_normals,
+				ext_quad_valid=fixture.ext_quad_valid,
+				external_surface_index=0,
+				mesh_epoch=0,
+				persistent_optimizer=False,
+				map_fixture=fixture,
 			)
 			continue
-		if _is_affine_init_scan(stage_cfg_raw):
-			_run_affine_multistart(
-				cfg_global=cfg_global,
-				stage=stage_cfg_raw,
-				affine=affine,
-				fixture=fixture,
-				stage_cfg=stage_cfg,
-				seed_hw=seed_hw,
-				station_target=station_target,
-				w_station=w_station,
-			)
-			continue
-		params: list[torch.nn.Parameter] = []
-		max_level = _max_supported_level(tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(stage_cfg_raw.min_scaledown))
-		level = min(int(stage_cfg_raw.min_scaledown), max_level)
-		if "affine" in stage_cfg_raw.params:
-			params.append(affine.affine)
-		if "map_uv_ms" in stage_cfg_raw.params:
-			if global_model is None:
-				levels = _max_supported_level(tuple(int(v) for v in fixture.ext_xyz.shape[:2]), max(int(stage_cfg_raw.min_scaledown), int(base_cfg.map_init.scale_levels) - 1)) + 1
-				station_target = affine.eval_at(seed_hw).detach()
-				global_model = GlobalMapModel(affine().detach(), levels=levels, factor=2)
-			level = min(level, len(global_model.map_uv_ms) - 1)
-			params.extend(list(global_model.map_uv_ms.parameters())[level:])
-		if not params:
-			continue
-		if "affine" in stage_cfg_raw.params:
-			_run_affine_multistart(
-				cfg_global=cfg_global,
-				stage=stage_cfg_raw,
-				affine=affine,
-				fixture=fixture,
-				stage_cfg=stage_cfg,
-				seed_hw=seed_hw,
-				station_target=station_target,
-				w_station=w_station,
-			)
-		stage_z_lift = _map_init_z_lift_for_fixture(
+
+		base_cfg = snap_surf_config_from_global_config(cfg_global, stage_cfg_raw)
+		cache_stats: _CacheStats = {
+			"zext_hit": 0,
+			"zext_miss": 0,
+			"zmdl_hit": 0,
+			"zmdl_miss": 0,
+			"health_hit": 0,
+			"health_miss": 0,
+		}
+		stage_fixture = _apply_external_quad_health_filter(
 			fixture,
+			base_cfg,
+			label="profile",
+			external_surface_index=0,
+			cache=runtime._external_health_cache,
+			cache_stats=cache_stats,
+		)
+		runtime.last_fixture = replace(stage_fixture, metadata=dict(stage_fixture.metadata))
+		runtime._ensure_models(stage_fixture, base_cfg, stage_cfg_raw)
+		params, level = runtime._params_for_stage(stage_cfg_raw)
+		if runtime.affine is None or runtime.global_model is None or not params:
+			raise ValueError("component profiling requires a map_surf_ms stage with initialized map parameters")
+		stage_cfg = _stage_loss_cfg(base_cfg, stage_cfg_raw)
+		if _truthy_arg(stage_cfg_raw.args.get("disable_z_lift", stage_cfg_raw.args.get("disable_turn", False))):
+			stage_cfg = replace(stage_cfg, map_init=replace(stage_cfg.map_init, z_lift_enabled=False, w_z_lift=0.0))
+		stage_z_lift = None if not bool(stage_cfg.map_init.z_lift_enabled) else runtime._z_lift_for_stage(
+			stage_fixture,
 			stage_cfg,
-			sign=int(fixture.metadata.get("sign", 1) or 1),
 			external_surface_index=0,
 			mesh_epoch=0,
-			external_cache=fixture_z_lift_external_cache,
-			model_cache=fixture_z_lift_model_cache,
+			cache_stats=cache_stats,
 		)
-		sample_level = _stage_objective_level(stage_cfg_raw, level, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
-		stage_active_quad = _level_active_quad(_full_active_quad(fixture), int(sample_level))
-		if "map_uv_ms" in stage_cfg_raw.params and global_model is not None and _profile_stage_selected(stage_cfg_raw, stage_idx, stage):
-			profile_params = list(global_model.map_uv_ms.parameters())[level:]
-			before = _snapshot_parameters([affine.affine] + list(global_model.map_uv_ms.parameters()))
-			uv_fn = lambda: global_model(active_level=int(sample_level))
-			rows: list[dict[str, Any]] = []
-			components = ["all"] + list(_PROFILE_COMPONENT_WEIGHTS.keys())
-			for component in components:
-				cfg_i = _profile_component_cfg(stage_cfg, component)
-				rows.append(_time_profile_component(
-					component=component,
-					repeats=int(repeats),
-					uv_fn=uv_fn,
-					params=profile_params,
-					fixture=fixture,
-					cfg=cfg_i,
-					level=int(sample_level),
-					z_lift=stage_z_lift,
-					active_quad=stage_active_quad,
-				))
-			if profiler_trace is not None:
-				_write_profile_trace(
-					path=profiler_trace,
-					uv_fn=uv_fn,
-					params=profile_params,
-					fixture=fixture,
-					cfg=stage_cfg,
-					level=int(sample_level),
-					z_lift=stage_z_lift,
-					active_quad=stage_active_quad,
-				)
-			_assert_parameters_unchanged([affine.affine] + list(global_model.map_uv_ms.parameters()), before)
-			out = Path(out_dir)
-			out.mkdir(parents=True, exist_ok=True)
-			payload = {
-				"kind": "snap_surf_map_component_profile",
-				"fixture_dir": str(Path(fixture_dir)),
-				"config_path": str(Path(config_path)),
-				"stage": int(stage_idx),
-				"stage_name": str(stage_cfg_raw.name),
-				"sample_level": int(sample_level),
-				"repeats": int(repeats),
-				"rows": rows,
-				"profiler_trace": None if profiler_trace is None else str(profiler_trace),
-			}
-			_write_json(out / "profile_components.json", payload)
-			return rows
-		_run_fixture_stage_training_step_loop(
-			stage=stage_cfg_raw,
-			stage_cfg=stage_cfg,
-			fixture=fixture,
-			affine=affine,
-			global_model=global_model,
-			level=level,
-			sample_level=sample_level,
-			stage_active_quad=stage_active_quad,
-			stage_z_lift=stage_z_lift,
-			params=params,
-			seed_hw=seed_hw,
-			station_target=station_target,
-			w_station=w_station,
-		)
+		sample_level = _stage_objective_level(stage_cfg_raw, level, tuple(int(v) for v in stage_fixture.ext_xyz.shape[:2]))
+		stage_active_quad = _level_active_quad(_full_active_quad(stage_fixture), int(sample_level))
+		profile_params = list(runtime.global_model.map_uv_ms.parameters())[level:]
+		before = _snapshot_parameters([runtime.affine.affine] + list(runtime.global_model.map_uv_ms.parameters()))
+		uv_fn = lambda: runtime.global_model(active_level=int(sample_level))
+		rows: list[dict[str, Any]] = []
+		component_names = list(_PROFILE_COMPONENT_WEIGHTS.keys())
+		components = ["none", "all"] + component_names + [f"without_{name}" for name in component_names]
+		for component in components:
+			cfg_i = _profile_component_cfg(stage_cfg, component)
+			rows.append(_time_profile_component(
+				component=component,
+				repeats=int(repeats),
+				uv_fn=uv_fn,
+				params=profile_params,
+				fixture=stage_fixture,
+				cfg=cfg_i,
+				level=int(sample_level),
+				z_lift=stage_z_lift,
+				active_quad=stage_active_quad,
+			))
+		rows = _annotate_profile_percentages(rows)
+		_print_profile_component_table([
+			row for row in rows
+			if not str(row.get("component", "")).startswith("without_")
+		])
+		if profiler_trace is not None:
+			_write_profile_trace(
+				path=profiler_trace,
+				uv_fn=uv_fn,
+				params=profile_params,
+				fixture=stage_fixture,
+				cfg=stage_cfg,
+				level=int(sample_level),
+				z_lift=stage_z_lift,
+				active_quad=stage_active_quad,
+			)
+		_assert_parameters_unchanged([runtime.affine.affine] + list(runtime.global_model.map_uv_ms.parameters()), before)
+		out = Path(out_dir)
+		out.mkdir(parents=True, exist_ok=True)
+		payload = {
+			"kind": "snap_surf_map_component_profile",
+			"fixture_dir": str(Path(fixture_dir)),
+			"config_path": str(Path(config_path)),
+			"stage": int(stage_idx),
+			"stage_name": str(stage_cfg_raw.name),
+			"sample_level": int(sample_level),
+			"repeats": int(repeats),
+			"rows": rows,
+			"profiler_trace": None if profiler_trace is None else str(profiler_trace),
+		}
+		_write_json(out / "profile_components.json", payload)
+		return rows
 	raise ValueError("no map_surf_ms stage matched component profile selector")
 
 

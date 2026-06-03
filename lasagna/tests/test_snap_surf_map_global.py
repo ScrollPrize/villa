@@ -155,35 +155,38 @@ def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8, write
 	path = Path(root, "cfg.json")
 	base = {
 		"map_station_t": 0.001,
+		"map_dist": 1.0,
+		"map_vec_normal": 0.0,
+		"map_surface_normal": 0.0,
+		"map_turn": 0.0,
+		"map_smooth": 0.0,
+		"map_bend": 0.0,
+		"map_jac": 0.0,
+		"map_metric_smooth": 0.0,
+		"map_area_smooth": 0.0,
+	}
+	stage_args = {
+		"subdiv": 2,
 		"map_init": {
-			"subdiv": 2,
 			"scale_levels": 4,
-			"w_dist": 1.0,
-			"w_vec_normal": 0.0,
-			"w_surface_normal": 0.0,
-			"w_smooth": 0.0,
-			"w_bend": 0.0,
-			"w_jac": 0.0,
-			"w_metric_smooth": 0.0,
-			"w_area_smooth": 0.0,
 			"max_sample_angle_deg": 180.0,
 			"max_step_neighbor_ratio": 0.0,
 		},
 	}
 	if bool(write_objs):
-		base["write_objs"] = True
+		stage_args["write_objs"] = True
 	_write_json(
 		path,
 		{
 			"base": base,
 			"stages": [
-				{"steps": affine_steps, "lr": 0.05, "params": ["map_surf_affine"], "args": {"subdiv": 2}},
+				{"steps": affine_steps, "lr": 0.05, "params": ["map_surf_affine"], "args": dict(stage_args)},
 				{
 					"steps": map_steps,
 					"lr": 0.02,
 					"params": ["map_surf_ms"],
 					"min_scaledown": 3,
-					"args": {"subdiv": 2, "map_station_t": 0.001},
+					"args": {**stage_args, "map_station_t": 0.001},
 				},
 			],
 		},
@@ -383,7 +386,8 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as tmp:
 			_write_planar_global_fixture(tmp, h=9, w=9)
 			fixture = load_map_fixture(tmp)
-			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
+			cfg_global = parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0))
+			cfg = snap_surf_config_from_global_config(cfg_global, cfg_global.stages[0])
 			affine = AffineMapModel(
 				ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
 				device=torch.device("cpu"),
@@ -518,7 +522,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 					"w_jac": 0.0,
 					"w_metric_smooth": 0.0,
 					"w_area_smooth": 0.0,
-					"w_z_lift": 0.0,
+					"map_turn": 0.0,
 					"max_sample_angle_deg": 180.0,
 					"max_step_neighbor_ratio": 0.0,
 				}
@@ -738,7 +742,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				"w_dist": 0.0,
 				"w_vec_normal": 0.0,
 				"w_surface_normal": 0.0,
-				"w_z_lift": 1.0,
+				"map_turn": 1.0,
 				"w_smooth": 0.0,
 				"w_bend": 0.0,
 				"w_jac": 0.0,
@@ -964,6 +968,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		stages = optimizer.load_stages_cfg({
 			"base": {
 				"map_dist": 2.0,
+				"map_turn": 3.0,
 				"map_smooth": 0.25,
 				"map_station_t": 0.5,
 			},
@@ -981,8 +986,54 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		opt = stages[0].global_opt
 		self.assertEqual(opt.kind, "map")
 		self.assertEqual(opt.eff["map_dist"], 1.0)
+		self.assertEqual(opt.eff["map_turn"], 3.0)
 		self.assertEqual(opt.eff["map_smooth"], 0.25)
 		self.assertEqual(opt.eff["map_station_t"], 0.5)
+
+	def test_lasagna_global_map_config_uses_shared_stage_parser(self) -> None:
+		cfg = optimizer.global_map_config_from_stages_cfg({
+			"base": {
+				"map_dist": 2.0,
+				"map_turn": 3.0,
+				"map_smooth": 0.25,
+			},
+			"stages": [
+				{
+					"name": "map",
+					"steps": 1,
+					"lr": 0.01,
+					"params": ["map_surf_ms"],
+					"w_fac": {"map_dist": 0.5, "map_turn": 0.0},
+				},
+			],
+		})
+
+		self.assertEqual(cfg.base["map_dist"], 2.0)
+		self.assertEqual(cfg.base["map_turn"], 3.0)
+		self.assertEqual(cfg.stages[0].params, ("map_uv_ms",))
+		self.assertEqual(cfg.stages[0].w_fac["dist"], 0.5)
+		self.assertEqual(cfg.stages[0].w_fac["turn"], 0.0)
+		parsed = snap_surf_config_from_global_config(cfg, cfg.stages[0])
+		stage_cfg = _stage_loss_cfg(parsed, cfg.stages[0])
+		self.assertEqual(parsed.map_init.w_z_lift, 3.0)
+		self.assertEqual(stage_cfg.map_init.w_dist, 1.0)
+		self.assertEqual(stage_cfg.map_init.w_z_lift, 0.0)
+
+	def test_lasagna_global_map_config_rejects_old_turn_keys(self) -> None:
+		for key in ("map_z_lift", "w_z_lift"):
+			with self.subTest(key=key):
+				with self.assertRaisesRegex(ValueError, "unknown term|use map_turn"):
+					optimizer.global_map_config_from_stages_cfg({
+						"base": {key: 1.0},
+						"stages": [{"name": "map", "steps": 1, "params": ["map_surf_ms"]}],
+					})
+		with self.assertRaisesRegex(ValueError, "unknown term"):
+			parse_global_map_stage_item({
+				"name": "map",
+				"steps": 1,
+				"params": ["map_surf_ms"],
+				"w_fac": {"turn": 0.0},
+			})
 
 	def test_lasagna_map_stage_rejects_model_loss_weight_override(self) -> None:
 		with self.assertRaisesRegex(ValueError, "map stages may only override map loss"):
@@ -1157,7 +1208,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				steps=0,
 				lr=0.0,
 				params=("affine",),
-				args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "w_z_lift": 1.0, "disable_z_lift": True},
+				args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "map_turn": 1.0, "disable_z_lift": True},
 			),
 			model_xyz=model_xyz,
 			model_normals=model_normals,
@@ -1827,6 +1878,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				"map_dist": 0.0001,
 				"map_vec_normal": 2.0,
 				"map_surface_normal": 3.0,
+				"map_turn": 3.5,
 				"map_smooth": 4.0,
 				"map_bend": 5.0,
 				"map_jac": 6.0,
@@ -1842,6 +1894,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertEqual(parsed.map_init.w_dist, 0.0001)
 		self.assertEqual(parsed.map_init.w_vec_normal, 2.0)
 		self.assertEqual(parsed.map_init.w_surface_normal, 3.0)
+		self.assertEqual(parsed.map_init.w_z_lift, 3.5)
 		self.assertEqual(parsed.map_init.w_smooth, 4.0)
 		self.assertEqual(parsed.map_init.w_bend, 5.0)
 		self.assertEqual(parsed.map_init.w_jac, 6.0)
@@ -2141,13 +2194,53 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertEqual(rc, 0)
 			profile = json.loads(Path(out_dir, "profile_components.json").read_text(encoding="utf-8"))
 			components = {row["component"] for row in profile["rows"]}
+			self.assertIn("none", components)
 			self.assertIn("all", components)
 			self.assertIn("dist", components)
+			self.assertIn("without_dist", components)
 			self.assertIn("jac", components)
 			for row in profile["rows"]:
 				self.assertGreaterEqual(row["mean_s"], 0.0)
+				self.assertIn("mean_pct_of_all", row)
+				self.assertIn("mean_net_s", row)
+				self.assertIn("mean_net_pct_of_all", row)
+			dist_row = next(row for row in profile["rows"] if row["component"] == "dist")
+			self.assertIn("mean_removed_delta_s", dist_row)
+			self.assertIn("mean_removed_pct_of_all", dist_row)
 			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
 			self.assertGreaterEqual(len(bench["profile_components"]), 3)
+
+	def test_benchmark_fixture_cli_profile_only_skips_full_benchmark(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=1)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--profile-only",
+				"--profile-repeats",
+				"1",
+			])
+
+			self.assertEqual(rc, 0)
+			profile = json.loads(Path(out_dir, "profile_components.json").read_text(encoding="utf-8"))
+			self.assertTrue(Path(out_dir, "profile_components.json").exists())
+			self.assertFalse(Path(out_dir, "benchmark.json").exists())
+			none_row = next(row for row in profile["rows"] if row["component"] == "none")
+			all_row = next(row for row in profile["rows"] if row["component"] == "all")
+			self.assertAlmostEqual(all_row["mean_pct_of_all"], 100.0)
+			self.assertAlmostEqual(none_row["mean_net_s"], 0.0)
+			self.assertAlmostEqual(all_row["mean_net_pct_of_all"], 100.0)
+			self.assertIn("median_pct_of_all", all_row)
+			self.assertIn("median_net_pct_of_all", all_row)
 
 	def test_reference_map_global_fixture_config_matches_small_fixture_thresholds(self) -> None:
 		fixture_dir, explicit = _map_init_small_fixture_dir()
@@ -2259,19 +2352,16 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				cfg_path,
 				{
 					"base": {
-						"write_objs": True,
 						"map_station_t": 0.001,
-						"map_init": {
-							"subdiv": 2,
-							"w_dist": 1.0,
-							"w_vec_normal": 0.0,
-							"w_surface_normal": 0.0,
-							"w_smooth": 0.0,
-							"w_bend": 0.0,
-							"w_jac": 0.0,
-							"w_metric_smooth": 0.0,
-							"w_area_smooth": 0.0,
-						},
+						"map_dist": 1.0,
+						"map_vec_normal": 0.0,
+						"map_surface_normal": 0.0,
+						"map_turn": 0.0,
+						"map_smooth": 0.0,
+						"map_bend": 0.0,
+						"map_jac": 0.0,
+						"map_metric_smooth": 0.0,
+						"map_area_smooth": 0.0,
 					},
 					"stages": [
 						{
@@ -2280,6 +2370,8 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 								"lr": 0.05,
 								"params": ["map_surf_affine"],
 							"args": {
+								"write_objs": True,
+								"subdiv": 2,
 								"affine_multistart": {
 									"enabled": True,
 									"rot_deg": [0.0, 15.0],
@@ -2315,19 +2407,16 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				cfg_path,
 				{
 					"base": {
-						"write_objs": True,
 						"map_station_t": 0.001,
-						"map_init": {
-							"subdiv": 2,
-							"w_dist": 1.0,
-							"w_vec_normal": 0.0,
-							"w_surface_normal": 0.0,
-							"w_smooth": 0.0,
-							"w_bend": 0.0,
-							"w_jac": 0.0,
-							"w_metric_smooth": 0.0,
-							"w_area_smooth": 0.0,
-						},
+						"map_dist": 1.0,
+						"map_vec_normal": 0.0,
+						"map_surface_normal": 0.0,
+						"map_turn": 0.0,
+						"map_smooth": 0.0,
+						"map_bend": 0.0,
+						"map_jac": 0.0,
+						"map_metric_smooth": 0.0,
+						"map_area_smooth": 0.0,
 					},
 					"stages": [
 						{
@@ -2335,7 +2424,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 							"steps": 1,
 							"lr": 0.05,
 								"params": ["map_surf_affine"],
-							"args": {"affine_seed_quad_init": {"enabled": True}},
+							"args": {"write_objs": True, "subdiv": 2, "affine_seed_quad_init": {"enabled": True}},
 						}
 					],
 				},
@@ -2368,17 +2457,15 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				cfg_path,
 				{
 					"base": {
-						"map_init": {
-							"subdiv": 2,
-							"w_dist": 1.0,
-							"w_vec_normal": 0.0,
-							"w_surface_normal": 0.0,
-							"w_smooth": 0.0,
-							"w_bend": 0.0,
-							"w_jac": 0.0,
-							"w_metric_smooth": 0.0,
-							"w_area_smooth": 0.0,
-						},
+						"map_dist": 1.0,
+						"map_vec_normal": 0.0,
+						"map_surface_normal": 0.0,
+						"map_turn": 0.0,
+						"map_smooth": 0.0,
+						"map_bend": 0.0,
+						"map_jac": 0.0,
+						"map_metric_smooth": 0.0,
+						"map_area_smooth": 0.0,
 					},
 					"stages": [
 						{
@@ -2386,7 +2473,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 							"steps": 1,
 							"lr": 0.05,
 							"params": ["map_surf_affine"],
-							"args": {"affine_seed_quad_init": {"enabled": True, "max_ray_distance": 1.0}},
+							"args": {"subdiv": 2, "affine_seed_quad_init": {"enabled": True, "max_ray_distance": 1.0}},
 						}
 					],
 				},

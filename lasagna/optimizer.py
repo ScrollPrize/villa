@@ -624,7 +624,7 @@ def _global_map_args_from_eff(args: dict, *, base: dict[str, float], eff: dict[s
 		"w_dist": float(base.get("map_dist", 0.0)),
 		"w_vec_normal": float(base.get("map_vec_normal", 0.0)),
 		"w_surface_normal": float(base.get("map_surface_normal", 0.0)),
-		"w_z_lift": float(base.get("map_turn", 0.0)),
+		"map_turn": float(base.get("map_turn", 0.0)),
 		"w_smooth": float(base.get("map_smooth", 0.0)),
 		"w_bend": float(base.get("map_bend", 0.0)),
 		"w_jac": float(base.get("map_jac", 0.0)),
@@ -649,6 +649,50 @@ def _global_map_stage_from_opt_settings(*, name: str, opt_cfg: OptSettings, args
 		w_fac=_global_map_w_fac_from_eff(base=opt_cfg.base_eff, eff=opt_cfg.eff),
 		args=_global_map_args_from_eff(args, base=opt_cfg.base_eff, eff=opt_cfg.eff),
 	)
+
+
+def global_map_config_from_stages_cfg(cfg: dict) -> snap_surf_map_global.GlobalMapConfig:
+	stages = load_stages_cfg(cfg)
+	map_stages: list[snap_surf_map_global.GlobalMapStageConfig] = []
+	base_eff: dict[str, float] | None = None
+
+	def _collect(raw_stages: list[Stage]) -> None:
+		nonlocal base_eff
+		for stage in raw_stages:
+			if stage.children:
+				raise ValueError("global map fixture configs do not support nested/expand stages")
+			if stage.global_opt is None:
+				continue
+			if stage.global_opt.kind != "map":
+				raise ValueError(
+					f"global map fixture config stage '{stage.name}' is not a map stage; "
+					"fixture configs must contain only map optimization stages"
+				)
+			if base_eff is None:
+				base_eff = dict(stage.global_opt.base_eff)
+			map_stages.append(_global_map_stage_from_opt_settings(
+				name=stage.name,
+				opt_cfg=stage.global_opt,
+				args=stage.global_opt.args or {},
+			))
+
+	_collect(stages)
+	if not map_stages:
+		raise ValueError("global map fixture config contains no map optimization stages")
+	return snap_surf_map_global.GlobalMapConfig(base=dict(base_eff or {}), stages=tuple(map_stages))
+
+
+def load_global_map_config(path: str | Path) -> snap_surf_map_global.GlobalMapConfig:
+	try:
+		with open(path, "r", encoding="utf-8") as f:
+			cfg = json.load(f)
+	except json.JSONDecodeError as exc:
+		raise ValueError(
+			f"stages_json: invalid JSON in {path}: line {exc.lineno}, column {exc.colno}: {exc.msg}"
+		) from exc
+	if not isinstance(cfg, dict):
+		raise ValueError("stages_json: expected an object")
+	return global_map_config_from_stages_cfg(cfg)
 
 
 def _resolve_snap_surf_map_fixture_export_args(args: dict, *, out_dir: str | None) -> dict:

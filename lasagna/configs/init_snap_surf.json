@@ -23,7 +23,7 @@
 		"map_surface_normal": 1.0,
 		"map_smooth": 0.1,
 		"map_bend": 0.01,
-		"map_z_lift": 0.1,
+		"map_turn": 0.1,
 		"map_jac": 1.0,
 		"map_metric_smooth": 0.1,
 		"map_area_smooth": 0.1,
@@ -94,49 +94,52 @@
 			}
 		},
 		{
-			"name": "map_surf_affine_refine",
+			"name": "map_surf_affine_refine5",
 			"steps": 500,
 			"lr": 0.01,
 			"params": ["map_surf_affine"],
 			"args": {
 				"status_interval": 100,
-				"subdiv": 2
-			}
+				"subdiv": 1
+			},
+			"w_fac" : { "map_turn" : 100.0 }
 		},
 		{
-			"name": "map_uv_coarse",
+			"name": "map_uv_coarse5",
 			"steps": 500,
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
-				"subdiv": 2,
+				"subdiv": 1,
 				"status_interval": 20
 			}
 		},
 		{
-			"name": "map_uv_refine",
+			"name": "map_uv_refine_noturn",
 			"steps": 200,
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
+			"w_fac" : { "map_turn" : 0.0 },
 			"args": {
-				"subdiv": 2,
+				"subdiv": 1,
 				"status_interval": 20
 			}
 		},
 		{
-			"name": "map_uv_fine",
+			"name": "map_uv_fine2",
 			"steps": 200,
 			"lr": 0.01,
 			"params": ["map_surf_ms"],
+			"w_fac" : { "map_turn" : 0.0 },
 			"min_scaledown": 0,
 			"args": {
-				"subdiv": 2,
+				"subdiv": 1,
 				"status_interval": 20,
 				"debug_obj_dir": "snap_surf_objs",
 				"export_fixture": {
-					"dir": "map_init_large/init",
+					"dir": "bench_fixtures_dbg/init",
 					"once": true,
 					"objs": true
 				}
@@ -161,6 +164,7 @@
 						"lr": 0.01,
 						"params": ["map_surf_ms"],
 						"min_scaledown": 0,
+						"w_fac" : { "map_turn" : 0.0 },
 						"args": {
 							"subdiv": 2,
 							"debug_obj_dir": "snap_surf_objs"

@@ -29,6 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	bench.add_argument("--max-model-valid-miss-frac", type=float, default=0.01, help="Maximum fraction of reference model-valid samples the rerun may miss")
 	bench.add_argument("--allow-mask-diff", action="store_true", help="Do not fail when active/blocked masks differ")
 	bench.add_argument("--profile-components", action="store_true", help="Time all and single map objective components without optimizer steps")
+	bench.add_argument("--profile-only", action="store_true", help="Only run component profiling; skip full optimization and reference comparison")
 	bench.add_argument("--profile-repeats", type=int, default=3, help="Component profiling repeats per component")
 	bench.add_argument("--profile-stage", default=None, help="Map stage index or name to profile; defaults to first map_surf_ms stage")
 	bench.add_argument("--profiler-trace", default=None, help="Optional profiler trace output path for component profiling")
@@ -64,6 +65,25 @@ def main(argv: list[str] | None = None) -> int:
 	if args.cmd == "benchmark-fixture":
 		device = _resolve_device(str(args.device))
 		print(f"[map_global_cli] device={device}", flush=True)
+		if bool(args.profile_only):
+			from .map_global import profile_fixture_components
+
+			rows = profile_fixture_components(
+				args.fixture_dir,
+				args.config,
+				out_dir=Path(args.out),
+				device=device,
+				repeats=int(args.profile_repeats),
+				stage=args.profile_stage,
+				profiler_trace=args.profiler_trace,
+			)
+			print(
+				"[map_global_cli] "
+				f"profile_components={len(rows)} "
+				f"out={Path(args.out) / 'profile_components.json'}",
+				flush=True,
+			)
+			return 0
 		result = benchmark_fixture(
 			args.fixture_dir,
 			args.config,

@@ -115,6 +115,12 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 				if "min_scale_level" in raw_cfg:
 					raise ValueError("snap_surf args.map_init: use only one of min_scale_level, min_scale, minscale")
 				raw_cfg["min_scale_level"] = raw_cfg.pop(alias)
+		if "map_z_lift" in raw_cfg:
+			raise ValueError("snap_surf args.map_init: use map_turn instead of map_z_lift")
+		if "w_z_lift" in raw_cfg:
+			raise ValueError("snap_surf args.map_init: use map_turn instead of w_z_lift")
+		if "map_turn" in raw_cfg:
+			raw_cfg["w_z_lift"] = raw_cfg.pop("map_turn")
 		bad = sorted(set(raw_cfg.keys()) - set(SnapSurfMapInitConfig.__dataclass_fields__.keys()))
 		if bad:
 			raise ValueError(f"snap_surf args.map_init: unknown key(s): {bad}")

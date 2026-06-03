@@ -124,7 +124,7 @@
 				"subdiv": 1,
 				"status_interval": 20,
 				"z_lift_enabled": false,
-				"w_z_lift": 0.0
+				"map_turn": 0.0
 			}
 		},
 		{

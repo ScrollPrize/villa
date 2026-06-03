@@ -23,7 +23,7 @@
 		"map_surface_normal": 1.0,
 		"map_smooth": 0.1,
 		"map_bend": 0.01,
-		"map_z_lift": 0.1,
+		"map_turn": 0.1,
 		"map_jac": 1.0,
 		"map_metric_smooth": 0.1,
 		"map_area_smooth": 0.1,
@@ -36,7 +36,7 @@
 			"steps": 100,
 			"lr": 0.1,
 			"params": ["map_surf_affine"],
-			"w_fac" : { "map_z_lift" : 100.0 },
+			"w_fac" : { "map_turn" : 100.0 },
 			"args": {
 				"status_interval": 10,
 				"subdiv": 1,
@@ -77,7 +77,7 @@
 				"status_interval": 100,
 				"subdiv": 1
 			},
-			"w_fac" : { "map_z_lift" : 100.0 }
+			"w_fac" : { "map_turn" : 100.0 }
 		},
 		{
 			"name": "map_uv_coarse5",
@@ -91,23 +91,12 @@
 			}
 		},
 		{
-			"name": "map_uv_refine2",
-			"steps": 0,
-			"lr": 0.1,
-			"params": ["map_surf_ms"],
-			"min_scaledown": 0,
-			"args": {
-				"subdiv": 1,
-				"status_interval": 20
-			}
-		},
-		{
 			"name": "map_uv_refine_noturn",
 			"steps": 200,
 			"lr": 0.1,
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
-			"w_fac" : { "turn" : 0.0 },
+			"w_fac" : { "map_turn" : 0.0 },
 			"args": {
 				"subdiv": 1,
 				"status_interval": 20
