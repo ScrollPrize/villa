@@ -38,6 +38,9 @@
 			"params": ["map_surf_affine"],
 			"w_fac" : { "map_turn" : 100.0 },
 			"args": {
+				"map_init": {
+					"compile_objective": true
+				},
 				"status_interval": 10,
 				"subdiv": 1,
 				"map_global": {
@@ -45,6 +48,7 @@
 					"huber_delta": 5.0,
 					"map_station_t": 1.0,
 					"map_init": {
+						"compile_objective": true,
 						"subdiv": 1,
 						"scale_levels": 4,
 						"w_dist": 0.0001,
@@ -74,6 +78,9 @@
 			"lr": 0.01,
 			"params": ["map_surf_affine"],
 			"args": {
+				"map_init": {
+					"compile_objective": true
+				},
 				"status_interval": 100,
 				"subdiv": 1
 			},
@@ -86,6 +93,9 @@
 			"params": ["map_surf_ms"],
 			"min_scaledown": 5,
 			"args": {
+				"map_init": {
+					"compile_objective": true
+				},
 				"subdiv": 1,
 				"status_interval": 20
 			}
@@ -98,6 +108,9 @@
 			"min_scaledown": 0,
 			"w_fac" : { "map_turn" : 0.0 },
 			"args": {
+				"map_init": {
+					"compile_objective": true
+				},
 				"subdiv": 1,
 				"status_interval": 20
 			}
@@ -109,6 +122,9 @@
 			"params": ["map_surf_ms"],
 			"min_scaledown": 0,
 			"args": {
+				"map_init": {
+					"compile_objective": true
+				},
 				"subdiv": 1,
 				"status_interval": 20,
 				"debug_obj_dir": "snap_surf_objs",

@@ -75,6 +75,8 @@ class SnapSurfMapInitConfig:
 	ext_mesh_health_min_normal_dot: float = 0.0
 	ext_mesh_health_reject_radius: int = 4
 	jac_margin: float = 0.05
+	compile_objective: bool = False
+	compile_objective_mode: str | None = None
 	fixture_export_dir: str | None = None
 	fixture_export_once: bool = True
 	fixture_export_objs: bool = True
@@ -186,6 +188,12 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			ext_mesh_health_min_normal_dot=float(raw_cfg.get("ext_mesh_health_min_normal_dot", defaults.ext_mesh_health_min_normal_dot)),
 			ext_mesh_health_reject_radius=max(0, int(raw_cfg.get("ext_mesh_health_reject_radius", defaults.ext_mesh_health_reject_radius))),
 			jac_margin=float(raw_cfg.get("jac_margin", defaults.jac_margin)),
+			compile_objective=bool(raw_cfg.get("compile_objective", defaults.compile_objective)),
+			compile_objective_mode=(
+				None
+				if raw_cfg.get("compile_objective_mode", defaults.compile_objective_mode) in {None, "", "default"}
+				else str(raw_cfg.get("compile_objective_mode", defaults.compile_objective_mode))
+			),
 			fixture_export_dir=(
 				None
 				if raw_cfg.get("fixture_export_dir", defaults.fixture_export_dir) in {None, ""}
@@ -243,6 +251,8 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 		raise ValueError("snap_surf args.map_init.jac_margin must be >= 0")
 	if cfg.progress_mode not in ("block", "periodic", "both", "none"):
 		raise ValueError("snap_surf args.map_init.progress_mode must be one of block, periodic, both, none")
+	if cfg.compile_objective_mode not in (None, "reduce-overhead", "max-autotune"):
+		raise ValueError("snap_surf args.map_init.compile_objective_mode must be one of default, reduce-overhead, max-autotune")
 	if int(cfg.scale_levels) > 1 and int(cfg.scale_factor) != 2:
 		raise ValueError("snap_surf args.map_init.scale_factor must be 2 when scale_levels > 1")
 	return cfg

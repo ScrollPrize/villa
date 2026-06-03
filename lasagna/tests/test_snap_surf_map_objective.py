@@ -1586,6 +1586,87 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertTrue(torch.isfinite(pen))
 		self.assertAlmostEqual(float(pen.detach()), 0.0, places=6)
 
+	def test_map_init_compile_objective_matches_eager_training_terms_and_grad(self) -> None:
+		H, W = 4, 4
+		hh = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		ww = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		base_uv = torch.stack([hh, ww], dim=-1)
+		uv_init = base_uv.clone()
+		uv_init[1, 1] = uv_init[1, 1] + torch.tensor([0.15, -0.05])
+		uv_init[2, 2] = uv_init[2, 2] + torch.tensor([-0.1, 0.2])
+		active_quad = torch.ones(H - 1, W - 1, dtype=torch.bool)
+		ext_pos = _plane_xyz(h=H, w=W, z=0.0)
+		ext_normals = _normals_2d(H, W)
+		ext_valid = torch.ones(H, W, dtype=torch.bool)
+		ext_quad_valid = torch.ones(H - 1, W - 1, dtype=torch.bool)
+		model_xyz = _plane_xyz(h=H, w=W, z=1.0).unsqueeze(0)
+		model_valid = torch.ones(1, H, W, dtype=torch.bool)
+		model_normals = _normals_3d(1, H, W)
+
+		def _cfg(*, compile_objective: bool) -> opt_loss_snap_surf.SnapSurfConfig:
+			return opt_loss_snap_surf.SnapSurfConfig(
+				map_init=opt_loss_snap_surf.SnapSurfMapInitConfig(
+					subdiv=2,
+					dense_opt=True,
+					dense_reg_radius=1,
+					w_dist=0.7,
+					w_vec_normal=0.2,
+					w_surface_normal=0.3,
+					z_lift_enabled=False,
+					w_z_lift=0.0,
+					w_smooth=0.05,
+					w_bend=0.02,
+					w_jac=0.6,
+					w_metric_smooth=0.4,
+					w_area_smooth=0.0,
+					w_dense_prior=0.1,
+					max_sample_angle_deg=180.0,
+					compile_objective=compile_objective,
+				),
+			)
+
+		def _run(cfg: opt_loss_snap_surf.SnapSurfConfig) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+			uv = uv_init.detach().clone().requires_grad_(True)
+			loss, terms = opt_loss_snap_surf._map_init_objective(
+				uv_full=uv,
+				active_quad=active_quad,
+				ext_pos=ext_pos,
+				ext_normals=ext_normals,
+				ext_valid=ext_valid,
+				ext_quad_valid=ext_quad_valid,
+				model_xyz=model_xyz,
+				model_valid=model_valid,
+				model_normals=model_normals,
+				model_depth=0,
+				sign=1,
+				cfg=cfg,
+				uv_prior=base_uv,
+				need_stats=False,
+				runtime_cache={},
+			)
+			grad = torch.autograd.grad(loss, uv)[0]
+			return loss.detach(), terms, grad.detach()
+
+		eager_loss, eager_terms, eager_grad = _run(_cfg(compile_objective=False))
+		map_objective._MAP_INIT_COMPILED_FN_CACHE.clear()
+		with mock.patch.object(map_objective.torch, "compile", side_effect=lambda fn, **_kwargs: fn, create=True):
+			compiled_loss, compiled_terms, compiled_grad = _run(_cfg(compile_objective=True))
+
+		torch.testing.assert_close(compiled_loss, eager_loss, rtol=1.0e-6, atol=1.0e-6)
+		for key in ("loss", "dist", "vec", "norm", "turn", "smooth", "bend", "jac", "metric_smooth", "area_smooth", "prior"):
+			torch.testing.assert_close(compiled_terms[key], eager_terms[key], rtol=1.0e-6, atol=1.0e-6)
+		torch.testing.assert_close(compiled_grad, eager_grad, rtol=1.0e-6, atol=1.0e-6)
+		compiled_names = {str(key[0]) for key in map_objective._MAP_INIT_COMPILED_FN_CACHE}
+		self.assertTrue({
+			"sample_reduce",
+			"forward_smooth_bend",
+			"jacobian_penalty",
+			"inverse_regularization",
+			"metric_evenness",
+			"prior_loss",
+		}.issubset(compiled_names))
+		self.assertNotIn("area_evenness", compiled_names)
+
 	def test_map_init_objective_skips_zero_weight_training_branches(self) -> None:
 		uv = torch.stack(torch.meshgrid(torch.arange(3, dtype=torch.float32), torch.arange(3, dtype=torch.float32), indexing="ij"), dim=-1)
 		cfg = opt_loss_snap_surf.SnapSurfConfig(
@@ -1602,9 +1683,12 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 				w_metric_smooth=0.0,
 				w_area_smooth=0.0,
 				w_dense_prior=0.0,
+				compile_objective=True,
 			),
 		)
+		map_objective._MAP_INIT_COMPILED_FN_CACHE.clear()
 		with (
+			mock.patch.object(map_objective.torch, "compile", side_effect=AssertionError("zero-weight branches should not compile"), create=True) as compile_mock,
 			mock.patch.object(opt_loss_snap_surf, "_map_init_dense_quad_sample_tensors", wraps=opt_loss_snap_surf._map_init_dense_quad_sample_tensors) as sample_mock,
 			mock.patch.object(opt_loss_snap_surf, "_map_init_model_metric_positions", wraps=opt_loss_snap_surf._map_init_model_metric_positions) as metric_mock,
 			mock.patch.object(opt_loss_snap_surf, "_map_init_inverse_regularization_terms", wraps=opt_loss_snap_surf._map_init_inverse_regularization_terms) as inv_mock,
@@ -1635,6 +1719,7 @@ class SnapSurfMapObjectiveTest(unittest.TestCase):
 		self.assertEqual(metric_mock.call_count, 0)
 		self.assertEqual(inv_mock.call_count, 0)
 		self.assertEqual(even_mock.call_count, 0)
+		self.assertEqual(compile_mock.call_count, 0)
 
 	def test_map_init_objective_zero_weight_diagnostics_still_compute_terms(self) -> None:
 		uv = torch.stack(torch.meshgrid(torch.arange(3, dtype=torch.float32), torch.arange(3, dtype=torch.float32), indexing="ij"), dim=-1)

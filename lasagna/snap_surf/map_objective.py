@@ -43,6 +43,61 @@ class _MapInitEvennessExternalContext:
 	area_pair_down: torch.Tensor | None = None
 	area_pair_right: torch.Tensor | None = None
 
+_MAP_INIT_COMPILED_FN_CACHE: dict[tuple[Any, ...], Any] = {}
+
+def _map_init_tensor_compile_signature(t: torch.Tensor) -> tuple[Any, ...]:
+	return (
+		str(t.device),
+		str(t.dtype),
+		tuple(int(v) for v in t.shape),
+		bool(t.requires_grad),
+	)
+
+def _map_init_compile_signature(args: tuple[Any, ...]) -> tuple[Any, ...]:
+	sig: list[tuple[Any, ...]] = []
+	for value in args:
+		if torch.is_tensor(value):
+			sig.append(_map_init_tensor_compile_signature(value))
+	return tuple(sig)
+
+def _map_init_compile_enabled(cfg: SnapSurfMapInitConfig, *, need_stats: bool) -> bool:
+	return bool(cfg.compile_objective) and not bool(need_stats) and hasattr(torch, "compile")
+
+def _map_init_call_compiled(
+	name: str,
+	fn,
+	args: tuple[Any, ...],
+	*,
+	mode: str | None = None,
+	fullgraph: bool = False,
+	dynamic: bool = False,
+):
+	tensor_sig = _map_init_compile_signature(args)
+	if not tensor_sig:
+		return fn(*args)
+	device = tensor_sig[0][0]
+	dtype = tensor_sig[0][1]
+	key = (
+		str(name),
+		device,
+		dtype,
+		tensor_sig,
+		None if mode in {None, "", "default"} else str(mode),
+		bool(fullgraph),
+		bool(dynamic),
+	)
+	compiled = _MAP_INIT_COMPILED_FN_CACHE.get(key)
+	if compiled is None:
+		compile_kwargs: dict[str, Any] = {
+			"fullgraph": bool(fullgraph),
+			"dynamic": bool(dynamic),
+		}
+		if mode not in {None, "", "default"}:
+			compile_kwargs["mode"] = str(mode)
+		compiled = torch.compile(fn, **compile_kwargs)
+		_MAP_INIT_COMPILED_FN_CACHE[key] = compiled
+	return compiled(*args)
+
 def _principal_angle_delta(to_angle: torch.Tensor, from_angle: torch.Tensor) -> torch.Tensor:
 	two_pi = 2.0 * math.pi
 	return torch.remainder(to_angle - from_angle + math.pi, two_pi) - math.pi
@@ -787,6 +842,16 @@ def _map_init_masked_mean_values(
 		count = count + finite.to(dtype=z.dtype).sum()
 	return torch.where(count > 0.0, total / count.clamp_min(1.0), z)
 
+def _map_init_prior_loss(
+	uv: torch.Tensor,
+	uv_prior: torch.Tensor,
+	reg_finite: torch.Tensor,
+	z: torch.Tensor,
+) -> torch.Tensor:
+	return _map_init_masked_mean_values([
+		((uv - uv_prior).square().sum(dim=-1), reg_finite.bool() & torch.isfinite(uv_prior).all(dim=-1))
+	], z)
+
 def _map_init_jacobian_bad_quad_mask(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
@@ -877,6 +942,13 @@ def _map_init_jacobian_penalty(
 	values = F.relu(float(jac_margin) - dets).square()
 	return _map_init_masked_mean_values([(values, finite)], z)
 
+def _map_init_jacobian_penalty_tensor(
+	uv: torch.Tensor,
+	active_quad: torch.Tensor,
+	jac_margin: float,
+) -> torch.Tensor:
+	return _map_init_jacobian_penalty(uv, active_quad, jac_margin=float(jac_margin))
+
 def _map_init_inverse_regularization_terms(
 	uv: torch.Tensor,
 	active_quad: torch.Tensor,
@@ -939,6 +1011,13 @@ def _map_init_inverse_regularization_terms(
 		"jac_min": jac_inv_min,
 		"jac_bad": jac_inv_bad,
 	}
+
+def _map_init_inverse_regularization_terms_tensor(
+	uv: torch.Tensor,
+	active_quad: torch.Tensor,
+	jac_margin: float,
+) -> dict[str, torch.Tensor]:
+	return _map_init_inverse_regularization_terms(uv, active_quad, jac_margin=float(jac_margin))
 
 def _map_init_mean_square_diffs(
 	pairs: list[tuple[torch.Tensor, torch.Tensor]],
@@ -1384,6 +1463,61 @@ def _map_init_cached_evenness_external_context(
 		)
 	return _map_init_cache_put(cache, key, ctx)
 
+def _map_init_local_metric_evenness_term(
+	duv_h: torch.Tensor,
+	duv_w: torch.Tensor,
+	finite_metric: torch.Tensor,
+	static_quad: torch.Tensor,
+	ext_len_h: torch.Tensor,
+	ext_len_w: torch.Tensor,
+	ext_len_h_valid: torch.Tensor,
+	ext_len_w_valid: torch.Tensor,
+	metric_h_pair_down: torch.Tensor,
+	metric_h_pair_right: torch.Tensor,
+	metric_w_pair_down: torch.Tensor,
+	metric_w_pair_right: torch.Tensor,
+	z: torch.Tensor,
+	eps_t: torch.Tensor,
+) -> torch.Tensor:
+	H, W = int(finite_metric.shape[0]), int(finite_metric.shape[1])
+	metric_quad = static_quad.bool() & _map_init_quad_corner_all(finite_metric)
+	edge_h = torch.zeros(H - 1, W, device=duv_h.device, dtype=torch.bool)
+	edge_h[:, :-1] |= metric_quad
+	edge_h[:, 1:] |= metric_quad
+	uv_len_h = duv_h.norm(dim=-1)
+	valid_h = (
+		edge_h &
+		ext_len_h_valid.bool() &
+		finite_metric[1:, :] & finite_metric[:-1, :] &
+		torch.isfinite(duv_h).all(dim=-1) &
+		torch.isfinite(uv_len_h)
+	)
+	scale_h = _map_init_signed_reciprocal_scale(uv_len_h, ext_len_h.to(device=duv_h.device, dtype=duv_h.dtype), eps_t)
+
+	edge_w = torch.zeros(H, W - 1, device=duv_w.device, dtype=torch.bool)
+	edge_w[:-1, :] |= metric_quad
+	edge_w[1:, :] |= metric_quad
+	uv_len_w = duv_w.norm(dim=-1)
+	valid_w = (
+		edge_w &
+		ext_len_w_valid.bool() &
+		finite_metric[:, 1:] & finite_metric[:, :-1] &
+		torch.isfinite(duv_w).all(dim=-1) &
+		torch.isfinite(uv_len_w)
+	)
+	scale_w = _map_init_signed_reciprocal_scale(uv_len_w, ext_len_w.to(device=duv_w.device, dtype=duv_w.dtype), eps_t)
+
+	metric_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+	if int(scale_h.shape[0]) > 1:
+		metric_pairs.append((scale_h[1:, :] - scale_h[:-1, :], metric_h_pair_down.bool() & valid_h[1:, :] & valid_h[:-1, :]))
+	if int(scale_h.shape[1]) > 1:
+		metric_pairs.append((scale_h[:, 1:] - scale_h[:, :-1], metric_h_pair_right.bool() & valid_h[:, 1:] & valid_h[:, :-1]))
+	if int(scale_w.shape[0]) > 1:
+		metric_pairs.append((scale_w[1:, :] - scale_w[:-1, :], metric_w_pair_down.bool() & valid_w[1:, :] & valid_w[:-1, :]))
+	if int(scale_w.shape[1]) > 1:
+		metric_pairs.append((scale_w[:, 1:] - scale_w[:, :-1], metric_w_pair_right.bool() & valid_w[:, 1:] & valid_w[:, :-1]))
+	return _map_init_mean_square_diffs(metric_pairs, z)
+
 def _map_init_local_evenness_terms(
 	uv: torch.Tensor,
 	ext_pos: torch.Tensor,
@@ -1402,6 +1536,8 @@ def _map_init_local_evenness_terms(
 	cache_key_prefix: tuple[Any, ...] = (),
 	external_static_cache_key: Any | None = None,
 	external_active_quad: torch.Tensor | None = None,
+	compile_objective: bool = False,
+	compile_mode: str | None = None,
 ) -> dict[str, torch.Tensor]:
 	z = uv[torch.isfinite(uv)].sum() * 0.0 if uv.numel() else torch.zeros((), device=uv.device, dtype=uv.dtype)
 	H, W = int(uv.shape[0]), int(uv.shape[1])
@@ -1455,43 +1591,31 @@ def _map_init_local_evenness_terms(
 		assert external_context.ext_len_h_valid is not None and external_context.ext_len_w_valid is not None
 		assert external_context.metric_h_pair_down is not None and external_context.metric_h_pair_right is not None
 		assert external_context.metric_w_pair_down is not None and external_context.metric_w_pair_right is not None
-		metric_quad = external_context.static_quad & _map_init_quad_corner_all(finite_metric)
-		edge_h = torch.zeros(H - 1, W, device=uv.device, dtype=torch.bool)
-		edge_h[:, :-1] |= metric_quad
-		edge_h[:, 1:] |= metric_quad
-		uv_len_h = duv_h.norm(dim=-1)
-		valid_h = (
-			edge_h &
-			external_context.ext_len_h_valid &
-			finite_metric[1:, :] & finite_metric[:-1, :] &
-			torch.isfinite(duv_h).all(dim=-1) &
-			torch.isfinite(uv_len_h)
+		metric_args = (
+			duv_h,
+			duv_w,
+			finite_metric,
+			external_context.static_quad,
+			external_context.ext_len_h,
+			external_context.ext_len_w,
+			external_context.ext_len_h_valid,
+			external_context.ext_len_w_valid,
+			external_context.metric_h_pair_down,
+			external_context.metric_h_pair_right,
+			external_context.metric_w_pair_down,
+			external_context.metric_w_pair_right,
+			z,
+			eps_t,
 		)
-		scale_h = _map_init_signed_reciprocal_scale(uv_len_h, external_context.ext_len_h.to(device=uv.device, dtype=uv.dtype), eps_t)
-
-		edge_w = torch.zeros(H, W - 1, device=uv.device, dtype=torch.bool)
-		edge_w[:-1, :] |= metric_quad
-		edge_w[1:, :] |= metric_quad
-		uv_len_w = duv_w.norm(dim=-1)
-		valid_w = (
-			edge_w &
-			external_context.ext_len_w_valid &
-			finite_metric[:, 1:] & finite_metric[:, :-1] &
-			torch.isfinite(duv_w).all(dim=-1) &
-			torch.isfinite(uv_len_w)
-		)
-		scale_w = _map_init_signed_reciprocal_scale(uv_len_w, external_context.ext_len_w.to(device=uv.device, dtype=uv.dtype), eps_t)
-
-		metric_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
-		if int(scale_h.shape[0]) > 1:
-			metric_pairs.append((scale_h[1:, :] - scale_h[:-1, :], external_context.metric_h_pair_down & valid_h[1:, :] & valid_h[:-1, :]))
-		if int(scale_h.shape[1]) > 1:
-			metric_pairs.append((scale_h[:, 1:] - scale_h[:, :-1], external_context.metric_h_pair_right & valid_h[:, 1:] & valid_h[:, :-1]))
-		if int(scale_w.shape[0]) > 1:
-			metric_pairs.append((scale_w[1:, :] - scale_w[:-1, :], external_context.metric_w_pair_down & valid_w[1:, :] & valid_w[:-1, :]))
-		if int(scale_w.shape[1]) > 1:
-			metric_pairs.append((scale_w[:, 1:] - scale_w[:, :-1], external_context.metric_w_pair_right & valid_w[:, 1:] & valid_w[:, :-1]))
-		metric_smooth = _map_init_mean_square_diffs(metric_pairs, z)
+		if bool(compile_objective):
+			metric_smooth = _map_init_call_compiled(
+				"metric_evenness",
+				_map_init_local_metric_evenness_term,
+				metric_args,
+				mode=compile_mode,
+			)
+		else:
+			metric_smooth = _map_init_local_metric_evenness_term(*metric_args)
 	else:
 		metric_smooth = z
 
@@ -1989,8 +2113,7 @@ def _map_init_dense_quad_physical_step_lengths(
 		),
 	)
 
-def _map_init_reduce_sample_terms(
-	*,
+def _map_init_reduce_sample_terms_tensor(
 	active_quad: torch.Tensor,
 	quad_uv_ok: torch.Tensor,
 	uv: torch.Tensor,
@@ -2012,7 +2135,10 @@ def _map_init_reduce_sample_terms(
 	need_stats: bool,
 	z_lift_active: bool,
 	z_lift_stats_active: bool,
-	mi: SnapSurfMapInitConfig,
+	w_dist: float,
+	w_vec_normal: float,
+	w_surface_normal: float,
+	w_z_lift: float,
 	z: torch.Tensor,
 	d: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
@@ -2067,10 +2193,10 @@ def _map_init_reduce_sample_terms(
 		turn_valid_count_t = (active_sample & turn_valid).to(dtype=z.dtype).sum()
 		sample_bad_frac = sample_bad_count_t / sample_total_count_t.clamp_min(1.0)
 		sample_values = (
-			float(mi.w_dist) * dist_values +
-			float(mi.w_vec_normal) * vec_values +
-			float(mi.w_surface_normal) * norm_values +
-			float(mi.w_z_lift) * turn_values
+			float(w_dist) * dist_values +
+			float(w_vec_normal) * vec_values +
+			float(w_surface_normal) * norm_values +
+			float(w_z_lift) * turn_values
 		)
 		sample_loss = _map_init_masked_mean_values([(sample_values, finite)], z)
 
@@ -2116,6 +2242,63 @@ def _map_init_reduce_sample_terms(
 		"valid_quad_count": valid_quad_count_t,
 		"turn_sample_count": turn_sample_count_t,
 	}
+
+def _map_init_reduce_sample_terms(
+	*,
+	active_quad: torch.Tensor,
+	quad_uv_ok: torch.Tensor,
+	uv: torch.Tensor,
+	p_ext: torch.Tensor,
+	n_ext_raw: torch.Tensor,
+	n_ext: torch.Tensor,
+	coord_ok: torch.Tensor,
+	p_model: torch.Tensor,
+	n_model_raw: torch.Tensor,
+	n_model: torch.Tensor,
+	dist_values: torch.Tensor,
+	vec_values: torch.Tensor,
+	norm_values: torch.Tensor,
+	turn_values: torch.Tensor,
+	turn_valid: torch.Tensor,
+	sample_ext_ok: torch.Tensor,
+	sample_limit_ok: torch.Tensor,
+	allow_partial_model_samples: bool,
+	need_stats: bool,
+	z_lift_active: bool,
+	z_lift_stats_active: bool,
+	mi: SnapSurfMapInitConfig,
+	z: torch.Tensor,
+	d: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+	return _map_init_reduce_sample_terms_tensor(
+		active_quad,
+		quad_uv_ok,
+		uv,
+		p_ext,
+		n_ext_raw,
+		n_ext,
+		coord_ok,
+		p_model,
+		n_model_raw,
+		n_model,
+		dist_values,
+		vec_values,
+		norm_values,
+		turn_values,
+		turn_valid,
+		sample_ext_ok,
+		sample_limit_ok,
+		bool(allow_partial_model_samples),
+		bool(need_stats),
+		bool(z_lift_active),
+		bool(z_lift_stats_active),
+		float(mi.w_dist),
+		float(mi.w_vec_normal),
+		float(mi.w_surface_normal),
+		float(mi.w_z_lift),
+		z,
+		d,
+	)
 
 def _map_init_active_quad_crop_slices(
 	active_quad: torch.Tensor,
@@ -2195,6 +2378,8 @@ def _map_init_objective(
 	metric_term_active = (not train_fast) or float(mi.w_metric_smooth) > 0.0
 	area_term_active = (not train_fast) or float(mi.w_area_smooth) > 0.0
 	prior_term_active = (not train_fast) or (bool(mi.dense_opt) and float(mi.w_dense_prior) > 0.0 and uv_prior is not None)
+	compile_objective = _map_init_compile_enabled(mi, need_stats=bool(need_stats))
+	compile_mode = mi.compile_objective_mode
 	sample_step_limits_need_physical = float(mi.max_sample_angle_deg) < 180.0 and float(mi.sample_angle_step_fraction) > 0.0
 	model_reg_metric_needed = smooth_term_active or bend_term_active or metric_term_active or area_term_active
 	reg_terms_active = (
@@ -2429,32 +2614,44 @@ def _map_init_objective(
 			turn_valid = torch.zeros((Hq, Wq, S), device=uv_full.device, dtype=torch.bool)
 		z_lift_active = turn_term_active and z_lift_fields_available
 		z_lift_stats_active = z_lift_fields_available
-		sample_reduced = _timed("sample_reduce", lambda: _map_init_reduce_sample_terms(
-			active_quad=active_quad,
-			quad_uv_ok=quad_uv_ok,
-			uv=uv,
-			p_ext=p_ext_f,
-			n_ext_raw=n_ext_raw_f,
-			n_ext=n_ext,
-			coord_ok=coord_ok,
-			p_model=p_model,
-			n_model_raw=n_model_raw,
-			n_model=n_model,
-			dist_values=dist_values,
-			vec_values=vec_values,
-			norm_values=norm_values,
-			turn_values=turn_values,
-			turn_valid=turn_valid,
-			sample_ext_ok=sample_ext_ok,
-			sample_limit_ok=sample_limit_ok,
-			allow_partial_model_samples=allow_partial_model_samples,
-			need_stats=need_stats,
-			z_lift_active=z_lift_active,
-			z_lift_stats_active=z_lift_stats_active,
-			mi=mi,
-			z=z,
-			d=d,
-		))
+		sample_reduce_args = (
+			active_quad,
+			quad_uv_ok,
+			uv,
+			p_ext_f,
+			n_ext_raw_f,
+			n_ext,
+			coord_ok,
+			p_model,
+			n_model_raw,
+			n_model,
+			dist_values,
+			vec_values,
+			norm_values,
+			turn_values,
+			turn_valid,
+			sample_ext_ok,
+			sample_limit_ok,
+			bool(allow_partial_model_samples),
+			bool(need_stats),
+			bool(z_lift_active),
+			bool(z_lift_stats_active),
+			float(mi.w_dist),
+			float(mi.w_vec_normal),
+			float(mi.w_surface_normal),
+			float(mi.w_z_lift),
+			z,
+			d,
+		)
+		if bool(compile_objective):
+			sample_reduced = _timed("sample_reduce", lambda: _map_init_call_compiled(
+				"sample_reduce",
+				_map_init_reduce_sample_terms_tensor,
+				sample_reduce_args,
+				mode=compile_mode,
+			))
+		else:
+			sample_reduced = _timed("sample_reduce", lambda: _map_init_reduce_sample_terms_tensor(*sample_reduce_args))
 		finite = sample_reduced["finite"]
 		loss_quad = sample_reduced["loss_quad"]
 		valid_quad = sample_reduced["valid_quad"]
@@ -2529,8 +2726,22 @@ def _map_init_objective(
 		torch.zeros_like(model_metric_pos),
 	)
 	if smooth_term_active or bend_term_active:
-		uv_fwd_terms = _timed("reg_uv_smooth_bend_fwd", lambda: _map_init_forward_smooth_bend_terms(uv_safe, reg_finite, reg_quad, z))
-		model_raw_fwd_terms = _timed("reg_model_smooth_bend_fwd", lambda: _map_init_forward_smooth_bend_terms(model_metric_safe, model_metric_valid, reg_quad, z))
+		if bool(compile_objective):
+			uv_fwd_terms = _timed("reg_uv_smooth_bend_fwd", lambda: _map_init_call_compiled(
+				"forward_smooth_bend",
+				_map_init_forward_smooth_bend_terms,
+				(uv_safe, reg_finite, reg_quad, z),
+				mode=compile_mode,
+			))
+			model_raw_fwd_terms = _timed("reg_model_smooth_bend_fwd", lambda: _map_init_call_compiled(
+				"forward_smooth_bend",
+				_map_init_forward_smooth_bend_terms,
+				(model_metric_safe, model_metric_valid, reg_quad, z),
+				mode=compile_mode,
+			))
+		else:
+			uv_fwd_terms = _timed("reg_uv_smooth_bend_fwd", lambda: _map_init_forward_smooth_bend_terms(uv_safe, reg_finite, reg_quad, z))
+			model_raw_fwd_terms = _timed("reg_model_smooth_bend_fwd", lambda: _map_init_forward_smooth_bend_terms(model_metric_safe, model_metric_valid, reg_quad, z))
 		physical_ref_key = _map_init_reg_physical_ref_cache_key(
 			ext_pos=ext_pos,
 			ext_valid=ext_valid,
@@ -2563,19 +2774,35 @@ def _map_init_objective(
 	bend_fwd_loss = bend_uv_fwd_loss + bend_model_fwd_loss
 
 	if jac_term_active:
-		jac_fwd_loss = _timed("reg_jac_fwd", lambda: _map_init_jacobian_penalty(
-			uv_safe,
-			reg_quad,
-			jac_margin=mi.jac_margin,
-		))
+		if bool(compile_objective):
+			jac_fwd_loss = _timed("reg_jac_fwd", lambda: _map_init_call_compiled(
+				"jacobian_penalty",
+				_map_init_jacobian_penalty_tensor,
+				(uv_safe, reg_quad, float(mi.jac_margin)),
+				mode=compile_mode,
+			))
+		else:
+			jac_fwd_loss = _timed("reg_jac_fwd", lambda: _map_init_jacobian_penalty(
+				uv_safe,
+				reg_quad,
+				jac_margin=mi.jac_margin,
+			))
 	else:
 		jac_fwd_loss = z
 	if smooth_term_active or bend_term_active or jac_term_active or bool(need_stats):
-		inv_terms = _timed("reg_inverse_terms", lambda: _map_init_inverse_regularization_terms(
-			uv_safe,
-			reg_quad,
-			jac_margin=mi.jac_margin,
-		))
+		if bool(compile_objective):
+			inv_terms = _timed("reg_inverse_terms", lambda: _map_init_call_compiled(
+				"inverse_regularization",
+				_map_init_inverse_regularization_terms_tensor,
+				(uv_safe, reg_quad, float(mi.jac_margin)),
+				mode=compile_mode,
+			))
+		else:
+			inv_terms = _timed("reg_inverse_terms", lambda: _map_init_inverse_regularization_terms(
+				uv_safe,
+				reg_quad,
+				jac_margin=mi.jac_margin,
+			))
 	else:
 		inv_terms = {"smooth": z, "bend": z, "jac": z, "jac_min": z, "jac_bad": z}
 	if metric_term_active or area_term_active:
@@ -2610,6 +2837,8 @@ def _map_init_objective(
 				cache_key_prefix=cache_key_prefix,
 				external_static_cache_key=external_static_cache_key,
 				external_active_quad=even_static_quad,
+				compile_objective=bool(compile_objective),
+				compile_mode=compile_mode,
 			)
 
 		even_terms = _timed("reg_evenness_terms", _evenness_terms)
@@ -2674,9 +2903,15 @@ def _map_init_objective(
 		jac_inv_bad_quad_count_t = jac_inv_bad_quad_grid.to(dtype=uv_full.dtype).sum()
 		step_bad_quad_count_t = step_bad_quad_grid.to(dtype=uv_full.dtype).sum()
 	if prior_term_active and bool(mi.dense_opt) and uv_prior is not None:
-		prior_loss = _timed("reg_prior", lambda: _map_init_masked_mean_values([
-			((uv_full - uv_prior).square().sum(dim=-1), reg_finite & torch.isfinite(uv_prior).all(dim=-1))
-		], z))
+		if bool(compile_objective):
+			prior_loss = _timed("reg_prior", lambda: _map_init_call_compiled(
+				"prior_loss",
+				_map_init_prior_loss,
+				(uv_full, uv_prior, reg_finite, z),
+				mode=compile_mode,
+			))
+		else:
+			prior_loss = _timed("reg_prior", lambda: _map_init_prior_loss(uv_full, uv_prior, reg_finite, z))
 	else:
 		prior_loss = z
 	loss = (

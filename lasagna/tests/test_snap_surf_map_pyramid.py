@@ -56,6 +56,8 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 			"max_sample_angle_deg": 45.0,
 			"sample_angle_step_fraction": 0.2,
 			"max_step_neighbor_ratio": 10.0,
+			"compile_objective": True,
+			"compile_objective_mode": "reduce-overhead",
 			"fixture_export_dir": "fixture_out",
 			"fixture_export_once": False,
 			"fixture_export_objs": False,
@@ -100,6 +102,8 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		self.assertAlmostEqual(cfg.max_sample_angle_deg, 45.0)
 		self.assertAlmostEqual(cfg.sample_angle_step_fraction, 0.2)
 		self.assertAlmostEqual(cfg.max_step_neighbor_ratio, 10.0)
+		self.assertTrue(cfg.compile_objective)
+		self.assertEqual(cfg.compile_objective_mode, "reduce-overhead")
 		self.assertEqual(cfg.fixture_export_dir, "fixture_out")
 		self.assertFalse(cfg.fixture_export_once)
 		self.assertFalse(cfg.fixture_export_objs)
@@ -117,6 +121,8 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 				opt_loss_snap_surf._parse_map_init_config({key: 0.0})
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf._parse_map_init_config({"progress_mode": "loud"})
+		with self.assertRaises(ValueError):
+			opt_loss_snap_surf._parse_map_init_config({"compile_objective_mode": "experimental"})
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf._parse_map_init_config({"scale_levels": 2, "scale_factor": 3})
 		cfg = opt_loss_snap_surf._parse_map_init_config({"minscale": 1})
