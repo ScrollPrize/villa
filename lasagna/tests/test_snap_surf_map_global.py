@@ -20,13 +20,23 @@ TEST_DIR = os.path.dirname(__file__)
 if TEST_DIR not in sys.path:
 	sys.path.insert(0, TEST_DIR)
 
-from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_vector_dir, load_map_fixture
+_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS = [
+	"--max-model-l2-mean-delta",
+	"1.0",
+	"--max-model-l2-mse-delta",
+	"1.0",
+]
+
+from snap_surf.map_fixture_io import _float_tif, _mask_tif, _write_json, _write_vector_dir, compare_map_tensors, load_map_fixture
 from snap_surf.map_global import (
 	AffineMapModel,
+	BoundarySelfMapRuntime,
 	GlobalMapModel,
 	GlobalMapRuntime,
 	GlobalMapStageConfig,
 	GlobalMapConfig,
+	MapRuntimeStatusPrinter,
+	SelfMapRuntime,
 	_LrAutoscaleState,
 	_affine_from_seed_ext_quads,
 	_affine_multistart_candidates,
@@ -40,15 +50,21 @@ from snap_surf.map_global import (
 	_run_affine_seed_quad_expansion_reopt,
 	_select_affine_seed_grid_candidate,
 	_seed_quad_affine_init_result,
+	_station_loss,
 	_stage_objective_level,
 	_stage_loss_cfg,
 	_stage_station_weight,
 	_write_map_objs,
+	_self_map_objective_for_uv,
+	self_map_active_quads,
+	self_map_initial_uv,
+	self_map_pair_depths,
 	optimize_fixture,
 	parse_global_map_stage_item,
 	parse_global_map_config,
 	snap_surf_config_from_global_config,
 )
+from snap_surf.map_pyramid import _map_init_integrate_dyadic_uv_pyramid, _map_init_uv_pyr_from_dense
 from snap_surf import map_global_cli
 from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz
 
@@ -139,35 +155,38 @@ def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8, write
 	path = Path(root, "cfg.json")
 	base = {
 		"map_station_t": 0.001,
+		"map_dist": 1.0,
+		"map_vec_normal": 0.0,
+		"map_surface_normal": 0.0,
+		"map_turn": 0.0,
+		"map_smooth": 0.0,
+		"map_bend": 0.0,
+		"map_jac": 0.0,
+		"map_metric_smooth": 0.0,
+		"map_area_smooth": 0.0,
+	}
+	stage_args = {
+		"subdiv": 2,
 		"map_init": {
-			"subdiv": 2,
 			"scale_levels": 4,
-			"w_dist": 1.0,
-			"w_vec_normal": 0.0,
-			"w_surface_normal": 0.0,
-			"w_smooth": 0.0,
-			"w_bend": 0.0,
-			"w_jac": 0.0,
-			"w_metric_smooth": 0.0,
-			"w_area_smooth": 0.0,
 			"max_sample_angle_deg": 180.0,
 			"max_step_neighbor_ratio": 0.0,
 		},
 	}
 	if bool(write_objs):
-		base["write_objs"] = True
+		stage_args["write_objs"] = True
 	_write_json(
 		path,
 		{
 			"base": base,
 			"stages": [
-				{"steps": affine_steps, "lr": 0.05, "params": ["map_surf_affine"], "args": {"subdiv": 2}},
+				{"steps": affine_steps, "lr": 0.05, "params": ["map_surf_affine"], "args": dict(stage_args)},
 				{
 					"steps": map_steps,
 					"lr": 0.02,
 					"params": ["map_surf_ms"],
 					"min_scaledown": 3,
-					"args": {"subdiv": 2, "map_station_t": 0.001},
+					"args": {**stage_args, "map_station_t": 0.001},
 				},
 			],
 		},
@@ -175,7 +194,136 @@ def _write_config(root: str, *, affine_steps: int = 8, map_steps: int = 8, write
 	return str(path)
 
 
+def _map_init_small_fixture_dir() -> tuple[Path | None, bool]:
+	explicit = os.environ.get("LASAGNA_MAP_INIT_SMALL_FIXTURE", "")
+	if explicit:
+		return Path(os.path.expandvars(os.path.expanduser(explicit))), True
+	candidates: list[Path] = []
+	data_root = os.environ.get("LASAGNA_TEST_DATA_ROOT", "")
+	if data_root:
+		candidates.append(Path(os.path.expandvars(os.path.expanduser(data_root))) / "map_init_small" / "init")
+	ves_root = os.environ.get("VES", "")
+	if ves_root:
+		candidates.append(Path(os.path.expandvars(os.path.expanduser(ves_root))) / "data" / "test_data" / "map_init_small" / "init")
+	repo_root = Path(__file__).resolve().parents[2]
+	candidates.append(repo_root.parent / "data" / "test_data" / "map_init_small" / "init")
+	for candidate in candidates:
+		if (candidate / "fixture.json").exists():
+			return candidate, False
+	return None, False
+
+
 class SnapSurfMapGlobalTest(unittest.TestCase):
+	def test_map_runtime_status_printer_includes_smoothing_losses(self) -> None:
+		stdout = StringIO()
+		stats = {
+			"snaps_map_loss": 1.0,
+			"snaps_map_dist": 2.0,
+			"snaps_map_vec": 3.0,
+			"snaps_map_norm": 4.0,
+			"snaps_map_turn": 5.0,
+			"snaps_map_smooth": 6.0,
+			"snaps_map_bend": 7.0,
+			"snaps_map_metric_smooth": 8.0,
+			"snaps_map_area_smooth": 9.0,
+		}
+
+		with redirect_stdout(stdout):
+			MapRuntimeStatusPrinter(label="stage", total_steps=1).print(
+				step=0,
+				total=1,
+				stats=stats,
+			)
+
+		out = stdout.getvalue()
+		self.assertIn("sm_smo", out)
+		self.assertIn("sm_bnd", out)
+		self.assertIn("sm_met", out)
+		self.assertIn("sm_ar", out)
+
+	def test_station_loss_applies_proxy_shift_to_active_vertices(self) -> None:
+		uv = torch.zeros(3, 3, 2, dtype=torch.float32, requires_grad=True)
+		active_quad = torch.zeros(2, 2, dtype=torch.bool)
+		active_quad[0, 0] = True
+
+		loss = _station_loss(
+			uv,
+			torch.tensor([1.0, 1.0]),
+			torch.tensor([-2.0, 3.0]),
+			active_quad=active_quad,
+		)
+		loss.backward()
+
+		expected = torch.tensor([0.5, -0.75])
+		active_vertex = torch.zeros(3, 3, dtype=torch.bool)
+		active_vertex[:2, :2] = True
+		self.assertTrue(torch.allclose(uv.grad[active_vertex], expected.expand(4, 2)))
+		self.assertTrue(torch.equal(uv.grad[~active_vertex], torch.zeros_like(uv.grad[~active_vertex])))
+
+	def test_compare_map_tensors_ignores_uvs_that_do_not_land_on_model(self) -> None:
+		active_quad = torch.ones(1, 1, dtype=torch.bool)
+		blocked_quad = torch.zeros(1, 1, dtype=torch.bool)
+		reference_uv = torch.tensor(
+			[
+				[[0.0, 0.0], [5.0, 5.0]],
+				[[5.0, 5.0], [5.0, 5.0]],
+			],
+			dtype=torch.float32,
+		)
+		rerun_uv = reference_uv.clone()
+		rerun_uv[0, 1] = torch.tensor([100.0, 100.0])
+		model_valid = torch.ones(1, 2, 2, dtype=torch.bool)
+
+		deltas = compare_map_tensors(
+			reference_uv=reference_uv,
+			reference_active_quad=active_quad,
+			reference_blocked_quad=blocked_quad,
+			rerun_uv=rerun_uv,
+			rerun_active_quad=active_quad,
+			rerun_blocked_quad=blocked_quad,
+			model_valid=model_valid,
+			model_depth=0,
+		)
+
+		self.assertEqual(deltas["finite_common_vertices"], 4)
+		self.assertEqual(deltas["common_vertices"], 1)
+		self.assertEqual(deltas["model_l2_max_delta"], 0.0)
+		self.assertEqual(deltas["model_l2_mean_delta"], 0.0)
+		self.assertEqual(deltas["model_l2_mse_delta"], 0.0)
+
+	def test_compare_map_tensors_reports_model_valid_coverage_misses(self) -> None:
+		active_quad = torch.ones(1, 1, dtype=torch.bool)
+		blocked_quad = torch.zeros(1, 1, dtype=torch.bool)
+		reference_uv = torch.tensor(
+			[
+				[[0.0, 0.0], [0.0, 1.0]],
+				[[1.0, 0.0], [1.0, 1.0]],
+			],
+			dtype=torch.float32,
+		)
+		rerun_uv = reference_uv.clone()
+		rerun_uv[0, 1] = torch.tensor([100.0, 100.0])
+		model_valid = torch.ones(1, 2, 2, dtype=torch.bool)
+
+		deltas = compare_map_tensors(
+			reference_uv=reference_uv,
+			reference_active_quad=active_quad,
+			reference_blocked_quad=blocked_quad,
+			rerun_uv=rerun_uv,
+			rerun_active_quad=active_quad,
+			rerun_blocked_quad=blocked_quad,
+			model_valid=model_valid,
+			model_depth=0,
+		)
+
+		self.assertEqual(deltas["reference_model_valid_vertices"], 4)
+		self.assertEqual(deltas["rerun_model_valid_vertices"], 3)
+		self.assertEqual(deltas["model_valid_missed_vertices"], 1)
+		self.assertAlmostEqual(deltas["model_valid_missed_frac"], 0.25)
+		self.assertEqual(deltas["common_vertices"], 3)
+		self.assertEqual(deltas["model_l2_mean_delta"], 0.0)
+		self.assertEqual(deltas["model_l2_mse_delta"], 0.0)
+
 	def _snap_loss_case(
 		self,
 		*,
@@ -238,7 +386,8 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as tmp:
 			_write_planar_global_fixture(tmp, h=9, w=9)
 			fixture = load_map_fixture(tmp)
-			cfg = snap_surf_config_from_global_config(parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0)))
+			cfg_global = parse_global_map_config(_write_config(tmp, affine_steps=0, map_steps=0))
+			cfg = snap_surf_config_from_global_config(cfg_global, cfg_global.stages[0])
 			affine = AffineMapModel(
 				ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
 				device=torch.device("cpu"),
@@ -283,6 +432,302 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		self.assertEqual(_stage_objective_level(coarse, 3, ext_shape), 3)
 		self.assertEqual(_stage_objective_level(explicit, 3, ext_shape), 2)
 
+	def test_self_map_mode1_initializes_single_shifted_map(self) -> None:
+		uv_out = self_map_initial_uv(
+			mode="multi_wrap_full",
+			direction="out",
+			depth=1,
+			height=3,
+			width=6,
+			model_w_wraps=2.5,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+		uv_in = self_map_initial_uv(
+			mode="multi_wrap_full",
+			direction="in",
+			depth=1,
+			height=3,
+			width=6,
+			model_w_wraps=2.5,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+
+		self.assertEqual(tuple(uv_out.shape), (1, 3, 6, 2))
+		self.assertTrue(torch.allclose(uv_out[0, :, :, 0], torch.arange(3, dtype=torch.float32).view(3, 1).expand(3, 6)))
+		self.assertAlmostEqual(float(uv_out[0, 0, 0, 1]), 2.0)
+		self.assertAlmostEqual(float(uv_in[0, 0, 0, 1]), -2.0)
+		self.assertEqual(self_map_pair_depths("multi_wrap_full", "out", 1), ([0], [0]))
+
+	def test_self_map_mode2_initializes_identity_pairs(self) -> None:
+		uv = self_map_initial_uv(
+			mode="multi_wrap_d",
+			direction="out",
+			depth=4,
+			height=3,
+			width=5,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+
+		self.assertEqual(tuple(uv.shape), (3, 3, 5, 2))
+		self.assertEqual(self_map_pair_depths("multi_wrap_d", "out", 4), ([0, 1, 2], [1, 2, 3]))
+		self.assertEqual(self_map_pair_depths("multi_wrap_d", "in", 4), ([1, 2, 3], [0, 1, 2]))
+		hh = torch.arange(3, dtype=torch.float32).view(3, 1).expand(3, 5)
+		ww = torch.arange(5, dtype=torch.float32).view(1, 5).expand(3, 5)
+		self.assertTrue(torch.allclose(uv[2, :, :, 0], hh))
+		self.assertTrue(torch.allclose(uv[2, :, :, 1], ww))
+
+	def test_stacked_uv_pyramid_preserves_batch_axis(self) -> None:
+		uv = self_map_initial_uv(
+			mode="multi_wrap_d",
+			direction="out",
+			depth=3,
+			height=5,
+			width=5,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+		pyr = _map_init_uv_pyr_from_dense(uv, levels=3, factor=2)
+		recon = _map_init_integrate_dyadic_uv_pyramid(list(pyr), preserve_batch=True)
+
+		self.assertEqual(tuple(pyr[0].shape), (2, 2, 5, 5))
+		self.assertEqual(tuple(pyr[1].shape[:2]), (2, 2))
+		self.assertEqual(tuple(recon.shape), tuple(uv.shape))
+		self.assertTrue(torch.allclose(recon, uv, atol=1.0e-6))
+
+	def test_self_map_batched_objective_matches_pair_average(self) -> None:
+		D, H, W = 3, 4, 4
+		model_xyz = torch.stack([_plane_xyz(h=H, w=W, z=float(d)) for d in range(D)], dim=0)
+		model_normals = _normals_3d(D, H, W)
+		model_valid = torch.ones(D, H, W, dtype=torch.bool)
+		uv = self_map_initial_uv(
+			mode="multi_wrap_d",
+			direction="out",
+			depth=D,
+			height=H,
+			width=W,
+			device=torch.device("cpu"),
+			dtype=torch.float32,
+		)
+		cfg = snap_surf_config_from_global_config(
+			GlobalMapConfig(base={
+				"map_init": {
+					"subdiv": 1,
+					"w_vec_normal": 0.0,
+					"w_surface_normal": 0.0,
+					"w_smooth": 0.0,
+					"w_bend": 0.0,
+					"w_jac": 0.0,
+					"w_metric_smooth": 0.0,
+					"w_area_smooth": 0.0,
+					"map_turn": 0.0,
+					"max_sample_angle_deg": 180.0,
+					"max_step_neighbor_ratio": 0.0,
+				}
+			}, stages=())
+		)
+		active = self_map_active_quads(mode="multi_wrap_d", direction="out", model_valid=model_valid, uv=uv)
+
+		loss_b, _terms = _self_map_objective_for_uv(
+			uv=uv,
+			mode="multi_wrap_d",
+			direction="out",
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			cfg=cfg,
+			level=0,
+			active_quad=active,
+		)
+		per_pair = []
+		for i in range(D - 1):
+			loss_i, _ = _self_map_objective_for_uv(
+				uv=uv[i:i + 1],
+				mode="multi_wrap_d",
+				direction="out",
+				model_xyz=model_xyz[i:i + 2],
+				model_normals=model_normals[i:i + 2],
+				model_valid=model_valid[i:i + 2],
+				cfg=cfg,
+				level=0,
+				active_quad=active[i:i + 1],
+			)
+			per_pair.append(loss_i)
+		expected = torch.stack(per_pair).mean()
+
+		self.assertTrue(torch.allclose(loss_b, expected, atol=1.0e-6))
+
+	def test_self_map_batched_snap_loss_matches_pair_average(self) -> None:
+		D, H, W = 3, 4, 4
+		model_xyz = torch.stack([_plane_xyz(h=H, w=W, z=float(d)) for d in range(D)], dim=0)
+		model_normals = _normals_3d(D, H, W)
+		model_valid = torch.ones(D, H, W, dtype=torch.bool)
+		runtime = SelfMapRuntime(mode="multi_wrap_d", direction="out")
+		loss_b, _lms, _masks, stats_b = runtime.snap_loss(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+			offset=1.0,
+			data=None,
+		)
+		per_pair = []
+		samples = 0.0
+		for i in range(D - 1):
+			pair_runtime = SelfMapRuntime(mode="multi_wrap_d", direction="out")
+			loss_i, _lms_i, _masks_i, stats_i = pair_runtime.snap_loss(
+				model_xyz=model_xyz[i:i + 2],
+				model_normals=model_normals[i:i + 2],
+				model_valid=model_valid[i:i + 2],
+				offset=1.0,
+				data=None,
+			)
+			per_pair.append(loss_i)
+			samples += stats_i["snaps_map_snap_samples"]
+
+		expected = torch.stack(per_pair).mean()
+
+		self.assertTrue(torch.allclose(loss_b, expected, atol=1.0e-6))
+		self.assertEqual(stats_b["snaps_map_snap_samples"], samples)
+
+	def test_self_map_in_direction_uses_negative_signed_offset(self) -> None:
+		D, H, W = 2, 4, 4
+		model_xyz = torch.stack([_plane_xyz(h=H, w=W, z=float(d)) for d in range(D)], dim=0)
+		model_normals = _normals_3d(D, H, W)
+		model_valid = torch.ones(D, H, W, dtype=torch.bool)
+
+		for data in (None, _constant_grad_data(1.0)):
+			loss_out, _lms_o, _masks_o, stats_out = SelfMapRuntime(
+				mode="multi_wrap_d",
+				direction="out",
+			).snap_loss(
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				offset=1.0,
+				data=data,
+			)
+			loss_in, _lms_i, _masks_i, stats_in = SelfMapRuntime(
+				mode="multi_wrap_d",
+				direction="in",
+			).snap_loss(
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				offset=1.0,
+				data=data,
+			)
+
+			self.assertLess(float(loss_out.detach()), 1.0e-6)
+			self.assertLess(float(loss_in.detach()), 1.0e-6)
+			self.assertEqual(stats_out["snaps_map_snap_samples"], stats_in["snaps_map_snap_samples"])
+
+	def test_boundary_self_map_snap_loss_identity_maps_both_directions(self) -> None:
+		H, W = 4, 4
+		fixed_xyz = _plane_xyz(h=H, w=W, z=0.0)
+		new_xyz = _plane_xyz(h=H, w=W, z=1.0).unsqueeze(0)
+		fixed_normals = _normals_2d(H, W)
+		new_normals = _normals_3d(1, H, W)
+		fixed_valid = torch.ones(H, W, dtype=torch.bool)
+		new_valid = torch.ones(1, H, W, dtype=torch.bool)
+
+		loss_out, _lms_o, _masks_o, stats_out = BoundarySelfMapRuntime(
+			mode="multi_wrap_d",
+			direction="out",
+			fixed_xyz=fixed_xyz,
+			fixed_normals=fixed_normals,
+			fixed_valid=fixed_valid,
+		).snap_loss(
+			model_xyz=new_xyz,
+			model_normals=new_normals,
+			model_valid=new_valid,
+			offset=1.0,
+			data=None,
+		)
+		loss_in, _lms_i, _masks_i, stats_in = BoundarySelfMapRuntime(
+			mode="multi_wrap_d",
+			direction="in",
+			fixed_xyz=fixed_xyz,
+			fixed_normals=fixed_normals,
+			fixed_valid=fixed_valid,
+		).snap_loss(
+			model_xyz=new_xyz,
+			model_normals=new_normals,
+			model_valid=new_valid,
+			offset=1.0,
+			data=None,
+		)
+
+		self.assertLess(float(loss_out.detach()), 1.0e-6)
+		self.assertLess(float(loss_in.detach()), 1.0e-6)
+		self.assertEqual(stats_out["snaps_map_snap_samples"], stats_in["snaps_map_snap_samples"])
+		self.assertGreater(stats_out["snaps_map_snap_samples"], 0.0)
+
+	def test_boundary_self_map_in_direction_grads_trainable_source_only(self) -> None:
+		H, W = 4, 4
+		fixed_xyz = _plane_xyz(h=H, w=W, z=0.0).requires_grad_(True)
+		new_xyz = _plane_xyz(h=H, w=W, z=1.25).unsqueeze(0).detach().requires_grad_(True)
+		runtime = BoundarySelfMapRuntime(
+			mode="multi_wrap_d",
+			direction="in",
+			fixed_xyz=fixed_xyz,
+			fixed_normals=_normals_2d(H, W),
+			fixed_valid=torch.ones(H, W, dtype=torch.bool),
+		)
+
+		loss, _lms, _masks, stats = runtime.snap_loss(
+			model_xyz=new_xyz,
+			model_normals=_normals_3d(1, H, W),
+			model_valid=torch.ones(1, H, W, dtype=torch.bool),
+			offset=1.0,
+			data=None,
+		)
+		loss.backward()
+
+		self.assertGreater(stats["snaps_map_snap_samples"], 0.0)
+		self.assertIsNotNone(new_xyz.grad)
+		self.assertGreater(float(new_xyz.grad.detach().abs().sum()), 0.0)
+		self.assertIsNone(fixed_xyz.grad)
+
+	def test_boundary_self_map_runtime_serializes_like_self_map_state(self) -> None:
+		H, W = 5, 5
+		runtime = BoundarySelfMapRuntime(
+			mode="multi_wrap_d",
+			direction="out",
+			fixed_xyz=_plane_xyz(h=H, w=W, z=0.0),
+			fixed_normals=_normals_2d(H, W),
+			fixed_valid=torch.ones(H, W, dtype=torch.bool),
+		)
+		stage = GlobalMapStageConfig(
+			steps=0,
+			lr=0.01,
+			params=("map_uv_ms",),
+			args={"startup_timing": False},
+		)
+
+		stats = runtime.run_stage(
+			stage=stage,
+			model_xyz=_plane_xyz(h=H, w=W, z=1.0).unsqueeze(0),
+			model_normals=_normals_3d(1, H, W),
+			model_valid=torch.ones(1, H, W, dtype=torch.bool),
+		)
+
+		self.assertIsNotNone(runtime.global_model)
+		assert runtime.global_model is not None
+		state = {
+			"preserve_batch": bool(runtime.global_model.preserve_batch),
+			"map_uv_ms": [p.detach().cpu() for p in runtime.global_model.map_uv_ms],
+			"mode": runtime.mode,
+			"direction": runtime.direction,
+			"steps_run": runtime.steps_run,
+		}
+		self.assertTrue(state["preserve_batch"])
+		self.assertEqual(state["mode"], "multi_wrap_d")
+		self.assertEqual(state["direction"], "out")
+		self.assertEqual(state["map_uv_ms"][0].shape[0], 1)
+		self.assertIn("snaps_map_loss", stats)
+
 	def test_runtime_map_init_keeps_z_lift_unless_disabled(self) -> None:
 		h, w = 5, 5
 		angles = torch.linspace(0.0, math.pi, w)
@@ -297,7 +742,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				"w_dist": 0.0,
 				"w_vec_normal": 0.0,
 				"w_surface_normal": 0.0,
-				"w_z_lift": 1.0,
+				"map_turn": 1.0,
 				"w_smooth": 0.0,
 				"w_bend": 0.0,
 				"w_jac": 0.0,
@@ -523,6 +968,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		stages = optimizer.load_stages_cfg({
 			"base": {
 				"map_dist": 2.0,
+				"map_turn": 3.0,
 				"map_smooth": 0.25,
 				"map_station_t": 0.5,
 			},
@@ -540,8 +986,54 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 		opt = stages[0].global_opt
 		self.assertEqual(opt.kind, "map")
 		self.assertEqual(opt.eff["map_dist"], 1.0)
+		self.assertEqual(opt.eff["map_turn"], 3.0)
 		self.assertEqual(opt.eff["map_smooth"], 0.25)
 		self.assertEqual(opt.eff["map_station_t"], 0.5)
+
+	def test_lasagna_global_map_config_uses_shared_stage_parser(self) -> None:
+		cfg = optimizer.global_map_config_from_stages_cfg({
+			"base": {
+				"map_dist": 2.0,
+				"map_turn": 3.0,
+				"map_smooth": 0.25,
+			},
+			"stages": [
+				{
+					"name": "map",
+					"steps": 1,
+					"lr": 0.01,
+					"params": ["map_surf_ms"],
+					"w_fac": {"map_dist": 0.5, "map_turn": 0.0},
+				},
+			],
+		})
+
+		self.assertEqual(cfg.base["map_dist"], 2.0)
+		self.assertEqual(cfg.base["map_turn"], 3.0)
+		self.assertEqual(cfg.stages[0].params, ("map_uv_ms",))
+		self.assertEqual(cfg.stages[0].w_fac["dist"], 0.5)
+		self.assertEqual(cfg.stages[0].w_fac["turn"], 0.0)
+		parsed = snap_surf_config_from_global_config(cfg, cfg.stages[0])
+		stage_cfg = _stage_loss_cfg(parsed, cfg.stages[0])
+		self.assertEqual(parsed.map_init.w_z_lift, 3.0)
+		self.assertEqual(stage_cfg.map_init.w_dist, 1.0)
+		self.assertEqual(stage_cfg.map_init.w_z_lift, 0.0)
+
+	def test_lasagna_global_map_config_rejects_old_turn_keys(self) -> None:
+		for key in ("map_z_lift", "w_z_lift"):
+			with self.subTest(key=key):
+				with self.assertRaisesRegex(ValueError, "unknown term|use map_turn"):
+					optimizer.global_map_config_from_stages_cfg({
+						"base": {key: 1.0},
+						"stages": [{"name": "map", "steps": 1, "params": ["map_surf_ms"]}],
+					})
+		with self.assertRaisesRegex(ValueError, "unknown term"):
+			parse_global_map_stage_item({
+				"name": "map",
+				"steps": 1,
+				"params": ["map_surf_ms"],
+				"w_fac": {"turn": 0.0},
+			})
 
 	def test_lasagna_map_stage_rejects_model_loss_weight_override(self) -> None:
 		with self.assertRaisesRegex(ValueError, "map stages may only override map loss"):
@@ -716,7 +1208,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				steps=0,
 				lr=0.0,
 				params=("affine",),
-				args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "w_z_lift": 1.0, "disable_z_lift": True},
+				args={"subdiv": 1, "z_lift_norm_xy_min": 0.01, "map_turn": 1.0, "disable_z_lift": True},
 			),
 			model_xyz=model_xyz,
 			model_normals=model_normals,
@@ -1296,7 +1788,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			stdout = StringIO()
 
 			with redirect_stdout(stdout):
-				filtered = _apply_external_quad_health_filter(fixture, cfg, label="test")
+				filtered = _apply_external_quad_health_filter(fixture, cfg, label="debug_values")
 
 			active = _full_active_quad(filtered)
 			self.assertLess(int(active.sum()), int(_full_active_quad(fixture).sum()))
@@ -1306,7 +1798,11 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertFalse(bool(active[2, 2]))
 			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected"], 0.0)
 			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected_padding"], 0.0)
-			self.assertIn("external quad health filter test", stdout.getvalue())
+			out_text = stdout.getvalue()
+			self.assertIn("external quad health filter debug_values", out_text)
+			self.assertIn("external quad health reject values debug_values", out_text)
+			self.assertIn("aspect count=", out_text)
+			self.assertIn("values=", out_text)
 
 	def test_external_quad_health_filter_rejects_twisted_quad(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -1333,6 +1829,36 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected"], 0.0)
 			self.assertIn("min_triangle_normal_dot", filtered.metadata["ext_mesh_health"])
 
+	def test_external_quad_health_filter_removes_disconnected_islands(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			_write_planar_global_fixture(tmp, h=6, w=6)
+			fixture = load_map_fixture(tmp)
+			ext_quad_valid = fixture.ext_quad_valid.clone()
+			ext_quad_valid[:, 3] = False
+			fixture = replace(fixture, ext_quad_valid=ext_quad_valid)
+			cfg = snap_surf_config_from_global_config(
+				GlobalMapConfig(
+					base={
+						"map_init": {
+							"ext_mesh_health_filter": True,
+							"ext_mesh_health_reject_radius": 0,
+						}
+					}
+				)
+			)
+
+			filtered = _apply_external_quad_health_filter(fixture, cfg, label="test")
+
+			active = _full_active_quad(filtered)
+			self.assertTrue(bool(active[2, 2]))
+			self.assertFalse(bool(active[2, 4]))
+			self.assertEqual(int(active[:, 4].sum()), 0)
+			self.assertGreater(filtered.metadata["ext_mesh_health"]["quads_rejected_disconnected"], 0.0)
+			self.assertEqual(
+				int(filtered.metadata["ext_mesh_health"]["quads_connected_kept"]),
+				int(active.sum()),
+			)
+
 	def test_config_parses_stage_args(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			cfg = parse_global_map_config(_write_config(tmp, affine_steps=1, map_steps=1))
@@ -1344,6 +1870,37 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			path.write_text(json.dumps({"stages": [{"name": "affine_init_scan", "params": ["map_surf_affine"]}]}), encoding="utf-8")
 			named = parse_global_map_config(path)
 			self.assertEqual(named.stages[0].name, "affine_init_scan")
+
+	def test_global_map_config_translates_lasagna_weight_aliases(self) -> None:
+		stage = GlobalMapStageConfig(params=("map_uv_ms",))
+		cfg = GlobalMapConfig(
+			base={
+				"map_dist": 0.0001,
+				"map_vec_normal": 2.0,
+				"map_surface_normal": 3.0,
+				"map_turn": 3.5,
+				"map_smooth": 4.0,
+				"map_bend": 5.0,
+				"map_jac": 6.0,
+				"map_metric_smooth": 7.0,
+				"map_area_smooth": 8.0,
+				"map_dense_prior": 9.0,
+			},
+			stages=(stage,),
+		)
+
+		parsed = snap_surf_config_from_global_config(cfg, stage)
+
+		self.assertEqual(parsed.map_init.w_dist, 0.0001)
+		self.assertEqual(parsed.map_init.w_vec_normal, 2.0)
+		self.assertEqual(parsed.map_init.w_surface_normal, 3.0)
+		self.assertEqual(parsed.map_init.w_z_lift, 3.5)
+		self.assertEqual(parsed.map_init.w_smooth, 4.0)
+		self.assertEqual(parsed.map_init.w_bend, 5.0)
+		self.assertEqual(parsed.map_init.w_jac, 6.0)
+		self.assertEqual(parsed.map_init.w_metric_smooth, 7.0)
+		self.assertEqual(parsed.map_init.w_area_smooth, 8.0)
+		self.assertEqual(parsed.map_init.w_dense_prior, 9.0)
 
 	def test_out_of_bounds_samples_are_skipped_without_clamping(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -1381,6 +1938,105 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			self.assertEqual(metrics["common_vertices"], 25)
 			self.assertIn("avg_model_quad_distance", metrics)
 
+	def test_runtime_stage_exports_fixture_once_from_stage_args(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			export_dir = os.path.join(tmp, "exported_fixture")
+			_write_planar_global_fixture(fixture_dir, h=6, w=6)
+			fixture = load_map_fixture(fixture_dir)
+			ext_xyz = fixture.ext_xyz.clone()
+			ext_xyz[2, 2, 2] = 1000.0
+			fixture = replace(fixture, ext_xyz=ext_xyz)
+			runtime = GlobalMapRuntime(
+				seed_xyz=(2.0, 2.0, 0.0),
+				base={
+					"map_init": {
+						"ext_mesh_health_filter": True,
+						"ext_mesh_health_reject_radius": 0,
+					},
+				},
+			)
+			stage = GlobalMapStageConfig(
+				name="export_init",
+				steps=0,
+				lr=0.05,
+				params=("affine",),
+				args={
+					"subdiv": 1,
+					"fixture_export_dir": export_dir,
+					"fixture_export_once": True,
+					"fixture_export_objs": False,
+				},
+			)
+
+			stats1 = runtime.run_stage(
+				stage=stage,
+				model_xyz=fixture.model_xyz,
+				model_normals=fixture.model_normals,
+				model_valid=fixture.model_valid,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_normals=fixture.ext_normals,
+				ext_quad_valid=fixture.ext_quad_valid,
+			)
+			stats2 = runtime.run_stage(
+				stage=stage,
+				model_xyz=fixture.model_xyz,
+				model_normals=fixture.model_normals,
+				model_valid=fixture.model_valid,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_normals=fixture.ext_normals,
+				ext_quad_valid=fixture.ext_quad_valid,
+			)
+
+			self.assertEqual(stats1["snaps_map_fixture_exported"], 1.0)
+			self.assertEqual(stats2["snaps_map_fixture_exported"], 0.0)
+			self.assertTrue(Path(export_dir, "fixture.json").exists())
+			self.assertTrue(Path(export_dir, "map", "model_x.tif").exists())
+			self.assertTrue(Path(export_dir, "ext_surface", "x.tif").exists())
+			self.assertFalse(Path(export_dir, "objs").exists())
+			exported = load_map_fixture(export_dir)
+			self.assertEqual(tuple(exported.reference_uv.shape), tuple(fixture.reference_uv.shape))
+			self.assertEqual(int(exported.ext_quad_valid.sum()), int(fixture.ext_quad_valid.sum()))
+			self.assertLess(int(exported.reference_active_quad.sum()), int(_full_active_quad(fixture).sum()))
+
+	def test_fixture_cli_stage_export_writes_fixture_under_out(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=1)
+			cfg_raw = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+			cfg_raw["stages"][1]["args"]["export_fixture"] = {
+				"dir": "rerun_fixture",
+				"once": True,
+				"objs": True,
+			}
+			Path(cfg_path).write_text(json.dumps(cfg_raw), encoding="utf-8")
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				*_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS,
+			])
+
+			self.assertEqual(rc, 0)
+			export_dir = Path(out_dir, "rerun_fixture")
+			self.assertTrue(Path(export_dir, "fixture.json").exists())
+			self.assertTrue(Path(export_dir, "map", "model_x.tif").exists())
+			self.assertTrue(Path(export_dir, "ext_surface", "x.tif").exists())
+			self.assertTrue(Path(export_dir, "model_stack", "x.tif").exists())
+			self.assertTrue(Path(export_dir, "objs", "map_ext_to_model.obj").exists())
+			exported = load_map_fixture(export_dir)
+			source = load_map_fixture(fixture_dir)
+			self.assertEqual(tuple(exported.reference_uv.shape), tuple(source.reference_uv.shape))
+
 	def test_fixture_cli_writes_debug_objs_when_enabled(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
 			fixture_dir = os.path.join(tmp, "fixture")
@@ -1401,6 +2057,239 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			metrics = json.loads(Path(out_dir, "metrics.json").read_text(encoding="utf-8"))
 			self.assertIn("avg_model_quad_distance", metrics["history"][-1])
 			self.assertLess(metrics["model_l2_max_delta"], 1.0)
+
+	def test_benchmark_fixture_cli_writes_json_and_passes(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=2, map_steps=2)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				*_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS,
+			])
+
+			self.assertEqual(rc, 0)
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			self.assertEqual(bench["status"], "pass")
+			self.assertTrue(bench["passed"])
+			self.assertIn("elapsed_s", bench)
+			self.assertIn("optimizer_metrics", bench)
+			self.assertEqual(bench["map_deltas"]["common_vertices"], 25)
+			self.assertEqual(bench["map_deltas"]["active_quad_diff"], 0)
+
+	def test_benchmark_fixture_cli_strict_threshold_fails(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=0)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--max-model-abs-delta",
+				"1e-12",
+				"--max-model-l2-delta",
+				"1e-12",
+			])
+
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			if rc == 0:
+				self.assertLessEqual(bench["map_deltas"]["model_l2_max_delta"], 1.0e-12)
+			else:
+				self.assertEqual(rc, 1)
+				self.assertEqual(bench["status"], "fail")
+				self.assertFalse(bench["passed"])
+
+	def test_benchmark_fixture_cli_mean_and_mse_thresholds_fail(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=0)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--max-model-abs-delta",
+				"10",
+				"--max-model-l2-delta",
+				"10",
+				"--max-model-l2-mean-delta",
+				"1e-12",
+				"--max-model-l2-mse-delta",
+				"1e-12",
+			])
+
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			self.assertEqual(rc, 1)
+			self.assertEqual(bench["status"], "fail")
+			self.assertGreater(bench["map_deltas"]["model_l2_mean_delta"], bench["thresholds"]["max_model_l2_mean_delta"])
+			self.assertGreater(bench["map_deltas"]["model_l2_mse_delta"], bench["thresholds"]["max_model_l2_mse_delta"])
+
+	def test_benchmark_fixture_cli_accepts_explicit_reference_map_dir(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=2, map_steps=2)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--reference-dir",
+				os.path.join(fixture_dir, "map"),
+				*_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS,
+			])
+
+			self.assertEqual(rc, 0)
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			self.assertEqual(bench["status"], "pass")
+			self.assertEqual(bench["reference_dir"], os.path.join(fixture_dir, "map"))
+
+	def test_benchmark_fixture_cli_profiles_components_without_changing_parameters(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=1)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--profile-components",
+				"--profile-repeats",
+				"1",
+				*_SYNTHETIC_BENCHMARK_THRESHOLD_ARGS,
+			])
+
+			self.assertEqual(rc, 0)
+			profile = json.loads(Path(out_dir, "profile_components.json").read_text(encoding="utf-8"))
+			components = {row["component"] for row in profile["rows"]}
+			self.assertIn("uv_fwd", components)
+			self.assertIn("none_fwd", components)
+			self.assertIn("none", components)
+			self.assertIn("all", components)
+			self.assertIn("dist", components)
+			self.assertIn("without_dist", components)
+			self.assertIn("jac", components)
+			for row in profile["rows"]:
+				self.assertGreaterEqual(row["mean_s"], 0.0)
+				self.assertIn("mean_pct_of_all", row)
+				self.assertIn("mean_net_s", row)
+				self.assertIn("mean_net_pct_of_all", row)
+			dist_row = next(row for row in profile["rows"] if row["component"] == "dist")
+			self.assertIn("mean_removed_delta_s", dist_row)
+			self.assertIn("mean_removed_pct_of_all", dist_row)
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			self.assertGreaterEqual(len(bench["profile_components"]), 3)
+
+	def test_benchmark_fixture_cli_profile_only_skips_full_benchmark(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			cfg_path = _write_config(tmp, affine_steps=1, map_steps=1)
+
+			rc = map_global_cli.main([
+				"benchmark-fixture",
+				fixture_dir,
+				cfg_path,
+				"--out",
+				out_dir,
+				"--device",
+				"cpu",
+				"--profile-only",
+				"--profile-repeats",
+				"1",
+			])
+
+			self.assertEqual(rc, 0)
+			profile = json.loads(Path(out_dir, "profile_components.json").read_text(encoding="utf-8"))
+			self.assertTrue(Path(out_dir, "profile_components.json").exists())
+			self.assertFalse(Path(out_dir, "benchmark.json").exists())
+			block_names = {row["block"] for row in profile["block_rows"]}
+			self.assertIn("sample_model_packed_source_prepare", block_names)
+			self.assertIn("sample_model_packed_grid_valid", block_names)
+			uv_fwd_row = next(row for row in profile["rows"] if row["component"] == "uv_fwd")
+			none_fwd_row = next(row for row in profile["rows"] if row["component"] == "none_fwd")
+			none_row = next(row for row in profile["rows"] if row["component"] == "none")
+			all_row = next(row for row in profile["rows"] if row["component"] == "all")
+			self.assertFalse(uv_fwd_row["include_objective"])
+			self.assertTrue(none_fwd_row["include_objective"])
+			self.assertFalse(none_fwd_row["include_backward"])
+			self.assertAlmostEqual(all_row["mean_pct_of_all"], 100.0)
+			self.assertAlmostEqual(none_row["mean_net_s"], 0.0)
+			self.assertAlmostEqual(all_row["mean_net_pct_of_all"], 100.0)
+			self.assertIn("median_pct_of_all", all_row)
+			self.assertIn("median_net_pct_of_all", all_row)
+
+	def test_reference_map_global_fixture_config_matches_small_fixture_thresholds(self) -> None:
+		fixture_dir, explicit = _map_init_small_fixture_dir()
+		if fixture_dir is None:
+			self.skipTest("map_init_small fixture unavailable; set LASAGNA_MAP_INIT_SMALL_FIXTURE or LASAGNA_TEST_DATA_ROOT")
+		if not (fixture_dir / "fixture.json").exists():
+			if explicit:
+				self.fail(f"LASAGNA_MAP_INIT_SMALL_FIXTURE does not contain fixture.json: {fixture_dir}")
+			self.skipTest(f"map_init_small fixture unavailable: {fixture_dir}")
+		cfg_path = Path(__file__).resolve().parents[1] / "reference_configs" / "map_global_fixture.json"
+		self.assertTrue(cfg_path.exists(), str(cfg_path))
+		device = os.environ.get("LASAGNA_MAP_FIXTURE_TEST_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+		with tempfile.TemporaryDirectory() as tmp:
+			out_dir = os.path.join(tmp, "out")
+			stdout = StringIO()
+			with redirect_stdout(stdout):
+				rc = map_global_cli.main([
+					"benchmark-fixture",
+					str(fixture_dir),
+					str(cfg_path),
+					"--out",
+					out_dir,
+					"--device",
+					device,
+				])
+			bench = json.loads(Path(out_dir, "benchmark.json").read_text(encoding="utf-8"))
+			thresholds = bench["thresholds"]
+			self.assertEqual(thresholds["max_model_abs_delta"], 2.0)
+			self.assertEqual(thresholds["max_model_l2_delta"], 2.0)
+			self.assertEqual(thresholds["max_model_l2_mean_delta"], 0.05)
+			self.assertEqual(thresholds["max_model_l2_mse_delta"], 0.005)
+			self.assertEqual(thresholds["max_model_valid_miss_frac"], 0.01)
+			deltas = bench["map_deltas"]
+			self.assertLessEqual(deltas["model_l2_max_delta"], thresholds["max_model_l2_delta"])
+			self.assertLessEqual(deltas["model_l2_mean_delta"], thresholds["max_model_l2_mean_delta"])
+			self.assertLessEqual(deltas["model_l2_mse_delta"], thresholds["max_model_l2_mse_delta"])
+			self.assertLessEqual(deltas["model_valid_missed_frac"], thresholds["max_model_valid_miss_frac"])
+			self.assertEqual(rc, 0, stdout.getvalue()[-4000:])
+			self.assertEqual(bench["status"], "pass")
 
 	def test_optimize_fixture_returns_full_rectangular_map(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -1428,13 +2317,13 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 			text = stdout.getvalue()
 			self.assertIn("0/3", text)
-			self.assertIn("1/3", text)
-			self.assertIn("3/3", text)
-			self.assertNotIn("2/3", text)
-			self.assertRegex(text, r"0/2\s+0\.0200\s+2")
-			self.assertIn("stat", text)
-			self.assertIn("station loss", text)
-			self.assertIn("dst", text)
+			self.assertIn("2/3", text)
+			self.assertNotIn("1/3", text)
+			self.assertNotIn("3/3", text)
+			self.assertRegex(text, r"stage1 0/2\s+\S+\s+\S+")
+			self.assertIn("sm_los", text)
+			self.assertIn("map objective loss", text)
+			self.assertIn("sm_dst", text)
 
 	def test_affine_multistart_prints_all_candidate_rows(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
@@ -1473,19 +2362,16 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				cfg_path,
 				{
 					"base": {
-						"write_objs": True,
 						"map_station_t": 0.001,
-						"map_init": {
-							"subdiv": 2,
-							"w_dist": 1.0,
-							"w_vec_normal": 0.0,
-							"w_surface_normal": 0.0,
-							"w_smooth": 0.0,
-							"w_bend": 0.0,
-							"w_jac": 0.0,
-							"w_metric_smooth": 0.0,
-							"w_area_smooth": 0.0,
-						},
+						"map_dist": 1.0,
+						"map_vec_normal": 0.0,
+						"map_surface_normal": 0.0,
+						"map_turn": 0.0,
+						"map_smooth": 0.0,
+						"map_bend": 0.0,
+						"map_jac": 0.0,
+						"map_metric_smooth": 0.0,
+						"map_area_smooth": 0.0,
 					},
 					"stages": [
 						{
@@ -1494,6 +2380,8 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 								"lr": 0.05,
 								"params": ["map_surf_affine"],
 							"args": {
+								"write_objs": True,
+								"subdiv": 2,
 								"affine_multistart": {
 									"enabled": True,
 									"rot_deg": [0.0, 15.0],
@@ -1529,19 +2417,16 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				cfg_path,
 				{
 					"base": {
-						"write_objs": True,
 						"map_station_t": 0.001,
-						"map_init": {
-							"subdiv": 2,
-							"w_dist": 1.0,
-							"w_vec_normal": 0.0,
-							"w_surface_normal": 0.0,
-							"w_smooth": 0.0,
-							"w_bend": 0.0,
-							"w_jac": 0.0,
-							"w_metric_smooth": 0.0,
-							"w_area_smooth": 0.0,
-						},
+						"map_dist": 1.0,
+						"map_vec_normal": 0.0,
+						"map_surface_normal": 0.0,
+						"map_turn": 0.0,
+						"map_smooth": 0.0,
+						"map_bend": 0.0,
+						"map_jac": 0.0,
+						"map_metric_smooth": 0.0,
+						"map_area_smooth": 0.0,
 					},
 					"stages": [
 						{
@@ -1549,7 +2434,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 							"steps": 1,
 							"lr": 0.05,
 								"params": ["map_surf_affine"],
-							"args": {"affine_seed_quad_init": {"enabled": True}},
+							"args": {"write_objs": True, "subdiv": 2, "affine_seed_quad_init": {"enabled": True}},
 						}
 					],
 				},
@@ -1560,12 +2445,53 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 				metrics = optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
 
 			text = stdout.getvalue()
-			self.assertIn("affine seed quad init", text)
+			self.assertIn("affine seed quad prepare", text)
 			self.assertIn("0/1", text)
-			self.assertIn("1/1", text)
 			self.assertNotIn("affine multistart candidates", text)
 			self.assertTrue(os.path.exists(os.path.join(out_dir, "objs", "stage_000_affine_seed_quad_init", "map_ext_to_model.obj")))
 			self.assertEqual(metrics["history"][0]["name"], "affine_seed_quad_init")
+
+	def test_affine_seed_quad_init_unavailable_fails_instead_of_continuing(self) -> None:
+		with tempfile.TemporaryDirectory() as tmp:
+			fixture_dir = os.path.join(tmp, "fixture")
+			out_dir = os.path.join(tmp, "out")
+			_write_planar_global_fixture(fixture_dir)
+			fixture = load_map_fixture(fixture_dir)
+			_float_tif(Path(fixture_dir) / "model_stack" / "z.tif", torch.full_like(fixture.model_xyz[..., 2], 100.0))
+			fixture_json = Path(fixture_dir, "fixture.json")
+			meta = json.loads(fixture_json.read_text(encoding="utf-8"))
+			meta["seed_model_quad"] = [0, 1, 1]
+			fixture_json.write_text(json.dumps(meta), encoding="utf-8")
+			cfg_path = Path(tmp, "cfg.json")
+			_write_json(
+				cfg_path,
+				{
+					"base": {
+						"map_dist": 1.0,
+						"map_vec_normal": 0.0,
+						"map_surface_normal": 0.0,
+						"map_turn": 0.0,
+						"map_smooth": 0.0,
+						"map_bend": 0.0,
+						"map_jac": 0.0,
+						"map_metric_smooth": 0.0,
+						"map_area_smooth": 0.0,
+					},
+					"stages": [
+						{
+							"name": "affine_seed_quad_init",
+							"steps": 1,
+							"lr": 0.05,
+							"params": ["map_surf_affine"],
+							"args": {"subdiv": 2, "affine_seed_quad_init": {"enabled": True, "max_ray_distance": 1.0}},
+						}
+					],
+				},
+			)
+
+			with self.assertRaisesRegex(RuntimeError, "affine seed quad ray init unavailable"):
+				optimize_fixture(fixture_dir, cfg_path, out_dir=out_dir)
+			self.assertFalse(Path(out_dir, "model_x.tif").exists())
 
 
 if __name__ == "__main__":

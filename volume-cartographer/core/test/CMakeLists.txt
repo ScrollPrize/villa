@@ -198,6 +198,13 @@ if(VC_RUN_BENCHES)
     set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_chunked_plane_sampler)
 endif()
 
+add_executable(bench_lasagna_line_edit bench_lasagna_line_edit.cpp)
+target_link_libraries(bench_lasagna_line_edit PRIVATE vc_lasagna)
+if(VC_RUN_BENCHES)
+    add_test(NAME bench_lasagna_line_edit COMMAND bench_lasagna_line_edit --help)
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_lasagna_line_edit)
+endif()
+
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
 # triggers a violation that the matching sanitizer must report; ctest
 # expects the abort and matches the report text via PASS_REGULAR_EXPRESSION.

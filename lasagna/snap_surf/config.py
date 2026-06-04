@@ -63,18 +63,20 @@ class SnapSurfMapInitConfig:
 	angle_dist_mult: float = 9.0
 	max_sample_distance: float = 1000.0
 	max_sample_angle_deg: float = 45.0
-	sample_angle_step_fraction: float = 0.1
+	sample_angle_step_fraction: float = 0.0
 	max_step_neighbor_ratio: float = 10.0
 	ext_mesh_health_filter: bool = True
 	ext_mesh_health_max_edge_ratio: float = 2.0
-	ext_mesh_health_max_area_ratio: float = 2.0
+	ext_mesh_health_max_area_ratio: float = 3.0
 	ext_mesh_health_min_area_ratio: float = 0.75
-	ext_mesh_health_max_aspect_ratio: float = 1.5
-	ext_mesh_health_max_diag_ratio: float = 1.5
+	ext_mesh_health_max_aspect_ratio: float = 2.0
+	ext_mesh_health_max_diag_ratio: float = 2.0
 	ext_mesh_health_min_triangle_normal_dot: float = 0.25
 	ext_mesh_health_min_normal_dot: float = 0.0
 	ext_mesh_health_reject_radius: int = 4
 	jac_margin: float = 0.05
+	compile_objective: bool = True
+	compile_objective_mode: str | None = None
 	fixture_export_dir: str | None = None
 	fixture_export_once: bool = True
 	fixture_export_objs: bool = True
@@ -115,6 +117,12 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 				if "min_scale_level" in raw_cfg:
 					raise ValueError("snap_surf args.map_init: use only one of min_scale_level, min_scale, minscale")
 				raw_cfg["min_scale_level"] = raw_cfg.pop(alias)
+		if "map_z_lift" in raw_cfg:
+			raise ValueError("snap_surf args.map_init: use map_turn instead of map_z_lift")
+		if "w_z_lift" in raw_cfg:
+			raise ValueError("snap_surf args.map_init: use map_turn instead of w_z_lift")
+		if "map_turn" in raw_cfg:
+			raw_cfg["w_z_lift"] = raw_cfg.pop("map_turn")
 		bad = sorted(set(raw_cfg.keys()) - set(SnapSurfMapInitConfig.__dataclass_fields__.keys()))
 		if bad:
 			raise ValueError(f"snap_surf args.map_init: unknown key(s): {bad}")
@@ -180,6 +188,12 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 			ext_mesh_health_min_normal_dot=float(raw_cfg.get("ext_mesh_health_min_normal_dot", defaults.ext_mesh_health_min_normal_dot)),
 			ext_mesh_health_reject_radius=max(0, int(raw_cfg.get("ext_mesh_health_reject_radius", defaults.ext_mesh_health_reject_radius))),
 			jac_margin=float(raw_cfg.get("jac_margin", defaults.jac_margin)),
+			compile_objective=bool(raw_cfg.get("compile_objective", defaults.compile_objective)),
+			compile_objective_mode=(
+				None
+				if raw_cfg.get("compile_objective_mode", defaults.compile_objective_mode) in {None, "", "default"}
+				else str(raw_cfg.get("compile_objective_mode", defaults.compile_objective_mode))
+			),
 			fixture_export_dir=(
 				None
 				if raw_cfg.get("fixture_export_dir", defaults.fixture_export_dir) in {None, ""}
@@ -237,6 +251,8 @@ def _parse_map_init_config(raw: object) -> SnapSurfMapInitConfig:
 		raise ValueError("snap_surf args.map_init.jac_margin must be >= 0")
 	if cfg.progress_mode not in ("block", "periodic", "both", "none"):
 		raise ValueError("snap_surf args.map_init.progress_mode must be one of block, periodic, both, none")
+	if cfg.compile_objective_mode not in (None, "reduce-overhead", "max-autotune"):
+		raise ValueError("snap_surf args.map_init.compile_objective_mode must be one of default, reduce-overhead, max-autotune")
 	if int(cfg.scale_levels) > 1 and int(cfg.scale_factor) != 2:
 		raise ValueError("snap_surf args.map_init.scale_factor must be 2 when scale_levels > 1")
 	return cfg

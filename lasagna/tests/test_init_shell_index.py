@@ -275,7 +275,7 @@ class InitShellCropTest(unittest.TestCase):
 
 		self.assertEqual(roi.payload["usable_point_count"], 3)
 		self.assertEqual(roi.payload["projection_mode"], "normal-line")
-		self.assertEqual(roi.payload["windings"], 1)
+		self.assertEqual(roi.payload["depth"], 1)
 		self.assertAlmostEqual(roi.payload["projected_h_span_grid"], 1.0, delta=1.0e-3)
 		self.assertAlmostEqual(roi.payload["projected_w_span_grid"], 8.0, delta=1.0e-3)
 		self.assertAlmostEqual(roi.model_h, 50.0, delta=1.0e-3)
@@ -484,6 +484,7 @@ class InitShellCropTest(unittest.TestCase):
 
 		self.assertFalse(info.full_width)
 		self.assertGreater(crop.shape[1], legacy_crop.shape[1])
+		self.assertAlmostEqual(info.requested_width_wraps, 1.5, places=6)
 
 	def test_narrow_crop_is_anchor_centered_and_nonperiodic(self) -> None:
 		surface = init_shell_index.InitShellSurface(

@@ -17,7 +17,7 @@
 		"corr": 0.0,
 		"bend": 100.0,
 		"ext_offset": 0.0,
-		"snap_surf_map": 0.01,
+		"snap_surf_map": 0.0001,
 		"map_dist": 0.0001,
 		"map_vec_normal": 1.0,
 		"map_surface_normal": 1.0,
@@ -26,42 +26,17 @@
 		"map_turn": 0.1,
 		"map_jac": 1.0,
 		"map_metric_smooth": 0.1,
-		"map_area_smooth": 0.0,
+		"map_area_smooth": 0.1,
 		"map_dense_prior": 0.001,
 		"map_station_t": 0.001
 	},
 	"stages": [
 		{
-			"name": "stage1",
-			"steps": 300,
-			"lr": 0.1,
-			"params": ["mesh_ms"],
-			"min_scaledown": 0,
-			"w_fac": {
-				"pred_dt": 0.0,
-				"station_n": 10.0,
-				"station_t": 10.0,
-				"snap_surf_map": 0.0
-			}
-		},
-		{
-			"name": "stage2",
-			"steps": 200,
-			"lr": 0.01,
-			"params": ["mesh_ms"],
-			"min_scaledown": 0,
-			"w_fac": {
-				"pred_dt": 0.0,
-				"station_n": 10.0,
-				"station_t": 10.0,
-				"snap_surf_map": 0.0
-			}
-		},
-		{
 			"name": "affine_seed_quad_init",
 			"steps": 100,
 			"lr": 0.1,
 			"params": ["map_surf_affine"],
+			"w_fac" : { "map_turn" : 100.0 },
 			"args": {
 				"status_interval": 10,
 				"subdiv": 1,
@@ -79,7 +54,7 @@
 						"w_bend": 0.01,
 						"w_jac": 1.0,
 						"w_metric_smooth": 0.05,
-						"w_area_smooth": 0.0,
+						"w_area_smooth": 0.02,
 						"w_dense_prior": 0.001,
 						"max_sample_distance": 1000.0,
 						"max_sample_angle_deg": 180.0,
@@ -132,64 +107,15 @@
 			"steps": 200,
 			"lr": 0.01,
 			"params": ["map_surf_ms"],
-			"w_fac" : { "map_turn" : 0.0 },
 			"min_scaledown": 0,
 			"args": {
 				"subdiv": 1,
-				"status_interval": 20
-			}
-		},
-		{
-			"name": "snap",
-			"steps": 500,
-			"lr": 1.0,
-			"params": ["mesh_ms"],
-			"min_scaledown": 0,
-			"w_fac": {
-				"pred_dt": 0.0,
-				"snap_surf_map": 0.01
-			},
-			"args": {
-				"status_interval": 50,
-				"snap_surf_map": {
-					"map_opt": {
-						"name": "snap_map_opt_final",
-						"steps": 1,
-						"lr": 0.01,
-						"params": ["map_surf_ms"],
-						"min_scaledown": 0,
-						"w_fac" : { "map_turn" : 0.0 },
-						"args": {
-							"subdiv": 1
-						}
-					}
-				}
-			}
-		},
-		{
-			"name": "snap",
-			"steps": "auto",
-			"lr": 1.0,
-			"params": ["mesh_ms"],
-			"min_scaledown": 0,
-			"w_fac": {
-				"pred_dt": 0.0,
-				"snap_surf_map": 1.0
-			},
-			"args": {
-				"status_interval": 50,
-				"snap_surf_map": {
-					"map_opt": {
-						"name": "snap_map_opt_final",
-						"steps": 1,
-						"lr": 0.01,
-						"params": ["map_surf_ms"],
-						"min_scaledown": 0,
-						"w_fac" : { "map_turn" : 0.0 },
-						"args": {
-							"subdiv": 1
-						}
-					}
+				"status_interval": 20,
+				"debug_obj_dir": "snap_surf_objs",
+				"export_fixture": {
+					"dir": "bench_fixtures_dbg/init",
+					"once": true,
+					"objs": true
 				}
 			}
 		}

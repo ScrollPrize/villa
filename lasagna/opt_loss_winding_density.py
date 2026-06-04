@@ -12,6 +12,39 @@ WINDING_DENSITY_BARRIER_MARGIN = 0.2
 WINDING_DENSITY_BARRIER_SCALE = 10.0
 
 
+def winding_density_prefetch_grad_mag_batches_for_result(*, res: fit_model.FitResult3D):
+	"""Yield grad_mag sample batches used by winding_density_loss_maps()."""
+	xy_conn = res.xy_conn
+	if xy_conn is None or res.xyz_hr is None:
+		return
+	D, Hm, Wm, _, _ = xy_conn.shape
+	if D < 2:
+		return
+	He = int(res.xyz_hr.shape[1])
+	We = int(res.xyz_hr.shape[2])
+	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
+	device = xy_conn.device
+	dtype = xy_conn.dtype
+
+	def _upsample_hw(pts: torch.Tensor) -> torch.Tensor:
+		t = pts.permute(0, 3, 1, 2)
+		t = F.interpolate(t, size=(He, We), mode='bilinear', align_corners=True)
+		return t.permute(0, 2, 3, 1)
+
+	prev_hr = _upsample_hw(xy_conn[:, :, :, :, 0])
+	center_hr = _upsample_hw(xy_conn[:, :, :, :, 1])
+	next_hr = _upsample_hw(xy_conn[:, :, :, :, 2])
+	t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
+
+	def _strip_flat(start: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
+		diff = end - start
+		strip = start.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
+		return strip.reshape(D, He, We * strip_samples, 3)
+
+	yield _strip_flat(prev_hr, center_hr)
+	yield _strip_flat(center_hr, next_hr)
+
+
 def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Tensor]:
 	"""Return (lm, mask) for winding-density period-sum loss.
 

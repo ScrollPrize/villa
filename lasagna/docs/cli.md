@@ -11,7 +11,6 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--device` (default `cuda`)
   - `--seed cx cy cz` seed point in fullres voxels
   - `--model-w`, `--model-h` model extent in fullres voxels
-  - `--windings` number of depth layers
   - `--winding-volume` optional winding volume zarr path
   - `--cuda-gridsample` enable custom CUDA uint8 sampling kernel
   - `--erode-valid-mask` erode valid mask by N pixels
@@ -21,7 +20,7 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--mesh-step` (default 100) height step in fullres voxels
   - `--winding-step` (default 25) radial step per winding
   - `--mesh-h`, `--mesh-w` mesh grid dimensions
-  - `--depth` number of windings
+  - `--depth` number of windings / model depth layers
   - `--subsample-mesh`, `--subsample-winding` HR subsampling factors (default 4)
   - `--model-input`, `--model-output` checkpoint paths
   - `--init-mode` (`arc` or `straight`)
@@ -63,7 +62,7 @@ Special config keys consumed by fit.py/fit_service.py before stage parsing:
 - `voxel_size_um`: voxel size for area calculations
 
 `args.model-init` selects the initial mesh source:
-- `seed` creates a fresh model from `args.seed`, `args.model-w`, `args.model-h`, and `args.windings`.
+- `seed` creates a fresh model from `args.seed`, `args.model-w`, `args.model-h`, and `args.depth`.
 - `ext` initializes from the selected tifxyz mesh sent by VC3D.
 - `model` initializes from the selected segment's `model.pt`.
 - `flatten` optimizes a 2D flattening over one external tifxyz source. The default [`configs/flatten.json`](../configs/flatten.json) keeps the existing inverse-map Adam path. [`configs/flatten_forward.json`](../configs/flatten_forward.json) sets `flatten_solver: "forward"` to optimize source-vertex UVs with the same pyramid/Adam stages, then invert that UV map at export. Use exactly one `external_surfaces` entry supplied by VC3D or the calling config.

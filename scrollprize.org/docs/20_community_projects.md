@@ -79,6 +79,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
+- [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/999) by pscamillo. Three GPU-native augmentations for the segmentation training pipeline, addressing #201: Squeeze (compression, [#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion (beam-scatter blur) and Warp (coherent warping). Each models a real scroll distortion rather than generic elastic noise, and is validated with a controlled ablation and a real-data demo to improve segmentation in compressed/warped/scattered regions.
+
 - [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
   
 - [Thaumato Anakalyptor](https://github.com/schillij95/ThaumatoAnakalyptor/tree/main) is an automatic tool that combines classical methods such as threshold gradient operator based edge detectors and Deep Learning based instance segmentation of point clouds to detect, merge and render segments. It was built by Julian Schilliger (part of Grand Prize winning submission).
@@ -159,8 +161,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Affinity Prediction with Unet](https://discordapp.com/channels/1079907749569237093/1407379961417039953) by Ayush Mishra
     - Unet trained on affinity labels using pytorch_connectomics and experiments with watershed
 - [Gabor Filter for surface prediction](https://www.kaggle.com/code/bluetriad/scroll4-gaborfilters/notebook?scriptVersionId=265957590) by Ayush Mishra
-
-
+  
+- [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
 
 ### 📦 Materials
 

@@ -12,6 +12,10 @@ _CHUNK_SIZE = 32
 _PADDED = _CHUNK_SIZE + 2
 
 
+def _fmt_mib(value: int | float) -> str:
+    return f"{float(value) / 1024.0 ** 2:.1f}MiB"
+
+
 class TensorStoreSparseChunkGroupCache:
     """PyTorch-facing sparse cache using TensorStore for parallel chunk reads."""
 
@@ -35,6 +39,7 @@ class TensorStoreSparseChunkGroupCache:
         self.channel_indices = channel_indices
         self.is_3d_zarr = bool(is_3d_zarr)
         self.device = device
+        self.cache_pool_bytes = int(cache_pool_bytes)
 
         Z, Y, X = self.vol_shape_zyx
         self.chunk_grid = (
@@ -110,35 +115,46 @@ class TensorStoreSparseChunkGroupCache:
             self._last_sync_new = 0
             return
 
-        t0 = time.perf_counter()
         pending = self._pending
-        self._pending = []
-        self._pending_keys.clear()
+        try:
+            t0 = time.perf_counter()
+            self._pending = []
+            self._pending_keys.clear()
 
-        n = len(pending)
-        C = self.n_channels
-        cpu_batch = torch.empty(n, C, _PADDED, _PADDED, _PADDED, dtype=torch.uint8,
-                                pin_memory=True)
-        coords_list: list[tuple[int, int, int]] = []
-        for i, (cz, cy, cx, futures) in enumerate(pending):
-            cpu_batch[i].zero_()
-            self._finish_chunk(cz, cy, cx, futures, cpu_batch[i].numpy())
-            coords_list.append((cz, cy, cx))
+            n = len(pending)
+            C = self.n_channels
+            cpu_batch = torch.empty(n, C, _PADDED, _PADDED, _PADDED, dtype=torch.uint8,
+                                    pin_memory=True)
+            coords_list: list[tuple[int, int, int]] = []
+            for i, (cz, cy, cx, futures) in enumerate(pending):
+                cpu_batch[i].zero_()
+                self._finish_chunk(cz, cy, cx, futures, cpu_batch[i].numpy())
+                coords_list.append((cz, cy, cx))
 
-        with torch.cuda.stream(self._transfer_stream):
-            gpu_batch = cpu_batch.to(self.device, non_blocking=True)
-        self._transfer_stream.synchronize()
-        self._batches.append(gpu_batch)
+            with torch.cuda.stream(self._transfer_stream):
+                gpu_batch = cpu_batch.to(self.device, non_blocking=True)
+            self._transfer_stream.synchronize()
+            self._batches.append(gpu_batch)
 
-        chunk_bytes = C * _PADDED * _PADDED * _PADDED
-        base_ptr = gpu_batch.data_ptr()
-        for i, (cz, cy, cx) in enumerate(coords_list):
-            self.chunk_table[cz, cy, cx] = base_ptr + i * chunk_bytes
+            chunk_bytes = C * _PADDED * _PADDED * _PADDED
+            base_ptr = gpu_batch.data_ptr()
+            for i, (cz, cy, cx) in enumerate(coords_list):
+                self.chunk_table[cz, cy, cx] = base_ptr + i * chunk_bytes
 
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        self._last_sync_new = n
-        self._total_new_chunks += n
-        self._total_fetch_ms += dt_ms
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self._last_sync_new = n
+            self._total_new_chunks += n
+            self._total_fetch_ms += dt_ms
+        except torch.OutOfMemoryError as exc:
+            self._print_cuda_oom_diagnostics(
+                "TensorStoreSparseChunkGroupCache.sync",
+                exc,
+                extra={
+                    "sync_pending_chunks": len(pending),
+                    "sync_pending_mib": len(pending) * self._chunk_bytes() / 1024**2,
+                },
+            )
+            raise
 
     def end_iteration(self) -> None:
         self._iter_count += 1
@@ -158,43 +174,123 @@ class TensorStoreSparseChunkGroupCache:
     def grid_sample(self, xyz_fullres: torch.Tensor, origin: torch.Tensor,
                     inv_scale: torch.Tensor, *, diff: bool = False,
                     context: str = "") -> torch.Tensor:
-        check_enabled = os.environ.get("LASAGNA_CHECK_SPARSE_CACHE", "0") != "0"
-        if check_enabled:
-            self._check_sample_chunks_loaded(
-                xyz_fullres,
-                origin,
-                inv_scale,
-                context=context,
+        try:
+            check_enabled = os.environ.get("LASAGNA_CHECK_SPARSE_CACHE", "0") != "0"
+            if check_enabled:
+                self._check_sample_chunks_loaded(
+                    xyz_fullres,
+                    origin,
+                    inv_scale,
+                    context=context,
+                )
+            if diff:
+                from sparse_grid_sample_3d_u8_diff import sparse_grid_sample_3d_u8_diff
+                out = sparse_grid_sample_3d_u8_diff(
+                    self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
+                )
+            else:
+                from sparse_grid_sample_3d_u8 import sparse_grid_sample_3d_u8
+                out = sparse_grid_sample_3d_u8(
+                    self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
+                )
+            if check_enabled:
+                try:
+                    torch.cuda.synchronize(self.device)
+                except RuntimeError as exc:
+                    shape = tuple(int(v) for v in xyz_fullres.shape)
+                    ctx = f" context={context}" if context else ""
+                    raise RuntimeError(
+                        "sparse CUDA sample failed after cache coverage check: "
+                        f"channels={','.join(self.channels)}{ctx} diff={diff} "
+                        f"sample_shape={shape} loaded_chunks={self.loaded_chunks()} "
+                        f"chunk_grid={self.chunk_grid}"
+                    ) from exc
+            return out
+        except torch.OutOfMemoryError as exc:
+            self._print_cuda_oom_diagnostics(
+                "TensorStoreSparseChunkGroupCache.grid_sample",
+                exc,
+                extra={
+                    "context": context,
+                    "diff": diff,
+                    "sample_shape": tuple(int(v) for v in xyz_fullres.shape),
+                    "sample_numel": int(xyz_fullres.numel()),
+                },
             )
-        if diff:
-            from sparse_grid_sample_3d_u8_diff import sparse_grid_sample_3d_u8_diff
-            out = sparse_grid_sample_3d_u8_diff(
-                self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
-            )
-        else:
-            from sparse_grid_sample_3d_u8 import sparse_grid_sample_3d_u8
-            out = sparse_grid_sample_3d_u8(
-                self.chunk_table, self.n_channels, xyz_fullres, origin, inv_scale,
-            )
-        if check_enabled:
-            try:
-                torch.cuda.synchronize(self.device)
-            except RuntimeError as exc:
-                shape = tuple(int(v) for v in xyz_fullres.shape)
-                ctx = f" context={context}" if context else ""
-                raise RuntimeError(
-                    "sparse CUDA sample failed after cache coverage check: "
-                    f"channels={','.join(self.channels)}{ctx} diff={diff} "
-                    f"sample_shape={shape} loaded_chunks={self.loaded_chunks()} "
-                    f"chunk_grid={self.chunk_grid}"
-                ) from exc
-        return out
+            raise
 
     def loaded_chunks(self) -> int:
         return int((self.chunk_table != 0).sum())
 
     def loaded_mib(self) -> float:
         return self.loaded_chunks() * self.n_channels * _PADDED**3 / 1024**2
+
+    def _chunk_bytes(self) -> int:
+        return self.n_channels * _PADDED**3
+
+    def cached_cuda_bytes(self) -> int:
+        table_bytes = self.chunk_table.numel() * self.chunk_table.element_size()
+        batch_bytes = sum(t.numel() * t.element_size() for t in self._batches)
+        return table_bytes + batch_bytes
+
+    def cache_diagnostics(self) -> str:
+        table_bytes = self.chunk_table.numel() * self.chunk_table.element_size()
+        batch_bytes = sum(t.numel() * t.element_size() for t in self._batches)
+        batch_chunks = [int(t.shape[0]) for t in self._batches]
+        if len(batch_chunks) > 8:
+            batch_desc = f"{batch_chunks[:4]}...{batch_chunks[-4:]}"
+        else:
+            batch_desc = str(batch_chunks)
+        pending_mib = len(self._pending) * self._chunk_bytes() / 1024**2
+        return (
+            f"channels={','.join(self.channels)} device={self.device} "
+            f"chunk_grid={self.chunk_grid[0]}x{self.chunk_grid[1]}x{self.chunk_grid[2]} "
+            f"chunk_bytes={self._chunk_bytes()} "
+            f"loaded_chunks_tracked={self._total_new_chunks} "
+            f"last_sync_new={self._last_sync_new} pending_chunks={len(self._pending)} "
+            f"pending={pending_mib:.1f}MiB batches={len(self._batches)} "
+            f"batch_chunks={batch_desc} table={_fmt_mib(table_bytes)} "
+            f"batch_gpu={_fmt_mib(batch_bytes)} total_cuda_cache={_fmt_mib(table_bytes + batch_bytes)} "
+            f"tensorstore_cache_pool={_fmt_mib(self.cache_pool_bytes)}"
+        )
+
+    def _print_cuda_oom_diagnostics(
+        self,
+        where: str,
+        exc: BaseException,
+        *,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            extra_text = ""
+            if extra:
+                extra_text = " " + " ".join(f"{k}={v}" for k, v in extra.items())
+            print(
+                f"[sparse_cache_oom] {where}:{extra_text} "
+                f"{self.cache_diagnostics()}",
+                flush=True,
+            )
+            if torch.cuda.is_available():
+                try:
+                    allocated = torch.cuda.memory_allocated(self.device)
+                    reserved = torch.cuda.memory_reserved(self.device)
+                    free, total = torch.cuda.mem_get_info(self.device)
+                    print(
+                        f"[sparse_cache_oom] {where}: torch_alloc={_fmt_mib(allocated)} "
+                        f"torch_reserved={_fmt_mib(reserved)} free={_fmt_mib(free)} "
+                        f"total={_fmt_mib(total)} oom={exc}",
+                        flush=True,
+                    )
+                except RuntimeError as mem_exc:
+                    print(
+                        f"[sparse_cache_oom] {where}: torch allocator stats unavailable: {mem_exc}",
+                        flush=True,
+                    )
+        except Exception as diag_exc:
+            print(
+                f"[sparse_cache_oom] {where}: diagnostics failed: {diag_exc}; original_oom={exc}",
+                flush=True,
+            )
 
     def _chunk_bounds(self, cz: int, cy: int, cx: int) -> tuple[slice, slice, slice, slice, slice, slice]:
         Z, Y, X = self.vol_shape_zyx

@@ -6,6 +6,7 @@ import unittest
 
 import torch
 
+from snap_surf.map_pyramid import _map_init_quad_offsets
 from snap_surf_test_utils import _normals_2d, _normals_3d, _plane_xyz, _result, opt_loss_snap_surf
 
 
@@ -15,6 +16,9 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 
 	def test_map_init_config_parse_and_validation(self) -> None:
 		self.assertEqual(opt_loss_snap_surf.SnapSurfMapInitConfig().global_opt_interval, 10)
+		self.assertAlmostEqual(opt_loss_snap_surf.SnapSurfMapInitConfig().sample_angle_step_fraction, 0.0)
+		self.assertAlmostEqual(opt_loss_snap_surf._parse_map_init_config({}).sample_angle_step_fraction, 0.0)
+		self.assertTrue(opt_loss_snap_surf._parse_map_init_config({}).compile_objective)
 		cfg = opt_loss_snap_surf._parse_map_init_config({
 			"enabled": True,
 			"surface_loss": True,
@@ -49,12 +53,14 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 			"z_lift_enabled": False,
 			"z_lift_refine_enabled": True,
 			"z_lift_norm_xy_min": 0.2,
-			"w_z_lift": 12.0,
+			"map_turn": 12.0,
 			"z_lift_huber_delta": 0.5,
 			"max_sample_distance": 500.0,
 			"max_sample_angle_deg": 45.0,
 			"sample_angle_step_fraction": 0.2,
 			"max_step_neighbor_ratio": 10.0,
+			"compile_objective": True,
+			"compile_objective_mode": "reduce-overhead",
 			"fixture_export_dir": "fixture_out",
 			"fixture_export_once": False,
 			"fixture_export_objs": False,
@@ -99,12 +105,14 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		self.assertAlmostEqual(cfg.max_sample_angle_deg, 45.0)
 		self.assertAlmostEqual(cfg.sample_angle_step_fraction, 0.2)
 		self.assertAlmostEqual(cfg.max_step_neighbor_ratio, 10.0)
+		self.assertTrue(cfg.compile_objective)
+		self.assertEqual(cfg.compile_objective_mode, "reduce-overhead")
 		self.assertEqual(cfg.fixture_export_dir, "fixture_out")
 		self.assertFalse(cfg.fixture_export_once)
 		self.assertFalse(cfg.fixture_export_objs)
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf._parse_map_init_config({"unknown": 1})
-		for key in ("w_metric_smooth", "w_area_smooth", "w_z_lift", "z_lift_norm_xy_min", "max_sample_distance", "sample_angle_step_fraction", "max_step_neighbor_ratio"):
+		for key in ("w_metric_smooth", "w_area_smooth", "map_turn", "z_lift_norm_xy_min", "max_sample_distance", "sample_angle_step_fraction", "max_step_neighbor_ratio"):
 			with self.assertRaises(ValueError):
 				opt_loss_snap_surf._parse_map_init_config({key: -0.1})
 		with self.assertRaises(ValueError):
@@ -116,6 +124,8 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 				opt_loss_snap_surf._parse_map_init_config({key: 0.0})
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf._parse_map_init_config({"progress_mode": "loud"})
+		with self.assertRaises(ValueError):
+			opt_loss_snap_surf._parse_map_init_config({"compile_objective_mode": "experimental"})
 		with self.assertRaises(ValueError):
 			opt_loss_snap_surf._parse_map_init_config({"scale_levels": 2, "scale_factor": 3})
 		cfg = opt_loss_snap_surf._parse_map_init_config({"minscale": 1})
@@ -135,6 +145,19 @@ class SnapSurfMapPyramidTest(unittest.TestCase):
 		self.assertEqual(opt_loss_snap_surf._map_init_dyadic_level_shape(9, 5, 2), (3, 2))
 		coords = opt_loss_snap_surf._map_init_dyadic_level_coords(torch.zeros(9, 5, 3), 2)
 		self.assertTrue(torch.equal(coords[1, 1], torch.tensor([4.0, 4.0])))
+
+	def test_map_init_quad_offsets_are_unshifted(self) -> None:
+		one = _map_init_quad_offsets(subdiv=1, device=torch.device("cpu"), dtype=torch.float32)
+		self.assertTrue(torch.equal(one, torch.tensor([[0.0, 0.0]])))
+
+		two = _map_init_quad_offsets(subdiv=2, device=torch.device("cpu"), dtype=torch.float32)
+		expected = torch.tensor([
+			[0.0, 0.0],
+			[0.0, 0.5],
+			[0.5, 0.0],
+			[0.5, 0.5],
+		])
+		self.assertTrue(torch.equal(two, expected))
 
 	def test_map_init_single_neighbor_prediction_uses_source_to_uv_transform(self) -> None:
 		state = opt_loss_snap_surf._DirectionState(source_rank=2, target_rank=2)

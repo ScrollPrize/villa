@@ -22,6 +22,20 @@ class ModelParams3D:
 	pyramid_d: bool         # whether depth axis participates in pyramid
 	model_w: float | None = None
 	model_h: float | None = None
+	depth_windings: tuple[int, ...] = field(default_factory=tuple)
+
+
+def _normalize_depth_windings(raw, *, depth: int, where: str) -> tuple[int, ...]:
+	if not isinstance(raw, (list, tuple)):
+		raise ValueError(f"{where}: missing required depth_windings list")
+	out = tuple(int(v) for v in raw)
+	if len(out) != int(depth):
+		raise ValueError(f"{where}: depth_windings length {len(out)} must match depth {int(depth)}")
+	if len(set(out)) != len(out):
+		raise ValueError(f"{where}: depth_windings must not contain duplicates")
+	if any(b <= a for a, b in zip(out, out[1:])):
+		raise ValueError(f"{where}: depth_windings must be strictly increasing")
+	return out
 
 
 def _frozen_channels(channels: set[str] | frozenset[str] | tuple[str, ...] | list[str] | None) -> frozenset[str]:
@@ -340,6 +354,7 @@ class Model3D(nn.Module):
 			z_step_eff=max(1, int(z_step_eff)),
 			volume_extent=volume_extent,
 			pyramid_d=self.pyramid_d,
+			depth_windings=tuple(range(self.depth)),
 		)
 
 		# Arc parameters (fullres coordinates)
@@ -2491,6 +2506,101 @@ class Model3D(nn.Module):
 		n = torch.cross(edge_h, edge_w, dim=-1)
 		return n
 
+	def mesh_conn_prefetch_points(self, xyz_lr: torch.Tensor) -> tuple[torch.Tensor, ...]:
+		"""Return grad_mag sample points used by mesh connection masks.
+
+		The optimizer calls this during sparse-cache prefetch, before the model
+		forward that will sample these exact points in _xyz_conn().
+		"""
+		D, Hm, Wm, _ = xyz_lr.shape
+		if D < 2:
+			return ()
+		device = xyz_lr.device
+		normals = self._vertex_normals(xyz_lr).detach()
+		prev_h_off = self.conn_offsets[0]
+		prev_w_off = self.conn_offsets[1]
+		next_h_off = self.conn_offsets[2]
+		next_w_off = self.conn_offsets[3]
+
+		def _intersect_direction(src_xyz: torch.Tensor, src_n: torch.Tensor, nb_xyz: torch.Tensor, h_off: torch.Tensor, w_off: torch.Tensor) -> torch.Tensor:
+			B = src_xyz.shape[0]
+			h_idx_b = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(B, Hm, Wm)
+			w_idx_b = torch.arange(Wm, device=device, dtype=torch.float32).view(1, 1, Wm).expand(B, Hm, Wm)
+			target_h = h_idx_b + h_off
+			target_w = w_idx_b + w_off
+			row = target_h.floor().clamp(0, Hm - 2).long()
+			col = target_w.floor().clamp(0, Wm - 2).long()
+			frac_h = target_h - row.float()
+
+			d_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, Hm, Wm)
+			P00 = nb_xyz[d_idx, row, col]
+			P10 = nb_xyz[d_idx, row + 1, col]
+			P01 = nb_xyz[d_idx, row, col + 1]
+			P11 = nb_xyz[d_idx, row + 1, col + 1]
+
+			O = src_xyz
+			n = src_n
+			a = P10 - P00
+			b = P01 - P00
+			c = P11 - P10 - P01 + P00
+			g = P00 - O
+
+			def cross2(vec: torch.Tensor, i: int, j: int) -> torch.Tensor:
+				return vec[..., i] * n[..., j] - vec[..., j] * n[..., i]
+
+			Ap = [cross2(a, 0, 1), cross2(a, 0, 2), cross2(a, 1, 2)]
+			Bp = [cross2(b, 0, 1), cross2(b, 0, 2), cross2(b, 1, 2)]
+			Cp = [cross2(c, 0, 1), cross2(c, 0, 2), cross2(c, 1, 2)]
+			Gp = [cross2(g, 0, 1), cross2(g, 0, 2), cross2(g, 1, 2)]
+			qpairs = [(0, 1), (0, 2), (1, 2)]
+			alphas = []
+			betas_q = []
+			gammas = []
+			for p, q in qpairs:
+				alphas.append(Ap[p] * Cp[q] - Ap[q] * Cp[p])
+				betas_q.append(Ap[p] * Bp[q] - Ap[q] * Bp[p] + Gp[p] * Cp[q] - Gp[q] * Cp[p])
+				gammas.append(Gp[p] * Bp[q] - Gp[q] * Bp[p])
+
+			abs_a = [aa.abs() for aa in alphas]
+			sel_q0 = (abs_a[0] >= abs_a[1]) & (abs_a[0] >= abs_a[2])
+			sel_q1 = (~sel_q0) & (abs_a[1] >= abs_a[2])
+			alpha = torch.where(sel_q0, alphas[0], torch.where(sel_q1, alphas[1], alphas[2]))
+			beta = torch.where(sel_q0, betas_q[0], torch.where(sel_q1, betas_q[1], betas_q[2]))
+			gamma = torch.where(sel_q0, gammas[0], torch.where(sel_q1, gammas[1], gammas[2]))
+
+			eps = 1e-12
+			disc_safe = (beta * beta - 4.0 * alpha * gamma).clamp(min=0.0)
+			sqrt_disc = torch.sqrt(disc_safe + 1e-12)
+			is_linear = alpha.abs() < eps
+			u1 = (-beta + sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
+			u2 = (-beta - sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
+			u_lin = -gamma / (beta + eps * (beta.abs() < eps).float())
+			u1 = torch.where(is_linear, u_lin, u1)
+			u2 = torch.where(is_linear, u_lin, u2)
+			u = torch.where((u1 - frac_h).abs() <= (u2 - frac_h).abs(), u1, u2)
+
+			denom_v = [Bp[k] + u * Cp[k] for k in range(3)]
+			numer_v = [-(Gp[k] + u * Ap[k]) for k in range(3)]
+			abs_dv = [d.abs() for d in denom_v]
+			sel_v0 = (abs_dv[0] >= abs_dv[1]) & (abs_dv[0] >= abs_dv[2])
+			sel_v1 = (~sel_v0) & (abs_dv[1] >= abs_dv[2])
+			dv = torch.where(sel_v0, denom_v[0], torch.where(sel_v1, denom_v[1], denom_v[2]))
+			nv = torch.where(sel_v0, numer_v[0], torch.where(sel_v1, numer_v[1], numer_v[2]))
+			v = nv / (dv + eps * (dv.abs() < eps).float())
+			return P00 + u.unsqueeze(-1) * a + v.unsqueeze(-1) * b + (u * v).unsqueeze(-1) * c
+
+		prev_conn = _intersect_direction(
+			xyz_lr[1:], normals[1:], xyz_lr[:-1], prev_h_off[1:], prev_w_off[1:]
+		)
+		next_conn = _intersect_direction(
+			xyz_lr[:-1], normals[:-1], xyz_lr[1:], next_h_off[:-1], next_w_off[:-1]
+		)
+		boundary_prev = (2.0 * xyz_lr[0] - next_conn[0]).detach()
+		boundary_next = (2.0 * xyz_lr[-1] - prev_conn[-1]).detach()
+		prev_full = torch.cat([boundary_prev.unsqueeze(0), prev_conn], dim=0)
+		next_full = torch.cat([next_conn, boundary_next.unsqueeze(0)], dim=0)
+		return prev_full.detach(), xyz_lr.detach(), next_full.detach()
+
 	def _xyz_conn(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 		"""Compute connection points to neighbor depth slices.
 
@@ -3570,10 +3680,12 @@ class Model3D(nn.Module):
 	def from_tifxyz_crop(xyz: torch.Tensor, valid: torch.Tensor, *,
 						 device: torch.device, mesh_step: int = 100,
 						 winding_step: int = 25, subsample_mesh: int = 4,
-						 subsample_winding: int = 4) -> "Model3D":
-		"""Create a depth=1 model from pre-cropped tifxyz tensors.
+						 subsample_winding: int = 4,
+						 depth: int = 1) -> "Model3D":
+		"""Create a model from pre-cropped tifxyz tensors.
 
 		xyz: (H, W, 3) float32 — invalid vertices should already be zeroed.
+		depth: number of identical initial D slices to stack.
 		valid: (H, W) bool — True for valid vertices.
 
 		Invalid vertices are inpainted via masked scale-space pyramid reconstruction.
@@ -3581,14 +3693,14 @@ class Model3D(nn.Module):
 		H, W, _ = xyz.shape
 		import math
 		mdl = Model3D(
-			device=device, depth=1, mesh_h=H, mesh_w=W,
+			device=device, depth=max(1, int(depth)), mesh_h=H, mesh_w=W,
 			mesh_step=mesh_step, winding_step=winding_step,
 			subsample_mesh=subsample_mesh, subsample_winding=subsample_winding,
 			arc_cx=0.0, arc_cy=0.0, arc_radius=1000.0,
 			arc_angle0=-0.5, arc_angle1=0.5,
 			init_mode="arc", pyramid_d=False,
 		)
-		flat_mesh = xyz.to(device=device).permute(2, 0, 1).unsqueeze(1)  # (3, 1, H, W)
+		flat_mesh = xyz.to(device=device).permute(2, 0, 1).unsqueeze(1).expand(3, mdl.depth, H, W).contiguous()
 		valid_dev = valid.to(device=device)
 		mdl.arc_enabled = False
 		mdl.straight_enabled = False
@@ -4086,6 +4198,7 @@ class Model3D(nn.Module):
 		st.pop("_model_params_", None)
 		st.pop("_fit_config_", None)
 		st.pop("_corr_points_results_", None)
+		st.pop("_snap_surf_map_state_", None)
 		st.pop("_approval_inpaint_output_mask_", None)
 		# Drop legacy conn_offset_ms pyramid keys
 		for k in list(st.keys()):
@@ -4139,6 +4252,16 @@ class Model3D(nn.Module):
 			z_step_eff=int(mp["z_step_eff"]),
 			volume_extent=mp.get("volume_extent"),
 			pyramid_d=bool(mp.get("pyramid_d", True)),
+		)
+		mdl.params = replace(
+			mdl.params,
+			model_w=None if mp.get("model_w") is None else float(mp["model_w"]),
+			model_h=None if mp.get("model_h") is None else float(mp["model_h"]),
+			depth_windings=_normalize_depth_windings(
+				mp.get("depth_windings"),
+				depth=D,
+				where="_model_params_",
+			),
 		)
 		# Reconstruct pyramid from flat
 		n_scales = len(mdl.mesh_ms)

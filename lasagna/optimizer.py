@@ -4,7 +4,8 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 import torch
 
@@ -37,6 +38,35 @@ def _debug_cuda_sync(label: str) -> None:
 			torch.cuda.synchronize()
 		except RuntimeError as exc:
 			raise RuntimeError(f"CUDA failure after {label}") from exc
+
+
+def _cuda_mem_debug_enabled() -> bool:
+	return os.environ.get("LASAGNA_CUDA_MEM_DEBUG", "0") != "0"
+
+
+def _fmt_mib(value: int | float) -> str:
+	return f"{float(value) / 1024.0 ** 2:.1f}MiB"
+
+
+def _log_cuda_memory(label: str, *, device: torch.device | int | None = None) -> None:
+	if not _cuda_mem_debug_enabled() or not torch.cuda.is_available():
+		return
+	try:
+		dev = device if device is not None else torch.cuda.current_device()
+		allocated = torch.cuda.memory_allocated(dev)
+		reserved = torch.cuda.memory_reserved(dev)
+		max_allocated = torch.cuda.max_memory_allocated(dev)
+		max_reserved = torch.cuda.max_memory_reserved(dev)
+		free, total = torch.cuda.mem_get_info(dev)
+		print(
+			f"[cuda_mem] {label}: "
+			f"alloc={_fmt_mib(allocated)} reserved={_fmt_mib(reserved)} "
+			f"peak_alloc={_fmt_mib(max_allocated)} peak_reserved={_fmt_mib(max_reserved)} "
+			f"free={_fmt_mib(free)} total={_fmt_mib(total)}",
+			flush=True,
+		)
+	except RuntimeError as exc:
+		print(f"[cuda_mem] {label}: unavailable ({exc})", flush=True)
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -74,7 +104,13 @@ class OptSettings:
 @dataclass(frozen=True)
 class Stage:
 	name: str
-	global_opt: OptSettings
+	global_opt: OptSettings | None
+	children: tuple["Stage", ...] = ()
+	grow: dict | None = None
+
+	@property
+	def is_expand(self) -> bool:
+		return self.name.startswith("expand-")
 
 
 @dataclass(frozen=True)
@@ -118,6 +154,7 @@ MAP_LOSS_NAMES = (
 	"map_dist",
 	"map_vec_normal",
 	"map_surface_normal",
+	"map_turn",
 	"map_smooth",
 	"map_bend",
 	"map_jac",
@@ -130,6 +167,7 @@ MAP_STAGE_LOSS_TO_GLOBAL = {
 	"dist": "map_dist",
 	"vec": "map_vec_normal",
 	"norm": "map_surface_normal",
+	"turn": "map_turn",
 	"smooth": "map_smooth",
 	"bend": "map_bend",
 	"jac": "map_jac",
@@ -366,6 +404,7 @@ lambda_global: dict[str, float] = {
 	"map_dist": 1.0,
 	"map_vec_normal": 1.0,
 	"map_surface_normal": 1.0,
+	"map_turn": 10.0,
 	"map_smooth": 0.05,
 	"map_bend": 0.01,
 	"map_jac": 1.0,
@@ -495,23 +534,46 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 		raise ValueError("stages_json: expected key 'stages' to be a non-empty list, got an empty list")
 	_require_consumed_dict(where="top-level", cfg=cfg)
 
-	out: list[Stage] = []
-	for s in stages_cfg:
-		if not isinstance(s, dict):
-			raise ValueError("stages_json: each stage must be an object")
-		s = dict(s)
-		name = str(s.pop("name", ""))
-		global_opt_cfg = s.pop("global_opt", None)
-		if global_opt_cfg is None:
-			global_opt_cfg = dict(s)
-			s.clear()
-		_require_consumed_dict(where=f"stage '{name}'", cfg=s)
-		if not isinstance(global_opt_cfg, dict):
-			raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
-		global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
-		out.append(Stage(name=name, global_opt=global_opt))
+	def _load_stage_list(raw_stages: list, *, where: str) -> list[Stage]:
+		out: list[Stage] = []
+		for s in raw_stages:
+			if not isinstance(s, dict):
+				raise ValueError(f"stages_json: each stage in {where} must be an object")
+			s = dict(s)
+			name = str(s.pop("name", ""))
+			children_cfg = s.pop("stages", None)
+			grow_cfg = s.pop("grow", None)
+			if children_cfg is not None or name.startswith("expand-"):
+				if not name.startswith("expand-"):
+					raise ValueError(f"stages_json: wrapper stage '{name}' must be named expand-*")
+				if name not in {"expand-z", "expand-xyz"}:
+					raise ValueError(f"stages_json: unsupported expand stage '{name}' (expected expand-z or expand-xyz)")
+				if not isinstance(children_cfg, list) or not children_cfg:
+					raise ValueError(f"stages_json: stage '{name}' requires non-empty nested 'stages' list")
+				if grow_cfg is not None and not isinstance(grow_cfg, dict):
+					raise ValueError(f"stages_json: stage '{name}' field 'grow' must be an object or null")
+				_require_consumed_dict(where=f"stage '{name}'", cfg=s)
+				out.append(Stage(
+					name=name,
+					global_opt=None,
+					children=tuple(_load_stage_list(children_cfg, where=f"stage '{name}'.stages")),
+					grow=None if grow_cfg is None else dict(grow_cfg),
+				))
+				continue
+			global_opt_cfg = s.pop("global_opt", None)
+			if global_opt_cfg is None:
+				global_opt_cfg = dict(s)
+				s.clear()
+			_require_consumed_dict(where=f"stage '{name}'", cfg=s)
+			if not isinstance(global_opt_cfg, dict):
+				raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
+			global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
+			out.append(Stage(name=name, global_opt=global_opt))
+		return out
+
+	out = _load_stage_list(stages_cfg, where="top-level stages")
 	if init_mode == "cylinder_seed":
-		_validate_cylinder_seed_stage_roles(out)
+		_validate_cylinder_seed_stage_roles([s for s in out if s.global_opt is not None])
 	return out
 
 
@@ -531,6 +593,11 @@ def load_stages(path: str) -> list[Stage]:
 def total_steps_for_stages(stages: list[Stage]) -> int:
 	total = 0
 	for stage in stages:
+		if stage.children:
+			total += total_steps_for_stages(list(stage.children))
+			continue
+		if stage.global_opt is None:
+			continue
 		total += max(0, stage.global_opt.steps)
 	return total
 
@@ -557,6 +624,7 @@ def _global_map_args_from_eff(args: dict, *, base: dict[str, float], eff: dict[s
 		"w_dist": float(base.get("map_dist", 0.0)),
 		"w_vec_normal": float(base.get("map_vec_normal", 0.0)),
 		"w_surface_normal": float(base.get("map_surface_normal", 0.0)),
+		"map_turn": float(base.get("map_turn", 0.0)),
 		"w_smooth": float(base.get("map_smooth", 0.0)),
 		"w_bend": float(base.get("map_bend", 0.0)),
 		"w_jac": float(base.get("map_jac", 0.0)),
@@ -581,6 +649,80 @@ def _global_map_stage_from_opt_settings(*, name: str, opt_cfg: OptSettings, args
 		w_fac=_global_map_w_fac_from_eff(base=opt_cfg.base_eff, eff=opt_cfg.eff),
 		args=_global_map_args_from_eff(args, base=opt_cfg.base_eff, eff=opt_cfg.eff),
 	)
+
+
+def global_map_config_from_stages_cfg(cfg: dict) -> snap_surf_map_global.GlobalMapConfig:
+	stages = load_stages_cfg(cfg)
+	map_stages: list[snap_surf_map_global.GlobalMapStageConfig] = []
+	base_eff: dict[str, float] | None = None
+
+	def _collect(raw_stages: list[Stage]) -> None:
+		nonlocal base_eff
+		for stage in raw_stages:
+			if stage.children:
+				raise ValueError("global map fixture configs do not support nested/expand stages")
+			if stage.global_opt is None:
+				continue
+			if stage.global_opt.kind != "map":
+				raise ValueError(
+					f"global map fixture config stage '{stage.name}' is not a map stage; "
+					"fixture configs must contain only map optimization stages"
+				)
+			if base_eff is None:
+				base_eff = dict(stage.global_opt.base_eff)
+			map_stages.append(_global_map_stage_from_opt_settings(
+				name=stage.name,
+				opt_cfg=stage.global_opt,
+				args=stage.global_opt.args or {},
+			))
+
+	_collect(stages)
+	if not map_stages:
+		raise ValueError("global map fixture config contains no map optimization stages")
+	return snap_surf_map_global.GlobalMapConfig(base=dict(base_eff or {}), stages=tuple(map_stages))
+
+
+def load_global_map_config(path: str | Path) -> snap_surf_map_global.GlobalMapConfig:
+	try:
+		with open(path, "r", encoding="utf-8") as f:
+			cfg = json.load(f)
+	except json.JSONDecodeError as exc:
+		raise ValueError(
+			f"stages_json: invalid JSON in {path}: line {exc.lineno}, column {exc.colno}: {exc.msg}"
+		) from exc
+	if not isinstance(cfg, dict):
+		raise ValueError("stages_json: expected an object")
+	return global_map_config_from_stages_cfg(cfg)
+
+
+def _resolve_snap_surf_map_fixture_export_args(args: dict, *, out_dir: str | None) -> dict:
+	if not isinstance(args, dict):
+		return args
+	if out_dir is None:
+		return dict(args)
+	out = dict(args)
+	base = Path(out_dir)
+
+	def _resolve_path(value):
+		if value in (None, "", False):
+			return value
+		path = Path(str(value))
+		return str(path if path.is_absolute() else base / path)
+
+	for key in ("fixture_export_dir", "map_fixture_export_dir"):
+		if key in out:
+			out[key] = _resolve_path(out[key])
+	for key in ("export_fixture", "fixture_export"):
+		raw = out.get(key)
+		if isinstance(raw, str):
+			out[key] = _resolve_path(raw)
+		elif isinstance(raw, dict):
+			nested = dict(raw)
+			for path_key in ("dir", "out_dir", "path"):
+				if path_key in nested:
+					nested[path_key] = _resolve_path(nested[path_key])
+			out[key] = nested
+	return out
 
 
 def _lr_scalespace(*, lr: float | list[float], scale_i: int) -> float:
@@ -738,14 +880,260 @@ def optimize(
 	out_dir: str | None = None,
 	capture_flow_gate_channels: bool = False,
 	cylinder_shell_callback=None,
+	self_map_init: str = "off",
+	self_map_model_w_wraps: float | None = None,
+	init_grow: dict | None = None,
+	snap_surf_map_state: dict | None = None,
+	require_snap_surf_map_state: bool = False,
+	snap_surf_boundary: dict | None = None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
 	opt_loss_snap_surf.reset_state()
 	_snap_global_runtime: snap_surf_map_global.GlobalMapRuntime | None = None
+	_snap_self_runtimes: dict[str, snap_surf_map_global.SelfMapRuntime] = {}
+	_loaded_snap_surf_map_state = snap_surf_map_state if isinstance(snap_surf_map_state, dict) else None
+	_snap_surf_boundary = snap_surf_boundary if isinstance(snap_surf_boundary, dict) else None
 	_snap_global_offset_debug_printed = False
 	_map_forward_needs = fit_model.ModelForwardNeeds(mesh_normals=True, ext_surfaces=True)
 	snap_global_mesh_epoch = 0
+	self_map_mode = snap_surf_map_global.normalize_self_map_init(self_map_init)
+
+	def _runtime_map_model_state(runtime) -> dict | None:
+		global_model = getattr(runtime, "global_model", None)
+		if global_model is None:
+			return None
+		return {
+			"preserve_batch": bool(getattr(global_model, "preserve_batch", False)),
+			"map_uv_ms": [p.detach().cpu() for p in list(getattr(global_model, "map_uv_ms", []))],
+		}
+
+	def _restore_runtime_map_model(
+		runtime,
+		state: dict,
+		*,
+		expected_mode: str | None = None,
+		expected_direction: str | None = None,
+	) -> None:
+		if expected_mode is not None and str(state.get("mode", expected_mode)).replace("-", "_") != str(expected_mode):
+			raise ValueError(f"snap-surf map checkpoint mode mismatch: expected {expected_mode}, got {state.get('mode')}")
+		if expected_direction is not None and str(state.get("direction", expected_direction)) != str(expected_direction):
+			raise ValueError(
+				f"snap-surf map checkpoint direction mismatch: expected {expected_direction}, got {state.get('direction')}"
+			)
+		tensors = state.get("map_uv_ms")
+		if not isinstance(tensors, list) or not tensors:
+			raise ValueError("snap-surf map checkpoint is missing map_uv_ms tensors")
+		device = next(model.parameters()).device
+		params = []
+		for t in tensors:
+			if not torch.is_tensor(t):
+				raise ValueError("snap-surf map checkpoint contains non-tensor map_uv_ms entries")
+			params.append(t.to(device=device, dtype=torch.float32).detach().clone())
+		first = params[0]
+		if first.ndim == 4 and int(first.shape[1]) == 2:
+			dense0 = first.permute(0, 2, 3, 1).contiguous()
+		elif first.ndim == 4 and int(first.shape[-1]) == 2:
+			dense0 = first
+		elif first.ndim == 3 and int(first.shape[-1]) == 2:
+			dense0 = first
+		else:
+			raise ValueError(f"snap-surf map checkpoint has unsupported map_uv_ms[0] shape {tuple(first.shape)}")
+		global_model = snap_surf_map_global.GlobalMapModel(
+			dense0,
+			levels=1,
+			factor=2,
+			preserve_batch=bool(state.get("preserve_batch", first.ndim == 4)),
+		)
+		global_model.map_uv_ms = torch.nn.ParameterList([torch.nn.Parameter(p) for p in params])
+		runtime.global_model = global_model
+		if state.get("model_w_wraps") is not None:
+			runtime.model_w_wraps = float(state["model_w_wraps"])
+		runtime.steps_run = int(state.get("steps_run", getattr(runtime, "steps_run", 0)))
+
+	def _current_snap_surf_map_state() -> dict | None:
+		self_maps: dict[str, dict] = {}
+		for direction, runtime in sorted(_snap_self_runtimes.items()):
+			model_state = _runtime_map_model_state(runtime)
+			if model_state is None:
+				continue
+			model_state.update({
+				"mode": runtime.mode,
+				"direction": direction,
+				"model_w_wraps": runtime.model_w_wraps,
+				"steps_run": int(getattr(runtime, "steps_run", 0)),
+			})
+			self_maps[direction] = model_state
+		out: dict[str, object] = {"version": 1, "self_map_init": self_map_mode}
+		if self_maps:
+			out["self_maps"] = self_maps
+		global_state = _runtime_map_model_state(_snap_global_runtime) if _snap_global_runtime is not None else None
+		if global_state is not None:
+			out["global_map"] = global_state
+		return out if ("self_maps" in out or "global_map" in out) else None
+
+	def _publish_snap_surf_map_state() -> None:
+		state = _current_snap_surf_map_state()
+		if state is not None:
+			setattr(model, "_snap_surf_map_state_for_save", state)
+
+	def _identity_self_map_state_for_model(direction: str) -> dict:
+		with torch.no_grad():
+			model_xyz = model._grid_xyz().detach()
+		runtime = snap_surf_map_global.SelfMapRuntime(
+			mode=self_map_mode,
+			direction=direction,
+			model_w_wraps=self_map_model_w_wraps,
+		)
+		runtime._ensure_model(
+			model_xyz,
+			snap_surf_map_global.snap_surf_config_from_global_config(runtime.cfg_global),
+			snap_surf_map_global.GlobalMapStageConfig(params=("map_uv_ms",)),
+		)
+		state = _runtime_map_model_state(runtime)
+		if state is None:
+			raise RuntimeError(f"failed to initialize identity self map state for direction {direction!r}")
+		state.update({
+			"mode": self_map_mode,
+			"direction": direction,
+			"model_w_wraps": self_map_model_w_wraps,
+			"steps_run": 0,
+		})
+		return state
+
+	def _state_level_batches(state: dict) -> list[torch.Tensor]:
+		raw = state.get("map_uv_ms")
+		if not isinstance(raw, list) or not raw:
+			raise RuntimeError("snap-surf map state is missing map_uv_ms tensors")
+		out: list[torch.Tensor] = []
+		for t in raw:
+			if not torch.is_tensor(t):
+				raise RuntimeError("snap-surf map state contains non-tensor map_uv_ms entry")
+			tt = t.detach().cpu()
+			if tt.ndim == 3:
+				tt = tt.unsqueeze(0)
+			if tt.ndim != 4 or (int(tt.shape[-1]) != 2 and int(tt.shape[1]) != 2):
+				raise RuntimeError(f"snap-surf map tensor must be batchable UV data, got {tuple(tt.shape)}")
+			out.append(tt)
+		return out
+
+	def _replace_self_map_batch(base_state: dict, source_state: dict, *, batch_index: int) -> dict:
+		base_levels = _state_level_batches(base_state)
+		source_levels = _state_level_batches(source_state)
+		if len(base_levels) != len(source_levels):
+			raise RuntimeError(
+				f"cannot fuse snap-surf map levels: self={len(base_levels)} source={len(source_levels)}"
+			)
+		fused_levels: list[torch.Tensor] = []
+		for bi, si in zip(base_levels, source_levels):
+			if int(si.shape[0]) != 1:
+				raise RuntimeError(f"expand-z boundary map must have one batch, got {int(si.shape[0])}")
+			if tuple(bi.shape[1:]) != tuple(si.shape[1:]):
+				raise RuntimeError(
+					f"cannot fuse snap-surf map level shape self={tuple(bi.shape)} source={tuple(si.shape)}"
+				)
+			if not (0 <= int(batch_index) < int(bi.shape[0])):
+				raise RuntimeError(
+					f"self-map batch index {int(batch_index)} outside tensor batch {int(bi.shape[0])}"
+				)
+			bf = bi.clone()
+			bf[int(batch_index)] = si[0]
+			fused_levels.append(bf)
+		out = dict(base_state)
+		out["preserve_batch"] = True
+		out["map_uv_ms"] = fused_levels
+		return out
+
+	def _copy_self_map_existing_batches(base_state: dict, old_state: dict | None) -> dict:
+		if old_state is None:
+			return base_state
+		base_levels = _state_level_batches(base_state)
+		old_levels = _state_level_batches(old_state)
+		if len(base_levels) != len(old_levels):
+			raise RuntimeError(
+				f"cannot preserve snap-surf map levels: new={len(base_levels)} old={len(old_levels)}"
+			)
+		fused_levels: list[torch.Tensor] = []
+		for bi, oi in zip(base_levels, old_levels):
+			if tuple(bi.shape[1:]) != tuple(oi.shape[1:]):
+				raise RuntimeError(
+					f"cannot preserve snap-surf map level shape new={tuple(bi.shape)} old={tuple(oi.shape)}"
+				)
+			if int(oi.shape[0]) > int(bi.shape[0]):
+				raise RuntimeError(
+					f"old snap-surf map batch {int(oi.shape[0])} exceeds new batch {int(bi.shape[0])}"
+				)
+			bf = bi.clone()
+			if int(oi.shape[0]) > 0:
+				bf[:int(oi.shape[0])] = oi
+			fused_levels.append(bf)
+		out = dict(base_state)
+		out["preserve_batch"] = True
+		out["map_uv_ms"] = fused_levels
+		return out
+
+	def _fuse_expand_z_snap_surf_maps_append(
+		*,
+		old_state: dict | None,
+		temp_state: dict | None,
+		old_depth: int,
+		add_depth: int,
+	) -> None:
+		if self_map_mode == "off":
+			return
+		if add_depth != 1:
+			raise NotImplementedError("expand-z map fusion currently requires init-grow.step=1")
+		if temp_state is None or not isinstance(temp_state.get("self_maps"), dict):
+			raise RuntimeError("expand-z map fusion requires optimized temporary boundary snap-surf self_maps")
+		if "global_map" in temp_state:
+			raise RuntimeError("expand-z map fusion no longer accepts temporary snap-surf global_map state")
+		temp_self = temp_state["self_maps"]
+		missing = [
+			d for d in ("out", "in")
+			if not isinstance(temp_self.get(d), dict)
+		]
+		if missing:
+			raise RuntimeError(f"expand-z map fusion requires boundary snap-surf self maps: missing {missing}")
+		old_self = old_state.get("self_maps", {}) if isinstance(old_state, dict) else {}
+		if old_self is not None and not isinstance(old_self, dict):
+			raise RuntimeError("existing snap-surf self map state is malformed")
+		boundary_batch = int(old_depth) - 1
+		self_maps: dict[str, dict] = {}
+		for direction in ("out", "in"):
+			old_direction_state = (
+				old_self.get(direction)
+				if isinstance(old_self, dict) and isinstance(old_self.get(direction), dict)
+				else None
+			)
+			base_state = _copy_self_map_existing_batches(
+				_identity_self_map_state_for_model(direction),
+				old_direction_state,
+			)
+			boundary_state = temp_self[direction]
+			base_state = _replace_self_map_batch(
+				base_state,
+				boundary_state,
+				batch_index=boundary_batch,
+			)
+			base_state["steps_run"] = int(boundary_state.get("steps_run", 0))
+			base_state.update({
+				"mode": self_map_mode,
+				"direction": direction,
+				"model_w_wraps": self_map_model_w_wraps,
+			})
+			self_maps[direction] = base_state
+		setattr(model, "_snap_surf_map_state_for_save", {
+			"version": 1,
+			"self_map_init": self_map_mode,
+			"self_maps": self_maps,
+		})
+
+	if require_snap_surf_map_state and self_map_mode != "off":
+		if _loaded_snap_surf_map_state is None or not isinstance(_loaded_snap_surf_map_state.get("self_maps"), dict):
+			raise ValueError("self-map reopt requires checkpoint snap-surf self maps")
+		missing = [d for d in ("out", "in") if d not in _loaded_snap_surf_map_state["self_maps"]]
+		if missing:
+			raise ValueError(f"self-map reopt checkpoint is missing snap-surf self maps: {missing}")
 
 	def _bump_snap_global_mesh_epoch() -> None:
 		nonlocal snap_global_mesh_epoch
@@ -788,6 +1176,61 @@ def optimize(
 			_snap_global_runtime = snap_surf_map_global.GlobalMapRuntime(base=base, seed_xyz=seed_xyz)
 		return _snap_global_runtime
 
+	def _snap_self_runtime_for(direction: str, stage_args: dict | None = None) -> snap_surf_map_global.SelfMapRuntime:
+		direction_i = str(direction).strip().lower()
+		runtime = _snap_self_runtimes.get(direction_i)
+		if runtime is None:
+			base = {}
+			if isinstance(stage_args, dict) and isinstance(stage_args.get("map_global"), dict):
+				base = dict(stage_args.get("map_global"))
+			if _snap_surf_boundary is not None:
+				missing = [
+					k for k in ("fixed_xyz", "fixed_normals", "fixed_valid")
+					if k not in _snap_surf_boundary
+				]
+				if missing:
+					raise ValueError(f"boundary self-map grow is missing fixed tensors: {missing}")
+				runtime = snap_surf_map_global.BoundarySelfMapRuntime(
+					mode=self_map_mode,
+					direction=direction_i,
+					model_w_wraps=self_map_model_w_wraps,
+					base=base,
+					fixed_xyz=_snap_surf_boundary["fixed_xyz"],
+					fixed_normals=_snap_surf_boundary["fixed_normals"],
+					fixed_valid=_snap_surf_boundary["fixed_valid"],
+				)
+			else:
+				runtime = snap_surf_map_global.SelfMapRuntime(
+					mode=self_map_mode,
+					direction=direction_i,
+					model_w_wraps=self_map_model_w_wraps,
+					base=base,
+				)
+			if _loaded_snap_surf_map_state is not None:
+				self_maps = _loaded_snap_surf_map_state.get("self_maps", {})
+				if isinstance(self_maps, dict) and direction_i in self_maps:
+					_restore_runtime_map_model(
+						runtime,
+						self_maps[direction_i],
+						expected_mode=self_map_mode,
+						expected_direction=direction_i,
+					)
+				elif require_snap_surf_map_state and self_map_mode != "off":
+					raise ValueError(f"self-map reopt checkpoint is missing snap-surf self map '{direction_i}'")
+			_snap_self_runtimes[direction_i] = runtime
+		return runtime
+
+	def _self_map_directions(stage_args: dict | None = None) -> list[str]:
+		if self_map_mode == "off":
+			return []
+		raw = (stage_args or {}).get("self_map_direction", (stage_args or {}).get("self-map-direction", "both"))
+		mode = str(raw).strip().lower()
+		if mode in {"both", "all"}:
+			return ["out", "in"]
+		if mode in {"out", "in"}:
+			return [mode]
+		raise ValueError(f"invalid self_map_direction {raw!r} (expected out, in, or both)")
+
 	def _run_snap_global_map_stage(
 		*,
 		stage: snap_surf_map_global.GlobalMapStageConfig,
@@ -797,6 +1240,25 @@ def optimize(
 		status_fn=None,
 		auto_stop_fn=None,
 	) -> dict[str, float]:
+		if self_map_mode != "off":
+			if res.normals is None:
+				raise RuntimeError("self snap_surf global map optimizer requires model normals")
+			all_stats: dict[str, float] = {}
+			for direction in _self_map_directions(stage_args):
+				stats = _snap_self_runtime_for(direction, stage_args).run_stage(
+					stage=stage,
+					model_xyz=res.xyz_lr,
+					model_normals=res.normals,
+					model_valid=torch.isfinite(res.xyz_lr).all(dim=-1),
+					persistent_optimizer=persistent_optimizer,
+					status_fn=status_fn,
+					cancel_fn=cancel_fn,
+					auto_stop_fn=auto_stop_fn,
+				)
+				for k, v in stats.items():
+					all_stats[k] = all_stats.get(k, 0.0) + float(v) / float(max(1, len(_self_map_directions(stage_args))))
+			_publish_snap_surf_map_state()
+			return all_stats
 		records = getattr(res, "ext_surfaces", None)
 		if not records:
 			raise RuntimeError("snap_surf global map optimizer requires external_surfaces")
@@ -805,7 +1267,7 @@ def optimize(
 		_print_snap_global_offset_debug(records)
 		ext_xyz, ext_valid, ext_normals, ext_quad_valid, _offset = _unpack_ext_surface_record(records[0])
 		runtime = _snap_global_runtime_for(stage_args)
-		return runtime.run_stage(
+		stats = runtime.run_stage(
 			stage=stage,
 			model_xyz=res.xyz_lr,
 			model_normals=res.normals,
@@ -821,6 +1283,8 @@ def optimize(
 			cancel_fn=cancel_fn,
 			auto_stop_fn=auto_stop_fn,
 		)
+		_publish_snap_surf_map_state()
+		return stats
 
 	def _compact_snap_global_map_stats(stats: dict[str, float]) -> dict[str, float]:
 		return {
@@ -830,6 +1294,31 @@ def optimize(
 		}
 
 	def _snap_global_map_loss(*, res) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+		if self_map_mode != "off":
+			if res.normals is None:
+				raise RuntimeError("self snap_surf_map requires model normals")
+			loss_total = res.xyz_lr.sum() * 0.0
+			lms_all: tuple[torch.Tensor, ...] = ()
+			masks_all: tuple[torch.Tensor, ...] = ()
+			stats_acc: dict[str, float] = {}
+			directions = _self_map_directions()
+			for direction in directions:
+				loss, lms, masks, stats = _snap_self_runtime_for(direction).snap_loss(
+					model_xyz=res.xyz_lr,
+					model_normals=res.normals,
+					model_valid=torch.isfinite(res.xyz_lr).all(dim=-1),
+					offset=1.0,
+					data=res.data,
+					strip_samples=max(2, int(res.params.subsample_mesh) + 1),
+				)
+				loss_total = loss_total + loss / float(max(1, len(directions)))
+				lms_all = lms_all + tuple(lms)
+				masks_all = masks_all + tuple(masks)
+				for k, v in stats.items():
+					stats_acc[k] = stats_acc.get(k, 0.0) + float(v) / float(max(1, len(directions)))
+			opt_loss_snap_surf.update_last_stats(stats_acc)
+			_publish_snap_surf_map_state()
+			return loss_total, lms_all, masks_all
 		records = getattr(res, "ext_surfaces", None)
 		if not records:
 			raise RuntimeError("snap_surf_map requires external_surfaces")
@@ -849,6 +1338,7 @@ def optimize(
 			strip_samples=max(2, int(res.params.subsample_mesh) + 1),
 		)
 		opt_loss_snap_surf.update_last_stats(stats)
+		_publish_snap_surf_map_state()
 		return loss, lms, masks
 
 	def _stage_start(name: str) -> float:
@@ -899,7 +1389,7 @@ def optimize(
 		return _truthy(raw)
 
 	def _is_cyl_stage(stage_: Stage) -> bool:
-		return "cyl_params" in stage_.global_opt.params
+		return stage_.global_opt is not None and "cyl_params" in stage_.global_opt.params
 
 	def _cyl_stage_width_target_step(opt_cfg_: OptSettings) -> float | None:
 		args = opt_cfg_.args if isinstance(opt_cfg_.args, dict) else {}
@@ -912,6 +1402,8 @@ def optimize(
 
 	def _cyl_stage_output_all_shells() -> bool:
 		for stage_ in stages:
+			if stage_.global_opt is None:
+				continue
 			args = stage_.global_opt.args if isinstance(stage_.global_opt.args, dict) else {}
 			for key in CYLINDER_OUTPUT_ALL_SHELLS_ARGS:
 				if key in args and _truthy(args.get(key)):
@@ -920,6 +1412,8 @@ def optimize(
 
 	def _cyl_stage_max_search_shells(default: int) -> int:
 		for stage_ in stages:
+			if stage_.global_opt is None:
+				continue
 			args = stage_.global_opt.args if isinstance(stage_.global_opt.args, dict) else {}
 			for key in CYLINDER_MAX_SEARCH_SHELLS_ARGS:
 				if key not in args or args.get(key) is None:
@@ -1073,6 +1567,8 @@ def optimize(
 			return total_steps_for_stages(stages)
 		total = 0
 		for stage_ in stages:
+			if stage_.global_opt is None:
+				continue
 			steps_ = max(0, int(stage_.global_opt.steps))
 			total += steps_
 		return total
@@ -1291,7 +1787,7 @@ def optimize(
 			"loss": _snap_global_map_loss,
 			"needs": Needs(
 				mesh_normals=True,
-				ext_surfaces=True,
+				ext_surfaces=(self_map_mode == "off"),
 				lr_prefetch_channels=frozenset({"grad_mag"}),
 				prefetch_snap_surf_map=True,
 			),
@@ -1574,14 +2070,14 @@ def optimize(
 			)
 
 		if opt_cfg.kind == "map":
-			if not getattr(model, "_ext_surfaces", None):
+			if self_map_mode == "off" and not getattr(model, "_ext_surfaces", None):
 				raise ValueError("snap_surf global map stages require external_surfaces")
 			map_stage = _global_map_stage_from_opt_settings(name=stage.name, opt_cfg=opt_cfg, args=stage_args)
-			_map_status_rows = 0
-			_map_status_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{max(0, opt_cfg.steps)}") + 2)
-			_map_wall = time.perf_counter()
-			_map_last_step = 0
-			_map_legend_printed = False
+			map_stage = replace(
+				map_stage,
+				args=_resolve_snap_surf_map_fixture_export_args(map_stage.args, out_dir=out_dir),
+			)
+			_map_status_printer = snap_surf_map_global.MapRuntimeStatusPrinter(label=label, total_steps=max(0, opt_cfg.steps))
 			_map_auto_stop_info: dict[str, float] = {}
 
 			def _map_auto_stop_fn(*, history: list[float], step: int) -> bool:
@@ -1595,61 +2091,12 @@ def optimize(
 				return True
 
 			def _print_map_status(*, step: int, total: int, stats: dict[str, float]) -> None:
-				nonlocal _map_status_rows, _map_wall, _map_last_step, _map_legend_printed
-				if not _map_legend_printed:
-					print_progress_legend(
-						prefix="[optimizer]",
-						items=[
-							("step", "stage step"),
-							("sm_los", "map objective loss"),
-							("sm_dst", "map distance loss"),
-							("sm_vec", "map vector-normal loss"),
-							("sm_nrm", "map normal alignment loss"),
-							("sm_trn", "lifted z-heading loss"),
-							("sm_ts", "valid lifted z-heading samples"),
-							("sm_smp", "valid map samples"),
-							("sm_bad", "map samples rejected by validity/limits"),
-							("sm_uvb", "active quads with non-finite UV"),
-							("sm_mbd", "active quads rejected by model/sample checks"),
-							("lr", "effective map optimizer learning rate"),
-							("lr_scl", "map LR autoscale factor"),
-							("it/s", "optimizer it/s"),
-						],
-					)
-					_map_legend_printed = True
-				if _map_status_rows % 20 == 0:
-					print(
-						f"{'step':>{_map_status_width}s} {'sm_los':>8s} {'sm_dst':>8s} "
-						f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} {'sm_ts':>8s} "
-						f"{'sm_smp':>8s} {'sm_bad':>8s} {'sm_uvb':>8s} {'sm_mbd':>8s} "
-						f"{'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
-						flush=True,
-					)
-				now = time.perf_counter()
-				its = None
-				if int(step) > int(_map_last_step):
-					its = (int(step) - int(_map_last_step)) / max(1.0e-9, now - _map_wall)
-					_map_wall = now
-					_map_last_step = int(step)
-				its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
-				print(
-					f"{f'{label} {int(step)}/{int(total)}':>{_map_status_width}s} "
-					f"{format_progress_value(float(stats.get('snaps_map_loss', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_dist', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_vec', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_norm', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_sample_bad', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_uvbad', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_model_bad', 0.0))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_lr', opt_cfg.lr if isinstance(opt_cfg.lr, (int, float)) else _lr_last(opt_cfg.lr)))):>8s} "
-					f"{format_progress_value(float(stats.get('snaps_map_lr_autoscale', 1.0))):>8s} "
-					f"{its_str}",
-					flush=True,
+				_map_status_printer.print(
+					step=int(step),
+					total=int(total),
+					stats=stats,
+					fallback_lr=float(opt_cfg.lr if isinstance(opt_cfg.lr, (int, float)) else _lr_last(opt_cfg.lr)),
 				)
-				_map_status_rows += 1
 				if progress_fn is not None:
 					_stage_total = max(1, int(total))
 					_stage_step = min(max(0, int(step)), _stage_total)
@@ -1754,6 +2201,10 @@ def optimize(
 				opt_cfg=map_opt_cfg,
 				args=map_opt_cfg.args or {},
 			)
+			snap_surf_map_opt_stage = replace(
+				snap_surf_map_opt_stage,
+				args=_resolve_snap_surf_map_fixture_export_args(snap_surf_map_opt_stage.args, out_dir=out_dir),
+			)
 
 		snap_surf_map_weight = _need_term("snap_surf_map", stage_eff)
 		snap_surf_global_map_mode = snap_surf_map_opt_stage is not None or snap_surf_map_weight > 0.0
@@ -1829,6 +2280,11 @@ def optimize(
 			pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
 			pred_dt_normal_source_=pred_dt_normal_source,
 		)
+		if snap_surf_map_opt_stage is not None:
+			stage_needs = stage_needs.merged(Needs(
+				mesh_normals=True,
+				ext_surfaces=(self_map_mode == "off"),
+			))
 		if not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: forward_needs={stage_needs.summary()} "
@@ -2303,10 +2759,14 @@ def optimize(
 				"snaps_map_snap_samples",
 				"snaps_map_loss",
 				"snaps_map_dist",
-				"snaps_map_vec",
-				"snaps_map_norm",
-				"snaps_map_samples",
-			}
+					"snaps_map_vec",
+					"snaps_map_norm",
+					"snaps_map_smooth",
+					"snaps_map_bend",
+					"snaps_map_metric_smooth",
+					"snaps_map_area_smooth",
+					"snaps_map_samples",
+				}
 			def _show_status_key(k: str) -> bool:
 				if not str(k).startswith("snaps_map_"):
 					return True
@@ -2417,6 +2877,10 @@ def optimize(
 					)
 					if needs_.prefetch_pred_dt_flow and _xyz_hr_pf is not None else None
 				)
+				_mesh_conn_pf = (
+					model.mesh_conn_prefetch_points(_xyz_lr_pf)
+					if needs_.mesh_conn and hasattr(model, "mesh_conn_prefetch_points") else ()
+				)
 				_cyl_pf = None
 				if (
 					needs_.prefetch_cyl_gt_normals
@@ -2444,6 +2908,9 @@ def optimize(
 					_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
 				if _cache_channels & _lr_channels:
 					_cache.prefetch(_xyz_lr_pf, data.origin_fullres, _sp)
+				if _mesh_conn_pf and "grad_mag" in _cache_channels:
+					for _pf in _mesh_conn_pf:
+						_cache.prefetch(_pf, data.origin_fullres, _sp)
 				if _pred_dt_extra_pf is not None and "pred_dt" in _cache_channels:
 					_cache.prefetch(_pred_dt_extra_pf, data.origin_fullres, _sp)
 				if _cyl_pf is not None and ({"grad_mag", "nx", "ny"} & _cache_channels):
@@ -2457,8 +2924,25 @@ def optimize(
 		def _prefetch_loss_points_for_result(res_, needs_: fit_model.ModelForwardNeeds) -> None:
 			if not _active_caches:
 				return
+			_prefetched_channels: set[str] = set()
 			with torch.no_grad():
 				_loss_prefetch_items: dict[str, torch.Tensor] = {}
+				if needs_.mesh_conn:
+					_log_cuda_memory(f"{label}.loss_prefetch.winding_density.begin")
+					for _i, _pf in enumerate(opt_loss_winding_density.winding_density_prefetch_grad_mag_batches_for_result(res=res_)):
+						_log_cuda_memory(
+							f"{label}.loss_prefetch.winding_density.batch{_i}.ready"
+						)
+						for _cache in _active_caches:
+							_cache_channels = set(_cache.channels)
+							if "grad_mag" not in _cache_channels:
+								continue
+							_sp = data._spacing_for(_cache.channels[0])
+							_cache.prefetch(_pf, data.origin_fullres, _sp)
+							_prefetched_channels.add("grad_mag")
+						_log_cuda_memory(
+							f"{label}.loss_prefetch.winding_density.batch{_i}.prefetched"
+						)
 				if needs_.prefetch_pred_dt_loss:
 					_add_prefetch_items(
 						_loss_prefetch_items,
@@ -2488,25 +2972,39 @@ def optimize(
 						opt_loss_winding_density.ext_offset_prefetch_items_for_result(res=res_),
 					)
 				if needs_.prefetch_snap_surf_map:
-					records = getattr(res_, "ext_surfaces", None)
-					if records and res_.normals is not None:
-						ext_xyz, ext_valid, ext_normals, ext_quad_valid, offset = _unpack_ext_surface_record(records[0])
-						_add_prefetch_items(
-							_loss_prefetch_items,
-							_snap_global_runtime_for().snap_loss_prefetch_items(
-								model_xyz=res_.xyz_lr,
-								model_normals=res_.normals,
-								model_valid=torch.isfinite(res_.xyz_lr).all(dim=-1),
-								ext_xyz=ext_xyz,
-								ext_valid=ext_valid,
-								ext_normals=ext_normals,
-								ext_quad_valid=ext_quad_valid,
-								offset=offset,
-								data=res_.data,
-								strip_samples=max(2, int(res_.params.subsample_mesh) + 1),
-							),
-						)
-			if not _loss_prefetch_items:
+					if self_map_mode != "off" and res_.normals is not None:
+						for direction in _self_map_directions():
+							_add_prefetch_items(
+								_loss_prefetch_items,
+								_snap_self_runtime_for(direction).snap_loss_prefetch_items(
+									model_xyz=res_.xyz_lr,
+									model_normals=res_.normals,
+									model_valid=torch.isfinite(res_.xyz_lr).all(dim=-1),
+									offset=1.0,
+									data=res_.data,
+									strip_samples=max(2, int(res_.params.subsample_mesh) + 1),
+								),
+							)
+					else:
+						records = getattr(res_, "ext_surfaces", None)
+						if records and res_.normals is not None:
+							ext_xyz, ext_valid, ext_normals, ext_quad_valid, offset = _unpack_ext_surface_record(records[0])
+							_add_prefetch_items(
+								_loss_prefetch_items,
+								_snap_global_runtime_for().snap_loss_prefetch_items(
+									model_xyz=res_.xyz_lr,
+									model_normals=res_.normals,
+									model_valid=torch.isfinite(res_.xyz_lr).all(dim=-1),
+									ext_xyz=ext_xyz,
+									ext_valid=ext_valid,
+									ext_normals=ext_normals,
+									ext_quad_valid=ext_quad_valid,
+									offset=offset,
+									data=res_.data,
+									strip_samples=max(2, int(res_.params.subsample_mesh) + 1),
+								),
+							)
+			if not _loss_prefetch_items and not _prefetched_channels:
 				return
 			for _cache in _active_caches:
 				points = [
@@ -2518,8 +3016,9 @@ def optimize(
 					_pf = torch.cat(points, dim=2) if len(points) > 1 else points[0]
 					_sp = data._spacing_for(_cache.channels[0])
 					_cache.prefetch(_pf, data.origin_fullres, _sp)
+					_prefetched_channels.update(ch for ch in _cache.channels if ch in _loss_prefetch_items)
 			for _cache in _active_caches:
-				if any(ch in _loss_prefetch_items for ch in _cache.channels):
+				if any(ch in _prefetched_channels for ch in _cache.channels):
 					_cache.sync()
 
 		# Initial evaluation
@@ -2552,10 +3051,13 @@ def optimize(
 						f"{profile_label or label}: active loss '{name}' missing forward artifact(s): "
 						f"{', '.join(missing)}"
 					)
+				loss_label = f"{profile_label or label}.{name}"
+				_log_cuda_memory(f"{loss_label}.before")
 				_t_loss = _stage_start(f"{profile_label}.{name}") if profile_label is not None else None
 				_t_loss_wall = time.perf_counter() if timing is not None else None
 				result = t["loss"](res=res_)
 				_debug_cuda_sync(f"{profile_label}.{name}" if profile_label is not None else name)
+				_log_cuda_memory(f"{loss_label}.after_raw")
 				if timing is not None and _t_loss_wall is not None:
 					timing.sync()
 					timing.add(f"loss:{name}", time.perf_counter() - _t_loss_wall)
@@ -3277,7 +3779,9 @@ def optimize(
 		# Initial prefetch for streaming mode
 		if _active_caches:
 			_t = _stage_start(f"{label}.initial_prefetch")
+			_log_cuda_memory(f"{label}.initial_prefetch.before")
 			_prefetch_model_points(stage_needs)
+			_log_cuda_memory(f"{label}.initial_prefetch.after")
 			_stage_done(f"{label}.initial_prefetch", _t)
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
@@ -3292,17 +3796,23 @@ def optimize(
 		_t = _stage_start(f"{label}.initial_eval")
 		with torch.no_grad():
 			_t_forward = _stage_start(f"{label}.initial_eval.model_forward")
+			_log_cuda_memory(f"{label}.initial_eval.model_forward.before")
 			res0 = model(data, needs=stage_needs)
 			_debug_cuda_sync(f"{label}.initial_eval.model_forward")
+			_log_cuda_memory(f"{label}.initial_eval.model_forward.after")
 			_stage_done(f"{label}.initial_eval.model_forward", _t_forward)
 			_t_loss_prefetch = _stage_start(f"{label}.initial_eval.loss_prefetch")
+			_log_cuda_memory(f"{label}.initial_eval.loss_prefetch.before")
 			_prefetch_loss_points_for_result(res0, stage_needs)
 			_debug_cuda_sync(f"{label}.initial_eval.loss_prefetch")
+			_log_cuda_memory(f"{label}.initial_eval.loss_prefetch.after")
 			_stage_done(f"{label}.initial_eval.loss_prefetch", _t_loss_prefetch)
 			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
+			_log_cuda_memory(f"{label}.initial_eval.loss_terms.before")
 			opt_loss_snap_surf.set_debug_step(0, label=f"{label}_initial")
 			loss0, term_vals0, display_loss0 = _eval_terms(
 				res0, stage_eff, profile_label=f"{label}.initial_eval.loss")
+			_log_cuda_memory(f"{label}.initial_eval.loss_terms.after")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
 			if snap_surf_map_opt_stage is not None:
 				map_initial_stage = snap_surf_map_global.GlobalMapStageConfig(
@@ -3379,11 +3889,13 @@ def optimize(
 		for step in range(max_steps):
 			_t_iter = time.perf_counter()
 			auto_stop = False
+			_log_cuda_memory(f"{label}.{step + 1}.iter.begin")
 			# Sync: wait for chunks loaded by last prefetch
 			_t_io = time.perf_counter()
 			if _active_caches:
 				for _cache in _active_caches:
 					_cache.sync()
+			_log_cuda_memory(f"{label}.{step + 1}.cache_sync.after")
 			if _flow_timing is not None:
 				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			if _opt_timing is not None:
@@ -3396,8 +3908,10 @@ def optimize(
 				_opt_timing.add("chunk_stats", time.perf_counter() - _t_part)
 
 			_t_forward = time.perf_counter()
+			_log_cuda_memory(f"{label}.{step + 1}.model_forward.before")
 			res = model(data, needs=stage_needs)
 			_debug_cuda_sync(f"{label}.{step + 1}.model_forward")
+			_log_cuda_memory(f"{label}.{step + 1}.model_forward.after")
 			if _flow_timing is not None:
 				_timing_cuda_sync()
 				_flow_timing.add("model_forward", time.perf_counter() - _t_forward)
@@ -3406,8 +3920,10 @@ def optimize(
 				_opt_timing.add("model_forward", time.perf_counter() - _t_forward)
 
 			_t_io = time.perf_counter()
+			_log_cuda_memory(f"{label}.{step + 1}.loss_prefetch.before")
 			_prefetch_loss_points_for_result(res, stage_needs)
 			_debug_cuda_sync(f"{label}.{step + 1}.loss_prefetch")
+			_log_cuda_memory(f"{label}.{step + 1}.loss_prefetch.after")
 			if _flow_timing is not None:
 				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			if _opt_timing is not None:
@@ -3416,7 +3932,9 @@ def optimize(
 
 			_t_loss_eval = time.perf_counter()
 			opt_loss_snap_surf.set_debug_step(step + 1, label=label)
+			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.before")
 			loss, term_vals, display_loss = _eval_terms(res, stage_eff, timing=_opt_timing)
+			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.after")
 			if _flow_timing is not None:
 				_timing_cuda_sync()
 				_flow_timing.add("loss_eval", time.perf_counter() - _t_loss_eval)
@@ -3435,11 +3953,15 @@ def optimize(
 
 			_t_opt = time.perf_counter()
 			_t_part = time.perf_counter()
+			_log_cuda_memory(f"{label}.{step + 1}.zero_grad.before")
 			opt.zero_grad(set_to_none=True)
+			_log_cuda_memory(f"{label}.{step + 1}.zero_grad.after")
 			if _opt_timing is not None:
 				_opt_timing.add("zero_grad", time.perf_counter() - _t_part)
 			_t_part = time.perf_counter()
+			_log_cuda_memory(f"{label}.{step + 1}.backward.before")
 			loss.backward()
+			_log_cuda_memory(f"{label}.{step + 1}.backward.after")
 			if _opt_timing is not None:
 				_opt_timing.sync()
 				_opt_timing.add("backward", time.perf_counter() - _t_part)
@@ -3449,7 +3971,9 @@ def optimize(
 			if flatten_max_update > 0.0 and _flatten_update_params:
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
+			_log_cuda_memory(f"{label}.{step + 1}.opt_step.before")
 			opt.step()
+			_log_cuda_memory(f"{label}.{step + 1}.opt_step.after")
 			_bump_snap_global_mesh_epoch()
 			if _flatten_update_before is not None:
 				_clamp_flatten_map_ms_update(
@@ -3600,14 +4124,14 @@ def optimize(
 	_num_stages = len(stages)
 	_cyl_init_only = (
 		bool(getattr(model, "cyl_shell_mode", False))
-		and any(stage.name == "cyl_init" for stage in stages)
-		and not any(stage.name == "cyl_grow" for stage in stages)
+		and any(stage.name == "cyl_init" for stage in stages if stage.global_opt is not None)
+		and not any(stage.name == "cyl_grow" for stage in stages if stage.global_opt is not None)
 	)
 
 	# Debug: show corr status
 	_corr_terms = ("corr",)
 	has_corr_pts = data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0
-	corr_weights = {t: [(_need_term(t, s.global_opt.eff), s.name) for s in stages if s.global_opt.steps > 0]
+	corr_weights = {t: [(_need_term(t, s.global_opt.eff), s.name) for s in stages if s.global_opt is not None and s.global_opt.steps > 0]
 					for t in _corr_terms}
 	active_corr = {t: ws for t, ws in corr_weights.items() if any(w > 0 for w, _ in ws)}
 	print(f"[optimizer] corr_points={has_corr_pts} active_corr_terms={list(active_corr.keys())}", flush=True)
@@ -3618,7 +4142,155 @@ def optimize(
 		if not active_corr:
 			print(f"[optimizer] WARNING: corr points loaded but no corr weight > 0 in any stage!", flush=True)
 
+	def _fuse_expand_z_append(
+		temp_model: fit_model.Model3D,
+		*,
+		old_snap_surf_map_state: dict | None,
+		temp_snap_surf_map_state: dict | None,
+		add_depth: int,
+	) -> None:
+		with torch.no_grad():
+			old_depth = int(model.depth)
+			old_flat = fit_model.Model3D._integrate_pyramid_3d(model.mesh_ms, pyramid_d=model.pyramid_d).detach()
+			new_flat = fit_model.Model3D._integrate_pyramid_3d(temp_model.mesh_ms, pyramid_d=temp_model.pyramid_d).detach()
+			if tuple(old_flat.shape[2:]) != tuple(new_flat.shape[2:]):
+				raise RuntimeError(
+					f"expand-z fuse requires matching H/W, got old={tuple(old_flat.shape)} new={tuple(new_flat.shape)}"
+				)
+			flat = torch.cat([old_flat, new_flat], dim=1).contiguous()
+			amp = torch.cat([model.amp.detach(), temp_model.amp.detach()], dim=0).contiguous()
+			bias = torch.cat([model.bias.detach(), temp_model.bias.detach()], dim=0).contiguous()
+			depth_windings = tuple(model.params.depth_windings) + tuple(temp_model.params.depth_windings)
+			if len(depth_windings) != int(flat.shape[1]):
+				raise RuntimeError(
+					f"expand-z fuse depth_windings length {len(depth_windings)} "
+					f"must match fused depth {int(flat.shape[1])}"
+				)
+		n_scales = len(model.mesh_ms)
+		model.depth = int(flat.shape[1])
+		model.pyramid_d = bool(model.params.pyramid_d) and model.depth > 1
+		model.params = replace(
+			model.params,
+			pyramid_d=model.pyramid_d,
+			depth_windings=depth_windings,
+		)
+		model.mesh_ms = fit_model.Model3D._construct_pyramid_from_flat_3d(
+			flat,
+			n_scales,
+			pyramid_d=model.pyramid_d,
+		)
+		model.conn_offsets = torch.zeros(
+			4,
+			model.depth,
+			model.mesh_h,
+			model.mesh_w,
+			device=flat.device,
+			dtype=torch.float32,
+		)
+		model.amp = torch.nn.Parameter(amp.to(device=flat.device, dtype=torch.float32))
+		model.bias = torch.nn.Parameter(bias.to(device=flat.device, dtype=torch.float32))
+		_fuse_expand_z_snap_surf_maps_append(
+			old_state=old_snap_surf_map_state,
+			temp_state=temp_snap_surf_map_state,
+			old_depth=old_depth,
+			add_depth=int(add_depth),
+		)
+		print(
+			f"[optimizer] expand-z fuse append: depth={model.depth} "
+			f"depth_windings={list(model.params.depth_windings)}",
+			flush=True,
+		)
+
+	def _run_expand_z_stage(*, si: int, stage: Stage, data: fit_data.FitData3D) -> fit_data.FitData3D:
+		if init_grow is None:
+			raise ValueError("expand-z requires args.init-grow")
+		order = tuple(str(v).strip().lower() for v in init_grow.get("order", ("up",)))
+		if order != ("up",):
+			raise NotImplementedError("expand-z currently implements init-grow order ['up'] only")
+		target_depth = int(init_grow.get("target_depth", model.depth))
+		step_depth = max(1, int(init_grow.get("step", 1)))
+		if target_depth <= model.depth:
+			print(f"[optimizer] expand-z: target_depth={target_depth} already reached", flush=True)
+			return data
+		while model.depth < target_depth:
+			add_depth = min(step_depth, target_depth - model.depth)
+			if add_depth != 1 and self_map_mode != "off":
+				raise NotImplementedError("expand-z self-map grow currently requires init-grow.step=1")
+			with torch.no_grad():
+				ref_res = model(data, needs=fit_model.ModelForwardNeeds(mesh_normals=True))
+				if ref_res.normals is None:
+					raise RuntimeError("expand-z boundary self-map grow requires reference model normals")
+				ref_xyz = ref_res.xyz_lr.detach()[-1].contiguous()
+				ref_normals = ref_res.normals.detach()[-1].contiguous()
+				ref_valid = torch.isfinite(ref_xyz).all(dim=-1)
+			print(
+				f"[optimizer] expand-z: building temporary +{add_depth} winding model "
+				f"from reference depth {model.depth - 1} toward target_depth={target_depth}",
+				flush=True,
+			)
+			temp_model = fit_model.Model3D.from_tifxyz_crop(
+				ref_xyz,
+				ref_valid,
+				device=ref_xyz.device,
+				mesh_step=model.params.mesh_step,
+				winding_step=model.params.winding_step,
+				subsample_mesh=model.params.subsample_mesh,
+				subsample_winding=model.params.subsample_winding,
+				depth=add_depth,
+			)
+			temp_model.params = replace(
+				temp_model.params,
+				scaledown=model.params.scaledown,
+				z_step_eff=model.params.z_step_eff,
+				volume_extent=model.params.volume_extent,
+				model_w=model.params.model_w,
+				model_h=model.params.model_h,
+				depth_windings=tuple(
+					int(model.params.depth_windings[-1]) + i + 1
+					for i in range(add_depth)
+				),
+			)
+			with torch.no_grad():
+				temp_model.amp.copy_(model.amp.detach()[-1:].expand_as(temp_model.amp))
+				temp_model.bias.copy_(model.bias.detach()[-1:].expand_as(temp_model.bias))
+			old_snap_surf_map_state = getattr(model, "_snap_surf_map_state_for_save", None)
+			data = optimize(
+				model=temp_model,
+				data=data,
+				stages=list(stage.children),
+				snapshot_interval=0,
+				snapshot_fn=lambda **_kw: None,
+				progress_fn=progress_fn,
+				cancel_fn=cancel_fn,
+				ensure_data_fn=ensure_data_fn,
+				seed_xyz=seed_xyz,
+				out_dir=out_dir,
+				self_map_init=self_map_mode,
+				self_map_model_w_wraps=self_map_model_w_wraps,
+				init_grow=None,
+				snap_surf_boundary={
+					"fixed_xyz": ref_xyz,
+					"fixed_normals": ref_normals,
+					"fixed_valid": ref_valid,
+				},
+			)
+			temp_snap_surf_map_state = getattr(temp_model, "_snap_surf_map_state_for_save", None)
+			_fuse_expand_z_append(
+				temp_model,
+				old_snap_surf_map_state=old_snap_surf_map_state if isinstance(old_snap_surf_map_state, dict) else None,
+				temp_snap_surf_map_state=temp_snap_surf_map_state if isinstance(temp_snap_surf_map_state, dict) else None,
+				add_depth=add_depth,
+			)
+		return data
+
 	for si, stage in enumerate(stages):
+		if stage.children:
+			if stage.name == "expand-z":
+				data = _run_expand_z_stage(si=si, stage=stage, data=data)
+				continue
+			raise NotImplementedError(f"unsupported wrapper stage '{stage.name}'")
+		if stage.global_opt is None:
+			continue
 		run_zero_step_cyl = "cyl_params" in stage.global_opt.params
 		if stage.global_opt.steps > 0 or run_zero_step_cyl:
 			_stage_wall_t0 = time.perf_counter()
@@ -3658,5 +4330,6 @@ def optimize(
 	elif has_corr_pts:
 		print("[optimizer] corr points present but no corr weight > 0, no corr loss computed", flush=True)
 
+	_publish_snap_surf_map_state()
 	print(f"[optimizer] total optimize time: {_fmt_duration(time.perf_counter() - _optimize_t0)}", flush=True)
 	return data

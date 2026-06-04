@@ -208,6 +208,52 @@ class FitServiceApprovalInpaintTest(unittest.TestCase):
 
 		self.assertTrue(fit_service._config_global_map_enabled(cfg))
 
+	def test_self_map_snap_surf_map_does_not_require_external_surface(self) -> None:
+		cfg = {
+			"args": {
+				"model-init": "seed",
+				"self-map-init": "multi_wrap_d",
+				"init-grow": {
+					"enabled": True,
+					"initial_depth": 1,
+					"order": ["up"],
+					"step": 1,
+				},
+			},
+			"base": {"snap_surf_map": 0.1},
+			"stages": [
+				{
+					"name": "expand-z",
+					"stages": [
+						{
+							"name": "expand_up",
+							"steps": 1,
+							"params": ["mesh_ms"],
+							"args": {
+								"snap_surf_map": {
+									"map_opt": {
+										"steps": 1,
+										"params": ["map_surf_ms"],
+									}
+								}
+							},
+						}
+					],
+				}
+			],
+		}
+
+		self.assertFalse(fit_service._config_global_map_enabled(cfg))
+		self.assertIsNone(
+			fit_service._wire_external_surface_for_request(
+				cfg=cfg,
+				args_section=cfg["args"],
+				model_init="seed",
+				ext_offset_enabled=False,
+				global_map_enabled=fit_service._config_global_map_enabled(cfg),
+			)
+		)
+
 	def test_snap_surf_map_debug_obj_dir_rewrites_existing_outputs(self) -> None:
 		cfg = {
 			"stages": [

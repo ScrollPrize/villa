@@ -506,6 +506,11 @@ def _stage_params_list(opt_cfg: dict[str, Any]) -> list[str]:
 
 
 def _config_global_map_enabled(cfg: dict[str, Any]) -> bool:
+    args = cfg.get("args")
+    if isinstance(args, dict):
+        self_map_init = args.get("self-map-init", args.get("self_map_init", "off"))
+        if str(self_map_init if self_map_init is not None else "off").strip().lower().replace("-", "_") != "off":
+            return False
     if _config_effective_loss_enabled(cfg, "snap_surf_map"):
         return True
     stages = cfg.get("stages")

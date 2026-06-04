@@ -7,9 +7,10 @@ the update walks direct neighbor quads before falling back to the same
 brute-force ray search used for initialization.
 
 Two loss components:
-  - Normal-offset: central winding's signed offset from the seed along the
+  - Normal-offset: winding-number 0's signed offset from the seed along the
     closest point's detached model normal, applied jointly to all windings
-    along that same base point normal.
+    along that same base point normal. Falls back to the center depth when
+    winding metadata is unavailable.
   - XY-centering: per-winding, how far the closest point is from the model
     center in grid-index space, pushing each winding along model tangents.
 """
@@ -150,6 +151,15 @@ def _print_station_recovery_event(message: str) -> None:
         return
     print(message, flush=True)
     _printed_recovery_events += 1
+
+
+def _station_anchor_depth_index(*, D: int, depth_windings: tuple[int, ...] | list[int] | None) -> int:
+    if depth_windings is not None and len(depth_windings) == int(D):
+        try:
+            return list(int(v) for v in depth_windings).index(0)
+        except ValueError:
+            pass
+    return max(0, (int(D) - 1) // 2)
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +599,10 @@ def station_loss(
         }
 
     seed = _seed.to(device=dev, dtype=res.xyz_lr.dtype)
-    d_center = (D - 1) // 2
+    d_anchor = _station_anchor_depth_index(
+        D=D,
+        depth_windings=getattr(res.params, "depth_windings", None),
+    )
     xyz_det = res.xyz_lr.detach()
 
     # Ensure tracked state matches current D
@@ -679,45 +692,45 @@ def station_loss(
             _w_frac[d] = w_frac
             anchors.append((d, conn_pt, h_frac, w_frac, normal))
 
-    # --- Normal-offset loss (from central winding, applied jointly) ---
+    # --- Normal-offset loss (from winding number 0, applied jointly) ---
     loss_normal = zero
     with torch.no_grad():
-        center_hits = [x for x in anchors if x[0] == d_center]
-        if center_hits:
-            _, p_int_c, h_int_c, w_int_c, n_model_c = center_hits[0]
-            offset = ((p_int_c - seed) * n_model_c).sum()  # signed scalar
-            target_n = xyz_det - offset * n_model_c
+        anchor_hits = [x for x in anchors if x[0] == d_anchor]
+        if anchor_hits:
+            _, p_int_a, h_int_a, w_int_a, n_model_a = anchor_hits[0]
+            offset = ((p_int_a - seed) * n_model_a).sum()  # signed scalar
+            target_n = xyz_det - offset * n_model_a
             normal_weights = _station_normal_weights(
                 D=D,
                 Hm=Hm,
                 Wm=Wm,
-                h_center=h_int_c,
-                w_center=w_int_c,
+                h_center=h_int_a,
+                w_center=w_int_a,
                 device=dev,
                 dtype=res.xyz_lr.dtype,
             )
         else:
-            p_int_c = None
-            h_int_c = None
-            w_int_c = None
-            n_model_c = None
+            p_int_a = None
+            h_int_a = None
+            w_int_a = None
+            n_model_a = None
             offset = None
             target_n = None
             normal_weights = None
         if not _printed_initial:
             _print_initial_station_diagnostic(
                 seed=seed,
-                p_int=p_int_c,
-                h_frac=h_int_c,
-                w_frac=w_int_c,
-                normal=n_model_c,
+                p_int=p_int_a,
+                h_frac=h_int_a,
+                w_frac=w_int_a,
+                normal=n_model_a,
                 normal_offset=offset,
                 mesh_step=float(res.params.mesh_step),
             )
             _printed_initial = True
 
     if target_n is not None:
-        normal_distance_vx = ((res.xyz_lr - target_n) * n_model_c.view(1, 1, 1, 3)).sum(dim=-1)
+        normal_distance_vx = ((res.xyz_lr - target_n) * n_model_a.view(1, 1, 1, 3)).sum(dim=-1)
         normal_lm = _huberized_loss_map(normal_distance_vx / mesh_scale, delta=huber_delta)
         loss_normal = (normal_lm * normal_weights).mean()
 

@@ -24,20 +24,23 @@ from .legacy import (
 	_closest_point_uv_on_model_quad,
 	_huber,
 )
-from .map_fixture_io import MapFixture, _float_tif, _write_json, load_map_fixture
+from .map_fixture_io import MapFixture, _float_tif, _mask_tif, _write_json, compare_map_tensors, export_map_fixture, load_map_fixture
 from .map_objective import (
 	_map_init_distance_multiplier,
-	_map_init_lifted_z_heading_field,
+	_map_init_lifted_z_vertex_heading_field,
 	_map_init_objective,
-	_map_init_sample_scalar_quad_field,
+	_map_init_sample_scalar_plan,
+	_map_init_surface_sample_plan,
 )
 from .map_pyramid import (
 	_map_init_coords3,
 	_map_init_dyadic_level_shape,
 	_map_init_dyadic_strides,
+	_map_init_external_quad_valid,
 	_map_init_integrate_dyadic_uv_pyramid,
 	_map_init_uv_pyr_from_dense,
 )
+from .state import _SurfaceState
 from .tensor import _quad_valid_at_coords, _sample_surface_grid
 
 
@@ -106,6 +109,83 @@ def _truthy_arg(value: Any) -> bool:
 	if isinstance(value, (int, float)):
 		return value != 0
 	return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+class MapRuntimeStatusPrinter:
+	def __init__(self, *, label: str, total_steps: int, prefix: str = "[optimizer]") -> None:
+		self.label = str(label)
+		self.prefix = str(prefix)
+		self.width = max(16, len(f"{self.label} {max(0, int(total_steps))}/{max(0, int(total_steps))}") + 2)
+		self.rows = 0
+		self.wall = time.perf_counter()
+		self.last_step = 0
+		self.legend_printed = False
+
+	def print(self, *, step: int, total: int, stats: dict[str, float], fallback_lr: float = 0.0) -> None:
+		if not self.legend_printed:
+			print_progress_legend(
+				prefix=self.prefix,
+				items=[
+					("step", "stage step"),
+					("sm_los", "map objective loss"),
+					("sm_dst", "map distance loss"),
+					("sm_vec", "map vector-normal loss"),
+					("sm_nrm", "map normal alignment loss"),
+					("sm_trn", "lifted z-heading loss"),
+					("sm_smo", "uv smooth loss"),
+					("sm_bnd", "uv bend loss"),
+					("sm_met", "model metric smoothness loss"),
+					("sm_ar", "external physical area smoothness loss"),
+					("sm_ts", "valid lifted z-heading samples"),
+					("sm_smp", "valid map samples"),
+					("sm_bad", "map samples rejected by validity/limits"),
+					("sm_uvb", "active quads with non-finite UV"),
+					("sm_mbd", "active quads rejected by model/sample checks"),
+					("lr", "effective map optimizer learning rate"),
+					("lr_scl", "map LR autoscale factor"),
+					("it/s", "optimizer it/s"),
+				],
+			)
+			self.legend_printed = True
+		if self.rows % 20 == 0:
+				print(
+					f"{'step':>{self.width}s} {'sm_los':>8s} {'sm_dst':>8s} "
+					f"{'sm_vec':>8s} {'sm_nrm':>8s} {'sm_trn':>8s} "
+					f"{'sm_smo':>8s} {'sm_bnd':>8s} {'sm_met':>8s} {'sm_ar':>8s} "
+					f"{'sm_ts':>8s} "
+					f"{'sm_smp':>8s} {'sm_bad':>8s} {'sm_uvb':>8s} {'sm_mbd':>8s} "
+					f"{'lr':>8s} {'lr_scl':>8s} {'it/s':>5s}",
+					flush=True,
+			)
+		now = time.perf_counter()
+		its = None
+		if int(step) > int(self.last_step):
+			its = (int(step) - int(self.last_step)) / max(1.0e-9, now - self.wall)
+			self.wall = now
+			self.last_step = int(step)
+		its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
+		print(
+			f"{f'{self.label} {int(step)}/{int(total)}':>{self.width}s} "
+			f"{format_progress_value(float(stats.get('snaps_map_loss', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_dist', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_vec', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_norm', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_turn', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_smooth', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_bend', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_metric_smooth', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_area_smooth', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_turn_smp', 0.0))):>8s} "
+				f"{format_progress_value(float(stats.get('snaps_map_samples', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_sample_bad', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_uvbad', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_model_bad', 0.0))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_lr', fallback_lr))):>8s} "
+			f"{format_progress_value(float(stats.get('snaps_map_lr_autoscale', 1.0))):>8s} "
+			f"{its_str}",
+			flush=True,
+		)
+		self.rows += 1
 
 
 def _obj_outputs_enabled(cfg: GlobalMapConfig, stage: GlobalMapStageConfig | None = None) -> bool:
@@ -330,8 +410,7 @@ _STAGE_W_FAC_KEYS = {
 	"map_vec_normal": "vec",
 	"norm": "norm",
 	"map_surface_normal": "norm",
-	"turn": "turn",
-	"map_z_lift": "turn",
+	"map_turn": "turn",
 	"smooth": "smooth",
 	"map_smooth": "smooth",
 	"bend": "bend",
@@ -346,6 +425,19 @@ _STAGE_W_FAC_KEYS = {
 	"map_dense_prior": "prior",
 	"map_station_t": "map_station_t",
 	"w_station_t": "map_station_t",
+}
+
+_GLOBAL_MAP_BASE_ALIASES = {
+	"map_dist": "w_dist",
+	"map_vec_normal": "w_vec_normal",
+	"map_surface_normal": "w_surface_normal",
+	"map_turn": "map_turn",
+	"map_smooth": "w_smooth",
+	"map_bend": "w_bend",
+	"map_jac": "w_jac",
+	"map_metric_smooth": "w_metric_smooth",
+	"map_area_smooth": "w_area_smooth",
+	"map_dense_prior": "w_dense_prior",
 }
 
 
@@ -439,39 +531,247 @@ class GlobalMapModel(torch.nn.Module):
 		*,
 		levels: int,
 		factor: int = 2,
+		preserve_batch: bool | None = None,
 	) -> None:
 		super().__init__()
+		self.preserve_batch = bool(full_uv.ndim == 4) if preserve_batch is None else bool(preserve_batch)
 		self.map_uv_ms = _map_init_uv_pyr_from_dense(full_uv.detach(), levels=int(levels), factor=int(factor))
 
 	def forward(self, *, active_level: int = 0) -> torch.Tensor:
-		return _map_init_integrate_dyadic_uv_pyramid(list(self.map_uv_ms), active_level=int(active_level))
+		return _map_init_integrate_dyadic_uv_pyramid(
+			list(self.map_uv_ms),
+			active_level=int(active_level),
+			preserve_batch=bool(self.preserve_batch),
+		)
+
+
+SELF_MAP_MODES = ("off", "multi_wrap_full", "multi_wrap_d")
+SELF_MAP_DIRECTIONS = ("out", "in")
+
+
+def normalize_self_map_init(value: object) -> str:
+	mode = str(value if value is not None else "off").strip().lower().replace("-", "_")
+	if mode not in SELF_MAP_MODES:
+		raise ValueError(f"invalid self-map-init '{value}' (expected off, multi_wrap_full, or multi_wrap_d)")
+	return mode
+
+
+def self_map_pair_depths(mode: str, direction: str, depth: int) -> tuple[list[int], list[int]]:
+	mode_i = normalize_self_map_init(mode)
+	direction_i = str(direction).strip().lower()
+	if direction_i not in SELF_MAP_DIRECTIONS:
+		raise ValueError(f"invalid self-map direction '{direction}' (expected out or in)")
+	D = int(depth)
+	if mode_i == "off":
+		return [], []
+	if mode_i == "multi_wrap_full":
+		if D != 1:
+			raise ValueError("self-map-init=multi_wrap_full requires model depth D=1")
+		return [0], [0]
+	if D <= 1:
+		raise ValueError("self-map-init=multi_wrap_d requires model depth D>1")
+	if direction_i == "out":
+		return list(range(0, D - 1)), list(range(1, D))
+	return list(range(1, D)), list(range(0, D - 1))
+
+
+def self_map_signed_offset(mode: str, direction: str, offset: float) -> float:
+	mode_i = normalize_self_map_init(mode)
+	if mode_i == "off":
+		return 0.0
+	direction_i = str(direction).strip().lower()
+	if direction_i not in SELF_MAP_DIRECTIONS:
+		raise ValueError(f"invalid self-map direction '{direction}' (expected out or in)")
+	sign = 1.0 if direction_i == "out" else -1.0
+	return sign * float(offset)
+
+
+def self_map_initial_uv(
+	*,
+	mode: str,
+	direction: str,
+	depth: int,
+	height: int,
+	width: int,
+	model_w_wraps: float | None = None,
+	device: torch.device,
+	dtype: torch.dtype,
+) -> torch.Tensor:
+	src, _dst = self_map_pair_depths(mode, direction, int(depth))
+	N = len(src)
+	H = int(height)
+	W = int(width)
+	if N <= 0:
+		return torch.empty(0, H, W, 2, device=device, dtype=dtype)
+	hh = torch.arange(H, device=device, dtype=dtype).view(1, H, 1).expand(N, H, W)
+	ww = torch.arange(W, device=device, dtype=dtype).view(1, 1, W).expand(N, H, W)
+	uv = torch.stack([hh, ww], dim=-1).contiguous()
+	if normalize_self_map_init(mode) == "multi_wrap_full":
+		wraps = 1.0 if model_w_wraps is None else float(model_w_wraps)
+		if not math.isfinite(wraps) or wraps <= 0.0:
+			raise ValueError("self-map-init=multi_wrap_full requires positive model_w_wraps")
+		wrap_cols = float(max(1, W - 1)) / wraps
+		sign = 1.0 if str(direction).strip().lower() == "out" else -1.0
+		uv[..., 1] = uv[..., 1] + sign * wrap_cols
+	return uv
+
+
+def self_map_active_quads(
+	*,
+	mode: str,
+	direction: str,
+	model_valid: torch.Tensor,
+	uv: torch.Tensor,
+) -> torch.Tensor:
+	if uv.ndim != 4 or int(uv.shape[-1]) != 2:
+		raise ValueError("self-map uv must be (N,H,W,2)")
+	src, dst = self_map_pair_depths(mode, direction, int(model_valid.shape[0]))
+	N, H, W = int(uv.shape[0]), int(uv.shape[1]), int(uv.shape[2])
+	if len(src) != N:
+		raise ValueError(f"self-map uv batch {N} does not match topology batch {len(src)}")
+	if H < 2 or W < 2:
+		return torch.zeros(N, max(0, H - 1), max(0, W - 1), device=uv.device, dtype=torch.bool)
+	full_h, full_w = int(model_valid.shape[1]), int(model_valid.shape[2])
+	source_valid = model_valid[torch.tensor(src, device=model_valid.device, dtype=torch.long)].to(device=uv.device).bool()
+	source_quad_full = (
+		source_valid[:, :-1, :-1] &
+		source_valid[:, 1:, :-1] &
+		source_valid[:, :-1, 1:] &
+		source_valid[:, 1:, 1:]
+	)
+	if (H, W) == (full_h, full_w):
+		source_quad = source_quad_full
+	else:
+		level = 0
+		for candidate in range(1, 32):
+			try:
+				if _map_init_dyadic_level_shape(full_h, full_w, candidate) == (H, W):
+					level = candidate
+					break
+			except ValueError:
+				break
+		if level <= 0:
+			raise ValueError(f"self-map uv shape {(H, W)} is not a dyadic level of model shape {(full_h, full_w)}")
+		stride = 1 << level
+		QH, QW = int(source_quad_full.shape[1]), int(source_quad_full.shape[2])
+		if QH % stride != 0 or QW % stride != 0:
+			raise ValueError(f"self-map source quad grid {(QH, QW)} is not divisible by dyadic stride {stride}")
+		pooled = torch.nn.functional.avg_pool2d(
+			source_quad_full.to(dtype=uv.dtype).unsqueeze(1),
+			kernel_size=stride,
+			stride=stride,
+		).squeeze(1)
+		source_quad = pooled >= 1.0
+	target_depth = torch.tensor(dst, device=uv.device, dtype=uv.dtype).view(N, 1, 1, 1).expand(N, H, W, 1)
+	coords = torch.cat([target_depth, uv], dim=-1)
+	target_ok = _quad_valid_at_coords(model_valid.bool(), coords, tuple(int(v) for v in model_valid.shape))
+	target_quad = target_ok[:, :-1, :-1] & target_ok[:, 1:, :-1] & target_ok[:, :-1, 1:] & target_ok[:, 1:, 1:]
+	return source_quad & target_quad
+
+
+def _combine_term_dicts(term_dicts: list[dict[str, torch.Tensor]], weights: list[torch.Tensor], z: torch.Tensor) -> dict[str, torch.Tensor]:
+	if not term_dicts:
+		return {"loss": z.detach()}
+	keys = sorted(set().union(*(d.keys() for d in term_dicts)))
+	total_w = z
+	for w in weights:
+		total_w = total_w + w
+	out: dict[str, torch.Tensor] = {}
+	for key in keys:
+		acc = z
+		for terms, w in zip(term_dicts, weights):
+			acc = acc + terms.get(key, z).to(device=z.device, dtype=z.dtype) * w.to(device=z.device, dtype=z.dtype)
+		out[key] = (acc / total_w.clamp_min(1.0)).detach()
+	return out
+
+
+def _self_map_objective_for_uv(
+	*,
+	uv: torch.Tensor,
+	mode: str,
+	direction: str,
+	model_xyz: torch.Tensor,
+	model_normals: torch.Tensor,
+	model_valid: torch.Tensor,
+	cfg: SnapSurfConfig,
+	level: int,
+	need_stats: bool = True,
+	active_quad: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+	if uv.ndim != 4 or int(uv.shape[-1]) != 2:
+		raise ValueError("self-map objective uv must be (N,H,W,2)")
+	src, dst = self_map_pair_depths(mode, direction, int(model_xyz.shape[0]))
+	if len(src) != int(uv.shape[0]):
+		raise ValueError(f"self-map uv batch {int(uv.shape[0])} does not match topology batch {len(src)}")
+	active = active_quad
+	if active is None:
+		active = self_map_active_quads(mode=mode, direction=direction, model_valid=model_valid, uv=uv)
+	z = model_xyz.sum() * 0.0 + uv.sum() * 0.0
+	losses: list[torch.Tensor] = []
+	terms_list: list[dict[str, torch.Tensor]] = []
+	weights: list[torch.Tensor] = []
+	for i, (src_d, dst_d) in enumerate(zip(src, dst)):
+		ext_coords = None
+		if tuple(int(v) for v in uv.shape[1:3]) != tuple(int(v) for v in model_xyz.shape[1:3]):
+			ext_coords = _level_coords(tuple(int(v) for v in model_xyz.shape[1:3]), int(level), uv[i])
+		loss_i, terms_i = _map_init_objective(
+			uv_full=uv[i],
+			active_quad=active[i],
+			ext_pos=model_xyz[int(src_d)].detach(),
+			ext_normals=model_normals[int(src_d)].detach(),
+			ext_valid=model_valid[int(src_d)].detach().bool(),
+			ext_quad_valid=None,
+			ext_coords=ext_coords,
+			model_xyz=model_xyz,
+			model_valid=model_valid,
+			model_normals=model_normals,
+			model_depth=int(dst_d),
+			sign=1,
+			cfg=cfg,
+			allow_partial_model_samples=True,
+			need_stats=bool(need_stats),
+			ext_z_lift_theta=None,
+			ext_z_lift_valid=None,
+			model_z_lift_theta=None,
+			model_z_lift_valid=None,
+		)
+		w = active[i].to(dtype=uv.dtype).sum().clamp_min(1.0)
+		losses.append(loss_i * w)
+		terms_list.append(terms_i)
+		weights.append(w)
+	if not losses:
+		return z, {"loss": z.detach()}
+	total_w = z
+	total = z
+	for loss_i, w in zip(losses, weights):
+		total = total + loss_i
+		total_w = total_w + w
+	return total / total_w.clamp_min(1.0), _combine_term_dicts(terms_list, weights, z)
 
 
 def parse_global_map_config(path: str | Path) -> GlobalMapConfig:
-	raw = json.loads(Path(path).read_text(encoding="utf-8"))
-	if not isinstance(raw, dict):
-		raise ValueError("global map config must be an object")
-	base = raw.get("base", {})
-	if not isinstance(base, dict):
-		raise ValueError("global map config base must be an object")
-	stages_raw = raw.get("stages", [])
-	if not isinstance(stages_raw, list):
-		raise ValueError("global map config stages must be a list")
-	stages: list[GlobalMapStageConfig] = []
-	for i, item in enumerate(stages_raw):
-		stages.append(parse_global_map_stage_item(item, index=i))
-	return GlobalMapConfig(base=dict(base), stages=tuple(stages))
+	from optimizer import load_global_map_config
+
+	return load_global_map_config(path)
 
 
 def snap_surf_config_from_global_config(cfg: GlobalMapConfig, stage: GlobalMapStageConfig | None = None) -> SnapSurfConfig:
 	raw = dict(cfg.base)
 	stage_args = dict(stage.args) if stage is not None else {}
 	raw_map = dict(raw.get("map_init", {}))
+	for global_key, map_key in _GLOBAL_MAP_BASE_ALIASES.items():
+		if map_key not in raw_map and global_key in raw:
+			raw_map[map_key] = raw[global_key]
 	raw_map.update(stage_args.get("map_init", {}))
 	if "subdiv" in stage_args:
 		raw_map["subdiv"] = stage_args["subdiv"]
 	for key, value in stage_args.items():
 		if key == "map_init":
+			continue
+		if key == "map_z_lift":
+			raise ValueError("global map stage args: use map_turn instead of map_z_lift")
+		if key == "map_turn":
+			raw_map["map_turn"] = value
 			continue
 		if key in SnapSurfMapInitConfig.__dataclass_fields__:
 			raw_map[key] = value
@@ -523,6 +823,85 @@ def _model_quad_base_valid(model_xyz: torch.Tensor, model_valid: torch.Tensor) -
 	v = model_valid.bool() & finite
 	return v[:, :-1, :-1] & v[:, 1:, :-1] & v[:, :-1, 1:] & v[:, 1:, 1:]
 
+def _external_vertex_base_valid(ext_xyz: torch.Tensor, ext_valid: torch.Tensor) -> torch.Tensor:
+	return ext_valid.bool() & torch.isfinite(ext_xyz).all(dim=-1)
+
+def _model_vertex_base_valid(model_xyz: torch.Tensor, model_valid: torch.Tensor) -> torch.Tensor:
+	return model_valid.bool() & torch.isfinite(model_xyz).all(dim=-1)
+
+def _nearest_valid_vertex_by_xyz(
+	xyz: torch.Tensor,
+	valid: torch.Tensor,
+	target: torch.Tensor,
+) -> tuple[int, ...] | None:
+	valid_b = valid.to(device=xyz.device).bool() & torch.isfinite(xyz).all(dim=-1)
+	idx = valid_b.nonzero(as_tuple=False)
+	if idx.numel() == 0:
+		return None
+	points = xyz[tuple(idx[:, i] for i in range(idx.shape[1]))]
+	target_t = target.to(device=xyz.device, dtype=xyz.dtype)
+	dist2 = (points - target_t).square().sum(dim=-1)
+	if not bool(torch.isfinite(dist2).any().detach().cpu()):
+		return None
+	best = int(torch.where(torch.isfinite(dist2), dist2, torch.full_like(dist2, float("inf"))).argmin().detach().cpu())
+	return tuple(int(v) for v in idx[best].detach().cpu().tolist())
+
+def _valid_quad_corner_vertices_2d(
+	xyz: torch.Tensor,
+	valid: torch.Tensor,
+	quad: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+	h, w = (int(v) for v in quad)
+	H, W = int(valid.shape[0]), int(valid.shape[1])
+	corners = [(h, w), (h + 1, w), (h, w + 1), (h + 1, w + 1)]
+	idx: list[tuple[int, int]] = []
+	points: list[torch.Tensor] = []
+	for hh, ww in corners:
+		if hh < 0 or ww < 0 or hh >= H or ww >= W:
+			continue
+		if not bool((valid[hh, ww].bool() & torch.isfinite(xyz[hh, ww]).all()).detach().cpu()):
+			continue
+		idx.append((hh, ww))
+		points.append(xyz[hh, ww])
+	if not points:
+		return None
+	return torch.tensor(idx, device=xyz.device, dtype=torch.long), torch.stack(points, dim=0)
+
+def _valid_quad_corner_vertices_3d(
+	xyz: torch.Tensor,
+	valid: torch.Tensor,
+	quad: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+	d, h, w = (int(v) for v in quad)
+	D, H, W = int(valid.shape[0]), int(valid.shape[1]), int(valid.shape[2])
+	corners = [(d, h, w), (d, h + 1, w), (d, h, w + 1), (d, h + 1, w + 1)]
+	idx: list[tuple[int, int, int]] = []
+	points: list[torch.Tensor] = []
+	for dd, hh, ww in corners:
+		if dd < 0 or hh < 0 or ww < 0 or dd >= D or hh >= H or ww >= W:
+			continue
+		if not bool((valid[dd, hh, ww].bool() & torch.isfinite(xyz[dd, hh, ww]).all()).detach().cpu()):
+			continue
+		idx.append((dd, hh, ww))
+		points.append(xyz[dd, hh, ww])
+	if not points:
+		return None
+	return torch.tensor(idx, device=xyz.device, dtype=torch.long), torch.stack(points, dim=0)
+
+def _nearest_corner_from_legacy_quad(
+	idx: torch.Tensor,
+	points: torch.Tensor,
+	seed: torch.Tensor | None,
+) -> tuple[int, ...] | None:
+	if idx.numel() == 0:
+		return None
+	target = points.mean(dim=0) if seed is None else seed.to(device=points.device, dtype=points.dtype)
+	dist2 = (points - target).square().sum(dim=-1)
+	if not bool(torch.isfinite(dist2).any().detach().cpu()):
+		return None
+	best = int(torch.where(torch.isfinite(dist2), dist2, torch.full_like(dist2, float("inf"))).argmin().detach().cpu())
+	return tuple(int(v) for v in idx[best].detach().cpu().tolist())
+
 def _fixture_seed_ext_quad(fixture: MapFixture) -> tuple[int, int] | None:
 	raw_init = fixture.metadata.get("seed_quad_init")
 	if isinstance(raw_init, dict):
@@ -544,6 +923,28 @@ def _fixture_seed_ext_quad(fixture: MapFixture) -> tuple[int, int] | None:
 		return None if quad is None else (int(quad[0]), int(quad[1]))
 	return None
 
+def _fixture_seed_ext_vertex(fixture: MapFixture) -> tuple[int, int] | None:
+	raw_vertex = fixture.metadata.get("seed_ext_vertex_hw")
+	if isinstance(raw_vertex, (list, tuple)) and len(raw_vertex) >= 2:
+		return int(raw_vertex[0]), int(raw_vertex[1])
+	raw_seed = fixture.metadata.get("seed_xyz")
+	seed = None
+	if isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 3:
+		seed = torch.tensor([float(raw_seed[0]), float(raw_seed[1]), float(raw_seed[2])], device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
+		vertex = _nearest_valid_vertex_by_xyz(fixture.ext_xyz, _external_vertex_base_valid(fixture.ext_xyz, fixture.ext_valid), seed)
+		if vertex is not None and len(vertex) == 2:
+			return int(vertex[0]), int(vertex[1])
+	raw_init = fixture.metadata.get("seed_quad_init")
+	raw_ext = raw_init.get("ext_quad") if isinstance(raw_init, dict) else fixture.metadata.get("seed_ext_sample_hw")
+	if isinstance(raw_ext, (list, tuple)) and len(raw_ext) >= 2:
+		# Compatibility-only fallback for legacy quad seed metadata.
+		corners = _valid_quad_corner_vertices_2d(fixture.ext_xyz, _external_vertex_base_valid(fixture.ext_xyz, fixture.ext_valid), (int(raw_ext[0]), int(raw_ext[1])))
+		if corners is not None:
+			vertex = _nearest_corner_from_legacy_quad(corners[0], corners[1], seed)
+			if vertex is not None and len(vertex) == 2:
+				return int(vertex[0]), int(vertex[1])
+	return None
+
 def _fixture_seed_model_quad(fixture: MapFixture) -> tuple[int, int, int] | None:
 	raw_init = fixture.metadata.get("seed_quad_init")
 	if isinstance(raw_init, dict):
@@ -562,6 +963,32 @@ def _fixture_seed_model_quad(fixture: MapFixture) -> tuple[int, int, int] | None
 			model_valid=fixture.model_valid.bool(),
 		)
 		return None if quad is None else (int(quad[0]), int(quad[1]), int(quad[2]))
+	return None
+
+def _fixture_seed_model_vertex(fixture: MapFixture) -> tuple[int, int, int] | None:
+	raw_vertex = fixture.metadata.get("seed_model_vertex")
+	if isinstance(raw_vertex, (list, tuple)) and len(raw_vertex) == 3:
+		return int(raw_vertex[0]), int(raw_vertex[1]), int(raw_vertex[2])
+	raw_seed = fixture.metadata.get("seed_xyz")
+	seed = None
+	if isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 3:
+		seed = torch.tensor([float(raw_seed[0]), float(raw_seed[1]), float(raw_seed[2])], device=fixture.model_xyz.device, dtype=fixture.model_xyz.dtype)
+		vertex = _nearest_valid_vertex_by_xyz(fixture.model_xyz, _model_vertex_base_valid(fixture.model_xyz, fixture.model_valid), seed)
+		if vertex is not None and len(vertex) == 3:
+			return int(vertex[0]), int(vertex[1]), int(vertex[2])
+	raw_init = fixture.metadata.get("seed_quad_init")
+	raw_model = raw_init.get("model_quad") if isinstance(raw_init, dict) else fixture.metadata.get("seed_model_quad")
+	if isinstance(raw_model, (list, tuple)) and len(raw_model) == 3:
+		# Compatibility-only fallback for legacy quad seed metadata.
+		corners = _valid_quad_corner_vertices_3d(
+			fixture.model_xyz,
+			_model_vertex_base_valid(fixture.model_xyz, fixture.model_valid),
+			(int(raw_model[0]), int(raw_model[1]), int(raw_model[2])),
+		)
+		if corners is not None:
+			vertex = _nearest_corner_from_legacy_quad(corners[0], corners[1], seed)
+			if vertex is not None and len(vertex) == 3:
+				return int(vertex[0]), int(vertex[1]), int(vertex[2])
 	return None
 
 def _tensor_cache_token(t: torch.Tensor) -> tuple[Any, ...]:
@@ -625,8 +1052,8 @@ def _map_init_z_lift_for_fixture(
 	mi = cfg.map_init
 	if not bool(mi.z_lift_enabled) or float(mi.w_z_lift) <= 0.0:
 		return None
-	seed_ext = _fixture_seed_ext_quad(fixture)
-	seed_model = _fixture_seed_model_quad(fixture)
+	seed_ext = _fixture_seed_ext_vertex(fixture)
+	seed_model = _fixture_seed_model_vertex(fixture)
 	if seed_ext is None or seed_model is None:
 		return None
 	sign_i = int(fixture.metadata.get("sign", 1) or 1) if sign is None else int(sign)
@@ -652,8 +1079,8 @@ def _map_init_z_lift_for_fixture(
 	else:
 		if external_cache is not None and ext_key is not None:
 			_bump("zext_miss")
-		ext_base = _external_quad_base_valid(fixture.ext_xyz, fixture.ext_valid.bool(), fixture.ext_quad_valid.bool())
-		ext_theta, ext_valid, ext_stats = _map_init_lifted_z_heading_field(
+		ext_base = _external_vertex_base_valid(fixture.ext_xyz, fixture.ext_valid.bool())
+		ext_theta, ext_valid, ext_stats = _map_init_lifted_z_vertex_heading_field(
 			fixture.ext_normals,
 			ext_base,
 			seed_ext,
@@ -691,8 +1118,8 @@ def _map_init_z_lift_for_fixture(
 	else:
 		if model_cache is not None and model_key is not None:
 			_bump("zmdl_miss")
-		model_base = _model_quad_base_valid(fixture.model_xyz, fixture.model_valid.bool())
-		model_theta, model_valid, model_stats = _map_init_lifted_z_heading_field(
+		model_base = _model_vertex_base_valid(fixture.model_xyz, fixture.model_valid.bool())
+		model_theta, model_valid, model_stats = _map_init_lifted_z_vertex_heading_field(
 			fixture.model_normals,
 			model_base,
 			seed_model,
@@ -760,6 +1187,136 @@ def _dilate_quad_mask_euclidean(mask: torch.Tensor, radius: int) -> torch.Tensor
 	return out
 
 
+def _quad_seed_connected_component(mask: torch.Tensor, seed_hw: tuple[int, int] | None) -> torch.Tensor:
+	src = mask.bool()
+	out = torch.zeros_like(src)
+	if seed_hw is None or src.ndim != 2 or int(src.numel()) == 0:
+		return out
+	h, w = int(seed_hw[0]), int(seed_hw[1])
+	H, W = int(src.shape[0]), int(src.shape[1])
+	if h < 0 or h >= H or w < 0 or w >= W or not bool(src[h, w].detach().cpu()):
+		return out
+	out[h, w] = True
+	frontier = torch.zeros_like(src)
+	frontier[h, w] = True
+	while bool(frontier.any().detach().cpu()):
+		expanded = torch.zeros_like(src)
+		expanded[1:, :] |= frontier[:-1, :]
+		expanded[:-1, :] |= frontier[1:, :]
+		expanded[:, 1:] |= frontier[:, :-1]
+		expanded[:, :-1] |= frontier[:, 1:]
+		next_frontier = expanded & src & ~out
+		if not bool(next_frontier.any().detach().cpu()):
+			break
+		out |= next_frontier
+		frontier = next_frontier
+	return out
+
+
+def _mask_component_summary(mask: torch.Tensor, *, max_components: int = 5) -> tuple[int, str]:
+	src = mask.detach().bool().cpu()
+	if src.ndim != 2 or int(src.numel()) == 0 or not bool(src.any()):
+		return 0, "none"
+	H, W = int(src.shape[0]), int(src.shape[1])
+	remaining = src.clone()
+	components: list[tuple[int, int, int, int, int, bool]] = []
+	while bool(remaining.any()):
+		start = remaining.nonzero(as_tuple=False)[0]
+		seed = (int(start[0]), int(start[1]))
+		comp = _quad_seed_connected_component(remaining.to(device=mask.device), seed).cpu()
+		ids = comp.nonzero(as_tuple=False)
+		h0 = int(ids[:, 0].min())
+		h1 = int(ids[:, 0].max())
+		w0 = int(ids[:, 1].min())
+		w1 = int(ids[:, 1].max())
+		touches_edge = h0 == 0 or w0 == 0 or h1 == H - 1 or w1 == W - 1
+		components.append((int(ids.shape[0]), h0, h1, w0, w1, touches_edge))
+		remaining &= ~comp
+	components.sort(key=lambda item: item[0], reverse=True)
+	parts = [
+		f"{size}@h{h0}-{h1},w{w0}-{w1},edge={int(touches_edge)}"
+		for size, h0, h1, w0, w1, touches_edge in components[:max(1, int(max_components))]
+	]
+	return len(components), ";".join(parts)
+
+
+def _print_external_quad_initial_mask_stats(fixture: MapFixture, *, label: str) -> None:
+	ext_valid = fixture.ext_valid.bool()
+	ext_xyz = fixture.ext_xyz
+	ext_normals = fixture.ext_normals
+	ext_quad_valid = fixture.ext_quad_valid.bool()
+	finite_xyz = torch.isfinite(ext_xyz).all(dim=-1)
+	finite_norm = torch.isfinite(ext_normals).all(dim=-1)
+	normal_norm = ext_normals.norm(dim=-1)
+	nonzero_norm = normal_norm > 1.0e-8
+	vertex_total = int(ext_valid.numel())
+	raw_quad = _map_init_external_quad_valid(ext_valid, None)
+	base_quad = _external_quad_base_valid(ext_xyz, ext_valid, ext_quad_valid)
+	norm_quad = _map_init_external_quad_valid(ext_valid & finite_xyz & finite_norm & nonzero_norm, ext_quad_valid)
+	raw_components, raw_top = _mask_component_summary(raw_quad)
+	ext_quad_components, ext_quad_top = _mask_component_summary(ext_quad_valid)
+	base_components, base_top = _mask_component_summary(base_quad)
+	norm_components, norm_top = _mask_component_summary(norm_quad)
+
+	def _count(mask: torch.Tensor) -> int:
+		return int(mask.sum().detach().cpu())
+
+	print(
+		f"[snap_surf.map_global] external quad initial vertex mask {label} "
+		f"valid={_count(ext_valid)}/{vertex_total} "
+		f"finite_xyz={_count(ext_valid & finite_xyz)} "
+		f"finite_norm={_count(ext_valid & finite_norm)} "
+		f"nonzero_norm={_count(ext_valid & finite_norm & nonzero_norm)} "
+		f"reject_xyz={_count(ext_valid & ~finite_xyz)} "
+		f"reject_norm_finite={_count(ext_valid & finite_xyz & ~finite_norm)} "
+		f"reject_norm_zero={_count(ext_valid & finite_xyz & finite_norm & ~nonzero_norm)}",
+		flush=True,
+	)
+	print(
+		f"[snap_surf.map_global] external quad initial components {label} "
+		f"raw_quad={_count(raw_quad)} comps={raw_components} top={raw_top} "
+		f"ext_quad_valid={_count(ext_quad_valid)} comps={ext_quad_components} top={ext_quad_top} "
+		f"base_quad={_count(base_quad)} comps={base_components} top={base_top} "
+		f"norm_quad={_count(norm_quad)} comps={norm_components} top={norm_top}",
+		flush=True,
+	)
+
+
+def _format_external_quad_reject_values(
+	*,
+	name: str,
+	mask: torch.Tensor,
+	values: torch.Tensor,
+	threshold: float,
+	over: bool,
+	factors: torch.Tensor | None = None,
+	limit: int = 20,
+) -> str | None:
+	count = int(mask.sum().detach().cpu())
+	if count <= 0:
+		return None
+	idx = mask.nonzero(as_tuple=False).detach().cpu()
+	vals = values[mask].detach().cpu()
+	facs = factors[mask].detach().cpu() if factors is not None else None
+	order = torch.argsort(vals, descending=bool(over))
+	limit = max(1, min(int(limit), int(order.numel())))
+	entries = []
+	for j in order[:limit].tolist():
+		h = int(idx[j, 0])
+		w = int(idx[j, 1])
+		entry = f"{h},{w}:{float(vals[j]):.6g}"
+		if facs is not None:
+			entry += f"(factor={float(facs[j]):.6g})"
+		entries.append(entry)
+	more = count - limit
+	more_text = f" +{more} more" if more > 0 else ""
+	op = ">" if over else "<"
+	return (
+		f"{name} count={count} threshold{op}{float(threshold):.6g} "
+		f"values={','.join(entries)}{more_text}"
+	)
+
+
 def _external_quad_health_filter(
 	*,
 	ext_xyz: torch.Tensor,
@@ -767,12 +1324,14 @@ def _external_quad_health_filter(
 	ext_quad_valid: torch.Tensor,
 	ext_normals: torch.Tensor | None,
 	cfg: SnapSurfMapInitConfig,
+	label: str,
 ) -> tuple[torch.Tensor, dict[str, float]]:
 	base = _external_quad_base_valid(ext_xyz, ext_valid, ext_quad_valid)
 	empty_stats = {
 		"quads_input": float(int(base.sum().detach().cpu())),
 		"quads_kept": 0.0,
 		"quads_rejected": float(int(base.sum().detach().cpu())),
+		"quads_rejected_disconnected": 0.0,
 		"median_edge": 0.0,
 		"median_area": 0.0,
 		"max_edge": 0.0,
@@ -856,6 +1415,25 @@ def _external_quad_health_filter(
 		healthy = healthy & torch.isfinite(normal_dot) & (normal_dot >= float(cfg.ext_mesh_health_min_normal_dot))
 	else:
 		normal_dot = torch.zeros_like(area)
+
+	zero_quad = torch.zeros_like(base)
+	positive_metrics = finite_metrics & (edge_min > 0.0) & (diag_min > 0.0) & (area > 0.0)
+	reject_nonfinite = base & ~finite_metrics
+	reject_nonpositive = base & finite_metrics & ~positive_metrics
+	reject_aspect = usable & (aspect > float(cfg.ext_mesh_health_max_aspect_ratio)) if float(cfg.ext_mesh_health_max_aspect_ratio) > 0.0 else zero_quad
+	reject_diag = usable & (diag_ratio > float(cfg.ext_mesh_health_max_diag_ratio)) if float(cfg.ext_mesh_health_max_diag_ratio) > 0.0 else zero_quad
+	reject_edge = usable & (edge_max > edge_ref_safe * float(cfg.ext_mesh_health_max_edge_ratio)) if float(cfg.ext_mesh_health_max_edge_ratio) > 0.0 else zero_quad
+	reject_area_max = usable & (area > area_ref_safe * float(cfg.ext_mesh_health_max_area_ratio)) if float(cfg.ext_mesh_health_max_area_ratio) > 0.0 else zero_quad
+	reject_area_min = usable & (area < area_ref_safe * float(cfg.ext_mesh_health_min_area_ratio)) if float(cfg.ext_mesh_health_min_area_ratio) > 0.0 else zero_quad
+	reject_tri_dot = usable & (tri_dot < float(cfg.ext_mesh_health_min_triangle_normal_dot)) if float(cfg.ext_mesh_health_min_triangle_normal_dot) > -1.0 else zero_quad
+	reject_normal_dot = (
+		usable & (~torch.isfinite(normal_dot) | (normal_dot < float(cfg.ext_mesh_health_min_normal_dot)))
+		if ext_normals is not None and float(cfg.ext_mesh_health_min_normal_dot) > 0.0 else zero_quad
+	)
+
+	def _count(mask: torch.Tensor) -> float:
+		return float(int(mask.sum().detach().cpu()))
+
 	stats = {
 		"quads_input": float(int(base.sum().detach().cpu())),
 		"quads_kept": float(int(healthy.sum().detach().cpu())),
@@ -868,7 +1446,88 @@ def _external_quad_health_filter(
 		"max_diag_ratio": float(diag_ratio[base].max().detach().cpu()),
 		"min_triangle_normal_dot": float(tri_dot[base].min().detach().cpu()),
 		"min_normal_dot": float(normal_dot[base].min().detach().cpu()) if ext_normals is not None and float(cfg.ext_mesh_health_min_normal_dot) > 0.0 else 0.0,
+		"threshold_max_aspect": float(cfg.ext_mesh_health_max_aspect_ratio),
+		"threshold_max_diag_ratio": float(cfg.ext_mesh_health_max_diag_ratio),
+		"threshold_max_edge_ratio": float(cfg.ext_mesh_health_max_edge_ratio),
+		"threshold_max_edge": float((edge_ref_safe * float(cfg.ext_mesh_health_max_edge_ratio)).detach().cpu()) if float(cfg.ext_mesh_health_max_edge_ratio) > 0.0 else 0.0,
+		"threshold_max_area_ratio": float(cfg.ext_mesh_health_max_area_ratio),
+		"threshold_max_area": float((area_ref_safe * float(cfg.ext_mesh_health_max_area_ratio)).detach().cpu()) if float(cfg.ext_mesh_health_max_area_ratio) > 0.0 else 0.0,
+		"threshold_min_area_ratio": float(cfg.ext_mesh_health_min_area_ratio),
+		"threshold_min_area": float((area_ref_safe * float(cfg.ext_mesh_health_min_area_ratio)).detach().cpu()) if float(cfg.ext_mesh_health_min_area_ratio) > 0.0 else 0.0,
+		"threshold_min_triangle_normal_dot": float(cfg.ext_mesh_health_min_triangle_normal_dot),
+		"threshold_min_normal_dot": float(cfg.ext_mesh_health_min_normal_dot) if ext_normals is not None else 0.0,
+		"reject_reason_nonfinite": _count(reject_nonfinite),
+		"reject_reason_nonpositive": _count(reject_nonpositive),
+		"reject_reason_aspect": _count(reject_aspect),
+		"reject_reason_diag": _count(reject_diag),
+		"reject_reason_edge": _count(reject_edge),
+		"reject_reason_area_max": _count(reject_area_max),
+		"reject_reason_area_min": _count(reject_area_min),
+		"reject_reason_triangle_normal": _count(reject_tri_dot),
+		"reject_reason_normal": _count(reject_normal_dot),
 	}
+	reject_value_lines = [
+		_format_external_quad_reject_values(
+			name="aspect",
+			mask=reject_aspect,
+			values=aspect,
+			threshold=float(cfg.ext_mesh_health_max_aspect_ratio),
+			over=True,
+		),
+		_format_external_quad_reject_values(
+			name="diag",
+			mask=reject_diag,
+			values=diag_ratio,
+			threshold=float(cfg.ext_mesh_health_max_diag_ratio),
+			over=True,
+		),
+		_format_external_quad_reject_values(
+			name="edge",
+			mask=reject_edge,
+			values=edge_max,
+			threshold=float(stats["threshold_max_edge"]),
+			over=True,
+			factors=edge_max / edge_ref_safe,
+		),
+		_format_external_quad_reject_values(
+			name="area_hi",
+			mask=reject_area_max,
+			values=area,
+			threshold=float(stats["threshold_max_area"]),
+			over=True,
+			factors=area / area_ref_safe,
+		),
+		_format_external_quad_reject_values(
+			name="area_lo",
+			mask=reject_area_min,
+			values=area,
+			threshold=float(stats["threshold_min_area"]),
+			over=False,
+			factors=area / area_ref_safe,
+		),
+		_format_external_quad_reject_values(
+			name="tri_dot",
+			mask=reject_tri_dot,
+			values=tri_dot,
+			threshold=float(cfg.ext_mesh_health_min_triangle_normal_dot),
+			over=False,
+		),
+		_format_external_quad_reject_values(
+			name="normal_dot",
+			mask=reject_normal_dot,
+			values=normal_dot,
+			threshold=float(cfg.ext_mesh_health_min_normal_dot),
+			over=False,
+		),
+	]
+	reject_value_lines = [line for line in reject_value_lines if line is not None]
+	if label != "test" and reject_value_lines:
+		print(
+			f"[snap_surf.map_global] external quad health reject values {label} pre_dilation worst=20",
+			flush=True,
+		)
+		for line in reject_value_lines:
+			print(f"[snap_surf.map_global]   {line}", flush=True)
 	initial_rejected = base & ~healthy
 	reject_radius = max(0, int(cfg.ext_mesh_health_reject_radius))
 	padding_rejected = torch.zeros_like(base)
@@ -885,6 +1544,54 @@ def _external_quad_health_filter(
 		stats["quads_rejected_padding"] = 0.0
 		stats["quads_reject_radius"] = float(reject_radius)
 	return ext_quad_valid.bool() & healthy, stats
+
+
+def _filter_external_quad_connected_component(
+	filtered_quad: torch.Tensor,
+	fixture: MapFixture,
+	metadata: dict[str, Any],
+	*,
+	label: str,
+) -> tuple[torch.Tensor, dict[str, float], list[int] | None]:
+	seed_raw = metadata.get("seed_ext_sample_hw")
+	seed_hw: tuple[int, int] | None = None
+	moved_seed: list[int] | None = None
+	if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
+		h, w = int(seed_raw[0]), int(seed_raw[1])
+		if 0 <= h < int(filtered_quad.shape[0]) and 0 <= w < int(filtered_quad.shape[1]) and bool(filtered_quad[h, w].detach().cpu()):
+			seed_hw = (h, w)
+	if seed_hw is None and metadata.get("seed_xyz") is not None:
+		seed_vals = metadata.get("seed_xyz")
+		if isinstance(seed_vals, (list, tuple)) and len(seed_vals) == 3:
+			seed = torch.tensor(seed_vals, device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
+			ext_quad, _point, _dist = _closest_external_seed_surface(
+				seed=seed,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_quad_valid=filtered_quad,
+			)
+			if ext_quad is not None:
+				seed_hw = (int(ext_quad[0]), int(ext_quad[1]))
+				moved_seed = [int(ext_quad[0]), int(ext_quad[1])]
+	if seed_hw is None:
+		return filtered_quad, {"quads_rejected_disconnected": 0.0, "quads_connected_kept": float(int(filtered_quad.sum().detach().cpu()))}, None
+	component = _quad_seed_connected_component(filtered_quad, seed_hw)
+	disconnected = filtered_quad & ~component
+	if label != "test" and bool(disconnected.any().detach().cpu()):
+		prefix = f"snap_surf_ext_quad_cc_{_debug_obj_safe_label(label)}"
+		_mask_tif(Path.cwd() / f"{prefix}_input.tif", filtered_quad.detach().bool())
+		_mask_tif(Path.cwd() / f"{prefix}_kept.tif", component.detach().bool())
+		_mask_tif(Path.cwd() / f"{prefix}_removed.tif", disconnected.detach().bool())
+		print(
+			f"[snap_surf.map_global] external quad connected component masks "
+			f"{label} input={prefix}_input.tif kept={prefix}_kept.tif removed={prefix}_removed.tif",
+			flush=True,
+		)
+	stats = {
+		"quads_rejected_disconnected": float(int(disconnected.sum().detach().cpu())),
+		"quads_connected_kept": float(int(component.sum().detach().cpu())),
+	}
+	return component, stats, moved_seed
 
 
 def _apply_external_quad_health_filter(
@@ -909,32 +1616,24 @@ def _apply_external_quad_health_filter(
 	if cached is None:
 		if cache is not None and cache_key is not None and cache_stats is not None:
 			cache_stats["health_miss"] = int(cache_stats.get("health_miss", 0)) + 1
+		_print_external_quad_initial_mask_stats(fixture, label=label)
 		filtered_quad, stats = _external_quad_health_filter(
 			ext_xyz=fixture.ext_xyz,
-			ext_valid=fixture.ext_valid,
-			ext_quad_valid=fixture.ext_quad_valid,
-			ext_normals=fixture.ext_normals,
-			cfg=mi,
+				ext_valid=fixture.ext_valid,
+				ext_quad_valid=fixture.ext_quad_valid,
+				ext_normals=fixture.ext_normals,
+				cfg=mi,
+				label=label,
+			)
+		filtered_quad, component_stats, moved_seed = _filter_external_quad_connected_component(
+			filtered_quad,
+			fixture,
+			metadata,
+			label=label,
 		)
-		moved_seed: list[int] | None = None
-		seed_raw = metadata.get("seed_ext_sample_hw")
-		seed_valid = False
-		if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 2:
-			h, w = int(seed_raw[0]), int(seed_raw[1])
-			if 0 <= h < int(filtered_quad.shape[0]) and 0 <= w < int(filtered_quad.shape[1]):
-				seed_valid = bool(filtered_quad[h, w].detach().cpu())
-		if not seed_valid and metadata.get("seed_xyz") is not None:
-			seed_vals = metadata.get("seed_xyz")
-			if isinstance(seed_vals, (list, tuple)) and len(seed_vals) == 3:
-				seed = torch.tensor(seed_vals, device=fixture.ext_xyz.device, dtype=fixture.ext_xyz.dtype)
-				ext_quad, _point, _dist = _closest_external_seed_surface(
-					seed=seed,
-					ext_xyz=fixture.ext_xyz,
-					ext_valid=fixture.ext_valid,
-					ext_quad_valid=filtered_quad,
-				)
-				if ext_quad is not None:
-					moved_seed = [int(ext_quad[0]), int(ext_quad[1])]
+		stats.update(component_stats)
+		stats["quads_kept"] = float(int(filtered_quad.sum().detach().cpu()))
+		stats["quads_rejected"] = float(int(stats["quads_input"]) - int(stats["quads_kept"]))
 		if cache is not None and cache_key is not None:
 			cache[cache_key] = (filtered_quad.detach(), dict(stats), moved_seed)
 	else:
@@ -950,6 +1649,14 @@ def _apply_external_quad_health_filter(
 	after = int(stats["quads_kept"])
 	rejected = int(stats["quads_rejected"])
 	if rejected > 0 and not cache_hit:
+		def _threshold_text(key: str, *, disabled_if_le: float | None = 0.0, disabled_if_lt: float | None = None) -> str:
+			value = float(stats.get(key, 0.0))
+			if disabled_if_lt is not None and value < float(disabled_if_lt):
+				return "off"
+			if disabled_if_le is not None and value <= float(disabled_if_le):
+				return "off"
+			return f"{value:.6g}"
+
 		print(
 			"[snap_surf.map_global] external quad health filter "
 			f"{label} kept={after}/{before} rejected={rejected} "
@@ -957,7 +1664,37 @@ def _apply_external_quad_health_filter(
 			f"median_area={stats['median_area']:.6g} max_area={stats['max_area']:.6g} "
 			f"max_aspect={stats.get('max_aspect', 0.0):.6g} max_diag={stats.get('max_diag_ratio', 0.0):.6g} "
 			f"min_tri_dot={stats.get('min_triangle_normal_dot', 0.0):.6g} "
-			f"pad_r={int(stats.get('quads_reject_radius', 0.0))} pad_rejected={int(stats.get('quads_rejected_padding', 0.0))}",
+			f"pad_r={int(stats.get('quads_reject_radius', 0.0))} pad_rejected={int(stats.get('quads_rejected_padding', 0.0))} "
+			f"disconnected={int(stats.get('quads_rejected_disconnected', 0.0))}",
+			flush=True,
+		)
+		print(
+			"[snap_surf.map_global] external quad health thresholds "
+			f"{label} "
+			f"edge<={_threshold_text('threshold_max_edge')} "
+			f"(ratio={_threshold_text('threshold_max_edge_ratio')}) "
+			f"area>={_threshold_text('threshold_min_area')} "
+			f"(ratio={_threshold_text('threshold_min_area_ratio')}) "
+			f"area<={_threshold_text('threshold_max_area')} "
+			f"(ratio={_threshold_text('threshold_max_area_ratio')}) "
+			f"aspect<={_threshold_text('threshold_max_aspect')} "
+			f"diag<={_threshold_text('threshold_max_diag_ratio')} "
+			f"tri_dot>={_threshold_text('threshold_min_triangle_normal_dot', disabled_if_le=None, disabled_if_lt=-1.0)} "
+			f"normal_dot>={_threshold_text('threshold_min_normal_dot')}",
+			flush=True,
+		)
+		print(
+			"[snap_surf.map_global] external quad health reject reasons "
+			f"{label} pre_dilation "
+			f"nonfinite={int(stats.get('reject_reason_nonfinite', 0.0))} "
+			f"nonpositive={int(stats.get('reject_reason_nonpositive', 0.0))} "
+			f"aspect={int(stats.get('reject_reason_aspect', 0.0))} "
+			f"diag={int(stats.get('reject_reason_diag', 0.0))} "
+			f"edge={int(stats.get('reject_reason_edge', 0.0))} "
+			f"area_hi={int(stats.get('reject_reason_area_max', 0.0))} "
+			f"area_lo={int(stats.get('reject_reason_area_min', 0.0))} "
+			f"tri_dot={int(stats.get('reject_reason_triangle_normal', 0.0))} "
+			f"normal_dot={int(stats.get('reject_reason_normal', 0.0))}",
 			flush=True,
 		)
 	if moved_seed is not None and rejected > 0:
@@ -1429,20 +2166,18 @@ def _seed_quad_affine_sample_terms(
 	turn_values = torch.zeros_like(norm_values)
 	turn_valid = torch.ones_like(coord_ok, dtype=torch.bool)
 	if z_lift is not None:
-		quad_hw = torch.floor(ext_hw.to(device=affine.device, dtype=affine.dtype)).long()
 		ext_theta = z_lift["ext_theta_lifted"].to(device=affine.device, dtype=affine.dtype)
 		ext_valid = z_lift["ext_valid"].to(device=affine.device).bool()
-		quad_hw[:, 0] = quad_hw[:, 0].clamp(0, max(0, int(ext_theta.shape[0]) - 1))
-		quad_hw[:, 1] = quad_hw[:, 1].clamp(0, max(0, int(ext_theta.shape[1]) - 1))
-		model_theta, model_theta_valid = _map_init_sample_scalar_quad_field(
+		ext_theta_plan = _map_init_surface_sample_plan(ext_hw.to(device=affine.device, dtype=affine.dtype), tuple(int(v) for v in ext_valid.shape))
+		ext_theta_sample, ext_theta_valid = _map_init_sample_scalar_plan(ext_theta, ext_valid, ext_theta_plan)
+		model_theta_plan = _map_init_surface_sample_plan(safe_coords, tuple(int(v) for v in z_lift["model_valid"].shape))
+		model_theta, model_theta_valid = _map_init_sample_scalar_plan(
 			z_lift["model_theta_lifted"].to(device=affine.device, dtype=affine.dtype),
 			z_lift["model_valid"].to(device=affine.device).bool(),
-			safe_coords,
-			tuple(int(v) for v in z_lift["model_valid"].shape),
+			model_theta_plan,
 		)
-		ext_theta_sample = ext_theta[quad_hw[:, 0], quad_hw[:, 1]]
 		turn_valid = (
-			ext_valid[quad_hw[:, 0], quad_hw[:, 1]] &
+			ext_theta_valid &
 			model_theta_valid &
 			torch.isfinite(ext_theta_sample) &
 			torch.isfinite(model_theta)
@@ -1935,7 +2670,7 @@ def _run_affine_seed_quad_expansion_reopt(
 			)
 			station_raw = loss.new_zeros(())
 			if float(w_station) > 0.0:
-				station_raw = _station_loss(uv, seed_hw, station_target)
+				station_raw = _station_loss(uv, seed_hw, station_target, active_quad=active)
 				loss = loss + float(w_station) * station_raw
 			row = _affine_seed_quad_expansion_row_from_terms(
 				radius=radius,
@@ -1967,7 +2702,7 @@ def _run_affine_seed_quad_expansion_reopt(
 			)
 			station_raw = loss.new_zeros(())
 			if float(w_station) > 0.0:
-				station_raw = _station_loss(uv, seed_hw, station_target)
+				station_raw = _station_loss(uv, seed_hw, station_target, active_quad=active)
 				loss = loss + float(w_station) * station_raw
 			progress_terms = dict(terms)
 			progress_terms["station"] = station_raw.detach()
@@ -2016,7 +2751,7 @@ def _run_affine_seed_quad_expansion_reopt(
 				active_quad_crop=crop,
 			)
 			if float(w_station) > 0.0:
-				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
+				loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target, active_quad=active)
 			loss.backward()
 			step1 = step + 1
 			_apply_optimizer_lr_schedule(
@@ -2403,10 +3138,11 @@ def _score_affine_tensor(
 	with torch.no_grad():
 		affine_model.affine.copy_(affine_tensor)
 	uv = affine_model()
-	loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0)
+	stage_active_quad = _level_active_quad(_full_active_quad(fixture), 0)
+	loss, terms = _objective_for_uv(uv=uv, fixture=fixture, cfg=stage_cfg, level=0, active_quad=stage_active_quad)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
-		station_raw = _station_loss(uv, seed_hw, station_target)
+		station_raw = _station_loss(uv, seed_hw, station_target, active_quad=stage_active_quad)
 		loss = loss + float(w_station) * station_raw
 	terms = dict(terms)
 	terms["station"] = station_raw.detach()
@@ -2447,7 +3183,7 @@ def _optimize_affine_candidate(
 			active_quad=stage_active_quad,
 		)
 		if float(w_station) > 0.0:
-			loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target)
+			loss = loss + float(w_station) * _station_loss(uv, seed_hw, station_target, active_quad=stage_active_quad)
 		last_loss = float(loss.detach().cpu())
 		if opt is None:
 			break
@@ -2910,8 +3646,10 @@ def _prepare_affine_seed_quad_candidate(
 		flush=True,
 	)
 	if seed_result is None:
-		print("[snap_surf.map_global] affine seed quad init unavailable", flush=True)
-		return None, None, float("nan"), 0
+		raise RuntimeError(
+			"snap_surf affine_seed_quad_init failed: affine seed quad ray init unavailable; "
+			"cannot continue with an uninitialized/bogus global map"
+		)
 	_apply_seed_quad_init_metadata(fixture, seed_result)
 	candidate = seed_result.affine
 	_write_affine_seed_initial_debug_radius(
@@ -3083,7 +3821,7 @@ def _run_affine_seed_quad_init(
 		)
 		station_raw = loss.new_zeros(())
 		if float(w_station) > 0.0:
-			station_raw = _station_loss(uv, seed_hw, station_target)
+			station_raw = _station_loss(uv, seed_hw, station_target, active_quad=stage_active_quad)
 			loss = loss + float(w_station) * station_raw
 		if opt is not None:
 			loss.backward()
@@ -3216,7 +3954,12 @@ def _stage_station_weight(cfg_global: GlobalMapConfig, stage: GlobalMapStageConf
 	return base * float(stage.w_fac)
 
 
-def _station_loss(uv: torch.Tensor, seed_ext_hw: torch.Tensor, target_uv: torch.Tensor) -> torch.Tensor:
+def _station_loss(
+	uv: torch.Tensor,
+	seed_ext_hw: torch.Tensor,
+	target_uv: torch.Tensor,
+	active_quad: torch.Tensor | None = None,
+) -> torch.Tensor:
 	H, W = int(uv.shape[0]), int(uv.shape[1])
 	coords = seed_ext_hw.view(1, 2)
 	h = coords[:, 0].clamp(0.0, float(max(0, H - 1)))
@@ -3233,7 +3976,15 @@ def _station_loss(uv: torch.Tensor, seed_ext_hw: torch.Tensor, target_uv: torch.
 		(1.0 - fh) * fw * uv[h0, w1] +
 		fh * fw * uv[h1, w1]
 	).view(2)
-	return (value - target_uv).square().mean()
+	seed_error = (value - target_uv.to(device=uv.device, dtype=uv.dtype)).detach()
+	finite = torch.isfinite(uv).all(dim=-1)
+	if active_quad is not None:
+		active_vertex = _vertex_mask_from_quad_mask(active_quad.to(device=uv.device), (H, W))
+		finite = finite & active_vertex
+	if not bool(finite.any().detach().cpu()):
+		return uv.new_zeros(())
+	target = uv.detach() - seed_error.view(1, 1, 2)
+	return (uv[finite] - target[finite]).square().mean()
 
 
 def _level_seed_hw(seed_ext_hw: torch.Tensor, level: int) -> torch.Tensor:
@@ -3275,9 +4026,25 @@ def _objective_for_uv(
 	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
 	need_stats: bool = True,
 	active_quad: torch.Tensor | None = None,
+	profile_blocks: dict[str, list[float]] | None = None,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
 	active = _level_active_quad(_full_active_quad(fixture), int(level)) if active_quad is None else active_quad
 	ext_coords = None if int(level) == 0 else _level_coords(fixture.ext_xyz.shape[:2], int(level), uv)
+	external_static_cache_key = (
+		"level0",
+		tuple(int(v) for v in uv.shape[:2]),
+		str(uv.dtype),
+		str(uv.device),
+	) if int(level) == 0 else (
+		"level_coords",
+		int(level),
+		tuple(int(v) for v in uv.shape[:2]),
+		tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+		str(uv.dtype),
+		str(uv.device),
+	)
 	sign_i = int(fixture.metadata.get("sign", 1) or 1)
 	if z_lift is _NO_Z_LIFT:
 		z_lift = _map_init_z_lift_for_fixture(fixture, cfg, sign=sign_i)
@@ -3304,6 +4071,10 @@ def _objective_for_uv(
 		ext_z_lift_valid=ext_z_lift_valid,
 		model_z_lift_theta=None if z_lift_d is None else z_lift_d["model_theta_lifted"],
 		model_z_lift_valid=None if z_lift_d is None else z_lift_d["model_valid"],
+		profile_blocks=profile_blocks,
+		runtime_cache=runtime_cache,
+		cache_key_prefix=cache_key_prefix,
+		external_static_cache_key=external_static_cache_key,
 	)
 
 
@@ -3627,6 +4398,8 @@ def _global_progress_state(
 	w_station: float,
 	z_lift: dict[str, Any] | None | object = _NO_Z_LIFT,
 	active_quad: torch.Tensor | None = None,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
 ) -> tuple[float, dict[str, torch.Tensor], dict[str, float]]:
 	loss, terms = _objective_for_uv(
 		uv=uv,
@@ -3635,10 +4408,12 @@ def _global_progress_state(
 		level=int(level),
 		z_lift=z_lift,
 		active_quad=active_quad,
+		runtime_cache=runtime_cache,
+		cache_key_prefix=cache_key_prefix,
 	)
 	station_raw = loss.new_zeros(())
 	if float(w_station) > 0.0:
-		station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(level)), station_target)
+		station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(level)), station_target, active_quad=active_quad)
 		loss = loss + float(w_station) * station_raw
 	progress_terms = dict(terms)
 	progress_terms["station"] = station_raw.detach()
@@ -3670,6 +4445,8 @@ def _fixture_from_live_tensors(
 	}
 	if seed_xyz is not None:
 		seed = torch.tensor(seed_xyz, device=device, dtype=dtype)
+		ext_vertex = _nearest_valid_vertex_by_xyz(ext_xyz, _external_vertex_base_valid(ext_xyz, ext_valid), seed)
+		model_vertex = _nearest_valid_vertex_by_xyz(model_xyz, _model_vertex_base_valid(model_xyz, model_valid), seed)
 		ext_quad, _ext_point, _ext_dist = _closest_external_seed_surface(
 			seed=seed,
 			ext_xyz=ext_xyz,
@@ -3683,8 +4460,12 @@ def _fixture_from_live_tensors(
 		)
 		if ext_quad is not None:
 			metadata["seed_ext_sample_hw"] = [int(ext_quad[0]), int(ext_quad[1])]
+		if ext_vertex is not None and len(ext_vertex) == 2:
+			metadata["seed_ext_vertex_hw"] = [int(ext_vertex[0]), int(ext_vertex[1])]
 		if model_quad is not None:
 			metadata["seed_model_quad"] = [int(model_quad[0]), int(model_quad[1]), int(model_quad[2])]
+		if model_vertex is not None and len(model_vertex) == 3:
+			metadata["seed_model_vertex"] = [int(model_vertex[0]), int(model_vertex[1]), int(model_vertex[2])]
 		metadata["seed_xyz"] = [float(v) for v in seed_xyz]
 	return MapFixture(
 		root=Path("."),
@@ -3712,6 +4493,741 @@ def _fixture_from_live_tensors(
 	)
 
 
+def _map_fixture_export_spec(stage: GlobalMapStageConfig) -> dict[str, Any] | None:
+	raw = stage.args.get("export_fixture", stage.args.get("fixture_export", None))
+	if raw is None:
+		raw_dir = stage.args.get("fixture_export_dir", stage.args.get("map_fixture_export_dir", None))
+		if raw_dir in (None, "", False):
+			return None
+		raw = {"dir": raw_dir}
+	if raw in (False, None, ""):
+		return None
+	if raw is True:
+		raw = {"dir": stage.args.get("fixture_export_dir", "map_fixture")}
+	if isinstance(raw, str):
+		raw = {"dir": raw}
+	if not isinstance(raw, dict):
+		raise ValueError("map fixture export config must be an object, string, bool, or null")
+	out_dir = raw.get("dir", raw.get("out_dir", raw.get("path", stage.args.get("fixture_export_dir", None))))
+	if out_dir in (None, "", False):
+		raise ValueError("map fixture export requires 'dir' or fixture_export_dir")
+	once = _truthy_arg(raw.get("once", stage.args.get("fixture_export_once", True)))
+	export_objs = _truthy_arg(raw.get("objs", raw.get("export_objs", stage.args.get("fixture_export_objs", False))))
+	write_geometry = _truthy_arg(raw.get("geometry", raw.get("write_geometry", True)))
+	return {
+		"dir": str(out_dir),
+		"once": bool(once),
+		"objs": bool(export_objs),
+		"geometry": bool(write_geometry),
+		"tag": str(raw.get("tag", raw.get("name", ""))),
+	}
+
+
+def _surface_state_for_fixture_export(
+	*,
+	fixture: MapFixture,
+	uv: torch.Tensor,
+	active_quad: torch.Tensor,
+	sign: int,
+) -> _SurfaceState:
+	state = _SurfaceState()
+	state.ensure(
+		model_shape=tuple(int(v) for v in fixture.model_xyz.shape[:3]),
+		ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
+		device=fixture.model_xyz.device,
+		dtype=fixture.model_xyz.dtype,
+	)
+	mi = state.map_init
+	mi.uv = uv.detach()
+	mi.active_quad = active_quad.detach().bool()
+	mi.blocked_quad = torch.zeros_like(mi.active_quad)
+	mi.ext_pos = fixture.ext_xyz.detach()
+	mi.ext_normals = fixture.ext_normals.detach()
+	mi.ext_valid = fixture.ext_valid.detach().bool()
+	mi.ext_quad_valid = fixture.ext_quad_valid.detach().bool()
+	mi.model_depth = int(fixture.metadata.get("model_depth", 0) or 0)
+	mi.sign = int(sign)
+	seed_hw = fixture.metadata.get("seed_ext_sample_hw")
+	if isinstance(seed_hw, (list, tuple)) and len(seed_hw) >= 2:
+		mi.seed_ext_sample_hw = (int(seed_hw[0]), int(seed_hw[1]))
+		state.ext_seed_hw = mi.seed_ext_sample_hw
+	seed_model = fixture.metadata.get("seed_model_quad")
+	if isinstance(seed_model, (list, tuple)) and len(seed_model) >= 3:
+		mi.seed_model_quad = (int(seed_model[0]), int(seed_model[1]), int(seed_model[2]))
+	mi.scale_level = 0
+	mi.target_scale_level = 0
+	mi.scale_strides = [1]
+	mi.scale_levels_used = 1
+	mi.done = True
+	return state
+
+
+class SelfMapRuntime:
+	"""Persistent batched self-map optimizer for init-shell winding pairs."""
+
+	def __init__(
+		self,
+		*,
+		mode: str,
+		direction: str,
+		model_w_wraps: float | None = None,
+		base: dict[str, Any] | None = None,
+	) -> None:
+		self.mode = normalize_self_map_init(mode)
+		self.direction = str(direction).strip().lower()
+		if self.direction not in SELF_MAP_DIRECTIONS:
+			raise ValueError(f"invalid self-map direction '{direction}'")
+		self.model_w_wraps = None if model_w_wraps is None else float(model_w_wraps)
+		self.cfg_global = GlobalMapConfig(base=dict(base or {}), stages=())
+		self.global_model: GlobalMapModel | None = None
+		self.optimizer: torch.optim.Optimizer | None = None
+		self.optimizer_key: tuple[tuple[str, ...], int, int, float, int] | None = None
+		self.lr_autoscale: _LrAutoscaleState | None = None
+		self.last: dict[str, float] = {}
+		self.steps_run = 0
+		self._snap_loss_mode_printed: set[tuple[str, float]] = set()
+
+	def _ensure_model(self, model_xyz: torch.Tensor, base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> None:
+		if self.global_model is not None:
+			return
+		D, H, W = int(model_xyz.shape[0]), int(model_xyz.shape[1]), int(model_xyz.shape[2])
+		initial_uv = self.initial_uv(depth=D, height=H, width=W, device=model_xyz.device, dtype=model_xyz.dtype)
+		levels = _max_supported_level(
+			(H, W),
+			max(int(stage.min_scaledown), int(base_cfg.map_init.scale_levels) - 1),
+		) + 1
+		self.global_model = GlobalMapModel(initial_uv.detach(), levels=levels, factor=2, preserve_batch=True)
+
+	def initial_uv(
+		self,
+		*,
+		depth: int,
+		height: int,
+		width: int,
+		device: torch.device,
+		dtype: torch.dtype,
+	) -> torch.Tensor:
+		return self_map_initial_uv(
+			mode=self.mode,
+			direction=self.direction,
+			depth=int(depth),
+			height=int(height),
+			width=int(width),
+			model_w_wraps=self.model_w_wraps,
+			device=device,
+			dtype=dtype,
+		)
+
+	def _uv(self, *, active_level: int = 0) -> torch.Tensor:
+		if self.global_model is None:
+			raise RuntimeError("self-map runtime is not initialized")
+		return self.global_model(active_level=int(active_level))
+
+	def _params_for_stage(self, stage: GlobalMapStageConfig) -> tuple[list[torch.nn.Parameter], int]:
+		if self.global_model is None:
+			raise RuntimeError("self-map runtime is not initialized")
+		params: list[torch.nn.Parameter] = []
+		level = 0
+		if "map_uv_ms" in stage.params or "affine" in stage.params:
+			level = min(max(0, int(stage.min_scaledown)), len(self.global_model.map_uv_ms) - 1)
+			params.extend(list(self.global_model.map_uv_ms.parameters())[level:])
+		return params, level
+
+	def _stats_from_terms(self, loss: torch.Tensor, terms: dict[str, torch.Tensor]) -> dict[str, float]:
+		stats = {
+			"snaps_map_loss": float(loss.detach().cpu()),
+			"snaps_map_runtime_steps": float(self.steps_run),
+			"snaps_map_samples": float(_global_term_value(terms, "samples")),
+		}
+		for term_key, stat_key in (
+			("dist", "snaps_map_dist"),
+			("vec", "snaps_map_vec"),
+			("norm", "snaps_map_norm"),
+			("turn", "snaps_map_turn"),
+			("turn_smp", "snaps_map_turn_smp"),
+			("smooth", "snaps_map_smooth"),
+			("bend", "snaps_map_bend"),
+			("jac", "snaps_map_jac"),
+			("metric_smooth", "snaps_map_metric_smooth"),
+			("area_smooth", "snaps_map_area_smooth"),
+			("prior", "snaps_map_prior"),
+			("sample_total", "snaps_map_sample_total"),
+			("sample_valid", "snaps_map_sample_valid"),
+			("sample_bad", "snaps_map_sample_bad"),
+			("uv_bad", "snaps_map_uvbad"),
+			("model_bad", "snaps_map_model_bad"),
+			("loss_finite", "snaps_map_loss_finite"),
+		):
+			stats[stat_key] = float(_global_term_value(terms, term_key))
+		return stats
+
+	def run_stage(
+		self,
+		*,
+		stage: GlobalMapStageConfig,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		persistent_optimizer: bool = False,
+		status_fn=None,
+		cancel_fn=None,
+		auto_stop_fn=None,
+		**_unused,
+	) -> dict[str, float]:
+		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
+		stage_cfg = _stage_loss_cfg(base_cfg, stage)
+		self._ensure_model(model_xyz, base_cfg, stage)
+		params, train_level = self._params_for_stage(stage)
+		sample_level = _stage_objective_level(stage, train_level, tuple(int(v) for v in model_xyz.shape[1:3]))
+		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+		lr_warmup_steps = _lr_warmup_steps(stage.args)
+		lr_autoscale_cfg = _lr_autoscale_config(stage.args)
+		auto_loss_history: list[float] = []
+		steps_completed = 0
+		auto_stopped = False
+		lr_autoscale: _LrAutoscaleState | None = None
+		opt: torch.optim.Optimizer | None = None
+		if params and int(stage.steps) > 0:
+			key = (tuple(stage.params), int(train_level), int(sample_level), float(stage.lr), int(stage.min_scaledown))
+			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
+				self.optimizer = torch.optim.Adam(params, lr=float(stage.lr))
+				_capture_optimizer_target_lrs(self.optimizer)
+				self.optimizer_key = key
+				self.lr_autoscale = _LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None
+			opt = self.optimizer
+			assert opt is not None
+			lr_autoscale = self.lr_autoscale if persistent_optimizer else (_LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None)
+			for step in range(int(stage.steps)):
+				if cancel_fn is not None:
+					cancel_fn()
+				opt.zero_grad(set_to_none=True)
+				uv = self._uv(active_level=int(sample_level))
+				status_due = (
+					status_fn is not None and (
+						step == 0 or step == int(stage.steps) - 1 or (status_interval > 0 and (step % status_interval) == 0)
+					)
+				)
+				active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=model_valid, uv=uv)
+				loss, terms = _self_map_objective_for_uv(
+					uv=uv,
+					mode=self.mode,
+					direction=self.direction,
+					model_xyz=model_xyz,
+					model_normals=model_normals,
+					model_valid=model_valid,
+					cfg=stage_cfg,
+					level=int(sample_level),
+					need_stats=status_due,
+					active_quad=active,
+				)
+				_apply_optimizer_lr_schedule(
+					opt,
+					step1=(self.steps_run + 1 if persistent_optimizer else step + 1),
+					warmup_steps=lr_warmup_steps,
+					autoscale=lr_autoscale,
+					loss=loss,
+				)
+				if status_due:
+					status_stats = self._stats_from_terms(loss, terms)
+					status_stats["snaps_map_lr"] = _optimizer_lr_for_display(opt, float(stage.lr))
+					status_stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+					status_fn(step=step, total=int(stage.steps), stats=status_stats)
+				loss.backward()
+				opt.step()
+				self.steps_run += 1
+				steps_completed = step + 1
+				if auto_stop_fn is not None and steps_completed > lr_warmup_steps:
+					auto_loss_history.append(float(loss.detach().cpu()))
+					auto_stopped = bool(auto_stop_fn(history=auto_loss_history, step=steps_completed - lr_warmup_steps))
+				if auto_stopped:
+					break
+			if not persistent_optimizer:
+				self.optimizer = None
+				self.optimizer_key = None
+				self.lr_autoscale = None
+		with torch.no_grad():
+			uv = self._uv(active_level=int(sample_level))
+			active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=model_valid, uv=uv)
+			loss, terms = _self_map_objective_for_uv(
+				uv=uv,
+				mode=self.mode,
+				direction=self.direction,
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				cfg=stage_cfg,
+				level=int(sample_level),
+				need_stats=True,
+				active_quad=active,
+			)
+		stats = self._stats_from_terms(loss, terms)
+		stats["snaps_map_lr"] = _optimizer_lr_for_display(opt if params and int(stage.steps) > 0 else None, float(stage.lr))
+		stats["snaps_map_stage_steps"] = float(steps_completed)
+		stats["snaps_map_auto_stopped"] = 1.0 if auto_stopped else 0.0
+		stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+		self.last = stats
+		return stats
+
+	def _snap_inputs(
+		self,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+		self._ensure_model(model_xyz, snap_surf_config_from_global_config(self.cfg_global), GlobalMapStageConfig(params=("map_uv_ms",)))
+		uv = self._uv().detach()
+		src, dst = self_map_pair_depths(self.mode, self.direction, int(model_xyz.shape[0]))
+		src_t = torch.tensor(src, device=model_xyz.device, dtype=torch.long)
+		dst_t = torch.tensor(dst, device=model_xyz.device, dtype=torch.long)
+		source_xyz = model_xyz[src_t].detach()
+		source_normals = model_normals[src_t].detach()
+		source_valid = model_valid[src_t].detach().bool()
+		active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=model_valid, uv=uv)
+		active_vertex = torch.zeros_like(source_valid, dtype=torch.bool)
+		if active.numel():
+			active_vertex[:, :-1, :-1] |= active
+			active_vertex[:, 1:, :-1] |= active
+			active_vertex[:, :-1, 1:] |= active
+			active_vertex[:, 1:, 1:] |= active
+		return uv, dst_t, source_xyz, source_normals, source_valid & active_vertex, active
+
+	def snap_loss_prefetch_items(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		offset: float = 1.0,
+		data=None,
+		strip_samples: int = 5,
+		**_unused,
+	) -> dict[str, torch.Tensor]:
+		if data is None:
+			return {}
+		uv, dst_t, source_xyz, _source_normals, source_valid, _active = self._snap_inputs(model_xyz, model_normals, model_valid)
+		target_depth = dst_t.to(dtype=uv.dtype).view(-1, 1, 1, 1).expand(*uv.shape[:-1], 1)
+		coords = torch.cat([target_depth, uv], dim=-1)
+		target_ok = _quad_valid_at_coords(model_valid.bool(), coords, tuple(int(v) for v in model_valid.shape))
+		valid = source_valid & target_ok & torch.isfinite(coords).all(dim=-1) & torch.isfinite(source_xyz).all(dim=-1)
+		if not bool(valid.any().detach().cpu()):
+			return {}
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		model_pos = _sample_surface_grid(model_xyz, safe_coords)
+		sample_valid = valid & torch.isfinite(model_pos).all(dim=-1)
+		if not bool(sample_valid.any().detach().cpu()):
+			return {}
+		t = torch.linspace(0.0, 1.0, max(2, int(strip_samples)), device=model_xyz.device, dtype=model_xyz.dtype)
+		source_valid_xyz = source_xyz[sample_valid]
+		target_valid_xyz = model_pos.detach()[sample_valid]
+		strip = source_valid_xyz.unsqueeze(-2) + t.view(1, -1, 1) * (target_valid_xyz - source_valid_xyz).unsqueeze(-2)
+		return {"grad_mag": strip.reshape(1, 1, -1, 3).contiguous()}
+
+	def snap_loss(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		offset: float = 1.0,
+		data=None,
+		strip_samples: int = 5,
+		**_unused,
+	) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], dict[str, float]]:
+		offset_f = float(offset)
+		signed_offset = self_map_signed_offset(self.mode, self.direction, offset_f)
+		mode_key = ("self_winding", offset_f, signed_offset)
+		if mode_key not in self._snap_loss_mode_printed:
+			print(
+				f"[snap_surf.map_global] self snap loss mode={self.mode}/{self.direction} "
+				f"offset={offset_f:.6g} signed_offset={signed_offset:.6g}",
+				flush=True,
+			)
+			self._snap_loss_mode_printed.add(mode_key)
+		uv, dst_t, source_xyz, _source_normals, source_valid, _active = self._snap_inputs(model_xyz, model_normals, model_valid)
+		target_depth = dst_t.to(dtype=uv.dtype).view(-1, 1, 1, 1).expand(*uv.shape[:-1], 1)
+		coords = torch.cat([target_depth, uv], dim=-1)
+		target_ok = _quad_valid_at_coords(model_valid.bool(), coords, tuple(int(v) for v in model_valid.shape))
+		valid = source_valid & target_ok & torch.isfinite(coords).all(dim=-1) & torch.isfinite(source_xyz).all(dim=-1)
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		model_pos = _sample_surface_grid(model_xyz, safe_coords)
+		model_n = torch.nn.functional.normalize(_sample_surface_grid(model_normals.detach(), safe_coords), dim=-1, eps=1.0e-8)
+		valid = valid & torch.isfinite(model_pos).all(dim=-1) & torch.isfinite(model_n).all(dim=-1)
+		z = model_xyz.sum() * 0.0
+		lm = torch.zeros(model_xyz.shape[:3], device=model_xyz.device, dtype=model_xyz.dtype).unsqueeze(1)
+		mask = torch.zeros_like(lm)
+		if not bool(valid.any().detach().cpu()):
+			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
+		signed_vox = ((model_pos - source_xyz.detach()) * model_n.detach()).sum(dim=-1)
+		if data is None:
+			residual = signed_vox - signed_vox.new_tensor(signed_offset)
+			valid_final = valid
+		else:
+			strip_samples_i = max(2, int(strip_samples))
+			sample_valid = valid & torch.isfinite(model_pos).all(dim=-1) & torch.isfinite(model_n).all(dim=-1)
+			with torch.no_grad():
+				t = torch.linspace(0.0, 1.0, strip_samples_i, device=model_xyz.device, dtype=model_xyz.dtype)
+				origin = torch.tensor(data.origin_fullres, device=model_xyz.device, dtype=model_xyz.dtype)
+				spacing = torch.tensor(data._spacing_for("grad_mag"), device=model_xyz.device, dtype=model_xyz.dtype)
+				sentinel = origin - 64.0 * spacing
+				source_safe = torch.where(sample_valid.unsqueeze(-1), source_xyz.detach(), sentinel.view(1, 1, 1, 3))
+				target_safe = torch.where(sample_valid.unsqueeze(-1), model_pos.detach(), sentinel.view(1, 1, 1, 3))
+				diff = target_safe - source_safe
+				strip = source_safe.unsqueeze(-2) + t.view(1, 1, 1, strip_samples_i, 1) * diff.unsqueeze(-2)
+				N, H, W = int(source_xyz.shape[0]), int(source_xyz.shape[1]), int(source_xyz.shape[2])
+				sampled = data.grid_sample_fullres(strip.reshape(1, N * H, W * strip_samples_i, 3), channels={"grad_mag"})
+				if sampled.grad_mag is None:
+					raise RuntimeError("self snap_surf_map offset mode requires grad_mag samples")
+				mag = sampled.grad_mag.detach().squeeze(0).squeeze(0).reshape(N, H, W, strip_samples_i)
+				strip_valid = (mag > 0.0).all(dim=-1)
+				mean_grad = mag.mean(dim=-1)
+				strip_len = diff.square().sum(dim=-1).sqrt()
+				int_sign = torch.sign(((model_pos.detach() - source_xyz.detach()) * model_n.detach()).sum(dim=-1))
+				signed_windings = int_sign * strip_len * mean_grad
+				winding_err = signed_windings - signed_vox.new_tensor(signed_offset)
+			valid_final = sample_valid & strip_valid
+			normal_residual = signed_vox * mean_grad
+			residual = normal_residual + (winding_err - normal_residual).detach()
+		vals = residual[valid_final]
+		if vals.numel() == 0:
+			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
+		loss = vals.square().mean()
+		stats = {
+			"snaps_map_snap": float(loss.detach().cpu()),
+			"snaps_map_snap_abs": float(vals.detach().abs().mean().cpu()),
+			"snaps_map_snap_max": float(vals.detach().abs().max().cpu()),
+			"snaps_map_snap_samples": float(int(vals.numel())),
+		}
+		return loss, (lm,), (mask,), stats
+
+
+class BoundarySelfMapRuntime(SelfMapRuntime):
+	"""Self-map runtime for grow boundaries with one fixed and one trainable surface."""
+
+	def __init__(
+		self,
+		*,
+		mode: str,
+		direction: str,
+		fixed_xyz: torch.Tensor,
+		fixed_normals: torch.Tensor,
+		fixed_valid: torch.Tensor,
+		model_w_wraps: float | None = None,
+		base: dict[str, Any] | None = None,
+	) -> None:
+		super().__init__(
+			mode=mode,
+			direction=direction,
+			model_w_wraps=model_w_wraps,
+			base=base,
+		)
+		if self.mode != "multi_wrap_d":
+			raise ValueError("boundary self-map grow currently requires self-map-init=multi_wrap_d")
+		self.fixed_xyz = fixed_xyz.detach()
+		self.fixed_normals = fixed_normals.detach()
+		self.fixed_valid = fixed_valid.detach().bool()
+
+	def _fixed_tensors_for(self, model_xyz: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		device = model_xyz.device
+		dtype = model_xyz.dtype
+		return (
+			self.fixed_xyz.to(device=device, dtype=dtype),
+			self.fixed_normals.to(device=device, dtype=dtype),
+			self.fixed_valid.to(device=device).bool(),
+		)
+
+	def _ensure_model(self, model_xyz: torch.Tensor, base_cfg: SnapSurfConfig, stage: GlobalMapStageConfig) -> None:
+		if self.global_model is not None:
+			return
+		if int(model_xyz.shape[0]) != 1:
+			raise ValueError(f"boundary self-map grow expects temporary model depth 1, got {int(model_xyz.shape[0])}")
+		H, W = int(model_xyz.shape[1]), int(model_xyz.shape[2])
+		initial_uv = self.initial_uv(depth=2, height=H, width=W, device=model_xyz.device, dtype=model_xyz.dtype)
+		levels = _max_supported_level(
+			(H, W),
+			max(int(stage.min_scaledown), int(base_cfg.map_init.scale_levels) - 1),
+		) + 1
+		self.global_model = GlobalMapModel(initial_uv.detach(), levels=levels, factor=2, preserve_batch=True)
+
+	def _stacked_boundary(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		if int(model_xyz.shape[0]) != 1:
+			raise ValueError(f"boundary self-map grow expects temporary model depth 1, got {int(model_xyz.shape[0])}")
+		fixed_xyz, fixed_normals, fixed_valid = self._fixed_tensors_for(model_xyz)
+		return (
+			torch.stack([fixed_xyz, model_xyz[0]], dim=0),
+			torch.stack([fixed_normals, model_normals[0]], dim=0),
+			torch.stack([fixed_valid, model_valid[0].bool()], dim=0),
+		)
+
+	def run_stage(
+		self,
+		*,
+		stage: GlobalMapStageConfig,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		persistent_optimizer: bool = False,
+		status_fn=None,
+		cancel_fn=None,
+		auto_stop_fn=None,
+		**_unused,
+	) -> dict[str, float]:
+		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
+		stage_cfg = _stage_loss_cfg(base_cfg, stage)
+		self._ensure_model(model_xyz, base_cfg, stage)
+		params, train_level = self._params_for_stage(stage)
+		sample_level = _stage_objective_level(stage, train_level, tuple(int(v) for v in model_xyz.shape[1:3]))
+		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
+		lr_warmup_steps = _lr_warmup_steps(stage.args)
+		lr_autoscale_cfg = _lr_autoscale_config(stage.args)
+		auto_loss_history: list[float] = []
+		steps_completed = 0
+		auto_stopped = False
+		lr_autoscale: _LrAutoscaleState | None = None
+		opt: torch.optim.Optimizer | None = None
+		stacked_xyz, stacked_normals, stacked_valid = self._stacked_boundary(
+			model_xyz=model_xyz,
+			model_normals=model_normals,
+			model_valid=model_valid,
+		)
+		if params and int(stage.steps) > 0:
+			key = (tuple(stage.params), int(train_level), int(sample_level), float(stage.lr), int(stage.min_scaledown))
+			if (not persistent_optimizer) or self.optimizer is None or self.optimizer_key != key:
+				self.optimizer = torch.optim.Adam(params, lr=float(stage.lr))
+				_capture_optimizer_target_lrs(self.optimizer)
+				self.optimizer_key = key
+				self.lr_autoscale = _LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None
+			opt = self.optimizer
+			assert opt is not None
+			lr_autoscale = self.lr_autoscale if persistent_optimizer else (_LrAutoscaleState(lr_autoscale_cfg) if lr_autoscale_cfg.enabled else None)
+			for step in range(int(stage.steps)):
+				if cancel_fn is not None:
+					cancel_fn()
+				opt.zero_grad(set_to_none=True)
+				uv = self._uv(active_level=int(sample_level))
+				status_due = (
+					status_fn is not None and (
+						step == 0 or step == int(stage.steps) - 1 or (status_interval > 0 and (step % status_interval) == 0)
+					)
+				)
+				active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=stacked_valid, uv=uv)
+				loss, terms = _self_map_objective_for_uv(
+					uv=uv,
+					mode=self.mode,
+					direction=self.direction,
+					model_xyz=stacked_xyz,
+					model_normals=stacked_normals,
+					model_valid=stacked_valid,
+					cfg=stage_cfg,
+					level=int(sample_level),
+					need_stats=status_due,
+					active_quad=active,
+				)
+				_apply_optimizer_lr_schedule(
+					opt,
+					step1=(self.steps_run + 1 if persistent_optimizer else step + 1),
+					warmup_steps=lr_warmup_steps,
+					autoscale=lr_autoscale,
+					loss=loss,
+				)
+				if status_due:
+					status_stats = self._stats_from_terms(loss, terms)
+					status_stats["snaps_map_lr"] = _optimizer_lr_for_display(opt, float(stage.lr))
+					status_stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+					status_fn(step=step, total=int(stage.steps), stats=status_stats)
+				loss.backward()
+				opt.step()
+				self.steps_run += 1
+				steps_completed = step + 1
+				if auto_stop_fn is not None and steps_completed > lr_warmup_steps:
+					auto_loss_history.append(float(loss.detach().cpu()))
+					auto_stopped = bool(auto_stop_fn(history=auto_loss_history, step=steps_completed - lr_warmup_steps))
+				if auto_stopped:
+					break
+			if not persistent_optimizer:
+				self.optimizer = None
+				self.optimizer_key = None
+				self.lr_autoscale = None
+		with torch.no_grad():
+			uv = self._uv(active_level=int(sample_level))
+			active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=stacked_valid, uv=uv)
+			loss, terms = _self_map_objective_for_uv(
+				uv=uv,
+				mode=self.mode,
+				direction=self.direction,
+				model_xyz=stacked_xyz,
+				model_normals=stacked_normals,
+				model_valid=stacked_valid,
+				cfg=stage_cfg,
+				level=int(sample_level),
+				need_stats=True,
+				active_quad=active,
+			)
+		stats = self._stats_from_terms(loss, terms)
+		stats["snaps_map_lr"] = _optimizer_lr_for_display(opt if params and int(stage.steps) > 0 else None, float(stage.lr))
+		stats["snaps_map_stage_steps"] = float(steps_completed)
+		stats["snaps_map_auto_stopped"] = 1.0 if auto_stopped else 0.0
+		stats.update(_lr_autoscale_stats("snaps_map", lr_autoscale))
+		self.last = stats
+		return stats
+
+	def _snap_inputs(
+		self,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+		self._ensure_model(model_xyz, snap_surf_config_from_global_config(self.cfg_global), GlobalMapStageConfig(params=("map_uv_ms",)))
+		uv = self._uv().detach()
+		fixed_xyz, fixed_normals, fixed_valid = self._fixed_tensors_for(model_xyz)
+		if self.direction == "out":
+			source_xyz = fixed_xyz.detach().unsqueeze(0)
+			source_valid = fixed_valid.detach().bool().unsqueeze(0)
+			target_xyz = model_xyz[0].unsqueeze(0)
+			target_normals = model_normals[0].unsqueeze(0)
+			target_valid = model_valid[0].bool().unsqueeze(0)
+			source_trainable = False
+		else:
+			source_xyz = model_xyz[0].unsqueeze(0)
+			source_valid = model_valid[0].bool().unsqueeze(0)
+			target_xyz = fixed_xyz.detach().unsqueeze(0)
+			target_normals = fixed_normals.detach().unsqueeze(0)
+			target_valid = fixed_valid.detach().bool().unsqueeze(0)
+			source_trainable = True
+		stacked_valid = torch.cat([fixed_valid.unsqueeze(0), model_valid[0].bool().unsqueeze(0)], dim=0)
+		active = self_map_active_quads(mode=self.mode, direction=self.direction, model_valid=stacked_valid, uv=uv)
+		active_vertex = torch.zeros_like(source_valid, dtype=torch.bool)
+		if active.numel():
+			active_vertex[:, :-1, :-1] |= active
+			active_vertex[:, 1:, :-1] |= active
+			active_vertex[:, :-1, 1:] |= active
+			active_vertex[:, 1:, 1:] |= active
+		return uv, target_xyz, target_normals, target_valid, source_xyz, source_valid & active_vertex, active, source_trainable
+
+	def snap_loss_prefetch_items(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		offset: float = 1.0,
+		data=None,
+		strip_samples: int = 5,
+		**_unused,
+	) -> dict[str, torch.Tensor]:
+		if data is None:
+			return {}
+		uv, target_xyz, _target_normals, target_valid, source_xyz, source_valid, _active, _source_trainable = self._snap_inputs(
+			model_xyz,
+			model_normals,
+			model_valid,
+		)
+		depth = torch.zeros((*uv.shape[:-1], 1), device=uv.device, dtype=uv.dtype)
+		coords = torch.cat([depth, uv], dim=-1)
+		target_ok = _quad_valid_at_coords(target_valid.bool(), coords, tuple(int(v) for v in target_valid.shape))
+		valid = source_valid & target_ok & torch.isfinite(coords).all(dim=-1) & torch.isfinite(source_xyz).all(dim=-1)
+		if not bool(valid.any().detach().cpu()):
+			return {}
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		target_pos = _sample_surface_grid(target_xyz, safe_coords)
+		sample_valid = valid & torch.isfinite(target_pos).all(dim=-1)
+		if not bool(sample_valid.any().detach().cpu()):
+			return {}
+		t = torch.linspace(0.0, 1.0, max(2, int(strip_samples)), device=model_xyz.device, dtype=model_xyz.dtype)
+		source_valid_xyz = source_xyz.detach()[sample_valid]
+		target_valid_xyz = target_pos.detach()[sample_valid]
+		strip = source_valid_xyz.unsqueeze(-2) + t.view(1, -1, 1) * (target_valid_xyz - source_valid_xyz).unsqueeze(-2)
+		return {"grad_mag": strip.reshape(1, 1, -1, 3).contiguous()}
+
+	def snap_loss(
+		self,
+		*,
+		model_xyz: torch.Tensor,
+		model_normals: torch.Tensor,
+		model_valid: torch.Tensor,
+		offset: float = 1.0,
+		data=None,
+		strip_samples: int = 5,
+		**_unused,
+	) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], dict[str, float]]:
+		offset_f = float(offset)
+		signed_offset = self_map_signed_offset(self.mode, self.direction, offset_f)
+		mode_key = ("boundary_self_winding", offset_f, signed_offset)
+		if mode_key not in self._snap_loss_mode_printed:
+			print(
+				f"[snap_surf.map_global] boundary self snap loss mode={self.mode}/{self.direction} "
+				f"offset={offset_f:.6g} signed_offset={signed_offset:.6g}",
+				flush=True,
+			)
+			self._snap_loss_mode_printed.add(mode_key)
+		uv, target_xyz, target_normals, target_valid, source_xyz, source_valid, _active, source_trainable = self._snap_inputs(
+			model_xyz,
+			model_normals,
+			model_valid,
+		)
+		depth = torch.zeros((*uv.shape[:-1], 1), device=uv.device, dtype=uv.dtype)
+		coords = torch.cat([depth, uv], dim=-1)
+		target_ok = _quad_valid_at_coords(target_valid.bool(), coords, tuple(int(v) for v in target_valid.shape))
+		valid = source_valid & target_ok & torch.isfinite(coords).all(dim=-1) & torch.isfinite(source_xyz).all(dim=-1)
+		safe_coords = torch.where(torch.isfinite(coords), coords, torch.zeros_like(coords))
+		target_pos = _sample_surface_grid(target_xyz, safe_coords)
+		target_n = torch.nn.functional.normalize(_sample_surface_grid(target_normals.detach(), safe_coords), dim=-1, eps=1.0e-8)
+		valid = valid & torch.isfinite(target_pos).all(dim=-1) & torch.isfinite(target_n).all(dim=-1)
+		z = model_xyz.sum() * 0.0
+		lm = torch.zeros(model_xyz.shape[:3], device=model_xyz.device, dtype=model_xyz.dtype).unsqueeze(1)
+		mask = torch.zeros_like(lm)
+		if not bool(valid.any().detach().cpu()):
+			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
+		source_for_residual = source_xyz if source_trainable else source_xyz.detach()
+		target_for_residual = target_pos.detach() if source_trainable else target_pos
+		signed_vox = ((target_for_residual - source_for_residual) * target_n.detach()).sum(dim=-1)
+		if data is None:
+			residual = signed_vox - signed_vox.new_tensor(signed_offset)
+			valid_final = valid
+		else:
+			strip_samples_i = max(2, int(strip_samples))
+			sample_valid = valid & torch.isfinite(target_pos).all(dim=-1) & torch.isfinite(target_n).all(dim=-1)
+			with torch.no_grad():
+				t = torch.linspace(0.0, 1.0, strip_samples_i, device=model_xyz.device, dtype=model_xyz.dtype)
+				origin = torch.tensor(data.origin_fullres, device=model_xyz.device, dtype=model_xyz.dtype)
+				spacing = torch.tensor(data._spacing_for("grad_mag"), device=model_xyz.device, dtype=model_xyz.dtype)
+				sentinel = origin - 64.0 * spacing
+				source_safe = torch.where(sample_valid.unsqueeze(-1), source_xyz.detach(), sentinel.view(1, 1, 1, 3))
+				target_safe = torch.where(sample_valid.unsqueeze(-1), target_pos.detach(), sentinel.view(1, 1, 1, 3))
+				diff = target_safe - source_safe
+				strip = source_safe.unsqueeze(-2) + t.view(1, 1, 1, strip_samples_i, 1) * diff.unsqueeze(-2)
+				N, H, W = int(source_xyz.shape[0]), int(source_xyz.shape[1]), int(source_xyz.shape[2])
+				sampled = data.grid_sample_fullres(strip.reshape(1, N * H, W * strip_samples_i, 3), channels={"grad_mag"})
+				if sampled.grad_mag is None:
+					raise RuntimeError("boundary self snap_surf_map offset mode requires grad_mag samples")
+				mag = sampled.grad_mag.detach().squeeze(0).squeeze(0).reshape(N, H, W, strip_samples_i)
+				strip_valid = (mag > 0.0).all(dim=-1)
+				mean_grad = mag.mean(dim=-1)
+				strip_len = diff.square().sum(dim=-1).sqrt()
+				int_sign = torch.sign(((target_pos.detach() - source_xyz.detach()) * target_n.detach()).sum(dim=-1))
+				signed_windings = int_sign * strip_len * mean_grad
+				winding_err = signed_windings - signed_vox.new_tensor(signed_offset)
+			valid_final = sample_valid & strip_valid
+			normal_residual = signed_vox * mean_grad
+			residual = normal_residual + (winding_err - normal_residual).detach()
+		vals = residual[valid_final]
+		if vals.numel() == 0:
+			return z, (lm,), (mask,), {"snaps_map_snap": 0.0, "snaps_map_snap_abs": 0.0, "snaps_map_snap_max": 0.0, "snaps_map_snap_samples": 0.0}
+		loss = vals.square().mean()
+		stats = {
+			"snaps_map_snap": float(loss.detach().cpu()),
+			"snaps_map_snap_abs": float(vals.detach().abs().mean().cpu()),
+			"snaps_map_snap_max": float(vals.detach().abs().max().cpu()),
+			"snaps_map_snap_samples": float(int(vals.numel())),
+		}
+		return loss, (lm,), (mask,), stats
+
+
 class GlobalMapRuntime:
 	"""Persistent global rectangular map optimizer for live snap-surf tensors."""
 
@@ -3731,6 +5247,9 @@ class GlobalMapRuntime:
 		self._external_health_cache: dict[tuple[Any, ...], tuple[torch.Tensor, dict[str, float], list[int] | None]] = {}
 		self._z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 		self._z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+		self._map_objective_cache: dict[tuple[Any, ...], Any] = {}
+		self._fixture_exports_done: set[str] = set()
+		self.last_fixture: MapFixture | None = None
 
 	def _z_lift_for_stage(
 		self,
@@ -3812,6 +5331,7 @@ class GlobalMapRuntime:
 		status_fn=None,
 		cancel_fn=None,
 		auto_stop_fn=None,
+		map_fixture: MapFixture | None = None,
 	) -> dict[str, float]:
 		cache_stats: _CacheStats = {
 			"zext_hit": 0,
@@ -3825,17 +5345,21 @@ class GlobalMapRuntime:
 		startup_health_s = 0.0
 		startup_z_lift_s = 0.0
 		startup_initial_eval_s = 0.0
-		fixture = _fixture_from_live_tensors(
-			model_xyz=model_xyz,
-			model_normals=model_normals,
-			model_valid=model_valid,
-			ext_xyz=ext_xyz,
-			ext_valid=ext_valid,
-			ext_normals=ext_normals,
-			ext_quad_valid=ext_quad_valid,
-			seed_xyz=self.seed_xyz,
-			sign=self.sign,
-		)
+		if map_fixture is None:
+			fixture = _fixture_from_live_tensors(
+				model_xyz=model_xyz,
+				model_normals=model_normals,
+				model_valid=model_valid,
+				ext_xyz=ext_xyz,
+				ext_valid=ext_valid,
+				ext_normals=ext_normals,
+				ext_quad_valid=ext_quad_valid,
+				seed_xyz=self.seed_xyz,
+				sign=self.sign,
+			)
+		else:
+			fixture = replace(map_fixture, metadata=dict(map_fixture.metadata))
+		fixture_source = replace(fixture, metadata=dict(fixture.metadata))
 		base_cfg = snap_surf_config_from_global_config(self.cfg_global, stage)
 		_t_startup = time.perf_counter()
 		fixture = _apply_external_quad_health_filter(
@@ -3846,6 +5370,7 @@ class GlobalMapRuntime:
 			cache=self._external_health_cache,
 			cache_stats=cache_stats,
 		)
+		self.last_fixture = replace(fixture, metadata=dict(fixture.metadata))
 		startup_health_s = time.perf_counter() - _t_startup
 		cache_stats["health_ms"] = float(cache_stats.get("health_ms", 0.0)) + 1000.0 * float(startup_health_s)
 		stage_cfg = _stage_loss_cfg(base_cfg, stage)
@@ -3890,7 +5415,11 @@ class GlobalMapRuntime:
 			)
 			if seed_result is not None:
 				self.sign = int(seed_result.sign)
-		if _is_affine_init_scan(stage):
+		if _is_affine_init_scan(stage) or (
+			"affine" in stage.params and
+			not _is_affine_seed_quad_init(stage) and
+			bool(_affine_multistart_cfg(self.cfg_global, stage).get("enabled", False))
+		):
 			seed_result = _run_affine_multistart(
 				cfg_global=self.cfg_global,
 				stage=stage,
@@ -3917,6 +5446,14 @@ class GlobalMapRuntime:
 		params, train_level = self._params_for_stage(stage)
 		sample_level = _stage_objective_level(stage, train_level, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
 		stage_active_quad = _level_active_quad(_full_active_quad(fixture), int(sample_level))
+		objective_cache_key_prefix = (
+			"runtime",
+			int(mesh_epoch),
+			int(external_surface_index),
+			int(sample_level),
+			int(self.sign),
+			stage.name or _stage_param_label(stage.params, fallback="map_stage"),
+		)
 		startup_initial_eval_s = 0.0
 		startup_timing_printed = False
 		def _maybe_print_startup_timing() -> None:
@@ -4009,6 +5546,8 @@ class GlobalMapRuntime:
 					w_station=w_station,
 					z_lift=stage_z_lift,
 					active_quad=stage_active_quad,
+					runtime_cache=self._map_objective_cache,
+					cache_key_prefix=objective_cache_key_prefix,
 				)
 			return _stats_from_eval(loss_f, terms, err)
 
@@ -4061,9 +5600,11 @@ class GlobalMapRuntime:
 					z_lift=stage_z_lift,
 					need_stats=status_due,
 					active_quad=stage_active_quad,
+					runtime_cache=self._map_objective_cache,
+					cache_key_prefix=objective_cache_key_prefix,
 				)
 				if w_station > 0.0:
-					station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target)
+					station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target, active_quad=stage_active_quad)
 					loss = loss + w_station * station_raw
 				else:
 					station_raw = loss.new_zeros(())
@@ -4136,6 +5677,48 @@ class GlobalMapRuntime:
 					**stats,
 				},
 			)
+		export_spec = _map_fixture_export_spec(stage)
+		if export_spec is not None:
+			export_dir = Path(str(export_spec["dir"]))
+			export_key = str(export_dir.resolve()) if export_dir.is_absolute() else str(export_dir)
+			if (not bool(export_spec["once"])) or export_key not in self._fixture_exports_done:
+				final_uv = self._uv(active_level=0).detach()
+				state = _surface_state_for_fixture_export(
+					fixture=fixture,
+					uv=final_uv,
+					active_quad=_full_active_quad(fixture),
+					sign=int(self.sign),
+				)
+				export_meta = export_map_fixture(
+					export_dir,
+					cfg=stage_cfg,
+					state=state,
+					model_xyz=fixture.model_xyz,
+					model_valid=fixture.model_valid,
+					model_normals=fixture.model_normals,
+					ext_xyz=fixture_source.ext_xyz,
+					ext_valid=fixture_source.ext_valid,
+					ext_normals=fixture_source.ext_normals,
+					ext_quad_valid=fixture_source.ext_quad_valid,
+					seed_xyz=tuple(float(v) for v in fixture_source.metadata.get("seed_xyz", (0.0, 0.0, 0.0))),
+					surface_index=int(external_surface_index),
+					surface_count=1,
+					step=int(self.steps_run),
+					stats=stats,
+					export_objs=bool(export_spec["objs"]),
+					write_geometry=bool(export_spec["geometry"]),
+				)
+				self._fixture_exports_done.add(export_key)
+				stats["snaps_map_fixture_exported"] = 1.0
+				stats["snaps_map_fixture_export_active_quads"] = float(export_meta.get("map_counts", {}).get("active_quads", 0))
+				print(
+					f"[snap_surf.map_global] exported map fixture dir={export_dir} "
+					f"stage={stage.name or _stage_param_label(stage.params, fallback='map_stage')} "
+					f"step={int(self.steps_run)}",
+					flush=True,
+				)
+			else:
+				stats["snaps_map_fixture_exported"] = 0.0
 		return stats
 
 	def snap_loss_prefetch_items(
@@ -4335,280 +5918,110 @@ def optimize_fixture(
 	device_t = torch.device(str(device))
 	fixture = load_map_fixture(fixture_dir, device=device_t)
 	cfg_global = parse_global_map_config(config_path)
-	base_cfg = snap_surf_config_from_global_config(cfg_global)
-	fixture = _apply_external_quad_health_filter(fixture, base_cfg, label="fixture")
-	fixture_z_lift_external_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
-	fixture_z_lift_model_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
-	dtype = fixture.model_xyz.dtype
-	seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
-	seed_uv = _seed_model_uv(fixture, seed_hw)
-	initial_affine = _affine_from_linear(seed_hw, seed_uv, torch.eye(2, device=device_t, dtype=dtype))
-	affine = AffineMapModel(
-		ext_shape=tuple(int(v) for v in fixture.ext_xyz.shape[:2]),
-		device=device_t,
-		dtype=dtype,
-		initial=initial_affine,
-	)
-	global_model: GlobalMapModel | None = None
-	station_target = affine.eval_at(seed_hw).detach()
-	history: list[dict[str, Any]] = []
-	full_active = _full_active_quad(fixture)
 	out = Path(out_dir)
 	out.mkdir(parents=True, exist_ok=True)
-	progress_rows = 0
-	progress_widths_run = _global_progress_widths(cfg_global)
-	first_affine_stage = next((stage for stage in cfg_global.stages if "affine" in stage.params), None)
-	if first_affine_stage is not None:
-		_print_reference_affine_diagnostic(
-			affine=affine,
-			fixture=fixture,
-			stage_cfg=_stage_loss_cfg(snap_surf_config_from_global_config(cfg_global, first_affine_stage), first_affine_stage),
-			seed_hw=seed_hw,
-			station_target=station_target,
-		)
+	seed_xyz_raw = fixture.metadata.get("seed_xyz", (0.0, 0.0, 0.0))
+	seed_xyz = tuple(float(v) for v in seed_xyz_raw[:3]) if isinstance(seed_xyz_raw, (list, tuple)) and len(seed_xyz_raw) >= 3 else None
+	runtime = GlobalMapRuntime(base=cfg_global.base, seed_xyz=seed_xyz)
+	runtime.cfg_global = cfg_global
+	runtime.sign = int(fixture.metadata.get("sign", 1) or 1)
+	history: list[dict[str, Any]] = []
+	dtype = fixture.model_xyz.dtype
+	seed_hw = _seed_ext_hw(fixture.metadata, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), device=device_t, dtype=dtype)
 
-	for stage_idx, stage in enumerate(cfg_global.stages):
-		stage_cfg = _stage_loss_cfg(snap_surf_config_from_global_config(cfg_global, stage), stage)
-		w_station = _stage_station_weight(cfg_global, stage)
-		if _is_affine_seed_quad_init(stage):
-			write_stage_objs = _obj_outputs_enabled(cfg_global, stage)
-			progress_rows += _run_affine_seed_quad_init(
-				stage_idx=stage_idx,
-				stage=stage,
-				affine=affine,
-				fixture=fixture,
-				stage_cfg=stage_cfg,
-				seed_hw=seed_hw,
-				station_target=station_target,
-				w_station=w_station,
-				progress_widths_run=progress_widths_run,
-				progress_row_idx=progress_rows,
-				out_root=out,
-				write_objs=write_stage_objs,
+	def _stage_with_fixture_output_paths(stage: GlobalMapStageConfig) -> GlobalMapStageConfig:
+		args = dict(stage.args)
+		export_spec = _map_fixture_export_spec(stage)
+		if export_spec is not None:
+			export_dir = Path(str(export_spec["dir"]))
+			if not export_dir.is_absolute():
+				export_dir = out / export_dir
+			args["export_fixture"] = {
+				"dir": str(export_dir),
+				"once": bool(export_spec["once"]),
+				"objs": bool(export_spec["objs"]),
+				"geometry": bool(export_spec["geometry"]),
+			}
+		debug_obj_dir = args.get("debug_obj_dir", None)
+		if debug_obj_dir not in (None, "", False):
+			if isinstance(debug_obj_dir, bool):
+				args["debug_obj_dir"] = str(out / "snap_surf_objs")
+			else:
+				debug_dir = Path(str(debug_obj_dir))
+				if not debug_dir.is_absolute():
+					debug_dir = out / debug_dir
+				args["debug_obj_dir"] = str(debug_dir)
+		return replace(stage, args=args)
+
+	for stage_idx, stage_raw in enumerate(cfg_global.stages):
+		stage = _stage_with_fixture_output_paths(stage_raw)
+		stage_label = stage.name or f"stage{stage_idx}"
+		status_printer = MapRuntimeStatusPrinter(label=stage_label, total_steps=int(stage.steps))
+		def _status_fn(*, step: int, total: int, stats: dict[str, float], _stage_idx: int = stage_idx, _stage: GlobalMapStageConfig = stage) -> None:
+			params, train_level = runtime._params_for_stage(_stage)
+			_ = params
+			status_printer.print(
+				step=int(step),
+				total=int(total),
+				stats=stats,
+				fallback_lr=float(_stage.lr),
 			)
-			stage_uv = affine().detach()
-			err = _fixture_mapping_error(stage_uv, fixture)
 			history.append({
-				"stage": stage_idx,
-				"name": stage.name,
-				"step": int(stage.steps),
-				"params": list(_public_stage_params(stage.params)),
-				"train_min_level": 0,
-				**err,
+				"stage": _stage_idx,
+				"name": _stage.name,
+				"step": int(step),
+				"params": list(_public_stage_params(_stage.params)),
+				"train_min_level": int(train_level),
+				"loss": float(stats.get("snaps_map_loss", 0.0)),
+				"avg_model_quad_distance": float(stats.get("snaps_map_avg", 0.0)),
+				"max_model_quad_distance": float(stats.get("snaps_map_max", 0.0)),
+				"mapping_error_samples": float(stats.get("snaps_map_samples", 0.0)),
+				"stats": dict(stats),
 			})
-			if write_stage_objs:
-				_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
-			continue
-		if _is_affine_init_scan(stage):
-			_run_affine_multistart(
-				cfg_global=cfg_global,
-				stage=stage,
-				affine=affine,
-				fixture=fixture,
-				stage_cfg=stage_cfg,
-				seed_hw=seed_hw,
-				station_target=station_target,
-				w_station=w_station,
-			)
-			stage_uv = affine().detach()
-			err = _fixture_mapping_error(stage_uv, fixture)
-			history.append({
-				"stage": stage_idx,
-				"name": stage.name,
-				"step": 0,
-				"params": list(_public_stage_params(stage.params)),
-				"train_min_level": 0,
-				**err,
-			})
-			if _obj_outputs_enabled(cfg_global, stage):
-				_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
-			continue
-		params: list[torch.nn.Parameter] = []
-		max_level = _max_supported_level(tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(stage.min_scaledown))
-		level = min(int(stage.min_scaledown), max_level)
-		if "affine" in stage.params:
-			params.append(affine.affine)
-		if "map_uv_ms" in stage.params:
-			if global_model is None:
-				levels = _max_supported_level(tuple(int(v) for v in fixture.ext_xyz.shape[:2]), max(int(stage.min_scaledown), int(base_cfg.map_init.scale_levels) - 1)) + 1
-				station_target = affine.eval_at(seed_hw).detach()
-				global_model = GlobalMapModel(affine().detach(), levels=levels, factor=2)
-			level = min(level, len(global_model.map_uv_ms) - 1)
-			params.extend(list(global_model.map_uv_ms.parameters())[level:])
-		if not params or int(stage.steps) <= 0:
-			continue
-		if "affine" in stage.params:
-			_run_affine_multistart(
-				cfg_global=cfg_global,
-				stage=stage,
-				affine=affine,
-				fixture=fixture,
-				stage_cfg=stage_cfg,
-				seed_hw=seed_hw,
-				station_target=station_target,
-				w_station=w_station,
-			)
-		stage_cache_stats: _CacheStats = {}
-		stage_z_lift = _map_init_z_lift_for_fixture(
-			fixture,
-			stage_cfg,
-			sign=int(fixture.metadata.get("sign", 1) or 1),
+
+		stats = runtime.run_stage(
+			stage=stage,
+			model_xyz=fixture.model_xyz,
+			model_normals=fixture.model_normals,
+			model_valid=fixture.model_valid,
+			ext_xyz=fixture.ext_xyz,
+			ext_valid=fixture.ext_valid,
+			ext_normals=fixture.ext_normals,
+			ext_quad_valid=fixture.ext_quad_valid,
 			external_surface_index=0,
 			mesh_epoch=0,
-			external_cache=fixture_z_lift_external_cache,
-			model_cache=fixture_z_lift_model_cache,
-			cache_stats=stage_cache_stats,
+			persistent_optimizer=False,
+			status_fn=_status_fn,
+			map_fixture=fixture,
 		)
-		sample_level = _stage_objective_level(stage, level, tuple(int(v) for v in fixture.ext_xyz.shape[:2]))
-		stage_active_quad = _level_active_quad(_full_active_quad(fixture), int(sample_level))
-		opt = torch.optim.Adam(params, lr=float(stage.lr))
-		_capture_optimizer_target_lrs(opt)
-		status_interval = max(0, int(stage.args.get("status_interval", stage.args.get("debug_print_interval", 100))))
-		lr_warmup_steps = _lr_warmup_steps(stage.args)
-		lr_autoscale = _make_lr_autoscale_state(stage.args)
-		last_status_time: float | None = None
-		last_status_step = 0
-		with torch.no_grad():
-			if "map_uv_ms" in stage.params and global_model is not None:
-				uv_report = global_model(active_level=int(sample_level))
-			else:
-				uv_report = _affine_uv_for_level(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(sample_level))
-			report_loss, report_terms, report_err = _global_progress_state(
-				uv=uv_report,
-				fixture=fixture,
-				cfg=stage_cfg,
-				level=int(sample_level),
-				seed_hw=seed_hw,
-				station_target=station_target,
-				w_station=w_station,
-				z_lift=stage_z_lift,
-				active_quad=stage_active_quad,
-			)
-		_print_global_progress(
-			row_idx=progress_rows,
-			widths=progress_widths_run,
-			stage_idx=stage_idx,
-			iter_label=f"0/{int(stage.steps)}",
-			lr=float(stage.lr),
-			level=level,
-			loss=report_loss,
-			terms=report_terms,
-			it_s=None,
-			err=report_err,
-		)
-		progress_rows += 1
-		for step in range(int(stage.steps)):
-			opt.zero_grad(set_to_none=True)
-			if "map_uv_ms" in stage.params and global_model is not None:
-				uv = global_model(active_level=int(sample_level))
-			else:
-				uv = _affine_uv_for_level(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(sample_level))
-			loss, _terms = _objective_for_uv(
-				uv=uv,
-				fixture=fixture,
-				cfg=stage_cfg,
-				level=int(sample_level),
-				z_lift=stage_z_lift,
-				need_stats=False,
-				active_quad=stage_active_quad,
-			)
-			station_raw = loss.new_zeros(())
-			if w_station > 0.0:
-				station_raw = _station_loss(uv, _level_seed_hw(seed_hw, int(sample_level)), station_target)
-				loss = loss + w_station * station_raw
-			loss.backward()
-			_apply_optimizer_lr_schedule(
-				opt,
-				step1=step + 1,
-				warmup_steps=lr_warmup_steps,
-				autoscale=lr_autoscale,
-				loss=loss,
-			)
-			opt.step()
-			with torch.no_grad():
-				if "map_uv_ms" in stage.params and global_model is not None:
-					uv_after = global_model(active_level=int(sample_level))
-				else:
-					uv_after = _affine_uv_for_level(affine, tuple(int(v) for v in fixture.ext_xyz.shape[:2]), int(sample_level))
-			step1 = step + 1
-			status_due = (
-				step == 0 or
-				step1 == int(stage.steps) or
-				(status_interval > 0 and (step1 % status_interval) == 0)
-			)
-			if status_due:
-				report_loss, report_terms, err = _global_progress_state(
-					uv=uv_after,
-					fixture=fixture,
-					cfg=stage_cfg,
-					level=int(sample_level),
-					seed_hw=seed_hw,
-					station_target=station_target,
-					w_station=w_station,
-					z_lift=stage_z_lift,
-					active_quad=stage_active_quad,
-				)
-				now = time.monotonic()
-				it_s = None
-				if last_status_time is not None:
-					it_s = float(step1 - last_status_step) / max(1.0e-9, now - last_status_time)
-				last_status_time = now
-				last_status_step = step1
-				_print_global_progress(
-					row_idx=progress_rows,
-					widths=progress_widths_run,
-					stage_idx=stage_idx,
-					iter_label=f"{step1}/{int(stage.steps)}",
-					lr=_optimizer_lr_for_display(opt, float(stage.lr)),
-					level=level,
-					loss=report_loss,
-					terms=report_terms,
-					it_s=it_s,
-					err=err,
-				)
-				progress_rows += 1
-				if step == int(stage.steps) - 1:
-					report_loss, report_terms, err = _global_progress_state(
-						uv=uv_after,
-						fixture=fixture,
-						cfg=stage_cfg,
-						level=int(sample_level),
-						seed_hw=seed_hw,
-						station_target=station_target,
-						w_station=w_station,
-						z_lift=stage_z_lift,
-						active_quad=stage_active_quad,
-					)
-				history.append({
-					"stage": stage_idx,
-					"step": step,
-					"params": list(_public_stage_params(stage.params)),
-					"train_min_level": level,
-					"loss": report_loss,
-					**err,
-					"terms": {k: float(v.detach().cpu()) for k, v in report_terms.items() if v.ndim == 0},
-				})
-		if "map_uv_ms" in stage.params and global_model is not None:
-			stage_uv = global_model(active_level=0).detach()
-		else:
-			stage_uv = affine().detach()
+		final_uv_stage = runtime._uv(active_level=0).detach()
+		err = _fixture_mapping_error(final_uv_stage, fixture)
+		history.append({
+			"stage": stage_idx,
+			"name": stage.name,
+			"step": int(stats.get("snaps_map_stage_steps", stage.steps)),
+			"params": list(_public_stage_params(stage.params)),
+			"loss": float(stats.get("snaps_map_loss", 0.0)),
+			**err,
+		})
 		if _obj_outputs_enabled(cfg_global, stage):
-			_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=stage_uv, fixture=fixture)
+			_write_stage_objs(out, stage_idx=stage_idx, stage=stage, uv=final_uv_stage, fixture=fixture)
 
-	final_uv = global_model(active_level=0).detach() if global_model is not None else affine().detach()
-	if _obj_outputs_enabled(cfg_global):
+	final_uv = runtime._uv(active_level=0).detach()
+	if _obj_outputs_enabled(cfg_global) or any(_obj_outputs_enabled(cfg_global, stage) for stage in cfg_global.stages):
 		_write_map_objs(
 			out / "objs" / "final",
 			uv=final_uv,
 			fixture=fixture,
 			meta={
 				"name": "final",
-				"params": ["map_surf_ms"] if global_model is not None else ["map_surf_affine"],
+				"params": ["map_surf_ms"] if runtime.global_model is not None else ["map_surf_affine"],
 				"stages_completed": len(cfg_global.stages),
 			},
 		)
 	_float_tif(out / "model_x.tif", final_uv[..., 1])
 	_float_tif(out / "model_y.tif", final_uv[..., 0])
+	full_active = _full_active_quad(fixture)
 	meta = {
 		"kind": "snap_surf_global_map",
 		"fixture_dir": str(Path(fixture_dir)),
@@ -4616,10 +6029,10 @@ def optimize_fixture(
 		"ext_shape": [int(v) for v in fixture.ext_xyz.shape[:2]],
 		"model_shape": [int(v) for v in fixture.model_xyz.shape[:3]],
 		"active_quads": int(full_active.sum().detach().cpu()),
-		"affine": affine.affine.detach().cpu(),
+		"affine": runtime.affine.affine.detach().cpu() if runtime.affine is not None else None,
 		"station_seed_ext_hw": seed_hw.detach().cpu(),
-		"station_target_uv": station_target.detach().cpu(),
-		"sign": int(fixture.metadata.get("sign", 1) or 1),
+		"station_target_uv": runtime.station_target.detach().cpu() if runtime.station_target is not None else None,
+		"sign": int(runtime.sign),
 		"sign_semantics": "model_normal_alignment",
 		"seed_quad_init": fixture.metadata.get("seed_quad_init"),
 		"stages": [asdict(stage) for stage in cfg_global.stages],
@@ -4663,6 +6076,696 @@ def _global_metrics(uv: torch.Tensor, fixture: MapFixture) -> dict[str, Any]:
 		"model_x_rms_delta": float(rms[1].detach().cpu()),
 		"model_l2_max_delta": float(max_l2.detach().cpu()),
 	}
+
+
+def _reference_map_tensors(
+	reference_dir: str | Path | None,
+	fixture: MapFixture,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
+	if reference_dir is None:
+		return fixture.reference_uv, fixture.reference_active_quad, fixture.reference_blocked_quad, str(fixture.root)
+	root = Path(reference_dir)
+	if (root / "fixture.json").exists():
+		ref_fixture = load_map_fixture(root, device=fixture.reference_uv.device)
+		return ref_fixture.reference_uv, ref_fixture.reference_active_quad, ref_fixture.reference_blocked_quad, str(root)
+	map_root = root / "map" if (root / "map" / "model_x.tif").exists() else root
+	import tifffile
+
+	model_x = torch.as_tensor(tifffile.imread(str(map_root / "model_x.tif")), device=fixture.reference_uv.device, dtype=fixture.reference_uv.dtype)
+	model_y = torch.as_tensor(tifffile.imread(str(map_root / "model_y.tif")), device=fixture.reference_uv.device, dtype=fixture.reference_uv.dtype)
+	reference_uv = torch.stack([model_y, model_x], dim=-1)
+	active_path = map_root / "active_quad.tif"
+	blocked_path = map_root / "blocked_quad.tif"
+	if active_path.exists():
+		reference_active_quad = torch.as_tensor(tifffile.imread(str(active_path)), device=fixture.reference_uv.device).bool()
+	else:
+		reference_active_quad = fixture.reference_active_quad
+	if blocked_path.exists():
+		reference_blocked_quad = torch.as_tensor(tifffile.imread(str(blocked_path)), device=fixture.reference_uv.device).bool()
+	else:
+		reference_blocked_quad = torch.zeros_like(reference_active_quad)
+	return reference_uv, reference_active_quad, reference_blocked_quad, str(root)
+
+
+def _benchmark_device_metadata(device: torch.device) -> dict[str, Any]:
+	meta: dict[str, Any] = {
+		"device": str(device),
+		"torch_version": str(torch.__version__),
+		"cuda_available": bool(torch.cuda.is_available()),
+	}
+	if device.type == "cuda":
+		idx = 0 if device.index is None else int(device.index)
+		meta.update({
+			"cuda_device_index": idx,
+			"cuda_device_name": torch.cuda.get_device_name(idx),
+			"cuda_version": torch.version.cuda,
+		})
+	return meta
+
+
+def benchmark_fixture(
+	fixture_dir: str | Path,
+	config_path: str | Path,
+	*,
+	out_dir: str | Path,
+	device: torch.device | str = "cpu",
+	reference_dir: str | Path | None = None,
+	max_model_abs_delta: float = 2.0,
+	max_model_l2_delta: float = 2.0,
+	max_model_l2_mean_delta: float = 0.05,
+	max_model_l2_mse_delta: float = 0.005,
+	max_model_valid_miss_frac: float = 0.01,
+	require_mask_equal: bool = True,
+	profile_components: bool = False,
+	profile_repeats: int = 3,
+	profile_stage: str | int | None = None,
+	profiler_trace: str | Path | None = None,
+) -> dict[str, Any]:
+	device_t = torch.device(str(device))
+	out = Path(out_dir)
+	out.mkdir(parents=True, exist_ok=True)
+	if device_t.type == "cuda":
+		torch.cuda.synchronize(device_t)
+	start = time.perf_counter()
+	metrics = optimize_fixture(fixture_dir, config_path, out_dir=out, device=device_t)
+	if device_t.type == "cuda":
+		torch.cuda.synchronize(device_t)
+	elapsed_s = time.perf_counter() - start
+	fixture = load_map_fixture(fixture_dir, device=device_t)
+	fixture = _apply_external_quad_health_filter(fixture, snap_surf_config_from_global_config(parse_global_map_config(config_path)), label="benchmark")
+	import tifffile
+
+	model_x = torch.as_tensor(tifffile.imread(str(out / "model_x.tif")), device=device_t, dtype=fixture.reference_uv.dtype)
+	model_y = torch.as_tensor(tifffile.imread(str(out / "model_y.tif")), device=device_t, dtype=fixture.reference_uv.dtype)
+	rerun_uv = torch.stack([model_y, model_x], dim=-1)
+	rerun_active = _full_active_quad(fixture)
+	rerun_blocked = torch.zeros_like(rerun_active)
+	ref_uv, ref_active, ref_blocked, ref_label = _reference_map_tensors(reference_dir, fixture)
+	compare = compare_map_tensors(
+		reference_uv=ref_uv.to(device=device_t, dtype=rerun_uv.dtype),
+		reference_active_quad=ref_active.to(device=device_t).bool(),
+		reference_blocked_quad=ref_blocked.to(device=device_t).bool(),
+		rerun_uv=rerun_uv,
+		rerun_active_quad=rerun_active,
+		rerun_blocked_quad=rerun_blocked,
+		model_valid=fixture.model_valid,
+		model_depth=int(fixture.metadata.get("model_depth", 0) or 0),
+	)
+	thresholds = {
+		"max_model_abs_delta": float(max_model_abs_delta),
+		"max_model_l2_delta": float(max_model_l2_delta),
+		"max_model_l2_mean_delta": float(max_model_l2_mean_delta),
+		"max_model_l2_mse_delta": float(max_model_l2_mse_delta),
+		"max_model_valid_miss_frac": float(max_model_valid_miss_frac),
+		"require_mask_equal": bool(require_mask_equal),
+	}
+	max_abs_observed = max(float(compare["model_y_max_abs_delta"]), float(compare["model_x_max_abs_delta"]))
+	passed = (
+		max_abs_observed <= float(max_model_abs_delta) and
+		float(compare["model_l2_max_delta"]) <= float(max_model_l2_delta) and
+		float(compare["model_l2_mean_delta"]) <= float(max_model_l2_mean_delta) and
+		float(compare["model_l2_mse_delta"]) <= float(max_model_l2_mse_delta) and
+		float(compare["model_valid_missed_frac"]) <= float(max_model_valid_miss_frac) and
+		((not bool(require_mask_equal)) or (bool(compare["active_quad_equal"]) and bool(compare["blocked_quad_equal"])))
+	)
+	profile_rows: list[dict[str, Any]] = []
+	if bool(profile_components):
+		profile_rows = profile_fixture_components(
+			fixture_dir,
+			config_path,
+			out_dir=out,
+			device=device_t,
+			repeats=int(profile_repeats),
+			stage=profile_stage,
+			profiler_trace=profiler_trace,
+		)
+	result = {
+		"kind": "snap_surf_map_benchmark",
+		"fixture_dir": str(Path(fixture_dir)),
+		"config_path": str(Path(config_path)),
+		"out_dir": str(out),
+		"reference_dir": ref_label,
+		"elapsed_s": float(elapsed_s),
+		"device": _benchmark_device_metadata(device_t),
+		"thresholds": thresholds,
+		"passed": bool(passed),
+		"status": "pass" if bool(passed) else "fail",
+		"optimizer_metrics": metrics,
+		"map_deltas": compare,
+		"profile_components": profile_rows,
+	}
+	_write_json(out / "benchmark.json", result)
+	return result
+
+
+_PROFILE_COMPONENT_WEIGHTS: dict[str, dict[str, float]] = {
+	"dist": {"w_dist": 1.0},
+	"vec": {"w_vec_normal": 1.0},
+	"norm": {"w_surface_normal": 1.0},
+	"turn": {"w_z_lift": 1.0},
+	"smooth": {"w_smooth": 1.0},
+	"bend": {"w_bend": 1.0},
+	"jac": {"w_jac": 1.0},
+	"metric_smooth": {"w_metric_smooth": 1.0},
+	"area_smooth": {"w_area_smooth": 1.0},
+	"prior": {"w_dense_prior": 1.0},
+}
+
+
+def _profile_component_cfg(stage_cfg: SnapSurfConfig, component: str) -> SnapSurfConfig:
+	if component == "all":
+		return stage_cfg
+	zeroed = {
+		"w_dist": 0.0,
+		"w_vec_normal": 0.0,
+		"w_surface_normal": 0.0,
+		"w_z_lift": 0.0,
+		"w_smooth": 0.0,
+		"w_bend": 0.0,
+		"w_jac": 0.0,
+		"w_metric_smooth": 0.0,
+		"w_area_smooth": 0.0,
+		"w_dense_prior": 0.0,
+	}
+	if component.startswith("without_"):
+		removed = component.removeprefix("without_")
+		if removed not in _PROFILE_COMPONENT_WEIGHTS:
+			raise KeyError(removed)
+		enabled = {
+			"w_dist": float(stage_cfg.map_init.w_dist),
+			"w_vec_normal": float(stage_cfg.map_init.w_vec_normal),
+			"w_surface_normal": float(stage_cfg.map_init.w_surface_normal),
+			"w_z_lift": float(stage_cfg.map_init.w_z_lift),
+			"w_smooth": float(stage_cfg.map_init.w_smooth),
+			"w_bend": float(stage_cfg.map_init.w_bend),
+			"w_jac": float(stage_cfg.map_init.w_jac),
+			"w_metric_smooth": float(stage_cfg.map_init.w_metric_smooth),
+			"w_area_smooth": float(stage_cfg.map_init.w_area_smooth),
+			"w_dense_prior": float(stage_cfg.map_init.w_dense_prior),
+		}
+		enabled.update({key: 0.0 for key in _PROFILE_COMPONENT_WEIGHTS[removed]})
+		zeroed.update(enabled)
+	elif component != "none":
+		zeroed.update(_PROFILE_COMPONENT_WEIGHTS[component])
+	if component != "turn":
+		zeroed["z_lift_enabled"] = bool(stage_cfg.map_init.z_lift_enabled)
+	return replace(stage_cfg, map_init=replace(stage_cfg.map_init, **zeroed))
+
+
+def _profile_stage_selected(stage: GlobalMapStageConfig, stage_idx: int, selector: str | int | None) -> bool:
+	if selector is None:
+		return True
+	if isinstance(selector, int):
+		return int(stage_idx) == int(selector)
+	raw = str(selector)
+	if raw.isdigit():
+		return int(stage_idx) == int(raw)
+	return str(stage.name) == raw
+
+
+def _snapshot_parameters(params: list[torch.nn.Parameter]) -> list[torch.Tensor]:
+	return [p.detach().clone() for p in params]
+
+
+def _assert_parameters_unchanged(params: list[torch.nn.Parameter], before: list[torch.Tensor]) -> None:
+	for i, (p, old) in enumerate(zip(params, before)):
+		if not bool(torch.equal(p.detach(), old)):
+			raise RuntimeError(f"profile changed optimizer parameter {i}")
+
+
+def _time_profile_component(
+	*,
+	component: str,
+	repeats: int,
+	uv_fn: Any,
+	params: list[torch.nn.Parameter],
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	level: int,
+	z_lift: dict[str, Any] | None | object,
+	active_quad: torch.Tensor,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+) -> dict[str, Any]:
+	times: list[float] = []
+	loss_value = 0.0
+	for _ in range(max(1, int(repeats))):
+		for p in params:
+			p.grad = None
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		start = time.perf_counter()
+		uv = uv_fn()
+		loss, terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=cfg,
+			level=int(level),
+			z_lift=z_lift,
+			need_stats=False,
+			active_quad=active_quad,
+			runtime_cache=runtime_cache,
+			cache_key_prefix=cache_key_prefix,
+		)
+		loss.backward()
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		times.append(time.perf_counter() - start)
+		loss_value = float(terms["loss"].detach().cpu())
+	for p in params:
+		p.grad = None
+	times_sorted = sorted(times)
+	n = len(times_sorted)
+	return {
+		"component": component,
+		"repeats": int(n),
+		"loss": float(loss_value),
+		"mean_s": float(sum(times) / max(1, len(times))),
+		"min_s": float(times_sorted[0]),
+		"median_s": float(times_sorted[n // 2]),
+		"max_s": float(times_sorted[-1]),
+	}
+
+
+def _profile_timing_row(component: str, times: list[float], *, loss_value: float = 0.0) -> dict[str, Any]:
+	times_sorted = sorted(times)
+	n = len(times_sorted)
+	return {
+		"component": component,
+		"repeats": int(n),
+		"loss": float(loss_value),
+		"mean_s": float(sum(times) / max(1, len(times))),
+		"min_s": float(times_sorted[0]),
+		"median_s": float(times_sorted[n // 2]),
+		"max_s": float(times_sorted[-1]),
+	}
+
+
+def _time_profile_shared_phase(
+	*,
+	component: str,
+	repeats: int,
+	uv_fn: Any,
+	params: list[torch.nn.Parameter],
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	level: int,
+	z_lift: dict[str, Any] | None | object,
+	active_quad: torch.Tensor,
+	include_objective: bool,
+	include_backward: bool,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+) -> dict[str, Any]:
+	times: list[float] = []
+	loss_value = 0.0
+	for _ in range(max(1, int(repeats))):
+		for p in params:
+			p.grad = None
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		start = time.perf_counter()
+		uv = uv_fn()
+		if include_objective:
+			loss, terms = _objective_for_uv(
+				uv=uv,
+				fixture=fixture,
+				cfg=cfg,
+				level=int(level),
+				z_lift=z_lift,
+				need_stats=False,
+				active_quad=active_quad,
+				runtime_cache=runtime_cache,
+				cache_key_prefix=cache_key_prefix,
+			)
+			loss_value = float(terms["loss"].detach().cpu())
+			if include_backward:
+				loss.backward()
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		times.append(time.perf_counter() - start)
+	for p in params:
+		p.grad = None
+	row = _profile_timing_row(component, times, loss_value=loss_value)
+	row["profile_phase"] = component
+	row["include_objective"] = bool(include_objective)
+	row["include_backward"] = bool(include_backward)
+	return row
+
+
+def _time_profile_objective_blocks(
+	*,
+	repeats: int,
+	uv_fn: Any,
+	params: list[torch.nn.Parameter],
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	level: int,
+	z_lift: dict[str, Any] | None | object,
+	active_quad: torch.Tensor,
+	runtime_cache: dict[tuple[Any, ...], Any] | None = None,
+	cache_key_prefix: tuple[Any, ...] = (),
+) -> list[dict[str, Any]]:
+	block_times: dict[str, list[float]] = {}
+	for _ in range(max(1, int(repeats))):
+		for p in params:
+			p.grad = None
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+		uv = uv_fn()
+		loss, _terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=cfg,
+			level=int(level),
+			z_lift=z_lift,
+			need_stats=False,
+			active_quad=active_quad,
+			profile_blocks=block_times,
+			runtime_cache=runtime_cache,
+			cache_key_prefix=cache_key_prefix,
+		)
+		loss.backward()
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+	for p in params:
+		p.grad = None
+	rows: list[dict[str, Any]] = []
+	for name in sorted(block_times):
+		row = _profile_timing_row(name, block_times[name])
+		row["block"] = name
+		rows.append(row)
+	total = sum(float(row["mean_s"]) for row in rows)
+	for row in rows:
+		row["mean_pct_of_block_sum"] = 0.0 if total <= 0.0 else 100.0 * float(row["mean_s"]) / total
+	return rows
+
+
+def _annotate_profile_percentages(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+	if not rows:
+		return rows
+	all_row = next((row for row in rows if str(row.get("component")) == "all"), rows[0])
+	none_row = next((row for row in rows if str(row.get("component")) == "none"), None)
+	by_component = {str(row.get("component")): row for row in rows}
+	bases = {key: float(all_row.get(key, 0.0)) for key in ("mean_s", "min_s", "median_s", "max_s")}
+	overheads = {key: float(none_row.get(key, 0.0)) if none_row is not None else 0.0 for key in bases}
+	for row in rows:
+		for key, base in bases.items():
+			pct_key = key[:-2] + "_pct_of_all"
+			value = float(row.get(key, 0.0))
+			row[pct_key] = 0.0 if base <= 0.0 else 100.0 * value / base
+			net_key = key[:-2] + "_net_s"
+			net_pct_key = key[:-2] + "_net_pct_of_all"
+			net_value = max(0.0, value - overheads[key])
+			net_base = max(0.0, base - overheads[key])
+			row[net_key] = net_value
+			row[net_pct_key] = 0.0 if net_base <= 0.0 else 100.0 * net_value / net_base
+	for name in _PROFILE_COMPONENT_WEIGHTS:
+		row = by_component.get(name)
+		without = by_component.get(f"without_{name}")
+		if row is None or without is None:
+			continue
+		for key, base in bases.items():
+			delta_key = key[:-2] + "_removed_delta_s"
+			delta_pct_key = key[:-2] + "_removed_pct_of_all"
+			delta = max(0.0, base - float(without.get(key, 0.0)))
+			row[delta_key] = delta
+			row[delta_pct_key] = 0.0 if base <= 0.0 else 100.0 * delta / base
+	return rows
+
+
+def _print_profile_component_table(rows: list[dict[str, Any]]) -> None:
+	if not rows:
+		return
+	columns = (
+		("component", "component", 16, "text"),
+		("mean_s", "mean_ms", 12, "ms"),
+		("mean_net_s", "single_ms", 12, "ms"),
+		("mean_net_pct_of_all", "single%", 9, "pct"),
+		("mean_removed_delta_s", "remove_ms", 12, "ms"),
+		("mean_removed_pct_of_all", "remove%", 9, "pct"),
+		("median_s", "median_ms", 12, "ms"),
+		("median_net_s", "single_md_ms", 12, "ms"),
+		("median_removed_delta_s", "remove_md_ms", 12, "ms"),
+	)
+	print("[snap_surf.map_global] component profile", flush=True)
+	print(" ".join(label.rjust(width) for _key, label, width, _kind in columns), flush=True)
+	for row in rows:
+		values: list[str] = []
+		for key, _label, width, kind in columns:
+			if kind == "text":
+				text = str(row.get(key, ""))
+			elif kind == "pct":
+				text = f"{float(row.get(key, 0.0)):.1f}%"
+			elif kind == "ms":
+				text = f"{float(row.get(key, 0.0)) * 1000.0:.3e}"
+			else:
+				text = f"{float(row.get(key, 0.0)):.6g}"
+			values.append(text.rjust(width))
+		print(" ".join(values), flush=True)
+
+
+def _print_profile_block_table(rows: list[dict[str, Any]]) -> None:
+	if not rows:
+		return
+	columns = (
+		("block", "block", 26, "text"),
+		("mean_s", "mean_ms", 12, "ms"),
+		("mean_pct_of_block_sum", "%sum", 8, "pct"),
+		("median_s", "median_ms", 12, "ms"),
+		("min_s", "min_ms", 12, "ms"),
+		("max_s", "max_ms", 12, "ms"),
+	)
+	print("[snap_surf.map_global] objective block profile", flush=True)
+	print(" ".join(label.rjust(width) for _key, label, width, _kind in columns), flush=True)
+	for row in rows:
+		values: list[str] = []
+		for key, _label, width, kind in columns:
+			if kind == "text":
+				text = str(row.get(key, ""))
+			elif kind == "pct":
+				text = f"{float(row.get(key, 0.0)):.1f}%"
+			elif kind == "ms":
+				text = f"{float(row.get(key, 0.0)) * 1000.0:.3e}"
+			else:
+				text = f"{float(row.get(key, 0.0)):.6g}"
+			values.append(text.rjust(width))
+		print(" ".join(values), flush=True)
+
+
+def _write_profile_trace(
+	*,
+	path: str | Path,
+	uv_fn: Any,
+	params: list[torch.nn.Parameter],
+	fixture: MapFixture,
+	cfg: SnapSurfConfig,
+	level: int,
+	z_lift: dict[str, Any] | None | object,
+	active_quad: torch.Tensor,
+) -> None:
+	trace_path = Path(path)
+	trace_path.parent.mkdir(parents=True, exist_ok=True)
+	for p in params:
+		p.grad = None
+	activities = [torch.profiler.ProfilerActivity.CPU]
+	if fixture.model_xyz.is_cuda:
+		activities.append(torch.profiler.ProfilerActivity.CUDA)
+		torch.cuda.synchronize(fixture.model_xyz.device)
+	with torch.profiler.profile(activities=activities, record_shapes=False, profile_memory=False) as prof:
+		uv = uv_fn()
+		loss, _terms = _objective_for_uv(
+			uv=uv,
+			fixture=fixture,
+			cfg=cfg,
+			level=int(level),
+			z_lift=z_lift,
+			need_stats=False,
+			active_quad=active_quad,
+		)
+		loss.backward()
+		if fixture.model_xyz.is_cuda:
+			torch.cuda.synchronize(fixture.model_xyz.device)
+	prof.export_chrome_trace(str(trace_path))
+	for p in params:
+		p.grad = None
+
+
+def profile_fixture_components(
+	fixture_dir: str | Path,
+	config_path: str | Path,
+	*,
+	out_dir: str | Path,
+	device: torch.device | str = "cpu",
+	repeats: int = 3,
+	stage: str | int | None = None,
+	profiler_trace: str | Path | None = None,
+) -> list[dict[str, Any]]:
+	_PRINTED_PROGRESS_LEGENDS.clear()
+	device_t = torch.device(str(device))
+	fixture = load_map_fixture(fixture_dir, device=device_t)
+	cfg_global = parse_global_map_config(config_path)
+	seed_xyz_raw = fixture.metadata.get("seed_xyz", (0.0, 0.0, 0.0))
+	seed_xyz = tuple(float(v) for v in seed_xyz_raw[:3]) if isinstance(seed_xyz_raw, (list, tuple)) and len(seed_xyz_raw) >= 3 else None
+	runtime = GlobalMapRuntime(base=cfg_global.base, seed_xyz=seed_xyz)
+	runtime.cfg_global = cfg_global
+	runtime.sign = int(fixture.metadata.get("sign", 1) or 1)
+	for stage_idx, stage_cfg_raw in enumerate(cfg_global.stages):
+		if not ("map_uv_ms" in stage_cfg_raw.params and _profile_stage_selected(stage_cfg_raw, stage_idx, stage)):
+			runtime.run_stage(
+				stage=stage_cfg_raw,
+				model_xyz=fixture.model_xyz,
+				model_normals=fixture.model_normals,
+				model_valid=fixture.model_valid,
+				ext_xyz=fixture.ext_xyz,
+				ext_valid=fixture.ext_valid,
+				ext_normals=fixture.ext_normals,
+				ext_quad_valid=fixture.ext_quad_valid,
+				external_surface_index=0,
+				mesh_epoch=0,
+				persistent_optimizer=False,
+				map_fixture=fixture,
+			)
+			continue
+
+		base_cfg = snap_surf_config_from_global_config(cfg_global, stage_cfg_raw)
+		cache_stats: _CacheStats = {
+			"zext_hit": 0,
+			"zext_miss": 0,
+			"zmdl_hit": 0,
+			"zmdl_miss": 0,
+			"health_hit": 0,
+			"health_miss": 0,
+		}
+		stage_fixture = _apply_external_quad_health_filter(
+			fixture,
+			base_cfg,
+			label="profile",
+			external_surface_index=0,
+			cache=runtime._external_health_cache,
+			cache_stats=cache_stats,
+		)
+		runtime.last_fixture = replace(stage_fixture, metadata=dict(stage_fixture.metadata))
+		runtime._ensure_models(stage_fixture, base_cfg, stage_cfg_raw)
+		params, level = runtime._params_for_stage(stage_cfg_raw)
+		if runtime.affine is None or runtime.global_model is None or not params:
+			raise ValueError("component profiling requires a map_surf_ms stage with initialized map parameters")
+		stage_cfg = _stage_loss_cfg(base_cfg, stage_cfg_raw)
+		if _truthy_arg(stage_cfg_raw.args.get("disable_z_lift", stage_cfg_raw.args.get("disable_turn", False))):
+			stage_cfg = replace(stage_cfg, map_init=replace(stage_cfg.map_init, z_lift_enabled=False, w_z_lift=0.0))
+		stage_z_lift = None if not bool(stage_cfg.map_init.z_lift_enabled) else runtime._z_lift_for_stage(
+			stage_fixture,
+			stage_cfg,
+			external_surface_index=0,
+			mesh_epoch=0,
+			cache_stats=cache_stats,
+		)
+		sample_level = _stage_objective_level(stage_cfg_raw, level, tuple(int(v) for v in stage_fixture.ext_xyz.shape[:2]))
+		stage_active_quad = _level_active_quad(_full_active_quad(stage_fixture), int(sample_level))
+		objective_cache_key_prefix = (
+			"profile_fixture",
+			int(sample_level),
+			stage_cfg_raw.name or _stage_param_label(stage_cfg_raw.params, fallback="map_stage"),
+		)
+		profile_params = list(runtime.global_model.map_uv_ms.parameters())[level:]
+		before = _snapshot_parameters([runtime.affine.affine] + list(runtime.global_model.map_uv_ms.parameters()))
+		uv_fn = lambda: runtime.global_model(active_level=int(sample_level))
+		rows: list[dict[str, Any]] = []
+		none_cfg = _profile_component_cfg(stage_cfg, "none")
+		rows.append(_time_profile_shared_phase(
+			component="uv_fwd",
+			repeats=int(repeats),
+			uv_fn=uv_fn,
+			params=profile_params,
+			fixture=stage_fixture,
+			cfg=none_cfg,
+			level=int(sample_level),
+			z_lift=stage_z_lift,
+			active_quad=stage_active_quad,
+			include_objective=False,
+			include_backward=False,
+			runtime_cache=runtime._map_objective_cache,
+			cache_key_prefix=objective_cache_key_prefix,
+		))
+		rows.append(_time_profile_shared_phase(
+			component="none_fwd",
+			repeats=int(repeats),
+			uv_fn=uv_fn,
+			params=profile_params,
+			fixture=stage_fixture,
+			cfg=none_cfg,
+			level=int(sample_level),
+			z_lift=stage_z_lift,
+			active_quad=stage_active_quad,
+			include_objective=True,
+			include_backward=False,
+			runtime_cache=runtime._map_objective_cache,
+			cache_key_prefix=objective_cache_key_prefix,
+		))
+		component_names = list(_PROFILE_COMPONENT_WEIGHTS.keys())
+		components = ["none", "all"] + component_names + [f"without_{name}" for name in component_names]
+		for component in components:
+			cfg_i = _profile_component_cfg(stage_cfg, component)
+			rows.append(_time_profile_component(
+				component=component,
+				repeats=int(repeats),
+				uv_fn=uv_fn,
+				params=profile_params,
+				fixture=stage_fixture,
+				cfg=cfg_i,
+				level=int(sample_level),
+				z_lift=stage_z_lift,
+				active_quad=stage_active_quad,
+				runtime_cache=runtime._map_objective_cache,
+				cache_key_prefix=objective_cache_key_prefix,
+			))
+		rows = _annotate_profile_percentages(rows)
+		_print_profile_component_table([
+			row for row in rows
+			if not str(row.get("component", "")).startswith("without_")
+		])
+		block_rows = _time_profile_objective_blocks(
+			repeats=int(repeats),
+			uv_fn=uv_fn,
+			params=profile_params,
+			fixture=stage_fixture,
+			cfg=stage_cfg,
+			level=int(sample_level),
+			z_lift=stage_z_lift,
+			active_quad=stage_active_quad,
+			runtime_cache=runtime._map_objective_cache,
+			cache_key_prefix=objective_cache_key_prefix,
+		)
+		_print_profile_block_table(block_rows)
+		if profiler_trace is not None:
+			_write_profile_trace(
+				path=profiler_trace,
+				uv_fn=uv_fn,
+				params=profile_params,
+				fixture=stage_fixture,
+				cfg=stage_cfg,
+				level=int(sample_level),
+				z_lift=stage_z_lift,
+				active_quad=stage_active_quad,
+			)
+		_assert_parameters_unchanged([runtime.affine.affine] + list(runtime.global_model.map_uv_ms.parameters()), before)
+		out = Path(out_dir)
+		out.mkdir(parents=True, exist_ok=True)
+		payload = {
+			"kind": "snap_surf_map_component_profile",
+			"fixture_dir": str(Path(fixture_dir)),
+			"config_path": str(Path(config_path)),
+			"stage": int(stage_idx),
+			"stage_name": str(stage_cfg_raw.name),
+			"sample_level": int(sample_level),
+			"repeats": int(repeats),
+			"rows": rows,
+			"block_rows": block_rows,
+			"profiler_trace": None if profiler_trace is None else str(profiler_trace),
+		}
+		_write_json(out / "profile_components.json", payload)
+		return rows
+	raise ValueError("no map_surf_ms stage matched component profile selector")
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -76,6 +77,12 @@ namespace {
 
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
+using Clock = std::chrono::steady_clock;
+
+double elapsedMs(Clock::time_point start, Clock::time_point end)
+{
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 bool finiteDirection(const cv::Vec3d& v)
 {
@@ -183,6 +190,7 @@ void writeLineDebugJson(const std::string& eventName,
             {"ceres_solve_ms", report->ceresSolveMs},
             {"normal_chunk_prefetch_ms", report->normalChunkPrefetchMs},
             {"normal_materialize_ms", report->normalMaterializeMs},
+            {"total_ms", report->totalMs},
             {"message", report->message},
         };
         root["optimization_report"]["losses"] = nlohmann::json::array();
@@ -327,6 +335,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.samplesPerSegment = 1;
         config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
+        config.printSolverProgress = false;
         config.initialTangent = initialTangentForMode(
             directionMode,
             sourceSliceNormal,
@@ -837,6 +846,10 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
 
     vc::lasagna::LineControlPointUpdateResult update;
+    const std::string updateEventName = editedExistingControl
+        ? "control_edit_span_update"
+        : "control_add_span_update";
+    const auto updateStart = Clock::now();
     try {
         vc::lasagna::LineOptimizationConfig updateConfig;
         updateConfig.segmentsPerSide = 200;
@@ -861,7 +874,12 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             session.seedPoint = changed.volumePoint;
         }
     }
-    writeLineDebugJson(editedExistingControl ? "control_edit_span_update" : "control_add_span_update",
+    const double updateMs = elapsedMs(updateStart, Clock::now());
+    Logger()->info("Line annotation Lasagna stage timing: event={} overall_ms={:.3f} points={}",
+                   updateEventName,
+                   updateMs,
+                   session.optimizedLine.points.size());
+    writeLineDebugJson(updateEventName,
                        session.controlPoints,
                        linePointsToJson(session.optimizedLine));
     startOptimization(session, false, update.activeStart, update.activeEnd);
@@ -1069,37 +1087,14 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return;
         }
-        Logger()->info("Line annotation Lasagna optimization complete: seed=[{}, {}, {}] points={} iterations={} initial_cost={} final_cost={} valid_normals={} invalid_normals={} converged={}",
-                       session.seedPoint[0],
-                       session.seedPoint[1],
-                       session.seedPoint[2],
-                       session.optimizedLine.points.size(),
-                       session.optimizationReport.iterations,
-                       session.optimizationReport.initialCost,
-                       session.optimizationReport.finalCost,
-                       session.optimizationReport.validNormalSamples,
-                       session.optimizationReport.invalidNormalSamples,
-                       session.optimizationReport.converged);
-        if (!session.optimizationReport.message.empty()) {
-            Logger()->info("Line annotation Lasagna Ceres report:\n{}",
-                           session.optimizationReport.message);
-        }
-        if (!session.optimizationReport.finalLosses.empty()) {
-            std::ostringstream losses;
-            losses.imbue(std::locale::classic());
-            losses << std::scientific << std::setprecision(3);
-            losses << "Line annotation Lasagna final loss breakdown:\n"
-                   << "term                 n      weight    raw_cost weighted_cost\n";
-            for (const auto& loss : session.optimizationReport.finalLosses) {
-                losses << std::left << std::setw(18) << loss.name
-                       << std::right << std::setw(6) << loss.residuals
-                       << std::setw(12) << loss.weight
-                       << std::setw(12) << loss.rawCost
-                       << std::setw(14) << loss.weightedCost
-                       << '\n';
-            }
-            Logger()->info("{}", losses.str());
-        }
+        const double prefetchPrepMs = session.optimizationReport.normalChunkPrefetchMs +
+                                      session.optimizationReport.normalMaterializeMs;
+        Logger()->info("Line annotation Lasagna stage timing: event={} prefetch_prep_ms={:.3f} ceres_solve_ms={:.3f} overall_ms={:.3f} points={}",
+                       resultEvent,
+                       prefetchPrepMs,
+                       session.optimizationReport.ceresSolveMs,
+                       session.optimizationReport.totalMs,
+                       session.optimizedLine.points.size());
         return;
     }
 

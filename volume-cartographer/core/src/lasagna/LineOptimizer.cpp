@@ -2615,6 +2615,7 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
         result.report.ceresSolveMs = 0.0;
         result.report.normalChunkPrefetchMs = 0.0;
         result.report.normalMaterializeMs = 0.0;
+        result.report.totalMs = elapsedMs(directNormalStart, Clock::now());
         result.report.normalPrefetchRequestedChunks = 0;
         result.report.normalPrefetchChunksRead = 0;
         std::ostringstream message;
@@ -2666,6 +2667,7 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     result.report.ceresSolveMs = selected.ceresSolveMs;
     result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
     result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
+    result.report.totalMs = selected.milliseconds;
     result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
     result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
     std::ostringstream message;
@@ -2830,6 +2832,7 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     result.report.ceresSolveMs = selected.ceresSolveMs;
     result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
     result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
+    result.report.totalMs = selected.milliseconds;
     result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
     result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
     result.report.finalLosses = evaluateLosses(selected.points,
@@ -3004,6 +3007,7 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
     result.report.ceresSolveMs = selected.ceresSolveMs;
     result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
     result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
+    result.report.totalMs = selected.milliseconds;
     result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
     result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
 

@@ -175,7 +175,7 @@ Generates a new surface at a configurable grad_mag integral offset from an exist
 
 **Config keys** (injected by VC3D in offset mode):
 - `external_surfaces[].offset` (float): target offset in winding-integral space (0 = reoptimize in place, ±1 = adjacent winding)
-- `args.windings`: forced to 1
+- `args.depth`: forced to 1
 
 **Invalid vertices**: tifxyz surfaces use `(-1,-1,-1)` as invalid sentinel. `tifxyz_io.load_tifxyz()` returns a validity mask. Invalid vertices are inpainted via masked scale-space pyramid reconstruction in `Model3D.from_tifxyz_crop()`. The external surface validity mask is checked during ray intersection so `ext_offset` loss skips rays hitting invalid regions.
 

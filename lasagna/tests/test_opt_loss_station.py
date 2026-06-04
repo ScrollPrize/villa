@@ -29,7 +29,12 @@ class _StationData:
 		return False
 
 
-def _station_result(xyz_lr: torch.Tensor, *, mesh_step: int = 10) -> fit_model.FitResult3D:
+def _station_result(
+	xyz_lr: torch.Tensor,
+	*,
+	mesh_step: int = 10,
+	depth_windings: tuple[int, ...] = (),
+) -> fit_model.FitResult3D:
 	d, h, w, _ = xyz_lr.shape
 	mask = torch.ones(d, 1, h, w, dtype=torch.float32)
 	return fit_model.FitResult3D(
@@ -57,6 +62,7 @@ def _station_result(xyz_lr: torch.Tensor, *, mesh_step: int = 10) -> fit_model.F
 			z_step_eff=1,
 			volume_extent=None,
 			pyramid_d=False,
+			depth_windings=depth_windings,
 		),
 	)
 
@@ -69,6 +75,12 @@ class StationLossHuberTest(unittest.TestCase):
 
 		expected = torch.tensor((0.25 + 1.0 + (2.0 * 2.0 * 3.0 - 2.0 * 2.0)) / 3.0)
 		self.assertAlmostEqual(float(got), float(expected), delta=1.0e-6)
+
+	def test_anchor_depth_index_prefers_zero_winding_metadata(self) -> None:
+		self.assertEqual(opt_loss_station._station_anchor_depth_index(D=3, depth_windings=(0, 1, 2)), 0)
+		self.assertEqual(opt_loss_station._station_anchor_depth_index(D=3, depth_windings=(-2, -1, 0)), 2)
+		self.assertEqual(opt_loss_station._station_anchor_depth_index(D=3, depth_windings=(-3, -2, -1)), 1)
+		self.assertEqual(opt_loss_station._station_anchor_depth_index(D=3, depth_windings=()), 1)
 
 	def test_local_ray_update_walks_direct_neighbors(self) -> None:
 		H, W = 3, 6
@@ -142,6 +154,33 @@ class StationLossHuberTest(unittest.TestCase):
 			delta=1.0e-6,
 		)
 		self.assertLess(float(losses["station_t"][0].detach()), 1.0e-6)
+
+	def test_normal_loss_anchors_on_zero_winding_not_center_depth(self) -> None:
+		x = torch.arange(3, dtype=torch.float32).view(1, 3).expand(3, 3) * 10.0
+		y = torch.arange(3, dtype=torch.float32).view(3, 1).expand(3, 3) * 10.0
+		zs = (10.0, 20.0, 30.0)
+		xyz = torch.stack([
+			torch.stack([x, y, torch.full((3, 3), z, dtype=torch.float32)], dim=-1)
+			for z in zs
+		], dim=0).requires_grad_(True)
+		seed = torch.tensor([10.0, 10.0, 0.0], dtype=torch.float32)
+
+		try:
+			opt_loss_station.set_seed(seed, _StationData(), Hm=3, Wm=3, D=3)
+			losses = opt_loss_station.station_loss(
+				res=_station_result(xyz, mesh_step=10, depth_windings=(0, 1, 2)),
+			)
+		finally:
+			opt_loss_station.reset()
+
+		weights = opt_loss_station._station_normal_weights(
+			D=3, Hm=3, Wm=3, h_center=1.0, w_center=1.0,
+			device=xyz.device, dtype=xyz.dtype)
+		self.assertAlmostEqual(
+			float(losses["station_n"][0].detach()),
+			float(1.0 * weights.mean()),
+			delta=1.0e-6,
+		)
 
 	def test_normal_loss_uses_closest_point_model_normal_for_push(self) -> None:
 		x = torch.arange(3, dtype=torch.float32).view(1, 3).expand(3, 3) * 10.0

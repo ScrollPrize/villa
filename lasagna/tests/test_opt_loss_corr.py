@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -15,6 +16,16 @@ import opt_loss_corr
 
 
 class CorrHeightSplatTest(unittest.TestCase):
+	def test_corr_winding_uses_central_relative_input_convention(self) -> None:
+		params = SimpleNamespace(depth_windings=(-2, -1, 0, 1))
+		relative = torch.tensor([-1.0, 0.0, 1.5], dtype=torch.float32)
+
+		model_winding = opt_loss_corr._corr_relative_to_model_winding(relative, params)
+		roundtrip = opt_loss_corr._corr_model_to_relative_winding(model_winding, params)
+
+		self.assertTrue(torch.allclose(model_winding, torch.tensor([1.0, 2.0, 3.5])))
+		self.assertTrue(torch.allclose(roundtrip, relative))
+
 	def test_overlapping_points_average_value_but_max_force_weight(self) -> None:
 		H_map = torch.zeros(1, 5, 5, dtype=torch.float32)
 		V_map = torch.zeros(1, 5, 5, 3, dtype=torch.float32)
