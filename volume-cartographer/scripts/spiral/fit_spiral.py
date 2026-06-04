@@ -2971,56 +2971,69 @@ def _rasterize_triangles_into_mesh(
 
     bbox_h = (u_max - u_min + 1).clamp(min=1)
     bbox_w = (v_max - v_min + 1).clamp(min=1)
-    max_h = int(bbox_h[valid_bbox].max().item()) if valid_bbox.any() else 1
-    max_w = int(bbox_w[valid_bbox].max().item()) if valid_bbox.any() else 1
 
-    du_grid, dv_grid = torch.meshgrid(
-        torch.arange(max_h, device=device),
-        torch.arange(max_w, device=device),
-        indexing='ij',
-    )
-    us = u_min[:, None, None] + du_grid[None]  # (T, max_h, max_w)
-    vs = v_min[:, None, None] + dv_grid[None]
-    in_bbox = (
-        (du_grid[None] < bbox_h[:, None, None])
-        & (dv_grid[None] < bbox_w[:, None, None])
-        & valid_bbox[:, None, None]
-    )
+    chunk_size = 16384
+    for s in range(0, T, chunk_size):
+        e = min(s + chunk_size, T)
+        valid_c = valid_bbox[s:e]
+        if not valid_c.any():
+            continue
+        u_min_c = u_min[s:e]
+        v_min_c = v_min[s:e]
+        bbox_h_c = bbox_h[s:e]
+        bbox_w_c = bbox_w[s:e]
+        max_h = int(bbox_h_c[valid_c].max().item())
+        max_w = int(bbox_w_c[valid_c].max().item())
 
-    pts = torch.stack([us.float(), vs.float()], dim=-1)
-    a = tri_uvs[:, 0]
-    b = tri_uvs[:, 1]
-    c = tri_uvs[:, 2]
-    v0 = b - a
-    v1 = c - a
-    v2 = pts - a[:, None, None]
-    d00 = (v0 * v0).sum(-1)
-    d01 = (v0 * v1).sum(-1)
-    d11 = (v1 * v1).sum(-1)
-    d20 = (v2 * v0[:, None, None]).sum(-1)
-    d21 = (v2 * v1[:, None, None]).sum(-1)
-    denom = d00 * d11 - d01 * d01
-    nonzero = denom.abs() >= 1e-9
-    denom_safe = torch.where(nonzero, denom, torch.ones_like(denom))
-    beta = (d11[:, None, None] * d20 - d01[:, None, None] * d21) / denom_safe[:, None, None]
-    gamma = (d00[:, None, None] * d21 - d01[:, None, None] * d20) / denom_safe[:, None, None]
-    alpha = 1 - beta - gamma
-    inside = (alpha >= -1e-6) & (beta >= -1e-6) & (gamma >= -1e-6) & nonzero[:, None, None]
-    mask = in_bbox & inside
-    if not mask.any():
-        return
+        du_grid, dv_grid = torch.meshgrid(
+            torch.arange(max_h, device=device),
+            torch.arange(max_w, device=device),
+            indexing='ij',
+        )
+        us = u_min_c[:, None, None] + du_grid[None]  # (n, max_h, max_w)
+        vs = v_min_c[:, None, None] + dv_grid[None]
+        in_bbox = (
+            (du_grid[None] < bbox_h_c[:, None, None])
+            & (dv_grid[None] < bbox_w_c[:, None, None])
+            & valid_c[:, None, None]
+        )
 
-    sa = tri_scrolls[:, 0][:, None, None, :]
-    sb = tri_scrolls[:, 1][:, None, None, :]
-    sc = tri_scrolls[:, 2][:, None, None, :]
-    interp = alpha[..., None] * sa + beta[..., None] * sb + gamma[..., None] * sc
+        tri_uvs_c = tri_uvs[s:e]
+        pts = torch.stack([us.float(), vs.float()], dim=-1)
+        a = tri_uvs_c[:, 0]
+        b = tri_uvs_c[:, 1]
+        c = tri_uvs_c[:, 2]
+        v0 = b - a
+        v1 = c - a
+        v2 = pts - a[:, None, None]
+        d00 = (v0 * v0).sum(-1)
+        d01 = (v0 * v1).sum(-1)
+        d11 = (v1 * v1).sum(-1)
+        d20 = (v2 * v0[:, None, None]).sum(-1)
+        d21 = (v2 * v1[:, None, None]).sum(-1)
+        denom = d00 * d11 - d01 * d01
+        nonzero = denom.abs() >= 1e-9
+        denom_safe = torch.where(nonzero, denom, torch.ones_like(denom))
+        beta = (d11[:, None, None] * d20 - d01[:, None, None] * d21) / denom_safe[:, None, None]
+        gamma = (d00[:, None, None] * d21 - d01[:, None, None] * d20) / denom_safe[:, None, None]
+        alpha = 1 - beta - gamma
+        inside = (alpha >= -1e-6) & (beta >= -1e-6) & (gamma >= -1e-6) & nonzero[:, None, None]
+        mask = in_bbox & inside
+        if not mask.any():
+            continue
 
-    sel = mask.reshape(-1)
-    target_u = us.reshape(-1)[sel]
-    target_v_local = vs.reshape(-1)[sel]
-    target_w_flat = tri_target_w[:, None, None].expand(-1, max_h, max_w).reshape(-1)[sel]
-    target_v_global = winding_offsets_t[target_w_flat] + target_v_local
-    scroll_zyxs[target_u, target_v_global] = interp.reshape(-1, 3)[sel]
+        tri_scrolls_c = tri_scrolls[s:e]
+        sa = tri_scrolls_c[:, 0][:, None, None, :]
+        sb = tri_scrolls_c[:, 1][:, None, None, :]
+        sc = tri_scrolls_c[:, 2][:, None, None, :]
+        interp = alpha[..., None] * sa + beta[..., None] * sb + gamma[..., None] * sc
+
+        sel = mask.reshape(-1)
+        target_u = us.reshape(-1)[sel]
+        target_v_local = vs.reshape(-1)[sel]
+        target_w_flat = tri_target_w[s:e][:, None, None].expand(-1, max_h, max_w).reshape(-1)[sel]
+        target_v_global = winding_offsets_t[target_w_flat] + target_v_local
+        scroll_zyxs[target_u, target_v_global] = interp.reshape(-1, 3)[sel]
 
 
 @torch.inference_mode
