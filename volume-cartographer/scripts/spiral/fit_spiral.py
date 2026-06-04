@@ -31,18 +31,18 @@ from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
 # PHercParis4
-dataset_path = '/home/paul/projects/vesuvius-scrolls/spiral/dataset_2026-05-28'
+dataset_path = '/home/paul/projects/vesuvius-scrolls/spiral/dataset'
 scroll_zarr_path = None
-normal_nx_zarr_path = os.environ.get('FIT_SPIRAL_NORMAL_NX_ZARR_PATH')
-normal_ny_zarr_path = os.environ.get('FIT_SPIRAL_NORMAL_NY_ZARR_PATH')
-normal_zarr_group = os.environ.get('FIT_SPIRAL_NORMAL_ZARR_GROUP', '4')
+normal_nx_zarr_path = f'{dataset_path}/normals/las_008_nx.ome.zarr'
+normal_ny_zarr_path = f'{dataset_path}/normals/las_008_ny.ome.zarr'
 grad_mag_zarr_path = None
+normal_zarr_group = '4'
 pcl_json_paths = [
-    f'{dataset_path}/s1_relative_windings_fixed.json',
+    f'{dataset_path}/rel_windings_new_reordered.json',
     f'{dataset_path}/same_winding_annotations_fixed_merged.json',
 ]
 patches_path = f'{dataset_path}/patches'
-shell_path = f'{dataset_path}/s1_outer_shell'
+shell_path = f'{dataset_path}/s1_2um_outer'
 tracks_dbm_path = None
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', downsample_factor=f)
