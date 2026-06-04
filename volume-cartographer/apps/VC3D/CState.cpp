@@ -2,7 +2,9 @@
 #include "VCSettings.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <thread>
+#include <optional>
 #include <QSettings>
 
 #include "vc/core/types/VolumePkg.hpp"
@@ -12,6 +14,169 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+
+namespace {
+
+bool isValidSurfacePoint(const cv::Vec3f& point)
+{
+    return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
+        && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+struct SurfaceFocusPoint {
+    cv::Vec3f world{0, 0, 0};
+    cv::Vec3f ptr{0, 0, 0};
+    int row = -1;
+    int col = -1;
+};
+
+std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row, int col)
+{
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (!points || row < 0 || col < 0 || row >= points->rows || col >= points->cols) {
+        return std::nullopt;
+    }
+    if (row <= 0 || col <= 0 || row >= points->rows - 1 || col >= points->cols - 1) {
+        return std::nullopt;
+    }
+    if (!surface.isQuadValid(row, col)) {
+        return std::nullopt;
+    }
+    const cv::Vec3f normal = surface.gridNormal(row, col);
+    if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
+        return std::nullopt;
+    }
+
+    const cv::Vec3f point = (*points)(row, col);
+    if (!isValidSurfacePoint(point)) {
+        return std::nullopt;
+    }
+
+    const cv::Vec3f center = surface.center();
+    const cv::Vec2f scale = surface.scale();
+    return SurfaceFocusPoint{
+        point,
+        cv::Vec3f(static_cast<float>(col) - center[0] * scale[0],
+                  static_cast<float>(row) - center[1] * scale[1],
+                  0.0f),
+        row,
+        col,
+    };
+}
+
+std::optional<SurfaceFocusPoint> findSegmentFocusPoint(QuadSurface& surface)
+{
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (!points || points->empty()) {
+        return std::nullopt;
+    }
+
+    const cv::Vec2f centerGrid = surface.ptrToGrid({0, 0, 0});
+    const int centerRow = std::clamp(static_cast<int>(std::lround(centerGrid[1])), 0, points->rows - 1);
+    const int centerCol = std::clamp(static_cast<int>(std::lround(centerGrid[0])), 0, points->cols - 1);
+
+    if (auto focus = focusPointAtGrid(surface, centerRow, centerCol)) {
+        return focus;
+    }
+
+    const int maxHorizontalRadius = std::max(centerCol, points->cols - 1 - centerCol);
+    for (int radius = 1; radius <= maxHorizontalRadius; ++radius) {
+        if (auto focus = focusPointAtGrid(surface, centerRow, centerCol - radius)) {
+            return focus;
+        }
+        if (auto focus = focusPointAtGrid(surface, centerRow, centerCol + radius)) {
+            return focus;
+        }
+    }
+
+    const int maxRadius = std::max(std::max(centerRow, centerCol),
+                                   std::max(points->rows - 1 - centerRow, points->cols - 1 - centerCol));
+    for (int radius = 1; radius <= maxRadius; ++radius) {
+        const int rowMin = std::max(0, centerRow - radius);
+        const int rowMax = std::min(points->rows - 1, centerRow + radius);
+        const int colMin = std::max(0, centerCol - radius);
+        const int colMax = std::min(points->cols - 1, centerCol + radius);
+
+        for (int col = colMin; col <= colMax; ++col) {
+            if (auto focus = focusPointAtGrid(surface, rowMin, col)) {
+                return focus;
+            }
+            if (rowMax != rowMin) {
+                if (auto focus = focusPointAtGrid(surface, rowMax, col)) {
+                    return focus;
+                }
+            }
+        }
+
+        for (int row = rowMin + 1; row < rowMax; ++row) {
+            if (auto focus = focusPointAtGrid(surface, row, colMin)) {
+                return focus;
+            }
+            if (colMax != colMin) {
+                if (auto focus = focusPointAtGrid(surface, row, colMax)) {
+                    return focus;
+                }
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::string segmentationSurfaceIdForFocus(CState* state, QuadSurface& surface)
+{
+    if (!state) {
+        return surface.id;
+    }
+    if (auto active = state->activeSurface().lock(); active.get() == &surface) {
+        return state->activeSurfaceId();
+    }
+    if (!surface.id.empty()) {
+        return surface.id;
+    }
+    return "segmentation";
+}
+
+bool resetViewOnSurfaceChangeEnabled()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                          vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
+}
+
+std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surface)
+{
+    if (!state) {
+        return nullptr;
+    }
+
+    const auto focusPoint = findSegmentFocusPoint(surface);
+    if (!focusPoint) {
+        return nullptr;
+    }
+
+    auto vol = state->currentVolume();
+    if (!vol) {
+        return nullptr;
+    }
+
+    auto [w, h, d] = vol->shapeXyz();
+    cv::Vec3f clamped = focusPoint->world;
+    clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
+    clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
+    clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
+
+    auto poi = std::make_unique<POI>();
+    poi->p = clamped;
+    poi->n = cv::Vec3f(0, 0, 0);
+    poi->surfaceId = segmentationSurfaceIdForFocus(state, surface);
+    poi->surfacePtr = focusPoint->ptr;
+    poi->suppressViewerRecenter = false;
+
+    return poi;
+}
+
+} // namespace
 
 CState::CState(size_t cacheSizeBytes, QObject* parent)
     : QObject(parent)
@@ -162,10 +327,31 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
         emit surfaceWillBeDeleted(name, it->second);
     }
 
+    POI* delayedFocusPoi = nullptr;
+    if (name == "segmentation" && surf != nullptr && !isEditUpdate &&
+        resetViewOnSurfaceChangeEnabled()) {
+        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
+            auto focusPoi = createSegmentationFocusPoi(this, *quad);
+            if (focusPoi) {
+                delayedFocusPoi = focusPoi.get();
+                _pois["focus"] = std::move(focusPoi);
+            }
+        }
+    }
+
     _surfs[name] = surf;
 
     if (!noSignalSend || surf == nullptr) {
         emit surfaceChanged(name, surf, isEditUpdate);
+    }
+
+    if (delayedFocusPoi) {
+        auto poiIt = _pois.find("focus");
+        if (poiIt != _pois.end() && poiIt->second.get() == delayedFocusPoi) {
+            emit poiChanged("focus", delayedFocusPoi);
+            delayedFocusPoi->suppressViewerRecenter = false;
+            delayedFocusPoi->suppressTransientPlaneIntersections = false;
+        }
     }
 }
 

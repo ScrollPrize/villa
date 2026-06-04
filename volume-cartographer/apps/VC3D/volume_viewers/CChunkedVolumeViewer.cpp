@@ -41,6 +41,7 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <source_location>
 #include <sstream>
@@ -78,12 +79,14 @@ constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(180, 200, 255), qRgb(255, 140, 180), qRgb(160, 255, 180),
 };
 constexpr int kIntersectionZ = 100;
+
 constexpr int kHighlightedIntersectionZ = 110;
 constexpr int kActiveIntersectionZ = 120;
 constexpr float kActiveIntersectionOpacityScale = 1.2f;
 constexpr float kActiveIntersectionWidthScale = 1.3f;
 constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
 constexpr float kApprovalPlaneIntersectionScale = 1.5f;
+constexpr float kFocusProjectionThreshold = 4.0f;
 
 struct IntersectionStyle {
     QRgb color = 0;
@@ -209,6 +212,124 @@ bool validSurfacePoint(const cv::Vec3f& p)
 {
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
            p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
+}
+
+bool finiteVec2(const cv::Vec2f& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]);
+}
+
+bool finiteVec3(const cv::Vec3f& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+float distance3(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    const cv::Vec3f d = a - b;
+    return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+}
+
+struct SafeFocusProjection {
+    bool valid = false;
+    const char* reason = "unchecked";
+    float dist = -1.0f;
+    cv::Vec3f ptr{NAN, NAN, NAN};
+    cv::Vec3f loc{NAN, NAN, NAN};
+    cv::Vec3f coord{NAN, NAN, NAN};
+    cv::Vec2f grid{NAN, NAN};
+    int row = -1;
+    int col = -1;
+    int nearestRow = -1;
+    int nearestCol = -1;
+};
+
+SafeFocusProjection validateSafeFocusProjection(
+    QuadSurface& surface,
+    const cv::Vec3f& ptr,
+    const cv::Vec3f* focusWorld,
+    std::optional<float> pointToDistance = std::nullopt)
+{
+    SafeFocusProjection result;
+    result.ptr = ptr;
+
+    if (!finiteVec3(result.ptr)) {
+        result.reason = "non_finite_ptr";
+        return result;
+    }
+
+    result.loc = surface.loc(result.ptr);
+    if (!finiteVec3(result.loc)) {
+        result.reason = "non_finite_loc";
+        return result;
+    }
+
+    if (pointToDistance) {
+        result.dist = *pointToDistance;
+        if (!std::isfinite(result.dist) ||
+            result.dist < 0.0f ||
+            result.dist >= kFocusProjectionThreshold) {
+            result.reason = "distance_out_of_range";
+            return result;
+        }
+    }
+
+    result.coord = surface.coord(result.ptr);
+    if (!validSurfacePoint(result.coord)) {
+        result.reason = "invalid_coord";
+        return result;
+    }
+
+    if (!pointToDistance) {
+        result.dist = focusWorld ? distance3(result.coord, *focusWorld) : 0.0f;
+        if (!std::isfinite(result.dist) ||
+            result.dist < 0.0f ||
+            result.dist >= kFocusProjectionThreshold) {
+            result.reason = "distance_out_of_range";
+            return result;
+        }
+    }
+
+    result.grid = surface.ptrToGrid(result.ptr);
+    if (!finiteVec2(result.grid)) {
+        result.reason = "non_finite_grid";
+        return result;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (!points || points->cols < 2 || points->rows < 2) {
+        result.reason = "missing_surface_points";
+        return result;
+    }
+    if (result.grid[0] <= 0.0f || result.grid[1] <= 0.0f ||
+        result.grid[0] >= static_cast<float>(points->cols - 1) ||
+        result.grid[1] >= static_cast<float>(points->rows - 1)) {
+        result.reason = "grid_on_or_outside_border";
+        return result;
+    }
+
+    result.col = static_cast<int>(std::floor(result.grid[0]));
+    result.row = static_cast<int>(std::floor(result.grid[1]));
+    if (!surface.isQuadValid(result.row, result.col)) {
+        result.reason = "invalid_interpolation_quad";
+        return result;
+    }
+
+    result.nearestCol = static_cast<int>(std::lround(result.grid[0]));
+    result.nearestRow = static_cast<int>(std::lround(result.grid[1]));
+    if (!surface.isPointValid(result.nearestRow, result.nearestCol)) {
+        result.reason = "invalid_nearest_point";
+        return result;
+    }
+    const cv::Vec3f normal = surface.gridNormal(result.nearestRow, result.nearestCol);
+    if (!finiteVec3(normal)) {
+        result.reason = "non_finite_grid_normal";
+        return result;
+    }
+
+    result.valid = true;
+    result.reason = "valid";
+    return result;
 }
 
 std::string profileCaller(const std::source_location& caller)
@@ -1062,18 +1183,55 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     updateContentBounds();
     const bool isSegmentationQuadSurface =
         _surfName == "segmentation" && dynamic_cast<QuadSurface*>(surf.get());
+
+    auto setSegmentationPointerFromFocus = [&]() {
+        auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+        auto* poi = _state ? _state->poi("focus") : nullptr;
+        if (!quad || !poi) {
+            return false;
+        }
+        if (!poi->surfaceId.empty() && !quad->id.empty() &&
+            poi->surfaceId != quad->id && poi->surfaceId != _surfName) {
+            return false;
+        }
+
+        if (poi->surfacePtr) {
+            const SafeFocusProjection projected =
+                validateSafeFocusProjection(*quad, *poi->surfacePtr, &poi->p);
+            if (projected.valid) {
+                _surfacePtrX = projected.loc[0];
+                _surfacePtrY = projected.loc[1];
+                return true;
+            }
+        }
+
+        cv::Vec3f ptr = quad->pointer();
+        const float dist = quad->pointTo(ptr, poi->p, kFocusProjectionThreshold, 100, nullptr);
+        const SafeFocusProjection projected =
+            validateSafeFocusProjection(*quad, ptr, &poi->p, dist);
+        if (!projected.valid) {
+            return false;
+        }
+
+        _surfacePtrX = projected.loc[0];
+        _surfacePtrY = projected.loc[1];
+        return true;
+    };
+
     if (!isEditUpdate && isSegmentationQuadSurface && !_initializedFirstSegmentationSurface) {
-        _surfacePtrX = 0.0f;
-        _surfacePtrY = 0.0f;
+        if (_resetViewOnSurfaceChange) {
+            (void)setSegmentationPointerFromFocus();
+        }
         _zOff = 0.0f;
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
-        _scale = scaleForCoarsestSegmentationRenderLevel(n);
-        recalcPyramidLevel();
+        if (_resetViewOnSurfaceChange) {
+            _scale = scaleForCoarsestSegmentationRenderLevel(n);
+            recalcPyramidLevel();
+        }
         _initializedFirstSegmentationSurface = true;
     } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
-        _surfacePtrX = 0.0f;
-        _surfacePtrY = 0.0f;
+        (void)setSegmentationPointerFromFocus();
         _zOff = 0.0f;
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
@@ -4219,9 +4377,6 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             profile.setDetails("action=skip flattened_disabled");
             return;
         }
-        renderFlattenedIntersections(surf, reason, caller);
-        profile.setDetails("action=delegated_flattened");
-        return;
     }
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();
@@ -4233,6 +4388,12 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     }
 
     auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    if (!plane) {
+        renderFlattenedIntersections(surf, reason, caller);
+        profile.setDetails("action=delegated_flattened");
+        return;
+    }
+
     std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
     auto addTarget = [&](const std::string& name) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name))) {

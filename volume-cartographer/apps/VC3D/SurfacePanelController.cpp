@@ -614,7 +614,6 @@ void SurfacePanelController::handleTreeSelectionChanged()
         if (surfaceJustLoaded || !_state->surface(id)) {
             _state->setSurface(id, surface, true, false);
         }
-        _state->setSurface("segmentation", surface, false, false);
     }
 
     syncSelectionUi(id, surface.get());
@@ -1938,7 +1937,6 @@ bool SurfacePanelController::cycleVisibleSegment(int direction)
         if (!_state->surface(id)) {
             _state->setSurface(id, surface, true, false);
         }
-        _state->setSurface("segmentation", surface, false, false);
     }
 
     _currentSurfaceId = id;
