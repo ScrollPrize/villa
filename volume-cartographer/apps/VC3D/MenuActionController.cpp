@@ -46,6 +46,7 @@
 #include <QMessageBox>
 #include <QProcess>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QStringList>
 #include <QSettings>
 #include <QStyle>
@@ -742,6 +743,9 @@ void MenuActionController::showSettingsDialog()
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
                                        vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
+    const bool resetViewOnSurfaceChange =
+        settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                       vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
     if (_window->_viewerManager) {
         _window->_viewerManager->forEachBaseViewer([showDirHints](VolumeViewerBase* viewer) {
             if (viewer) {
@@ -749,6 +753,11 @@ void MenuActionController::showSettingsDialog()
             }
         });
     }
+    if (_window->ui.chkMoveOnSurfaceChanged) {
+        QSignalBlocker blocker(_window->ui.chkMoveOnSurfaceChanged);
+        _window->ui.chkMoveOnSurfaceChanged->setChecked(resetViewOnSurfaceChange);
+    }
+    _window->onMoveOnSurfaceChangedToggled(resetViewOnSurfaceChange);
 
     dialog->deleteLater();
 }
