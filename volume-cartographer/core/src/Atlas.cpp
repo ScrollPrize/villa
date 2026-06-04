@@ -563,31 +563,107 @@ AtlasAnchor anchorFromHit(int sourceIndex, const ProjectionHit& hit)
     return anchor;
 }
 
+struct ContinuationRejectDebug {
+    int hitCount = 0;
+    int candidateCount = 0;
+    double lineStep = 0.0;
+    double mismatchRatio = 0.0;
+    double previousAtlasU = 0.0;
+    double previousAtlasV = 0.0;
+    int previousWinding = 0;
+    double bestRejectedGridStep = std::numeric_limits<double>::infinity();
+    double bestRejectedRatio = std::numeric_limits<double>::infinity();
+    double bestRejectedAtlasU = 0.0;
+    double bestRejectedAtlasV = 0.0;
+    double bestRejectedHitU = 0.0;
+    double bestRejectedHitV = 0.0;
+    double bestRejectedDistance = 0.0;
+    int bestRejectedWinding = 0;
+    std::string reason;
+};
+
+std::string continuationRejectDebugString(int sourceIndex,
+                                          const ContinuationRejectDebug& debug)
+{
+    std::ostringstream out;
+    out << "line_point[" << sourceIndex << "] continuation_rejection"
+        << " reason=" << (debug.reason.empty() ? "unknown" : debug.reason)
+        << " hits=" << debug.hitCount
+        << " candidates=" << debug.candidateCount
+        << " line_step=" << debug.lineStep
+        << " threshold=" << debug.mismatchRatio
+        << " prev_uv=(" << debug.previousAtlasU << ", " << debug.previousAtlasV << ")"
+        << " prev_winding=" << debug.previousWinding;
+    if (std::isfinite(debug.bestRejectedGridStep)) {
+        out << " best_rejected_grid_step=" << debug.bestRejectedGridStep
+            << " best_rejected_ratio=" << debug.bestRejectedRatio
+            << " best_rejected_uv=(" << debug.bestRejectedAtlasU << ", "
+            << debug.bestRejectedAtlasV << ")"
+            << " raw_hit_uv=(" << debug.bestRejectedHitU << ", "
+            << debug.bestRejectedHitV << ")"
+            << " winding=" << debug.bestRejectedWinding
+            << " projection_distance=" << debug.bestRejectedDistance;
+    }
+    return out.str();
+}
+
 std::optional<AtlasAnchor> chooseContinuationHit(int sourceIndex,
                                                  const std::vector<ProjectionHit>& hits,
                                                  const AtlasAnchor& previous,
                                                  const cv::Vec3d& previousLinePoint,
                                                  const cv::Vec3d& linePoint,
                                                  int columns,
-                                                 double mismatchRatio)
+                                                 double mismatchRatio,
+                                                 ContinuationRejectDebug* rejectDebug = nullptr)
 {
+    if (rejectDebug) {
+        *rejectDebug = {};
+        rejectDebug->hitCount = static_cast<int>(hits.size());
+        rejectDebug->mismatchRatio = mismatchRatio;
+        rejectDebug->previousAtlasU = previous.atlasU;
+        rejectDebug->previousAtlasV = previous.atlasV;
+        rejectDebug->previousWinding = columns > 0
+            ? static_cast<int>(std::floor(previous.atlasU / columns))
+            : 0;
+    }
     if (hits.empty() || columns <= 0) {
+        if (rejectDebug) {
+            rejectDebug->reason = hits.empty() ? "no_hits" : "invalid_columns";
+        }
         return std::nullopt;
     }
     const double lineStep = distance(previousLinePoint, linePoint);
+    if (rejectDebug) {
+        rejectDebug->lineStep = lineStep;
+    }
     double bestScore = std::numeric_limits<double>::infinity();
     std::optional<AtlasAnchor> best;
     for (const auto& hit : hits) {
         const int prevWinding = static_cast<int>(std::floor(previous.atlasU / columns));
         for (int winding = prevWinding - 1; winding <= prevWinding + 1; ++winding) {
+            if (rejectDebug) {
+                ++rejectDebug->candidateCount;
+            }
             AtlasAnchor candidate = anchorFromHit(sourceIndex, hit);
             candidate.atlasU = hit.atlasU + static_cast<double>(winding * columns);
             const double du = candidate.atlasU - previous.atlasU;
             const double dv = candidate.atlasV - previous.atlasV;
             const double gridStep = std::sqrt(du * du + dv * dv);
+            double ratio = 1.0;
             if (lineStep > kEpsilon && gridStep > kEpsilon) {
-                const double ratio = std::max(gridStep, lineStep) / std::min(gridStep, lineStep);
+                ratio = std::max(gridStep, lineStep) / std::min(gridStep, lineStep);
                 if (ratio > mismatchRatio) {
+                    if (rejectDebug && gridStep < rejectDebug->bestRejectedGridStep) {
+                        rejectDebug->reason = "step_mismatch";
+                        rejectDebug->bestRejectedGridStep = gridStep;
+                        rejectDebug->bestRejectedRatio = ratio;
+                        rejectDebug->bestRejectedAtlasU = candidate.atlasU;
+                        rejectDebug->bestRejectedAtlasV = candidate.atlasV;
+                        rejectDebug->bestRejectedHitU = hit.atlasU;
+                        rejectDebug->bestRejectedHitV = hit.atlasV;
+                        rejectDebug->bestRejectedDistance = hit.distance;
+                        rejectDebug->bestRejectedWinding = winding;
+                    }
                     continue;
                 }
             }
@@ -596,6 +672,9 @@ std::optional<AtlasAnchor> chooseContinuationHit(int sourceIndex,
                 best = candidate;
             }
         }
+    }
+    if (!best && rejectDebug && rejectDebug->reason.empty()) {
+        rejectDebug->reason = "no_acceptable_candidate";
     }
     return best;
 }
@@ -1105,15 +1184,17 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                std::to_string(anchors[seedIndex]->atlasV));
 
     for (int i = seedIndex + 1; i < static_cast<int>(fiber.linePoints.size()); ++i) {
+        ContinuationRejectDebug rejectDebug;
         const auto chosen = chooseContinuationHit(i,
                                                   hitsByLinePoint[i],
                                                   *anchors[i - 1],
                                                   fiber.linePoints[i - 1],
                                                   fiber.linePoints[i],
                                                   points->cols,
-                                                  options.mismatchRatio);
+                                                  options.mismatchRatio,
+                                                  atlasDebugEnabled() ? &rejectDebug : nullptr);
         if (!chosen) {
-            atlasDebug("line_point[" + std::to_string(i) + "] continuation_rejection");
+            atlasDebug(continuationRejectDebugString(i, rejectDebug));
             break;
         }
         anchors[i] = *chosen;
@@ -1122,15 +1203,17 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                    std::to_string(anchors[i]->atlasV));
     }
     for (int i = seedIndex - 1; i >= 0; --i) {
+        ContinuationRejectDebug rejectDebug;
         const auto chosen = chooseContinuationHit(i,
                                                   hitsByLinePoint[i],
                                                   *anchors[i + 1],
                                                   fiber.linePoints[i + 1],
                                                   fiber.linePoints[i],
                                                   points->cols,
-                                                  options.mismatchRatio);
+                                                  options.mismatchRatio,
+                                                  atlasDebugEnabled() ? &rejectDebug : nullptr);
         if (!chosen) {
-            atlasDebug("line_point[" + std::to_string(i) + "] continuation_rejection");
+            atlasDebug(continuationRejectDebugString(i, rejectDebug));
             break;
         }
         anchors[i] = *chosen;
