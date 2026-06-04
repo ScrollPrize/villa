@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <thread>
 #include <optional>
 #include <QSettings>
@@ -331,10 +332,17 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     if (name == "segmentation" && surf != nullptr && !isEditUpdate &&
         resetViewOnSurfaceChangeEnabled()) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
-            auto focusPoi = createSegmentationFocusPoi(this, *quad);
-            if (focusPoi) {
-                delayedFocusPoi = focusPoi.get();
-                _pois["focus"] = std::move(focusPoi);
+            try {
+                auto focusPoi = createSegmentationFocusPoi(this, *quad);
+                if (focusPoi) {
+                    delayedFocusPoi = focusPoi.get();
+                    _pois["focus"] = std::move(focusPoi);
+                }
+            } catch (const std::exception&) {
+                // Reset recentering is optional; activation/orientation paths
+                // handle and report lazy-load failures after the surface is set.
+            } catch (...) {
+                // Keep surface activation alive even if focus initialization fails.
             }
         }
     }
