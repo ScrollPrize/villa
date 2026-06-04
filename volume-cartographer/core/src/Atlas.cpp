@@ -1054,8 +1054,15 @@ void saveIdxRotatedBaseMesh(const QuadSurface& surface,
     rotated->save(targetDir, true);
 }
 
-AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas)
+AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas, cv::Vec2f atlasScale)
 {
+    if (!std::isfinite(atlasScale[0]) || !std::isfinite(atlasScale[1]) ||
+        atlasScale[0] <= 0.0f || atlasScale[1] <= 0.0f) {
+        throw std::runtime_error("atlas base mesh has invalid scale");
+    }
+    const double scaleX = static_cast<double>(atlasScale[0]);
+    const double scaleY = static_cast<double>(atlasScale[1]);
+
     bool haveAnchor = false;
     double minU = std::numeric_limits<double>::infinity();
     double minV = std::numeric_limits<double>::infinity();
@@ -1084,8 +1091,8 @@ AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas)
     }
 
     AtlasCoveredSize size;
-    size.width = std::max(1, static_cast<int>(std::ceil(maxU) - std::floor(minU) + 1.0));
-    size.height = std::max(1, static_cast<int>(std::ceil(maxV) - std::floor(minV) + 1.0));
+    size.width = (maxU - minU) / scaleX;
+    size.height = (maxV - minV) / scaleY;
     size.valid = true;
     return size;
 }

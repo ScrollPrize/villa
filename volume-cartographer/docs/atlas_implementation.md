@@ -9,7 +9,7 @@ Atlas Overview intentionally exposes only the minimal object summary:
 - `Fiber count`
 - `Object covered atlas size`
 
-`Object covered atlas size` is computed from mapped fiber `lineAnchors` only and is displayed as `W x H vx`. `controlAnchors` are display metadata for source control points and are not used for footprint calculations.
+`Object covered atlas size` is computed from mapped fiber `lineAnchors` only and is displayed as `W x H vx` in nominal volume voxel units using the saved atlas base mesh scale. `controlAnchors` are display metadata for source control points and are not used for footprint calculations.
 
 ## Atlas Viewer
 

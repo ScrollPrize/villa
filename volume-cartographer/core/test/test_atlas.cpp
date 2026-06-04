@@ -285,8 +285,19 @@ TEST_CASE("Atlas mapped object covered size uses line anchors only")
 
     const auto size = vc::atlas::mappedObjectCoveredAtlasSize(atlas);
     REQUIRE(size.valid);
-    CHECK(size.width == 6);
-    CHECK(size.height == 3);
+    CHECK(size.width == doctest::Approx(5.0));
+    CHECK(size.height == doctest::Approx(2.0));
+
+    const auto scaledSize = vc::atlas::mappedObjectCoveredAtlasSize(
+        atlas, cv::Vec2f(2.0f, 4.0f));
+    REQUIRE(scaledSize.valid);
+    CHECK(scaledSize.width == doctest::Approx(2.5));
+    CHECK(scaledSize.height == doctest::Approx(0.5));
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::mappedObjectCoveredAtlasSize(atlas, cv::Vec2f(0.0f, -1.0f)),
+        doctest::Contains("invalid scale"),
+        std::runtime_error);
 }
 
 TEST_CASE("Atlas grid coordinates convert to QuadSurface surface coordinates with scale and center")

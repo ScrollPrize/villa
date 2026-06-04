@@ -54,8 +54,8 @@ struct Atlas {
 };
 
 struct AtlasCoveredSize {
-    int width = 0;
-    int height = 0;
+    double width = 0.0;
+    double height = 0.0;
     bool valid = false;
 };
 
@@ -133,7 +133,9 @@ std::shared_ptr<QuadSurface> idxRotatedSurface(const QuadSurface& surface,
 void saveIdxRotatedBaseMesh(const QuadSurface& surface,
                             int rotationColumns,
                             const std::filesystem::path& targetDir);
-AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas);
+AtlasCoveredSize mappedObjectCoveredAtlasSize(
+    const Atlas& atlas,
+    cv::Vec2f atlasScale = cv::Vec2f(1.0f, 1.0f));
 int atlasHorizontalPeriodColumns(const QuadSurface& surface);
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns);
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,

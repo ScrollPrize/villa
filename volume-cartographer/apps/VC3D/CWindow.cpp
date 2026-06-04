@@ -129,7 +129,13 @@ QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
     if (!size.valid) {
         return QObject::tr("No valid footprint");
     }
-    return QStringLiteral("%1 x %2 vx").arg(size.width).arg(size.height);
+    auto formatValue = [](double value) {
+        if (std::abs(value - std::round(value)) < 1.0e-6) {
+            return QString::number(static_cast<qint64>(std::llround(value)));
+        }
+        return QString::number(value, 'f', 2);
+    };
+    return QStringLiteral("%1 x %2 vx").arg(formatValue(size.width), formatValue(size.height));
 }
 
 class DockMenuMainWindow : public QMainWindow
@@ -2121,7 +2127,10 @@ void CWindow::refreshAtlasOverviewDocks()
 
                 auto* coveredSize = new QTreeWidgetItem(item);
                 coveredSize->setText(0, tr("Object covered atlas size"));
-                coveredSize->setText(1, formatAtlasCoveredSize(vc::atlas::mappedObjectCoveredAtlasSize(atlas)));
+                const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
+                const QuadSurface baseSurface(basePath);
+                coveredSize->setText(1, formatAtlasCoveredSize(
+                    vc::atlas::mappedObjectCoveredAtlasSize(atlas, baseSurface.scale())));
             } catch (const std::exception& ex) {
                 auto* item = new QTreeWidgetItem(tree);
                 item->setText(0, QString::fromStdString(atlasDir.filename().string()));
@@ -2147,6 +2156,11 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
         const auto* points = baseSurface->rawPointsPtr();
         if (!points || points->empty() || points->cols <= 0) {
             throw std::runtime_error("atlas base mesh has no valid grid");
+        }
+        const cv::Vec2f baseScale = baseSurface->scale();
+        if (!std::isfinite(baseScale[0]) || !std::isfinite(baseScale[1]) ||
+            baseScale[0] <= 0.0f || baseScale[1] <= 0.0f) {
+            throw std::runtime_error("atlas base mesh has invalid scale");
         }
 
         const vc::atlas::AtlasDisplayRange displayRange =
