@@ -1,5 +1,7 @@
 #include "LineAnnotationDialog.hpp"
 
+#include "Keybinds.hpp"
+#include "LineAnnotationShiftScroll.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -10,6 +12,7 @@
 #include <QEvent>
 #include <QKeyEvent>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPushButton>
@@ -23,7 +26,6 @@
 namespace {
 
 constexpr int kBottomCrossSliceCount = 7;
-constexpr double kBottomCrossSliceLineStep = 10.0;
 
 CChunkedVolumeViewer::CameraState generatedPaneCamera(CChunkedVolumeViewer* viewer,
                                                       const CChunkedVolumeViewer::CameraState& fallback)
@@ -116,6 +118,18 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _initialDirectionCombo->setCurrentIndex(1);
     _initialDirectionCombo->installEventFilter(this);
     buttonLayout->addWidget(_initialDirectionCombo);
+    _sliceStepLabel = new QLabel(this);
+    _sliceStepLabel->setText(tr("Step: %1").arg(_viewerManager ? _viewerManager->sliceStepSize() : 1));
+    _sliceStepLabel->setToolTip(tr("Shift+Scroll step size. Use Shift+G / Shift+H to adjust."));
+    _sliceStepLabel->installEventFilter(this);
+    buttonLayout->addWidget(_sliceStepLabel);
+    if (_viewerManager) {
+        connect(_viewerManager, &ViewerManager::sliceStepSizeChanged, this, [this](int size) {
+            if (_sliceStepLabel) {
+                _sliceStepLabel->setText(tr("Step: %1").arg(size));
+            }
+        });
+    }
     _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
     _showAsMeshButton->setEnabled(false);
     _showAsMeshButton->installEventFilter(this);
@@ -261,6 +275,13 @@ void LineAnnotationDialog::bindPaneInteractions(const std::string& surfaceName,
     }
 
     viewer->setLineAnnotationPlacementPreviewEnabled(seedPlacementEnabled);
+    viewer->installEventFilter(this);
+    if (auto* view = viewer->graphicsView()) {
+        view->installEventFilter(this);
+        if (auto* viewport = view->viewport()) {
+            viewport->installEventFilter(this);
+        }
+    }
     if (!seedPlacementEnabled) {
         return;
     }
@@ -414,6 +435,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                         ? currentCutCamera
                                         : generatedPaneCamera(currentViewer, camera),
                                     false);
+    currentViewer->setShiftScrollOverride(
+        [this](int steps, QPointF, Qt::KeyboardModifiers) {
+            return shiftCurrentLinePositionByScrollSteps(steps);
+        });
     bindPaneInteractions(views.currentCutName, currentViewer, false);
     connect(currentViewer,
             &CChunkedVolumeViewer::sendMousePressVolume,
@@ -526,6 +551,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                      ? bottomSliceCameras[static_cast<size_t>(slot)]
                                      : generatedPaneCamera(viewer, camera),
                                  false);
+        viewer->setShiftScrollOverride(
+            [this](int steps, QPointF, Qt::KeyboardModifiers) {
+                return shiftBottomSlicesByScrollSteps(steps);
+            });
         bindPaneInteractions(surfaceName, viewer, false);
         connect(viewer,
                 &CChunkedVolumeViewer::sendMousePressVolume,
@@ -769,17 +798,55 @@ void LineAnnotationDialog::setCurrentLinePosition(double position)
         return;
     }
     position = std::clamp(position, 0.0, static_cast<double>(_generatedViews.linePoints.size() - 1));
-    if (std::abs(position - _currentLinePosition) < 1.0e-3 && _currentCutViewer) {
+    const bool currentChanged = std::abs(position - _currentLinePosition) >= 1.0e-3;
+    const bool bottomChanged = std::abs(position - _bottomCenterPosition) >= 1.0e-3;
+    if (!currentChanged && !bottomChanged) {
         return;
     }
     _currentLinePosition = position;
-    if (_generatedViews.currentCutSurface) {
+    if (currentChanged && _generatedViews.currentCutSurface) {
         (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
     }
-    if (_currentCutViewer) {
+    if (currentChanged && _currentCutViewer) {
         _currentCutViewer->renderVisible(true, "line annotation current cut");
     }
+    _bottomCenterPosition = position;
+    renderBottomSlicePlanes("line annotation bottom cuts follow current");
     rebuildGeneratedOverlays();
+}
+
+bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
+        return true;
+    }
+    const int sliceStepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
+    const double position = vc3d::line_annotation::shiftedLinePosition(
+        _currentLinePosition,
+        steps,
+        sliceStepSize,
+        static_cast<int>(_generatedViews.linePoints.size()));
+    setCurrentLinePosition(position);
+    return true;
+}
+
+bool LineAnnotationDialog::shiftBottomSlicesByScrollSteps(int steps)
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
+        return true;
+    }
+    const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
+    if (bottomCount <= 0) {
+        return true;
+    }
+    const int sliceStepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
+    const double position = vc3d::line_annotation::shiftedLinePosition(
+        _bottomCenterPosition,
+        steps,
+        sliceStepSize,
+        static_cast<int>(_generatedViews.linePoints.size()));
+    setCurrentLinePosition(position);
+    return true;
 }
 
 void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
@@ -792,14 +859,11 @@ void LineAnnotationDialog::recenterBottomSlicesOnCurrentPosition()
     if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
         return;
     }
-    _currentLinePosition = snappedControlPointPosition(_currentLinePosition);
-    if (_generatedViews.currentCutSurface) {
-        (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
-    }
-    if (_currentCutViewer) {
-        _currentCutViewer->renderVisible(true, "line annotation current cut");
-    }
-    _bottomCenterPosition = _currentLinePosition;
+    setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
+}
+
+void LineAnnotationDialog::renderBottomSlicePlanes(const char* reason)
+{
     const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
     if (bottomCount <= 0) {
         return;
@@ -812,9 +876,8 @@ void LineAnnotationDialog::recenterBottomSlicesOnCurrentPosition()
         const double position = bottomSliceLinePosition(slot, bottomCount);
         const auto& plane = _generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].second;
         (void)updatePlaneSurface(plane.get(), position);
-        viewer->renderVisible(true, "line annotation bottom cuts");
+        viewer->renderVisible(true, reason);
     }
-    rebuildGeneratedOverlays();
 }
 
 double LineAnnotationDialog::snappedControlPointPosition(double position) const
@@ -1013,10 +1076,11 @@ double LineAnnotationDialog::bottomSliceLinePosition(int slot, int bottomCount) 
     if (!_hasGeneratedViews || _generatedViews.linePoints.empty() || bottomCount <= 0) {
         return 0.0;
     }
-    const double maxLinePosition = static_cast<double>(_generatedViews.linePoints.size() - 1);
-    const double centerOffset = static_cast<double>(slot - bottomCount / 2) *
-                                kBottomCrossSliceLineStep;
-    return std::clamp(_bottomCenterPosition + centerOffset, 0.0, maxLinePosition);
+    return vc3d::line_annotation::bottomCrossSliceLinePosition(
+        _bottomCenterPosition,
+        slot,
+        bottomCount,
+        static_cast<int>(_generatedViews.linePoints.size()));
 }
 
 QPointF LineAnnotationDialog::stripLinePositionToScene(CChunkedVolumeViewer* viewer,
@@ -1043,30 +1107,51 @@ QPointF LineAnnotationDialog::stripLinePositionToScene(CChunkedVolumeViewer* vie
 
 void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
 {
-    if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
-        setCurrentCutFollowsStripMouse(!_currentCutFollowsStripMouse);
-        event->accept();
-        return;
-    }
-    if (event->key() == Qt::Key_Escape ||
-        (event->key() == Qt::Key_X && event->modifiers() == Qt::NoModifier)) {
-        close();
-        event->accept();
+    if (handleKeyPress(event)) {
         return;
     }
     QDialog::keyPressEvent(event);
 }
 
+bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
+{
+    if (!event) {
+        return false;
+    }
+    if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
+        setCurrentCutFollowsStripMouse(!_currentCutFollowsStripMouse);
+        event->accept();
+        return true;
+    }
+    if (_viewerManager &&
+        event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers) {
+        if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
+            const int newStep = std::max(1, _viewerManager->sliceStepSize() - 1);
+            _viewerManager->setSliceStepSize(newStep);
+            event->accept();
+            return true;
+        }
+        if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
+            const int newStep = std::min(100, _viewerManager->sliceStepSize() + 1);
+            _viewerManager->setSliceStepSize(newStep);
+            event->accept();
+            return true;
+        }
+    }
+    if (event->key() == Qt::Key_Escape ||
+        (event->key() == Qt::Key_X && event->modifiers() == Qt::NoModifier)) {
+        close();
+        event->accept();
+        return true;
+    }
+    return false;
+}
+
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
-    if ((watched == _initialDirectionCombo ||
-         watched == _showAsMeshButton ||
-         watched == _fullOptimizationButton) &&
-        event->type() == QEvent::KeyPress) {
+    if (event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
-        if (keyEvent->key() == Qt::Key_Space && keyEvent->modifiers() == Qt::NoModifier) {
-            setCurrentCutFollowsStripMouse(!_currentCutFollowsStripMouse);
-            keyEvent->accept();
+        if (handleKeyPress(keyEvent)) {
             return true;
         }
     }

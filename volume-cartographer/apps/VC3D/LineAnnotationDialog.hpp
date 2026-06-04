@@ -17,6 +17,7 @@
 
 class CState;
 class QComboBox;
+class QLabel;
 class QMdiArea;
 class QMdiSubWindow;
 class QPushButton;
@@ -124,6 +125,8 @@ private:
                                const GeneratedOverlay& overlay);
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
     void setCurrentLinePosition(double position);
+    bool shiftCurrentLinePositionByScrollSteps(int steps);
+    bool shiftBottomSlicesByScrollSteps(int steps);
     void setCurrentCutFollowsStripMouse(bool follows);
     void recenterBottomSlicesOnCurrentPosition();
     double snappedControlPointPosition(double position) const;
@@ -141,10 +144,13 @@ private:
     QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                      QuadSurface* surface,
                                      double linePosition) const;
+    bool handleKeyPress(QKeyEvent* event);
+    void renderBottomSlicePlanes(const char* reason);
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _initialDirectionCombo = nullptr;
+    QLabel* _sliceStepLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
     QPushButton* _fullOptimizationButton = nullptr;
     QMdiArea* _mdiArea = nullptr;

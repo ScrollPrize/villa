@@ -937,7 +937,12 @@ void ViewerManager::broadcastLinkedCursor(VolumeViewerBase* source,
 
 void ViewerManager::setSliceStepSize(int size)
 {
-    _sliceStepSize = std::max(1, size);
+    const int clampedSize = std::max(1, size);
+    if (_sliceStepSize == clampedSize) {
+        return;
+    }
+    _sliceStepSize = clampedSize;
+    emit sliceStepSizeChanged(_sliceStepSize);
 }
 
 void ViewerManager::forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const

@@ -2576,7 +2576,7 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onZoomIn);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomOutRequested,
             this, &CWindow::onZoomOut);
-    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::sliceStepSizeChanged,
+    connect(_viewerManager.get(), &ViewerManager::sliceStepSizeChanged,
             this, &CWindow::onSliceStepSizeChanged);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
@@ -2882,14 +2882,12 @@ void CWindow::keyPressEvent(QKeyEvent* event)
             int currentStep = _viewerManager->sliceStepSize();
             int newStep = std::max(1, currentStep - 1);
             _viewerManager->setSliceStepSize(newStep);
-            onSliceStepSizeChanged(newStep);
             event->accept();
             return;
         } else if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
             int currentStep = _viewerManager->sliceStepSize();
             int newStep = std::min(100, currentStep + 1);
             _viewerManager->setSliceStepSize(newStep);
-            onSliceStepSizeChanged(newStep);
             event->accept();
             return;
         }

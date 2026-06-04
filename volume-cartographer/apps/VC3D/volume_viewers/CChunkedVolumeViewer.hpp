@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -17,6 +18,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -59,6 +61,7 @@ public:
         float zOffset = 0.0f;
         cv::Vec3f zOffsetWorldDir{0, 0, 0};
     };
+    using ShiftScrollOverride = std::function<bool(int, QPointF, Qt::KeyboardModifiers)>;
 
     CChunkedVolumeViewer(CState* state, ViewerManager* manager, QWidget* parent = nullptr);
     ~CChunkedVolumeViewer() override;
@@ -177,6 +180,7 @@ public:
     void setLineAnnotationPlacementPreviewEnabled(bool enabled);
     bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
     bool lineAnnotationPlacementMarkerVisible() const;
+    void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
     QObject* asQObject() override { return this; }
@@ -476,6 +480,7 @@ private:
     QPointF _lastPanSceneF;
     QPointF _lastScenePos;
     std::optional<cv::Vec3f> _lastCursorVolumePos;
+    ShiftScrollOverride _shiftScrollOverride;
 
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;

@@ -134,6 +134,7 @@ signals:
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
     void samplingStrideChanged(int stride);
+    void sliceStepSizeChanged(int size);
 
 private slots:
     void handleSurfacePatchIndexPrimeFinished();

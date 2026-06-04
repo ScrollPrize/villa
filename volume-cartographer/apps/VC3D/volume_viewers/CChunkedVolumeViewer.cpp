@@ -3024,6 +3024,9 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
     if (!surf)
         return;
     if (modifiers & Qt::ShiftModifier) {
+        if (_shiftScrollOverride && _shiftScrollOverride(steps, scenePoint, modifiers)) {
+            return;
+        }
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
             const cv::Vec3f normal = plane->normal({0, 0, 0});
             if (std::isfinite(normal[0]) && std::isfinite(normal[1]) &&
