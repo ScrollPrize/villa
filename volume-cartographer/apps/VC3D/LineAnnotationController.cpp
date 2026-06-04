@@ -898,13 +898,12 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(
             input, candidates, shellIndex, sampler);
         auto& selected = candidates.at(static_cast<size_t>(selection.surfaceIndex));
-        const int rotationColumns = vc::atlas::computeIdxRotationColumns(*selected.surface);
-        atlasDebug("rotation_columns=" + std::to_string(rotationColumns));
-        auto rotatedBase = vc::atlas::idxRotatedSurface(*selected.surface, rotationColumns);
+        const int zeroWindingColumn = vc::atlas::computeZeroWindingColumn(*selected.surface);
+        atlasDebug("zero_winding_column=" + std::to_string(zeroWindingColumn));
 
         SurfacePatchIndex baseIndex;
-        baseIndex.rebuild({rotatedBase});
-        auto mapping = vc::atlas::mapFiberToBaseSurface(input, *rotatedBase, baseIndex, sampler);
+        baseIndex.rebuild({selected.surface});
+        auto mapping = vc::atlas::mapFiberToBaseSurface(input, *selected.surface, baseIndex, sampler);
 
         const std::string atlasName = "fiber_" + std::to_string(fiberId);
         const fs::path atlasDir = vc::atlas::uniqueAtlasDirectory(volpkgRoot, atlasName);
@@ -912,11 +911,10 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
                                                        atlasDir.filename().string(),
                                                        input,
                                                        selected,
-                                                       rotationColumns,
+                                                       zeroWindingColumn,
                                                        std::move(mapping));
-        vc::atlas::saveIdxRotatedBaseMesh(*selected.surface,
-                                          rotationColumns,
-                                          atlasDir / atlas.metadata.baseMeshPath);
+        vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
+                                         atlasDir / atlas.metadata.baseMeshPath);
         atlas.save(atlasDir);
         emit atlasCreated(atlasDir);
     } catch (const std::exception& ex) {

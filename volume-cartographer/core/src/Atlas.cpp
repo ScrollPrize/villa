@@ -29,6 +29,7 @@ namespace vc::atlas {
 namespace {
 
 constexpr double kEpsilon = 1.0e-9;
+constexpr int kAtlasMetadataVersion = 2;
 
 bool atlasDebugEnabled()
 {
@@ -744,11 +745,11 @@ void Atlas::save(const fs::path& atlasDir) const
 {
     nlohmann::json metadataJson = {
         {"type", metadata.type},
-        {"version", metadata.version},
+        {"version", kAtlasMetadataVersion},
         {"name", metadata.name},
         {"base_mesh_path", metadata.baseMeshPath.generic_string()},
         {"source_base_mesh_path", metadata.sourceBaseMeshPath.generic_string()},
-        {"idx_rotation_columns", metadata.idxRotationColumns},
+        {"zero_winding_column", metadata.zeroWindingColumn},
         {"seed_line_index", metadata.seedLineIndex},
         {"seed_atlas", nlohmann::json::array({metadata.seedAtlasU, metadata.seedAtlasV})},
     };
@@ -787,13 +788,16 @@ Atlas Atlas::load(const fs::path& atlasDir)
     const auto metadata = readJsonFile(atlasDir / "metadata.json");
     atlas.metadata.type = metadata.value("type", std::string{});
     atlas.metadata.version = metadata.value("version", 0);
-    if (atlas.metadata.type != "vc3d_atlas" || atlas.metadata.version != 1) {
+    if (atlas.metadata.type != "vc3d_atlas" || atlas.metadata.version != kAtlasMetadataVersion) {
+        throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
+    }
+    if (metadata.contains("idx_rotation_columns") || !metadata.contains("zero_winding_column")) {
         throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
     }
     atlas.metadata.name = metadata.value("name", atlasDir.filename().string());
     atlas.metadata.baseMeshPath = metadata.value("base_mesh_path", std::string{});
     atlas.metadata.sourceBaseMeshPath = metadata.value("source_base_mesh_path", std::string{});
-    atlas.metadata.idxRotationColumns = metadata.value("idx_rotation_columns", 0);
+    atlas.metadata.zeroWindingColumn = metadata.at("zero_winding_column").get<int>();
     atlas.metadata.seedLineIndex = metadata.value("seed_line_index", 0);
     if (metadata.contains("seed_atlas") && metadata["seed_atlas"].is_array() &&
         metadata["seed_atlas"].size() == 2) {
@@ -979,16 +983,17 @@ BaseSelection selectBaseSurfaceBySeedRay(const FiberInput& fiber,
     return selection;
 }
 
-int computeIdxRotationColumns(const QuadSurface& surface)
+int computeZeroWindingColumn(const QuadSurface& surface)
 {
     const auto* points = surface.rawPointsPtr();
     if (!points || points->cols <= 0) {
         return 0;
     }
+    const int periodColumns = atlasHorizontalPeriodColumns(surface);
 
     int bestCol = 0;
     double bestAverageY = std::numeric_limits<double>::infinity();
-    for (int col = 0; col < points->cols; ++col) {
+    for (int col = 0; col < periodColumns; ++col) {
         double sumY = 0.0;
         int count = 0;
         for (int row = 0; row < points->rows; ++row) {
@@ -1011,47 +1016,23 @@ int computeIdxRotationColumns(const QuadSurface& surface)
     return bestCol;
 }
 
-std::shared_ptr<QuadSurface> idxRotatedSurface(const QuadSurface& surface,
-                                               int rotationColumns)
+void saveAtlasBaseMeshCopy(const QuadSurface& surface,
+                           const fs::path& targetDir)
 {
     const auto* points = surface.rawPointsPtr();
     if (!points) {
         throw std::runtime_error("base surface has no point grid");
     }
-    const int cols = points->cols;
-    const int rows = points->rows;
-    const int shift = cols > 0 ? ((rotationColumns % cols) + cols) % cols : 0;
-    cv::Mat_<cv::Vec3f> rotated(rows, cols);
-    for (int row = 0; row < rows; ++row) {
-        for (int col = 0; col < cols; ++col) {
-            rotated(row, col) = (*points)(row, (col + shift) % cols);
-        }
-    }
-
-    auto out = std::make_shared<QuadSurface>(rotated, surface.scale());
+    QuadSurface copy(*points, surface.scale());
     auto& mutableSurface = const_cast<QuadSurface&>(surface);
     for (const auto& name : mutableSurface.channelNames()) {
-        cv::Mat channel = mutableSurface.channel(name);
-        if (channel.empty() || channel.cols != cols || channel.rows != rows) {
+        cv::Mat channel = mutableSurface.channel(name, SURF_CHANNEL_NORESIZE);
+        if (channel.empty()) {
             continue;
         }
-        cv::Mat rotatedChannel(channel.rows, channel.cols, channel.type());
-        for (int row = 0; row < channel.rows; ++row) {
-            for (int col = 0; col < channel.cols; ++col) {
-                channel.col((col + shift) % cols).row(row).copyTo(rotatedChannel.col(col).row(row));
-            }
-        }
-        out->setChannel(name, rotatedChannel);
+        copy.setChannel(name, channel.clone());
     }
-    return out;
-}
-
-void saveIdxRotatedBaseMesh(const QuadSurface& surface,
-                            int rotationColumns,
-                            const fs::path& targetDir)
-{
-    auto rotated = idxRotatedSurface(surface, rotationColumns);
-    rotated->save(targetDir, true);
+    copy.save(targetDir, true);
 }
 
 AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas, cv::Vec2f atlasScale)
@@ -1100,31 +1081,38 @@ AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas, cv::Vec2f atla
 int atlasHorizontalPeriodColumns(const QuadSurface& surface)
 {
     const auto* points = surface.rawPointsPtr();
-    if (!points || points->cols <= 0) {
-        return 0;
+    if (!points || points->empty() || points->rows <= 0 || points->cols <= 0) {
+        throw std::runtime_error("atlas init shell has no valid grid");
     }
     const int cols = points->cols;
-    if (cols <= 1) {
-        return cols;
+    if (cols < 2) {
+        throw std::runtime_error("atlas init shell must have at least two columns");
     }
 
-    bool comparedAny = false;
     for (int row = 0; row < points->rows; ++row) {
         const cv::Vec3f first = (*points)(row, 0);
         const cv::Vec3f last = (*points)(row, cols - 1);
         if (!finitePoint(first) || !finitePoint(last)) {
-            if (first == last) {
-                continue;
-            }
-            return cols;
+            throw std::runtime_error(
+                "atlas init shell is not explicitly wrapped: first and last columns differ");
         }
-        comparedAny = true;
         const cv::Vec3d delta = toVec3d(first) - toVec3d(last);
         if (norm(delta) > 1.0e-5) {
-            return cols;
+            throw std::runtime_error(
+                "atlas init shell is not explicitly wrapped: first and last columns differ");
         }
     }
-    return comparedAny ? cols - 1 : cols;
+    return cols - 1;
+}
+
+int atlasWindingForColumn(double atlasU, int periodColumns, int zeroWindingColumn)
+{
+    if (periodColumns <= 0 || !std::isfinite(atlasU)) {
+        return 0;
+    }
+    const double period = static_cast<double>(periodColumns);
+    return static_cast<int>(
+        std::floor((atlasU - static_cast<double>(zeroWindingColumn)) / period));
 }
 
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
@@ -1143,7 +1131,8 @@ AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
         if (!std::isfinite(anchor.atlasU)) {
             return;
         }
-        const int winding = static_cast<int>(std::floor(anchor.atlasU / static_cast<double>(baseColumns)));
+        const int winding = atlasWindingForColumn(
+            anchor.atlasU, baseColumns, atlas.metadata.zeroWindingColumn);
         if (!haveAnchor) {
             minWinding = winding;
             maxWinding = winding;
@@ -1161,14 +1150,16 @@ AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
     }
 
     if (!haveAnchor) {
-        minWinding = static_cast<int>(std::floor(atlas.metadata.seedAtlasU / static_cast<double>(baseColumns)));
+        minWinding = atlasWindingForColumn(
+            atlas.metadata.seedAtlasU, baseColumns, atlas.metadata.zeroWindingColumn);
         maxWinding = minWinding;
     }
 
     range.leftmostWinding = minWinding;
     range.rightmostWinding = maxWinding;
     range.unwrapCount = std::max(1, maxWinding - minWinding + 1);
-    range.atlasUOffset = static_cast<double>(minWinding * baseColumns);
+    range.atlasUOffset = static_cast<double>(atlas.metadata.zeroWindingColumn) +
+                         static_cast<double>(minWinding * baseColumns);
     range.hasMappedObjects = haveAnchor;
     return range;
 }
@@ -1197,14 +1188,15 @@ cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
 }
 
 std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& baseSurface,
-                                                        int unwrapCount)
+                                                        int unwrapCount,
+                                                        int startColumn)
 {
     const auto* points = baseSurface.rawPointsPtr();
     if (!points) {
         throw std::runtime_error("base surface has no point grid");
     }
-    if (unwrapCount <= 1) {
-        return std::make_shared<QuadSurface>(*points, baseSurface.scale());
+    if (unwrapCount <= 0) {
+        throw std::runtime_error("atlas display unwrap count must be positive");
     }
 
     const int rows = points->rows;
@@ -1214,20 +1206,13 @@ std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& base
     }
 
     const int periodColumns = atlasHorizontalPeriodColumns(baseSurface);
-    const bool wrapped = periodColumns == cols - 1 && periodColumns > 0;
-    const int outCols = wrapped ? periodColumns * unwrapCount + 1 : cols * unwrapCount;
+    const int outCols = periodColumns * unwrapCount;
+    const int start = ((startColumn % periodColumns) + periodColumns) % periodColumns;
 
     cv::Mat_<cv::Vec3f> repeated(rows, outCols);
-    if (wrapped) {
-        for (int row = 0; row < rows; ++row) {
-            for (int col = 0; col < outCols; ++col) {
-                repeated(row, col) = (*points)(row, col % periodColumns);
-            }
-        }
-    } else {
-        for (int unwrap = 0; unwrap < unwrapCount; ++unwrap) {
-            const cv::Rect dst(unwrap * cols, 0, cols, rows);
-            points->copyTo(repeated(dst));
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < outCols; ++col) {
+            repeated(row, col) = (*points)(row, (start + col) % periodColumns);
         }
     }
 
@@ -1239,16 +1224,10 @@ std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& base
             continue;
         }
         cv::Mat repeatedChannel(rows, outCols, channel.type());
-        if (wrapped) {
-            for (int row = 0; row < rows; ++row) {
-                for (int col = 0; col < outCols; ++col) {
-                    channel.col(col % periodColumns).row(row).copyTo(
-                        repeatedChannel.col(col).row(row));
-                }
-            }
-        } else {
-            for (int unwrap = 0; unwrap < unwrapCount; ++unwrap) {
-                channel.copyTo(repeatedChannel(cv::Rect(unwrap * cols, 0, cols, rows)));
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < outCols; ++col) {
+                channel(cv::Rect((start + col) % periodColumns, row, 1, 1)).copyTo(
+                    repeatedChannel(cv::Rect(col, row, 1, 1)));
             }
         }
         out->setChannel(name, repeatedChannel);
@@ -1392,7 +1371,7 @@ Atlas createSingleFiberAtlas(const fs::path& volpkgRoot,
                              const std::string& atlasName,
                              const FiberInput& fiber,
                              const SurfaceCandidate& baseSurface,
-                             int rotationColumns,
+                             int zeroWindingColumn,
                              FiberMapping mapping)
 {
     if (!baseSurface.surface) {
@@ -1403,7 +1382,7 @@ Atlas createSingleFiberAtlas(const fs::path& volpkgRoot,
     const std::string baseDirName = sanitizeAtlasName(baseSurface.name) + ".tifxyz";
     atlas.metadata.baseMeshPath = fs::path("base_mesh") / baseDirName;
     atlas.metadata.sourceBaseMeshPath = fs::relative(baseSurface.path, volpkgRoot);
-    atlas.metadata.idxRotationColumns = rotationColumns;
+    atlas.metadata.zeroWindingColumn = zeroWindingColumn;
     atlas.metadata.seedLineIndex = seedLineIndexForFiber(fiber);
     auto seedIt = std::find_if(mapping.lineAnchors.begin(),
                                mapping.lineAnchors.end(),

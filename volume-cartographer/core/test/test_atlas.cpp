@@ -8,7 +8,11 @@
 #include "vc/lasagna/LineModel.hpp"
 
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <limits>
 #include <memory>
+#include <string>
 
 namespace fs = std::filesystem;
 
@@ -63,6 +67,24 @@ std::shared_ptr<QuadSurface> makePlane(int rows,
     return std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
 }
 
+std::shared_ptr<QuadSurface> makeWrappedPlane(int rows,
+                                              int uniqueCols,
+                                              double z,
+                                              double yBias = 0.0,
+                                              double xBias = 0.0)
+{
+    cv::Mat_<cv::Vec3f> points(rows, uniqueCols + 1);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < uniqueCols; ++col) {
+            points(row, col) = cv::Vec3f(static_cast<float>(col + xBias),
+                                         static_cast<float>(row + yBias),
+                                         static_cast<float>(z));
+        }
+        points(row, uniqueCols) = points(row, 0);
+    }
+    return std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
+}
+
 fs::path tempRoot(const std::string& name)
 {
     const fs::path root = fs::temp_directory_path() / name;
@@ -70,6 +92,12 @@ fs::path tempRoot(const std::string& name)
     fs::remove_all(root, ec);
     fs::create_directories(root);
     return root;
+}
+
+std::string readText(const fs::path& path)
+{
+    std::ifstream in(path);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
 } // namespace
@@ -82,7 +110,7 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     atlas.metadata.name = "fiber_1";
     atlas.metadata.baseMeshPath = "base_mesh/shell.tifxyz";
     atlas.metadata.sourceBaseMeshPath = "segments/shell";
-    atlas.metadata.idxRotationColumns = 3;
+    atlas.metadata.zeroWindingColumn = 3;
     atlas.metadata.seedLineIndex = 1;
     atlas.metadata.seedAtlasU = 4.5;
     atlas.metadata.seedAtlasV = 2.0;
@@ -95,10 +123,16 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     atlas.fibers.push_back(mapping);
 
     atlas.save(root);
+    const std::string metadata = readText(root / "metadata.json");
+    CHECK(metadata.find("\"version\": 2") != std::string::npos);
+    CHECK(metadata.find("\"zero_winding_column\": 3") != std::string::npos);
+    CHECK(metadata.find("idx_rotation_columns") == std::string::npos);
+
     const auto loaded = vc::atlas::Atlas::load(root);
 
     REQUIRE(loaded.metadata.name == "fiber_1");
-    CHECK(loaded.metadata.idxRotationColumns == 3);
+    CHECK(loaded.metadata.version == 2);
+    CHECK(loaded.metadata.zeroWindingColumn == 3);
     CHECK(loaded.metadata.seedLineIndex == 1);
     CHECK(loaded.metadata.seedAtlasU == doctest::Approx(4.5));
     REQUIRE(loaded.links.size() == 1);
@@ -108,9 +142,32 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     CHECK(loaded.fibers[0].lineAnchors[0].atlasV == doctest::Approx(5.0));
 }
 
+TEST_CASE("Atlas loader rejects legacy idx rotation metadata")
+{
+    const fs::path root = tempRoot("vc_atlas_legacy_metadata");
+    {
+        std::ofstream out(root / "metadata.json");
+        out << R"({
+  "type": "vc3d_atlas",
+  "version": 1,
+  "name": "legacy",
+  "base_mesh_path": "base_mesh/shell.tifxyz",
+  "source_base_mesh_path": "segments/shell",
+  "idx_rotation_columns": 3,
+  "seed_line_index": 0,
+  "seed_atlas": [0, 0]
+})";
+    }
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::Atlas::load(root),
+        doctest::Contains("unsupported atlas metadata"),
+        std::runtime_error);
+}
+
 TEST_CASE("Atlas seed selection uses line points without requiring controls")
 {
-    auto surface = makePlane(4, 4, 0.0);
+    auto surface = makeWrappedPlane(4, 4, 0.0);
     SurfacePatchIndex index;
     index.rebuild({surface});
     std::vector<vc::atlas::SurfaceCandidate> surfaces = {
@@ -248,26 +305,59 @@ TEST_CASE("Atlas ray projection returns fractional coordinates on bilinear quads
     CHECK(hits[0].world[2] == doctest::Approx(0.125));
 }
 
-TEST_CASE("Atlas idx rotation cyclically shifts columns without moving coordinates")
+TEST_CASE("Atlas zero winding column finds the lowest average Y column")
 {
-    cv::Mat_<cv::Vec3f> points(2, 4);
+    cv::Mat_<cv::Vec3f> points(2, 5);
     for (int row = 0; row < points.rows; ++row) {
-        for (int col = 0; col < points.cols; ++col) {
+        for (int col = 0; col < points.cols - 1; ++col) {
             points(row, col) = cv::Vec3f(static_cast<float>(col),
                                          static_cast<float>((col == 2 ? -10 : col) + row),
                                          0.0f);
         }
+        points(row, points.cols - 1) = points(row, 0);
     }
     QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
-    CHECK(vc::atlas::computeIdxRotationColumns(surface) == 2);
+    CHECK(vc::atlas::computeZeroWindingColumn(surface) == 2);
+}
 
-    auto rotated = vc::atlas::idxRotatedSurface(surface, 2);
-    const auto* out = rotated->rawPointsPtr();
+TEST_CASE("Atlas base mesh copy preserves source columns and explicit wrapped seam")
+{
+    const fs::path root = tempRoot("vc_atlas_base_mesh_copy");
+    cv::Mat_<cv::Vec3f> points(2, 5);
+    cv::Mat labels(2, 5, CV_8U);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols - 1; ++col) {
+            points(row, col) = cv::Vec3f(static_cast<float>(col),
+                                         static_cast<float>(row),
+                                         static_cast<float>(10 + col));
+            labels.at<uint8_t>(row, col) = static_cast<uint8_t>(col + 1);
+        }
+        points(row, points.cols - 1) = points(row, 0);
+        labels.at<uint8_t>(row, points.cols - 1) = 99;
+    }
+    QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
+    surface.setChannel("labels", labels);
+
+    vc::atlas::saveAtlasBaseMeshCopy(surface, root / "base_mesh" / "shell.tifxyz");
+    QuadSurface saved(root / "base_mesh" / "shell.tifxyz");
+    const auto* out = saved.rawPointsPtr();
     REQUIRE(out != nullptr);
-    CHECK((*out)(0, 0)[0] == doctest::Approx(points(0, 2)[0]));
-    CHECK((*out)(0, 1)[0] == doctest::Approx(points(0, 3)[0]));
-    CHECK((*out)(0, 2)[0] == doctest::Approx(points(0, 0)[0]));
-    CHECK((*out)(0, 3)[0] == doctest::Approx(points(0, 1)[0]));
+    CHECK(out->cols == 5);
+    for (int col = 0; col < out->cols; ++col) {
+        CHECK((*out)(0, col)[0] == doctest::Approx(points(0, col)[0]));
+        CHECK((*out)(0, col)[2] == doctest::Approx(points(0, col)[2]));
+    }
+    CHECK((*out)(0, 4)[0] == doctest::Approx((*out)(0, 0)[0]));
+    CHECK((*out)(1, 4)[2] == doctest::Approx((*out)(1, 0)[2]));
+    CHECK(vc::atlas::atlasHorizontalPeriodColumns(saved) == 4);
+
+    const cv::Mat savedLabels = saved.channel("labels");
+    REQUIRE(!savedLabels.empty());
+    CHECK(savedLabels.at<uint8_t>(0, 0) == 1);
+    CHECK(savedLabels.at<uint8_t>(0, 1) == 2);
+    CHECK(savedLabels.at<uint8_t>(0, 2) == 3);
+    CHECK(savedLabels.at<uint8_t>(0, 3) == 4);
+    CHECK(savedLabels.at<uint8_t>(0, 4) == 99);
 }
 
 TEST_CASE("Atlas mapped object covered size uses line anchors only")
@@ -330,10 +420,30 @@ TEST_CASE("Atlas wrapped shell period uses unique columns")
     }
     QuadSurface wrapped(points, cv::Vec2f(1.0f, 1.0f));
     CHECK(vc::atlas::atlasHorizontalPeriodColumns(wrapped) == 4);
+    const cv::Mat_<cv::Vec3f> wrappedPoints = points.clone();
 
     points(0, points.cols - 1)[0] = 9.0f;
     QuadSurface open(points, cv::Vec2f(1.0f, 1.0f));
-    CHECK(vc::atlas::atlasHorizontalPeriodColumns(open) == 5);
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::atlasHorizontalPeriodColumns(open),
+        doctest::Contains("atlas init shell is not explicitly wrapped"),
+        std::runtime_error);
+
+    cv::Mat_<cv::Vec3f> oneColumn(2, 1);
+    oneColumn.setTo(cv::Vec3f(0.0f, 0.0f, 0.0f));
+    QuadSurface tooNarrow(oneColumn, cv::Vec2f(1.0f, 1.0f));
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::atlasHorizontalPeriodColumns(tooNarrow),
+        doctest::Contains("at least two columns"),
+        std::runtime_error);
+
+    cv::Mat_<cv::Vec3f> nonFinite = wrappedPoints.clone();
+    nonFinite(1, 0)[0] = std::numeric_limits<float>::quiet_NaN();
+    QuadSurface invalidEndpoint(nonFinite, cv::Vec2f(1.0f, 1.0f));
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::atlasHorizontalPeriodColumns(invalidEndpoint),
+        doctest::Contains("atlas init shell is not explicitly wrapped"),
+        std::runtime_error);
 }
 
 TEST_CASE("Atlas display range uses leftmost mapped unwrap as the minimum column offset")
@@ -370,7 +480,51 @@ TEST_CASE("Atlas display range uses wrapped shell period for winding and offset"
     CHECK(range.hasMappedObjects);
 }
 
-TEST_CASE("Atlas repeated display surface duplicates base mesh columns for multi unwrap views")
+TEST_CASE("Atlas zero winding column changes winding interpretation only")
+{
+    vc::atlas::Atlas atlas;
+    atlas.metadata.zeroWindingColumn = 2;
+    vc::atlas::FiberMapping mapping;
+    mapping.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
+    mapping.lineAnchors.push_back({1, {}, 5.0, 1.0, 0.0});
+    atlas.fibers.push_back(mapping);
+
+    const auto shiftedRange = vc::atlas::atlasDisplayRange(atlas, 4);
+    CHECK(shiftedRange.leftmostWinding == -1);
+    CHECK(shiftedRange.rightmostWinding == 0);
+    CHECK(shiftedRange.unwrapCount == 2);
+    CHECK(shiftedRange.atlasUOffset == doctest::Approx(-2.0));
+    CHECK(vc::atlas::atlasWindingForColumn(1.0, 4, 2) == -1);
+    CHECK(vc::atlas::atlasWindingForColumn(1.0, 4, 0) == 0);
+    CHECK(atlas.fibers[0].lineAnchors[0].atlasU == doctest::Approx(1.0));
+    CHECK(atlas.fibers[0].lineAnchors[1].atlasU == doctest::Approx(5.0));
+}
+
+TEST_CASE("Atlas creation keeps base-relative anchor coordinates")
+{
+    const fs::path root = tempRoot("vc_atlas_base_relative_anchors");
+    auto surface = makeWrappedPlane(3, 4, 0.0);
+    vc::atlas::SurfaceCandidate base{"shell_a", root / "segments" / "shell_a.tifxyz", surface};
+    vc::atlas::FiberInput fiber;
+    fiber.fiberPath = "fibers/1.json";
+    fiber.linePoints = {{1.0, 1.0, 1.0}, {2.0, 1.0, 1.0}};
+
+    vc::atlas::FiberMapping mapping;
+    mapping.fiberPath = fiber.fiberPath;
+    mapping.lineAnchors.push_back({0, {}, 1.25, 1.0, 0.0});
+    mapping.lineAnchors.push_back({1, {}, 2.25, 1.0, 0.0});
+
+    auto atlas = vc::atlas::createSingleFiberAtlas(
+        root, "fiber_1", fiber, base, 3, std::move(mapping));
+
+    CHECK(atlas.metadata.zeroWindingColumn == 3);
+    REQUIRE(atlas.fibers.size() == 1);
+    REQUIRE(atlas.fibers[0].lineAnchors.size() == 2);
+    CHECK(atlas.fibers[0].lineAnchors[0].atlasU == doctest::Approx(1.25));
+    CHECK(atlas.fibers[0].lineAnchors[1].atlasU == doctest::Approx(2.25));
+}
+
+TEST_CASE("Atlas repeated display surface rejects non-wrapped base meshes")
 {
     cv::Mat_<cv::Vec3f> points(2, 3);
     for (int row = 0; row < points.rows; ++row) {
@@ -382,16 +536,13 @@ TEST_CASE("Atlas repeated display surface duplicates base mesh columns for multi
     }
     QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
 
-    auto repeated = vc::atlas::repeatedAtlasDisplaySurface(surface, 3);
-    const auto* out = repeated->rawPointsPtr();
-    REQUIRE(out != nullptr);
-    CHECK(out->rows == 2);
-    CHECK(out->cols == 9);
-    CHECK((*out)(1, 0)[2] == doctest::Approx((*out)(1, 3)[2]));
-    CHECK((*out)(1, 1)[2] == doctest::Approx((*out)(1, 7)[2]));
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::repeatedAtlasDisplaySurface(surface, 3),
+        doctest::Contains("atlas init shell is not explicitly wrapped"),
+        std::runtime_error);
 }
 
-TEST_CASE("Atlas repeated wrapped display surface tiles unique period and closes seam")
+TEST_CASE("Atlas repeated wrapped display surface tiles unique period without duplicate seam")
 {
     cv::Mat_<cv::Vec3f> points(2, 4);
     cv::Mat labels(2, 4, CV_8U);
@@ -403,30 +554,57 @@ TEST_CASE("Atlas repeated wrapped display surface tiles unique period and closes
                                          static_cast<float>(10 + uniqueCol));
             labels.at<uint8_t>(row, col) = static_cast<uint8_t>(uniqueCol + 1);
         }
+        labels.at<uint8_t>(row, points.cols - 1) = 99;
     }
     QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
     surface.setChannel("labels", labels);
+
+    auto single = vc::atlas::repeatedAtlasDisplaySurface(surface, 1);
+    const auto* singleOut = single->rawPointsPtr();
+    REQUIRE(singleOut != nullptr);
+    CHECK(singleOut->rows == 2);
+    CHECK(singleOut->cols == 3);
+    CHECK((*singleOut)(0, 2)[2] == doctest::Approx(12.0));
+    const cv::Mat singleLabels = single->channel("labels");
+    REQUIRE(!singleLabels.empty());
+    CHECK(singleLabels.cols == 3);
+    CHECK(singleLabels.at<uint8_t>(0, 0) == 1);
+    CHECK(singleLabels.at<uint8_t>(0, 1) == 2);
+    CHECK(singleLabels.at<uint8_t>(0, 2) == 3);
+
+    auto shifted = vc::atlas::repeatedAtlasDisplaySurface(surface, 1, 2);
+    const auto* shiftedOut = shifted->rawPointsPtr();
+    REQUIRE(shiftedOut != nullptr);
+    CHECK(shiftedOut->cols == 3);
+    CHECK((*shiftedOut)(0, 0)[2] == doctest::Approx(12.0));
+    CHECK((*shiftedOut)(0, 1)[2] == doctest::Approx(10.0));
+    CHECK((*shiftedOut)(0, 2)[2] == doctest::Approx(11.0));
+    const cv::Mat shiftedLabels = shifted->channel("labels");
+    REQUIRE(!shiftedLabels.empty());
+    CHECK(shiftedLabels.at<uint8_t>(0, 0) == 3);
+    CHECK(shiftedLabels.at<uint8_t>(0, 1) == 1);
+    CHECK(shiftedLabels.at<uint8_t>(0, 2) == 2);
 
     auto repeated = vc::atlas::repeatedAtlasDisplaySurface(surface, 3);
     const auto* out = repeated->rawPointsPtr();
     REQUIRE(out != nullptr);
     CHECK(out->rows == 2);
-    CHECK(out->cols == 10);
+    CHECK(out->cols == 9);
     CHECK((*out)(0, 0)[2] == doctest::Approx((*out)(0, 3)[2]));
-    CHECK((*out)(0, 0)[2] == doctest::Approx((*out)(0, 9)[2]));
     CHECK((*out)(0, 8)[2] == doctest::Approx(12.0));
 
     const cv::Mat repeatedLabels = repeated->channel("labels");
     REQUIRE(!repeatedLabels.empty());
-    CHECK(repeatedLabels.cols == 10);
+    CHECK(repeatedLabels.cols == 9);
     CHECK(repeatedLabels.at<uint8_t>(0, 0) == repeatedLabels.at<uint8_t>(0, 3));
-    CHECK(repeatedLabels.at<uint8_t>(0, 0) == repeatedLabels.at<uint8_t>(0, 9));
+    CHECK(repeatedLabels.at<uint8_t>(0, 6) == 1);
+    CHECK(repeatedLabels.at<uint8_t>(0, 7) == 2);
     CHECK(repeatedLabels.at<uint8_t>(0, 8) == 3);
 }
 
 TEST_CASE("Atlas maps a synthetic fiber over a simple grid")
 {
-    auto surface = makePlane(5, 8, 0.0);
+    auto surface = makeWrappedPlane(5, 8, 0.0);
     SurfacePatchIndex index;
     index.rebuild({surface});
 
@@ -481,7 +659,7 @@ TEST_CASE("Atlas mapping keeps wrapped seam hits continuous")
 
 TEST_CASE("Atlas mapping stops when grid and line step mismatch")
 {
-    auto surface = makePlane(5, 16, 0.0);
+    auto surface = makeWrappedPlane(5, 16, 0.0);
     SurfacePatchIndex index;
     index.rebuild({surface});
 
@@ -550,7 +728,7 @@ TEST_CASE("Atlas init shell loading reports missing and empty dirs")
 
 TEST_CASE("Atlas mapping reports incomplete fibers with fewer than two line anchors")
 {
-    auto surface = makePlane(5, 8, 0.0);
+    auto surface = makeWrappedPlane(5, 8, 0.0);
     SurfacePatchIndex index;
     index.rebuild({surface});
 

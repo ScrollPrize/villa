@@ -20,11 +20,11 @@ namespace vc::atlas {
 
 struct AtlasMetadata {
     std::string type = "vc3d_atlas";
-    int version = 1;
+    int version = 2;
     std::string name;
     std::filesystem::path baseMeshPath;
     std::filesystem::path sourceBaseMeshPath;
-    int idxRotationColumns = 0;
+    int zeroWindingColumn = 0;
     int seedLineIndex = 0;
     double seedAtlasU = 0.0;
     double seedAtlasV = 0.0;
@@ -127,23 +127,22 @@ BaseSelection selectBaseSurfaceBySeedRay(const FiberInput& fiber,
                                          const vc::lasagna::NormalSampler& normalSampler,
                                          const LineMappingOptions& options = {});
 
-int computeIdxRotationColumns(const QuadSurface& surface);
-std::shared_ptr<QuadSurface> idxRotatedSurface(const QuadSurface& surface,
-                                               int rotationColumns);
-void saveIdxRotatedBaseMesh(const QuadSurface& surface,
-                            int rotationColumns,
-                            const std::filesystem::path& targetDir);
+int computeZeroWindingColumn(const QuadSurface& surface);
+void saveAtlasBaseMeshCopy(const QuadSurface& surface,
+                           const std::filesystem::path& targetDir);
 AtlasCoveredSize mappedObjectCoveredAtlasSize(
     const Atlas& atlas,
     cv::Vec2f atlasScale = cv::Vec2f(1.0f, 1.0f));
 int atlasHorizontalPeriodColumns(const QuadSurface& surface);
+int atlasWindingForColumn(double atlasU, int periodColumns, int zeroWindingColumn);
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns);
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
                                    double atlasV,
                                    const QuadSurface& displaySurface,
                                    double atlasUOffset = 0.0);
 std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& baseSurface,
-                                                        int unwrapCount);
+                                                        int unwrapCount,
+                                                        int startColumn = 0);
 
 FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                    const QuadSurface& baseSurface,
@@ -155,7 +154,7 @@ Atlas createSingleFiberAtlas(const std::filesystem::path& volpkgRoot,
                              const std::string& atlasName,
                              const FiberInput& fiber,
                              const SurfaceCandidate& baseSurface,
-                             int rotationColumns,
+                             int zeroWindingColumn,
                              FiberMapping mapping);
 
 } // namespace vc::atlas
