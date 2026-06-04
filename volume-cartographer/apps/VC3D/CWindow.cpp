@@ -53,6 +53,8 @@
 #include <QMenu>
 #include <QMainWindow>
 #include <QTabWidget>
+#include <QTreeWidget>
+#include <QHeaderView>
 #include "utils/Json.hpp"
 #include <QPointer>
 #include <QListView>
@@ -364,6 +366,30 @@ QString absoluteSegmentPathForClipboard(const std::filesystem::path& segmentPath
     return QString::fromStdString(path.lexically_normal().string());
 }
 
+QDockWidget* createAtlasOverviewDock(QWidget* parent)
+{
+    auto* dock = new QDockWidget(QObject::tr("Atlas Overview"), parent);
+    auto* atlasTree = new QTreeWidget(dock);
+    atlasTree->setObjectName(QStringLiteral("atlasOverviewTree"));
+    atlasTree->setColumnCount(2);
+    atlasTree->setHeaderLabels({QObject::tr("Atlas"), QObject::tr("Value")});
+    atlasTree->setAlternatingRowColors(true);
+    atlasTree->setRootIsDecorated(true);
+    atlasTree->setSelectionMode(QAbstractItemView::SingleSelection);
+    atlasTree->header()->setStretchLastSection(true);
+    dock->setWidget(atlasTree);
+    return dock;
+}
+
+QDockWidget* createAtlasSearchDock(QWidget* parent)
+{
+    auto* dock = new QDockWidget(QObject::tr("Atlas Object Search"), parent);
+    auto* content = new QWidget(dock);
+    content->setObjectName(QStringLiteral("atlasSearchContent"));
+    dock->setWidget(content);
+    return dock;
+}
+
 constexpr float kEpsilon = 1e-6f;
 
 cv::Vec3f projectVectorOntoPlane(const cv::Vec3f& v, const cv::Vec3f& normal)
@@ -557,10 +583,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _lasagnaWorkspaceWindow = new QMainWindow(this);
     _lasagnaWorkspaceWindow->setObjectName(QStringLiteral("lasagnaWorkspaceWindow"));
 
+    _atlasWorkspaceWindow = new QMainWindow(this);
+    _atlasWorkspaceWindow->setObjectName(QStringLiteral("atlasWorkspaceWindow"));
+    _atlasWorkspaceWindow->setDockOptions(dockOptions());
+
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
+    _workspaceTabs->addTab(_atlasWorkspaceWindow, tr("Atlas"));
     setCentralWidget(_workspaceTabs);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
     auto* lasagnaEscapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), _lasagnaWorkspaceWindow);
@@ -795,7 +826,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     // Ensure right-side tabified docks have a usable minimum size
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
-                               ui.dockWidgetDistanceTransform }) {
+                               ui.dockWidgetDistanceTransform,
+                               _atlasOverviewDock,
+                               _atlasSearchDock,
+                               _atlasWorkspaceOverviewDock,
+                               _atlasWorkspaceSearchDock }) {
         if (dock) {
             dock->setMinimumWidth(250);
             dock->setMinimumHeight(120);
@@ -819,9 +854,14 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetVolumes,
-                               ui.dockWidgetViewerControls  }) {
+                               ui.dockWidgetViewerControls,
+                               _atlasOverviewDock,
+                               _atlasSearchDock,
+                               _atlasWorkspaceOverviewDock,
+                               _atlasWorkspaceSearchDock  }) {
         ensureDockWidgetFeatures(dock);
         // Connect dock widget signals to trigger state saving
+        if (!dock) continue;
         connect(dock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
         connect(dock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
     }
@@ -847,6 +887,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    ui.dockWidgetDistanceTransform,
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
+                                   _atlasOverviewDock,
+                                   _atlasSearchDock,
+                                   _atlasWorkspaceOverviewDock,
+                                   _atlasWorkspaceSearchDock,
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
             if (!dock) continue;
             connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
@@ -1118,6 +1162,8 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(ui.dockWidgetComposite);
     addDock(ui.dockWidgetPostprocessing);
     addDock(_lasagnaDock);
+    addDock(_atlasOverviewDock);
+    addDock(_atlasSearchDock);
     addDock(_point_collection_widget);
     addDock(_fiberWidget);
 }
@@ -1944,6 +1990,49 @@ void CWindow::setSegmentationCursorMirroring(bool enabled)
     }
 }
 
+void CWindow::createAtlasWorkspace()
+{
+    if (!_atlasWorkspaceWindow || !_segmentWorkspaceWindow || !_viewerManager) {
+        return;
+    }
+
+    if (!_atlasWorkspaceWindow->centralWidget()) {
+        if (auto* viewer = _viewerManager->createViewerInWidget("xy plane", _atlasWorkspaceWindow)) {
+            viewer->setIntersects({"segmentation"});
+            if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+                chunkedViewer->setObjectName(QStringLiteral("atlasSliceViewer"));
+                configureChunkedViewerConnections(chunkedViewer);
+                _atlasWorkspaceWindow->setCentralWidget(chunkedViewer);
+            }
+        }
+    }
+
+    if (!_atlasWorkspaceWindow->centralWidget()) {
+        auto* placeholder = new QLabel(tr("Atlas slice view"), _atlasWorkspaceWindow);
+        placeholder->setAlignment(Qt::AlignCenter);
+        _atlasWorkspaceWindow->setCentralWidget(placeholder);
+    }
+
+    _atlasWorkspaceOverviewDock = createAtlasOverviewDock(this);
+    _atlasWorkspaceOverviewDock->setObjectName(QStringLiteral("dockWidgetAtlasOverviewAtlas"));
+    _atlasWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasWorkspaceOverviewDock);
+
+    _atlasWorkspaceSearchDock = createAtlasSearchDock(this);
+    _atlasWorkspaceSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearchAtlas"));
+    _atlasWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasWorkspaceSearchDock);
+
+    _atlasOverviewDock = createAtlasOverviewDock(this);
+    _atlasOverviewDock->setObjectName(QStringLiteral("dockWidgetAtlasOverview"));
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasOverviewDock);
+
+    _atlasSearchDock = createAtlasSearchDock(this);
+    _atlasSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearch"));
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasSearchDock);
+
+    _atlasOverviewDock->hide();
+    _atlasSearchDock->hide();
+}
+
 // Create widgets
 void CWindow::CreateWidgets(void)
 {
@@ -1974,6 +2063,8 @@ void CWindow::CreateWidgets(void)
         newConnectedViewer("segmentation", tr("Surface"), mdiArea)->setIntersects({"seg xz","seg yz"});
     }
     mdiArea->tileSubWindows();
+
+    createAtlasWorkspace();
 
     treeWidgetSurfaces = ui.treeWidgetSurfaces;
     treeWidgetSurfaces->setSelectionMode(QAbstractItemView::ExtendedSelection);

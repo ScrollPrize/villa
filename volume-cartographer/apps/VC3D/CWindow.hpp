@@ -121,6 +121,7 @@ private:
     void CreateWidgets(void);
     QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
     void populateDockToggleMenu(QMenu* menu) const;
+    void createAtlasWorkspace();
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void repeatLastLasagnaAction();
@@ -229,6 +230,11 @@ private:
     QTabWidget* _workspaceTabs{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
+    QMainWindow* _atlasWorkspaceWindow{nullptr};
+    QDockWidget* _atlasOverviewDock{nullptr};
+    QDockWidget* _atlasSearchDock{nullptr};
+    QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
+    QDockWidget* _atlasWorkspaceSearchDock{nullptr};
     QMdiArea *mdiArea;
 
     bool can_change_volume_();
