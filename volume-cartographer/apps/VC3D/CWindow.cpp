@@ -2129,6 +2129,10 @@ void CWindow::refreshAtlasOverviewDocks()
                 coveredSize->setText(0, tr("Object covered atlas size"));
                 const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
                 const QuadSurface baseSurface(basePath);
+                const auto* basePoints = baseSurface.rawPointsPtr();
+                if (!basePoints || basePoints->empty() || basePoints->cols <= 0) {
+                    throw std::runtime_error("atlas base mesh has no valid grid");
+                }
                 coveredSize->setText(1, formatAtlasCoveredSize(
                     vc::atlas::mappedObjectCoveredAtlasSize(atlas, baseSurface.scale())));
             } catch (const std::exception& ex) {
