@@ -17,17 +17,18 @@
 		"corr": 0.0,
 		"bend": 100.0,
 		"ext_offset": 0.0,
-		"snap_surf_map": 0.1,
+		"snap_surf_map": 0.01,
 		"map_dist": 0.0001,
 		"map_vec_normal": 1.0,
 		"map_surface_normal": 1.0,
-		"map_smooth": 0.05,
+		"map_smooth": 0.1,
 		"map_bend": 0.01,
+		"map_turn": 0.1,
 		"map_jac": 1.0,
-		"map_metric_smooth": 0.05,
-		"map_area_smooth": 0.02,
+		"map_metric_smooth": 0.1,
+		"map_area_smooth": 0.0,
 		"map_dense_prior": 0.001,
-		"map_station_t": 1.0
+		"map_station_t": 0.001
 	},
 	"stages": [
 		{
@@ -79,7 +80,7 @@
 						"w_bend": 0.01,
 						"w_jac": 1.0,
 						"w_metric_smooth": 0.05,
-						"w_area_smooth": 0.02,
+						"w_area_smooth": 0.0,
 						"w_dense_prior": 0.001,
 						"max_sample_distance": 1000.0,
 						"max_sample_angle_deg": 180.0,
@@ -149,8 +150,7 @@
 						"params": ["map_surf_ms"],
 						"min_scaledown": 0,
 						"args": {
-							"subdiv": 1,
-							"debug_obj_dir": "snap_surf_objs"
+							"subdiv": 1
 						}
 					}
 				}
@@ -178,8 +178,7 @@
 						"params": ["map_surf_ms"],
 						"min_scaledown": 0,
 						"args": {
-							"subdiv": 1,
-							"debug_obj_dir": "snap_surf_objs"
+							"subdiv": 1
 						}
 					}
 				}

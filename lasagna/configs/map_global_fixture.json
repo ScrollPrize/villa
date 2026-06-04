@@ -17,7 +17,7 @@
 		"corr": 0.0,
 		"bend": 100.0,
 		"ext_offset": 0.0,
-		"snap_surf_map": 0.0001,
+		"snap_surf_map": 0.01,
 		"map_dist": 0.0001,
 		"map_vec_normal": 1.0,
 		"map_surface_normal": 1.0,
@@ -111,11 +111,10 @@
 			"args": {
 				"subdiv": 1,
 				"status_interval": 20,
-				"debug_obj_dir": "snap_surf_objs",
 				"export_fixture": {
 					"dir": "bench_fixtures_dbg/init",
 					"once": true,
-					"objs": true
+					"objs": false
 				}
 			}
 		}

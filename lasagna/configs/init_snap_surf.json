@@ -136,7 +136,7 @@
 			"min_scaledown": 0,
 			"args": {
 				"subdiv": 1,
-				"status_interval": 20,
+				"status_interval": 20
 			}
 		},
 		{
@@ -160,7 +160,7 @@
 						"min_scaledown": 0,
 						"w_fac" : { "map_turn" : 0.0 },
 						"args": {
-							"subdiv": 1,
+							"subdiv": 1
 						}
 					}
 				}
@@ -187,7 +187,7 @@
 						"min_scaledown": 0,
 						"w_fac" : { "map_turn" : 0.0 },
 						"args": {
-							"subdiv": 1,
+							"subdiv": 1
 						}
 					}
 				}
