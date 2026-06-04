@@ -58,6 +58,12 @@ public:
         OverlayStyle style{};
     };
 
+    struct SurfacePointPrimitive {
+        cv::Vec2f position{0.0f, 0.0f};
+        qreal radius{3.0};
+        OverlayStyle style{};
+    };
+
     struct CirclePrimitive {
         QPointF center;
         qreal radius{3.0};
@@ -67,6 +73,12 @@ public:
 
     struct LineStripPrimitive {
         std::vector<QPointF> points;
+        bool closed{false};
+        OverlayStyle style{};
+    };
+
+    struct SurfaceLineStripPrimitive {
+        std::vector<cv::Vec2f> points;
         bool closed{false};
         OverlayStyle style{};
     };
@@ -132,8 +144,10 @@ public:
 
     using OverlayPrimitive = std::variant<PointPrimitive,
                                           VolumePointPrimitive,
+                                          SurfacePointPrimitive,
                                           CirclePrimitive,
                                           LineStripPrimitive,
+                                          SurfaceLineStripPrimitive,
                                           RectPrimitive,
                                           TextPrimitive,
                                           PathPrimitive,
@@ -182,6 +196,10 @@ protected:
                       qreal radius,
                       OverlayStyle style);
 
+        void addSurfacePoint(const cv::Vec2f& position,
+                             qreal radius,
+                             OverlayStyle style);
+
         void addCircle(const QPointF& center,
                        qreal radius,
                        bool filled,
@@ -190,6 +208,10 @@ protected:
         void addLineStrip(const std::vector<QPointF>& points,
                           bool closed,
                           OverlayStyle style);
+
+        void addSurfaceLineStrip(const std::vector<cv::Vec2f>& points,
+                                 bool closed,
+                                 OverlayStyle style);
 
         void addRect(const QRectF& rect,
                      bool filled,

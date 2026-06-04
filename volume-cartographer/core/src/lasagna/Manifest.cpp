@@ -158,6 +158,13 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
     if (!(manifest.sourceToBase > 0.0)) {
         throw std::runtime_error("Lasagna manifest source_to_base must be positive");
     }
+    if (root.contains("init_shell_dir")) {
+        if (!root.at("init_shell_dir").is_string()) {
+            throw std::runtime_error("Lasagna manifest init_shell_dir must be a string");
+        }
+        manifest.initShellDir = resolvePath(manifest.baseDirectory,
+                                            root.at("init_shell_dir").get<std::string>());
+    }
     manifest.groups = parseGroups(root, manifest.baseDirectory);
 
     if (manifest.hasNormalSource()) {

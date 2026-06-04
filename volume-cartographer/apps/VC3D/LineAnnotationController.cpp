@@ -42,6 +42,7 @@
 #include <iomanip>
 #include <locale>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -89,6 +90,19 @@ namespace {
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
 using Clock = std::chrono::steady_clock;
+
+bool atlasDebugEnabled()
+{
+    const char* value = std::getenv("VC_ATLAS_DEBUG");
+    return value && *value != '\0' && std::string_view(value) != "0";
+}
+
+void atlasDebug(const std::string& message)
+{
+    if (atlasDebugEnabled()) {
+        Logger()->info("[atlas] {}", message);
+    }
+}
 
 double elapsedMs(Clock::time_point start, Clock::time_point end)
 {
@@ -829,9 +843,6 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         if (fiberIt->linePoints.empty()) {
             throw std::runtime_error("Selected fiber has no line points");
         }
-        if (fiberIt->controlPoints.empty()) {
-            throw std::runtime_error("Selected fiber has no control points");
-        }
 
         fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
         if (manifestPath.empty()) {
@@ -847,37 +858,21 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         }
         vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        const fs::path initShellDir =
+            vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
+        atlasDebug("selected_manifest=" + manifestPath.string());
+        atlasDebug("resolved_init_shell_dir=" + initShellDir.string());
 
-        std::vector<vc::atlas::SurfaceCandidate> candidates;
-        const auto segmentIds = vpkg->segmentationIDs();
-        candidates.reserve(segmentIds.size());
-
-        auto segmentPathForId = [vpkg](const std::string& id) -> fs::path {
-            for (const auto& path : vpkg->availableSegmentPaths()) {
-                try {
-                    Segmentation seg(path);
-                    if (seg.id() == id) {
-                        return path;
-                    }
-                } catch (...) {
-                }
+        std::vector<vc::atlas::SurfaceCandidate> candidates =
+            vc::atlas::loadInitShellCandidates(initShellDir);
+        if (atlasDebugEnabled()) {
+            for (const auto& candidate : candidates) {
+                const auto* points = candidate.surface ? candidate.surface->rawPointsPtr() : nullptr;
+                atlasDebug("candidate_shell path=" + candidate.path.string() +
+                           " grid=" + (points
+                               ? std::to_string(points->cols) + "x" + std::to_string(points->rows)
+                               : std::string("invalid")));
             }
-            return vpkg->findSegmentPathByName(id);
-        };
-
-        for (const auto& id : segmentIds) {
-            auto surface = vpkg->loadSurface(id);
-            if (!surface) {
-                continue;
-            }
-            candidates.push_back(vc::atlas::SurfaceCandidate{
-                id,
-                segmentPathForId(id),
-                surface,
-            });
-        }
-        if (candidates.empty()) {
-            throw std::runtime_error("No tifxyz shell surfaces are available in the current segmentation directory");
         }
 
         vc::atlas::FiberInput input;
@@ -888,6 +883,8 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         }
         input.controlPoints = fiberIt->controlPoints;
         input.linePoints = fiberIt->linePoints;
+        atlasDebug("fiber line_points=" + std::to_string(input.linePoints.size()) +
+                   " control_points=" + std::to_string(input.controlPoints.size()));
 
         SurfacePatchIndex shellIndex;
         std::vector<SurfacePatchIndex::SurfacePtr> candidateSurfaces;
@@ -902,6 +899,7 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
             input, candidates, shellIndex, sampler);
         auto& selected = candidates.at(static_cast<size_t>(selection.surfaceIndex));
         const int rotationColumns = vc::atlas::computeIdxRotationColumns(*selected.surface);
+        atlasDebug("rotation_columns=" + std::to_string(rotationColumns));
         auto rotatedBase = vc::atlas::idxRotatedSurface(*selected.surface, rotationColumns);
 
         SurfacePatchIndex baseIndex;

@@ -30,6 +30,7 @@
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/SurfaceRotationOverlayController.hpp"
+#include "overlays/AtlasOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 #include "SurfaceAffineTransformController.hpp"
 
@@ -62,7 +63,6 @@ static constexpr int VOLPKG_MIN_VERSION = 1;
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
 class CommandLineToolRunner;
 class FiberAnnotationController;
-class AtlasCanvasWidget;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
@@ -238,7 +238,7 @@ private:
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceSearchDock{nullptr};
-    AtlasCanvasWidget* _atlasCanvas{nullptr};
+    VolumeViewerBase* _atlasViewer{nullptr};
     QMdiArea *mdiArea;
 
     bool can_change_volume_();
@@ -265,6 +265,7 @@ private:
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
+    std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;

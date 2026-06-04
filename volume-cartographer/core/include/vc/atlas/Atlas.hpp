@@ -12,6 +12,7 @@ class QuadSurface;
 class SurfacePatchIndex;
 
 namespace vc::lasagna {
+struct LasagnaDatasetManifest;
 class NormalSampler;
 }
 
@@ -50,6 +51,21 @@ struct Atlas {
 
     void save(const std::filesystem::path& atlasDir) const;
     static Atlas load(const std::filesystem::path& atlasDir);
+};
+
+struct AtlasCoveredSize {
+    int width = 0;
+    int height = 0;
+    bool valid = false;
+};
+
+struct AtlasDisplayRange {
+    int baseColumns = 0;
+    int leftmostWinding = 0;
+    int rightmostWinding = 0;
+    int unwrapCount = 1;
+    double atlasUOffset = 0.0;
+    bool hasMappedObjects = false;
 };
 
 struct FiberInput {
@@ -93,6 +109,10 @@ struct ProjectionHit {
 std::string sanitizeAtlasName(std::string name);
 std::filesystem::path uniqueAtlasDirectory(const std::filesystem::path& volpkgRoot,
                                            const std::string& baseName);
+std::filesystem::path initShellDirectoryFromManifest(
+    const vc::lasagna::LasagnaDatasetManifest& manifest);
+std::vector<SurfaceCandidate> loadInitShellCandidates(
+    const std::filesystem::path& initShellDir);
 
 std::vector<ProjectionHit> projectPointAlongNormalToSurfaces(
     const cv::Vec3d& linePoint,
@@ -113,6 +133,14 @@ std::shared_ptr<QuadSurface> idxRotatedSurface(const QuadSurface& surface,
 void saveIdxRotatedBaseMesh(const QuadSurface& surface,
                             int rotationColumns,
                             const std::filesystem::path& targetDir);
+AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas);
+AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns);
+cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
+                                   double atlasV,
+                                   const QuadSurface& displaySurface,
+                                   double atlasUOffset = 0.0);
+std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& baseSurface,
+                                                        int unwrapCount);
 
 FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                    const QuadSurface& baseSurface,

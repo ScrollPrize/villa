@@ -25,8 +25,6 @@ set(srcs
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
-    AtlasCanvasWidget.cpp
-    AtlasCanvasWidget.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationDialog.cpp
@@ -123,6 +121,8 @@ set(srcs
     overlays/PlaneSlicingOverlayController.hpp
     overlays/SurfaceRotationOverlayController.cpp
     overlays/SurfaceRotationOverlayController.hpp
+    overlays/AtlasOverlayController.cpp
+    overlays/AtlasOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp

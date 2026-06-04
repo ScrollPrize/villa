@@ -31,6 +31,7 @@ struct LasagnaDatasetManifest {
 
     int version = 0;
     double sourceToBase = 1.0;
+    std::optional<std::filesystem::path> initShellDir;
     std::vector<LasagnaChannelGroup> groups;
 
     // Backward-compatible summary for old callers: a Lasagna dataset's

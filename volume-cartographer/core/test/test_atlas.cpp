@@ -4,6 +4,7 @@
 #include "vc/atlas/Atlas.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/lasagna/Manifest.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
 #include <filesystem>
@@ -107,7 +108,7 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     CHECK(loaded.fibers[0].lineAnchors[0].atlasV == doctest::Approx(5.0));
 }
 
-TEST_CASE("Atlas rejects fibers without control points")
+TEST_CASE("Atlas seed selection uses line points without requiring controls")
 {
     auto surface = makePlane(4, 4, 0.0);
     SurfacePatchIndex index;
@@ -116,17 +117,14 @@ TEST_CASE("Atlas rejects fibers without control points")
         {"shell", "segments/shell", surface},
     };
     vc::atlas::FiberInput fiber;
-    fiber.linePoints = {{1.0, 1.0, 1.0}};
+    fiber.linePoints = {{1.0, 1.0, 1.0}, {2.0, 1.0, 1.0}};
 
     ConstantNormalSampler sampler({0.0, 0.0, 1.0});
-    CHECK_THROWS_WITH_AS(
-        vc::atlas::selectBaseSurfaceBySeedRay(fiber, surfaces, index, sampler),
-        doctest::Contains("fiber has no control points"),
-        std::runtime_error);
-    CHECK_THROWS_WITH_AS(
-        vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler),
-        doctest::Contains("fiber has no control points"),
-        std::runtime_error);
+    const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(fiber, surfaces, index, sampler);
+    CHECK(selection.seedLineIndex == 0);
+    const auto mapping = vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler);
+    CHECK(mapping.lineAnchors.size() == 2);
+    CHECK(mapping.controlAnchors.empty());
 }
 
 TEST_CASE("Atlas base selection chooses nearest seed-normal ray hit")
@@ -272,6 +270,76 @@ TEST_CASE("Atlas idx rotation cyclically shifts columns without moving coordinat
     CHECK((*out)(0, 3)[0] == doctest::Approx(points(0, 1)[0]));
 }
 
+TEST_CASE("Atlas mapped object covered size uses line anchors only")
+{
+    vc::atlas::Atlas atlas;
+    vc::atlas::FiberMapping first;
+    first.lineAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
+    first.lineAnchors.push_back({1, {}, 4.0, 3.0, 0.0});
+    first.controlAnchors.push_back({1, {}, 5.0, 4.0, 0.0});
+    atlas.fibers.push_back(std::move(first));
+
+    vc::atlas::FiberMapping second;
+    second.lineAnchors.push_back({0, {}, -1.0, 2.0, 0.0});
+    atlas.fibers.push_back(std::move(second));
+
+    const auto size = vc::atlas::mappedObjectCoveredAtlasSize(atlas);
+    REQUIRE(size.valid);
+    CHECK(size.width == 6);
+    CHECK(size.height == 3);
+}
+
+TEST_CASE("Atlas grid coordinates convert to QuadSurface surface coordinates with scale and center")
+{
+    cv::Mat_<cv::Vec3f> points(4, 6);
+    points.setTo(cv::Vec3f(0.0f, 0.0f, 0.0f));
+    QuadSurface surface(points, cv::Vec2f(2.0f, 3.0f));
+
+    const cv::Vec2f surfaceCoord =
+        vc::atlas::atlasGridToSurfaceCoords(5.0, 7.0, surface, 2.0);
+    CHECK(surfaceCoord[0] == doctest::Approx(0.0));
+    CHECK(surfaceCoord[1] == doctest::Approx(5.0));
+}
+
+TEST_CASE("Atlas display range uses leftmost mapped unwrap as the minimum column offset")
+{
+    vc::atlas::Atlas atlas;
+    atlas.metadata.seedAtlasU = 30.0;
+    vc::atlas::FiberMapping mapping;
+    mapping.lineAnchors.push_back({0, {}, 9.0, 1.0, 0.0});
+    mapping.lineAnchors.push_back({1, {}, 13.0, 1.0, 0.0});
+    mapping.controlAnchors.push_back({1, {}, 4.5, 1.0, 0.0});
+    atlas.fibers.push_back(std::move(mapping));
+
+    const auto range = vc::atlas::atlasDisplayRange(atlas, 4);
+    CHECK(range.leftmostWinding == 2);
+    CHECK(range.rightmostWinding == 3);
+    CHECK(range.unwrapCount == 2);
+    CHECK(range.atlasUOffset == doctest::Approx(8.0));
+    CHECK(range.hasMappedObjects);
+}
+
+TEST_CASE("Atlas repeated display surface duplicates base mesh columns for multi unwrap views")
+{
+    cv::Mat_<cv::Vec3f> points(2, 3);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            points(row, col) = cv::Vec3f(static_cast<float>(col),
+                                         static_cast<float>(row),
+                                         static_cast<float>(col + row));
+        }
+    }
+    QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
+
+    auto repeated = vc::atlas::repeatedAtlasDisplaySurface(surface, 3);
+    const auto* out = repeated->rawPointsPtr();
+    REQUIRE(out != nullptr);
+    CHECK(out->rows == 2);
+    CHECK(out->cols == 9);
+    CHECK((*out)(1, 0)[2] == doctest::Approx((*out)(1, 3)[2]));
+    CHECK((*out)(1, 1)[2] == doctest::Approx((*out)(1, 7)[2]));
+}
+
 TEST_CASE("Atlas maps a synthetic fiber over a simple grid")
 {
     auto surface = makePlane(5, 8, 0.0);
@@ -293,7 +361,7 @@ TEST_CASE("Atlas maps a synthetic fiber over a simple grid")
     CHECK(mapping.lineAnchors[0].atlasU == doctest::Approx(1.0));
     CHECK(mapping.lineAnchors[1].atlasU == doctest::Approx(2.0));
     CHECK(mapping.lineAnchors[2].atlasV == doctest::Approx(2.0));
-    REQUIRE(mapping.controlAnchors.size() == 1);
+    CHECK(mapping.controlAnchors.empty());
 }
 
 TEST_CASE("Atlas mapping stops when grid and line step mismatch")
@@ -318,4 +386,66 @@ TEST_CASE("Atlas mapping stops when grid and line step mismatch")
     const auto mapping = vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler, options);
     REQUIRE(mapping.lineAnchors.size() == 2);
     CHECK(mapping.lineAnchors.back().sourceIndex == 1);
+}
+
+TEST_CASE("Atlas manifest init_shell_dir resolves relative to lasagna manifest")
+{
+    const fs::path root = tempRoot("vc_atlas_manifest_init_shell_dir");
+    const fs::path manifestPath = root / "dataset.lasagna.json";
+    const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(
+        R"({"version":1,"init_shell_dir":"init_shells"})",
+        manifestPath);
+    REQUIRE(manifest.initShellDir.has_value());
+    CHECK(*manifest.initShellDir == fs::absolute(root / "init_shells").lexically_normal());
+}
+
+TEST_CASE("Atlas init shell loading accepts only shell tifxyz directories")
+{
+    const fs::path root = tempRoot("vc_atlas_init_shell_candidates");
+    const fs::path initDir = root / "init_shells";
+    fs::create_directories(initDir);
+    makePlane(3, 4, 0.0)->save(initDir / "shell_a.tifxyz", true);
+    makePlane(3, 4, 1.0)->save(initDir / "other.tifxyz", true);
+    fs::create_directories(initDir / "shell_b");
+
+    const auto candidates = vc::atlas::loadInitShellCandidates(initDir);
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates[0].name == "shell_a");
+    CHECK(candidates[0].path.filename() == fs::path("shell_a.tifxyz"));
+}
+
+TEST_CASE("Atlas init shell loading reports missing and empty dirs")
+{
+    const fs::path root = tempRoot("vc_atlas_init_shell_missing");
+    const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(
+        R"({"version":1})",
+        root / "dataset.lasagna.json");
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::initShellDirectoryFromManifest(manifest),
+        doctest::Contains("missing init_shell_dir"),
+        std::runtime_error);
+
+    const fs::path initDir = root / "empty";
+    fs::create_directories(initDir);
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadInitShellCandidates(initDir),
+        doctest::Contains("contains no shell_*.tifxyz"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas mapping reports incomplete fibers with fewer than two line anchors")
+{
+    auto surface = makePlane(5, 8, 0.0);
+    SurfacePatchIndex index;
+    index.rebuild({surface});
+
+    vc::atlas::FiberInput fiber;
+    fiber.fiberPath = "fibers/1.json";
+    fiber.linePoints = {{1.0, 2.0, 1.0}};
+
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler),
+        doctest::Contains("incomplete atlas mapping"),
+        std::runtime_error);
 }

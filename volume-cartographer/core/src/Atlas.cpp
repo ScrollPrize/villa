@@ -2,6 +2,7 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/lasagna/Manifest.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
 #include <nlohmann/json.hpp>
@@ -16,6 +17,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <tuple>
 #include <unordered_map>
@@ -28,65 +30,23 @@ namespace {
 
 constexpr double kEpsilon = 1.0e-9;
 
-struct ProjectionStats {
-    int candidateSurfaces = 0;
-    int usableSurfaces = 0;
-    int rtreeTriangles = 0;
-    int uniqueCells = 0;
-    int bilinearHits = 0;
-    cv::Vec3d src{0.0, 0.0, 0.0};
-    cv::Vec3d end{0.0, 0.0, 0.0};
-    cv::Vec3d dir{0.0, 0.0, 0.0};
-    double segmentLength = 0.0;
-};
-
-struct ProjectionAttempt {
-    double rayHalfLength = 0.0;
-    ProjectionStats stats;
-    size_t hits = 0;
-};
-
 bool atlasDebugEnabled()
 {
     const char* value = std::getenv("VC_ATLAS_DEBUG");
-    return value && *value != '\0' && std::string(value) != "0";
+    return value && *value != '\0' && std::string_view(value) != "0";
+}
+
+void atlasDebug(const std::string& message)
+{
+    if (atlasDebugEnabled()) {
+        std::cerr << "[atlas] " << message << std::endl;
+    }
 }
 
 std::string vecString(const cv::Vec3d& p)
 {
     std::ostringstream out;
     out << '(' << p[0] << ", " << p[1] << ", " << p[2] << ')';
-    return out.str();
-}
-
-std::string projectionStatsString(const ProjectionStats& stats)
-{
-    std::ostringstream out;
-    out << "candidate_surfaces=" << stats.candidateSurfaces
-        << " usable_surfaces=" << stats.usableSurfaces
-        << " rtree_triangles=" << stats.rtreeTriangles
-        << " unique_cells=" << stats.uniqueCells
-        << " bilinear_hits=" << stats.bilinearHits
-        << " ray_src=" << vecString(stats.src)
-        << " ray_end=" << vecString(stats.end)
-        << " ray_dir=" << vecString(stats.dir)
-        << " ray_length=" << stats.segmentLength;
-    return out.str();
-}
-
-std::string projectionAttemptsString(const std::vector<ProjectionAttempt>& attempts)
-{
-    std::ostringstream out;
-    out << "attempts=[";
-    for (size_t i = 0; i < attempts.size(); ++i) {
-        if (i > 0) {
-            out << "; ";
-        }
-        out << "half_length=" << attempts[i].rayHalfLength
-            << " hits=" << attempts[i].hits
-            << ' ' << projectionStatsString(attempts[i].stats);
-    }
-    out << ']';
     return out.str();
 }
 
@@ -198,60 +158,12 @@ nlohmann::json readJsonFile(const fs::path& path)
     return nlohmann::json::parse(in);
 }
 
-double cumulativeLineLengthTo(const std::vector<cv::Vec3d>& points, int index)
-{
-    double length = 0.0;
-    for (int i = 1; i <= index && i < static_cast<int>(points.size()); ++i) {
-        length += distance(points[i - 1], points[i]);
-    }
-    return length;
-}
-
-std::vector<double> cumulativeLineLengths(const std::vector<cv::Vec3d>& points)
-{
-    std::vector<double> lengths(points.size(), 0.0);
-    for (size_t i = 1; i < points.size(); ++i) {
-        lengths[i] = lengths[i - 1] + distance(points[i - 1], points[i]);
-    }
-    return lengths;
-}
-
-int lineIndexClosestToPoint(const std::vector<cv::Vec3d>& line, const cv::Vec3d& point)
-{
-    int best = 0;
-    double bestDist = std::numeric_limits<double>::infinity();
-    for (int i = 0; i < static_cast<int>(line.size()); ++i) {
-        const double d = squaredDistance(line[i], point);
-        if (d < bestDist) {
-            bestDist = d;
-            best = i;
-        }
-    }
-    return best;
-}
-
 int seedLineIndexForFiber(const FiberInput& fiber)
 {
     if (fiber.linePoints.empty()) {
         throw std::runtime_error("fiber has no line points");
     }
-    if (fiber.controlPoints.empty()) {
-        throw std::runtime_error("fiber has no control points");
-    }
-
-    const auto lengths = cumulativeLineLengths(fiber.linePoints);
-    const double target = lengths.empty() ? 0.0 : lengths.back() * 0.5;
-    int bestLineIndex = static_cast<int>(fiber.linePoints.size() - 1) / 2;
-    double bestDist = std::numeric_limits<double>::infinity();
-    for (const auto& control : fiber.controlPoints) {
-        const int lineIndex = lineIndexClosestToPoint(fiber.linePoints, control);
-        const double d = std::abs(lengths[lineIndex] - target);
-        if (d < bestDist) {
-            bestDist = d;
-            bestLineIndex = lineIndex;
-        }
-    }
-    return bestLineIndex;
+    return static_cast<int>((fiber.linePoints.size() - 1) / 2);
 }
 
 struct BilinearRayHit {
@@ -500,13 +412,8 @@ std::vector<ProjectionHit> projectPointToSurfaces(const cv::Vec3d& linePoint,
                                                   const cv::Vec3d& normal,
                                                   const std::vector<SurfaceCandidate>& surfaces,
                                                   const SurfacePatchIndex& index,
-                                                  double rayHalfLength,
-                                                  ProjectionStats* stats = nullptr)
+                                                  double rayHalfLength)
 {
-    if (stats) {
-        *stats = {};
-        stats->candidateSurfaces = static_cast<int>(surfaces.size());
-    }
     if (!validNormal(normal) || !std::isfinite(rayHalfLength) || rayHalfLength <= 0.0) {
         return {};
     }
@@ -521,9 +428,6 @@ std::vector<ProjectionHit> projectPointToSurfaces(const cv::Vec3d& linePoint,
         include.insert(surfaces[i].surface);
         surfaceIndexByPtr.emplace(surfaces[i].surface.get(), i);
     }
-    if (stats) {
-        stats->usableSurfaces = static_cast<int>(include.size());
-    }
     if (include.empty()) {
         return {};
     }
@@ -534,12 +438,6 @@ std::vector<ProjectionHit> projectPointToSurfaces(const cv::Vec3d& linePoint,
     const cv::Vec3d end = linePoint + dir * rayHalfLength;
     const cv::Vec3d segment = end - src;
     const double segmentLength = norm(segment);
-    if (stats) {
-        stats->src = src;
-        stats->end = end;
-        stats->dir = dir;
-        stats->segmentLength = segmentLength;
-    }
     if (segmentLength <= kEpsilon) {
         return {};
     }
@@ -587,9 +485,6 @@ std::vector<ProjectionHit> projectPointToSurfaces(const cv::Vec3d& linePoint,
     std::unordered_set<VisitedCell, VisitedHash, VisitedEq> visited;
     std::vector<ProjectionHit> hits;
     index.forEachTriangle(query, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-        if (stats) {
-            ++stats->rtreeTriangles;
-        }
         if (!tri.surface) {
             return;
         }
@@ -607,9 +502,6 @@ std::vector<ProjectionHit> projectPointToSurfaces(const cv::Vec3d& linePoint,
         if (!visited.insert(cell).second) {
             return;
         }
-        if (stats) {
-            ++stats->uniqueCells;
-        }
 
         const auto surfaceIndexIt = surfaceIndexByPtr.find(tri.surface.get());
         if (surfaceIndexIt == surfaceIndexByPtr.end()) {
@@ -618,9 +510,6 @@ std::vector<ProjectionHit> projectPointToSurfaces(const cv::Vec3d& linePoint,
         const int surfaceIndex = surfaceIndexIt->second;
         const auto& candidate = surfaces[static_cast<size_t>(surfaceIndex)];
         for (const auto& quadHit : rayBilinearQuadIntersections(src, rayDir, segmentLength, quad)) {
-            if (stats) {
-                ++stats->bilinearHits;
-            }
             ProjectionHit hit;
             hit.surface = tri.surface;
             hit.surfaceIndex = surfaceIndex;
@@ -644,8 +533,7 @@ std::vector<ProjectionHit> projectPointToSurfacesAdaptive(
     const cv::Vec3d& normal,
     const std::vector<SurfaceCandidate>& surfaces,
     const SurfacePatchIndex& index,
-    double initialRayHalfLength,
-    std::vector<ProjectionAttempt>* attempts = nullptr)
+    double initialRayHalfLength)
 {
     const double maxRayHalfLength = boundedRayHalfLength(
         linePoint, normal, surfaces, initialRayHalfLength);
@@ -655,22 +543,13 @@ std::vector<ProjectionHit> projectPointToSurfacesAdaptive(
         : 1.0;
     while (true) {
         rayHalfLength = std::min(rayHalfLength, maxRayHalfLength);
-        ProjectionStats stats;
         auto hits = projectPointToSurfaces(
-            linePoint, normal, surfaces, index, rayHalfLength, &stats);
-        if (attempts) {
-            attempts->push_back({rayHalfLength, stats, hits.size()});
-        }
+            linePoint, normal, surfaces, index, rayHalfLength);
         if (!hits.empty() || rayHalfLength >= maxRayHalfLength - kEpsilon) {
             return hits;
         }
         rayHalfLength = std::min(rayHalfLength * 2.0, maxRayHalfLength);
     }
-}
-
-ProjectionStats lastProjectionStats(const std::vector<ProjectionAttempt>& attempts)
-{
-    return attempts.empty() ? ProjectionStats{} : attempts.back().stats;
 }
 
 AtlasAnchor anchorFromHit(int sourceIndex, const ProjectionHit& hit)
@@ -839,6 +718,53 @@ fs::path uniqueAtlasDirectory(const fs::path& volpkgRoot, const std::string& bas
     return candidate;
 }
 
+fs::path initShellDirectoryFromManifest(const vc::lasagna::LasagnaDatasetManifest& manifest)
+{
+    if (!manifest.initShellDir.has_value()) {
+        throw std::runtime_error("Lasagna manifest is missing init_shell_dir");
+    }
+    if (!fs::is_directory(*manifest.initShellDir)) {
+        throw std::runtime_error("Lasagna init_shell_dir does not exist or is not a directory: " +
+                                 manifest.initShellDir->string());
+    }
+    return *manifest.initShellDir;
+}
+
+std::vector<SurfaceCandidate> loadInitShellCandidates(const fs::path& initShellDir)
+{
+    if (!fs::is_directory(initShellDir)) {
+        throw std::runtime_error("Lasagna init_shell_dir does not exist or is not a directory: " +
+                                 initShellDir.string());
+    }
+
+    std::vector<fs::path> shellDirs;
+    for (const auto& entry : fs::directory_iterator(initShellDir)) {
+        if (!entry.is_directory()) {
+            continue;
+        }
+        const fs::path path = entry.path();
+        const std::string filename = path.filename().string();
+        if (filename.rfind("shell_", 0) != 0 || path.extension() != ".tifxyz") {
+            continue;
+        }
+        shellDirs.push_back(path);
+    }
+    std::sort(shellDirs.begin(), shellDirs.end());
+
+    std::vector<SurfaceCandidate> candidates;
+    candidates.reserve(shellDirs.size());
+    for (const auto& shellDir : shellDirs) {
+        auto surface = std::make_shared<QuadSurface>(shellDir);
+        std::string name = shellDir.stem().string();
+        candidates.push_back({std::move(name), shellDir, std::move(surface)});
+    }
+    if (candidates.empty()) {
+        throw std::runtime_error("Lasagna init_shell_dir contains no shell_*.tifxyz directories: " +
+                                 initShellDir.string());
+    }
+    return candidates;
+}
+
 std::vector<ProjectionHit> projectPointAlongNormalToSurfaces(
     const cv::Vec3d& linePoint,
     const cv::Vec3d& normal,
@@ -860,6 +786,9 @@ BaseSelection selectBaseSurfaceBySeedRay(const FiberInput& fiber,
     }
     const int seedIndex = seedLineIndexForFiber(fiber);
     const cv::Vec3d seedPoint = fiber.linePoints.at(seedIndex);
+    atlasDebug("fiber line_points=" + std::to_string(fiber.linePoints.size()) +
+               " control_points=" + std::to_string(fiber.controlPoints.size()) +
+               " seed_index=" + std::to_string(seedIndex));
     const auto normalSample = normalSampler.sampleNormal(seedPoint);
     if (!normalSample.valid || !validNormal(normalSample.normal)) {
         std::ostringstream message;
@@ -869,42 +798,30 @@ BaseSelection selectBaseSurfaceBySeedRay(const FiberInput& fiber,
         throw std::runtime_error(message.str());
     }
 
-    std::vector<ProjectionAttempt> attempts;
     const auto hits = projectPointToSurfacesAdaptive(seedPoint,
                                                     normalSample.normal,
                                                     surfaces,
                                                     index,
-                                                    options.rayHalfLength,
-                                                    &attempts);
+                                                    options.rayHalfLength);
     if (atlasDebugEnabled()) {
-        std::cerr << "[Atlas] seed ray selection"
-                  << " seed_index=" << seedIndex
-                  << " seed=" << vecString(seedPoint)
-                  << " normal=" << vecString(normalSample.normal)
-                  << " ray_half_length=" << options.rayHalfLength
-                  << ' ' << projectionAttemptsString(attempts)
-                  << " hits=" << hits.size()
-                  << '\n';
-        if (!hits.empty()) {
-            const auto& best = hits.front();
-            std::cerr << "[Atlas] best seed ray hit"
-                      << " surface_index=" << best.surfaceIndex
-                      << " surface_name=" << best.surfaceName
-                      << " world=" << vecString(best.world)
-                      << " atlas=(" << best.atlasU << ", " << best.atlasV << ')'
-                      << " distance=" << best.distance
-                      << '\n';
+        std::ostringstream out;
+        out << "seed=" << vecString(seedPoint)
+            << " normal=" << vecString(normalSample.normal)
+            << " ray_hits=" << hits.size();
+        for (const auto& hit : hits) {
+            out << " [" << hit.surfaceName
+                << " u=" << hit.atlasU
+                << " v=" << hit.atlasV
+                << " d=" << hit.distance << ']';
         }
+        atlasDebug(out.str());
     }
     if (hits.empty()) {
         std::ostringstream message;
         message << "Atlas seed ray did not intersect any shell"
                 << " seed_index=" << seedIndex
                 << " seed=" << vecString(seedPoint)
-                << " normal=" << vecString(normalSample.normal)
-                << " ray_half_length=" << options.rayHalfLength
-                << ' ' << projectionStatsString(lastProjectionStats(attempts))
-                << ' ' << projectionAttemptsString(attempts);
+                << " normal=" << vecString(normalSample.normal);
         throw std::runtime_error(message.str());
     }
 
@@ -918,6 +835,9 @@ BaseSelection selectBaseSurfaceBySeedRay(const FiberInput& fiber,
     selection.atlasU = best.atlasU;
     selection.atlasV = best.atlasV;
     selection.distance = best.distance;
+    atlasDebug("selected_shell=" + selection.surfaceName +
+               " seed_atlas=(" + std::to_string(selection.atlasU) + ", " +
+               std::to_string(selection.atlasV) + ")");
     return selection;
 }
 
@@ -996,6 +916,140 @@ void saveIdxRotatedBaseMesh(const QuadSurface& surface,
     rotated->save(targetDir, true);
 }
 
+AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas)
+{
+    bool haveAnchor = false;
+    double minU = std::numeric_limits<double>::infinity();
+    double minV = std::numeric_limits<double>::infinity();
+    double maxU = -std::numeric_limits<double>::infinity();
+    double maxV = -std::numeric_limits<double>::infinity();
+
+    auto includeAnchor = [&](const AtlasAnchor& anchor) {
+        if (!std::isfinite(anchor.atlasU) || !std::isfinite(anchor.atlasV)) {
+            return;
+        }
+        haveAnchor = true;
+        minU = std::min(minU, anchor.atlasU);
+        minV = std::min(minV, anchor.atlasV);
+        maxU = std::max(maxU, anchor.atlasU);
+        maxV = std::max(maxV, anchor.atlasV);
+    };
+
+    for (const auto& fiber : atlas.fibers) {
+        for (const auto& anchor : fiber.lineAnchors) {
+            includeAnchor(anchor);
+        }
+    }
+
+    if (!haveAnchor) {
+        return {};
+    }
+
+    AtlasCoveredSize size;
+    size.width = std::max(1, static_cast<int>(std::ceil(maxU) - std::floor(minU) + 1.0));
+    size.height = std::max(1, static_cast<int>(std::ceil(maxV) - std::floor(minV) + 1.0));
+    size.valid = true;
+    return size;
+}
+
+AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
+{
+    AtlasDisplayRange range;
+    range.baseColumns = baseColumns;
+    if (baseColumns <= 0) {
+        range.unwrapCount = 0;
+        return range;
+    }
+
+    bool haveAnchor = false;
+    int minWinding = 0;
+    int maxWinding = 0;
+    auto includeAnchor = [&](const AtlasAnchor& anchor) {
+        if (!std::isfinite(anchor.atlasU)) {
+            return;
+        }
+        const int winding = static_cast<int>(std::floor(anchor.atlasU / static_cast<double>(baseColumns)));
+        if (!haveAnchor) {
+            minWinding = winding;
+            maxWinding = winding;
+            haveAnchor = true;
+            return;
+        }
+        minWinding = std::min(minWinding, winding);
+        maxWinding = std::max(maxWinding, winding);
+    };
+
+    for (const auto& fiber : atlas.fibers) {
+        for (const auto& anchor : fiber.lineAnchors) {
+            includeAnchor(anchor);
+        }
+    }
+
+    if (!haveAnchor) {
+        minWinding = static_cast<int>(std::floor(atlas.metadata.seedAtlasU / static_cast<double>(baseColumns)));
+        maxWinding = minWinding;
+    }
+
+    range.leftmostWinding = minWinding;
+    range.rightmostWinding = maxWinding;
+    range.unwrapCount = std::max(1, maxWinding - minWinding + 1);
+    range.atlasUOffset = static_cast<double>(minWinding * baseColumns);
+    range.hasMappedObjects = haveAnchor;
+    return range;
+}
+
+cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
+                                   double atlasV,
+                                   const QuadSurface& displaySurface,
+                                   double atlasUOffset)
+{
+    const cv::Vec3f center = displaySurface.center();
+    const cv::Vec2f scale = displaySurface.scale();
+    return {
+        static_cast<float>((atlasU - atlasUOffset) - static_cast<double>(center[0] * scale[0])),
+        static_cast<float>(atlasV - static_cast<double>(center[1] * scale[1])),
+    };
+}
+
+std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& baseSurface,
+                                                        int unwrapCount)
+{
+    const auto* points = baseSurface.rawPointsPtr();
+    if (!points) {
+        throw std::runtime_error("base surface has no point grid");
+    }
+    if (unwrapCount <= 1) {
+        return std::make_shared<QuadSurface>(*points, baseSurface.scale());
+    }
+
+    const int rows = points->rows;
+    const int cols = points->cols;
+    if (rows <= 0 || cols <= 0) {
+        throw std::runtime_error("base surface has no valid grid");
+    }
+
+    cv::Mat_<cv::Vec3f> repeated(rows, cols * unwrapCount);
+    for (int unwrap = 0; unwrap < unwrapCount; ++unwrap) {
+        const cv::Rect dst(unwrap * cols, 0, cols, rows);
+        points->copyTo(repeated(dst));
+    }
+
+    auto out = std::make_shared<QuadSurface>(repeated, baseSurface.scale());
+    auto& mutableSurface = const_cast<QuadSurface&>(baseSurface);
+    for (const auto& name : mutableSurface.channelNames()) {
+        cv::Mat channel = mutableSurface.channel(name);
+        if (channel.empty() || channel.cols != cols || channel.rows != rows) {
+            continue;
+        }
+        cv::Mat repeatedChannel(rows, cols * unwrapCount, channel.type());
+        for (int unwrap = 0; unwrap < unwrapCount; ++unwrap) {
+            channel.copyTo(repeatedChannel(cv::Rect(unwrap * cols, 0, cols, rows)));
+        }
+        out->setChannel(name, repeatedChannel);
+    }
+    return out;
+}
+
 FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                    const QuadSurface& baseSurface,
                                    SurfacePatchIndex& baseIndex,
@@ -1018,10 +1072,15 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
     }};
 
     const int seedIndex = seedLineIndexForFiber(fiber);
+    atlasDebug("map fiber line_points=" + std::to_string(fiber.linePoints.size()) +
+               " control_points=" + std::to_string(fiber.controlPoints.size()) +
+               " seed_index=" + std::to_string(seedIndex));
     std::vector<std::vector<ProjectionHit>> hitsByLinePoint(fiber.linePoints.size());
     for (size_t i = 0; i < fiber.linePoints.size(); ++i) {
         const auto sample = normalSampler.sampleNormal(fiber.linePoints[i]);
         if (!sample.valid || !validNormal(sample.normal)) {
+            atlasDebug("line_point[" + std::to_string(i) + "] invalid_normal point=" +
+                       vecString(fiber.linePoints[i]));
             if (static_cast<int>(i) == seedIndex) {
                 throw std::runtime_error("No valid normal at atlas seed point");
             }
@@ -1029,6 +1088,10 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
         }
         hitsByLinePoint[i] = projectPointToSurfacesAdaptive(
             fiber.linePoints[i], sample.normal, baseCandidates, baseIndex, options.rayHalfLength);
+        if (hitsByLinePoint[i].empty()) {
+            atlasDebug("line_point[" + std::to_string(i) + "] no_hits point=" +
+                       vecString(fiber.linePoints[i]) + " normal=" + vecString(sample.normal));
+        }
     }
 
     if (hitsByLinePoint[seedIndex].empty()) {
@@ -1037,6 +1100,9 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
 
     std::vector<std::optional<AtlasAnchor>> anchors(fiber.linePoints.size());
     anchors[seedIndex] = anchorFromHit(seedIndex, hitsByLinePoint[seedIndex].front());
+    atlasDebug("line_point[" + std::to_string(seedIndex) + "] chosen_anchor u=" +
+               std::to_string(anchors[seedIndex]->atlasU) + " v=" +
+               std::to_string(anchors[seedIndex]->atlasV));
 
     for (int i = seedIndex + 1; i < static_cast<int>(fiber.linePoints.size()); ++i) {
         const auto chosen = chooseContinuationHit(i,
@@ -1047,9 +1113,13 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                                   points->cols,
                                                   options.mismatchRatio);
         if (!chosen) {
+            atlasDebug("line_point[" + std::to_string(i) + "] continuation_rejection");
             break;
         }
         anchors[i] = *chosen;
+        atlasDebug("line_point[" + std::to_string(i) + "] chosen_anchor u=" +
+                   std::to_string(anchors[i]->atlasU) + " v=" +
+                   std::to_string(anchors[i]->atlasV));
     }
     for (int i = seedIndex - 1; i >= 0; --i) {
         const auto chosen = chooseContinuationHit(i,
@@ -1060,9 +1130,13 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                                   points->cols,
                                                   options.mismatchRatio);
         if (!chosen) {
+            atlasDebug("line_point[" + std::to_string(i) + "] continuation_rejection");
             break;
         }
         anchors[i] = *chosen;
+        atlasDebug("line_point[" + std::to_string(i) + "] chosen_anchor u=" +
+                   std::to_string(anchors[i]->atlasU) + " v=" +
+                   std::to_string(anchors[i]->atlasV));
     }
 
     FiberMapping mapping;
@@ -1072,23 +1146,9 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
             mapping.lineAnchors.push_back(*anchor);
         }
     }
-    if (mapping.lineAnchors.empty()) {
-        throw std::runtime_error("fiber did not produce any atlas anchors");
-    }
-
-    for (int i = 0; i < static_cast<int>(fiber.controlPoints.size()); ++i) {
-        const int lineIndex = lineIndexClosestToPoint(fiber.linePoints, fiber.controlPoints[i]);
-        auto it = std::find_if(mapping.lineAnchors.begin(),
-                               mapping.lineAnchors.end(),
-                               [lineIndex](const AtlasAnchor& anchor) {
-                                   return anchor.sourceIndex == lineIndex;
-                               });
-        if (it != mapping.lineAnchors.end()) {
-            AtlasAnchor control = *it;
-            control.sourceIndex = i;
-            control.world = fiber.controlPoints[i];
-            mapping.controlAnchors.push_back(control);
-        }
+    atlasDebug("final_line_anchor_count=" + std::to_string(mapping.lineAnchors.size()));
+    if (mapping.lineAnchors.size() < 2) {
+        throw std::runtime_error("incomplete atlas mapping: produced fewer than two line anchors");
     }
     return mapping;
 }

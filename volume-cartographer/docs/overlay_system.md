@@ -34,8 +34,10 @@ Key responsibilities handled by the base:
 Controllers add any combination of primitives when collecting:
 
 - `addPoint(position, radius, style)`
+- `addSurfacePoint(surfacePosition, radius, style)`
 - `addCircle(center, radius, filled, style)`
 - `addLineStrip(points, closed, style)`
+- `addSurfaceLineStrip(surfacePoints, closed, style)`
 - `addRect(rect, filled, style)`
 - `addText(position, text, font, style)`
 - `addPath(pathPrimitive)` for complex paths (like seeding widget or drawing widget).

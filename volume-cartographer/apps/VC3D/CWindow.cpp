@@ -15,6 +15,7 @@
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
 #include <QGridLayout>
+#include <QVBoxLayout>
 #include <QCursor>
 #include <QKeyEvent>
 #include <QResizeEvent>
@@ -92,7 +93,6 @@
 #include "MenuActionController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
-#include "AtlasCanvasWidget.hpp"
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
@@ -122,6 +122,15 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 namespace
 {
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
+constexpr auto ATLAS_INTERNAL_SURFACE_NAME = "__atlas_workspace_base_mesh";
+
+QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
+{
+    if (!size.valid) {
+        return QObject::tr("No valid footprint");
+    }
+    return QStringLiteral("%1 x %2 vx").arg(size.width).arg(size.height);
+}
 
 class DockMenuMainWindow : public QMainWindow
 {
@@ -616,6 +625,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,
             [this](std::shared_ptr<VolumePkg> pkg) {
+                refreshAtlasOverviewDocks();
                 if (!pkg) return;
                 pkg->setSegmentsChangedCallback(
                     [self = QPointer<CWindow>(this)]() {
@@ -2003,8 +2013,27 @@ void CWindow::createAtlasWorkspace()
     }
 
     if (!_atlasWorkspaceWindow->centralWidget()) {
-        _atlasCanvas = new AtlasCanvasWidget(_atlasWorkspaceWindow);
-        _atlasWorkspaceWindow->setCentralWidget(_atlasCanvas);
+        auto* central = new QWidget(_atlasWorkspaceWindow);
+        auto* layout = new QVBoxLayout(central);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(0);
+        _atlasWorkspaceWindow->setCentralWidget(central);
+    }
+
+    if (!_atlasViewer && _viewerManager) {
+        auto* central = _atlasWorkspaceWindow->centralWidget();
+        _atlasViewer = _viewerManager->createViewerInWidget(ATLAS_INTERNAL_SURFACE_NAME,
+                                                            central,
+                                                            ViewerManager::ViewerRole::Annotation);
+        if (auto* layout = central ? dynamic_cast<QVBoxLayout*>(central->layout()) : nullptr) {
+            if (auto* viewerWidget = _atlasViewer ? qobject_cast<QWidget*>(_atlasViewer->asQObject()) : nullptr) {
+                layout->addWidget(viewerWidget);
+            }
+        }
+        if (!_atlasOverlay) {
+            _atlasOverlay = std::make_unique<AtlasOverlayController>(this);
+        }
+        _atlasOverlay->attachViewer(_atlasViewer);
     }
 
     _atlasWorkspaceOverviewDock = createAtlasOverviewDock(this);
@@ -2084,16 +2113,15 @@ void CWindow::refreshAtlasOverviewDocks()
                 const auto atlas = vc::atlas::Atlas::load(atlasDir);
                 auto* item = new QTreeWidgetItem(tree);
                 item->setText(0, QString::fromStdString(atlas.metadata.name));
-                item->setText(1, QString::number(static_cast<int>(atlas.fibers.size())));
                 item->setData(0, Qt::UserRole, QString::fromStdString(atlasDir.string()));
 
-                auto* base = new QTreeWidgetItem(item);
-                base->setText(0, tr("Base mesh"));
-                base->setText(1, QString::fromStdString(atlas.metadata.baseMeshPath.generic_string()));
+                auto* fiberCount = new QTreeWidgetItem(item);
+                fiberCount->setText(0, tr("Fiber count"));
+                fiberCount->setText(1, QString::number(static_cast<int>(atlas.fibers.size())));
 
-                auto* rotation = new QTreeWidgetItem(item);
-                rotation->setText(0, tr("Idx rotation"));
-                rotation->setText(1, QString::number(atlas.metadata.idxRotationColumns));
+                auto* coveredSize = new QTreeWidgetItem(item);
+                coveredSize->setText(0, tr("Object covered atlas size"));
+                coveredSize->setText(1, formatAtlasCoveredSize(vc::atlas::mappedObjectCoveredAtlasSize(atlas)));
             } catch (const std::exception& ex) {
                 auto* item = new QTreeWidgetItem(tree);
                 item->setText(0, QString::fromStdString(atlasDir.filename().string()));
@@ -2110,19 +2138,51 @@ void CWindow::refreshAtlasOverviewDocks()
 void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
 {
     try {
-        if (!_atlasWorkspaceWindow || !_atlasCanvas) {
+        if (!_atlasWorkspaceWindow || !_atlasViewer) {
             createAtlasWorkspace();
         }
         const auto atlas = vc::atlas::Atlas::load(atlasDir);
-        if (_atlasCanvas) {
-            _atlasCanvas->setAtlas(atlasDir, atlas);
+        const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
+        auto baseSurface = std::make_shared<QuadSurface>(basePath);
+        const auto* points = baseSurface->rawPointsPtr();
+        if (!points || points->empty() || points->cols <= 0) {
+            throw std::runtime_error("atlas base mesh has no valid grid");
+        }
+
+        const vc::atlas::AtlasDisplayRange displayRange =
+            vc::atlas::atlasDisplayRange(atlas, points->cols);
+        std::shared_ptr<QuadSurface> displaySurface = displayRange.unwrapCount > 1
+            ? vc::atlas::repeatedAtlasDisplaySurface(*baseSurface, displayRange.unwrapCount)
+            : baseSurface;
+        displaySurface->id = ATLAS_INTERNAL_SURFACE_NAME;
+        if (_state) {
+            _state->setSurface(ATLAS_INTERNAL_SURFACE_NAME, displaySurface);
+        }
+
+        if (!_atlasOverlay) {
+            _atlasOverlay = std::make_unique<AtlasOverlayController>(this);
+        }
+        if (_atlasViewer) {
+            _atlasOverlay->attachViewer(_atlasViewer);
+        }
+        _atlasOverlay->setAtlas(atlas, displaySurface, displayRange);
+
+        if (_atlasViewer) {
+            if (const auto bounds = _atlasOverlay->surfaceBounds()) {
+                _atlasViewer->centerOnSurfacePoint({
+                    static_cast<float>(bounds->center().x()),
+                    static_cast<float>(bounds->center().y()),
+                }, false);
+            } else {
+                _atlasViewer->fitSurfaceInView();
+            }
         }
         refreshAtlasOverviewDocks();
         if (_workspaceTabs && _atlasWorkspaceWindow) {
             _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
         }
         if (statusBar()) {
-            statusBar()->showMessage(tr("Created atlas %1")
+            statusBar()->showMessage(tr("Displayed atlas %1")
                                          .arg(QString::fromStdString(atlas.metadata.name)),
                                      3000);
         }
