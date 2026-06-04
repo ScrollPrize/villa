@@ -2150,7 +2150,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
         }
 
         const vc::atlas::AtlasDisplayRange displayRange =
-            vc::atlas::atlasDisplayRange(atlas, points->cols);
+            vc::atlas::atlasDisplayRange(atlas, vc::atlas::atlasHorizontalPeriodColumns(*baseSurface));
         std::shared_ptr<QuadSurface> displaySurface = displayRange.unwrapCount > 1
             ? vc::atlas::repeatedAtlasDisplaySurface(*baseSurface, displayRange.unwrapCount)
             : baseSurface;

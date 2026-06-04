@@ -298,7 +298,31 @@ TEST_CASE("Atlas grid coordinates convert to QuadSurface surface coordinates wit
     const cv::Vec2f surfaceCoord =
         vc::atlas::atlasGridToSurfaceCoords(5.0, 7.0, surface, 2.0);
     CHECK(surfaceCoord[0] == doctest::Approx(0.0));
-    CHECK(surfaceCoord[1] == doctest::Approx(5.0));
+    CHECK(surfaceCoord[1] == doctest::Approx(5.0 / 3.0));
+
+    QuadSurface invalidScaleSurface(points, cv::Vec2f(0.0f, 1.0f));
+    const cv::Vec2f invalidCoord =
+        vc::atlas::atlasGridToSurfaceCoords(5.0, 7.0, invalidScaleSurface, 2.0);
+    CHECK(!std::isfinite(invalidCoord[0]));
+    CHECK(!std::isfinite(invalidCoord[1]));
+}
+
+TEST_CASE("Atlas wrapped shell period uses unique columns")
+{
+    cv::Mat_<cv::Vec3f> points(2, 5);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            points(row, col) = cv::Vec3f(static_cast<float>(col % 4),
+                                         static_cast<float>(row),
+                                         0.0f);
+        }
+    }
+    QuadSurface wrapped(points, cv::Vec2f(1.0f, 1.0f));
+    CHECK(vc::atlas::atlasHorizontalPeriodColumns(wrapped) == 4);
+
+    points(0, points.cols - 1)[0] = 9.0f;
+    QuadSurface open(points, cv::Vec2f(1.0f, 1.0f));
+    CHECK(vc::atlas::atlasHorizontalPeriodColumns(open) == 5);
 }
 
 TEST_CASE("Atlas display range uses leftmost mapped unwrap as the minimum column offset")
@@ -316,6 +340,22 @@ TEST_CASE("Atlas display range uses leftmost mapped unwrap as the minimum column
     CHECK(range.rightmostWinding == 3);
     CHECK(range.unwrapCount == 2);
     CHECK(range.atlasUOffset == doctest::Approx(8.0));
+    CHECK(range.hasMappedObjects);
+}
+
+TEST_CASE("Atlas display range uses wrapped shell period for winding and offset")
+{
+    vc::atlas::Atlas atlas;
+    vc::atlas::FiberMapping mapping;
+    mapping.lineAnchors.push_back({0, {}, 3.25, 1.0, 0.0});
+    mapping.lineAnchors.push_back({1, {}, 8.25, 1.0, 0.0});
+    atlas.fibers.push_back(std::move(mapping));
+
+    const auto range = vc::atlas::atlasDisplayRange(atlas, 4);
+    CHECK(range.leftmostWinding == 0);
+    CHECK(range.rightmostWinding == 2);
+    CHECK(range.unwrapCount == 3);
+    CHECK(range.atlasUOffset == doctest::Approx(0.0));
     CHECK(range.hasMappedObjects);
 }
 
@@ -340,6 +380,39 @@ TEST_CASE("Atlas repeated display surface duplicates base mesh columns for multi
     CHECK((*out)(1, 1)[2] == doctest::Approx((*out)(1, 7)[2]));
 }
 
+TEST_CASE("Atlas repeated wrapped display surface tiles unique period and closes seam")
+{
+    cv::Mat_<cv::Vec3f> points(2, 4);
+    cv::Mat labels(2, 4, CV_8U);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            const int uniqueCol = col % 3;
+            points(row, col) = cv::Vec3f(static_cast<float>(uniqueCol),
+                                         static_cast<float>(row),
+                                         static_cast<float>(10 + uniqueCol));
+            labels.at<uint8_t>(row, col) = static_cast<uint8_t>(uniqueCol + 1);
+        }
+    }
+    QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
+    surface.setChannel("labels", labels);
+
+    auto repeated = vc::atlas::repeatedAtlasDisplaySurface(surface, 3);
+    const auto* out = repeated->rawPointsPtr();
+    REQUIRE(out != nullptr);
+    CHECK(out->rows == 2);
+    CHECK(out->cols == 10);
+    CHECK((*out)(0, 0)[2] == doctest::Approx((*out)(0, 3)[2]));
+    CHECK((*out)(0, 0)[2] == doctest::Approx((*out)(0, 9)[2]));
+    CHECK((*out)(0, 8)[2] == doctest::Approx(12.0));
+
+    const cv::Mat repeatedLabels = repeated->channel("labels");
+    REQUIRE(!repeatedLabels.empty());
+    CHECK(repeatedLabels.cols == 10);
+    CHECK(repeatedLabels.at<uint8_t>(0, 0) == repeatedLabels.at<uint8_t>(0, 3));
+    CHECK(repeatedLabels.at<uint8_t>(0, 0) == repeatedLabels.at<uint8_t>(0, 9));
+    CHECK(repeatedLabels.at<uint8_t>(0, 8) == 3);
+}
+
 TEST_CASE("Atlas maps a synthetic fiber over a simple grid")
 {
     auto surface = makePlane(5, 8, 0.0);
@@ -361,7 +434,38 @@ TEST_CASE("Atlas maps a synthetic fiber over a simple grid")
     CHECK(mapping.lineAnchors[0].atlasU == doctest::Approx(1.0));
     CHECK(mapping.lineAnchors[1].atlasU == doctest::Approx(2.0));
     CHECK(mapping.lineAnchors[2].atlasV == doctest::Approx(2.0));
-    CHECK(mapping.controlAnchors.empty());
+    REQUIRE(mapping.controlAnchors.size() == 1);
+    CHECK(mapping.controlAnchors[0].atlasU == doctest::Approx(2.0));
+}
+
+TEST_CASE("Atlas mapping keeps wrapped seam hits continuous")
+{
+    cv::Mat_<cv::Vec3f> points(2, 5);
+    for (int row = 0; row < points.rows; ++row) {
+        const float radius = static_cast<float>(row + 1);
+        points(row, 0) = cv::Vec3f(radius, 0.0f, 0.0f);
+        points(row, 1) = cv::Vec3f(0.0f, radius, 0.0f);
+        points(row, 2) = cv::Vec3f(-radius, 0.0f, 0.0f);
+        points(row, 3) = cv::Vec3f(0.0f, -radius, 0.0f);
+        points(row, 4) = points(row, 0);
+    }
+    auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
+    SurfacePatchIndex index;
+    index.rebuild({surface});
+
+    vc::atlas::FiberInput fiber;
+    fiber.fiberPath = "fibers/wrapped.json";
+    fiber.linePoints = {
+        {0.3, -1.2, 1.0},
+        {1.35, 0.15, 1.0},
+    };
+
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    const auto mapping = vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler);
+    REQUIRE(mapping.lineAnchors.size() == 2);
+    CHECK(mapping.lineAnchors[0].atlasU == doctest::Approx(3.2).epsilon(1.0e-4));
+    CHECK(mapping.lineAnchors[1].atlasU > 4.0);
+    CHECK(mapping.lineAnchors[1].atlasU < 4.2);
 }
 
 TEST_CASE("Atlas mapping stops when grid and line step mismatch")

@@ -71,6 +71,36 @@ double distance(const cv::Vec3d& a, const cv::Vec3d& b)
     return std::sqrt(squaredDistance(a, b));
 }
 
+double normalizeAtlasU(double atlasU, int periodColumns)
+{
+    if (periodColumns <= 0 || !std::isfinite(atlasU)) {
+        return atlasU;
+    }
+    const double period = static_cast<double>(periodColumns);
+    double normalized = std::fmod(atlasU, period);
+    if (normalized < 0.0) {
+        normalized += period;
+    }
+    if (normalized >= period) {
+        normalized -= period;
+    }
+    return normalized;
+}
+
+int lineIndexClosestToPoint(const std::vector<cv::Vec3d>& line, const cv::Vec3d& point)
+{
+    int best = 0;
+    double bestDist = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < static_cast<int>(line.size()); ++i) {
+        const double d = squaredDistance(line[i], point);
+        if (d < bestDist) {
+            bestDist = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
 cv::Vec3d toVec3d(const cv::Vec3f& p)
 {
     return {p[0], p[1], p[2]};
@@ -568,10 +598,13 @@ struct ContinuationRejectDebug {
     int candidateCount = 0;
     double lineStep = 0.0;
     double mismatchRatio = 0.0;
+    double atlasNominalStepU = 1.0;
+    double atlasNominalStepV = 1.0;
     double previousAtlasU = 0.0;
     double previousAtlasV = 0.0;
     int previousWinding = 0;
     double bestRejectedGridStep = std::numeric_limits<double>::infinity();
+    double bestRejectedScaledAtlasStep = std::numeric_limits<double>::infinity();
     double bestRejectedRatio = std::numeric_limits<double>::infinity();
     double bestRejectedAtlasU = 0.0;
     double bestRejectedAtlasV = 0.0;
@@ -591,11 +624,14 @@ std::string continuationRejectDebugString(int sourceIndex,
         << " hits=" << debug.hitCount
         << " candidates=" << debug.candidateCount
         << " line_step=" << debug.lineStep
+        << " atlas_nominal_step=(" << debug.atlasNominalStepU << ", "
+        << debug.atlasNominalStepV << ")"
         << " threshold=" << debug.mismatchRatio
         << " prev_uv=(" << debug.previousAtlasU << ", " << debug.previousAtlasV << ")"
         << " prev_winding=" << debug.previousWinding;
     if (std::isfinite(debug.bestRejectedGridStep)) {
         out << " best_rejected_grid_step=" << debug.bestRejectedGridStep
+            << " best_rejected_scaled_atlas_step=" << debug.bestRejectedScaledAtlasStep
             << " best_rejected_ratio=" << debug.bestRejectedRatio
             << " best_rejected_uv=(" << debug.bestRejectedAtlasU << ", "
             << debug.bestRejectedAtlasV << ")"
@@ -612,7 +648,8 @@ std::optional<AtlasAnchor> chooseContinuationHit(int sourceIndex,
                                                  const AtlasAnchor& previous,
                                                  const cv::Vec3d& previousLinePoint,
                                                  const cv::Vec3d& linePoint,
-                                                 int columns,
+                                                 int periodColumns,
+                                                 const cv::Vec2d& atlasNominalStep,
                                                  double mismatchRatio,
                                                  ContinuationRejectDebug* rejectDebug = nullptr)
 {
@@ -620,15 +657,17 @@ std::optional<AtlasAnchor> chooseContinuationHit(int sourceIndex,
         *rejectDebug = {};
         rejectDebug->hitCount = static_cast<int>(hits.size());
         rejectDebug->mismatchRatio = mismatchRatio;
+        rejectDebug->atlasNominalStepU = atlasNominalStep[0];
+        rejectDebug->atlasNominalStepV = atlasNominalStep[1];
         rejectDebug->previousAtlasU = previous.atlasU;
         rejectDebug->previousAtlasV = previous.atlasV;
-        rejectDebug->previousWinding = columns > 0
-            ? static_cast<int>(std::floor(previous.atlasU / columns))
+        rejectDebug->previousWinding = periodColumns > 0
+            ? static_cast<int>(std::floor(previous.atlasU / periodColumns))
             : 0;
     }
-    if (hits.empty() || columns <= 0) {
+    if (hits.empty() || periodColumns <= 0) {
         if (rejectDebug) {
-            rejectDebug->reason = hits.empty() ? "no_hits" : "invalid_columns";
+            rejectDebug->reason = hits.empty() ? "no_hits" : "invalid_period_columns";
         }
         return std::nullopt;
     }
@@ -638,40 +677,60 @@ std::optional<AtlasAnchor> chooseContinuationHit(int sourceIndex,
     }
     double bestScore = std::numeric_limits<double>::infinity();
     std::optional<AtlasAnchor> best;
+    double bestGridStep = std::numeric_limits<double>::infinity();
+    double bestScaledAtlasStep = std::numeric_limits<double>::infinity();
+    double bestRatio = 0.0;
+    double bestHitU = 0.0;
+    double bestHitV = 0.0;
+    double bestDistance = 0.0;
+    int bestWinding = 0;
+    const int prevWinding = static_cast<int>(
+        std::floor(previous.atlasU / static_cast<double>(periodColumns)));
     for (const auto& hit : hits) {
-        const int prevWinding = static_cast<int>(std::floor(previous.atlasU / columns));
         for (int winding = prevWinding - 1; winding <= prevWinding + 1; ++winding) {
             if (rejectDebug) {
                 ++rejectDebug->candidateCount;
             }
             AtlasAnchor candidate = anchorFromHit(sourceIndex, hit);
-            candidate.atlasU = hit.atlasU + static_cast<double>(winding * columns);
+            candidate.atlasU = normalizeAtlasU(hit.atlasU, periodColumns) +
+                               static_cast<double>(winding * periodColumns);
             const double du = candidate.atlasU - previous.atlasU;
             const double dv = candidate.atlasV - previous.atlasV;
             const double gridStep = std::sqrt(du * du + dv * dv);
-            double ratio = 1.0;
-            if (lineStep > kEpsilon && gridStep > kEpsilon) {
-                ratio = std::max(gridStep, lineStep) / std::min(gridStep, lineStep);
-                if (ratio > mismatchRatio) {
-                    if (rejectDebug && gridStep < rejectDebug->bestRejectedGridStep) {
-                        rejectDebug->reason = "step_mismatch";
-                        rejectDebug->bestRejectedGridStep = gridStep;
-                        rejectDebug->bestRejectedRatio = ratio;
-                        rejectDebug->bestRejectedAtlasU = candidate.atlasU;
-                        rejectDebug->bestRejectedAtlasV = candidate.atlasV;
-                        rejectDebug->bestRejectedHitU = hit.atlasU;
-                        rejectDebug->bestRejectedHitV = hit.atlasV;
-                        rejectDebug->bestRejectedDistance = hit.distance;
-                        rejectDebug->bestRejectedWinding = winding;
-                    }
-                    continue;
-                }
+            const double scaledDu = du * atlasNominalStep[0];
+            const double scaledDv = dv * atlasNominalStep[1];
+            const double scaledAtlasStep = std::sqrt(scaledDu * scaledDu + scaledDv * scaledDv);
+            double ratio = 0.0;
+            if (lineStep > kEpsilon) {
+                ratio = scaledAtlasStep / lineStep;
             }
             if (gridStep < bestScore) {
                 bestScore = gridStep;
                 best = candidate;
+                bestGridStep = gridStep;
+                bestScaledAtlasStep = scaledAtlasStep;
+                bestRatio = ratio;
+                bestHitU = hit.atlasU;
+                bestHitV = hit.atlasV;
+                bestDistance = hit.distance;
+                bestWinding = winding;
             }
         }
+    }
+    if (best && lineStep > kEpsilon && bestScaledAtlasStep > lineStep * mismatchRatio) {
+        if (rejectDebug) {
+            rejectDebug->reason = "step_mismatch";
+            rejectDebug->bestRejectedGridStep = bestGridStep;
+            rejectDebug->bestRejectedScaledAtlasStep = bestScaledAtlasStep;
+            rejectDebug->bestRejectedRatio = bestRatio;
+            rejectDebug->bestRejectedAtlasU = best->atlasU;
+            rejectDebug->bestRejectedAtlasV = best->atlasV;
+            rejectDebug->bestRejectedHitU = bestHitU;
+            rejectDebug->bestRejectedHitV = bestHitV;
+            rejectDebug->bestRejectedDistance = bestDistance;
+            rejectDebug->bestRejectedWinding = bestWinding;
+        }
+        return std::nullopt;
     }
     if (!best && rejectDebug && rejectDebug->reason.empty()) {
         rejectDebug->reason = "no_acceptable_candidate";
@@ -1031,6 +1090,36 @@ AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas)
     return size;
 }
 
+int atlasHorizontalPeriodColumns(const QuadSurface& surface)
+{
+    const auto* points = surface.rawPointsPtr();
+    if (!points || points->cols <= 0) {
+        return 0;
+    }
+    const int cols = points->cols;
+    if (cols <= 1) {
+        return cols;
+    }
+
+    bool comparedAny = false;
+    for (int row = 0; row < points->rows; ++row) {
+        const cv::Vec3f first = (*points)(row, 0);
+        const cv::Vec3f last = (*points)(row, cols - 1);
+        if (!finitePoint(first) || !finitePoint(last)) {
+            if (first == last) {
+                continue;
+            }
+            return cols;
+        }
+        comparedAny = true;
+        const cv::Vec3d delta = toVec3d(first) - toVec3d(last);
+        if (norm(delta) > 1.0e-5) {
+            return cols;
+        }
+    }
+    return comparedAny ? cols - 1 : cols;
+}
+
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
 {
     AtlasDisplayRange range;
@@ -1082,11 +1171,21 @@ cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
                                    const QuadSurface& displaySurface,
                                    double atlasUOffset)
 {
-    const cv::Vec3f center = displaySurface.center();
+    const auto* points = displaySurface.rawPointsPtr();
     const cv::Vec2f scale = displaySurface.scale();
+    if (!points || points->empty() ||
+        !std::isfinite(atlasU) || !std::isfinite(atlasV) ||
+        !std::isfinite(atlasUOffset) ||
+        !std::isfinite(scale[0]) || !std::isfinite(scale[1]) ||
+        scale[0] == 0.0f || scale[1] == 0.0f) {
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
+    }
     return {
-        static_cast<float>((atlasU - atlasUOffset) - static_cast<double>(center[0] * scale[0])),
-        static_cast<float>(atlasV - static_cast<double>(center[1] * scale[1])),
+        static_cast<float>(((atlasU - atlasUOffset) - static_cast<double>(points->cols) / 2.0) /
+                           static_cast<double>(scale[0])),
+        static_cast<float>((atlasV - static_cast<double>(points->rows) / 2.0) /
+                           static_cast<double>(scale[1])),
     };
 }
 
@@ -1107,10 +1206,22 @@ std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& base
         throw std::runtime_error("base surface has no valid grid");
     }
 
-    cv::Mat_<cv::Vec3f> repeated(rows, cols * unwrapCount);
-    for (int unwrap = 0; unwrap < unwrapCount; ++unwrap) {
-        const cv::Rect dst(unwrap * cols, 0, cols, rows);
-        points->copyTo(repeated(dst));
+    const int periodColumns = atlasHorizontalPeriodColumns(baseSurface);
+    const bool wrapped = periodColumns == cols - 1 && periodColumns > 0;
+    const int outCols = wrapped ? periodColumns * unwrapCount + 1 : cols * unwrapCount;
+
+    cv::Mat_<cv::Vec3f> repeated(rows, outCols);
+    if (wrapped) {
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < outCols; ++col) {
+                repeated(row, col) = (*points)(row, col % periodColumns);
+            }
+        }
+    } else {
+        for (int unwrap = 0; unwrap < unwrapCount; ++unwrap) {
+            const cv::Rect dst(unwrap * cols, 0, cols, rows);
+            points->copyTo(repeated(dst));
+        }
     }
 
     auto out = std::make_shared<QuadSurface>(repeated, baseSurface.scale());
@@ -1120,9 +1231,18 @@ std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& base
         if (channel.empty() || channel.cols != cols || channel.rows != rows) {
             continue;
         }
-        cv::Mat repeatedChannel(rows, cols * unwrapCount, channel.type());
-        for (int unwrap = 0; unwrap < unwrapCount; ++unwrap) {
-            channel.copyTo(repeatedChannel(cv::Rect(unwrap * cols, 0, cols, rows)));
+        cv::Mat repeatedChannel(rows, outCols, channel.type());
+        if (wrapped) {
+            for (int row = 0; row < rows; ++row) {
+                for (int col = 0; col < outCols; ++col) {
+                    channel.col(col % periodColumns).row(row).copyTo(
+                        repeatedChannel.col(col).row(row));
+                }
+            }
+        } else {
+            for (int unwrap = 0; unwrap < unwrapCount; ++unwrap) {
+                channel.copyTo(repeatedChannel(cv::Rect(unwrap * cols, 0, cols, rows)));
+            }
         }
         out->setChannel(name, repeatedChannel);
     }
@@ -1142,6 +1262,12 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
     if (!points || points->cols <= 0) {
         throw std::runtime_error("base surface has no valid grid");
     }
+    const int periodColumns = atlasHorizontalPeriodColumns(baseSurface);
+    const cv::Vec2f baseScale = baseSurface.scale();
+    const cv::Vec2d atlasNominalStep{
+        std::isfinite(baseScale[0]) && baseScale[0] > 0.0f ? 1.0 / static_cast<double>(baseScale[0]) : 1.0,
+        std::isfinite(baseScale[1]) && baseScale[1] > 0.0f ? 1.0 / static_cast<double>(baseScale[1]) : 1.0,
+    };
 
     SurfacePatchIndex::SurfacePtr baseSurfacePtr(const_cast<QuadSurface*>(&baseSurface), [](QuadSurface*) {});
     const std::vector<SurfaceCandidate> baseCandidates = {{
@@ -1179,6 +1305,7 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
 
     std::vector<std::optional<AtlasAnchor>> anchors(fiber.linePoints.size());
     anchors[seedIndex] = anchorFromHit(seedIndex, hitsByLinePoint[seedIndex].front());
+    anchors[seedIndex]->atlasU = normalizeAtlasU(anchors[seedIndex]->atlasU, periodColumns);
     atlasDebug("line_point[" + std::to_string(seedIndex) + "] chosen_anchor u=" +
                std::to_string(anchors[seedIndex]->atlasU) + " v=" +
                std::to_string(anchors[seedIndex]->atlasV));
@@ -1190,7 +1317,8 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                                   *anchors[i - 1],
                                                   fiber.linePoints[i - 1],
                                                   fiber.linePoints[i],
-                                                  points->cols,
+                                                  periodColumns,
+                                                  atlasNominalStep,
                                                   options.mismatchRatio,
                                                   atlasDebugEnabled() ? &rejectDebug : nullptr);
         if (!chosen) {
@@ -1209,7 +1337,8 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                                   *anchors[i + 1],
                                                   fiber.linePoints[i + 1],
                                                   fiber.linePoints[i],
-                                                  points->cols,
+                                                  periodColumns,
+                                                  atlasNominalStep,
                                                   options.mismatchRatio,
                                                   atlasDebugEnabled() ? &rejectDebug : nullptr);
         if (!chosen) {
@@ -1232,6 +1361,22 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
     atlasDebug("final_line_anchor_count=" + std::to_string(mapping.lineAnchors.size()));
     if (mapping.lineAnchors.size() < 2) {
         throw std::runtime_error("incomplete atlas mapping: produced fewer than two line anchors");
+    }
+
+    for (int i = 0; i < static_cast<int>(fiber.controlPoints.size()); ++i) {
+        const int lineIndex = lineIndexClosestToPoint(fiber.linePoints, fiber.controlPoints[i]);
+        auto it = std::find_if(mapping.lineAnchors.begin(),
+                               mapping.lineAnchors.end(),
+                               [lineIndex](const AtlasAnchor& anchor) {
+                                   return anchor.sourceIndex == lineIndex;
+                               });
+        if (it == mapping.lineAnchors.end()) {
+            continue;
+        }
+        AtlasAnchor control = *it;
+        control.sourceIndex = i;
+        control.world = fiber.controlPoints[i];
+        mapping.controlAnchors.push_back(control);
     }
     return mapping;
 }

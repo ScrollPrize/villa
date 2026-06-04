@@ -248,7 +248,7 @@ private slots:
         controller.setAtlas(updatedAtlas, surface, range);
         controller.refreshViewer(&viewer);
 
-        QCOMPARE(viewer.scene().items().size(), 2);
+        QCOMPARE(viewer.scene().items().size(), 1);
     }
 };
 

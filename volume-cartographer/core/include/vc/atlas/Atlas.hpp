@@ -93,7 +93,7 @@ struct BaseSelection {
 
 struct LineMappingOptions {
     double rayHalfLength = 96.0;
-    double mismatchRatio = 1.5;
+    double mismatchRatio = 10.0;
 };
 
 struct ProjectionHit {
@@ -134,6 +134,7 @@ void saveIdxRotatedBaseMesh(const QuadSurface& surface,
                             int rotationColumns,
                             const std::filesystem::path& targetDir);
 AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas);
+int atlasHorizontalPeriodColumns(const QuadSurface& surface);
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns);
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
                                    double atlasV,

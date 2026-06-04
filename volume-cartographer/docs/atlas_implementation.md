@@ -9,7 +9,7 @@ Atlas Overview intentionally exposes only the minimal object summary:
 - `Fiber count`
 - `Object covered atlas size`
 
-`Object covered atlas size` is computed from mapped fiber `lineAnchors` only and is displayed as `W x H vx`. Legacy `controlAnchors` remain readable in saved mappings but are not used for footprint calculations or Atlas line display.
+`Object covered atlas size` is computed from mapped fiber `lineAnchors` only and is displayed as `W x H vx`. `controlAnchors` are display metadata for source control points and are not used for footprint calculations.
 
 ## Atlas Viewer
 
@@ -21,4 +21,4 @@ Atlas overlays are rendered through generic surface-coordinate overlay primitive
 
 When mapped objects live in a single unwrap, the saved base mesh is displayed directly. When mapped objects span multiple unwraps, the display surface repeats the saved base mesh columns enough times to cover the mapped range, and anchors subtract only the leftmost unwrap column offset.
 
-The Atlas viewer uses a live overlay controller. It draws each mapped fiber from `lineAnchors` as a line strip and draws every line anchor as a point marker so projection density and gaps remain visible during pan, zoom, normal-offset scrolling, and refresh.
+The Atlas viewer uses a live overlay controller. It draws each mapped fiber from `lineAnchors` as a line strip and draws source control points from `controlAnchors` as point markers during pan, zoom, normal-offset scrolling, and refresh.

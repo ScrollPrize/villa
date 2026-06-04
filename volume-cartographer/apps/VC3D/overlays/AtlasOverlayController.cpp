@@ -126,10 +126,16 @@ void AtlasOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                 continue;
             }
             linePoints.push_back(*surfaceCoord);
-            builder.addSurfacePoint(*surfaceCoord, 3.5, anchorStyle);
         }
         if (linePoints.size() >= 2) {
             builder.addSurfaceLineStrip(linePoints, false, lineStyle);
+        }
+        for (const auto& anchor : fiber.controlAnchors) {
+            const auto surfaceCoord = atlasAnchorToSurface(anchor);
+            if (!surfaceCoord) {
+                continue;
+            }
+            builder.addSurfacePoint(*surfaceCoord, 4.0, anchorStyle);
         }
     }
 }
