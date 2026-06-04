@@ -164,7 +164,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
 
-- [Plumbline](https://github.com/GitHwwb/plumbline) by GitHwwb. CPU-only trace-quality checker: reads a segment's ink-detection prediction and flags where the trace likely drifted — orientation breaks, row-spacing jumps, garble, and pure vertical sheet-jumps (sheet-to-sheet drift) — as a self-contained HTML dashboard + JSON sidecar. Targets the wishlist item "integrate ink detection to help see if an area was segmented correctly." [Live demo](https://githwwb.github.io/plumbline/).
+- [Plumbline](https://github.com/GitHwwb/plumbline) by GitHwwb. CPU-only trace-quality checker: reads a segment's ink-detection prediction and flags where the trace likely drifted — orientation breaks, row-spacing jumps, garble, and pure vertical sheet-jumps (sheet-to-sheet drift) — as a self-contained HTML dashboard + JSON sidecar. Targets the wishlist item "integrate ink detection to help see if an area was segmented correctly."
 
 ### 📦 Materials
 
