@@ -3853,10 +3853,17 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lambda step: 1.)
 
     def save_model(suffix):
-        torch.save([spiral_and_transform.state_dict(), optimiser.state_dict()], f'{out_path}/checkpoint_{suffix}.ckpt')
+        torch.save({
+            'spiral_and_transform': spiral_and_transform.state_dict(),
+            'optimiser': optimiser.state_dict(),
+            'cfg': cfg,
+            'z_begin': z_begin,
+            'z_end': z_end,
+        }, f'{out_path}/checkpoint_{suffix}.ckpt')
 
     def load_model(path):
-        transformed_spiral_state, optimiser_state = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu')
+        transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         spiral_and_transform.load_state_dict(transformed_spiral_state)
         optimiser.load_state_dict(optimiser_state)
 
