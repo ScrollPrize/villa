@@ -25,6 +25,8 @@ set(srcs
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
+    AtlasCanvasWidget.cpp
+    AtlasCanvasWidget.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationDialog.cpp
@@ -222,6 +224,7 @@ target_link_libraries(VC3D
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
+    vc_atlas
     vc_lasagna
     vc_tracer
     vc_flattening

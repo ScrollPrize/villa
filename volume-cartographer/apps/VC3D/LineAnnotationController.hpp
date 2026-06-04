@@ -87,6 +87,7 @@ public:
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
+    void createAtlasFromFiber(uint64_t fiberId);
     void saveOpenFibers();
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
 
@@ -96,6 +97,7 @@ public:
 
 signals:
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
+    void atlasCreated(std::filesystem::path atlasDir);
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);

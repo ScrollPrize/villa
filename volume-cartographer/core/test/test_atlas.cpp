@@ -1,0 +1,321 @@
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "vc_test.hpp"
+
+#include "vc/atlas/Atlas.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/lasagna/LineModel.hpp"
+
+#include <filesystem>
+#include <memory>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+class ConstantNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    explicit ConstantNormalSampler(cv::Vec3d normal) : normal_(normal) {}
+
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+    {
+        return {normal_, true, {}};
+    }
+
+private:
+    cv::Vec3d normal_;
+};
+
+class InvalidNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+    {
+        return {{0.0, 0.0, 0.0}, false, {}};
+    }
+};
+
+class JumpNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& p) const override
+    {
+        if (p[0] > 2.5) {
+            return {cv::Vec3d{7.0, 0.0, -1.0}, true, {}};
+        }
+        return {cv::Vec3d{0.0, 0.0, 1.0}, true, {}};
+    }
+};
+
+std::shared_ptr<QuadSurface> makePlane(int rows,
+                                       int cols,
+                                       double z,
+                                       double yBias = 0.0,
+                                       double xBias = 0.0)
+{
+    cv::Mat_<cv::Vec3f> points(rows, cols);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            points(row, col) = cv::Vec3f(static_cast<float>(col + xBias),
+                                         static_cast<float>(row + yBias),
+                                         static_cast<float>(z));
+        }
+    }
+    return std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
+}
+
+fs::path tempRoot(const std::string& name)
+{
+    const fs::path root = fs::temp_directory_path() / name;
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root);
+    return root;
+}
+
+} // namespace
+
+TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
+{
+    const fs::path root = tempRoot("vc_atlas_roundtrip");
+
+    vc::atlas::Atlas atlas;
+    atlas.metadata.name = "fiber_1";
+    atlas.metadata.baseMeshPath = "base_mesh/shell.tifxyz";
+    atlas.metadata.sourceBaseMeshPath = "segments/shell";
+    atlas.metadata.idxRotationColumns = 3;
+    atlas.metadata.seedLineIndex = 1;
+    atlas.metadata.seedAtlasU = 4.5;
+    atlas.metadata.seedAtlasV = 2.0;
+    atlas.links.push_back("placeholder");
+
+    vc::atlas::FiberMapping mapping;
+    mapping.fiberPath = "fibers/1.json";
+    mapping.lineAnchors.push_back({0, {1.0, 2.0, 3.0}, 4.0, 5.0, 0.25});
+    mapping.controlAnchors.push_back({0, {1.0, 2.0, 3.0}, 4.0, 5.0, 0.25});
+    atlas.fibers.push_back(mapping);
+
+    atlas.save(root);
+    const auto loaded = vc::atlas::Atlas::load(root);
+
+    REQUIRE(loaded.metadata.name == "fiber_1");
+    CHECK(loaded.metadata.idxRotationColumns == 3);
+    CHECK(loaded.metadata.seedLineIndex == 1);
+    CHECK(loaded.metadata.seedAtlasU == doctest::Approx(4.5));
+    REQUIRE(loaded.links.size() == 1);
+    REQUIRE(loaded.fibers.size() == 1);
+    CHECK(loaded.fibers[0].fiberPath == fs::path("fibers/1.json"));
+    REQUIRE(loaded.fibers[0].lineAnchors.size() == 1);
+    CHECK(loaded.fibers[0].lineAnchors[0].atlasV == doctest::Approx(5.0));
+}
+
+TEST_CASE("Atlas rejects fibers without control points")
+{
+    auto surface = makePlane(4, 4, 0.0);
+    SurfacePatchIndex index;
+    index.rebuild({surface});
+    std::vector<vc::atlas::SurfaceCandidate> surfaces = {
+        {"shell", "segments/shell", surface},
+    };
+    vc::atlas::FiberInput fiber;
+    fiber.linePoints = {{1.0, 1.0, 1.0}};
+
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::selectBaseSurfaceBySeedRay(fiber, surfaces, index, sampler),
+        doctest::Contains("fiber has no control points"),
+        std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler),
+        doctest::Contains("fiber has no control points"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas base selection chooses nearest seed-normal ray hit")
+{
+    vc::atlas::FiberInput fiber;
+    fiber.linePoints = {
+        {0.0, 1.0, 0.0},
+        {1.0, 1.0, 4.8},
+        {2.0, 1.0, 4.9},
+    };
+    fiber.controlPoints = {{1.0, 1.0, 4.8}};
+
+    std::vector<vc::atlas::SurfaceCandidate> surfaces = {
+        {"low", "segments/low", makePlane(4, 4, 0.0)},
+        {"high", "segments/high", makePlane(4, 4, 5.0)},
+    };
+    SurfacePatchIndex index;
+    index.rebuild({surfaces[0].surface, surfaces[1].surface});
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(fiber, surfaces, index, sampler);
+    CHECK(selection.surfaceIndex == 1);
+    CHECK(selection.seedLineIndex == 1);
+}
+
+TEST_CASE("Atlas base selection ignores shells not intersected by seed ray")
+{
+    vc::atlas::FiberInput fiber;
+    fiber.linePoints = {{1.0, 1.0, 0.0}};
+    fiber.controlPoints = {{1.0, 1.0, 0.0}};
+
+    std::vector<vc::atlas::SurfaceCandidate> surfaces = {
+        {"closer_miss", "segments/closer_miss", makePlane(2, 2, 0.1, 1.2, 1.2)},
+        {"far_hit", "segments/far_hit", makePlane(3, 3, 5.0)},
+    };
+    SurfacePatchIndex index;
+    index.rebuild({surfaces[0].surface, surfaces[1].surface});
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+
+    const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(fiber, surfaces, index, sampler);
+    CHECK(selection.surfaceIndex == 1);
+    CHECK(selection.surfaceName == "far_hit");
+    CHECK(selection.distance == doctest::Approx(5.0));
+}
+
+TEST_CASE("Atlas base selection expands seed ray beyond the initial probe length")
+{
+    vc::atlas::FiberInput fiber;
+    fiber.linePoints = {{1.0, 1.0, 0.0}};
+    fiber.controlPoints = {{1.0, 1.0, 0.0}};
+
+    std::vector<vc::atlas::SurfaceCandidate> surfaces = {
+        {"distant_hit", "segments/distant_hit", makePlane(3, 3, 250.0)},
+    };
+    SurfacePatchIndex index;
+    index.rebuild({surfaces[0].surface});
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+
+    vc::atlas::LineMappingOptions options;
+    options.rayHalfLength = 16.0;
+    const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(
+        fiber, surfaces, index, sampler, options);
+    CHECK(selection.surfaceIndex == 0);
+    CHECK(selection.distance == doctest::Approx(250.0));
+}
+
+TEST_CASE("Atlas base selection reports invalid seed normals")
+{
+    vc::atlas::FiberInput fiber;
+    fiber.linePoints = {{1.0, 1.0, 0.0}};
+    fiber.controlPoints = {{1.0, 1.0, 0.0}};
+    auto surface = makePlane(3, 3, 0.0);
+    SurfacePatchIndex index;
+    index.rebuild({surface});
+    std::vector<vc::atlas::SurfaceCandidate> surfaces = {
+        {"shell", "segments/shell", surface},
+    };
+    InvalidNormalSampler sampler;
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::selectBaseSurfaceBySeedRay(fiber, surfaces, index, sampler),
+        doctest::Contains("No valid normal at atlas seed point"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas base selection reports missing seed-ray intersections")
+{
+    vc::atlas::FiberInput fiber;
+    fiber.linePoints = {{1.0, 1.0, 0.0}};
+    fiber.controlPoints = {{1.0, 1.0, 0.0}};
+    std::vector<vc::atlas::SurfaceCandidate> surfaces = {
+        {"miss", "segments/miss", makePlane(2, 2, 0.1, 2.0, 2.0)},
+    };
+    SurfacePatchIndex index;
+    index.rebuild({surfaces[0].surface});
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::selectBaseSurfaceBySeedRay(fiber, surfaces, index, sampler),
+        doctest::Contains("Atlas seed ray did not intersect any shell"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas ray projection returns fractional coordinates on bilinear quads")
+{
+    cv::Mat_<cv::Vec3f> points(2, 2);
+    points(0, 0) = {0.0f, 0.0f, 0.0f};
+    points(0, 1) = {1.0f, 0.0f, 0.0f};
+    points(1, 0) = {0.0f, 1.0f, 0.0f};
+    points(1, 1) = {1.0f, 1.0f, 1.0f};
+    auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
+    SurfacePatchIndex index;
+    index.rebuild({surface});
+    std::vector<vc::atlas::SurfaceCandidate> surfaces = {
+        {"curved", "segments/curved", surface},
+    };
+
+    const auto hits = vc::atlas::projectPointAlongNormalToSurfaces(
+        {0.25, 0.5, 2.0}, {0.0, 0.0, 1.0}, surfaces, index, 4.0);
+    REQUIRE(hits.size() == 1);
+    CHECK(hits[0].surfaceIndex == 0);
+    CHECK(hits[0].atlasU == doctest::Approx(0.25));
+    CHECK(hits[0].atlasV == doctest::Approx(0.5));
+    CHECK(hits[0].world[2] == doctest::Approx(0.125));
+}
+
+TEST_CASE("Atlas idx rotation cyclically shifts columns without moving coordinates")
+{
+    cv::Mat_<cv::Vec3f> points(2, 4);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            points(row, col) = cv::Vec3f(static_cast<float>(col),
+                                         static_cast<float>((col == 2 ? -10 : col) + row),
+                                         0.0f);
+        }
+    }
+    QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
+    CHECK(vc::atlas::computeIdxRotationColumns(surface) == 2);
+
+    auto rotated = vc::atlas::idxRotatedSurface(surface, 2);
+    const auto* out = rotated->rawPointsPtr();
+    REQUIRE(out != nullptr);
+    CHECK((*out)(0, 0)[0] == doctest::Approx(points(0, 2)[0]));
+    CHECK((*out)(0, 1)[0] == doctest::Approx(points(0, 3)[0]));
+    CHECK((*out)(0, 2)[0] == doctest::Approx(points(0, 0)[0]));
+    CHECK((*out)(0, 3)[0] == doctest::Approx(points(0, 1)[0]));
+}
+
+TEST_CASE("Atlas maps a synthetic fiber over a simple grid")
+{
+    auto surface = makePlane(5, 8, 0.0);
+    SurfacePatchIndex index;
+    index.rebuild({surface});
+
+    vc::atlas::FiberInput fiber;
+    fiber.fiberPath = "fibers/1.json";
+    fiber.linePoints = {
+        {1.0, 2.0, 1.0},
+        {2.0, 2.0, 1.0},
+        {3.0, 2.0, 1.0},
+    };
+    fiber.controlPoints = {{2.0, 2.0, 1.0}};
+
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    const auto mapping = vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler);
+    REQUIRE(mapping.lineAnchors.size() == 3);
+    CHECK(mapping.lineAnchors[0].atlasU == doctest::Approx(1.0));
+    CHECK(mapping.lineAnchors[1].atlasU == doctest::Approx(2.0));
+    CHECK(mapping.lineAnchors[2].atlasV == doctest::Approx(2.0));
+    REQUIRE(mapping.controlAnchors.size() == 1);
+}
+
+TEST_CASE("Atlas mapping stops when grid and line step mismatch")
+{
+    auto surface = makePlane(5, 16, 0.0);
+    SurfacePatchIndex index;
+    index.rebuild({surface});
+
+    vc::atlas::FiberInput fiber;
+    fiber.fiberPath = "fibers/1.json";
+    fiber.linePoints = {
+        {1.0, 2.0, 1.0},
+        {2.0, 2.0, 1.0},
+        {3.0, 2.0, 1.0},
+    };
+    fiber.controlPoints = {{1.0, 2.0, 1.0}};
+
+    JumpNormalSampler sampler;
+    vc::atlas::LineMappingOptions options;
+    options.rayHalfLength = 16.0;
+    options.mismatchRatio = 1.5;
+    const auto mapping = vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler, options);
+    REQUIRE(mapping.lineAnchors.size() == 2);
+    CHECK(mapping.lineAnchors.back().sourceIndex == 1);
+}

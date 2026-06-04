@@ -144,6 +144,11 @@ add_library(vc_lasagna
 )
 target_link_libraries(vc_lasagna PUBLIC vc_core PRIVATE Ceres::ceres)
 
+add_library(vc_atlas
+    src/Atlas.cpp
+)
+target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna)
+
 add_library(vc_tracer
     src/GrowPatch.cpp
     src/GrowSurface.cpp
@@ -158,7 +163,7 @@ target_link_libraries(vc_tracer PUBLIC vc_core vc_flattening Ceres::ceres)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
 if(VC_USE_PCH)
-    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_tracer)
+    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_atlas vc_tracer)
         target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
     endforeach()
 endif()

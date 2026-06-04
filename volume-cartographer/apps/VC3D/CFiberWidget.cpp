@@ -5,6 +5,7 @@
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
 #include <QLabel>
+#include <QMenu>
 #include <QSignalBlocker>
 #include <QVBoxLayout>
 
@@ -28,12 +29,15 @@ void CFiberWidget::setupUi()
     _listView->setModel(_model);
     _listView->setEditTriggers(QAbstractItemView::NoEditTriggers);
     _listView->setSelectionMode(QAbstractItemView::SingleSelection);
+    _listView->setContextMenuPolicy(Qt::CustomContextMenu);
     layout->addWidget(_listView, 1);
 
     connect(_listView->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &CFiberWidget::onSelectionChanged);
     connect(_listView, &QListView::doubleClicked,
             this, &CFiberWidget::onDoubleClicked);
+    connect(_listView, &QWidget::customContextMenuRequested,
+            this, &CFiberWidget::showContextMenu);
 
     _scoreLabel = new QLabel(mainWidget);
     _scoreLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -252,4 +256,24 @@ void CFiberWidget::updateClassificationUi()
     _manualVButton->setEnabled(hasSelection);
     _manualResetButton->setEnabled(hasSelection && fiber->manualHvTag != "");
     _recalculateScoreButton->setEnabled(hasSelection);
+}
+
+void CFiberWidget::showContextMenu(const QPoint& pos)
+{
+    QModelIndex index = _listView->indexAt(pos);
+    if (index.isValid()) {
+        if (auto* item = _model->itemFromIndex(index)) {
+            selectFiber(item->data().toULongLong());
+        }
+    }
+
+    QMenu menu(this);
+    auto* newAtlasAction = menu.addAction(tr("New atlas from line"));
+    newAtlasAction->setEnabled(_selectedFiberId != 0);
+    connect(newAtlasAction, &QAction::triggered, this, [this]() {
+        if (_selectedFiberId != 0) {
+            emit newAtlasFromFiberRequested(_selectedFiberId);
+        }
+    });
+    menu.exec(_listView->viewport()->mapToGlobal(pos));
 }

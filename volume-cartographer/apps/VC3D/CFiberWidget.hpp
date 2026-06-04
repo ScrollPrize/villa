@@ -44,6 +44,7 @@ signals:
     void deleteFiberRequested(uint64_t fiberId);
     void manualHvTagChanged(uint64_t fiberId, QString tag);
     void hvScoreRecalculationRequested(uint64_t fiberId);
+    void newAtlasFromFiberRequested(uint64_t fiberId);
 
 private slots:
     void onSelectionChanged();
@@ -52,6 +53,7 @@ private slots:
     void onManualHvButtonClicked(int id);
     void onManualHvResetClicked();
     void onRecalculateHvScoreClicked();
+    void showContextMenu(const QPoint& pos);
 
 private:
     void setupUi();

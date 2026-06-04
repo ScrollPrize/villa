@@ -92,6 +92,7 @@
 #include "MenuActionController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
+#include "AtlasCanvasWidget.hpp"
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
@@ -107,6 +108,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
 #include "vc/core/util/Tiff.hpp"
+#include "vc/atlas/Atlas.hpp"
 #include <utils/zarr.hpp>
 
 
@@ -642,6 +644,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                                                            _viewerManager.get(),
                                                                            this,
                                                                            this);
+    connect(_lineAnnotationController.get(),
+            &LineAnnotationController::atlasCreated,
+            this,
+            &CWindow::displayAtlasFromDirectory);
     connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
@@ -1992,25 +1998,13 @@ void CWindow::setSegmentationCursorMirroring(bool enabled)
 
 void CWindow::createAtlasWorkspace()
 {
-    if (!_atlasWorkspaceWindow || !_segmentWorkspaceWindow || !_viewerManager) {
+    if (!_atlasWorkspaceWindow || !_segmentWorkspaceWindow) {
         return;
     }
 
     if (!_atlasWorkspaceWindow->centralWidget()) {
-        if (auto* viewer = _viewerManager->createViewerInWidget("xy plane", _atlasWorkspaceWindow)) {
-            viewer->setIntersects({"segmentation"});
-            if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
-                chunkedViewer->setObjectName(QStringLiteral("atlasSliceViewer"));
-                configureChunkedViewerConnections(chunkedViewer);
-                _atlasWorkspaceWindow->setCentralWidget(chunkedViewer);
-            }
-        }
-    }
-
-    if (!_atlasWorkspaceWindow->centralWidget()) {
-        auto* placeholder = new QLabel(tr("Atlas slice view"), _atlasWorkspaceWindow);
-        placeholder->setAlignment(Qt::AlignCenter);
-        _atlasWorkspaceWindow->setCentralWidget(placeholder);
+        _atlasCanvas = new AtlasCanvasWidget(_atlasWorkspaceWindow);
+        _atlasWorkspaceWindow->setCentralWidget(_atlasCanvas);
     }
 
     _atlasWorkspaceOverviewDock = createAtlasOverviewDock(this);
@@ -2031,6 +2025,112 @@ void CWindow::createAtlasWorkspace()
 
     _atlasOverviewDock->hide();
     _atlasSearchDock->hide();
+
+    auto connectOverview = [this](QDockWidget* dock) {
+        if (!dock) {
+            return;
+        }
+        auto* tree = qobject_cast<QTreeWidget*>(dock->widget());
+        if (!tree) {
+            return;
+        }
+        connect(tree, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem* item, int) {
+            while (item && item->data(0, Qt::UserRole).toString().isEmpty()) {
+                item = item->parent();
+            }
+            if (!item) {
+                return;
+            }
+            const QString path = item->data(0, Qt::UserRole).toString();
+            if (!path.isEmpty()) {
+                displayAtlasFromDirectory(std::filesystem::path(path.toStdString()));
+            }
+        });
+    };
+    connectOverview(_atlasOverviewDock);
+    connectOverview(_atlasWorkspaceOverviewDock);
+    refreshAtlasOverviewDocks();
+}
+
+void CWindow::refreshAtlasOverviewDocks()
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    const std::filesystem::path volpkgRoot = vpkg && !vpkg->path().empty()
+        ? vpkg->path().parent_path()
+        : std::filesystem::path{};
+    const std::filesystem::path atlasesRoot = volpkgRoot / "atlases";
+
+    auto populate = [this, &atlasesRoot](QDockWidget* dock) {
+        if (!dock) {
+            return;
+        }
+        auto* tree = qobject_cast<QTreeWidget*>(dock->widget());
+        if (!tree) {
+            return;
+        }
+        tree->clear();
+        if (atlasesRoot.empty() || !std::filesystem::is_directory(atlasesRoot)) {
+            return;
+        }
+        std::vector<std::filesystem::path> atlasDirs;
+        for (const auto& entry : std::filesystem::directory_iterator(atlasesRoot)) {
+            if (entry.is_directory() && std::filesystem::exists(entry.path() / "metadata.json")) {
+                atlasDirs.push_back(entry.path());
+            }
+        }
+        std::sort(atlasDirs.begin(), atlasDirs.end());
+        for (const auto& atlasDir : atlasDirs) {
+            try {
+                const auto atlas = vc::atlas::Atlas::load(atlasDir);
+                auto* item = new QTreeWidgetItem(tree);
+                item->setText(0, QString::fromStdString(atlas.metadata.name));
+                item->setText(1, QString::number(static_cast<int>(atlas.fibers.size())));
+                item->setData(0, Qt::UserRole, QString::fromStdString(atlasDir.string()));
+
+                auto* base = new QTreeWidgetItem(item);
+                base->setText(0, tr("Base mesh"));
+                base->setText(1, QString::fromStdString(atlas.metadata.baseMeshPath.generic_string()));
+
+                auto* rotation = new QTreeWidgetItem(item);
+                rotation->setText(0, tr("Idx rotation"));
+                rotation->setText(1, QString::number(atlas.metadata.idxRotationColumns));
+            } catch (const std::exception& ex) {
+                auto* item = new QTreeWidgetItem(tree);
+                item->setText(0, QString::fromStdString(atlasDir.filename().string()));
+                item->setText(1, QString::fromStdString(ex.what()));
+            }
+        }
+        tree->expandAll();
+    };
+
+    populate(_atlasOverviewDock);
+    populate(_atlasWorkspaceOverviewDock);
+}
+
+void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
+{
+    try {
+        if (!_atlasWorkspaceWindow || !_atlasCanvas) {
+            createAtlasWorkspace();
+        }
+        const auto atlas = vc::atlas::Atlas::load(atlasDir);
+        if (_atlasCanvas) {
+            _atlasCanvas->setAtlas(atlasDir, atlas);
+        }
+        refreshAtlasOverviewDocks();
+        if (_workspaceTabs && _atlasWorkspaceWindow) {
+            _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
+        }
+        if (statusBar()) {
+            statusBar()->showMessage(tr("Created atlas %1")
+                                         .arg(QString::fromStdString(atlas.metadata.name)),
+                                     3000);
+        }
+    } catch (const std::exception& ex) {
+        QMessageBox::warning(this,
+                             tr("Atlas"),
+                             tr("Could not display atlas: %1").arg(QString::fromStdString(ex.what())));
+    }
 }
 
 // Create widgets
@@ -2601,6 +2701,10 @@ void CWindow::CreateWidgets(void)
                 &CFiberWidget::hvScoreRecalculationRequested,
                 _lineAnnotationController.get(),
                 &LineAnnotationController::recalculateFiberHvClassification);
+        connect(_fiberWidget,
+                &CFiberWidget::newAtlasFromFiberRequested,
+                _lineAnnotationController.get(),
+                &LineAnnotationController::createAtlasFromFiber);
         updateFiberList(_lineAnnotationController->fiberSummaries());
     }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,

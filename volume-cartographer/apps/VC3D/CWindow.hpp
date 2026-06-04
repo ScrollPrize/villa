@@ -62,6 +62,7 @@ static constexpr int VOLPKG_MIN_VERSION = 1;
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
 class CommandLineToolRunner;
 class FiberAnnotationController;
+class AtlasCanvasWidget;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
@@ -122,6 +123,8 @@ private:
     QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
     void populateDockToggleMenu(QMenu* menu) const;
     void createAtlasWorkspace();
+    void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
+    void refreshAtlasOverviewDocks();
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void repeatLastLasagnaAction();
@@ -235,6 +238,7 @@ private:
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceSearchDock{nullptr};
+    AtlasCanvasWidget* _atlasCanvas{nullptr};
     QMdiArea *mdiArea;
 
     bool can_change_volume_();

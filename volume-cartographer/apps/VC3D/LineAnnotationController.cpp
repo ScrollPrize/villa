@@ -7,10 +7,13 @@
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
@@ -800,6 +803,126 @@ void LineAnnotationController::recalculateAllFiberHvClassifications()
     }
     if (changed) {
         emitFiberSummaries();
+    }
+}
+
+void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
+{
+    try {
+        auto vpkg = _state ? _state->vpkg() : nullptr;
+        if (!vpkg) {
+            throw std::runtime_error("No volume package is loaded");
+        }
+        const fs::path volpkgRoot = vpkg->path().empty()
+            ? fs::path(vpkg->getVolpkgDirectory())
+            : vpkg->path().parent_path();
+        if (volpkgRoot.empty()) {
+            throw std::runtime_error("The current volume package has no root directory");
+        }
+
+        auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+            return fiber.id == fiberId;
+        });
+        if (fiberIt == _fibers.end()) {
+            throw std::runtime_error("Selected fiber is not available");
+        }
+        if (fiberIt->linePoints.empty()) {
+            throw std::runtime_error("Selected fiber has no line points");
+        }
+        if (fiberIt->controlPoints.empty()) {
+            throw std::runtime_error("Selected fiber has no control points");
+        }
+
+        fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+        if (manifestPath.empty()) {
+            const auto picked = pickDataset(_parentWidget.data(), volpkgRoot);
+            if (!picked) {
+                throw std::runtime_error("No Lasagna normal dataset selected");
+            }
+            vpkg->setSelectedLasagnaDataset(*picked);
+            manifestPath = vpkg->selectedLasagnaDatasetPath();
+        }
+        if (manifestPath.empty() || !fs::exists(manifestPath)) {
+            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+        }
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+        std::vector<vc::atlas::SurfaceCandidate> candidates;
+        const auto segmentIds = vpkg->segmentationIDs();
+        candidates.reserve(segmentIds.size());
+
+        auto segmentPathForId = [vpkg](const std::string& id) -> fs::path {
+            for (const auto& path : vpkg->availableSegmentPaths()) {
+                try {
+                    Segmentation seg(path);
+                    if (seg.id() == id) {
+                        return path;
+                    }
+                } catch (...) {
+                }
+            }
+            return vpkg->findSegmentPathByName(id);
+        };
+
+        for (const auto& id : segmentIds) {
+            auto surface = vpkg->loadSurface(id);
+            if (!surface) {
+                continue;
+            }
+            candidates.push_back(vc::atlas::SurfaceCandidate{
+                id,
+                segmentPathForId(id),
+                surface,
+            });
+        }
+        if (candidates.empty()) {
+            throw std::runtime_error("No tifxyz shell surfaces are available in the current segmentation directory");
+        }
+
+        vc::atlas::FiberInput input;
+        std::error_code relativeEc;
+        input.fiberPath = fs::relative(fiberPath(fiberId), volpkgRoot, relativeEc);
+        if (relativeEc || input.fiberPath.empty()) {
+            input.fiberPath = fs::path("fibers") / (std::to_string(fiberId) + ".json");
+        }
+        input.controlPoints = fiberIt->controlPoints;
+        input.linePoints = fiberIt->linePoints;
+
+        SurfacePatchIndex shellIndex;
+        std::vector<SurfacePatchIndex::SurfacePtr> candidateSurfaces;
+        candidateSurfaces.reserve(candidates.size());
+        for (const auto& candidate : candidates) {
+            if (candidate.surface) {
+                candidateSurfaces.push_back(candidate.surface);
+            }
+        }
+        shellIndex.rebuild(candidateSurfaces);
+        const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(
+            input, candidates, shellIndex, sampler);
+        auto& selected = candidates.at(static_cast<size_t>(selection.surfaceIndex));
+        const int rotationColumns = vc::atlas::computeIdxRotationColumns(*selected.surface);
+        auto rotatedBase = vc::atlas::idxRotatedSurface(*selected.surface, rotationColumns);
+
+        SurfacePatchIndex baseIndex;
+        baseIndex.rebuild({rotatedBase});
+        auto mapping = vc::atlas::mapFiberToBaseSurface(input, *rotatedBase, baseIndex, sampler);
+
+        const std::string atlasName = "fiber_" + std::to_string(fiberId);
+        const fs::path atlasDir = vc::atlas::uniqueAtlasDirectory(volpkgRoot, atlasName);
+        auto atlas = vc::atlas::createSingleFiberAtlas(volpkgRoot,
+                                                       atlasDir.filename().string(),
+                                                       input,
+                                                       selected,
+                                                       rotationColumns,
+                                                       std::move(mapping));
+        vc::atlas::saveIdxRotatedBaseMesh(*selected.surface,
+                                          rotationColumns,
+                                          atlasDir / atlas.metadata.baseMeshPath);
+        atlas.save(atlasDir);
+        emit atlasCreated(atlasDir);
+    } catch (const std::exception& ex) {
+        showError(tr("Could not create atlas: %1").arg(QString::fromStdString(ex.what())));
     }
 }
 
