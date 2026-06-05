@@ -1293,6 +1293,12 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     }
     if (name != "focus" || !poi)
         return;
+    if (property("vc_viewer_role").toString() == QStringLiteral("annotation")) {
+        if (_focusMarker) {
+            _focusMarker->hide();
+        }
+        return;
+    }
 
     auto surf = _surfWeak.lock();
     const bool isPlaneSurface = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
@@ -4385,6 +4391,12 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
+        return;
+    }
+    if (property("vc_viewer_role").toString() == QStringLiteral("annotation")) {
+        clearIntersectionItems();
+        _lastIntersectFp = {};
+        profile.setDetails("action=skip annotation_viewer");
         return;
     }
 

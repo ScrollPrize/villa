@@ -92,6 +92,7 @@ public:
     void recalculateAllFiberHvClassifications();
     void createAtlasFromFiber(uint64_t fiberId);
     void saveOpenFibers();
+    void closeFiberWindowForSurface(const std::string& surfaceName);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
 

@@ -1340,26 +1340,28 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
             connect(viewer,
                     &CChunkedVolumeViewer::sendVolumeClicked,
                     this,
-                    [this, atlasFocusViewer, surfaceName](cv::Vec3f volLoc,
-                                                          cv::Vec3f normal,
-                                                          Surface* surf,
-                                                          Qt::MouseButton button,
-                                                          Qt::KeyboardModifiers modifiers) {
+                    [this, atlasFocusViewer, lineFocusViewer, surfaceName](cv::Vec3f volLoc,
+                                                                           cv::Vec3f normal,
+                                                                           Surface*,
+                                                                           Qt::MouseButton button,
+                                                                           Qt::KeyboardModifiers modifiers) {
                         if (button != Qt::LeftButton || !modifiers.testFlag(Qt::ControlModifier)) {
                             return;
                         }
                         std::string sourceId;
-                        if (!atlasFocusViewer) {
-                            if (_state && surf) {
-                                sourceId = _state->findSurfaceId(surf);
-                            }
-                            if (sourceId.empty()) {
-                                sourceId = surfaceName;
-                            }
+                        if (lineFocusViewer) {
+                            sourceId = "segmentation";
                         }
-                        centerFocusAt(volLoc, normal, sourceId);
-                        if (atlasFocusViewer) {
+                        const bool focused = centerFocusAt(volLoc, normal, sourceId);
+                        if (atlasFocusViewer || (lineFocusViewer && focused)) {
                             switchToMainWorkspace();
+                        }
+                        if (lineFocusViewer && focused) {
+                            QTimer::singleShot(0, this, [this, surfaceName]() {
+                                if (_lineAnnotationController) {
+                                    _lineAnnotationController->closeFiberWindowForSurface(surfaceName);
+                                }
+                            });
                         }
                     });
             viewer->setProperty("vc_annotation_focus_bound", true);

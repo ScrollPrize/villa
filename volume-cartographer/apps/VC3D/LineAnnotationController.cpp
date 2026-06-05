@@ -1019,6 +1019,14 @@ void LineAnnotationController::saveOpenFibers()
     }
 }
 
+void LineAnnotationController::closeFiberWindowForSurface(const std::string& surfaceName)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (pane && pane->dialog) {
+        pane->dialog->close();
+    }
+}
+
 std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fiberSummaries() const
 {
     std::vector<FiberSummary> summaries;
