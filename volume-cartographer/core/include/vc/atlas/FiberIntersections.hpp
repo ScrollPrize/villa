@@ -36,7 +36,7 @@ struct FiberSegmentEntry {
 };
 
 struct FiberIntersectionBroadPhaseOptions {
-    double maxDistance = 2.0;
+    double maxDistance = 2000.0;
     double clusterArclength = 8.0;
 
     friend bool operator==(const FiberIntersectionBroadPhaseOptions& a,

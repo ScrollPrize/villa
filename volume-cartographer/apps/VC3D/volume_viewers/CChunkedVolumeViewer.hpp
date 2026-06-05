@@ -61,6 +61,11 @@ public:
         float zOffset = 0.0f;
         cv::Vec3f zOffsetWorldDir{0, 0, 0};
     };
+    struct SceneVolumeSample {
+        cv::Vec3f position{0, 0, 0};
+        cv::Vec3f normal{0, 0, 1};
+        Surface* surface = nullptr;
+    };
     using ShiftScrollOverride = std::function<bool(int, QPointF, Qt::KeyboardModifiers)>;
 
     CChunkedVolumeViewer(CState* state, ViewerManager* manager, QWidget* parent = nullptr);
@@ -173,6 +178,7 @@ public:
 
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
+    [[nodiscard]] std::optional<SceneVolumeSample> sampleSceneVolume(const QPointF& scenePoint) const;
     cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const override;
     QPointF surfaceCoordsToScene(float surfX, float surfY) const override { return surfaceToScene(surfX, surfY); }
     void setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point) override;

@@ -76,6 +76,7 @@ struct LineAnnotationController::LineAnnotationSession {
     std::vector<std::string> generatedSurfaceNames;
     std::string error;
     QPointer<QFutureWatcher<OptimizationTaskResult>> watcher;
+    bool deferShowUntilGenerated = false;
     uint64_t fiberId = 0;
     std::string fiberUsername;
     std::string fiberStartedAt;
@@ -487,8 +488,12 @@ bool LineAnnotationController::canLaunchFromViewer(const CChunkedVolumeViewer* v
     if (dynamic_cast<PlaneSurface*>(surface)) {
         return true;
     }
-    return viewer->surfName() == "segmentation" &&
-           dynamic_cast<QuadSurface*>(surface) != nullptr;
+    if (!dynamic_cast<QuadSurface*>(surface)) {
+        return false;
+    }
+    const std::string surfaceName = viewer->surfName();
+    return surfaceName == "segmentation" ||
+           surfaceName.rfind("line-", 0) == 0;
 }
 
 void LineAnnotationController::launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& /*scenePoint*/)
@@ -532,17 +537,67 @@ void LineAnnotationController::launchFromViewer(CChunkedVolumeViewer* viewer, co
                   std::move(session));
 }
 
+void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* viewer, const QPointF& scenePoint)
+{
+    if (!canLaunchFromViewer(viewer)) {
+        return;
+    }
+
+    const auto sample = viewer->sampleSceneVolume(scenePoint);
+    if (!sample) {
+        return;
+    }
+    const std::string clickedSurfaceName = viewer->surfName();
+
+    cv::Vec3f normal = sample->normal;
+    if (!std::isfinite(normal[0]) ||
+        !std::isfinite(normal[1]) ||
+        !std::isfinite(normal[2]) ||
+        cv::norm(normal) <= 0.0f) {
+        normal = {0.0f, 0.0f, 1.0f};
+    }
+    normal *= 1.0f / cv::norm(normal);
+
+    std::string owningSurfaceName;
+    QPointer<LineAnnotationDialog> owningDialog;
+    if (auto* owner = paneForSurface(clickedSurfaceName)) {
+        owningSurfaceName = owner->surfaceName;
+        owningDialog = owner->dialog;
+    }
+    if (!owningSurfaceName.empty()) {
+        cleanupSurfaceName(owningSurfaceName);
+        if (owningDialog) {
+            owningDialog->close();
+        }
+    }
+
+    auto surfaceName = nextSurfaceName();
+    CChunkedVolumeViewer::CameraState camera;
+    auto sourceSurface = std::make_shared<PlaneSurface>(sample->position, normal);
+    auto session = std::make_shared<LineAnnotationSession>();
+    launchSession(SourceKind::Plane,
+                  surfaceName,
+                  std::move(sourceSurface),
+                  camera,
+                  cv::Vec3d{normal[0], normal[1], normal[2]},
+                  session,
+                  true);
+    handleLineSeed(surfaceName, sample->position, InitialDirectionMode::ZInOut);
+}
+
 void LineAnnotationController::launchSession(LineAnnotationController::SourceKind sourceKind,
                                              const std::string& surfaceName,
                                              std::shared_ptr<Surface> sourceSurface,
                                              const CChunkedVolumeViewer::CameraState& camera,
                                              cv::Vec3d sourceSliceNormal,
-                                             std::shared_ptr<LineAnnotationController::LineAnnotationSession> session)
+                                             std::shared_ptr<LineAnnotationController::LineAnnotationSession> session,
+                                             bool deferShowUntilGenerated)
 {
     if (!_state || !session) {
         return;
     }
 
+    session->deferShowUntilGenerated = deferShowUntilGenerated;
     _state->setSurface(surfaceName, std::move(sourceSurface));
     auto* dialog = new LineAnnotationDialog(_viewerManager, nullptr);
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
@@ -550,10 +605,6 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         _state->setSurface(surfaceName, nullptr);
         return;
     }
-    dialog->showMaximized();
-    dialog->raise();
-    dialog->activateWindow();
-
     session->surfaceName = surfaceName;
     session->sourceAnnotationSurfaceName = surfaceName;
     session->sourceSliceNormal = finiteDirection(sourceSliceNormal)
@@ -610,6 +661,11 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     if (!session->optimizedLine.points.empty()) {
         session->taskState = LineAnnotationSession::TaskState::Succeeded;
         materializeGeneratedViews(*session);
+    }
+    if (!session->deferShowUntilGenerated || !session->optimizedLine.points.empty()) {
+        dialog->showMaximized();
+        dialog->raise();
+        dialog->activateWindow();
     }
 }
 
@@ -1356,6 +1412,11 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         if (!materializeGeneratedViews(session)) {
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return;
+        }
+        if (session.deferShowUntilGenerated && pane->dialog && !pane->dialog->isVisible()) {
+            pane->dialog->showMaximized();
+            pane->dialog->raise();
+            pane->dialog->activateWindow();
         }
         const double prefetchPrepMs = session.optimizationReport.normalChunkPrefetchMs +
                                       session.optimizationReport.normalMaterializeMs;

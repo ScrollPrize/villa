@@ -1,6 +1,6 @@
 #pragma once
 
-#include <QDialog>
+#include <QMainWindow>
 #include <QMetaObject>
 #include <QPointer>
 
@@ -27,7 +27,7 @@ class ViewerManager;
 class PlaneSurface;
 class QuadSurface;
 
-class LineAnnotationDialog : public QDialog
+class LineAnnotationDialog : public QMainWindow
 {
     Q_OBJECT
 

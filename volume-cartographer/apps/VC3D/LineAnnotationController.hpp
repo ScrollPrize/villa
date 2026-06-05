@@ -83,6 +83,7 @@ public:
 
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
     void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
+    void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void openFiber(uint64_t fiberId);
     void deleteFiber(uint64_t fiberId);
     void deleteFibers(std::vector<uint64_t> fiberIds);
@@ -144,7 +145,8 @@ private:
                        std::shared_ptr<Surface> sourceSurface,
                        const CChunkedVolumeViewer::CameraState& camera,
                        cv::Vec3d sourceSliceNormal,
-                       std::shared_ptr<LineAnnotationSession> session);
+                       std::shared_ptr<LineAnnotationSession> session,
+                       bool deferShowUntilGenerated = false);
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
                         InitialDirectionMode directionMode);

@@ -30,6 +30,11 @@ No normal, winding, or atlas-space scoring is used before Ceres. Candidate
 clustering removes neighboring duplicate segment hits by fiber pair and
 arclength proximity while preserving separated local intersections.
 
+`maxDistance` is the R-tree candidate radius in original voxel coordinates, not
+a refined score cutoff. Segment pairs farther apart than this are not sent to
+Ceres. The default is `2000 vx` for atlas-scale searches; lowering it reduces
+work but can miss intersections before refinement has a chance to run.
+
 ## Ceres Refinement
 
 Each candidate creates exactly one Ceres problem. The solve is single-threaded
@@ -59,6 +64,9 @@ in-atlas to outside-atlas pairs and in-atlas to in-atlas pairs.
 Atlas mappings are used only to decide membership. Intersection geometry is
 searched in the original saved fiber volume coordinates. Results are displayed
 in the table and are not persisted into atlas metadata.
+
+Ctrl-clicking in the atlas viewer focuses the main volume view at the clicked
+volume point and leaves the atlas camera unchanged.
 
 ## Live Editing Preparation
 

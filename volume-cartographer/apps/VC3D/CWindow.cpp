@@ -447,10 +447,12 @@ QDockWidget* createAtlasSearchDock(QWidget* parent)
     form->setContentsMargins(0, 0, 0, 0);
     auto* maxDistance = new QDoubleSpinBox(content);
     maxDistance->setObjectName(QStringLiteral("atlasSearchMaxDistanceSpin"));
-    maxDistance->setRange(0.01, 1024.0);
+    maxDistance->setRange(1.0, 100000.0);
     maxDistance->setDecimals(2);
-    maxDistance->setValue(2.0);
+    maxDistance->setValue(vc::atlas::FiberIntersectionBroadPhaseOptions{}.maxDistance);
     maxDistance->setSuffix(QObject::tr(" vx"));
+    maxDistance->setToolTip(QObject::tr(
+        "Broad-phase segment radius in original voxel coordinates. Segment pairs farther apart than this are not sent to Ceres."));
     form->addRow(QObject::tr("Max straight distance"), maxDistance);
     layout->addLayout(form);
 
@@ -1330,6 +1332,38 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     connect(_state, &CState::volumeClosing, viewer, &CChunkedVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
     if (!annotationViewer) {
         connect(viewer, &CChunkedVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
+    } else if (!viewer->property("vc_annotation_focus_bound").toBool()) {
+        const std::string surfaceName = viewer->surfName();
+        const bool atlasFocusViewer = surfaceName == ATLAS_INTERNAL_SURFACE_NAME;
+        const bool lineFocusViewer = surfaceName.rfind("line-", 0) == 0;
+        if (atlasFocusViewer || lineFocusViewer) {
+            connect(viewer,
+                    &CChunkedVolumeViewer::sendVolumeClicked,
+                    this,
+                    [this, atlasFocusViewer, surfaceName](cv::Vec3f volLoc,
+                                                          cv::Vec3f normal,
+                                                          Surface* surf,
+                                                          Qt::MouseButton button,
+                                                          Qt::KeyboardModifiers modifiers) {
+                        if (button != Qt::LeftButton || !modifiers.testFlag(Qt::ControlModifier)) {
+                            return;
+                        }
+                        std::string sourceId;
+                        if (!atlasFocusViewer) {
+                            if (_state && surf) {
+                                sourceId = _state->findSurfaceId(surf);
+                            }
+                            if (sourceId.empty()) {
+                                sourceId = surfaceName;
+                            }
+                        }
+                        centerFocusAt(volLoc, normal, sourceId);
+                        if (atlasFocusViewer) {
+                            switchToMainWorkspace();
+                        }
+                    });
+            viewer->setProperty("vc_annotation_focus_bound", true);
+        }
     }
 
     if (auto* graphicsView = viewer->graphicsView()) {
@@ -1473,10 +1507,11 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         QAction* action = menu.addAction(tr("New line annotation"));
                         action->setEnabled(_lineAnnotationController &&
-                                           _lineAnnotationController->canLaunchFromViewer(viewer));
+                                           _lineAnnotationController->canLaunchFromViewer(viewer) &&
+                                           viewer->sampleSceneVolume(scenePoint).has_value());
                         QAction* selected = menu.exec(globalPos);
                         if (selected == action && action->isEnabled() && _lineAnnotationController) {
-                            _lineAnnotationController->launchFromViewer(viewer, scenePoint);
+                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
                         }
                     });
             viewer->setProperty("vc_annotation_context_bound", true);

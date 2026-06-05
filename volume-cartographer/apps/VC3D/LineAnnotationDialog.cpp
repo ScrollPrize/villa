@@ -98,7 +98,7 @@ QPointF quadGridToScene(CChunkedVolumeViewer* viewer, QuadSurface* surface, int 
 } // namespace
 
 LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget* parent)
-    : QDialog(parent)
+    : QMainWindow(parent)
     , _viewerManager(viewerManager)
 {
     setWindowTitle(tr("Line Annotation"));
@@ -106,11 +106,14 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     resize(900, 700);
     _bottomSliceLineStep = vc3d::line_annotation::kDefaultBottomCrossSliceLineStep;
 
-    _layout = new QVBoxLayout(this);
+    auto* content = new QWidget(this);
+    setCentralWidget(content);
+
+    _layout = new QVBoxLayout(content);
     _layout->setContentsMargins(0, 0, 0, 0);
     _layout->setSpacing(0);
 
-    auto* buttonRow = new QWidget(this);
+    auto* buttonRow = new QWidget(content);
     buttonRow->installEventFilter(this);
     auto* buttonLayout = new QHBoxLayout(buttonRow);
     buttonLayout->setContentsMargins(6, 6, 6, 6);
@@ -156,7 +159,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
         emit fullOptimizationRequested();
     });
 
-    _mdiArea = new QMdiArea(this);
+    _mdiArea = new QMdiArea(content);
     _mdiArea->installEventFilter(this);
     _layout->addWidget(_mdiArea);
 }
@@ -1182,7 +1185,7 @@ void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
     if (handleKeyPress(event)) {
         return;
     }
-    QDialog::keyPressEvent(event);
+    QMainWindow::keyPressEvent(event);
 }
 
 bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
@@ -1236,5 +1239,5 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
     if (watched == _generatedTopWidget && event->type() == QEvent::Resize && _currentCutViewer) {
         _currentCutViewer->setFixedWidth(std::max(1, _generatedTopWidget->height()));
     }
-    return QDialog::eventFilter(watched, event);
+    return QMainWindow::eventFilter(watched, event);
 }

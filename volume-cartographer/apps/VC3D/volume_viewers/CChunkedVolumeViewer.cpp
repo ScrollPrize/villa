@@ -3146,27 +3146,11 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
         }
     }
 
-    auto surf = _surfWeak.lock();
-    const auto cursorPos = cursorVolumePosition(scenePos);
-    cv::Vec3f volumePos;
-    if (cursorPos) {
-        volumePos = *cursorPos;
-    } else {
-        volumePos = sceneToVolume(scenePos);
+    const auto sample = sampleSceneVolume(scenePos);
+    if (!sample) {
+        return;
     }
-    cv::Vec3f n(0, 0, 1);
-    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-        n = plane->normal({0, 0, 0});
-    } else if (surf) {
-        const cv::Vec2f sp = sceneToSurface(scenePos);
-        const cv::Vec3f surfaceNormal = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
-        if (std::isfinite(surfaceNormal[0]) &&
-            std::isfinite(surfaceNormal[1]) &&
-            std::isfinite(surfaceNormal[2])) {
-            n = surfaceNormal;
-        }
-    }
-    emit sendVolumeClicked(volumePos, n, surf.get(), button, modifiers);
+    emit sendVolumeClicked(sample->position, sample->normal, sample->surface, button, modifiers);
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationMode(bool enabled)
@@ -3557,6 +3541,45 @@ cv::Vec3f CChunkedVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
         return {0, 0, 0};
     const cv::Vec2f sp = sceneToSurface(scenePoint);
     return surf->coord({0, 0, 0}, {sp[0], sp[1], 0});
+}
+
+std::optional<CChunkedVolumeViewer::SceneVolumeSample> CChunkedVolumeViewer::sampleSceneVolume(
+    const QPointF& scenePoint) const
+{
+    auto surf = _surfWeak.lock();
+    if (!surf) {
+        return std::nullopt;
+    }
+
+    const auto cursorPos = cursorVolumePosition(scenePoint);
+    SceneVolumeSample sample;
+    sample.position = cursorPos ? *cursorPos : sceneToVolume(scenePoint);
+    sample.surface = surf.get();
+    if (!std::isfinite(sample.position[0]) ||
+        !std::isfinite(sample.position[1]) ||
+        !std::isfinite(sample.position[2])) {
+        return std::nullopt;
+    }
+
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        sample.normal = plane->normal({0, 0, 0});
+    } else {
+        const cv::Vec2f sp = sceneToSurface(scenePoint);
+        const cv::Vec3f surfaceNormal = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
+        if (std::isfinite(surfaceNormal[0]) &&
+            std::isfinite(surfaceNormal[1]) &&
+            std::isfinite(surfaceNormal[2]) &&
+            cv::norm(surfaceNormal) > 0.0f) {
+            sample.normal = surfaceNormal;
+        }
+    }
+    if (!std::isfinite(sample.normal[0]) ||
+        !std::isfinite(sample.normal[1]) ||
+        !std::isfinite(sample.normal[2]) ||
+        cv::norm(sample.normal) <= 0.0f) {
+        sample.normal = {0, 0, 1};
+    }
+    return sample;
 }
 
 void CChunkedVolumeViewer::setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items)

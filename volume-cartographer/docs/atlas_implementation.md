@@ -43,3 +43,8 @@ target set, covering mapped-to-outside and mapped-to-mapped fiber pairs.
 Intersection candidate search and refinement run in original saved fiber volume
 coordinates, not atlas display coordinates. Search results are shown in the dock
 table and are not persisted into atlas metadata yet.
+
+The atlas viewer accepts Ctrl-click as a focus shortcut for the main volume
+view. The shared focus point is updated from the clicked original-volume point,
+then the UI switches back to the main workspace without changing the atlas
+camera.
