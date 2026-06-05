@@ -6,6 +6,14 @@ Atlas anchor U/V values are stored in base-mesh-relative grid coordinates. The m
 
 `winding = floor((atlasU - zero_winding_column) / period_columns)`
 
+## Atlas Storage Model
+
+Atlas creation copies the selected `shell_*.tifxyz` base mesh as-is into the atlas directory. It does not rotate, reindex, or shift the saved base shell columns. The first and duplicate closing seam columns remain exactly as they were in the source shell, and ancillary surface channels are copied without column rotation.
+
+Fiber anchors are also stored in that same base-mesh-relative coordinate system. Projection hits keep their raw base mesh U/V values. Continuation mapping may unwrap `atlasU` across the seam for line continuity, but the modulo column position still refers to the original base mesh columns.
+
+`zero_winding_column` records the column that should be treated as winding zero for interpretation. It replaces the old `idx_rotation_columns` metadata from V1 atlases; V1 atlas metadata is intentionally unsupported.
+
 ## Atlas Overview
 
 Atlas Overview intentionally exposes only the minimal object summary:
@@ -23,6 +31,6 @@ Atlas overlays are rendered through generic surface-coordinate overlay primitive
 
 `surface = displayed_grid - center * scale`
 
-The atlas viewer constructs a display-only repeated surface from the saved base mesh, excluding the duplicate closing seam column from each repeat. The repeated surface starts at `zero_winding_column` so winding-zero can be shown first, and anchors subtract the display range's atlas U offset. This does not modify stored anchors or the saved base mesh.
+The atlas viewer constructs a display-only repeated surface from the saved base mesh, excluding the duplicate closing seam column from each repeat. The repeated surface starts at `zero_winding_column` so winding-zero can be shown first. This is the only place where the old "rotation placement" behavior still exists, and it is a viewer ordering choice only. Overlays convert stored anchor U/V values with the display range's atlas U offset; they do not rewrite or persist shifted anchor coordinates.
 
 The Atlas viewer uses a live overlay controller. It draws each mapped fiber from `lineAnchors` as a line strip and draws source control points from `controlAnchors` as point markers during pan, zoom, normal-offset scrolling, and refresh.
