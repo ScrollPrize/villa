@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
+#include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -93,4 +94,13 @@ TEST_CASE("line annotation bottom shift scroll preserves generated slice spacing
 
     CHECK(vc3d::line_annotation::shiftedLinePosition(98.0, 2, 3, 101) == 100.0);
     CHECK(vc3d::line_annotation::bottomCrossSliceLinePosition(100.0, 6, 7, 101) == 100.0);
+}
+
+TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
+{
+    CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");
+    CHECK(vc3d::line_annotation::normalizedFiberUsername("  alice  ") == "alice");
+    CHECK(vc3d::line_annotation::normalizedFiberUsername("A User/Name") == "A_User_Name");
+    CHECK(vc3d::line_annotation::fiberFileName("alice", "20260605T123456789", 42) ==
+          "alice_20260605T123456789_000042.json");
 }

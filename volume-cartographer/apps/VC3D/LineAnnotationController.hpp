@@ -99,6 +99,10 @@ private:
     struct LineAnnotationSession;
     struct StoredFiber {
         uint64_t id = 0;
+        std::string username;
+        std::string startedAt;
+        uint64_t sequence = 0;
+        std::string fileName;
         std::vector<cv::Vec3d> controlPoints;
         std::vector<cv::Vec3d> linePoints;
     };
@@ -153,7 +157,12 @@ private:
     void emitFiberSummaries();
     [[nodiscard]] std::filesystem::path fibersDir() const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
+    [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] uint64_t nextFiberId() const;
+    [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
+    [[nodiscard]] std::string currentFiberUsername() const;
+    [[nodiscard]] static std::string currentFiberDateTimeString();
+    void ensureSessionFiberIdentity(LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,

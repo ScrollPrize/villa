@@ -40,7 +40,7 @@ option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on c
 option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
 option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
-option(VC_USE_PCH "Precompile common headers into vc_core; downstream targets REUSE_FROM it" OFF)
+option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
 set(VC_CCACHE_PCH_SLOPPINESS "pch_defines,time_macros" CACHE STRING
     "ccache sloppiness required when VC_USE_PCH and VC_USE_CCACHE are both ON")
@@ -56,7 +56,7 @@ endif()
 # Fast local iteration: keep some optimization so optimized code paths still
 # compile, but skip LTO and force the shared vc_core PCH back on.
 if(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
-    set(VC_USE_PCH ON CACHE BOOL "Precompile common headers into vc_core; downstream targets REUSE_FROM it" FORCE)
+    set(VC_USE_PCH ON CACHE BOOL "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" FORCE)
     message(STATUS "QuickBuild: -O1, PCH enabled, LTO disabled")
 endif()
 

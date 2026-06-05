@@ -69,8 +69,10 @@ target_link_libraries(vc_core PRIVATE
     ${VC_LIBBACKTRACE}
 )
 
-# PCH on vc_core; downstream libs/apps/tests REUSE_FROM it. CXX-gated as a
-# guard so any future C source can't try to precompile C++ headers.
+# Neutral PCH carrier shared by vc_core, downstream vc_* libs, and CLI apps.
+# Keep this separate from vc_core: shared-library targets add export macros
+# such as vc_core_EXPORTS while compiling themselves, and GCC rejects a PCH
+# built with those target-local definitions when consumers try to REUSE_FROM it.
 if(VC_USE_PCH)
     set(VC_PCH_HEADERS
         "$<$<COMPILE_LANGUAGE:CXX>:<algorithm>>"
@@ -109,7 +111,22 @@ if(VC_USE_PCH)
         "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgcodecs.hpp>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<nlohmann/json.hpp>>"
         CACHE INTERNAL "PCH header list shared by vc_* and downstream targets")
-    target_precompile_headers(vc_core PRIVATE ${VC_PCH_HEADERS})
+
+    set(_vc_common_pch_source "${CMAKE_CURRENT_BINARY_DIR}/vc_common_pch.cpp")
+    file(WRITE "${_vc_common_pch_source}" "void vc_common_pch_anchor() {}\n")
+    add_library(vc_common_pch STATIC "${_vc_common_pch_source}")
+    set_target_properties(vc_common_pch PROPERTIES
+        AUTOMOC OFF AUTOUIC OFF AUTORCC OFF
+        POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(vc_common_pch PRIVATE
+        opencv_core
+        opencv_imgproc
+        opencv_imgcodecs
+        nlohmann_json::nlohmann_json
+        OpenMP::OpenMP_CXX
+        TIFF::TIFF)
+    target_precompile_headers(vc_common_pch PRIVATE ${VC_PCH_HEADERS})
+    target_precompile_headers(vc_core REUSE_FROM vc_common_pch)
 endif()
 
 add_library(vc_flattening src/ABFFlattening.cpp)
@@ -142,6 +159,6 @@ target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs
 
 if(VC_USE_PCH)
     foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_tracer)
-        target_precompile_headers(${_lib} REUSE_FROM vc_core)
+        target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
     endforeach()
 endif()

@@ -9,10 +9,9 @@ set_target_properties(doctest::doctest PROPERTIES
 
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Test Widgets)
 
-# Dedicated PCH carrier for the test suite. vc_core is SHARED, so CMake bakes
-# -Dvc_core_EXPORTS into its PCH; GCC then rejects that PCH for tests (which
-# don't define the macro) with -Winvalid-pch. Owning the PCH on a STATIC target
-# also leaves room to add test-only headers without bloating vc_core.
+# Dedicated PCH carrier for the test suite. Keep this STATIC and separate from
+# production targets so tests can add test-only headers without bloating the
+# common production PCH.
 if(VC_USE_PCH)
     add_library(vc_test_pch STATIC vc_test_pch_dummy.cpp)
     set_target_properties(vc_test_pch PROPERTIES
