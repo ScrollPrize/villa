@@ -3784,9 +3784,32 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         indexing='ij'
     ), axis=-1).to(device)
 
+    # Load the resume checkpoint (if any) before constructing the model. The
+    # model's parameter tensors are shaped by the z-range it was trained with,
+    # so when resuming we must build them with the checkpoint's z-range -
+    # otherwise the shapes won't match and load_state_dict will fail. This only
+    # affects the model's flow-field domain; the optimisation continues to use
+    # the current z_begin/z_end for sampling, losses and rendering.
+    resume_path = os.environ.get('FIT_SPIRAL_RESUME_PATH')
+    start_iteration = int(os.environ.get('FIT_SPIRAL_RESUME_STEP', '0'))
+    resume_checkpoint = None
+    model_z_begin, model_z_end = z_begin, z_end
+    if resume_path:
+        resume_checkpoint = torch.load(resume_path, map_location='cpu')
+        if isinstance(resume_checkpoint, dict) and 'z_begin' in resume_checkpoint:
+            model_z_begin, model_z_end = resume_checkpoint['z_begin'], resume_checkpoint['z_end']
+            if (model_z_begin, model_z_end) != (z_begin, z_end):
+                print(f'using checkpoint z-range [{model_z_begin}, {model_z_end}) for model parameter shapes (optimisation z-range is [{z_begin}, {z_end}))')
+                assert z_begin >= model_z_begin and z_end <= model_z_end, (
+                    f'optimisation z-range [{z_begin}, {z_end}) extends beyond the checkpoint '
+                    f"model z-range [{model_z_begin}, {model_z_end}); the flow field has no "
+                    'parameters outside its domain. Narrow z_begin/z_end to fit within the '
+                    'checkpoint range, or train from scratch with the wider range.'
+                )
+
     flow_field_radius = cfg['flow_bounds_radius']
-    flow_min_corner_spiral_zyx = torch.tensor([z_begin - cfg['flow_bounds_z_margin'], -flow_field_radius, -flow_field_radius], dtype=torch.int64, device=device)
-    flow_max_corner_spiral_zyx = torch.tensor([z_end + cfg['flow_bounds_z_margin'], flow_field_radius, flow_field_radius], dtype=torch.int64, device=device)
+    flow_min_corner_spiral_zyx = torch.tensor([model_z_begin - cfg['flow_bounds_z_margin'], -flow_field_radius, -flow_field_radius], dtype=torch.int64, device=device)
+    flow_max_corner_spiral_zyx = torch.tensor([model_z_end + cfg['flow_bounds_z_margin'], flow_field_radius, flow_field_radius], dtype=torch.int64, device=device)
 
     num_training_steps = cfg['num_training_steps']
 
@@ -3861,17 +3884,14 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             'z_end': z_end,
         }, f'{out_path}/checkpoint_{suffix}.ckpt')
 
-    def load_model(path):
-        checkpoint = torch.load(path, map_location='cpu')
+    def load_model(checkpoint):
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         spiral_and_transform.load_state_dict(transformed_spiral_state)
         optimiser.load_state_dict(optimiser_state)
 
-    resume_path = os.environ.get('FIT_SPIRAL_RESUME_PATH')
-    start_iteration = int(os.environ.get('FIT_SPIRAL_RESUME_STEP', '0'))
     if resume_path:
         print(f'resuming from {resume_path} at iteration {start_iteration}')
-        load_model(resume_path)
+        load_model(resume_checkpoint)
         for _ in range(start_iteration):
             lr_scheduler.step()
 
