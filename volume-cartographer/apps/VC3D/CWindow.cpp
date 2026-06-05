@@ -1374,6 +1374,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                     &CVolumeViewerView::sendAnnotationContextMenuRequested,
                     this,
                     [this, viewer](QPointF scenePoint, QPoint globalPos, Qt::KeyboardModifiers) {
+                        if (_lineAnnotationController &&
+                            _lineAnnotationController->showGeneratedControlPointContextMenu(
+                                viewer,
+                                scenePoint,
+                                globalPos)) {
+                            return;
+                        }
+
                         const cv::Vec3f volumePoint = viewer->sceneToVolume(scenePoint);
                         const bool validVolumePoint =
                             std::isfinite(volumePoint[0]) &&

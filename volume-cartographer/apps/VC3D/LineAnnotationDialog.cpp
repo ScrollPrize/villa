@@ -7,12 +7,14 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <QAction>
 #include <QBrush>
 #include <QComboBox>
 #include <QEvent>
 #include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMenu>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPushButton>
@@ -75,6 +77,14 @@ cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
 bool finiteScenePoint(const QPointF& point)
 {
     return std::isfinite(point.x()) && std::isfinite(point.y());
+}
+
+bool validLinePosition(double position, size_t pointCount)
+{
+    return std::isfinite(position) &&
+           pointCount > 0 &&
+           position >= 0.0 &&
+           position <= static_cast<double>(pointCount - 1);
 }
 
 QPointF quadGridToScene(CChunkedVolumeViewer* viewer, QuadSurface* surface, int row, int col)
@@ -614,6 +624,128 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     return true;
 }
 
+LineAnnotationDialog::GeneratedControlPointContextResult
+LineAnnotationDialog::showGeneratedControlPointContextMenu(const std::string& surfaceName,
+                                                           CChunkedVolumeViewer* viewer,
+                                                           const QPointF& scenePoint,
+                                                           const QPoint& globalPos)
+{
+    if (!viewer || !_hasGeneratedViews || _generatedViews.controlPoints.empty() ||
+        _generatedViews.linePoints.empty()) {
+        return GeneratedControlPointContextResult::None;
+    }
+
+    double linePosition = std::numeric_limits<double>::quiet_NaN();
+    if (viewer == _currentCutViewer) {
+        linePosition = _currentLinePosition;
+    } else {
+        for (size_t i = 0; i < _stripViewers.size(); ++i) {
+            if (viewer == _stripViewers[i]) {
+                linePosition = linePositionFromStripScene(viewer, scenePoint);
+                break;
+            }
+        }
+        if (!std::isfinite(linePosition)) {
+            const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
+            for (int slot = 0; slot < bottomCount; ++slot) {
+                if (viewer == _bottomSliceViewers[static_cast<size_t>(slot)]) {
+                    linePosition = bottomSliceLinePosition(slot, bottomCount);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!validLinePosition(linePosition, _generatedViews.linePoints.size())) {
+        return GeneratedControlPointContextResult::None;
+    }
+
+    const bool stripViewer =
+        std::any_of(_stripViewers.begin(),
+                    _stripViewers.end(),
+                    [viewer](const QPointer<CChunkedVolumeViewer>& candidate) {
+                        return candidate == viewer;
+                    });
+
+    size_t selectedIndex = 0;
+    QPointF targetScene;
+    bool haveSelection = false;
+    double bestDistanceSq = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < _generatedViews.controlPoints.size(); ++i) {
+        const auto& control = _generatedViews.controlPoints[i];
+        if (!validLinePosition(control.linePosition, _generatedViews.linePoints.size())) {
+            continue;
+        }
+
+        QPointF controlScene;
+        if (stripViewer) {
+            auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+            controlScene = stripLinePositionToScene(viewer, quad, control.linePosition);
+        } else {
+            controlScene = viewer->volumeToScene(control.point);
+        }
+        if (!finiteScenePoint(controlScene)) {
+            continue;
+        }
+
+        const QPointF delta = controlScene - scenePoint;
+        const double distanceSq = delta.x() * delta.x() + delta.y() * delta.y();
+        if (distanceSq < bestDistanceSq) {
+            haveSelection = true;
+            bestDistanceSq = distanceSq;
+            selectedIndex = i;
+            targetScene = controlScene;
+        }
+    }
+    if (!haveSelection) {
+        return GeneratedControlPointContextResult::None;
+    }
+    const auto& selectedControl = _generatedViews.controlPoints[selectedIndex];
+
+    clearControlPointContextPreview(surfaceName, viewer);
+    if (finiteScenePoint(scenePoint) && finiteScenePoint(targetScene)) {
+        ViewerOverlayControllerBase::OverlayStyle previewStyle;
+        previewStyle.penColor = QColor(255, 120, 40, 245);
+        previewStyle.brushColor = QColor(255, 120, 40, 190);
+        previewStyle.penWidth = 2.5;
+        previewStyle.z = 180.0;
+
+        std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
+        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+            {scenePoint, targetScene},
+            false,
+            previewStyle});
+        primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+            targetScene,
+            selectedControl.isSeed ? 6.5 : 6.0,
+            true,
+            previewStyle});
+        ViewerOverlayControllerBase::applyPrimitives(
+            viewer,
+            "line_annotation_control_context_" + surfaceName,
+            std::move(primitives));
+    }
+
+    QMenu menu(this);
+    QAction* deleteAction = menu.addAction(tr("Delete control point"));
+    deleteAction->setEnabled(_generatedViews.controlPoints.size() > 1);
+    QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
+    newLineAnnotationAction->setEnabled(viewer->sampleSceneVolume(scenePoint).has_value());
+    QAction* selected = menu.exec(globalPos);
+    clearControlPointContextPreview(surfaceName, viewer);
+
+    if (selected == deleteAction && deleteAction->isEnabled()) {
+        emit generatedControlPointDeleteRequested(surfaceName,
+                                                  selectedControl.linePosition,
+                                                  selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (selected == newLineAnnotationAction && newLineAnnotationAction->isEnabled()) {
+        return GeneratedControlPointContextResult::NewLineAnnotationRequested;
+    }
+    return GeneratedControlPointContextResult::Handled;
+}
+
 void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
                                                  CChunkedVolumeViewer* viewer,
                                                  const GeneratedOverlay& overlay)
@@ -791,6 +923,18 @@ void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
     }
 
     ViewerOverlayControllerBase::applyPrimitives(viewer, key, std::move(primitives));
+}
+
+void LineAnnotationDialog::clearControlPointContextPreview(const std::string& surfaceName,
+                                                           CChunkedVolumeViewer* viewer)
+{
+    if (!viewer) {
+        return;
+    }
+    ViewerOverlayControllerBase::applyPrimitives(
+        viewer,
+        "line_annotation_control_context_" + surfaceName,
+        {});
 }
 
 double LineAnnotationDialog::linePositionFromStripScene(CChunkedVolumeViewer* viewer,

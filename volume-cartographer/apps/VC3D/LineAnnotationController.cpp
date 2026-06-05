@@ -24,6 +24,7 @@
 #include <QFileDialog>
 #include <QFutureWatcher>
 #include <QMessageBox>
+#include <QPoint>
 #include <QPointF>
 #include <QDateTime>
 #include <QSettings>
@@ -633,6 +634,12 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             [this](const std::string& name, cv::Vec3f volumePoint, double linePosition) {
                 handleGeneratedControlPoint(name, volumePoint, linePosition);
             });
+    connect(dialog,
+            &LineAnnotationDialog::generatedControlPointDeleteRequested,
+            this,
+            [this](const std::string& name, double linePosition, cv::Vec3f volumePoint) {
+                handleGeneratedControlPointDelete(name, linePosition, volumePoint);
+            });
     connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
         handleShowAsMesh(surfaceName);
     });
@@ -1027,6 +1034,33 @@ void LineAnnotationController::closeFiberWindowForSurface(const std::string& sur
     }
 }
 
+bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
+                                                                    const QPointF& scenePoint,
+                                                                    const QPoint& globalPos)
+{
+    if (!viewer) {
+        return false;
+    }
+    auto* pane = paneForSurface(viewer->surfName());
+    if (!pane || !pane->dialog || !pane->session) {
+        return false;
+    }
+    if (std::find(pane->session->generatedSurfaceNames.begin(),
+                  pane->session->generatedSurfaceNames.end(),
+                  viewer->surfName()) == pane->session->generatedSurfaceNames.end()) {
+        return false;
+    }
+    const auto result = pane->dialog->showGeneratedControlPointContextMenu(
+        viewer->surfName(),
+        viewer,
+        scenePoint,
+        globalPos);
+    if (result == LineAnnotationDialog::GeneratedControlPointContextResult::NewLineAnnotationRequested) {
+        launchFromViewerAtPoint(viewer, scenePoint);
+    }
+    return result != LineAnnotationDialog::GeneratedControlPointContextResult::None;
+}
+
 std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fiberSummaries() const
 {
     std::vector<FiberSummary> summaries;
@@ -1217,6 +1251,100 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                        session.controlPoints,
                        linePointsToJson(session.optimizedLine));
     startOptimization(session, false, update.activeStart, update.activeEnd);
+}
+
+void LineAnnotationController::handleGeneratedControlPointDelete(const std::string& surfaceName,
+                                                                double linePosition,
+                                                                cv::Vec3f volumePoint)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+
+    auto& session = *pane->session;
+    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+        showError(tr("Line optimization is already running."));
+        return;
+    }
+    if (session.optimizedLine.points.empty() || session.controlPoints.size() <= 1) {
+        return;
+    }
+    if (!ensureDatasetForSession(session)) {
+        return;
+    }
+
+    const double maxPosition = static_cast<double>(session.optimizedLine.points.size() - 1);
+    linePosition = std::clamp(linePosition, 0.0, maxPosition);
+    const cv::Vec3d selectedPoint(volumePoint[0], volumePoint[1], volumePoint[2]);
+
+    auto selected = session.controlPoints.end();
+    double bestScore = std::numeric_limits<double>::infinity();
+    for (auto it = session.controlPoints.begin(); it != session.controlPoints.end(); ++it) {
+        if (!std::isfinite(it->linePosition)) {
+            continue;
+        }
+        const cv::Vec3d delta = it->volumePoint - selectedPoint;
+        const double pointDistanceSq = delta.dot(delta);
+        const double lineDistance = std::abs(it->linePosition - linePosition);
+        const double score = pointDistanceSq + lineDistance * 1.0e-6;
+        if (score < bestScore) {
+            bestScore = score;
+            selected = it;
+        }
+    }
+    if (selected == session.controlPoints.end()) {
+        return;
+    }
+
+    const bool deletedSeed = selected->isSeed;
+    session.controlPoints.erase(selected);
+    if (session.controlPoints.empty()) {
+        return;
+    }
+
+    const bool hasSeed = std::any_of(session.controlPoints.begin(),
+                                     session.controlPoints.end(),
+                                     [](const vc::lasagna::LineControlPoint& control) {
+                                         return control.isSeed;
+                                     });
+    if (deletedSeed || !hasSeed) {
+        auto replacementSeed = session.controlPoints.begin();
+        double replacementDistance = std::numeric_limits<double>::infinity();
+        for (auto it = session.controlPoints.begin(); it != session.controlPoints.end(); ++it) {
+            it->isSeed = false;
+            const double distance = std::isfinite(it->linePosition)
+                ? std::abs(it->linePosition - linePosition)
+                : std::numeric_limits<double>::infinity();
+            if (distance < replacementDistance) {
+                replacementDistance = distance;
+                replacementSeed = it;
+            }
+        }
+        replacementSeed->isSeed = true;
+        session.seedPoint = replacementSeed->volumePoint;
+    }
+
+    auto focus = session.controlPoints.begin();
+    double focusDistance = std::numeric_limits<double>::infinity();
+    for (auto it = session.controlPoints.begin(); it != session.controlPoints.end(); ++it) {
+        const double distance = std::isfinite(it->linePosition)
+            ? std::abs(it->linePosition - linePosition)
+            : std::numeric_limits<double>::infinity();
+        if (distance < focusDistance) {
+            focusDistance = distance;
+            focus = it;
+        }
+    }
+    session.focusedLinePosition = std::isfinite(focus->linePosition)
+        ? focus->linePosition
+        : linePosition;
+    session.focusedControlPoint = focus->volumePoint;
+
+    writeLineDebugJson("control_delete",
+                       session.controlPoints,
+                       linePointsToJson(session.optimizedLine));
+    startOptimization(session, true);
 }
 
 bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& session)

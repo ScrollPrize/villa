@@ -22,6 +22,7 @@
 
 class CState;
 class LineAnnotationDialog;
+class QPoint;
 class Surface;
 class SurfacePanelController;
 class ViewerManager;
@@ -93,6 +94,9 @@ public:
     void createAtlasFromFiber(uint64_t fiberId);
     void saveOpenFibers();
     void closeFiberWindowForSurface(const std::string& surfaceName);
+    bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
+                                              const QPointF& scenePoint,
+                                              const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
 
@@ -154,6 +158,9 @@ private:
     void handleGeneratedControlPoint(const std::string& surfaceName,
                                      cv::Vec3f volumePoint,
                                      double linePosition);
+    void handleGeneratedControlPointDelete(const std::string& surfaceName,
+                                           double linePosition,
+                                           cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
     void startOptimization(LineAnnotationSession& session,
                            bool fullOptimization = false,
