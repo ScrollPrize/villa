@@ -13,7 +13,9 @@
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
+#include "vc/atlas/FiberIntersections.hpp"
 
+#include <filesystem>
 #include <QShortcut>
 #include <unordered_map>
 #include <map>
@@ -125,6 +127,10 @@ private:
     void createAtlasWorkspace();
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
     void refreshAtlasOverviewDocks();
+    void updateAtlasSearchDocks();
+    void startAtlasFiberIntersectionSearch();
+    void cancelAtlasFiberIntersectionSearch();
+    void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results);
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void repeatLastLasagnaAction();
@@ -239,6 +245,11 @@ private:
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceSearchDock{nullptr};
     VolumeViewerBase* _atlasViewer{nullptr};
+    std::optional<std::filesystem::path> _currentAtlasDir;
+    std::string _currentAtlasName;
+    vc::atlas::FiberSpatialIndex _fiberIntersectionIndex;
+    vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
+    bool _atlasSearchCancelRequested{false};
     QMdiArea *mdiArea;
 
     bool can_change_volume_();

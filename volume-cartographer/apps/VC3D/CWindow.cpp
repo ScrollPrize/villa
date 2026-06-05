@@ -56,6 +56,11 @@
 #include <QTabWidget>
 #include <QTreeWidget>
 #include <QHeaderView>
+#include <QFormLayout>
+#include <QProgressBar>
+#include <QPushButton>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include "utils/Json.hpp"
 #include <QPointer>
 #include <QListView>
@@ -109,6 +114,7 @@
 #include "vc/core/util/Render.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/atlas/Atlas.hpp"
+#include "vc/atlas/FiberIntersections.hpp"
 #include <utils/zarr.hpp>
 
 
@@ -166,6 +172,31 @@ protected:
 private:
     DockMenuBuilder _dockMenuBuilder;
 };
+
+std::optional<uint64_t> fiberIdFromAtlasPath(const std::filesystem::path& path)
+{
+    std::string stem = path.stem().string();
+    if (stem.rfind("fiber_", 0) == 0) {
+        stem = stem.substr(6);
+    }
+    if (stem.empty() || !std::all_of(stem.begin(), stem.end(), [](char ch) {
+            return ch >= '0' && ch <= '9';
+        })) {
+        return std::nullopt;
+    }
+    try {
+        return static_cast<uint64_t>(std::stoull(stem));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+QTableWidgetItem* numericItem(double value, int precision = 3)
+{
+    auto* item = new QTableWidgetItem(QString::number(value, 'f', precision));
+    item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    return item;
+}
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
 {
@@ -403,6 +434,63 @@ QDockWidget* createAtlasSearchDock(QWidget* parent)
     auto* dock = new QDockWidget(QObject::tr("Atlas Object Search"), parent);
     auto* content = new QWidget(dock);
     content->setObjectName(QStringLiteral("atlasSearchContent"));
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(6);
+
+    auto* current = new QLabel(QObject::tr("No atlas selected"), content);
+    current->setObjectName(QStringLiteral("atlasSearchCurrentLabel"));
+    current->setWordWrap(true);
+    layout->addWidget(current);
+
+    auto* form = new QFormLayout();
+    form->setContentsMargins(0, 0, 0, 0);
+    auto* maxDistance = new QDoubleSpinBox(content);
+    maxDistance->setObjectName(QStringLiteral("atlasSearchMaxDistanceSpin"));
+    maxDistance->setRange(0.01, 1024.0);
+    maxDistance->setDecimals(2);
+    maxDistance->setValue(2.0);
+    maxDistance->setSuffix(QObject::tr(" vx"));
+    form->addRow(QObject::tr("Max straight distance"), maxDistance);
+    layout->addLayout(form);
+
+    auto* buttons = new QHBoxLayout();
+    auto* run = new QPushButton(QObject::tr("Search"), content);
+    run->setObjectName(QStringLiteral("atlasSearchRunButton"));
+    auto* cancel = new QPushButton(QObject::tr("Cancel"), content);
+    cancel->setObjectName(QStringLiteral("atlasSearchCancelButton"));
+    cancel->setEnabled(false);
+    buttons->addWidget(run);
+    buttons->addWidget(cancel);
+    buttons->addStretch(1);
+    layout->addLayout(buttons);
+
+    auto* progress = new QProgressBar(content);
+    progress->setObjectName(QStringLiteral("atlasSearchProgressBar"));
+    progress->setRange(0, 100);
+    progress->setValue(0);
+    layout->addWidget(progress);
+
+    auto* table = new QTableWidget(content);
+    table->setObjectName(QStringLiteral("atlasSearchResultTable"));
+    table->setColumnCount(9);
+    table->setHorizontalHeaderLabels({
+        QObject::tr("Source"),
+        QObject::tr("Target"),
+        QObject::tr("Candidate dist"),
+        QObject::tr("Score"),
+        QObject::tr("Source s"),
+        QObject::tr("Target s"),
+        QObject::tr("Converged"),
+        QObject::tr("Cache"),
+        QObject::tr("Message"),
+    });
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setAlternatingRowColors(true);
+    table->horizontalHeader()->setStretchLastSection(true);
+    layout->addWidget(table, 1);
+
     dock->setWidget(content);
     return dock;
 }
@@ -631,7 +719,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,
             [this](std::shared_ptr<VolumePkg> pkg) {
+                _currentAtlasDir.reset();
+                _currentAtlasName.clear();
+                _fiberIntersectionIndex.clear();
+                _fiberIntersectionCache.clear();
                 refreshAtlasOverviewDocks();
+                updateAtlasSearchDocks();
                 if (!pkg) return;
                 pkg->setSegmentsChangedCallback(
                     [self = QPointer<CWindow>(this)]() {
@@ -664,6 +757,24 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             &LineAnnotationController::atlasCreated,
             this,
             &CWindow::displayAtlasFromDirectory);
+    connect(_lineAnnotationController.get(),
+            &LineAnnotationController::fiberSaved,
+            this,
+            [this](uint64_t fiberId, uint64_t) {
+                _fiberIntersectionCache.pruneFiber(fiberId);
+                _fiberIntersectionIndex.removeFiber(fiberId);
+                updateAtlasSearchDocks();
+            });
+    connect(_lineAnnotationController.get(),
+            &LineAnnotationController::fibersDeleted,
+            this,
+            [this](std::vector<uint64_t> fiberIds) {
+                for (uint64_t fiberId : fiberIds) {
+                    _fiberIntersectionCache.pruneFiber(fiberId);
+                    _fiberIntersectionIndex.removeFiber(fiberId);
+                }
+                updateAtlasSearchDocks();
+            });
     connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
@@ -2084,7 +2195,22 @@ void CWindow::createAtlasWorkspace()
     };
     connectOverview(_atlasOverviewDock);
     connectOverview(_atlasWorkspaceOverviewDock);
+
+    auto connectSearchDock = [this](QDockWidget* dock) {
+        if (!dock || !dock->widget()) {
+            return;
+        }
+        if (auto* run = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchRunButton"))) {
+            connect(run, &QPushButton::clicked, this, &CWindow::startAtlasFiberIntersectionSearch);
+        }
+        if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
+            connect(cancel, &QPushButton::clicked, this, &CWindow::cancelAtlasFiberIntersectionSearch);
+        }
+    };
+    connectSearchDock(_atlasSearchDock);
+    connectSearchDock(_atlasWorkspaceSearchDock);
     refreshAtlasOverviewDocks();
+    updateAtlasSearchDocks();
 }
 
 void CWindow::refreshAtlasOverviewDocks()
@@ -2148,6 +2274,200 @@ void CWindow::refreshAtlasOverviewDocks()
     populate(_atlasWorkspaceOverviewDock);
 }
 
+void CWindow::updateAtlasSearchDocks()
+{
+    const auto snapshots = _lineAnnotationController
+        ? _lineAnnotationController->fiberSnapshots()
+        : std::vector<vc::atlas::FiberPolyline>{};
+    const bool enabled = _currentAtlasDir.has_value() && !snapshots.empty();
+    const QString atlasText = _currentAtlasDir
+        ? tr("Atlas: %1 (%2 saved fibers)")
+              .arg(QString::fromStdString(_currentAtlasName.empty()
+                    ? _currentAtlasDir->filename().string()
+                    : _currentAtlasName))
+              .arg(static_cast<int>(snapshots.size()))
+        : tr("No atlas selected");
+
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* label = dock->widget()->findChild<QLabel*>(QStringLiteral("atlasSearchCurrentLabel"))) {
+            label->setText(atlasText);
+        }
+        if (auto* run = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchRunButton"))) {
+            run->setEnabled(enabled);
+        }
+        if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
+            cancel->setEnabled(false);
+        }
+    }
+}
+
+void CWindow::cancelAtlasFiberIntersectionSearch()
+{
+    _atlasSearchCancelRequested = true;
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
+            progress->setRange(0, 100);
+            progress->setValue(0);
+            progress->setFormat(tr("Canceled"));
+        }
+        if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
+            cancel->setEnabled(false);
+        }
+    }
+}
+
+void CWindow::startAtlasFiberIntersectionSearch()
+{
+    if (!_currentAtlasDir || !_lineAnnotationController) {
+        updateAtlasSearchDocks();
+        return;
+    }
+
+    vc::atlas::Atlas atlas;
+    try {
+        atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
+    } catch (const std::exception& ex) {
+        QMessageBox::warning(this,
+                             tr("Atlas Object Search"),
+                             tr("Could not load selected atlas: %1")
+                                 .arg(QString::fromStdString(ex.what())));
+        return;
+    }
+
+    std::vector<vc::atlas::FiberPolyline> fibers = _lineAnnotationController->fiberSnapshots();
+    if (fibers.empty()) {
+        updateAtlasSearchDocks();
+        return;
+    }
+
+    std::vector<uint64_t> inAtlas;
+    for (const auto& mapping : atlas.fibers) {
+        if (auto id = fiberIdFromAtlasPath(mapping.fiberPath)) {
+            inAtlas.push_back(*id);
+        }
+    }
+    std::sort(inAtlas.begin(), inAtlas.end());
+    inAtlas.erase(std::unique(inAtlas.begin(), inAtlas.end()), inAtlas.end());
+    if (inAtlas.empty()) {
+        QMessageBox::information(this,
+                                 tr("Atlas Object Search"),
+                                 tr("Selected atlas has no saved fiber mappings."));
+        return;
+    }
+
+    std::vector<uint64_t> allFiberIds;
+    allFiberIds.reserve(fibers.size());
+    for (const auto& fiber : fibers) {
+        allFiberIds.push_back(fiber.id);
+    }
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (dock && dock->widget()) {
+            if (auto* spin = dock->widget()->findChild<QDoubleSpinBox*>(
+                    QStringLiteral("atlasSearchMaxDistanceSpin"))) {
+                broad.maxDistance = spin->value();
+                break;
+            }
+        }
+    }
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+
+    _atlasSearchCancelRequested = false;
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* run = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchRunButton"))) {
+            run->setEnabled(false);
+        }
+        if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
+            cancel->setEnabled(true);
+        }
+        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
+            progress->setRange(0, 0);
+            progress->setFormat(tr("Searching candidates and refining"));
+        }
+        if (auto* table = dock->widget()->findChild<QTableWidget*>(QStringLiteral("atlasSearchResultTable"))) {
+            table->setRowCount(0);
+        }
+    }
+
+    auto* watcher = new QFutureWatcher<std::vector<vc::atlas::FiberIntersectionResult>>(this);
+    connect(watcher,
+            &QFutureWatcher<std::vector<vc::atlas::FiberIntersectionResult>>::finished,
+            this,
+            [this, watcher]() {
+                const auto results = watcher->result();
+                watcher->deleteLater();
+                if (!_atlasSearchCancelRequested) {
+                    populateAtlasSearchResults(results);
+                    if (statusBar()) {
+                        statusBar()->showMessage(tr("Atlas object search found %1 result(s)")
+                                                     .arg(static_cast<int>(results.size())),
+                                                 3000);
+                    }
+                }
+                updateAtlasSearchDocks();
+            });
+
+    vc::atlas::FiberSpatialIndex* index = &_fiberIntersectionIndex;
+    vc::atlas::FiberIntersectionCache* cache = &_fiberIntersectionCache;
+    watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
+                                          inAtlas = std::move(inAtlas),
+                                          allFiberIds = std::move(allFiberIds),
+                                          index,
+                                          cache,
+                                          broad,
+                                          ceres]() mutable {
+        return vc::atlas::searchFiberIntersections(fibers,
+                                                   inAtlas,
+                                                   allFiberIds,
+                                                   *index,
+                                                   cache,
+                                                   broad,
+                                                   ceres);
+    }));
+}
+
+void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results)
+{
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
+            progress->setRange(0, 100);
+            progress->setValue(100);
+            progress->setFormat(tr("Done"));
+        }
+        auto* table = dock->widget()->findChild<QTableWidget*>(QStringLiteral("atlasSearchResultTable"));
+        if (!table) {
+            continue;
+        }
+        table->setRowCount(static_cast<int>(results.size()));
+        for (int row = 0; row < static_cast<int>(results.size()); ++row) {
+            const auto& result = results[static_cast<size_t>(row)];
+            table->setItem(row, 0, new QTableWidgetItem(QString::number(result.sourceFiberId)));
+            table->setItem(row, 1, new QTableWidgetItem(QString::number(result.targetFiberId)));
+            table->setItem(row, 2, numericItem(result.candidateDistance));
+            table->setItem(row, 3, numericItem(result.refinedScore, 6));
+            table->setItem(row, 4, numericItem(result.sourceArclength));
+            table->setItem(row, 5, numericItem(result.targetArclength));
+            table->setItem(row, 6, new QTableWidgetItem(result.converged ? tr("yes") : tr("no")));
+            table->setItem(row, 7, new QTableWidgetItem(result.cacheHit ? tr("hit") : tr("miss")));
+            table->setItem(row, 8, new QTableWidgetItem(QString::fromStdString(result.message)));
+        }
+        table->resizeColumnsToContents();
+    }
+}
+
 void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
 {
     try {
@@ -2155,6 +2475,8 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
             createAtlasWorkspace();
         }
         const auto atlas = vc::atlas::Atlas::load(atlasDir);
+        _currentAtlasDir = atlasDir;
+        _currentAtlasName = atlas.metadata.name;
         const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
         auto baseSurface = std::make_shared<QuadSurface>(basePath);
         const auto* points = baseSurface->rawPointsPtr();
@@ -2197,6 +2519,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
             }
         }
         refreshAtlasOverviewDocks();
+        updateAtlasSearchDocks();
         if (_workspaceTabs && _atlasWorkspaceWindow) {
             _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
         }

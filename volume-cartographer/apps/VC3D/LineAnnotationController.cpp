@@ -759,6 +759,7 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
         }
     }
     emitFiberSummaries();
+    emit fibersDeleted(deletedIds);
 }
 
 void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QString& tag)
@@ -985,6 +986,23 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
         return a.id < b.id;
     });
     return summaries;
+}
+
+std::vector<vc::atlas::FiberPolyline> LineAnnotationController::fiberSnapshots() const
+{
+    std::vector<vc::atlas::FiberPolyline> snapshots;
+    snapshots.reserve(_fibers.size());
+    for (const auto& fiber : _fibers) {
+        vc::atlas::FiberPolyline snapshot;
+        snapshot.id = fiber.id;
+        snapshot.generation = fiber.generation;
+        snapshot.points.reserve(fiber.linePoints.size());
+        for (const auto& point : fiber.linePoints) {
+            snapshot.points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
+        }
+        snapshots.push_back(std::move(snapshot));
+    }
+    return snapshots;
 }
 
 void LineAnnotationController::onSurfaceChanged(std::string name,
@@ -1942,6 +1960,14 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         fiber.startedAt = session.fiberStartedAt;
         fiber.sequence = session.fiberSequence;
         fiber.fileName = session.fiberFileName;
+        auto existingIt = std::find_if(_fibers.begin(),
+                                       _fibers.end(),
+                                       [&fiber](const StoredFiber& existing) {
+                                           return existing.id == fiber.id;
+                                       });
+        fiber.generation = existingIt == _fibers.end()
+            ? uint64_t{1}
+            : std::max<uint64_t>(uint64_t{1}, existingIt->generation + 1);
         fiber.controlPoints.reserve(session.controlPoints.size());
         auto controls = session.controlPoints;
         std::stable_sort(controls.begin(),
@@ -1965,6 +1991,8 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         session.fiberStartedAt = fiber.startedAt;
         session.fiberSequence = fiber.sequence;
         session.fiberFileName = fiber.fileName;
+        const uint64_t savedFiberId = fiber.id;
+        const uint64_t savedGeneration = fiber.generation;
 
         auto it = std::find_if(_fibers.begin(), _fibers.end(), [&fiber](const StoredFiber& existing) {
             return existing.id == fiber.id;
@@ -1975,6 +2003,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
             *it = std::move(fiber);
         }
         emitFiberSummaries();
+        emit fiberSaved(savedFiberId, savedGeneration);
     } catch (const std::exception& ex) {
         showError(tr("Could not save fiber: %1").arg(QString::fromStdString(ex.what())));
     }
@@ -2002,6 +2031,7 @@ void LineAnnotationController::saveFiber(const StoredFiber& fiber) const
     root["started_at"] = fiber.startedAt;
     root["sequence"] = fiber.sequence;
     root["filename"] = fiber.fileName;
+    root["generation"] = fiber.generation;
     root["hv_classification"] = {
         {"z_distance", fiber.hvClassification.zDistance},
         {"control_point_length", fiber.hvClassification.fiberLength},
@@ -2063,6 +2093,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     }
 
     StoredFiber fiber;
+    fiber.generation = std::max<uint64_t>(uint64_t{1}, root.value("generation", uint64_t{1}));
     if (root.contains("id")) {
         fiber.id = root.at("id").get<uint64_t>();
     } else if (hasLegacyNumericStem) {

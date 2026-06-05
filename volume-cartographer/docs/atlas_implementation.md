@@ -34,3 +34,12 @@ Atlas overlays are rendered through generic surface-coordinate overlay primitive
 The atlas viewer constructs a display-only repeated surface from the saved base mesh, excluding the duplicate closing seam column from each repeat. The repeated surface starts at `zero_winding_column` so winding-zero can be shown first. This is the only place where the old "rotation placement" behavior still exists, and it is a viewer ordering choice only. Overlays convert stored anchor U/V values with the display range's atlas U offset; they do not rewrite or persist shifted anchor coordinates.
 
 The Atlas viewer uses a live overlay controller. It draws each mapped fiber from `lineAnchors` as a line strip and draws source control points from `controlAnchors` as point markers during pan, zoom, normal-offset scrolling, and refresh.
+
+## Atlas Object Search
+
+Atlas Object Search uses atlas fiber mappings only for membership. The first
+search mode treats mapped fibers as the source set and all saved fibers as the
+target set, covering mapped-to-outside and mapped-to-mapped fiber pairs.
+Intersection candidate search and refinement run in original saved fiber volume
+coordinates, not atlas display coordinates. Search results are shown in the dock
+table and are not persisted into atlas metadata yet.

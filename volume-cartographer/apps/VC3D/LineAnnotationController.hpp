@@ -16,6 +16,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include "LineAnnotationFiberClassification.hpp"
+#include "vc/atlas/FiberIntersections.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -91,6 +92,7 @@ public:
     void createAtlasFromFiber(uint64_t fiberId);
     void saveOpenFibers();
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
@@ -98,6 +100,8 @@ public:
 
 signals:
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
+    void fiberSaved(uint64_t fiberId, uint64_t generation);
+    void fibersDeleted(std::vector<uint64_t> fiberIds);
     void atlasCreated(std::filesystem::path atlasDir);
 
 private slots:
@@ -117,6 +121,7 @@ private:
         std::string startedAt;
         uint64_t sequence = 0;
         std::string fileName;
+        uint64_t generation = 1;
         std::vector<cv::Vec3d> controlPoints;
         std::vector<cv::Vec3d> linePoints;
         vc3d::line_annotation::FiberHvClassification hvClassification;
