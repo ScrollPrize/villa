@@ -79,6 +79,23 @@ inline bool isValidPointSample(const cv::Vec3f& point)
         && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
 }
 
+float scaledCenterComponent(int count, float scale)
+{
+    if (!std::isfinite(scale) || scale == 0.0f) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    return static_cast<float>(static_cast<double>(count) / 2.0 / static_cast<double>(scale));
+}
+
+cv::Vec3f surfaceCenterFor(const cv::Mat_<cv::Vec3f>& points, const cv::Vec2f& scale)
+{
+    return {
+        scaledCenterComponent(points.cols, scale[0]),
+        scaledCenterComponent(points.rows, scale[1]),
+        0.f
+    };
+}
+
 cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     const cv::Mat_<cv::Vec3f>& points,
     const cv::Size& newSize)
@@ -360,7 +377,7 @@ QuadSurface::QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &sca
     _points = std::make_unique<cv::Mat_<cv::Vec3f>>(points.clone());
     _bounds = {0,0,_points->cols-1,_points->rows-1};
     _scale = scale;
-    _center = {static_cast<float>(_points->cols/2.0/_scale[0]), static_cast<float>(_points->rows/2.0/_scale[1]), 0.f};
+    _center = surfaceCenterFor(*_points, _scale);
 }
 
 QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
@@ -369,7 +386,7 @@ QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
     //-1 as many times we read with linear interpolation and access +1 locations
     _bounds = {0,0,_points->cols-1,_points->rows-1};
     _scale = scale;
-    _center = {static_cast<float>(_points->cols/2.0/_scale[0]), static_cast<float>(_points->rows/2.0/_scale[1]), 0.f};
+    _center = surfaceCenterFor(*_points, _scale);
 }
 
 namespace {
@@ -715,11 +732,7 @@ void QuadSurface::invalidateCache()
 {
     if (_points) {
         _bounds = {0, 0, _points->cols - 1, _points->rows - 1};
-        _center = {
-            static_cast<float>(_points->cols / 2.0 / _scale[0]),
-            static_cast<float>(_points->rows / 2.0 / _scale[1]),
-            0.f
-        };
+        _center = surfaceCenterFor(*_points, _scale);
     } else {
         _bounds = {0, 0, -1, -1};
         _center = {0, 0, 0};
