@@ -93,8 +93,8 @@ default_config = {
     'num_patches_per_step': 120,
     'num_patches_per_step_for_dt': 80,
     'num_points_per_patch': 800,
-    'winding_number_num_pairs': 2000,
-    'winding_number_num_pcls': 1,
+    'winding_number_num_pcls': 16,
+    'winding_number_num_patch_pairs_per_pcl': 4,
     'winding_number_adjacent_patches_only': True,
     'unattached_pcl_num_per_step': 28,
     'unattached_pcl_num_points_per_step': 32,
@@ -1434,10 +1434,7 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
         if not cross_pairs:
             continue
 
-        num_pairs_for_pcl = min(
-            len(cross_pairs),
-            cfg['winding_number_num_pairs'] // max(1, len(selected_pcls)),
-        )
+        num_pairs_for_pcl = min(len(cross_pairs), cfg['winding_number_num_patch_pairs_per_pcl'])
         if num_pairs_for_pcl <= 0:
             continue
         chosen = np.random.choice(len(cross_pairs), num_pairs_for_pcl, replace=False)
