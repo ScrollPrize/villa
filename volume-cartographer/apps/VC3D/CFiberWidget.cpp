@@ -6,10 +6,12 @@
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QMenu>
+#include <QMessageBox>
 #include <QSignalBlocker>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <utility>
 
 CFiberWidget::CFiberWidget(QWidget* parent)
     : QDockWidget(tr("Fibers"), parent)
@@ -28,7 +30,7 @@ void CFiberWidget::setupUi()
     _listView = new QListView(mainWidget);
     _listView->setModel(_model);
     _listView->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    _listView->setSelectionMode(QAbstractItemView::SingleSelection);
+    _listView->setSelectionMode(QAbstractItemView::ExtendedSelection);
     _listView->setContextMenuPolicy(Qt::CustomContextMenu);
     layout->addWidget(_listView, 1);
 
@@ -80,6 +82,7 @@ void CFiberWidget::setupUi()
 
     auto* buttonLayout = new QHBoxLayout();
     _deleteButton = new QPushButton(tr("Delete"), mainWidget);
+    _deleteButton->setObjectName(QStringLiteral("fiberDeleteButton"));
     _deleteButton->setEnabled(false);
     buttonLayout->addWidget(_deleteButton);
     buttonLayout->addStretch(1);
@@ -100,9 +103,42 @@ QString CFiberWidget::labelForFiber(const FiberEntry& fiber)
         .arg(fiber.lengthVx, 0, 'f', 1);
 }
 
+std::vector<uint64_t> CFiberWidget::selectedFiberIds() const
+{
+    std::vector<uint64_t> ids;
+    if (!_listView || !_listView->selectionModel()) {
+        return ids;
+    }
+
+    const auto indexes = _listView->selectionModel()->selectedIndexes();
+    ids.reserve(static_cast<size_t>(indexes.size()));
+    for (const QModelIndex& index : indexes) {
+        auto* item = _model->itemFromIndex(index);
+        if (item) {
+            const uint64_t id = item->data().toULongLong();
+            if (id != 0) {
+                ids.push_back(id);
+            }
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+bool CFiberWidget::canDeleteSelection() const
+{
+    return !selectedFiberIds().empty();
+}
+
+bool CFiberWidget::canCreateAtlasFromSelection() const
+{
+    return selectedFiberIds().size() == 1;
+}
+
 void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
 {
-    const uint64_t previousSelection = _selectedFiberId;
+    const std::vector<uint64_t> previousSelection = selectedFiberIds();
     _fibers = fibers;
     std::sort(_fibers.begin(), _fibers.end(), [](const FiberEntry& a, const FiberEntry& b) {
         return a.id < b.id;
@@ -116,10 +152,10 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
     }
 
     _selectedFiberId = 0;
-    if (previousSelection != 0) {
-        selectFiber(previousSelection);
+    if (!previousSelection.empty()) {
+        selectFibers(previousSelection);
     }
-    _deleteButton->setEnabled(_selectedFiberId != 0);
+    _deleteButton->setEnabled(canDeleteSelection());
     updateClassificationUi();
 }
 
@@ -136,12 +172,13 @@ QStandardItem* CFiberWidget::findFiberItem(uint64_t fiberId)
 
 void CFiberWidget::selectFiber(uint64_t fiberId)
 {
-    auto* item = findFiberItem(fiberId);
-    if (!item) {
+    selectFibers(fiberId == 0 ? std::vector<uint64_t>{} : std::vector<uint64_t>{fiberId});
+}
+
+void CFiberWidget::selectFibers(const std::vector<uint64_t>& fiberIds)
+{
+    if (!_listView || !_listView->selectionModel()) {
         _selectedFiberId = 0;
-        if (_listView && _listView->selectionModel()) {
-            _listView->selectionModel()->clearSelection();
-        }
         if (_deleteButton) {
             _deleteButton->setEnabled(false);
         }
@@ -150,27 +187,40 @@ void CFiberWidget::selectFiber(uint64_t fiberId)
     }
 
     _listView->selectionModel()->clearSelection();
-    _listView->selectionModel()->select(item->index(),
-                                        QItemSelectionModel::ClearAndSelect);
-    _listView->scrollTo(item->index());
-    _selectedFiberId = fiberId;
-    _deleteButton->setEnabled(true);
+    QModelIndex firstSelectedIndex;
+    for (uint64_t fiberId : fiberIds) {
+        auto* item = findFiberItem(fiberId);
+        if (!item) {
+            continue;
+        }
+        _listView->selectionModel()->select(item->index(), QItemSelectionModel::Select);
+        if (!firstSelectedIndex.isValid()) {
+            firstSelectedIndex = item->index();
+        }
+    }
+    if (firstSelectedIndex.isValid()) {
+        _listView->scrollTo(firstSelectedIndex);
+    }
+
+    const auto selected = selectedFiberIds();
+    _selectedFiberId = selected.size() == 1 ? selected.front() : 0;
+    if (_deleteButton) {
+        _deleteButton->setEnabled(!selected.empty());
+    }
     updateClassificationUi();
+}
+
+void CFiberWidget::setDeleteConfirmationForTesting(
+    std::function<bool(const std::vector<uint64_t>&)> confirmer)
+{
+    _deleteConfirmationForTesting = std::move(confirmer);
 }
 
 void CFiberWidget::onSelectionChanged()
 {
-    _selectedFiberId = 0;
-
-    auto indexes = _listView->selectionModel()->selectedIndexes();
-    if (!indexes.isEmpty()) {
-        auto* item = _model->itemFromIndex(indexes.first());
-        if (item) {
-            _selectedFiberId = item->data().toULongLong();
-        }
-    }
-
-    _deleteButton->setEnabled(_selectedFiberId != 0);
+    const auto selected = selectedFiberIds();
+    _selectedFiberId = selected.size() == 1 ? selected.front() : 0;
+    _deleteButton->setEnabled(!selected.empty());
     updateClassificationUi();
 }
 
@@ -188,9 +238,7 @@ void CFiberWidget::onDoubleClicked(const QModelIndex& index)
 
 void CFiberWidget::onDeleteClicked()
 {
-    if (_selectedFiberId != 0) {
-        emit deleteFiberRequested(_selectedFiberId);
-    }
+    requestDeleteSelectedFibers();
 }
 
 void CFiberWidget::onManualHvButtonClicked(int id)
@@ -263,17 +311,53 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
     QModelIndex index = _listView->indexAt(pos);
     if (index.isValid()) {
         if (auto* item = _model->itemFromIndex(index)) {
-            selectFiber(item->data().toULongLong());
+            const uint64_t clickedId = item->data().toULongLong();
+            const auto selected = selectedFiberIds();
+            if (std::find(selected.begin(), selected.end(), clickedId) == selected.end()) {
+                selectFiber(clickedId);
+            }
         }
     }
 
     QMenu menu(this);
     auto* newAtlasAction = menu.addAction(tr("New atlas from line"));
-    newAtlasAction->setEnabled(_selectedFiberId != 0);
+    newAtlasAction->setEnabled(canCreateAtlasFromSelection());
     connect(newAtlasAction, &QAction::triggered, this, [this]() {
         if (_selectedFiberId != 0) {
             emit newAtlasFromFiberRequested(_selectedFiberId);
         }
     });
+    menu.addSeparator();
+    auto* deleteAction = menu.addAction(tr("Delete"));
+    deleteAction->setEnabled(canDeleteSelection());
+    connect(deleteAction, &QAction::triggered, this, [this]() {
+        requestDeleteSelectedFibers();
+    });
     menu.exec(_listView->viewport()->mapToGlobal(pos));
+}
+
+void CFiberWidget::requestDeleteSelectedFibers()
+{
+    const auto ids = selectedFiberIds();
+    if (ids.empty() || !confirmDeleteFibers(ids)) {
+        return;
+    }
+
+    emit deleteFibersRequested(ids);
+}
+
+bool CFiberWidget::confirmDeleteFibers(const std::vector<uint64_t>& fiberIds)
+{
+    if (_deleteConfirmationForTesting) {
+        return _deleteConfirmationForTesting(fiberIds);
+    }
+
+    const QString message = fiberIds.size() == 1
+        ? tr("Delete fiber %1? This cannot be undone.").arg(fiberIds.front())
+        : tr("Delete %1 selected fibers? This cannot be undone.").arg(fiberIds.size());
+    return QMessageBox::question(this,
+                                 tr("Delete Fibers"),
+                                 message,
+                                 QMessageBox::Yes | QMessageBox::Cancel,
+                                 QMessageBox::Cancel) == QMessageBox::Yes;
 }

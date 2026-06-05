@@ -7,6 +7,7 @@
 #include <QString>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -36,12 +37,17 @@ public:
     ~CFiberWidget();
 
     uint64_t selectedFiberId() const { return _selectedFiberId; }
+    std::vector<uint64_t> selectedFiberIds() const;
+    bool canDeleteSelection() const;
+    bool canCreateAtlasFromSelection() const;
     void setFibers(const std::vector<FiberEntry>& fibers);
     void selectFiber(uint64_t fiberId);
+    void selectFibers(const std::vector<uint64_t>& fiberIds);
+    void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
 
 signals:
     void fiberOpenRequested(uint64_t fiberId);
-    void deleteFiberRequested(uint64_t fiberId);
+    void deleteFibersRequested(std::vector<uint64_t> fiberIds);
     void manualHvTagChanged(uint64_t fiberId, QString tag);
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void newAtlasFromFiberRequested(uint64_t fiberId);
@@ -60,10 +66,13 @@ private:
     QStandardItem* findFiberItem(uint64_t fiberId);
     const FiberEntry* selectedFiber() const;
     void updateClassificationUi();
+    void requestDeleteSelectedFibers();
+    bool confirmDeleteFibers(const std::vector<uint64_t>& fiberIds);
     static QString labelForFiber(const FiberEntry& fiber);
 
     uint64_t _selectedFiberId = 0;
     std::vector<FiberEntry> _fibers;
+    std::function<bool(const std::vector<uint64_t>&)> _deleteConfirmationForTesting;
 
     QListView* _listView;
     QStandardItemModel* _model;

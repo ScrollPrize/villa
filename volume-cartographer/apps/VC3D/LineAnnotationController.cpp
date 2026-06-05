@@ -713,24 +713,48 @@ void LineAnnotationController::openFiber(uint64_t fiberId)
 
 void LineAnnotationController::deleteFiber(uint64_t fiberId)
 {
-    const auto path = fiberPath(fiberId);
-    std::error_code ec;
-    fs::remove(path, ec);
-    if (ec) {
-        showError(tr("Could not delete fiber %1: %2")
-                      .arg(fiberId)
-                      .arg(QString::fromStdString(ec.message())));
+    deleteFibers({fiberId});
+}
+
+void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
+{
+    std::sort(fiberIds.begin(), fiberIds.end());
+    fiberIds.erase(std::unique(fiberIds.begin(), fiberIds.end()), fiberIds.end());
+    fiberIds.erase(std::remove(fiberIds.begin(), fiberIds.end(), uint64_t{0}), fiberIds.end());
+    if (fiberIds.empty()) {
+        return;
+    }
+
+    std::vector<uint64_t> deletedIds;
+    deletedIds.reserve(fiberIds.size());
+    for (uint64_t fiberId : fiberIds) {
+        const auto path = fiberPath(fiberId);
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec) {
+            showError(tr("Could not delete fiber %1: %2")
+                          .arg(fiberId)
+                          .arg(QString::fromStdString(ec.message())));
+            continue;
+        }
+        deletedIds.push_back(fiberId);
+    }
+    if (deletedIds.empty()) {
         return;
     }
 
     _fibers.erase(std::remove_if(_fibers.begin(),
                                  _fibers.end(),
-                                 [fiberId](const StoredFiber& fiber) {
-                                     return fiber.id == fiberId;
+                                 [&deletedIds](const StoredFiber& fiber) {
+                                     return std::binary_search(deletedIds.begin(),
+                                                               deletedIds.end(),
+                                                               fiber.id);
                                  }),
                   _fibers.end());
     for (const auto& pane : _panes) {
-        if (pane.session && pane.session->fiberId == fiberId) {
+        if (pane.session && std::binary_search(deletedIds.begin(),
+                                               deletedIds.end(),
+                                               pane.session->fiberId)) {
             pane.session->suppressFiberSave = true;
         }
     }

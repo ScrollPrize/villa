@@ -2769,9 +2769,9 @@ void CWindow::CreateWidgets(void)
                 _lineAnnotationController.get(),
                 &LineAnnotationController::openFiber);
         connect(_fiberWidget,
-                &CFiberWidget::deleteFiberRequested,
+                &CFiberWidget::deleteFibersRequested,
                 _lineAnnotationController.get(),
-                &LineAnnotationController::deleteFiber);
+                &LineAnnotationController::deleteFibers);
         connect(_fiberWidget,
                 &CFiberWidget::manualHvTagChanged,
                 _lineAnnotationController.get(),
