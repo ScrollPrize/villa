@@ -18,6 +18,7 @@ import numpy as np
 import scipy.ndimage
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.spatial import cKDTree
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 import pyro.distributions
@@ -3480,28 +3481,36 @@ def _build_snap_anchors(slice_to_spiral_transform, patch_atlas, unattached_pcl_s
     return anchor_scroll, anchor_spiral
 
 
-def _track_points_far_from_anchors_mask(track_zyx, anchor_zyx, threshold):
-    # Returns a boolean mask, True where the track point is farther than `threshold` from
-    # every anchor. Both inputs must be on the same device. Computed in chunks so neither
-    # the track nor the anchor tensor needs to fit a full pairwise distance matrix in VRAM.
-    if threshold <= 0 or anchor_zyx.shape[0] == 0:
-        return torch.ones(track_zyx.shape[0], dtype=torch.bool, device=track_zyx.device)
-    threshold_sq = float(threshold) * float(threshold)
-    track_chunk = 4096
-    anchor_chunk = 8192
-    keep = torch.empty(track_zyx.shape[0], dtype=torch.bool, device=track_zyx.device)
-    for ts in range(0, track_zyx.shape[0], track_chunk):
-        te = min(ts + track_chunk, track_zyx.shape[0])
-        tk = track_zyx[ts:te]
-        min_d2 = torch.full((te - ts,), float('inf'), device=track_zyx.device, dtype=track_zyx.dtype)
-        for as_ in range(0, anchor_zyx.shape[0], anchor_chunk):
-            ae = min(as_ + anchor_chunk, anchor_zyx.shape[0])
-            ank = anchor_zyx[as_:ae]
-            d2 = ((tk[:, None, :] - ank[None, :, :]) ** 2).sum(dim=-1)
-            chunk_min, _ = d2.min(dim=1)
-            min_d2 = torch.minimum(min_d2, chunk_min)
-        keep[ts:te] = min_d2 > threshold_sq
-    return keep
+def _build_anchor_kdtree(anchor_zyx):
+    # Build a cKDTree over the scroll-space anchor points (CPU) for fixed-radius
+    # nearest-neighbour queries. Accepts a torch tensor or ndarray; returns None when
+    # there are no anchors.
+    if anchor_zyx is None:
+        return None
+    if isinstance(anchor_zyx, torch.Tensor):
+        anchor_np = anchor_zyx.detach().cpu().numpy()
+    else:
+        anchor_np = np.asarray(anchor_zyx)
+    if anchor_np.shape[0] == 0:
+        return None
+    return cKDTree(np.ascontiguousarray(anchor_np, dtype=np.float32))
+
+
+def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
+    # Returns a boolean numpy mask, True where the track point is farther than `threshold`
+    # from every anchor. `track_zyx` is an (N, 3) array (numpy or tensor); `anchor_tree` is
+    # a cKDTree built by _build_anchor_kdtree (or None). Uses a fixed-radius nearest-neighbour
+    # query — O(N log A), parallel across cores — instead of the full pairwise distance matrix.
+    if isinstance(track_zyx, torch.Tensor):
+        track_np = track_zyx.detach().cpu().numpy()
+    else:
+        track_np = np.asarray(track_zyx)
+    track_np = np.ascontiguousarray(track_np, dtype=np.float32)
+    if threshold <= 0 or anchor_tree is None:
+        return np.ones(track_np.shape[0], dtype=bool)
+    # query returns dist == inf for points with no anchor within distance_upper_bound.
+    dist, _ = anchor_tree.query(track_np, k=1, distance_upper_bound=float(threshold), workers=-1)
+    return np.isinf(dist)
 
 
 def _prepare_main_phase_tracks(tracks, patch_atlas, unattached_pcl_strips, exclusion_radius, device):
@@ -3510,20 +3519,20 @@ def _prepare_main_phase_tracks(tracks, patch_atlas, unattached_pcl_strips, exclu
     # zyx tensor plus per-track offsets and lengths, all on `device`.
     if not tracks:
         return None
+    print('removing tracks near patches')
     anchor_scroll = _collect_anchor_scroll_zyxs(patch_atlas, unattached_pcl_strips, device)
+    anchor_tree = _build_anchor_kdtree(anchor_scroll)
     flat_zyx_np = np.concatenate([t.astype(np.float32) for t in tracks], axis=0)
     track_id_np = np.concatenate([
         np.full(len(t), i, dtype=np.int64) for i, t in enumerate(tracks)
     ])
-    flat_zyx = torch.from_numpy(flat_zyx_np).to(device=device)
-    with torch.no_grad():
-        keep = _track_points_far_from_anchors_mask(flat_zyx, anchor_scroll, exclusion_radius)
-    keep_np = keep.cpu().numpy()
+    keep_np = _track_points_far_from_anchors_mask(flat_zyx_np, anchor_tree, exclusion_radius)
     flat_zyx_np = flat_zyx_np[keep_np]
     track_id_np = track_id_np[keep_np]
     num_tracks_orig = len(tracks)
     new_lengths = np.bincount(track_id_np, minlength=num_tracks_orig)
     surviving = np.where(new_lengths >= 2)[0]
+    print(f'kept {len(surviving)} / {len(tracks)} tracks')
     if len(surviving) == 0:
         return None
     old_to_new = -np.ones(num_tracks_orig, dtype=np.int64)
@@ -3602,11 +3611,12 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     return radius_loss, dt_loss
 
 
-def _build_snap_track_set(slice_to_spiral_transform, dr_per_winding, tracks, device, lower_fraction, upper_fraction, anchor_scroll, exclusion_radius):
+def _build_snap_track_set(slice_to_spiral_transform, dr_per_winding, tracks, device, lower_fraction, upper_fraction, anchor_tree, exclusion_radius):
     # Run get_partially_supported_tracks against the current transform and turn the
     # returned (track, mode_winding) pairs into two flat GPU tensors: per-point
     # scroll zyx and per-point target winding index. Points within `exclusion_radius`
-    # of any anchor (cached patch vertex / unattached pcl strip point) are dropped,
+    # of any anchor (cached patch vertex / unattached pcl strip point, indexed by the
+    # prebuilt `anchor_tree`) are dropped,
     # since those locations are already well-constrained by the anchor loss.
     # Also returns the subset of the partially-supported tracks that retained at
     # least one point after the exclusion filter — i.e. the tracks actually being
@@ -3628,13 +3638,11 @@ def _build_snap_track_set(slice_to_spiral_transform, dr_per_winding, tracks, dev
         zyx_pieces.append(t)
         target_pieces.append(np.full((len(t),), mode_winding, dtype=np.float32))
         track_lengths.append(len(t))
-    flat_zyx = torch.from_numpy(np.concatenate(zyx_pieces, axis=0)).to(device=device)
-    flat_target = torch.from_numpy(np.concatenate(target_pieces, axis=0)).to(device=device)
-    with torch.no_grad():
-        keep = _track_points_far_from_anchors_mask(flat_zyx, anchor_scroll.to(device=device), exclusion_radius)
-    keep_cpu = keep.cpu().numpy()
-    flat_zyx = flat_zyx[keep]
-    flat_target = flat_target[keep]
+    flat_zyx_np = np.concatenate(zyx_pieces, axis=0)
+    flat_target_np = np.concatenate(target_pieces, axis=0)
+    keep_cpu = _track_points_far_from_anchors_mask(flat_zyx_np, anchor_tree, exclusion_radius)
+    flat_zyx = torch.from_numpy(flat_zyx_np[keep_cpu]).to(device=device)
+    flat_target = torch.from_numpy(flat_target_np[keep_cpu]).to(device=device)
     snapped_tracks = []
     offset = 0
     for (track, _), length in zip(partial, track_lengths):
@@ -4158,6 +4166,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             slice_to_spiral_transform, patch_atlas, unattached_pcl_strips, device,
         )
         print(f'snap anchors: {anchor_scroll.shape[0]} points')
+        anchor_tree = _build_anchor_kdtree(anchor_scroll)
 
         snap_anchor_n = int(cfg['snapping_num_anchor_points'])
         snap_track_n = int(cfg['snapping_num_track_points'])
@@ -4176,7 +4185,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             snap_track_scroll, snap_track_target_winding, num_partial, snap_target_tracks, num_below, num_above = _build_snap_track_set(
                 slice_to_spiral_transform, dr_per_winding, tracks, device,
                 lower_fraction=snap_lower, upper_fraction=snap_upper,
-                anchor_scroll=anchor_scroll, exclusion_radius=snap_exclusion_radius,
+                anchor_tree=anchor_tree, exclusion_radius=snap_exclusion_radius,
             )
             num_points = 0 if snap_track_scroll is None else snap_track_scroll.shape[0]
             print(f'snap iter {snap_iter}: working set has {num_partial} tracks ({num_points} points); discarded {num_below} below and {num_above} above satisfaction thresholds')
@@ -4463,18 +4472,29 @@ def load_tracks_from_dbm(path, z_lo, z_hi):
     # Load tracks written by extract_surface_tracks.py. Each DBM value
     # is a pickled list of (N, 3) int32 zyx arrays; we keep only tracks that
     # lie entirely within [z_lo, z_hi).
+    z_lo_raw = z_lo * downsample_factor
+    z_hi_raw = z_hi * downsample_factor
     tracks = []
     with dbm.open(path, 'r') as db:
-        for key in db.keys():
+        for key in tqdm(db.keys(), desc='loading tracks'):
             entries = pickle.loads(db[key])
-            for track in entries:
-                if len(track) == 0:
-                    continue
-                track = np.asarray(track, dtype=np.int32)
-                track = track.astype(np.float32) / downsample_factor
-                zs = track[:, 0]
-                if zs.min() >= z_lo and zs.max() < z_hi:
-                    tracks.append(track)
+            if not entries:
+                continue
+            # Vectorize the per-track z min/max across the whole key: concatenate
+            # every (non-empty) track's z column and reduce per segment with
+            # reduceat, rather than calling .min()/.max() once per track .
+            idx = [i for i in range(len(entries)) if len(entries[i])]
+            if not idx:
+                continue
+            lengths = np.fromiter((len(entries[i]) for i in idx), dtype=np.intp, count=len(idx))
+            zcat = np.concatenate([entries[i][:, 0] for i in idx])
+            offsets = np.zeros(len(idx), dtype=np.intp)
+            np.cumsum(lengths[:-1], out=offsets[1:])
+            zmins = np.minimum.reduceat(zcat, offsets)
+            zmaxs = np.maximum.reduceat(zcat, offsets)
+            keep = (zmins >= z_lo_raw) & (zmaxs < z_hi_raw)
+            for j in np.nonzero(keep)[0]:
+                tracks.append(entries[idx[j]].astype(np.float32) / downsample_factor)
     return tracks
 
 
