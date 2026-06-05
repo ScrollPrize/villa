@@ -21,7 +21,9 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 class CState;
+class FiberSliceOverlayController;
 class LineAnnotationDialog;
+class QMdiArea;
 class QPoint;
 class Surface;
 class SurfacePanelController;
@@ -81,6 +83,7 @@ public:
                              ViewerManager* viewerManager,
                              QWidget* parentWidget,
                              QObject* parent = nullptr);
+    ~LineAnnotationController() override;
 
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
     void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
@@ -92,6 +95,7 @@ public:
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
     void createAtlasFromFiber(uint64_t fiberId);
+    void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
     void saveOpenFibers();
     void closeFiberWindowForSurface(const std::string& surfaceName);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
@@ -211,6 +215,7 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
 };

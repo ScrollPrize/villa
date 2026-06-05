@@ -1,5 +1,6 @@
 #include "CFiberWidget.hpp"
 
+#include <QAction>
 #include <QApplication>
 #include <QPushButton>
 
@@ -54,6 +55,7 @@ int main(int argc, char** argv)
     require(!deleteButton->isEnabled(), "Delete button should start disabled");
     require(!widget.canDeleteSelection(), "Empty selection should not allow delete");
     require(!widget.canCreateAtlasFromSelection(), "Empty selection should not allow atlas creation");
+    require(!widget.canShowFiberSlice(), "Empty selection should not allow fiber slice");
 
     widget.selectFiber(2);
     require(widget.selectedFiberId() == 2, "Single selection did not set selectedFiberId");
@@ -61,6 +63,22 @@ int main(int argc, char** argv)
     require(deleteButton->isEnabled(), "Delete button should enable for a single selection");
     require(widget.canDeleteSelection(), "Single selection should allow delete");
     require(widget.canCreateAtlasFromSelection(), "Single selection should allow atlas creation");
+    require(widget.canShowFiberSlice(), "Single selection should allow fiber slice");
+
+    int sliceRequests = 0;
+    uint64_t requestedSliceFiberId = 0;
+    QObject::connect(&widget,
+                     &CFiberWidget::fiberSliceRequested,
+                     &widget,
+                     [&](uint64_t fiberId) {
+                         ++sliceRequests;
+                         requestedSliceFiberId = fiberId;
+                     });
+    auto* showSliceAction = widget.createShowFiberSliceAction(&widget);
+    require(showSliceAction->isEnabled(), "Single selection should enable Show fiber slice action");
+    showSliceAction->trigger();
+    require(sliceRequests == 1, "Show fiber slice action did not emit one request");
+    require(requestedSliceFiberId == 2, "Show fiber slice emitted the wrong fiber ID");
 
     widget.selectFibers({1, 3});
     require(widget.selectedFiberId() == 0, "Multi-selection should not expose a single selected fiber");
@@ -68,6 +86,9 @@ int main(int argc, char** argv)
     require(deleteButton->isEnabled(), "Delete button should enable for multi-selection");
     require(widget.canDeleteSelection(), "Multi-selection should allow delete");
     require(!widget.canCreateAtlasFromSelection(), "Multi-selection should gray out atlas creation");
+    require(!widget.canShowFiberSlice(), "Multi-selection should gray out fiber slice");
+    auto* multiShowSliceAction = widget.createShowFiberSliceAction(&widget);
+    require(!multiShowSliceAction->isEnabled(), "Multi-selection should disable Show fiber slice action");
 
     int confirmations = 0;
     int batchDeletes = 0;

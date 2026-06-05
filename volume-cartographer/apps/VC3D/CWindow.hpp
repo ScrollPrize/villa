@@ -133,6 +133,7 @@ private:
     void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results);
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
+    void switchToFiberSliceWorkspace();
     void repeatLastLasagnaAction();
     void selectLasagnaOutputSegment(const QString& outputName);
 
@@ -222,6 +223,7 @@ private:
     QDockWidget* _lasagnaDock{nullptr};
     CPointCollectionWidget* _point_collection_widget;
     CFiberWidget* _fiberWidget{nullptr};
+    CFiberWidget* _fiberSliceWidget{nullptr};
     std::unique_ptr<FiberAnnotationController> _fiberController;
 
     SurfaceTreeWidget *treeWidgetSurfaces;
@@ -240,6 +242,7 @@ private:
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMainWindow* _atlasWorkspaceWindow{nullptr};
+    QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
@@ -251,6 +254,7 @@ private:
     vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
     bool _atlasSearchCancelRequested{false};
     QMdiArea *mdiArea;
+    QMdiArea* _fiberSliceMdiArea{nullptr};
 
     bool can_change_volume_();
 

@@ -71,6 +71,15 @@ public:
         OverlayStyle style{};
     };
 
+    struct RotatedEllipsePrimitive {
+        QPointF center;
+        qreal radiusX{3.0};
+        qreal radiusY{2.0};
+        qreal rotationRadians{0.0};
+        bool filled{true};
+        OverlayStyle style{};
+    };
+
     struct LineStripPrimitive {
         std::vector<QPointF> points;
         bool closed{false};
@@ -146,6 +155,7 @@ public:
                                           VolumePointPrimitive,
                                           SurfacePointPrimitive,
                                           CirclePrimitive,
+                                          RotatedEllipsePrimitive,
                                           LineStripPrimitive,
                                           SurfaceLineStripPrimitive,
                                           RectPrimitive,
@@ -204,6 +214,13 @@ protected:
                        qreal radius,
                        bool filled,
                        OverlayStyle style);
+
+        void addRotatedEllipse(const QPointF& center,
+                               qreal radiusX,
+                               qreal radiusY,
+                               qreal rotationRadians,
+                               bool filled,
+                               OverlayStyle style);
 
         void addLineStrip(const std::vector<QPointF>& points,
                           bool closed,

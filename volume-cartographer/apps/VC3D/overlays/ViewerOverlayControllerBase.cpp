@@ -137,6 +137,26 @@ void ViewerOverlayControllerBase::OverlayBuilder::addCircle(const QPointF& cente
     _primitives.emplace_back(std::move(prim));
 }
 
+void ViewerOverlayControllerBase::OverlayBuilder::addRotatedEllipse(const QPointF& center,
+                                                                    qreal radiusX,
+                                                                    qreal radiusY,
+                                                                    qreal rotationRadians,
+                                                                    bool filled,
+                                                                    OverlayStyle style)
+{
+    if (radiusX <= 0.0 || radiusY <= 0.0) {
+        return;
+    }
+    RotatedEllipsePrimitive prim;
+    prim.center = center;
+    prim.radiusX = radiusX;
+    prim.radiusY = radiusY;
+    prim.rotationRadians = rotationRadians;
+    prim.filled = filled;
+    prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
 void ViewerOverlayControllerBase::OverlayBuilder::addLineStrip(const std::vector<QPointF>& points,
                                                                bool closed,
                                                                OverlayStyle style)
@@ -716,6 +736,22 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                         prim.center.y() - prim.radius,
                         prim.radius * 2.0,
                         prim.radius * 2.0);
+                    auto style = prim.style;
+                    if (!prim.filled) {
+                        style.brushColor = Qt::transparent;
+                    }
+                    addItem(item, style);
+                } else if constexpr (std::is_same_v<T, RotatedEllipsePrimitive>) {
+                    flushPointGroups();
+                    if (prim.radiusX <= 0.0 || prim.radiusY <= 0.0) {
+                        return;
+                    }
+                    QPainterPath path;
+                    path.addEllipse(QPointF(0.0, 0.0), prim.radiusX, prim.radiusY);
+                    QTransform transform;
+                    transform.translate(prim.center.x(), prim.center.y());
+                    transform.rotateRadians(prim.rotationRadians);
+                    auto* item = new QGraphicsPathItem(transform.map(path));
                     auto style = prim.style;
                     if (!prim.filled) {
                         style.brushColor = Qt::transparent;

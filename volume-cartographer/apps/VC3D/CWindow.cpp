@@ -694,11 +694,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _atlasWorkspaceWindow->setObjectName(QStringLiteral("atlasWorkspaceWindow"));
     _atlasWorkspaceWindow->setDockOptions(dockOptions());
 
+    _fiberSliceWorkspaceWindow = new QMainWindow(this);
+    _fiberSliceWorkspaceWindow->setObjectName(QStringLiteral("fiberSliceWorkspaceWindow"));
+    _fiberSliceWorkspaceWindow->setDockOptions(dockOptions());
+
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
     _workspaceTabs->addTab(_atlasWorkspaceWindow, tr("Atlas"));
+    _workspaceTabs->addTab(_fiberSliceWorkspaceWindow, tr("Fiber Slice"));
     setCentralWidget(_workspaceTabs);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
     auto* lasagnaEscapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), _lasagnaWorkspaceWindow);
@@ -965,7 +970,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                _atlasOverviewDock,
                                _atlasSearchDock,
                                _atlasWorkspaceOverviewDock,
-                               _atlasWorkspaceSearchDock }) {
+                               _atlasWorkspaceSearchDock,
+                               static_cast<QDockWidget*>(_fiberSliceWidget) }) {
         if (dock) {
             dock->setMinimumWidth(250);
             dock->setMinimumHeight(120);
@@ -993,7 +999,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                _atlasOverviewDock,
                                _atlasSearchDock,
                                _atlasWorkspaceOverviewDock,
-                               _atlasWorkspaceSearchDock  }) {
+                               _atlasWorkspaceSearchDock,
+                               static_cast<QDockWidget*>(_fiberSliceWidget)  }) {
         ensureDockWidgetFeatures(dock);
         // Connect dock widget signals to trigger state saving
         if (!dock) continue;
@@ -1026,6 +1033,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    _atlasSearchDock,
                                    _atlasWorkspaceOverviewDock,
                                    _atlasWorkspaceSearchDock,
+                                   static_cast<QDockWidget*>(_fiberSliceWidget),
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
             if (!dock) continue;
             connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
@@ -1301,6 +1309,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(_atlasSearchDock);
     addDock(_point_collection_widget);
     addDock(_fiberWidget);
+    addDock(_fiberSliceWidget);
 }
 
 VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
@@ -1888,6 +1897,19 @@ void CWindow::switchToMainWorkspace()
         _workspaceTabs->setCurrentIndex(index);
         _segmentWorkspaceWindow->raise();
         _segmentWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
+    }
+}
+
+void CWindow::switchToFiberSliceWorkspace()
+{
+    if (!_workspaceTabs || !_fiberSliceWorkspaceWindow) {
+        return;
+    }
+    const int index = _workspaceTabs->indexOf(_fiberSliceWorkspaceWindow);
+    if (index >= 0) {
+        _workspaceTabs->setCurrentIndex(index);
+        _fiberSliceWorkspaceWindow->raise();
+        _fiberSliceWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
     }
 }
 
@@ -2611,6 +2633,21 @@ void CWindow::CreateWidgets(void)
     }
     mdiArea->tileSubWindows();
 
+    if (_fiberSliceWorkspaceWindow) {
+        _fiberSliceMdiArea = new QMdiArea(_fiberSliceWorkspaceWindow);
+        _fiberSliceMdiArea->setObjectName(QStringLiteral("fiberSliceMdiArea"));
+        _fiberSliceWorkspaceWindow->setCentralWidget(_fiberSliceMdiArea);
+        connect(_fiberSliceMdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
+            if (subWindow) {
+                if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
+                    if (auto* graphicsView = viewer->graphicsView()) {
+                        graphicsView->setFocus();
+                    }
+                }
+            }
+        });
+    }
+
     createAtlasWorkspace();
 
     treeWidgetSurfaces = ui.treeWidgetSurfaces;
@@ -3105,6 +3142,12 @@ void CWindow::CreateWidgets(void)
     _fiberWidget->setObjectName("fiberDock");
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
 
+    if (_fiberSliceWorkspaceWindow) {
+        _fiberSliceWidget = new CFiberWidget(_fiberSliceWorkspaceWindow);
+        _fiberSliceWidget->setObjectName(QStringLiteral("fiberSliceDock"));
+        _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
+    }
+
     if (_lineAnnotationController) {
         auto updateFiberList = [this](const std::vector<LineAnnotationController::FiberSummary>& fibers) {
             std::vector<CFiberWidget::FiberEntry> entries;
@@ -3127,31 +3170,56 @@ void CWindow::CreateWidgets(void)
             if (_fiberWidget) {
                 _fiberWidget->setFibers(entries);
             }
+            if (_fiberSliceWidget) {
+                _fiberSliceWidget->setFibers(entries);
+            }
+        };
+        auto connectFiberWidget = [this](CFiberWidget* widget) {
+            if (!widget || !_lineAnnotationController) {
+                return;
+            }
+            connect(widget,
+                    &CFiberWidget::fiberOpenRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::openFiber);
+            connect(widget,
+                    &CFiberWidget::deleteFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::deleteFibers);
+            connect(widget,
+                    &CFiberWidget::manualHvTagChanged,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::setFiberManualHvTag);
+            connect(widget,
+                    &CFiberWidget::hvScoreRecalculationRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::recalculateFiberHvClassification);
+            connect(widget,
+                    &CFiberWidget::newAtlasFromFiberRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::createAtlasFromFiber);
+            connect(widget,
+                    &CFiberWidget::fiberSliceRequested,
+                    this,
+                    [this](uint64_t fiberId) {
+                        if (_fiberWidget) {
+                            _fiberWidget->selectFiber(fiberId);
+                        }
+                        if (_fiberSliceWidget) {
+                            _fiberSliceWidget->selectFiber(fiberId);
+                        }
+                        switchToFiberSliceWorkspace();
+                        if (_lineAnnotationController) {
+                            _lineAnnotationController->showFiberSlice(fiberId, _fiberSliceMdiArea);
+                        }
+                    });
         };
         connect(_lineAnnotationController.get(),
                 &LineAnnotationController::fibersChanged,
                 this,
                 updateFiberList);
-        connect(_fiberWidget,
-                &CFiberWidget::fiberOpenRequested,
-                _lineAnnotationController.get(),
-                &LineAnnotationController::openFiber);
-        connect(_fiberWidget,
-                &CFiberWidget::deleteFibersRequested,
-                _lineAnnotationController.get(),
-                &LineAnnotationController::deleteFibers);
-        connect(_fiberWidget,
-                &CFiberWidget::manualHvTagChanged,
-                _lineAnnotationController.get(),
-                &LineAnnotationController::setFiberManualHvTag);
-        connect(_fiberWidget,
-                &CFiberWidget::hvScoreRecalculationRequested,
-                _lineAnnotationController.get(),
-                &LineAnnotationController::recalculateFiberHvClassification);
-        connect(_fiberWidget,
-                &CFiberWidget::newAtlasFromFiberRequested,
-                _lineAnnotationController.get(),
-                &LineAnnotationController::createAtlasFromFiber);
+        connectFiberWidget(_fiberWidget);
+        connectFiberWidget(_fiberSliceWidget);
         updateFiberList(_lineAnnotationController->fiberSummaries());
     }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
@@ -3164,6 +3232,11 @@ void CWindow::CreateWidgets(void)
     ensureDockWidgetFeatures(_fiberWidget);
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    ensureDockWidgetFeatures(_fiberSliceWidget);
+    if (_fiberSliceWidget) {
+        connect(_fiberSliceWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+        connect(_fiberSliceWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    }
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Fibers together
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
@@ -5271,5 +5344,8 @@ void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
 {
     if (_fiberWidget) {
         _fiberWidget->selectFiber(fiberId);
+    }
+    if (_fiberSliceWidget) {
+        _fiberSliceWidget->selectFiber(fiberId);
     }
 }

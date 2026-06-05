@@ -144,6 +144,8 @@ vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}

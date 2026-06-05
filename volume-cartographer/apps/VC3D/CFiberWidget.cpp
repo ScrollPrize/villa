@@ -1,6 +1,7 @@
 #include "CFiberWidget.hpp"
 
 #include <QAbstractItemView>
+#include <QAction>
 #include <QButtonGroup>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
@@ -134,6 +135,22 @@ bool CFiberWidget::canDeleteSelection() const
 bool CFiberWidget::canCreateAtlasFromSelection() const
 {
     return selectedFiberIds().size() == 1;
+}
+
+bool CFiberWidget::canShowFiberSlice() const
+{
+    return selectedFiberIds().size() == 1;
+}
+
+QAction* CFiberWidget::createShowFiberSliceAction(QObject* parent)
+{
+    auto* action = new QAction(tr("Show fiber slice"), parent);
+    action->setObjectName(QStringLiteral("showFiberSliceAction"));
+    action->setEnabled(canShowFiberSlice());
+    connect(action, &QAction::triggered, this, [this]() {
+        requestShowFiberSlice();
+    });
+    return action;
 }
 
 void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
@@ -320,6 +337,9 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
     }
 
     QMenu menu(this);
+    auto* showFiberSliceAction = createShowFiberSliceAction(&menu);
+    menu.addAction(showFiberSliceAction);
+    menu.addSeparator();
     auto* newAtlasAction = menu.addAction(tr("New atlas from line"));
     newAtlasAction->setEnabled(canCreateAtlasFromSelection());
     connect(newAtlasAction, &QAction::triggered, this, [this]() {
@@ -344,6 +364,13 @@ void CFiberWidget::requestDeleteSelectedFibers()
     }
 
     emit deleteFibersRequested(ids);
+}
+
+void CFiberWidget::requestShowFiberSlice()
+{
+    if (_selectedFiberId != 0 && canShowFiberSlice()) {
+        emit fiberSliceRequested(_selectedFiberId);
+    }
 }
 
 bool CFiberWidget::confirmDeleteFibers(const std::vector<uint64_t>& fiberIds)
