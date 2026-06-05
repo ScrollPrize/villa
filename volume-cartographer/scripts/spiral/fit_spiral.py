@@ -3879,7 +3879,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         torch.save({
             'spiral_and_transform': spiral_and_transform.state_dict(),
             'optimiser': optimiser.state_dict(),
-            'cfg': cfg,
+            'cfg': dict(cfg),
             'z_begin': z_begin,
             'z_end': z_end,
         }, f'{out_path}/checkpoint_{suffix}.ckpt')
