@@ -18,6 +18,7 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <QWheelEvent>
 
 #include <algorithm>
 #include <cmath>
@@ -103,12 +104,14 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     setWindowTitle(tr("Line Annotation"));
     setAttribute(Qt::WA_DeleteOnClose);
     resize(900, 700);
+    _bottomSliceLineStep = vc3d::line_annotation::kDefaultBottomCrossSliceLineStep;
 
     _layout = new QVBoxLayout(this);
     _layout->setContentsMargins(0, 0, 0, 0);
     _layout->setSpacing(0);
 
     auto* buttonRow = new QWidget(this);
+    buttonRow->installEventFilter(this);
     auto* buttonLayout = new QHBoxLayout(buttonRow);
     buttonLayout->setContentsMargins(6, 6, 6, 6);
     buttonLayout->setSpacing(6);
@@ -130,6 +133,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
             }
         });
     }
+    _bottomSliceStepLabel = new QLabel(this);
+    _bottomSliceStepLabel->setToolTip(
+        tr("Small cross-slice spacing along the line. Use Ctrl+Shift+Scroll anywhere in this window to adjust."));
+    _bottomSliceStepLabel->installEventFilter(this);
+    updateBottomSliceStepLabel();
+    buttonLayout->addWidget(_bottomSliceStepLabel);
     _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
     _showAsMeshButton->setEnabled(false);
     _showAsMeshButton->installEventFilter(this);
@@ -148,6 +157,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     });
 
     _mdiArea = new QMdiArea(this);
+    _mdiArea->installEventFilter(this);
     _layout->addWidget(_mdiArea);
 }
 
@@ -229,6 +239,7 @@ bool LineAnnotationDialog::setGeneratedRows(
         }
 
         auto* rowWidget = new QWidget(this);
+        rowWidget->installEventFilter(this);
         auto* rowLayout = new QHBoxLayout(rowWidget);
         rowLayout->setContentsMargins(0, 0, 0, 0);
         rowLayout->setSpacing(0);
@@ -436,7 +447,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                         : generatedPaneCamera(currentViewer, camera),
                                     false);
     currentViewer->setShiftScrollOverride(
-        [this](int steps, QPointF, Qt::KeyboardModifiers) {
+        [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
+            if (modifiers.testFlag(Qt::ControlModifier)) {
+                return scaleBottomSliceLineStepByScrollSteps(steps);
+            }
             return shiftCurrentLinePositionByScrollSteps(steps);
         });
     bindPaneInteractions(views.currentCutName, currentViewer, false);
@@ -461,6 +475,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     connectGeneratedOverlayRefresh(currentViewer);
 
     auto* stripStack = new QWidget(topWidget);
+    stripStack->installEventFilter(this);
     auto* stripLayout = new QVBoxLayout(stripStack);
     stripLayout->setContentsMargins(0, 0, 0, 0);
     stripLayout->setSpacing(0);
@@ -524,6 +539,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
 
     auto* bottomWidget = new QWidget(this);
+    bottomWidget->installEventFilter(this);
     auto* bottomLayout = new QHBoxLayout(bottomWidget);
     bottomLayout->setContentsMargins(0, 0, 0, 0);
     bottomLayout->setSpacing(0);
@@ -552,7 +568,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                      : generatedPaneCamera(viewer, camera),
                                  false);
         viewer->setShiftScrollOverride(
-            [this](int steps, QPointF, Qt::KeyboardModifiers) {
+            [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
+                if (modifiers.testFlag(Qt::ControlModifier)) {
+                    return scaleBottomSliceLineStepByScrollSteps(steps);
+                }
                 return shiftBottomSlicesByScrollSteps(steps);
             });
         bindPaneInteractions(surfaceName, viewer, false);
@@ -849,6 +868,49 @@ bool LineAnnotationDialog::shiftBottomSlicesByScrollSteps(int steps)
     return true;
 }
 
+bool LineAnnotationDialog::scaleBottomSliceLineStepByScrollSteps(int steps)
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
+        return true;
+    }
+    const double lineStep = vc3d::line_annotation::adjustedBottomCrossSliceLineStep(
+        _bottomSliceLineStep,
+        steps,
+        static_cast<int>(_generatedViews.linePoints.size()));
+    if (std::abs(lineStep - _bottomSliceLineStep) < 1.0e-6) {
+        return true;
+    }
+    _bottomSliceLineStep = lineStep;
+    updateBottomSliceStepLabel();
+    renderBottomSlicePlanes("line annotation bottom cut spacing");
+    rebuildGeneratedOverlays();
+    return true;
+}
+
+bool LineAnnotationDialog::handleBottomSliceStepWheel(QWheelEvent* event)
+{
+    if (!event) {
+        return false;
+    }
+    const Qt::KeyboardModifiers modifiers = event->modifiers();
+    if (!modifiers.testFlag(Qt::ControlModifier) ||
+        !modifiers.testFlag(Qt::ShiftModifier) ||
+        !_hasGeneratedViews ||
+        _generatedViews.linePoints.empty()) {
+        return false;
+    }
+
+    _bottomSliceStepWheelAccum += event->angleDelta().y();
+    constexpr int kStepThreshold = 120;
+    const int steps = _bottomSliceStepWheelAccum / kStepThreshold;
+    if (steps != 0) {
+        _bottomSliceStepWheelAccum -= steps * kStepThreshold;
+        scaleBottomSliceLineStepByScrollSteps(steps);
+    }
+    event->accept();
+    return true;
+}
+
 void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 {
     _currentCutFollowsStripMouse = follows;
@@ -1080,7 +1142,17 @@ double LineAnnotationDialog::bottomSliceLinePosition(int slot, int bottomCount) 
         _bottomCenterPosition,
         slot,
         bottomCount,
-        static_cast<int>(_generatedViews.linePoints.size()));
+        static_cast<int>(_generatedViews.linePoints.size()),
+        _bottomSliceLineStep);
+}
+
+void LineAnnotationDialog::updateBottomSliceStepLabel()
+{
+    if (!_bottomSliceStepLabel) {
+        return;
+    }
+    _bottomSliceStepLabel->setText(tr("Small step: %1")
+                                       .arg(QString::number(_bottomSliceLineStep, 'g', 3)));
 }
 
 QPointF LineAnnotationDialog::stripLinePositionToScene(CChunkedVolumeViewer* viewer,
@@ -1149,6 +1221,12 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
+    if (event->type() == QEvent::Wheel) {
+        auto* wheelEvent = static_cast<QWheelEvent*>(event);
+        if (handleBottomSliceStepWheel(wheelEvent)) {
+            return true;
+        }
+    }
     if (event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (handleKeyPress(keyEvent)) {

@@ -96,6 +96,21 @@ TEST_CASE("line annotation bottom shift scroll preserves generated slice spacing
     CHECK(vc3d::line_annotation::bottomCrossSliceLinePosition(100.0, 6, 7, 101) == 100.0);
 }
 
+TEST_CASE("line annotation bottom cross slice spacing scales exponentially")
+{
+    CHECK(vc3d::line_annotation::adjustedBottomCrossSliceLineStep(10.0, 1, 101) ==
+          doctest::Approx(15.0));
+    CHECK(vc3d::line_annotation::adjustedBottomCrossSliceLineStep(10.0, -1, 101) ==
+          doctest::Approx(10.0 / 1.5));
+    CHECK(vc3d::line_annotation::adjustedBottomCrossSliceLineStep(10.0, 2, 101) ==
+          doctest::Approx(22.5));
+
+    const double spacing = 15.0;
+    CHECK(vc3d::line_annotation::bottomCrossSliceLinePosition(50.0, 0, 7, 101, spacing) == 5.0);
+    CHECK(vc3d::line_annotation::bottomCrossSliceLinePosition(50.0, 3, 7, 101, spacing) == 50.0);
+    CHECK(vc3d::line_annotation::bottomCrossSliceLinePosition(50.0, 6, 7, 101, spacing) == 95.0);
+}
+
 TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
 {
     CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");

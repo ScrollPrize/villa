@@ -22,6 +22,7 @@ class QMdiArea;
 class QMdiSubWindow;
 class QPushButton;
 class QVBoxLayout;
+class QWheelEvent;
 class ViewerManager;
 class PlaneSurface;
 class QuadSurface;
@@ -127,6 +128,8 @@ private:
     void setCurrentLinePosition(double position);
     bool shiftCurrentLinePositionByScrollSteps(int steps);
     bool shiftBottomSlicesByScrollSteps(int steps);
+    bool scaleBottomSliceLineStepByScrollSteps(int steps);
+    bool handleBottomSliceStepWheel(QWheelEvent* event);
     void setCurrentCutFollowsStripMouse(bool follows);
     void recenterBottomSlicesOnCurrentPosition();
     double snappedControlPointPosition(double position) const;
@@ -141,6 +144,7 @@ private:
     cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
     bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
     double bottomSliceLinePosition(int slot, int bottomCount) const;
+    void updateBottomSliceStepLabel();
     QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                      QuadSurface* surface,
                                      double linePosition) const;
@@ -151,6 +155,7 @@ private:
     QVBoxLayout* _layout = nullptr;
     QComboBox* _initialDirectionCombo = nullptr;
     QLabel* _sliceStepLabel = nullptr;
+    QLabel* _bottomSliceStepLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
     QPushButton* _fullOptimizationButton = nullptr;
     QMdiArea* _mdiArea = nullptr;
@@ -167,5 +172,7 @@ private:
     bool _hasGeneratedViews = false;
     double _currentLinePosition = 0.0;
     double _bottomCenterPosition = 0.0;
+    double _bottomSliceLineStep = 10.0;
+    int _bottomSliceStepWheelAccum = 0;
     bool _currentCutFollowsStripMouse = true;
 };

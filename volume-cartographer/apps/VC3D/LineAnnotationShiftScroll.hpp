@@ -1,10 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 
 namespace vc3d::line_annotation {
 
-constexpr double kBottomCrossSliceLineStep = 10.0;
+constexpr double kDefaultBottomCrossSliceLineStep = 10.0;
+constexpr double kMinBottomCrossSliceLineStep = 0.25;
+constexpr double kBottomCrossSliceLineStepFactor = 1.5;
 
 inline int shiftScrollLineStepSize(int viewerSliceStepSize)
 {
@@ -28,15 +31,30 @@ inline double shiftedLinePosition(double currentPosition,
 inline double bottomCrossSliceLinePosition(double centerPosition,
                                            int slot,
                                            int bottomCount,
-                                           int linePointCount)
+                                           int linePointCount,
+                                           double lineStep = kDefaultBottomCrossSliceLineStep)
 {
     if (linePointCount <= 0 || bottomCount <= 0) {
         return 0.0;
     }
     const double maxLinePosition = static_cast<double>(linePointCount - 1);
-    const double centerOffset = static_cast<double>(slot - bottomCount / 2) *
-                                kBottomCrossSliceLineStep;
+    lineStep = std::max(kMinBottomCrossSliceLineStep, lineStep);
+    const double centerOffset = static_cast<double>(slot - bottomCount / 2) * lineStep;
     return std::clamp(centerPosition + centerOffset, 0.0, maxLinePosition);
+}
+
+inline double adjustedBottomCrossSliceLineStep(double currentLineStep,
+                                               int scrollSteps,
+                                               int linePointCount)
+{
+    currentLineStep = std::max(kMinBottomCrossSliceLineStep, currentLineStep);
+    if (scrollSteps == 0) {
+        return currentLineStep;
+    }
+    const double maxLineStep = std::max(kMinBottomCrossSliceLineStep,
+                                        static_cast<double>(std::max(1, linePointCount - 1)));
+    const double scale = std::pow(kBottomCrossSliceLineStepFactor, static_cast<double>(scrollSteps));
+    return std::clamp(currentLineStep * scale, kMinBottomCrossSliceLineStep, maxLineStep);
 }
 
 } // namespace vc3d::line_annotation
