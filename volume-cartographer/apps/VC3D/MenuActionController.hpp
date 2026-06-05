@@ -128,6 +128,7 @@ private:
     QAction* _rotateSurfaceAct{nullptr};
     QAction* _mergeTifxyzAct{nullptr};
     QAction* _mergePatchAct{nullptr};
+    QAction* _recalculateFiberScoresAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
 };

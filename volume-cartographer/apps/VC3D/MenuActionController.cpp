@@ -12,6 +12,7 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
+#include "LineAnnotationController.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -169,6 +170,13 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
+    _recalculateFiberScoresAct = new QAction(QObject::tr("Recalc fiber H/V scores"), this);
+    connect(_recalculateFiberScoresAct, &QAction::triggered, this, [qWindow]() {
+        if (qWindow->_lineAnnotationController) {
+            qWindow->_lineAnnotationController->recalculateAllFiberHvClassifications();
+        }
+    });
+
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
@@ -213,6 +221,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
+    _actionsMenu->addAction(_recalculateFiberScoresAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);

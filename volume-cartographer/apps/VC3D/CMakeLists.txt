@@ -24,6 +24,7 @@ set(srcs
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
+    LineAnnotationFiberClassification.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationDialog.cpp

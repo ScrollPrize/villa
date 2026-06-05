@@ -2477,6 +2477,13 @@ void CWindow::CreateWidgets(void)
                     fiber.controlPointCount,
                     fiber.linePointCount,
                     fiber.lengthVx,
+                    fiber.hvZDistance,
+                    fiber.hvFiberLength,
+                    fiber.horizontalScore,
+                    fiber.verticalScore,
+                    fiber.automaticCertainty,
+                    fiber.automaticHvTag,
+                    fiber.manualHvTag,
                 });
             }
             if (_fiberWidget) {
@@ -2495,6 +2502,14 @@ void CWindow::CreateWidgets(void)
                 &CFiberWidget::deleteFiberRequested,
                 _lineAnnotationController.get(),
                 &LineAnnotationController::deleteFiber);
+        connect(_fiberWidget,
+                &CFiberWidget::manualHvTagChanged,
+                _lineAnnotationController.get(),
+                &LineAnnotationController::setFiberManualHvTag);
+        connect(_fiberWidget,
+                &CFiberWidget::hvScoreRecalculationRequested,
+                _lineAnnotationController.get(),
+                &LineAnnotationController::recalculateFiberHvClassification);
         updateFiberList(_lineAnnotationController->fiberSummaries());
     }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,

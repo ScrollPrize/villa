@@ -4,9 +4,14 @@
 #include <QListView>
 #include <QStandardItemModel>
 #include <QPushButton>
+#include <QString>
 
 #include <cstdint>
+#include <string>
 #include <vector>
+
+class QLabel;
+class QButtonGroup;
 
 class CFiberWidget : public QDockWidget
 {
@@ -18,6 +23,13 @@ public:
         int controlPointCount = 0;
         int linePointCount = 0;
         double lengthVx = 0.0;
+        double hvZDistance = 0.0;
+        double hvFiberLength = 0.0;
+        double horizontalScore = 0.0;
+        double verticalScore = 0.0;
+        double automaticCertainty = 0.0;
+        std::string automaticHvTag;
+        std::string manualHvTag;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);
@@ -30,15 +42,22 @@ public:
 signals:
     void fiberOpenRequested(uint64_t fiberId);
     void deleteFiberRequested(uint64_t fiberId);
+    void manualHvTagChanged(uint64_t fiberId, QString tag);
+    void hvScoreRecalculationRequested(uint64_t fiberId);
 
 private slots:
     void onSelectionChanged();
     void onDoubleClicked(const QModelIndex& index);
     void onDeleteClicked();
+    void onManualHvButtonClicked(int id);
+    void onManualHvResetClicked();
+    void onRecalculateHvScoreClicked();
 
 private:
     void setupUi();
     QStandardItem* findFiberItem(uint64_t fiberId);
+    const FiberEntry* selectedFiber() const;
+    void updateClassificationUi();
     static QString labelForFiber(const FiberEntry& fiber);
 
     uint64_t _selectedFiberId = 0;
@@ -46,5 +65,12 @@ private:
 
     QListView* _listView;
     QStandardItemModel* _model;
+    QLabel* _scoreLabel;
+    QLabel* _autoLabel;
+    QButtonGroup* _manualHvGroup;
+    QPushButton* _manualHButton;
+    QPushButton* _manualVButton;
+    QPushButton* _manualResetButton;
+    QPushButton* _recalculateScoreButton;
     QPushButton* _deleteButton;
 };

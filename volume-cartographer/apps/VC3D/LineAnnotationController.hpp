@@ -15,6 +15,7 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include "LineAnnotationFiberClassification.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -53,6 +54,13 @@ public:
         int controlPointCount = 0;
         int linePointCount = 0;
         double lengthVx = 0.0;
+        double hvZDistance = 0.0;
+        double hvFiberLength = 0.0;
+        double horizontalScore = 0.0;
+        double verticalScore = 0.0;
+        double automaticCertainty = 0.0;
+        std::string automaticHvTag;
+        std::string manualHvTag;
     };
 
     using DatasetPicker =
@@ -76,6 +84,9 @@ public:
     void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void openFiber(uint64_t fiberId);
     void deleteFiber(uint64_t fiberId);
+    void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
+    void recalculateFiberHvClassification(uint64_t fiberId);
+    void recalculateAllFiberHvClassifications();
     void saveOpenFibers();
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
 
@@ -105,6 +116,9 @@ private:
         std::string fileName;
         std::vector<cv::Vec3d> controlPoints;
         std::vector<cv::Vec3d> linePoints;
+        vc3d::line_annotation::FiberHvClassification hvClassification;
+        std::string manualHvTag;
+        bool needsSave = false;
     };
 
     struct PaneRecord {

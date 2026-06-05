@@ -2,12 +2,14 @@
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
+#include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -118,4 +120,62 @@ TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
     CHECK(vc3d::line_annotation::normalizedFiberUsername("A User/Name") == "A_User_Name");
     CHECK(vc3d::line_annotation::fiberFileName("alice", "20260605T123456789", 42) ==
           "alice_20260605T123456789_000042.json");
+}
+
+TEST_CASE("line annotation fiber h/v classification scores endpoint z distance")
+{
+    using vc3d::line_annotation::FiberHvTag;
+    using vc3d::line_annotation::classifyFiberHv;
+
+    const auto horizontal = classifyFiberHv({
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+    });
+    CHECK(horizontal.valid);
+    CHECK(horizontal.zDistance == doctest::Approx(0.0));
+    CHECK(horizontal.fiberLength == doctest::Approx(10.0));
+    CHECK(horizontal.horizontalScore == doctest::Approx(1.0));
+    CHECK(horizontal.verticalScore == doctest::Approx(0.0));
+    CHECK(horizontal.automaticTag == FiberHvTag::H);
+    CHECK(horizontal.automaticCertainty == doctest::Approx(1.0));
+
+    const auto vertical = classifyFiberHv({
+        {0.0, 0.0, 0.0},
+        {0.0, 0.0, 5.0},
+        {0.0, 0.0, 10.0},
+    });
+    CHECK(vertical.valid);
+    CHECK(vertical.zDistance == doctest::Approx(10.0));
+    CHECK(vertical.fiberLength == doctest::Approx(10.0));
+    CHECK(vertical.horizontalScore == doctest::Approx(0.0));
+    CHECK(vertical.verticalScore == doctest::Approx(1.0));
+    CHECK(vertical.automaticTag == FiberHvTag::V);
+    CHECK(vertical.automaticCertainty == doctest::Approx(1.0));
+
+    const auto boundary = classifyFiberHv({
+        {0.0, 0.0, 0.0},
+        {std::sqrt(100.0 - 5.0 * 5.0), 0.0, 5.0},
+    });
+    CHECK(boundary.valid);
+    CHECK(boundary.zDistance == doctest::Approx(5.0));
+    CHECK(boundary.fiberLength == doctest::Approx(10.0));
+    CHECK(boundary.verticalScore == doctest::Approx(0.5));
+    CHECK(boundary.automaticTag == FiberHvTag::V);
+    CHECK(boundary.automaticCertainty == doctest::Approx(0.0));
+
+    const auto quarterVertical = classifyFiberHv({
+        {0.0, 0.0, 0.0},
+        {std::sqrt(800.0 * 800.0 - 200.0 * 200.0), 0.0, 200.0},
+    });
+    CHECK(quarterVertical.valid);
+    CHECK(quarterVertical.zDistance == doctest::Approx(200.0));
+    CHECK(quarterVertical.fiberLength == doctest::Approx(800.0));
+    CHECK(quarterVertical.verticalScore == doctest::Approx(0.25));
+    CHECK(quarterVertical.horizontalScore == doctest::Approx(0.75));
+    CHECK(quarterVertical.automaticTag == FiberHvTag::H);
+    CHECK(quarterVertical.automaticCertainty == doctest::Approx(0.5));
+
+    const auto invalid = classifyFiberHv({{0.0, 0.0, 0.0}});
+    CHECK_FALSE(invalid.valid);
+    CHECK(invalid.automaticTag == FiberHvTag::Unknown);
 }
