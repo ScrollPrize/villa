@@ -113,6 +113,20 @@ TEST_CASE("line annotation bottom cross slice spacing scales exponentially")
     CHECK(vc3d::line_annotation::bottomCrossSliceLinePosition(50.0, 6, 7, 101, spacing) == 95.0);
 }
 
+TEST_CASE("line annotation fixed current slice snaps only within quarter line position")
+{
+    const std::vector<double> controlPositions{12.0, 20.0, 40.0};
+
+    CHECK(vc3d::line_annotation::snappedControlPointLinePosition(19.75, controlPositions) ==
+          doctest::Approx(20.0));
+    CHECK(vc3d::line_annotation::snappedControlPointLinePosition(20.25, controlPositions) ==
+          doctest::Approx(20.0));
+    CHECK(vc3d::line_annotation::snappedControlPointLinePosition(20.2501, controlPositions) ==
+          doctest::Approx(20.2501));
+    CHECK(vc3d::line_annotation::snappedControlPointLinePosition(19.7499, controlPositions) ==
+          doctest::Approx(19.7499));
+}
+
 TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
 {
     CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");

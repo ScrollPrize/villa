@@ -18,6 +18,7 @@
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPushButton>
+#include <QRect>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWheelEvent>
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 
 namespace {
 
@@ -103,6 +105,54 @@ QPointF quadGridToScene(CChunkedVolumeViewer* viewer, QuadSurface* surface, int 
     const float surfaceX = (static_cast<float>(col) - static_cast<float>(points->cols) / 2.0f) / scale[0];
     const float surfaceY = (static_cast<float>(row) - static_cast<float>(points->rows) / 2.0f) / scale[1];
     return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+}
+
+std::optional<float> crossSliceControlPointDistanceThreshold(CChunkedVolumeViewer* viewer)
+{
+    if (!viewer || !viewer->graphicsView() || !viewer->graphicsView()->viewport()) {
+        return std::nullopt;
+    }
+
+    auto* view = viewer->graphicsView();
+    const QRect viewportRect = view->viewport()->rect();
+    if (viewportRect.width() <= 0 || viewportRect.height() <= 0) {
+        return std::nullopt;
+    }
+
+    const QPointF topLeftScene = view->mapToScene(viewportRect.topLeft());
+    const QPointF topRightScene = view->mapToScene(viewportRect.topRight());
+    const QPointF bottomLeftScene = view->mapToScene(viewportRect.bottomLeft());
+    const QPointF bottomRightScene = view->mapToScene(viewportRect.bottomRight());
+    if (!finiteScenePoint(topLeftScene) ||
+        !finiteScenePoint(topRightScene) ||
+        !finiteScenePoint(bottomLeftScene) ||
+        !finiteScenePoint(bottomRightScene)) {
+        return std::nullopt;
+    }
+
+    const cv::Vec3f topLeft = viewer->sceneToVolume(topLeftScene);
+    const cv::Vec3f topRight = viewer->sceneToVolume(topRightScene);
+    const cv::Vec3f bottomLeft = viewer->sceneToVolume(bottomLeftScene);
+    const cv::Vec3f bottomRight = viewer->sceneToVolume(bottomRightScene);
+    if (!finitePoint(topLeft) ||
+        !finitePoint(topRight) ||
+        !finitePoint(bottomLeft) ||
+        !finitePoint(bottomRight)) {
+        return std::nullopt;
+    }
+
+    const float visibleWidthVx = std::max(cv::norm(topRight - topLeft),
+                                          cv::norm(bottomRight - bottomLeft));
+    const float visibleHeightVx = std::max(cv::norm(bottomLeft - topLeft),
+                                           cv::norm(bottomRight - topRight));
+    if (!std::isfinite(visibleWidthVx) ||
+        !std::isfinite(visibleHeightVx) ||
+        visibleWidthVx <= 0.0f ||
+        visibleHeightVx <= 0.0f) {
+        return std::nullopt;
+    }
+
+    return std::min(visibleWidthVx, visibleHeightVx) * 0.05f;
 }
 
 } // namespace
@@ -774,7 +824,10 @@ void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
     seedStyle.penColor = QColor(255, 230, 0, 220);
     seedStyle.brushColor = QColor(255, 230, 0, 170);
     seedStyle.penWidth = 1.5;
-    seedStyle.z = 152.0;
+    seedStyle.z = 161.0;
+
+    ViewerOverlayControllerBase::OverlayStyle controlPointStyle = seedStyle;
+    controlPointStyle.z = 160.0;
 
     ViewerOverlayControllerBase::OverlayStyle markerStyle;
     markerStyle.penColor = QColor(0, 220, 255, 210);
@@ -861,7 +914,7 @@ void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
                         controlScene,
                         control.isSeed ? 5.5 : 5.0,
                         true,
-                        seedStyle});
+                        control.isSeed ? seedStyle : controlPointStyle});
                 }
             }
         }
@@ -880,7 +933,9 @@ void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
 
     if (!overlay.useSurfaceCenterLine) {
         for (const auto& control : overlay.controlPoints) {
-            addVolumePointMarker(control.point, control.isSeed ? 5.5 : 5.0, seedStyle);
+            addVolumePointMarker(control.point,
+                                 control.isSeed ? 11.0 : 10.0,
+                                 control.isSeed ? seedStyle : controlPointStyle);
         }
     }
 
@@ -893,7 +948,7 @@ void LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
 
     if (finitePoint(overlay.pointMarker)) {
         addVolumePointMarker(overlay.pointMarker,
-                             overlay.emphasizedPointMarker ? 6.0 : 4.0,
+                             overlay.emphasizedPointMarker ? 2.5 : 2.0,
                              overlay.emphasizedPointMarker ? currentMarkerStyle : markerStyle);
     }
 
@@ -1094,19 +1149,12 @@ double LineAnnotationDialog::snappedControlPointPosition(double position) const
     if (!_hasGeneratedViews || _generatedViews.controlPoints.empty()) {
         return position;
     }
-    double bestPosition = position;
-    double bestDistance = std::numeric_limits<double>::infinity();
+    std::vector<double> controlLinePositions;
+    controlLinePositions.reserve(_generatedViews.controlPoints.size());
     for (const auto& control : _generatedViews.controlPoints) {
-        if (!std::isfinite(control.linePosition)) {
-            continue;
-        }
-        const double distance = std::abs(control.linePosition - position);
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            bestPosition = control.linePosition;
-        }
+        controlLinePositions.push_back(control.linePosition);
     }
-    return bestDistance <= 0.5 ? bestPosition : position;
+    return vc3d::line_annotation::snappedControlPointLinePosition(position, controlLinePositions);
 }
 
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::stripOverlay() const
@@ -1131,15 +1179,25 @@ LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::stripOverlay() cons
 }
 
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(double linePosition,
-                                                                           bool emphasized) const
+                                                                           bool emphasized,
+                                                                           CChunkedVolumeViewer* viewer,
+                                                                           PlaneSurface* plane) const
 {
     GeneratedOverlay overlay;
     overlay.pointMarker = interpolatedLinePoint(linePosition);
     overlay.emphasizedPointMarker = emphasized;
-    for (const auto& control : _generatedViews.controlPoints) {
-        if (std::isfinite(control.linePosition) &&
-            std::abs(control.linePosition - linePosition) <= 0.5) {
-            overlay.controlPoints.push_back(control);
+
+    const std::optional<float> distanceThreshold =
+        plane ? crossSliceControlPointDistanceThreshold(viewer) : std::nullopt;
+    if (distanceThreshold) {
+        for (const auto& control : _generatedViews.controlPoints) {
+            if (!finitePoint(control.point)) {
+                continue;
+            }
+            const float distance = plane->pointDist(control.point);
+            if (std::isfinite(distance) && distance <= *distanceThreshold) {
+                overlay.controlPoints.push_back(control);
+            }
         }
     }
     return overlay;
@@ -1165,7 +1223,10 @@ void LineAnnotationDialog::rebuildGeneratedOverlays()
     if (_currentCutViewer) {
         applyOverlayForViewer("line-z-slice-current",
                               _currentCutViewer,
-                              zSliceOverlay(_currentLinePosition, true));
+                              zSliceOverlay(_currentLinePosition,
+                                            true,
+                                            _currentCutViewer,
+                                            _generatedViews.currentCutSurface.get()));
     }
 
     const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
@@ -1178,9 +1239,10 @@ void LineAnnotationDialog::rebuildGeneratedOverlays()
             continue;
         }
         const double position = bottomSliceLinePosition(slot, bottomCount);
+        const auto& plane = _generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].second;
         applyOverlayForViewer(_generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].first,
                               viewer,
-                              zSliceOverlay(position, false));
+                              zSliceOverlay(position, false, viewer, plane.get()));
     }
 }
 
@@ -1338,7 +1400,12 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
         return false;
     }
     if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
-        setCurrentCutFollowsStripMouse(!_currentCutFollowsStripMouse);
+        if (_currentCutFollowsStripMouse) {
+            setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
+            setCurrentCutFollowsStripMouse(false);
+        } else {
+            setCurrentCutFollowsStripMouse(true);
+        }
         event->accept();
         return true;
     }

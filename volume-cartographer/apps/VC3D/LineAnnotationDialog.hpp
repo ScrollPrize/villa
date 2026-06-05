@@ -154,7 +154,10 @@ private:
     void clearControlPointContextPreview(const std::string& surfaceName,
                                          CChunkedVolumeViewer* viewer);
     GeneratedOverlay stripOverlay() const;
-    GeneratedOverlay zSliceOverlay(double linePosition, bool emphasized) const;
+    GeneratedOverlay zSliceOverlay(double linePosition,
+                                   bool emphasized,
+                                   CChunkedVolumeViewer* viewer,
+                                   PlaneSurface* plane) const;
     cv::Vec3f interpolatedLinePoint(double linePosition) const;
     cv::Vec3f interpolatedLineTangent(double linePosition) const;
     cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
