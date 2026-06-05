@@ -201,15 +201,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _editMenu = new QMenu(QObject::tr("&Edit"), qWindow);
 
     _viewMenu = new QMenu(QObject::tr("&View"), qWindow);
-    _viewMenu->addAction(qWindow->ui.dockWidgetVolumes->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetSegmentation->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetDistanceTransform->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetViewerControls->toggleViewAction());
-
-    if (qWindow->_point_collection_widget) {
-        _viewMenu->addAction(qWindow->_point_collection_widget->toggleViewAction());
-    }
-
+    qWindow->populateDockToggleMenu(_viewMenu);
     _viewMenu->addAction(_mirrorCursorAct);
     _viewMenu->addSeparator();
     _viewMenu->addAction(_resetViewsAct);

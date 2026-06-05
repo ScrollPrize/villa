@@ -119,6 +119,35 @@ namespace
 {
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
 
+class DockMenuMainWindow : public QMainWindow
+{
+public:
+    using DockMenuBuilder = std::function<void(QMenu*)>;
+
+    explicit DockMenuMainWindow(QWidget* parent = nullptr)
+        : QMainWindow(parent)
+    {
+    }
+
+    void setDockMenuBuilder(DockMenuBuilder builder)
+    {
+        _dockMenuBuilder = std::move(builder);
+    }
+
+protected:
+    QMenu* createPopupMenu() override
+    {
+        auto* menu = new QMenu(this);
+        if (_dockMenuBuilder) {
+            _dockMenuBuilder(menu);
+        }
+        return menu;
+    }
+
+private:
+    DockMenuBuilder _dockMenuBuilder;
+};
+
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
 {
     if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(widget)) {
@@ -495,7 +524,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
     QWidget* segmentCentralWidget = takeCentralWidget();
-    _segmentWorkspaceWindow = new QMainWindow(this);
+    auto* segmentWorkspaceWindow = new DockMenuMainWindow(this);
+    segmentWorkspaceWindow->setDockMenuBuilder([this](QMenu* menu) {
+        populateDockToggleMenu(menu);
+    });
+    _segmentWorkspaceWindow = segmentWorkspaceWindow;
     _segmentWorkspaceWindow->setObjectName(QStringLiteral("segmentWorkspaceWindow"));
     _segmentWorkspaceWindow->setDockOptions(dockOptions());
     _segmentWorkspaceWindow->setCentralWidget(segmentCentralWidget);
@@ -1059,6 +1092,34 @@ CWindow::~CWindow()
         _lineAnnotationController->saveOpenFibers();
     }
     CloseVolume();
+}
+
+void CWindow::populateDockToggleMenu(QMenu* menu) const
+{
+    if (!menu) {
+        return;
+    }
+
+    auto addDock = [menu](QDockWidget* dock) {
+        if (dock) {
+            menu->addAction(dock->toggleViewAction());
+        }
+    };
+
+    addDock(ui.dockWidgetVolumes);
+    addDock(ui.dockWidgetSegmentation);
+    addDock(ui.dockWidgetDistanceTransform);
+    addDock(ui.dockWidgetViewerControls);
+    addDock(ui.dockWidgetPreprocessing);
+    addDock(ui.dockWidgetNormalVis);
+    addDock(ui.dockWidgetView);
+    addDock(ui.dockWidgetOverlay);
+    addDock(ui.dockWidgetRenderSettings);
+    addDock(ui.dockWidgetComposite);
+    addDock(ui.dockWidgetPostprocessing);
+    addDock(_lasagnaDock);
+    addDock(_point_collection_widget);
+    addDock(_fiberWidget);
 }
 
 VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)

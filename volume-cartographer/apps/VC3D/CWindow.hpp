@@ -69,6 +69,7 @@ class SegmentationGrower;
 class ViewerControlsPanel;
 class QLabel;
 class QMainWindow;
+class QMenu;
 class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
@@ -119,6 +120,7 @@ protected:
 private:
     void CreateWidgets(void);
     QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
+    void populateDockToggleMenu(QMenu* menu) const;
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void repeatLastLasagnaAction();
