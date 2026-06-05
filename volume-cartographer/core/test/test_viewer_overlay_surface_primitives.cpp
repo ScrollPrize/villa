@@ -17,6 +17,17 @@
 
 namespace {
 
+struct OffscreenQtPlatformGuard {
+    OffscreenQtPlatformGuard()
+    {
+        if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
+            qputenv("QT_QPA_PLATFORM", "offscreen");
+        }
+    }
+};
+
+const OffscreenQtPlatformGuard kOffscreenQtPlatformGuard;
+
 class FakeViewer final : public QObject, public VolumeViewerBase {
     Q_OBJECT
 
