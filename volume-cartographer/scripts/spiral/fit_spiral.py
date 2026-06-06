@@ -86,11 +86,12 @@ default_config = {
     'gap_expander_lr_scale': 0.3,
     'linear_z_resolution': 12,
     'initial_dr_per_winding': 4.,
-    'radius_loss_margin': 0.025,
+    'patch_radius_loss_margin': 0.025,
     'patch_radius_loss_inv': False,
     'patch_loss_z_margin': 0,
     'patch_dt_norm_p': 0.5,
     'patch_dt_within_patch_norm_p': 3.0,
+    'patch_dt_loss_margin': 0.025,
     'num_patches_per_step': 120,
     'num_patches_per_step_for_dt': 80,
     'num_points_per_patch': 800,
@@ -104,8 +105,10 @@ default_config = {
     'track_num_points_per_step': 8,
     'track_exclusion_radius': 12.0,
     'track_radius_target': 'mean',
+    'track_radius_loss_margin': 0.025,
     'track_dt_within_track_norm_p': 3.0,  # within a track; -> inf strongly penalises isolated badly-aligned points
     'track_dt_norm_p': 0.5,  # across tracks; -> 0 prefers many fully-satisfied tracks (winner-take-all snapping)
+    'track_dt_loss_margin': 0.025,
     'normals_num_points': 2000,
     'pcl_normals_num_points': 4000,
     'pcl_normals_sample_radius': 1,
@@ -1225,7 +1228,8 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
     umbilicus_spiral = extra_spiral[:n_umb]
     shell_spiral_zyxs = extra_spiral[n_umb:] if shell_valid_zyxs is not None else None
 
-    hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
+    radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
+    dt_hinge_margin = dr_per_winding.detach() * cfg['patch_dt_loss_margin']
 
     # Each patch row/col should lie at constant shifted-radius.
     radius_shifted_radii = all_shifted_radii[:, :num_patches_for_radius]
@@ -1249,12 +1253,12 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         radius_target_scroll_zyxs = slice_to_spiral_transform.inv(radius_target_spiral_zyxs.reshape(-1, 3)).reshape(*radius_target_spiral_zyxs.shape)
 
         radius_point_distances = torch.linalg.norm(radius_slice_zyxs - radius_target_scroll_zyxs, dim=-1)
-        mean_radius_deviation = F.relu(radius_point_distances - hinge_margin).mean()
+        mean_radius_deviation = F.relu(radius_point_distances - radius_hinge_margin).mean()
     else:
         # Penalise deviation from the track's mean shifted-radius directly in spiral space.
         mean_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
         radius_deviations = (radius_shifted_radii - mean_radii).abs()
-        radius_deviations_hinge = F.relu(radius_deviations - hinge_margin)
+        radius_deviations_hinge = F.relu(radius_deviations - radius_hinge_margin)
         mean_radius_deviation = radius_deviations_hinge.mean()
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
@@ -1263,7 +1267,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
     if shell_spiral_zyxs is not None:
         _, _, shell_shifted_radii = get_theta_and_radii(shell_spiral_zyxs[..., 1:], dr_per_winding)
         shell_target = dr_per_winding * float(shell_outer_winding_idx)
-        shell_patch_radius_loss = F.relu((shell_shifted_radii - shell_target).abs() - hinge_margin).mean()
+        shell_patch_radius_loss = F.relu((shell_shifted_radii - shell_target).abs() - radius_hinge_margin).mean()
     else:
         shell_patch_radius_loss = torch.zeros([], device=dr_per_winding.device)
 
@@ -1291,7 +1295,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
 
         point_distances = torch.linalg.norm(dt_slice_zyxs - target_scroll_zyxs, dim=-1)
-        point_distances = F.relu(point_distances - hinge_margin) + 1.e-5  # epsilon to avoid NaN in p-norm backward
+        point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5  # epsilon to avoid NaN in p-norm backward
         track_losses = (point_distances ** within_patch_norm_p).mean(dim=-1) ** (1 / within_patch_norm_p)
         patch_dt_loss = ((track_losses ** dt_norm_p).sum() / track_losses.numel()) ** (1 / dt_norm_p)
     else:
@@ -2035,11 +2039,12 @@ def get_unattached_pcl_strip_losses(
     # Normalise so a pcl with mixed annotations still reads as a single 'strip'.
     normalised_radii = shifted_radii - winding_t * dr_per_winding
 
-    hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
+    radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
+    dt_hinge_margin = dr_per_winding.detach() * cfg['patch_dt_loss_margin']
 
     mean_radii = normalised_radii.mean(dim=-1, keepdim=True)
     radius_deviations = (normalised_radii - mean_radii).abs()
-    radius_loss = F.relu(radius_deviations - hinge_margin).mean()
+    radius_loss = F.relu(radius_deviations - radius_hinge_margin).mean()
 
     if not compute_dt:
         return radius_loss, zero
@@ -2057,7 +2062,7 @@ def get_unattached_pcl_strip_losses(
     within_p = cfg['patch_dt_within_patch_norm_p']
     across_p = cfg['patch_dt_norm_p']
     point_distances = torch.linalg.norm(zyxs_t - target_scroll_zyxs, dim=-1)
-    point_distances = F.relu(point_distances - hinge_margin) + 1.e-5
+    point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
     track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
     dt_loss = ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
 
@@ -3636,7 +3641,8 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, num_points_per_track, 3)
     theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
     shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
-    hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
+    radius_hinge_margin = dr_per_winding.detach() * cfg['track_radius_loss_margin']
+    dt_hinge_margin = dr_per_winding.detach() * cfg['track_dt_loss_margin']
 
     if cfg['track_radius_target'] == 'mean':
         radius_target_per_track = shifted_radii.mean(dim=-1, keepdim=True)
@@ -3645,7 +3651,7 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     else:
         raise ValueError(f"track_radius_target must be 'mean' or 'median', got {cfg['track_radius_target']!r}")
     deviations = (shifted_radii - radius_target_per_track).abs()
-    radius_loss = F.relu(deviations - hinge_margin).mean()
+    radius_loss = F.relu(deviations - radius_hinge_margin).mean()
 
     if not compute_dt:
         return radius_loss, zero
@@ -3662,7 +3668,7 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     within_p = cfg['track_dt_within_track_norm_p']
     across_p = cfg['track_dt_norm_p']
     point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
-    point_distances = F.relu(point_distances - hinge_margin) + 1.e-5
+    point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
     track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
     dt_loss = ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
 
