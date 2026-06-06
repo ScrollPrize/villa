@@ -2566,6 +2566,7 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         'lengths_cpu': lengths_cpu,
         'spiral_zyxs': spiral_zyxs,
         'theta': theta,
+        'adjustments': adjustments,
         'unwrapped_shifted': unwrapped_shifted,
         'normalised_radii': normalised_radii,
     }
@@ -2583,6 +2584,7 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
     strip_id = ctx['strip_id']
     windings = ctx['windings']
     theta = ctx['theta']
+    adjustments = ctx['adjustments']
     unwrapped_shifted = ctx['unwrapped_shifted']
     spiral_zyxs = ctx['spiral_zyxs']
     zyxs = ctx['zyxs']
@@ -2597,7 +2599,7 @@ def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
         target_shifted = target_normalised + windings * dr
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
-        target_radii = target_shifted + theta / (2 * np.pi) * dr
+        target_radii = target_shifted - adjustments + theta / (2 * np.pi) * dr
         target_spiral_zyxs = torch.stack([
             spiral_zyxs[..., 0],
             torch.sin(theta) * target_radii,
