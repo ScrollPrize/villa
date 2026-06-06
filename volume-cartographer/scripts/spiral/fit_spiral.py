@@ -104,6 +104,8 @@ default_config = {
     'track_num_points_per_step': 8,
     'track_exclusion_radius': 12.0,
     'track_radius_target': 'mean',
+    'track_dt_within_track_norm_p': 3.0,  # within a track; -> inf strongly penalises isolated badly-aligned points
+    'track_dt_norm_p': 0.5,  # across tracks; -> 0 prefers many fully-satisfied tracks (winner-take-all snapping)
     'normals_num_points': 2000,
     'pcl_normals_num_points': 4000,
     'pcl_normals_sample_radius': 1,
@@ -3657,8 +3659,8 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     ], dim=-1).detach()
     target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
 
-    within_p = cfg['patch_dt_within_patch_norm_p']
-    across_p = cfg['patch_dt_norm_p']
+    within_p = cfg['track_dt_within_track_norm_p']
+    across_p = cfg['track_dt_norm_p']
     point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
     point_distances = F.relu(point_distances - hinge_margin) + 1.e-5
     track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
