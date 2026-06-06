@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace vc::lasagna {
 
@@ -26,6 +27,10 @@ public:
     LasagnaNormalSampler& operator=(LasagnaNormalSampler&&) noexcept;
 
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override;
+    [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const;
+    [[nodiscard]] double windingDistance(const cv::Vec3d& a,
+                                         const cv::Vec3d& b,
+                                         double stepVx = 8.0) const;
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(
         const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] NormalPrefetchReport prefetchNormalSamples(

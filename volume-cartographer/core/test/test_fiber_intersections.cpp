@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 namespace {
 
@@ -38,6 +39,7 @@ TEST_CASE("Fiber R-tree candidate search uses straight segment distance")
 
     vc::atlas::FiberIntersectionBroadPhaseOptions options;
     options.maxDistance = 0.25;
+    options.maxSampleSpacing = 1.0;
     const auto candidates = index.candidatesForFiber(a, options);
 
     REQUIRE(candidates.size() == 1);
@@ -58,6 +60,7 @@ TEST_CASE("Fiber R-tree filters stale generations and recent fibers override com
 
     vc::atlas::FiberIntersectionBroadPhaseOptions options;
     options.maxDistance = 0.25;
+    options.maxSampleSpacing = 1.0;
     CHECK(index.candidatesForFiber(source, options).empty());
     CHECK(index.generation(2) == 2);
 }
@@ -76,11 +79,116 @@ TEST_CASE("Fiber R-tree preserves separated local intersections before clusterin
 
     vc::atlas::FiberIntersectionBroadPhaseOptions options;
     options.maxDistance = 0.25;
+    options.maxSampleSpacing = 1.0;
     options.clusterArclength = 2.0;
     const auto candidates = index.candidatesForFiber(source, options);
 
     REQUIRE(candidates.size() == 2);
     CHECK(candidates[0].sourceSegmentIndex != candidates[1].sourceSegmentIndex);
+}
+
+TEST_CASE("Fiber point R-tree indexes interpolated dense samples for long sparse segments")
+{
+    vc::atlas::FiberSpatialIndex index;
+    auto source = fiber(1, 1, {p(250.0 / 3.0, 1.0, 0), p(250.0 / 3.0, 2.0, 0)});
+    auto target = fiber(2, 1, {p(0, 0, 0), p(250, 0, 0)});
+    index.upsertCommitted(target);
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions options;
+    options.maxDistance = 1.1;
+    const auto candidates = index.candidatesForFiber(source, options);
+
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates[0].targetFiberId == 2);
+    CHECK(candidates[0].targetArclength == doctest::Approx(250.0 / 3.0));
+    CHECK(candidates[0].straightDistance == doctest::Approx(1.0));
+}
+
+TEST_CASE("Fiber point R-tree direct search converges from offset dense seed")
+{
+    vc::atlas::FiberSpatialIndex index;
+    auto source = fiber(1, 1, {p(0, 0, 0), p(200, 0, 0)});
+    auto target = fiber(2, 1, {p(100, -50, 0), p(100, 50, 0)});
+    index.upsertCommitted(target);
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions options;
+    options.maxDistance = 15.0;
+    options.maxSampleSpacing = 10.0;
+    options.seedStride = 100;
+    options.clusterArclength = 0.1;
+    const auto candidates = index.candidatesForFiber(source, options);
+
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates[0].sourceArclength == doctest::Approx(100.0));
+    CHECK(candidates[0].targetArclength == doctest::Approx(50.0));
+    CHECK(candidates[0].straightDistance == doctest::Approx(0.0));
+}
+
+TEST_CASE("Fiber point R-tree coverage suppresses same-target repeated hits only")
+{
+    auto source = fiber(1, 1, {p(0, 0, 0), p(0, 1, 0)});
+    auto targetA = fiber(2, 1, {p(-0.1, 0, 0), p(0.1, 0, 0), p(0.2, 0, 0)});
+    auto targetB = fiber(3, 1, {p(0, -0.1, 0), p(0, 0.1, 0), p(0, 0.2, 0)});
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions options;
+    options.maxDistance = 0.3;
+    options.maxSampleSpacing = 1.0;
+    options.clusterArclength = 0.0;
+
+    vc::atlas::FiberSpatialIndex oneTarget;
+    oneTarget.upsertCommitted(targetA);
+    CHECK(oneTarget.candidatesForFiber(source, options).size() == 1);
+
+    vc::atlas::FiberSpatialIndex twoTargets;
+    twoTargets.upsertCommitted(targetA);
+    twoTargets.upsertCommitted(targetB);
+    const auto candidates = twoTargets.candidatesForFiber(source, options);
+    REQUIRE(candidates.size() == 2);
+    std::set<uint64_t> targets;
+    for (const auto& candidate : candidates) {
+        targets.insert(candidate.targetFiberId);
+    }
+    CHECK(targets == std::set<uint64_t>{2, 3});
+}
+
+TEST_CASE("Fiber intersection search runs two-sided discovery and preserves distinct minima")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberIntersectionCache cache;
+    auto source = fiber(1, 1, {p(0, 0, 0), p(400, 0, 0)});
+    auto target = fiber(2, 1, {
+        p(100, -20, 0),
+        p(100, 20, 0),
+        p(300, 20, 0),
+        p(300, -20, 0),
+    });
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    broad.maxDistance = 1.0;
+    broad.maxSampleSpacing = 1.0;
+    broad.clusterArclength = 2.0;
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.deduplicateArclength = 2.0;
+
+    const auto results = vc::atlas::searchFiberIntersections(
+        {source, target},
+        {1},
+        {2},
+        index,
+        &cache,
+        broad,
+        ceres);
+
+    REQUIRE(results.size() == 2);
+    std::vector<double> sourceArclengths;
+    for (const auto& result : results) {
+        CHECK(result.sourceFiberId == 1);
+        CHECK(result.targetFiberId == 2);
+        sourceArclengths.push_back(result.sourceArclength);
+    }
+    std::sort(sourceArclengths.begin(), sourceArclengths.end());
+    CHECK(sourceArclengths[0] == doctest::Approx(100.0).epsilon(1e-5));
+    CHECK(sourceArclengths[1] == doctest::Approx(300.0).epsilon(1e-5));
 }
 
 TEST_CASE("Fiber Ceres refinement uses one solve and sign-ambiguous normal residuals")

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -23,12 +24,19 @@ public:
         std::vector<cv::Vec3d> controlPoints;
     };
 
+    struct ConnectionSegment {
+        cv::Vec3d sourcePoint{0.0, 0.0, 0.0};
+        cv::Vec3d targetPoint{0.0, 0.0, 0.0};
+        double maxDistanceVx{1.0};
+    };
+
     struct SliceData {
         std::string surfaceName;
         uint64_t selectedFiberId{0};
         vc3d::fiber_slice::Plane plane;
         std::vector<cv::Vec3d> fitSamples;
         std::vector<FiberData> fibers;
+        std::optional<ConnectionSegment> connectionSegment;
     };
 
     explicit FiberSliceOverlayController(QObject* parent = nullptr);
@@ -42,9 +50,10 @@ protected:
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    QPointF projectedVolumeToScene(VolumeViewerBase* viewer, const cv::Vec3d& point) const;
-    double currentViewportMinSpan(VolumeViewerBase* viewer) const;
+    QPointF projectedVolumeToScene(VolumeViewerBase* viewer,
+                                   const SliceData& slice,
+                                   const cv::Vec3d& point) const;
+    double currentViewportMinSpan(VolumeViewerBase* viewer, const SliceData& slice) const;
 
-    VolumeViewerBase* _activeViewer{nullptr};
-    std::optional<SliceData> _slice;
+    std::unordered_map<VolumeViewerBase*, SliceData> _slices;
 };

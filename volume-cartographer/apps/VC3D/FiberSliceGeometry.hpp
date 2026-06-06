@@ -38,6 +38,13 @@ struct Plane {
     cv::Vec3d normal{0.0, 0.0, 1.0};
 };
 
+struct ArclengthSample {
+    bool valid = false;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    cv::Vec3d tangent{1.0, 0.0, 0.0};
+    double arclength = 0.0;
+};
+
 struct SegmentPlaneIntersection {
     cv::Vec3d point{0.0, 0.0, 0.0};
     cv::Vec3d tangent{0.0, 0.0, 0.0};
@@ -67,6 +74,18 @@ double distanceScaledSize(double distanceToPlane,
                           double minVisibleViewportSpanVx,
                           double fullSize,
                           double minSize);
+ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoints,
+                                          double arclength);
+PlaneFit planeFromNormalAndTangent(const cv::Vec3d& origin,
+                                   const cv::Vec3d& normal,
+                                   const cv::Vec3d& tangent);
+PlaneFit planeFromDirections(const cv::Vec3d& origin,
+                             const cv::Vec3d& firstDirection,
+                             const cv::Vec3d& secondDirection);
+double connectorNormalizedThickness(double distanceToSliceVx,
+                                    double maxDistanceVx,
+                                    double fullSize,
+                                    double minSize);
 
 std::optional<SegmentPlaneIntersection> segmentPlaneIntersection(const cv::Vec3d& p0,
                                                                  const cv::Vec3d& p1,

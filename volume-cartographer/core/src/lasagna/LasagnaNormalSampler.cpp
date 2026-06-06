@@ -1025,12 +1025,52 @@ public:
         : nx_(bindChannel(dataset.manifest(), "nx"))
         , ny_(bindChannel(dataset.manifest(), "ny"))
         , gradMag_(bindChannel(dataset.manifest(), "grad_mag"))
+        , gradMagDecodeScale_(std::max(
+              kEpsilon,
+              dataset.manifest().raw.value("grad_mag_encode_scale", 1000.0) /
+                  dataset.manifest().raw.value("grad_mag_factor", 1.0)))
         , options_(options)
         , cache_(sharedNormalChunkCache(options.maxCachedBytes))
     {
         if (nx_.shapeZYX != ny_.shapeZYX) {
             throw std::runtime_error("Lasagna nx and ny channels must have matching spatial shapes");
         }
+    }
+
+    [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const
+    {
+        const auto gradMag = sampleChannel(gradMag_, *cache_, volumePoint);
+        if (!gradMag.has_value() || *gradMag < 0.0) {
+            return std::nullopt;
+        }
+        return *gradMag / gradMagDecodeScale_;
+    }
+
+    [[nodiscard]] double windingDistance(const cv::Vec3d& a,
+                                         const cv::Vec3d& b,
+                                         double stepVx) const
+    {
+        const cv::Vec3d delta = b - a;
+        const double distanceVx = length(delta);
+        if (!(distanceVx > kEpsilon) || !std::isfinite(distanceVx)) {
+            return 0.0;
+        }
+        const double step = std::isfinite(stepVx) && stepVx > 0.0 ? stepVx : 8.0;
+        const int intervals = std::max(1, static_cast<int>(std::ceil(distanceVx / step)));
+        double integral = 0.0;
+        for (int i = 0; i < intervals; ++i) {
+            const double t0 = static_cast<double>(i) / static_cast<double>(intervals);
+            const double t1 = static_cast<double>(i + 1) / static_cast<double>(intervals);
+            const cv::Vec3d p0 = a * (1.0 - t0) + b * t0;
+            const cv::Vec3d p1 = a * (1.0 - t1) + b * t1;
+            const auto d0 = sampleWindingDensity(p0);
+            const auto d1 = sampleWindingDensity(p1);
+            if (!d0.has_value() || !d1.has_value()) {
+                return std::numeric_limits<double>::infinity();
+            }
+            integral += 0.5 * (*d0 + *d1) * (distanceVx / static_cast<double>(intervals));
+        }
+        return integral;
     }
 
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const
@@ -1295,6 +1335,7 @@ private:
     ChannelBinding nx_;
     ChannelBinding ny_;
     ChannelBinding gradMag_;
+    double gradMagDecodeScale_ = 1000.0;
     LasagnaNormalSamplerOptions options_;
     std::shared_ptr<ChunkCache> cache_;
 };
@@ -1315,6 +1356,18 @@ LasagnaNormalSampler& LasagnaNormalSampler::operator=(LasagnaNormalSampler&&) no
 NormalSample LasagnaNormalSampler::sampleNormal(const cv::Vec3d& volumePoint) const
 {
     return impl_->sampleNormal(volumePoint);
+}
+
+std::optional<double> LasagnaNormalSampler::sampleWindingDensity(const cv::Vec3d& volumePoint) const
+{
+    return impl_->sampleWindingDensity(volumePoint);
+}
+
+double LasagnaNormalSampler::windingDistance(const cv::Vec3d& a,
+                                             const cv::Vec3d& b,
+                                             double stepVx) const
+{
+    return impl_->windingDistance(a, b, stepVx);
 }
 
 NormalSampleWithDerivative LasagnaNormalSampler::sampleNormalWithDerivative(

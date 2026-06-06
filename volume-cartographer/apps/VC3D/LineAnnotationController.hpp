@@ -55,6 +55,7 @@ public:
 
     struct FiberSummary {
         uint64_t id = 0;
+        std::string name;
         int controlPointCount = 0;
         int linePointCount = 0;
         double lengthVx = 0.0;
@@ -96,6 +97,8 @@ public:
     void recalculateAllFiberHvClassifications();
     void createAtlasFromFiber(uint64_t fiberId);
     void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
+    void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
+                                    QMdiArea* targetArea);
     void saveOpenFibers();
     void closeFiberWindowForSurface(const std::string& surfaceName);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,

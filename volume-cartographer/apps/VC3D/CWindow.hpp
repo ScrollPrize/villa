@@ -131,6 +131,7 @@ private:
     void startAtlasFiberIntersectionSearch();
     void cancelAtlasFiberIntersectionSearch();
     void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results);
+    void openAtlasSearchResult(int sortedResultIndex);
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void switchToFiberSliceWorkspace();
@@ -243,6 +244,7 @@ private:
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
+    QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
@@ -252,9 +254,11 @@ private:
     std::string _currentAtlasName;
     vc::atlas::FiberSpatialIndex _fiberIntersectionIndex;
     vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
+    std::vector<vc::atlas::FiberIntersectionResult> _atlasSearchResults;
     bool _atlasSearchCancelRequested{false};
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
+    QMdiArea* _intersectionsMdiArea{nullptr};
 
     bool can_change_volume_();
 

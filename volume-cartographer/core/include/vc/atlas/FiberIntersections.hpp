@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -9,6 +10,10 @@
 #include <vector>
 
 #include <opencv2/core/types.hpp>
+
+namespace vc::lasagna {
+class LasagnaNormalSampler;
+}
 
 namespace vc::atlas {
 
@@ -36,13 +41,17 @@ struct FiberSegmentEntry {
 };
 
 struct FiberIntersectionBroadPhaseOptions {
-    double maxDistance = 2000.0;
+    double maxDistance = 500.0;
+    double maxSampleSpacing = 100.0;
+    int seedStride = 100;
     double clusterArclength = 8.0;
 
     friend bool operator==(const FiberIntersectionBroadPhaseOptions& a,
                            const FiberIntersectionBroadPhaseOptions& b)
     {
         return a.maxDistance == b.maxDistance &&
+               a.maxSampleSpacing == b.maxSampleSpacing &&
+               a.seedStride == b.seedStride &&
                a.clusterArclength == b.clusterArclength;
     }
 };
@@ -82,6 +91,7 @@ struct FiberIntersectionResult {
     uint64_t targetGeneration = 1;
     double candidateDistance = 0.0;
     double refinedScore = 0.0;
+    double windingDistance = std::numeric_limits<double>::infinity();
     double sourceArclength = 0.0;
     double targetArclength = 0.0;
     cv::Vec3d sourcePoint{0.0, 0.0, 0.0};
@@ -162,6 +172,8 @@ private:
             combine(std::hash<uint64_t>{}(key.fiberB));
             combine(std::hash<uint64_t>{}(key.generationB));
             combine(std::hash<double>{}(key.broad.maxDistance));
+            combine(std::hash<double>{}(key.broad.maxSampleSpacing));
+            combine(std::hash<int>{}(key.broad.seedStride));
             combine(std::hash<double>{}(key.broad.clusterArclength));
             combine(std::hash<int>{}(key.ceres.maxIterations));
             combine(std::hash<double>{}(key.ceres.distanceWeight));
@@ -179,7 +191,8 @@ private:
     const FiberPolyline& source,
     const FiberPolyline& target,
     const FiberIntersectionCandidate& candidate,
-    const FiberIntersectionCeresOptions& options);
+    const FiberIntersectionCeresOptions& options,
+    const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr);
 
 [[nodiscard]] std::vector<FiberIntersectionResult> deduplicateFiberIntersectionResults(
     std::vector<FiberIntersectionResult> results,
@@ -192,6 +205,7 @@ private:
     FiberSpatialIndex& index,
     FiberIntersectionCache* cache,
     const FiberIntersectionBroadPhaseOptions& broad,
-    const FiberIntersectionCeresOptions& ceres);
+    const FiberIntersectionCeresOptions& ceres,
+    const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr);
 
 } // namespace vc::atlas

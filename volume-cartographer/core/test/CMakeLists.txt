@@ -152,6 +152,13 @@ vc_add_test(NAME test_line_annotation_generated_views
     LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_fiber_slice_geometry
+    SOURCES test_fiber_slice_geometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+    LIBS doctest::doctest vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
 
@@ -224,6 +231,13 @@ target_link_libraries(bench_lasagna_line_edit PRIVATE vc_lasagna)
 if(VC_RUN_BENCHES)
     add_test(NAME bench_lasagna_line_edit COMMAND bench_lasagna_line_edit --help)
     set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_lasagna_line_edit)
+endif()
+
+add_executable(bench_fiber_intersections bench_fiber_intersections.cpp)
+target_link_libraries(bench_fiber_intersections PRIVATE vc_atlas vc_lasagna nlohmann_json::nlohmann_json)
+if(VC_RUN_BENCHES)
+    add_test(NAME bench_fiber_intersections COMMAND bench_fiber_intersections --help)
+    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_fiber_intersections)
 endif()
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary

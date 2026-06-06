@@ -65,6 +65,7 @@
 #include <QPointer>
 #include <QListView>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include "vc/core/types/Segmentation.hpp"
 #include <limits>
@@ -73,6 +74,7 @@
 #include <utility>
 #include <filesystem>
 #include <system_error>
+#include <unordered_map>
 #include <vector>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -115,6 +117,8 @@
 #include "vc/core/util/Tiff.hpp"
 #include "vc/atlas/Atlas.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include <utils/zarr.hpp>
 
 
@@ -475,17 +479,13 @@ QDockWidget* createAtlasSearchDock(QWidget* parent)
 
     auto* table = new QTableWidget(content);
     table->setObjectName(QStringLiteral("atlasSearchResultTable"));
-    table->setColumnCount(9);
+    table->setColumnCount(5);
     table->setHorizontalHeaderLabels({
-        QObject::tr("Source"),
-        QObject::tr("Target"),
-        QObject::tr("Candidate dist"),
-        QObject::tr("Score"),
-        QObject::tr("Source s"),
-        QObject::tr("Target s"),
-        QObject::tr("Converged"),
-        QObject::tr("Cache"),
-        QObject::tr("Message"),
+        QObject::tr("Distance (windings)"),
+        QObject::tr("Source fiber"),
+        QObject::tr("Target fiber"),
+        QObject::tr("Src idx"),
+        QObject::tr("Tgt idx"),
     });
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -698,12 +698,17 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _fiberSliceWorkspaceWindow->setObjectName(QStringLiteral("fiberSliceWorkspaceWindow"));
     _fiberSliceWorkspaceWindow->setDockOptions(dockOptions());
 
+    _intersectionsWorkspaceWindow = new QMainWindow(this);
+    _intersectionsWorkspaceWindow->setObjectName(QStringLiteral("intersectionsWorkspaceWindow"));
+    _intersectionsWorkspaceWindow->setDockOptions(dockOptions());
+
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
     _workspaceTabs->addTab(_atlasWorkspaceWindow, tr("Atlas"));
     _workspaceTabs->addTab(_fiberSliceWorkspaceWindow, tr("Fiber Slice"));
+    _workspaceTabs->addTab(_intersectionsWorkspaceWindow, tr("Intersections"));
     setCentralWidget(_workspaceTabs);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
     auto* lasagnaEscapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), _lasagnaWorkspaceWindow);
@@ -2273,6 +2278,33 @@ void CWindow::createAtlasWorkspace()
         if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
             connect(cancel, &QPushButton::clicked, this, &CWindow::cancelAtlasFiberIntersectionSearch);
         }
+        if (auto* table = dock->widget()->findChild<QTableWidget*>(QStringLiteral("atlasSearchResultTable"))) {
+            auto openFromItem = [this, table](QTableWidgetItem* item) {
+                if (!item || table->property("vc_atlas_opening_result").toBool()) {
+                    return;
+                }
+                bool ok = false;
+                const int resultIndex = item->data(Qt::UserRole).toInt(&ok);
+                if (!ok) {
+                    return;
+                }
+                table->setProperty("vc_atlas_opening_result", true);
+                QTimer::singleShot(0, table, [table]() {
+                    table->setProperty("vc_atlas_opening_result", false);
+                });
+                openAtlasSearchResult(resultIndex);
+            };
+            connect(table,
+                    &QTableWidget::cellDoubleClicked,
+                    this,
+                    [table, openFromItem](int row, int /*column*/) {
+                        openFromItem(table->item(row, 0));
+                    });
+            connect(table,
+                    &QTableWidget::itemDoubleClicked,
+                    this,
+                    openFromItem);
+        }
     };
     connectSearchDock(_atlasSearchDock);
     connectSearchDock(_atlasWorkspaceSearchDock);
@@ -2446,6 +2478,18 @@ void CWindow::startAtlasFiberIntersectionSearch()
     }
     vc::atlas::FiberIntersectionCeresOptions ceres;
 
+    std::filesystem::path lasagnaManifestPath;
+    if (_state && _state->vpkg()) {
+        lasagnaManifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
+    }
+    if (lasagnaManifestPath.empty()) {
+        QMessageBox::warning(this,
+                             tr("Atlas Object Search"),
+                             tr("Select a local Lasagna dataset before searching. "
+                                "Intersection distance is measured in grad_mag winding-integral space."));
+        return;
+    }
+
     _atlasSearchCancelRequested = false;
     for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
         if (!dock || !dock->widget()) {
@@ -2465,6 +2509,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
             table->setRowCount(0);
         }
     }
+    _atlasSearchResults.clear();
 
     auto* watcher = new QFutureWatcher<std::vector<vc::atlas::FiberIntersectionResult>>(this);
     connect(watcher,
@@ -2489,22 +2534,73 @@ void CWindow::startAtlasFiberIntersectionSearch()
     watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
                                           inAtlas = std::move(inAtlas),
                                           allFiberIds = std::move(allFiberIds),
+                                          lasagnaManifestPath = std::move(lasagnaManifestPath),
                                           index,
                                           cache,
                                           broad,
                                           ceres]() mutable {
+        vc::lasagna::LasagnaDataset dataset =
+            vc::lasagna::LasagnaDataset::open(lasagnaManifestPath);
+        vc::lasagna::LasagnaNormalSampler windingSampler(dataset);
         return vc::atlas::searchFiberIntersections(fibers,
                                                    inAtlas,
                                                    allFiberIds,
                                                    *index,
                                                    cache,
                                                    broad,
-                                                   ceres);
+                                                   ceres,
+                                                   &windingSampler);
     }));
 }
 
 void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results)
 {
+    struct FiberDisplayInfo {
+        QString label;
+        double lengthVx = 0.0;
+    };
+    std::unordered_map<uint64_t, FiberDisplayInfo> fiberInfo;
+    if (_lineAnnotationController) {
+        for (const auto& fiber : _lineAnnotationController->fiberSummaries()) {
+            QString label = QString::number(fiber.id);
+            if (!fiber.name.empty()) {
+                label = tr("%1 (%2)")
+                    .arg(QString::fromStdString(fiber.name))
+                    .arg(fiber.id);
+            }
+            fiberInfo[fiber.id] = FiberDisplayInfo{label, fiber.lengthVx};
+        }
+    }
+
+    auto displayedDistance = [](const vc::atlas::FiberIntersectionResult& result) {
+        return result.windingDistance;
+    };
+    auto fiberLabel = [&fiberInfo](uint64_t fiberId) {
+        const auto it = fiberInfo.find(fiberId);
+        if (it != fiberInfo.end()) {
+            return it->second.label;
+        }
+        return QString::number(fiberId);
+    };
+    auto arclengthFraction = [&fiberInfo](uint64_t fiberId, double arclength) {
+        const auto it = fiberInfo.find(fiberId);
+        if (it == fiberInfo.end() || !std::isfinite(it->second.lengthVx) ||
+            it->second.lengthVx <= 0.0 || !std::isfinite(arclength)) {
+            return 0.0;
+        }
+        return std::clamp(arclength / it->second.lengthVx, 0.0, 1.0);
+    };
+
+    std::vector<vc::atlas::FiberIntersectionResult> sortedResults = results;
+    std::sort(sortedResults.begin(), sortedResults.end(), [&](const auto& a, const auto& b) {
+        const double da = displayedDistance(a);
+        const double db = displayedDistance(b);
+        if (da != db) return da < db;
+        if (a.sourceFiberId != b.sourceFiberId) return a.sourceFiberId < b.sourceFiberId;
+        return a.targetFiberId < b.targetFiberId;
+    });
+    _atlasSearchResults = sortedResults;
+
     for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
         if (!dock || !dock->widget()) {
             continue;
@@ -2518,21 +2614,55 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
         if (!table) {
             continue;
         }
-        table->setRowCount(static_cast<int>(results.size()));
-        for (int row = 0; row < static_cast<int>(results.size()); ++row) {
-            const auto& result = results[static_cast<size_t>(row)];
-            table->setItem(row, 0, new QTableWidgetItem(QString::number(result.sourceFiberId)));
-            table->setItem(row, 1, new QTableWidgetItem(QString::number(result.targetFiberId)));
-            table->setItem(row, 2, numericItem(result.candidateDistance));
-            table->setItem(row, 3, numericItem(result.refinedScore, 6));
-            table->setItem(row, 4, numericItem(result.sourceArclength));
-            table->setItem(row, 5, numericItem(result.targetArclength));
-            table->setItem(row, 6, new QTableWidgetItem(result.converged ? tr("yes") : tr("no")));
-            table->setItem(row, 7, new QTableWidgetItem(result.cacheHit ? tr("hit") : tr("miss")));
-            table->setItem(row, 8, new QTableWidgetItem(QString::fromStdString(result.message)));
+        table->setColumnCount(5);
+        table->setHorizontalHeaderLabels({
+            tr("Distance (windings)"),
+            tr("Source fiber"),
+            tr("Target fiber"),
+            tr("Src idx"),
+            tr("Tgt idx"),
+        });
+        table->setRowCount(static_cast<int>(_atlasSearchResults.size()));
+        for (int row = 0; row < static_cast<int>(_atlasSearchResults.size()); ++row) {
+            const auto& result = _atlasSearchResults[static_cast<size_t>(row)];
+            std::array<QTableWidgetItem*, 5> items{
+                numericItem(displayedDistance(result)),
+                new QTableWidgetItem(fiberLabel(result.sourceFiberId)),
+                new QTableWidgetItem(fiberLabel(result.targetFiberId)),
+                numericItem(arclengthFraction(result.sourceFiberId,
+                                              result.sourceArclength),
+                            6),
+                numericItem(arclengthFraction(result.targetFiberId,
+                                              result.targetArclength),
+                            6),
+            };
+            for (int column = 0; column < static_cast<int>(items.size()); ++column) {
+                items[static_cast<size_t>(column)]->setData(Qt::UserRole, row);
+                table->setItem(row, column, items[static_cast<size_t>(column)]);
+            }
         }
         table->resizeColumnsToContents();
     }
+}
+
+void CWindow::openAtlasSearchResult(int sortedResultIndex)
+{
+    if (sortedResultIndex < 0 ||
+        sortedResultIndex >= static_cast<int>(_atlasSearchResults.size())) {
+        return;
+    }
+    if (!_lineAnnotationController || !_intersectionsMdiArea) {
+        QMessageBox::warning(this,
+                             tr("Intersections"),
+                             tr("Intersections workspace is not available."));
+        return;
+    }
+    if (_workspaceTabs && _intersectionsWorkspaceWindow) {
+        _workspaceTabs->setCurrentWidget(_intersectionsWorkspaceWindow);
+    }
+    _lineAnnotationController->showIntersectionInspection(
+        _atlasSearchResults[static_cast<size_t>(sortedResultIndex)],
+        _intersectionsMdiArea);
 }
 
 void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
@@ -2638,6 +2768,21 @@ void CWindow::CreateWidgets(void)
         _fiberSliceMdiArea->setObjectName(QStringLiteral("fiberSliceMdiArea"));
         _fiberSliceWorkspaceWindow->setCentralWidget(_fiberSliceMdiArea);
         connect(_fiberSliceMdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
+            if (subWindow) {
+                if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
+                    if (auto* graphicsView = viewer->graphicsView()) {
+                        graphicsView->setFocus();
+                    }
+                }
+            }
+        });
+    }
+
+    if (_intersectionsWorkspaceWindow) {
+        _intersectionsMdiArea = new QMdiArea(_intersectionsWorkspaceWindow);
+        _intersectionsMdiArea->setObjectName(QStringLiteral("intersectionsMdiArea"));
+        _intersectionsWorkspaceWindow->setCentralWidget(_intersectionsMdiArea);
+        connect(_intersectionsMdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
             if (subWindow) {
                 if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
                     if (auto* graphicsView = viewer->graphicsView()) {

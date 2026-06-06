@@ -129,6 +129,37 @@ TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordina
     fs::remove_all(dir);
 }
 
+TEST_CASE("LasagnaNormalSampler integrates decoded grad_mag as winding distance")
+{
+    const auto dir = tmpDir("winding_distance");
+    std::vector<uint8_t> gradMag(2 * 2 * 2, 100);
+    std::vector<uint8_t> nx(2 * 2 * 2, 128);
+    std::vector<uint8_t> ny(2 * 2 * 2, 128);
+    createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
+    createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, &nx);
+    createU8Zarr(dir / "ny.zarr", {2, 2, 2}, {2, 2, 2}, &ny);
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    writeText(manifestPath, R"({
+        "version": 2,
+        "grad_mag_encode_scale": 100.0,
+        "groups": {
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+        }
+    })");
+
+    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+    const auto density = sampler.sampleWindingDensity({0.5, 0.5, 0.5});
+    REQUIRE(density.has_value());
+    CHECK(*density == doctest::Approx(1.0));
+    CHECK(sampler.windingDistance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.25) ==
+          doctest::Approx(1.0));
+    fs::remove_all(dir);
+}
+
 TEST_CASE("LasagnaNormalSampler interpolates unoriented normal tensors")
 {
     const auto dir = tmpDir("tensor_interp");

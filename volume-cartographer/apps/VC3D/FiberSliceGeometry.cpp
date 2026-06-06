@@ -234,6 +234,154 @@ double distanceScaledSize(double distanceToPlane,
     return fullSize + (minSize - fullSize) * std::clamp(t, 0.0, 1.0);
 }
 
+ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoints,
+                                          double arclength)
+{
+    ArclengthSample sample;
+    if (linePoints.size() < 2 || !std::isfinite(arclength)) {
+        return sample;
+    }
+
+    double accumulated = 0.0;
+    std::optional<cv::Vec3d> previous;
+    for (const cv::Vec3d& current : linePoints) {
+        if (!isFinitePoint(current)) {
+            previous.reset();
+            continue;
+        }
+        if (!previous) {
+            previous = current;
+            continue;
+        }
+
+        const cv::Vec3d segment = current - *previous;
+        const double segmentLength = norm(segment);
+        if (segmentLength <= kEpsilon) {
+            previous = current;
+            continue;
+        }
+
+        if (arclength <= accumulated + segmentLength) {
+            const double t = std::clamp((arclength - accumulated) / segmentLength, 0.0, 1.0);
+            sample.valid = true;
+            sample.point = *previous + segment * t;
+            sample.tangent = segment * (1.0 / segmentLength);
+            sample.arclength = accumulated + segmentLength * t;
+            return sample;
+        }
+
+        accumulated += segmentLength;
+        previous = current;
+    }
+
+    if (previous && accumulated > kEpsilon) {
+        for (size_t i = linePoints.size(); i-- > 0;) {
+            if (!isFinitePoint(linePoints[i])) {
+                continue;
+            }
+            for (size_t j = i; j-- > 0;) {
+                if (!isFinitePoint(linePoints[j])) {
+                    break;
+                }
+                const cv::Vec3d segment = linePoints[i] - linePoints[j];
+                const double segmentLength = norm(segment);
+                if (segmentLength <= kEpsilon) {
+                    continue;
+                }
+                sample.valid = true;
+                sample.point = linePoints[i];
+                sample.tangent = segment * (1.0 / segmentLength);
+                sample.arclength = accumulated;
+                return sample;
+            }
+            break;
+        }
+    }
+    return sample;
+}
+
+PlaneFit planeFromNormalAndTangent(const cv::Vec3d& origin,
+                                   const cv::Vec3d& normal,
+                                   const cv::Vec3d& tangent)
+{
+    PlaneFit fit;
+    if (!isFinitePoint(origin)) {
+        fit.error = "Plane origin is not finite.";
+        return fit;
+    }
+
+    cv::Vec3d planeNormal = stableOrientedNormal(normal);
+    if (norm(planeNormal) <= kEpsilon) {
+        fit.error = "Plane normal is not finite.";
+        return fit;
+    }
+
+    cv::Vec3d upHint = tangent - planeNormal * tangent.dot(planeNormal);
+    upHint = normalizedOrZero(upHint);
+    if (norm(upHint) <= kEpsilon) {
+        upHint = fallbackInPlaneAxis(planeNormal);
+    }
+
+    fit.valid = true;
+    fit.origin = origin;
+    fit.normal = planeNormal;
+    fit.upHint = upHint;
+    return fit;
+}
+
+PlaneFit planeFromDirections(const cv::Vec3d& origin,
+                             const cv::Vec3d& firstDirection,
+                             const cv::Vec3d& secondDirection)
+{
+    PlaneFit fit;
+    if (!isFinitePoint(origin)) {
+        fit.error = "Plane origin is not finite.";
+        return fit;
+    }
+
+    cv::Vec3d first = normalizedOrZero(firstDirection);
+    if (norm(first) <= kEpsilon) {
+        fit.error = "Plane direction is not finite.";
+        return fit;
+    }
+
+    cv::Vec3d second = secondDirection - first * secondDirection.dot(first);
+    second = normalizedOrZero(second);
+    if (norm(second) <= kEpsilon) {
+        second = fallbackInPlaneAxis(first);
+    }
+
+    cv::Vec3d normal{
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    };
+    normal = stableOrientedNormal(normal);
+    if (norm(normal) <= kEpsilon) {
+        fit.error = "Could not compute a finite plane normal.";
+        return fit;
+    }
+
+    fit.valid = true;
+    fit.origin = origin;
+    fit.normal = normal;
+    fit.upHint = first;
+    return fit;
+}
+
+double connectorNormalizedThickness(double distanceToSliceVx,
+                                    double maxDistanceVx,
+                                    double fullSize,
+                                    double minSize)
+{
+    if (!std::isfinite(distanceToSliceVx) || distanceToSliceVx <= 0.0) {
+        return fullSize;
+    }
+    const double span = std::max(std::abs(maxDistanceVx), kEpsilon);
+    const double t = std::clamp(distanceToSliceVx / span, 0.0, 1.0);
+    return fullSize + (minSize - fullSize) * t;
+}
+
 std::optional<SegmentPlaneIntersection> segmentPlaneIntersection(const cv::Vec3d& p0,
                                                                  const cv::Vec3d& p1,
                                                                  const Plane& plane)

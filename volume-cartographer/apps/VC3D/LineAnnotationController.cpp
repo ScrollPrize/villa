@@ -38,6 +38,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -1136,6 +1137,241 @@ void LineAnnotationController::showFiberSlice(uint64_t fiberId, QMdiArea* target
     }
 }
 
+void LineAnnotationController::showIntersectionInspection(
+    const vc::atlas::FiberIntersectionResult& result,
+    QMdiArea* targetArea)
+{
+    namespace fslice = vc3d::fiber_slice;
+
+    struct SliceSpec {
+        QString title;
+        uint64_t selectedFiberId = 0;
+        cv::Vec3d origin{0.0, 0.0, 0.0};
+        cv::Vec3d normal{0.0, 0.0, 1.0};
+        cv::Vec3d upHint{1.0, 0.0, 0.0};
+        bool useDirections = false;
+        cv::Vec3d firstDirection{1.0, 0.0, 0.0};
+        cv::Vec3d secondDirection{0.0, 1.0, 0.0};
+        cv::Vec3d center{0.0, 0.0, 0.0};
+    };
+
+    try {
+        if (!_state || !_viewerManager || !targetArea) {
+            throw std::runtime_error("Intersections workspace is not available");
+        }
+
+        auto sourceIt = std::find_if(_fibers.begin(), _fibers.end(),
+                                     [&result](const StoredFiber& fiber) {
+                                         return fiber.id == result.sourceFiberId;
+                                     });
+        auto targetIt = std::find_if(_fibers.begin(), _fibers.end(),
+                                     [&result](const StoredFiber& fiber) {
+                                         return fiber.id == result.targetFiberId;
+                                     });
+        if (sourceIt == _fibers.end() || targetIt == _fibers.end()) {
+            throw std::runtime_error("One or both intersection fibers are not loaded");
+        }
+
+        auto finitePointCount = [](const std::vector<cv::Vec3d>& points) {
+            return std::count_if(points.begin(), points.end(), fslice::isFinitePoint);
+        };
+        if (finitePointCount(sourceIt->linePoints) < 2 ||
+            finitePointCount(targetIt->linePoints) < 2) {
+            throw std::runtime_error("One or both intersection fibers have too few finite line points");
+        }
+
+        const fslice::ArclengthSample sourceSample =
+            fslice::samplePolylineAtArclength(sourceIt->linePoints, result.sourceArclength);
+        const fslice::ArclengthSample targetSample =
+            fslice::samplePolylineAtArclength(targetIt->linePoints, result.targetArclength);
+        if (!sourceSample.valid || !targetSample.valid) {
+            throw std::runtime_error("Could not sample intersection arclengths on the loaded fibers");
+        }
+
+        if (!_state->vpkg()) {
+            throw std::runtime_error("No volume package loaded");
+        }
+        const fs::path manifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
+        if (manifestPath.empty()) {
+            throw std::runtime_error("Select a local Lasagna dataset before inspecting intersections");
+        }
+
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        const vc::lasagna::NormalSample sourceNormal = sampler.sampleNormal(result.sourcePoint);
+        const vc::lasagna::NormalSample targetNormal = sampler.sampleNormal(result.targetPoint);
+        if (!sourceNormal.valid || !fslice::isFinitePoint(sourceNormal.normal) ||
+            cv::norm(sourceNormal.normal) <= 1.0e-10 ||
+            !targetNormal.valid || !fslice::isFinitePoint(targetNormal.normal) ||
+            cv::norm(targetNormal.normal) <= 1.0e-10) {
+            throw std::runtime_error("Could not sample Lasagna normals at the refined intersection points");
+        }
+
+        const cv::Vec3d connector = result.targetPoint - result.sourcePoint;
+        const cv::Vec3d midpoint = (result.sourcePoint + result.targetPoint) * 0.5;
+        const double connectorDistance = std::max(cv::norm(connector), 1.0e-6);
+        if (!fslice::isFinitePoint(connector) || cv::norm(connector) <= 1.0e-10) {
+            throw std::runtime_error("The refined connector segment is too short to define an inspection plane");
+        }
+
+        const std::array<SliceSpec, 4> specs{{
+            {tr("source-normal"),
+             result.sourceFiberId,
+             result.sourcePoint,
+             sourceNormal.normal,
+             sourceSample.tangent,
+             false,
+             {},
+             {},
+             result.sourcePoint},
+            {tr("source-connection"),
+             result.sourceFiberId,
+             midpoint,
+             {},
+             {},
+             true,
+             connector,
+             sourceSample.tangent,
+             midpoint},
+            {tr("target-normal"),
+             result.targetFiberId,
+             result.targetPoint,
+             targetNormal.normal,
+             targetSample.tangent,
+             false,
+             {},
+             {},
+             result.targetPoint},
+            {tr("target-connection"),
+             result.targetFiberId,
+             midpoint,
+             {},
+             {},
+             true,
+             connector,
+             targetSample.tangent,
+             midpoint},
+        }};
+
+        if (_fiberSliceOverlay) {
+            _fiberSliceOverlay->clearSlice();
+        }
+        for (QMdiSubWindow* subWindow : targetArea->subWindowList()) {
+            if (!subWindow) {
+                continue;
+            }
+            const QString oldSurface = subWindow->property("vc_fiber_slice_surface").toString();
+            if (!oldSurface.isEmpty()) {
+                _state->setSurface(oldSurface.toStdString(), nullptr);
+            }
+            const QString oldIntersectionSurface =
+                subWindow->property("vc_intersection_slice_surface").toString();
+            if (!oldIntersectionSurface.isEmpty()) {
+                _state->setSurface(oldIntersectionSurface.toStdString(), nullptr);
+            }
+        }
+        targetArea->closeAllSubWindows();
+
+        std::vector<FiberSliceOverlayController::FiberData> overlayFibers{
+            FiberSliceOverlayController::FiberData{
+                sourceIt->id,
+                sourceIt->linePoints,
+                sourceIt->controlPoints,
+            },
+            FiberSliceOverlayController::FiberData{
+                targetIt->id,
+                targetIt->linePoints,
+                targetIt->controlPoints,
+            },
+        };
+
+        for (const SliceSpec& spec : specs) {
+            const fslice::PlaneFit fit = spec.useDirections
+                ? fslice::planeFromDirections(spec.origin,
+                                              spec.firstDirection,
+                                              spec.secondDirection)
+                : fslice::planeFromNormalAndTangent(spec.origin, spec.normal, spec.upHint);
+            if (!fit.valid) {
+                throw std::runtime_error(fit.error);
+            }
+
+            const std::string surfaceName =
+                "intersection_slice_" + std::to_string(result.sourceFiberId) + "_" +
+                std::to_string(result.targetFiberId) + "_" + std::to_string(_nextPaneId++);
+            auto surface = std::make_shared<PlaneSurface>();
+            surface->setFromNormalAndUp(
+                cv::Vec3f{static_cast<float>(fit.origin[0]),
+                          static_cast<float>(fit.origin[1]),
+                          static_cast<float>(fit.origin[2])},
+                cv::Vec3f{static_cast<float>(fit.normal[0]),
+                          static_cast<float>(fit.normal[1]),
+                          static_cast<float>(fit.normal[2])},
+                cv::Vec3f{static_cast<float>(fit.upHint[0]),
+                          static_cast<float>(fit.upHint[1]),
+                          static_cast<float>(fit.upHint[2])});
+            surface->id = surfaceName;
+            _state->setSurface(surfaceName, surface);
+
+            VolumeViewerBase* viewer = _viewerManager->createViewer(
+                surfaceName,
+                spec.title,
+                targetArea,
+                ViewerManager::ViewerRole::Annotation);
+            if (!viewer) {
+                _state->setSurface(surfaceName, nullptr);
+                throw std::runtime_error("Could not create intersection slice viewer");
+            }
+            if (auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject())) {
+                if (auto* subWindow = qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())) {
+                    subWindow->setProperty("vc_intersection_slice_surface",
+                                           QString::fromStdString(surfaceName));
+                    subWindow->show();
+                } else {
+                    viewerWidget->show();
+                }
+                connect(viewerWidget, &QObject::destroyed, this, [this, surfaceName]() {
+                    if (_state) {
+                        _state->setSurface(surfaceName, nullptr);
+                    }
+                });
+            }
+
+            viewer->fitSurfaceInView();
+            viewer->centerOnVolumePoint(cv::Vec3f{static_cast<float>(spec.center[0]),
+                                                  static_cast<float>(spec.center[1]),
+                                                  static_cast<float>(spec.center[2])},
+                                        true);
+
+            if (_fiberSliceOverlay) {
+                FiberSliceOverlayController::SliceData overlayData;
+                overlayData.surfaceName = surfaceName;
+                overlayData.selectedFiberId = spec.selectedFiberId;
+                overlayData.plane = fslice::Plane{fit.origin, fit.normal};
+                overlayData.fitSamples = {result.sourcePoint, result.targetPoint, spec.center};
+                overlayData.fibers = overlayFibers;
+                overlayData.connectionSegment = FiberSliceOverlayController::ConnectionSegment{
+                    result.sourcePoint,
+                    result.targetPoint,
+                    connectorDistance,
+                };
+                _fiberSliceOverlay->setSlice(viewer, std::move(overlayData));
+            }
+        }
+
+        targetArea->tileSubWindows();
+        if (auto* active = targetArea->activeSubWindow()) {
+            if (auto* viewer = dynamic_cast<VolumeViewerBase*>(active->widget())) {
+                if (auto* graphicsView = viewer->graphicsView()) {
+                    graphicsView->setFocus();
+                }
+            }
+        }
+    } catch (const std::exception& ex) {
+        showError(tr("Could not show intersection inspection: %1")
+                      .arg(QString::fromStdString(ex.what())));
+    }
+}
+
 void LineAnnotationController::saveOpenFibers()
 {
     for (const auto& pane : _panes) {
@@ -1194,6 +1430,7 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     for (const auto& fiber : _fibers) {
         summaries.push_back(FiberSummary{
             fiber.id,
+            fiber.fileName,
             static_cast<int>(fiber.controlPoints.size()),
             static_cast<int>(fiber.linePoints.size()),
             lineLengthVx(fiber.linePoints),
