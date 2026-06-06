@@ -22,6 +22,7 @@ class CFiberWidget : public QDockWidget
 public:
     struct FiberEntry {
         uint64_t id = 0;
+        std::string fileName;
         int controlPointCount = 0;
         int linePointCount = 0;
         double lengthVx = 0.0;

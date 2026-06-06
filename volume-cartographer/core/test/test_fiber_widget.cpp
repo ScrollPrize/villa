@@ -2,6 +2,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QListView>
 #include <QPushButton>
 
 #include <cstdlib>
@@ -45,10 +46,17 @@ int main(int argc, char** argv)
 
     CFiberWidget widget;
     widget.setFibers({
-        {1, 2, 20, 12.0},
-        {2, 3, 30, 24.0},
-        {3, 4, 40, 36.0},
+        {1, "fibers/1.json", 2, 20, 12.0},
+        {2, "kb_20260605T184821587_000002.json", 3, 30, 24.0},
+        {3, "fibers/3.json", 4, 40, 36.0},
     });
+
+    auto* listView = widget.findChild<QListView*>();
+    require(listView != nullptr, "Fiber list view was not found");
+    require(listView->model() != nullptr, "Fiber list view model was not found");
+    require(listView->model()->index(1, 0).data().toString().contains(
+                QStringLiteral("kb_20260605T184821587_000002.json")),
+            "Fiber list row did not include the fiber filename");
 
     auto* deleteButton = widget.findChild<QPushButton*>(QStringLiteral("fiberDeleteButton"));
     require(deleteButton != nullptr, "Fiber delete button was not found");

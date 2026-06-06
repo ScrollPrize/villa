@@ -253,6 +253,29 @@ private slots:
         QVERIFY(initialBounds.has_value());
         QVERIFY(initialBounds->right() < 5.0);
 
+        vc::atlas::FiberMapping previewMapping;
+        previewMapping.lineAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
+        previewMapping.lineAnchors.push_back({1, {}, 3.0, 2.0, 0.0});
+        previewMapping.controlAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
+        vc::atlas::FiberMapping shiftedPreviewMapping = previewMapping;
+        shiftedPreviewMapping.windingOffset = 1;
+
+        controller.setSearchPreviewCandidates({
+            AtlasOverlayController::SearchPreviewCandidate{0, cv::Vec2f(2.5f, 1.5f)},
+            AtlasOverlayController::SearchPreviewCandidate{1, cv::Vec2f(3.5f, 2.5f)},
+        });
+        controller.setSearchPreviewHover(0);
+        controller.setSearchPreviewSelection({1});
+        controller.setSearchPreviewFiber({0, previewMapping});
+        controller.setSearchPreviewFiber({1, shiftedPreviewMapping});
+
+        // Saved atlas line + saved control point group + two cross markers
+        // (two line strips each) + two line-only preview mappings.
+        QCOMPARE(viewer.scene().items().size(), 8);
+
+        controller.clearSearchPreviews();
+        QCOMPARE(viewer.scene().items().size(), 2);
+
         vc::atlas::Atlas updatedAtlas;
         vc::atlas::FiberMapping updatedMapping;
         updatedMapping.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});

@@ -42,6 +42,7 @@
 #include <QPointF>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QShortcut>
 #include <QDateTime>
 #include <QSettings>
 #include <QStringList>
@@ -142,6 +143,7 @@ struct LineAnnotationController::IntersectionInspectionSession {
     std::string targetSessionSurfaceName;
     FollowSlice sourceFollow;
     FollowSlice targetFollow;
+    QPointer<QShortcut> followShortcut;
     std::optional<bool> activeFollowSourceSide;
     std::map<std::string, GeneratedSurfaceContext> generatedSurfaceContexts;
 };
@@ -1362,6 +1364,16 @@ void LineAnnotationController::showIntersectionInspection(
         _intersectionInspection->targetArea = targetArea;
         _intersectionInspection->result = result;
         _intersectionInspection->atlasDir = std::move(atlasDir);
+        targetArea->installEventFilter(this);
+        if (auto* viewport = targetArea->viewport()) {
+            viewport->installEventFilter(this);
+        }
+        auto* followShortcut = new QShortcut(QKeySequence(Qt::Key_Space), targetArea);
+        followShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+        _intersectionInspection->followShortcut = followShortcut;
+        connect(followShortcut, &QShortcut::activated, this, [this]() {
+            (void)handleIntersectionFollowKeyPress(Qt::Key_Space, Qt::NoModifier);
+        });
         rebuildIntersectionInspection();
     } catch (const std::exception& ex) {
         showError(tr("Could not show intersection inspection: %1")
@@ -1563,6 +1575,10 @@ void LineAnnotationController::cleanupIntersectionInspectionSurfaces()
     _intersectionInspection->targetSessionSurfaceName.clear();
     _intersectionInspection->sourceFollow = {};
     _intersectionInspection->targetFollow = {};
+    if (_intersectionInspection->followShortcut) {
+        delete _intersectionInspection->followShortcut.data();
+        _intersectionInspection->followShortcut = nullptr;
+    }
     _intersectionInspection->activeFollowSourceSide.reset();
     _intersectionInspection->generatedSurfaceContexts.clear();
 }
@@ -1646,11 +1662,33 @@ bool LineAnnotationController::handleIntersectionFollowKeyPress(int key,
     if (!_intersectionInspection || key != Qt::Key_Space || modifiers != Qt::NoModifier) {
         return false;
     }
-    if (_intersectionInspection->activeFollowSourceSide) {
-        toggleIntersectionFollowSlice(*_intersectionInspection->activeFollowSourceSide);
-    } else {
+
+    const bool anyFollowing =
+        (_intersectionInspection->sourceFollow.valid &&
+         _intersectionInspection->sourceFollow.followsMouse) ||
+        (_intersectionInspection->targetFollow.valid &&
+         _intersectionInspection->targetFollow.followsMouse);
+    if (!anyFollowing) {
+        if (_intersectionInspection->sourceFollow.valid) {
+            _intersectionInspection->sourceFollow.followsMouse = true;
+        }
+        if (_intersectionInspection->targetFollow.valid) {
+            _intersectionInspection->targetFollow.followsMouse = true;
+        }
+        return true;
+    }
+
+    if (_intersectionInspection->sourceFollow.valid &&
+        _intersectionInspection->sourceFollow.followsMouse) {
         toggleIntersectionFollowSlice(true);
+    } else if (_intersectionInspection->sourceFollow.valid) {
+        _intersectionInspection->sourceFollow.followsMouse = false;
+    }
+    if (_intersectionInspection->targetFollow.valid &&
+        _intersectionInspection->targetFollow.followsMouse) {
         toggleIntersectionFollowSlice(false);
+    } else if (_intersectionInspection->targetFollow.valid) {
+        _intersectionInspection->targetFollow.followsMouse = false;
     }
     return true;
 }

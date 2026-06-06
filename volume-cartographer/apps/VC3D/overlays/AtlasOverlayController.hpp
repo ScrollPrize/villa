@@ -6,20 +6,38 @@
 
 #include <QRectF>
 
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
+#include <vector>
 
 class QuadSurface;
 
 class AtlasOverlayController : public ViewerOverlayControllerBase
 {
 public:
+    struct SearchPreviewCandidate {
+        int resultIndex = -1;
+        cv::Vec2f surfaceCoord{0.0f, 0.0f};
+    };
+
+    struct SearchPreviewFiber {
+        int resultIndex = -1;
+        vc::atlas::FiberMapping mapping;
+    };
+
     explicit AtlasOverlayController(QObject* parent = nullptr);
 
     void setAtlas(vc::atlas::Atlas atlas,
                   std::shared_ptr<const QuadSurface> displaySurface,
                   vc::atlas::AtlasDisplayRange displayRange);
     void clearAtlas();
+    void clearSearchPreviews();
+    void setSearchPreviewCandidates(std::vector<SearchPreviewCandidate> candidates);
+    void setSearchPreviewHover(std::optional<int> resultIndex);
+    void setSearchPreviewSelection(std::set<int> resultIndices);
+    void setSearchPreviewFiber(SearchPreviewFiber fiber);
 
     [[nodiscard]] std::optional<QRectF> surfaceBounds() const;
 
@@ -35,4 +53,8 @@ private:
     std::optional<vc::atlas::Atlas> _atlas;
     std::shared_ptr<const QuadSurface> _displaySurface;
     vc::atlas::AtlasDisplayRange _displayRange;
+    std::vector<SearchPreviewCandidate> _searchPreviewCandidates;
+    std::map<int, vc::atlas::FiberMapping> _searchPreviewFibers;
+    std::optional<int> _hoverSearchResult;
+    std::set<int> _selectedSearchResults;
 };

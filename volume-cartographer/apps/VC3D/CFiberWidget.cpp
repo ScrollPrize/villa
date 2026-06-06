@@ -97,8 +97,12 @@ void CFiberWidget::setupUi()
 
 QString CFiberWidget::labelForFiber(const FiberEntry& fiber)
 {
-    return tr("Fiber %1  cp=%2  pts=%3  len=%4 vx")
-        .arg(fiber.id)
+    const QString fileName = QString::fromStdString(fiber.fileName);
+    const QString nameText = fileName.isEmpty()
+        ? tr("Fiber %1").arg(fiber.id)
+        : tr("Fiber %1  %2").arg(fiber.id).arg(fileName);
+    return tr("%1  cp=%2  pts=%3  len=%4 vx")
+        .arg(nameText)
         .arg(fiber.controlPointCount)
         .arg(fiber.linePointCount)
         .arg(fiber.lengthVx, 0, 'f', 1);

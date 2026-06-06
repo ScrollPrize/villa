@@ -17,6 +17,7 @@
 
 #include <filesystem>
 #include <QShortcut>
+#include <set>
 #include <unordered_map>
 #include <map>
 
@@ -56,6 +57,11 @@ struct RenderBenchOptions {
     bool replayWarm = false;
 };
 
+struct AtlasSearchFiberSnapshot {
+    std::filesystem::path fiberPath;
+    vc::atlas::FiberPolyline fiber;
+};
+
 #define MAX_RECENT_VOLPKG 10
 
 // Project JSON schema version required by this app.
@@ -76,6 +82,7 @@ class QMenu;
 class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
+class QTableWidget;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
@@ -132,6 +139,13 @@ private:
     void cancelAtlasFiberIntersectionSearch();
     void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results);
     void openAtlasSearchResult(int sortedResultIndex);
+    void clearAtlasSearchPreviewState();
+    void updateAtlasSearchPreviewCandidates();
+    void setAtlasSearchHoverResult(std::optional<int> sortedResultIndex);
+    void updateAtlasSearchSelectionFromTable(QTableWidget* sourceTable);
+    void syncAtlasSearchTableSelection(QTableWidget* sourceTable);
+    void updateAtlasSearchPreviewRequests();
+    void requestAtlasSearchPreviewLine(int sortedResultIndex);
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void switchToFiberSliceWorkspace();
@@ -255,6 +269,12 @@ private:
     vc::atlas::FiberSpatialIndex _fiberIntersectionIndex;
     vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
     std::vector<vc::atlas::FiberIntersectionResult> _atlasSearchResults;
+    std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _atlasSearchFiberSnapshotsByRuntimeId;
+    std::optional<std::filesystem::path> _atlasSearchLasagnaManifestPath;
+    int _atlasSearchPreviewGeneration{0};
+    std::optional<int> _atlasSearchHoveredResult;
+    std::set<int> _atlasSearchSelectedResults;
+    std::set<int> _atlasSearchPreviewRequestedResults;
     bool _atlasSearchCancelRequested{false};
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
