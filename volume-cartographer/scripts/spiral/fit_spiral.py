@@ -2705,6 +2705,56 @@ def _mode_winding_per_strip(strip_id, winding_idx_per_point, S, device):
     return mode_winding_per_strip
 
 
+def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks):
+    # Tracks are unannotated strips. For each track, infer the integer winding it
+    # most often lies near, then reuse the same per-point spiral-space and scan-
+    # space satisfaction checks as unattached PCLs. Returns values aligned to
+    # `valid_track_indices`, since tracks with fewer than two points are skipped.
+    device = dr_per_winding.device
+    if not tracks:
+        empty = torch.zeros(0, dtype=torch.int64)
+        return empty, empty, empty, [], empty
+
+    valid_track_indices = [i for i, track in enumerate(tracks) if len(track) >= 2]
+    if not valid_track_indices:
+        empty = torch.zeros(0, dtype=torch.int64)
+        return empty, empty, empty, [], empty
+
+    strip_arrays = [
+        (
+            np.asarray(tracks[i], dtype=np.float32),
+            np.zeros(len(tracks[i]), dtype=np.float32),
+        )
+        for i in valid_track_indices
+    ]
+    flat = _build_strip_flat_bundle(strip_arrays, device)
+    ctx, lengths_cpu, S = _build_strip_spiral_context(
+        slice_to_spiral_transform, dr_per_winding, flat, len(valid_track_indices),
+    )
+    valid_track_indices_t = torch.tensor(valid_track_indices, dtype=torch.int64)
+    if ctx is None:
+        per_point = [torch.zeros([int(n.item())], dtype=torch.bool) for n in lengths_cpu]
+        return valid_track_indices_t, torch.zeros(S, dtype=torch.int64), lengths_cpu.clone(), per_point, torch.zeros(S, dtype=torch.int64)
+
+    dr = ctx['dr']
+    strip_id = ctx['strip_id']
+    normalised_radii = ctx['normalised_radii']
+
+    with torch.no_grad():
+        winding_idx_per_point = torch.round(normalised_radii / dr).to(torch.int64)
+        mode_winding_per_strip = _mode_winding_per_strip(strip_id, winding_idx_per_point, S, device)
+        target_normalised_per_strip = mode_winding_per_strip.to(dr.dtype) * dr
+
+    satisfied_counts, per_point_satisfaction = _strip_satisfaction_from_target(ctx, target_normalised_per_strip)
+    return (
+        valid_track_indices_t,
+        satisfied_counts,
+        lengths_cpu.clone(),
+        per_point_satisfaction,
+        mode_winding_per_strip.cpu(),
+    )
+
+
 def get_partially_supported_tracks(
     slice_to_spiral_transform, dr_per_winding, tracks,
     lower_fraction=0.5, upper_fraction=0.95,
@@ -3938,6 +3988,19 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             total_points = int(unattached_pcl_total_counts.sum().item())
             satisfied_point_ratio = satisfied_points / max(total_points, 1)
             print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
+        if tracks:
+            _, track_satisfied_counts, track_total_counts, _, _ = get_track_satisfied_counts(
+                slice_to_spiral_transform, dr_per_winding, tracks,
+            )
+            track_fully_satisfied = (track_satisfied_counts == track_total_counts)
+            fully_satisfied_tracks = int(track_fully_satisfied.sum().item())
+            num_valid_tracks = int(track_total_counts.numel())
+            fully_satisfied_track_ratio = fully_satisfied_tracks / max(num_valid_tracks, 1)
+            print(f'satisfied_tracks = {fully_satisfied_tracks}/{num_valid_tracks} ({fully_satisfied_track_ratio * 100:.1f}%)')
+            track_satisfied_points = int(track_satisfied_counts.sum().item())
+            track_total_points = int(track_total_counts.sum().item())
+            track_satisfied_point_ratio = track_satisfied_points / max(track_total_points, 1)
+            print(f'satisfied_track_points = {track_satisfied_points}/{track_total_points} ({track_satisfied_point_ratio * 100:.1f}%)')
         patch_ids = list(patches_dict.keys())
         patch_satisfaction_entries = []
         for pid, sat_area_t, tot_area_t in zip(patch_ids, satisfied_areas.tolist(), total_areas.tolist()):
