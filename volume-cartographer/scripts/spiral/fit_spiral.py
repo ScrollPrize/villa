@@ -103,6 +103,7 @@ default_config = {
     'track_num_per_step': 200,
     'track_num_points_per_step': 8,
     'track_exclusion_radius': 12.0,
+    'track_radius_target': 'mean',
     'normals_num_points': 2000,
     'pcl_normals_num_points': 4000,
     'pcl_normals_sample_radius': 1,
@@ -3635,8 +3636,13 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
     hinge_margin = dr_per_winding.detach() * cfg['radius_loss_margin']
 
-    mean_per_track = shifted_radii.mean(dim=-1, keepdim=True)
-    deviations = (shifted_radii - mean_per_track).abs()
+    if cfg['track_radius_target'] == 'mean':
+        radius_target_per_track = shifted_radii.mean(dim=-1, keepdim=True)
+    elif cfg['track_radius_target'] == 'median':
+        radius_target_per_track = shifted_radii.median(dim=-1, keepdim=True).values
+    else:
+        raise ValueError(f"track_radius_target must be 'mean' or 'median', got {cfg['track_radius_target']!r}")
+    deviations = (shifted_radii - radius_target_per_track).abs()
     radius_loss = F.relu(deviations - hinge_margin).mean()
 
     if not compute_dt:
