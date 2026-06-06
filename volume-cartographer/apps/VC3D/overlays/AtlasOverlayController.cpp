@@ -31,6 +31,50 @@ ViewerOverlayControllerBase::OverlayStyle atlasAnchorStyle()
     style.z = 60.0;
     return style;
 }
+
+std::optional<std::pair<int, int>> controlAnchorSourceRange(
+    const vc::atlas::FiberMapping& fiber)
+{
+    if (fiber.lineAnchors.empty()) {
+        return std::nullopt;
+    }
+
+    int first = std::numeric_limits<int>::max();
+    int last = std::numeric_limits<int>::min();
+    int count = 0;
+    for (const auto& anchor : fiber.controlAnchors) {
+        const vc::atlas::AtlasAnchor* bestLineAnchor = nullptr;
+        double bestDistance2 = std::numeric_limits<double>::infinity();
+        for (const auto& lineAnchor : fiber.lineAnchors) {
+            const double du = lineAnchor.atlasU - anchor.atlasU;
+            const double dv = lineAnchor.atlasV - anchor.atlasV;
+            const double distance2 = du * du + dv * dv;
+            if (distance2 < bestDistance2) {
+                bestDistance2 = distance2;
+                bestLineAnchor = &lineAnchor;
+            }
+        }
+        if (!bestLineAnchor) {
+            continue;
+        }
+        first = std::min(first, bestLineAnchor->sourceIndex);
+        last = std::max(last, bestLineAnchor->sourceIndex);
+        ++count;
+    }
+    if (count < 2 || first > last) {
+        return std::nullopt;
+    }
+    return std::make_pair(first, last);
+}
+
+bool anchorInControlRange(const vc::atlas::AtlasAnchor& anchor,
+                          const std::optional<std::pair<int, int>>& range)
+{
+    if (!range) {
+        return true;
+    }
+    return anchor.sourceIndex >= range->first && anchor.sourceIndex <= range->second;
+}
 }
 
 AtlasOverlayController::AtlasOverlayController(QObject* parent)
@@ -87,7 +131,11 @@ std::optional<QRectF> AtlasOverlayController::surfaceBounds() const
     float maxX = -std::numeric_limits<float>::infinity();
     float maxY = -std::numeric_limits<float>::infinity();
     for (const auto& fiber : _atlas->fibers) {
+        const auto sourceRange = controlAnchorSourceRange(fiber);
         for (const auto& anchor : fiber.lineAnchors) {
+            if (!anchorInControlRange(anchor, sourceRange)) {
+                continue;
+            }
             const auto surfaceCoord = atlasAnchorToSurface(anchor, fiber);
             if (!surfaceCoord) {
                 continue;
@@ -120,9 +168,13 @@ void AtlasOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     const auto lineStyle = atlasLineStyle();
     const auto anchorStyle = atlasAnchorStyle();
     for (const auto& fiber : _atlas->fibers) {
+        const auto sourceRange = controlAnchorSourceRange(fiber);
         std::vector<cv::Vec2f> linePoints;
         linePoints.reserve(fiber.lineAnchors.size());
         for (const auto& anchor : fiber.lineAnchors) {
+            if (!anchorInControlRange(anchor, sourceRange)) {
+                continue;
+            }
             const auto surfaceCoord = atlasAnchorToSurface(anchor, fiber);
             if (!surfaceCoord) {
                 continue;

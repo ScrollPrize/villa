@@ -101,6 +101,38 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
            linePoints[static_cast<size_t>(upper)] * t;
 }
 
+inline std::optional<std::pair<double, double>> generatedControlLinePositionRange(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    double first = std::numeric_limits<double>::infinity();
+    double last = -std::numeric_limits<double>::infinity();
+    int finiteCount = 0;
+    for (const auto& control : controlPoints) {
+        if (!std::isfinite(control.linePosition)) {
+            continue;
+        }
+        ++finiteCount;
+        first = std::min(first, control.linePosition);
+        last = std::max(last, control.linePosition);
+    }
+    if (finiteCount < 2 || !std::isfinite(first) || !std::isfinite(last) || first >= last) {
+        return std::nullopt;
+    }
+    return std::make_pair(first, last);
+}
+
+inline bool generatedLineSegmentIsTail(
+    double startPosition,
+    double endPosition,
+    const std::optional<std::pair<double, double>>& controlRange)
+{
+    if (!controlRange || !std::isfinite(startPosition) || !std::isfinite(endPosition)) {
+        return false;
+    }
+    const double midpoint = (startPosition + endPosition) * 0.5;
+    return midpoint < controlRange->first || midpoint > controlRange->second;
+}
+
 inline GeneratedOverlay makeGeneratedStripOverlay(
     const GeneratedViews& views,
     double currentLinePosition,

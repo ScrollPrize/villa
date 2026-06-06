@@ -244,6 +244,26 @@ TEST_CASE("line annotation generated strip overlay includes controls and current
     CHECK(overlay.seedLineIndex == -1);
 }
 
+TEST_CASE("line annotation generated line tail style uses control span")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    using vc3d::line_annotation::generatedControlLinePositionRange;
+    using vc3d::line_annotation::generatedLineSegmentIsTail;
+
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 4.0, false},
+        {{0.0f, 0.0f, 0.0f}, 1.0, true},
+    };
+    const auto range = generatedControlLinePositionRange(controls);
+    REQUIRE(range.has_value());
+    CHECK(range->first == doctest::Approx(1.0));
+    CHECK(range->second == doctest::Approx(4.0));
+    CHECK(generatedLineSegmentIsTail(0.0, 1.0, range));
+    CHECK_FALSE(generatedLineSegmentIsTail(1.0, 2.0, range));
+    CHECK_FALSE(generatedLineSegmentIsTail(3.0, 4.0, range));
+    CHECK(generatedLineSegmentIsTail(4.0, 5.0, range));
+}
+
 TEST_CASE("line annotation generated cross slice filters controls by viewport threshold")
 {
     vc3d::line_annotation::GeneratedViews views;

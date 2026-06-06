@@ -232,10 +232,12 @@ private slots:
 
         vc::atlas::Atlas atlas;
         vc::atlas::FiberMapping mapping;
-        mapping.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
+        mapping.lineAnchors.push_back({0, {}, 40.0, 1.0, 0.0});
         mapping.lineAnchors.push_back({1, {}, 2.0, 1.0, 0.0});
         mapping.lineAnchors.push_back({2, {}, 3.0, 2.0, 0.0});
-        mapping.controlAnchors.push_back({0, {}, 5.0, 3.0, 0.0});
+        mapping.lineAnchors.push_back({3, {}, 50.0, 2.0, 0.0});
+        mapping.controlAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
+        mapping.controlAnchors.push_back({1, {}, 3.0, 2.0, 0.0});
         atlas.fibers.push_back(std::move(mapping));
 
         vc::atlas::AtlasDisplayRange range;

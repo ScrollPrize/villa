@@ -1,5 +1,6 @@
 #include "FiberSliceOverlayController.hpp"
 
+#include "../LineAnnotationGeneratedViews.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 
@@ -62,6 +63,16 @@ cv::Vec3d toVec3d(const cv::Vec3f& point)
         static_cast<double>(point[1]),
         static_cast<double>(point[2]),
     };
+}
+
+QColor fadedLineTailColor(const QColor& baseColor)
+{
+    QColor color;
+    color.setRed(std::clamp(static_cast<int>(std::round(baseColor.red() * 0.75)), 0, 255));
+    color.setGreen(std::clamp(static_cast<int>(std::round(baseColor.green() * 0.75)), 0, 255));
+    color.setBlue(std::clamp(static_cast<int>(std::round(baseColor.blue() * 0.75)), 0, 255));
+    color.setAlpha(std::clamp(static_cast<int>(std::round(baseColor.alpha() * 0.75)), 0, 255));
+    return color;
 }
 } // namespace
 
@@ -259,11 +270,24 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
 
         auto thisLineStyle = fiberIt->style.lineStyle;
         auto thisControlStyle = fiberIt->style.controlStyle;
+        auto tailLineStyle = thisLineStyle;
+        tailLineStyle.penColor = fadedLineTailColor(thisLineStyle.penColor);
+        tailLineStyle.z = thisLineStyle.z - 1.0;
+
+        std::optional<std::pair<double, double>> controlRange;
+        const fslice::ControlSpanSelection span =
+            fslice::selectControlSpan(fiberIt->linePoints, fiberIt->controlPoints);
+        if (span.valid) {
+            controlRange = std::make_pair(static_cast<double>(span.firstLineIndex),
+                                          static_cast<double>(span.lastLineIndex));
+        }
 
         QPointF previousScene;
         double previousSize = 0.0;
+        double previousLinePosition = 0.0;
         bool hasPrevious = false;
-        for (const cv::Vec3d& point : fiberIt->linePoints) {
+        for (size_t pointIndex = 0; pointIndex < fiberIt->linePoints.size(); ++pointIndex) {
+            const cv::Vec3d& point = fiberIt->linePoints[pointIndex];
             if (!fslice::isFinitePoint(point)) {
                 hasPrevious = false;
                 previousSize = 0.0;
@@ -280,13 +304,20 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             }
 
             if (hasPrevious) {
-                auto segmentStyle = thisLineStyle;
+                auto segmentStyle =
+                    vc3d::line_annotation::generatedLineSegmentIsTail(
+                        previousLinePosition,
+                        static_cast<double>(pointIndex),
+                        controlRange)
+                    ? tailLineStyle
+                    : thisLineStyle;
                 segmentStyle.penWidth = (previousSize + size) * 0.5;
                 builder.addLineStrip({previousScene, scenePoint}, false, segmentStyle);
             }
 
             previousScene = scenePoint;
             previousSize = size;
+            previousLinePosition = static_cast<double>(pointIndex);
             hasPrevious = true;
         }
 
