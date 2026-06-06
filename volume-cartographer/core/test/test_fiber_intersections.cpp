@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <set>
 
 namespace {
@@ -242,6 +243,27 @@ TEST_CASE("Fiber Ceres results deduplicate converged arclength neighborhoods")
     const auto deduped = vc::atlas::deduplicateFiberIntersectionResults(std::move(results), 1.0);
     REQUIRE(deduped.size() == 1);
     CHECK(deduped[0].refinedScore == doctest::Approx(0.1));
+}
+
+TEST_CASE("Fiber intersection refresh picks nearest arclength result")
+{
+    std::vector<vc::atlas::FiberIntersectionResult> results(3);
+    results[0].sourceArclength = 10.0;
+    results[0].targetArclength = 20.0;
+    results[1].sourceArclength = 12.0;
+    results[1].targetArclength = 19.0;
+    results[2].sourceArclength = 30.0;
+    results[2].targetArclength = 40.0;
+
+    const auto nearest = vc::atlas::nearestIntersectionResultByArclength(results, 11.5, 19.2);
+    REQUIRE(nearest.has_value());
+    CHECK(*nearest == 1);
+
+    CHECK_FALSE(vc::atlas::nearestIntersectionResultByArclength(
+                    results,
+                    std::numeric_limits<double>::quiet_NaN(),
+                    19.2)
+                    .has_value());
 }
 
 TEST_CASE("Fiber intersection cache keys include pair generations and options")

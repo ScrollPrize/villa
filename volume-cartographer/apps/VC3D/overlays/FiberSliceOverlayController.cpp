@@ -1,6 +1,7 @@
 #include "FiberSliceOverlayController.hpp"
 
 #include "../volume_viewers/VolumeViewerBase.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
 
 #include <QColor>
 #include <QPointF>
@@ -26,6 +27,15 @@ cv::Vec3f toVec3f(const cv::Vec3d& point)
         static_cast<float>(point[0]),
         static_cast<float>(point[1]),
         static_cast<float>(point[2]),
+    };
+}
+
+cv::Vec3d toVec3d(const cv::Vec3f& point)
+{
+    return cv::Vec3d{
+        static_cast<double>(point[0]),
+        static_cast<double>(point[1]),
+        static_cast<double>(point[2]),
     };
 }
 } // namespace
@@ -74,6 +84,24 @@ bool FiberSliceOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) 
     return it != _slices.end() && viewer->surfName() == it->second.surfaceName;
 }
 
+vc3d::fiber_slice::Plane FiberSliceOverlayController::currentPlaneForViewer(
+    VolumeViewerBase* viewer,
+    const SliceData& slice) const
+{
+    if (viewer) {
+        if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+            const cv::Vec3d origin = toVec3d(plane->origin());
+            const cv::Vec3d normal = toVec3d(plane->normal({0, 0, 0}));
+            if (vc3d::fiber_slice::isFinitePoint(origin) &&
+                vc3d::fiber_slice::isFinitePoint(normal) &&
+                cv::norm(normal) > 1.0e-10) {
+                return vc3d::fiber_slice::Plane{origin, normal};
+            }
+        }
+    }
+    return slice.plane;
+}
+
 QPointF FiberSliceOverlayController::projectedVolumeToScene(VolumeViewerBase* viewer,
                                                             const SliceData& slice,
                                                             const cv::Vec3d& point) const
@@ -82,7 +110,8 @@ QPointF FiberSliceOverlayController::projectedVolumeToScene(VolumeViewerBase* vi
         return {};
     }
 
-    const cv::Vec3d projected = vc3d::fiber_slice::projectPointToPlane(point, slice.plane);
+    const cv::Vec3d projected =
+        vc3d::fiber_slice::projectPointToPlane(point, currentPlaneForViewer(viewer, slice));
     return volumeToScene(viewer, toVec3f(projected));
 }
 
@@ -135,14 +164,16 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         return;
     }
     const SliceData& slice = sliceIt->second;
+    const fslice::Plane plane = currentPlaneForViewer(viewer, slice);
 
-    const auto selectedIt = std::find_if(slice.fibers.begin(), slice.fibers.end(),
-                                         [&slice](const FiberData& fiber) {
-                                             return fiber.id == slice.selectedFiberId;
-                                         });
-    if (selectedIt == slice.fibers.end()) {
-        return;
+    std::vector<uint64_t> fullLineFiberIds = slice.fullLineFiberIds;
+    if (fullLineFiberIds.empty() && slice.selectedFiberId != 0) {
+        fullLineFiberIds.push_back(slice.selectedFiberId);
     }
+    auto isFullLineFiber = [&fullLineFiberIds](uint64_t fiberId) {
+        return std::find(fullLineFiberIds.begin(), fullLineFiberIds.end(), fiberId) !=
+               fullLineFiberIds.end();
+    };
 
     const double minViewportSpan = currentViewportMinSpan(viewer, slice);
 
@@ -153,52 +184,72 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     lineStyle.penJoin = Qt::RoundJoin;
     lineStyle.z = 40.0;
 
-    QPointF previousScene;
-    double previousSize = 0.0;
-    bool hasPrevious = false;
-    for (const cv::Vec3d& point : selectedIt->linePoints) {
-        if (!fslice::isFinitePoint(point)) {
-            hasPrevious = false;
-            previousSize = 0.0;
-            continue;
-        }
-
-        const double distance = std::abs(fslice::signedDistanceToPlane(point, slice.plane));
-        const double size = fslice::distanceScaledSize(distance, minViewportSpan, 3.0, 0.75);
-        const QPointF scenePoint = projectedVolumeToScene(viewer, slice, point);
-        if (!finiteScenePoint(scenePoint)) {
-            hasPrevious = false;
-            previousSize = 0.0;
-            continue;
-        }
-
-        if (hasPrevious) {
-            auto segmentStyle = lineStyle;
-            segmentStyle.penWidth = (previousSize + size) * 0.5;
-            builder.addLineStrip({previousScene, scenePoint}, false, segmentStyle);
-        }
-
-        previousScene = scenePoint;
-        previousSize = size;
-        hasPrevious = true;
-    }
-
     OverlayStyle controlStyle;
     controlStyle.penColor = QColor(255, 220, 40, 255);
     controlStyle.brushColor = QColor(255, 220, 40, 220);
     controlStyle.penWidth = 1.0;
     controlStyle.z = 45.0;
-    for (const cv::Vec3d& control : selectedIt->controlPoints) {
-        if (!fslice::isFinitePoint(control)) {
+
+    for (size_t fullIndex = 0; fullIndex < fullLineFiberIds.size(); ++fullIndex) {
+        const uint64_t fullFiberId = fullLineFiberIds[fullIndex];
+        const auto fiberIt = std::find_if(slice.fibers.begin(), slice.fibers.end(),
+                                          [fullFiberId](const FiberData& fiber) {
+                                              return fiber.id == fullFiberId;
+                                          });
+        if (fiberIt == slice.fibers.end()) {
             continue;
         }
-        const QPointF scenePoint = projectedVolumeToScene(viewer, slice, control);
-        if (!finiteScenePoint(scenePoint)) {
-            continue;
+
+        auto thisLineStyle = lineStyle;
+        auto thisControlStyle = controlStyle;
+        if (fullIndex > 0) {
+            thisLineStyle.penColor = QColor(80, 210, 255, 210);
+            thisControlStyle.penColor = QColor(80, 210, 255, 255);
+            thisControlStyle.brushColor = QColor(80, 210, 255, 220);
         }
-        const double distance = std::abs(fslice::signedDistanceToPlane(control, slice.plane));
-        const double radius = fslice::distanceScaledSize(distance, minViewportSpan, 7.0, 4.0);
-        builder.addPoint(scenePoint, radius, controlStyle);
+
+        QPointF previousScene;
+        double previousSize = 0.0;
+        bool hasPrevious = false;
+        for (const cv::Vec3d& point : fiberIt->linePoints) {
+            if (!fslice::isFinitePoint(point)) {
+                hasPrevious = false;
+                previousSize = 0.0;
+                continue;
+            }
+
+            const double distance = std::abs(fslice::signedDistanceToPlane(point, plane));
+            const double size = fslice::distanceScaledSize(distance, minViewportSpan, 3.0, 0.75);
+            const QPointF scenePoint = projectedVolumeToScene(viewer, slice, point);
+            if (!finiteScenePoint(scenePoint)) {
+                hasPrevious = false;
+                previousSize = 0.0;
+                continue;
+            }
+
+            if (hasPrevious) {
+                auto segmentStyle = thisLineStyle;
+                segmentStyle.penWidth = (previousSize + size) * 0.5;
+                builder.addLineStrip({previousScene, scenePoint}, false, segmentStyle);
+            }
+
+            previousScene = scenePoint;
+            previousSize = size;
+            hasPrevious = true;
+        }
+
+        for (const cv::Vec3d& control : fiberIt->controlPoints) {
+            if (!fslice::isFinitePoint(control)) {
+                continue;
+            }
+            const QPointF scenePoint = projectedVolumeToScene(viewer, slice, control);
+            if (!finiteScenePoint(scenePoint)) {
+                continue;
+            }
+            const double distance = std::abs(fslice::signedDistanceToPlane(control, plane));
+            const double radius = fslice::distanceScaledSize(distance, minViewportSpan, 7.0, 4.0);
+            builder.addPoint(scenePoint, radius, thisControlStyle);
+        }
     }
 
     OverlayStyle ellipseStyle;
@@ -208,12 +259,12 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     ellipseStyle.z = 38.0;
 
     for (const FiberData& other : slice.fibers) {
-        if (other.id == slice.selectedFiberId || other.linePoints.size() < 2) {
+        if (isFullLineFiber(other.id) || other.linePoints.size() < 2) {
             continue;
         }
         for (size_t i = 1; i < other.linePoints.size(); ++i) {
             const auto crossing =
-                fslice::segmentPlaneIntersection(other.linePoints[i - 1], other.linePoints[i], slice.plane);
+                fslice::segmentPlaneIntersection(other.linePoints[i - 1], other.linePoints[i], plane);
             if (!crossing) {
                 continue;
             }
@@ -224,7 +275,7 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             }
 
             cv::Vec3d projectedTangent =
-                crossing->tangent - slice.plane.normal * crossing->tangent.dot(slice.plane.normal);
+                crossing->tangent - plane.normal * crossing->tangent.dot(plane.normal);
             projectedTangent = fslice::normalizedOrZero(projectedTangent);
             const QPointF centerScene = projectedVolumeToScene(viewer, slice, crossing->point);
             if (!finiteScenePoint(centerScene)) {
@@ -281,7 +332,7 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                     continue;
                 }
                 const double distance =
-                    std::abs(fslice::signedDistanceToPlane(point, slice.plane));
+                    std::abs(fslice::signedDistanceToPlane(point, plane));
                 const double size = fslice::connectorNormalizedThickness(distance,
                                                                          connector.maxDistanceVx,
                                                                          5.0,

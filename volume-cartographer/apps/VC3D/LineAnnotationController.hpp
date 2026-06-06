@@ -128,6 +128,7 @@ private:
     };
 
     struct LineAnnotationSession;
+    struct IntersectionInspectionSession;
     struct StoredFiber {
         uint64_t id = 0;
         std::string username;
@@ -175,6 +176,8 @@ private:
                            int activeEnd = -1);
     void finishOptimization(const std::string& surfaceName);
     bool materializeGeneratedViews(LineAnnotationSession& session);
+    bool materializeGeneratedViews(LineAnnotationSession& session,
+                                   const std::string& surfacePrefix);
     void handleShowAsMesh(const std::string& surfaceName);
     [[nodiscard]] std::filesystem::path resolveMeshExportPathsDir() const;
     [[nodiscard]] std::filesystem::path nextMeshExportPath(const std::filesystem::path& pathsDir,
@@ -206,10 +209,23 @@ private:
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
         const vc::lasagna::NormalSampler* normalSampler);
+    [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
+        const std::vector<cv::Vec3d>& points);
     void saveSessionAsFiber(LineAnnotationSession& session);
     void saveFiber(const StoredFiber& fiber) const;
     [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
     void showError(const QString& message) const;
+    void cleanupIntersectionInspectionSurfaces();
+    void rebuildIntersectionInspection();
+    void refreshIntersectionInspectionAfterEdit(uint64_t editedFiberId,
+                                                double oldSourceArclength,
+                                                double oldTargetArclength);
+    [[nodiscard]] std::shared_ptr<LineAnnotationSession> makeIntersectionLineSession(
+        const StoredFiber& fiber,
+        double focusLinePosition,
+        const cv::Vec3d& sourceSliceNormal,
+        const std::string& surfaceName,
+        std::function<void()> onOptimizationSucceeded);
 
     CState* _state = nullptr;
     ViewerManager* _viewerManager = nullptr;
@@ -218,6 +234,7 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;

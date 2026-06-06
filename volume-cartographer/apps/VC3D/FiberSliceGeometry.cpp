@@ -244,13 +244,16 @@ ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoin
 
     double accumulated = 0.0;
     std::optional<cv::Vec3d> previous;
-    for (const cv::Vec3d& current : linePoints) {
+    size_t previousIndex = 0;
+    for (size_t currentIndex = 0; currentIndex < linePoints.size(); ++currentIndex) {
+        const cv::Vec3d& current = linePoints[currentIndex];
         if (!isFinitePoint(current)) {
             previous.reset();
             continue;
         }
         if (!previous) {
             previous = current;
+            previousIndex = currentIndex;
             continue;
         }
 
@@ -267,11 +270,14 @@ ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoin
             sample.point = *previous + segment * t;
             sample.tangent = segment * (1.0 / segmentLength);
             sample.arclength = accumulated + segmentLength * t;
+            sample.linePosition = static_cast<double>(previousIndex) +
+                                  (static_cast<double>(currentIndex - previousIndex) * t);
             return sample;
         }
 
         accumulated += segmentLength;
         previous = current;
+        previousIndex = currentIndex;
     }
 
     if (previous && accumulated > kEpsilon) {
@@ -292,12 +298,96 @@ ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoin
                 sample.point = linePoints[i];
                 sample.tangent = segment * (1.0 / segmentLength);
                 sample.arclength = accumulated;
+                sample.linePosition = static_cast<double>(i);
                 return sample;
             }
             break;
         }
     }
     return sample;
+}
+
+double linePositionAtArclength(const std::vector<cv::Vec3d>& linePoints,
+                               double arclength)
+{
+    const ArclengthSample sample = samplePolylineAtArclength(linePoints, arclength);
+    return sample.valid ? sample.linePosition : std::numeric_limits<double>::quiet_NaN();
+}
+
+ControlTripletSelection selectControlTriplet(const std::vector<cv::Vec3d>& linePoints,
+                                             const std::vector<cv::Vec3d>& controlPoints,
+                                             double currentLinePosition,
+                                             const cv::Vec3d& currentPoint)
+{
+    ControlTripletSelection selection;
+    if (linePoints.empty() || !std::isfinite(currentLinePosition) || !isFinitePoint(currentPoint)) {
+        return selection;
+    }
+
+    const double maxLinePosition = static_cast<double>(linePoints.size() - 1);
+    selection.currentLinePosition = std::clamp(currentLinePosition, 0.0, maxLinePosition);
+    selection.currentPoint = currentPoint;
+
+    struct Candidate {
+        double position = 0.0;
+        cv::Vec3d point{0.0, 0.0, 0.0};
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(controlPoints.size() + 2);
+    if (isFinitePoint(linePoints.front())) {
+        candidates.push_back({0.0, linePoints.front()});
+    }
+    if (linePoints.size() > 1 && isFinitePoint(linePoints.back())) {
+        candidates.push_back({maxLinePosition, linePoints.back()});
+    }
+    for (const cv::Vec3d& control : controlPoints) {
+        if (!isFinitePoint(control)) {
+            continue;
+        }
+        candidates.push_back({static_cast<double>(nearestLinePointIndex(linePoints, control)),
+                              control});
+    }
+    if (candidates.empty()) {
+        return selection;
+    }
+
+    const Candidate* previous = nullptr;
+    const Candidate* next = nullptr;
+    const Candidate* nearest = nullptr;
+    double bestPreviousDistance = std::numeric_limits<double>::infinity();
+    double bestNextDistance = std::numeric_limits<double>::infinity();
+    double bestNearestDistance = std::numeric_limits<double>::infinity();
+    for (const Candidate& candidate : candidates) {
+        const double signedDistance = candidate.position - selection.currentLinePosition;
+        const double absDistance = std::abs(signedDistance);
+        if (absDistance < bestNearestDistance) {
+            bestNearestDistance = absDistance;
+            nearest = &candidate;
+        }
+        if (signedDistance < -1.0e-9 && -signedDistance < bestPreviousDistance) {
+            bestPreviousDistance = -signedDistance;
+            previous = &candidate;
+        } else if (signedDistance > 1.0e-9 && signedDistance < bestNextDistance) {
+            bestNextDistance = signedDistance;
+            next = &candidate;
+        }
+    }
+    if (!previous) {
+        previous = nearest;
+    }
+    if (!next) {
+        next = nearest;
+    }
+    if (!previous || !next) {
+        return selection;
+    }
+
+    selection.previousLinePosition = previous->position;
+    selection.previousPoint = previous->point;
+    selection.nextLinePosition = next->position;
+    selection.nextPoint = next->point;
+    selection.valid = true;
+    return selection;
 }
 
 PlaneFit planeFromNormalAndTangent(const cv::Vec3d& origin,

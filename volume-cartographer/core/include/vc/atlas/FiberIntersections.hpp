@@ -198,6 +198,11 @@ private:
     std::vector<FiberIntersectionResult> results,
     double arclengthTolerance);
 
+[[nodiscard]] std::optional<size_t> nearestIntersectionResultByArclength(
+    const std::vector<FiberIntersectionResult>& results,
+    double sourceArclength,
+    double targetArclength);
+
 [[nodiscard]] std::vector<FiberIntersectionResult> searchFiberIntersections(
     const std::vector<FiberPolyline>& fibers,
     const std::vector<uint64_t>& sourceFiberIds,

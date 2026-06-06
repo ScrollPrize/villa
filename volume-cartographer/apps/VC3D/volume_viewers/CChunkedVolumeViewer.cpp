@@ -4902,6 +4902,9 @@ void CChunkedVolumeViewer::updateStatusLabel()
             if (auto* poi = _state->poi("focus"))
                 items << QString("POI %1").arg(formatVec3(poi->p));
         }
+    } else if (property("vc_show_custom_normal_offset").toBool()) {
+        items << QString("normal offset %1")
+                     .arg(property("vc_custom_normal_offset_vx").toDouble(), 0, 'f', 1);
     }
 
     _statsBar->setItems(items);

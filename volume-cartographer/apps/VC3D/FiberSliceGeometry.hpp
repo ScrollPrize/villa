@@ -43,6 +43,17 @@ struct ArclengthSample {
     cv::Vec3d point{0.0, 0.0, 0.0};
     cv::Vec3d tangent{1.0, 0.0, 0.0};
     double arclength = 0.0;
+    double linePosition = 0.0;
+};
+
+struct ControlTripletSelection {
+    bool valid = false;
+    double previousLinePosition = 0.0;
+    double currentLinePosition = 0.0;
+    double nextLinePosition = 0.0;
+    cv::Vec3d previousPoint{0.0, 0.0, 0.0};
+    cv::Vec3d currentPoint{0.0, 0.0, 0.0};
+    cv::Vec3d nextPoint{0.0, 0.0, 0.0};
 };
 
 struct SegmentPlaneIntersection {
@@ -76,6 +87,12 @@ double distanceScaledSize(double distanceToPlane,
                           double minSize);
 ArclengthSample samplePolylineAtArclength(const std::vector<cv::Vec3d>& linePoints,
                                           double arclength);
+double linePositionAtArclength(const std::vector<cv::Vec3d>& linePoints,
+                               double arclength);
+ControlTripletSelection selectControlTriplet(const std::vector<cv::Vec3d>& linePoints,
+                                             const std::vector<cv::Vec3d>& controlPoints,
+                                             double currentLinePosition,
+                                             const cv::Vec3d& currentPoint);
 PlaneFit planeFromNormalAndTangent(const cv::Vec3d& origin,
                                    const cv::Vec3d& normal,
                                    const cv::Vec3d& tangent);

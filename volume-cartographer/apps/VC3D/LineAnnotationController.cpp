@@ -8,6 +8,7 @@
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/FiberSliceOverlayController.hpp"
+#include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -26,6 +27,7 @@
 
 #include <QFileDialog>
 #include <QFutureWatcher>
+#include <QColor>
 #include <QMessageBox>
 #include <QMdiArea>
 #include <QMdiSubWindow>
@@ -91,6 +93,20 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string fiberFileName;
     std::string fiberManualHvTag;
     bool suppressFiberSave = false;
+    bool suppressGeneratedViews = false;
+    std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
+};
+
+struct LineAnnotationController::IntersectionInspectionSession {
+    QPointer<QMdiArea> targetArea;
+    vc::atlas::FiberIntersectionResult result;
+    double sourceFocusLinePosition = 0.0;
+    double targetFocusLinePosition = 0.0;
+    std::vector<std::string> surfaceNames;
+    std::shared_ptr<LineAnnotationSession> sourceLineSession;
+    std::shared_ptr<LineAnnotationSession> targetLineSession;
+    std::string sourceSessionSurfaceName;
+    std::string targetSessionSurfaceName;
 };
 
 namespace {
@@ -140,9 +156,256 @@ bool finitePoint(const cv::Vec3d& v)
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
 
+bool finitePoint(const cv::Vec3f& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+cv::Vec3f toVec3f(const cv::Vec3d& v)
+{
+    return {static_cast<float>(v[0]),
+            static_cast<float>(v[1]),
+            static_cast<float>(v[2])};
+}
+
+cv::Vec3d toVec3d(const cv::Vec3f& v)
+{
+    return {static_cast<double>(v[0]),
+            static_cast<double>(v[1]),
+            static_cast<double>(v[2])};
+}
+
 bool approximatelyEqual(double a, double b)
 {
     return std::abs(a - b) <= 1.0e-9;
+}
+
+cv::Vec3d interpolatedPointAtLinePosition(const std::vector<cv::Vec3d>& points,
+                                          double linePosition)
+{
+    if (points.empty() || !std::isfinite(linePosition)) {
+        return {0.0, 0.0, 0.0};
+    }
+    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(points.size() - 1));
+    const int lower = static_cast<int>(std::floor(linePosition));
+    const int upper = std::min<int>(lower + 1, static_cast<int>(points.size()) - 1);
+    const double t = linePosition - static_cast<double>(lower);
+    return points[static_cast<size_t>(lower)] * (1.0 - t) +
+           points[static_cast<size_t>(upper)] * t;
+}
+
+cv::Vec3d tangentAtLinePosition(const std::vector<cv::Vec3d>& points,
+                                double linePosition)
+{
+    if (points.size() < 2 || !std::isfinite(linePosition)) {
+        return {1.0, 0.0, 0.0};
+    }
+    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(points.size() - 1));
+    int lower = static_cast<int>(std::floor(linePosition));
+    int upper = std::min<int>(lower + 1, static_cast<int>(points.size()) - 1);
+    if (lower == upper && lower > 0) {
+        --lower;
+    }
+    cv::Vec3d tangent = points[static_cast<size_t>(upper)] - points[static_cast<size_t>(lower)];
+    tangent = normalizedOrZero(tangent);
+    return finiteDirection(tangent) ? tangent : cv::Vec3d{1.0, 0.0, 0.0};
+}
+
+cv::Vec3f interpolatedUpAtLinePosition(const std::vector<cv::Vec3f>& upVectors,
+                                       double linePosition,
+                                       const cv::Vec3d& tangent)
+{
+    if (upVectors.empty() || !std::isfinite(linePosition)) {
+        return {0.0f, 1.0f, 0.0f};
+    }
+    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(upVectors.size() - 1));
+    const int lower = static_cast<int>(std::floor(linePosition));
+    const int upper = std::min<int>(lower + 1, static_cast<int>(upVectors.size()) - 1);
+    cv::Vec3f lowerUp = upVectors[static_cast<size_t>(lower)];
+    cv::Vec3f upperUp = upVectors[static_cast<size_t>(upper)];
+    if (!finitePoint(lowerUp) || !finitePoint(upperUp)) {
+        return {0.0f, 1.0f, 0.0f};
+    }
+    if (lowerUp.dot(upperUp) < 0.0f) {
+        upperUp *= -1.0f;
+    }
+    const float t = static_cast<float>(linePosition - static_cast<double>(lower));
+    cv::Vec3d up = toVec3d(lowerUp * (1.0f - t) + upperUp * t);
+    up -= tangent * up.dot(tangent);
+    up = normalizedOrZero(up);
+    return finiteDirection(up) ? toVec3f(up) : cv::Vec3f{0.0f, 1.0f, 0.0f};
+}
+
+double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint)
+{
+    if (!viewer) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+    const auto* points = quad ? quad->rawPointsPtr() : nullptr;
+    if (!points || points->cols <= 0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const cv::Vec2f surfacePoint = viewer->sceneToSurfaceCoords(scenePoint);
+    const cv::Vec2f scale = quad->scale();
+    if (scale[0] == 0.0f || !std::isfinite(surfacePoint[0])) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double position = static_cast<double>(surfacePoint[0] * scale[0]) +
+                            static_cast<double>(points->cols) / 2.0;
+    return std::clamp(position, 0.0, static_cast<double>(points->cols - 1));
+}
+
+QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
+                                 QuadSurface* surface,
+                                 double linePosition)
+{
+    if (!viewer || !surface) {
+        return {};
+    }
+    const auto* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return {};
+    }
+    const cv::Vec2f scale = surface->scale();
+    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+        return {};
+    }
+    const float surfaceX = (static_cast<float>(linePosition) -
+                            static_cast<float>(points->cols) / 2.0f) / scale[0];
+    const float centerRow = static_cast<float>(points->rows / 2);
+    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
+    return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+}
+
+bool finiteScenePoint(const QPointF& point)
+{
+    return std::isfinite(point.x()) && std::isfinite(point.y());
+}
+
+void applyLineStripOverlay(CChunkedVolumeViewer* viewer,
+                           const std::string& key,
+                           const std::vector<vc::lasagna::LineControlPoint>& controls,
+                           double currentLinePosition)
+{
+    if (!viewer) {
+        return;
+    }
+    auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+    const auto* points = quad ? quad->rawPointsPtr() : nullptr;
+    if (!points || points->cols <= 0) {
+        return;
+    }
+
+    ViewerOverlayControllerBase::OverlayStyle lineStyle;
+    lineStyle.penColor = QColor(0, 220, 255, 190);
+    lineStyle.penWidth = 1.0;
+    lineStyle.z = 150.0;
+
+    ViewerOverlayControllerBase::OverlayStyle controlStyle;
+    controlStyle.penColor = QColor(255, 230, 0, 220);
+    controlStyle.brushColor = QColor(255, 230, 0, 170);
+    controlStyle.penWidth = 1.5;
+    controlStyle.z = 160.0;
+
+    ViewerOverlayControllerBase::OverlayStyle currentStyle;
+    currentStyle.penColor = QColor(0, 245, 255, 245);
+    currentStyle.brushColor = QColor(0, 245, 255, 210);
+    currentStyle.penWidth = 1.5;
+    currentStyle.z = 153.0;
+
+    std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
+    std::vector<QPointF> sceneLine;
+    sceneLine.reserve(static_cast<size_t>(points->cols));
+    for (int col = 0; col < points->cols; ++col) {
+        const QPointF scene = stripLinePositionToScene(viewer, quad, static_cast<double>(col));
+        if (finiteScenePoint(scene)) {
+            sceneLine.push_back(scene);
+        }
+    }
+    if (sceneLine.size() >= 2) {
+        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+            sceneLine,
+            false,
+            lineStyle});
+    }
+    if (std::isfinite(currentLinePosition)) {
+        const QPointF currentScene = stripLinePositionToScene(viewer, quad, currentLinePosition);
+        if (finiteScenePoint(currentScene)) {
+            primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                currentScene,
+                4.0,
+                true,
+                currentStyle});
+        }
+    }
+    for (const auto& control : controls) {
+        if (!std::isfinite(control.linePosition)) {
+            continue;
+        }
+        const QPointF controlScene = stripLinePositionToScene(viewer, quad, control.linePosition);
+        if (!finiteScenePoint(controlScene)) {
+            continue;
+        }
+        primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+            controlScene,
+            control.isSeed ? 5.5 : 5.0,
+            true,
+            controlStyle});
+    }
+    ViewerOverlayControllerBase::applyPrimitives(
+        viewer,
+        "intersection_line_strip_" + key,
+        std::move(primitives));
+}
+
+void applyFocusPointOverlay(CChunkedVolumeViewer* viewer,
+                            const std::string& key,
+                            const cv::Vec3d& point)
+{
+    if (!viewer || !finitePoint(point)) {
+        return;
+    }
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = QColor(0, 245, 255, 245);
+    style.brushColor = QColor(0, 245, 255, 210);
+    style.penWidth = 1.5;
+    style.z = 170.0;
+    std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
+    primitives.push_back(ViewerOverlayControllerBase::VolumePointPrimitive{
+        toVec3f(point),
+        7.0,
+        style});
+    ViewerOverlayControllerBase::applyPrimitives(
+        viewer,
+        "intersection_focus_" + key,
+        std::move(primitives));
+}
+
+cv::Vec3d nearestControlPointForLinePosition(
+    const std::vector<vc::lasagna::LineControlPoint>& controls,
+    double linePosition,
+    const std::optional<cv::Vec3d>& fallback)
+{
+    const vc::lasagna::LineControlPoint* best = nullptr;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (const auto& control : controls) {
+        if (!std::isfinite(control.linePosition)) {
+            continue;
+        }
+        const double distance = std::abs(control.linePosition - linePosition);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = &control;
+        }
+    }
+    if (best) {
+        return best->volumePoint;
+    }
+    if (fallback) {
+        return *fallback;
+    }
+    return {0.0, 0.0, 0.0};
 }
 
 nlohmann::json pointToJson(const cv::Vec3d& point)
@@ -1141,25 +1404,103 @@ void LineAnnotationController::showIntersectionInspection(
     const vc::atlas::FiberIntersectionResult& result,
     QMdiArea* targetArea)
 {
-    namespace fslice = vc3d::fiber_slice;
-
-    struct SliceSpec {
-        QString title;
-        uint64_t selectedFiberId = 0;
-        cv::Vec3d origin{0.0, 0.0, 0.0};
-        cv::Vec3d normal{0.0, 0.0, 1.0};
-        cv::Vec3d upHint{1.0, 0.0, 0.0};
-        bool useDirections = false;
-        cv::Vec3d firstDirection{1.0, 0.0, 0.0};
-        cv::Vec3d secondDirection{0.0, 1.0, 0.0};
-        cv::Vec3d center{0.0, 0.0, 0.0};
-    };
-
     try {
         if (!_state || !_viewerManager || !targetArea) {
             throw std::runtime_error("Intersections workspace is not available");
         }
+        cleanupIntersectionInspectionSurfaces();
+        _intersectionInspection = std::make_unique<IntersectionInspectionSession>();
+        _intersectionInspection->targetArea = targetArea;
+        _intersectionInspection->result = result;
+        rebuildIntersectionInspection();
+    } catch (const std::exception& ex) {
+        showError(tr("Could not show intersection inspection: %1")
+                      .arg(QString::fromStdString(ex.what())));
+    }
+}
 
+void LineAnnotationController::cleanupIntersectionInspectionSurfaces()
+{
+    if (!_intersectionInspection) {
+        return;
+    }
+    if (_fiberSliceOverlay) {
+        _fiberSliceOverlay->clearSlice();
+    }
+    if (auto* area = _intersectionInspection->targetArea.data()) {
+        for (QMdiSubWindow* subWindow : area->subWindowList()) {
+            if (!subWindow) {
+                continue;
+            }
+            const QString oldSurface = subWindow->property("vc_intersection_slice_surface").toString();
+            if (!oldSurface.isEmpty() && _state) {
+                _state->setSurface(oldSurface.toStdString(), nullptr);
+            }
+        }
+        area->closeAllSubWindows();
+    }
+    if (_state) {
+        for (const auto& name : _intersectionInspection->surfaceNames) {
+            _state->setSurface(name, nullptr);
+        }
+    }
+    const std::string sourceSession = _intersectionInspection->sourceSessionSurfaceName;
+    const std::string targetSession = _intersectionInspection->targetSessionSurfaceName;
+    _panes.erase(std::remove_if(_panes.begin(),
+                                _panes.end(),
+                                [&sourceSession, &targetSession](const PaneRecord& pane) {
+                                    return (!sourceSession.empty() && pane.surfaceName == sourceSession) ||
+                                           (!targetSession.empty() && pane.surfaceName == targetSession);
+                                }),
+                 _panes.end());
+    _intersectionInspection->surfaceNames.clear();
+    _intersectionInspection->sourceLineSession.reset();
+    _intersectionInspection->targetLineSession.reset();
+    _intersectionInspection->sourceSessionSurfaceName.clear();
+    _intersectionInspection->targetSessionSurfaceName.clear();
+}
+
+void LineAnnotationController::rebuildIntersectionInspection()
+{
+    namespace fslice = vc3d::fiber_slice;
+
+    struct SliceSpec {
+        QString title;
+        std::string surfaceName;
+        uint64_t selectedFiberId = 0;
+        fslice::PlaneFit fit;
+        cv::Vec3d center{0.0, 0.0, 0.0};
+        std::vector<uint64_t> fullLineFiberIds;
+        bool editableCurrentCross = false;
+        std::shared_ptr<LineAnnotationSession> editSession;
+        double editLinePosition = 0.0;
+        bool shiftScroll = false;
+    };
+
+    struct SideBuild {
+        const StoredFiber* fiber = nullptr;
+        uint64_t otherFiberId = 0;
+        bool sourceSide = true;
+        double focusLinePosition = 0.0;
+        cv::Vec3d focusPoint{0.0, 0.0, 0.0};
+        cv::Vec3d tangent{1.0, 0.0, 0.0};
+        vc::lasagna::LineViewSurfaces lineViews;
+        fslice::ControlTripletSelection triplet;
+        std::shared_ptr<LineAnnotationSession> editSession;
+        std::string editSessionName;
+        std::string stripSurfaceName;
+    };
+
+    try {
+        if (!_intersectionInspection || !_state || !_viewerManager) {
+            return;
+        }
+        auto* targetArea = _intersectionInspection->targetArea.data();
+        if (!targetArea) {
+            throw std::runtime_error("Intersections workspace is not available");
+        }
+
+        const auto result = _intersectionInspection->result;
         auto sourceIt = std::find_if(_fibers.begin(), _fibers.end(),
                                      [&result](const StoredFiber& fiber) {
                                          return fiber.id == result.sourceFiberId;
@@ -1171,7 +1512,6 @@ void LineAnnotationController::showIntersectionInspection(
         if (sourceIt == _fibers.end() || targetIt == _fibers.end()) {
             throw std::runtime_error("One or both intersection fibers are not loaded");
         }
-
         auto finitePointCount = [](const std::vector<cv::Vec3d>& points) {
             return std::count_if(points.begin(), points.end(), fslice::isFinitePoint);
         };
@@ -1188,24 +1528,9 @@ void LineAnnotationController::showIntersectionInspection(
             throw std::runtime_error("Could not sample intersection arclengths on the loaded fibers");
         }
 
-        if (!_state->vpkg()) {
-            throw std::runtime_error("No volume package loaded");
-        }
-        const fs::path manifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
-        if (manifestPath.empty()) {
-            throw std::runtime_error("Select a local Lasagna dataset before inspecting intersections");
-        }
-
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
-        const vc::lasagna::NormalSample sourceNormal = sampler.sampleNormal(result.sourcePoint);
-        const vc::lasagna::NormalSample targetNormal = sampler.sampleNormal(result.targetPoint);
-        if (!sourceNormal.valid || !fslice::isFinitePoint(sourceNormal.normal) ||
-            cv::norm(sourceNormal.normal) <= 1.0e-10 ||
-            !targetNormal.valid || !fslice::isFinitePoint(targetNormal.normal) ||
-            cv::norm(targetNormal.normal) <= 1.0e-10) {
-            throw std::runtime_error("Could not sample Lasagna normals at the refined intersection points");
-        }
+        cleanupIntersectionInspectionSurfaces();
+        _intersectionInspection->sourceFocusLinePosition = sourceSample.linePosition;
+        _intersectionInspection->targetFocusLinePosition = targetSample.linePosition;
 
         const cv::Vec3d connector = result.targetPoint - result.sourcePoint;
         const cv::Vec3d midpoint = (result.sourcePoint + result.targetPoint) * 0.5;
@@ -1214,139 +1539,280 @@ void LineAnnotationController::showIntersectionInspection(
             throw std::runtime_error("The refined connector segment is too short to define an inspection plane");
         }
 
-        const std::array<SliceSpec, 4> specs{{
-            {tr("source-normal"),
-             result.sourceFiberId,
-             result.sourcePoint,
-             sourceNormal.normal,
-             sourceSample.tangent,
-             false,
-             {},
-             {},
-             result.sourcePoint},
-            {tr("source-connection"),
-             result.sourceFiberId,
-             midpoint,
-             {},
-             {},
-             true,
-             connector,
-             sourceSample.tangent,
-             midpoint},
-            {tr("target-normal"),
-             result.targetFiberId,
-             result.targetPoint,
-             targetNormal.normal,
-             targetSample.tangent,
-             false,
-             {},
-             {},
-             result.targetPoint},
-            {tr("target-connection"),
-             result.targetFiberId,
-             midpoint,
-             {},
-             {},
-             true,
-             connector,
-             targetSample.tangent,
-             midpoint},
-        }};
-
-        if (_fiberSliceOverlay) {
-            _fiberSliceOverlay->clearSlice();
-        }
-        for (QMdiSubWindow* subWindow : targetArea->subWindowList()) {
-            if (!subWindow) {
-                continue;
+        const double oldSourceArclength = result.sourceArclength;
+        const double oldTargetArclength = result.targetArclength;
+        auto sourceCallback = [this, oldSourceArclength, oldTargetArclength]() {
+            if (_intersectionInspection && _intersectionInspection->sourceLineSession) {
+                saveSessionAsFiber(*_intersectionInspection->sourceLineSession);
             }
-            const QString oldSurface = subWindow->property("vc_fiber_slice_surface").toString();
-            if (!oldSurface.isEmpty()) {
-                _state->setSurface(oldSurface.toStdString(), nullptr);
+            refreshIntersectionInspectionAfterEdit(
+                _intersectionInspection ? _intersectionInspection->result.sourceFiberId : 0,
+                oldSourceArclength,
+                oldTargetArclength);
+        };
+        auto targetCallback = [this, oldSourceArclength, oldTargetArclength]() {
+            if (_intersectionInspection && _intersectionInspection->targetLineSession) {
+                saveSessionAsFiber(*_intersectionInspection->targetLineSession);
             }
-            const QString oldIntersectionSurface =
-                subWindow->property("vc_intersection_slice_surface").toString();
-            if (!oldIntersectionSurface.isEmpty()) {
-                _state->setSurface(oldIntersectionSurface.toStdString(), nullptr);
-            }
-        }
-        targetArea->closeAllSubWindows();
-
-        std::vector<FiberSliceOverlayController::FiberData> overlayFibers{
-            FiberSliceOverlayController::FiberData{
-                sourceIt->id,
-                sourceIt->linePoints,
-                sourceIt->controlPoints,
-            },
-            FiberSliceOverlayController::FiberData{
-                targetIt->id,
-                targetIt->linePoints,
-                targetIt->controlPoints,
-            },
+            refreshIntersectionInspectionAfterEdit(
+                _intersectionInspection ? _intersectionInspection->result.targetFiberId : 0,
+                oldSourceArclength,
+                oldTargetArclength);
         };
 
-        for (const SliceSpec& spec : specs) {
-            const fslice::PlaneFit fit = spec.useDirections
-                ? fslice::planeFromDirections(spec.origin,
-                                              spec.firstDirection,
-                                              spec.secondDirection)
-                : fslice::planeFromNormalAndTangent(spec.origin, spec.normal, spec.upHint);
-            if (!fit.valid) {
-                throw std::runtime_error(fit.error);
-            }
+        SideBuild sourceSide;
+        sourceSide.fiber = &*sourceIt;
+        sourceSide.otherFiberId = targetIt->id;
+        sourceSide.sourceSide = true;
+        sourceSide.focusLinePosition = sourceSample.linePosition;
+        sourceSide.focusPoint = result.sourcePoint;
+        sourceSide.tangent = sourceSample.tangent;
+        sourceSide.editSessionName = "intersection_edit_source_" + std::to_string(_nextPaneId++);
+        sourceSide.editSession = makeIntersectionLineSession(*sourceIt,
+                                                             sourceSample.linePosition,
+                                                             sourceSample.tangent,
+                                                             sourceSide.editSessionName,
+                                                             sourceCallback);
 
-            const std::string surfaceName =
-                "intersection_slice_" + std::to_string(result.sourceFiberId) + "_" +
-                std::to_string(result.targetFiberId) + "_" + std::to_string(_nextPaneId++);
+        SideBuild targetSide;
+        targetSide.fiber = &*targetIt;
+        targetSide.otherFiberId = sourceIt->id;
+        targetSide.sourceSide = false;
+        targetSide.focusLinePosition = targetSample.linePosition;
+        targetSide.focusPoint = result.targetPoint;
+        targetSide.tangent = targetSample.tangent;
+        targetSide.editSessionName = "intersection_edit_target_" + std::to_string(_nextPaneId++);
+        targetSide.editSession = makeIntersectionLineSession(*targetIt,
+                                                             targetSample.linePosition,
+                                                             targetSample.tangent,
+                                                             targetSide.editSessionName,
+                                                             targetCallback);
+
+        auto prepareSide = [this](SideBuild& side) {
+            side.lineViews = vc::lasagna::buildLineViewSurfaces(
+                syntheticLineModelFromPoints(side.fiber->linePoints));
+            side.triplet = vc3d::fiber_slice::selectControlTriplet(
+                side.fiber->linePoints,
+                side.fiber->controlPoints,
+                side.focusLinePosition,
+                side.focusPoint);
+            if (!side.triplet.valid) {
+                throw std::runtime_error("Could not select intersection cross-slice control points");
+            }
+            side.stripSurfaceName = std::string("intersection_strip_") +
+                                    (side.sourceSide ? "source_" : "target_") +
+                                    std::to_string(_nextPaneId++);
+            side.lineViews.lineSurface->id = side.stripSurfaceName;
+            _state->setSurface(side.stripSurfaceName, side.lineViews.lineSurface);
+            _intersectionInspection->surfaceNames.push_back(side.stripSurfaceName);
+            side.editSession->generatedSurfaceNames.push_back(side.stripSurfaceName);
+        };
+        prepareSide(sourceSide);
+        prepareSide(targetSide);
+
+        _intersectionInspection->sourceLineSession = sourceSide.editSession;
+        _intersectionInspection->targetLineSession = targetSide.editSession;
+        _intersectionInspection->sourceSessionSurfaceName = sourceSide.editSessionName;
+        _intersectionInspection->targetSessionSurfaceName = targetSide.editSessionName;
+        _panes.push_back(PaneRecord{_nextPaneId++,
+                                    SourceKind::Plane,
+                                    sourceSide.editSessionName,
+                                    {},
+                                    sourceSide.editSession});
+        _panes.push_back(PaneRecord{_nextPaneId++,
+                                    SourceKind::Plane,
+                                    targetSide.editSessionName,
+                                    {},
+                                    targetSide.editSession});
+
+        std::vector<FiberSliceOverlayController::FiberData> overlayFibers{
+            {sourceIt->id, sourceIt->linePoints, sourceIt->controlPoints},
+            {targetIt->id, targetIt->linePoints, targetIt->controlPoints},
+        };
+
+        auto makeCrossFit = [](const SideBuild& side, double position, const cv::Vec3d& origin) {
+            const cv::Vec3d tangent = tangentAtLinePosition(side.fiber->linePoints, position);
+            const cv::Vec3f upHint = interpolatedUpAtLinePosition(
+                side.lineViews.lineUpVectors,
+                position,
+                tangent);
+            return vc3d::fiber_slice::planeFromNormalAndTangent(origin,
+                                                                 tangent,
+                                                                 toVec3d(upHint));
+        };
+
+        std::vector<SliceSpec> planeSpecs;
+        planeSpecs.reserve(9);
+        auto appendSideSpecs = [&](const SideBuild& side) {
+            const QString sideTitle = side.sourceSide ? tr("source") : tr("target");
+            const std::string prefix = side.sourceSide ? "source" : "target";
+            const std::array<std::pair<QString, std::pair<double, cv::Vec3d>>, 3> crosses{{
+                {tr("previous"), {side.triplet.previousLinePosition, side.triplet.previousPoint}},
+                {tr("current"), {side.triplet.currentLinePosition, side.triplet.currentPoint}},
+                {tr("next"), {side.triplet.nextLinePosition, side.triplet.nextPoint}},
+            }};
+            for (const auto& cross : crosses) {
+                const std::string surfaceName = "intersection_" + prefix + "_cross_" +
+                    cross.first.toStdString() + "_" + std::to_string(_nextPaneId++);
+                const bool current = cross.first == tr("current");
+                SliceSpec spec;
+                spec.title = sideTitle + QStringLiteral(" ") + cross.first;
+                spec.surfaceName = surfaceName;
+                spec.selectedFiberId = side.fiber->id;
+                spec.fit = makeCrossFit(side, cross.second.first, cross.second.second);
+                spec.center = cross.second.second;
+                spec.fullLineFiberIds = {side.fiber->id};
+                spec.editableCurrentCross = current;
+                spec.editSession = side.editSession;
+                spec.editLinePosition = side.focusLinePosition;
+                planeSpecs.push_back(std::move(spec));
+                side.editSession->generatedSurfaceNames.push_back(surfaceName);
+            }
+            SliceSpec connection;
+            connection.title = sideTitle + tr(" connection");
+            connection.surfaceName = "intersection_" + prefix + "_connection_" +
+                                     std::to_string(_nextPaneId++);
+            connection.selectedFiberId = side.fiber->id;
+            connection.fit = fslice::planeFromDirections(midpoint, connector, side.tangent);
+            connection.center = midpoint;
+            connection.fullLineFiberIds = {side.fiber->id};
+            connection.shiftScroll = true;
+            planeSpecs.push_back(std::move(connection));
+        };
+        appendSideSpecs(sourceSide);
+        appendSideSpecs(targetSide);
+
+        SliceSpec normalSpec;
+        normalSpec.title = tr("normal");
+        normalSpec.surfaceName = "intersection_normal_" + std::to_string(_nextPaneId++);
+        normalSpec.selectedFiberId = sourceIt->id;
+        normalSpec.fit = fslice::planeFromDirections(midpoint,
+                                                     sourceSample.tangent,
+                                                     targetSample.tangent);
+        normalSpec.center = midpoint;
+        normalSpec.fullLineFiberIds = {sourceIt->id, targetIt->id};
+        normalSpec.shiftScroll = true;
+
+        auto addPlaneViewer = [&](const SliceSpec& spec, const QRect& geometry) -> VolumeViewerBase* {
+            if (!spec.fit.valid) {
+                throw std::runtime_error(spec.fit.error);
+            }
             auto surface = std::make_shared<PlaneSurface>();
-            surface->setFromNormalAndUp(
-                cv::Vec3f{static_cast<float>(fit.origin[0]),
-                          static_cast<float>(fit.origin[1]),
-                          static_cast<float>(fit.origin[2])},
-                cv::Vec3f{static_cast<float>(fit.normal[0]),
-                          static_cast<float>(fit.normal[1]),
-                          static_cast<float>(fit.normal[2])},
-                cv::Vec3f{static_cast<float>(fit.upHint[0]),
-                          static_cast<float>(fit.upHint[1]),
-                          static_cast<float>(fit.upHint[2])});
-            surface->id = surfaceName;
-            _state->setSurface(surfaceName, surface);
+            surface->setFromNormalAndUp(toVec3f(spec.fit.origin),
+                                        toVec3f(spec.fit.normal),
+                                        toVec3f(spec.fit.upHint));
+            surface->id = spec.surfaceName;
+            _state->setSurface(spec.surfaceName, surface);
+            _intersectionInspection->surfaceNames.push_back(spec.surfaceName);
 
             VolumeViewerBase* viewer = _viewerManager->createViewer(
-                surfaceName,
+                spec.surfaceName,
                 spec.title,
                 targetArea,
                 ViewerManager::ViewerRole::Annotation);
             if (!viewer) {
-                _state->setSurface(surfaceName, nullptr);
                 throw std::runtime_error("Could not create intersection slice viewer");
             }
             if (auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject())) {
                 if (auto* subWindow = qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())) {
                     subWindow->setProperty("vc_intersection_slice_surface",
-                                           QString::fromStdString(surfaceName));
+                                           QString::fromStdString(spec.surfaceName));
+                    subWindow->setGeometry(geometry);
                     subWindow->show();
                 } else {
                     viewerWidget->show();
                 }
-                connect(viewerWidget, &QObject::destroyed, this, [this, surfaceName]() {
+                connect(viewerWidget, &QObject::destroyed, this, [this, name = spec.surfaceName]() {
                     if (_state) {
-                        _state->setSurface(surfaceName, nullptr);
+                        _state->setSurface(name, nullptr);
                     }
                 });
             }
+            if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+                if (spec.shiftScroll) {
+                    chunkedViewer->setProperty("vc_show_custom_normal_offset", true);
+                    chunkedViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+                    const cv::Vec3f stableUpHint = toVec3f(spec.fit.upHint);
+                    auto offsetVx = std::make_shared<double>(0.0);
+                    chunkedViewer->setShiftScrollOverride(
+                        [this, surfaceName = spec.surfaceName, stableUpHint, offsetVx, chunkedViewer](
+                            int steps,
+                            QPointF,
+                            Qt::KeyboardModifiers) {
+                            if (!_state || steps == 0) {
+                                return true;
+                            }
+                            auto planeShared =
+                                std::dynamic_pointer_cast<PlaneSurface>(_state->surface(surfaceName));
+                            if (!planeShared) {
+                                return false;
+                            }
+                            const cv::Vec3f normal = planeShared->normal({0, 0, 0});
+                            if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+                                !std::isfinite(normal[2]) || cv::norm(normal) <= 0.0f) {
+                                return true;
+                            }
 
+                            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                            const double sensitivity = std::max(
+                                0.01,
+                                settings.value(vc3d::settings::viewer::ZSCROLL_SENSITIVITY,
+                                               vc3d::settings::viewer::ZSCROLL_SENSITIVITY_DEFAULT)
+                                    .toDouble());
+                            const double delta = static_cast<double>(steps) * sensitivity;
+                            auto shiftedPlane = std::make_shared<PlaneSurface>();
+                            shiftedPlane->setFromNormalAndUp(
+                                planeShared->origin() + normal * static_cast<float>(delta),
+                                normal,
+                                stableUpHint);
+                            shiftedPlane->id = surfaceName;
+                            *offsetVx += delta;
+                            chunkedViewer->setProperty("vc_custom_normal_offset_vx", *offsetVx);
+                            _state->setSurface(surfaceName, shiftedPlane, false, true);
+                            return true;
+                        });
+                }
+                if (spec.editableCurrentCross && spec.editSession) {
+                    connect(chunkedViewer,
+                            &CChunkedVolumeViewer::sendMousePressVolume,
+                            this,
+                            [this,
+                             surfaceName = spec.surfaceName,
+                             session = spec.editSession,
+                             linePosition = spec.editLinePosition](
+                                cv::Vec3f volumePoint,
+                                cv::Vec3f,
+                                Qt::MouseButton button,
+                                Qt::KeyboardModifiers modifiers,
+                                QPointF) {
+                                if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                                    handleGeneratedControlPoint(surfaceName, volumePoint, linePosition);
+                                } else if (button == Qt::RightButton && modifiers == Qt::NoModifier) {
+                                    const cv::Vec3d control = nearestControlPointForLinePosition(
+                                        session->controlPoints,
+                                        linePosition,
+                                        session->focusedControlPoint);
+                                    handleGeneratedControlPointDelete(surfaceName,
+                                                                      linePosition,
+                                                                      toVec3f(control));
+                                }
+                            });
+                    applyFocusPointOverlay(chunkedViewer, spec.surfaceName, spec.center);
+                    chunkedViewer->connectOverlaysUpdated(
+                        this,
+                        [chunkedViewer, key = spec.surfaceName, point = spec.center]() {
+                            applyFocusPointOverlay(chunkedViewer, key, point);
+                        });
+                }
+            }
             viewer->fitSurfaceInView();
-            viewer->centerOnVolumePoint(cv::Vec3f{static_cast<float>(spec.center[0]),
-                                                  static_cast<float>(spec.center[1]),
-                                                  static_cast<float>(spec.center[2])},
-                                        true);
-
+            viewer->centerOnVolumePoint(toVec3f(spec.center), true);
             if (_fiberSliceOverlay) {
                 FiberSliceOverlayController::SliceData overlayData;
-                overlayData.surfaceName = surfaceName;
+                overlayData.surfaceName = spec.surfaceName;
                 overlayData.selectedFiberId = spec.selectedFiberId;
-                overlayData.plane = fslice::Plane{fit.origin, fit.normal};
+                overlayData.fullLineFiberIds = spec.fullLineFiberIds;
+                overlayData.plane = fslice::Plane{spec.fit.origin, spec.fit.normal};
                 overlayData.fitSamples = {result.sourcePoint, result.targetPoint, spec.center};
                 overlayData.fibers = overlayFibers;
                 overlayData.connectionSegment = FiberSliceOverlayController::ConnectionSegment{
@@ -1356,9 +1822,114 @@ void LineAnnotationController::showIntersectionInspection(
                 };
                 _fiberSliceOverlay->setSlice(viewer, std::move(overlayData));
             }
-        }
+            return viewer;
+        };
 
-        targetArea->tileSubWindows();
+        auto addStripViewer = [&](const SideBuild& side, const QRect& geometry) {
+            VolumeViewerBase* viewer = _viewerManager->createViewer(
+                side.stripSurfaceName,
+                side.sourceSide ? tr("source line") : tr("target line"),
+                targetArea,
+                ViewerManager::ViewerRole::Annotation);
+            if (!viewer) {
+                throw std::runtime_error("Could not create intersection line strip viewer");
+            }
+            if (auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject())) {
+                if (auto* subWindow = qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())) {
+                    subWindow->setProperty("vc_intersection_slice_surface",
+                                           QString::fromStdString(side.stripSurfaceName));
+                    subWindow->setGeometry(geometry);
+                    subWindow->show();
+                } else {
+                    viewerWidget->show();
+                }
+            }
+            auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
+            if (!chunkedViewer) {
+                return;
+            }
+            chunkedViewer->fitSurfaceInView();
+            applyLineStripOverlay(chunkedViewer,
+                                  side.stripSurfaceName,
+                                  side.editSession->controlPoints,
+                                  side.focusLinePosition);
+            chunkedViewer->connectOverlaysUpdated(
+                this,
+                [chunkedViewer,
+                 key = side.stripSurfaceName,
+                 session = side.editSession,
+                 focus = side.focusLinePosition]() {
+                    applyLineStripOverlay(chunkedViewer, key, session->controlPoints, focus);
+                });
+            connect(chunkedViewer,
+                    &CChunkedVolumeViewer::sendMousePressVolume,
+                    this,
+                    [this, surfaceName = side.stripSurfaceName, session = side.editSession](
+                        cv::Vec3f volumePoint,
+                        cv::Vec3f,
+                        Qt::MouseButton button,
+                        Qt::KeyboardModifiers modifiers,
+                        QPointF scenePoint) {
+                        if (modifiers != Qt::NoModifier) {
+                            return;
+                        }
+                        const double linePosition = linePositionFromStripScene(
+                            qobject_cast<CChunkedVolumeViewer*>(sender()),
+                            scenePoint);
+                        if (!std::isfinite(linePosition)) {
+                            return;
+                        }
+                        if (button == Qt::LeftButton) {
+                            handleGeneratedControlPoint(surfaceName, volumePoint, linePosition);
+                        } else if (button == Qt::RightButton) {
+                            const cv::Vec3d control = nearestControlPointForLinePosition(
+                                session->controlPoints,
+                                linePosition,
+                                session->focusedControlPoint);
+                            handleGeneratedControlPointDelete(surfaceName,
+                                                              linePosition,
+                                                              toVec3f(control));
+                        }
+                    });
+        };
+
+        const QSize size = targetArea->viewport() ? targetArea->viewport()->size()
+                                                  : targetArea->size();
+        const int width = std::max(3, size.width());
+        const int height = std::max(4, size.height());
+        const int colW = width / 3;
+        const int leftX = 0;
+        const int centerX = colW;
+        const int rightX = colW * 2;
+        const int rightW = width - rightX;
+        const int topH = height / 4;
+        const int midH = height / 2;
+        const int bottomY = topH + midH;
+        const int bottomH = height - bottomY;
+        auto topRect = [&](int x, int colWidth, int slot) {
+            const int slotW = colWidth / 3;
+            const int slotX = x + slot * slotW;
+            const int w = slot == 2 ? colWidth - slotW * 2 : slotW;
+            return QRect(slotX, 0, w, topH);
+        };
+        const QRect leftMid(leftX, topH, colW, midH);
+        const QRect leftBottom(leftX, bottomY, colW, bottomH);
+        const QRect centerRect(centerX, 0, colW, height);
+        const QRect rightMid(rightX, topH, rightW, midH);
+        const QRect rightBottom(rightX, bottomY, rightW, bottomH);
+
+        addPlaneViewer(planeSpecs[0], topRect(leftX, colW, 0));
+        addPlaneViewer(planeSpecs[1], topRect(leftX, colW, 1));
+        addPlaneViewer(planeSpecs[2], topRect(leftX, colW, 2));
+        addPlaneViewer(planeSpecs[3], leftMid);
+        addStripViewer(sourceSide, leftBottom);
+        addPlaneViewer(normalSpec, centerRect);
+        addPlaneViewer(planeSpecs[4], topRect(rightX, rightW, 0));
+        addPlaneViewer(planeSpecs[5], topRect(rightX, rightW, 1));
+        addPlaneViewer(planeSpecs[6], topRect(rightX, rightW, 2));
+        addPlaneViewer(planeSpecs[7], rightMid);
+        addStripViewer(targetSide, rightBottom);
+
         if (auto* active = targetArea->activeSubWindow()) {
             if (auto* viewer = dynamic_cast<VolumeViewerBase*>(active->widget())) {
                 if (auto* graphicsView = viewer->graphicsView()) {
@@ -1368,6 +1939,66 @@ void LineAnnotationController::showIntersectionInspection(
         }
     } catch (const std::exception& ex) {
         showError(tr("Could not show intersection inspection: %1")
+                      .arg(QString::fromStdString(ex.what())));
+    }
+}
+
+void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t editedFiberId,
+                                                                      double oldSourceArclength,
+                                                                      double oldTargetArclength)
+{
+    if (!_intersectionInspection || editedFiberId == 0) {
+        return;
+    }
+    const uint64_t sourceId = _intersectionInspection->result.sourceFiberId;
+    const uint64_t targetId = _intersectionInspection->result.targetFiberId;
+    try {
+        std::vector<vc::atlas::FiberPolyline> fibers;
+        fibers.reserve(2);
+        for (const auto& fiber : _fibers) {
+            if (fiber.id != sourceId && fiber.id != targetId) {
+                continue;
+            }
+            vc::atlas::FiberPolyline polyline;
+            polyline.id = fiber.id;
+            polyline.generation = fiber.generation;
+            polyline.points.reserve(fiber.linePoints.size());
+            for (const auto& point : fiber.linePoints) {
+                polyline.points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
+            }
+            fibers.push_back(std::move(polyline));
+        }
+        if (fibers.size() != 2) {
+            throw std::runtime_error("The edited intersection fibers are no longer both loaded");
+        }
+        vc::atlas::FiberSpatialIndex index;
+        vc::atlas::FiberIntersectionCache cache;
+        vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+        vc::atlas::FiberIntersectionCeresOptions ceres;
+        const auto results = vc::atlas::searchFiberIntersections(
+            fibers,
+            {sourceId},
+            {targetId},
+            index,
+            &cache,
+            broad,
+            ceres);
+        const auto nearest = vc::atlas::nearestIntersectionResultByArclength(
+            results,
+            oldSourceArclength,
+            oldTargetArclength);
+        if (!nearest) {
+            cleanupIntersectionInspectionSurfaces();
+            _intersectionInspection.reset();
+            QMessageBox::warning(_parentWidget,
+                                 tr("Intersections"),
+                                 tr("The edited fiber pair no longer has an intersection result."));
+            return;
+        }
+        _intersectionInspection->result = results[*nearest];
+        rebuildIntersectionInspection();
+    } catch (const std::exception& ex) {
+        showError(tr("Could not refresh intersection inspection: %1")
                       .arg(QString::fromStdString(ex.what())));
     }
 }
@@ -1908,9 +2539,11 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                            session.controlPoints,
                            linePointsToJson(session.optimizedLine),
                            &session.optimizationReport);
-        if (!materializeGeneratedViews(session)) {
-            session.taskState = LineAnnotationSession::TaskState::Failed;
-            return;
+        if (!session.suppressGeneratedViews) {
+            if (!materializeGeneratedViews(session)) {
+                session.taskState = LineAnnotationSession::TaskState::Failed;
+                return;
+            }
         }
         if (session.deferShowUntilGenerated && pane->dialog && !pane->dialog->isVisible()) {
             pane->dialog->showMaximized();
@@ -1925,6 +2558,10 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                        session.optimizationReport.ceresSolveMs,
                        session.optimizationReport.totalMs,
                        session.optimizedLine.points.size());
+        auto callback = session.optimizationSucceededCallback;
+        if (callback) {
+            callback(session);
+        }
         return;
     }
 
@@ -2508,6 +3145,108 @@ vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
     }
     model.displayFrameAnchorIndex = bestAnchor;
     return model;
+}
+
+vc::lasagna::LineModel LineAnnotationController::syntheticLineModelFromPoints(
+    const std::vector<cv::Vec3d>& points)
+{
+    if (points.empty()) {
+        throw std::runtime_error("Fiber has no line points");
+    }
+
+    vc::lasagna::LineModel model;
+    model.points.reserve(points.size());
+    for (const cv::Vec3d& point : points) {
+        vc::lasagna::LinePoint linePoint;
+        linePoint.position = point;
+        linePoint.sampledNormal = vc::lasagna::NormalSample{{0.0, 0.0, 1.0}, true, {}};
+        model.points.push_back(linePoint);
+    }
+    model.displayFrameAnchorIndex = static_cast<int>(points.size() / 2);
+    if (points.size() >= 2) {
+        model.segmentSamples.reserve(points.size() - 1);
+        for (size_t i = 1; i < points.size(); ++i) {
+            vc::lasagna::LineSegmentSamples segment;
+            segment.samples.push_back({0.0, points[i - 1], model.points[i - 1].sampledNormal});
+            segment.samples.push_back({1.0, points[i], model.points[i].sampledNormal});
+            model.segmentSamples.push_back(std::move(segment));
+        }
+    }
+    return model;
+}
+
+std::shared_ptr<LineAnnotationController::LineAnnotationSession>
+LineAnnotationController::makeIntersectionLineSession(
+    const StoredFiber& fiber,
+    double focusLinePosition,
+    const cv::Vec3d& sourceSliceNormal,
+    const std::string& surfaceName,
+    std::function<void()> onOptimizationSucceeded)
+{
+    auto session = std::make_shared<LineAnnotationSession>();
+    session->surfaceName = surfaceName;
+    session->sourceAnnotationSurfaceName = surfaceName;
+    session->fiberId = fiber.id;
+    session->fiberUsername = fiber.username;
+    session->fiberStartedAt = fiber.startedAt;
+    session->fiberSequence = fiber.sequence;
+    session->fiberFileName = fiber.fileName;
+    session->fiberManualHvTag = fiber.manualHvTag;
+    session->focusedLinePosition = std::clamp(
+        focusLinePosition,
+        0.0,
+        static_cast<double>(std::max<size_t>(1, fiber.linePoints.size()) - 1));
+    session->focusedControlPoint = interpolatedPointAtLinePosition(
+        fiber.linePoints,
+        session->focusedLinePosition);
+    session->sourceSliceNormal = finiteDirection(sourceSliceNormal)
+        ? normalizedOrZero(sourceSliceNormal)
+        : cv::Vec3d{0.0, 0.0, 1.0};
+    session->optimizedLine = syntheticLineModelFromPoints(fiber.linePoints);
+    session->taskState = LineAnnotationSession::TaskState::Succeeded;
+    session->suppressGeneratedViews = true;
+    session->optimizationSucceededCallback =
+        [callback = std::move(onOptimizationSucceeded)](LineAnnotationSession&) {
+            if (callback) {
+                callback();
+            }
+        };
+
+    session->controlPoints.reserve(fiber.controlPoints.size());
+    int seedControl = -1;
+    double seedDistance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < fiber.controlPoints.size(); ++i) {
+        const cv::Vec3d& controlPoint = fiber.controlPoints[i];
+        const int index = static_cast<int>(
+            vc3d::fiber_slice::nearestLinePointIndex(fiber.linePoints, controlPoint));
+        vc::lasagna::LineControlPoint control;
+        control.linePosition = static_cast<double>(index);
+        control.volumePoint = controlPoint;
+        control.optimizedIndex = index;
+        session->controlPoints.push_back(control);
+        const double distance = std::abs(control.linePosition - session->focusedLinePosition);
+        if (distance < seedDistance) {
+            seedDistance = distance;
+            seedControl = static_cast<int>(i);
+        }
+    }
+    if (session->controlPoints.empty()) {
+        vc::lasagna::LineControlPoint control;
+        control.linePosition = session->focusedLinePosition;
+        control.volumePoint = *session->focusedControlPoint;
+        control.optimizedIndex = static_cast<int>(std::llround(session->focusedLinePosition));
+        control.isSeed = true;
+        session->controlPoints.push_back(control);
+        seedControl = 0;
+    }
+    if (seedControl < 0) {
+        seedControl = 0;
+    }
+    session->controlPoints[static_cast<size_t>(seedControl)].isSeed = true;
+    session->seedPoint = session->controlPoints[static_cast<size_t>(seedControl)].volumePoint;
+    session->optimizedLine.displayFrameAnchorIndex =
+        session->controlPoints[static_cast<size_t>(seedControl)].optimizedIndex;
+    return session;
 }
 
 void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session)

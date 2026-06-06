@@ -23,6 +23,58 @@ TEST_CASE("fiber slice arclength sampling interpolates point and tangent")
     CHECK(sample.tangent[1] == doctest::Approx(1.0));
     CHECK(sample.tangent[2] == doctest::Approx(0.0));
     CHECK(sample.arclength == doctest::Approx(5.0));
+    CHECK(sample.linePosition == doctest::Approx(1.5));
+    CHECK(vc3d::fiber_slice::linePositionAtArclength(linePoints, 5.0) ==
+          doctest::Approx(1.5));
+}
+
+TEST_CASE("fiber slice control triplet selects previous current and next positions")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+        {30.0, 0.0, 0.0},
+        {40.0, 0.0, 0.0},
+    };
+    const std::vector<cv::Vec3d> controls{
+        {0.0, 0.0, 0.0},
+        {10.1, 0.0, 0.0},
+        {30.1, 0.0, 0.0},
+        {40.0, 0.0, 0.0},
+    };
+
+    const auto triplet = vc3d::fiber_slice::selectControlTriplet(
+        linePoints,
+        controls,
+        2.0,
+        {20.0, 0.0, 0.0});
+    CHECK(triplet.valid);
+    CHECK(triplet.previousLinePosition == doctest::Approx(1.0));
+    CHECK(triplet.currentLinePosition == doctest::Approx(2.0));
+    CHECK(triplet.nextLinePosition == doctest::Approx(3.0));
+    CHECK(triplet.currentPoint[0] == doctest::Approx(20.0));
+}
+
+TEST_CASE("fiber slice control triplet falls back to endpoint when neighbor is missing")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+    };
+    const std::vector<cv::Vec3d> controls{
+        {0.0, 0.0, 0.0},
+    };
+
+    const auto triplet = vc3d::fiber_slice::selectControlTriplet(
+        linePoints,
+        controls,
+        0.0,
+        {0.0, 0.0, 0.0});
+    CHECK(triplet.valid);
+    CHECK(triplet.previousLinePosition == doctest::Approx(0.0));
+    CHECK(triplet.nextLinePosition == doctest::Approx(2.0));
 }
 
 TEST_CASE("fiber slice plane construction falls back when tangent is parallel to normal")

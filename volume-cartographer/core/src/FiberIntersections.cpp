@@ -7,6 +7,7 @@
 #include <cmath>
 #include <future>
 #include <limits>
+#include <optional>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -880,6 +881,34 @@ std::vector<FiberIntersectionResult> deduplicateFiberIntersectionResults(
         }
     }
     return deduped;
+}
+
+std::optional<size_t> nearestIntersectionResultByArclength(
+    const std::vector<FiberIntersectionResult>& results,
+    double sourceArclength,
+    double targetArclength)
+{
+    if (!std::isfinite(sourceArclength) || !std::isfinite(targetArclength)) {
+        return std::nullopt;
+    }
+
+    std::optional<size_t> bestIndex;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& result = results[i];
+        if (!std::isfinite(result.sourceArclength) ||
+            !std::isfinite(result.targetArclength)) {
+            continue;
+        }
+        const double sourceDelta = result.sourceArclength - sourceArclength;
+        const double targetDelta = result.targetArclength - targetArclength;
+        const double distance = std::hypot(sourceDelta, targetDelta);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = i;
+        }
+    }
+    return bestIndex;
 }
 
 std::vector<FiberIntersectionResult> searchFiberIntersections(

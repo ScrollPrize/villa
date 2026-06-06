@@ -33,6 +33,7 @@ public:
     struct SliceData {
         std::string surfaceName;
         uint64_t selectedFiberId{0};
+        std::vector<uint64_t> fullLineFiberIds;
         vc3d::fiber_slice::Plane plane;
         std::vector<cv::Vec3d> fitSamples;
         std::vector<FiberData> fibers;
@@ -54,6 +55,8 @@ private:
                                    const SliceData& slice,
                                    const cv::Vec3d& point) const;
     double currentViewportMinSpan(VolumeViewerBase* viewer, const SliceData& slice) const;
+    vc3d::fiber_slice::Plane currentPlaneForViewer(VolumeViewerBase* viewer,
+                                                   const SliceData& slice) const;
 
     std::unordered_map<VolumeViewerBase*, SliceData> _slices;
 };
