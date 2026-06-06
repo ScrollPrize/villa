@@ -49,6 +49,42 @@ inline FiberHvTag fiberHvTagFromString(const std::string& tag)
     return FiberHvTag::Unknown;
 }
 
+inline bool firstFiberDisplaysAsH(const FiberHvClassification& first,
+                                  const std::string& firstManualTag,
+                                  const FiberHvClassification& second,
+                                  const std::string& secondManualTag,
+                                  bool firstTieBreak = true)
+{
+    const FiberHvTag firstManual = fiberHvTagFromString(firstManualTag);
+    const FiberHvTag secondManual = fiberHvTagFromString(secondManualTag);
+    if (firstManual != FiberHvTag::Unknown || secondManual != FiberHvTag::Unknown) {
+        if (firstManual == FiberHvTag::H && secondManual != FiberHvTag::H) {
+            return true;
+        }
+        if (secondManual == FiberHvTag::H && firstManual != FiberHvTag::H) {
+            return false;
+        }
+        if (firstManual == FiberHvTag::V && secondManual != FiberHvTag::V) {
+            return false;
+        }
+        if (secondManual == FiberHvTag::V && firstManual != FiberHvTag::V) {
+            return true;
+        }
+    }
+
+    if (std::isfinite(first.horizontalScore) &&
+        std::isfinite(second.horizontalScore) &&
+        first.horizontalScore != second.horizontalScore) {
+        return first.horizontalScore > second.horizontalScore;
+    }
+    if (std::isfinite(first.verticalScore) &&
+        std::isfinite(second.verticalScore) &&
+        first.verticalScore != second.verticalScore) {
+        return first.verticalScore < second.verticalScore;
+    }
+    return firstTieBreak;
+}
+
 inline double fiberLineLengthVx(const std::vector<cv::Vec3d>& points)
 {
     double length = 0.0;

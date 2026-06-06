@@ -16,6 +16,31 @@ namespace
 constexpr const char* kOverlayGroup = "fiber_slice_overlay";
 constexpr qreal kIntersectionMarkerBaseRadius = 3.0;
 
+ViewerOverlayControllerBase::OverlayStyle lineStyle(QColor color, qreal width = 1.6)
+{
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = color;
+    style.brushColor = Qt::transparent;
+    style.penWidth = width;
+    style.penCap = Qt::RoundCap;
+    style.penJoin = Qt::RoundJoin;
+    style.z = 40.0;
+    return style;
+}
+
+ViewerOverlayControllerBase::OverlayStyle filledPointStyle(QColor pen,
+                                                           QColor brush,
+                                                           qreal width,
+                                                           qreal z)
+{
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = pen;
+    style.brushColor = brush;
+    style.penWidth = width;
+    style.z = z;
+    return style;
+}
+
 bool finiteScenePoint(const QPointF& point)
 {
     return std::isfinite(point.x()) && std::isfinite(point.y());
@@ -43,6 +68,51 @@ cv::Vec3d toVec3d(const cv::Vec3f& point)
 FiberSliceOverlayController::FiberSliceOverlayController(QObject* parent)
     : ViewerOverlayControllerBase(kOverlayGroup, parent)
 {
+}
+
+FiberSliceOverlayController::FiberStyle FiberSliceOverlayController::sourceFiberStyle()
+{
+    FiberStyle style;
+    style.lineStyle = lineStyle(QColor(255, 185, 35, 215), 1.7);
+    style.controlStyle = filledPointStyle(QColor(255, 95, 35, 255),
+                                          QColor(255, 155, 35, 225),
+                                          1.1,
+                                          45.0);
+    style.markerStyle = filledPointStyle(QColor(255, 235, 65, 250),
+                                         QColor(255, 80, 55, 180),
+                                         1.7,
+                                         55.0);
+    return style;
+}
+
+FiberSliceOverlayController::FiberStyle FiberSliceOverlayController::targetFiberStyle()
+{
+    FiberStyle style;
+    style.lineStyle = lineStyle(QColor(35, 220, 255, 215), 1.7);
+    style.controlStyle = filledPointStyle(QColor(0, 150, 255, 255),
+                                          QColor(65, 225, 255, 225),
+                                          1.1,
+                                          45.0);
+    style.markerStyle = filledPointStyle(QColor(85, 235, 255, 250),
+                                         QColor(0, 150, 255, 180),
+                                         1.7,
+                                         55.0);
+    return style;
+}
+
+bool FiberSliceOverlayController::focusMarkerVisible(double distanceToPlane,
+                                                     double minVisibleViewportSpanVx,
+                                                     double viewportFraction)
+{
+    if (!std::isfinite(distanceToPlane) ||
+        !std::isfinite(minVisibleViewportSpanVx) ||
+        !std::isfinite(viewportFraction) ||
+        viewportFraction < 0.0) {
+        return false;
+    }
+    return vc3d::fiber_slice::focusedIntersectionMarkerVisible(distanceToPlane,
+                                                               minVisibleViewportSpanVx,
+                                                               viewportFraction);
 }
 
 void FiberSliceOverlayController::setSlice(VolumeViewerBase* viewer, SliceData data)
@@ -177,19 +247,6 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
 
     const double minViewportSpan = currentViewportMinSpan(viewer, slice);
 
-    OverlayStyle lineStyle;
-    lineStyle.penColor = QColor(250, 220, 70, 210);
-    lineStyle.brushColor = Qt::transparent;
-    lineStyle.penCap = Qt::RoundCap;
-    lineStyle.penJoin = Qt::RoundJoin;
-    lineStyle.z = 40.0;
-
-    OverlayStyle controlStyle;
-    controlStyle.penColor = QColor(255, 220, 40, 255);
-    controlStyle.brushColor = QColor(255, 220, 40, 220);
-    controlStyle.penWidth = 1.0;
-    controlStyle.z = 45.0;
-
     for (size_t fullIndex = 0; fullIndex < fullLineFiberIds.size(); ++fullIndex) {
         const uint64_t fullFiberId = fullLineFiberIds[fullIndex];
         const auto fiberIt = std::find_if(slice.fibers.begin(), slice.fibers.end(),
@@ -200,13 +257,8 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             continue;
         }
 
-        auto thisLineStyle = lineStyle;
-        auto thisControlStyle = controlStyle;
-        if (fullIndex > 0) {
-            thisLineStyle.penColor = QColor(80, 210, 255, 210);
-            thisControlStyle.penColor = QColor(80, 210, 255, 255);
-            thisControlStyle.brushColor = QColor(80, 210, 255, 220);
-        }
+        auto thisLineStyle = fiberIt->style.lineStyle;
+        auto thisControlStyle = fiberIt->style.controlStyle;
 
         QPointF previousScene;
         double previousSize = 0.0;
@@ -252,56 +304,116 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         }
     }
 
-    OverlayStyle ellipseStyle;
-    ellipseStyle.penColor = QColor(80, 210, 255, 130);
-    ellipseStyle.brushColor = QColor(80, 210, 255, 90);
-    ellipseStyle.penWidth = 0.75;
-    ellipseStyle.z = 38.0;
+    if (slice.showGenericCrossings) {
+        for (const FiberData& other : slice.fibers) {
+            if (isFullLineFiber(other.id) || other.linePoints.size() < 2) {
+                continue;
+            }
+            for (size_t i = 1; i < other.linePoints.size(); ++i) {
+                const auto crossing =
+                    fslice::segmentPlaneIntersection(other.linePoints[i - 1], other.linePoints[i], plane);
+                if (!crossing) {
+                    continue;
+                }
+                const fslice::EllipseStyle ellipse =
+                    fslice::ellipseStyleForAngle(crossing->angleDegrees, kIntersectionMarkerBaseRadius);
+                if (ellipse.opacity <= 0.01) {
+                    continue;
+                }
 
-    for (const FiberData& other : slice.fibers) {
-        if (isFullLineFiber(other.id) || other.linePoints.size() < 2) {
+                cv::Vec3d projectedTangent =
+                    crossing->tangent - plane.normal * crossing->tangent.dot(plane.normal);
+                projectedTangent = fslice::normalizedOrZero(projectedTangent);
+                const QPointF centerScene = projectedVolumeToScene(viewer, slice, crossing->point);
+                if (!finiteScenePoint(centerScene)) {
+                    continue;
+                }
+
+                double rotation = 0.0;
+                if (cv::norm(projectedTangent) > 0.0) {
+                    const QPointF tangentScene =
+                        projectedVolumeToScene(viewer, slice, crossing->point + projectedTangent);
+                    const QPointF delta = tangentScene - centerScene;
+                    if (finiteScenePoint(tangentScene) && std::hypot(delta.x(), delta.y()) > 1.0e-6) {
+                        rotation = std::atan2(delta.y(), delta.x());
+                    }
+                }
+
+                auto style = other.style.markerStyle;
+                style.penWidth = 0.75;
+                style.z = 38.0;
+                style.penColor.setAlphaF(std::clamp(ellipse.opacity * 0.55, 0.0, 1.0));
+                style.brushColor.setAlphaF(std::clamp(ellipse.opacity * 0.38, 0.0, 1.0));
+                builder.addRotatedEllipse(centerScene,
+                                          ellipse.majorRadius,
+                                          ellipse.minorRadius,
+                                          rotation,
+                                          true,
+                                          style);
+            }
+        }
+    }
+
+    auto styleForFiber = [&slice](uint64_t fiberId) -> FiberStyle {
+        const auto it = std::find_if(slice.fibers.begin(), slice.fibers.end(),
+                                     [fiberId](const FiberData& fiber) {
+                                         return fiber.id == fiberId;
+                                     });
+        if (it != slice.fibers.end()) {
+            return it->style;
+        }
+        return sourceFiberStyle();
+    };
+
+    auto drawEndpointCross = [&](const cv::Vec3d& point, const OverlayStyle& markerStyle) {
+        const QPointF center = projectedVolumeToScene(viewer, slice, point);
+        if (!finiteScenePoint(center)) {
+            return;
+        }
+        auto crossStyle = markerStyle;
+        crossStyle.brushColor = Qt::transparent;
+        crossStyle.penCap = Qt::RoundCap;
+        crossStyle.penJoin = Qt::RoundJoin;
+        crossStyle.z = std::max<qreal>(crossStyle.z, 55.0);
+        constexpr qreal kRadius = 7.0;
+        builder.addLineStrip({
+            center + QPointF{-kRadius, -kRadius},
+            center + QPointF{kRadius, kRadius},
+        }, false, crossStyle);
+        builder.addLineStrip({
+            center + QPointF{-kRadius, kRadius},
+            center + QPointF{kRadius, -kRadius},
+        }, false, crossStyle);
+    };
+
+    for (const FocusMarker& marker : slice.focusMarkers) {
+        if (!fslice::isFinitePoint(marker.point)) {
             continue;
         }
-        for (size_t i = 1; i < other.linePoints.size(); ++i) {
-            const auto crossing =
-                fslice::segmentPlaneIntersection(other.linePoints[i - 1], other.linePoints[i], plane);
-            if (!crossing) {
-                continue;
-            }
-            const fslice::EllipseStyle ellipse =
-                fslice::ellipseStyleForAngle(crossing->angleDegrees, kIntersectionMarkerBaseRadius);
-            if (ellipse.opacity <= 0.01) {
-                continue;
-            }
-
-            cv::Vec3d projectedTangent =
-                crossing->tangent - plane.normal * crossing->tangent.dot(plane.normal);
-            projectedTangent = fslice::normalizedOrZero(projectedTangent);
-            const QPointF centerScene = projectedVolumeToScene(viewer, slice, crossing->point);
-            if (!finiteScenePoint(centerScene)) {
-                continue;
-            }
-
-            double rotation = 0.0;
-            if (cv::norm(projectedTangent) > 0.0) {
-                const QPointF tangentScene =
-                    projectedVolumeToScene(viewer, slice, crossing->point + projectedTangent);
-                const QPointF delta = tangentScene - centerScene;
-                if (finiteScenePoint(tangentScene) && std::hypot(delta.x(), delta.y()) > 1.0e-6) {
-                    rotation = std::atan2(delta.y(), delta.x());
-                }
-            }
-
-            auto style = ellipseStyle;
-            style.penColor.setAlphaF(std::clamp(ellipse.opacity * 0.55, 0.0, 1.0));
-            style.brushColor.setAlphaF(std::clamp(ellipse.opacity * 0.38, 0.0, 1.0));
-            builder.addRotatedEllipse(centerScene,
-                                      ellipse.majorRadius,
-                                      ellipse.minorRadius,
-                                      rotation,
-                                      true,
-                                      style);
+        const double distance = fslice::signedDistanceToPlane(marker.point, plane);
+        if (marker.requirePlaneProximity &&
+            !focusMarkerVisible(distance, minViewportSpan, slice.focusMarkerViewportFraction)) {
+            continue;
         }
+        const QPointF center = projectedVolumeToScene(viewer, slice, marker.point);
+        if (!finiteScenePoint(center)) {
+            continue;
+        }
+        auto style = styleForFiber(marker.fiberId).markerStyle;
+        style.brushColor = Qt::transparent;
+        style.penCap = Qt::RoundCap;
+        style.penJoin = Qt::RoundJoin;
+        style.penWidth = std::max<qreal>(style.penWidth, 2.0);
+        style.z = std::max<qreal>(style.z, 180.0);
+        const qreal radius = static_cast<qreal>(marker.radius);
+        builder.addLineStrip({
+            center + QPointF{-radius, -radius},
+            center + QPointF{radius, radius},
+        }, false, style);
+        builder.addLineStrip({
+            center + QPointF{-radius, radius},
+            center + QPointF{radius, -radius},
+        }, false, style);
     }
 
     if (slice.connectionSegment) {
@@ -352,30 +464,10 @@ void FiberSliceOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                 hasPreviousConnector = true;
             }
 
-            auto drawEndpointCross = [&](const cv::Vec3d& point, const QColor& color) {
-                const QPointF center = projectedVolumeToScene(viewer, slice, point);
-                if (!finiteScenePoint(center)) {
-                    return;
-                }
-                OverlayStyle crossStyle;
-                crossStyle.penColor = color;
-                crossStyle.brushColor = Qt::transparent;
-                crossStyle.penCap = Qt::RoundCap;
-                crossStyle.penJoin = Qt::RoundJoin;
-                crossStyle.penWidth = 1.5;
-                crossStyle.z = 55.0;
-                constexpr qreal kRadius = 7.0;
-                builder.addLineStrip({
-                    center + QPointF{-kRadius, -kRadius},
-                    center + QPointF{kRadius, kRadius},
-                }, false, crossStyle);
-                builder.addLineStrip({
-                    center + QPointF{-kRadius, kRadius},
-                    center + QPointF{kRadius, -kRadius},
-                }, false, crossStyle);
-            };
-            drawEndpointCross(connector.sourcePoint, QColor(255, 230, 70, 245));
-            drawEndpointCross(connector.targetPoint, QColor(80, 230, 255, 245));
+            drawEndpointCross(connector.sourcePoint,
+                              styleForFiber(connector.sourceFiberId).markerStyle);
+            drawEndpointCross(connector.targetPoint,
+                              styleForFiber(connector.targetFiberId).markerStyle);
         }
     }
 }

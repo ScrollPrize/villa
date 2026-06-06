@@ -26,6 +26,7 @@ struct FiberPolyline {
     uint64_t id = 0;
     uint64_t generation = 1;
     std::vector<FiberPoint> points;
+    std::vector<cv::Vec3d> controlPoints;
 };
 
 struct FiberSegmentEntry {

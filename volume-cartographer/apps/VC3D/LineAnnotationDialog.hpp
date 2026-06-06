@@ -11,6 +11,7 @@
 #include <vector>
 #include <utility>
 
+#include "LineAnnotationGeneratedViews.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <opencv2/core/mat.hpp>
@@ -37,11 +38,8 @@ public:
         Sideways,
         ZInOut,
     };
-    enum class GeneratedControlPointContextResult {
-        None,
-        Handled,
-        NewLineAnnotationRequested,
-    };
+    using GeneratedControlPointContextResult =
+        vc3d::line_annotation::GeneratedControlPointContextResult;
 
     struct Pane {
         std::string surfaceName;
@@ -49,47 +47,8 @@ public:
         QPointer<QMdiSubWindow> subWindow;
     };
 
-    struct GeneratedOverlay {
-        struct ControlPointMarker {
-            cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN()};
-            double linePosition = std::numeric_limits<double>::quiet_NaN();
-            bool isSeed = false;
-        };
-
-        std::vector<cv::Vec3f> linePoints;
-        cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN()};
-        cv::Vec3f pointMarker{std::numeric_limits<float>::quiet_NaN(),
-                              std::numeric_limits<float>::quiet_NaN(),
-                              std::numeric_limits<float>::quiet_NaN()};
-        int seedLineIndex = -1;
-        std::vector<double> markerLinePositions;
-        std::vector<ControlPointMarker> controlPoints;
-        double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
-        bool emphasizedPointMarker = false;
-        bool useSurfaceCenterLine = false;
-    };
-
-    struct GeneratedViews {
-        std::string lineSurfaceName;
-        QString lineSurfaceTitle;
-        std::string lineSideSliceName;
-        QString lineSideSliceTitle;
-        std::string currentCutName;
-        std::shared_ptr<PlaneSurface> currentCutSurface;
-        std::vector<std::pair<std::string, std::shared_ptr<PlaneSurface>>> bottomCutSurfaces;
-        std::vector<cv::Vec3f> linePoints;
-        std::vector<cv::Vec3f> lineUpVectors;
-        cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN()};
-        int seedLineIndex = -1;
-        int initialCenterIndex = 0;
-        std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
-    };
+    using GeneratedOverlay = vc3d::line_annotation::GeneratedOverlay;
+    using GeneratedViews = vc3d::line_annotation::GeneratedViews;
 
     explicit LineAnnotationDialog(ViewerManager* viewerManager, QWidget* parent = nullptr);
 

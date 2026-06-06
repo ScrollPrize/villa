@@ -48,6 +48,11 @@ struct FiberPointEntry {
 using PointRTreeValue = std::pair<Point3, FiberPointEntry>;
 using PointTree = bgi::rtree<PointRTreeValue, bgi::quadratic<32>>;
 
+struct ArclengthDomain {
+    double start = 0.0;
+    double end = 0.0;
+};
+
 double dot(const cv::Vec3d& a, const cv::Vec3d& b)
 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -99,10 +104,80 @@ std::vector<double> cumulativeArclengths(const FiberPolyline& fiber)
     return lengths;
 }
 
-double totalLength(const FiberPolyline& fiber)
+cv::Vec3d pointAtSegmentArclength(const cv::Vec3d& a,
+                                  const cv::Vec3d& b,
+                                  double segmentStart,
+                                  double segmentEnd,
+                                  double arclength)
 {
-    const auto lengths = cumulativeArclengths(fiber);
-    return lengths.empty() ? 0.0 : lengths.back();
+    const double span = std::max(kEpsilon, segmentEnd - segmentStart);
+    const double t = std::clamp((arclength - segmentStart) / span, 0.0, 1.0);
+    return a * (1.0 - t) + b * t;
+}
+
+std::optional<double> closestArclengthOnPolyline(const FiberPolyline& fiber,
+                                                 const std::vector<double>& lengths,
+                                                 const cv::Vec3d& point)
+{
+    if (!finitePoint(point) || fiber.points.size() < 2 || lengths.size() != fiber.points.size()) {
+        return std::nullopt;
+    }
+    double bestDistanceSq = std::numeric_limits<double>::infinity();
+    double bestArclength = std::numeric_limits<double>::quiet_NaN();
+    for (size_t i = 1; i < fiber.points.size(); ++i) {
+        const cv::Vec3d a = fiber.points[i - 1].position;
+        const cv::Vec3d b = fiber.points[i].position;
+        if (!finitePoint(a) || !finitePoint(b)) {
+            continue;
+        }
+        const cv::Vec3d ab = b - a;
+        const double denom = dot(ab, ab);
+        if (!std::isfinite(denom) || denom <= kEpsilon) {
+            continue;
+        }
+        const double t = std::clamp(dot(point - a, ab) / denom, 0.0, 1.0);
+        const cv::Vec3d projected = a + ab * t;
+        const cv::Vec3d delta = point - projected;
+        const double distanceSq = dot(delta, delta);
+        if (distanceSq < bestDistanceSq) {
+            bestDistanceSq = distanceSq;
+            bestArclength = lengths[i - 1] + (lengths[i] - lengths[i - 1]) * t;
+        }
+    }
+    if (!std::isfinite(bestArclength)) {
+        return std::nullopt;
+    }
+    return bestArclength;
+}
+
+ArclengthDomain activeArclengthDomain(const FiberPolyline& fiber,
+                                      const std::vector<double>& lengths)
+{
+    const double fullEnd = lengths.empty() ? 0.0 : lengths.back();
+    ArclengthDomain domain{0.0, fullEnd};
+    if (fiber.controlPoints.size() < 2 || fiber.points.size() < 2) {
+        return domain;
+    }
+
+    double first = std::numeric_limits<double>::infinity();
+    double last = -std::numeric_limits<double>::infinity();
+    int finiteControls = 0;
+    for (const cv::Vec3d& control : fiber.controlPoints) {
+        const auto arclength = closestArclengthOnPolyline(fiber, lengths, control);
+        if (!arclength || !std::isfinite(*arclength)) {
+            continue;
+        }
+        first = std::min(first, *arclength);
+        last = std::max(last, *arclength);
+        ++finiteControls;
+    }
+    if (finiteControls < 2 || !std::isfinite(first) || !std::isfinite(last) ||
+        last - first <= kEpsilon) {
+        return domain;
+    }
+    domain.start = std::clamp(first, 0.0, fullEnd);
+    domain.end = std::clamp(last, domain.start, fullEnd);
+    return domain;
 }
 
 double sanitizedSampleSpacing(double spacing)
@@ -124,6 +199,10 @@ std::vector<FiberDenseSample> denseSamplesForFiber(const FiberPolyline& fiber, d
 
     const double spacing = sanitizedSampleSpacing(maxSampleSpacing);
     const auto lengths = cumulativeArclengths(fiber);
+    const ArclengthDomain domain = activeArclengthDomain(fiber, lengths);
+    if (domain.end - domain.start <= kEpsilon) {
+        return samples;
+    }
     auto addSample = [&samples](int segmentIndex,
                                 const cv::Vec3d& position,
                                 double arclength) {
@@ -153,12 +232,22 @@ std::vector<FiberDenseSample> denseSamplesForFiber(const FiberPolyline& fiber, d
         if (!std::isfinite(segmentLength) || segmentLength <= kEpsilon) {
             continue;
         }
+        const double clippedStart = std::max(lengths[i - 1], domain.start);
+        const double clippedEnd = std::min(lengths[i], domain.end);
+        if (clippedEnd - clippedStart <= kEpsilon) {
+            continue;
+        }
         const int segmentIndex = static_cast<int>(i - 1);
-        addSample(segmentIndex, a, lengths[i - 1]);
-        const int steps = std::max(1, static_cast<int>(std::ceil(segmentLength / spacing)));
+        addSample(segmentIndex,
+                  pointAtSegmentArclength(a, b, lengths[i - 1], lengths[i], clippedStart),
+                  clippedStart);
+        const int steps = std::max(1, static_cast<int>(std::ceil((clippedEnd - clippedStart) / spacing)));
         for (int step = 1; step <= steps; ++step) {
             const double t = static_cast<double>(step) / static_cast<double>(steps);
-            addSample(segmentIndex, a * (1.0 - t) + b * t, lengths[i - 1] + segmentLength * t);
+            const double arclength = clippedStart + (clippedEnd - clippedStart) * t;
+            addSample(segmentIndex,
+                      pointAtSegmentArclength(a, b, lengths[i - 1], lengths[i], arclength),
+                      arclength);
         }
     }
 
@@ -791,8 +880,12 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
     const FiberIntersectionCeresOptions& options,
     const vc::lasagna::LasagnaNormalSampler* windingSampler)
 {
-    double sourceS = std::clamp(candidate.sourceArclength, 0.0, totalLength(source));
-    double targetS = std::clamp(candidate.targetArclength, 0.0, totalLength(target));
+    const auto sourceLengths = cumulativeArclengths(source);
+    const auto targetLengths = cumulativeArclengths(target);
+    const ArclengthDomain sourceDomain = activeArclengthDomain(source, sourceLengths);
+    const ArclengthDomain targetDomain = activeArclengthDomain(target, targetLengths);
+    double sourceS = std::clamp(candidate.sourceArclength, sourceDomain.start, sourceDomain.end);
+    double targetS = std::clamp(candidate.targetArclength, targetDomain.start, targetDomain.end);
 
     ceres::Problem problem;
     auto* residual = new ceres::NumericDiffCostFunction<JointIntersectionResidual,
@@ -802,10 +895,10 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
                                                         1>(
         new JointIntersectionResidual{source, target, options, windingSampler});
     problem.AddResidualBlock(residual, nullptr, &sourceS, &targetS);
-    problem.SetParameterLowerBound(&sourceS, 0, 0.0);
-    problem.SetParameterUpperBound(&sourceS, 0, totalLength(source));
-    problem.SetParameterLowerBound(&targetS, 0, 0.0);
-    problem.SetParameterUpperBound(&targetS, 0, totalLength(target));
+    problem.SetParameterLowerBound(&sourceS, 0, sourceDomain.start);
+    problem.SetParameterUpperBound(&sourceS, 0, sourceDomain.end);
+    problem.SetParameterLowerBound(&targetS, 0, targetDomain.start);
+    problem.SetParameterUpperBound(&targetS, 0, targetDomain.end);
 
     double initialCost = 0.0;
     problem.Evaluate(ceres::Problem::EvaluateOptions{}, &initialCost, nullptr, nullptr, nullptr);

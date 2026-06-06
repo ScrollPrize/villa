@@ -103,6 +103,11 @@ double connectorNormalizedThickness(double distanceToSliceVx,
                                     double maxDistanceVx,
                                     double fullSize,
                                     double minSize);
+double focusedIntersectionMarkerThreshold(double minVisibleViewportSpanVx,
+                                          double viewportFraction = 0.05);
+bool focusedIntersectionMarkerVisible(double distanceToPlane,
+                                      double minVisibleViewportSpanVx,
+                                      double viewportFraction = 0.05);
 
 std::optional<SegmentPlaneIntersection> segmentPlaneIntersection(const cv::Vec3d& p0,
                                                                  const cv::Vec3d& p1,

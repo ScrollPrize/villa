@@ -24,6 +24,7 @@ class CState;
 class FiberSliceOverlayController;
 class LineAnnotationDialog;
 class QMdiArea;
+class QEvent;
 class QPoint;
 class Surface;
 class SurfacePanelController;
@@ -217,6 +218,12 @@ private:
     void showError(const QString& message) const;
     void cleanupIntersectionInspectionSurfaces();
     void rebuildIntersectionInspection();
+    bool updateIntersectionFollowSlice(bool sourceSideFlag,
+                                       double linePosition,
+                                       const char* reason);
+    void toggleIntersectionFollowSlice(bool sourceSideFlag);
+    bool handleIntersectionFollowKeyPress(int key, Qt::KeyboardModifiers modifiers);
+    bool eventFilter(QObject* watched, QEvent* event) override;
     void refreshIntersectionInspectionAfterEdit(uint64_t editedFiberId,
                                                 double oldSourceArclength,
                                                 double oldTargetArclength);

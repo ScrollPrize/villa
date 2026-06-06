@@ -5,12 +5,14 @@
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -195,6 +197,81 @@ TEST_CASE("line annotation fiber h/v classification scores endpoint z distance")
     CHECK(invalid.automaticTag == FiberHvTag::Unknown);
 }
 
+TEST_CASE("line annotation intersection display h side uses manual tags before scores")
+{
+    using vc3d::line_annotation::FiberHvClassification;
+    using vc3d::line_annotation::firstFiberDisplaysAsH;
+
+    FiberHvClassification first;
+    first.horizontalScore = 0.25;
+    first.verticalScore = 0.75;
+    FiberHvClassification second;
+    second.horizontalScore = 0.75;
+    second.verticalScore = 0.25;
+
+    CHECK_FALSE(firstFiberDisplaysAsH(first, "", second, ""));
+    CHECK(firstFiberDisplaysAsH(first, "H", second, ""));
+    CHECK(firstFiberDisplaysAsH(first, "", second, "V"));
+    CHECK_FALSE(firstFiberDisplaysAsH(first, "V", second, ""));
+    CHECK_FALSE(firstFiberDisplaysAsH(first, "H", second, "H"));
+
+    second.horizontalScore = first.horizontalScore;
+    second.verticalScore = first.verticalScore;
+    CHECK(firstFiberDisplaysAsH(first, "", second, "", true));
+    CHECK_FALSE(firstFiberDisplaysAsH(first, "", second, "", false));
+}
+
+TEST_CASE("line annotation generated strip overlay includes controls and current marker")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.linePoints = {
+        {0.0f, 0.0f, 0.0f},
+        {1.0f, 0.0f, 0.0f},
+        {2.0f, 0.0f, 0.0f},
+    };
+    views.seedLineIndex = 1;
+    views.controlPoints = {
+        {{0.0f, 0.0f, 0.0f}, 0.0, false},
+        {{2.0f, 0.0f, 0.0f}, 2.0, true},
+    };
+
+    const auto overlay =
+        vc3d::line_annotation::makeGeneratedStripOverlay(views, 1.0, {0.0, 1.0, 2.0});
+    CHECK(overlay.useSurfaceCenterLine);
+    CHECK(overlay.currentLinePosition == doctest::Approx(1.0));
+    CHECK(overlay.controlPoints.size() == 2);
+    CHECK(overlay.markerLinePositions.size() == 3);
+    CHECK(overlay.seedLineIndex == -1);
+}
+
+TEST_CASE("line annotation generated cross slice filters controls by viewport threshold")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.linePoints = {
+        {0.0f, 0.0f, 0.0f},
+        {10.0f, 0.0f, 0.0f},
+    };
+    views.controlPoints = {
+        {{0.0f, 0.0f, 0.0f}, 0.0, false},
+        {{0.0f, 0.0f, 4.9f}, 0.5, false},
+        {{0.0f, 0.0f, 5.1f}, 1.0, true},
+    };
+
+    const auto overlay = vc3d::line_annotation::makeGeneratedCrossSliceOverlay(
+        views,
+        0.5,
+        true,
+        5.0f,
+        [](const cv::Vec3f& point) {
+            return point[2];
+        });
+    CHECK(overlay.emphasizedPointMarker);
+    CHECK(overlay.pointMarker[0] == doctest::Approx(5.0f));
+    CHECK(overlay.controlPoints.size() == 2);
+    CHECK(overlay.controlPoints[0].linePosition == doctest::Approx(0.0));
+    CHECK(overlay.controlPoints[1].linePosition == doctest::Approx(0.5));
+}
+
 TEST_CASE("fiber slice control span uses nearest control line indices")
 {
     using namespace vc3d::fiber_slice;
@@ -260,6 +337,16 @@ TEST_CASE("fiber slice distance scaling clamps at viewport thresholds")
     CHECK(distanceScaledSize(10.0, 100.0, 10.0, 2.0) == doctest::Approx(2.0));
     CHECK(distanceScaledSize(20.0, 100.0, 10.0, 2.0) == doctest::Approx(2.0));
     CHECK(distanceScaledSize(5.5, 100.0, 10.0, 2.0) == doctest::Approx(6.0));
+}
+
+TEST_CASE("fiber slice focused marker uses five percent viewport threshold")
+{
+    using namespace vc3d::fiber_slice;
+    CHECK(focusedIntersectionMarkerThreshold(100.0) == doctest::Approx(5.0));
+    CHECK(focusedIntersectionMarkerVisible(5.0, 100.0));
+    CHECK(focusedIntersectionMarkerVisible(-5.0, 100.0));
+    CHECK_FALSE(focusedIntersectionMarkerVisible(5.001, 100.0));
+    CHECK_FALSE(focusedIntersectionMarkerVisible(std::numeric_limits<double>::infinity(), 100.0));
 }
 
 TEST_CASE("fiber slice segment-plane intersection handles crossings")

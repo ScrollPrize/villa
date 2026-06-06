@@ -472,6 +472,29 @@ double connectorNormalizedThickness(double distanceToSliceVx,
     return fullSize + (minSize - fullSize) * t;
 }
 
+double focusedIntersectionMarkerThreshold(double minVisibleViewportSpanVx,
+                                          double viewportFraction)
+{
+    if (!std::isfinite(minVisibleViewportSpanVx) ||
+        !std::isfinite(viewportFraction) ||
+        viewportFraction < 0.0) {
+        return 0.0;
+    }
+    return viewportFraction * viewportMinVoxelSpan(minVisibleViewportSpanVx,
+                                                   minVisibleViewportSpanVx);
+}
+
+bool focusedIntersectionMarkerVisible(double distanceToPlane,
+                                      double minVisibleViewportSpanVx,
+                                      double viewportFraction)
+{
+    if (!std::isfinite(distanceToPlane)) {
+        return false;
+    }
+    return std::abs(distanceToPlane) <=
+           focusedIntersectionMarkerThreshold(minVisibleViewportSpanVx, viewportFraction);
+}
+
 std::optional<SegmentPlaneIntersection> segmentPlaneIntersection(const cv::Vec3d& p0,
                                                                  const cv::Vec3d& p1,
                                                                  const Plane& plane)

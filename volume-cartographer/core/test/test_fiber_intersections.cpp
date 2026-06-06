@@ -192,6 +192,47 @@ TEST_CASE("Fiber intersection search runs two-sided discovery and preserves dist
     CHECK(sourceArclengths[1] == doctest::Approx(300.0).epsilon(1e-5));
 }
 
+TEST_CASE("Fiber intersection search ignores extensions outside outer control points")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberIntersectionCache cache;
+    auto source = fiber(1, 1, {p(0, 0, 0), p(10, 0, 0)});
+    source.controlPoints = {
+        {2.0, 0.0, 0.0},
+        {8.0, 0.0, 0.0},
+    };
+    auto target = fiber(2, 1, {
+        p(1, -1, 0),
+        p(1, 1, 0),
+        p(5, 1, 0),
+        p(5, -1, 0),
+    });
+    target.controlPoints = {
+        {1.0, -1.0, 0.0},
+        {5.0, -1.0, 0.0},
+    };
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    broad.maxDistance = 0.25;
+    broad.maxSampleSpacing = 0.5;
+    broad.clusterArclength = 1.0;
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.deduplicateArclength = 1.0;
+
+    const auto results = vc::atlas::searchFiberIntersections(
+        {source, target},
+        {1},
+        {2},
+        index,
+        &cache,
+        broad,
+        ceres);
+
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].sourceArclength == doctest::Approx(5.0).epsilon(1e-5));
+    CHECK(results[0].sourcePoint[0] == doctest::Approx(5.0).epsilon(1e-5));
+}
+
 TEST_CASE("Fiber Ceres refinement uses one solve and sign-ambiguous normal residuals")
 {
     auto source = fiber(1, 1, {

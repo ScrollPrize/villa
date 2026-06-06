@@ -31,6 +31,8 @@ set(srcs
     LineAnnotationController.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
+    LineAnnotationGeneratedViews.cpp
+    LineAnnotationGeneratedViews.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
