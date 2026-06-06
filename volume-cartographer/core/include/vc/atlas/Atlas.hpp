@@ -3,7 +3,9 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <opencv2/core/types.hpp>
@@ -121,7 +123,30 @@ struct ProjectionHit {
     double distance = 0.0;
 };
 
+struct FiberRuntimeIdentityMap {
+    std::vector<std::filesystem::path> canonicalPaths;
+    std::unordered_map<std::string, uint64_t> idByPathKey;
+    std::unordered_map<uint64_t, std::filesystem::path> pathById;
+
+    [[nodiscard]] uint64_t idForPath(const std::filesystem::path& path) const;
+    [[nodiscard]] std::filesystem::path pathForId(uint64_t id) const;
+};
+
+struct AtlasFiberSearchSets {
+    std::vector<uint64_t> sourceFiberIds;
+    std::vector<uint64_t> targetFiberIds;
+    std::vector<std::filesystem::path> sourceFiberPaths;
+    std::vector<std::filesystem::path> targetFiberPaths;
+};
+
 std::string sanitizeAtlasName(std::string name);
+std::string atlasFiberPathKey(const std::filesystem::path& path);
+std::vector<std::string> atlasMappedFiberPathKeys(const Atlas& atlas);
+FiberRuntimeIdentityMap makeFiberRuntimeIdentityMap(
+    const std::vector<std::filesystem::path>& orderedCanonicalFiberPaths);
+AtlasFiberSearchSets atlasFiberSearchSets(
+    const Atlas& atlas,
+    const FiberRuntimeIdentityMap& runtimeIds);
 std::filesystem::path uniqueAtlasDirectory(const std::filesystem::path& volpkgRoot,
                                            const std::string& baseName);
 std::filesystem::path initShellDirectoryFromManifest(

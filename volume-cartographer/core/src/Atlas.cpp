@@ -920,6 +920,88 @@ std::string sanitizeAtlasName(std::string name)
     return name.empty() ? "atlas" : name;
 }
 
+std::string atlasFiberPathKey(const fs::path& path)
+{
+    return path.lexically_normal().generic_string();
+}
+
+std::vector<std::string> atlasMappedFiberPathKeys(const Atlas& atlas)
+{
+    std::vector<std::string> keys;
+    keys.reserve(atlas.fibers.size());
+    for (const auto& mapping : atlas.fibers) {
+        if (!mapping.fiberPath.empty()) {
+            keys.push_back(atlasFiberPathKey(mapping.fiberPath));
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
+uint64_t FiberRuntimeIdentityMap::idForPath(const fs::path& path) const
+{
+    const auto it = idByPathKey.find(atlasFiberPathKey(path));
+    if (it == idByPathKey.end()) {
+        throw std::out_of_range("fiber path is not in the runtime identity map: " +
+                                path.generic_string());
+    }
+    return it->second;
+}
+
+fs::path FiberRuntimeIdentityMap::pathForId(uint64_t id) const
+{
+    const auto it = pathById.find(id);
+    if (it == pathById.end()) {
+        throw std::out_of_range("fiber runtime id is not in the identity map: " +
+                                std::to_string(id));
+    }
+    return it->second;
+}
+
+FiberRuntimeIdentityMap makeFiberRuntimeIdentityMap(
+    const std::vector<fs::path>& orderedCanonicalFiberPaths)
+{
+    FiberRuntimeIdentityMap map;
+    map.canonicalPaths.reserve(orderedCanonicalFiberPaths.size());
+    uint64_t nextId = 1;
+    for (const auto& path : orderedCanonicalFiberPaths) {
+        const std::string key = atlasFiberPathKey(path);
+        if (key.empty() || map.idByPathKey.find(key) != map.idByPathKey.end()) {
+            continue;
+        }
+        const uint64_t id = nextId++;
+        const fs::path canonicalPath(key);
+        map.canonicalPaths.push_back(canonicalPath);
+        map.idByPathKey.emplace(key, id);
+        map.pathById.emplace(id, canonicalPath);
+    }
+    return map;
+}
+
+AtlasFiberSearchSets atlasFiberSearchSets(const Atlas& atlas,
+                                          const FiberRuntimeIdentityMap& runtimeIds)
+{
+    const std::vector<std::string> atlasKeys = atlasMappedFiberPathKeys(atlas);
+    AtlasFiberSearchSets sets;
+    sets.sourceFiberIds.reserve(atlasKeys.size());
+    sets.sourceFiberPaths.reserve(atlasKeys.size());
+    sets.targetFiberIds.reserve(runtimeIds.canonicalPaths.size());
+    sets.targetFiberPaths.reserve(runtimeIds.canonicalPaths.size());
+    for (const auto& path : runtimeIds.canonicalPaths) {
+        const std::string key = atlasFiberPathKey(path);
+        const uint64_t id = runtimeIds.idForPath(path);
+        if (std::binary_search(atlasKeys.begin(), atlasKeys.end(), key)) {
+            sets.sourceFiberIds.push_back(id);
+            sets.sourceFiberPaths.push_back(path);
+        } else {
+            sets.targetFiberIds.push_back(id);
+            sets.targetFiberPaths.push_back(path);
+        }
+    }
+    return sets;
+}
+
 fs::path uniqueAtlasDirectory(const fs::path& volpkgRoot, const std::string& baseName)
 {
     const std::string clean = sanitizeAtlasName(baseName);

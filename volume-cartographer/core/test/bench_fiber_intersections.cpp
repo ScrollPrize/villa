@@ -1,3 +1,4 @@
+#include "vc/atlas/Atlas.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -35,6 +36,7 @@ struct TimedFiber {
 
 struct Options {
     fs::path fiberDir = "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fibers";
+    fs::path atlasDir;
     fs::path lasagnaManifest;
     vc::atlas::FiberIntersectionBroadPhaseOptions broad;
     vc::atlas::FiberIntersectionCeresOptions ceres;
@@ -51,6 +53,7 @@ void printUsage(const char* argv0)
         << "Usage: " << argv0 << " [fiber_dir] [options]\n"
         << "\n"
         << "Options:\n"
+        << "  --atlas-dir <path>         Required atlas directory; search atlas fibers -> non-atlas fibers\n"
         << "  --lasagna-manifest <path>  Required .lasagna.json for grad_mag winding distance\n"
         << "  --max-distance <vx>        Broad-phase radius, default 500\n"
         << "  --max-sample-spacing <vx>  Indexed dense point spacing, default 100\n"
@@ -97,6 +100,8 @@ Options parseOptions(int argc, char** argv)
         if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
             std::exit(0);
+        } else if (arg == "--atlas-dir") {
+            options.atlasDir = requireValue("--atlas-dir");
         } else if (arg == "--lasagna-manifest") {
             options.lasagnaManifest = requireValue("--lasagna-manifest");
         } else if (arg == "--max-distance") {
@@ -169,6 +174,7 @@ std::vector<vc::atlas::FiberPoint> pointsFromJson(const nlohmann::json& root)
 
 vc::atlas::FiberPolyline readFiberJson(const fs::path& path, uint64_t fallbackId)
 {
+    (void)fallbackId;
     std::ifstream in(path);
     if (!in) {
         throw std::runtime_error("failed to open " + path.string());
@@ -176,7 +182,7 @@ vc::atlas::FiberPolyline readFiberJson(const fs::path& path, uint64_t fallbackId
     const nlohmann::json root = nlohmann::json::parse(in);
 
     vc::atlas::FiberPolyline fiber;
-    fiber.id = root.value("id", fallbackId);
+    fiber.id = 0;
     fiber.generation = root.value("generation", uint64_t{1});
     fiber.points = pointsFromJson(root);
     if (fiber.points.size() < 2) {
@@ -208,10 +214,16 @@ std::vector<TimedFiber> loadFibers(const fs::path& dir)
     return fibers;
 }
 
-const TimedFiber* findFiber(const std::vector<TimedFiber>& fibers, uint64_t id)
+fs::path packageRelativeFiberPath(const TimedFiber& fiber)
 {
-    const auto it = std::find_if(fibers.begin(), fibers.end(), [id](const TimedFiber& item) {
-        return item.fiber.id == id;
+    return fs::path("fibers") / fiber.path.filename();
+}
+
+const TimedFiber* findFiberByPath(const std::vector<TimedFiber>& fibers, const fs::path& path)
+{
+    const std::string key = vc::atlas::atlasFiberPathKey(path);
+    const auto it = std::find_if(fibers.begin(), fibers.end(), [&key](const TimedFiber& item) {
+        return vc::atlas::atlasFiberPathKey(packageRelativeFiberPath(item)) == key;
     });
     return it == fibers.end() ? nullptr : &*it;
 }
@@ -243,7 +255,7 @@ std::string fiberLabel(const TimedFiber* fiber, uint64_t fallbackId)
     if (!fiber) {
         return std::to_string(fallbackId);
     }
-    return fiber->path.filename().string() + "(" + std::to_string(fiber->fiber.id) + ")";
+    return packageRelativeFiberPath(*fiber).generic_string();
 }
 
 } // namespace
@@ -256,6 +268,9 @@ int main(int argc, char** argv)
         if (fibers.empty()) {
             throw std::runtime_error("no .json fibers found in " + options.fiberDir.string());
         }
+        if (options.atlasDir.empty()) {
+            throw std::runtime_error("--atlas-dir is required");
+        }
         if (options.lasagnaManifest.empty()) {
             throw std::runtime_error("--lasagna-manifest is required for winding-distance results");
         }
@@ -266,6 +281,7 @@ int main(int argc, char** argv)
 
         std::cout << std::fixed << std::setprecision(3);
         std::cout << "fiber_dir: " << options.fiberDir << "\n";
+        std::cout << "atlas_dir: " << options.atlasDir << "\n";
         std::cout << "lasagna_manifest: " << options.lasagnaManifest << "\n";
         std::cout << "broad_phase: maxDistance=" << options.broad.maxDistance
                   << " maxSampleSpacing=" << options.broad.maxSampleSpacing
@@ -275,11 +291,21 @@ int main(int argc, char** argv)
                   << " deduplicateArclength=" << options.ceres.deduplicateArclength << "\n";
 
         std::cout << "\nfibers:\n";
+        std::vector<fs::path> canonicalPaths;
+        canonicalPaths.reserve(fibers.size());
         for (const auto& item : fibers) {
-            std::cout << "  id=" << item.fiber.id
+            canonicalPaths.push_back(packageRelativeFiberPath(item));
+        }
+        const auto runtimeIds = vc::atlas::makeFiberRuntimeIdentityMap(canonicalPaths);
+        for (auto& item : fibers) {
+            item.fiber.id = runtimeIds.idForPath(packageRelativeFiberPath(item));
+        }
+        for (const auto& item : fibers) {
+            std::cout << "  path=" << packageRelativeFiberPath(item).generic_string()
+                      << " runtime_id=" << item.fiber.id
                       << " generation=" << item.fiber.generation
                       << " points=" << item.fiber.points.size()
-                      << " file=" << item.path.filename().string() << "\n";
+                      << "\n";
         }
 
         vc::atlas::FiberSpatialIndex index;
@@ -295,7 +321,8 @@ int main(int argc, char** argv)
         std::cout << "\nindex_creation:\n";
         std::cout << "  total_ms=" << totalIndexMs << "\n";
         for (const auto& item : fibers) {
-            std::cout << "  fiber_id=" << item.fiber.id
+            std::cout << "  fiber_path=" << packageRelativeFiberPath(item).generic_string()
+                      << " runtime_id=" << item.fiber.id
                       << " ms=" << item.indexMs << "\n";
         }
 
@@ -306,26 +333,61 @@ int main(int argc, char** argv)
             const auto end = Clock::now();
             item.searchMs = elapsedMs(start, end);
             item.candidateCount = candidates.size();
-            std::cout << "  source_id=" << item.fiber.id
+            std::cout << "  source_path=" << packageRelativeFiberPath(item).generic_string()
+                      << " runtime_id=" << item.fiber.id
                       << " ms=" << item.searchMs
                       << " candidates=" << item.candidateCount << "\n";
         }
 
         std::vector<vc::atlas::FiberPolyline> fiberPolylines;
-        std::vector<uint64_t> fiberIds;
         fiberPolylines.reserve(fibers.size());
-        fiberIds.reserve(fibers.size());
+        const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(options.atlasDir);
+        const std::vector<std::string> atlasKeys =
+            vc::atlas::atlasMappedFiberPathKeys(atlas);
+        if (atlasKeys.empty()) {
+            throw std::runtime_error("atlas has no fiber mappings: " +
+                                     options.atlasDir.string());
+        }
+        std::cout << "\natlas_mappings:\n";
+        for (const auto& mapping : atlas.fibers) {
+            std::cout << "  fiber_path=" << mapping.fiberPath.generic_string()
+                      << " key=" << vc::atlas::atlasFiberPathKey(mapping.fiberPath)
+                      << "\n";
+        }
         for (const auto& item : fibers) {
             fiberPolylines.push_back(item.fiber);
-            fiberIds.push_back(item.fiber.id);
         }
+        const auto searchSets = vc::atlas::atlasFiberSearchSets(atlas, runtimeIds);
+        const std::vector<uint64_t>& sourceFiberIds = searchSets.sourceFiberIds;
+        const std::vector<uint64_t>& targetFiberIds = searchSets.targetFiberIds;
+        if (sourceFiberIds.empty()) {
+            throw std::runtime_error("none of the atlas fibers are present in " +
+                                     options.fiberDir.string());
+        }
+        if (targetFiberIds.empty()) {
+            throw std::runtime_error("no non-atlas fibers are present in " +
+                                     options.fiberDir.string());
+        }
+
+        std::cout << "\nshared_search_mode: atlas-fibers-to-non-atlas-fibers\n";
+        std::cout << "  source_paths=";
+        for (size_t i = 0; i < searchSets.sourceFiberPaths.size(); ++i) {
+            if (i > 0) std::cout << ',';
+            std::cout << searchSets.sourceFiberPaths[i].generic_string();
+        }
+        std::cout << "\n  target_paths=";
+        for (size_t i = 0; i < searchSets.targetFiberPaths.size(); ++i) {
+            if (i > 0) std::cout << ',';
+            std::cout << searchSets.targetFiberPaths[i].generic_string();
+        }
+        std::cout << "\n";
 
         vc::atlas::FiberSpatialIndex resultIndex;
         const auto finalStart = Clock::now();
         std::vector<vc::atlas::FiberIntersectionResult> allResults =
             vc::atlas::searchFiberIntersections(fiberPolylines,
-                                                fiberIds,
-                                                fiberIds,
+                                                sourceFiberIds,
+                                                targetFiberIds,
                                                 resultIndex,
                                                 nullptr,
                                                 options.broad,
@@ -343,8 +405,10 @@ int main(int argc, char** argv)
         std::cout << "  count=" << allResults.size() << " shared_search_ms=" << finalMs << "\n";
         for (size_t i = 0; i < allResults.size(); ++i) {
             const auto& result = allResults[i];
-            const auto* source = findFiber(fibers, result.sourceFiberId);
-            const auto* target = findFiber(fibers, result.targetFiberId);
+            const fs::path sourcePath = runtimeIds.pathForId(result.sourceFiberId);
+            const fs::path targetPath = runtimeIds.pathForId(result.targetFiberId);
+            const auto* source = findFiberByPath(fibers, sourcePath);
+            const auto* target = findFiberByPath(fibers, targetPath);
             std::cout << "  [" << i << "]"
                       << " distance_windings=" << result.windingDistance
                       << " source=" << fiberLabel(source, result.sourceFiberId)

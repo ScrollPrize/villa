@@ -13,6 +13,8 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -199,6 +201,48 @@ TEST_CASE("Atlas loader accepts version 2 mappings without offsets and ignores s
     CHECK(loaded.links.empty());
     REQUIRE(loaded.fibers.size() == 1);
     CHECK(loaded.fibers[0].windingOffset == 0);
+}
+
+TEST_CASE("Atlas fiber runtime identity map uses canonical paths, not numeric stems")
+{
+    const auto ids = vc::atlas::makeFiberRuntimeIdentityMap({
+        fs::path("fibers/3.json"),
+        fs::path("fibers/alice_20260605T184821587_000001.json"),
+        fs::path("fibers/bob_20260605T184821587_000001.json"),
+        fs::path("fibers/kb_20260605T184821587_000002.json"),
+        fs::path("fibers/3.json"),
+    });
+
+    CHECK(ids.idForPath("fibers/3.json") == 1);
+    CHECK(ids.idForPath("fibers/alice_20260605T184821587_000001.json") == 2);
+    CHECK(ids.idForPath("fibers/bob_20260605T184821587_000001.json") == 3);
+    CHECK(ids.idForPath("fibers/kb_20260605T184821587_000002.json") == 4);
+    CHECK(ids.pathForId(1) == fs::path("fibers/3.json"));
+    CHECK(ids.pathForId(4) == fs::path("fibers/kb_20260605T184821587_000002.json"));
+    CHECK(ids.canonicalPaths.size() == 4);
+}
+
+TEST_CASE("Atlas fiber search split uses atlas path membership")
+{
+    vc::atlas::Atlas atlas;
+    vc::atlas::FiberMapping mapped;
+    mapped.fiberPath = "fibers/kb_20260605T184821587_000002.json";
+    atlas.fibers.push_back(std::move(mapped));
+
+    const auto ids = vc::atlas::makeFiberRuntimeIdentityMap({
+        fs::path("fibers/3.json"),
+        fs::path("fibers/kb_20260605T184821587_000002.json"),
+    });
+    const auto sets = vc::atlas::atlasFiberSearchSets(atlas, ids);
+
+    CHECK(sets.sourceFiberPaths == std::vector<fs::path>{
+        fs::path("fibers/kb_20260605T184821587_000002.json"),
+    });
+    CHECK(sets.targetFiberPaths == std::vector<fs::path>{
+        fs::path("fibers/3.json"),
+    });
+    CHECK(sets.sourceFiberIds == std::vector<uint64_t>{2});
+    CHECK(sets.targetFiberIds == std::vector<uint64_t>{1});
 }
 
 TEST_CASE("Atlas loader rejects legacy idx rotation metadata")

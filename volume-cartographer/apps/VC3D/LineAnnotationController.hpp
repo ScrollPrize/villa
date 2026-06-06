@@ -69,6 +69,11 @@ public:
         std::string manualHvTag;
     };
 
+    struct FiberSnapshotWithPath {
+        std::filesystem::path fiberPath;
+        vc::atlas::FiberPolyline fiber;
+    };
+
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using OptimizationTaskFactory =
@@ -108,6 +113,8 @@ public:
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
+    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
+    [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths() const;
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);

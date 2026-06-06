@@ -67,10 +67,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include "vc/core/types/Segmentation.hpp"
 #include <limits>
 #include <optional>
 #include <cctype>
+#include <string_view>
 #include <utility>
 #include <filesystem>
 #include <system_error>
@@ -133,6 +135,7 @@ namespace
 {
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
 constexpr auto ATLAS_INTERNAL_SURFACE_NAME = "__atlas_workspace_base_mesh";
+constexpr int ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS = 0;
 
 QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
 {
@@ -177,22 +180,20 @@ private:
     DockMenuBuilder _dockMenuBuilder;
 };
 
-std::optional<uint64_t> fiberIdFromAtlasPath(const std::filesystem::path& path)
+QString atlasSearchIdListString(const std::vector<uint64_t>& ids)
 {
-    std::string stem = path.stem().string();
-    if (stem.rfind("fiber_", 0) == 0) {
-        stem = stem.substr(6);
+    QStringList parts;
+    parts.reserve(static_cast<int>(ids.size()));
+    for (uint64_t id : ids) {
+        parts.push_back(QString::number(id));
     }
-    if (stem.empty() || !std::all_of(stem.begin(), stem.end(), [](char ch) {
-            return ch >= '0' && ch <= '9';
-        })) {
-        return std::nullopt;
-    }
-    try {
-        return static_cast<uint64_t>(std::stoull(stem));
-    } catch (...) {
-        return std::nullopt;
-    }
+    return parts.join(QStringLiteral(","));
+}
+
+bool atlasSearchDebugEnabled()
+{
+    const char* value = std::getenv("VC_ATLAS_SEARCH_DEBUG");
+    return value && *value != '\0' && std::string_view(value) != "0";
 }
 
 QTableWidgetItem* numericItem(double value, int precision = 3)
@@ -449,6 +450,14 @@ QDockWidget* createAtlasSearchDock(QWidget* parent)
 
     auto* form = new QFormLayout();
     form->setContentsMargins(0, 0, 0, 0);
+    auto* searchType = new QComboBox(content);
+    searchType->setObjectName(QStringLiteral("atlasSearchTypeCombo"));
+    searchType->addItem(QObject::tr("Atlas fibers -> non-atlas fibers"),
+                        ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS);
+    searchType->setToolTip(QObject::tr(
+        "Search from fibers already mapped in the selected atlas to saved fibers that are not in that atlas."));
+    form->addRow(QObject::tr("Search type"), searchType);
+
     auto* maxDistance = new QDoubleSpinBox(content);
     maxDistance->setObjectName(QStringLiteral("atlasSearchMaxDistanceSpin"));
     maxDistance->setRange(1.0, 100000.0);
@@ -2379,16 +2388,32 @@ void CWindow::refreshAtlasOverviewDocks()
 void CWindow::updateAtlasSearchDocks()
 {
     const auto snapshots = _lineAnnotationController
-        ? _lineAnnotationController->fiberSnapshots()
+        ? _lineAnnotationController->fiberSnapshotsFromStorage()
         : std::vector<vc::atlas::FiberPolyline>{};
-    const bool enabled = _currentAtlasDir.has_value() && !snapshots.empty();
-    const QString atlasText = _currentAtlasDir
-        ? tr("Atlas: %1 (%2 saved fibers)")
-              .arg(QString::fromStdString(_currentAtlasName.empty()
-                    ? _currentAtlasDir->filename().string()
-                    : _currentAtlasName))
-              .arg(static_cast<int>(snapshots.size()))
-        : tr("No atlas selected");
+    int savedFiberCount = 0;
+    QString atlasLoadError;
+    if (_currentAtlasDir) {
+        try {
+            const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
+            savedFiberCount = static_cast<int>(atlas.fibers.size());
+        } catch (const std::exception& ex) {
+            atlasLoadError = QString::fromStdString(ex.what());
+        }
+    }
+    const bool enabled = _currentAtlasDir.has_value() &&
+                         atlasLoadError.isEmpty() &&
+                         savedFiberCount > 0 &&
+                         !snapshots.empty();
+    const QString atlasName = _currentAtlasDir
+        ? QString::fromStdString(_currentAtlasName.empty()
+              ? _currentAtlasDir->filename().string()
+              : _currentAtlasName)
+        : QString{};
+    const QString atlasText = !_currentAtlasDir
+        ? tr("No atlas selected")
+        : (!atlasLoadError.isEmpty()
+              ? tr("Atlas: %1 (could not load: %2)").arg(atlasName, atlasLoadError)
+              : tr("Atlas: %1 (%2 saved fibers)").arg(atlasName).arg(savedFiberCount));
 
     for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
         if (!dock || !dock->widget()) {
@@ -2399,6 +2424,10 @@ void CWindow::updateAtlasSearchDocks()
         }
         if (auto* run = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchRunButton"))) {
             run->setEnabled(enabled);
+        }
+        if (auto* combo = dock->widget()->findChild<QComboBox*>(QStringLiteral("atlasSearchTypeCombo"))) {
+            combo->setEnabled(enabled);
+            combo->setCurrentIndex(0);
         }
         if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
             cancel->setEnabled(false);
@@ -2442,42 +2471,106 @@ void CWindow::startAtlasFiberIntersectionSearch()
         return;
     }
 
-    std::vector<vc::atlas::FiberPolyline> fibers = _lineAnnotationController->fiberSnapshots();
-    if (fibers.empty()) {
+    const auto fiberSnapshots = _lineAnnotationController->fiberSnapshotsFromStorageWithPaths();
+    if (fiberSnapshots.empty()) {
         updateAtlasSearchDocks();
         return;
     }
 
-    std::vector<uint64_t> inAtlas;
-    for (const auto& mapping : atlas.fibers) {
-        if (auto id = fiberIdFromAtlasPath(mapping.fiberPath)) {
-            inAtlas.push_back(*id);
-        }
-    }
-    std::sort(inAtlas.begin(), inAtlas.end());
-    inAtlas.erase(std::unique(inAtlas.begin(), inAtlas.end()), inAtlas.end());
-    if (inAtlas.empty()) {
+    std::vector<std::string> atlasFiberPaths = vc::atlas::atlasMappedFiberPathKeys(atlas);
+    if (atlasFiberPaths.empty()) {
         QMessageBox::information(this,
                                  tr("Atlas Object Search"),
                                  tr("Selected atlas has no saved fiber mappings."));
         return;
     }
 
-    std::vector<uint64_t> allFiberIds;
-    allFiberIds.reserve(fibers.size());
-    for (const auto& fiber : fibers) {
-        allFiberIds.push_back(fiber.id);
+    const bool debugSearch = atlasSearchDebugEnabled();
+    if (debugSearch) {
+        qInfo().noquote() << QStringLiteral("[atlas-search] atlas_dir=%1 name=%2 mapping_count=%3")
+            .arg(QString::fromStdString(_currentAtlasDir->string()),
+                 QString::fromStdString(atlas.metadata.name))
+            .arg(static_cast<int>(atlas.fibers.size()));
+        for (const auto& mapping : atlas.fibers) {
+            qInfo().noquote() << QStringLiteral("[atlas-search] atlas_mapping fiber_path=%1 key=%2 line_anchors=%3 control_anchors=%4")
+                .arg(QString::fromStdString(mapping.fiberPath.generic_string()),
+                     QString::fromStdString(vc::atlas::atlasFiberPathKey(mapping.fiberPath)))
+                .arg(static_cast<int>(mapping.lineAnchors.size()))
+                .arg(static_cast<int>(mapping.controlAnchors.size()));
+        }
+        qInfo().noquote() << QStringLiteral("[atlas-search] saved_fiber_count=%1")
+            .arg(static_cast<int>(fiberSnapshots.size()));
+    }
+
+    std::vector<std::filesystem::path> canonicalPaths;
+    canonicalPaths.reserve(fiberSnapshots.size());
+    for (const auto& snapshot : fiberSnapshots) {
+        canonicalPaths.push_back(snapshot.fiberPath);
+    }
+    const auto runtimeIds = vc::atlas::makeFiberRuntimeIdentityMap(canonicalPaths);
+    const auto searchSets = vc::atlas::atlasFiberSearchSets(atlas, runtimeIds);
+    std::vector<vc::atlas::FiberPolyline> fibers;
+    std::vector<uint64_t> sourceFiberIds = searchSets.sourceFiberIds;
+    std::vector<uint64_t> targetFiberIds = searchSets.targetFiberIds;
+    std::unordered_map<uint64_t, std::string> fiberPathById;
+    fibers.reserve(fiberSnapshots.size());
+    for (const auto& snapshot : fiberSnapshots) {
+        const uint64_t fiberId = runtimeIds.idForPath(snapshot.fiberPath);
+        auto fiber = snapshot.fiber;
+        fiber.id = fiberId;
+        fibers.push_back(std::move(fiber));
+        const std::string pathKey = vc::atlas::atlasFiberPathKey(snapshot.fiberPath);
+        const bool inAtlas = std::binary_search(atlasFiberPaths.begin(), atlasFiberPaths.end(), pathKey);
+        fiberPathById.emplace(fiberId, pathKey);
+        if (debugSearch) {
+            qInfo().noquote() << QStringLiteral("[atlas-search] saved_fiber path=%1 key=%2 runtime_id=%3 generation=%4 points=%5 controls=%6 side=%7")
+                .arg(QString::fromStdString(snapshot.fiberPath.generic_string()),
+                     QString::fromStdString(pathKey),
+                     QString::number(fiberId),
+                     QString::number(snapshot.fiber.generation),
+                     QString::number(static_cast<int>(snapshot.fiber.points.size())),
+                     QString::number(static_cast<int>(snapshot.fiber.controlPoints.size())),
+                     inAtlas ? QStringLiteral("source_atlas") : QStringLiteral("target_non_atlas"));
+        }
+    }
+    if (sourceFiberIds.empty()) {
+        QMessageBox::information(this,
+                                 tr("Atlas Object Search"),
+                                 tr("None of the selected atlas fibers are available in saved fiber files."));
+        return;
+    }
+    if (targetFiberIds.empty()) {
+        QMessageBox::information(this,
+                                 tr("Atlas Object Search"),
+                                 tr("No saved non-atlas fibers are available to search."));
+        return;
+    }
+    if (debugSearch) {
+        qInfo().noquote() << QStringLiteral("[atlas-search] split source_ids=%1 target_ids=%2")
+            .arg(atlasSearchIdListString(sourceFiberIds),
+                 atlasSearchIdListString(targetFiberIds));
     }
 
     vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    int searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
     for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
         if (dock && dock->widget()) {
+            if (auto* combo = dock->widget()->findChild<QComboBox*>(
+                    QStringLiteral("atlasSearchTypeCombo"))) {
+                searchMode = combo->currentData().toInt();
+            }
             if (auto* spin = dock->widget()->findChild<QDoubleSpinBox*>(
                     QStringLiteral("atlasSearchMaxDistanceSpin"))) {
                 broad.maxDistance = spin->value();
                 break;
             }
         }
+    }
+    if (searchMode != ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS) {
+        QMessageBox::warning(this,
+                             tr("Atlas Object Search"),
+                             tr("Unsupported atlas search type."));
+        return;
     }
     vc::atlas::FiberIntersectionCeresOptions ceres;
 
@@ -2518,8 +2611,32 @@ void CWindow::startAtlasFiberIntersectionSearch()
     connect(watcher,
             &QFutureWatcher<std::vector<vc::atlas::FiberIntersectionResult>>::finished,
             this,
-            [this, watcher]() {
+            [this,
+             watcher,
+             sourceFiberIds,
+             targetFiberIds,
+             fiberPathById = std::move(fiberPathById),
+             debugSearch]() {
                 const auto results = watcher->result();
+                if (debugSearch) {
+                    qInfo().noquote() << QStringLiteral("[atlas-search] finished source_ids=%1 target_ids=%2 result_count=%3")
+                        .arg(atlasSearchIdListString(sourceFiberIds),
+                             atlasSearchIdListString(targetFiberIds))
+                        .arg(static_cast<int>(results.size()));
+                    for (const auto& result : results) {
+                        const auto sourcePath = fiberPathById.find(result.sourceFiberId);
+                        const auto targetPath = fiberPathById.find(result.targetFiberId);
+                        qInfo().noquote() << QStringLiteral("[atlas-search] result source_id=%1 source_path=%2 target_id=%3 target_path=%4 winding=%5 candidate=%6 source_s=%7 target_s=%8")
+                            .arg(QString::number(result.sourceFiberId),
+                                 QString::fromStdString(sourcePath == fiberPathById.end() ? std::string("<missing>") : sourcePath->second),
+                                 QString::number(result.targetFiberId),
+                                 QString::fromStdString(targetPath == fiberPathById.end() ? std::string("<missing>") : targetPath->second),
+                                 QString::number(result.windingDistance, 'g', 12),
+                                 QString::number(result.candidateDistance, 'g', 12),
+                                 QString::number(result.sourceArclength, 'g', 12),
+                                 QString::number(result.targetArclength, 'g', 12));
+                    }
+                }
                 watcher->deleteLater();
                 if (!_atlasSearchCancelRequested) {
                     populateAtlasSearchResults(results);
@@ -2535,8 +2652,8 @@ void CWindow::startAtlasFiberIntersectionSearch()
     vc::atlas::FiberSpatialIndex* index = &_fiberIntersectionIndex;
     vc::atlas::FiberIntersectionCache* cache = &_fiberIntersectionCache;
     watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
-                                          inAtlas = std::move(inAtlas),
-                                          allFiberIds = std::move(allFiberIds),
+                                          sourceFiberIds = std::move(sourceFiberIds),
+                                          targetFiberIds = std::move(targetFiberIds),
                                           lasagnaManifestPath = std::move(lasagnaManifestPath),
                                           index,
                                           cache,
@@ -2546,8 +2663,8 @@ void CWindow::startAtlasFiberIntersectionSearch()
             vc::lasagna::LasagnaDataset::open(lasagnaManifestPath);
         vc::lasagna::LasagnaNormalSampler windingSampler(dataset);
         return vc::atlas::searchFiberIntersections(fibers,
-                                                   inAtlas,
-                                                   allFiberIds,
+                                                   sourceFiberIds,
+                                                   targetFiberIds,
                                                    *index,
                                                    cache,
                                                    broad,

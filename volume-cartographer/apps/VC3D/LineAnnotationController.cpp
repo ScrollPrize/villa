@@ -1186,9 +1186,9 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
 
         vc::atlas::FiberInput input;
         std::error_code relativeEc;
-        input.fiberPath = fs::relative(fiberPath(fiberId), volpkgRoot, relativeEc);
+        input.fiberPath = fs::relative(fiberPath(*fiberIt), volpkgRoot, relativeEc);
         if (relativeEc || input.fiberPath.empty()) {
-            input.fiberPath = fs::path("fibers") / (std::to_string(fiberId) + ".json");
+            input.fiberPath = fs::path("fibers") / fiberIt->fileName;
         }
         input.controlPoints = fiberIt->controlPoints;
         input.linePoints = fiberIt->linePoints;
@@ -1407,7 +1407,7 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
             std::error_code relativeEc;
             input.fiberPath = fs::relative(fiberPath(fiber), volpkgRoot, relativeEc);
             if (relativeEc || input.fiberPath.empty()) {
-                input.fiberPath = fs::path("fibers") / (std::to_string(fiber.id) + ".json");
+                input.fiberPath = fs::path("fibers") / fiber.fileName;
             }
             input.controlPoints = fiber.controlPoints;
             input.linePoints = fiber.linePoints;
@@ -1418,10 +1418,11 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
 
         vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_intersectionInspection->atlasDir);
         auto findMapping = [](vc::atlas::Atlas& atlas, const fs::path& fiberPath) {
+            const std::string key = vc::atlas::atlasFiberPathKey(fiberPath);
             return std::find_if(atlas.fibers.begin(),
                                 atlas.fibers.end(),
-                                [&fiberPath](const vc::atlas::FiberMapping& mapping) {
-                                    return mapping.fiberPath == fiberPath;
+                                [&key](const vc::atlas::FiberMapping& mapping) {
+                                    return vc::atlas::atlasFiberPathKey(mapping.fiberPath) == key;
                                 });
         };
         auto sourceMappingIt = findMapping(atlas, sourceInput.fiberPath);
@@ -2722,6 +2723,81 @@ std::vector<vc::atlas::FiberPolyline> LineAnnotationController::fiberSnapshots()
     return snapshots;
 }
 
+std::vector<vc::atlas::FiberPolyline> LineAnnotationController::fiberSnapshotsFromStorage() const
+{
+    std::vector<vc::atlas::FiberPolyline> snapshots;
+    const auto snapshotsWithPaths = fiberSnapshotsFromStorageWithPaths();
+    snapshots.reserve(snapshotsWithPaths.size());
+    for (const auto& snapshot : snapshotsWithPaths) {
+        snapshots.push_back(snapshot.fiber);
+    }
+    return snapshots;
+}
+
+std::vector<LineAnnotationController::FiberSnapshotWithPath>
+LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
+{
+    auto snapshotForFiber = [](const StoredFiber& fiber) {
+        vc::atlas::FiberPolyline snapshot;
+        snapshot.id = 0;
+        snapshot.generation = fiber.generation;
+        snapshot.controlPoints = fiber.controlPoints;
+        snapshot.points.reserve(fiber.linePoints.size());
+        for (const auto& point : fiber.linePoints) {
+            snapshot.points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
+        }
+        return snapshot;
+    };
+    auto relativeFiberPath = [](const StoredFiber& fiber) {
+        return fs::path("fibers") / fiber.fileName;
+    };
+
+    std::map<fs::path, FiberSnapshotWithPath> byPath;
+    const fs::path dir = fibersDir();
+    std::error_code ec;
+    if (!dir.empty() && fs::exists(dir, ec)) {
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            if (ec) {
+                break;
+            }
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+                continue;
+            }
+            try {
+                if (auto fiber = loadFiberFile(entry.path())) {
+                    const fs::path path = relativeFiberPath(*fiber);
+                    byPath[path] = FiberSnapshotWithPath{path, snapshotForFiber(*fiber)};
+                }
+            } catch (const std::exception& ex) {
+                Logger()->warn("Skipping invalid VC3D fiber file {} during atlas search: {}",
+                               entry.path().string(),
+                               ex.what());
+            }
+        }
+    }
+
+    for (const auto& fiber : _fibers) {
+        const fs::path path = relativeFiberPath(fiber);
+        byPath[path] = FiberSnapshotWithPath{path, snapshotForFiber(fiber)};
+    }
+
+    std::vector<fs::path> orderedPaths;
+    orderedPaths.reserve(byPath.size());
+    for (const auto& [path, snapshot] : byPath) {
+        (void)snapshot;
+        orderedPaths.push_back(path);
+    }
+    const auto runtimeIds = vc::atlas::makeFiberRuntimeIdentityMap(orderedPaths);
+
+    std::vector<FiberSnapshotWithPath> snapshots;
+    snapshots.reserve(byPath.size());
+    for (auto& [path, snapshot] : byPath) {
+        snapshot.fiber.id = runtimeIds.idForPath(path);
+        snapshots.push_back(std::move(snapshot));
+    }
+    return snapshots;
+}
+
 void LineAnnotationController::onSurfaceChanged(std::string name,
                                                 std::shared_ptr<Surface> surf,
                                                 bool /*isEditUpdate*/)
@@ -3580,6 +3656,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         return;
     }
 
+    std::vector<fs::path> fiberFiles;
     for (const auto& entry : fs::directory_iterator(dir, ec)) {
         if (ec) {
             break;
@@ -3587,8 +3664,13 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         if (!entry.is_regular_file() || entry.path().extension() != ".json") {
             continue;
         }
+        fiberFiles.push_back(entry.path());
+    }
+    std::sort(fiberFiles.begin(), fiberFiles.end());
+
+    for (const auto& path : fiberFiles) {
         try {
-            if (auto fiber = loadFiberFile(entry.path())) {
+            if (auto fiber = loadFiberFile(path)) {
                 if (fiber->needsSave) {
                     try {
                         fiber->needsSave = false;
@@ -3596,7 +3678,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                     } catch (const std::exception& ex) {
                         fiber->needsSave = true;
                         Logger()->warn("Could not update VC3D fiber metadata {}: {}",
-                                       entry.path().string(),
+                                       path.string(),
                                        ex.what());
                     }
                 }
@@ -3604,13 +3686,18 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             }
         } catch (const std::exception& ex) {
             Logger()->warn("Skipping invalid VC3D fiber file {}: {}",
-                           entry.path().string(),
+                           path.string(),
                            ex.what());
         }
     }
     std::sort(_fibers.begin(), _fibers.end(), [](const StoredFiber& a, const StoredFiber& b) {
-        return a.id < b.id;
+        return vc::atlas::atlasFiberPathKey(fs::path("fibers") / a.fileName) <
+               vc::atlas::atlasFiberPathKey(fs::path("fibers") / b.fileName);
     });
+    uint64_t runtimeId = 1;
+    for (auto& fiber : _fibers) {
+        fiber.id = runtimeId++;
+    }
     emitFiberSummaries();
 }
 
@@ -3704,9 +3791,6 @@ void LineAnnotationController::ensureSessionFiberIdentity(LineAnnotationSession&
     if (!session.fiberFileName.empty()) {
         if (session.fiberUsername.empty()) {
             session.fiberUsername = "anon";
-        }
-        if (session.fiberSequence == 0 && session.fiberId != 0) {
-            session.fiberSequence = session.fiberId;
         }
         return;
     }
@@ -3879,7 +3963,6 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
     try {
         ensureSessionFiberIdentity(session);
         StoredFiber fiber;
-        fiber.id = session.fiberId == 0 ? nextFiberId() : session.fiberId;
         fiber.username = session.fiberUsername;
         fiber.startedAt = session.fiberStartedAt;
         fiber.sequence = session.fiberSequence;
@@ -3887,8 +3970,19 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         auto existingIt = std::find_if(_fibers.begin(),
                                        _fibers.end(),
                                        [&fiber](const StoredFiber& existing) {
-                                           return existing.id == fiber.id;
+                                           return !fiber.fileName.empty() &&
+                                                  existing.fileName == fiber.fileName;
                                        });
+        if (existingIt == _fibers.end() && session.fiberId != 0) {
+            existingIt = std::find_if(_fibers.begin(),
+                                      _fibers.end(),
+                                      [&session](const StoredFiber& existing) {
+                                          return existing.id == session.fiberId;
+                                      });
+        }
+        fiber.id = existingIt == _fibers.end()
+            ? (session.fiberId == 0 ? nextFiberId() : session.fiberId)
+            : existingIt->id;
         fiber.generation = existingIt == _fibers.end()
             ? uint64_t{1}
             : std::max<uint64_t>(uint64_t{1}, existingIt->generation + 1);
@@ -3919,8 +4013,13 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         const uint64_t savedGeneration = fiber.generation;
 
         auto it = std::find_if(_fibers.begin(), _fibers.end(), [&fiber](const StoredFiber& existing) {
-            return existing.id == fiber.id;
+            return !fiber.fileName.empty() && existing.fileName == fiber.fileName;
         });
+        if (it == _fibers.end()) {
+            it = std::find_if(_fibers.begin(), _fibers.end(), [&fiber](const StoredFiber& existing) {
+                return existing.id == fiber.id;
+            });
+        }
         if (it == _fibers.end()) {
             _fibers.push_back(std::move(fiber));
         } else {
@@ -3950,7 +4049,6 @@ void LineAnnotationController::saveFiber(const StoredFiber& fiber) const
     nlohmann::json root = nlohmann::json::object();
     root["type"] = "vc3d_fiber";
     root["version"] = 1;
-    root["id"] = fiber.id;
     root["username"] = fiber.username;
     root["started_at"] = fiber.startedAt;
     root["sequence"] = fiber.sequence;
@@ -4018,20 +4116,13 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
 
     StoredFiber fiber;
     fiber.generation = std::max<uint64_t>(uint64_t{1}, root.value("generation", uint64_t{1}));
-    if (root.contains("id")) {
-        fiber.id = root.at("id").get<uint64_t>();
-    } else if (hasLegacyNumericStem) {
-        fiber.id = std::stoull(stem);
-    } else {
-        return std::nullopt;
-    }
     fiber.username = vc3d::line_annotation::normalizedFiberUsername(
         root.value("username", std::string{"anon"}));
     fiber.startedAt = root.value("started_at", std::string{});
     if (root.contains("sequence")) {
         fiber.sequence = root.at("sequence").get<uint64_t>();
     } else if (hasLegacyNumericStem) {
-        fiber.sequence = fiber.id;
+        fiber.sequence = std::stoull(stem);
     }
     fiber.fileName = path.filename().string();
     if (fiber.fileName.empty() && !fiber.startedAt.empty() && fiber.sequence > 0) {
