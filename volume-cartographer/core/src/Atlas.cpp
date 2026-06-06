@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -29,7 +30,7 @@ namespace vc::atlas {
 namespace {
 
 constexpr double kEpsilon = 1.0e-9;
-constexpr int kAtlasMetadataVersion = 2;
+constexpr int kAtlasMetadataVersion = 3;
 
 bool atlasDebugEnabled()
 {
@@ -141,6 +142,69 @@ nlohmann::json anchorJson(const AtlasAnchor& anchor)
         {"atlas", nlohmann::json::array({anchor.atlasU, anchor.atlasV})},
         {"distance", anchor.distance},
     };
+}
+
+bool finiteAtlasCoord(double u, double v)
+{
+    return std::isfinite(u) && std::isfinite(v);
+}
+
+nlohmann::json linkEndpointJson(const AtlasLinkEndpoint& endpoint)
+{
+    return {
+        {"object_type", "fiber"},
+        {"fiber_path", endpoint.fiberPath.generic_string()},
+        {"source_index", endpoint.sourceIndex},
+        {"arclength", endpoint.arclength},
+        {"base_atlas", nlohmann::json::array({endpoint.atlasU, endpoint.atlasV})},
+    };
+}
+
+AtlasLinkEndpoint linkEndpointFromJson(const nlohmann::json& value)
+{
+    if (!value.is_object()) {
+        throw std::runtime_error("atlas link endpoint must be an object");
+    }
+    if (value.value("object_type", std::string{"fiber"}) != "fiber") {
+        throw std::runtime_error("atlas link endpoint object_type must be fiber");
+    }
+    AtlasLinkEndpoint endpoint;
+    endpoint.fiberPath = value.at("fiber_path").get<std::string>();
+    endpoint.sourceIndex = value.value("source_index", 0);
+    endpoint.arclength = value.value("arclength", 0.0);
+    const auto& atlas = value.at("base_atlas");
+    if (!atlas.is_array() || atlas.size() != 2) {
+        throw std::runtime_error("atlas link endpoint must contain base_atlas [u, v]");
+    }
+    endpoint.atlasU = atlas.at(0).get<double>();
+    endpoint.atlasV = atlas.at(1).get<double>();
+    if (endpoint.fiberPath.empty() ||
+        !finiteAtlasCoord(endpoint.atlasU, endpoint.atlasV) ||
+        !std::isfinite(endpoint.arclength)) {
+        throw std::runtime_error("atlas link endpoint contains invalid values");
+    }
+    return endpoint;
+}
+
+nlohmann::json linkJson(const AtlasLink& link)
+{
+    return {
+        {"first", linkEndpointJson(link.first)},
+        {"second", linkEndpointJson(link.second)},
+        {"desired_winding_delta", link.desiredWindingDelta},
+    };
+}
+
+AtlasLink linkFromJson(const nlohmann::json& value)
+{
+    if (!value.is_object()) {
+        throw std::runtime_error("atlas link must be an object");
+    }
+    AtlasLink link;
+    link.first = linkEndpointFromJson(value.at("first"));
+    link.second = linkEndpointFromJson(value.at("second"));
+    link.desiredWindingDelta = value.at("desired_winding_delta").get<int>();
+    return link;
 }
 
 AtlasAnchor anchorFromJson(const nlohmann::json& value)
@@ -756,17 +820,19 @@ void Atlas::save(const fs::path& atlasDir) const
     writeJsonFile(atlasDir / "metadata.json", metadataJson);
 
     nlohmann::json linksJson;
+    linksJson["version"] = 1;
     linksJson["links"] = nlohmann::json::array();
     for (const auto& link : links) {
-        linksJson["links"].push_back(link);
+        linksJson["links"].push_back(linkJson(link));
     }
     writeJsonFile(atlasDir / "links.json", linksJson);
 
     for (const auto& fiber : fibers) {
         nlohmann::json root;
         root["type"] = "vc3d_atlas_fiber_mapping";
-        root["version"] = 1;
+        root["version"] = 2;
         root["fiber_path"] = fiber.fiberPath.generic_string();
+        root["winding_offset"] = fiber.windingOffset;
         root["line_anchors"] = nlohmann::json::array();
         for (const auto& anchor : fiber.lineAnchors) {
             root["line_anchors"].push_back(anchorJson(anchor));
@@ -788,7 +854,8 @@ Atlas Atlas::load(const fs::path& atlasDir)
     const auto metadata = readJsonFile(atlasDir / "metadata.json");
     atlas.metadata.type = metadata.value("type", std::string{});
     atlas.metadata.version = metadata.value("version", 0);
-    if (atlas.metadata.type != "vc3d_atlas" || atlas.metadata.version != kAtlasMetadataVersion) {
+    if (atlas.metadata.type != "vc3d_atlas" ||
+        (atlas.metadata.version != 2 && atlas.metadata.version != kAtlasMetadataVersion)) {
         throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
     }
     if (metadata.contains("idx_rotation_columns") || !metadata.contains("zero_winding_column")) {
@@ -810,7 +877,10 @@ Atlas Atlas::load(const fs::path& atlasDir)
         const auto linksJson = readJsonFile(linksPath);
         if (linksJson.contains("links") && linksJson["links"].is_array()) {
             for (const auto& link : linksJson["links"]) {
-                atlas.links.push_back(link.get<std::string>());
+                if (link.is_string()) {
+                    continue;
+                }
+                atlas.links.push_back(linkFromJson(link));
             }
         }
     }
@@ -824,6 +894,7 @@ Atlas Atlas::load(const fs::path& atlasDir)
             const auto root = readJsonFile(entry.path());
             FiberMapping mapping;
             mapping.fiberPath = root.value("fiber_path", std::string{});
+            mapping.windingOffset = root.value("winding_offset", 0);
             for (const auto& anchor : root.value("line_anchors", nlohmann::json::array())) {
                 mapping.lineAnchors.push_back(anchorFromJson(anchor));
             }
@@ -1035,7 +1106,9 @@ void saveAtlasBaseMeshCopy(const QuadSurface& surface,
     copy.save(targetDir, true);
 }
 
-AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas, cv::Vec2f atlasScale)
+AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas,
+                                              cv::Vec2f atlasScale,
+                                              int periodColumns)
 {
     if (!std::isfinite(atlasScale[0]) || !std::isfinite(atlasScale[1]) ||
         atlasScale[0] <= 0.0f || atlasScale[1] <= 0.0f) {
@@ -1050,20 +1123,21 @@ AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas, cv::Vec2f atla
     double maxU = -std::numeric_limits<double>::infinity();
     double maxV = -std::numeric_limits<double>::infinity();
 
-    auto includeAnchor = [&](const AtlasAnchor& anchor) {
+    auto includeAnchor = [&](const AtlasAnchor& anchor, const FiberMapping& fiber) {
         if (!std::isfinite(anchor.atlasU) || !std::isfinite(anchor.atlasV)) {
             return;
         }
+        const double atlasU = actualAtlasU(anchor, fiber, periodColumns);
         haveAnchor = true;
-        minU = std::min(minU, anchor.atlasU);
+        minU = std::min(minU, atlasU);
         minV = std::min(minV, anchor.atlasV);
-        maxU = std::max(maxU, anchor.atlasU);
+        maxU = std::max(maxU, atlasU);
         maxV = std::max(maxV, anchor.atlasV);
     };
 
     for (const auto& fiber : atlas.fibers) {
         for (const auto& anchor : fiber.lineAnchors) {
-            includeAnchor(anchor);
+            includeAnchor(anchor, fiber);
         }
     }
 
@@ -1115,6 +1189,16 @@ int atlasWindingForColumn(double atlasU, int periodColumns, int zeroWindingColum
         std::floor((atlasU - static_cast<double>(zeroWindingColumn)) / period));
 }
 
+double actualAtlasU(const AtlasAnchor& anchor,
+                    const FiberMapping& fiber,
+                    int periodColumns)
+{
+    if (periodColumns <= 0 || !std::isfinite(anchor.atlasU)) {
+        return anchor.atlasU;
+    }
+    return anchor.atlasU + static_cast<double>(fiber.windingOffset * periodColumns);
+}
+
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
 {
     AtlasDisplayRange range;
@@ -1127,12 +1211,13 @@ AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
     bool haveAnchor = false;
     int minWinding = 0;
     int maxWinding = 0;
-    auto includeAnchor = [&](const AtlasAnchor& anchor) {
+    auto includeAnchor = [&](const AtlasAnchor& anchor, const FiberMapping& fiber) {
         if (!std::isfinite(anchor.atlasU)) {
             return;
         }
+        const double atlasU = actualAtlasU(anchor, fiber, baseColumns);
         const int winding = atlasWindingForColumn(
-            anchor.atlasU, baseColumns, atlas.metadata.zeroWindingColumn);
+            atlasU, baseColumns, atlas.metadata.zeroWindingColumn);
         if (!haveAnchor) {
             minWinding = winding;
             maxWinding = winding;
@@ -1145,7 +1230,7 @@ AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
 
     for (const auto& fiber : atlas.fibers) {
         for (const auto& anchor : fiber.lineAnchors) {
-            includeAnchor(anchor);
+            includeAnchor(anchor, fiber);
         }
     }
 
@@ -1162,6 +1247,59 @@ AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
                          static_cast<double>(minWinding * baseColumns);
     range.hasMappedObjects = haveAnchor;
     return range;
+}
+
+void layoutAtlasObjects(Atlas& atlas, int periodColumns)
+{
+    if (periodColumns <= 0 || atlas.fibers.empty()) {
+        return;
+    }
+
+    std::unordered_map<std::string, size_t> fiberIndexByPath;
+    fiberIndexByPath.reserve(atlas.fibers.size());
+    for (size_t i = 0; i < atlas.fibers.size(); ++i) {
+        fiberIndexByPath.emplace(atlas.fibers[i].fiberPath.generic_string(), i);
+        atlas.fibers[i].windingOffset = 0;
+    }
+
+    struct Edge {
+        size_t to = 0;
+        int delta = 0;
+    };
+    std::vector<std::vector<Edge>> graph(atlas.fibers.size());
+    for (const auto& link : atlas.links) {
+        const auto firstIt = fiberIndexByPath.find(link.first.fiberPath.generic_string());
+        const auto secondIt = fiberIndexByPath.find(link.second.fiberPath.generic_string());
+        if (firstIt == fiberIndexByPath.end() || secondIt == fiberIndexByPath.end()) {
+            continue;
+        }
+        const int firstBaseWinding = atlasWindingForColumn(
+            link.first.atlasU, periodColumns, atlas.metadata.zeroWindingColumn);
+        const int secondBaseWinding = atlasWindingForColumn(
+            link.second.atlasU, periodColumns, atlas.metadata.zeroWindingColumn);
+        const int secondMinusFirst =
+            link.desiredWindingDelta - (secondBaseWinding - firstBaseWinding);
+        graph[firstIt->second].push_back({secondIt->second, secondMinusFirst});
+        graph[secondIt->second].push_back({firstIt->second, -secondMinusFirst});
+    }
+
+    std::vector<bool> visited(atlas.fibers.size(), false);
+    std::queue<size_t> pending;
+    visited[0] = true;
+    pending.push(0);
+    while (!pending.empty()) {
+        const size_t current = pending.front();
+        pending.pop();
+        for (const auto& edge : graph[current]) {
+            const int candidateOffset = atlas.fibers[current].windingOffset + edge.delta;
+            if (visited[edge.to]) {
+                continue;
+            }
+            atlas.fibers[edge.to].windingOffset = candidateOffset;
+            visited[edge.to] = true;
+            pending.push(edge.to);
+        }
+    }
 }
 
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,

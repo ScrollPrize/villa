@@ -29,7 +29,8 @@ protected:
 
 private:
     [[nodiscard]] std::optional<cv::Vec2f> atlasAnchorToSurface(
-        const vc::atlas::AtlasAnchor& anchor) const;
+        const vc::atlas::AtlasAnchor& anchor,
+        const vc::atlas::FiberMapping& fiber) const;
 
     std::optional<vc::atlas::Atlas> _atlas;
     std::shared_ptr<const QuadSurface> _displaySurface;

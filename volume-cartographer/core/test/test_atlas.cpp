@@ -114,32 +114,91 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     atlas.metadata.seedLineIndex = 1;
     atlas.metadata.seedAtlasU = 4.5;
     atlas.metadata.seedAtlasV = 2.0;
-    atlas.links.push_back("placeholder");
+    vc::atlas::AtlasLink link;
+    link.first.fiberPath = "fibers/1.json";
+    link.first.sourceIndex = 0;
+    link.first.arclength = 1.25;
+    link.first.atlasU = 4.0;
+    link.first.atlasV = 5.0;
+    link.second.fiberPath = "fibers/2.json";
+    link.second.sourceIndex = 2;
+    link.second.arclength = 6.5;
+    link.second.atlasU = 12.0;
+    link.second.atlasV = 7.0;
+    link.desiredWindingDelta = -1;
+    atlas.links.push_back(link);
 
     vc::atlas::FiberMapping mapping;
     mapping.fiberPath = "fibers/1.json";
+    mapping.windingOffset = 2;
     mapping.lineAnchors.push_back({0, {1.0, 2.0, 3.0}, 4.0, 5.0, 0.25});
     mapping.controlAnchors.push_back({0, {1.0, 2.0, 3.0}, 4.0, 5.0, 0.25});
     atlas.fibers.push_back(mapping);
 
     atlas.save(root);
     const std::string metadata = readText(root / "metadata.json");
-    CHECK(metadata.find("\"version\": 2") != std::string::npos);
+    CHECK(metadata.find("\"version\": 3") != std::string::npos);
     CHECK(metadata.find("\"zero_winding_column\": 3") != std::string::npos);
     CHECK(metadata.find("idx_rotation_columns") == std::string::npos);
 
     const auto loaded = vc::atlas::Atlas::load(root);
 
     REQUIRE(loaded.metadata.name == "fiber_1");
-    CHECK(loaded.metadata.version == 2);
+    CHECK(loaded.metadata.version == 3);
     CHECK(loaded.metadata.zeroWindingColumn == 3);
     CHECK(loaded.metadata.seedLineIndex == 1);
     CHECK(loaded.metadata.seedAtlasU == doctest::Approx(4.5));
     REQUIRE(loaded.links.size() == 1);
+    CHECK(loaded.links[0].first.fiberPath == fs::path("fibers/1.json"));
+    CHECK(loaded.links[0].first.arclength == doctest::Approx(1.25));
+    CHECK(loaded.links[0].second.fiberPath == fs::path("fibers/2.json"));
+    CHECK(loaded.links[0].desiredWindingDelta == -1);
     REQUIRE(loaded.fibers.size() == 1);
     CHECK(loaded.fibers[0].fiberPath == fs::path("fibers/1.json"));
+    CHECK(loaded.fibers[0].windingOffset == 2);
     REQUIRE(loaded.fibers[0].lineAnchors.size() == 1);
     CHECK(loaded.fibers[0].lineAnchors[0].atlasV == doctest::Approx(5.0));
+}
+
+TEST_CASE("Atlas loader accepts version 2 mappings without offsets and ignores string links")
+{
+    const fs::path root = tempRoot("vc_atlas_v2_compat");
+    fs::create_directories(root / "mappings" / "fibers");
+    {
+        std::ofstream out(root / "metadata.json");
+        out << R"({
+  "type": "vc3d_atlas",
+  "version": 2,
+  "name": "compat",
+  "base_mesh_path": "base_mesh/shell.tifxyz",
+  "source_base_mesh_path": "segments/shell",
+  "zero_winding_column": 0,
+  "seed_line_index": 0,
+  "seed_atlas": [0, 0]
+})";
+    }
+    {
+        std::ofstream out(root / "links.json");
+        out << R"({"links":["legacy placeholder"]})";
+    }
+    {
+        std::ofstream out(root / "mappings" / "fibers" / "one.json");
+        out << R"({
+  "type": "vc3d_atlas_fiber_mapping",
+  "version": 1,
+  "fiber_path": "fibers/1.json",
+  "line_anchors": [
+    {"source_index": 0, "world": [0, 0, 0], "atlas": [1, 2], "distance": 0}
+  ],
+  "control_anchors": []
+})";
+    }
+
+    const auto loaded = vc::atlas::Atlas::load(root);
+    CHECK(loaded.metadata.version == 2);
+    CHECK(loaded.links.empty());
+    REQUIRE(loaded.fibers.size() == 1);
+    CHECK(loaded.fibers[0].windingOffset == 0);
 }
 
 TEST_CASE("Atlas loader rejects legacy idx rotation metadata")
@@ -390,6 +449,26 @@ TEST_CASE("Atlas mapped object covered size uses line anchors only")
         std::runtime_error);
 }
 
+TEST_CASE("Atlas covered size applies object winding offsets when period is known")
+{
+    vc::atlas::Atlas atlas;
+    vc::atlas::FiberMapping first;
+    first.fiberPath = "fibers/1.json";
+    first.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
+    atlas.fibers.push_back(std::move(first));
+
+    vc::atlas::FiberMapping second;
+    second.fiberPath = "fibers/2.json";
+    second.windingOffset = 2;
+    second.lineAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
+    atlas.fibers.push_back(std::move(second));
+
+    const auto size = vc::atlas::mappedObjectCoveredAtlasSize(atlas, cv::Vec2f(1.0f, 1.0f), 4);
+    REQUIRE(size.valid);
+    CHECK(size.width == doctest::Approx(9.0));
+    CHECK(atlas.fibers[1].lineAnchors[0].atlasU == doctest::Approx(2.0));
+}
+
 TEST_CASE("Atlas grid coordinates convert to QuadSurface surface coordinates with scale and center")
 {
     cv::Mat_<cv::Vec3f> points(4, 6);
@@ -478,6 +557,93 @@ TEST_CASE("Atlas display range uses wrapped shell period for winding and offset"
     CHECK(range.unwrapCount == 3);
     CHECK(range.atlasUOffset == doctest::Approx(0.0));
     CHECK(range.hasMappedObjects);
+}
+
+TEST_CASE("Atlas display range includes object winding offsets without mutating anchors")
+{
+    vc::atlas::Atlas atlas;
+    vc::atlas::FiberMapping first;
+    first.fiberPath = "fibers/1.json";
+    first.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
+    atlas.fibers.push_back(std::move(first));
+
+    vc::atlas::FiberMapping second;
+    second.fiberPath = "fibers/2.json";
+    second.windingOffset = 2;
+    second.lineAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
+    atlas.fibers.push_back(std::move(second));
+
+    const auto range = vc::atlas::atlasDisplayRange(atlas, 4);
+    CHECK(range.leftmostWinding == 0);
+    CHECK(range.rightmostWinding == 2);
+    CHECK(range.unwrapCount == 3);
+    CHECK(atlas.fibers[1].lineAnchors[0].atlasU == doctest::Approx(2.0));
+}
+
+TEST_CASE("Atlas layout flood fills same-winding link offsets from root")
+{
+    vc::atlas::Atlas atlas;
+    atlas.metadata.zeroWindingColumn = 0;
+    vc::atlas::FiberMapping root;
+    root.fiberPath = "fibers/root.json";
+    root.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
+    atlas.fibers.push_back(std::move(root));
+
+    vc::atlas::FiberMapping linked;
+    linked.fiberPath = "fibers/linked.json";
+    linked.lineAnchors.push_back({0, {}, 9.0, 1.0, 0.0});
+    atlas.fibers.push_back(std::move(linked));
+
+    vc::atlas::AtlasLink link;
+    link.first.fiberPath = "fibers/root.json";
+    link.first.atlasU = 1.0;
+    link.first.atlasV = 1.0;
+    link.second.fiberPath = "fibers/linked.json";
+    link.second.atlasU = 9.0;
+    link.second.atlasV = 1.0;
+    link.desiredWindingDelta = 0;
+    atlas.links.push_back(link);
+
+    vc::atlas::layoutAtlasObjects(atlas, 4);
+    CHECK(atlas.fibers[0].windingOffset == 0);
+    CHECK(atlas.fibers[1].windingOffset == -2);
+}
+
+TEST_CASE("Atlas layout propagates offsets through a link chain")
+{
+    vc::atlas::Atlas atlas;
+    atlas.metadata.zeroWindingColumn = 0;
+    for (int i = 0; i < 3; ++i) {
+        vc::atlas::FiberMapping mapping;
+        mapping.fiberPath = fs::path("fibers") / (std::to_string(i) + ".json");
+        mapping.lineAnchors.push_back({0, {}, static_cast<double>(1 + i * 4), 1.0, 0.0});
+        atlas.fibers.push_back(std::move(mapping));
+    }
+
+    vc::atlas::AtlasLink first;
+    first.first.fiberPath = "fibers/0.json";
+    first.first.atlasU = 1.0;
+    first.first.atlasV = 1.0;
+    first.second.fiberPath = "fibers/1.json";
+    first.second.atlasU = 5.0;
+    first.second.atlasV = 1.0;
+    first.desiredWindingDelta = 0;
+    atlas.links.push_back(first);
+
+    vc::atlas::AtlasLink second;
+    second.first.fiberPath = "fibers/1.json";
+    second.first.atlasU = 5.0;
+    second.first.atlasV = 1.0;
+    second.second.fiberPath = "fibers/2.json";
+    second.second.atlasU = 9.0;
+    second.second.atlasV = 1.0;
+    second.desiredWindingDelta = 0;
+    atlas.links.push_back(second);
+
+    vc::atlas::layoutAtlasObjects(atlas, 4);
+    CHECK(atlas.fibers[0].windingOffset == 0);
+    CHECK(atlas.fibers[1].windingOffset == -1);
+    CHECK(atlas.fibers[2].windingOffset == -2);
 }
 
 TEST_CASE("Atlas zero winding column changes winding interpretation only")

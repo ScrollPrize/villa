@@ -20,7 +20,7 @@ namespace vc::atlas {
 
 struct AtlasMetadata {
     std::string type = "vc3d_atlas";
-    int version = 2;
+    int version = 3;
     std::string name;
     std::filesystem::path baseMeshPath;
     std::filesystem::path sourceBaseMeshPath;
@@ -40,13 +40,28 @@ struct AtlasAnchor {
 
 struct FiberMapping {
     std::filesystem::path fiberPath;
+    int windingOffset = 0;
     std::vector<AtlasAnchor> lineAnchors;
     std::vector<AtlasAnchor> controlAnchors;
 };
 
+struct AtlasLinkEndpoint {
+    std::filesystem::path fiberPath;
+    int sourceIndex = 0;
+    double arclength = 0.0;
+    double atlasU = 0.0;
+    double atlasV = 0.0;
+};
+
+struct AtlasLink {
+    AtlasLinkEndpoint first;
+    AtlasLinkEndpoint second;
+    int desiredWindingDelta = 0;
+};
+
 struct Atlas {
     AtlasMetadata metadata;
-    std::vector<std::string> links;
+    std::vector<AtlasLink> links;
     std::vector<FiberMapping> fibers;
 
     void save(const std::filesystem::path& atlasDir) const;
@@ -132,10 +147,15 @@ void saveAtlasBaseMeshCopy(const QuadSurface& surface,
                            const std::filesystem::path& targetDir);
 AtlasCoveredSize mappedObjectCoveredAtlasSize(
     const Atlas& atlas,
-    cv::Vec2f atlasScale = cv::Vec2f(1.0f, 1.0f));
+    cv::Vec2f atlasScale = cv::Vec2f(1.0f, 1.0f),
+    int periodColumns = 0);
 int atlasHorizontalPeriodColumns(const QuadSurface& surface);
 int atlasWindingForColumn(double atlasU, int periodColumns, int zeroWindingColumn);
+double actualAtlasU(const AtlasAnchor& anchor,
+                    const FiberMapping& fiber,
+                    int periodColumns);
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns);
+void layoutAtlasObjects(Atlas& atlas, int periodColumns);
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
                                    double atlasV,
                                    const QuadSurface& displaySurface,

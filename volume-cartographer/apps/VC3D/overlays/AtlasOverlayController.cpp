@@ -57,13 +57,15 @@ void AtlasOverlayController::clearAtlas()
 }
 
 std::optional<cv::Vec2f> AtlasOverlayController::atlasAnchorToSurface(
-    const vc::atlas::AtlasAnchor& anchor) const
+    const vc::atlas::AtlasAnchor& anchor,
+    const vc::atlas::FiberMapping& fiber) const
 {
     if (!_displaySurface || !std::isfinite(anchor.atlasU) || !std::isfinite(anchor.atlasV)) {
         return std::nullopt;
     }
+    const double atlasU = vc::atlas::actualAtlasU(anchor, fiber, _displayRange.baseColumns);
     const cv::Vec2f surfaceCoord =
-        vc::atlas::atlasGridToSurfaceCoords(anchor.atlasU,
+        vc::atlas::atlasGridToSurfaceCoords(atlasU,
                                             anchor.atlasV,
                                             *_displaySurface,
                                             _displayRange.atlasUOffset);
@@ -86,7 +88,7 @@ std::optional<QRectF> AtlasOverlayController::surfaceBounds() const
     float maxY = -std::numeric_limits<float>::infinity();
     for (const auto& fiber : _atlas->fibers) {
         for (const auto& anchor : fiber.lineAnchors) {
-            const auto surfaceCoord = atlasAnchorToSurface(anchor);
+            const auto surfaceCoord = atlasAnchorToSurface(anchor, fiber);
             if (!surfaceCoord) {
                 continue;
             }
@@ -121,7 +123,7 @@ void AtlasOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         std::vector<cv::Vec2f> linePoints;
         linePoints.reserve(fiber.lineAnchors.size());
         for (const auto& anchor : fiber.lineAnchors) {
-            const auto surfaceCoord = atlasAnchorToSurface(anchor);
+            const auto surfaceCoord = atlasAnchorToSurface(anchor, fiber);
             if (!surfaceCoord) {
                 continue;
             }
@@ -131,7 +133,7 @@ void AtlasOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             builder.addSurfaceLineStrip(linePoints, false, lineStyle);
         }
         for (const auto& anchor : fiber.controlAnchors) {
-            const auto surfaceCoord = atlasAnchorToSurface(anchor);
+            const auto surfaceCoord = atlasAnchorToSurface(anchor, fiber);
             if (!surfaceCoord) {
                 continue;
             }

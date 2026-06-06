@@ -99,7 +99,8 @@ public:
     void createAtlasFromFiber(uint64_t fiberId);
     void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
     void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
-                                    QMdiArea* targetArea);
+                                    QMdiArea* targetArea,
+                                    std::optional<std::filesystem::path> atlasDir = std::nullopt);
     void saveOpenFibers();
     void closeFiberWindowForSurface(const std::string& surfaceName);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
@@ -227,6 +228,7 @@ private:
     void refreshIntersectionInspectionAfterEdit(uint64_t editedFiberId,
                                                 double oldSourceArclength,
                                                 double oldTargetArclength);
+    bool acceptIntersectionSameWindingChoice();
     [[nodiscard]] std::shared_ptr<LineAnnotationSession> makeIntersectionLineSession(
         const StoredFiber& fiber,
         double focusLinePosition,

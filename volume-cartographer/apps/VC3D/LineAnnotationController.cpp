@@ -29,19 +29,25 @@
 
 #include <QFileDialog>
 #include <QFutureWatcher>
+#include <QButtonGroup>
 #include <QColor>
 #include <QEvent>
+#include <QHBoxLayout>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QMessageBox>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPoint>
 #include <QPointF>
+#include <QPushButton>
+#include <QRadioButton>
 #include <QDateTime>
 #include <QSettings>
 #include <QStringList>
 #include <QtConcurrent/QtConcurrent>
 #include <QVariant>
+#include <QVBoxLayout>
 #include <QWidget>
 
 #include <algorithm>
@@ -126,6 +132,7 @@ struct LineAnnotationController::IntersectionInspectionSession {
 
     QPointer<QMdiArea> targetArea;
     vc::atlas::FiberIntersectionResult result;
+    std::optional<fs::path> atlasDir;
     double sourceFocusLinePosition = 0.0;
     double targetFocusLinePosition = 0.0;
     std::vector<std::string> surfaceNames;
@@ -1343,7 +1350,8 @@ void LineAnnotationController::showFiberSlice(uint64_t fiberId, QMdiArea* target
 
 void LineAnnotationController::showIntersectionInspection(
     const vc::atlas::FiberIntersectionResult& result,
-    QMdiArea* targetArea)
+    QMdiArea* targetArea,
+    std::optional<fs::path> atlasDir)
 {
     try {
         if (!_state || !_viewerManager || !targetArea) {
@@ -1353,10 +1361,163 @@ void LineAnnotationController::showIntersectionInspection(
         _intersectionInspection = std::make_unique<IntersectionInspectionSession>();
         _intersectionInspection->targetArea = targetArea;
         _intersectionInspection->result = result;
+        _intersectionInspection->atlasDir = std::move(atlasDir);
         rebuildIntersectionInspection();
     } catch (const std::exception& ex) {
         showError(tr("Could not show intersection inspection: %1")
                       .arg(QString::fromStdString(ex.what())));
+    }
+}
+
+bool LineAnnotationController::acceptIntersectionSameWindingChoice()
+{
+    try {
+        if (!_intersectionInspection) {
+            throw std::runtime_error("No intersection inspection is active");
+        }
+        if (!_intersectionInspection->atlasDir || _intersectionInspection->atlasDir->empty()) {
+            throw std::runtime_error("Select an atlas before accepting an intersection link");
+        }
+        auto vpkg = _state ? _state->vpkg() : nullptr;
+        if (!vpkg) {
+            throw std::runtime_error("No volume package is loaded");
+        }
+        const fs::path volpkgRoot = vpkg->path().empty()
+            ? fs::path(vpkg->getVolpkgDirectory())
+            : vpkg->path().parent_path();
+        if (volpkgRoot.empty()) {
+            throw std::runtime_error("The current volume package has no root directory");
+        }
+
+        const auto result = _intersectionInspection->result;
+        auto sourceIt = std::find_if(_fibers.begin(), _fibers.end(),
+                                     [&result](const StoredFiber& fiber) {
+                                         return fiber.id == result.sourceFiberId;
+                                     });
+        auto targetIt = std::find_if(_fibers.begin(), _fibers.end(),
+                                     [&result](const StoredFiber& fiber) {
+                                         return fiber.id == result.targetFiberId;
+                                     });
+        if (sourceIt == _fibers.end() || targetIt == _fibers.end()) {
+            throw std::runtime_error("One or both intersection fibers are not loaded");
+        }
+
+        auto makeInput = [this, &volpkgRoot](const StoredFiber& fiber) {
+            vc::atlas::FiberInput input;
+            std::error_code relativeEc;
+            input.fiberPath = fs::relative(fiberPath(fiber), volpkgRoot, relativeEc);
+            if (relativeEc || input.fiberPath.empty()) {
+                input.fiberPath = fs::path("fibers") / (std::to_string(fiber.id) + ".json");
+            }
+            input.controlPoints = fiber.controlPoints;
+            input.linePoints = fiber.linePoints;
+            return input;
+        };
+        const vc::atlas::FiberInput sourceInput = makeInput(*sourceIt);
+        const vc::atlas::FiberInput targetInput = makeInput(*targetIt);
+
+        vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_intersectionInspection->atlasDir);
+        auto findMapping = [](vc::atlas::Atlas& atlas, const fs::path& fiberPath) {
+            return std::find_if(atlas.fibers.begin(),
+                                atlas.fibers.end(),
+                                [&fiberPath](const vc::atlas::FiberMapping& mapping) {
+                                    return mapping.fiberPath == fiberPath;
+                                });
+        };
+        auto sourceMappingIt = findMapping(atlas, sourceInput.fiberPath);
+        auto targetMappingIt = findMapping(atlas, targetInput.fiberPath);
+        const bool sourceMapped = sourceMappingIt != atlas.fibers.end();
+        const bool targetMapped = targetMappingIt != atlas.fibers.end();
+        if (!sourceMapped && !targetMapped) {
+            throw std::runtime_error(
+                "An atlas must be seeded from one inspected object before linked objects can be added");
+        }
+
+        fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+        if (manifestPath.empty()) {
+            throw std::runtime_error("No Lasagna normal dataset selected");
+        }
+        if (!fs::exists(manifestPath)) {
+            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+        }
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+        const fs::path basePath = *_intersectionInspection->atlasDir / atlas.metadata.baseMeshPath;
+        auto baseSurface = std::make_shared<QuadSurface>(basePath);
+        SurfacePatchIndex baseIndex;
+        baseIndex.rebuild({baseSurface});
+        const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(*baseSurface);
+
+        if (!sourceMapped) {
+            auto mapping = vc::atlas::mapFiberToBaseSurface(
+                sourceInput, *baseSurface, baseIndex, sampler);
+            atlas.fibers.push_back(std::move(mapping));
+        }
+        if (!targetMapped) {
+            auto mapping = vc::atlas::mapFiberToBaseSurface(
+                targetInput, *baseSurface, baseIndex, sampler);
+            atlas.fibers.push_back(std::move(mapping));
+        }
+
+        sourceMappingIt = findMapping(atlas, sourceInput.fiberPath);
+        targetMappingIt = findMapping(atlas, targetInput.fiberPath);
+        if (sourceMappingIt == atlas.fibers.end() || targetMappingIt == atlas.fibers.end()) {
+            throw std::runtime_error("Could not map both inspected fibers into the selected atlas");
+        }
+
+        const auto sourceSample =
+            vc3d::fiber_slice::samplePolylineAtArclength(sourceIt->linePoints,
+                                                         result.sourceArclength);
+        const auto targetSample =
+            vc3d::fiber_slice::samplePolylineAtArclength(targetIt->linePoints,
+                                                         result.targetArclength);
+        if (!sourceSample.valid || !targetSample.valid) {
+            throw std::runtime_error("Could not sample inspected arclengths on the loaded fibers");
+        }
+
+        auto endpointFor = [](const vc::atlas::FiberMapping& mapping,
+                              double arclength,
+                              double linePosition) {
+            const vc::atlas::AtlasAnchor* best = nullptr;
+            double bestDelta = std::numeric_limits<double>::infinity();
+            for (const auto& anchor : mapping.lineAnchors) {
+                const double delta = std::abs(static_cast<double>(anchor.sourceIndex) - linePosition);
+                if (delta < bestDelta) {
+                    best = &anchor;
+                    bestDelta = delta;
+                }
+            }
+            if (!best) {
+                throw std::runtime_error("Mapped fiber has no line anchors for the inspected link");
+            }
+            vc::atlas::AtlasLinkEndpoint endpoint;
+            endpoint.fiberPath = mapping.fiberPath;
+            endpoint.sourceIndex = best->sourceIndex;
+            endpoint.arclength = arclength;
+            endpoint.atlasU = best->atlasU;
+            endpoint.atlasV = best->atlasV;
+            return endpoint;
+        };
+
+        vc::atlas::AtlasLink link;
+        link.first = endpointFor(*sourceMappingIt,
+                                 result.sourceArclength,
+                                 sourceSample.linePosition);
+        link.second = endpointFor(*targetMappingIt,
+                                  result.targetArclength,
+                                  targetSample.linePosition);
+        link.desiredWindingDelta = 0;
+        atlas.links.push_back(std::move(link));
+        vc::atlas::layoutAtlasObjects(atlas, periodColumns);
+        atlas.save(*_intersectionInspection->atlasDir);
+
+        emit atlasCreated(*_intersectionInspection->atlasDir);
+        return true;
+    } catch (const std::exception& ex) {
+        showError(tr("Could not accept intersection link: %1")
+                      .arg(QString::fromStdString(ex.what())));
+        return false;
     }
 }
 
@@ -2192,6 +2353,112 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     });
         };
 
+        auto fiberDisplayName = [](const StoredFiber& fiber) {
+            if (!fiber.fileName.empty()) {
+                return QString::fromStdString(fs::path(fiber.fileName).stem().string());
+            }
+            return QStringLiteral("fiber %1").arg(fiber.id);
+        };
+        auto hvSummary = [](const StoredFiber& fiber) {
+            const QString manual = fiber.manualHvTag.empty()
+                ? QStringLiteral("unknown")
+                : QString::fromStdString(fiber.manualHvTag);
+            const auto& c = fiber.hvClassification;
+            return QStringLiteral("manual %1; auto %2 h=%3 v=%4 cert=%5")
+                .arg(manual,
+                     QString::fromStdString(vc3d::line_annotation::fiberHvTagToString(c.automaticTag)))
+                .arg(c.horizontalScore, 0, 'f', 2)
+                .arg(c.verticalScore, 0, 'f', 2)
+                .arg(c.automaticCertainty, 0, 'f', 2);
+        };
+        auto addDecisionPane = [&](const QRect& geometry) {
+            auto* pane = new QWidget;
+            pane->setObjectName(QStringLiteral("intersectionDecisionPane"));
+            auto* layout = new QVBoxLayout(pane);
+            layout->setContentsMargins(8, 8, 8, 8);
+            layout->setSpacing(4);
+
+            auto* title = new QLabel(tr("Intersection decision"), pane);
+            title->setObjectName(QStringLiteral("intersectionDecisionTitle"));
+            layout->addWidget(title);
+
+            auto* hLabel = new QLabel(
+                tr("H: %1 - %2").arg(fiberDisplayName(*hSide.fiber), hvSummary(*hSide.fiber)),
+                pane);
+            hLabel->setObjectName(QStringLiteral("intersectionDecisionHLabel"));
+            hLabel->setWordWrap(true);
+            layout->addWidget(hLabel);
+
+            auto* vLabel = new QLabel(
+                tr("V: %1 - %2").arg(fiberDisplayName(*vSide.fiber), hvSummary(*vSide.fiber)),
+                pane);
+            vLabel->setObjectName(QStringLiteral("intersectionDecisionVLabel"));
+            vLabel->setWordWrap(true);
+            layout->addWidget(vLabel);
+
+            auto* choices = new QButtonGroup(pane);
+            choices->setExclusive(true);
+            auto* same = new QRadioButton(tr("same winding (h inside v)"), pane);
+            same->setObjectName(QStringLiteral("intersectionDecisionSameWinding"));
+            auto* different = new QRadioButton(tr("different winding"), pane);
+            different->setObjectName(QStringLiteral("intersectionDecisionDifferentWinding"));
+            auto* hard = new QRadioButton(tr("hard to say"), pane);
+            hard->setObjectName(QStringLiteral("intersectionDecisionHardToSay"));
+            hard->setChecked(true);
+            choices->addButton(same, 0);
+            choices->addButton(different, 1);
+            choices->addButton(hard, 2);
+            layout->addWidget(same);
+            layout->addWidget(different);
+            layout->addWidget(hard);
+
+            auto* bottomRow = new QHBoxLayout;
+            auto* status = new QLabel(pane);
+            status->setObjectName(QStringLiteral("intersectionDecisionStatus"));
+            status->setWordWrap(true);
+            status->setText(_intersectionInspection && _intersectionInspection->atlasDir
+                ? tr("Ready")
+                : tr("No atlas selected"));
+            bottomRow->addWidget(status, 1);
+
+            auto* accept = new QPushButton(tr("Accept choice"), pane);
+            accept->setObjectName(QStringLiteral("intersectionDecisionAccept"));
+            accept->setEnabled(_intersectionInspection &&
+                               _intersectionInspection->atlasDir.has_value() &&
+                               hSide.fiber && vSide.fiber &&
+                               hSide.fiber->linePoints.size() >= 2 &&
+                               vSide.fiber->linePoints.size() >= 2);
+            bottomRow->addWidget(accept);
+            layout->addLayout(bottomRow);
+
+            connect(accept, &QPushButton::clicked, this, [this, choices, status]() {
+                switch (choices->checkedId()) {
+                case 0:
+                    if (acceptIntersectionSameWindingChoice() && status) {
+                        status->setText(tr("Saved same-winding link"));
+                    }
+                    break;
+                case 1:
+                    if (status) {
+                        status->setText(tr("No atlas change recorded for different winding"));
+                    }
+                    break;
+                case 2:
+                default:
+                    if (status) {
+                        status->setText(tr("No atlas change recorded"));
+                    }
+                    break;
+                }
+            });
+
+            auto* subWindow = targetArea->addSubWindow(pane);
+            subWindow->setObjectName(QStringLiteral("intersectionDecisionSubWindow"));
+            subWindow->setWindowTitle(tr("Decision"));
+            subWindow->setGeometry(geometry);
+            subWindow->show();
+        };
+
         const QSize size = targetArea->viewport() ? targetArea->viewport()->size()
                                                   : targetArea->size();
         const int width = std::max(3, size.width());
@@ -2221,7 +2488,8 @@ void LineAnnotationController::rebuildIntersectionInspection()
                                 0,
                                 colW - centerFollowW,
                                 centerTopH);
-        const QRect centerRect(centerX, centerTopH, colW, height - centerTopH);
+        const QRect centerRect(centerX, centerTopH, colW, std::max(1, bottomY - centerTopH));
+        const QRect decisionRect(centerX, bottomY, colW, bottomH);
         const QRect rightMid(rightX, topH, rightW, midH);
         const QRect rightBottom(rightX, bottomY, rightW, bottomH);
 
@@ -2233,6 +2501,7 @@ void LineAnnotationController::rebuildIntersectionInspection()
         addPlaneViewer(hFollowSpec, hFollowRect);
         addPlaneViewer(vFollowSpec, vFollowRect);
         addPlaneViewer(normalSpec, centerRect);
+        addDecisionPane(decisionRect);
         addPlaneViewer(planeSpecs[4], topRect(rightX, rightW, 0));
         addPlaneViewer(planeSpecs[5], topRect(rightX, rightW, 1));
         addPlaneViewer(planeSpecs[6], topRect(rightX, rightW, 2));

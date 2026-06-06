@@ -2359,7 +2359,10 @@ void CWindow::refreshAtlasOverviewDocks()
                     throw std::runtime_error("atlas base mesh has no valid grid");
                 }
                 coveredSize->setText(1, formatAtlasCoveredSize(
-                    vc::atlas::mappedObjectCoveredAtlasSize(atlas, baseSurface.scale())));
+                    vc::atlas::mappedObjectCoveredAtlasSize(
+                        atlas,
+                        baseSurface.scale(),
+                        vc::atlas::atlasHorizontalPeriodColumns(baseSurface))));
             } catch (const std::exception& ex) {
                 auto* item = new QTreeWidgetItem(tree);
                 item->setText(0, QString::fromStdString(atlasDir.filename().string()));
@@ -2662,7 +2665,8 @@ void CWindow::openAtlasSearchResult(int sortedResultIndex)
     }
     _lineAnnotationController->showIntersectionInspection(
         _atlasSearchResults[static_cast<size_t>(sortedResultIndex)],
-        _intersectionsMdiArea);
+        _intersectionsMdiArea,
+        _currentAtlasDir);
 }
 
 void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
