@@ -109,6 +109,17 @@ default_config = {
     'track_dt_within_track_norm_p': 3.0,  # within a track; -> inf strongly penalises isolated badly-aligned points
     'track_dt_norm_p': 0.5,  # across tracks; -> 0 prefers many fully-satisfied tracks (winner-take-all snapping)
     'track_dt_loss_margin': 0.025,
+    'track_loss_use_em': False,
+    'track_em_start_step': 3000,
+    'track_em_reassign_interval': 500,
+    'track_em_assignment': 'mode',  # 'mode' or 'median'
+    'track_em_min_confidence': 0.5,
+    'track_em_unassigned_radius_weight': 0.0,
+    'track_abs_radius_aggregation': 'hinge_mean',  # 'hinge_mean' or 'coverage'
+    'track_coverage_reduce': 'softmin',  # 'softmin' or 'mean'
+    'track_coverage_radius_tol': 0.5,
+    'track_coverage_tau_init': 0.5,
+    'track_coverage_tau_final': 0.05,
     'normals_num_points': 2000,
     'pcl_normals_num_points': 4000,
     'pcl_normals_sample_radius': 1,
@@ -126,6 +137,7 @@ default_config = {
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_track_radius': 50.,
     'loss_weight_track_dt': 20.,
+    'loss_weight_track_coverage': 0.0,
     'loss_weight_patch_stretch': 0.0,
     'loss_weight_bending': 0.0,
     'loss_weight_sym_dirichlet': 10.0,
@@ -2566,6 +2578,7 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         'lengths_cpu': lengths_cpu,
         'spiral_zyxs': spiral_zyxs,
         'theta': theta,
+        'shifted_radii': shifted_radii,
         'adjustments': adjustments,
         'unwrapped_shifted': unwrapped_shifted,
         'normalised_radii': normalised_radii,
@@ -2644,33 +2657,42 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
         return torch.zeros(S, dtype=torch.int64), lengths_cpu.clone(), per_point
 
     dr = ctx['dr']
-    strip_id = ctx['strip_id']
-    starts = ctx['starts']
-    lengths = ctx['lengths']
-    normalised_radii = ctx['normalised_radii']
 
     with torch.no_grad():
-        # Segmented median: sort the flat values with a composite key
-        # (strip_id-major, normalised_radii-minor) so values for each strip end
-        # up contiguous and sorted within their range. Per-strip median is then
-        # at start + (length - 1) // 2 (matching torch.median's lower-median
-        # convention for even lengths). Float64 keeps headroom against
-        # strip_id * val_range overflow for hundreds-of-thousands of strips.
-        val_min = normalised_radii.min().to(torch.float64)
-        val_max = normalised_radii.max().to(torch.float64)
-        val_range = (val_max - val_min) + 1.0
-        composite = (
-            strip_id.to(torch.float64) * val_range
-            + (normalised_radii.to(torch.float64) - val_min)
-        )
-        order = torch.argsort(composite)
-        sorted_norm = normalised_radii[order]
-        median_indices = starts[:-1] + (lengths - 1) // 2
-        medians = sorted_norm[median_indices]
+        medians = _segmented_median_per_strip(ctx)
         target_normalised_per_strip = torch.round(medians / dr) * dr
 
     satisfied_counts, per_point_satisfaction = _strip_satisfaction_from_target(ctx, target_normalised_per_strip)
     return satisfied_counts, lengths_cpu.clone(), per_point_satisfaction
+
+
+def _segmented_median_per_strip(ctx):
+    # Segmented median: sort the flat values with a composite key
+    # (strip_id-major, normalised_radii-minor) so values for each strip end
+    # up contiguous and sorted within their range. Per-strip median is then
+    # at start + (length - 1) // 2 (matching torch.median's lower-median
+    # convention for even lengths). Float64 keeps headroom against
+    # strip_id * val_range overflow for hundreds-of-thousands of strips.
+    normalised_radii = ctx['normalised_radii']
+    strip_id = ctx['strip_id']
+    starts = ctx['starts']
+    lengths = ctx['lengths']
+    S = ctx['S']
+    device = ctx['device']
+    if normalised_radii.numel() == 0:
+        return torch.zeros(S, dtype=normalised_radii.dtype, device=device)
+
+    val_min = normalised_radii.min().to(torch.float64)
+    val_max = normalised_radii.max().to(torch.float64)
+    val_range = (val_max - val_min) + 1.0
+    composite = (
+        strip_id.to(torch.float64) * val_range
+        + (normalised_radii.to(torch.float64) - val_min)
+    )
+    order = torch.argsort(composite)
+    sorted_norm = normalised_radii[order]
+    median_indices = starts[:-1] + (lengths - 1) // 2
+    return sorted_norm[median_indices]
 
 
 def _mode_winding_per_strip(strip_id, winding_idx_per_point, S, device):
@@ -3618,6 +3640,254 @@ def _prepare_main_phase_tracks(tracks, patch_atlas, unattached_pcl_strips, exclu
     }
 
 
+def _track_flat_bundle(prepared_tracks, device):
+    cached = prepared_tracks.get('_flat_bundle')
+    if cached is not None:
+        return cached
+
+    offsets = prepared_tracks['offsets']
+    lengths = prepared_tracks['lengths']
+    total = int(prepared_tracks['flat_zyx'].shape[0])
+    S = int(lengths.numel())
+    strip_id = torch.repeat_interleave(torch.arange(S, device=device), lengths)
+    bundle = {
+        'zyxs': prepared_tracks['flat_zyx'],
+        'windings': torch.zeros(total, device=device),
+        'strip_id': strip_id,
+        'starts': offsets,
+        'starts_cpu': offsets.cpu(),
+        'lengths': lengths,
+        'lengths_cpu': lengths.cpu(),
+        'num_strips': S,
+        'total': total,
+    }
+    prepared_tracks['_flat_bundle'] = bundle
+    return bundle
+
+
+@torch.no_grad()
+def compute_track_em_assignment(slice_to_spiral_transform, dr_per_winding, track_flat, cfg):
+    ctx, lengths_cpu, S = _build_strip_spiral_context(
+        slice_to_spiral_transform, dr_per_winding, track_flat, track_flat['num_strips'],
+    )
+    if ctx is None:
+        device = dr_per_winding.device
+        return {
+            'W': torch.zeros(S, dtype=torch.int64, device=device),
+            'm_p': torch.zeros(0, dtype=torch.int64, device=device),
+            'confidence': torch.zeros(S, dtype=dr_per_winding.dtype, device=device),
+            'valid': torch.zeros(S, dtype=torch.bool, device=device),
+        }
+
+    dr = ctx['dr']
+    device = ctx['device']
+    normalised_radii = ctx['normalised_radii']
+    winding_idx_per_point = torch.round(normalised_radii / dr).to(torch.int64)
+    if cfg['track_em_assignment'] == 'mode':
+        W = _mode_winding_per_strip(ctx['strip_id'], winding_idx_per_point, S, device)
+    elif cfg['track_em_assignment'] == 'median':
+        W = torch.round(_segmented_median_per_strip(ctx) / dr).to(torch.int64)
+    else:
+        raise ValueError(f"track_em_assignment must be 'mode' or 'median', got {cfg['track_em_assignment']!r}")
+
+    m_p = torch.round(ctx['adjustments'] / dr).to(torch.int64)
+    target_normalised_per_strip = W.to(dr.dtype) * dr
+    satisfied_counts, _ = _strip_satisfaction_from_target(ctx, target_normalised_per_strip)
+    satisfied_counts = satisfied_counts.to(device=device)
+    confidence = satisfied_counts.to(dr.dtype) / ctx['lengths'].clamp(min=1).to(dr.dtype)
+    valid = confidence >= float(cfg['track_em_min_confidence'])
+    return {
+        'W': W,
+        'm_p': m_p,
+        'confidence': confidence,
+        'valid': valid,
+    }
+
+
+def _sample_prepared_track_points(prepared_tracks, candidate_track_ids, num_tracks_per_step, num_points_per_track):
+    flat_zyx = prepared_tracks['flat_zyx']
+    offsets = prepared_tracks['offsets']
+    lengths = prepared_tracks['lengths']
+    device = flat_zyx.device
+    num_tracks = int(lengths.numel())
+    if num_tracks == 0 or num_tracks_per_step <= 0 or num_points_per_track <= 0:
+        return None
+
+    if candidate_track_ids is None:
+        num_candidates = num_tracks
+        k = min(int(num_tracks_per_step), num_candidates)
+        track_idx = torch.randint(num_candidates, (k,), device=device)
+    else:
+        if candidate_track_ids.numel() == 0:
+            return None
+        num_candidates = int(candidate_track_ids.numel())
+        k = min(int(num_tracks_per_step), num_candidates)
+        candidate_sel = torch.randint(num_candidates, (k,), device=device)
+        track_idx = candidate_track_ids[candidate_sel]
+
+    track_lengths_sample = lengths[track_idx]
+    track_offsets_sample = offsets[track_idx]
+    point_idx_within = (
+        torch.rand([k, num_points_per_track], device=device)
+        * track_lengths_sample[:, None].to(torch.float32)
+    ).to(torch.int64)
+    point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
+    flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
+    sampled_scroll = flat_zyx[flat_idx].view(k, num_points_per_track, 3)
+    return track_idx, flat_idx, sampled_scroll
+
+
+def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding):
+    radius_hinge_margin = dr_per_winding.detach() * cfg['track_radius_loss_margin']
+    if cfg['track_radius_target'] == 'mean':
+        radius_target_per_track = shifted_radii.mean(dim=-1, keepdim=True)
+    elif cfg['track_radius_target'] == 'median':
+        radius_target_per_track = shifted_radii.median(dim=-1, keepdim=True).values
+    else:
+        raise ValueError(f"track_radius_target must be 'mean' or 'median', got {cfg['track_radius_target']!r}")
+    deviations = (shifted_radii - radius_target_per_track).abs()
+    return F.relu(deviations - radius_hinge_margin).mean()
+
+
+def _same_radius_loss_for_track_subset(
+    slice_to_spiral_transform,
+    dr_per_winding,
+    prepared_tracks,
+    candidate_track_ids,
+    num_tracks_per_step,
+    num_points_per_track,
+):
+    zero = torch.zeros([], device=dr_per_winding.device)
+    sample = _sample_prepared_track_points(
+        prepared_tracks, candidate_track_ids, num_tracks_per_step, num_points_per_track,
+    )
+    if sample is None:
+        return zero
+    _, _, sampled_scroll = sample
+    k = sampled_scroll.shape[0]
+    M = sampled_scroll.shape[1]
+    sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, M, 3)
+    theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
+    shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
+    return _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding)
+
+
+def _coverage_loss(residual, tol, tau, reduce='softmin'):
+    tau_t = torch.as_tensor(tau, device=residual.device, dtype=residual.dtype).clamp(min=1.e-8)
+    if reduce == 'softmin':
+        worst = tau_t * torch.logsumexp(residual / tau_t, dim=-1)
+        s = torch.sigmoid((tol - worst) / tau_t)
+    elif reduce == 'mean':
+        s = torch.sigmoid((tol - residual) / tau_t).mean(dim=-1)
+    else:
+        raise ValueError(f"track_coverage_reduce must be 'softmin' or 'mean', got {reduce!r}")
+    return (1.0 - s).mean()
+
+
+def _coverage_tau(iteration, cfg):
+    tau_init = float(cfg['track_coverage_tau_init'])
+    tau_final = float(cfg['track_coverage_tau_final'])
+    if tau_init <= 0 or tau_final <= 0:
+        raise ValueError('track_coverage_tau_init and track_coverage_tau_final must be positive')
+    span = max(1, int(cfg['num_training_steps']) - int(cfg['track_em_start_step']))
+    f = min(1.0, max(0.0, (iteration - int(cfg['track_em_start_step'])) / span))
+    return tau_init * (tau_final / tau_init) ** f
+
+
+def get_track_em_losses(
+    slice_to_spiral_transform,
+    dr_per_winding,
+    prepared_tracks,
+    em_state,
+    num_tracks_per_step,
+    num_points_per_track,
+    tau,
+    cfg,
+):
+    device = dr_per_winding.device
+    zero = torch.zeros([], device=device)
+    if prepared_tracks is None or em_state is None:
+        fallback = _same_radius_loss_for_track_subset(
+            slice_to_spiral_transform, dr_per_winding, prepared_tracks, None,
+            num_tracks_per_step, num_points_per_track,
+        ) if prepared_tracks is not None else zero
+        return {'track_radius': fallback, 'track_dt': zero, 'track_coverage': zero}
+
+    valid_track_ids = torch.nonzero(em_state['valid'], as_tuple=False).squeeze(-1)
+    invalid_track_ids = torch.nonzero(~em_state['valid'], as_tuple=False).squeeze(-1)
+
+    assigned_radius_loss = zero
+    dt_loss = zero
+    coverage_loss = zero
+    sample = _sample_prepared_track_points(
+        prepared_tracks, valid_track_ids, num_tracks_per_step, num_points_per_track,
+    )
+    if sample is not None:
+        track_idx, flat_idx, sampled_scroll = sample
+        k = sampled_scroll.shape[0]
+        M = sampled_scroll.shape[1]
+        m_p = em_state['m_p'][flat_idx].view(k, M).to(dr_per_winding.dtype)
+        W = em_state['W'][track_idx].to(dr_per_winding.dtype)[:, None]
+        sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, M, 3)
+        theta, _, raw_shifted = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
+        unwrapped = raw_shifted + m_p * dr_per_winding
+        abs_residual = (unwrapped - W * dr_per_winding).abs()
+
+        if cfg['track_abs_radius_aggregation'] == 'hinge_mean':
+            radius_hinge_margin = dr_per_winding.detach() * cfg['track_radius_loss_margin']
+            assigned_radius_loss = F.relu(abs_residual - radius_hinge_margin).mean()
+        elif cfg['track_abs_radius_aggregation'] == 'coverage':
+            radius_tol = dr_per_winding.detach() * cfg['track_coverage_radius_tol']
+            assigned_radius_loss = _coverage_loss(
+                abs_residual, radius_tol, tau, reduce=cfg['track_coverage_reduce'],
+            )
+        else:
+            raise ValueError(
+                "track_abs_radius_aggregation must be 'hinge_mean' or 'coverage', "
+                f"got {cfg['track_abs_radius_aggregation']!r}"
+            )
+
+        target_raw_radius = (W - m_p) * dr_per_winding + theta / (2 * np.pi) * dr_per_winding
+        target_spiral_zyxs = torch.stack([
+            sampled_spiral[..., 0],
+            torch.sin(theta) * target_raw_radius,
+            torch.cos(theta) * target_raw_radius,
+        ], dim=-1).detach()
+        target_scroll_zyxs = slice_to_spiral_transform.inv(
+            target_spiral_zyxs.reshape(-1, 3),
+        ).reshape(k, M, 3)
+
+        dt_hinge_margin = dr_per_winding.detach() * cfg['track_dt_loss_margin']
+        point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
+        point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
+        within_p = cfg['track_dt_within_track_norm_p']
+        across_p = cfg['track_dt_norm_p']
+        track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
+        dt_loss = ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
+
+        if cfg['loss_weight_track_coverage'] > 0:
+            coverage_loss = _coverage_loss(
+                point_distances,
+                torch.as_tensor(metrics_config['satisfaction_distance_tolerance'], device=device, dtype=point_distances.dtype),
+                tau,
+                reduce=cfg['track_coverage_reduce'],
+            )
+
+    fallback_radius_loss = zero
+    if invalid_track_ids.numel() > 0 and cfg['track_em_unassigned_radius_weight'] > 0:
+        fallback_radius_loss = _same_radius_loss_for_track_subset(
+            slice_to_spiral_transform,
+            dr_per_winding,
+            prepared_tracks,
+            invalid_track_ids,
+            num_tracks_per_step,
+            num_points_per_track,
+        )
+
+    radius_loss = assigned_radius_loss + cfg['track_em_unassigned_radius_weight'] * fallback_radius_loss
+    return {'track_radius': radius_loss, 'track_dt': dt_loss, 'track_coverage': coverage_loss}
+
+
 def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, num_tracks_per_step, num_points_per_track, compute_dt=True):
     # Sample K tracks (with replacement) and M points per track, transform to spiral space, and
     # compute two losses analogous to the patch radius/DT losses: (1) each point's deviation
@@ -3628,32 +3898,17 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     zero = torch.zeros([], device=device)
     if prepared_tracks is None:
         return zero, zero
-    flat_zyx = prepared_tracks['flat_zyx']
-    offsets = prepared_tracks['offsets']
-    lengths = prepared_tracks['lengths']
-    num_tracks = lengths.numel()
-    k = min(num_tracks_per_step, num_tracks)
-    track_idx = torch.randint(num_tracks, (k,), device=device)
-    track_lengths_sample = lengths[track_idx]
-    track_offsets_sample = offsets[track_idx]
-    point_idx_within = (torch.rand([k, num_points_per_track], device=device) * track_lengths_sample[:, None].to(torch.float32)).to(torch.int64)
-    point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
-    flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
-    sampled_scroll = flat_zyx[flat_idx].view(k, num_points_per_track, 3)
-    sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, num_points_per_track, 3)
+    sample = _sample_prepared_track_points(prepared_tracks, None, num_tracks_per_step, num_points_per_track)
+    if sample is None:
+        return zero, zero
+    _, _, sampled_scroll = sample
+    k = sampled_scroll.shape[0]
+    M = sampled_scroll.shape[1]
+    sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, M, 3)
     theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
     shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
-    radius_hinge_margin = dr_per_winding.detach() * cfg['track_radius_loss_margin']
     dt_hinge_margin = dr_per_winding.detach() * cfg['track_dt_loss_margin']
-
-    if cfg['track_radius_target'] == 'mean':
-        radius_target_per_track = shifted_radii.mean(dim=-1, keepdim=True)
-    elif cfg['track_radius_target'] == 'median':
-        radius_target_per_track = shifted_radii.median(dim=-1, keepdim=True).values
-    else:
-        raise ValueError(f"track_radius_target must be 'mean' or 'median', got {cfg['track_radius_target']!r}")
-    deviations = (shifted_radii - radius_target_per_track).abs()
-    radius_loss = F.relu(deviations - radius_hinge_margin).mean()
+    radius_loss = _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding)
 
     if not compute_dt:
         return radius_loss, zero
@@ -4089,6 +4344,9 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             tracks, patch_atlas, unattached_pcl_strips,
             float(cfg['track_exclusion_radius']), device,
         )
+    use_track_em = bool(cfg['track_loss_use_em']) and prepared_main_tracks is not None
+    track_flat = _track_flat_bundle(prepared_main_tracks, device) if use_track_em else None
+    track_em_state = None
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
@@ -4099,6 +4357,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         dr_per_winding = spiral_and_transform.get_dr_per_winding()
 
         losses = {}
+        log_metrics = {}
 
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
         patch_radius_loss, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss = get_patch_and_umbilicus_losses(
@@ -4181,16 +4440,67 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
 
         if prepared_main_tracks is not None:
-            track_radius_loss, track_dt_loss = get_track_losses(
-                slice_to_spiral_transform,
-                dr_per_winding,
-                prepared_main_tracks,
-                cfg['track_num_per_step'],
-                cfg['track_num_points_per_step'],
-                compute_dt=compute_patch_dt,
-            )
-            losses['track_radius'] = track_radius_loss * cfg['loss_weight_track_radius']
-            losses['track_dt'] = track_dt_loss * cfg['loss_weight_track_dt']
+            if use_track_em and iteration >= int(cfg['track_em_start_step']):
+                reassign_interval = max(1, int(cfg['track_em_reassign_interval']))
+                should_reassign = (
+                    track_em_state is None
+                    or iteration == start_iteration
+                    or (iteration - int(cfg['track_em_start_step'])) % reassign_interval == 0
+                )
+                if should_reassign:
+                    prev_W = None if track_em_state is None else track_em_state['W']
+                    track_em_state = compute_track_em_assignment(
+                        slice_to_spiral_transform, dr_per_winding, track_flat, cfg,
+                    )
+                    valid = track_em_state['valid']
+                    total_tracks = int(valid.numel())
+                    valid_tracks = int(valid.sum().item())
+                    mean_conf = float(track_em_state['confidence'].mean().item()) if total_tracks > 0 else 0.0
+                    changed_msg = ''
+                    if prev_W is not None and prev_W.shape == track_em_state['W'].shape:
+                        changed = int((prev_W != track_em_state['W']).sum().item())
+                        changed_msg = f', changed_windings = {changed}'
+                    W_valid = track_em_state['W'][valid].detach().cpu()
+                    if W_valid.numel() > 0:
+                        uniq, counts = torch.unique(W_valid, return_counts=True)
+                        order = torch.argsort(counts, descending=True)
+                        top = ', '.join( f'{int(uniq[i].item())}' for i in order[:8] )
+                    else:
+                        top = 'none'
+                    print(
+                        f'track EM step {iteration}: valid = {valid_tracks}/{total_tracks}, '
+                        f'mean_conf = {mean_conf:.3f}{changed_msg}, top_windings = {top}'
+                    )
+                    log_metrics['track_em_valid_tracks'] = valid_tracks
+                    log_metrics['track_em_total_tracks'] = total_tracks
+                    log_metrics['track_em_mean_confidence'] = mean_conf
+
+                tau = _coverage_tau(iteration, cfg)
+                log_metrics['track_em_tau'] = tau
+                track_losses = get_track_em_losses(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    prepared_main_tracks,
+                    track_em_state,
+                    cfg['track_num_per_step'],
+                    cfg['track_num_points_per_step'],
+                    tau,
+                    cfg,
+                )
+                losses['track_radius'] = track_losses['track_radius'] * cfg['loss_weight_track_radius']
+                losses['track_dt'] = track_losses['track_dt'] * cfg['loss_weight_track_dt']
+                losses['track_coverage'] = track_losses['track_coverage'] * cfg['loss_weight_track_coverage']
+            else:
+                track_radius_loss, track_dt_loss = get_track_losses(
+                    slice_to_spiral_transform,
+                    dr_per_winding,
+                    prepared_main_tracks,
+                    cfg['track_num_per_step'],
+                    cfg['track_num_points_per_step'],
+                    compute_dt=(not use_track_em) and compute_patch_dt,
+                )
+                losses['track_radius'] = track_radius_loss * cfg['loss_weight_track_radius']
+                losses['track_dt'] = track_dt_loss * cfg['loss_weight_track_dt']
 
         shell_metrics = {}
         if shell_map is not None:
@@ -4226,6 +4536,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 'total_loss': loss.item(),
                 **{name + '_loss': value for name, value in losses.items()},
                 **shell_metrics,
+                **log_metrics,
             })
 
     suffix = 'fitted'
