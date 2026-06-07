@@ -69,10 +69,10 @@ z_end //= downsample_factor
 
 default_config = {
     'random_seed': 1,
-    'learning_rate': 1.e-4,
+    'learning_rate': 3.e-5,
     'exp_lr_schedule': True,
-    'lr_final_factor': 0.05,
-    'num_training_steps': 10_000,
+    'lr_final_factor': 0.3,
+    'num_training_steps': 30_000,
     'num_flow_integration_steps': 3,
     'flow_integration_solver': 'rk4',
     'num_flow_timesteps': 1,
@@ -92,6 +92,7 @@ default_config = {
     'patch_dt_norm_p': 0.5,
     'patch_dt_within_patch_norm_p': 3.0,
     'patch_dt_loss_margin': 0.025,
+    'patch_radius_within_norm_p': 3.0,  # >1 emphasises worst within-track points in the radius loss
     'num_patches_per_step': 120,
     'num_patches_per_step_for_dt': 80,
     'num_points_per_patch': 800,
@@ -101,7 +102,7 @@ default_config = {
     'unattached_pcl_num_per_step': 28,
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 4.,
-    'track_num_per_step': 200,
+    'track_num_per_step': 2000,
     'track_num_points_per_step': 8,
     'track_exclusion_radius': 12.0,
     'track_radius_target': 'mean',
@@ -152,7 +153,7 @@ default_config = {
     'loss_weight_shell_patch_radius': 0.0,
     'weight_decay_gap_expander': 1.e-2,
     'weight_decay_flow_field': 0.0,
-    'loss_start_patch_dt': 9000,
+    'loss_start_patch_dt': 25_000,
     'num_snapping_subpasses': 0,
     'snapping_steps_per_subpass': 500,
     'snapping_num_anchor_points': 2000,
@@ -1271,7 +1272,13 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         mean_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
         radius_deviations = (radius_shifted_radii - mean_radii).abs()
         radius_deviations_hinge = F.relu(radius_deviations - radius_hinge_margin)
-        mean_radius_deviation = radius_deviations_hinge.mean()
+        within_norm_p = cfg['patch_radius_within_norm_p']
+        if within_norm_p == 1.0:
+            mean_radius_deviation = radius_deviations_hinge.mean()
+        else:
+            d = radius_deviations_hinge + 1.e-5
+            per_track = (d ** within_norm_p).mean(dim=-1) ** (1.0 / within_norm_p)
+            mean_radius_deviation = per_track.mean()
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
     umbilicus_loss = umbilicus_spiral[..., 1:].abs().mean()

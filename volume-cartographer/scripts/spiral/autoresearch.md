@@ -19,14 +19,14 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The fitting script runs for a **fixed iteration budget of 10000 steps**; this will take around 20 minutes in the baseline configuration (and you should avoid increasing this time by too large a factor).
+Each experiment runs on a single GPU. The fitting script runs for a **fixed iteration budget of 30000 steps**; this will take around 60 minutes in the baseline configuration (and you should avoid increasing this time by too large a factor).
 You launch it as: `WANDB_MODE=disabled python fit_spiral.py > run.log`.
 
 **What you CAN do:**
 - Modify `fit_spiral.py` — this is the only file you edit. Everything is fair game: losses, optimizer, hyperparameters, flow field, etc -- but NOT the metrics themselves! That would be cheating.
 
 **What you CANNOT do:**
-- Change the number of iterations (num_training_steps in config) above 10000. It must stay fixed (or can be reduced if that actually gives better results).
+- Change the number of iterations (num_training_steps in config) above 30000. It must stay fixed (or can be reduced if that actually gives better results).
 - Install new packages or add dependencies. You can only use what's already installed in this conda env.
 - Modify the evaluation metrics (get_patch_satisfied_areas, get_unattached_pcl_satisfied_counts, and related methods) or their parameters (in metrics_config).
 - Change from the 'global' `working_set_mode` to another. Only the global mode is in scope here.
@@ -37,7 +37,7 @@ We also track two "softer" versions of these metrics: `satisfied_area` (a contin
 
 We expect all four metrics to be reasonably well correlated, but **avoid changes that make any of them substantially worse**, even if one of the others improves. A change that lifts `satisfied_patches` by 1 while halving `satisfied_unattached_pcls` is not a win.
 
-Everything else is fair game: change the diffeomorphism, the optimizer, the hyperparameters, the losses. The only constraints are that the code runs without crashing, does not run for more than 10000 iterations, and wall-clock time does not increase more than 50% versus the baseline run.
+Everything else is fair game: change the diffeomorphism, the optimizer, the hyperparameters, the losses. The only constraints are that the code runs without crashing, does not run for more than 30000 iterations, and wall-clock time does not increase more than 50% versus the baseline run.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A tiny working-set improvement that adds 20 lines of hacky code? Probably not worth it. A tiny working-set improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
@@ -115,7 +115,20 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **Timeout**: If a run exceeds three times the duration of the baseline, kill it and treat it as a failure (discard and revert).
 
-**Shell commands**: Only inspect `run.log` to check current run status, and poll internally for whether the process is still running. Do not use external tools like `pgrep` that might require permission from the user. DO NOT USE ANY SHELL COMMAND REQUIRING SUBSTITUTION (like `ps $(pgrep ...)`), since these require user confirmation (so the experiment would stop). Similarly do not use ansi c-strings in shell commands.
+**Shell commands — avoid approval prompts at all costs**: Every shell command you type is matched against an allow-list, and anything novel triggers a user-approval prompt that *blocks the whole loop* until the (possibly absent/asleep) user responds. So the iron rule is: the set of *distinct command strings* you ever type must be tiny and fixed. Concretely:
+
+- DO NOT type any command containing shell substitution (`$(...)`, backticks), process substitution (`<(...)`), or ANSI C-strings (`$'...'`). These always prompt. This includes inside `run_in_background` commands and inside `&&`/`;` chains. (Operators like `&&`, `|`, `>` themselves are fine; it is *substitution* that prompts.)
+- DO NOT type ad-hoc inspection one-liners (`for d in ...; do grep ... $(...); done`, `cat run.log | ...`, etc.). Every new variant is a new prompt.
+- INSTEAD, build a small set of **fixed-form helper scripts once**, then invoke each with an *identical command string* every time. All the logic that needs substitution/loops/pipes lives *inside* the script file (substitution inside a committed `.sh` is fine — only the command string you submit is matched). A good set:
+  - `run_exp.sh <gpu> <run_dir>` — pins `CUDA_VISIBLE_DEVICES`, sets `WANDB_MODE=disabled`, `FIT_SPIRAL_SKIP_SAVE_OVERLAY=1`, `FIT_SPIRAL_SKIP_SAVE_MESH=1` (skip slow/irrelevant output so the GPU frees right after metrics print), reads JSON overrides from `<run_dir>/overrides.json` into `FIT_SPIRAL_CONFIG_OVERRIDES`, runs `python fit_spiral.py > <run_dir>/run.log 2>&1`, and writes `<run_dir>/status` (`"<elapsed_s> <exit_code>"`).
+  - `launch_batch.sh` — reads a `batch.txt` manifest (`<gpu> <run_dir>` per line), launches each via `run_exp.sh` with a stagger (e.g. 45s, to avoid a thundering herd in the CPU-bound data-load phase), then `wait`s for all; one completion notification covers the batch.
+  - `summarize.sh` / `diag.sh` — scan `runs/*/` and print a TSV of metrics / GPU+disk+phase status. Use these instead of ad-hoc `grep`/`tail`.
+  - `record.sh` — append finished runs to `results_*.tsv` (read each run's `desc.txt` for the curated status+description; otherwise default).
+  - `commit.sh` — `git add fit_spiral.py && git commit -F COMMIT_MSG.txt`. Keeping the message in a file makes the *command* identical every time (a raw `git commit -m "..."` with a unique message is a new string and prompts).
+- CREATE AND EDIT ALL DATA FILES WITH THE Write/Edit TOOLS, never with `printf >`/`echo >`/`mkdir` in Bash. The Write tool never triggers a Bash approval prompt and avoids minting a unique command string per file. This applies to `overrides.json`, `batch.txt`, `COMMIT_MSG.txt`, `desc.txt`, the helper scripts themselves, etc.
+- To inspect progress, prefer reading the background task's output file with the Read tool, or run one of the fixed scripts above. Do not use external tools like `pgrep`/`ps` (also prompt). Poll internally / rely on the background-completion notifications.
+
+The very first time you use the experiment loop, set up these helper scripts (with the Write tool) before launching anything, so that from then on every shell command is one of a handful of pre-approved fixed strings and the loop can run unattended without ever stopping for approval.
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
