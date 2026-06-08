@@ -80,7 +80,10 @@ default_config = {
     'flow_bounds_radius': 800,
     'flow_voxel_resolution': 4,
     'flow_field_type': 'cartesian',  # 'cartesian' or 'cylindrical'
-    'flow_field_high_res_lr_scale': 3.0e-1,
+    'flow_field_high_res_lr_scale_initial': 3.0e-1,
+    'flow_field_high_res_lr_scale_final': 3.0e-1,
+    'flow_field_high_res_lr_ramp_start_step': 0,
+    'flow_field_high_res_lr_ramp_steps': 1,
     'gap_expander_logit_resolution': 6,
     'gap_expander_num_windings': 130,
     'gap_expander_lr_scale': 0.3,
@@ -904,7 +907,7 @@ class SpiralAndTransform(nn.Module):
 
         flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // cfg['flow_voxel_resolution']
         flow_field_cls = {'cartesian': CartesianFlowField, 'cylindrical': CylindricalFlowField}[cfg['flow_field_type']]
-        self.flow_field = flow_field_cls(flow_resolution, lr_scale_factor=cfg['flow_field_high_res_lr_scale'])
+        self.flow_field = flow_field_cls(flow_resolution, lr_scale_factor=cfg['flow_field_high_res_lr_scale_initial'])
 
         self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // cfg['linear_z_resolution'], 2, 2], dtype=torch.float32))
 
@@ -4095,6 +4098,19 @@ def save_spiral_on_tracks_overlay(
         )
 
 
+def get_flow_field_high_res_lr_scale(iteration):
+    # Factor multiplying the high-resolution flow logits, which scales down their effective
+    # learning rate relative to the main LR (kept <= 1 so the hi-res LR stays bounded by the
+    # main LR). Ramps linearly from _initial to _final over _ramp_steps steps, starting at
+    # _ramp_start_step; constant when _initial == _final.
+    initial = cfg['flow_field_high_res_lr_scale_initial']
+    final = cfg['flow_field_high_res_lr_scale_final']
+    start_step = cfg['flow_field_high_res_lr_ramp_start_step']
+    ramp_steps = max(1, int(cfg['flow_field_high_res_lr_ramp_steps']))
+    frac = min(1., max(0., (iteration - start_step) / ramp_steps))
+    return min(1., initial + frac * (final - initial))
+
+
 def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, tracks, pcl_normal_samples, lasagna_volume, shell_patch, z_to_umbilicus_yx, out_path):
     patches_list = list(patches_dict.values())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
@@ -4379,11 +4395,14 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
     for iteration in tqdm(range(start_iteration, num_training_steps)):
 
+        spiral_and_transform.flow_field.flow_scales[1] = get_flow_field_high_res_lr_scale(iteration)
+
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
         dr_per_winding = spiral_and_transform.get_dr_per_winding()
 
         losses = {}
         log_metrics = {}
+        log_metrics['flow_field_high_res_lr_scale'] = spiral_and_transform.flow_field.flow_scales[1]
 
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
         track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
