@@ -114,9 +114,6 @@ class AtlasParserTest(unittest.TestCase):
 					device=torch.device("cpu"),
 					mesh_step=1,
 					winding_step=1,
-					subsample_mesh=1,
-					subsample_winding=1,
-					depth=1,
 				)
 
 				self.assertEqual(init.metadata["period_columns"], 3)
@@ -203,9 +200,6 @@ class AtlasParserTest(unittest.TestCase):
 				device=torch.device("cpu"),
 				mesh_step=1,
 				winding_step=1,
-				subsample_mesh=1,
-				subsample_winding=1,
-				depth=1,
 			)
 
 			self.assertEqual(init.metadata["period_columns"], 4)
@@ -266,9 +260,6 @@ class AtlasParserTest(unittest.TestCase):
 				device=torch.device("cpu"),
 				mesh_step=20,
 				winding_step=1,
-				subsample_mesh=1,
-				subsample_winding=1,
-				depth=1,
 			)
 
 			self.assertEqual(int(init.model.params.mesh_step), 20)
@@ -325,9 +316,6 @@ class AtlasParserTest(unittest.TestCase):
 				device=torch.device("cpu"),
 				mesh_step=2000,
 				winding_step=1,
-				subsample_mesh=1,
-				subsample_winding=1,
-				depth=1,
 			)
 
 			model_xyz = init.model._grid_xyz().detach()
@@ -380,9 +368,6 @@ class AtlasParserTest(unittest.TestCase):
 				device=torch.device("cpu"),
 				mesh_step=2000,
 				winding_step=1,
-				subsample_mesh=1,
-				subsample_winding=1,
-				depth=1,
 			)
 
 			self.assertTrue(torch.allclose(
@@ -442,9 +427,6 @@ class AtlasParserTest(unittest.TestCase):
 				device=torch.device("cpu"),
 				mesh_step=1,
 				winding_step=1,
-				subsample_mesh=1,
-				subsample_winding=1,
-				depth=1,
 			)
 
 			self.assertEqual(init.atlas_lines.source_indices, (0, 1, 3, 4))
@@ -506,9 +488,6 @@ class AtlasParserTest(unittest.TestCase):
 				device=torch.device("cpu"),
 				mesh_step=1,
 				winding_step=1,
-				subsample_mesh=1,
-				subsample_winding=1,
-				depth=1,
 			)
 
 			self.assertEqual(init.atlas_lines.source_indices, (0, 1, 1))

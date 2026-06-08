@@ -130,9 +130,9 @@ class AtlasLineLossTest(unittest.TestCase):
 		self.assertTrue(bool(payload.valid[0, 1]))
 		self.assertTrue(bool(payload.is_control[0, 0]))
 		self.assertFalse(bool(payload.is_control[0, 1]))
-		proxy = payload.hit_xyz + payload.signed_delta.unsqueeze(-1) * payload.model_normal
-		self.assertTrue(torch.allclose(proxy[0, 0], torch.tensor([1.0, 1.0, 1.0]), atol=1.0e-6))
-		self.assertTrue(torch.allclose(proxy[0, 1], torch.tensor([2.0, 1.0, 2.0]), atol=1.0e-6))
+		self.assertEqual(tuple(payload.normal_proxy_valid.shape), (1, 3, 4))
+		self.assertGreater(int(payload.normal_proxy_valid.sum()), int(payload.valid.sum()))
+		self.assertTrue(torch.isfinite(payload.normal_proxy_target_xyz[payload.normal_proxy_valid]).all().item())
 
 	def test_debug_payload_omits_invalid_samples(self) -> None:
 		opt_loss_atlas_line.reset_state()
@@ -162,15 +162,18 @@ class AtlasLineLossTest(unittest.TestCase):
 		lines = fit_data.AtlasLines3D(
 			target_xyz=torch.tensor([
 				[1.0, 1.0, 1.0],
+				[1.0, 2.0, 1.5],
 				[2.0, 1.0, 2.0],
 			], dtype=torch.float32),
 			normal_xyz=torch.tensor([
 				[0.0, 0.0, -1.0],
 				[0.0, 0.0, -1.0],
+				[0.0, 0.0, -1.0],
 			], dtype=torch.float32),
-			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
-			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
-			is_control_point=torch.tensor([True, False]),
+			model_h=torch.tensor([1.0, 2.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 1.0, 2.0], dtype=torch.float32),
+			object_ids=("fibers/a.json", "fibers/b.json", "fibers/a.json"),
+			is_control_point=torch.tensor([True, True, False]),
 		)
 		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines), debug_payload=True)
 
@@ -185,11 +188,56 @@ class AtlasLineLossTest(unittest.TestCase):
 			wdir = root / "winding_000"
 			self.assertTrue((wdir / "model_surface.obj").exists())
 			self.assertIn("\nf ", (wdir / "model_surface.obj").read_text(encoding="utf-8"))
-			self.assertEqual((wdir / "control_connections.obj").read_text(encoding="utf-8").count("\nl "), 1)
+			self.assertEqual((wdir / "control_connections.obj").read_text(encoding="utf-8").count("\nl "), 2)
 			self.assertEqual((wdir / "other_connections.obj").read_text(encoding="utf-8").count("\nl "), 1)
 			normal_obj = (wdir / "normal_proxy.obj").read_text(encoding="utf-8")
-			self.assertEqual(normal_obj.count("\nl "), 2)
-			self.assertIn("v 1 1 1", normal_obj)
+			self.assertEqual(normal_obj.count("\nl "), 12)
+			self.assertIn("v 0 0 0", normal_obj)
+			by_fiber = root / "control_connections_by_fiber"
+			self.assertEqual((by_fiber / "fibers_a.json.obj").read_text(encoding="utf-8").count("\nl "), 1)
+			self.assertEqual((by_fiber / "fibers_b.json.obj").read_text(encoding="utf-8").count("\nl "), 1)
+
+	def test_write_debug_objs_splits_atlas_wraps_by_model_columns(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		H, W = 3, 8
+		y = torch.arange(H, dtype=torch.float32).view(H, 1).expand(H, W)
+		x = torch.arange(W, dtype=torch.float32).view(1, W).expand(H, W)
+		xyz = torch.stack([x, y, torch.zeros_like(x)], dim=-1).unsqueeze(0).requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([
+				[1.0, 1.0, 1.0],
+				[5.0, 1.0, 2.0],
+			], dtype=torch.float32),
+			normal_xyz=torch.tensor([
+				[0.0, 0.0, -1.0],
+				[0.0, 0.0, -1.0],
+			], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 5.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+			atlas_winding_model_ranges=((0, 0.0, 4.0), (1, 4.0, 8.0)),
+		)
+		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines), debug_payload=True)
+
+		old_cwd = Path.cwd()
+		with tempfile.TemporaryDirectory() as td:
+			try:
+				os.chdir(td)
+				root = opt_loss_atlas_line.write_debug_objs(stage="atlas_init_relax", step=0)
+			finally:
+				os.chdir(old_cwd)
+			self.assertEqual(root, Path(td) / "atlas_debug_objs" / "atlas_init_relax_step000000")
+			self.assertFalse((root / "winding_000").exists())
+			w0 = root / "atlas_winding_+000"
+			w1 = root / "atlas_winding_+001"
+			self.assertTrue((w0 / "model_surface.obj").exists())
+			self.assertTrue((w1 / "model_surface.obj").exists())
+			self.assertEqual((w0 / "control_connections.obj").read_text(encoding="utf-8").count("\nl "), 1)
+			self.assertEqual((w0 / "other_connections.obj").read_text(encoding="utf-8").count("\nl "), 0)
+			self.assertEqual((w1 / "control_connections.obj").read_text(encoding="utf-8").count("\nl "), 0)
+			self.assertEqual((w1 / "other_connections.obj").read_text(encoding="utf-8").count("\nl "), 1)
+			self.assertGreater((w0 / "normal_proxy.obj").read_text(encoding="utf-8").count("\nl "), 0)
+			self.assertGreater((w1 / "normal_proxy.obj").read_text(encoding="utf-8").count("\nl "), 0)
 
 	def test_optimizer_atlas_debug_objs_initial_eval_and_one_step(self) -> None:
 		class TinyAtlasModel(torch.nn.Module):
@@ -254,7 +302,7 @@ class AtlasLineLossTest(unittest.TestCase):
 				self.assertTrue((wdir / "model_surface.obj").exists())
 				self.assertIn("\nf ", (wdir / "model_surface.obj").read_text(encoding="utf-8"))
 				self.assertEqual((wdir / "control_connections.obj").read_text(encoding="utf-8").count("\nl "), 1)
-				self.assertEqual((wdir / "normal_proxy.obj").read_text(encoding="utf-8").count("\nl "), 1)
+				self.assertEqual((wdir / "normal_proxy.obj").read_text(encoding="utf-8").count("\nl "), 12)
 
 	def test_atlas_line_updates_at_most_one_neighboring_quad_and_clamps(self) -> None:
 		opt_loss_atlas_line.reset_state()

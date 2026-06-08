@@ -1526,6 +1526,18 @@ def main(argv: list[str] | None = None) -> int:
 			raise ValueError("model-init=atlas must not set --tifxyz-init")
 		if not isinstance(cfg.get("atlas"), dict):
 			raise ValueError("model-init=atlas requires top-level config atlas object")
+		if isinstance(args_cfg, dict):
+			bad_atlas_args = [
+				name for name in ("depth", "subsample-mesh", "subsample_mesh", "subsample-winding", "subsample_winding")
+				if name in args_cfg
+			]
+			if bad_atlas_args:
+				raise ValueError(
+					"model-init=atlas does not support args "
+					+ ", ".join(sorted(bad_atlas_args))
+					+ "; atlas models are always depth=1 with fixed atlas sampling"
+				)
+		model_cfg = dataclasses.replace(model_cfg, depth=1, subsample_mesh=1, subsample_winding=1, pyramid_d=False)
 
 	if model_init == "seed" and data_cfg.seed is not None:
 		model_cfg = dataclasses.replace(model_cfg, z_center=float(data_cfg.seed[2]))
@@ -1560,9 +1572,6 @@ def main(argv: list[str] | None = None) -> int:
 			device=device,
 			mesh_step=model_cfg.mesh_step,
 			winding_step=model_cfg.winding_step,
-			subsample_mesh=model_cfg.subsample_mesh,
-			subsample_winding=model_cfg.subsample_winding,
-			depth=model_cfg.depth,
 		)
 		mdl = atlas_init.model
 		atlas_lines_3d = atlas_init.atlas_lines

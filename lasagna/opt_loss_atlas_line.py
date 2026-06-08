@@ -26,6 +26,11 @@ class AtlasLineDebugPayload:
 	model_normal: torch.Tensor
 	signed_delta: torch.Tensor
 	is_control: torch.Tensor
+	sample_model_w: torch.Tensor
+	normal_proxy_target_xyz: torch.Tensor
+	normal_proxy_valid: torch.Tensor
+	object_ids: tuple[str, ...]
+	atlas_winding_model_ranges: tuple[tuple[int, float, float], ...] = ()
 
 
 def reset_state() -> None:
@@ -46,6 +51,13 @@ def last_debug_payload() -> AtlasLineDebugPayload | None:
 	return _last_debug_payload
 
 
+def _atlas_object_ids(lines, count: int) -> tuple[str, ...]:
+	raw = tuple(str(v) for v in (getattr(lines, "object_ids", ()) or ()))
+	if len(raw) == int(count):
+		return raw
+	return tuple("unknown" for _ in range(int(count)))
+
+
 def _empty_debug_payload(*, res: fit_model.FitResult3D, lines) -> AtlasLineDebugPayload:
 	D = int(res.xyz_lr.shape[0])
 	K = int(lines.target_xyz.shape[0])
@@ -57,10 +69,47 @@ def _empty_debug_payload(*, res: fit_model.FitResult3D, lines) -> AtlasLineDebug
 		model_normal=torch.full((D, K, 3), float("nan"), dtype=torch.float32),
 		signed_delta=torch.full((D, K), float("nan"), dtype=torch.float32),
 		is_control=torch.zeros((D, K), dtype=torch.bool),
+		sample_model_w=torch.full((D, K), float("nan"), dtype=torch.float32),
+		normal_proxy_target_xyz=torch.full(tuple(res.xyz_lr.shape), float("nan"), dtype=torch.float32),
+		normal_proxy_valid=torch.zeros(tuple(res.xyz_lr.shape[:3]), dtype=torch.bool),
+		object_ids=_atlas_object_ids(lines, K),
+		atlas_winding_model_ranges=tuple(getattr(lines, "atlas_winding_model_ranges", ()) or ()),
 	)
 
 
 def _write_obj_mesh(path: Path, xyz: torch.Tensor) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	xyz_cpu = xyz.detach().cpu()
+	if xyz_cpu.ndim == 3:
+		xyz_cpu = xyz_cpu.unsqueeze(0)
+	if xyz_cpu.ndim != 4:
+		raise ValueError(f"debug mesh expects (H,W,3) or (D,H,W,3), got {tuple(xyz_cpu.shape)}")
+	D, H, W, _ = xyz_cpu.shape
+	lines = ["o model_surface\n"]
+	vertex_index = 1
+	for d in range(D):
+		index = torch.zeros((H, W), dtype=torch.long)
+		lines.append(f"g layer_{d:03d}\n")
+		for h in range(H):
+			for w in range(W):
+				p = xyz_cpu[d, h, w]
+				if not bool(torch.isfinite(p).all()):
+					continue
+				index[h, w] = vertex_index
+				vertex_index += 1
+				lines.append(f"v {float(p[0]):.9g} {float(p[1]):.9g} {float(p[2]):.9g}\n")
+		for h in range(max(0, H - 1)):
+			for w in range(max(0, W - 1)):
+				v00 = int(index[h, w])
+				v10 = int(index[h + 1, w])
+				v11 = int(index[h + 1, w + 1])
+				v01 = int(index[h, w + 1])
+				if v00 and v10 and v11 and v01:
+					lines.append(f"f {v00} {v10} {v11} {v01}\n")
+	path.write_text("".join(lines), encoding="utf-8")
+
+
+def _write_obj_mesh_legacy(path: Path, xyz: torch.Tensor) -> None:
 	path.parent.mkdir(parents=True, exist_ok=True)
 	xyz_cpu = xyz.detach().cpu()
 	H, W, _ = xyz_cpu.shape
@@ -109,6 +158,51 @@ def _debug_stage_label(stage: str) -> str:
 	return str(stage).replace("/", "_").replace("\\", "_")
 
 
+def _debug_obj_name(name: str) -> str:
+	out = []
+	for ch in str(name):
+		if ch.isalnum() or ch in ("-", "_", "."):
+			out.append(ch)
+		else:
+			out.append("_")
+	s = "".join(out).strip("._")
+	return s or "unknown"
+
+
+def _column_slice_for_winding(start_w: float, end_w: float, width: int) -> slice:
+	lo = min(float(start_w), float(end_w))
+	hi = max(float(start_w), float(end_w))
+	c0 = max(0, int(torch.floor(torch.tensor(lo)).item()))
+	c1 = min(int(width), int(torch.ceil(torch.tensor(hi)).item()) + 1)
+	if c1 <= c0:
+		c1 = min(int(width), c0 + 1)
+	return slice(c0, c1)
+
+
+def _write_control_connections_by_fiber(root: Path, payload: AtlasLineDebugPayload) -> None:
+	out_dir = root / "control_connections_by_fiber"
+	valid_control = payload.valid.to(dtype=torch.bool) & payload.is_control.to(dtype=torch.bool)
+	object_ids = tuple(payload.object_ids)
+	if not object_ids:
+		return
+	seen: set[str] = set()
+	for object_id in object_ids:
+		if object_id in seen:
+			continue
+		seen.add(object_id)
+		k_mask = torch.tensor([oid == object_id for oid in object_ids], dtype=torch.bool).view(1, -1)
+		mask = valid_control & k_mask.expand_as(valid_control)
+		if not bool(mask.any()):
+			continue
+		_write_obj_lines(
+			out_dir / f"{_debug_obj_name(object_id)}.obj",
+			payload.hit_xyz,
+			payload.target_xyz,
+			mask,
+			label=f"control_connections_{_debug_obj_name(object_id)}",
+		)
+
+
 def write_debug_objs(*, stage: str, step: int, interval: int = 1,
 					 payload: AtlasLineDebugPayload | None = None) -> Path | None:
 	payload = _last_debug_payload if payload is None else payload
@@ -122,11 +216,48 @@ def write_debug_objs(*, stage: str, step: int, interval: int = 1,
 	model_xyz = payload.model_xyz
 	valid = payload.valid.to(dtype=torch.bool)
 	control = payload.is_control.to(dtype=torch.bool)
-	normal_target = payload.hit_xyz + payload.signed_delta.unsqueeze(-1) * payload.model_normal
+	proxy_valid = payload.normal_proxy_valid.to(dtype=torch.bool)
+	_write_control_connections_by_fiber(root, payload)
+	ranges = tuple(payload.atlas_winding_model_ranges or ())
+	if ranges:
+		D, _H, W, _ = model_xyz.shape
+		for winding, start_w, end_w in ranges:
+			col_slice = _column_slice_for_winding(start_w, end_w, int(W))
+			wdir = root / f"atlas_winding_{int(winding):+04d}"
+			wdir.mkdir(parents=True, exist_ok=True)
+			_write_obj_mesh(wdir / "model_surface.obj", model_xyz[:, :, col_slice])
+			w_sample = payload.sample_model_w
+			if int(winding) == int(ranges[-1][0]):
+				wmask = (w_sample >= min(start_w, end_w)) & (w_sample <= max(start_w, end_w))
+			else:
+				wmask = (w_sample >= min(start_w, end_w)) & (w_sample < max(start_w, end_w))
+			_write_obj_lines(
+				wdir / "control_connections.obj",
+				payload.hit_xyz,
+				payload.target_xyz,
+				valid & control & wmask,
+				label="control_connections",
+			)
+			_write_obj_lines(
+				wdir / "other_connections.obj",
+				payload.hit_xyz,
+				payload.target_xyz,
+				valid & ~control & wmask,
+				label="other_connections",
+			)
+			_write_obj_lines(
+				wdir / "normal_proxy.obj",
+				model_xyz[:, :, col_slice],
+				payload.normal_proxy_target_xyz[:, :, col_slice],
+				proxy_valid[:, :, col_slice],
+				label="normal_proxy",
+			)
+		return root
+
 	for d in range(int(model_xyz.shape[0])):
 		wdir = root / f"winding_{d:03d}"
 		wdir.mkdir(parents=True, exist_ok=True)
-		_write_obj_mesh(wdir / "model_surface.obj", model_xyz[d])
+		_write_obj_mesh_legacy(wdir / "model_surface.obj", model_xyz[d])
 		_write_obj_lines(
 			wdir / "control_connections.obj",
 			payload.hit_xyz[d],
@@ -143,9 +274,9 @@ def write_debug_objs(*, stage: str, step: int, interval: int = 1,
 		)
 		_write_obj_lines(
 			wdir / "normal_proxy.obj",
-			payload.hit_xyz[d],
-			normal_target[d],
-			valid[d],
+			model_xyz[d],
+			payload.normal_proxy_target_xyz[d],
+			proxy_valid[d],
 			label="normal_proxy",
 		)
 	return root
@@ -257,17 +388,19 @@ def _loss_from_splats(
 	signed_delta_p: torch.Tensor,
 	normal_p: torch.Tensor,
 	mask_p: torch.Tensor,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], float]:
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], float, torch.Tensor, torch.Tensor]:
 	D, H, W, _ = res.xyz_lr.shape
 	dev = res.xyz_lr.device
 	dt = res.xyz_lr.dtype
 	z = res.xyz_lr.sum() * 0.0
 	sq_map = torch.zeros((D, H, W), device=dev, dtype=dt) + z
 	mask_map = torch.zeros((D, H, W), device=dev, dtype=dt)
+	proxy_target_map = torch.full((D, H, W, 3), float("nan"), device=dev, dtype=dt)
+	proxy_valid_map = torch.zeros((D, H, W), device=dev, dtype=torch.bool)
 
 	valid = mask_p > 1.0e-8
 	if not bool(valid.any().detach().cpu()):
-		return z, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), 0.0
+		return z, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), 0.0, proxy_target_map, proxy_valid_map
 
 	d_p = d_p[valid]
 	h_floor_p = h_floor_p[valid]
@@ -292,7 +425,7 @@ def _loss_from_splats(
 	active = W_map > 1.0e-8
 	active_count = float(active.to(dtype=torch.float32).sum().detach().cpu())
 	if not bool(active.any().detach().cpu()):
-		return z, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), 0.0
+		return z, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), 0.0, proxy_target_map, proxy_valid_map
 
 	d_idx, h_idx, w_idx = active.nonzero(as_tuple=True)
 	live = res.xyz_lr[d_idx, h_idx, w_idx]
@@ -304,7 +437,9 @@ def _loss_from_splats(
 	loss = (weights * sq).sum() / weights.sum().clamp_min(1.0e-8)
 	sq_map[d_idx, h_idx, w_idx] = sq
 	mask_map[d_idx, h_idx, w_idx] = weights
-	return loss, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), active_count
+	proxy_target_map[d_idx, h_idx, w_idx] = target.detach()
+	proxy_valid_map[d_idx, h_idx, w_idx] = True
+	return loss, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), active_count, proxy_target_map, proxy_valid_map
 
 
 def atlas_line_loss(
@@ -429,30 +564,8 @@ def atlas_line_loss(
 		with torch.no_grad():
 			if bool(valid_active.any().detach().cpu()):
 				signed_delta_mean = float(signed_delta[valid_active].mean().detach().cpu())
-			if debug_payload:
-				idx_cpu = active_idx.detach().cpu()
-				target_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
-				hit_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
-				normal_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
-				signed_full = torch.full((D, K), float("nan"), dtype=torch.float32)
-				valid_full = torch.zeros((D, K), dtype=torch.bool)
-				control_full = control_k.view(1, K).expand(D, K).detach().cpu().to(dtype=torch.bool)
-				target_full[:, idx_cpu] = target.detach().cpu().to(dtype=torch.float32)
-				hit_full[:, idx_cpu] = hit_xyz.detach().cpu().to(dtype=torch.float32)
-				normal_full[:, idx_cpu] = model_n.detach().cpu().to(dtype=torch.float32)
-				signed_full[:, idx_cpu] = signed_delta.detach().cpu().to(dtype=torch.float32)
-				valid_full[:, idx_cpu] = valid_active.detach().cpu().to(dtype=torch.bool)
-				_last_debug_payload = AtlasLineDebugPayload(
-					model_xyz=res.xyz_lr.detach().cpu(),
-					valid=valid_full,
-					target_xyz=target_full,
-					hit_xyz=hit_full,
-					model_normal=normal_full,
-					signed_delta=signed_full,
-					is_control=control_full,
-				)
 
-		combined_loss, combined_maps, combined_masks, combined_active_verts = _loss_from_splats(
+		combined_loss, combined_maps, combined_masks, combined_active_verts, proxy_target_map, proxy_valid_map = _loss_from_splats(
 			res=res,
 			d_p=d_flat,
 			h_floor_p=h_floor_flat,
@@ -464,7 +577,37 @@ def atlas_line_loss(
 			mask_p=mask_flat,
 		)
 		combined_item = (combined_loss, combined_maps, combined_masks)
-		control_loss, control_maps, control_masks, control_active_verts = _loss_from_splats(
+		if debug_payload:
+			with torch.no_grad():
+				idx_cpu = active_idx.detach().cpu()
+				target_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
+				hit_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
+				normal_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
+				signed_full = torch.full((D, K), float("nan"), dtype=torch.float32)
+				sample_w_full = torch.full((D, K), float("nan"), dtype=torch.float32)
+				valid_full = torch.zeros((D, K), dtype=torch.bool)
+				control_full = control_k.view(1, K).expand(D, K).detach().cpu().to(dtype=torch.bool)
+				target_full[:, idx_cpu] = target.detach().cpu().to(dtype=torch.float32)
+				hit_full[:, idx_cpu] = hit_xyz.detach().cpu().to(dtype=torch.float32)
+				normal_full[:, idx_cpu] = model_n.detach().cpu().to(dtype=torch.float32)
+				signed_full[:, idx_cpu] = signed_delta.detach().cpu().to(dtype=torch.float32)
+				sample_w_full[:, idx_cpu] = w_cont.detach().cpu().to(dtype=torch.float32)
+				valid_full[:, idx_cpu] = valid_active.detach().cpu().to(dtype=torch.bool)
+				_last_debug_payload = AtlasLineDebugPayload(
+					model_xyz=res.xyz_lr.detach().cpu(),
+					valid=valid_full,
+					target_xyz=target_full,
+					hit_xyz=hit_full,
+					model_normal=normal_full,
+					signed_delta=signed_full,
+					is_control=control_full,
+					sample_model_w=sample_w_full,
+					normal_proxy_target_xyz=proxy_target_map.detach().cpu().to(dtype=torch.float32),
+					normal_proxy_valid=proxy_valid_map.detach().cpu().to(dtype=torch.bool),
+					object_ids=_atlas_object_ids(lines, K),
+					atlas_winding_model_ranges=tuple(getattr(lines, "atlas_winding_model_ranges", ()) or ()),
+				)
+		control_loss, control_maps, control_masks, control_active_verts, _control_proxy_target_map, _control_proxy_valid_map = _loss_from_splats(
 			res=res,
 			d_p=d_flat,
 			h_floor_p=h_floor_flat,
@@ -476,7 +619,7 @@ def atlas_line_loss(
 			mask_p=mask_flat * control_flat.to(dtype=res.xyz_lr.dtype),
 		)
 		control_item = (control_loss, control_maps, control_masks)
-		other_loss, other_maps, other_masks, other_active_verts = _loss_from_splats(
+		other_loss, other_maps, other_masks, other_active_verts, _other_proxy_target_map, _other_proxy_valid_map = _loss_from_splats(
 			res=res,
 			d_p=d_flat,
 			h_floor_p=h_floor_flat,

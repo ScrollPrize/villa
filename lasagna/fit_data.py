@@ -285,6 +285,7 @@ class AtlasLines3D:
 	object_ids: tuple[str, ...] = ()
 	source_indices: tuple[int, ...] = ()
 	is_control_point: torch.Tensor | None = None  # (K,) bool — True for VC3D fiber control points
+	atlas_winding_model_ranges: tuple[tuple[int, float, float], ...] = ()  # (winding, model_w_start, model_w_end)
 
 
 @dataclass(frozen=True)
