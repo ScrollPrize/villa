@@ -3258,6 +3258,11 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl
         scroll_pieces.append(slice_to_spiral_transform.inv(flat_spiral_zyxs[start : start + chunk]))
     scroll_zyxs = torch.cat(scroll_pieces, dim=0).reshape(*spiral_zyxs.shape)
 
+    # Mark vertices whose scroll-space z falls outside the [z_begin, z_end) ROI as invalid
+    # (-1, -1, -1), but allow splicing to still replace these.
+    out_of_roi = (scroll_zyxs[..., 0] < z_begin) | (scroll_zyxs[..., 0] >= z_end)
+    scroll_zyxs[out_of_roi] = -1.0
+
     # Spliced variant: replace cells covered by quads of overall- or boundary-satisfied
     # patches with patch-derived points, interpolated bilinearly across each quad in the
     # flattened-spiral UV coords of its target winding.
@@ -3279,7 +3284,10 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl
         offset = 0
         for winding_idx, num_thetas in enumerate(tqdm(num_thetas_by_winding, desc=f'saving winding patches ({name}{uuid_suffix})')):
             if num_thetas >= 2 and winding_idx >= min_winding_idx:
-                winding_zyxs = (variant_zyxs[:, offset:offset + num_thetas] * downsample_factor).cpu().numpy().astype(np.float32)
+                winding_slice = variant_zyxs[:, offset:offset + num_thetas]
+                invalid_mask = (winding_slice == -1.0).all(dim=-1).cpu().numpy()
+                winding_zyxs = (winding_slice * downsample_factor).cpu().numpy().astype(np.float32)
+                winding_zyxs[invalid_mask] = -1.0
                 save_tifxyz(
                     winding_zyxs,
                     out_dir,
