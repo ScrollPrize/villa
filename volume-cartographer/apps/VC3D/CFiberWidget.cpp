@@ -146,6 +146,11 @@ bool CFiberWidget::canShowFiberSlice() const
     return selectedFiberIds().size() == 1;
 }
 
+bool CFiberWidget::canRenameFiberFile() const
+{
+    return selectedFiberIds().size() == 1;
+}
+
 QAction* CFiberWidget::createShowFiberSliceAction(QObject* parent)
 {
     auto* action = new QAction(tr("Show fiber slice"), parent);
@@ -153,6 +158,17 @@ QAction* CFiberWidget::createShowFiberSliceAction(QObject* parent)
     action->setEnabled(canShowFiberSlice());
     connect(action, &QAction::triggered, this, [this]() {
         requestShowFiberSlice();
+    });
+    return action;
+}
+
+QAction* CFiberWidget::createRenameFiberFileAction(QObject* parent)
+{
+    auto* action = new QAction(tr("Rename JSON file..."), parent);
+    action->setObjectName(QStringLiteral("renameFiberFileAction"));
+    action->setEnabled(canRenameFiberFile());
+    connect(action, &QAction::triggered, this, [this]() {
+        requestRenameFiberFile();
     });
     return action;
 }
@@ -351,6 +367,8 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
             emit newAtlasFromFiberRequested(_selectedFiberId);
         }
     });
+    auto* renameAction = createRenameFiberFileAction(&menu);
+    menu.addAction(renameAction);
     menu.addSeparator();
     auto* deleteAction = menu.addAction(tr("Delete"));
     deleteAction->setEnabled(canDeleteSelection());
@@ -374,6 +392,13 @@ void CFiberWidget::requestShowFiberSlice()
 {
     if (_selectedFiberId != 0 && canShowFiberSlice()) {
         emit fiberSliceRequested(_selectedFiberId);
+    }
+}
+
+void CFiberWidget::requestRenameFiberFile()
+{
+    if (_selectedFiberId != 0 && canRenameFiberFile()) {
+        emit renameFiberFileRequested(_selectedFiberId);
     }
 }
 

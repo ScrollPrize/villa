@@ -116,6 +116,154 @@ TEST_CASE("line annotation bottom cross slice spacing scales exponentially")
     CHECK(vc3d::line_annotation::bottomCrossSliceLinePosition(50.0, 6, 7, 101, spacing) == 95.0);
 }
 
+TEST_CASE("line annotation current cut manual rotations preserve orthonormal frame")
+{
+    using vc3d::line_annotation::GeneratedCutRotationAxis;
+    constexpr float pi = 3.14159265358979323846f;
+
+    cv::Matx33f rotation = cv::Matx33f::eye();
+    rotation = vc3d::line_annotation::accumulatedGeneratedCutRotation(
+        rotation,
+        GeneratedCutRotationAxis::Horizontal,
+        pi / 12.0f);
+    rotation = vc3d::line_annotation::accumulatedGeneratedCutRotation(
+        rotation,
+        GeneratedCutRotationAxis::Vertical,
+        -pi / 18.0f);
+    rotation = vc3d::line_annotation::accumulatedGeneratedCutRotation(
+        rotation,
+        GeneratedCutRotationAxis::Horizontal,
+        pi / 20.0f);
+
+    const auto frame = vc3d::line_annotation::generatedCutFrameWithManualRotation(
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        rotation);
+    CHECK(vc3d::line_annotation::generatedCutFrameIsOrthonormal(frame));
+}
+
+TEST_CASE("line annotation current cut manual rotation reapplies at new line position")
+{
+    using vc3d::line_annotation::GeneratedCutRotationAxis;
+    constexpr float pi = 3.14159265358979323846f;
+
+    const cv::Matx33f rotation = vc3d::line_annotation::accumulatedGeneratedCutRotation(
+        cv::Matx33f::eye(),
+        GeneratedCutRotationAxis::Vertical,
+        pi / 6.0f);
+
+    const auto first = vc3d::line_annotation::generatedCutFrameWithManualRotation(
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        rotation);
+    const auto second = vc3d::line_annotation::generatedCutFrameWithManualRotation(
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        rotation);
+
+    CHECK(vc3d::line_annotation::generatedCutFrameIsOrthonormal(first));
+    CHECK(vc3d::line_annotation::generatedCutFrameIsOrthonormal(second));
+    CHECK(std::abs(first.normal.dot({1.0f, 0.0f, 0.0f})) < 0.99f);
+    CHECK(std::abs(second.normal.dot({0.0f, 1.0f, 0.0f})) < 0.99f);
+}
+
+TEST_CASE("line annotation reset navigation state restores initial generated view values")
+{
+    auto state = vc3d::line_annotation::resetGeneratedLineViewNavigationState(12.0, 15.0, 7.5);
+
+    CHECK(state.currentLinePosition == doctest::Approx(12.0));
+    CHECK(state.bottomCenterPosition == doctest::Approx(15.0));
+    CHECK(state.bottomSliceLineStep == doctest::Approx(7.5));
+    CHECK_FALSE(state.currentCutManualRotationActive);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            const float expected = row == col ? 1.0f : 0.0f;
+            CHECK(state.currentCutManualRotation(row, col) == doctest::Approx(expected));
+        }
+    }
+}
+
+TEST_CASE("line annotation control point navigation chooses nearest previous and next")
+{
+    const std::vector<double> positions{40.0, 12.0, 28.0, 20.0};
+
+    const auto previous = vc3d::line_annotation::previousGeneratedControlPointLinePosition(
+        25.0,
+        positions);
+    const auto next = vc3d::line_annotation::nextGeneratedControlPointLinePosition(
+        25.0,
+        positions);
+
+    REQUIRE(previous.has_value());
+    REQUIRE(next.has_value());
+    CHECK(*previous == doctest::Approx(20.0));
+    CHECK(*next == doctest::Approx(28.0));
+}
+
+TEST_CASE("line annotation control point navigation boundaries do not wrap")
+{
+    const std::vector<double> positions{12.0, 20.0, 40.0};
+
+    CHECK_FALSE(vc3d::line_annotation::previousGeneratedControlPointLinePosition(
+        12.0,
+        positions).has_value());
+    CHECK_FALSE(vc3d::line_annotation::nextGeneratedControlPointLinePosition(
+        40.0,
+        positions).has_value());
+    CHECK_FALSE(vc3d::line_annotation::previousGeneratedControlPointLinePosition(
+        std::numeric_limits<double>::quiet_NaN(),
+        positions).has_value());
+    CHECK_FALSE(vc3d::line_annotation::nextGeneratedControlPointLinePosition(
+        std::numeric_limits<double>::quiet_NaN(),
+        positions).has_value());
+}
+
+TEST_CASE("line annotation closest control point chooses nearest valid position")
+{
+    const std::vector<double> positions{12.0, 20.0, 40.0};
+
+    const auto closest = vc3d::line_annotation::closestGeneratedControlPointLinePosition(
+        26.0,
+        positions);
+
+    REQUIRE(closest.has_value());
+    CHECK(*closest == doctest::Approx(20.0));
+}
+
+TEST_CASE("line annotation control point navigation ignores invalid positions")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 30.0, false},
+        {{0.0f, 0.0f, 0.0f}, nan, false},
+        {{0.0f, 0.0f, 0.0f}, 10.0, true},
+        {{0.0f, 0.0f, 0.0f}, std::numeric_limits<double>::infinity(), false},
+    };
+
+    const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(controls);
+    REQUIRE(positions.size() == 2);
+    CHECK(positions[0] == doctest::Approx(10.0));
+    CHECK(positions[1] == doctest::Approx(30.0));
+
+    const auto previous = vc3d::line_annotation::previousGeneratedControlPointLinePosition(
+        20.0,
+        positions);
+    const auto next = vc3d::line_annotation::nextGeneratedControlPointLinePosition(
+        20.0,
+        positions);
+    const auto closest = vc3d::line_annotation::closestGeneratedControlPointLinePosition(
+        26.0,
+        positions);
+
+    REQUIRE(previous.has_value());
+    REQUIRE(next.has_value());
+    REQUIRE(closest.has_value());
+    CHECK(*previous == doctest::Approx(10.0));
+    CHECK(*next == doctest::Approx(30.0));
+    CHECK(*closest == doctest::Approx(30.0));
+}
+
 TEST_CASE("line annotation fixed current slice snaps only within quarter line position")
 {
     const std::vector<double> controlPositions{12.0, 20.0, 40.0};

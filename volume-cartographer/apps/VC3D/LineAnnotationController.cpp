@@ -33,8 +33,10 @@
 #include <QColor>
 #include <QEvent>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QMdiArea>
 #include <QMdiSubWindow>
@@ -217,6 +219,45 @@ cv::Vec3d toVec3d(const cv::Vec3f& v)
 bool approximatelyEqual(double a, double b)
 {
     return std::abs(a - b) <= 1.0e-9;
+}
+
+std::optional<std::string> normalizedFiberJsonFileNameInput(const QString& input, QString* error)
+{
+    QString fileName = input.trimmed();
+    if (fileName.isEmpty()) {
+        if (error) {
+            *error = QObject::tr("Enter a JSON file name.");
+        }
+        return std::nullopt;
+    }
+    if (fileName.contains(QChar('/')) || fileName.contains(QChar('\\'))) {
+        if (error) {
+            *error = QObject::tr("The file name cannot contain folders or path separators.");
+        }
+        return std::nullopt;
+    }
+
+    constexpr int kJsonSuffixLength = 5;
+    if (fileName.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) {
+        fileName = fileName.left(fileName.size() - kJsonSuffixLength) + QStringLiteral(".json");
+    } else {
+        fileName += QStringLiteral(".json");
+    }
+
+    const QString stem = fileName.left(fileName.size() - kJsonSuffixLength).trimmed();
+    if (stem.isEmpty() || stem == QStringLiteral(".") || stem == QStringLiteral("..")) {
+        if (error) {
+            *error = QObject::tr("Enter a file name before the .json extension.");
+        }
+        return std::nullopt;
+    }
+    if (fileName == QStringLiteral(".") || fileName == QStringLiteral("..")) {
+        if (error) {
+            *error = QObject::tr("Enter a valid JSON file name.");
+        }
+        return std::nullopt;
+    }
+    return fileName.toStdString();
 }
 
 cv::Vec3d interpolatedPointAtLinePosition(const std::vector<cv::Vec3d>& points,
@@ -1046,6 +1087,89 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     }
     emitFiberSummaries();
     emit fibersDeleted(deletedIds);
+}
+
+void LineAnnotationController::renameFiberFile(uint64_t fiberId)
+{
+    auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (it == _fibers.end()) {
+        showError(tr("Fiber %1 is not loaded.").arg(fiberId));
+        return;
+    }
+
+    const QString currentName = QString::fromStdString(
+        it->fileName.empty() ? fiberPath(*it).filename().string() : it->fileName);
+    bool accepted = false;
+    const QString input = QInputDialog::getText(_parentWidget.data(),
+                                                tr("Rename Line JSON"),
+                                                tr("File name:"),
+                                                QLineEdit::Normal,
+                                                currentName,
+                                                &accepted);
+    if (!accepted) {
+        return;
+    }
+
+    QString validationError;
+    const auto newFileName = normalizedFiberJsonFileNameInput(input, &validationError);
+    if (!newFileName) {
+        showError(validationError);
+        return;
+    }
+    if (*newFileName == it->fileName) {
+        return;
+    }
+
+    const fs::path dir = fibersDir();
+    if (dir.empty()) {
+        showError(tr("No volume package is loaded."));
+        return;
+    }
+
+    const fs::path oldPath = fiberPath(*it);
+    const fs::path newPath = dir / *newFileName;
+    std::error_code ec;
+    if (!fs::exists(oldPath, ec)) {
+        showError(tr("Could not rename fiber %1: %2 does not exist.")
+                      .arg(fiberId)
+                      .arg(QString::fromStdString(oldPath.string())));
+        return;
+    }
+    ec.clear();
+    if (fs::exists(newPath, ec)) {
+        showError(tr("Could not rename fiber %1: %2 already exists.")
+                      .arg(fiberId)
+                      .arg(QString::fromStdString(newPath.filename().string())));
+        return;
+    }
+
+    StoredFiber renamed = *it;
+    renamed.fileName = *newFileName;
+    try {
+        saveFiber(renamed);
+        ec.clear();
+        fs::remove(oldPath, ec);
+        if (ec) {
+            fs::remove(newPath);
+            throw std::runtime_error("Failed to remove old file " +
+                                     oldPath.string() + ": " + ec.message());
+        }
+    } catch (const std::exception& ex) {
+        showError(tr("Could not rename fiber %1: %2")
+                      .arg(fiberId)
+                      .arg(QString::fromStdString(ex.what())));
+        return;
+    }
+
+    *it = std::move(renamed);
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->fiberId == fiberId) {
+            pane.session->fiberFileName = it->fileName;
+        }
+    }
+    emitFiberSummaries();
 }
 
 void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QString& tag)

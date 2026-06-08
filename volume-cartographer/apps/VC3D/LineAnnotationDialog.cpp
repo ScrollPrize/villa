@@ -17,6 +17,9 @@
 #include <QMdiSubWindow>
 #include <QPushButton>
 #include <QRect>
+#include <QShortcut>
+#include <QTimer>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWheelEvent>
@@ -29,6 +32,7 @@
 namespace {
 
 constexpr int kBottomCrossSliceCount = 7;
+constexpr float kCurrentCutRotationStepRadians = 3.14159265358979323846f / 36.0f;
 
 CChunkedVolumeViewer::CameraState generatedPaneCamera(CChunkedVolumeViewer* viewer,
                                                       const CChunkedVolumeViewer::CameraState& fallback)
@@ -129,6 +133,10 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _fullOptimizationButton->setEnabled(false);
     _fullOptimizationButton->installEventFilter(this);
     buttonLayout->addWidget(_fullOptimizationButton);
+    _resetViewsButton = new QPushButton(tr("Reset views"), buttonRow);
+    _resetViewsButton->setEnabled(false);
+    _resetViewsButton->installEventFilter(this);
+    buttonLayout->addWidget(_resetViewsButton);
     buttonLayout->addStretch(1);
     _layout->addWidget(buttonRow, 0);
     connect(_showAsMeshButton, &QPushButton::clicked, this, [this]() {
@@ -137,6 +145,10 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     connect(_fullOptimizationButton, &QPushButton::clicked, this, [this]() {
         emit fullOptimizationRequested();
     });
+    connect(_resetViewsButton, &QPushButton::clicked, this, [this]() {
+        resetGeneratedViews();
+    });
+    installGeneratedViewShortcuts();
 
     _mdiArea = new QMdiArea(content);
     _mdiArea->installEventFilter(this);
@@ -204,6 +216,9 @@ bool LineAnnotationDialog::setGeneratedRows(
     if (_fullOptimizationButton) {
         _fullOptimizationButton->setEnabled(false);
     }
+    if (_resetViewsButton) {
+        _resetViewsButton->setEnabled(false);
+    }
 
     clearGeneratedOverlayRefreshConnections();
     _suppressPaneClosed = true;
@@ -214,6 +229,15 @@ bool LineAnnotationDialog::setGeneratedRows(
     }
     _suppressPaneClosed = false;
     _panes.clear();
+    _stripViewers.clear();
+    _bottomSliceViewers.clear();
+    _currentCutViewer = nullptr;
+    _hasGeneratedViews = false;
+    _currentCutManualRotation = cv::Matx33f::eye();
+    _currentCutManualRotationActive = false;
+    _haveInitialCurrentCutCamera = false;
+    _initialStripCameras.clear();
+    _initialBottomSliceCameras.clear();
 
     for (const auto& row : rows) {
         if (row.empty()) {
@@ -341,6 +365,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (_fullOptimizationButton) {
         _fullOptimizationButton->setEnabled(false);
     }
+    if (_resetViewsButton) {
+        _resetViewsButton->setEnabled(false);
+    }
 
     const bool replacingGeneratedViews = _hasGeneratedViews;
     const double previousCurrentLinePosition = _currentLinePosition;
@@ -393,6 +420,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedViews = views;
     _hasGeneratedViews = true;
     _currentCutFollowsStripMouse = true;
+    if (!replacingGeneratedViews) {
+        _currentCutManualRotation = cv::Matx33f::eye();
+        _currentCutManualRotationActive = false;
+    }
     const double maxLinePosition = static_cast<double>(views.linePoints.size() - 1);
     _currentLinePosition = replacingGeneratedViews
         ? std::clamp(previousCurrentLinePosition, 0.0, maxLinePosition)
@@ -590,6 +621,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (_fullOptimizationButton) {
         _fullOptimizationButton->setEnabled(true);
     }
+    captureInitialGeneratedViewState();
+    if (_resetViewsButton) {
+        _resetViewsButton->setEnabled(true);
+    }
     return true;
 }
 
@@ -708,6 +743,87 @@ void LineAnnotationDialog::setCurrentLinePosition(double position)
     rebuildGeneratedOverlays();
 }
 
+void LineAnnotationDialog::cancelControlPointPreviewAnimation()
+{
+    if (!_controlPointPreviewAnimation) {
+        return;
+    }
+    auto* animation = _controlPointPreviewAnimation.data();
+    _controlPointPreviewAnimation = nullptr;
+    animation->stop();
+    animation->deleteLater();
+}
+
+void LineAnnotationDialog::jumpToPreviousControlPoint()
+{
+    if (!_hasGeneratedViews || _generatedViews.controlPoints.empty()) {
+        return;
+    }
+    cancelControlPointPreviewAnimation();
+    const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
+        _generatedViews.controlPoints);
+    const auto previous = vc3d::line_annotation::previousGeneratedControlPointLinePosition(
+        _currentLinePosition,
+        positions);
+    if (previous) {
+        setCurrentLinePosition(*previous);
+    }
+}
+
+void LineAnnotationDialog::jumpToNextControlPoint()
+{
+    if (!_hasGeneratedViews || _generatedViews.controlPoints.empty()) {
+        return;
+    }
+    cancelControlPointPreviewAnimation();
+    const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
+        _generatedViews.controlPoints);
+    const auto next = vc3d::line_annotation::nextGeneratedControlPointLinePosition(
+        _currentLinePosition,
+        positions);
+    if (next) {
+        setCurrentLinePosition(*next);
+    }
+}
+
+void LineAnnotationDialog::previewClosestControlPoint()
+{
+    if (!_hasGeneratedViews || _generatedViews.controlPoints.empty()) {
+        return;
+    }
+    cancelControlPointPreviewAnimation();
+    const double originalPosition = _currentLinePosition;
+    const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
+        _generatedViews.controlPoints);
+    const auto closest = vc3d::line_annotation::closestGeneratedControlPointLinePosition(
+        originalPosition,
+        positions);
+    if (!closest) {
+        return;
+    }
+    setCurrentLinePosition(*closest);
+
+    auto* animation = new QVariantAnimation(this);
+    _controlPointPreviewAnimation = animation;
+    animation->setDuration(1000);
+    animation->setStartValue(*closest);
+    animation->setEndValue(originalPosition);
+    connect(animation, &QVariantAnimation::valueChanged, this, [this, animation](const QVariant& value) {
+        if (_controlPointPreviewAnimation == animation) {
+            setCurrentLinePosition(value.toDouble());
+        }
+    });
+    connect(animation, &QVariantAnimation::finished, this, [this, animation]() {
+        if (_controlPointPreviewAnimation == animation) {
+            _controlPointPreviewAnimation = nullptr;
+            animation->deleteLater();
+        }
+    });
+    QTimer::singleShot(30, animation, [animation]() {
+        animation->start();
+    });
+}
+
 bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
 {
     if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
@@ -796,6 +912,159 @@ void LineAnnotationDialog::recenterBottomSlicesOnCurrentPosition()
         return;
     }
     setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
+}
+
+void LineAnnotationDialog::installGeneratedViewShortcuts()
+{
+    const auto bindNavigationShortcut = [this](Qt::Key key, void (LineAnnotationDialog::*slot)()) {
+        auto* shortcut = new QShortcut(QKeySequence(key), this);
+        shortcut->setContext(Qt::WindowShortcut);
+        connect(shortcut, &QShortcut::activated, this, slot);
+    };
+
+    const auto bindRotationShortcut =
+        [this](Qt::Key key, vc3d::line_annotation::GeneratedCutRotationAxis axis, float radians) {
+            auto* shortcut = new QShortcut(QKeySequence(key), this);
+            shortcut->setContext(Qt::WindowShortcut);
+            connect(shortcut, &QShortcut::activated, this, [this, axis, radians]() {
+                (void)rotateCurrentCut(axis, radians);
+            });
+        };
+
+    using vc3d::line_annotation::GeneratedCutRotationAxis;
+    bindRotationShortcut(Qt::Key_W, GeneratedCutRotationAxis::Horizontal, kCurrentCutRotationStepRadians);
+    bindRotationShortcut(Qt::Key_S, GeneratedCutRotationAxis::Horizontal, -kCurrentCutRotationStepRadians);
+    bindRotationShortcut(Qt::Key_A, GeneratedCutRotationAxis::Vertical, -kCurrentCutRotationStepRadians);
+    bindRotationShortcut(Qt::Key_D, GeneratedCutRotationAxis::Vertical, kCurrentCutRotationStepRadians);
+    bindNavigationShortcut(Qt::Key_Y, &LineAnnotationDialog::jumpToPreviousControlPoint);
+    bindNavigationShortcut(Qt::Key_C, &LineAnnotationDialog::jumpToNextControlPoint);
+    bindNavigationShortcut(Qt::Key_X, &LineAnnotationDialog::previewClosestControlPoint);
+}
+
+cv::Vec3f LineAnnotationDialog::currentCutViewerCenterVolumePoint() const
+{
+    auto* viewer = _currentCutViewer.data();
+    auto* view = viewer ? viewer->graphicsView() : nullptr;
+    auto* viewport = view ? view->viewport() : nullptr;
+    if (viewer && view && viewport && viewport->width() > 0 && viewport->height() > 0) {
+        const QPointF sceneCenter = view->mapToScene(viewport->rect().center());
+        const cv::Vec3f center = viewer->sceneToVolume(sceneCenter);
+        if (finitePoint(center)) {
+            return center;
+        }
+    }
+    return interpolatedLinePoint(_currentLinePosition);
+}
+
+bool LineAnnotationDialog::rotateCurrentCut(vc3d::line_annotation::GeneratedCutRotationAxis axis,
+                                            float radians)
+{
+    if (!_hasGeneratedViews || !_generatedViews.currentCutSurface || !_currentCutViewer) {
+        return false;
+    }
+    const cv::Vec3f centerVolumePoint = currentCutViewerCenterVolumePoint();
+    _currentCutManualRotation =
+        vc3d::line_annotation::accumulatedGeneratedCutRotation(_currentCutManualRotation,
+                                                               axis,
+                                                               radians);
+    _currentCutManualRotationActive = true;
+    if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition)) {
+        return false;
+    }
+    if (finitePoint(centerVolumePoint)) {
+        _currentCutViewer->centerOnVolumePoint(centerVolumePoint, false);
+    }
+    _currentCutViewer->renderVisible(true, "line annotation current cut rotation");
+    rebuildGeneratedOverlays();
+    return true;
+}
+
+void LineAnnotationDialog::captureInitialGeneratedViewState()
+{
+    _initialCurrentLinePosition = _currentLinePosition;
+    _initialBottomCenterPosition = _bottomCenterPosition;
+    _initialBottomSliceLineStep = _bottomSliceLineStep;
+
+    _haveInitialCurrentCutCamera = false;
+    if (_currentCutViewer) {
+        _initialCurrentCutCamera = _currentCutViewer->cameraState();
+        _haveInitialCurrentCutCamera = true;
+    }
+    _initialStripCameras.clear();
+    _initialStripCameras.reserve(_stripViewers.size());
+    for (const auto& viewer : _stripViewers) {
+        if (viewer) {
+            _initialStripCameras.push_back(viewer->cameraState());
+        }
+    }
+    _initialBottomSliceCameras.clear();
+    _initialBottomSliceCameras.reserve(_bottomSliceViewers.size());
+    for (const auto& viewer : _bottomSliceViewers) {
+        if (viewer) {
+            _initialBottomSliceCameras.push_back(viewer->cameraState());
+        }
+    }
+}
+
+void LineAnnotationDialog::restoreInitialGeneratedViewerCameras()
+{
+    if (_currentCutViewer && _haveInitialCurrentCutCamera) {
+        _currentCutViewer->applyCameraState(_initialCurrentCutCamera, false);
+    }
+    for (size_t i = 0; i < _stripViewers.size() && i < _initialStripCameras.size(); ++i) {
+        if (_stripViewers[i]) {
+            _stripViewers[i]->applyCameraState(_initialStripCameras[i], false);
+        }
+    }
+    for (size_t i = 0; i < _bottomSliceViewers.size() && i < _initialBottomSliceCameras.size(); ++i) {
+        if (_bottomSliceViewers[i]) {
+            _bottomSliceViewers[i]->applyCameraState(_initialBottomSliceCameras[i], false);
+        }
+    }
+}
+
+void LineAnnotationDialog::resetGeneratedViews()
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
+        return;
+    }
+
+    const auto state = vc3d::line_annotation::resetGeneratedLineViewNavigationState(
+        _initialCurrentLinePosition,
+        _initialBottomCenterPosition,
+        _initialBottomSliceLineStep);
+    _currentLinePosition = std::clamp(state.currentLinePosition,
+                                      0.0,
+                                      static_cast<double>(_generatedViews.linePoints.size() - 1));
+    _bottomCenterPosition = std::clamp(state.bottomCenterPosition,
+                                       0.0,
+                                       static_cast<double>(_generatedViews.linePoints.size() - 1));
+    _bottomSliceLineStep = state.bottomSliceLineStep;
+    _currentCutManualRotation = state.currentCutManualRotation;
+    _currentCutManualRotationActive = state.currentCutManualRotationActive;
+    _bottomSliceStepWheelAccum = 0;
+    _currentCutFollowsStripMouse = true;
+    updateBottomSliceStepLabel();
+
+    if (_generatedViews.currentCutSurface) {
+        (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
+    }
+    renderBottomSlicePlanes("line annotation reset bottom cuts");
+    restoreInitialGeneratedViewerCameras();
+    if (_currentCutViewer) {
+        _currentCutViewer->renderVisible(true, "line annotation reset current cut");
+    }
+    for (const auto& viewer : _stripViewers) {
+        if (viewer) {
+            viewer->renderVisible(true, "line annotation reset strip view");
+        }
+    }
+    for (const auto& viewer : _bottomSliceViewers) {
+        if (viewer) {
+            viewer->renderVisible(true, "line annotation reset bottom view");
+        }
+    }
+    rebuildGeneratedOverlays();
 }
 
 void LineAnnotationDialog::renderBottomSlicePlanes(const char* reason)
@@ -979,7 +1248,20 @@ bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePo
         cv::norm(upHint) <= 1.0e-6f) {
         return false;
     }
-    plane->setFromNormalAndUp(origin, tangent, upHint);
+    if (_currentCutManualRotationActive &&
+        _generatedViews.currentCutSurface &&
+        plane == _generatedViews.currentCutSurface.get()) {
+        const auto frame =
+            vc3d::line_annotation::generatedCutFrameWithManualRotation(tangent,
+                                                                       upHint,
+                                                                       _currentCutManualRotation);
+        if (!vc3d::line_annotation::generatedCutFrameIsOrthonormal(frame)) {
+            return false;
+        }
+        plane->setFromNormalAndUp(origin, frame.normal, frame.vertical);
+    } else {
+        plane->setFromNormalAndUp(origin, tangent, upHint);
+    }
     return true;
 }
 
@@ -1065,8 +1347,7 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
             return true;
         }
     }
-    if (event->key() == Qt::Key_Escape ||
-        (event->key() == Qt::Key_X && event->modifiers() == Qt::NoModifier)) {
+    if (event->key() == Qt::Key_Escape) {
         close();
         event->accept();
         return true;

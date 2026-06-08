@@ -72,9 +72,127 @@ struct GeneratedViews {
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
 };
 
+enum class GeneratedCutRotationAxis {
+    Horizontal,
+    Vertical,
+};
+
+struct GeneratedCutFrame {
+    cv::Vec3f horizontal{std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::quiet_NaN()};
+    cv::Vec3f vertical{std::numeric_limits<float>::quiet_NaN(),
+                       std::numeric_limits<float>::quiet_NaN(),
+                       std::numeric_limits<float>::quiet_NaN()};
+    cv::Vec3f normal{std::numeric_limits<float>::quiet_NaN(),
+                     std::numeric_limits<float>::quiet_NaN(),
+                     std::numeric_limits<float>::quiet_NaN()};
+};
+
+struct GeneratedLineViewNavigationState {
+    double currentLinePosition = 0.0;
+    double bottomCenterPosition = 0.0;
+    double bottomSliceLineStep = 10.0;
+    cv::Matx33f currentCutManualRotation = cv::Matx33f::eye();
+    bool currentCutManualRotationActive = false;
+};
+
 inline bool finiteGeneratedPoint(const cv::Vec3f& point)
 {
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+inline cv::Vec3f normalizedGeneratedVectorOrNan(const cv::Vec3f& vector)
+{
+    const float n = cv::norm(vector);
+    if (!finiteGeneratedPoint(vector) || n <= 1.0e-6f) {
+        return {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
+    }
+    return vector * (1.0f / n);
+}
+
+inline cv::Vec3f generatedMatrixColumn(const cv::Matx33f& matrix, int column)
+{
+    return {matrix(0, column), matrix(1, column), matrix(2, column)};
+}
+
+inline cv::Matx33f generatedCutAxisRotation(GeneratedCutRotationAxis axis, float radians)
+{
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    if (axis == GeneratedCutRotationAxis::Horizontal) {
+        return {1.0f, 0.0f, 0.0f,
+                0.0f, c, -s,
+                0.0f, s, c};
+    }
+    return {c, 0.0f, s,
+            0.0f, 1.0f, 0.0f,
+            -s, 0.0f, c};
+}
+
+inline cv::Matx33f accumulatedGeneratedCutRotation(const cv::Matx33f& current,
+                                                   GeneratedCutRotationAxis axis,
+                                                   float radians)
+{
+    return current * generatedCutAxisRotation(axis, radians);
+}
+
+inline GeneratedCutFrame generatedCutFrameWithManualRotation(const cv::Vec3f& tangent,
+                                                             const cv::Vec3f& upHint,
+                                                             const cv::Matx33f& manualRotation)
+{
+    const cv::Vec3f normal = normalizedGeneratedVectorOrNan(tangent);
+    cv::Vec3f vertical = upHint - normal * upHint.dot(normal);
+    vertical = normalizedGeneratedVectorOrNan(vertical);
+    if (!finiteGeneratedPoint(normal) || !finiteGeneratedPoint(vertical)) {
+        return {};
+    }
+    const cv::Vec3f horizontal = normalizedGeneratedVectorOrNan(vertical.cross(normal));
+    if (!finiteGeneratedPoint(horizontal)) {
+        return {};
+    }
+
+    const cv::Matx33f base(horizontal[0], vertical[0], normal[0],
+                           horizontal[1], vertical[1], normal[1],
+                           horizontal[2], vertical[2], normal[2]);
+    const cv::Matx33f rotated = base * manualRotation;
+    GeneratedCutFrame frame;
+    frame.horizontal = normalizedGeneratedVectorOrNan(generatedMatrixColumn(rotated, 0));
+    frame.vertical = normalizedGeneratedVectorOrNan(generatedMatrixColumn(rotated, 1));
+    frame.normal = normalizedGeneratedVectorOrNan(generatedMatrixColumn(rotated, 2));
+    return frame;
+}
+
+inline bool generatedCutFrameIsOrthonormal(const GeneratedCutFrame& frame,
+                                           float tolerance = 1.0e-4f)
+{
+    if (!finiteGeneratedPoint(frame.horizontal) ||
+        !finiteGeneratedPoint(frame.vertical) ||
+        !finiteGeneratedPoint(frame.normal)) {
+        return false;
+    }
+    return std::abs(cv::norm(frame.horizontal) - 1.0f) <= tolerance &&
+           std::abs(cv::norm(frame.vertical) - 1.0f) <= tolerance &&
+           std::abs(cv::norm(frame.normal) - 1.0f) <= tolerance &&
+           std::abs(frame.horizontal.dot(frame.vertical)) <= tolerance &&
+           std::abs(frame.horizontal.dot(frame.normal)) <= tolerance &&
+           std::abs(frame.vertical.dot(frame.normal)) <= tolerance;
+}
+
+inline GeneratedLineViewNavigationState resetGeneratedLineViewNavigationState(
+    double initialCurrentLinePosition,
+    double initialBottomCenterPosition,
+    double initialBottomSliceLineStep)
+{
+    GeneratedLineViewNavigationState state;
+    state.currentLinePosition = initialCurrentLinePosition;
+    state.bottomCenterPosition = initialBottomCenterPosition;
+    state.bottomSliceLineStep = initialBottomSliceLineStep;
+    state.currentCutManualRotation = cv::Matx33f::eye();
+    state.currentCutManualRotationActive = false;
+    return state;
 }
 
 inline bool validGeneratedLinePosition(double position, size_t pointCount)
@@ -119,6 +237,80 @@ inline std::optional<std::pair<double, double>> generatedControlLinePositionRang
         return std::nullopt;
     }
     return std::make_pair(first, last);
+}
+
+inline std::vector<double> finiteGeneratedControlPointLinePositions(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    std::vector<double> positions;
+    positions.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        if (std::isfinite(control.linePosition)) {
+            positions.push_back(control.linePosition);
+        }
+    }
+    std::sort(positions.begin(), positions.end());
+    return positions;
+}
+
+inline std::optional<double> previousGeneratedControlPointLinePosition(
+    double currentLinePosition,
+    const std::vector<double>& controlLinePositions)
+{
+    if (!std::isfinite(currentLinePosition)) {
+        return std::nullopt;
+    }
+    std::optional<double> previous;
+    for (const double position : controlLinePositions) {
+        if (!std::isfinite(position) || position >= currentLinePosition) {
+            continue;
+        }
+        if (!previous || position > *previous) {
+            previous = position;
+        }
+    }
+    return previous;
+}
+
+inline std::optional<double> nextGeneratedControlPointLinePosition(
+    double currentLinePosition,
+    const std::vector<double>& controlLinePositions)
+{
+    if (!std::isfinite(currentLinePosition)) {
+        return std::nullopt;
+    }
+    std::optional<double> next;
+    for (const double position : controlLinePositions) {
+        if (!std::isfinite(position) || position <= currentLinePosition) {
+            continue;
+        }
+        if (!next || position < *next) {
+            next = position;
+        }
+    }
+    return next;
+}
+
+inline std::optional<double> closestGeneratedControlPointLinePosition(
+    double currentLinePosition,
+    const std::vector<double>& controlLinePositions)
+{
+    if (!std::isfinite(currentLinePosition)) {
+        return std::nullopt;
+    }
+    std::optional<double> closest;
+    double closestDistance = std::numeric_limits<double>::infinity();
+    for (const double position : controlLinePositions) {
+        if (!std::isfinite(position)) {
+            continue;
+        }
+        const double distance = std::abs(position - currentLinePosition);
+        if (distance < closestDistance) {
+            closest = position;
+            closestDistance = distance;
+        }
+    }
+    return closest;
 }
 
 inline bool generatedLineSegmentIsTail(
