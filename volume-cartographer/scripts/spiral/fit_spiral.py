@@ -43,6 +43,7 @@ pcl_json_paths = [
     # f'{dataset_path}/same_winding_annotations_fixed_merged.json',
 ]
 patches_path = f'{dataset_path}/patches'
+unverified_patches_path = None
 shell_path = f'{dataset_path}/s1_2um_outer'
 tracks_dbm_path = None
 spiral_outward_sense = 'CW'  # CW | ACW
@@ -99,6 +100,16 @@ default_config = {
     'num_patches_per_step': 120,
     'num_patches_per_step_for_dt': 80,
     'num_points_per_patch': 800,
+    'unverified_patch_radius_loss_margin': 0.025,
+    'unverified_patch_radius_loss_inv': False,
+    'unverified_patch_radius_within_norm_p': 3.0,
+    'unverified_patch_dt_norm_p': 0.5,
+    'unverified_patch_dt_within_patch_norm_p': 3.0,
+    'unverified_patch_dt_loss_margin': 0.025,
+    'unverified_num_patches_per_step': 120,
+    'unverified_num_patches_per_step_for_dt': 80,
+    'unverified_num_points_per_patch': 800,
+    'unverified_patch_exclusion_radius': 8.0,  # mask unverified-patch vertices within this of trusted geometry (downsampled voxels)
     'winding_number_num_pcls': 16,
     'winding_number_num_patch_pairs_per_pcl': 4,
     'winding_number_adjacent_patches_only': True,
@@ -137,6 +148,8 @@ default_config = {
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
+    'loss_weight_unverified_patch_radius': 32.e0,
+    'loss_weight_unverified_patch_dt': 16.e0,
     'loss_weight_winding_number': 20.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
@@ -159,6 +172,7 @@ default_config = {
     'weight_decay_flow_field': 0.0,
     'loss_start_patch_dt': 25_000,
     'loss_start_track_dt': 10_000,
+    'loss_start_unverified_patch_dt': None,  # None => fall back to loss_start_patch_dt
     'dt_progressive_windings': False,  # gate the DT losses (patch, track, unattached-pcl) to grow outwards across windings
     'dt_progressive_inner_winding': 20,  # outer-winding cutoff when each DT loss first turns on
     'dt_progressive_steps': 50_000,  # steps to grow the cutoff from start_winding to shell_outer_winding_idx
@@ -1143,7 +1157,7 @@ def _progressive_dt_active_mask(snapped_winding, dr_per_winding, dt_max_winding)
     return winding_idx <= dt_max_winding
 
 
-def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, extra_zyxs=None):
+def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, extra_zyxs=None, num_points_per_patch=None):
     if len(patch_indices) == 0:
         raise ValueError('Expected at least one patch index')
 
@@ -1154,7 +1168,9 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     # TODO: instead of 'strict' horizontal & vertical strips, could/should take wiggly strips that take a mostly-horizontal
     #  or mostly-vertical patch between distant points, skirting around gaps/holes; important for long, ragged traces
 
-    num_points_per_direction = cfg['num_points_per_patch'] // 2
+    if num_points_per_patch is None:
+        num_points_per_patch = cfg['num_points_per_patch']
+    num_points_per_direction = num_points_per_patch // 2
     N = len(patch_indices)
 
     P = num_points_per_direction
@@ -1247,6 +1263,87 @@ def _get_patch_valid_points(patch, device, max_points=None, fixed_num_points=Non
     return patch.zyxs[valid_indices[0], valid_indices[1], :].to(device=device, dtype=torch.float32)
 
 
+def _patch_radius_and_dt_losses(
+    slice_to_spiral_transform, dr_per_winding,
+    all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
+    num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
+    radius_loss_margin, radius_loss_inv, radius_within_norm_p,
+    dt_loss_margin, dt_norm_p, dt_within_patch_norm_p,
+):
+    # Shared radius + DT patch losses, operating on pre-sampled row/column tracks
+    # (all_*; see _sample_patch_tracks). Pulled out of get_patch_and_umbilicus_losses so the
+    # same loss can serve both the verified and the untrusted ('unverified') patch sets with
+    # independent hyperparameters. Returns (mean_radius_deviation, patch_dt_loss).
+    radius_hinge_margin = dr_per_winding.detach() * radius_loss_margin
+    dt_hinge_margin = dr_per_winding.detach() * dt_loss_margin
+
+    # Each patch row/col should lie at constant shifted-radius.
+    radius_shifted_radii = all_shifted_radii[:, :num_patches_for_radius]
+    if radius_loss_inv:
+        # Express the loss in scroll space like the DT loss below: construct target
+        # spiral-space points at the track's mean shifted-radius (continuous, not snapped
+        # to an integer winding) but with each point's own z and theta, transform back to
+        # scroll space, and penalise the distance from the original sampled points.
+        radius_slice_zyxs = all_slice_zyxs[:, :num_patches_for_radius]
+        radius_spiral_zyxs = all_spiral_zyxs[:, :num_patches_for_radius]
+        radius_theta = all_theta[:, :num_patches_for_radius]
+
+        mean_shifted_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
+        radius_target_radii = mean_shifted_radii + radius_theta / (2 * np.pi) * dr_per_winding
+        radius_target_spiral_zyxs = torch.stack([
+            radius_spiral_zyxs[..., 0],
+            torch.sin(radius_theta) * radius_target_radii,
+            torch.cos(radius_theta) * radius_target_radii,
+        ], dim=-1).detach()
+
+        radius_target_scroll_zyxs = slice_to_spiral_transform.inv(radius_target_spiral_zyxs.reshape(-1, 3)).reshape(*radius_target_spiral_zyxs.shape)
+
+        radius_point_distances = torch.linalg.norm(radius_slice_zyxs - radius_target_scroll_zyxs, dim=-1)
+        mean_radius_deviation = F.relu(radius_point_distances - radius_hinge_margin).mean()
+    else:
+        # Penalise deviation from the track's mean shifted-radius directly in spiral space.
+        mean_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
+        radius_deviations = (radius_shifted_radii - mean_radii).abs()
+        radius_deviations_hinge = F.relu(radius_deviations - radius_hinge_margin)
+        if radius_within_norm_p == 1.0:
+            mean_radius_deviation = radius_deviations_hinge.mean()
+        else:
+            d = radius_deviations_hinge + 1.e-5
+            per_track = (d ** radius_within_norm_p).mean(dim=-1) ** (1.0 / radius_within_norm_p)
+            mean_radius_deviation = per_track.mean()
+
+    if compute_dt:
+        dt_slice_zyxs = all_slice_zyxs[:, :num_patches_for_dt]
+        dt_spiral_zyxs = all_spiral_zyxs[:, :num_patches_for_dt]
+        dt_theta = all_theta[:, :num_patches_for_dt]
+        dt_shifted_radii = all_shifted_radii[:, :num_patches_for_dt]
+
+        # Define the DT target from the same sampled row/column tracks as the radius loss:
+        # each track is snapped to the nearest integer-winding shifted-radius, then every
+        # sampled point on the track is pulled towards the corresponding point on that
+        # target winding.
+        target_shifted_radii = torch.round(dt_shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
+        target_radii = target_shifted_radii + dt_theta / (2 * np.pi) * dr_per_winding
+        target_spiral_zyxs = torch.stack([
+            dt_spiral_zyxs[..., 0],
+            torch.sin(dt_theta) * target_radii,
+            torch.cos(dt_theta) * target_radii,
+        ], dim=-1).detach()
+
+        target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
+
+        point_distances = torch.linalg.norm(dt_slice_zyxs - target_scroll_zyxs, dim=-1)
+        point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5  # epsilon to avoid NaN in p-norm backward
+        track_losses = (point_distances ** dt_within_patch_norm_p).mean(dim=-1) ** (1 / dt_within_patch_norm_p)
+        # Progressive DT: only patches whose snapped winding is within the current cutoff contribute.
+        active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
+        patch_dt_loss = _aggregate_dt_track_losses(track_losses, dt_norm_p, active_mask)
+    else:
+        patch_dt_loss = torch.zeros([], device=dr_per_winding.device)
+
+    return mean_radius_deviation, patch_dt_loss
+
+
 def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None):
 
     # Sample once and share the tracks between the radius and DT losses; the loss using
@@ -1273,88 +1370,53 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
     umbilicus_spiral = extra_spiral[:n_umb]
     shell_spiral_zyxs = extra_spiral[n_umb:] if shell_valid_zyxs is not None else None
 
-    radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
-    dt_hinge_margin = dr_per_winding.detach() * cfg['patch_dt_loss_margin']
-
-    # Each patch row/col should lie at constant shifted-radius.
-    radius_shifted_radii = all_shifted_radii[:, :num_patches_for_radius]
-    if cfg['patch_radius_loss_inv']:
-        # Express the loss in scroll space like the DT loss below: construct target
-        # spiral-space points at the track's mean shifted-radius (continuous, not snapped
-        # to an integer winding) but with each point's own z and theta, transform back to
-        # scroll space, and penalise the distance from the original sampled points.
-        radius_slice_zyxs = all_slice_zyxs[:, :num_patches_for_radius]
-        radius_spiral_zyxs = all_spiral_zyxs[:, :num_patches_for_radius]
-        radius_theta = all_theta[:, :num_patches_for_radius]
-
-        mean_shifted_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
-        radius_target_radii = mean_shifted_radii + radius_theta / (2 * np.pi) * dr_per_winding
-        radius_target_spiral_zyxs = torch.stack([
-            radius_spiral_zyxs[..., 0],
-            torch.sin(radius_theta) * radius_target_radii,
-            torch.cos(radius_theta) * radius_target_radii,
-        ], dim=-1).detach()
-
-        radius_target_scroll_zyxs = slice_to_spiral_transform.inv(radius_target_spiral_zyxs.reshape(-1, 3)).reshape(*radius_target_spiral_zyxs.shape)
-
-        radius_point_distances = torch.linalg.norm(radius_slice_zyxs - radius_target_scroll_zyxs, dim=-1)
-        mean_radius_deviation = F.relu(radius_point_distances - radius_hinge_margin).mean()
-    else:
-        # Penalise deviation from the track's mean shifted-radius directly in spiral space.
-        mean_radii = radius_shifted_radii.mean(dim=-1, keepdim=True)
-        radius_deviations = (radius_shifted_radii - mean_radii).abs()
-        radius_deviations_hinge = F.relu(radius_deviations - radius_hinge_margin)
-        within_norm_p = cfg['patch_radius_within_norm_p']
-        if within_norm_p == 1.0:
-            mean_radius_deviation = radius_deviations_hinge.mean()
-        else:
-            d = radius_deviations_hinge + 1.e-5
-            per_track = (d ** within_norm_p).mean(dim=-1) ** (1.0 / within_norm_p)
-            mean_radius_deviation = per_track.mean()
+    mean_radius_deviation, patch_dt_loss = _patch_radius_and_dt_losses(
+        slice_to_spiral_transform, dr_per_winding,
+        all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
+        num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
+        cfg['patch_radius_loss_margin'], cfg['patch_radius_loss_inv'], cfg['patch_radius_within_norm_p'],
+        cfg['patch_dt_loss_margin'], cfg['patch_dt_norm_p'], cfg['patch_dt_within_patch_norm_p'],
+    )
 
     # Umbilicus should map to the spiral origin (yx ≈ 0)
     umbilicus_loss = umbilicus_spiral[..., 1:].abs().mean()
 
     if shell_spiral_zyxs is not None:
+        radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
         _, _, shell_shifted_radii = get_theta_and_radii(shell_spiral_zyxs[..., 1:], dr_per_winding)
         shell_target = dr_per_winding * float(shell_outer_winding_idx)
         shell_patch_radius_loss = F.relu((shell_shifted_radii - shell_target).abs() - radius_hinge_margin).mean()
     else:
         shell_patch_radius_loss = torch.zeros([], device=dr_per_winding.device)
 
-    if compute_dt:
-        dt_slice_zyxs = all_slice_zyxs[:, :num_patches_for_dt]
-        dt_spiral_zyxs = all_spiral_zyxs[:, :num_patches_for_dt]
-        dt_theta = all_theta[:, :num_patches_for_dt]
-        dt_shifted_radii = all_shifted_radii[:, :num_patches_for_dt]
-
-        dt_norm_p = cfg['patch_dt_norm_p']  # this is the 'across different tracks' norm; we prefer many tracks with zero norm when p -> 0
-        within_patch_norm_p = cfg['patch_dt_within_patch_norm_p']  # this is the 'within a track' norm; we strongly penalise isolated badly-misaligned points when p -> inf
-
-        # Define the DT target from the same sampled row/column tracks as the radius loss:
-        # each track is snapped to the nearest integer-winding shifted-radius, then every
-        # sampled point on the track is pulled towards the corresponding point on that
-        # target winding.
-        target_shifted_radii = torch.round(dt_shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
-        target_radii = target_shifted_radii + dt_theta / (2 * np.pi) * dr_per_winding
-        target_spiral_zyxs = torch.stack([
-            dt_spiral_zyxs[..., 0],
-            torch.sin(dt_theta) * target_radii,
-            torch.cos(dt_theta) * target_radii,
-        ], dim=-1).detach()
-
-        target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
-
-        point_distances = torch.linalg.norm(dt_slice_zyxs - target_scroll_zyxs, dim=-1)
-        point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5  # epsilon to avoid NaN in p-norm backward
-        track_losses = (point_distances ** within_patch_norm_p).mean(dim=-1) ** (1 / within_patch_norm_p)
-        # Progressive DT: only patches whose snapped winding is within the current cutoff contribute.
-        active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
-        patch_dt_loss = _aggregate_dt_track_losses(track_losses, dt_norm_p, active_mask)
-    else:
-        patch_dt_loss = torch.zeros([], device=dr_per_winding.device)
-
     return mean_radius_deviation, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss
+
+
+def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, compute_dt=True, dt_max_winding=None):
+    # Radius + DT losses for the untrusted 'unverified' patch set. Same machinery as the
+    # verified patches (shared _sample_patch_tracks + _patch_radius_and_dt_losses) but with the
+    # independent unverified_* hyperparameters and no umbilicus/shell extras. These patches are
+    # masked away near trusted geometry upstream (see _mask_patches_near_trusted_geometry), so
+    # they only constrain regions the verified inputs don't cover.
+    num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
+    patch_indices = np.random.choice(len(patches), num_patches_to_sample, p=patch_sampling_probabilities, replace=True)
+
+    all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii, _ = _sample_patch_tracks(
+        slice_to_spiral_transform,
+        dr_per_winding,
+        patches,
+        patch_atlas,
+        patch_indices,
+        num_points_per_patch=cfg['unverified_num_points_per_patch'],
+    )
+
+    return _patch_radius_and_dt_losses(
+        slice_to_spiral_transform, dr_per_winding,
+        all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
+        num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
+        cfg['unverified_patch_radius_loss_margin'], cfg['unverified_patch_radius_loss_inv'], cfg['unverified_patch_radius_within_norm_p'],
+        cfg['unverified_patch_dt_loss_margin'], cfg['unverified_patch_dt_norm_p'], cfg['unverified_patch_dt_within_patch_norm_p'],
+    )
 
 
 def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, num_points):
@@ -3649,6 +3711,45 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
     return np.isinf(dist)
 
 
+def _mask_patches_near_trusted_geometry(patches_dict, anchor_tree, radius):
+    # For each patch in `patches_dict`, invalidate (set zyxs -> -1) every currently-valid vertex
+    # lying within `radius` (scroll space, downsampled voxels) of any trusted-geometry anchor in
+    # `anchor_tree`, then re-derive the patch's masks/area. Patches left with no valid quad are
+    # dropped. This is the patch analogue of the track-exclusion in _prepare_main_phase_tracks:
+    # untrusted patches only constrain regions the trusted inputs don't already cover, so they
+    # can't fight verified geometry. Mutates and returns a possibly-smaller dict; a non-positive
+    # radius or empty tree leaves everything intact.
+    if not patches_dict or anchor_tree is None or radius <= 0:
+        return patches_dict
+    kept = {}
+    n_masked_vertices = 0
+    n_dropped = 0
+    for pid, patch in patches_dict.items():
+        zyxs_np = patch.zyxs.reshape(-1, 3).cpu().numpy()
+        valid_flat = patch.valid_vertex_mask.reshape(-1).cpu().numpy()
+        far = _track_points_far_from_anchors_mask(zyxs_np, anchor_tree, radius)  # True => keep
+        invalidate = valid_flat & ~far
+        if invalidate.any():
+            mask2d = torch.from_numpy(invalidate.reshape(patch.zyxs.shape[:2]))
+            patch.zyxs[mask2d] = -1.0
+            n_masked_vertices += int(invalidate.sum())
+            new_valid_vertex = torch.any(patch.zyxs != -1, dim=-1)
+            new_valid_quad = (
+                new_valid_vertex[:-1, :-1] & new_valid_vertex[1:, :-1]
+                & new_valid_vertex[:-1, 1:] & new_valid_vertex[1:, 1:]
+            )
+            if not bool(new_valid_quad.any()):
+                n_dropped += 1
+                continue
+            patch.__post_init__()  # re-derive valid_vertex_mask / valid_quad_mask / area / valid_zyxs
+        kept[pid] = patch
+    print(
+        f'unverified patches: masked {n_masked_vertices} vertices near trusted geometry '
+        f'(radius {radius:.1f}), dropped {n_dropped} fully-masked patches; {len(kept)} remain'
+    )
+    return kept
+
+
 def _prepare_main_phase_tracks(tracks, patch_atlas, unattached_pcl_strips, exclusion_radius, device):
     # Drop every track point that lies within `exclusion_radius` of any patch vertex / pcl
     # strip point, then drop tracks left with fewer than 2 points. Returns a flat per-point
@@ -4175,7 +4276,7 @@ def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding
     return w_inner + (w_outer - w_inner) * f_warped
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, tracks, pcl_normal_samples, lasagna_volume, shell_patch, z_to_umbilicus_yx, out_path):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, tracks, pcl_normal_samples, lasagna_volume, shell_patch, z_to_umbilicus_yx, out_path, unverified_patches_dict=None):
     patches_list = list(patches_dict.values())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
@@ -4190,6 +4291,25 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
     device = torch.device('cuda')
     pcl_normal_samples = _pcl_normal_samples_to_gpu(pcl_normal_samples, device)
+
+    # Untrusted 'unverified' patches: mask away wherever they fall near trusted geometry (verified
+    # patch vertices + pcl strips, same anchor cloud used for snap-anchors / track-exclusion), then
+    # build their own sampling cache + GPU atlas. They feed only their own radius/DT losses.
+    unverified_patches_dict = unverified_patches_dict or {}
+    unverified_patches_list = []
+    unverified_patch_sampling_probabilities = None
+    unverified_patch_atlas = None
+    if unverified_patches_dict:
+        trusted_anchor_scroll = _collect_anchor_scroll_zyxs(patch_atlas, unattached_pcl_strips, device)
+        trusted_anchor_tree = _build_anchor_kdtree(trusted_anchor_scroll)
+        unverified_patches_dict = _mask_patches_near_trusted_geometry(
+            unverified_patches_dict, trusted_anchor_tree, float(cfg['unverified_patch_exclusion_radius']),
+        )
+    if unverified_patches_dict:
+        unverified_patches_list = list(unverified_patches_dict.values())
+        unverified_patch_sampling_probabilities = _prepare_patch_sampling_cache(unverified_patches_list, cfg['patch_loss_z_margin'])
+        unverified_patch_atlas = PatchGpuAtlas(unverified_patches_dict, device='cuda')
+        print(f'fitting {len(unverified_patches_list)} unverified patches; atlas {unverified_patch_atlas.memory_mb():.1f} MB')
 
     all_zs = np.arange(z_begin, z_end)
     zs_for_visualisation = np.linspace(z_begin, z_end - 1, min(num_slices_for_visualisation, z_end - 1 - z_begin), dtype=np.int64)
@@ -4378,6 +4498,31 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             track_total_points = int(track_total_counts.sum().item())
             track_satisfied_point_ratio = track_satisfied_points / max(track_total_points, 1)
             print(f'satisfied_track_points = {track_satisfied_points}/{track_total_points} ({track_satisfied_point_ratio * 100:.1f}%)')
+        # Unverified patches are reported entirely separately so they never inflate the verified
+        # satisfaction numbers.
+        unverified_patch_satisfaction_entries = []
+        if unverified_patches_list:
+            u_satisfied, u_sat_areas, u_tot_areas, _, _, _ = get_patch_satisfied_areas(
+                slice_to_spiral_transform, dr_per_winding, unverified_patches_list, verbose=False,
+            )
+            u_count = int(u_satisfied.sum().item())
+            u_total = u_satisfied.numel()
+            u_ratio = u_count / max(u_total, 1)
+            print(f'unverified_satisfied_patches = {u_count}/{u_total} ({u_ratio * 100:.1f}%)')
+            u_sat_area = float(u_sat_areas.sum().item())
+            u_tot_area = float(u_tot_areas.sum().item())
+            u_area_ratio = u_sat_area / max(u_tot_area, 1e-9)
+            print(f'unverified_satisfied_area = {u_sat_area:.1f}/{u_tot_area:.1f} ({u_area_ratio * 100:.1f}%)')
+            for pid, sat_area_t, tot_area_t in zip(unverified_patches_dict.keys(), u_sat_areas.tolist(), u_tot_areas.tolist()):
+                fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
+                unverified_patch_satisfaction_entries.append({
+                    'id': pid,
+                    'satisfied_area': sat_area_t,
+                    'total_area': tot_area_t,
+                    'fraction': fraction,
+                })
+            unverified_patch_satisfaction_entries.sort(key=lambda e: e['fraction'])
+
         patch_ids = list(patches_dict.keys())
         patch_satisfaction_entries = []
         for pid, sat_area_t, tot_area_t in zip(patch_ids, satisfied_areas.tolist(), total_areas.tolist()):
@@ -4405,7 +4550,11 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 })
             pcl_satisfaction_entries.sort(key=lambda e: e['fraction'])
         with open(f'{out_path}/satisfied_{suffix}.json', 'w') as f:
-            json.dump({'patches': patch_satisfaction_entries, 'pcls': pcl_satisfaction_entries}, f, indent=2)
+            json.dump({
+                'patches': patch_satisfaction_entries,
+                'pcls': pcl_satisfaction_entries,
+                'unverified_patches': unverified_patch_satisfaction_entries,
+            }, f, indent=2)
         # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
         # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
         if satisfied_quad_masks:
@@ -4471,6 +4620,8 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
         track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
         compute_track_dt = iteration > track_dt_start
+        unverified_patch_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_unverified_patch_dt'] is None else cfg['loss_start_unverified_patch_dt']
+        compute_unverified_patch_dt = iteration > unverified_patch_dt_start
 
         # Progressive-outward DT gating: winding cutoff that grows from the respective DT start
         # step. Falls back to the configured shell_outer_winding_idx when shell losses are off so
@@ -4478,6 +4629,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         dt_progressive_outer = shell_outer_winding_idx if shell_outer_winding_idx is not None else cfg['shell_outer_winding_idx']
         patch_dt_max_winding = get_progressive_dt_max_winding(iteration, cfg['loss_start_patch_dt'], dt_progressive_outer)
         track_dt_max_winding = get_progressive_dt_max_winding(iteration, track_dt_start, dt_progressive_outer)
+        unverified_patch_dt_max_winding = get_progressive_dt_max_winding(iteration, unverified_patch_dt_start, dt_progressive_outer)
         if patch_dt_max_winding is not None:
             log_metrics['patch_dt_max_winding'] = patch_dt_max_winding
         if track_dt_max_winding is not None:
@@ -4501,6 +4653,21 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         losses['patch_dt'] = patch_dt_loss * cfg['loss_weight_patch_dt']
         if shell_valid_zyxs_gpu is not None:
             losses['shell_patch_radius'] = shell_patch_radius_loss * cfg['loss_weight_shell_patch_radius']
+
+        if unverified_patch_atlas is not None and (cfg['loss_weight_unverified_patch_radius'] > 0 or cfg['loss_weight_unverified_patch_dt'] > 0):
+            unverified_patch_radius_loss, unverified_patch_dt_loss = get_unverified_patch_losses(
+                slice_to_spiral_transform,
+                dr_per_winding,
+                cfg['unverified_num_patches_per_step'],
+                cfg['unverified_num_patches_per_step_for_dt'],
+                unverified_patches_list,
+                unverified_patch_atlas,
+                unverified_patch_sampling_probabilities,
+                compute_dt=compute_unverified_patch_dt,
+                dt_max_winding=unverified_patch_dt_max_winding,
+            )
+            losses['unverified_patch_radius'] = unverified_patch_radius_loss * cfg['loss_weight_unverified_patch_radius']
+            losses['unverified_patch_dt'] = unverified_patch_dt_loss * cfg['loss_weight_unverified_patch_dt']
 
         if cfg['loss_weight_patch_stretch'] > 0 or cfg['loss_weight_patch_normals'] > 0:
             patch_stretch_loss, patch_normals_loss = get_patch_stretch_and_normals_loss(
@@ -5022,20 +5189,27 @@ def prepare_patches():
         patch.valid_zyxs /= downsample_factor
         patch.area /= downsample_factor ** 2
 
-    patches = load_patches(patches_path)
-    for patch in patches.values():
-        scale_patch(patch)
-
     def patch_intersects_z_roi(patch):
         zs = patch.valid_zyxs[..., 0]
         if zs.numel() == 0:
             return False
         return bool(((zs >= z_begin) & (zs < z_end)).any().item())
 
-    dropped_patch_ids = [pid for pid, patch in patches.items() if not patch_intersects_z_roi(patch)]
-    for pid in dropped_patch_ids:
-        del patches[pid]
-    print(f'dropped {len(dropped_patch_ids)} patches outside z-roi [{z_begin}, {z_end})')
+    def load_scale_and_roi_filter(path, label):
+        loaded = load_patches(path)
+        for patch in loaded.values():
+            scale_patch(patch)
+        dropped = [pid for pid, patch in loaded.items() if not patch_intersects_z_roi(patch)]
+        for pid in dropped:
+            del loaded[pid]
+        print(f'dropped {len(dropped)} {label} patches outside z-roi [{z_begin}, {z_end})')
+        return loaded
+
+    patches = load_scale_and_roi_filter(patches_path, 'verified')
+
+    unverified_patches = {}
+    if unverified_patches_path is not None:
+        unverified_patches = load_scale_and_roi_filter(unverified_patches_path, 'unverified')
 
     shell_patch = None
     if shell_losses_enabled():
@@ -5045,7 +5219,7 @@ def prepare_patches():
         scale_patch(shell_patch)
         print(f'loaded shell from {shell_path}: {shell_patch.valid_zyxs.shape[0]} valid points')
 
-    return patches, shell_patch
+    return patches, unverified_patches, shell_patch
 
 
 def main():
@@ -5061,7 +5235,7 @@ def main():
     else:
         scroll_zarr_array = None
 
-    patches, shell_patch = prepare_patches()
+    patches, unverified_patches, shell_patch = prepare_patches()
     cross_patch_point_collections, unattached_pcl_strips = prepare_point_collections(patches)
     pcl_normal_samples = prepare_pcl_normal_samples(
         list(cross_patch_point_collections.values()),
@@ -5097,6 +5271,7 @@ def main():
         shell_patch,
         umbilicus,
         out_path,
+        unverified_patches_dict=unverified_patches,
     )
 
 
