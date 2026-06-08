@@ -111,6 +111,8 @@ private:
     void setCurrentCutFollowsStripMouse(bool follows);
     void recenterBottomSlicesOnCurrentPosition();
     double snappedControlPointPosition(double position) const;
+    void rebuildGeneratedStaticStripOverlays();
+    void rebuildGeneratedDynamicOverlays();
     void rebuildGeneratedOverlays();
     void installGeneratedViewShortcuts();
     void resetGeneratedViews();
@@ -124,6 +126,8 @@ private:
     void clearControlPointContextPreview(const std::string& surfaceName,
                                          CChunkedVolumeViewer* viewer);
     GeneratedOverlay stripOverlay() const;
+    GeneratedOverlay staticStripOverlay() const;
+    GeneratedOverlay dynamicStripOverlay() const;
     GeneratedOverlay zSliceOverlay(double linePosition,
                                    bool emphasized,
                                    CChunkedVolumeViewer* viewer,
@@ -170,6 +174,7 @@ private:
     bool _currentCutFollowsStripMouse = true;
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
+    vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     bool _haveInitialCurrentCutCamera = false;
     CChunkedVolumeViewer::CameraState _initialCurrentCutCamera;

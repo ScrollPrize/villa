@@ -392,6 +392,36 @@ TEST_CASE("line annotation generated strip overlay includes controls and current
     CHECK(overlay.seedLineIndex == -1);
 }
 
+TEST_CASE("line annotation generated strip static and dynamic overlays split ownership")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.linePoints = {
+        {0.0f, 0.0f, 0.0f},
+        {1.0f, 0.0f, 0.0f},
+        {2.0f, 0.0f, 0.0f},
+    };
+    views.seedLineIndex = 1;
+    views.controlPoints = {
+        {{0.0f, 0.0f, 0.0f}, 0.0, false},
+        {{2.0f, 0.0f, 0.0f}, 2.0, true},
+    };
+
+    const auto staticOverlay = vc3d::line_annotation::makeGeneratedStaticStripOverlay(views);
+    CHECK(staticOverlay.useSurfaceCenterLine);
+    CHECK(staticOverlay.linePoints.size() == 3);
+    CHECK(staticOverlay.controlPoints.size() == 2);
+    CHECK(staticOverlay.markerLinePositions.empty());
+    CHECK_FALSE(std::isfinite(staticOverlay.currentLinePosition));
+
+    const auto dynamicOverlay =
+        vc3d::line_annotation::makeGeneratedDynamicStripOverlay(views, 1.0, {0.0, 2.0});
+    CHECK(dynamicOverlay.useSurfaceCenterLine);
+    CHECK(dynamicOverlay.linePoints.empty());
+    CHECK(dynamicOverlay.controlPoints.empty());
+    CHECK(dynamicOverlay.markerLinePositions.size() == 2);
+    CHECK(dynamicOverlay.currentLinePosition == doctest::Approx(1.0));
+}
+
 TEST_CASE("line annotation generated line tail style uses control span")
 {
     using vc3d::line_annotation::GeneratedOverlay;
@@ -410,6 +440,54 @@ TEST_CASE("line annotation generated line tail style uses control span")
     CHECK_FALSE(generatedLineSegmentIsTail(1.0, 2.0, range));
     CHECK_FALSE(generatedLineSegmentIsTail(3.0, 4.0, range));
     CHECK(generatedLineSegmentIsTail(4.0, 5.0, range));
+}
+
+TEST_CASE("line annotation control point index returns sorted line position window")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 12.0, false},
+        {{0.0f, 0.0f, 0.0f}, nan, false},
+        {{0.0f, 0.0f, 0.0f}, 5.0, true},
+        {{0.0f, 0.0f, 0.0f}, 9.0, false},
+        {{0.0f, 0.0f, 0.0f}, std::numeric_limits<double>::infinity(), false},
+    };
+
+    const auto index =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(controls);
+    REQUIRE(index.sortedControlIndices.size() == 3);
+    CHECK(index.sortedControlIndices[0] == 2);
+    CHECK(index.sortedControlIndices[1] == 3);
+    CHECK(index.sortedControlIndices[2] == 0);
+
+    const auto candidates =
+        vc3d::line_annotation::generatedControlPointCandidateIndicesInLinePositionWindow(
+            controls,
+            index,
+            10.0,
+            2.0);
+    REQUIRE(candidates.size() == 2);
+    CHECK(candidates[0] == 3);
+    CHECK(candidates[1] == 0);
+}
+
+TEST_CASE("line annotation line position radius uses local spacing and minimum")
+{
+    const std::vector<cv::Vec3f> points{
+        {0.0f, 0.0f, 0.0f},
+        {10.0f, 0.0f, 0.0f},
+        {20.0f, 0.0f, 0.0f},
+    };
+
+    CHECK(vc3d::line_annotation::generatedLinePositionRadiusForVolumeThreshold(
+              points,
+              0.5,
+              2.0f) == doctest::Approx(0.5));
+    CHECK(vc3d::line_annotation::generatedLinePositionRadiusForVolumeThreshold(
+              points,
+              0.5,
+              15.0f) == doctest::Approx(1.5));
 }
 
 TEST_CASE("line annotation generated cross slice filters controls by viewport threshold")
@@ -438,6 +516,38 @@ TEST_CASE("line annotation generated cross slice filters controls by viewport th
     CHECK(overlay.controlPoints.size() == 2);
     CHECK(overlay.controlPoints[0].linePosition == doctest::Approx(0.0));
     CHECK(overlay.controlPoints[1].linePosition == doctest::Approx(0.5));
+}
+
+TEST_CASE("line annotation generated cross slice filters indexed candidates then plane distance")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.linePoints = {
+        {0.0f, 0.0f, 0.0f},
+        {10.0f, 0.0f, 0.0f},
+        {20.0f, 0.0f, 0.0f},
+    };
+    views.controlPoints = {
+        {{0.0f, 0.0f, 0.0f}, 0.0, false},
+        {{10.0f, 0.0f, 4.9f}, 1.0, false},
+        {{10.0f, 0.0f, 5.1f}, 1.25, false},
+        {{20.0f, 0.0f, 0.0f}, 2.0, true},
+    };
+    const auto index =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(views.controlPoints);
+
+    const auto overlay = vc3d::line_annotation::makeGeneratedCrossSliceOverlay(
+        views,
+        1.0,
+        true,
+        5.0f,
+        [](const cv::Vec3f& point) {
+            return point[2];
+        },
+        &index,
+        0.5);
+
+    REQUIRE(overlay.controlPoints.size() == 1);
+    CHECK(overlay.controlPoints[0].linePosition == doctest::Approx(1.0));
 }
 
 TEST_CASE("fiber slice control span uses nearest control line indices")

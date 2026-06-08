@@ -7,6 +7,7 @@
 #include <QString>
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -70,6 +71,10 @@ struct GeneratedViews {
     int seedLineIndex = -1;
     int initialCenterIndex = 0;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
+};
+
+struct GeneratedControlPointLinePositionIndex {
+    std::vector<size_t> sortedControlIndices;
 };
 
 enum class GeneratedCutRotationAxis {
@@ -253,6 +258,130 @@ inline std::vector<double> finiteGeneratedControlPointLinePositions(
     return positions;
 }
 
+inline GeneratedControlPointLinePositionIndex buildGeneratedControlPointLinePositionIndex(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    GeneratedControlPointLinePositionIndex index;
+    index.sortedControlIndices.reserve(controlPoints.size());
+    for (size_t i = 0; i < controlPoints.size(); ++i) {
+        if (std::isfinite(controlPoints[i].linePosition)) {
+            index.sortedControlIndices.push_back(i);
+        }
+    }
+    std::sort(index.sortedControlIndices.begin(),
+              index.sortedControlIndices.end(),
+              [&controlPoints](size_t lhs, size_t rhs) {
+                  const double lhsPosition = controlPoints[lhs].linePosition;
+                  const double rhsPosition = controlPoints[rhs].linePosition;
+                  if (lhsPosition == rhsPosition) {
+                      return lhs < rhs;
+                  }
+                  return lhsPosition < rhsPosition;
+              });
+    return index;
+}
+
+inline std::vector<size_t> generatedControlPointCandidateIndicesInLinePositionWindow(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    const GeneratedControlPointLinePositionIndex& index,
+    double linePosition,
+    double radius)
+{
+    std::vector<size_t> candidates;
+    if (!std::isfinite(linePosition) || !std::isfinite(radius) || radius < 0.0) {
+        return candidates;
+    }
+
+    const double lower = linePosition - radius;
+    const double upper = linePosition + radius;
+    const auto positionForIndex = [&controlPoints](size_t controlIndex) {
+        return controlPoints[controlIndex].linePosition;
+    };
+    const auto lowerIt = std::lower_bound(
+        index.sortedControlIndices.begin(),
+        index.sortedControlIndices.end(),
+        lower,
+        [&positionForIndex](size_t controlIndex, double value) {
+            return positionForIndex(controlIndex) < value;
+        });
+    for (auto it = lowerIt; it != index.sortedControlIndices.end(); ++it) {
+        const double position = positionForIndex(*it);
+        if (!std::isfinite(position)) {
+            continue;
+        }
+        if (position > upper) {
+            break;
+        }
+        candidates.push_back(*it);
+    }
+    return candidates;
+}
+
+inline double medianGeneratedLinePointSpacing(const std::vector<cv::Vec3f>& linePoints)
+{
+    std::vector<double> spacings;
+    if (linePoints.size() < 2) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    spacings.reserve(linePoints.size() - 1);
+    for (size_t i = 1; i < linePoints.size(); ++i) {
+        if (!finiteGeneratedPoint(linePoints[i - 1]) || !finiteGeneratedPoint(linePoints[i])) {
+            continue;
+        }
+        const double spacing = cv::norm(linePoints[i] - linePoints[i - 1]);
+        if (std::isfinite(spacing) && spacing > 1.0e-6) {
+            spacings.push_back(spacing);
+        }
+    }
+    if (spacings.empty()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const size_t middle = spacings.size() / 2;
+    std::nth_element(spacings.begin(),
+                     spacings.begin() + static_cast<std::ptrdiff_t>(middle),
+                     spacings.end());
+    double median = spacings[middle];
+    if (spacings.size() % 2 == 0) {
+        const auto lowerIt =
+            std::max_element(spacings.begin(),
+                             spacings.begin() + static_cast<std::ptrdiff_t>(middle));
+        median = (*lowerIt + median) * 0.5;
+    }
+    return median;
+}
+
+inline double generatedLinePositionRadiusForVolumeThreshold(
+    const std::vector<cv::Vec3f>& linePoints,
+    double linePosition,
+    float volumeThreshold)
+{
+    constexpr double kMinimumRadius = 0.5;
+    if (!std::isfinite(linePosition) ||
+        !std::isfinite(volumeThreshold) ||
+        volumeThreshold <= 0.0f ||
+        linePoints.size() < 2) {
+        return kMinimumRadius;
+    }
+
+    const int lower = std::clamp(static_cast<int>(std::floor(linePosition)),
+                                 0,
+                                 static_cast<int>(linePoints.size()) - 1);
+    double spacing = std::numeric_limits<double>::quiet_NaN();
+    if (lower + 1 < static_cast<int>(linePoints.size()) &&
+        finiteGeneratedPoint(linePoints[static_cast<size_t>(lower)]) &&
+        finiteGeneratedPoint(linePoints[static_cast<size_t>(lower + 1)])) {
+        spacing = cv::norm(linePoints[static_cast<size_t>(lower + 1)] -
+                           linePoints[static_cast<size_t>(lower)]);
+    }
+    if (!std::isfinite(spacing) || spacing <= 1.0e-6) {
+        spacing = medianGeneratedLinePointSpacing(linePoints);
+    }
+    if (!std::isfinite(spacing) || spacing <= 1.0e-6) {
+        return kMinimumRadius;
+    }
+    return std::max(kMinimumRadius, static_cast<double>(volumeThreshold) / spacing);
+}
+
 inline std::optional<double> previousGeneratedControlPointLinePosition(
     double currentLinePosition,
     const std::vector<double>& controlLinePositions)
@@ -341,12 +470,37 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     return overlay;
 }
 
+inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& views)
+{
+    GeneratedOverlay overlay;
+    overlay.linePoints = views.linePoints;
+    overlay.seedPoint = views.seedPoint;
+    overlay.seedLineIndex = views.controlPoints.empty() ? views.seedLineIndex : -1;
+    overlay.useSurfaceCenterLine = true;
+    overlay.controlPoints = views.controlPoints;
+    return overlay;
+}
+
+inline GeneratedOverlay makeGeneratedDynamicStripOverlay(
+    const GeneratedViews& views,
+    double currentLinePosition,
+    const std::vector<double>& markerLinePositions)
+{
+    GeneratedOverlay overlay;
+    overlay.useSurfaceCenterLine = true;
+    overlay.currentLinePosition = currentLinePosition;
+    overlay.markerLinePositions = markerLinePositions;
+    return overlay;
+}
+
 inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
     const GeneratedViews& views,
     double linePosition,
     bool emphasized,
     std::optional<float> controlDistanceThreshold,
-    const std::function<float(const cv::Vec3f&)>& pointDistance)
+    const std::function<float(const cv::Vec3f&)>& pointDistance,
+    const GeneratedControlPointLinePositionIndex* controlIndex = nullptr,
+    std::optional<double> controlLinePositionRadius = std::nullopt)
 {
     GeneratedOverlay overlay;
     overlay.pointMarker = interpolatedGeneratedLinePoint(views.linePoints, linePosition);
@@ -354,7 +508,26 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
     if (!controlDistanceThreshold || !pointDistance) {
         return overlay;
     }
-    for (const auto& control : views.controlPoints) {
+
+    std::vector<size_t> candidateIndices;
+    if (controlIndex && controlLinePositionRadius) {
+        candidateIndices = generatedControlPointCandidateIndicesInLinePositionWindow(
+            views.controlPoints,
+            *controlIndex,
+            linePosition,
+            *controlLinePositionRadius);
+    } else {
+        candidateIndices.reserve(views.controlPoints.size());
+        for (size_t i = 0; i < views.controlPoints.size(); ++i) {
+            candidateIndices.push_back(i);
+        }
+    }
+
+    for (const size_t controlIndexValue : candidateIndices) {
+        if (controlIndexValue >= views.controlPoints.size()) {
+            continue;
+        }
+        const auto& control = views.controlPoints[controlIndexValue];
         if (!finiteGeneratedPoint(control.point)) {
             continue;
         }
@@ -389,7 +562,8 @@ GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& vi
                                                         double linePosition,
                                                         bool emphasized,
                                                         CChunkedVolumeViewer* viewer,
-                                                        PlaneSurface* plane);
+                                                        PlaneSurface* plane,
+                                                        const GeneratedControlPointLinePositionIndex* controlIndex = nullptr);
 void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                            const std::string& surfaceName,
                            const GeneratedOverlay& overlay);
