@@ -25,6 +25,7 @@ import opt_loss_station
 import opt_loss_bend
 import opt_loss_cyl
 import opt_loss_snap_surf
+import opt_loss_atlas_line
 from snap_surf import map_global as snap_surf_map_global
 from progress_table import format_progress_value, print_progress_legend
 import opt_loss_flatten
@@ -401,6 +402,7 @@ lambda_global: dict[str, float] = {
 	"bend": 0.0,
 	"ext_offset": 0.0,
 	"snap_surf_map": 0.0,
+	"atlas_line": 0.0,
 	"map_dist": 1.0,
 	"map_vec_normal": 1.0,
 	"map_surface_normal": 1.0,
@@ -561,6 +563,8 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 				))
 				continue
 			global_opt_cfg = s.pop("global_opt", None)
+			if global_opt_cfg is None:
+				global_opt_cfg = s.pop("opt", None)
 			if global_opt_cfg is None:
 				global_opt_cfg = dict(s)
 				s.clear()
@@ -890,6 +894,7 @@ def optimize(
 	_optimize_t0 = time.perf_counter()
 	opt_loss_corr.reset_state()
 	opt_loss_snap_surf.reset_state()
+	opt_loss_atlas_line.reset_state()
 	_snap_global_runtime: snap_surf_map_global.GlobalMapRuntime | None = None
 	_snap_self_runtimes: dict[str, snap_surf_map_global.SelfMapRuntime] = {}
 	_loaded_snap_surf_map_state = snap_surf_map_state if isinstance(snap_surf_map_state, dict) else None
@@ -1791,6 +1796,10 @@ def optimize(
 				lr_prefetch_channels=frozenset({"grad_mag"}),
 				prefetch_snap_surf_map=True,
 			),
+		},
+		"atlas_line": {
+			"loss": opt_loss_atlas_line.atlas_line_loss,
+			"needs": Needs(mesh_normals=True),
 		},
 		"cyl_normal": {
 			"loss": opt_loss_cyl.cyl_normal_loss,
@@ -3080,6 +3089,8 @@ def optimize(
 						tv.update(opt_loss_cyl.last_stats())
 					if name == "snap_surf_map":
 						tv.update(opt_loss_snap_surf.last_stats())
+					if name == "atlas_line":
+						tv.update(opt_loss_atlas_line.last_stats())
 					if name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
 						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv

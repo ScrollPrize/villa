@@ -277,6 +277,16 @@ class CorrPoints3D:
 
 
 @dataclass(frozen=True)
+class AtlasLines3D:
+	target_xyz: torch.Tensor        # (K, 3) original line/fiber target points
+	normal_xyz: torch.Tensor        # (K, 3) atlas base-shell normals at mapped anchors
+	model_h: torch.Tensor           # (K,) initial continuous model row from atlas V
+	model_w: torch.Tensor           # (K,) initial continuous model column from actual atlas U
+	object_ids: tuple[str, ...] = ()
+	source_indices: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class FitData3D:
 	cos: torch.Tensor | None       # (1, 1, Z, Y, X) uint8 on GPU, or None if skipped
 	grad_mag: torch.Tensor | None  # (1, 1, Z, Y, X) uint8 on GPU, or None in streaming mode
@@ -287,6 +297,7 @@ class FitData3D:
 	winding_volume: torch.Tensor | None  # (1, 1, Z, Y, X) float32 on GPU
 	origin_fullres: tuple[float, float, float]  # (x0, y0, z0) in fullres voxels
 	spacing: tuple[float, float, float]          # (sx, sy, sz) voxel size in fullres units (cos channel)
+	atlas_lines: AtlasLines3D | None = None
 	channel_spacing: dict[str, tuple[float, float, float]] | None = None  # per-channel override
 	source_to_base: float = 1.0                  # source-to-base factor for tifxyz coord conversion
 	winding_min: float | None = None     # min valid winding value (from zarr metadata)

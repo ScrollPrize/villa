@@ -8,6 +8,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/atlas/Atlas.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 #include <QAbstractItemView>
@@ -23,6 +24,7 @@
 #include <QFileInfo>
 #include <QFrame>
 #include <QDoubleSpinBox>
+#include <QHash>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
@@ -68,6 +70,8 @@ QString lasagnaModeDebugName(int mode)
         return QStringLiteral("new_model");
     case 3:
         return QStringLiteral("offset");
+    case 4:
+        return QStringLiteral("atlas");
     default:
         return QStringLiteral("reopt");
     }
@@ -84,13 +88,58 @@ QString md5Ref(const QByteArray& bytes)
         QCryptographicHash::hash(bytes, QCryptographicHash::Md5).toHex()));
 }
 
-QJsonObject makeObjectRef(const QString& type, const QString& name, const QString& hash)
+QJsonObject makeObjectRef(const QString& type,
+                          const QString& name,
+                          const QString& hash,
+                          const QString& format = QString())
 {
     QJsonObject ref;
     ref[QStringLiteral("type")] = type;
     ref[QStringLiteral("name")] = name;
     ref[QStringLiteral("hash")] = hash;
+    if (!format.isEmpty()) {
+        ref[QStringLiteral("format")] = format;
+    }
     return ref;
+}
+
+QString objectRefKeyForUpload(const QJsonObject& ref)
+{
+    return ref[QStringLiteral("type")].toString() + QStringLiteral("\n")
+        + ref[QStringLiteral("name")].toString() + QStringLiteral("\n")
+        + ref[QStringLiteral("hash")].toString();
+}
+
+QJsonObject fileArtifactForPath(const std::filesystem::path& path,
+                                const QString& type,
+                                const QString& refName,
+                                const QString& format,
+                                qint64* rawBytes)
+{
+    QFile f(QString::fromStdString(path.string()));
+    if (!f.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    const QByteArray bytes = f.readAll();
+    if (rawBytes) {
+        *rawBytes += bytes.size();
+    }
+    QJsonObject upload;
+    upload[QStringLiteral("object")] = makeObjectRef(type, refName, md5Ref(bytes), format);
+    upload[QStringLiteral("_local_payload")] = QStringLiteral("file");
+    upload[QStringLiteral("_local_path")] = QString::fromStdString(path.string());
+    return upload;
+}
+
+QJsonObject bytesArtifact(const QByteArray& bytes,
+                          const QString& type,
+                          const QString& refName,
+                          const QString& format)
+{
+    QJsonObject upload;
+    upload[QStringLiteral("object")] = makeObjectRef(type, refName, md5Ref(bytes), format);
+    upload[QStringLiteral("data")] = QString::fromLatin1(bytes.toBase64());
+    return upload;
 }
 
 QJsonObject modelArtifactForPath(const std::filesystem::path& modelPath,
@@ -108,11 +157,27 @@ QJsonObject modelArtifactForPath(const std::filesystem::path& modelPath,
     QJsonObject upload;
     upload[QStringLiteral("object")] = makeObjectRef(
         QStringLiteral("lasagna_model"), refName, md5Ref(bytes));
-    upload[QStringLiteral("data")] = QString::fromLatin1(bytes.toBase64());
+    upload[QStringLiteral("_local_payload")] = QStringLiteral("file");
+    upload[QStringLiteral("_local_path")] = QString::fromStdString(modelPath.string());
     return upload;
 }
 
 QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
+                                   const QString& objectType,
+                                   const QString& objectFormat,
+                                   qint64* rawBytes,
+                                   int* fileCount);
+
+QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
+                                   qint64* rawBytes,
+                                   int* fileCount)
+{
+    return segmentArtifactForPath(segPath, QStringLiteral("tifxyz_segment"), QString(), rawBytes, fileCount);
+}
+
+QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
+                                   const QString& objectType,
+                                   const QString& objectFormat,
                                    qint64* rawBytes,
                                    int* fileCount)
 {
@@ -125,7 +190,6 @@ QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
     }
     std::sort(files.begin(), files.end());
 
-    QJsonObject encodedFiles;
     QByteArray manifest;
     for (const auto& path : files) {
         QFile f(QString::fromStdString(path.string()));
@@ -143,7 +207,6 @@ QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
         manifest.append('\t');
         manifest.append(fileHash.toUtf8());
         manifest.append('\n');
-        encodedFiles[rel] = QString::fromLatin1(bytes.toBase64());
         if (rawBytes) {
             *rawBytes += bytes.size();
         }
@@ -155,8 +218,9 @@ QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
     const QString segName = QString::fromStdString(segPath.filename().string());
     QJsonObject upload;
     upload[QStringLiteral("object")] = makeObjectRef(
-        QStringLiteral("tifxyz_segment"), segName, md5Ref(manifest));
-    upload[QStringLiteral("files")] = encodedFiles;
+        objectType, segName, md5Ref(manifest), objectFormat);
+    upload[QStringLiteral("_local_payload")] = QStringLiteral("directory");
+    upload[QStringLiteral("_local_path")] = QString::fromStdString(segPath.string());
     return upload;
 }
 
@@ -241,6 +305,190 @@ std::filesystem::path selectedSegmentPathForState(CState* state)
         segPath = outputSegmentsPath / segPath.filename();
     }
     return segPath;
+}
+
+std::filesystem::path volpkgRootForState(CState* state)
+{
+    if (!state || !state->vpkg()) {
+        return {};
+    }
+    return std::filesystem::absolute(
+        std::filesystem::path(state->vpkg()->getVolpkgDirectory())).lexically_normal();
+}
+
+QString safeAtlasObjectName(const QString& atlasName, const QString& relPath, const QString& fallback)
+{
+    QString name = relPath.trimmed();
+    if (name.isEmpty() || name.startsWith(QLatin1Char('/')) || name.contains(QStringLiteral(".."))) {
+        name = fallback;
+    }
+    return atlasName + QStringLiteral("/") + name;
+}
+
+struct AtlasRequestArtifacts
+{
+    QJsonObject atlasRef;
+    QJsonObject compactAtlas;
+    QJsonArray uploads;
+    qint64 rawBytes{0};
+    int fileCount{0};
+};
+
+bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
+                                const std::filesystem::path& volpkgRootIn,
+                                AtlasRequestArtifacts* out,
+                                QString* error)
+{
+    if (!out) {
+        return false;
+    }
+    vc::atlas::LasagnaAtlasExport atlasExport;
+    try {
+        atlasExport = vc::atlas::loadLasagnaAtlasExport(atlasDir, volpkgRootIn);
+    } catch (const std::exception& ex) {
+        if (error) {
+            *error = QString::fromStdString(ex.what());
+        }
+        return false;
+    }
+
+    const QString atlasName = QString::fromStdString(
+        atlasExport.atlas.metadata.name.empty()
+            ? atlasDir.filename().string()
+            : atlasExport.atlas.metadata.name);
+    const QString baseRel = QString::fromStdString(
+        atlasExport.baseRelativePath.generic_string());
+
+    auto appendUploadIfNew = [out](const QJsonObject& upload) {
+        const QJsonObject ref = upload[QStringLiteral("object")].toObject();
+        if (ref.isEmpty()) {
+            return;
+        }
+        const QString key = objectRefKeyForUpload(ref);
+        for (const QJsonValue& existingValue : out->uploads) {
+            const QJsonObject existingRef = existingValue.toObject()[QStringLiteral("object")].toObject();
+            if (objectRefKeyForUpload(existingRef) == key) {
+                return;
+            }
+        }
+        out->uploads.append(upload);
+    };
+
+    QJsonObject baseUpload = segmentArtifactForPath(
+        atlasExport.basePath,
+        QStringLiteral("atlas-base"),
+        QStringLiteral("tifxyz"),
+        &out->rawBytes,
+        &out->fileCount);
+    if (baseUpload.isEmpty()) {
+        if (error) {
+            *error = QObject::tr("Cannot pack atlas base mesh: %1")
+                .arg(QString::fromStdString(atlasExport.basePath.string()));
+        }
+        return false;
+    }
+    QJsonObject baseRef = baseUpload[QStringLiteral("object")].toObject();
+    baseRef[QStringLiteral("name")] = safeAtlasObjectName(atlasName, baseRel, QStringLiteral("base_mesh.tifxyz"));
+    baseUpload[QStringLiteral("object")] = baseRef;
+    appendUploadIfNew(baseUpload);
+
+    QJsonDocument compactDoc = QJsonDocument::fromJson(
+        QByteArray::fromStdString(atlasExport.compactJson.dump()));
+    QJsonObject compact = compactDoc.object();
+    QJsonObject compactBase = compact[QStringLiteral("base")].toObject();
+    compactBase[QStringLiteral("ref")] = baseRef;
+    compact[QStringLiteral("base")] = compactBase;
+
+    QSet<QString> lineIds;
+    QHash<QString, QJsonObject> lineRefsById;
+    QHash<QString, QJsonObject> mapRefsByObjectKey;
+    for (const vc::atlas::LasagnaAtlasObject& object : atlasExport.objects) {
+        const QString lineId = QString::fromStdString(object.id);
+        const QString fiberRel = QString::fromStdString(object.fiberRelativePath.generic_string());
+        const QString mapRel = QString::fromStdString(object.mappingRelativePath.generic_string());
+
+        QJsonObject lineUpload = fileArtifactForPath(
+            object.fiberPath,
+            QStringLiteral("line"),
+            safeAtlasObjectName(atlasName, fiberRel, QString::fromStdString(object.fiberPath.filename().string())),
+            QStringLiteral("vc3d_fiber_json"),
+            &out->rawBytes);
+        if (lineUpload.isEmpty()) {
+            if (error) {
+                *error = QObject::tr("Cannot pack atlas fiber JSON: %1")
+                    .arg(QString::fromStdString(object.fiberPath.string()));
+            }
+            return false;
+        }
+        ++out->fileCount;
+        const QJsonObject lineRef = lineUpload[QStringLiteral("object")].toObject();
+        appendUploadIfNew(lineUpload);
+
+        QJsonObject mapUpload = fileArtifactForPath(
+            object.mappingPath,
+            QStringLiteral("line-map"),
+            safeAtlasObjectName(atlasName, mapRel, QString::fromStdString(object.mappingPath.filename().string())),
+            QStringLiteral("vc3d_atlas_fiber_mapping_json"),
+            &out->rawBytes);
+        if (mapUpload.isEmpty()) {
+            if (error) {
+                *error = QObject::tr("Cannot pack atlas mapping JSON: %1")
+                    .arg(QString::fromStdString(object.mappingPath.string()));
+            }
+            return false;
+        }
+        ++out->fileCount;
+        const QJsonObject mapRef = mapUpload[QStringLiteral("object")].toObject();
+        appendUploadIfNew(mapUpload);
+
+        lineRefsById.insert(lineId, lineRef);
+        mapRefsByObjectKey.insert(lineId + QStringLiteral("\n") + mapRel, mapRef);
+        if (!lineIds.contains(lineId)) {
+            lineIds.insert(lineId);
+        }
+    }
+
+    QJsonObject objects;
+    QJsonArray lineObjects;
+    for (const QJsonValue& value : compact[QStringLiteral("objects")].toObject()[QStringLiteral("line")].toArray()) {
+        QJsonObject lineEntry = value.toObject();
+        const QString lineId = lineEntry[QStringLiteral("id")].toString();
+        if (lineRefsById.contains(lineId)) {
+            lineEntry[QStringLiteral("ref")] = lineRefsById.value(lineId);
+        }
+        lineObjects.append(lineEntry);
+    }
+    objects[QStringLiteral("line")] = lineObjects;
+    compact[QStringLiteral("objects")] = objects;
+
+    QJsonArray maps;
+    for (const QJsonValue& value : compact[QStringLiteral("maps")].toArray()) {
+        QJsonObject mapEntry = value.toObject();
+        const QString lineId = mapEntry[QStringLiteral("object_id")].toString();
+        const QString mapRel = mapEntry[QStringLiteral("mapping_path")].toString();
+        if (lineRefsById.contains(lineId)) {
+            mapEntry[QStringLiteral("object_ref")] = lineRefsById.value(lineId);
+        }
+        const QString key = lineId + QStringLiteral("\n") + mapRel;
+        if (mapRefsByObjectKey.contains(key)) {
+            mapEntry[QStringLiteral("map_ref")] = mapRefsByObjectKey.value(key);
+        }
+        maps.append(mapEntry);
+    }
+    compact[QStringLiteral("maps")] = maps;
+
+    const QByteArray compactBytes = QJsonDocument(compact).toJson(QJsonDocument::Compact);
+    QJsonObject atlasUpload = bytesArtifact(
+        compactBytes,
+        QStringLiteral("atlas"),
+        safeAtlasObjectName(atlasName, QStringLiteral("lasagna_atlas.json"), QStringLiteral("lasagna_atlas.json")),
+        QStringLiteral("lasagna_atlas_json"));
+    out->atlasRef = atlasUpload[QStringLiteral("object")].toObject();
+    out->compactAtlas = compact;
+    out->rawBytes += compactBytes.size();
+    ++out->fileCount;
+    appendUploadIfNew(atlasUpload);
+    return true;
 }
 }  // namespace
 
@@ -522,6 +770,40 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     panelLayout->addWidget(_offsetBtn);
 
     // =======================================================================
+    // Atlas settings + action button
+    // =======================================================================
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
+
+    _atlasGroup = new CollapsibleSettingsGroup(tr("Atlas"), this);
+    auto* atlasContent = _atlasGroup->contentWidget();
+
+    _atlasGroup->addRow(tr("Atlas:"), [&](QHBoxLayout* row) {
+        _atlasCombo = new QComboBox(atlasContent);
+        _atlasCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        row->addWidget(_atlasCombo, 1);
+    }, tr("Atlas directory from the current volpkg atlases folder."));
+
+    _atlasGroup->addRow(tr("Config:"), [&](QHBoxLayout* row) {
+        _atlasConfigCombo = new QComboBox(atlasContent);
+        _atlasConfigCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        _atlasConfigBrowse = new QToolButton(atlasContent);
+        _atlasConfigBrowse->setText(QStringLiteral("..."));
+        _atlasConfigBrowse->setToolTip(tr("Browse for a JSON config file"));
+        row->addWidget(_atlasConfigCombo, 1);
+        row->addWidget(_atlasConfigBrowse);
+    }, tr("JSON config file for atlas optimization."));
+
+    panelLayout->addWidget(_atlasGroup);
+
+    _atlasBtn = new QPushButton(tr("Send Atlas"), this);
+    panelLayout->addWidget(_atlasBtn);
+
+    // =======================================================================
     // Shared bottom area — stop buttons, progress
     // =======================================================================
     auto* btnRow = new QHBoxLayout();
@@ -611,6 +893,8 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             if (_newModelBtn) _newModelBtn->setEnabled(false);
             if (_reoptBtn) _reoptBtn->setEnabled(false);
             if (_offsetBtn) _offsetBtn->setEnabled(false);
+            if (_atlasBtn) _atlasBtn->setEnabled(false);
+            syncCompactStatusFromFull();
             return;
         }
         int restoreIdx = 0;
@@ -628,6 +912,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
         if (_offsetBtn) _offsetBtn->setEnabled(true);
+        if (_atlasBtn) _atlasBtn->setEnabled(true);
     });
 
     connect(_dataInputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
@@ -771,6 +1056,43 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     connect(_offsetValueSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         writeSetting(QStringLiteral("lasagna_offset_value"), v);
     });
+
+    // -- Atlas selectors --
+    connect(_atlasCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (_restoringSettings || index < 0 || !_atlasCombo) return;
+        const QString path = _atlasCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _atlasDirPath = path;
+            writeSetting(QStringLiteral("lasagna_atlas_dir_path"), _atlasDirPath);
+            syncCompactConfigCombos();
+        }
+    });
+    connect(_atlasConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (_restoringSettings || index < 0) return;
+        QString path = _atlasConfigCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _atlasConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_atlas_config_file_path"), _atlasConfigFilePath);
+            syncCompactConfigCombos();
+        }
+    });
+    connect(_atlasConfigBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _atlasConfigFilePath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_atlasConfigFilePath).absolutePath();
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select optimizer config JSON file"), initial,
+            tr("JSON files (*.json);;All files (*)"));
+        if (!path.isEmpty()) {
+            _atlasConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_atlas_config_file_path"), _atlasConfigFilePath);
+            QFileInfo fi(path);
+            populateConfigCombo(_atlasConfigCombo, fi.absolutePath(), fi.fileName(), _atlasConfigFilePath);
+            syncCompactConfigCombos();
+        }
+    });
+
     // -- Action buttons --
     connect(_newModelBtn, &QPushButton::clicked, this, [this]() {
         launchLasagnaMode(LasagnaMode::NewModel);
@@ -780,6 +1102,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(_offsetBtn, &QPushButton::clicked, this, [this]() {
         launchLasagnaMode(LasagnaMode::Offset);
+    });
+    connect(_atlasBtn, &QPushButton::clicked, this, [this]() {
+        launchAtlasOptimization();
     });
 
     // -- Stop buttons --
@@ -802,6 +1127,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(_offsetGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
         writeSetting(QStringLiteral("group_lasagna_offset_expanded"), expanded);
+    });
+    connect(_atlasGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        writeSetting(QStringLiteral("group_lasagna_atlas_expanded"), expanded);
     });
 
     // -----------------------------------------------------------------------
@@ -841,10 +1169,12 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             if (_newModelBtn) _newModelBtn->setEnabled(false);
             if (_reoptBtn) _reoptBtn->setEnabled(false);
             if (_offsetBtn) _offsetBtn->setEnabled(false);
+            if (_atlasBtn) _atlasBtn->setEnabled(false);
         } else {
             if (_newModelBtn) _newModelBtn->setEnabled(true);
             if (_reoptBtn) _reoptBtn->setEnabled(true);
             if (_offsetBtn) _offsetBtn->setEnabled(true);
+            if (_atlasBtn) _atlasBtn->setEnabled(true);
             }
         syncCompactStatusFromFull();
     });
@@ -860,6 +1190,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             if (_newModelBtn) _newModelBtn->setEnabled(false);
             if (_reoptBtn) _reoptBtn->setEnabled(false);
             if (_offsetBtn) _offsetBtn->setEnabled(false);
+            if (_atlasBtn) _atlasBtn->setEnabled(false);
         }
         syncCompactStatusFromFull();
     });
@@ -962,6 +1293,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
         if (_offsetBtn) _offsetBtn->setEnabled(true);
+        if (_atlasBtn) _atlasBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization finished. Output: %1").arg(outputDir));
@@ -977,6 +1309,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
         if (_offsetBtn) _offsetBtn->setEnabled(true);
+        if (_atlasBtn) _atlasBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization error: %1").arg(err));
@@ -1020,6 +1353,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 void SegmentationLasagnaPanel::setState(CState* state)
 {
     if (_state == state) {
+        refreshAtlasComboFromState();
         updateLinkedSurfaceTables();
         return;
     }
@@ -1028,6 +1362,7 @@ void SegmentationLasagnaPanel::setState(CState* state)
         _stateSurfaceChangedConnection = {};
     }
     _state = state;
+    refreshAtlasComboFromState();
     if (_state) {
         _stateSurfaceChangedConnection = connect(
             _state,
@@ -1075,6 +1410,11 @@ QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
     _compactReoptBtn = new QPushButton(tr("Re-optimize"), _compactView);
     layout->addWidget(_compactReoptBtn);
 
+    addConfigRow(tr("Atlas:"), _compactAtlasCombo);
+    addConfigRow(tr("Atlas cfg:"), _compactAtlasConfigCombo);
+    _compactAtlasBtn = new QPushButton(tr("Send Atlas"), _compactView);
+    layout->addWidget(_compactAtlasBtn);
+
     layout->addWidget(new QLabel(tr("Linked Surfaces"), _compactView));
     _compactLinkedSurfaceModel = new QStandardItemModel(_compactView);
     _compactLinkedSurfaceModel->setHorizontalHeaderLabels({tr("Name")});
@@ -1108,6 +1448,9 @@ QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
     connect(_compactReoptBtn, &QPushButton::clicked, this, [this]() {
         launchLasagnaMode(LasagnaMode::ReOptimize);
     });
+    connect(_compactAtlasBtn, &QPushButton::clicked, this, [this]() {
+        launchAtlasOptimization();
+    });
     connect(_compactStopBtn, &QPushButton::clicked, this, [this]() {
         emit lasagnaStopRequested();
     });
@@ -1140,6 +1483,32 @@ QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
             if (fullIndex >= 0) _reoptConfigCombo->setCurrentIndex(fullIndex);
         }
     });
+    connect(_compactAtlasCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (index < 0 || !_compactAtlasCombo) return;
+        const QString path = _compactAtlasCombo->currentData().toString();
+        if (path.isEmpty() || path == _atlasDirPath) return;
+        _atlasDirPath = path;
+        writeSetting(QStringLiteral("lasagna_atlas_dir_path"), _atlasDirPath);
+        if (_atlasCombo) {
+            const QSignalBlocker blocker(_atlasCombo);
+            const int fullIndex = _atlasCombo->findData(path);
+            if (fullIndex >= 0) _atlasCombo->setCurrentIndex(fullIndex);
+        }
+    });
+    connect(_compactAtlasConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (index < 0 || !_compactAtlasConfigCombo) return;
+        const QString path = _compactAtlasConfigCombo->currentData().toString();
+        if (path.isEmpty() || path == _atlasConfigFilePath) return;
+        _atlasConfigFilePath = path;
+        writeSetting(QStringLiteral("lasagna_atlas_config_file_path"), _atlasConfigFilePath);
+        if (_atlasConfigCombo) {
+            const QSignalBlocker blocker(_atlasConfigCombo);
+            const int fullIndex = _atlasConfigCombo->findData(path);
+            if (fullIndex >= 0) _atlasConfigCombo->setCurrentIndex(fullIndex);
+        }
+    });
 
     syncCompactConfigCombos();
     syncCompactStatusFromFull();
@@ -1166,6 +1535,8 @@ void SegmentationLasagnaPanel::syncCompactConfigCombos()
 
     syncCombo(_compactNewModelConfigCombo, _newModelConfigCombo, _newModelConfigFilePath);
     syncCombo(_compactReoptConfigCombo, _reoptConfigCombo, _reoptConfigFilePath);
+    syncCombo(_compactAtlasConfigCombo, _atlasConfigCombo, _atlasConfigFilePath);
+    syncCombo(_compactAtlasCombo, _atlasCombo, _atlasDirPath);
 }
 
 void SegmentationLasagnaPanel::syncCompactStatusFromFull()
@@ -1175,6 +1546,9 @@ void SegmentationLasagnaPanel::syncCompactStatusFromFull()
     }
     if (_compactReoptBtn && _reoptBtn) {
         _compactReoptBtn->setEnabled(_reoptBtn->isEnabled());
+    }
+    if (_compactAtlasBtn && _atlasBtn) {
+        _compactAtlasBtn->setEnabled(_atlasBtn->isEnabled());
     }
     if (_compactStopBtn && _stopBtn) {
         _compactStopBtn->setEnabled(_stopBtn->isEnabled());
@@ -1281,6 +1655,10 @@ void SegmentationLasagnaPanel::triggerOptimization()
 
 void SegmentationLasagnaPanel::launchLasagnaMode(LasagnaMode mode)
 {
+    if (mode == LasagnaMode::Atlas) {
+        launchAtlasOptimization();
+        return;
+    }
     _lastLasagnaMode = mode;
     _lasagnaMode = static_cast<int>(mode);
     updateLinkedSurfaceTables();
@@ -1345,6 +1723,7 @@ QString SegmentationLasagnaPanel::selectedLasagnaConfigPathForMode(LasagnaMode m
 {
     return (mode == LasagnaMode::NewModel) ? _newModelConfigFilePath
          : (mode == LasagnaMode::Offset) ? _offsetConfigFilePath
+         : (mode == LasagnaMode::Atlas) ? _atlasConfigFilePath
          : _reoptConfigFilePath;
 }
 
@@ -1352,6 +1731,7 @@ QStringList SegmentationLasagnaPanel::lasagnaConfigPathsForMode(LasagnaMode mode
 {
     const QComboBox* combo = (mode == LasagnaMode::NewModel) ? _newModelConfigCombo
                           : (mode == LasagnaMode::Offset) ? _offsetConfigCombo
+                          : (mode == LasagnaMode::Atlas) ? _atlasConfigCombo
                           : _reoptConfigCombo;
     const QString currentPath = selectedLasagnaConfigPathForMode(mode);
     QStringList paths;
@@ -1411,6 +1791,216 @@ bool SegmentationLasagnaPanel::validateLasagnaConfigPath(const QString& configPa
     }
 
     return true;
+}
+
+bool SegmentationLasagnaPanel::validateAtlasDirPath(const QString& atlasDir,
+                                                    QStatusBar* statusBar)
+{
+    if (atlasDir.isEmpty()) {
+        showLasagnaConfigError(tr("No Atlas selected."), statusBar, 5000);
+        return false;
+    }
+    const QFileInfo info(atlasDir);
+    if (!info.exists() || !info.isDir()) {
+        showLasagnaConfigError(tr("Atlas directory not found: %1").arg(atlasDir),
+                               statusBar,
+                               7000);
+        return false;
+    }
+    const QFileInfo metadata(QDir(atlasDir).filePath(QStringLiteral("metadata.json")));
+    if (!metadata.exists() || !metadata.isFile()) {
+        showLasagnaConfigError(tr("Atlas metadata.json not found: %1").arg(atlasDir),
+                               statusBar,
+                               7000);
+        return false;
+    }
+    return true;
+}
+
+void SegmentationLasagnaPanel::populateAtlasCombo(const QString& volpkgRoot,
+                                                  const QString& selectPath)
+{
+    if (!_atlasCombo) {
+        return;
+    }
+    const QSignalBlocker blocker(_atlasCombo);
+    _atlasCombo->clear();
+
+    const auto atlasDirs = vc::atlas::discoverAtlasDirectories(
+        std::filesystem::path(volpkgRoot.toStdString()));
+    if (atlasDirs.empty()) {
+        syncCompactConfigCombos();
+        return;
+    }
+    int selectedIndex = -1;
+    for (const auto& entry : atlasDirs) {
+        const QString label = QString::fromStdString(entry.name);
+        const QString path = QString::fromStdString(entry.path.string());
+        _atlasCombo->addItem(label, path);
+        if (QFileInfo(path).absoluteFilePath() == QFileInfo(selectPath).absoluteFilePath()) {
+            selectedIndex = _atlasCombo->count() - 1;
+        }
+    }
+    if (selectedIndex < 0 && !_atlasDirPath.isEmpty()) {
+        selectedIndex = _atlasCombo->findData(_atlasDirPath);
+    }
+    if (selectedIndex < 0 && _atlasCombo->count() > 0) {
+        selectedIndex = 0;
+    }
+    if (selectedIndex >= 0) {
+        _atlasCombo->setCurrentIndex(selectedIndex);
+        _atlasDirPath = _atlasCombo->currentData().toString();
+    }
+    syncCompactConfigCombos();
+}
+
+void SegmentationLasagnaPanel::refreshAtlasComboFromState()
+{
+    const std::filesystem::path root = volpkgRootForState(_state);
+    if (!root.empty()) {
+        populateAtlasCombo(QString::fromStdString(root.string()), _atlasDirPath);
+    } else if (_atlasCombo && !_atlasDirPath.isEmpty()) {
+        const QSignalBlocker blocker(_atlasCombo);
+        _atlasCombo->clear();
+        _atlasCombo->addItem(QFileInfo(_atlasDirPath).fileName(), _atlasDirPath);
+        syncCompactConfigCombos();
+    }
+}
+
+void SegmentationLasagnaPanel::launchAtlasOptimization()
+{
+    _lastLasagnaMode = LasagnaMode::Atlas;
+    _lasagnaMode = static_cast<int>(LasagnaMode::Atlas);
+
+    if (!validateLasagnaConfigPath(_atlasConfigFilePath, nullptr) ||
+        !validateAtlasDirPath(_atlasDirPath, nullptr)) {
+        return;
+    }
+
+    if (_connectionMode == 1) {
+        auto& mgr = LasagnaServiceManager::instance();
+        if (!mgr.isExternal() || !mgr.isRunning()) {
+            mgr.connectToExternal(_externalHost, _externalPort);
+            auto* conn = new QMetaObject::Connection;
+            auto* errConn = new QMetaObject::Connection;
+            *conn = connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
+                [this, conn, errConn]() {
+                    QObject::disconnect(*conn);
+                    QObject::disconnect(*errConn);
+                    delete conn;
+                    delete errConn;
+                    startAtlasOptimization(_state, nullptr);
+                });
+            *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
+                [conn, errConn](const QString&) {
+                    QObject::disconnect(*conn);
+                    QObject::disconnect(*errConn);
+                    delete conn;
+                    delete errConn;
+                });
+            return;
+        }
+    }
+
+    startAtlasOptimization(_state, nullptr);
+}
+
+void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar* statusBar)
+{
+    auto showStatus = [statusBar](const QString& msg, int timeout) {
+        if (statusBar) {
+            statusBar->showMessage(msg, timeout);
+        }
+    };
+
+    if (!validateLasagnaConfigPath(_atlasConfigFilePath, statusBar) ||
+        !validateAtlasDirPath(_atlasDirPath, statusBar)) {
+        return;
+    }
+
+    auto& mgr = LasagnaServiceManager::instance();
+    if (mgr.isExternal()) {
+        if (!mgr.isRunning()) {
+            const QString msg = tr("External service not connected. Select a service or check host/port.");
+            showStatus(msg, 5000);
+            return;
+        }
+    } else if (!mgr.ensureServiceRunning()) {
+        const QString msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
+        showStatus(msg, 5000);
+        return;
+    }
+
+    const QString dataInput = lasagnaDataInputPath();
+    if (dataInput.isEmpty()) {
+        const QString msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
+        showStatus(msg, 5000);
+        showLasagnaConfigError(msg, nullptr, 5000);
+        return;
+    }
+
+    QFile f(_atlasConfigFilePath);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        showLasagnaConfigError(
+            tr("Cannot read Lasagna config %1: %2").arg(_atlasConfigFilePath, f.errorString()),
+            statusBar,
+            7000);
+        return;
+    }
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError) {
+        showLasagnaConfigError(
+            tr("Invalid Lasagna config JSON at byte %1: %2")
+                .arg(parseError.offset)
+                .arg(parseError.errorString()),
+            statusBar,
+            7000);
+        return;
+    }
+    if (!doc.isObject()) {
+        showLasagnaConfigError(
+            tr("Invalid Lasagna config JSON: top-level value must be an object."),
+            statusBar,
+            7000);
+        return;
+    }
+    const QJsonObject config = doc.object();
+
+    AtlasRequestArtifacts artifacts;
+    QString error;
+    const std::filesystem::path atlasDir(_atlasDirPath.toStdString());
+    if (!buildAtlasRequestArtifacts(atlasDir, volpkgRootForState(state), &artifacts, &error)) {
+        showLasagnaConfigError(error, statusBar, 7000);
+        return;
+    }
+
+    QJsonObject jobSpec;
+    jobSpec[QStringLiteral("config")] = config;
+    jobSpec[QStringLiteral("atlas")] = artifacts.atlasRef;
+
+    QJsonObject request;
+    request[QStringLiteral("data_input")] = dataInput;
+    request[QStringLiteral("config_name")] = QFileInfo(_atlasConfigFilePath).fileName();
+    request[QStringLiteral("config")] = config;
+    request[QStringLiteral("job_spec")] = jobSpec;
+    request[QStringLiteral("_objects")] = artifacts.uploads;
+
+    QString outputDir;
+    const std::filesystem::path outputSegmentsPath = outputSegmentsPathForState(state);
+    if (!outputSegmentsPath.empty()) {
+        outputDir = QString::fromStdString(outputSegmentsPath.string());
+    }
+
+    std::cerr << "[lasagna] atlas request prep:"
+              << " atlas=" << _atlasDirPath.toStdString()
+              << " config=" << _atlasConfigFilePath.toStdString()
+              << " files=" << artifacts.fileCount
+              << " raw=" << bytesToMiB(artifacts.rawBytes) << " MiB"
+              << std::endl;
+
+    mgr.startOptimization(request, outputDir);
+    showStatus(tr("Lasagna atlas optimization started."), 3000);
 }
 
 void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
@@ -1993,6 +2583,8 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
 
     // Offset settings
     _offsetConfigFilePath = settings.value(QStringLiteral("lasagna_offset_config_file_path"), QString()).toString();
+    _atlasConfigFilePath = settings.value(QStringLiteral("lasagna_atlas_config_file_path"), QString()).toString();
+    _atlasDirPath = settings.value(QStringLiteral("lasagna_atlas_dir_path"), QString()).toString();
     if (_offsetValueSpin) {
         const QSignalBlocker b(_offsetValueSpin);
         _offsetValueSpin->setValue(
@@ -2026,6 +2618,16 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
             _offsetConfigCombo->addItem(fi.fileName(), _offsetConfigFilePath);
         }
     }
+    if (!_atlasConfigFilePath.isEmpty()) {
+        QFileInfo fi(_atlasConfigFilePath);
+        if (fi.exists()) {
+            populateConfigCombo(_atlasConfigCombo, fi.absolutePath(), fi.fileName(), _atlasConfigFilePath);
+        } else if (_atlasConfigCombo) {
+            _atlasConfigCombo->clear();
+            _atlasConfigCombo->addItem(fi.fileName(), _atlasConfigFilePath);
+        }
+    }
+    refreshAtlasComboFromState();
 
     // Expand states
     if (_connectionGroup) {
@@ -2044,6 +2646,10 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
         _offsetGroup->setExpanded(
             settings.value(QStringLiteral("group_lasagna_offset_expanded"), false).toBool());
     }
+    if (_atlasGroup) {
+        _atlasGroup->setExpanded(
+            settings.value(QStringLiteral("group_lasagna_atlas_expanded"), false).toBool());
+    }
 
     _restoringSettings = false;
     syncCompactConfigCombos();
@@ -2060,6 +2666,7 @@ void SegmentationLasagnaPanel::syncUiState(bool /*editingEnabled*/, bool optimiz
     if (_newModelBtn) _newModelBtn->setEnabled(!optimizing);
     if (_reoptBtn) _reoptBtn->setEnabled(!optimizing);
     if (_offsetBtn) _offsetBtn->setEnabled(!optimizing);
+    if (_atlasBtn) _atlasBtn->setEnabled(!optimizing);
     if (_stopBtn) _stopBtn->setEnabled(optimizing);
     syncCompactStatusFromFull();
     updateLinkedSurfaceTables();
@@ -2127,6 +2734,7 @@ QString SegmentationLasagnaPanel::lasagnaConfigText() const
 {
     const QString& path = (_lasagnaMode == 1) ? _newModelConfigFilePath
                         : (_lasagnaMode == 3) ? _offsetConfigFilePath
+                        : (_lasagnaMode == 4) ? _atlasConfigFilePath
                         : _reoptConfigFilePath;
     if (path.isEmpty()) return {};
     QFile f(path);
@@ -2236,12 +2844,14 @@ void SegmentationLasagnaPanel::updateConnectionWidgets()
         if (_newModelBtn) _newModelBtn->setEnabled(hasDatasets);
         if (_reoptBtn) _reoptBtn->setEnabled(hasDatasets);
         if (_offsetBtn) _offsetBtn->setEnabled(hasDatasets);
+        if (_atlasBtn) _atlasBtn->setEnabled(hasDatasets);
     } else {
         // Internal mode: re-enable controls
         if (_datasetCombo) _datasetCombo->setEnabled(true);
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
         if (_offsetBtn) _offsetBtn->setEnabled(true);
+        if (_atlasBtn) _atlasBtn->setEnabled(true);
     }
 
     if (external && !_restoringSettings && !_externalHost.isEmpty() && _externalPort > 0) {

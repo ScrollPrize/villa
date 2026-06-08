@@ -253,6 +253,46 @@ nlohmann::json readJsonFile(const fs::path& path)
     return nlohmann::json::parse(in);
 }
 
+fs::path inferVolpkgRootFromAtlasDir(const fs::path& atlasDir)
+{
+    if (atlasDir.parent_path().filename() == "atlases") {
+        return atlasDir.parent_path().parent_path();
+    }
+    return {};
+}
+
+fs::path resolveAtlasRelativePath(const fs::path& atlasDir,
+                                  const fs::path& volpkgRoot,
+                                  const fs::path& jsonPath)
+{
+    if (jsonPath.empty()) {
+        return {};
+    }
+    if (jsonPath.is_absolute()) {
+        return jsonPath;
+    }
+    if (!volpkgRoot.empty()) {
+        return (volpkgRoot / jsonPath).lexically_normal();
+    }
+    return (atlasDir / jsonPath).lexically_normal();
+}
+
+std::vector<fs::path> sortedAtlasFiberMappingFiles(const fs::path& atlasDir)
+{
+    const fs::path mappingsDir = atlasDir / "mappings" / "fibers";
+    std::vector<fs::path> mappingFiles;
+    if (!fs::is_directory(mappingsDir)) {
+        return mappingFiles;
+    }
+    for (const auto& entry : fs::directory_iterator(mappingsDir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".json") {
+            mappingFiles.push_back(entry.path());
+        }
+    }
+    std::sort(mappingFiles.begin(), mappingFiles.end());
+    return mappingFiles;
+}
+
 int seedLineIndexForFiber(const FiberInput& fiber)
 {
     if (fiber.linePoints.empty()) {
@@ -887,11 +927,8 @@ Atlas Atlas::load(const fs::path& atlasDir)
 
     const fs::path mappingsDir = atlasDir / "mappings" / "fibers";
     if (fs::is_directory(mappingsDir)) {
-        for (const auto& entry : fs::directory_iterator(mappingsDir)) {
-            if (!entry.is_regular_file() || entry.path().extension() != ".json") {
-                continue;
-            }
-            const auto root = readJsonFile(entry.path());
+        for (const auto& mappingPath : sortedAtlasFiberMappingFiles(atlasDir)) {
+            const auto root = readJsonFile(mappingPath);
             FiberMapping mapping;
             mapping.fiberPath = root.value("fiber_path", std::string{});
             mapping.windingOffset = root.value("winding_offset", 0);
@@ -1000,6 +1037,177 @@ AtlasFiberSearchSets atlasFiberSearchSets(const Atlas& atlas,
         }
     }
     return sets;
+}
+
+std::vector<AtlasDirectoryInfo> discoverAtlasDirectories(const fs::path& volpkgRoot)
+{
+    std::vector<AtlasDirectoryInfo> out;
+    const fs::path atlasRoot = volpkgRoot / "atlases";
+    if (volpkgRoot.empty() || !fs::is_directory(atlasRoot)) {
+        return out;
+    }
+
+    std::vector<fs::path> atlasDirs;
+    for (const auto& entry : fs::directory_iterator(atlasRoot)) {
+        if (entry.is_directory() && fs::exists(entry.path() / "metadata.json")) {
+            atlasDirs.push_back(entry.path());
+        }
+    }
+    std::sort(atlasDirs.begin(), atlasDirs.end());
+
+    out.reserve(atlasDirs.size());
+    for (const auto& atlasDir : atlasDirs) {
+        try {
+            const auto metadata = readJsonFile(atlasDir / "metadata.json");
+            if (metadata.value("type", std::string{}) != "vc3d_atlas") {
+                continue;
+            }
+            std::string name = metadata.value("name", atlasDir.filename().string());
+            if (name.empty()) {
+                name = atlasDir.filename().string();
+            }
+            out.push_back({atlasDir, name});
+        } catch (...) {
+            continue;
+        }
+    }
+    return out;
+}
+
+LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
+                                          const fs::path& volpkgRootIn)
+{
+    if (atlasDir.empty() || !fs::is_directory(atlasDir)) {
+        throw std::runtime_error("Atlas directory not found: " + atlasDir.string());
+    }
+    if (!fs::is_regular_file(atlasDir / "metadata.json")) {
+        throw std::runtime_error("Atlas metadata.json not found: " + atlasDir.string());
+    }
+
+    LasagnaAtlasExport exportData;
+    exportData.atlasDir = atlasDir;
+    exportData.volpkgRoot = volpkgRootIn.empty()
+        ? inferVolpkgRootFromAtlasDir(atlasDir)
+        : volpkgRootIn;
+    exportData.atlas = Atlas::load(atlasDir);
+    exportData.baseRelativePath = exportData.atlas.metadata.baseMeshPath;
+    if (exportData.baseRelativePath.empty()) {
+        throw std::runtime_error("Atlas metadata is missing base_mesh_path.");
+    }
+    exportData.basePath = (atlasDir / exportData.baseRelativePath).lexically_normal();
+    if (!fs::is_directory(exportData.basePath)) {
+        throw std::runtime_error("Atlas base mesh does not exist: " + exportData.basePath.string());
+    }
+    try {
+        const QuadSurface base(exportData.basePath);
+        const cv::Mat_<cv::Vec3f>* points = base.rawPointsPtr();
+        if (!points || points->rows < 2 || points->cols < 2) {
+            throw std::runtime_error("Atlas base mesh is too small: " +
+                                     exportData.basePath.string());
+        }
+        double maxDelta = 0.0;
+        for (int row = 0; row < points->rows; ++row) {
+            const cv::Vec3f first = (*points)(row, 0);
+            const cv::Vec3f last = (*points)(row, points->cols - 1);
+            if (!finitePoint(first) || !finitePoint(last)) {
+                throw std::runtime_error(
+                    "Atlas base mesh contains invalid wrap endpoints: " +
+                    exportData.basePath.string());
+            }
+            for (int c = 0; c < 3; ++c) {
+                maxDelta = std::max(
+                    maxDelta,
+                    std::abs(static_cast<double>(first[c] - last[c])));
+            }
+        }
+        if (maxDelta > 1.0e-4) {
+            std::ostringstream message;
+            message << "Atlas base mesh is not explicitly wrapped; first/last column max delta is "
+                    << maxDelta << '.';
+            throw std::runtime_error(message.str());
+        }
+        (void)atlasHorizontalPeriodColumns(base);
+    } catch (const std::exception& ex) {
+        throw std::runtime_error("Cannot load atlas base mesh " +
+                                 exportData.basePath.string() + ": " + ex.what());
+    }
+
+    const fs::path mappingsDir = atlasDir / "mappings" / "fibers";
+    if (!fs::is_directory(mappingsDir)) {
+        throw std::runtime_error("Atlas has no fiber mappings directory: " +
+                                 mappingsDir.string());
+    }
+    const std::vector<fs::path> mappingFiles = sortedAtlasFiberMappingFiles(atlasDir);
+    if (mappingFiles.empty()) {
+        throw std::runtime_error("Atlas has no mapped fiber JSON files.");
+    }
+    if (mappingFiles.size() != exportData.atlas.fibers.size()) {
+        throw std::runtime_error("Atlas fiber mapping count does not match loaded atlas state.");
+    }
+
+    exportData.objects.reserve(mappingFiles.size());
+    for (size_t i = 0; i < mappingFiles.size(); ++i) {
+        const FiberMapping& mapping = exportData.atlas.fibers[i];
+        if (mapping.fiberPath.empty()) {
+            throw std::runtime_error("Atlas mapping " + mappingFiles[i].string() +
+                                     " references missing fiber path: ");
+        }
+        const fs::path fiberPath = resolveAtlasRelativePath(
+            atlasDir, exportData.volpkgRoot, mapping.fiberPath);
+        if (!fs::is_regular_file(fiberPath)) {
+            throw std::runtime_error("Atlas mapping " + mappingFiles[i].string() +
+                                     " references missing fiber path: " +
+                                     mapping.fiberPath.generic_string());
+        }
+
+        LasagnaAtlasObject object;
+        object.id = mapping.fiberPath.generic_string();
+        object.fiberPath = fiberPath;
+        object.mappingPath = mappingFiles[i];
+        object.fiberRelativePath = mapping.fiberPath;
+        object.mappingRelativePath = fs::relative(mappingFiles[i], atlasDir).lexically_normal();
+        object.windingOffset = mapping.windingOffset;
+        exportData.objects.push_back(std::move(object));
+    }
+
+    const std::string atlasName = exportData.atlas.metadata.name.empty()
+        ? atlasDir.filename().string()
+        : exportData.atlas.metadata.name;
+    nlohmann::json lineObjects = nlohmann::json::array();
+    nlohmann::json maps = nlohmann::json::array();
+    std::unordered_set<std::string> lineIds;
+    for (const auto& object : exportData.objects) {
+        if (lineIds.insert(object.id).second) {
+            lineObjects.push_back({
+                {"id", object.id},
+                {"fiber_path", object.fiberRelativePath.generic_string()},
+            });
+        }
+        maps.push_back({
+            {"object_type", "line"},
+            {"object_id", object.id},
+            {"fiber_path", object.fiberRelativePath.generic_string()},
+            {"mapping_path", object.mappingRelativePath.generic_string()},
+            {"winding_offset", object.windingOffset},
+        });
+    }
+
+    exportData.compactJson = {
+        {"type", "lasagna_atlas"},
+        {"version", 1},
+        {"name", atlasName},
+        {"base", {
+            {"path", exportData.baseRelativePath.generic_string()},
+        }},
+        {"metadata", {
+            {"zero_winding_column", exportData.atlas.metadata.zeroWindingColumn},
+        }},
+        {"objects", {
+            {"line", lineObjects},
+        }},
+        {"maps", maps},
+    };
+    return exportData;
 }
 
 fs::path uniqueAtlasDirectory(const fs::path& volpkgRoot, const std::string& baseName)

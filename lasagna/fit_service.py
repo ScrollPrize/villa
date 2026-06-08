@@ -92,20 +92,41 @@ def _hash_bytes(data: bytes) -> str:
     return "md5:" + hashlib.md5(data).hexdigest()
 
 
+_SINGLE_FILE_OBJECT_TYPES = {"lasagna_model", "line", "line-map", "atlas"}
+_DIRECTORY_OBJECT_TYPES = {"tifxyz_segment", "atlas-base"}
+_SUPPORTED_OBJECT_TYPES = _SINGLE_FILE_OBJECT_TYPES | _DIRECTORY_OBJECT_TYPES
+_SUPPORTED_OBJECT_FORMATS = {
+    "line": {"vc3d_fiber_json"},
+    "line-map": {"vc3d_atlas_fiber_mapping_json"},
+    "atlas-base": {"tifxyz"},
+    "atlas": {"lasagna_atlas_json"},
+}
+
+
 def _validate_object_ref(ref: Any) -> dict[str, str]:
     if not isinstance(ref, dict):
         raise ValueError("object ref must be an object")
     obj_type = str(ref.get("type") or "").strip()
     name = str(ref.get("name") or "").strip()
     digest = str(ref.get("hash") or "").strip().lower()
-    if obj_type not in {"lasagna_model", "tifxyz_segment"}:
+    fmt = str(ref.get("format") or "").strip()
+    if obj_type not in _SUPPORTED_OBJECT_TYPES:
         raise ValueError(f"unsupported object type: {obj_type or '<missing>'}")
     if not name or Path(name).is_absolute() or ".." in Path(name).parts:
         raise ValueError("object name must be a non-empty relative path without '..'")
     if not digest.startswith("md5:") or len(digest) != 36:
         raise ValueError("object hash must be md5:<32 hex chars>")
     int(digest[4:], 16)
+    if fmt:
+        supported = _SUPPORTED_OBJECT_FORMATS.get(obj_type)
+        if supported is not None and fmt not in supported:
+            raise ValueError(f"unsupported object format for {obj_type}: {fmt}")
+        return {"type": obj_type, "name": name, "hash": digest, "format": fmt}
     return {"type": obj_type, "name": name, "hash": digest}
+
+
+def _object_identity(ref: dict[str, str]) -> dict[str, str]:
+    return {k: ref[k] for k in ("type", "name", "hash")}
 
 
 def _object_dir(ref: dict[str, str]) -> Path:
@@ -122,6 +143,8 @@ def _object_payload_path(ref: dict[str, str]) -> Path:
     base = _object_dir(ref)
     if ref["type"] == "lasagna_model":
         return base / "model.pt"
+    if ref["type"] in {"line", "line-map", "atlas"}:
+        return base / "data.json"
     return base / "segment"
 
 
@@ -138,9 +161,9 @@ def _object_present(ref_raw: Any) -> bool:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    if {k: meta.get(k) for k in ("type", "name", "hash")} != ref:
+    if {k: meta.get(k) for k in ("type", "name", "hash")} != _object_identity(ref):
         return False
-    return payload_path.is_file() if ref["type"] == "lasagna_model" else payload_path.is_dir()
+    return payload_path.is_file() if ref["type"] in _SINGLE_FILE_OBJECT_TYPES else payload_path.is_dir()
 
 
 def _segment_manifest_hash(files: dict[str, bytes]) -> str:
@@ -161,19 +184,24 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
     tmp_dir = Path(tempfile.mkdtemp(prefix="upload_", dir=str(tmp_parent)))
     final_dir = _object_dir(ref)
     try:
-        if ref["type"] == "lasagna_model":
+        if ref["type"] in _SINGLE_FILE_OBJECT_TYPES:
             data_b64 = body.get("data")
             if not isinstance(data_b64, str):
-                raise ValueError("lasagna_model upload requires base64 data")
+                raise ValueError(f"{ref['type']} upload requires base64 data")
             data = base64.b64decode(data_b64)
             actual_hash = _hash_bytes(data)
             if actual_hash != ref["hash"]:
-                raise ValueError(f"model hash mismatch: declared {ref['hash']} actual {actual_hash}")
-            (tmp_dir / "model.pt").write_bytes(data)
+                raise ValueError(f"object hash mismatch: declared {ref['hash']} actual {actual_hash}")
+            if ref["type"] in {"line", "line-map", "atlas"}:
+                try:
+                    json.loads(data.decode("utf-8"))
+                except Exception as exc:
+                    raise ValueError(f"{ref['type']} upload data must be UTF-8 JSON") from exc
+            (tmp_dir / _object_payload_path(ref).name).write_bytes(data)
         else:
             files_raw = body.get("files")
             if not isinstance(files_raw, dict) or not files_raw:
-                raise ValueError("tifxyz_segment upload requires non-empty files object")
+                raise ValueError(f"{ref['type']} upload requires non-empty files object")
             segment_dir = tmp_dir / "segment"
             segment_dir.mkdir(parents=True, exist_ok=True)
             decoded: dict[str, bytes] = {}
@@ -204,6 +232,64 @@ def _resolve_object_ref(ref_raw: Any) -> Path:
     if not _object_present(ref):
         raise ValueError(f"missing object: {ref['type']} {ref['name']} {ref['hash']}")
     return _object_payload_path(ref)
+
+
+def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
+    atlas_path = _resolve_object_ref(ref_raw)
+    try:
+        atlas_obj = json.loads(atlas_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"failed to load atlas JSON for object {ref_raw!r}: {exc}") from exc
+    if not isinstance(atlas_obj, dict):
+        raise ValueError("atlas object payload must be a JSON object")
+    if atlas_obj.get("type") != "lasagna_atlas" or int(atlas_obj.get("version", 0)) != 1:
+        raise ValueError("unsupported atlas payload; expected type=lasagna_atlas version=1")
+
+    resolved = json.loads(json.dumps(atlas_obj))
+    base = resolved.get("base")
+    if not isinstance(base, dict) or not isinstance(base.get("ref"), dict):
+        raise ValueError("atlas JSON requires base.ref")
+    base["path"] = str(_resolve_object_ref(base["ref"]))
+
+    objects = resolved.get("objects")
+    if not isinstance(objects, dict):
+        raise ValueError("atlas JSON requires objects")
+    line_by_id: dict[str, dict[str, Any]] = {}
+    line_entries = objects.get("line", [])
+    if not isinstance(line_entries, list):
+        raise ValueError("atlas JSON objects.line must be a list")
+    for i, item in enumerate(line_entries):
+        if not isinstance(item, dict):
+            raise ValueError(f"atlas JSON objects.line[{i}] must be an object")
+        ref = item.get("ref")
+        if not isinstance(ref, dict):
+            raise ValueError(f"atlas JSON objects.line[{i}] requires ref")
+        item["path"] = str(_resolve_object_ref(ref))
+        line_id = str(item.get("id") or ref.get("name") or "")
+        if line_id:
+            line_by_id[line_id] = item
+
+    maps = resolved.get("maps", [])
+    if not isinstance(maps, list):
+        raise ValueError("atlas JSON maps must be a list")
+    for i, item in enumerate(maps):
+        if not isinstance(item, dict):
+            raise ValueError(f"atlas JSON maps[{i}] must be an object")
+        if str(item.get("object_type") or "line") != "line":
+            raise ValueError(f"atlas JSON maps[{i}] unsupported object_type")
+        map_ref = item.get("map_ref")
+        if not isinstance(map_ref, dict):
+            raise ValueError(f"atlas JSON maps[{i}] requires map_ref")
+        item["map_path"] = str(_resolve_object_ref(map_ref))
+        obj_ref = item.get("object_ref")
+        if isinstance(obj_ref, dict):
+            item["object_path"] = str(_resolve_object_ref(obj_ref))
+        else:
+            object_id = str(item.get("object_id") or "")
+            line_obj = line_by_id.get(object_id)
+            if line_obj is not None and line_obj.get("path"):
+                item["object_path"] = str(line_obj["path"])
+    return resolved
 
 
 def _truthy_config_bool(value: Any) -> bool:
@@ -242,6 +328,8 @@ def _config_enables_pred_dt_flow_gate(cfg: dict[str, Any]) -> bool:
             continue
         opt_cfg = stage.get("global_opt")
         if not isinstance(opt_cfg, dict):
+            opt_cfg = stage.get("opt")
+        if not isinstance(opt_cfg, dict):
             opt_cfg = stage
         args = opt_cfg.get("args")
         if not isinstance(args, dict):
@@ -261,6 +349,8 @@ def _set_pred_dt_flow_gate_debug_out_dir(cfg: dict[str, Any], out_dir: str) -> N
             continue
         opt_cfg = stage.get("global_opt")
         if not isinstance(opt_cfg, dict):
+            opt_cfg = stage.get("opt")
+        if not isinstance(opt_cfg, dict):
             opt_cfg = stage
         args = opt_cfg.get("args")
         if not isinstance(args, dict):
@@ -278,6 +368,8 @@ def _set_snap_surf_map_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
         if not isinstance(stage, dict):
             continue
         opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage.get("opt")
         if not isinstance(opt_cfg, dict):
             opt_cfg = stage
         args = opt_cfg.get("args")
@@ -404,6 +496,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     resolved["config"] = resolved_cfg
     resolved["_job_spec_"] = {
         "model": spec.get("model"),
+        "atlas": spec.get("atlas"),
         "linked_surfaces": spec.get("linked_surfaces", []),
         "config": cfg,
     }
@@ -413,6 +506,10 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     model_ref = spec.get("model")
     if model_ref not in (None, {}, ""):
         resolved["model_input"] = str(_resolve_object_ref(model_ref))
+
+    atlas_ref = spec.get("atlas")
+    if atlas_ref not in (None, {}, ""):
+        resolved_cfg["atlas"] = _resolve_lasagna_atlas_ref(atlas_ref)
 
     linked_refs = spec.get("linked_surfaces", [])
     if linked_refs is None:
@@ -453,6 +550,8 @@ def _config_effective_loss_enabled(cfg: dict[str, Any], term_name: str) -> bool:
         if not isinstance(stage, dict):
             continue
         opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage.get("opt")
         if not isinstance(opt_cfg, dict):
             opt_cfg = stage
         try:
@@ -520,6 +619,8 @@ def _config_global_map_enabled(cfg: dict[str, Any]) -> bool:
         if not isinstance(stage, dict):
             continue
         opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage.get("opt")
         if not isinstance(opt_cfg, dict):
             opt_cfg = stage
         params = set(_stage_params_list(opt_cfg))
@@ -1067,9 +1168,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     model_init_requested = str(
         args_section_initial.get("model-init", args_section_initial.get("model_init", "seed"))
     ).strip().lower()
-    if model_init_requested not in {"seed", "ext", "model", "flatten"}:
+    if model_init_requested not in {"seed", "ext", "model", "flatten", "atlas"}:
         job.set_error(
-            f"invalid args.model-init '{model_init_requested}' (expected seed, ext, model, or flatten)"
+            f"invalid args.model-init '{model_init_requested}' (expected seed, ext, model, flatten, or atlas)"
         )
         return
     if not data_input and model_init_requested != "flatten":

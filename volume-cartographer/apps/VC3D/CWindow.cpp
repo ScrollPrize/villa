@@ -8,6 +8,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/atlas/Atlas.hpp"
 
 #include <iostream>
 
@@ -2476,9 +2477,8 @@ void CWindow::refreshAtlasOverviewDocks()
     const std::filesystem::path volpkgRoot = vpkg && !vpkg->path().empty()
         ? vpkg->path().parent_path()
         : std::filesystem::path{};
-    const std::filesystem::path atlasesRoot = volpkgRoot / "atlases";
 
-    auto populate = [this, &atlasesRoot](QDockWidget* dock) {
+    auto populate = [this, &volpkgRoot](QDockWidget* dock) {
         if (!dock) {
             return;
         }
@@ -2487,17 +2487,8 @@ void CWindow::refreshAtlasOverviewDocks()
             return;
         }
         tree->clear();
-        if (atlasesRoot.empty() || !std::filesystem::is_directory(atlasesRoot)) {
-            return;
-        }
-        std::vector<std::filesystem::path> atlasDirs;
-        for (const auto& entry : std::filesystem::directory_iterator(atlasesRoot)) {
-            if (entry.is_directory() && std::filesystem::exists(entry.path() / "metadata.json")) {
-                atlasDirs.push_back(entry.path());
-            }
-        }
-        std::sort(atlasDirs.begin(), atlasDirs.end());
-        for (const auto& atlasDir : atlasDirs) {
+        for (const auto& atlasInfo : vc::atlas::discoverAtlasDirectories(volpkgRoot)) {
+            const std::filesystem::path& atlasDir = atlasInfo.path;
             try {
                 const auto atlas = vc::atlas::Atlas::load(atlasDir);
                 auto* item = new QTreeWidgetItem(tree);

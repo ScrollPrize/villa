@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 
 class QuadSurface;
@@ -139,6 +140,30 @@ struct AtlasFiberSearchSets {
     std::vector<std::filesystem::path> targetFiberPaths;
 };
 
+struct AtlasDirectoryInfo {
+    std::filesystem::path path;
+    std::string name;
+};
+
+struct LasagnaAtlasObject {
+    std::string id;
+    std::filesystem::path fiberPath;
+    std::filesystem::path mappingPath;
+    std::filesystem::path fiberRelativePath;
+    std::filesystem::path mappingRelativePath;
+    int windingOffset = 0;
+};
+
+struct LasagnaAtlasExport {
+    Atlas atlas;
+    std::filesystem::path atlasDir;
+    std::filesystem::path volpkgRoot;
+    std::filesystem::path basePath;
+    std::filesystem::path baseRelativePath;
+    std::vector<LasagnaAtlasObject> objects;
+    nlohmann::json compactJson;
+};
+
 std::string sanitizeAtlasName(std::string name);
 std::string atlasFiberPathKey(const std::filesystem::path& path);
 std::vector<std::string> atlasMappedFiberPathKeys(const Atlas& atlas);
@@ -147,6 +172,11 @@ FiberRuntimeIdentityMap makeFiberRuntimeIdentityMap(
 AtlasFiberSearchSets atlasFiberSearchSets(
     const Atlas& atlas,
     const FiberRuntimeIdentityMap& runtimeIds);
+std::vector<AtlasDirectoryInfo> discoverAtlasDirectories(
+    const std::filesystem::path& volpkgRoot);
+LasagnaAtlasExport loadLasagnaAtlasExport(
+    const std::filesystem::path& atlasDir,
+    const std::filesystem::path& volpkgRoot = {});
 std::filesystem::path uniqueAtlasDirectory(const std::filesystem::path& volpkgRoot,
                                            const std::string& baseName);
 std::filesystem::path initShellDirectoryFromManifest(

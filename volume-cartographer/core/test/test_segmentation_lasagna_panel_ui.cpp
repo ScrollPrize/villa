@@ -20,6 +20,7 @@
 
 #include "CState.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <memory>
@@ -61,6 +62,23 @@ void writeFile(const QString& path, const QByteArray& bytes)
     QFile file(path);
     require(file.open(QIODevice::WriteOnly), "Failed to create temporary file");
     file.write(bytes);
+}
+
+void writeWrappedTifxyz(const QString& path)
+{
+    cv::Mat_<cv::Vec3f> points(3, 4);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            const int wrappedCol = (col == points.cols - 1) ? 0 : col;
+            points(row, col) = cv::Vec3f{
+                static_cast<float>(wrappedCol),
+                static_cast<float>(row),
+                0.0f,
+            };
+        }
+    }
+    QuadSurface surface(points, cv::Vec2f{1.0f, 1.0f});
+    surface.save(path.toStdString(), true);
 }
 
 } // namespace
@@ -408,6 +426,133 @@ int main(int argc, char** argv)
             "New Model launch should send the saved wraps width value");
     require(wrapJobArgs[QStringLiteral("model-w-unit")].toString() == QStringLiteral("wraps"),
             "New Model launch should send the wraps width unit");
+
+    const QString volpkgRoot = tempDir.filePath(QStringLiteral("sample.volpkg"));
+    require(QDir().mkpath(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/base_mesh/base.tifxyz")),
+            "Failed to create atlas base directory");
+    require(QDir().mkpath(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/mappings/fibers")),
+            "Failed to create atlas mappings directory");
+    require(QDir().mkpath(volpkgRoot + QStringLiteral("/fibers")),
+            "Failed to create atlas fibers directory");
+    writeWrappedTifxyz(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/base_mesh/base.tifxyz"));
+    writeFile(volpkgRoot + QStringLiteral("/fibers/fiber.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})"));
+    writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/mappings/fibers/fiber.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}]})"));
+    writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/metadata.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":3,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})"));
+
+    const QString projectPath = volpkgRoot + QStringLiteral("/project.volpkg");
+    writeFile(projectPath, QByteArrayLiteral(R"({"name":"atlas-test","version":1})"));
+    auto vpkg = VolumePkg::New(projectPath.toStdString());
+    state.setVpkg(vpkg);
+    panel.setState(&state);
+    require(panel._atlasCombo->count() == 1,
+            "Atlas combo should discover atlases from the current volpkg atlases directory");
+    require(panel._atlasCombo->currentData().toString().endsWith(QStringLiteral("atlases/fiber_atlas")),
+            "Atlas combo should select the discovered atlas directory");
+    require(panel._compactAtlasCombo->count() == panel._atlasCombo->count(),
+            "Compact atlas combo should mirror the full atlas combo");
+
+    panel._atlasConfigFilePath = configPath;
+    panel.populateConfigCombo(panel._atlasConfigCombo,
+                              QFileInfo(configPath).absolutePath(),
+                              QFileInfo(configPath).fileName(),
+                              panel._atlasConfigFilePath);
+    require(panel._compactAtlasConfigCombo->count() == panel._atlasConfigCombo->count(),
+            "Compact atlas config combo should mirror the full atlas config combo");
+    panel.setLasagnaDataInputPath(QStringLiteral("/data/atlas_input.lasagna.json"));
+    panel.startAtlasOptimization(&state, &statusBar);
+    QJsonObject atlasRequest = g_lastLasagnaOptimizationRequest;
+    require(atlasRequest[QStringLiteral("data_input")].toString() == QStringLiteral("/data/atlas_input.lasagna.json"),
+            "Atlas launch should send the selected data_input");
+    require(!atlasRequest.contains(QStringLiteral("single_segment")) &&
+                !atlasRequest.contains(QStringLiteral("copy_model")) &&
+                !atlasRequest.contains(QStringLiteral("model_input")),
+            "Atlas launch should not send segmentation/model launch flags");
+    QJsonObject atlasJobSpec = atlasRequest[QStringLiteral("job_spec")].toObject();
+    require(atlasJobSpec.contains(QStringLiteral("atlas")),
+            "Atlas launch should send job_spec.atlas");
+    require(!atlasJobSpec.contains(QStringLiteral("model")) &&
+                !atlasJobSpec.contains(QStringLiteral("linked_surfaces")),
+            "Atlas launch should not send model or linked surface refs");
+    QJsonArray atlasUploads = atlasRequest[QStringLiteral("_objects")].toArray();
+    require(atlasUploads.size() == 4,
+            "Atlas launch should upload base, line, line-map, and compact atlas objects");
+    bool sawBase = false;
+    bool sawLine = false;
+    bool sawMap = false;
+    bool sawAtlas = false;
+    QJsonObject compactAtlas;
+    for (const QJsonValue& value : atlasUploads) {
+        QJsonObject upload = value.toObject();
+        QJsonObject ref = upload[QStringLiteral("object")].toObject();
+        const QString type = ref[QStringLiteral("type")].toString();
+        sawBase = sawBase || type == QStringLiteral("atlas-base");
+        sawLine = sawLine || type == QStringLiteral("line");
+        sawMap = sawMap || type == QStringLiteral("line-map");
+        if (type == QStringLiteral("atlas")) {
+            sawAtlas = true;
+            QByteArray data = QByteArray::fromBase64(upload[QStringLiteral("data")].toString().toLatin1());
+            compactAtlas = QJsonDocument::fromJson(data).object();
+        }
+        require(type != QStringLiteral("tifxyz_segment") && type != QStringLiteral("lasagna_model"),
+                "Atlas launch should not upload selected segmentation or model objects");
+    }
+    require(sawBase && sawLine && sawMap && sawAtlas,
+            "Atlas launch should include the expected atlas object types");
+    QJsonObject compactMetadata = compactAtlas[QStringLiteral("metadata")].toObject();
+    require(compactMetadata[QStringLiteral("zero_winding_column")].toInt() == 1,
+            "Compact atlas JSON should include zero_winding_column");
+    require(!compactMetadata.contains(QStringLiteral("period_columns")) &&
+                !compactMetadata.contains(QStringLiteral("u_offset_columns")),
+            "Compact atlas JSON should omit period_columns and u_offset_columns");
+    QJsonObject compactMap = compactAtlas[QStringLiteral("maps")].toArray()[0].toObject();
+    require(compactMap[QStringLiteral("winding_offset")].toInt() == 2,
+            "Compact atlas JSON should include each map winding_offset");
+
+    panel._atlasDirPath = volpkgRoot + QStringLiteral("/atlases/missing_atlas");
+    panel.startAtlasOptimization(&state, &statusBar);
+    require(statusBar.currentMessage().contains(QStringLiteral("Atlas directory not found")),
+            "Atlas launch should fail clearly for a missing atlas directory");
+
+    const QString missingBaseAtlas = volpkgRoot + QStringLiteral("/atlases/missing_base");
+    require(QDir().mkpath(missingBaseAtlas + QStringLiteral("/mappings/fibers")),
+            "Failed to create missing-base atlas directory");
+    writeFile(missingBaseAtlas + QStringLiteral("/metadata.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":3,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})"));
+    writeFile(missingBaseAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})"));
+    panel._atlasDirPath = missingBaseAtlas;
+    panel.startAtlasOptimization(&state, &statusBar);
+    require(statusBar.currentMessage().contains(QStringLiteral("base mesh does not exist")),
+            "Atlas launch should fail clearly for a missing base mesh");
+
+    const QString missingFiberAtlas = volpkgRoot + QStringLiteral("/atlases/missing_fiber");
+    require(QDir().mkpath(missingFiberAtlas + QStringLiteral("/base_mesh/base.tifxyz")),
+            "Failed to create missing-fiber base directory");
+    require(QDir().mkpath(missingFiberAtlas + QStringLiteral("/mappings/fibers")),
+            "Failed to create missing-fiber mappings directory");
+    writeWrappedTifxyz(missingFiberAtlas + QStringLiteral("/base_mesh/base.tifxyz"));
+    writeFile(missingFiberAtlas + QStringLiteral("/metadata.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":3,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
+    writeFile(missingFiberAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})"));
+    panel._atlasDirPath = missingFiberAtlas;
+    panel.startAtlasOptimization(&state, &statusBar);
+    require(statusBar.currentMessage().contains(QStringLiteral("references missing fiber path")),
+            "Atlas launch should fail clearly for a missing fiber JSON");
+
+    const QString missingMapAtlas = volpkgRoot + QStringLiteral("/atlases/missing_map");
+    require(QDir().mkpath(missingMapAtlas + QStringLiteral("/base_mesh/base.tifxyz")),
+            "Failed to create missing-map base directory");
+    writeWrappedTifxyz(missingMapAtlas + QStringLiteral("/base_mesh/base.tifxyz"));
+    writeFile(missingMapAtlas + QStringLiteral("/metadata.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":3,"name":"missing_map","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
+    panel._atlasDirPath = missingMapAtlas;
+    panel.startAtlasOptimization(&state, &statusBar);
+    require(statusBar.currentMessage().contains(QStringLiteral("no fiber mappings directory")),
+            "Atlas launch should fail clearly for missing mapping files");
 
     return 0;
 }

@@ -134,7 +134,7 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             ${collapsible_settings_group_moc}
             ${cstate_lasagna_panel_moc}
             ${vccollection_lasagna_panel_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 

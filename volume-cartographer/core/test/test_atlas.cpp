@@ -7,6 +7,8 @@
 #include "vc/lasagna/Manifest.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
+#include <opencv2/imgcodecs.hpp>
+
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -100,6 +102,45 @@ std::string readText(const fs::path& path)
 {
     std::ifstream in(path);
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+void writeText(const fs::path& path, const std::string& text)
+{
+    fs::create_directories(path.parent_path());
+    std::ofstream out(path);
+    out << text;
+}
+
+void saveSurface(const fs::path& path, const std::shared_ptr<QuadSurface>& surface)
+{
+    fs::create_directories(path.parent_path());
+    surface->save(path, true);
+}
+
+void corruptWrappedSeam(const fs::path& tifxyzPath)
+{
+    cv::Mat x = cv::imread((tifxyzPath / "x.tif").string(), cv::IMREAD_UNCHANGED);
+    if (x.empty()) {
+        throw std::runtime_error("failed to read saved x.tif");
+    }
+    x.col(x.cols - 1).setTo(42.0f);
+    if (!cv::imwrite((tifxyzPath / "x.tif").string(), x)) {
+        throw std::runtime_error("failed to rewrite saved x.tif");
+    }
+}
+
+void writeValidLasagnaAtlasFixture(const fs::path& volpkgRoot,
+                                   const std::string& atlasName = "fiber_atlas")
+{
+    const fs::path atlasDir = volpkgRoot / "atlases" / atlasName;
+    saveSurface(atlasDir / "base_mesh" / "base.tifxyz", makeWrappedPlane(3, 3, 1.0));
+    writeText(volpkgRoot / "fibers" / "fiber.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})");
+    writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
+    writeText(atlasDir / "metadata.json",
+              R"({"type":"vc3d_atlas","version":3,"name":")" + atlasName +
+              R"(","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})");
 }
 
 } // namespace
@@ -201,6 +242,114 @@ TEST_CASE("Atlas loader accepts version 2 mappings without offsets and ignores s
     CHECK(loaded.links.empty());
     REQUIRE(loaded.fibers.size() == 1);
     CHECK(loaded.fibers[0].windingOffset == 0);
+}
+
+TEST_CASE("Atlas discovery lists metadata-backed atlas directories with display names")
+{
+    const fs::path root = tempRoot("vc_atlas_discovery");
+    writeValidLasagnaAtlasFixture(root, "fiber_atlas");
+    fs::create_directories(root / "atlases" / "not_an_atlas");
+    writeText(root / "atlases" / "not_an_atlas" / "metadata.json",
+              R"({"type":"something_else","name":"skip"})");
+
+    const auto atlases = vc::atlas::discoverAtlasDirectories(root);
+    REQUIRE(atlases.size() == 1);
+    CHECK(atlases[0].path == root / "atlases" / "fiber_atlas");
+    CHECK(atlases[0].name == "fiber_atlas");
+}
+
+TEST_CASE("Lasagna atlas export is derived from native atlas metadata and mappings")
+{
+    const fs::path root = tempRoot("vc_atlas_lasagna_export");
+    writeValidLasagnaAtlasFixture(root, "fiber_atlas");
+
+    const auto exported = vc::atlas::loadLasagnaAtlasExport(root / "atlases" / "fiber_atlas", root);
+    CHECK(exported.atlas.metadata.zeroWindingColumn == 1);
+    CHECK(exported.basePath == root / "atlases" / "fiber_atlas" / "base_mesh" / "base.tifxyz");
+    REQUIRE(exported.objects.size() == 1);
+    CHECK(exported.objects[0].id == "fibers/fiber.json");
+    CHECK(exported.objects[0].fiberPath == root / "fibers" / "fiber.json");
+    CHECK(exported.objects[0].mappingRelativePath == fs::path("mappings/fibers/fiber.json"));
+    CHECK(exported.objects[0].windingOffset == 2);
+
+    const auto& compact = exported.compactJson;
+    CHECK(compact.at("metadata").at("zero_winding_column").get<int>() == 1);
+    CHECK_FALSE(compact.at("metadata").contains("period_columns"));
+    CHECK_FALSE(compact.at("metadata").contains("u_offset_columns"));
+    REQUIRE(compact.at("maps").size() == 1);
+    CHECK(compact.at("maps")[0].at("winding_offset").get<int>() == 2);
+    CHECK(compact.at("maps")[0].at("mapping_path").get<std::string>() ==
+          "mappings/fibers/fiber.json");
+}
+
+TEST_CASE("Lasagna atlas export validates missing metadata base fibers and mappings")
+{
+    const fs::path root = tempRoot("vc_atlas_lasagna_export_validation");
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadLasagnaAtlasExport(root / "atlases" / "missing", root),
+        doctest::Contains("Atlas directory not found"),
+        std::runtime_error);
+
+    const fs::path missingMetadata = root / "atlases" / "missing_metadata";
+    fs::create_directories(missingMetadata);
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadLasagnaAtlasExport(missingMetadata, root),
+        doctest::Contains("Atlas metadata.json not found"),
+        std::runtime_error);
+
+    const fs::path missingBase = root / "atlases" / "missing_base";
+    writeText(missingBase / "metadata.json",
+              R"({"type":"vc3d_atlas","version":3,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})");
+    writeText(missingBase / "mappings" / "fibers" / "fiber.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadLasagnaAtlasExport(missingBase, root),
+        doctest::Contains("base mesh does not exist"),
+        std::runtime_error);
+
+    const fs::path missingFiber = root / "atlases" / "missing_fiber";
+    saveSurface(missingFiber / "base_mesh" / "base.tifxyz", makeWrappedPlane(3, 3, 1.0));
+    writeText(missingFiber / "metadata.json",
+              R"({"type":"vc3d_atlas","version":3,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+    writeText(missingFiber / "mappings" / "fibers" / "fiber.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})");
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadLasagnaAtlasExport(missingFiber, root),
+        doctest::Contains("references missing fiber path"),
+        std::runtime_error);
+
+    const fs::path missingMap = root / "atlases" / "missing_map";
+    saveSurface(missingMap / "base_mesh" / "base.tifxyz", makeWrappedPlane(3, 3, 1.0));
+    writeText(missingMap / "metadata.json",
+              R"({"type":"vc3d_atlas","version":3,"name":"missing_map","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadLasagnaAtlasExport(missingMap, root),
+        doctest::Contains("no fiber mappings directory"),
+        std::runtime_error);
+}
+
+TEST_CASE("Lasagna atlas export rejects non-wrapped base shells")
+{
+    const fs::path root = tempRoot("vc_atlas_lasagna_export_nonwrapped");
+    const fs::path atlasDir = root / "atlases" / "nonwrapped";
+    saveSurface(atlasDir / "base_mesh" / "base.tifxyz", makeWrappedPlane(3, 3, 1.0));
+    corruptWrappedSeam(atlasDir / "base_mesh" / "base.tifxyz");
+    writeText(root / "fibers" / "fiber.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})");
+    writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
+    writeText(atlasDir / "metadata.json",
+              R"({"type":"vc3d_atlas","version":3,"name":"nonwrapped","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::atlasHorizontalPeriodColumns(QuadSurface(atlasDir / "base_mesh" / "base.tifxyz")),
+        doctest::Contains("not explicitly wrapped"),
+        std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadLasagnaAtlasExport(atlasDir, root),
+        doctest::Contains("not explicitly wrapped"),
+        std::runtime_error);
 }
 
 TEST_CASE("Atlas fiber runtime identity map uses canonical paths, not numeric stems")
