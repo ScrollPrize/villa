@@ -159,6 +159,10 @@ default_config = {
     'weight_decay_flow_field': 0.0,
     'loss_start_patch_dt': 25_000,
     'loss_start_track_dt': 10_000,
+    'dt_progressive_windings': False,  # gate the DT losses (patch, track, unattached-pcl) to grow outwards across windings
+    'dt_progressive_inner_winding': 20,  # outer-winding cutoff when each DT loss first turns on
+    'dt_progressive_steps': 50_000,  # steps to grow the cutoff from start_winding to shell_outer_winding_idx
+    'dt_progressive_exponent': 1.0,  # warp on the time fraction; 1.0 = linear in winding, <1 = slower later (~0.5 ≈ constant area rate)
     'num_snapping_subpasses': 0,
     'snapping_steps_per_subpass': 500,
     'snapping_num_anchor_points': 2000,
@@ -1116,6 +1120,29 @@ class PatchGpuAtlas:
         return top + (bottom - top) * di
 
 
+def _aggregate_dt_track_losses(track_losses, across_p, active_mask=None):
+    # Power-mean across tracks/patches: ((sum x^p) / n)^(1/p). When `active_mask` is given
+    # (progressive DT gating), only the masked-in tracks contribute and n is the number active;
+    # returns a zero scalar when none are active.
+    if active_mask is not None:
+        track_losses = track_losses[active_mask]
+    if track_losses.numel() == 0:
+        return torch.zeros([], device=track_losses.device)
+    return ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
+
+
+def _progressive_dt_active_mask(snapped_winding, dr_per_winding, dt_max_winding):
+    # Boolean mask over tracks/patches whose snapped spiral-space winding index is within the
+    # progressive cutoff (see get_progressive_dt_max_winding); None when gating is disabled.
+    # `snapped_winding` is the per-track round(median(shifted_radius)/dr)*dr target (sampled in
+    # scroll space, transformed to spiral space upstream); we divide dr_per_winding back out to
+    # recover the integer winding index.
+    if dt_max_winding is None:
+        return None
+    winding_idx = (snapped_winding / dr_per_winding).detach()
+    return winding_idx <= dt_max_winding
+
+
 def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, extra_zyxs=None):
     if len(patch_indices) == 0:
         raise ValueError('Expected at least one patch index')
@@ -1220,7 +1247,7 @@ def _get_patch_valid_points(patch, device, max_points=None, fixed_num_points=Non
     return patch.zyxs[valid_indices[0], valid_indices[1], :].to(device=device, dtype=torch.float32)
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None):
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None):
 
     # Sample once and share the tracks between the radius and DT losses; the loss using
     # fewer patches takes a prefix of the larger sample.
@@ -1321,7 +1348,9 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         point_distances = torch.linalg.norm(dt_slice_zyxs - target_scroll_zyxs, dim=-1)
         point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5  # epsilon to avoid NaN in p-norm backward
         track_losses = (point_distances ** within_patch_norm_p).mean(dim=-1) ** (1 / within_patch_norm_p)
-        patch_dt_loss = ((track_losses ** dt_norm_p).sum() / track_losses.numel()) ** (1 / dt_norm_p)
+        # Progressive DT: only patches whose snapped winding is within the current cutoff contribute.
+        active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
+        patch_dt_loss = _aggregate_dt_track_losses(track_losses, dt_norm_p, active_mask)
     else:
         patch_dt_loss = torch.zeros([], device=dr_per_winding.device)
 
@@ -2024,6 +2053,7 @@ def get_unattached_pcl_strip_losses(
     num_pcls_per_step,
     num_points_per_pcl,
     compute_dt,
+    dt_max_winding=None,
 ):
     # Unattached pcls are treated as ordered strips, indexed by int(point_id), and
     # assumed to be locally dense enough that adjacent samples have |dtheta| < pi
@@ -2088,7 +2118,11 @@ def get_unattached_pcl_strip_losses(
     point_distances = torch.linalg.norm(zyxs_t - target_scroll_zyxs, dim=-1)
     point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
     track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
-    dt_loss = ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
+    # Progressive DT: only strips whose snapped (raw, spiral-space) winding is within the current
+    # cutoff contribute. Use shifted_radii (the strip's actual spiral position), not normalised_radii.
+    strip_snapped_winding = torch.round(shifted_radii.median(dim=-1).values / dr_per_winding) * dr_per_winding
+    active_mask = _progressive_dt_active_mask(strip_snapped_winding, dr_per_winding, dt_max_winding)
+    dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
 
     return radius_loss, dt_loss
 
@@ -3917,7 +3951,7 @@ def get_track_em_losses(
     return {'track_radius': radius_loss, 'track_dt': dt_loss, 'track_coverage': coverage_loss}
 
 
-def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, num_tracks_per_step, num_points_per_track, compute_dt=True):
+def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, num_tracks_per_step, num_points_per_track, compute_dt=True, dt_max_winding=None):
     # Sample K tracks (with replacement) and M points per track, transform to spiral space, and
     # compute two losses analogous to the patch radius/DT losses: (1) each point's deviation
     # from the track's mean shifted-radius beyond the radius hinge margin; (2) each point
@@ -3956,7 +3990,9 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
     point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
     point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
     track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
-    dt_loss = ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
+    # Progressive DT: only tracks whose snapped winding is within the current cutoff contribute.
+    active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
+    dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
 
     return radius_loss, dt_loss
 
@@ -4109,6 +4145,34 @@ def get_flow_field_high_res_lr_scale(iteration):
     ramp_steps = max(1, int(cfg['flow_field_high_res_lr_ramp_steps']))
     frac = min(1., max(0., (iteration - start_step) / ramp_steps))
     return min(1., initial + frac * (final - initial))
+
+
+def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding_idx):
+    # When `dt_progressive_windings` is set, the DT losses (patch, track, unattached-pcl) only act
+    # on tracks/patches whose snapped spiral-space winding is <= the returned cutoff. The cutoff
+    # grows outwards from `dt_progressive_inner_winding` (when the DT loss first turns on, at
+    # `dt_start_step`) to `shell_outer_winding_idx` over `dt_progressive_steps` steps, so the
+    # constraint expands across windings even after it has started. Returns None to disable gating
+    # (include everything) -- when the feature is off, or no outer winding is known.
+    #
+    # The membership test lives in spiral space, but tracks/patches are sampled in scroll space;
+    # callers reuse the per-track snapped winding (round(median(shifted_radius)/dr)) already needed
+    # for the DT target, so deciding inclusion needs no extra transform (only a handful of points).
+    #
+    # `dt_progressive_exponent` warps the linear time fraction f -> f**exponent before mapping to
+    # the winding cutoff. exponent == 1 grows the winding index (radius) linearly; exponent < 1 is
+    # concave (fast early, slow late), so the outermost windings -- which gain area/volume
+    # quadratically -- expand more slowly and get more time to catch up (~0.5 ≈ constant
+    # area-introduction rate); exponent > 1 is the opposite.
+    if not cfg['dt_progressive_windings'] or shell_outer_winding_idx is None:
+        return None
+    span = max(1, int(cfg['dt_progressive_steps']))
+    f = min(1., max(0., (iteration - dt_start_step) / span))
+    exponent = float(cfg['dt_progressive_exponent'])
+    f_warped = f ** exponent if exponent != 1.0 else f
+    w_inner = float(cfg['dt_progressive_inner_winding'])
+    w_outer = float(shell_outer_winding_idx)
+    return w_inner + (w_outer - w_inner) * f_warped
 
 
 def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, tracks, pcl_normal_samples, lasagna_volume, shell_patch, z_to_umbilicus_yx, out_path):
@@ -4407,6 +4471,18 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
         track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
         compute_track_dt = iteration > track_dt_start
+
+        # Progressive-outward DT gating: winding cutoff that grows from the respective DT start
+        # step. Falls back to the configured shell_outer_winding_idx when shell losses are off so
+        # the feature still works; None => no gating.
+        dt_progressive_outer = shell_outer_winding_idx if shell_outer_winding_idx is not None else cfg['shell_outer_winding_idx']
+        patch_dt_max_winding = get_progressive_dt_max_winding(iteration, cfg['loss_start_patch_dt'], dt_progressive_outer)
+        track_dt_max_winding = get_progressive_dt_max_winding(iteration, track_dt_start, dt_progressive_outer)
+        if patch_dt_max_winding is not None:
+            log_metrics['patch_dt_max_winding'] = patch_dt_max_winding
+        if track_dt_max_winding is not None:
+            log_metrics['track_dt_max_winding'] = track_dt_max_winding
+
         patch_radius_loss, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss = get_patch_and_umbilicus_losses(
             slice_to_spiral_transform,
             dr_per_winding,
@@ -4419,6 +4495,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             compute_dt=compute_patch_dt,
             shell_valid_zyxs=shell_valid_zyxs_gpu,
             shell_outer_winding_idx=shell_outer_winding_idx,
+            dt_max_winding=patch_dt_max_winding,
         )
         losses['patch_radius'] = patch_radius_loss * cfg['loss_weight_patch_radius']
         losses['patch_dt'] = patch_dt_loss * cfg['loss_weight_patch_dt']
@@ -4482,6 +4559,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 cfg['unattached_pcl_num_per_step'],
                 cfg['unattached_pcl_num_points_per_step'],
                 compute_dt=compute_patch_dt,
+                dt_max_winding=patch_dt_max_winding,
             )
             losses['unattached_pcl_radius'] = unattached_pcl_radius_loss * cfg['loss_weight_unattached_pcl_radius']
             losses['unattached_pcl_dt'] = unattached_pcl_dt_loss * cfg['loss_weight_unattached_pcl_dt']
@@ -4545,6 +4623,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                     cfg['track_num_per_step'],
                     cfg['track_num_points_per_step'],
                     compute_dt=(not use_track_em) and compute_track_dt,
+                    dt_max_winding=track_dt_max_winding,
                 )
                 losses['track_radius'] = track_radius_loss * cfg['loss_weight_track_radius']
                 losses['track_dt'] = track_dt_loss * cfg['loss_weight_track_dt']
