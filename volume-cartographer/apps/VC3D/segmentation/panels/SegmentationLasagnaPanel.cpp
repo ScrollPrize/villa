@@ -1361,9 +1361,20 @@ void SegmentationLasagnaPanel::setState(CState* state)
         QObject::disconnect(_stateSurfaceChangedConnection);
         _stateSurfaceChangedConnection = {};
     }
+    if (_stateVpkgChangedConnection) {
+        QObject::disconnect(_stateVpkgChangedConnection);
+        _stateVpkgChangedConnection = {};
+    }
     _state = state;
     refreshAtlasComboFromState();
     if (_state) {
+        _stateVpkgChangedConnection = connect(
+            _state,
+            &CState::vpkgChanged,
+            this,
+            [this](std::shared_ptr<VolumePkg>) {
+                refreshAtlasComboFromState();
+            });
         _stateSurfaceChangedConnection = connect(
             _state,
             &CState::surfaceChanged,

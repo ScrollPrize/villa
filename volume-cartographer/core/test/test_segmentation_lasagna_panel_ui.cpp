@@ -445,10 +445,11 @@ int main(int argc, char** argv)
     const QString projectPath = volpkgRoot + QStringLiteral("/project.volpkg");
     writeFile(projectPath, QByteArrayLiteral(R"({"name":"atlas-test","version":1})"));
     auto vpkg = VolumePkg::New(projectPath.toStdString());
+    require(panel._atlasCombo->count() == 0,
+            "Atlas combo should be empty before a volume package is loaded");
     state.setVpkg(vpkg);
-    panel.setState(&state);
     require(panel._atlasCombo->count() == 1,
-            "Atlas combo should discover atlases from the current volpkg atlases directory");
+            "Atlas combo should refresh when the state's volume package changes");
     require(panel._atlasCombo->currentData().toString().endsWith(QStringLiteral("atlases/fiber_atlas")),
             "Atlas combo should select the discovered atlas directory");
     require(panel._compactAtlasCombo->count() == panel._atlasCombo->count(),

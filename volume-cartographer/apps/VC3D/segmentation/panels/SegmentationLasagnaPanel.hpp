@@ -214,6 +214,7 @@ private:
     bool _restoringSettings{false};
     const QString _settingsGroup;
     CState* _state{nullptr};
+    QMetaObject::Connection _stateVpkgChangedConnection;
     QMetaObject::Connection _stateSurfaceChangedConnection;
     QSet<QString> _submittedOutputNames;
 };
