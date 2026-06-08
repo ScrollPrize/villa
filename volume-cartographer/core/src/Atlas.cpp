@@ -1,5 +1,6 @@
 #include "vc/atlas/Atlas.hpp"
 
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/lasagna/Manifest.hpp"
@@ -1487,6 +1488,39 @@ double actualAtlasU(const AtlasAnchor& anchor,
         return anchor.atlasU;
     }
     return anchor.atlasU + static_cast<double>(fiber.windingOffset * periodColumns);
+}
+
+std::optional<cv::Vec3d> atlasBasePointAt(double atlasU,
+                                          double atlasV,
+                                          const QuadSurface& baseSurface)
+{
+    const auto* points = baseSurface.rawPointsPtr();
+    if (!points || points->empty() ||
+        !std::isfinite(atlasU) || !std::isfinite(atlasV)) {
+        return std::nullopt;
+    }
+    const int periodColumns = atlasHorizontalPeriodColumns(baseSurface);
+    const double baseU = normalizeAtlasU(atlasU, periodColumns);
+    const cv::Vec2d grid{baseU, atlasV};
+    if (!loc_valid_xy(*points, grid)) {
+        return std::nullopt;
+    }
+    const cv::Vec3f p = at_int(*points, cv::Vec2f(static_cast<float>(baseU),
+                                                  static_cast<float>(atlasV)));
+    if (!finitePoint(p)) {
+        return std::nullopt;
+    }
+    return toVec3d(p);
+}
+
+std::optional<cv::Vec3d> atlasAnchorBasePoint(const AtlasAnchor& anchor,
+                                              const FiberMapping& fiber,
+                                              const QuadSurface& baseSurface)
+{
+    const int periodColumns = atlasHorizontalPeriodColumns(baseSurface);
+    return atlasBasePointAt(actualAtlasU(anchor, fiber, periodColumns),
+                            anchor.atlasV,
+                            baseSurface);
 }
 
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)

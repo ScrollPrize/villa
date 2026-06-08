@@ -717,6 +717,26 @@ TEST_CASE("Atlas grid coordinates convert to QuadSurface surface coordinates wit
     CHECK(!std::isfinite(invalidCoord[1]));
 }
 
+TEST_CASE("Atlas base point helper samples wrapped base mesh at anchor coordinates")
+{
+    auto surface = makeWrappedPlane(4, 4, 0.0);
+    const auto p = vc::atlas::atlasBasePointAt(5.5, 1.25, *surface);
+    REQUIRE(p.has_value());
+    CHECK((*p)[0] == doctest::Approx(1.5));
+    CHECK((*p)[1] == doctest::Approx(1.25));
+    CHECK((*p)[2] == doctest::Approx(0.0));
+
+    vc::atlas::FiberMapping mapping;
+    mapping.windingOffset = 1;
+    vc::atlas::AtlasAnchor anchor;
+    anchor.atlasU = 1.5;
+    anchor.atlasV = 1.25;
+    const auto viaAnchor = vc::atlas::atlasAnchorBasePoint(anchor, mapping, *surface);
+    REQUIRE(viaAnchor.has_value());
+    CHECK((*viaAnchor)[0] == doctest::Approx(1.5));
+    CHECK((*viaAnchor)[1] == doctest::Approx(1.25));
+}
+
 TEST_CASE("Atlas wrapped shell period uses unique columns")
 {
     cv::Mat_<cv::Vec3f> points(2, 5);

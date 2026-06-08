@@ -209,6 +209,12 @@ int atlasWindingForColumn(double atlasU, int periodColumns, int zeroWindingColum
 double actualAtlasU(const AtlasAnchor& anchor,
                     const FiberMapping& fiber,
                     int periodColumns);
+std::optional<cv::Vec3d> atlasBasePointAt(double atlasU,
+                                          double atlasV,
+                                          const QuadSurface& baseSurface);
+std::optional<cv::Vec3d> atlasAnchorBasePoint(const AtlasAnchor& anchor,
+                                              const FiberMapping& fiber,
+                                              const QuadSurface& baseSurface);
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns);
 void layoutAtlasObjects(Atlas& atlas, int periodColumns);
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
