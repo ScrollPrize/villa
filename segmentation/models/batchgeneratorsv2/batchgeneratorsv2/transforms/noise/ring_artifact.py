@@ -51,6 +51,8 @@ class RingArtifactTransform(ImageOnlyTransform):
         Gaussian sigma of a ring, in voxels.
     radius_range : Tuple[float, float]
         Fraction of the maximum in-plane radius where ring centers may fall.
+        Kept strictly inside (0, 1) so a ring never degenerates into a central
+        blob (r -> 0) or a corner-only arc (r -> r_max).
     center_offset : RandomScalar
         Center-of-rotation jitter as a fraction of the plane half-size, applied
         independently to each in-plane axis.
@@ -63,6 +65,11 @@ class RingArtifactTransform(ImageOnlyTransform):
         rings are extruded. One is sampled per affected channel from the
         non-singleton subset. None -> all non-singleton spatial axes are
         candidates. Ignored for 2-D input.
+        For anisotropic data with a distinct acquisition axis (e.g. scroll CT,
+        where the scan/rotation axis is the long axis), set this to that axis so
+        rings lie in the true reconstruction plane; leaving it None randomizes
+        the plane across all spatial axes, which on anisotropic patches can place
+        artifacts in non-physical orientations.
     p_per_channel : float
         Probability of applying the transform to each channel.
     synchronize_channels : bool
@@ -77,7 +84,7 @@ class RingArtifactTransform(ImageOnlyTransform):
                  num_rings: RandomScalar = (1, 5),
                  intensity: RandomScalar = (0.05, 0.3),
                  ring_width: RandomScalar = (0.5, 3.0),
-                 radius_range: Tuple[float, float] = (0.0, 1.0),
+                 radius_range: Tuple[float, float] = (0.1, 0.9),
                  center_offset: RandomScalar = (-0.05, 0.05),
                  p_negative: float = 0.5,
                  relative_to_std: bool = True,
