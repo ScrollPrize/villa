@@ -936,9 +936,9 @@ void LineAnnotationDialog::installGeneratedViewShortcuts()
     bindRotationShortcut(Qt::Key_S, GeneratedCutRotationAxis::Horizontal, -kCurrentCutRotationStepRadians);
     bindRotationShortcut(Qt::Key_A, GeneratedCutRotationAxis::Vertical, -kCurrentCutRotationStepRadians);
     bindRotationShortcut(Qt::Key_D, GeneratedCutRotationAxis::Vertical, kCurrentCutRotationStepRadians);
-    bindNavigationShortcut(Qt::Key_Y, &LineAnnotationDialog::jumpToPreviousControlPoint);
-    bindNavigationShortcut(Qt::Key_C, &LineAnnotationDialog::jumpToNextControlPoint);
-    bindNavigationShortcut(Qt::Key_X, &LineAnnotationDialog::previewClosestControlPoint);
+    bindNavigationShortcut(Qt::Key_E, &LineAnnotationDialog::jumpToPreviousControlPoint);
+    bindNavigationShortcut(Qt::Key_R, &LineAnnotationDialog::previewClosestControlPoint);
+    bindNavigationShortcut(Qt::Key_T, &LineAnnotationDialog::jumpToNextControlPoint);
 }
 
 cv::Vec3f LineAnnotationDialog::currentCutViewerCenterVolumePoint() const
