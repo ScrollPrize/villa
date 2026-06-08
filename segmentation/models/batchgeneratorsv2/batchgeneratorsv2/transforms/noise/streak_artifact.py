@@ -44,6 +44,10 @@ class StreakArtifactTransform(ImageOnlyTransform):
         Scale amplitudes by per-channel spatial std.
     streak_axes : Optional[List[int]]
         Candidate scan/extrusion axes (0-based spatial). None -> all non-singleton.
+        For anisotropic data with a distinct acquisition axis (e.g. scroll CT),
+        set this to the scan/rotation axis so streaks lie in the true
+        reconstruction plane; None randomizes across all spatial axes and can
+        place streaks in non-physical orientations on anisotropic patches.
     p_per_channel : float
     synchronize_channels : bool
     benchmark : bool
