@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
+
 import torch
 
 import model as fit_model
@@ -11,19 +14,141 @@ _cols: torch.Tensor | None = None
 _frac_h: torch.Tensor | None = None
 _frac_w: torch.Tensor | None = None
 _last_stats: dict[str, float] = {}
+_last_debug_payload: "AtlasLineDebugPayload | None" = None
+
+
+@dataclass(frozen=True)
+class AtlasLineDebugPayload:
+	model_xyz: torch.Tensor
+	valid: torch.Tensor
+	target_xyz: torch.Tensor
+	hit_xyz: torch.Tensor
+	model_normal: torch.Tensor
+	signed_delta: torch.Tensor
+	is_control: torch.Tensor
 
 
 def reset_state() -> None:
-	global _rows, _cols, _frac_h, _frac_w, _last_stats
+	global _rows, _cols, _frac_h, _frac_w, _last_stats, _last_debug_payload
 	_rows = None
 	_cols = None
 	_frac_h = None
 	_frac_w = None
 	_last_stats = {}
+	_last_debug_payload = None
 
 
 def last_stats() -> dict[str, float]:
 	return dict(_last_stats)
+
+
+def last_debug_payload() -> AtlasLineDebugPayload | None:
+	return _last_debug_payload
+
+
+def _empty_debug_payload(*, res: fit_model.FitResult3D, lines) -> AtlasLineDebugPayload:
+	D = int(res.xyz_lr.shape[0])
+	K = int(lines.target_xyz.shape[0])
+	return AtlasLineDebugPayload(
+		model_xyz=res.xyz_lr.detach().cpu(),
+		valid=torch.zeros((D, K), dtype=torch.bool),
+		target_xyz=torch.full((D, K, 3), float("nan"), dtype=torch.float32),
+		hit_xyz=torch.full((D, K, 3), float("nan"), dtype=torch.float32),
+		model_normal=torch.full((D, K, 3), float("nan"), dtype=torch.float32),
+		signed_delta=torch.full((D, K), float("nan"), dtype=torch.float32),
+		is_control=torch.zeros((D, K), dtype=torch.bool),
+	)
+
+
+def _write_obj_mesh(path: Path, xyz: torch.Tensor) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	xyz_cpu = xyz.detach().cpu()
+	H, W, _ = xyz_cpu.shape
+	index = torch.zeros((H, W), dtype=torch.long)
+	next_index = 1
+	lines = ["o model_surface\n"]
+	for h in range(H):
+		for w in range(W):
+			p = xyz_cpu[h, w]
+			if not bool(torch.isfinite(p).all()):
+				continue
+			index[h, w] = next_index
+			next_index += 1
+			lines.append(f"v {float(p[0]):.9g} {float(p[1]):.9g} {float(p[2]):.9g}\n")
+	for h in range(max(0, H - 1)):
+		for w in range(max(0, W - 1)):
+			v00 = int(index[h, w])
+			v10 = int(index[h + 1, w])
+			v11 = int(index[h + 1, w + 1])
+			v01 = int(index[h, w + 1])
+			if v00 and v10 and v11 and v01:
+				lines.append(f"f {v00} {v10} {v11} {v01}\n")
+	path.write_text("".join(lines), encoding="utf-8")
+
+
+def _write_obj_lines(path: Path, start: torch.Tensor, end: torch.Tensor, valid: torch.Tensor, *, label: str) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	start_cpu = start.detach().cpu().reshape(-1, 3)
+	end_cpu = end.detach().cpu().reshape(-1, 3)
+	valid_cpu = valid.detach().cpu().reshape(-1).to(dtype=torch.bool)
+	lines = [f"o {label}\n"]
+	vertex_index = 1
+	for a, b, ok in zip(start_cpu, end_cpu, valid_cpu):
+		if not bool(ok):
+			continue
+		if not bool(torch.isfinite(a).all() and torch.isfinite(b).all()):
+			continue
+		lines.append(f"v {float(a[0]):.9g} {float(a[1]):.9g} {float(a[2]):.9g}\n")
+		lines.append(f"v {float(b[0]):.9g} {float(b[1]):.9g} {float(b[2]):.9g}\n")
+		lines.append(f"l {vertex_index} {vertex_index + 1}\n")
+		vertex_index += 2
+	path.write_text("".join(lines), encoding="utf-8")
+
+
+def _debug_stage_label(stage: str) -> str:
+	return str(stage).replace("/", "_").replace("\\", "_")
+
+
+def write_debug_objs(*, stage: str, step: int, interval: int = 1,
+					 payload: AtlasLineDebugPayload | None = None) -> Path | None:
+	payload = _last_debug_payload if payload is None else payload
+	if payload is None:
+		return None
+	interval = max(1, int(interval))
+	step_i = int(step)
+	if step_i % interval != 0:
+		return None
+	root = Path.cwd() / "atlas_debug_objs" / f"{_debug_stage_label(stage)}_step{step_i:06d}"
+	model_xyz = payload.model_xyz
+	valid = payload.valid.to(dtype=torch.bool)
+	control = payload.is_control.to(dtype=torch.bool)
+	normal_target = payload.hit_xyz + payload.signed_delta.unsqueeze(-1) * payload.model_normal
+	for d in range(int(model_xyz.shape[0])):
+		wdir = root / f"winding_{d:03d}"
+		wdir.mkdir(parents=True, exist_ok=True)
+		_write_obj_mesh(wdir / "model_surface.obj", model_xyz[d])
+		_write_obj_lines(
+			wdir / "control_connections.obj",
+			payload.hit_xyz[d],
+			payload.target_xyz[d],
+			valid[d] & control[d],
+			label="control_connections",
+		)
+		_write_obj_lines(
+			wdir / "other_connections.obj",
+			payload.hit_xyz[d],
+			payload.target_xyz[d],
+			valid[d] & ~control[d],
+			label="other_connections",
+		)
+		_write_obj_lines(
+			wdir / "normal_proxy.obj",
+			payload.hit_xyz[d],
+			normal_target[d],
+			valid[d],
+			label="normal_proxy",
+		)
+	return root
 
 
 def _ensure_state(*, res: fit_model.FitResult3D) -> None:
@@ -185,13 +310,17 @@ def _loss_from_splats(
 def atlas_line_loss(
 	*, res: fit_model.FitResult3D,
 	stage_eff: dict[str, float] | None = None,
+	debug_payload: bool = False,
 ) -> dict[str, tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]]:
-	global _rows, _cols, _frac_h, _frac_w, _last_stats
+	global _rows, _cols, _frac_h, _frac_w, _last_stats, _last_debug_payload
+	_last_debug_payload = None
 	lines = getattr(res.data, "atlas_lines", None)
 	if lines is None:
 		raise ValueError("atlas_line loss requires FitData3D.atlas_lines")
 	if int(lines.target_xyz.shape[0]) <= 0:
 		item = _zero_item(res)
+		if debug_payload:
+			_last_debug_payload = _empty_debug_payload(res=res, lines=lines)
 		return {"atlas_line": item, "atlas_line_control": item, "atlas_line_other": item}
 
 	_ensure_state(res=res)
@@ -230,6 +359,8 @@ def atlas_line_loss(
 	control_active_verts = 0.0
 	other_active_verts = 0.0
 	signed_delta_mean = 0.0
+	if debug_payload:
+		_last_debug_payload = _empty_debug_payload(res=res, lines=lines)
 
 	if bool(active_k.any().detach().cpu()):
 		active_idx = torch.nonzero(active_k, as_tuple=False).flatten()
@@ -298,6 +429,28 @@ def atlas_line_loss(
 		with torch.no_grad():
 			if bool(valid_active.any().detach().cpu()):
 				signed_delta_mean = float(signed_delta[valid_active].mean().detach().cpu())
+			if debug_payload:
+				idx_cpu = active_idx.detach().cpu()
+				target_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
+				hit_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
+				normal_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
+				signed_full = torch.full((D, K), float("nan"), dtype=torch.float32)
+				valid_full = torch.zeros((D, K), dtype=torch.bool)
+				control_full = control_k.view(1, K).expand(D, K).detach().cpu().to(dtype=torch.bool)
+				target_full[:, idx_cpu] = target.detach().cpu().to(dtype=torch.float32)
+				hit_full[:, idx_cpu] = hit_xyz.detach().cpu().to(dtype=torch.float32)
+				normal_full[:, idx_cpu] = model_n.detach().cpu().to(dtype=torch.float32)
+				signed_full[:, idx_cpu] = signed_delta.detach().cpu().to(dtype=torch.float32)
+				valid_full[:, idx_cpu] = valid_active.detach().cpu().to(dtype=torch.bool)
+				_last_debug_payload = AtlasLineDebugPayload(
+					model_xyz=res.xyz_lr.detach().cpu(),
+					valid=valid_full,
+					target_xyz=target_full,
+					hit_xyz=hit_full,
+					model_normal=normal_full,
+					signed_delta=signed_full,
+					is_control=control_full,
+				)
 
 		combined_loss, combined_maps, combined_masks, combined_active_verts = _loss_from_splats(
 			res=res,

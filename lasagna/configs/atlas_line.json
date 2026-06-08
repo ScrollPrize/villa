@@ -17,9 +17,13 @@
     {
       "name": "atlas_init_relax",
       "opt": {
-        "steps": 500,
+        "steps": 1,
         "lr": 0.01,
         "params": ["mesh_ms"],
+        "args": {
+          "atlas_debug_objs": true,
+          "atlas_debug_obj_interval": 1
+        },
         "w_fac": {
           "atlas_line_control": 0.000001,
           "atlas_line_other": 0.000001
@@ -29,7 +33,7 @@
     {
       "name": "atlas_line_fit",
       "opt": {
-        "steps": 2000,
+        "steps": 0,
         "lr": 0.01,
         "params": ["mesh_ms"],
         "w_fac": {

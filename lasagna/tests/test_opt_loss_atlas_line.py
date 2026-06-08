@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -13,6 +15,7 @@ if ROOT not in sys.path:
 
 import fit_data
 import model as fit_model
+import optimizer
 import opt_loss_atlas_line
 
 
@@ -85,6 +88,174 @@ def _plane_grid() -> torch.Tensor:
 
 
 class AtlasLineLossTest(unittest.TestCase):
+	def test_debug_payload_is_only_generated_when_requested(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0], dtype=torch.float32),
+		)
+
+		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines))
+		self.assertIsNone(opt_loss_atlas_line.last_debug_payload())
+
+		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines), debug_payload=True)
+		payload = opt_loss_atlas_line.last_debug_payload()
+		self.assertIsNotNone(payload)
+		self.assertEqual(tuple(payload.valid.shape), (1, 1))
+
+	def test_debug_payload_splits_control_other_and_normal_proxy(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([
+				[1.0, 1.0, 1.0],
+				[2.0, 1.0, 2.0],
+			], dtype=torch.float32),
+			normal_xyz=torch.tensor([
+				[0.0, 0.0, -1.0],
+				[0.0, 0.0, -1.0],
+			], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+		)
+
+		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines), debug_payload=True)
+		payload = opt_loss_atlas_line.last_debug_payload()
+		self.assertIsNotNone(payload)
+		self.assertTrue(bool(payload.valid[0, 0]))
+		self.assertTrue(bool(payload.valid[0, 1]))
+		self.assertTrue(bool(payload.is_control[0, 0]))
+		self.assertFalse(bool(payload.is_control[0, 1]))
+		proxy = payload.hit_xyz + payload.signed_delta.unsqueeze(-1) * payload.model_normal
+		self.assertTrue(torch.allclose(proxy[0, 0], torch.tensor([1.0, 1.0, 1.0]), atol=1.0e-6))
+		self.assertTrue(torch.allclose(proxy[0, 1], torch.tensor([2.0, 1.0, 2.0]), atol=1.0e-6))
+
+	def test_debug_payload_omits_invalid_samples(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([
+				[1.0, 1.0, 1.0],
+				[float("nan"), 1.0, 2.0],
+			], dtype=torch.float32),
+			normal_xyz=torch.tensor([
+				[0.0, 0.0, -1.0],
+				[0.0, 0.0, -1.0],
+			], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+		)
+
+		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines), debug_payload=True)
+		payload = opt_loss_atlas_line.last_debug_payload()
+		self.assertIsNotNone(payload)
+		self.assertEqual(payload.valid.tolist(), [[True, False]])
+
+	def test_write_debug_objs_uses_working_directory_and_expected_line_sets(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([
+				[1.0, 1.0, 1.0],
+				[2.0, 1.0, 2.0],
+			], dtype=torch.float32),
+			normal_xyz=torch.tensor([
+				[0.0, 0.0, -1.0],
+				[0.0, 0.0, -1.0],
+			], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+		)
+		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines), debug_payload=True)
+
+		old_cwd = Path.cwd()
+		with tempfile.TemporaryDirectory() as td:
+			try:
+				os.chdir(td)
+				root = opt_loss_atlas_line.write_debug_objs(stage="atlas_init_relax", step=0)
+			finally:
+				os.chdir(old_cwd)
+			self.assertEqual(root, Path(td) / "atlas_debug_objs" / "atlas_init_relax_step000000")
+			wdir = root / "winding_000"
+			self.assertTrue((wdir / "model_surface.obj").exists())
+			self.assertIn("\nf ", (wdir / "model_surface.obj").read_text(encoding="utf-8"))
+			self.assertEqual((wdir / "control_connections.obj").read_text(encoding="utf-8").count("\nl "), 1)
+			self.assertEqual((wdir / "other_connections.obj").read_text(encoding="utf-8").count("\nl "), 1)
+			normal_obj = (wdir / "normal_proxy.obj").read_text(encoding="utf-8")
+			self.assertEqual(normal_obj.count("\nl "), 2)
+			self.assertIn("v 1 1 1", normal_obj)
+
+	def test_optimizer_atlas_debug_objs_initial_eval_and_one_step(self) -> None:
+		class TinyAtlasModel(torch.nn.Module):
+			def __init__(self) -> None:
+				super().__init__()
+				self.xyz = torch.nn.Parameter(_plane_grid().clone())
+				self.mesh_h = int(self.xyz.shape[1])
+				self.mesh_w = int(self.xyz.shape[2])
+				self.depth = int(self.xyz.shape[0])
+
+			def opt_params(self):
+				return {"mesh_ms": [self.xyz]}
+
+			def update_conn_offsets(self) -> None:
+				return None
+
+			def update_ext_conn_offsets(self) -> None:
+				return None
+
+			def forward(self, data: fit_data.FitData3D, needs=None):
+				return _result(self.xyz, data.atlas_lines, normals=_normal_grid(self.xyz))
+
+		opt_loss_atlas_line.reset_state()
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True]),
+		)
+		stages = optimizer.load_stages_cfg({
+			"base": {"normal": 0.0, "atlas_line_control": 1.0, "atlas_line_other": 0.0},
+			"stages": [{
+				"name": "atlas_init_relax",
+				"opt": {
+					"steps": 1,
+					"lr": 0.01,
+					"params": ["mesh_ms"],
+					"args": {"atlas_debug_objs": True, "atlas_debug_obj_interval": 1},
+					"w_fac": {"atlas_line_control": 1.0},
+				},
+			}],
+		})
+		data = _fit_data(lines)
+		model = TinyAtlasModel()
+
+		old_cwd = Path.cwd()
+		with tempfile.TemporaryDirectory() as td:
+			try:
+				os.chdir(td)
+				optimizer.optimize(
+					model=model,
+					data=data,
+					stages=stages,
+					snapshot_interval=0,
+					snapshot_fn=lambda **_kw: None,
+				)
+			finally:
+				os.chdir(old_cwd)
+			for step in (0, 1):
+				wdir = Path(td) / "atlas_debug_objs" / f"atlas_init_relax_step{step:06d}" / "winding_000"
+				self.assertTrue((wdir / "model_surface.obj").exists())
+				self.assertIn("\nf ", (wdir / "model_surface.obj").read_text(encoding="utf-8"))
+				self.assertEqual((wdir / "control_connections.obj").read_text(encoding="utf-8").count("\nl "), 1)
+				self.assertEqual((wdir / "normal_proxy.obj").read_text(encoding="utf-8").count("\nl "), 1)
+
 	def test_atlas_line_updates_at_most_one_neighboring_quad_and_clamps(self) -> None:
 		opt_loss_atlas_line.reset_state()
 		xyz = _plane_grid().requires_grad_(True)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
+from pathlib import Path
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -13,6 +15,18 @@ import optimizer
 
 
 class OptimizerStageWeightsTest(unittest.TestCase):
+	def test_atlas_line_diagnostic_config_enables_first_stage_debug_only(self) -> None:
+		cfg_path = Path(ROOT) / "configs" / "atlas_line.json"
+		cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+		stages = optimizer.load_stages_cfg(cfg)
+
+		self.assertEqual(stages[0].name, "atlas_init_relax")
+		self.assertEqual(stages[0].global_opt.steps, 1)
+		self.assertTrue(stages[0].global_opt.args["atlas_debug_objs"])
+		self.assertEqual(stages[0].global_opt.args["atlas_debug_obj_interval"], 1)
+		self.assertEqual(stages[1].name, "atlas_line_fit")
+		self.assertEqual(stages[1].global_opt.steps, 0)
+
 	def test_stage_w_fac_does_not_inherit_to_later_stages(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"base": {

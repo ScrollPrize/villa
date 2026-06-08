@@ -2048,6 +2048,11 @@ def optimize(
 			_need_term("cyl_outside", stage_eff) > 0
 		)
 		stage_args = opt_cfg.args or {}
+		atlas_debug_objs = bool(stage_args.get("atlas_debug_objs", stage_args.get("atlas-debug-objs", False)))
+		atlas_debug_obj_interval = max(1, int(stage_args.get(
+			"atlas_debug_obj_interval",
+			stage_args.get("atlas-debug-obj-interval", 1),
+		)))
 		status_interval_raw = stage_args.get("status_interval", stage_args.get("debug_print_interval", 100))
 		status_interval = max(0, int(status_interval_raw))
 		steps_label = _steps_label(opt_cfg)
@@ -3076,7 +3081,9 @@ def optimize(
 					_cache.sync()
 
 		# Initial evaluation
-		def _eval_terms(res_, eff_, *, profile_label: str | None = None, timing: _OptTimingWindow | None = None):
+		def _eval_terms(res_, eff_, *, profile_label: str | None = None,
+						timing: _OptTimingWindow | None = None,
+						atlas_debug_step: int | None = None):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
 			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
@@ -3110,7 +3117,18 @@ def optimize(
 				_t_loss = _stage_start(f"{profile_label}.{name}") if profile_label is not None else None
 				_t_loss_wall = time.perf_counter() if timing is not None else None
 				if name == "atlas_line":
-					result = t["loss"](res=res_, stage_eff=eff_)
+					write_atlas_debug = (
+						atlas_debug_objs
+						and atlas_debug_step is not None
+						and (int(atlas_debug_step) % atlas_debug_obj_interval) == 0
+					)
+					result = t["loss"](res=res_, stage_eff=eff_, debug_payload=write_atlas_debug)
+					if write_atlas_debug:
+						opt_loss_atlas_line.write_debug_objs(
+							stage=stage.name,
+							step=int(atlas_debug_step),
+							interval=1,
+						)
 				else:
 					result = t["loss"](res=res_)
 				_debug_cuda_sync(f"{profile_label}.{name}" if profile_label is not None else name)
@@ -3872,7 +3890,7 @@ def optimize(
 			_log_cuda_memory(f"{label}.initial_eval.loss_terms.before")
 			opt_loss_snap_surf.set_debug_step(0, label=f"{label}_initial")
 			loss0, term_vals0, display_loss0 = _eval_terms(
-				res0, stage_eff, profile_label=f"{label}.initial_eval.loss")
+				res0, stage_eff, profile_label=f"{label}.initial_eval.loss", atlas_debug_step=0)
 			_log_cuda_memory(f"{label}.initial_eval.loss_terms.after")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
 			if snap_surf_map_opt_stage is not None:
@@ -3994,7 +4012,8 @@ def optimize(
 			_t_loss_eval = time.perf_counter()
 			opt_loss_snap_surf.set_debug_step(step + 1, label=label)
 			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.before")
-			loss, term_vals, display_loss = _eval_terms(res, stage_eff, timing=_opt_timing)
+			loss, term_vals, display_loss = _eval_terms(
+				res, stage_eff, timing=_opt_timing, atlas_debug_step=step + 1)
 			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.after")
 			if _flow_timing is not None:
 				_timing_cuda_sync()
