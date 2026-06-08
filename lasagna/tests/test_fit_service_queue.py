@@ -51,6 +51,18 @@ class FitServiceQueueTest(unittest.TestCase):
 		self.assertEqual(queue.snapshot(j1.job_id)["output_name"], "sheet_042")
 		self.assertEqual(queue.snapshot_response()["jobs"][0]["output_name"], "sheet_042")
 
+	def test_single_result_archive_child_uses_requested_output_name(self):
+		self.assertEqual(
+			fit_service._result_archive_child_name("selected_segment.tifxyz", 1, "atlas_result_v002.tifxyz"),
+			"atlas_result_v002.tifxyz",
+		)
+
+	def test_multi_result_archive_keeps_child_names(self):
+		self.assertEqual(
+			fit_service._result_archive_child_name("layer_0000.tifxyz", 2, "combined.tifxyz"),
+			"layer_0000.tifxyz",
+		)
+
 	def test_reorder_waiting_jobs_changes_execution_order(self):
 		queue = fit_service._JobQueue()
 		seen = []

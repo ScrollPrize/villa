@@ -306,7 +306,9 @@ struct ResultsPlacementResult
     QStringList placedNames;
 };
 
-ResultsPlacementResult placeResultsArchive(const QByteArray& data, const QString& targetDir)
+ResultsPlacementResult placeResultsArchive(const QByteArray& data,
+                                           const QString& targetDir,
+                                           const QString& expectedOutputName = QString())
 {
     ResultsPlacementResult result;
     result.targetDir = targetDir;
@@ -346,11 +348,15 @@ ResultsPlacementResult placeResultsArchive(const QByteArray& data, const QString
     QDir unpackRoot(unpackDir.path());
     const QFileInfoList children = unpackRoot.entryInfoList(
         QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot);
+    const QString expectedName = expectedOutputName.trimmed();
+    const bool useExpectedName = !expectedName.isEmpty() && children.size() == 1;
     for (const QFileInfo& child : children) {
         if (child.fileName() == QStringLiteral(".lasagna_results.tar.gz")) {
             continue;
         }
-        const QString finalName = uniqueSegmentName(targetDir, child.fileName());
+        const QString finalName = uniqueSegmentName(
+            targetDir,
+            useExpectedName ? expectedName : child.fileName());
         const QString finalPath = QDir(targetDir).filePath(finalName);
         if (QFileInfo::exists(finalPath)) {
             result.error = QObject::tr("Refusing to overwrite existing segment: %1").arg(finalPath);
@@ -671,6 +677,7 @@ void LasagnaServiceManager::stopService()
         _startedJobIds.clear();
         _completedJobIds.clear();
         _jobOutputDirs.clear();
+        _jobOutputNames.clear();
         _lastJobs = QJsonArray();
         _lastQueueGeneration = -1;
         _fetchedQueueGeneration = -1;
@@ -704,6 +711,7 @@ void LasagnaServiceManager::stopService()
     _startedJobIds.clear();
     _completedJobIds.clear();
     _jobOutputDirs.clear();
+    _jobOutputNames.clear();
     _lastJobs = QJsonArray();
     _lastQueueGeneration = -1;
     _fetchedQueueGeneration = -1;
@@ -1322,6 +1330,7 @@ void LasagnaServiceManager::postOptimizationRequest(const QJsonObject& requestCo
 
     QByteArray body = QJsonDocument(requestConfig).toJson(QJsonDocument::Compact);
     const qint64 bodyBytes = body.size();
+    const QString requestedOutputName = requestConfig[QStringLiteral("output_name")].toString().trimmed();
 
     std::cout << "[lasagna] sending queued optimize request: "
               << bytesToMiB(bodyBytes) << " MiB" << std::endl;
@@ -1348,7 +1357,7 @@ void LasagnaServiceManager::postOptimizationRequest(const QJsonObject& requestCo
         }
     });
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, sendTimer, uploadLogged, bodyBytes, generation, localUploadJobId]() {
+            [this, reply, sendTimer, uploadLogged, bodyBytes, generation, localUploadJobId, requestedOutputName]() {
         if (generation != _requestGeneration) {
             reply->deleteLater();
             return;
@@ -1378,6 +1387,9 @@ void LasagnaServiceManager::postOptimizationRequest(const QJsonObject& requestCo
         std::cout << " error=" << reply->error()
                   << " bytes_available=" << reply->bytesAvailable()
                   << std::endl;
+        if (!requestedOutputName.isEmpty()) {
+            reply->setProperty("vc3d_requested_output_name", requestedOutputName);
+        }
         handleOptimizeReply(reply, localUploadJobId);
         if (!localUploadJobId.isEmpty()) {
             finishActiveArtifactUpload();
@@ -1645,6 +1657,11 @@ void LasagnaServiceManager::handleOptimizeReply(QNetworkReply* reply,
         _submittedJobIds.insert(jobId);
         _startedJobIds.insert(jobId);
         _jobOutputDirs.insert(jobId, _localOutputDir);
+        QString outputName = reply->property("vc3d_requested_output_name").toString().trimmed();
+        if (outputName.isEmpty()) {
+            outputName = obj[QStringLiteral("output_name")].toString().trimmed();
+        }
+        _jobOutputNames.insert(jobId, outputName);
         QJsonObject optimisticJob;
         optimisticJob[QStringLiteral("job_id")] = jobId;
         optimisticJob[QStringLiteral("sequence")] = obj[QStringLiteral("sequence")].toInt();
@@ -1869,6 +1886,7 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
     emit statusMessage(tr("Downloading results from external service..."));
 
     const QString targetDir = outputDir.isEmpty() ? _localOutputDir : outputDir;
+    const QString expectedOutputName = _jobOutputNames.value(jobId);
     QUrl url(jobId.isEmpty()
         ? QStringLiteral("%1/results").arg(baseUrl())
         : QStringLiteral("%1/jobs/%2/results").arg(baseUrl(), jobId));
@@ -1876,7 +1894,7 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
 
     const quint64 generation = _requestGeneration;
     QNetworkReply* reply = _nam->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, jobId, targetDir, generation]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, jobId, targetDir, expectedOutputName, generation]() {
         if (generation != _requestGeneration) {
             reply->deleteLater();
             return;
@@ -1938,8 +1956,8 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
             }
             emit optimizationFinished(result.targetDir);
         });
-        watcher->setFuture(QtConcurrent::run([data = std::move(data), targetDir]() {
-            return placeResultsArchive(data, targetDir);
+        watcher->setFuture(QtConcurrent::run([data = std::move(data), targetDir, expectedOutputName]() {
+            return placeResultsArchive(data, targetDir, expectedOutputName);
         }));
     });
 }

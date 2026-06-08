@@ -80,6 +80,13 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _result_archive_child_name(child_name: str, child_count: int, output_name: str) -> str:
+    requested = str(output_name or "").strip()
+    if requested and int(child_count) == 1:
+        return requested
+    return child_name
+
+
 def _default_object_store_dir() -> Path:
     return Path.home() / ".cache" / "lasagna" / "fit_service" / "objects"
 
@@ -1481,9 +1488,12 @@ class _Handler(BaseHTTPRequestHandler):
         pack_t0 = time.perf_counter()
         buf = io.BytesIO()
         out_path = Path(output_dir)
+        children = sorted(out_path.iterdir())
+        requested_output_name = str(snap.get("output_name") or "").strip()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for child in sorted(out_path.iterdir()):
-                tar.add(str(child), arcname=child.name)
+            for child in children:
+                arcname = _result_archive_child_name(child.name, len(children), requested_output_name)
+                tar.add(str(child), arcname=arcname)
 
         data = buf.getvalue()
         pack_s = time.perf_counter() - pack_t0

@@ -130,14 +130,25 @@ class AtlasParserTest(unittest.TestCase):
 				self.assertEqual(init.metadata["atlas_u_offset"], -748.0)
 				self.assertEqual(init.metadata["control_point_sample_count"], 2)
 				self.assertEqual(init.metadata["other_line_point_sample_count"], 0)
-				self.assertEqual(tuple(init.model._grid_xyz().shape), (1, 3, 1506, 3))
+				self.assertEqual(init.metadata["requested_mesh_step"], 1)
+				self.assertEqual(init.metadata["resampled_source_rows"], 3)
+				self.assertEqual(init.metadata["resampled_source_columns"], 1506)
+				self.assertEqual(tuple(init.model._grid_xyz().shape), (
+					1,
+					init.metadata["resampled_rows"],
+					init.metadata["resampled_columns"],
+					3,
+				))
+				self.assertEqual(int(init.model.params.mesh_step), 1)
 				self.assertTrue(torch.allclose(init.atlas_lines.target_xyz[0], torch.tensor([10.0, 20.0, 30.0])))
 				self.assertEqual(init.atlas_lines.source_indices, (0, 1))
 				self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True])
-				self.assertAlmostEqual(float(init.atlas_lines.model_h[0]), 1.0, delta=1.0e-6)
-				self.assertAlmostEqual(float(init.atlas_lines.model_w[0]), 750.0, delta=1.0e-6)
-				self.assertAlmostEqual(float(init.atlas_lines.model_h[1]), 1.0, delta=1.0e-6)
-				self.assertAlmostEqual(float(init.atlas_lines.model_w[1]), 756.0, delta=1.0e-6)
+				row_scale = float(init.metadata["resampled_row_index_scale"])
+				col_scale = float(init.metadata["resampled_column_index_scale"])
+				self.assertAlmostEqual(float(init.atlas_lines.model_h[0]), 1.0 * row_scale, delta=1.0e-6)
+				self.assertAlmostEqual(float(init.atlas_lines.model_w[0]), 750.0 * col_scale, delta=1.0e-4)
+				self.assertAlmostEqual(float(init.atlas_lines.model_h[1]), 1.0 * row_scale, delta=1.0e-6)
+				self.assertAlmostEqual(float(init.atlas_lines.model_w[1]), 756.0 * col_scale, delta=1.0e-4)
 
 	def test_atlas_init_keeps_in_span_line_anchors_and_ignores_tails(self) -> None:
 		import tempfile
@@ -200,6 +211,71 @@ class AtlasParserTest(unittest.TestCase):
 			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True, False])
 			self.assertEqual(init.metadata["control_point_sample_count"], 2)
 			self.assertEqual(init.metadata["other_line_point_sample_count"], 1)
+			self.assertEqual(tuple(init.model._grid_xyz().shape), (
+				1,
+				init.metadata["resampled_rows"],
+				init.metadata["resampled_columns"],
+				3,
+			))
+
+	def test_atlas_init_mesh_step_coarsens_base_and_remaps_anchor_coords(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=5, cols=5, row_step=10.0, col_step=10.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+				"control_points": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 2,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [],
+				"control_anchors": [
+					{"source_index": 0, "world": [1.0, 2.0, 3.0], "atlas": [1.0, 1.0], "distance": 0.0},
+					{"source_index": 1, "world": [4.0, 5.0, 6.0], "atlas": [3.0, 3.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=20,
+				winding_step=1,
+				subsample_mesh=1,
+				subsample_winding=1,
+				depth=1,
+			)
+
+			self.assertEqual(int(init.model.params.mesh_step), 20)
+			self.assertLess(init.metadata["resampled_rows"], init.metadata["resampled_source_rows"])
+			self.assertLess(init.metadata["resampled_columns"], init.metadata["resampled_source_columns"])
+			row_scale = float(init.metadata["resampled_row_index_scale"])
+			col_scale = float(init.metadata["resampled_column_index_scale"])
+			expected_h0 = (1.0 - float(init.metadata["crop_row_start"])) * row_scale
+			expected_w0 = (1.0 - float(init.metadata["atlas_u_offset"])) * col_scale
+			self.assertAlmostEqual(float(init.atlas_lines.model_h[0]), expected_h0, delta=1.0e-6)
+			self.assertAlmostEqual(float(init.atlas_lines.model_w[0]), expected_w0, delta=1.0e-5)
 
 	def test_wrapped_base_crop_allows_negative_start_and_multiple_wraps(self) -> None:
 		xyz = torch.tensor([[

@@ -185,6 +185,7 @@ private:
     QSet<QString> _startedJobIds;
     QSet<QString> _completedJobIds;
     QHash<QString, QString> _jobOutputDirs;
+    QHash<QString, QString> _jobOutputNames;
     QJsonArray _lastJobs;
     QList<ArtifactUploadJob> _artifactUploadQueue;
     ArtifactUploadJob _activeArtifactUpload;
