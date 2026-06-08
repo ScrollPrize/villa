@@ -823,8 +823,15 @@ void LineAnnotationDialog::previewClosestControlPoint()
 
     auto* animation = new QVariantAnimation(this);
     _controlPointPreviewAnimation = animation;
-    animation->setDuration(1000);
+    constexpr int kClosestControlPointHoldMs = 500;
+    constexpr int kClosestControlPointReturnMs = 2000;
+    constexpr int kClosestControlPointTotalMs =
+        kClosestControlPointHoldMs + kClosestControlPointReturnMs;
+    animation->setDuration(kClosestControlPointTotalMs);
     animation->setStartValue(*closest);
+    animation->setKeyValueAt(static_cast<double>(kClosestControlPointHoldMs) /
+                                 static_cast<double>(kClosestControlPointTotalMs),
+                             *closest);
     animation->setEndValue(originalPosition);
     connect(animation, &QVariantAnimation::valueChanged, this, [this, animation](const QVariant& value) {
         if (_controlPointPreviewAnimation == animation) {
