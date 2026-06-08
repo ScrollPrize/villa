@@ -279,11 +279,12 @@ class CorrPoints3D:
 @dataclass(frozen=True)
 class AtlasLines3D:
 	target_xyz: torch.Tensor        # (K, 3) original line/fiber target points
-	normal_xyz: torch.Tensor        # (K, 3) atlas base-shell normals at mapped anchors
+	normal_xyz: torch.Tensor        # (K, 3) atlas base-shell normals at mapped anchors; atlas-line loss ignores these
 	model_h: torch.Tensor           # (K,) initial continuous model row from atlas V
 	model_w: torch.Tensor           # (K,) initial continuous model column from actual atlas U
 	object_ids: tuple[str, ...] = ()
 	source_indices: tuple[int, ...] = ()
+	is_control_point: torch.Tensor | None = None  # (K,) bool — True for VC3D fiber control points
 
 
 @dataclass(frozen=True)

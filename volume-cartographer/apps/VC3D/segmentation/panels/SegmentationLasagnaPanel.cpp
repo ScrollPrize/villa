@@ -316,6 +316,68 @@ std::filesystem::path volpkgRootForState(CState* state)
         std::filesystem::path(state->vpkg()->getVolpkgDirectory())).lexically_normal();
 }
 
+QString versionedTifxyzOutputName(const QString& baseNameIn,
+                                  const QString& outputDir,
+                                  const QSet<QString>& submittedOutputNames)
+{
+    const std::string tifxyzSuffix = ".tifxyz";
+    QString rootNameQt = baseNameIn.trimmed();
+    if (rootNameQt.isEmpty()) {
+        rootNameQt = QStringLiteral("atlas");
+    }
+    const std::string rootName = rootNameQt.toStdString();
+
+    int maxVersion = 0;
+    if (!outputDir.isEmpty()) {
+        std::error_code ec;
+        for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec)) {
+            const std::string name = entry.path().filename().string();
+            const std::string prefix = rootName + "_v";
+            if (name.size() > prefix.size() + tifxyzSuffix.size() &&
+                name.compare(0, prefix.size(), prefix) == 0 &&
+                name.compare(name.size() - tifxyzSuffix.size(),
+                             tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                const std::string numStr = name.substr(
+                    prefix.size(),
+                    name.size() - prefix.size() - tifxyzSuffix.size());
+                bool allDigits = !numStr.empty();
+                for (char c : numStr) {
+                    if (!std::isdigit(static_cast<unsigned char>(c))) {
+                        allDigits = false;
+                        break;
+                    }
+                }
+                if (allDigits) {
+                    const int version = std::stoi(numStr);
+                    if (version > maxVersion) {
+                        maxVersion = version;
+                    }
+                }
+            }
+        }
+    }
+
+    const QString versionPrefix = QString::fromStdString(rootName + "_v");
+    const QString suffix = QString::fromStdString(tifxyzSuffix);
+    for (const QString& reserved : submittedOutputNames) {
+        if (!reserved.startsWith(versionPrefix) || !reserved.endsWith(suffix)) {
+            continue;
+        }
+        const QString numStr = reserved.mid(
+            versionPrefix.size(),
+            reserved.size() - versionPrefix.size() - suffix.size());
+        bool ok = false;
+        const int version = numStr.toInt(&ok);
+        if (ok && version > maxVersion) {
+            maxVersion = version;
+        }
+    }
+
+    char numBuf[16];
+    std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
+    return QString::fromStdString(rootName + numBuf + tifxyzSuffix);
+}
+
 QString safeAtlasObjectName(const QString& atlasName, const QString& relPath, const QString& fallback)
 {
     QString name = relPath.trimmed();
@@ -1986,6 +2048,16 @@ void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar*
         return;
     }
 
+    QString outputDir;
+    const std::filesystem::path outputSegmentsPath = outputSegmentsPathForState(state);
+    if (!outputSegmentsPath.empty()) {
+        outputDir = QString::fromStdString(outputSegmentsPath.string());
+    }
+    const QString outputName = versionedTifxyzOutputName(
+        newModelOutputName(),
+        outputDir,
+        _submittedOutputNames);
+
     QJsonObject jobSpec;
     jobSpec[QStringLiteral("config")] = config;
     jobSpec[QStringLiteral("atlas")] = artifacts.atlasRef;
@@ -1993,25 +2065,22 @@ void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar*
     QJsonObject request;
     request[QStringLiteral("data_input")] = dataInput;
     request[QStringLiteral("config_name")] = QFileInfo(_atlasConfigFilePath).fileName();
+    request[QStringLiteral("output_name")] = outputName;
     request[QStringLiteral("config")] = config;
     request[QStringLiteral("job_spec")] = jobSpec;
     request[QStringLiteral("_objects")] = artifacts.uploads;
 
-    QString outputDir;
-    const std::filesystem::path outputSegmentsPath = outputSegmentsPathForState(state);
-    if (!outputSegmentsPath.empty()) {
-        outputDir = QString::fromStdString(outputSegmentsPath.string());
-    }
-
     std::cerr << "[lasagna] atlas request prep:"
               << " atlas=" << _atlasDirPath.toStdString()
               << " config=" << _atlasConfigFilePath.toStdString()
+              << " outputName=" << outputName.toStdString()
               << " files=" << artifacts.fileCount
               << " raw=" << bytesToMiB(artifacts.rawBytes) << " MiB"
               << std::endl;
 
     mgr.startOptimization(request, outputDir);
-    showStatus(tr("Lasagna atlas optimization started."), 3000);
+    _submittedOutputNames.insert(outputName);
+    showStatus(tr("Lasagna atlas optimization started. Output: %1").arg(outputName), 3000);
 }
 
 void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,

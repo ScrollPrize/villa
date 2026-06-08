@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import model as fit_model
+import opt_loss_corr
 
 
 _rows: torch.Tensor | None = None
@@ -106,16 +107,92 @@ def _intersect_quad(
 	return torch.where(use_aff, u_aff, u), torch.where(use_aff, v_aff, v)
 
 
+def _unit_with_valid(n: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+	n_len = torch.linalg.vector_norm(n, dim=-1, keepdim=True)
+	valid = torch.isfinite(n).all(dim=-1) & (n_len.squeeze(-1) > 1.0e-8)
+	return n / n_len.clamp_min(1.0e-8), valid
+
+
+def _zero_item(res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	D, H, W, _ = res.xyz_lr.shape
+	z = res.xyz_lr.sum() * 0.0
+	lm = torch.zeros((D, 1, H, W), device=res.xyz_lr.device, dtype=res.xyz_lr.dtype) + z
+	mask = torch.zeros_like(lm)
+	return z, (lm,), (mask,)
+
+
+def _loss_from_splats(
+	*,
+	res: fit_model.FitResult3D,
+	d_p: torch.Tensor,
+	h_floor_p: torch.Tensor,
+	w_floor_p: torch.Tensor,
+	h_cont_p: torch.Tensor,
+	w_cont_p: torch.Tensor,
+	signed_delta_p: torch.Tensor,
+	normal_p: torch.Tensor,
+	mask_p: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], float]:
+	D, H, W, _ = res.xyz_lr.shape
+	dev = res.xyz_lr.device
+	dt = res.xyz_lr.dtype
+	z = res.xyz_lr.sum() * 0.0
+	sq_map = torch.zeros((D, H, W), device=dev, dtype=dt) + z
+	mask_map = torch.zeros((D, H, W), device=dev, dtype=dt)
+
+	valid = mask_p > 1.0e-8
+	if not bool(valid.any().detach().cpu()):
+		return z, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), 0.0
+
+	d_p = d_p[valid]
+	h_floor_p = h_floor_p[valid]
+	w_floor_p = w_floor_p[valid]
+	h_cont_p = h_cont_p[valid]
+	w_cont_p = w_cont_p[valid]
+	signed_delta_p = signed_delta_p[valid]
+	normal_p = normal_p[valid]
+	mask_p = mask_p[valid]
+
+	H_map = torch.zeros((D, H, W), device=dev, dtype=dt)
+	V_map = torch.zeros((D, H, W, 3), device=dev, dtype=dt)
+	W_map = torch.zeros((D, H, W), device=dev, dtype=dt)
+	W_max_map = torch.zeros((D, H, W), device=dev, dtype=dt)
+	sigma = max(1.0e-6, float(getattr(opt_loss_corr, "_corr_splat_sigma", 1.0)))
+	opt_loss_corr._height_map_splat(
+		d_p, h_floor_p, w_floor_p, h_cont_p, w_cont_p,
+		signed_delta_p, normal_p, mask_p, sigma,
+		D, H, W, H_map, V_map, W_map, W_max_map,
+	)
+
+	active = W_map > 1.0e-8
+	active_count = float(active.to(dtype=torch.float32).sum().detach().cpu())
+	if not bool(active.any().detach().cpu()):
+		return z, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), 0.0
+
+	d_idx, h_idx, w_idx = active.nonzero(as_tuple=True)
+	live = res.xyz_lr[d_idx, h_idx, w_idx]
+	det = res.xyz_lr.detach()[d_idx, h_idx, w_idx]
+	disp = V_map[d_idx, h_idx, w_idx] / W_map[d_idx, h_idx, w_idx].clamp_min(1.0e-8).unsqueeze(-1)
+	target = det + disp
+	sq = (live - target).square().sum(dim=-1)
+	weights = W_max_map[d_idx, h_idx, w_idx]
+	loss = (weights * sq).sum() / weights.sum().clamp_min(1.0e-8)
+	sq_map[d_idx, h_idx, w_idx] = sq
+	mask_map[d_idx, h_idx, w_idx] = weights
+	return loss, (sq_map.unsqueeze(1),), (mask_map.unsqueeze(1),), active_count
+
+
 def atlas_line_loss(
 	*, res: fit_model.FitResult3D,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	stage_eff: dict[str, float] | None = None,
+) -> dict[str, tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]]:
 	global _rows, _cols, _frac_h, _frac_w, _last_stats
 	lines = getattr(res.data, "atlas_lines", None)
 	if lines is None:
 		raise ValueError("atlas_line loss requires FitData3D.atlas_lines")
 	if int(lines.target_xyz.shape[0]) <= 0:
-		z = res.xyz_lr.sum() * 0.0
-		return z, (z.view(1, 1, 1, 1),), (torch.zeros_like(z).view(1, 1, 1, 1),)
+		item = _zero_item(res)
+		return {"atlas_line": item, "atlas_line_control": item, "atlas_line_other": item}
 
 	_ensure_state(res=res)
 	assert _rows is not None and _cols is not None and _frac_h is not None and _frac_w is not None
@@ -124,51 +201,176 @@ def atlas_line_loss(
 	device = res.xyz_lr.device
 	if H < 2 or W < 2:
 		raise ValueError(f"atlas_line requires model H/W >= 2, got {H}x{W}")
+	if res.normals is None:
+		raise ValueError("atlas_line loss requires model normals")
 
-	target = lines.target_xyz.to(device=device, dtype=res.xyz_lr.dtype).view(1, K, 3).expand(D, K, 3)
-	normal = lines.normal_xyz.to(device=device, dtype=res.xyz_lr.dtype).view(1, K, 3).expand(D, K, 3)
-	n_valid = torch.isfinite(normal).all(dim=-1) & (torch.linalg.vector_norm(normal, dim=-1) > 1.0e-8)
-	t_valid = torch.isfinite(target).all(dim=-1)
-	in_bounds = (_rows >= 0) & (_rows < H - 1) & (_cols >= 0) & (_cols < W - 1)
-	valid0 = n_valid & t_valid & in_bounds
+	is_control = getattr(lines, "is_control_point", None)
+	if is_control is None:
+		control_k = torch.zeros(K, device=device, dtype=torch.bool)
+	else:
+		control_k = is_control.to(device=device, dtype=torch.bool).view(K)
+	other_k = ~control_k
+	if stage_eff is None:
+		process_control = True
+		process_other = True
+	else:
+		legacy_weight = float(stage_eff.get("atlas_line", 0.0)) > 0.0
+		process_control = legacy_weight or float(stage_eff.get("atlas_line_control", 0.0)) > 0.0
+		process_other = legacy_weight or float(stage_eff.get("atlas_line_other", 0.0)) > 0.0
+	active_k = (control_k & process_control) | (other_k & process_other)
+	zero_item = _zero_item(res)
 
-	xyz_det = res.xyz_lr.detach()
-	M00, M10, M01, M11 = _gather_quads(xyz_det, _rows, _cols)
-	u1, v1 = _intersect_quad(target, normal, M00, M10, M01, M11, _frac_h, _frac_w)
-	finite1 = torch.isfinite(u1) & torch.isfinite(v1)
-	step_h = torch.where(u1 < 0.0, torch.full_like(_rows, -1), torch.where(u1 > 1.0, torch.ones_like(_rows), torch.zeros_like(_rows)))
-	step_w = torch.where(v1 < 0.0, torch.full_like(_cols, -1), torch.where(v1 > 1.0, torch.ones_like(_cols), torch.zeros_like(_cols)))
-	row2 = torch.where(finite1, (_rows + step_h).clamp(0, H - 2), _rows)
-	col2 = torch.where(finite1, (_cols + step_w).clamp(0, W - 2), _cols)
-	frac_h1 = torch.where(finite1, u1.clamp(0.0, 1.0), _frac_h)
-	frac_w1 = torch.where(finite1, v1.clamp(0.0, 1.0), _frac_w)
+	valid = torch.zeros((D, K), device=device, dtype=torch.bool)
+	valid_control = torch.zeros_like(valid)
+	valid_other = torch.zeros_like(valid)
+	combined_item = zero_item
+	control_item = zero_item
+	other_item = zero_item
+	combined_active_verts = 0.0
+	control_active_verts = 0.0
+	other_active_verts = 0.0
+	signed_delta_mean = 0.0
 
-	Q00, Q10, Q01, Q11 = _gather_quads(xyz_det, row2, col2)
-	u2, v2 = _intersect_quad(target, normal, Q00, Q10, Q01, Q11, frac_h1, frac_w1)
-	finite2 = torch.isfinite(u2) & torch.isfinite(v2)
-	u = torch.where(finite2, u2.clamp(0.0, 1.0), frac_h1).detach()
-	v = torch.where(finite2, v2.clamp(0.0, 1.0), frac_w1).detach()
-	valid = valid0 & finite1 & finite2
+	if bool(active_k.any().detach().cpu()):
+		active_idx = torch.nonzero(active_k, as_tuple=False).flatten()
+		K_active = int(active_idx.shape[0])
+		rows_active = _rows.index_select(1, active_idx)
+		cols_active = _cols.index_select(1, active_idx)
+		frac_h_active = _frac_h.index_select(1, active_idx)
+		frac_w_active = _frac_w.index_select(1, active_idx)
+		target = lines.target_xyz.to(device=device, dtype=res.xyz_lr.dtype).index_select(0, active_idx).view(1, K_active, 3).expand(D, K_active, 3)
+		t_valid = torch.isfinite(target).all(dim=-1)
+		in_bounds = (rows_active >= 0) & (rows_active < H - 1) & (cols_active >= 0) & (cols_active < W - 1)
 
-	G00, G10, G01, G11 = _gather_quads(res.xyz_lr, row2, col2)
-	model_pt = _bilinear(G00, G10, G01, G11, u, v)
-	sq = ((model_pt - target) ** 2).sum(dim=-1)
-	sq = torch.where(valid, sq, torch.zeros_like(sq))
-	den = valid.to(dtype=res.xyz_lr.dtype).sum().clamp_min(1.0)
-	loss = sq.sum() / den
+		xyz_det = res.xyz_lr.detach()
+		norm_det = res.normals.detach()
+		N00, N10, N01, N11 = _gather_quads(norm_det, rows_active, cols_active)
+		n0, n0_valid = _unit_with_valid(_bilinear(N00, N10, N01, N11, frac_h_active, frac_w_active))
+
+		M00, M10, M01, M11 = _gather_quads(xyz_det, rows_active, cols_active)
+		cached_hit = _bilinear(M00, M10, M01, M11, frac_h_active, frac_w_active)
+		u1, v1 = _intersect_quad(target, n0, M00, M10, M01, M11, frac_h_active, frac_w_active)
+		finite1 = torch.isfinite(u1) & torch.isfinite(v1)
+		step_h = torch.where(u1 < 0.0, torch.full_like(rows_active, -1), torch.where(u1 > 1.0, torch.ones_like(rows_active), torch.zeros_like(rows_active)))
+		step_w = torch.where(v1 < 0.0, torch.full_like(cols_active, -1), torch.where(v1 > 1.0, torch.ones_like(cols_active), torch.zeros_like(cols_active)))
+		row2 = torch.where(finite1, (rows_active + step_h).clamp(0, H - 2), rows_active)
+		col2 = torch.where(finite1, (cols_active + step_w).clamp(0, W - 2), cols_active)
+		frac_h1 = torch.where(finite1, u1.clamp(0.0, 1.0), frac_h_active)
+		frac_w1 = torch.where(finite1, v1.clamp(0.0, 1.0), frac_w_active)
+
+		Q00, Q10, Q01, Q11 = _gather_quads(xyz_det, row2, col2)
+		u2, v2 = _intersect_quad(target, n0, Q00, Q10, Q01, Q11, frac_h1, frac_w1)
+		finite2 = torch.isfinite(u2) & torch.isfinite(v2)
+		u = torch.where(finite2, u2.clamp(0.0, 1.0), frac_h_active).detach()
+		v = torch.where(finite2, v2.clamp(0.0, 1.0), frac_w_active).detach()
+		hit_rows = torch.where(finite2, row2, rows_active)
+		hit_cols = torch.where(finite2, col2, cols_active)
+		H00, H10, H01, H11 = _gather_quads(xyz_det, hit_rows, hit_cols)
+		hit_xyz = torch.where(
+			finite2.unsqueeze(-1),
+			_bilinear(H00, H10, H01, H11, u, v),
+			cached_hit,
+		)
+		HN00, HN10, HN01, HN11 = _gather_quads(norm_det, hit_rows, hit_cols)
+		hit_n, hit_n_valid = _unit_with_valid(_bilinear(HN00, HN10, HN01, HN11, u, v))
+		model_n = torch.where(finite2.unsqueeze(-1), hit_n, n0)
+		model_n_valid = torch.where(finite2, hit_n_valid, n0_valid)
+		valid_active = t_valid & in_bounds & n0_valid & model_n_valid & torch.isfinite(hit_xyz).all(dim=-1)
+		valid = valid.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active)
+		active_control = control_k.index_select(0, active_idx).view(1, K_active).expand(D, K_active)
+		active_other = other_k.index_select(0, active_idx).view(1, K_active).expand(D, K_active)
+		valid_control = valid_control.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active & active_control)
+		valid_other = valid_other.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active & active_other)
+
+		signed_delta = ((target - hit_xyz) * model_n).sum(dim=-1)
+		h_cont = hit_rows.to(dtype=res.xyz_lr.dtype) + u
+		w_cont = hit_cols.to(dtype=res.xyz_lr.dtype) + v
+		d_flat = torch.arange(D, device=device, dtype=torch.long).view(D, 1).expand(D, K_active).reshape(-1)
+		h_floor_flat = torch.floor(h_cont).to(dtype=torch.long).clamp(0, H - 1).reshape(-1)
+		w_floor_flat = torch.floor(w_cont).to(dtype=torch.long).clamp(0, W - 1).reshape(-1)
+		h_cont_flat = h_cont.reshape(-1)
+		w_cont_flat = w_cont.reshape(-1)
+		signed_flat = signed_delta.reshape(-1)
+		normal_flat = model_n.reshape(-1, 3)
+		mask_flat = valid_active.to(dtype=res.xyz_lr.dtype).reshape(-1)
+		control_flat = active_control.reshape(-1)
+		other_flat = active_other.reshape(-1)
+		with torch.no_grad():
+			if bool(valid_active.any().detach().cpu()):
+				signed_delta_mean = float(signed_delta[valid_active].mean().detach().cpu())
+
+		combined_loss, combined_maps, combined_masks, combined_active_verts = _loss_from_splats(
+			res=res,
+			d_p=d_flat,
+			h_floor_p=h_floor_flat,
+			w_floor_p=w_floor_flat,
+			h_cont_p=h_cont_flat,
+			w_cont_p=w_cont_flat,
+			signed_delta_p=signed_flat,
+			normal_p=normal_flat,
+			mask_p=mask_flat,
+		)
+		combined_item = (combined_loss, combined_maps, combined_masks)
+		control_loss, control_maps, control_masks, control_active_verts = _loss_from_splats(
+			res=res,
+			d_p=d_flat,
+			h_floor_p=h_floor_flat,
+			w_floor_p=w_floor_flat,
+			h_cont_p=h_cont_flat,
+			w_cont_p=w_cont_flat,
+			signed_delta_p=signed_flat,
+			normal_p=normal_flat,
+			mask_p=mask_flat * control_flat.to(dtype=res.xyz_lr.dtype),
+		)
+		control_item = (control_loss, control_maps, control_masks)
+		other_loss, other_maps, other_masks, other_active_verts = _loss_from_splats(
+			res=res,
+			d_p=d_flat,
+			h_floor_p=h_floor_flat,
+			w_floor_p=w_floor_flat,
+			h_cont_p=h_cont_flat,
+			w_cont_p=w_cont_flat,
+			signed_delta_p=signed_flat,
+			normal_p=normal_flat,
+			mask_p=mask_flat * other_flat.to(dtype=res.xyz_lr.dtype),
+		)
+		other_item = (other_loss, other_maps, other_masks)
+
+		with torch.no_grad():
+			next_rows = _rows.clone()
+			next_cols = _cols.clone()
+			next_frac_h = _frac_h.clone()
+			next_frac_w = _frac_w.clone()
+			cache_ok = finite2 & t_valid & n0_valid
+			next_rows[:, active_idx] = torch.where(cache_ok, row2, rows_active).detach()
+			next_cols[:, active_idx] = torch.where(cache_ok, col2, cols_active).detach()
+			next_frac_h[:, active_idx] = torch.where(cache_ok, u, frac_h_active).detach()
+			next_frac_w[:, active_idx] = torch.where(cache_ok, v, frac_w_active).detach()
+			_rows = next_rows.detach()
+			_cols = next_cols.detach()
+			_frac_h = next_frac_h.detach()
+			_frac_w = next_frac_w.detach()
 
 	with torch.no_grad():
-		_rows = torch.where(valid, row2, _rows).detach()
-		_cols = torch.where(valid, col2, _cols).detach()
-		_frac_h = torch.where(valid, u, _frac_h).detach()
-		_frac_w = torch.where(valid, v, _frac_w).detach()
 		valid_count = float(valid.to(dtype=torch.float32).sum().detach().cpu())
+		control_count = float(valid_control.to(dtype=torch.float32).sum().detach().cpu())
+		other_count = float(valid_other.to(dtype=torch.float32).sum().detach().cpu())
 		_last_stats = {
 			"atlas_line_samples": float(D * K),
 			"atlas_line_valid": valid_count,
-			"atlas_line_rms": float(torch.sqrt(sq.sum() / den).detach().cpu()),
+			"atlas_line_rms": float(torch.sqrt(combined_item[0]).detach().cpu()),
+			"atlas_line_active_vertices": combined_active_verts,
+			"atlas_line_signed_delta_mean": signed_delta_mean,
+			"atlas_line_control_valid": control_count,
+			"atlas_line_control_rms": float(torch.sqrt(control_item[0]).detach().cpu()),
+			"atlas_line_control_active_vertices": control_active_verts,
+			"atlas_line_other_valid": other_count,
+			"atlas_line_other_rms": float(torch.sqrt(other_item[0]).detach().cpu()),
+			"atlas_line_other_active_vertices": other_active_verts,
 		}
 
-	lm = sq.reshape(D, 1, 1, K)
-	mask = valid.to(dtype=res.xyz_lr.dtype).reshape(D, 1, 1, K)
-	return loss, (lm,), (mask,)
+	return {
+		"atlas_line": combined_item,
+		"atlas_line_control": control_item,
+		"atlas_line_other": other_item,
+	}

@@ -872,7 +872,6 @@ void Atlas::save(const fs::path& atlasDir) const
         root["type"] = "vc3d_atlas_fiber_mapping";
         root["version"] = 2;
         root["fiber_path"] = fiber.fiberPath.generic_string();
-        root["winding_offset"] = fiber.windingOffset;
         root["line_anchors"] = nlohmann::json::array();
         for (const auto& anchor : fiber.lineAnchors) {
             root["line_anchors"].push_back(anchorJson(anchor));
@@ -931,7 +930,7 @@ Atlas Atlas::load(const fs::path& atlasDir)
             const auto root = readJsonFile(mappingPath);
             FiberMapping mapping;
             mapping.fiberPath = root.value("fiber_path", std::string{});
-            mapping.windingOffset = root.value("winding_offset", 0);
+            mapping.windingOffset = 0;
             for (const auto& anchor : root.value("line_anchors", nlohmann::json::array())) {
                 mapping.lineAnchors.push_back(anchorFromJson(anchor));
             }
@@ -1126,7 +1125,8 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
                     << maxDelta << '.';
             throw std::runtime_error(message.str());
         }
-        (void)atlasHorizontalPeriodColumns(base);
+        const int periodColumns = atlasHorizontalPeriodColumns(base);
+        layoutAtlasObjects(exportData.atlas, periodColumns);
     } catch (const std::exception& ex) {
         throw std::runtime_error("Cannot load atlas base mesh " +
                                  exportData.basePath.string() + ": " + ex.what());

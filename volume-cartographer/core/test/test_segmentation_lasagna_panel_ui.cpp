@@ -463,10 +463,20 @@ int main(int argc, char** argv)
     require(panel._compactAtlasConfigCombo->count() == panel._atlasConfigCombo->count(),
             "Compact atlas config combo should mirror the full atlas config combo");
     panel.setLasagnaDataInputPath(QStringLiteral("/data/atlas_input.lasagna.json"));
+    const QString outputPathsDir = volpkgRoot + QStringLiteral("/paths");
+    require(QDir().mkpath(outputPathsDir + QStringLiteral("/my_sheet_v001.tifxyz")),
+            "Failed to create atlas output collision directory");
+    panel._submittedOutputNames.clear();
+    panel._submittedOutputNames.insert(QStringLiteral("my_sheet_v002.tifxyz"));
+    panel._outputNameEdit->setText(QStringLiteral("my_sheet"));
     panel.startAtlasOptimization(&state, &statusBar);
     QJsonObject atlasRequest = g_lastLasagnaOptimizationRequest;
     require(atlasRequest[QStringLiteral("data_input")].toString() == QStringLiteral("/data/atlas_input.lasagna.json"),
             "Atlas launch should send the selected data_input");
+    require(atlasRequest[QStringLiteral("output_name")].toString() == QStringLiteral("my_sheet_v003.tifxyz"),
+            "Atlas launch should version the explicit output-name field independently");
+    require(panel._submittedOutputNames.contains(QStringLiteral("my_sheet_v003.tifxyz")),
+            "Atlas launch should reserve the generated output name");
     require(!atlasRequest.contains(QStringLiteral("single_segment")) &&
                 !atlasRequest.contains(QStringLiteral("copy_model")) &&
                 !atlasRequest.contains(QStringLiteral("model_input")),
@@ -509,8 +519,18 @@ int main(int argc, char** argv)
                 !compactMetadata.contains(QStringLiteral("u_offset_columns")),
             "Compact atlas JSON should omit period_columns and u_offset_columns");
     QJsonObject compactMap = compactAtlas[QStringLiteral("maps")].toArray()[0].toObject();
-    require(compactMap[QStringLiteral("winding_offset")].toInt() == 2,
-            "Compact atlas JSON should include each map winding_offset");
+    require(compactMap[QStringLiteral("winding_offset")].toInt() == 0,
+            "Compact atlas JSON should include each derived map winding_offset");
+
+    panel._outputNameEdit->clear();
+    panel._submittedOutputNames.clear();
+    panel._submittedOutputNames.insert(QStringLiteral("atlas_v001.tifxyz"));
+    panel.startAtlasOptimization(&state, &statusBar);
+    QJsonObject fallbackAtlasRequest = g_lastLasagnaOptimizationRequest;
+    require(fallbackAtlasRequest[QStringLiteral("output_name")].toString() == QStringLiteral("atlas_v002.tifxyz"),
+            "Atlas launch should fall back to atlas and ignore the selected segment name");
+    require(panel._submittedOutputNames.contains(QStringLiteral("atlas_v002.tifxyz")),
+            "Atlas fallback launch should reserve submitted-name collisions");
 
     panel._atlasDirPath = volpkgRoot + QStringLiteral("/atlases/missing_atlas");
     panel.startAtlasOptimization(&state, &statusBar);

@@ -403,6 +403,8 @@ lambda_global: dict[str, float] = {
 	"ext_offset": 0.0,
 	"snap_surf_map": 0.0,
 	"atlas_line": 0.0,
+	"atlas_line_control": 0.0,
+	"atlas_line_other": 0.0,
 	"map_dist": 1.0,
 	"map_vec_normal": 1.0,
 	"map_surface_normal": 1.0,
@@ -1799,6 +1801,7 @@ def optimize(
 		},
 		"atlas_line": {
 			"loss": opt_loss_atlas_line.atlas_line_loss,
+			"sub": ["atlas_line", "atlas_line_control", "atlas_line_other"],
 			"needs": Needs(mesh_normals=True),
 		},
 		"cyl_normal": {
@@ -2499,6 +2502,20 @@ def optimize(
 				"cyl_outside_pen_frac": "out%",
 				"cyl_outside_depth_max": "outmax",
 				"cyl_outside_depth_avg": "outavg",
+				"atlas_line": "a_line",
+				"atlas_line_control": "a_ctl",
+				"atlas_line_other": "a_oth",
+				"atlas_line_samples": "a_samp",
+				"atlas_line_valid": "a_val",
+				"atlas_line_rms": "a_rms",
+				"atlas_line_active_vertices": "a_vtx",
+				"atlas_line_signed_delta_mean": "a_dlt",
+				"atlas_line_control_valid": "a_cval",
+				"atlas_line_control_rms": "a_crms",
+				"atlas_line_control_active_vertices": "a_cvtx",
+				"atlas_line_other_valid": "a_oval",
+				"atlas_line_other_rms": "a_orms",
+				"atlas_line_other_active_vertices": "a_ovtx",
 				"flatten_point_valid": "f_pt",
 				"flatten_quad_valid": "f_quad",
 				"flatten_tgt_step": "f_tgt",
@@ -2638,6 +2655,20 @@ def optimize(
 				"cyl_outside_pen_frac": "outside frac",
 				"cyl_outside_depth_max": "outside max",
 				"cyl_outside_depth_avg": "outside avg",
+				"atlas_line": "atlas line loss",
+				"atlas_line_control": "atlas control-anchor loss",
+				"atlas_line_other": "atlas in-span line-anchor loss",
+				"atlas_line_samples": "atlas line sample slots",
+				"atlas_line_valid": "atlas valid samples",
+				"atlas_line_rms": "atlas line RMS",
+				"atlas_line_active_vertices": "atlas active vertices",
+				"atlas_line_signed_delta_mean": "atlas signed normal correction mean",
+				"atlas_line_control_valid": "atlas valid control samples",
+				"atlas_line_control_rms": "atlas control RMS",
+				"atlas_line_control_active_vertices": "atlas active control vertices",
+				"atlas_line_other_valid": "atlas valid other samples",
+				"atlas_line_other_rms": "atlas other RMS",
+				"atlas_line_other_active_vertices": "atlas active other vertices",
 				"p:wcirc_avg_vx": "param circ avg",
 				"p:wcirc_tgt_vx": "param circ target",
 				"p:wstep_invalid_avg_vx": "param invalid avg",
@@ -2737,9 +2768,23 @@ def optimize(
 				"snaps_map_nsign": 179,
 				"snaps_map_scales": 180,
 				"snaps_map_repair": 181,
-				"cyl_outside_pen_frac": 190,
-				"cyl_outside_depth_max": 191,
-				"cyl_outside_depth_avg": 192,
+				"atlas_line": 182,
+				"atlas_line_control": 183,
+				"atlas_line_other": 184,
+				"atlas_line_samples": 185,
+				"atlas_line_valid": 186,
+				"atlas_line_rms": 187,
+				"atlas_line_active_vertices": 188,
+				"atlas_line_signed_delta_mean": 189,
+				"atlas_line_control_valid": 190,
+				"atlas_line_control_rms": 191,
+				"atlas_line_control_active_vertices": 192,
+				"atlas_line_other_valid": 193,
+				"atlas_line_other_rms": 194,
+				"atlas_line_other_active_vertices": 195,
+				"cyl_outside_pen_frac": 200,
+				"cyl_outside_depth_max": 201,
+				"cyl_outside_depth_avg": 202,
 			}
 			def _sort_key(k: str) -> tuple[int, str]:
 				return (key_order.get(k, 0), k)
@@ -3064,7 +3109,10 @@ def optimize(
 				_log_cuda_memory(f"{loss_label}.before")
 				_t_loss = _stage_start(f"{profile_label}.{name}") if profile_label is not None else None
 				_t_loss_wall = time.perf_counter() if timing is not None else None
-				result = t["loss"](res=res_)
+				if name == "atlas_line":
+					result = t["loss"](res=res_, stage_eff=eff_)
+				else:
+					result = t["loss"](res=res_)
 				_debug_cuda_sync(f"{profile_label}.{name}" if profile_label is not None else name)
 				_log_cuda_memory(f"{loss_label}.after_raw")
 				if timing is not None and _t_loss_wall is not None:
@@ -3079,6 +3127,8 @@ def optimize(
 							continue
 						tv[sub_name] = float(lv.detach().cpu())
 						total = total + w * lv
+					if name == "atlas_line":
+						tv.update(opt_loss_atlas_line.last_stats())
 				else:
 					lv, lms, masks = result
 					w = _need_term(name, eff_)

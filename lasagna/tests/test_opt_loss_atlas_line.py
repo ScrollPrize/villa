@@ -32,8 +32,21 @@ def _fit_data(lines: fit_data.AtlasLines3D) -> fit_data.FitData3D:
 	)
 
 
-def _result(xyz: torch.Tensor, lines: fit_data.AtlasLines3D) -> fit_model.FitResult3D:
+def _normal_grid(xyz: torch.Tensor, *, sign: float = 1.0) -> torch.Tensor:
+	n = torch.zeros_like(xyz)
+	n[..., 2] = float(sign)
+	return n
+
+
+def _result(
+	xyz: torch.Tensor,
+	lines: fit_data.AtlasLines3D,
+	*,
+	normals: torch.Tensor | None = None,
+) -> fit_model.FitResult3D:
 	D, H, W, _ = xyz.shape
+	if normals is None:
+		normals = _normal_grid(xyz)
 	return fit_model.FitResult3D(
 		xyz_lr=xyz,
 		xyz_hr=None,
@@ -46,7 +59,7 @@ def _result(xyz: torch.Tensor, lines: fit_data.AtlasLines3D) -> fit_model.FitRes
 		bias_lr=torch.zeros(D, 1, H, W, dtype=xyz.dtype),
 		mask_hr=None,
 		mask_lr=None,
-		normals=torch.zeros_like(xyz),
+		normals=normals,
 		xy_conn=None,
 		mask_conn=None,
 		sign_conn=None,
@@ -84,12 +97,13 @@ class AtlasLineLossTest(unittest.TestCase):
 			source_indices=(0,),
 		)
 
-		loss, maps, masks = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines))
+		result = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines))
+		loss, maps, masks = result["atlas_line"]
 		loss.backward()
 
 		self.assertAlmostEqual(float(loss.detach()), 1.0, delta=1.0e-5)
-		self.assertEqual(tuple(maps[0].shape), (1, 1, 1, 1))
-		self.assertEqual(float(masks[0].sum()), 1.0)
+		self.assertEqual(tuple(maps[0].shape), (1, 1, 3, 4))
+		self.assertAlmostEqual(float(masks[0].sum()), 1.0, delta=1.0e-5)
 		self.assertEqual(int(opt_loss_atlas_line._cols[0, 0]), 2)
 		self.assertAlmostEqual(float(opt_loss_atlas_line._frac_w[0, 0]), 0.2, delta=1.0e-5)
 		self.assertTrue(torch.isfinite(xyz.grad).all().item())
@@ -104,10 +118,213 @@ class AtlasLineLossTest(unittest.TestCase):
 			model_w=torch.tensor([1.0], dtype=torch.float32),
 		)
 
-		loss, _maps, masks = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines))
+		result = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines))
+		loss, _maps, masks = result["atlas_line"]
 
 		self.assertEqual(float(loss.detach()), 0.0)
 		self.assertEqual(float(masks[0].sum()), 0.0)
+
+	def test_atlas_normals_are_ignored(self) -> None:
+		xyz = _plane_grid().requires_grad_(True)
+		base_kwargs = {
+			"target_xyz": torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
+			"model_h": torch.tensor([1.0], dtype=torch.float32),
+			"model_w": torch.tensor([1.0], dtype=torch.float32),
+		}
+		lines_a = fit_data.AtlasLines3D(
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+			**base_kwargs,
+		)
+		lines_b = fit_data.AtlasLines3D(
+			normal_xyz=torch.tensor([[float("nan"), float("nan"), float("nan")]], dtype=torch.float32),
+			**base_kwargs,
+		)
+
+		opt_loss_atlas_line.reset_state()
+		loss_a = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines_a))["atlas_line"][0]
+		opt_loss_atlas_line.reset_state()
+		loss_b = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines_b))["atlas_line"][0]
+
+		self.assertAlmostEqual(float(loss_a.detach()), float(loss_b.detach()), delta=1.0e-6)
+		self.assertTrue(torch.isfinite(loss_b).item())
+
+	def test_signed_correction_scalar_follows_model_normal_sign(self) -> None:
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0], dtype=torch.float32),
+		)
+
+		opt_loss_atlas_line.reset_state()
+		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines, normals=_normal_grid(xyz, sign=1.0)))
+		pos = opt_loss_atlas_line.last_stats()["atlas_line_signed_delta_mean"]
+		opt_loss_atlas_line.reset_state()
+		opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines, normals=_normal_grid(xyz, sign=-1.0)))
+		neg = opt_loss_atlas_line.last_stats()["atlas_line_signed_delta_mean"]
+
+		self.assertAlmostEqual(pos, 1.0, delta=1.0e-5)
+		self.assertAlmostEqual(neg, -1.0, delta=1.0e-5)
+
+	def test_tangential_target_offset_has_no_normal_displacement_loss(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[2.0, 1.0, 0.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0], dtype=torch.float32),
+		)
+
+		loss = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines))["atlas_line"][0]
+
+		self.assertEqual(float(loss.detach()), 0.0)
+
+	def test_gaussian_splat_affects_neighboring_vertices(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0], dtype=torch.float32),
+		)
+
+		loss, _maps, masks = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines))["atlas_line"]
+		loss.backward()
+
+		self.assertGreater(int((masks[0] > 0.0).sum()), 4)
+		self.assertGreater(int((xyz.grad[..., 2].abs() > 0.0).sum()), 4)
+
+	def test_atlas_line_exposes_control_and_other_components_from_one_batch(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([
+				[1.0, 1.0, 1.0],
+				[2.0, 1.0, 2.0],
+			], dtype=torch.float32),
+			normal_xyz=torch.tensor([
+				[0.0, 0.0, -1.0],
+				[0.0, 0.0, -1.0],
+			], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+		)
+
+		result = opt_loss_atlas_line.atlas_line_loss(res=_result(xyz, lines))
+		loss_all = result["atlas_line"][0]
+		loss_control = result["atlas_line_control"][0]
+		loss_other = result["atlas_line_other"][0]
+
+		self.assertGreater(float(loss_all.detach()), 0.0)
+		self.assertAlmostEqual(float(loss_control.detach()), 1.0, delta=1.0e-5)
+		self.assertAlmostEqual(float(loss_other.detach()), 4.0, delta=1.0e-5)
+		stats = opt_loss_atlas_line.last_stats()
+		self.assertEqual(stats["atlas_line_valid"], 2.0)
+		self.assertEqual(stats["atlas_line_control_valid"], 1.0)
+		self.assertEqual(stats["atlas_line_other_valid"], 1.0)
+		self.assertAlmostEqual(float(result["atlas_line_control"][2][0].sum()), 1.0, delta=1.0e-5)
+		self.assertAlmostEqual(float(result["atlas_line_other"][2][0].sum()), 1.0, delta=1.0e-5)
+
+	def test_atlas_line_stage_weights_process_control_only(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[1.0, 1.0, 1.0], [2.0, 1.0, 2.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+		)
+
+		result = opt_loss_atlas_line.atlas_line_loss(
+			res=_result(xyz, lines),
+			stage_eff={"atlas_line": 0.0, "atlas_line_control": 1.0, "atlas_line_other": 0.0},
+		)
+
+		self.assertAlmostEqual(float(result["atlas_line"][2][0].sum()), 1.0, delta=1.0e-5)
+		self.assertAlmostEqual(float(result["atlas_line_control"][2][0].sum()), 1.0, delta=1.0e-5)
+		self.assertEqual(float(result["atlas_line_other"][2][0].sum()), 0.0)
+		self.assertEqual(opt_loss_atlas_line.last_stats()["atlas_line_other_valid"], 0.0)
+
+	def test_atlas_line_stage_weights_process_other_only(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[1.0, 1.0, 1.0], [2.0, 1.0, 2.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+		)
+
+		result = opt_loss_atlas_line.atlas_line_loss(
+			res=_result(xyz, lines),
+			stage_eff={"atlas_line": 0.0, "atlas_line_control": 0.0, "atlas_line_other": 1.0},
+		)
+
+		self.assertAlmostEqual(float(result["atlas_line"][2][0].sum()), 1.0, delta=1.0e-5)
+		self.assertEqual(float(result["atlas_line_control"][2][0].sum()), 0.0)
+		self.assertAlmostEqual(float(result["atlas_line_other"][2][0].sum()), 1.0, delta=1.0e-5)
+		self.assertEqual(opt_loss_atlas_line.last_stats()["atlas_line_control_valid"], 0.0)
+
+	def test_atlas_line_legacy_weight_processes_both_groups(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[1.0, 1.0, 1.0], [2.0, 1.0, 2.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+		)
+
+		result = opt_loss_atlas_line.atlas_line_loss(
+			res=_result(xyz, lines),
+			stage_eff={"atlas_line": 1.0, "atlas_line_control": 0.0, "atlas_line_other": 0.0},
+		)
+
+		self.assertGreater(float(result["atlas_line"][2][0].sum()), 1.0)
+		self.assertAlmostEqual(float(result["atlas_line_control"][2][0].sum()), 1.0, delta=1.0e-5)
+		self.assertAlmostEqual(float(result["atlas_line_other"][2][0].sum()), 1.0, delta=1.0e-5)
+		self.assertEqual(opt_loss_atlas_line.last_stats()["atlas_line_valid"], 2.0)
+
+	def test_atlas_line_all_zero_weights_skip_intersections(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([[1.0, 1.0, 1.0], [2.0, 1.0, 2.0]], dtype=torch.float32),
+			normal_xyz=torch.tensor([[0.0, 0.0, -1.0], [0.0, 0.0, -1.0]], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False]),
+		)
+		original = opt_loss_atlas_line._intersect_quad
+		calls = 0
+
+		def counted(*args, **kwargs):
+			nonlocal calls
+			calls += 1
+			return original(*args, **kwargs)
+
+		opt_loss_atlas_line._intersect_quad = counted
+		try:
+			result = opt_loss_atlas_line.atlas_line_loss(
+				res=_result(xyz, lines),
+				stage_eff={"atlas_line": 0.0, "atlas_line_control": 0.0, "atlas_line_other": 0.0},
+			)
+		finally:
+			opt_loss_atlas_line._intersect_quad = original
+
+		self.assertEqual(calls, 0)
+		self.assertEqual(float(result["atlas_line"][0].detach()), 0.0)
+		result["atlas_line"][0].backward()
+		self.assertTrue(torch.equal(xyz.grad, torch.zeros_like(xyz)))
+		self.assertEqual(float(result["atlas_line"][2][0].sum()), 0.0)
+		self.assertEqual(tuple(result["atlas_line"][2][0].shape), (1, 1, 3, 4))
 
 
 if __name__ == "__main__":

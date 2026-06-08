@@ -1,43 +1,40 @@
 {
   "args": {
     "model-init": "atlas",
-    "mesh-step": 100,
+    "mesh-step": 50,
     "subsample-mesh": 4,
     "subsample-winding": 4,
     "depth": 1
   },
   "base": {
     "normal": 1.0,
-    "step": 0.1,
-    "smooth": 0.01,
-    "atlas_line": 0.001
+    "step": 10.0,
+    "smooth": 10.0,
+    "atlas_line_control": 0.01,
+    "atlas_line_other": 0.01
   },
   "stages": [
     {
       "name": "atlas_init_relax",
       "opt": {
-        "steps": 100,
-        "lr": 0.001,
+        "steps": 2000,
+        "lr": 0.1,
         "params": ["mesh_ms"],
         "w_fac": {
-          "atlas_line": 0.0,
-          "normal": 1.0,
-          "step": 1.0,
-          "smooth": 1.0
+          "atlas_line_control": 0.000001,
+          "atlas_line_other": 0.000001
         }
       }
     },
     {
       "name": "atlas_line_fit",
       "opt": {
-        "steps": 500,
-        "lr": 0.001,
+        "steps": "auto",
+        "lr": 0.1,
         "params": ["mesh_ms"],
         "w_fac": {
-          "atlas_line": 1.0,
-          "normal": 1.0,
-          "step": 1.0,
-          "smooth": 1.0
+          "atlas_line_control": 0.00001,
+          "atlas_line_other": 0.0
         }
       }
     }

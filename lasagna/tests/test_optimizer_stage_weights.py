@@ -67,6 +67,24 @@ class OptimizerStageWeightsTest(unittest.TestCase):
 		self.assertEqual(opt.eff["smooth"], 1.0)
 		self.assertEqual(opt.eff["map_dist"], 8.0)
 
+	def test_atlas_line_split_weights_parse_independently(self) -> None:
+		stages = optimizer.load_stages_cfg({
+			"base": {
+				"atlas_line_control": 0.2,
+				"atlas_line_other": 0.5,
+			},
+			"stages": [
+				{"name": "stage0", "steps": 1, "params": ["mesh_ms"], "w_fac": {
+					"atlas_line_control": 3.0,
+					"atlas_line_other": 0.25,
+				}},
+			],
+		})
+
+		opt = stages[0].global_opt
+		self.assertAlmostEqual(opt.eff["atlas_line_control"], 0.6, delta=1.0e-12)
+		self.assertAlmostEqual(opt.eff["atlas_line_other"], 0.125, delta=1.0e-12)
+
 	def test_numeric_w_fac_scales_applicable_map_losses(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"base": {
