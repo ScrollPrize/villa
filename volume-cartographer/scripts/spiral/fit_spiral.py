@@ -40,7 +40,7 @@ grad_mag_zarr_path = None
 normal_zarr_group = '4'
 pcl_json_paths = [
     f'{dataset_path}/rel_windings_new_reordered.json',
-    f'{dataset_path}/same_winding_annotations_fixed_merged.json',
+    # f'{dataset_path}/same_winding_annotations_fixed_merged.json',
 ]
 patches_path = f'{dataset_path}/patches'
 shell_path = f'{dataset_path}/s1_2um_outer'
@@ -48,7 +48,7 @@ tracks_dbm_path = None
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 6000, 16000
+z_begin, z_end = 10_000, 13_000
 voxel_size_um = 2.4 * 4  # before downsampling
 
 # # PHerc0172
@@ -102,11 +102,12 @@ default_config = {
     'unattached_pcl_num_per_step': 28,
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 4.,
-    'track_num_per_step': 2000,
-    'track_num_points_per_step': 8,
-    'track_exclusion_radius': 12.0,
+    'track_num_per_step': 16000,
+    'track_num_points_per_step': 24,
+    'track_exclusion_radius': 0.0,
     'track_radius_target': 'mean',
     'track_radius_loss_margin': 0.025,
+    'track_radius_within_norm_p': 6.0,  # >1 emphasises worst within-track point in the radius loss (1.0 = mean)
     'track_dt_within_track_norm_p': 3.0,  # within a track; -> inf strongly penalises isolated badly-aligned points
     'track_dt_norm_p': 0.5,  # across tracks; -> 0 prefers many fully-satisfied tracks (winner-take-all snapping)
     'track_dt_loss_margin': 0.025,
@@ -136,8 +137,8 @@ default_config = {
     'loss_weight_winding_number': 20.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
-    'loss_weight_track_radius': 50.,
-    'loss_weight_track_dt': 20.,
+    'loss_weight_track_radius': 200.,
+    'loss_weight_track_dt': 40.,
     'loss_weight_track_coverage': 0.0,
     'loss_weight_patch_stretch': 0.0,
     'loss_weight_bending': 0.0,
@@ -154,6 +155,7 @@ default_config = {
     'weight_decay_gap_expander': 1.e-2,
     'weight_decay_flow_field': 0.0,
     'loss_start_patch_dt': 25_000,
+    'loss_start_track_dt': 10_000,
     'num_snapping_subpasses': 0,
     'snapping_steps_per_subpass': 500,
     'snapping_num_anchor_points': 2000,
@@ -3761,7 +3763,16 @@ def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding):
     else:
         raise ValueError(f"track_radius_target must be 'mean' or 'median', got {cfg['track_radius_target']!r}")
     deviations = (shifted_radii - radius_target_per_track).abs()
-    return F.relu(deviations - radius_hinge_margin).mean()
+    hinged = F.relu(deviations - radius_hinge_margin)
+    within_p = cfg['track_radius_within_norm_p']
+    if within_p == 1.0:
+        return hinged.mean()
+    # Emphasise the worst within-track point: the satisfied_tracks metric requires
+    # ALL points in the spiral band, so a per-track p-norm (p>1) over the residuals
+    # targets the binding point. +1e-5 mirrors the dt loss, avoiding the x**(1/p)
+    # zero-gradient singularity.
+    per_track = ((hinged + 1.e-5) ** within_p).mean(dim=-1) ** (1.0 / within_p)
+    return per_track.mean()
 
 
 def _same_radius_loss_for_track_subset(
@@ -4375,6 +4386,8 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         log_metrics = {}
 
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
+        track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
+        compute_track_dt = iteration > track_dt_start
         patch_radius_loss, umbilicus_loss, patch_dt_loss, shell_patch_radius_loss = get_patch_and_umbilicus_losses(
             slice_to_spiral_transform,
             dr_per_winding,
@@ -4512,7 +4525,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                     prepared_main_tracks,
                     cfg['track_num_per_step'],
                     cfg['track_num_points_per_step'],
-                    compute_dt=(not use_track_em) and compute_patch_dt,
+                    compute_dt=(not use_track_em) and compute_track_dt,
                 )
                 losses['track_radius'] = track_radius_loss * cfg['loss_weight_track_radius']
                 losses['track_dt'] = track_dt_loss * cfg['loss_weight_track_dt']
