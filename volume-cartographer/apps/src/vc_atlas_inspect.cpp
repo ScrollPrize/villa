@@ -56,6 +56,8 @@ struct ControlVector {
 
 using ControlLengthBySourceIndex = std::unordered_map<int, double>;
 using ControlLengthByObjectId = std::unordered_map<std::string, ControlLengthBySourceIndex>;
+using SourceControlByLineIndex = std::unordered_map<int, cv::Vec3d>;
+using SourceControlByObjectId = std::unordered_map<std::string, SourceControlByLineIndex>;
 
 struct RemapReport {
     ControlLengthByObjectId lengths;
@@ -184,9 +186,40 @@ vc::atlas::FiberInput loadFiberInput(const vc::atlas::LasagnaAtlasObject& object
     return input;
 }
 
+SourceControlByObjectId loadSourceControlPoints(
+    const vc::atlas::LasagnaAtlasExport& exportData)
+{
+    SourceControlByObjectId out;
+    for (const auto& object : exportData.objects) {
+        vc::atlas::FiberInput input = loadFiberInput(object);
+        auto& controls = out[object.id];
+        for (size_t i = 0; i < input.controlLineIndices.size(); ++i) {
+            controls[input.controlLineIndices[i]] = input.controlPoints[i];
+        }
+    }
+    return out;
+}
+
+std::optional<cv::Vec3d> sourceControlPoint(
+    const SourceControlByObjectId& sourceControls,
+    const std::string& objectId,
+    int sourceIndex)
+{
+    const auto objectIt = sourceControls.find(objectId);
+    if (objectIt == sourceControls.end()) {
+        return std::nullopt;
+    }
+    const auto pointIt = objectIt->second.find(sourceIndex);
+    if (pointIt == objectIt->second.end()) {
+        return std::nullopt;
+    }
+    return pointIt->second;
+}
+
 RemapReport remapFibers(const vc::atlas::LasagnaAtlasExport& exportData,
                         const QuadSurface& baseSurface,
-                        const vc::lasagna::NormalSampler& sampler)
+                        const vc::lasagna::NormalSampler& sampler,
+                        const SourceControlByObjectId& sourceControls)
 {
     auto baseSurfacePtr = std::shared_ptr<QuadSurface>(
         const_cast<QuadSurface*>(&baseSurface),
@@ -204,10 +237,12 @@ RemapReport remapFibers(const vc::atlas::LasagnaAtlasExport& exportData,
             for (const auto& anchor : remapped.controlAnchors) {
                 const auto basePoint =
                     vc::atlas::atlasAnchorBasePoint(anchor, remapped, baseSurface);
-                if (!basePoint) {
+                const auto controlPoint = sourceControlPoint(
+                    sourceControls, object.id, anchor.sourceIndex);
+                if (!basePoint || !controlPoint) {
                     continue;
                 }
-                const double length = norm(anchor.world - *basePoint);
+                const double length = norm(*controlPoint - *basePoint);
                 if (std::isfinite(length)) {
                     lengths[anchor.sourceIndex] = length;
                     ++report.remappedControls;
@@ -225,6 +260,7 @@ RemapReport remapFibers(const vc::atlas::LasagnaAtlasExport& exportData,
 
 std::vector<ControlVector> collectControlVectors(const vc::atlas::Atlas& atlas,
                                                  const QuadSurface& baseSurface,
+                                                 const SourceControlByObjectId& sourceControls,
                                                  const ControlLengthByObjectId* remappedLengths)
 {
     const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(baseSurface);
@@ -238,8 +274,19 @@ std::vector<ControlVector> collectControlVectors(const vc::atlas::Atlas& atlas,
             row.atlasV = anchor.atlasV;
             row.actualAtlasU = vc::atlas::actualAtlasU(anchor, fiber, periodColumns);
             row.windingOffset = fiber.windingOffset;
-            row.controlPoint = anchor.world;
-            if (const auto basePoint = vc::atlas::atlasAnchorBasePoint(anchor, fiber, baseSurface)) {
+            const auto controlPoint = sourceControlPoint(
+                sourceControls, row.objectId, anchor.sourceIndex);
+            if (controlPoint) {
+                row.controlPoint = *controlPoint;
+            } else {
+                row.controlPoint = {
+                    std::numeric_limits<double>::quiet_NaN(),
+                    std::numeric_limits<double>::quiet_NaN(),
+                    std::numeric_limits<double>::quiet_NaN(),
+                };
+            }
+            if (const auto basePoint = vc::atlas::atlasAnchorBasePoint(anchor, fiber, baseSurface);
+                basePoint && controlPoint) {
                 row.basePoint = *basePoint;
                 row.vector = row.controlPoint - row.basePoint;
                 row.length = norm(row.vector);
@@ -388,7 +435,8 @@ std::string sanitizeObjName(const std::string& value)
 int writeMappingObj(const fs::path& path,
                     const std::string& label,
                     const vc::atlas::FiberMapping& mapping,
-                    const QuadSurface& baseSurface)
+                    const QuadSurface& baseSurface,
+                    const SourceControlByObjectId& sourceControls)
 {
     std::ofstream out(path);
     if (!out) {
@@ -404,10 +452,12 @@ int writeMappingObj(const fs::path& path,
     int segments = 0;
     for (const auto& anchor : mapping.controlAnchors) {
         const auto basePoint = vc::atlas::atlasAnchorBasePoint(anchor, mapping, baseSurface);
-        if (!basePoint) {
+        const auto controlPoint = sourceControlPoint(
+            sourceControls, mapping.fiberPath.generic_string(), anchor.sourceIndex);
+        if (!basePoint || !controlPoint) {
             continue;
         }
-        const cv::Vec3d vector = anchor.world - *basePoint;
+        const cv::Vec3d vector = *controlPoint - *basePoint;
         const double length = norm(vector);
         if (!std::isfinite(length)) {
             continue;
@@ -416,8 +466,8 @@ int writeMappingObj(const fs::path& path,
             << " length " << length << '\n'
             << "v " << (*basePoint)[0] << ' ' << (*basePoint)[1] << ' '
             << (*basePoint)[2] << '\n'
-            << "v " << anchor.world[0] << ' ' << anchor.world[1] << ' '
-            << anchor.world[2] << '\n'
+            << "v " << (*controlPoint)[0] << ' ' << (*controlPoint)[1] << ' '
+            << (*controlPoint)[2] << '\n'
             << "l " << vertexIndex << ' ' << (vertexIndex + 1) << '\n';
         vertexIndex += 2;
         ++segments;
@@ -441,13 +491,14 @@ void writeMissingMappingObj(const fs::path& path,
 
 int writeDebugObjs(const vc::atlas::LasagnaAtlasExport& exportData,
                    const QuadSurface& baseSurface,
+                   const SourceControlByObjectId& sourceControls,
                    const RemapReport* remapReport)
 {
     int written = 0;
     for (const auto& mapping : exportData.atlas.fibers) {
         const std::string name = sanitizeObjName(mapping.fiberPath.generic_string());
         const fs::path oldPath = fs::current_path() / ("atlas_inspect_old_" + name + ".obj");
-        writeMappingObj(oldPath, "old", mapping, baseSurface);
+        writeMappingObj(oldPath, "old", mapping, baseSurface, sourceControls);
         ++written;
 
         if (!remapReport) {
@@ -460,7 +511,7 @@ int writeDebugObjs(const vc::atlas::LasagnaAtlasExport& exportData,
             ++written;
             continue;
         }
-        writeMappingObj(newPath, "new", it->second, baseSurface);
+        writeMappingObj(newPath, "new", it->second, baseSurface, sourceControls);
         ++written;
     }
     return written;
@@ -476,13 +527,14 @@ int main(int argc, char** argv)
         const auto exportData = vc::atlas::loadLasagnaAtlasExport(options.atlasDir,
                                                                   project.volpkgRoot);
         const QuadSurface baseSurface(exportData.basePath);
+        const SourceControlByObjectId sourceControls = loadSourceControlPoints(exportData);
 
         std::optional<RemapReport> remapReport;
         if (!project.lasagnaManifestPath.empty()) {
             const vc::lasagna::LasagnaDataset dataset =
                 vc::lasagna::LasagnaDataset::open(project.lasagnaManifestPath);
             const vc::lasagna::LasagnaNormalSampler sampler(dataset);
-            remapReport = remapFibers(exportData, baseSurface, sampler);
+            remapReport = remapFibers(exportData, baseSurface, sampler, sourceControls);
         } else {
             std::cerr << "vc_atlas_inspect: no selected Lasagna dataset; "
                       << "len_new and new OBJ output will be missing. "
@@ -491,10 +543,12 @@ int main(int argc, char** argv)
 
         const auto rows = collectControlVectors(exportData.atlas,
                                                 baseSurface,
+                                                sourceControls,
                                                 remapReport ? &remapReport->lengths : nullptr);
         printHuman(exportData, baseSurface, rows);
         const int objCount = writeDebugObjs(exportData,
                                             baseSurface,
+                                            sourceControls,
                                             remapReport ? &*remapReport : nullptr);
         if (remapReport) {
             std::cout << "\nremap_control_vectors=" << remapReport->remappedControls

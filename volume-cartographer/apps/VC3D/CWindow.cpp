@@ -2517,8 +2517,10 @@ void CWindow::refreshAtlasOverviewDocks()
                         vc::atlas::atlasHorizontalPeriodColumns(baseSurface))));
             } catch (const std::exception& ex) {
                 auto* item = new QTreeWidgetItem(tree);
-                item->setText(0, QString::fromStdString(atlasDir.filename().string()));
+                item->setText(0, QString::fromStdString(
+                    atlasInfo.name.empty() ? atlasDir.filename().string() : atlasInfo.name));
                 item->setText(1, QString::fromStdString(ex.what()));
+                item->setData(0, Qt::UserRole, QString::fromStdString(atlasDir.string()));
             }
         }
         tree->expandAll();

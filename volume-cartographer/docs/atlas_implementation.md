@@ -10,7 +10,7 @@ Atlas anchor U/V values are stored in base-mesh-relative grid coordinates. The m
 
 Atlas creation copies the selected `shell_*.tifxyz` base mesh as-is into the atlas directory. It does not rotate, reindex, or shift the saved base shell columns. The first and duplicate closing seam columns remain exactly as they were in the source shell, and ancillary surface channels are copied without column rotation.
 
-Fiber anchors are also stored in that same base-mesh-relative coordinate system. Projection hits keep their raw base mesh U/V values. Continuation mapping may unwrap `atlasU` across the seam for line continuity, but the modulo column position still refers to the original base mesh columns. Atlas layout never rewrites anchor coordinates.
+Fiber anchors store source geometry in `world` and mapped-shell coordinates in `atlasU`/`atlasV`. Projection hits keep their raw base mesh U/V values. Continuation mapping may unwrap `atlasU` across the seam for line continuity, but the modulo column position still refers to the original base mesh columns. Atlas layout never rewrites anchor coordinates or source fiber geometry.
 
 Each mapped fiber stores an integer `winding_offset`, derived from atlas links at load/export time and defaulting to `0` before layout. Display and footprint calculations use:
 

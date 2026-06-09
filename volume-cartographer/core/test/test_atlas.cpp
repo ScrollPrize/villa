@@ -9,12 +9,15 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -157,6 +160,119 @@ void writeValidLasagnaAtlasFixture(const fs::path& volpkgRoot,
     writeText(atlasDir / "metadata.json",
               R"({"type":"vc3d_atlas","version":4,"name":")" + atlasName +
               R"(","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})");
+}
+
+fs::path atlas21FixtureRoot()
+{
+    if (const char* env = std::getenv("VC_ATLAS21_FIXTURE_ROOT");
+        env && *env) {
+        return fs::path(env);
+    }
+    fs::path repoRoot = fs::current_path();
+    if (!fs::is_directory(repoRoot / "volume-cartographer")) {
+        fs::path cursor = fs::absolute(fs::path(__FILE__)).parent_path();
+        for (int i = 0; i < 8; ++i) {
+            if (fs::is_directory(cursor / "volume-cartographer")) {
+                repoRoot = cursor;
+                break;
+            }
+            cursor = cursor.parent_path();
+        }
+    }
+    return repoRoot.parent_path() / "data" / "test_data" / "atlas_export" / "fiber_21";
+}
+
+bool envFlagEnabled(const char* name)
+{
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE";
+}
+
+bool finiteVec3(const cv::Vec3d& p)
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+std::optional<nlohmann::json> atlas21SampleRecord(const std::string& objectId,
+                                                  const vc::atlas::FiberMapping& mapping,
+                                                  const vc::atlas::AtlasAnchor& anchor,
+                                                  bool isControlPoint,
+                                                  const QuadSurface& baseSurface)
+{
+    const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(baseSurface);
+    const double actualU = vc::atlas::actualAtlasU(anchor, mapping, periodColumns);
+    const auto basePoint =
+        vc::atlas::atlasAnchorBasePoint(anchor, mapping, baseSurface);
+    if (!basePoint.has_value() || !finiteVec3(*basePoint)) {
+        return std::nullopt;
+    }
+    return nlohmann::json{
+        {"object_id", objectId},
+        {"source_index", anchor.sourceIndex},
+        {"is_control_point", isControlPoint},
+        {"atlas_u", anchor.atlasU},
+        {"atlas_v", anchor.atlasV},
+        {"winding_offset", mapping.windingOffset},
+        {"actual_u", actualU},
+        {"base_xyz", {(*basePoint)[0], (*basePoint)[1], (*basePoint)[2]}},
+    };
+}
+
+nlohmann::json atlas21ExpectedSamples(const vc::atlas::LasagnaAtlasExport& exportData,
+                                      const QuadSurface& baseSurface)
+{
+    nlohmann::json records = nlohmann::json::array();
+    constexpr size_t kMaxLineSamplesPerMapping = 8;
+    for (const auto& mapping : exportData.atlas.fibers) {
+        const std::string objectId = mapping.fiberPath.generic_string();
+        std::unordered_set<int> controlIndices;
+        int controlStart = std::numeric_limits<int>::max();
+        int controlEnd = std::numeric_limits<int>::min();
+        for (const auto& anchor : mapping.controlAnchors) {
+            controlIndices.insert(anchor.sourceIndex);
+            controlStart = std::min(controlStart, anchor.sourceIndex);
+            controlEnd = std::max(controlEnd, anchor.sourceIndex);
+            if (auto record =
+                    atlas21SampleRecord(objectId, mapping, anchor, true, baseSurface)) {
+                records.push_back(*record);
+            }
+        }
+
+        if (mapping.controlAnchors.empty()) {
+            continue;
+        }
+        std::vector<const vc::atlas::AtlasAnchor*> lineCandidates;
+        for (const auto& anchor : mapping.lineAnchors) {
+            if (anchor.sourceIndex < controlStart || anchor.sourceIndex > controlEnd) {
+                continue;
+            }
+            if (controlIndices.count(anchor.sourceIndex) != 0) {
+                continue;
+            }
+            lineCandidates.push_back(&anchor);
+        }
+        if (lineCandidates.empty()) {
+            continue;
+        }
+        const size_t wanted = std::min(kMaxLineSamplesPerMapping, lineCandidates.size());
+        std::unordered_set<size_t> picked;
+        for (size_t i = 0; i < wanted; ++i) {
+            const size_t pick = wanted == 1
+                ? 0
+                : (i * (lineCandidates.size() - 1)) / (wanted - 1);
+            if (picked.insert(pick).second) {
+                if (auto record = atlas21SampleRecord(
+                        objectId, mapping, *lineCandidates[pick], false, baseSurface)) {
+                    records.push_back(*record);
+                }
+            }
+        }
+    }
+    return records;
 }
 
 } // namespace
@@ -377,6 +493,105 @@ TEST_CASE("Lasagna atlas export is derived from native atlas metadata and mappin
     CHECK(compact.at("maps")[0].at("winding_offset").get<int>() == 0);
     CHECK(compact.at("maps")[0].at("mapping_path").get<std::string>() ==
           "mappings/fibers/fiber.json");
+}
+
+TEST_CASE("Atlas 21 Lasagna export fixture resolves mappings and native base samples")
+{
+    const fs::path fixtureRoot = atlas21FixtureRoot();
+    if (!fs::is_directory(fixtureRoot)) {
+        MESSAGE("Atlas 21 fixture root is absent: " << fixtureRoot);
+        return;
+    }
+
+    const fs::path atlasDir = fixtureRoot / "atlases" / "fiber_21";
+    const auto exported = vc::atlas::loadLasagnaAtlasExport(atlasDir, fixtureRoot);
+    CHECK(exported.atlas.metadata.version == 4);
+    CHECK(exported.atlas.metadata.name == "fiber_21");
+    CHECK(exported.atlas.metadata.baseMeshPath ==
+          fs::path("base_mesh/shell_0034.tifxyz"));
+    CHECK(exported.basePath ==
+          atlasDir / "base_mesh" / "shell_0034.tifxyz");
+    REQUIRE(exported.objects.size() == 8);
+    REQUIRE(exported.atlas.fibers.size() == 8);
+
+    std::unordered_set<std::string> objectIds;
+    for (const auto& object : exported.objects) {
+        CHECK(objectIds.insert(object.id).second);
+        CHECK(object.fiberPath.parent_path() == fixtureRoot / "fibers");
+        CHECK(fs::is_regular_file(object.fiberPath));
+        CHECK(fs::is_regular_file(object.mappingPath));
+    }
+
+    const QuadSurface baseSurface(exported.basePath);
+    for (const auto& mapping : exported.atlas.fibers) {
+        CHECK(mapping.controlAnchors.size() > 0);
+        CHECK(mapping.lineAnchors.size() > mapping.controlAnchors.size());
+        size_t finiteControlAnchors = 0;
+        for (const auto& anchor : mapping.controlAnchors) {
+            const auto basePoint =
+                vc::atlas::atlasAnchorBasePoint(anchor, mapping, baseSurface);
+            if (basePoint.has_value() && finiteVec3(*basePoint)) {
+                ++finiteControlAnchors;
+            }
+        }
+        CHECK_MESSAGE(
+            finiteControlAnchors > 0,
+            "mapping has no finite control base samples fiber="
+                << mapping.fiberPath.generic_string());
+        size_t finiteLineAnchors = 0;
+        for (size_t i = 0; i < mapping.lineAnchors.size();
+             i += std::max<size_t>(1, mapping.lineAnchors.size() / 5)) {
+            const auto basePoint = vc::atlas::atlasAnchorBasePoint(
+                mapping.lineAnchors[i], mapping, baseSurface);
+            if (basePoint.has_value() && finiteVec3(*basePoint)) {
+                ++finiteLineAnchors;
+            }
+        }
+        CHECK_MESSAGE(
+            finiteLineAnchors > 0,
+            "mapping has no finite representative line base samples fiber="
+                << mapping.fiberPath.generic_string());
+    }
+
+    const nlohmann::json expected =
+        atlas21ExpectedSamples(exported, baseSurface);
+    REQUIRE(expected.is_array());
+    CHECK(expected.size() > exported.atlas.fibers.size());
+
+    const fs::path expectedPath = fixtureRoot / "expected_cpp_base_samples.json";
+    if (envFlagEnabled("VC_ATLAS21_WRITE_EXPECTED")) {
+        std::ofstream out(expectedPath);
+        out << expected.dump(2) << '\n';
+    }
+    if (!fs::is_regular_file(expectedPath)) {
+        MESSAGE("Atlas 21 expected sample file is absent: " << expectedPath);
+        return;
+    }
+
+    const nlohmann::json stored = nlohmann::json::parse(readText(expectedPath));
+    REQUIRE(stored.is_array());
+    REQUIRE(stored.size() == expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        CHECK(stored[i].at("object_id").get<std::string>() ==
+              expected[i].at("object_id").get<std::string>());
+        CHECK(stored[i].at("source_index").get<int>() ==
+              expected[i].at("source_index").get<int>());
+        CHECK(stored[i].at("is_control_point").get<bool>() ==
+              expected[i].at("is_control_point").get<bool>());
+        CHECK(stored[i].at("atlas_u").get<double>() ==
+              doctest::Approx(expected[i].at("atlas_u").get<double>()));
+        CHECK(stored[i].at("atlas_v").get<double>() ==
+              doctest::Approx(expected[i].at("atlas_v").get<double>()));
+        CHECK(stored[i].at("winding_offset").get<int>() ==
+              expected[i].at("winding_offset").get<int>());
+        CHECK(stored[i].at("actual_u").get<double>() ==
+              doctest::Approx(expected[i].at("actual_u").get<double>()));
+        for (int c = 0; c < 3; ++c) {
+            CHECK(stored[i].at("base_xyz").at(c).get<double>() ==
+                  doctest::Approx(expected[i].at("base_xyz").at(c).get<double>())
+                      .epsilon(1.0e-5));
+        }
+    }
 }
 
 TEST_CASE("Lasagna atlas export derives winding offsets from links without rewriting mappings")
@@ -1185,8 +1400,12 @@ TEST_CASE("Atlas maps a synthetic fiber over a simple grid")
     CHECK(mapping.lineAnchors[0].atlasU == doctest::Approx(1.0));
     CHECK(mapping.lineAnchors[1].atlasU == doctest::Approx(2.0));
     CHECK(mapping.lineAnchors[2].atlasV == doctest::Approx(2.0));
+    CHECK(mapping.lineAnchors[1].world[0] == doctest::Approx(2.0));
+    CHECK(mapping.lineAnchors[1].world[1] == doctest::Approx(2.0));
+    CHECK(mapping.lineAnchors[1].world[2] == doctest::Approx(1.0));
     REQUIRE(mapping.controlAnchors.size() == 1);
     CHECK(mapping.controlAnchors[0].sourceIndex == 1);
+    CHECK(mapping.controlAnchors[0].world[2] == doctest::Approx(1.0));
     CHECK(mapping.controlAnchors[0].atlasU == doctest::Approx(2.0));
 }
 

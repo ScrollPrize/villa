@@ -763,11 +763,11 @@ std::vector<ProjectionHit> projectPointToSurfacesAdaptive(
     }
 }
 
-AtlasAnchor anchorFromHit(int sourceIndex, const ProjectionHit& hit)
+AtlasAnchor anchorFromHit(int sourceIndex, const cv::Vec3d& sourcePoint, const ProjectionHit& hit)
 {
     AtlasAnchor anchor;
     anchor.sourceIndex = sourceIndex;
-    anchor.world = hit.world;
+    anchor.world = sourcePoint;
     anchor.atlasU = hit.atlasU;
     anchor.atlasV = hit.atlasV;
     anchor.distance = hit.distance;
@@ -872,7 +872,7 @@ std::optional<AtlasAnchor> chooseContinuationHit(int sourceIndex,
             if (rejectDebug) {
                 ++rejectDebug->candidateCount;
             }
-            AtlasAnchor candidate = anchorFromHit(sourceIndex, hit);
+            AtlasAnchor candidate = anchorFromHit(sourceIndex, linePoint, hit);
             candidate.atlasU = normalizeAtlasU(hit.atlasU, periodColumns) +
                                static_cast<double>(winding * periodColumns);
             const double du = candidate.atlasU - previous.atlasU;
@@ -1981,7 +1981,9 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
     }
 
     std::vector<std::optional<AtlasAnchor>> anchors(validatedFiber.linePoints.size());
-    anchors[seedIndex] = anchorFromHit(seedIndex, hitsByLinePoint[seedIndex].front());
+    anchors[seedIndex] = anchorFromHit(seedIndex,
+                                       validatedFiber.linePoints[static_cast<size_t>(seedIndex)],
+                                       hitsByLinePoint[seedIndex].front());
     anchors[seedIndex]->atlasU = normalizeAtlasU(anchors[seedIndex]->atlasU, periodColumns);
     atlasDebug("line_point[" + std::to_string(seedIndex) + "] chosen_anchor u=" +
                std::to_string(anchors[seedIndex]->atlasU) + " v=" +
@@ -2045,13 +2047,16 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
         throw std::runtime_error("incomplete atlas mapping: produced fewer than two line anchors");
     }
 
-    for (const int lineIndex : validatedFiber.controlLineIndices) {
+    for (size_t controlIndex = 0; controlIndex < validatedFiber.controlLineIndices.size(); ++controlIndex) {
+        const int lineIndex = validatedFiber.controlLineIndices[controlIndex];
         if (lineIndex < mappedFirst || lineIndex > mappedLast) {
             continue;
         }
         const auto& anchor = anchors[static_cast<size_t>(lineIndex)];
         if (anchor) {
-            mapping.controlAnchors.push_back(*anchor);
+            AtlasAnchor control = *anchor;
+            control.world = validatedFiber.controlPoints[controlIndex];
+            mapping.controlAnchors.push_back(control);
         }
     }
     return mapping;

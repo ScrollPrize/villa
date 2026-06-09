@@ -45,6 +45,58 @@ def _write_tifxyz(
 	(path / "meta.json").write_text(json.dumps({"scale": [1.0, 1.0, 1.0]}) + "\n", encoding="utf-8")
 
 
+def _atlas21_fixture_root() -> Path:
+	if os.environ.get("VC_ATLAS21_FIXTURE_ROOT"):
+		return Path(os.environ["VC_ATLAS21_FIXTURE_ROOT"])
+	return Path(__file__).resolve().parents[2].parent / "data" / "test_data" / "atlas_export" / "fiber_21"
+
+
+def _atlas21_config_from_fixture(
+	fixture_root: Path,
+	expected_records: list[dict[str, object]],
+) -> dict[str, object]:
+	atlas_dir = fixture_root / "atlases" / "fiber_21"
+	metadata = json.loads((atlas_dir / "metadata.json").read_text(encoding="utf-8"))
+	winding_offsets: dict[str, int] = {}
+	for record in expected_records:
+		object_id = str(record["object_id"])
+		offset = int(record["winding_offset"])
+		if object_id in winding_offsets and winding_offsets[object_id] != offset:
+			raise AssertionError(f"inconsistent winding offset for {object_id}")
+		winding_offsets[object_id] = offset
+
+	line_objects = []
+	maps = []
+	for map_path in sorted((atlas_dir / "mappings" / "fibers").glob("*.json")):
+		mapping = json.loads(map_path.read_text(encoding="utf-8"))
+		object_id = str(mapping["fiber_path"])
+		fiber_path = fixture_root / object_id
+		line_objects.append({
+			"id": object_id,
+			"fiber_path": object_id,
+			"path": str(fiber_path),
+		})
+		maps.append({
+			"object_type": "line",
+			"object_id": object_id,
+			"fiber_path": object_id,
+			"object_path": str(fiber_path),
+			"mapping_path": str(map_path.relative_to(atlas_dir)),
+			"map_path": str(map_path),
+			"winding_offset": winding_offsets.get(object_id, 0),
+		})
+
+	return {
+		"type": "lasagna_atlas",
+		"version": 1,
+		"name": metadata.get("name", "fiber_21"),
+		"base": {"path": str(atlas_dir / metadata["base_mesh_path"])},
+		"metadata": {"zero_winding_column": int(metadata["zero_winding_column"])},
+		"objects": {"line": line_objects},
+		"maps": maps,
+	}
+
+
 class AtlasParserTest(unittest.TestCase):
 	def test_atlas_init_crops_from_anchor_extents_with_margin(self) -> None:
 		with self.subTest("synthetic atlas"):
@@ -442,6 +494,69 @@ class AtlasParserTest(unittest.TestCase):
 				atol=1.0e-6,
 			))
 
+	def test_atlas_init_v3_control_anchor_uses_line_index_and_anchor_world(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=6, cols=6, row_step=10.0, col_step=10.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[float(i), 0.0, 0.0] for i in range(6)],
+				"control_points": [[900.0, 0.0, 0.0], [901.0, 0.0, 0.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 3,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [
+					{"source_index": 1, "world": [1.0, 0.0, 0.0], "atlas": [1.0, 1.0], "distance": 0.0},
+					{"source_index": 2, "world": [2.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 3, "world": [3.0, 0.0, 0.0], "atlas": [3.0, 3.0], "distance": 0.0},
+					{"source_index": 4, "world": [4.0, 0.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
+				],
+				"control_anchors": [
+					{"source_index": 2, "world": [222.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 4, "world": [444.0, 0.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=1,
+				winding_step=1,
+			)
+
+			self.assertEqual(init.atlas_lines.source_indices, (2, 4, 3))
+			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True, False])
+			self.assertTrue(torch.allclose(
+				init.atlas_lines.target_xyz,
+				torch.tensor([
+					[222.0, 0.0, 0.0],
+					[444.0, 0.0, 0.0],
+					[3.0, 0.0, 0.0],
+				]),
+				atol=1.0e-6,
+			))
+
 	def test_atlas_init_line_anchor_target_uses_line_points_before_world(self) -> None:
 		import tempfile
 		with tempfile.TemporaryDirectory() as td:
@@ -531,6 +646,53 @@ class AtlasParserTest(unittest.TestCase):
 			}), encoding="utf-8")
 			obj = atlas.load_vc3d_atlas_fiber_mapping(path)
 			self.assertEqual(obj["line_anchors"][0]["source_index"], 0)
+
+	def test_atlas21_fixture_matches_cpp_base_samples(self) -> None:
+		fixture_root = _atlas21_fixture_root()
+		atlas_dir = fixture_root / "atlases" / "fiber_21"
+		expected_path = fixture_root / "expected_cpp_base_samples.json"
+		if not atlas_dir.is_dir():
+			self.skipTest(f"Atlas 21 fixture root is absent: {fixture_root}")
+		if not expected_path.is_file():
+			self.skipTest(f"Atlas 21 expected samples are absent: {expected_path}")
+
+		expected_records = json.loads(expected_path.read_text(encoding="utf-8"))
+		self.assertIsInstance(expected_records, list)
+		self.assertGreater(len(expected_records), 8)
+		atlas_obj = _atlas21_config_from_fixture(fixture_root, expected_records)
+		init = atlas.build_atlas_init(
+			atlas_obj,
+			device=torch.device("cpu"),
+			mesh_step=50,
+			winding_step=1,
+		)
+
+		line_lookup: dict[tuple[str, int, bool], int] = {}
+		for i, (object_id, source_index, is_control_point) in enumerate(zip(
+			init.atlas_lines.object_ids,
+			init.atlas_lines.source_indices,
+			init.atlas_lines.is_control_point.detach().cpu().tolist(),
+		)):
+			line_lookup[(object_id, int(source_index), bool(is_control_point))] = i
+
+		model_xyz = init.model._grid_xyz().detach()
+		max_error = 0.0
+		for record in expected_records:
+			key = (
+				str(record["object_id"]),
+				int(record["source_index"]),
+				bool(record["is_control_point"]),
+			)
+			self.assertIn(key, line_lookup)
+			i = line_lookup[key]
+			h = init.atlas_lines.model_h[i:i + 1]
+			w = init.atlas_lines.model_w[i:i + 1]
+			actual = _sample_model_xyz(model_xyz, h, w)[0].detach().cpu()
+			expected = torch.tensor(record["base_xyz"], dtype=torch.float32)
+			max_error = max(max_error, float(torch.linalg.vector_norm(actual - expected)))
+			self.assertTrue(torch.allclose(actual, expected, atol=6.0, rtol=1.0e-4),
+			                f"{key} actual={actual.tolist()} expected={expected.tolist()}")
+		self.assertLess(max_error, 6.0)
 
 
 if __name__ == "__main__":
