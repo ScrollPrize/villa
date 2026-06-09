@@ -10,7 +10,7 @@ import PrizeCard from '@site/src/components/PrizeCard';
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
 
   <meta property="og:type" content="website" />
@@ -18,7 +18,7 @@ import PrizeCard from '@site/src/components/PrizeCard';
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
   <meta
     property="og:image"
@@ -30,7 +30,7 @@ import PrizeCard from '@site/src/components/PrizeCard';
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
   <meta
     property="twitter:image"
@@ -38,7 +38,7 @@ import PrizeCard from '@site/src/components/PrizeCard';
   />
 </head>
 
-Vesuvius Challenge has awarded **\$1,793,500** in prizes!
+Vesuvius Challenge has awarded **\$1,800,500** in prizes!
 
 This page lists all the prizes awarded so far:
 
