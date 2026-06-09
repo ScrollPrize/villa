@@ -9,6 +9,7 @@
 #include <opencv2/core.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -56,13 +57,21 @@ struct ControlVector {
 using ControlLengthBySourceIndex = std::unordered_map<int, double>;
 using ControlLengthByObjectId = std::unordered_map<std::string, ControlLengthBySourceIndex>;
 
+struct RemapReport {
+    ControlLengthByObjectId lengths;
+    std::unordered_map<std::string, vc::atlas::FiberMapping> mappings;
+    int remappedControls = 0;
+    int failedFibers = 0;
+};
+
 void printUsage(const char* argv0)
 {
     std::cerr
         << "Usage: " << argv0 << " <atlas_dir> [project.volpkg.json]\n"
         << "Loads a native VC3D atlas and reports control-anchor vectors from\n"
         << "the current base mesh point at each control atlas coordinate to the\n"
-        << "stored control point. Line anchors are not reported.\n";
+        << "stored control point. Line anchors are not reported.\n"
+        << "Also writes old/new control-connection OBJ files in the cwd.\n";
 }
 
 Options parseArgs(int argc, char** argv)
@@ -171,14 +180,13 @@ vc::atlas::FiberInput loadFiberInput(const vc::atlas::LasagnaAtlasObject& object
     input.fiberPath = object.fiberRelativePath;
     input.controlPoints = pointArrayFromJson(root, "control_points", object.fiberPath);
     input.linePoints = pointArrayFromJson(root, "line_points", object.fiberPath);
+    vc::atlas::validateFiberInputControlPoints(input);
     return input;
 }
 
-ControlLengthByObjectId remapControlLengths(const vc::atlas::LasagnaAtlasExport& exportData,
-                                            const QuadSurface& baseSurface,
-                                            const vc::lasagna::NormalSampler& sampler,
-                                            int* remappedControls,
-                                            int* failedFibers)
+RemapReport remapFibers(const vc::atlas::LasagnaAtlasExport& exportData,
+                        const QuadSurface& baseSurface,
+                        const vc::lasagna::NormalSampler& sampler)
 {
     auto baseSurfacePtr = std::shared_ptr<QuadSurface>(
         const_cast<QuadSurface*>(&baseSurface),
@@ -186,19 +194,13 @@ ControlLengthByObjectId remapControlLengths(const vc::atlas::LasagnaAtlasExport&
     SurfacePatchIndex baseIndex;
     baseIndex.rebuild({baseSurfacePtr});
 
-    ControlLengthByObjectId out;
-    if (remappedControls) {
-        *remappedControls = 0;
-    }
-    if (failedFibers) {
-        *failedFibers = 0;
-    }
+    RemapReport report;
     for (const auto& object : exportData.objects) {
         try {
             const vc::atlas::FiberInput input = loadFiberInput(object);
-            const vc::atlas::FiberMapping remapped =
+            vc::atlas::FiberMapping remapped =
                 vc::atlas::mapFiberToBaseSurface(input, baseSurface, baseIndex, sampler);
-            auto& lengths = out[object.id];
+            auto& lengths = report.lengths[object.id];
             for (const auto& anchor : remapped.controlAnchors) {
                 const auto basePoint =
                     vc::atlas::atlasAnchorBasePoint(anchor, remapped, baseSurface);
@@ -208,20 +210,17 @@ ControlLengthByObjectId remapControlLengths(const vc::atlas::LasagnaAtlasExport&
                 const double length = norm(anchor.world - *basePoint);
                 if (std::isfinite(length)) {
                     lengths[anchor.sourceIndex] = length;
-                    if (remappedControls) {
-                        ++(*remappedControls);
-                    }
+                    ++report.remappedControls;
                 }
             }
+            report.mappings.emplace(object.id, std::move(remapped));
         } catch (const std::exception& ex) {
-            if (failedFibers) {
-                ++(*failedFibers);
-            }
+            ++report.failedFibers;
             std::cerr << "vc_atlas_inspect: remap failed for " << object.id
                       << ": " << ex.what() << '\n';
         }
     }
-    return out;
+    return report;
 }
 
 std::vector<ControlVector> collectControlVectors(const vc::atlas::Atlas& atlas,
@@ -369,6 +368,104 @@ void printHuman(const vc::atlas::LasagnaAtlasExport& exportData,
     }
 }
 
+std::string sanitizeObjName(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (const unsigned char ch : value) {
+        if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.') {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) {
+        return "fiber";
+    }
+    return out;
+}
+
+int writeMappingObj(const fs::path& path,
+                    const std::string& label,
+                    const vc::atlas::FiberMapping& mapping,
+                    const QuadSurface& baseSurface)
+{
+    std::ofstream out(path);
+    if (!out) {
+        throw std::runtime_error("failed to write OBJ: " + path.string());
+    }
+    out.imbue(std::locale::classic());
+    out << std::fixed << std::setprecision(6)
+        << "# vc_atlas_inspect " << label << " control connections\n"
+        << "# fiber " << mapping.fiberPath.generic_string() << '\n'
+        << "o " << label << '_' << sanitizeObjName(mapping.fiberPath.generic_string()) << '\n';
+
+    int vertexIndex = 1;
+    int segments = 0;
+    for (const auto& anchor : mapping.controlAnchors) {
+        const auto basePoint = vc::atlas::atlasAnchorBasePoint(anchor, mapping, baseSurface);
+        if (!basePoint) {
+            continue;
+        }
+        const cv::Vec3d vector = anchor.world - *basePoint;
+        const double length = norm(vector);
+        if (!std::isfinite(length)) {
+            continue;
+        }
+        out << "# source_index " << anchor.sourceIndex
+            << " length " << length << '\n'
+            << "v " << (*basePoint)[0] << ' ' << (*basePoint)[1] << ' '
+            << (*basePoint)[2] << '\n'
+            << "v " << anchor.world[0] << ' ' << anchor.world[1] << ' '
+            << anchor.world[2] << '\n'
+            << "l " << vertexIndex << ' ' << (vertexIndex + 1) << '\n';
+        vertexIndex += 2;
+        ++segments;
+    }
+    return segments;
+}
+
+void writeMissingMappingObj(const fs::path& path,
+                            const std::string& label,
+                            const vc::atlas::FiberMapping& mapping)
+{
+    std::ofstream out(path);
+    if (!out) {
+        throw std::runtime_error("failed to write OBJ: " + path.string());
+    }
+    out << "# vc_atlas_inspect " << label << " control connections\n"
+        << "# fiber " << mapping.fiberPath.generic_string() << '\n'
+        << "# no regenerated mapping available\n"
+        << "o " << label << '_' << sanitizeObjName(mapping.fiberPath.generic_string()) << '\n';
+}
+
+int writeDebugObjs(const vc::atlas::LasagnaAtlasExport& exportData,
+                   const QuadSurface& baseSurface,
+                   const RemapReport* remapReport)
+{
+    int written = 0;
+    for (const auto& mapping : exportData.atlas.fibers) {
+        const std::string name = sanitizeObjName(mapping.fiberPath.generic_string());
+        const fs::path oldPath = fs::current_path() / ("atlas_inspect_old_" + name + ".obj");
+        writeMappingObj(oldPath, "old", mapping, baseSurface);
+        ++written;
+
+        if (!remapReport) {
+            continue;
+        }
+        const fs::path newPath = fs::current_path() / ("atlas_inspect_new_" + name + ".obj");
+        const auto it = remapReport->mappings.find(mapping.fiberPath.generic_string());
+        if (it == remapReport->mappings.end()) {
+            writeMissingMappingObj(newPath, "new", mapping);
+            ++written;
+            continue;
+        }
+        writeMappingObj(newPath, "new", it->second, baseSurface);
+        ++written;
+    }
+    return written;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -380,31 +477,31 @@ int main(int argc, char** argv)
                                                                   project.volpkgRoot);
         const QuadSurface baseSurface(exportData.basePath);
 
-        std::optional<ControlLengthByObjectId> remappedLengths;
-        int remappedControls = 0;
-        int failedFibers = 0;
+        std::optional<RemapReport> remapReport;
         if (!project.lasagnaManifestPath.empty()) {
             const vc::lasagna::LasagnaDataset dataset =
                 vc::lasagna::LasagnaDataset::open(project.lasagnaManifestPath);
             const vc::lasagna::LasagnaNormalSampler sampler(dataset);
-            remappedLengths = remapControlLengths(exportData,
-                                                  baseSurface,
-                                                  sampler,
-                                                  &remappedControls,
-                                                  &failedFibers);
+            remapReport = remapFibers(exportData, baseSurface, sampler);
         } else {
             std::cerr << "vc_atlas_inspect: no selected Lasagna dataset; "
-                      << "len_new will be nan. Pass project.volpkg.json for remap comparison.\n";
+                      << "len_new and new OBJ output will be missing. "
+                      << "Pass project.volpkg.json for remap comparison.\n";
         }
 
         const auto rows = collectControlVectors(exportData.atlas,
                                                 baseSurface,
-                                                remappedLengths ? &*remappedLengths : nullptr);
+                                                remapReport ? &remapReport->lengths : nullptr);
         printHuman(exportData, baseSurface, rows);
-        if (remappedLengths) {
-            std::cout << "\nremap_control_vectors=" << remappedControls
-                      << " remap_failed_fibers=" << failedFibers << '\n';
+        const int objCount = writeDebugObjs(exportData,
+                                            baseSurface,
+                                            remapReport ? &*remapReport : nullptr);
+        if (remapReport) {
+            std::cout << "\nremap_control_vectors=" << remapReport->remappedControls
+                      << " remap_failed_fibers=" << remapReport->failedFibers << '\n';
         }
+        std::cout << "debug_objs_written=" << objCount
+                  << " dir=" << fs::current_path().generic_string() << '\n';
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "vc_atlas_inspect: " << ex.what() << '\n';

@@ -1,6 +1,6 @@
 # Atlas Implementation
 
-Atlas generation stores V3 metadata, an unchanged copy of the selected base mesh, typed links, and V2 fiber mappings under `<volpkg-root>/atlases/<atlas-name>/`. Atlas creation reads the selected `.lasagna.json` manifest, resolves its `init_shell_dir` relative to that manifest, and uses only `shell_*.tifxyz` directories from that init shell directory as base candidates. Saved fiber `linePoints` are projected onto the selected base mesh using Lasagna normals and adaptive base-surface ray projection.
+Atlas generation stores V4 metadata, an unchanged copy of the selected base mesh, typed links, and V3 fiber mappings under `<volpkg-root>/atlases/<atlas-name>/`. Atlas creation reads the selected `.lasagna.json` manifest, resolves its `init_shell_dir` relative to that manifest, and uses only `shell_*.tifxyz` directories from that init shell directory as base candidates. Saved fiber `linePoints` are projected onto the selected base mesh using Lasagna normals and adaptive base-surface ray projection.
 
 Atlas anchor U/V values are stored in base-mesh-relative grid coordinates. The metadata field `zero_winding_column` is not a coordinate transform; it only defines the origin for winding labels and display ranges:
 
@@ -12,13 +12,13 @@ Atlas creation copies the selected `shell_*.tifxyz` base mesh as-is into the atl
 
 Fiber anchors are also stored in that same base-mesh-relative coordinate system. Projection hits keep their raw base mesh U/V values. Continuation mapping may unwrap `atlasU` across the seam for line continuity, but the modulo column position still refers to the original base mesh columns. Atlas layout never rewrites anchor coordinates.
 
-Each mapped fiber stores an integer `winding_offset`, defaulting to `0` for V2 mapping files that do not contain the field. Display and footprint calculations use:
+Each mapped fiber stores an integer `winding_offset`, derived from atlas links at load/export time and defaulting to `0` before layout. Display and footprint calculations use:
 
 `actual_atlasU = anchor.atlasU + winding_offset * period_columns`
 
 Stored anchor U/V values remain immutable base-relative coordinates.
 
-`zero_winding_column` records the column that should be treated as winding zero for interpretation. It replaces the old `idx_rotation_columns` metadata from V1 atlases; V1 atlas metadata is intentionally unsupported.
+`zero_winding_column` records the column that should be treated as winding zero for interpretation. It replaces the old `idx_rotation_columns` metadata from V1 atlases; old atlas metadata and old fiber mapping versions are rejected by normal loads and require an explicit rebuild from source fiber JSON.
 
 ## Atlas Links And Layout
 
@@ -51,7 +51,7 @@ Atlas overlays are rendered through generic surface-coordinate overlay primitive
 
 The atlas viewer constructs a display-only repeated surface from the saved base mesh, excluding the duplicate closing seam column from each repeat. The repeated surface starts at `zero_winding_column` so winding-zero can be shown first. This is the only place where the old "rotation placement" behavior still exists, and it is a viewer ordering choice only. Overlays convert actual anchor U/V values with the display range's atlas U offset; they do not rewrite or persist shifted anchor coordinates.
 
-The Atlas viewer uses a live overlay controller. It draws each mapped fiber from `lineAnchors` as a line strip and draws source control points from `controlAnchors` as point markers during pan, zoom, normal-offset scrolling, and refresh.
+The Atlas viewer uses a live overlay controller. It draws each mapped fiber from `lineAnchors` as a line strip and draws source control points from `controlAnchors` as point markers during pan, zoom, normal-offset scrolling, and refresh. `controlAnchors[].sourceIndex` is the original `line_points[]` index, matching `lineAnchors[].sourceIndex`; control anchors are copied from already mapped line anchors and are not independently nearest-matched.
 
 ## Atlas Object Search
 

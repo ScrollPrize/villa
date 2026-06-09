@@ -1194,6 +1194,7 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         }
         input.controlPoints = fiberIt->controlPoints;
         input.linePoints = fiberIt->linePoints;
+        vc::atlas::validateFiberInputControlPoints(input);
         atlasDebug("fiber line_points=" + std::to_string(input.linePoints.size()) +
                    " control_points=" + std::to_string(input.controlPoints.size()));
 
@@ -1423,6 +1424,7 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
             }
             input.controlPoints = fiber.controlPoints;
             input.linePoints = fiber.linePoints;
+            vc::atlas::validateFiberInputControlPoints(input);
             return input;
         };
         const vc::atlas::FiberInput sourceInput = makeInput(*sourceIt);
@@ -4191,6 +4193,10 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     for (const auto& point : linePoints) {
         fiber.linePoints.push_back(pointFromJson(point));
     }
+    vc::atlas::FiberInput atlasFiberInput;
+    atlasFiberInput.controlPoints = fiber.controlPoints;
+    atlasFiberInput.linePoints = fiber.linePoints;
+    vc::atlas::validateFiberInputControlPoints(atlasFiberInput);
 
     fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(fiber.controlPoints);
     fiber.manualHvTag.clear();

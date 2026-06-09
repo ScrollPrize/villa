@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <cstdint>
@@ -23,7 +24,7 @@ namespace vc::atlas {
 
 struct AtlasMetadata {
     std::string type = "vc3d_atlas";
-    int version = 3;
+    int version = 4;
     std::string name;
     std::filesystem::path baseMeshPath;
     std::filesystem::path sourceBaseMeshPath;
@@ -90,6 +91,7 @@ struct FiberInput {
     std::filesystem::path fiberPath;
     std::vector<cv::Vec3d> controlPoints;
     std::vector<cv::Vec3d> linePoints;
+    std::vector<int> controlLineIndices;
 };
 
 struct SurfaceCandidate {
@@ -224,6 +226,19 @@ cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
 std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& baseSurface,
                                                         int unwrapCount,
                                                         int startColumn = 0);
+
+void validateFiberInputControlPoints(FiberInput& fiber);
+bool atlasLoadErrorRequiresRebuild(const std::exception& ex);
+Atlas rebuildAtlasFromSourceFibers(const std::filesystem::path& atlasDir,
+                                   const std::filesystem::path& volpkgRoot,
+                                   const vc::lasagna::NormalSampler& normalSampler,
+                                   const LineMappingOptions& options = {});
+Atlas rebuildAtlasFromSourceFibers(const std::filesystem::path& atlasDir,
+                                   const std::filesystem::path& volpkgRoot,
+                                   const QuadSurface& baseSurface,
+                                   SurfacePatchIndex& baseIndex,
+                                   const vc::lasagna::NormalSampler& normalSampler,
+                                   const LineMappingOptions& options = {});
 
 FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                    const QuadSurface& baseSurface,

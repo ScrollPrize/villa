@@ -54,6 +54,22 @@ public:
     }
 };
 
+class InvalidAtXNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    explicit InvalidAtXNormalSampler(double x) : x_(x) {}
+
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& p) const override
+    {
+        if (std::abs(p[0] - x_) < 1.0e-9) {
+            return {{0.0, 0.0, 0.0}, false, {}};
+        }
+        return {cv::Vec3d{0.0, 0.0, 1.0}, true, {}};
+    }
+
+private:
+    double x_ = 0.0;
+};
+
 std::shared_ptr<QuadSurface> makePlane(int rows,
                                        int cols,
                                        double z,
@@ -137,9 +153,9 @@ void writeValidLasagnaAtlasFixture(const fs::path& volpkgRoot,
     writeText(volpkgRoot / "fibers" / "fiber.json",
               R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})");
     writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
     writeText(atlasDir / "metadata.json",
-              R"({"type":"vc3d_atlas","version":3,"name":")" + atlasName +
+              R"({"type":"vc3d_atlas","version":4,"name":")" + atlasName +
               R"(","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})");
 }
 
@@ -180,16 +196,17 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
 
     atlas.save(root);
     const std::string metadata = readText(root / "metadata.json");
-    CHECK(metadata.find("\"version\": 3") != std::string::npos);
+    CHECK(metadata.find("\"version\": 4") != std::string::npos);
     CHECK(metadata.find("\"zero_winding_column\": 3") != std::string::npos);
     CHECK(metadata.find("idx_rotation_columns") == std::string::npos);
     const std::string mappingJson = readText(root / "mappings" / "fibers" / "1.json");
+    CHECK(mappingJson.find("\"version\": 3") != std::string::npos);
     CHECK(mappingJson.find("winding_offset") == std::string::npos);
 
     const auto loaded = vc::atlas::Atlas::load(root);
 
     REQUIRE(loaded.metadata.name == "fiber_1");
-    CHECK(loaded.metadata.version == 3);
+    CHECK(loaded.metadata.version == 4);
     CHECK(loaded.metadata.zeroWindingColumn == 3);
     CHECK(loaded.metadata.seedLineIndex == 1);
     CHECK(loaded.metadata.seedAtlasU == doctest::Approx(4.5));
@@ -205,7 +222,7 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     CHECK(loaded.fibers[0].lineAnchors[0].atlasV == doctest::Approx(5.0));
 }
 
-TEST_CASE("Atlas loader accepts version 2 mappings without offsets and ignores string links")
+TEST_CASE("Atlas loader rejects obsolete atlas versions with rebuild required")
 {
     const fs::path root = tempRoot("vc_atlas_v2_compat");
     fs::create_directories(root / "mappings" / "fibers");
@@ -240,11 +257,88 @@ TEST_CASE("Atlas loader accepts version 2 mappings without offsets and ignores s
 })";
     }
 
-    const auto loaded = vc::atlas::Atlas::load(root);
-    CHECK(loaded.metadata.version == 2);
-    CHECK(loaded.links.empty());
-    REQUIRE(loaded.fibers.size() == 1);
-    CHECK(loaded.fibers[0].windingOffset == 0);
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::Atlas::load(root),
+        doctest::Contains("rebuild required"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas loader requires current fiber mapping versions")
+{
+    const fs::path root = tempRoot("vc_atlas_mapping_version_required");
+    fs::create_directories(root / "mappings" / "fibers");
+    writeText(root / "metadata.json",
+              R"({"type":"vc3d_atlas","version":4,"name":"current","base_mesh_path":"base_mesh/shell.tifxyz","source_base_mesh_path":"segments/shell","zero_winding_column":0,"seed_line_index":0,"seed_atlas":[0,0]})");
+    writeText(root / "mappings" / "fibers" / "missing_version.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","fiber_path":"fibers/1.json","line_anchors":[],"control_anchors":[]})");
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::Atlas::load(root),
+        doctest::Contains("missing version"),
+        std::runtime_error);
+
+    writeText(root / "mappings" / "fibers" / "missing_version.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/1.json","line_anchors":[],"control_anchors":[]})");
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::Atlas::load(root),
+        doctest::Contains("rebuild required"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas rebuild remaps source fibers and refreshes link endpoints")
+{
+    const fs::path root = tempRoot("vc_atlas_rebuild_old_versions");
+    const fs::path atlasDir = root / "atlases" / "fiber_atlas";
+    cv::Mat_<cv::Vec3f> points(5, 9);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < 8; ++col) {
+            points(row, col) = cv::Vec3f(static_cast<float>(col),
+                                         static_cast<float>(row),
+                                         static_cast<float>(0.1 * col));
+        }
+        points(row, 8) = points(row, 0);
+    }
+    auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
+    saveSurface(atlasDir / "base_mesh" / "base.tifxyz", surface);
+    writeText(root / "fibers" / "a.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[1,2,1.1],[2,2,1.2],[3,2,1.3]],"control_points":[[2,2,1.2]]})");
+    writeText(root / "fibers" / "b.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[4,2,1.4],[5,2,1.5],[6,2,1.6]],"control_points":[[5,2,1.5]]})");
+    writeText(atlasDir / "metadata.json",
+              R"({"type":"vc3d_atlas","version":3,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0,"seed_line_index":1,"seed_atlas":[99,99]})");
+    writeText(atlasDir / "links.json",
+              R"({"version":1,"links":[{"first":{"object_type":"fiber","fiber_path":"fibers/a.json","source_index":1,"arclength":12.5,"base_atlas":[99,99]},"second":{"object_type":"fiber","fiber_path":"fibers/b.json","source_index":1,"arclength":42.5,"base_atlas":[88,88]},"desired_winding_delta":1}]})");
+    writeText(atlasDir / "mappings" / "fibers" / "a.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/a.json","line_anchors":[{"source_index":1,"world":[0,0,0],"atlas":[99,99],"distance":0}],"control_anchors":[{"source_index":0,"world":[0,0,0],"atlas":[99,99],"distance":0}]})");
+    writeText(atlasDir / "mappings" / "fibers" / "b.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/b.json","line_anchors":[{"source_index":1,"world":[0,0,0],"atlas":[88,88],"distance":0}],"control_anchors":[{"source_index":0,"world":[0,0,0],"atlas":[88,88],"distance":0}]})");
+
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    const auto rebuilt = vc::atlas::rebuildAtlasFromSourceFibers(
+        atlasDir, root, sampler);
+
+    CHECK(rebuilt.metadata.version == 4);
+    REQUIRE(rebuilt.fibers.size() == 2);
+    REQUIRE(rebuilt.fibers[0].controlAnchors.size() == 1);
+    CHECK(rebuilt.fibers[0].controlAnchors[0].sourceIndex == 1);
+    REQUIRE(rebuilt.links.size() == 1);
+    CHECK(rebuilt.links[0].first.fiberPath == fs::path("fibers/a.json"));
+    CHECK(rebuilt.links[0].first.sourceIndex == 1);
+    CHECK(rebuilt.links[0].first.arclength == doctest::Approx(12.5));
+    CHECK(rebuilt.links[0].first.atlasU == doctest::Approx(2.0));
+    CHECK(rebuilt.links[0].second.fiberPath == fs::path("fibers/b.json"));
+    CHECK(rebuilt.links[0].second.sourceIndex == 1);
+    CHECK(rebuilt.links[0].second.arclength == doctest::Approx(42.5));
+    CHECK(rebuilt.links[0].second.atlasU == doctest::Approx(5.0));
+    CHECK(rebuilt.links[0].desiredWindingDelta == 1);
+
+    CHECK(readText(atlasDir / "metadata.json").find("\"version\": 4") != std::string::npos);
+    CHECK(readText(atlasDir / "mappings" / "fibers" / "a.json")
+              .find("\"version\": 3") != std::string::npos);
+    const auto loaded = vc::atlas::Atlas::load(atlasDir);
+    CHECK(loaded.metadata.version == 4);
+    REQUIRE(loaded.links.size() == 1);
+    CHECK(loaded.links[0].first.atlasU == doctest::Approx(2.0));
 }
 
 TEST_CASE("Atlas discovery lists metadata-backed atlas directories with display names")
@@ -297,11 +391,11 @@ TEST_CASE("Lasagna atlas export derives winding offsets from links without rewri
     writeText(root / "fibers" / "linked.json",
               R"({"type":"vc3d_fiber","version":1,"line_points":[[1,0,0]],"control_points":[]})");
     writeText(atlasDir / "mappings" / "fibers" / "0_root.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/root.json","winding_offset":5,"line_anchors":[{"source_index":0,"world":[0,0,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/root.json","winding_offset":5,"line_anchors":[{"source_index":0,"world":[0,0,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
     writeText(atlasDir / "mappings" / "fibers" / "1_linked.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/linked.json","winding_offset":9,"line_anchors":[{"source_index":0,"world":[1,0,0],"atlas":[7,1],"distance":0}],"control_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/linked.json","winding_offset":9,"line_anchors":[{"source_index":0,"world":[1,0,0],"atlas":[7,1],"distance":0}],"control_anchors":[]})");
     writeText(atlasDir / "metadata.json",
-              R"({"type":"vc3d_atlas","version":3,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+              R"({"type":"vc3d_atlas","version":4,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
     writeText(atlasDir / "links.json",
               R"({"version":1,"links":[{"first":{"object_type":"fiber","fiber_path":"fibers/root.json","source_index":0,"arclength":0,"base_atlas":[1,1]},"second":{"object_type":"fiber","fiber_path":"fibers/linked.json","source_index":0,"arclength":0,"base_atlas":[7,1]},"desired_winding_delta":0}]})");
     const fs::path linkedMapping = atlasDir / "mappings" / "fibers" / "1_linked.json";
@@ -337,9 +431,9 @@ TEST_CASE("Lasagna atlas export validates missing metadata base fibers and mappi
 
     const fs::path missingBase = root / "atlases" / "missing_base";
     writeText(missingBase / "metadata.json",
-              R"({"type":"vc3d_atlas","version":3,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})");
+              R"({"type":"vc3d_atlas","version":4,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})");
     writeText(missingBase / "mappings" / "fibers" / "fiber.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
     CHECK_THROWS_WITH_AS(
         vc::atlas::loadLasagnaAtlasExport(missingBase, root),
         doctest::Contains("base mesh does not exist"),
@@ -348,9 +442,9 @@ TEST_CASE("Lasagna atlas export validates missing metadata base fibers and mappi
     const fs::path missingFiber = root / "atlases" / "missing_fiber";
     saveSurface(missingFiber / "base_mesh" / "base.tifxyz", makeWrappedPlane(3, 3, 1.0));
     writeText(missingFiber / "metadata.json",
-              R"({"type":"vc3d_atlas","version":3,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+              R"({"type":"vc3d_atlas","version":4,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
     writeText(missingFiber / "mappings" / "fibers" / "fiber.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})");
     CHECK_THROWS_WITH_AS(
         vc::atlas::loadLasagnaAtlasExport(missingFiber, root),
         doctest::Contains("references missing fiber path"),
@@ -359,7 +453,7 @@ TEST_CASE("Lasagna atlas export validates missing metadata base fibers and mappi
     const fs::path missingMap = root / "atlases" / "missing_map";
     saveSurface(missingMap / "base_mesh" / "base.tifxyz", makeWrappedPlane(3, 3, 1.0));
     writeText(missingMap / "metadata.json",
-              R"({"type":"vc3d_atlas","version":3,"name":"missing_map","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+              R"({"type":"vc3d_atlas","version":4,"name":"missing_map","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
     CHECK_THROWS_WITH_AS(
         vc::atlas::loadLasagnaAtlasExport(missingMap, root),
         doctest::Contains("no fiber mappings directory"),
@@ -375,9 +469,9 @@ TEST_CASE("Lasagna atlas export rejects non-wrapped base shells")
     writeText(root / "fibers" / "fiber.json",
               R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})");
     writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
     writeText(atlasDir / "metadata.json",
-              R"({"type":"vc3d_atlas","version":3,"name":"nonwrapped","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+              R"({"type":"vc3d_atlas","version":4,"name":"nonwrapped","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
 
     CHECK_THROWS_WITH_AS(
         vc::atlas::atlasHorizontalPeriodColumns(QuadSurface(atlasDir / "base_mesh" / "base.tifxyz")),
@@ -438,7 +532,7 @@ TEST_CASE("Atlas loader rejects legacy idx rotation metadata")
         std::ofstream out(root / "metadata.json");
         out << R"({
   "type": "vc3d_atlas",
-  "version": 1,
+  "version": 4,
   "name": "legacy",
   "base_mesh_path": "base_mesh/shell.tifxyz",
   "source_base_mesh_path": "segments/shell",
@@ -452,6 +546,58 @@ TEST_CASE("Atlas loader rejects legacy idx rotation metadata")
         vc::atlas::Atlas::load(root),
         doctest::Contains("unsupported atlas metadata"),
         std::runtime_error);
+}
+
+TEST_CASE("Atlas fiber validation derives ordered control line indices")
+{
+    vc::atlas::FiberInput fiber;
+    fiber.linePoints = {
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {2.0, 0.0, 0.0},
+    };
+    fiber.controlPoints = {
+        {0.0, 0.0, 0.0},
+        {1.0 + 5.0e-9, 0.0, 0.0},
+        {2.0, 0.0, 0.0},
+    };
+
+    vc::atlas::validateFiberInputControlPoints(fiber);
+    CHECK(fiber.controlLineIndices == std::vector<int>{0, 1, 2});
+}
+
+TEST_CASE("Atlas fiber validation rejects controls not present in line points")
+{
+    vc::atlas::FiberInput fiber;
+    fiber.linePoints = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}};
+    fiber.controlPoints = {{0.5, 0.0, 0.0}};
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::validateFiberInputControlPoints(fiber),
+        doctest::Contains("not an ordered subset"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas fiber validation rejects out-of-order and duplicate controls")
+{
+    {
+        vc::atlas::FiberInput fiber;
+        fiber.linePoints = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}};
+        fiber.controlPoints = {{1.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+        CHECK_THROWS_WITH_AS(
+            vc::atlas::validateFiberInputControlPoints(fiber),
+            doctest::Contains("not an ordered subset"),
+            std::runtime_error);
+    }
+    {
+        vc::atlas::FiberInput fiber;
+        fiber.linePoints = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}};
+        fiber.controlPoints = {{1.0, 0.0, 0.0}, {1.0, 0.0, 0.0}};
+        CHECK_THROWS_WITH_AS(
+            vc::atlas::validateFiberInputControlPoints(fiber),
+            doctest::Contains("not an ordered subset"),
+            std::runtime_error);
+    }
 }
 
 TEST_CASE("Atlas seed selection uses line points without requiring controls")
@@ -1040,6 +1186,7 @@ TEST_CASE("Atlas maps a synthetic fiber over a simple grid")
     CHECK(mapping.lineAnchors[1].atlasU == doctest::Approx(2.0));
     CHECK(mapping.lineAnchors[2].atlasV == doctest::Approx(2.0));
     REQUIRE(mapping.controlAnchors.size() == 1);
+    CHECK(mapping.controlAnchors[0].sourceIndex == 1);
     CHECK(mapping.controlAnchors[0].atlasU == doctest::Approx(2.0));
 }
 
@@ -1086,7 +1233,10 @@ TEST_CASE("Atlas mapping stops when grid and line step mismatch")
         {2.0, 2.0, 1.0},
         {3.0, 2.0, 1.0},
     };
-    fiber.controlPoints = {{1.0, 2.0, 1.0}};
+    fiber.controlPoints = {
+        {1.0, 2.0, 1.0},
+        {3.0, 2.0, 1.0},
+    };
 
     JumpNormalSampler sampler;
     vc::atlas::LineMappingOptions options;
@@ -1094,7 +1244,42 @@ TEST_CASE("Atlas mapping stops when grid and line step mismatch")
     options.mismatchRatio = 1.5;
     const auto mapping = vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler, options);
     REQUIRE(mapping.lineAnchors.size() == 2);
+    CHECK(mapping.lineAnchors[0].sourceIndex == 0);
     CHECK(mapping.lineAnchors.back().sourceIndex == 1);
+    REQUIRE(mapping.controlAnchors.size() == 1);
+    CHECK(mapping.controlAnchors[0].sourceIndex == 0);
+}
+
+TEST_CASE("Atlas mapping truncates at interior failures without sparse line anchors")
+{
+    auto surface = makeWrappedPlane(5, 16, 0.0);
+    SurfacePatchIndex index;
+    index.rebuild({surface});
+
+    vc::atlas::FiberInput fiber;
+    fiber.fiberPath = "fibers/1.json";
+    fiber.linePoints = {
+        {0.0, 2.0, 1.0},
+        {1.0, 2.0, 1.0},
+        {2.0, 2.0, 1.0},
+        {3.0, 2.0, 1.0},
+        {4.0, 2.0, 1.0},
+    };
+    fiber.controlPoints = {
+        {0.0, 2.0, 1.0},
+        {2.0, 2.0, 1.0},
+        {4.0, 2.0, 1.0},
+    };
+
+    InvalidAtXNormalSampler sampler(1.0);
+    const auto mapping = vc::atlas::mapFiberToBaseSurface(fiber, *surface, index, sampler);
+    REQUIRE(mapping.lineAnchors.size() == 3);
+    CHECK(mapping.lineAnchors[0].sourceIndex == 2);
+    CHECK(mapping.lineAnchors[1].sourceIndex == 3);
+    CHECK(mapping.lineAnchors[2].sourceIndex == 4);
+    REQUIRE(mapping.controlAnchors.size() == 2);
+    CHECK(mapping.controlAnchors[0].sourceIndex == 2);
+    CHECK(mapping.controlAnchors[1].sourceIndex == 4);
 }
 
 TEST_CASE("Atlas manifest init_shell_dir resolves relative to lasagna manifest")

@@ -62,27 +62,11 @@ std::optional<std::pair<int, int>> controlAnchorSourceRange(
 
     int first = std::numeric_limits<int>::max();
     int last = std::numeric_limits<int>::min();
-    int count = 0;
     for (const auto& anchor : fiber.controlAnchors) {
-        const vc::atlas::AtlasAnchor* bestLineAnchor = nullptr;
-        double bestDistance2 = std::numeric_limits<double>::infinity();
-        for (const auto& lineAnchor : fiber.lineAnchors) {
-            const double du = lineAnchor.atlasU - anchor.atlasU;
-            const double dv = lineAnchor.atlasV - anchor.atlasV;
-            const double distance2 = du * du + dv * dv;
-            if (distance2 < bestDistance2) {
-                bestDistance2 = distance2;
-                bestLineAnchor = &lineAnchor;
-            }
-        }
-        if (!bestLineAnchor) {
-            continue;
-        }
-        first = std::min(first, bestLineAnchor->sourceIndex);
-        last = std::max(last, bestLineAnchor->sourceIndex);
-        ++count;
+        first = std::min(first, anchor.sourceIndex);
+        last = std::max(last, anchor.sourceIndex);
     }
-    if (count < 2 || first > last) {
+    if (fiber.controlAnchors.size() < 2 || first > last) {
         return std::nullopt;
     }
     return std::make_pair(first, last);

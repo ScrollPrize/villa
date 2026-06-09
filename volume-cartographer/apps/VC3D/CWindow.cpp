@@ -9,6 +9,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/atlas/Atlas.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <iostream>
 
@@ -226,6 +228,7 @@ vc::atlas::FiberInput fiberInputFromSnapshot(const std::filesystem::path& fiberP
     input.fiberPath = fiberPath;
     input.controlPoints = fiber.controlPoints;
     input.linePoints = linePointsFromPolyline(fiber);
+    vc::atlas::validateFiberInputControlPoints(input);
     return input;
 }
 
@@ -3300,6 +3303,48 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                                      3000);
         }
     } catch (const std::exception& ex) {
+        if (vc::atlas::atlasLoadErrorRequiresRebuild(ex)) {
+            const auto choice = QMessageBox::question(
+                this,
+                tr("Atlas Rebuild Required"),
+                tr("This atlas was saved with an older mapping format and must be rebuilt "
+                   "from its source fiber JSON using the selected Lasagna normal dataset.\n\n"
+                   "Rebuild now?"),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No);
+            if (choice != QMessageBox::Yes) {
+                return;
+            }
+            try {
+                auto vpkg = _state ? _state->vpkg() : nullptr;
+                if (!vpkg) {
+                    throw std::runtime_error("No volume package is loaded");
+                }
+                const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+                if (manifestPath.empty()) {
+                    throw std::runtime_error("No local Lasagna normal dataset is selected");
+                }
+                if (!std::filesystem::exists(manifestPath)) {
+                    throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+                }
+                const std::filesystem::path volpkgRoot = vpkg->path().empty()
+                    ? std::filesystem::path{}
+                    : vpkg->path().parent_path();
+                vc::lasagna::LasagnaDataset dataset =
+                    vc::lasagna::LasagnaDataset::open(manifestPath);
+                vc::lasagna::LasagnaNormalSampler sampler(dataset);
+                vc::atlas::rebuildAtlasFromSourceFibers(
+                    atlasDir, volpkgRoot, sampler);
+                displayAtlasFromDirectory(atlasDir);
+            } catch (const std::exception& rebuildEx) {
+                QMessageBox::warning(
+                    this,
+                    tr("Atlas Rebuild"),
+                    tr("Could not rebuild atlas: %1")
+                        .arg(QString::fromStdString(rebuildEx.what())));
+            }
+            return;
+        }
         QMessageBox::warning(this,
                              tr("Atlas"),
                              tr("Could not display atlas: %1").arg(QString::fromStdString(ex.what())));

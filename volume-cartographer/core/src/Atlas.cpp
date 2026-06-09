@@ -31,7 +31,9 @@ namespace vc::atlas {
 namespace {
 
 constexpr double kEpsilon = 1.0e-9;
-constexpr int kAtlasMetadataVersion = 3;
+constexpr double kControlPointMatchEpsilon = 1.0e-8;
+constexpr int kAtlasMetadataVersion = 4;
+constexpr int kFiberMappingVersion = 3;
 
 bool atlasDebugEnabled()
 {
@@ -88,20 +90,6 @@ double normalizeAtlasU(double atlasU, int periodColumns)
         normalized -= period;
     }
     return normalized;
-}
-
-int lineIndexClosestToPoint(const std::vector<cv::Vec3d>& line, const cv::Vec3d& point)
-{
-    int best = 0;
-    double bestDist = std::numeric_limits<double>::infinity();
-    for (int i = 0; i < static_cast<int>(line.size()); ++i) {
-        const double d = squaredDistance(line[i], point);
-        if (d < bestDist) {
-            bestDist = d;
-            best = i;
-        }
-    }
-    return best;
 }
 
 cv::Vec3d toVec3d(const cv::Vec3f& p)
@@ -254,6 +242,41 @@ nlohmann::json readJsonFile(const fs::path& path)
     return nlohmann::json::parse(in);
 }
 
+std::vector<cv::Vec3d> pointArrayFromJson(const nlohmann::json& root,
+                                          const char* key,
+                                          const fs::path& path)
+{
+    const auto it = root.find(key);
+    if (it == root.end() || !it->is_array()) {
+        throw std::runtime_error("fiber JSON is missing array " + std::string(key) +
+                                 ": " + path.string());
+    }
+    std::vector<cv::Vec3d> points;
+    points.reserve(it->size());
+    for (const auto& point : *it) {
+        points.push_back(pointFromJson(point));
+    }
+    return points;
+}
+
+FiberInput loadSourceFiberInput(const fs::path& fiberPath,
+                                const fs::path& fiberRelativePath)
+{
+    const auto root = readJsonFile(fiberPath);
+    if (root.value("type", std::string{}) != "vc3d_fiber") {
+        throw std::runtime_error("fiber JSON is not a vc3d_fiber: " + fiberPath.string());
+    }
+    if (root.value("version", 0) != 1) {
+        throw std::runtime_error("unsupported vc3d_fiber version in " + fiberPath.string());
+    }
+    FiberInput input;
+    input.fiberPath = fiberRelativePath;
+    input.controlPoints = pointArrayFromJson(root, "control_points", fiberPath);
+    input.linePoints = pointArrayFromJson(root, "line_points", fiberPath);
+    validateFiberInputControlPoints(input);
+    return input;
+}
+
 fs::path inferVolpkgRootFromAtlasDir(const fs::path& atlasDir)
 {
     if (atlasDir.parent_path().filename() == "atlases") {
@@ -292,6 +315,58 @@ std::vector<fs::path> sortedAtlasFiberMappingFiles(const fs::path& atlasDir)
     }
     std::sort(mappingFiles.begin(), mappingFiles.end());
     return mappingFiles;
+}
+
+Atlas loadAtlasContextForRebuild(const fs::path& atlasDir)
+{
+    Atlas atlas;
+    const auto metadata = readJsonFile(atlasDir / "metadata.json");
+    atlas.metadata.type = metadata.value("type", std::string{});
+    atlas.metadata.version = metadata.value("version", 0);
+    if (atlas.metadata.type != "vc3d_atlas") {
+        throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
+    }
+    if (metadata.contains("idx_rotation_columns") || !metadata.contains("zero_winding_column")) {
+        throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
+    }
+    atlas.metadata.name = metadata.value("name", atlasDir.filename().string());
+    atlas.metadata.baseMeshPath = metadata.value("base_mesh_path", std::string{});
+    atlas.metadata.sourceBaseMeshPath = metadata.value("source_base_mesh_path", std::string{});
+    atlas.metadata.zeroWindingColumn = metadata.at("zero_winding_column").get<int>();
+    atlas.metadata.seedLineIndex = metadata.value("seed_line_index", 0);
+    if (metadata.contains("seed_atlas") && metadata["seed_atlas"].is_array() &&
+        metadata["seed_atlas"].size() == 2) {
+        atlas.metadata.seedAtlasU = metadata["seed_atlas"][0].get<double>();
+        atlas.metadata.seedAtlasV = metadata["seed_atlas"][1].get<double>();
+    }
+
+    const fs::path linksPath = atlasDir / "links.json";
+    if (fs::exists(linksPath)) {
+        const auto linksJson = readJsonFile(linksPath);
+        if (linksJson.contains("links") && linksJson["links"].is_array()) {
+            for (const auto& link : linksJson["links"]) {
+                if (link.is_string()) {
+                    continue;
+                }
+                atlas.links.push_back(linkFromJson(link));
+            }
+        }
+    }
+
+    for (const auto& mappingPath : sortedAtlasFiberMappingFiles(atlasDir)) {
+        const auto root = readJsonFile(mappingPath);
+        FiberMapping mapping;
+        mapping.fiberPath = root.value("fiber_path", std::string{});
+        mapping.windingOffset = 0;
+        for (const auto& anchor : root.value("line_anchors", nlohmann::json::array())) {
+            mapping.lineAnchors.push_back(anchorFromJson(anchor));
+        }
+        for (const auto& anchor : root.value("control_anchors", nlohmann::json::array())) {
+            mapping.controlAnchors.push_back(anchorFromJson(anchor));
+        }
+        atlas.fibers.push_back(std::move(mapping));
+    }
+    return atlas;
 }
 
 int seedLineIndexForFiber(const FiberInput& fiber)
@@ -871,7 +946,7 @@ void Atlas::save(const fs::path& atlasDir) const
     for (const auto& fiber : fibers) {
         nlohmann::json root;
         root["type"] = "vc3d_atlas_fiber_mapping";
-        root["version"] = 2;
+        root["version"] = kFiberMappingVersion;
         root["fiber_path"] = fiber.fiberPath.generic_string();
         root["line_anchors"] = nlohmann::json::array();
         for (const auto& anchor : fiber.lineAnchors) {
@@ -894,9 +969,13 @@ Atlas Atlas::load(const fs::path& atlasDir)
     const auto metadata = readJsonFile(atlasDir / "metadata.json");
     atlas.metadata.type = metadata.value("type", std::string{});
     atlas.metadata.version = metadata.value("version", 0);
-    if (atlas.metadata.type != "vc3d_atlas" ||
-        (atlas.metadata.version != 2 && atlas.metadata.version != kAtlasMetadataVersion)) {
+    if (atlas.metadata.type != "vc3d_atlas") {
         throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
+    }
+    if (atlas.metadata.version != kAtlasMetadataVersion) {
+        throw std::runtime_error(
+            "atlas metadata version " + std::to_string(atlas.metadata.version) +
+            " is obsolete; rebuild required for " + atlasDir.string());
     }
     if (metadata.contains("idx_rotation_columns") || !metadata.contains("zero_winding_column")) {
         throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
@@ -929,6 +1008,17 @@ Atlas Atlas::load(const fs::path& atlasDir)
     if (fs::is_directory(mappingsDir)) {
         for (const auto& mappingPath : sortedAtlasFiberMappingFiles(atlasDir)) {
             const auto root = readJsonFile(mappingPath);
+            if (!root.contains("version")) {
+                throw std::runtime_error("atlas fiber mapping " + mappingPath.string() +
+                                         " is missing version; rebuild required");
+            }
+            const int mappingVersion = root.at("version").get<int>();
+            if (mappingVersion != kFiberMappingVersion) {
+                throw std::runtime_error(
+                    "atlas fiber mapping " + mappingPath.string() +
+                    " has obsolete version " + std::to_string(mappingVersion) +
+                    "; rebuild required");
+            }
             FiberMapping mapping;
             mapping.fiberPath = root.value("fiber_path", std::string{});
             mapping.windingOffset = 0;
@@ -942,6 +1032,105 @@ Atlas Atlas::load(const fs::path& atlasDir)
         }
     }
     return atlas;
+}
+
+bool atlasLoadErrorRequiresRebuild(const std::exception& ex)
+{
+    const std::string message = ex.what();
+    return message.find("rebuild required") != std::string::npos ||
+           message.find("obsolete") != std::string::npos;
+}
+
+Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
+                                   const fs::path& volpkgRoot,
+                                   const vc::lasagna::NormalSampler& normalSampler,
+                                   const LineMappingOptions& options)
+{
+    const Atlas legacy = loadAtlasContextForRebuild(atlasDir);
+    if (legacy.metadata.baseMeshPath.empty()) {
+        throw std::runtime_error("cannot rebuild atlas without base_mesh_path");
+    }
+    QuadSurface loadedBase(atlasDir / legacy.metadata.baseMeshPath);
+    const auto* points = loadedBase.rawPointsPtr();
+    if (!points || points->empty()) {
+        throw std::runtime_error("cannot rebuild atlas: base mesh has no valid grid");
+    }
+    auto baseSurface = std::make_shared<QuadSurface>(*points, loadedBase.scale());
+    SurfacePatchIndex baseIndex;
+    baseIndex.rebuild({baseSurface});
+    return rebuildAtlasFromSourceFibers(
+        atlasDir, volpkgRoot, *baseSurface, baseIndex, normalSampler, options);
+}
+
+Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
+                                   const fs::path& volpkgRootIn,
+                                   const QuadSurface& baseSurface,
+                                   SurfacePatchIndex& baseIndex,
+                                   const vc::lasagna::NormalSampler& normalSampler,
+                                   const LineMappingOptions& options)
+{
+    const fs::path volpkgRoot = volpkgRootIn.empty()
+        ? inferVolpkgRootFromAtlasDir(atlasDir)
+        : volpkgRootIn;
+    if (volpkgRoot.empty()) {
+        throw std::runtime_error("cannot rebuild atlas without a volume package root");
+    }
+
+    const Atlas legacy = loadAtlasContextForRebuild(atlasDir);
+    Atlas rebuilt;
+    rebuilt.metadata = legacy.metadata;
+    rebuilt.metadata.version = kAtlasMetadataVersion;
+    rebuilt.links = legacy.links;
+    rebuilt.fibers.reserve(legacy.fibers.size());
+
+    for (const auto& oldMapping : legacy.fibers) {
+        if (oldMapping.fiberPath.empty()) {
+            throw std::runtime_error("cannot rebuild atlas mapping with missing fiber path");
+        }
+        const fs::path fiberPath = resolveAtlasRelativePath(
+            atlasDir, volpkgRoot, oldMapping.fiberPath);
+        const FiberInput input = loadSourceFiberInput(fiberPath, oldMapping.fiberPath);
+        rebuilt.fibers.push_back(
+            mapFiberToBaseSurface(input, baseSurface, baseIndex, normalSampler, options));
+    }
+
+    auto refreshEndpoint = [&rebuilt](AtlasLinkEndpoint& endpoint) {
+        const std::string endpointKey = atlasFiberPathKey(endpoint.fiberPath);
+        const auto mappingIt = std::find_if(
+            rebuilt.fibers.begin(),
+            rebuilt.fibers.end(),
+            [&endpointKey](const FiberMapping& mapping) {
+                return atlasFiberPathKey(mapping.fiberPath) == endpointKey;
+            });
+        if (mappingIt == rebuilt.fibers.end()) {
+            throw std::runtime_error(
+                "cannot rebuild atlas link endpoint for missing fiber " +
+                endpoint.fiberPath.generic_string());
+        }
+        const auto anchorIt = std::find_if(
+            mappingIt->lineAnchors.begin(),
+            mappingIt->lineAnchors.end(),
+            [&endpoint](const AtlasAnchor& anchor) {
+                return anchor.sourceIndex == endpoint.sourceIndex;
+            });
+        if (anchorIt == mappingIt->lineAnchors.end()) {
+            throw std::runtime_error(
+                "cannot rebuild atlas link endpoint " +
+                endpoint.fiberPath.generic_string() +
+                " source_index " + std::to_string(endpoint.sourceIndex) +
+                ": mapped line anchor not found");
+        }
+        endpoint.atlasU = anchorIt->atlasU;
+        endpoint.atlasV = anchorIt->atlasV;
+    };
+
+    for (auto& link : rebuilt.links) {
+        refreshEndpoint(link.first);
+        refreshEndpoint(link.second);
+    }
+    layoutAtlasObjects(rebuilt, atlasHorizontalPeriodColumns(baseSurface));
+    rebuilt.save(atlasDir);
+    return rebuilt;
 }
 
 std::string sanitizeAtlasName(std::string name)
@@ -1697,13 +1886,53 @@ std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& base
     return out;
 }
 
+void validateFiberInputControlPoints(FiberInput& fiber)
+{
+    fiber.controlLineIndices.clear();
+    fiber.controlLineIndices.reserve(fiber.controlPoints.size());
+
+    for (size_t i = 0; i < fiber.linePoints.size(); ++i) {
+        if (!finitePoint(fiber.linePoints[i])) {
+            throw std::runtime_error("fiber line_points[" + std::to_string(i) +
+                                     "] contains non-finite coordinates");
+        }
+    }
+
+    int nextLineIndex = 0;
+    const double maxDistanceSq = kControlPointMatchEpsilon * kControlPointMatchEpsilon;
+    for (size_t i = 0; i < fiber.controlPoints.size(); ++i) {
+        if (!finitePoint(fiber.controlPoints[i])) {
+            throw std::runtime_error("fiber control_points[" + std::to_string(i) +
+                                     "] contains non-finite coordinates");
+        }
+        int matchedLineIndex = -1;
+        for (int j = nextLineIndex; j < static_cast<int>(fiber.linePoints.size()); ++j) {
+            if (squaredDistance(fiber.controlPoints[i], fiber.linePoints[static_cast<size_t>(j)]) <=
+                maxDistanceSq) {
+                matchedLineIndex = j;
+                break;
+            }
+        }
+        if (matchedLineIndex < 0) {
+            throw std::runtime_error(
+                "fiber control_points[" + std::to_string(i) +
+                "] is not an ordered subset of line_points; rebuild or repair the fiber JSON");
+        }
+        fiber.controlLineIndices.push_back(matchedLineIndex);
+        nextLineIndex = matchedLineIndex + 1;
+    }
+}
+
 FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                    const QuadSurface& baseSurface,
                                    SurfacePatchIndex& baseIndex,
                                    const vc::lasagna::NormalSampler& normalSampler,
                                    const LineMappingOptions& options)
 {
-    if (fiber.linePoints.empty()) {
+    FiberInput validatedFiber = fiber;
+    validateFiberInputControlPoints(validatedFiber);
+
+    if (validatedFiber.linePoints.empty()) {
         throw std::runtime_error("fiber has no line points");
     }
     const auto* points = baseSurface.rawPointsPtr();
@@ -1724,26 +1953,26 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
         baseSurfacePtr,
     }};
 
-    const int seedIndex = seedLineIndexForFiber(fiber);
-    atlasDebug("map fiber line_points=" + std::to_string(fiber.linePoints.size()) +
-               " control_points=" + std::to_string(fiber.controlPoints.size()) +
+    const int seedIndex = seedLineIndexForFiber(validatedFiber);
+    atlasDebug("map fiber line_points=" + std::to_string(validatedFiber.linePoints.size()) +
+               " control_points=" + std::to_string(validatedFiber.controlPoints.size()) +
                " seed_index=" + std::to_string(seedIndex));
-    std::vector<std::vector<ProjectionHit>> hitsByLinePoint(fiber.linePoints.size());
-    for (size_t i = 0; i < fiber.linePoints.size(); ++i) {
-        const auto sample = normalSampler.sampleNormal(fiber.linePoints[i]);
+    std::vector<std::vector<ProjectionHit>> hitsByLinePoint(validatedFiber.linePoints.size());
+    for (size_t i = 0; i < validatedFiber.linePoints.size(); ++i) {
+        const auto sample = normalSampler.sampleNormal(validatedFiber.linePoints[i]);
         if (!sample.valid || !validNormal(sample.normal)) {
             atlasDebug("line_point[" + std::to_string(i) + "] invalid_normal point=" +
-                       vecString(fiber.linePoints[i]));
+                       vecString(validatedFiber.linePoints[i]));
             if (static_cast<int>(i) == seedIndex) {
                 throw std::runtime_error("No valid normal at atlas seed point");
             }
             continue;
         }
         hitsByLinePoint[i] = projectPointToSurfacesAdaptive(
-            fiber.linePoints[i], sample.normal, baseCandidates, baseIndex, options.rayHalfLength);
+            validatedFiber.linePoints[i], sample.normal, baseCandidates, baseIndex, options.rayHalfLength);
         if (hitsByLinePoint[i].empty()) {
             atlasDebug("line_point[" + std::to_string(i) + "] no_hits point=" +
-                       vecString(fiber.linePoints[i]) + " normal=" + vecString(sample.normal));
+                       vecString(validatedFiber.linePoints[i]) + " normal=" + vecString(sample.normal));
         }
     }
 
@@ -1751,20 +1980,22 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
         throw std::runtime_error("failed to project atlas seed point onto the base shell");
     }
 
-    std::vector<std::optional<AtlasAnchor>> anchors(fiber.linePoints.size());
+    std::vector<std::optional<AtlasAnchor>> anchors(validatedFiber.linePoints.size());
     anchors[seedIndex] = anchorFromHit(seedIndex, hitsByLinePoint[seedIndex].front());
     anchors[seedIndex]->atlasU = normalizeAtlasU(anchors[seedIndex]->atlasU, periodColumns);
     atlasDebug("line_point[" + std::to_string(seedIndex) + "] chosen_anchor u=" +
                std::to_string(anchors[seedIndex]->atlasU) + " v=" +
                std::to_string(anchors[seedIndex]->atlasV));
 
-    for (int i = seedIndex + 1; i < static_cast<int>(fiber.linePoints.size()); ++i) {
+    int mappedFirst = seedIndex;
+    int mappedLast = seedIndex;
+    for (int i = seedIndex + 1; i < static_cast<int>(validatedFiber.linePoints.size()); ++i) {
         ContinuationRejectDebug rejectDebug;
         const auto chosen = chooseContinuationHit(i,
                                                   hitsByLinePoint[i],
                                                   *anchors[i - 1],
-                                                  fiber.linePoints[i - 1],
-                                                  fiber.linePoints[i],
+                                                  validatedFiber.linePoints[i - 1],
+                                                  validatedFiber.linePoints[i],
                                                   periodColumns,
                                                   atlasNominalStep,
                                                   options.mismatchRatio,
@@ -1774,6 +2005,7 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
             break;
         }
         anchors[i] = *chosen;
+        mappedLast = i;
         atlasDebug("line_point[" + std::to_string(i) + "] chosen_anchor u=" +
                    std::to_string(anchors[i]->atlasU) + " v=" +
                    std::to_string(anchors[i]->atlasV));
@@ -1783,8 +2015,8 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
         const auto chosen = chooseContinuationHit(i,
                                                   hitsByLinePoint[i],
                                                   *anchors[i + 1],
-                                                  fiber.linePoints[i + 1],
-                                                  fiber.linePoints[i],
+                                                  validatedFiber.linePoints[i + 1],
+                                                  validatedFiber.linePoints[i],
                                                   periodColumns,
                                                   atlasNominalStep,
                                                   options.mismatchRatio,
@@ -1794,37 +2026,33 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
             break;
         }
         anchors[i] = *chosen;
+        mappedFirst = i;
         atlasDebug("line_point[" + std::to_string(i) + "] chosen_anchor u=" +
                    std::to_string(anchors[i]->atlasU) + " v=" +
                    std::to_string(anchors[i]->atlasV));
     }
 
     FiberMapping mapping;
-    mapping.fiberPath = fiber.fiberPath;
-    for (const auto& anchor : anchors) {
-        if (anchor) {
-            mapping.lineAnchors.push_back(*anchor);
+    mapping.fiberPath = validatedFiber.fiberPath;
+    for (int i = mappedFirst; i <= mappedLast; ++i) {
+        if (!anchors[static_cast<size_t>(i)]) {
+            break;
         }
+        mapping.lineAnchors.push_back(*anchors[static_cast<size_t>(i)]);
     }
     atlasDebug("final_line_anchor_count=" + std::to_string(mapping.lineAnchors.size()));
     if (mapping.lineAnchors.size() < 2) {
         throw std::runtime_error("incomplete atlas mapping: produced fewer than two line anchors");
     }
 
-    for (int i = 0; i < static_cast<int>(fiber.controlPoints.size()); ++i) {
-        const int lineIndex = lineIndexClosestToPoint(fiber.linePoints, fiber.controlPoints[i]);
-        auto it = std::find_if(mapping.lineAnchors.begin(),
-                               mapping.lineAnchors.end(),
-                               [lineIndex](const AtlasAnchor& anchor) {
-                                   return anchor.sourceIndex == lineIndex;
-                               });
-        if (it == mapping.lineAnchors.end()) {
+    for (const int lineIndex : validatedFiber.controlLineIndices) {
+        if (lineIndex < mappedFirst || lineIndex > mappedLast) {
             continue;
         }
-        AtlasAnchor control = *it;
-        control.sourceIndex = i;
-        control.world = fiber.controlPoints[i];
-        mapping.controlAnchors.push_back(control);
+        const auto& anchor = anchors[static_cast<size_t>(lineIndex)];
+        if (anchor) {
+            mapping.controlAnchors.push_back(*anchor);
+        }
     }
     return mapping;
 }
