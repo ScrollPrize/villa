@@ -100,6 +100,7 @@ default_config = {
     'num_patches_per_step': 360,
     'num_patches_per_step_for_dt': 240,
     'num_points_per_patch': 800,
+    'erode_patches': 0,  # if >0, erode every patch's valid region (verified + unverified) by this many grid cells
     'unverified_patch_radius_loss_margin': 0.025,
     'unverified_patch_radius_loss_inv': False,
     'unverified_patch_radius_within_norm_p': 3.0,
@@ -5247,6 +5248,31 @@ def load_tracks_from_dbm(path, z_lo, z_hi):
     return tracks
 
 
+def erode_patch_valid_region(patch, num_cells):
+    """Erode the patch's valid-vertex region inward by `num_cells` grid cells,
+    marking the removed vertices invalid (zyxs = -1) and re-deriving the patch.
+
+    Returns True if any valid quad survives, False if the patch was fully eroded
+    (in which case the caller should drop it).
+    """
+    valid = patch.valid_vertex_mask.cpu().numpy()
+    # border_value=0 so the patch outline is treated as invalid, eroding edges too.
+    eroded = scipy.ndimage.binary_erosion(valid, iterations=num_cells, border_value=0)
+    remove = valid & ~eroded
+    if not remove.any():
+        return True
+    patch.zyxs[torch.from_numpy(remove)] = -1.0
+    new_valid_vertex = torch.any(patch.zyxs != -1, dim=-1)
+    new_valid_quad = (
+        new_valid_vertex[:-1, :-1] & new_valid_vertex[1:, :-1]
+        & new_valid_vertex[:-1, 1:] & new_valid_vertex[1:, 1:]
+    )
+    if not bool(new_valid_quad.any()):
+        return False
+    patch.__post_init__()  # re-derive valid_vertex_mask / valid_quad_mask / area / valid_zyxs
+    return True
+
+
 def prepare_patches():
 
     def scale_patch(patch):
@@ -5265,6 +5291,12 @@ def prepare_patches():
         loaded = load_patches(path)
         for patch in loaded.values():
             scale_patch(patch)
+        erode_cells = int(cfg['erode_patches'])
+        if erode_cells > 0:
+            fully_eroded = [pid for pid, patch in loaded.items() if not erode_patch_valid_region(patch, erode_cells)]
+            for pid in fully_eroded:
+                del loaded[pid]
+            print(f'eroded {label} patches by {erode_cells} cells; dropped {len(fully_eroded)} fully-eroded patches')
         dropped = [pid for pid, patch in loaded.items() if not patch_intersects_z_roi(patch)]
         for pid in dropped:
             del loaded[pid]
