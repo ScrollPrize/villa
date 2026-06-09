@@ -1019,21 +1019,40 @@ void appendInterpolationChunkKeys(
 
 } // namespace
 
+double requiredPositiveManifestDouble(
+    const LasagnaDatasetManifest& manifest,
+    const char* key)
+{
+    const auto it = manifest.raw.find(key);
+    if (it == manifest.raw.end() || !it->is_number()) {
+        throw std::runtime_error(
+            std::string("Lasagna manifest is missing numeric field '") + key + "'");
+    }
+    const double value = it->get<double>();
+    if (!std::isfinite(value) || value <= 0.0) {
+        throw std::runtime_error(
+            std::string("Lasagna manifest field '") + key + "' must be positive and finite");
+    }
+    return value;
+}
+
 class LasagnaNormalSampler::Impl {
 public:
     Impl(const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options)
         : nx_(bindChannel(dataset.manifest(), "nx"))
         , ny_(bindChannel(dataset.manifest(), "ny"))
         , gradMag_(bindChannel(dataset.manifest(), "grad_mag"))
-        , gradMagDecodeScale_(std::max(
-              kEpsilon,
-              dataset.manifest().raw.value("grad_mag_encode_scale", 1000.0) /
-                  dataset.manifest().raw.value("grad_mag_factor", 1.0)))
+        , gradMagDecodeScale_(
+              requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_encode_scale") /
+              requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_factor"))
         , options_(options)
         , cache_(sharedNormalChunkCache(options.maxCachedBytes))
     {
         if (nx_.shapeZYX != ny_.shapeZYX) {
             throw std::runtime_error("Lasagna nx and ny channels must have matching spatial shapes");
+        }
+        if (dataset.manifest().groupForChannel("pred_dt") != nullptr) {
+            predDt_ = bindChannel(dataset.manifest(), "pred_dt");
         }
     }
 
@@ -1044,6 +1063,27 @@ public:
             return std::nullopt;
         }
         return *gradMag / gradMagDecodeScale_;
+    }
+
+    [[nodiscard]] std::optional<double> samplePredDt(const cv::Vec3d& volumePoint) const
+    {
+        if (!predDt_.has_value()) {
+            return std::nullopt;
+        }
+        return sampleChannel(*predDt_, *cache_, volumePoint);
+    }
+
+    [[nodiscard]] bool hasPredDtChannel() const
+    {
+        return predDt_.has_value();
+    }
+
+    [[nodiscard]] std::optional<double> predDtSpacing() const
+    {
+        if (!predDt_.has_value()) {
+            return std::nullopt;
+        }
+        return predDt_->spacing;
     }
 
     [[nodiscard]] double windingDistance(const cv::Vec3d& a,
@@ -1335,6 +1375,7 @@ private:
     ChannelBinding nx_;
     ChannelBinding ny_;
     ChannelBinding gradMag_;
+    std::optional<ChannelBinding> predDt_;
     double gradMagDecodeScale_ = 1000.0;
     LasagnaNormalSamplerOptions options_;
     std::shared_ptr<ChunkCache> cache_;
@@ -1361,6 +1402,21 @@ NormalSample LasagnaNormalSampler::sampleNormal(const cv::Vec3d& volumePoint) co
 std::optional<double> LasagnaNormalSampler::sampleWindingDensity(const cv::Vec3d& volumePoint) const
 {
     return impl_->sampleWindingDensity(volumePoint);
+}
+
+std::optional<double> LasagnaNormalSampler::samplePredDt(const cv::Vec3d& volumePoint) const
+{
+    return impl_->samplePredDt(volumePoint);
+}
+
+bool LasagnaNormalSampler::hasPredDtChannel() const
+{
+    return impl_->hasPredDtChannel();
+}
+
+std::optional<double> LasagnaNormalSampler::predDtSpacing() const
+{
+    return impl_->predDtSpacing();
 }
 
 double LasagnaNormalSampler::windingDistance(const cv::Vec3d& a,

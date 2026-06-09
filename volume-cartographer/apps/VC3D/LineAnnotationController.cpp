@@ -107,6 +107,9 @@ struct LineAnnotationController::LineAnnotationSession {
     uint64_t fiberSequence = 0;
     std::string fiberFileName;
     std::string fiberManualHvTag;
+    std::optional<fs::path> atlasDir;
+    fs::path atlasFiberPath;
+    vc::atlas::AtlasPredSnapSet predSnapSet;
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
     bool controlPointsDirtySinceOptimization = false;
@@ -384,6 +387,38 @@ generatedControlMarkers(const std::vector<vc::lasagna::LineControlPoint>& contro
         marker.point = toVec3f(control.volumePoint);
         marker.linePosition = control.linePosition;
         marker.isSeed = control.isSeed;
+        markers.push_back(marker);
+    }
+    return markers;
+}
+
+std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker>
+generatedPredSnapMarkers(const std::vector<vc::lasagna::LineControlPoint>& controls,
+                         const vc::atlas::AtlasPredSnapSet& predSnapSet)
+{
+    std::unordered_map<std::string, const vc::atlas::AtlasPredSnapPoint*> snapsByControl;
+    snapsByControl.reserve(predSnapSet.points.size());
+    for (const auto& point : predSnapSet.points) {
+        if (point.predSnapPoint) {
+            snapsByControl[vc::atlas::atlasPredSnapControlPointKey(point.controlPoint)] = &point;
+        }
+    }
+
+    std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker> markers;
+    markers.reserve(controls.size());
+    for (size_t i = 0; i < controls.size(); ++i) {
+        const auto& control = controls[i];
+        const auto it = snapsByControl.find(
+            vc::atlas::atlasPredSnapControlPointKey(control.volumePoint));
+        if (it == snapsByControl.end() || !it->second || !it->second->predSnapPoint) {
+            continue;
+        }
+        vc3d::line_annotation::GeneratedOverlay::PredSnapMarker marker;
+        marker.controlPoint = toVec3f(control.volumePoint);
+        marker.snapPoint = toVec3f(*it->second->predSnapPoint);
+        marker.linePosition = control.linePosition;
+        marker.controlIndex = i;
+        marker.manual = it->second->source == vc::atlas::AtlasPredSnapSource::Manual;
         markers.push_back(marker);
     }
     return markers;
@@ -745,6 +780,11 @@ void LineAnnotationController::setSurfacePanel(SurfacePanelController* panel)
     _surfacePanel = panel;
 }
 
+void LineAnnotationController::setCurrentAtlasDirectory(std::optional<fs::path> atlasDir)
+{
+    _currentAtlasDir = std::move(atlasDir);
+}
+
 bool LineAnnotationController::canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const
 {
     if (!viewer || !_state || !_viewerManager) {
@@ -905,6 +945,12 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             [this](const std::string& name, double linePosition, cv::Vec3f volumePoint) {
                 handleGeneratedControlPointDelete(name, linePosition, volumePoint);
             });
+    connect(dialog,
+            &LineAnnotationDialog::generatedPredSnapPointRequested,
+            this,
+            [this](const std::string& name, cv::Vec3f volumePoint) {
+                handleGeneratedPredSnapPoint(name, volumePoint);
+            });
     connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
         handleShowAsMesh(surfaceName);
     });
@@ -1046,6 +1092,19 @@ void LineAnnotationController::openFiber(uint64_t fiberId)
             session->controlPoints[static_cast<size_t>(seedControl)].optimizedIndex;
         session->focusedLinePosition =
             session->controlPoints[static_cast<size_t>(seedControl)].linePosition;
+    }
+    if (_currentAtlasDir && !it->fileName.empty()) {
+        session->atlasDir = *_currentAtlasDir;
+        session->atlasFiberPath = fs::path("fibers") / it->fileName;
+        try {
+            session->predSnapSet = vc::atlas::loadAtlasPredSnapSet(
+                vc::atlas::atlasPredSnapAttachmentPath(*session->atlasDir,
+                                                       session->atlasFiberPath));
+        } catch (const std::exception& ex) {
+            Logger()->warn("Could not load pred-snap attachment for {}: {}",
+                           session->atlasFiberPath.string(),
+                           ex.what());
+        }
     }
 
     CChunkedVolumeViewer::CameraState camera;
@@ -1380,6 +1439,13 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
                                          atlasDir / atlas.metadata.baseMeshPath);
         atlas.save(atlasDir);
+        if (sampler.hasPredDtChannel() && !atlas.fibers.empty()) {
+            (void)vc::atlas::ensureAtlasPredSnapSet(atlasDir,
+                                                    input,
+                                                    atlas.fibers.front(),
+                                                    *selected.surface,
+                                                    sampler);
+        }
         emit atlasCreated(atlasDir);
     } catch (const std::exception& ex) {
         showError(tr("Could not create atlas: %1").arg(QString::fromStdString(ex.what())));
@@ -1677,6 +1743,24 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
         link.desiredWindingDelta = 0;
         atlas.links.push_back(std::move(link));
         vc::atlas::layoutAtlasObjects(atlas, periodColumns);
+        if (sampler.hasPredDtChannel()) {
+            sourceMappingIt = findMapping(atlas, sourceInput.fiberPath);
+            targetMappingIt = findMapping(atlas, targetInput.fiberPath);
+            if (sourceMappingIt != atlas.fibers.end()) {
+                (void)vc::atlas::ensureAtlasPredSnapSet(*_intersectionInspection->atlasDir,
+                                                        sourceInput,
+                                                        *sourceMappingIt,
+                                                        *baseSurface,
+                                                        sampler);
+            }
+            if (targetMappingIt != atlas.fibers.end()) {
+                (void)vc::atlas::ensureAtlasPredSnapSet(*_intersectionInspection->atlasDir,
+                                                        targetInput,
+                                                        *targetMappingIt,
+                                                        *baseSurface,
+                                                        sampler);
+            }
+        }
         atlas.save(*_intersectionInspection->atlasDir);
 
         emit atlasCreated(*_intersectionInspection->atlasDir);
@@ -2003,6 +2087,26 @@ void LineAnnotationController::rebuildIntersectionInspection()
                                                              targetSide.editSessionName,
                                                              targetCallback);
 
+        auto attachAtlasPredSnaps = [this](const StoredFiber& fiber,
+                                           const std::shared_ptr<LineAnnotationSession>& session) {
+            if (!_intersectionInspection || !_intersectionInspection->atlasDir || !session) {
+                return;
+            }
+            session->atlasDir = *_intersectionInspection->atlasDir;
+            session->atlasFiberPath = fs::path("fibers") / fiber.fileName;
+            try {
+                session->predSnapSet = vc::atlas::loadAtlasPredSnapSet(
+                    vc::atlas::atlasPredSnapAttachmentPath(*session->atlasDir,
+                                                           session->atlasFiberPath));
+            } catch (const std::exception& ex) {
+                Logger()->warn("Could not load pred-snap attachment for {}: {}",
+                               session->atlasFiberPath.string(),
+                               ex.what());
+            }
+        };
+        attachAtlasPredSnaps(*sourceIt, sourceSide.editSession);
+        attachAtlasPredSnaps(*targetIt, targetSide.editSession);
+
         const bool sourceIsH = vc3d::line_annotation::firstFiberDisplaysAsH(
             sourceIt->hvClassification,
             sourceIt->manualHvTag,
@@ -2319,7 +2423,9 @@ void LineAnnotationController::rebuildIntersectionInspection()
                                         effectiveLinePosition = follow.linePosition;
                                     }
                                 }
-                                if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                                if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+                                    handleGeneratedPredSnapPoint(surfaceName, volumePoint);
+                                } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                                     handleGeneratedControlPoint(surfaceName,
                                                                 volumePoint,
                                                                 effectiveLinePosition);
@@ -2360,6 +2466,9 @@ void LineAnnotationController::rebuildIntersectionInspection()
                             views.linePoints = generatedLinePoints(linePoints);
                             views.lineUpVectors = lineUpVectors;
                             views.controlPoints = generatedControlMarkers(session->controlPoints);
+                            views.predSnapPoints =
+                                generatedPredSnapMarkers(session->controlPoints,
+                                                         session->predSnapSet);
                             vc3d::line_annotation::applyGeneratedOverlay(
                                 chunkedViewer,
                                 surfaceName,
@@ -2477,6 +2586,9 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     views.linePoints = generatedLinePoints(linePoints);
                     views.lineUpVectors = lineUpVectors;
                     views.controlPoints = generatedControlMarkers(session->controlPoints);
+                    views.predSnapPoints =
+                        generatedPredSnapMarkers(session->controlPoints,
+                                                 session->predSnapSet);
                     auto overlay = vc3d::line_annotation::makeGeneratedStripOverlay(
                         views,
                         focus,
@@ -2527,7 +2639,7 @@ void LineAnnotationController::rebuildIntersectionInspection()
                         Qt::MouseButton button,
                         Qt::KeyboardModifiers modifiers,
                         QPointF scenePoint) {
-                        if (modifiers != Qt::NoModifier) {
+                        if (modifiers != Qt::NoModifier && modifiers != Qt::ShiftModifier) {
                             return;
                         }
                         const double linePosition =
@@ -2541,7 +2653,11 @@ void LineAnnotationController::rebuildIntersectionInspection()
                             _intersectionInspection->activeFollowSourceSide = sourceSideFlag;
                         }
                         if (button == Qt::LeftButton) {
-                            handleGeneratedControlPoint(surfaceName, volumePoint, linePosition);
+                            if (modifiers == Qt::ShiftModifier) {
+                                handleGeneratedPredSnapPoint(surfaceName, volumePoint);
+                            } else {
+                                handleGeneratedControlPoint(surfaceName, volumePoint, linePosition);
+                            }
                         }
                     });
         };
@@ -3109,6 +3225,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         session.controlPointsDirtySinceOptimization = true;
         if (pane->dialog) {
             pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
+            pane->dialog->setGeneratedPredSnapPoints(
+                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
         }
         return;
     }
@@ -3157,6 +3275,65 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                        session.controlPoints,
                        linePointsToJson(session.optimizedLine));
     startOptimization(session, false, update.activeStart, update.activeEnd);
+}
+
+void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& surfaceName,
+                                                           cv::Vec3f volumePoint)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+
+    auto& session = *pane->session;
+    if (!session.atlasDir || session.atlasDir->empty() || session.controlPoints.empty()) {
+        return;
+    }
+
+    const cv::Vec3d clicked(volumePoint[0], volumePoint[1], volumePoint[2]);
+    if (!finitePoint(clicked)) {
+        return;
+    }
+
+    size_t nearestIndex = 0;
+    double nearestDistanceSq = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < session.controlPoints.size(); ++i) {
+        const cv::Vec3d delta = session.controlPoints[i].volumePoint - clicked;
+        const double distanceSq = delta.dot(delta);
+        if (distanceSq < nearestDistanceSq) {
+            nearestIndex = i;
+            nearestDistanceSq = distanceSq;
+        }
+    }
+
+    fs::path atlasFiberPath = session.atlasFiberPath;
+    if (atlasFiberPath.empty() && !session.fiberFileName.empty()) {
+        atlasFiberPath = fs::path("fibers") / session.fiberFileName;
+    }
+    if (atlasFiberPath.empty()) {
+        return;
+    }
+
+    std::optional<double> predDtValue;
+    if (session.normalSampler) {
+        predDtValue = session.normalSampler->samplePredDt(clicked);
+    }
+
+    try {
+        session.predSnapSet = vc::atlas::setManualAtlasPredSnapPoint(
+            *session.atlasDir,
+            atlasFiberPath,
+            session.controlPoints[nearestIndex].volumePoint,
+            clicked,
+            predDtValue);
+        if (pane->dialog) {
+            pane->dialog->setGeneratedPredSnapPoints(
+                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
+        }
+    } catch (const std::exception& ex) {
+        showError(tr("Could not save pred-snap point: %1")
+                      .arg(QString::fromStdString(ex.what())));
+    }
 }
 
 void LineAnnotationController::handleGeneratedControlPointDelete(const std::string& surfaceName,
@@ -3571,6 +3748,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             generatedViews.seedLineIndex = static_cast<int>(std::llround(marker.linePosition));
         }
     }
+    generatedViews.predSnapPoints =
+        generatedPredSnapMarkers(session.controlPoints, session.predSnapSet);
     generatedViews.initialCenterIndex = static_cast<int>(std::llround(std::clamp(
         session.focusedLinePosition,
         0.0,

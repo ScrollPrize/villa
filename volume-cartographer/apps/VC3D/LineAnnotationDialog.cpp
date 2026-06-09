@@ -225,6 +225,16 @@ void LineAnnotationDialog::setGeneratedControlPoints(
     rebuildGeneratedOverlays();
 }
 
+void LineAnnotationDialog::setGeneratedPredSnapPoints(
+    std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints)
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+    _generatedViews.predSnapPoints = std::move(predSnapPoints);
+    rebuildGeneratedOverlays();
+}
+
 void LineAnnotationDialog::setOptimizationBusy(bool busy)
 {
     auto* content = centralWidget();
@@ -576,7 +586,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                    Qt::MouseButton button,
                    Qt::KeyboardModifiers modifiers,
                    QPointF) {
-                if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+                    emit generatedPredSnapPointRequested(_generatedViews.currentCutName,
+                                                         volumePoint);
+                } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                     setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
@@ -635,14 +648,19 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers modifiers,
                                             QPointF scenePoint) {
-                    if (button != Qt::LeftButton || modifiers != Qt::NoModifier) {
+                    if (button != Qt::LeftButton ||
+                        (modifiers != Qt::NoModifier && modifiers != Qt::ShiftModifier)) {
                         return;
                     }
                     const double position = linePositionFromStripScene(viewer, scenePoint);
                     if (std::isfinite(position)) {
                         setCurrentCutFollowsStripMouse(true);
                         setCurrentLinePosition(position);
-                        emit generatedControlPointRequested(surfaceName, volumePoint, position);
+                        if (modifiers == Qt::ShiftModifier) {
+                            emit generatedPredSnapPointRequested(surfaceName, volumePoint);
+                        } else {
+                            emit generatedControlPointRequested(surfaceName, volumePoint, position);
+                        }
                     }
                 });
         stripLayout->addWidget(viewer, 1);
@@ -697,7 +715,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                           Qt::MouseButton button,
                                           Qt::KeyboardModifiers modifiers,
                                           QPointF) {
-                    if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                    if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+                        emit generatedPredSnapPointRequested(surfaceName, volumePoint);
+                    } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                         const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
                         const double linePosition = bottomSliceLinePosition(slot, bottomCount);
                         setCurrentCutFollowsStripMouse(true);

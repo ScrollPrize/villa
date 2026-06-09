@@ -334,7 +334,7 @@ vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
 
 vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagna)
 
-vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 
