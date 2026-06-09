@@ -21,6 +21,20 @@ bool finiteScenePoint(const QPointF& point)
     return std::isfinite(point.x()) && std::isfinite(point.y());
 }
 
+QPointF generatedStripControlPointToScene(
+    CChunkedVolumeViewer* viewer,
+    QuadSurface* surface,
+    const GeneratedOverlay::ControlPointMarker& control)
+{
+    if (viewer && finiteGeneratedPoint(control.point)) {
+        const QPointF pointScene = viewer->volumeToScene(control.point);
+        if (finiteScenePoint(pointScene)) {
+            return pointScene;
+        }
+    }
+    return generatedStripLinePositionToScene(viewer, surface, control.linePosition);
+}
+
 } // namespace
 
 QColor generatedLineTailColor(const QColor& baseColor)
@@ -254,7 +268,7 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                     continue;
                 }
                 const QPointF controlScene =
-                    generatedStripLinePositionToScene(viewer, quad, control.linePosition);
+                    generatedStripControlPointToScene(viewer, quad, control);
                 if (finiteScenePoint(controlScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                         controlScene,
@@ -403,7 +417,7 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         QPointF controlScene;
         if (options.stripViewer) {
             auto* quad = dynamic_cast<QuadSurface*>(options.viewer->currentSurface());
-            controlScene = generatedStripLinePositionToScene(options.viewer, quad, control.linePosition);
+            controlScene = generatedStripControlPointToScene(options.viewer, quad, control);
         } else {
             controlScene = options.viewer->volumeToScene(control.point);
         }

@@ -638,7 +638,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.tangentGuideMode = directionMode == LineAnnotationController::InitialDirectionMode::ZInOut
             ? vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane
             : vc::lasagna::LineOptimizationConfig::TangentGuideMode::CrossVectorWithNormal;
-        if (initialLinePoints.size() >= 2) {
+        if (!forceFullOptimization && initialLinePoints.size() >= 2) {
             std::vector<int> fixedIndices;
             fixedIndices.reserve(task.controlPoints.size());
             int displayFrameAnchorIndex = static_cast<int>(initialLinePoints.size() / 2);
@@ -3445,12 +3445,12 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                 }
             }
             if (bestIndex >= 0) {
+                const cv::Vec3d controlVolumePoint = control.volumePoint;
                 control.optimizedIndex = bestIndex;
                 control.linePosition = static_cast<double>(bestIndex);
-                control.volumePoint = session.optimizedLine.points[static_cast<size_t>(bestIndex)].position;
                 const bool matchesFocusedControl = session.focusedControlPoint.has_value() &&
-                    std::sqrt((control.volumePoint - *session.focusedControlPoint).dot(
-                        control.volumePoint - *session.focusedControlPoint)) <= 1.0e-6;
+                    std::sqrt((controlVolumePoint - *session.focusedControlPoint).dot(
+                        controlVolumePoint - *session.focusedControlPoint)) <= 1.0e-6;
                 if (std::abs(session.focusedLinePosition - control.linePosition) <= 0.5 ||
                     matchesFocusedControl) {
                     session.focusedLinePosition = control.linePosition;
