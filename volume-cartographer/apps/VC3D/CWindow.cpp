@@ -4026,6 +4026,10 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::deleteFibers);
             connect(widget,
+                    &CFiberWidget::renameFiberFileRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::renameFiberFile);
+            connect(widget,
                     &CFiberWidget::manualHvTagChanged,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::setFiberManualHvTag);

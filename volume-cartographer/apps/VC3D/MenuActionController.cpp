@@ -751,6 +751,9 @@ void MenuActionController::showSettingsDialog()
         _window->_viewerManager->forEachBaseViewer([showDirHints](VolumeViewerBase* viewer) {
             if (viewer) {
                 viewer->setShowDirectionHints(showDirHints);
+                // Re-read viewer settings (sensitivities, scalebar voxel size, ...)
+                // so changes made in the dialog take effect immediately.
+                viewer->reloadPerfSettings();
             }
         });
     }

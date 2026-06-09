@@ -268,6 +268,7 @@ private:
     bool shouldRefreshInteractivePreview();
     void resizeFramebuffer();
     void recalcPyramidLevel();
+    void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
     bool isAxisAlignedView() const;
@@ -395,6 +396,7 @@ private:
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
+    double _voxelSizeOverrideUm = 0.0;   // scalebar fallback when volume metadata lacks voxelsize
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     int _maxDisplayedResolution = 0;
     bool _showDirectionHints = true;

@@ -43,7 +43,9 @@ public:
     bool canDeleteSelection() const;
     bool canCreateAtlasFromSelection() const;
     bool canShowFiberSlice() const;
+    bool canRenameFiberFile() const;
     QAction* createShowFiberSliceAction(QObject* parent);
+    QAction* createRenameFiberFileAction(QObject* parent);
     void setFibers(const std::vector<FiberEntry>& fibers);
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
@@ -56,6 +58,7 @@ signals:
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void newAtlasFromFiberRequested(uint64_t fiberId);
     void fiberSliceRequested(uint64_t fiberId);
+    void renameFiberFileRequested(uint64_t fiberId);
 
 private slots:
     void onSelectionChanged();
@@ -73,6 +76,7 @@ private:
     void updateClassificationUi();
     void requestDeleteSelectedFibers();
     void requestShowFiberSlice();
+    void requestRenameFiberFile();
     bool confirmDeleteFibers(const std::vector<uint64_t>& fiberIds);
     static QString labelForFiber(const FiberEntry& fiber);
 

@@ -23,6 +23,7 @@ class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
 class QPushButton;
+class QVariantAnimation;
 class QVBoxLayout;
 class QWheelEvent;
 class ViewerManager;
@@ -99,6 +100,10 @@ private:
                                const GeneratedOverlay& overlay);
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
     void setCurrentLinePosition(double position);
+    void cancelControlPointPreviewAnimation();
+    void jumpToPreviousControlPoint();
+    void jumpToNextControlPoint();
+    void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
     bool shiftBottomSlicesByScrollSteps(int steps);
     bool scaleBottomSliceLineStepByScrollSteps(int steps);
@@ -106,13 +111,23 @@ private:
     void setCurrentCutFollowsStripMouse(bool follows);
     void recenterBottomSlicesOnCurrentPosition();
     double snappedControlPointPosition(double position) const;
+    void rebuildGeneratedStaticStripOverlays();
+    void rebuildGeneratedDynamicOverlays();
     void rebuildGeneratedOverlays();
+    void installGeneratedViewShortcuts();
+    void resetGeneratedViews();
+    bool rotateCurrentCut(vc3d::line_annotation::GeneratedCutRotationAxis axis, float radians);
+    cv::Vec3f currentCutViewerCenterVolumePoint() const;
+    void captureInitialGeneratedViewState();
+    void restoreInitialGeneratedViewerCameras();
     void applyOverlayForViewer(const std::string& overlayKey,
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
     void clearControlPointContextPreview(const std::string& surfaceName,
                                          CChunkedVolumeViewer* viewer);
     GeneratedOverlay stripOverlay() const;
+    GeneratedOverlay staticStripOverlay() const;
+    GeneratedOverlay dynamicStripOverlay() const;
     GeneratedOverlay zSliceOverlay(double linePosition,
                                    bool emphasized,
                                    CChunkedVolumeViewer* viewer,
@@ -136,6 +151,7 @@ private:
     QLabel* _bottomSliceStepLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
     QPushButton* _fullOptimizationButton = nullptr;
+    QPushButton* _resetViewsButton = nullptr;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
@@ -151,6 +167,17 @@ private:
     double _currentLinePosition = 0.0;
     double _bottomCenterPosition = 0.0;
     double _bottomSliceLineStep = 10.0;
+    double _initialCurrentLinePosition = 0.0;
+    double _initialBottomCenterPosition = 0.0;
+    double _initialBottomSliceLineStep = 10.0;
     int _bottomSliceStepWheelAccum = 0;
     bool _currentCutFollowsStripMouse = true;
+    cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
+    bool _currentCutManualRotationActive = false;
+    vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
+    QPointer<QVariantAnimation> _controlPointPreviewAnimation;
+    bool _haveInitialCurrentCutCamera = false;
+    CChunkedVolumeViewer::CameraState _initialCurrentCutCamera;
+    std::vector<CChunkedVolumeViewer::CameraState> _initialStripCameras;
+    std::vector<CChunkedVolumeViewer::CameraState> _initialBottomSliceCameras;
 };

@@ -21,24 +21,6 @@ bool finiteScenePoint(const QPointF& point)
     return std::isfinite(point.x()) && std::isfinite(point.y());
 }
 
-QPointF quadGridToScene(CChunkedVolumeViewer* viewer, QuadSurface* surface, int row, int col)
-{
-    if (!viewer || !surface) {
-        return {};
-    }
-    const auto* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return {};
-    }
-    const cv::Vec2f scale = surface->scale();
-    if (scale[0] == 0.0f || scale[1] == 0.0f) {
-        return {};
-    }
-    const float surfaceX = (static_cast<float>(col) - static_cast<float>(points->cols) / 2.0f) / scale[0];
-    const float surfaceY = (static_cast<float>(row) - static_cast<float>(points->rows) / 2.0f) / scale[1];
-    return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
-}
-
 } // namespace
 
 QColor generatedLineTailColor(const QColor& baseColor)
@@ -146,10 +128,17 @@ GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& vi
                                                         double linePosition,
                                                         bool emphasized,
                                                         CChunkedVolumeViewer* viewer,
-                                                        PlaneSurface* plane)
+                                                        PlaneSurface* plane,
+                                                        const GeneratedControlPointLinePositionIndex* controlIndex)
 {
     const std::optional<float> threshold =
         plane ? generatedCrossSliceControlPointDistanceThreshold(viewer) : std::nullopt;
+    const std::optional<double> linePositionRadius =
+        threshold ? std::optional<double>(generatedLinePositionRadiusForVolumeThreshold(
+                        views.linePoints,
+                        linePosition,
+                        *threshold))
+                  : std::nullopt;
     return makeGeneratedCrossSliceOverlay(
         views,
         linePosition,
@@ -157,7 +146,9 @@ GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& vi
         threshold,
         [plane](const cv::Vec3f& point) {
             return plane ? plane->pointDist(point) : std::numeric_limits<float>::quiet_NaN();
-        });
+        },
+        controlIndex,
+        linePositionRadius);
 }
 
 void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
@@ -222,13 +213,17 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
         const auto* points = quad ? quad->rawPointsPtr() : nullptr;
         if (points && !points->empty()) {
-            const int row = points->rows / 2;
-            sceneLine.reserve(static_cast<size_t>(points->cols));
-            for (int col = 0; col < points->cols; ++col) {
-                const QPointF scenePoint = quadGridToScene(viewer, quad, row, col);
-                if (finiteScenePoint(scenePoint)) {
-                    sceneLine.push_back({scenePoint, static_cast<double>(col)});
-                }
+            const cv::Vec2f scale = quad->scale();
+            if (scale[0] != 0.0f && scale[1] != 0.0f && !overlay.linePoints.empty()) {
+                const float centerRow = static_cast<float>(points->rows / 2);
+                const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
+                const float startX = -static_cast<float>(points->cols) / 2.0f / scale[0];
+                const float endX = (static_cast<float>(points->cols - 1) -
+                                    static_cast<float>(points->cols) / 2.0f) / scale[0];
+                primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                    {cv::Vec2f(startX, surfaceY), cv::Vec2f(endX, surfaceY)},
+                    false,
+                    lineStyle});
             }
             if (overlay.controlPoints.empty() &&
                 overlay.seedLineIndex >= 0 &&
@@ -322,7 +317,7 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         }
     }
 
-    if (sceneLine.size() >= 2) {
+    if (!overlay.useSurfaceCenterLine && sceneLine.size() >= 2) {
         const auto controlRange = generatedControlLinePositionRange(overlay.controlPoints);
         for (size_t i = 1; i < sceneLine.size(); ++i) {
             const auto& previous = sceneLine[i - 1];

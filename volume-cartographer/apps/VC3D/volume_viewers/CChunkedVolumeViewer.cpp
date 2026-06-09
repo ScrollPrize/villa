@@ -900,6 +900,8 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
     _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
+    _voxelSizeOverrideUm = std::max(0.0, s.value(viewer::VOXEL_SIZE_UM, viewer::VOXEL_SIZE_UM_DEFAULT).toDouble());
+    updateScalebarScale();   // override may have changed -> refresh the scalebar
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
     _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
     _maxDisplayedResolution = std::clamp(
@@ -1053,11 +1055,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
                                   : static_cast<int>(_volume->numScales());
         _scale = scaleForCoarsestPlaneRenderLevel(n);
     }
-    recalcPyramidLevel();
-    if (_volume) {
-        const double vs = _volume->voxelSize() / static_cast<double>(_dsScale);
-        _view->setVoxelSize(vs, vs);
-    }
+    recalcPyramidLevel();   // also pushes the scalebar µm/px (updateScalebarScale)
     updateContentBounds();
     resizeFramebuffer();
     scheduleRender("volume changed");
@@ -1377,6 +1375,36 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
         static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
         0, std::max(0, n - 1));
     _dsScale = static_cast<float>(std::uint64_t{1} << _dsScaleIdx);
+    updateScalebarScale();
+}
+
+void CChunkedVolumeViewer::updateScalebarScale()
+{
+    // The scalebar overlay (CVolumeViewerView::drawForeground) needs µm per scene
+    // pixel, where one scene pixel == one rendered framebuffer pixel (the framebuffer
+    // is blitted 1:1, so the view transform m11 ~= 1 and does NOT carry the zoom).
+    // The zoom + LOD live in the FRAMEBUFFER render, not the view transform:
+    //   - 1 framebuffer px = 1/_scale render-LOD voxels (gen steps gridScale/_scale).
+    //   - 1 render-LOD voxel = _dsScale level-0 voxels = _dsScale * voxelSize µm.
+    // => µm/px = voxelSize * _dsScale / _scale. Must be recomputed on every zoom AND
+    // LOD change (both happen here) -- the old code set it once at volume-load with
+    // the wrong formula (voxelSize/_dsScale, zoom ignored), so the bar was wrong at
+    // every zoom level.
+    if (!_view || !_volume)
+        return;
+    // Voxel size (µm per level-0 voxel): prefer the volume's own metadata, but many
+    // .vca archives don't carry one (voxelSize()==0). Fall back to the user-set
+    // override (viewer/voxel_size_um in settings) so the scalebar still shows real
+    // units. If neither is available the bar can't be physical -> leave the view's
+    // default and the overlay shows nothing meaningful.
+    double voxel = _volume->voxelSize();
+    if (!(voxel > 0.0))
+        voxel = _voxelSizeOverrideUm;                 // 0 if unset
+    if (!(voxel > 0.0) || !(_scale > 0.0f))
+        return;
+    const double umPerScenePx =
+        voxel * static_cast<double>(_dsScale) / static_cast<double>(_scale);
+    _view->setVoxelSize(umPerScenePx, umPerScenePx);
 }
 
 void CChunkedVolumeViewer::resizeFramebuffer()

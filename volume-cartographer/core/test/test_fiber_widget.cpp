@@ -64,6 +64,7 @@ int main(int argc, char** argv)
     require(!widget.canDeleteSelection(), "Empty selection should not allow delete");
     require(!widget.canCreateAtlasFromSelection(), "Empty selection should not allow atlas creation");
     require(!widget.canShowFiberSlice(), "Empty selection should not allow fiber slice");
+    require(!widget.canRenameFiberFile(), "Empty selection should not allow JSON rename");
 
     widget.selectFiber(2);
     require(widget.selectedFiberId() == 2, "Single selection did not set selectedFiberId");
@@ -72,9 +73,12 @@ int main(int argc, char** argv)
     require(widget.canDeleteSelection(), "Single selection should allow delete");
     require(widget.canCreateAtlasFromSelection(), "Single selection should allow atlas creation");
     require(widget.canShowFiberSlice(), "Single selection should allow fiber slice");
+    require(widget.canRenameFiberFile(), "Single selection should allow JSON rename");
 
     int sliceRequests = 0;
+    int renameRequests = 0;
     uint64_t requestedSliceFiberId = 0;
+    uint64_t requestedRenameFiberId = 0;
     QObject::connect(&widget,
                      &CFiberWidget::fiberSliceRequested,
                      &widget,
@@ -82,11 +86,23 @@ int main(int argc, char** argv)
                          ++sliceRequests;
                          requestedSliceFiberId = fiberId;
                      });
+    QObject::connect(&widget,
+                     &CFiberWidget::renameFiberFileRequested,
+                     &widget,
+                     [&](uint64_t fiberId) {
+                         ++renameRequests;
+                         requestedRenameFiberId = fiberId;
+                     });
     auto* showSliceAction = widget.createShowFiberSliceAction(&widget);
     require(showSliceAction->isEnabled(), "Single selection should enable Show fiber slice action");
     showSliceAction->trigger();
     require(sliceRequests == 1, "Show fiber slice action did not emit one request");
     require(requestedSliceFiberId == 2, "Show fiber slice emitted the wrong fiber ID");
+    auto* renameAction = widget.createRenameFiberFileAction(&widget);
+    require(renameAction->isEnabled(), "Single selection should enable Rename JSON file action");
+    renameAction->trigger();
+    require(renameRequests == 1, "Rename JSON file action did not emit one request");
+    require(requestedRenameFiberId == 2, "Rename JSON file emitted the wrong fiber ID");
 
     widget.selectFibers({1, 3});
     require(widget.selectedFiberId() == 0, "Multi-selection should not expose a single selected fiber");
@@ -95,8 +111,11 @@ int main(int argc, char** argv)
     require(widget.canDeleteSelection(), "Multi-selection should allow delete");
     require(!widget.canCreateAtlasFromSelection(), "Multi-selection should gray out atlas creation");
     require(!widget.canShowFiberSlice(), "Multi-selection should gray out fiber slice");
+    require(!widget.canRenameFiberFile(), "Multi-selection should gray out JSON rename");
     auto* multiShowSliceAction = widget.createShowFiberSliceAction(&widget);
     require(!multiShowSliceAction->isEnabled(), "Multi-selection should disable Show fiber slice action");
+    auto* multiRenameAction = widget.createRenameFiberFileAction(&widget);
+    require(!multiRenameAction->isEnabled(), "Multi-selection should disable Rename JSON file action");
 
     int confirmations = 0;
     int batchDeletes = 0;

@@ -105,6 +105,9 @@ namespace viewer {
     constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
     constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
     constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
+    // Fallback voxel size (µm per level-0 voxel) for the scalebar when the loaded
+    // volume's metadata has none (e.g. .vca archives). 0 = unset (no fallback).
+    constexpr auto VOXEL_SIZE_UM = "viewer/voxel_size_um";
 
     constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
     constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
@@ -112,6 +115,7 @@ namespace viewer {
     constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr double VOXEL_SIZE_UM_DEFAULT = 0.0;   // unset; scalebar falls back to volume metadata only
     constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
     constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 

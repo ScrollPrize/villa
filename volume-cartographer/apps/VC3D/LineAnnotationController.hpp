@@ -98,6 +98,7 @@ public:
     void openFiber(uint64_t fiberId);
     void deleteFiber(uint64_t fiberId);
     void deleteFibers(std::vector<uint64_t> fiberIds);
+    void renameFiberFile(uint64_t fiberId);
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
