@@ -322,6 +322,9 @@ QString versionedTifxyzOutputName(const QString& baseNameIn,
 {
     const std::string tifxyzSuffix = ".tifxyz";
     QString rootNameQt = baseNameIn.trimmed();
+    if (rootNameQt.endsWith(QString::fromStdString(tifxyzSuffix))) {
+        rootNameQt.chop(static_cast<int>(tifxyzSuffix.size()));
+    }
     if (rootNameQt.isEmpty()) {
         rootNameQt = QStringLiteral("atlas");
     }
@@ -2073,6 +2076,7 @@ void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar*
     std::cerr << "[lasagna] atlas request prep:"
               << " atlas=" << _atlasDirPath.toStdString()
               << " config=" << _atlasConfigFilePath.toStdString()
+              << " requestedName=" << newModelOutputName().toStdString()
               << " outputName=" << outputName.toStdString()
               << " files=" << artifacts.fileCount
               << " raw=" << bytesToMiB(artifacts.rawBytes) << " MiB"

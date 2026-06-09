@@ -26,6 +26,7 @@ class AtlasLineDebugPayload:
 	model_normal: torch.Tensor
 	signed_delta: torch.Tensor
 	is_control: torch.Tensor
+	sample_model_h: torch.Tensor
 	sample_model_w: torch.Tensor
 	normal_proxy_target_xyz: torch.Tensor
 	normal_proxy_valid: torch.Tensor
@@ -58,6 +59,132 @@ def _atlas_object_ids(lines, count: int) -> tuple[str, ...]:
 	return tuple("unknown" for _ in range(int(count)))
 
 
+def _atlas_source_indices(lines, count: int) -> tuple[int, ...]:
+	raw = tuple(int(v) for v in (getattr(lines, "source_indices", ()) or ()))
+	if len(raw) == int(count):
+		return raw
+	return tuple(int(i) for i in range(int(count)))
+
+
+def _finite_float(value: object) -> float | None:
+	try:
+		v = float(value)
+	except (TypeError, ValueError):
+		return None
+	return v if torch.isfinite(torch.tensor(v)).item() else None
+
+
+def _xyz_list(values: torch.Tensor) -> list[float | None]:
+	vals = values.detach().cpu().reshape(3).tolist()
+	return [_finite_float(v) for v in vals]
+
+
+def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None = None) -> dict | None:
+	"""Build JSON-safe final atlas-control feedback from an atlas-line debug payload."""
+	payload = _last_debug_payload if payload is None else payload
+	if payload is None or lines is None:
+		return None
+
+	K = int(lines.target_xyz.shape[0])
+	if K <= 0:
+		return {
+			"format": "lasagna_atlas_control_points_results",
+			"version": 1,
+			"summary": _atlas_control_summary([]),
+			"fibers": [],
+			"records": [],
+		}
+
+	is_control = getattr(lines, "is_control_point", None)
+	if is_control is None:
+		control_k = torch.zeros(K, dtype=torch.bool)
+	else:
+		control_k = is_control.detach().cpu().to(dtype=torch.bool).view(K)
+	object_ids = _atlas_object_ids(lines, K)
+	source_indices = _atlas_source_indices(lines, K)
+
+	valid = payload.valid.detach().cpu().to(dtype=torch.bool)
+	target_xyz = payload.target_xyz.detach().cpu().to(dtype=torch.float32)
+	hit_xyz = payload.hit_xyz.detach().cpu().to(dtype=torch.float32)
+	signed_delta = payload.signed_delta.detach().cpu().to(dtype=torch.float32)
+	model_h = payload.sample_model_h.detach().cpu().to(dtype=torch.float32)
+	model_w = payload.sample_model_w.detach().cpu().to(dtype=torch.float32)
+	D = int(valid.shape[0])
+
+	records: list[dict] = []
+	for d in range(D):
+		for k in range(K):
+			if not bool(control_k[k]):
+				continue
+			target = target_xyz[d, k]
+			mesh = hit_xyz[d, k]
+			ok = bool(valid[d, k]) and bool(torch.isfinite(target).all()) and bool(torch.isfinite(mesh).all())
+			distance = None
+			if ok:
+				distance = float(torch.linalg.vector_norm(target - mesh).item())
+			record = {
+				"fiber_id": object_ids[k],
+				"object_id": object_ids[k],
+				"source_index": int(source_indices[k]),
+				"control_index": -1,
+				"target_xyz": _xyz_list(target),
+				"mesh_xyz": _xyz_list(mesh),
+				"model_h": _finite_float(model_h[d, k].item()),
+				"model_w": _finite_float(model_w[d, k].item()),
+				"distance": _finite_float(distance),
+				"signed_delta": _finite_float(signed_delta[d, k].item()),
+				"valid": ok,
+			}
+			if D != 1:
+				record["layer_index"] = int(d)
+			records.append(record)
+
+	records.sort(key=lambda r: (str(r["fiber_id"]), int(r.get("layer_index", 0)), int(r["source_index"])))
+	fibers: list[dict] = []
+	by_fiber: dict[str, list[dict]] = {}
+	for record in records:
+		by_fiber.setdefault(str(record["fiber_id"]), []).append(record)
+	for fiber_id in sorted(by_fiber):
+		points = by_fiber[fiber_id]
+		for i, record in enumerate(points):
+			record["control_index"] = int(i)
+		fibers.append({
+			"fiber_id": fiber_id,
+			"object_id": fiber_id,
+			"control_points": points,
+		})
+
+	return {
+		"format": "lasagna_atlas_control_points_results",
+		"version": 1,
+		"summary": _atlas_control_summary(records),
+		"fibers": fibers,
+		"records": records,
+	}
+
+
+def _atlas_control_summary(records: list[dict]) -> dict:
+	distances = [
+		float(r["distance"])
+		for r in records
+		if bool(r.get("valid")) and r.get("distance") is not None
+	]
+	total = int(len(records))
+	valid_count = int(len(distances))
+	max_distance = max(distances) if distances else 0.0
+	rms_distance = (
+		float(sum(d * d for d in distances) / len(distances)) ** 0.5
+		if distances else 0.0
+	)
+	return {
+		"total_count": total,
+		"control_count": total,
+		"valid_count": valid_count,
+		"max_distance": float(max_distance),
+		"rms_distance": float(rms_distance),
+	}
+
+
 def _empty_debug_payload(*, res: fit_model.FitResult3D, lines) -> AtlasLineDebugPayload:
 	D = int(res.xyz_lr.shape[0])
 	K = int(lines.target_xyz.shape[0])
@@ -69,6 +196,7 @@ def _empty_debug_payload(*, res: fit_model.FitResult3D, lines) -> AtlasLineDebug
 		model_normal=torch.full((D, K, 3), float("nan"), dtype=torch.float32),
 		signed_delta=torch.full((D, K), float("nan"), dtype=torch.float32),
 		is_control=torch.zeros((D, K), dtype=torch.bool),
+		sample_model_h=torch.full((D, K), float("nan"), dtype=torch.float32),
 		sample_model_w=torch.full((D, K), float("nan"), dtype=torch.float32),
 		normal_proxy_target_xyz=torch.full(tuple(res.xyz_lr.shape), float("nan"), dtype=torch.float32),
 		normal_proxy_valid=torch.zeros(tuple(res.xyz_lr.shape[:3]), dtype=torch.bool),
@@ -584,6 +712,7 @@ def atlas_line_loss(
 				hit_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
 				normal_full = torch.full((D, K, 3), float("nan"), dtype=torch.float32)
 				signed_full = torch.full((D, K), float("nan"), dtype=torch.float32)
+				sample_h_full = torch.full((D, K), float("nan"), dtype=torch.float32)
 				sample_w_full = torch.full((D, K), float("nan"), dtype=torch.float32)
 				valid_full = torch.zeros((D, K), dtype=torch.bool)
 				control_full = control_k.view(1, K).expand(D, K).detach().cpu().to(dtype=torch.bool)
@@ -591,6 +720,7 @@ def atlas_line_loss(
 				hit_full[:, idx_cpu] = hit_xyz.detach().cpu().to(dtype=torch.float32)
 				normal_full[:, idx_cpu] = model_n.detach().cpu().to(dtype=torch.float32)
 				signed_full[:, idx_cpu] = signed_delta.detach().cpu().to(dtype=torch.float32)
+				sample_h_full[:, idx_cpu] = h_cont.detach().cpu().to(dtype=torch.float32)
 				sample_w_full[:, idx_cpu] = w_cont.detach().cpu().to(dtype=torch.float32)
 				valid_full[:, idx_cpu] = valid_active.detach().cpu().to(dtype=torch.bool)
 				_last_debug_payload = AtlasLineDebugPayload(
@@ -601,6 +731,7 @@ def atlas_line_loss(
 					model_normal=normal_full,
 					signed_delta=signed_full,
 					is_control=control_full,
+					sample_model_h=sample_h_full,
 					sample_model_w=sample_w_full,
 					normal_proxy_target_xyz=proxy_target_map.detach().cpu().to(dtype=torch.float32),
 					normal_proxy_valid=proxy_valid_map.detach().cpu().to(dtype=torch.bool),

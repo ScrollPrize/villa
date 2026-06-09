@@ -37,6 +37,9 @@ set(srcs
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
     SurfaceAreaCalculator.hpp
+    AtlasControlPointsDock.cpp
+    AtlasControlPointsDock.hpp
+    AtlasControlPointsTypes.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
@@ -127,6 +130,8 @@ set(srcs
     overlays/SurfaceRotationOverlayController.hpp
     overlays/AtlasOverlayController.cpp
     overlays/AtlasOverlayController.hpp
+    overlays/AtlasControlPointsOverlayController.cpp
+    overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
     overlays/VolumeOverlayController.cpp

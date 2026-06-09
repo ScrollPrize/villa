@@ -156,7 +156,7 @@ void writeValidLasagnaAtlasFixture(const fs::path& volpkgRoot,
     writeText(volpkgRoot / "fibers" / "fiber.json",
               R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})");
     writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
     writeText(atlasDir / "metadata.json",
               R"({"type":"vc3d_atlas","version":4,"name":")" + atlasName +
               R"(","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})");
@@ -279,7 +279,10 @@ nlohmann::json atlas21ExpectedSamples(const vc::atlas::LasagnaAtlasExport& expor
 
 TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
 {
-    const fs::path root = tempRoot("vc_atlas_roundtrip");
+    const fs::path volpkgRoot = tempRoot("vc_atlas_roundtrip");
+    const fs::path atlasDir = volpkgRoot / "atlases" / "fiber_1";
+    writeText(volpkgRoot / "fibers" / "1.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[1,2,3]],"control_points":[[1,2,3]]})");
 
     vc::atlas::Atlas atlas;
     atlas.metadata.name = "fiber_1";
@@ -310,16 +313,16 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     mapping.controlAnchors.push_back({0, {1.0, 2.0, 3.0}, 4.0, 5.0, 0.25});
     atlas.fibers.push_back(mapping);
 
-    atlas.save(root);
-    const std::string metadata = readText(root / "metadata.json");
+    atlas.save(atlasDir);
+    const std::string metadata = readText(atlasDir / "metadata.json");
     CHECK(metadata.find("\"version\": 4") != std::string::npos);
     CHECK(metadata.find("\"zero_winding_column\": 3") != std::string::npos);
     CHECK(metadata.find("idx_rotation_columns") == std::string::npos);
-    const std::string mappingJson = readText(root / "mappings" / "fibers" / "1.json");
-    CHECK(mappingJson.find("\"version\": 3") != std::string::npos);
+    const std::string mappingJson = readText(atlasDir / "mappings" / "fibers" / "1.json");
+    CHECK(mappingJson.find("\"version\": 4") != std::string::npos);
     CHECK(mappingJson.find("winding_offset") == std::string::npos);
 
-    const auto loaded = vc::atlas::Atlas::load(root);
+    const auto loaded = vc::atlas::Atlas::load(atlasDir);
 
     REQUIRE(loaded.metadata.name == "fiber_1");
     CHECK(loaded.metadata.version == 4);
@@ -399,6 +402,30 @@ TEST_CASE("Atlas loader requires current fiber mapping versions")
         vc::atlas::Atlas::load(root),
         doctest::Contains("rebuild required"),
         std::runtime_error);
+
+    writeText(root / "mappings" / "fibers" / "missing_version.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/1.json","line_anchors":[],"control_anchors":[]})");
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::Atlas::load(root),
+        doctest::Contains("rebuild required"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas loader rejects v4 control anchors with stale world coordinates")
+{
+    const fs::path root = tempRoot("vc_atlas_load_stale_control_world");
+    const fs::path atlasDir = root / "atlases" / "fiber_atlas";
+    writeText(root / "fibers" / "fiber.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[0,0,0],[1,0,0],[2,0,0]],"control_points":[[1,0,0]]})");
+    writeText(atlasDir / "metadata.json",
+              R"({"type":"vc3d_atlas","version":4,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+    writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","line_anchors":[{"source_index":1,"world":[1,0,0],"atlas":[1,1],"distance":0}],"control_anchors":[{"source_index":1,"world":[99,0,0],"atlas":[1,1],"distance":0}]})");
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::Atlas::load(atlasDir),
+        doctest::Contains("world does not match source fiber control point"),
+        std::runtime_error);
 }
 
 TEST_CASE("Atlas rebuild remaps source fibers and refreshes link endpoints")
@@ -421,7 +448,7 @@ TEST_CASE("Atlas rebuild remaps source fibers and refreshes link endpoints")
     writeText(root / "fibers" / "b.json",
               R"({"type":"vc3d_fiber","version":1,"line_points":[[4,2,1.4],[5,2,1.5],[6,2,1.6]],"control_points":[[5,2,1.5]]})");
     writeText(atlasDir / "metadata.json",
-              R"({"type":"vc3d_atlas","version":3,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0,"seed_line_index":1,"seed_atlas":[99,99]})");
+              R"({"type":"vc3d_atlas","version":4,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0,"seed_line_index":1,"seed_atlas":[99,99]})");
     writeText(atlasDir / "links.json",
               R"({"version":1,"links":[{"first":{"object_type":"fiber","fiber_path":"fibers/a.json","source_index":1,"arclength":12.5,"base_atlas":[99,99]},"second":{"object_type":"fiber","fiber_path":"fibers/b.json","source_index":1,"arclength":42.5,"base_atlas":[88,88]},"desired_winding_delta":1}]})");
     writeText(atlasDir / "mappings" / "fibers" / "a.json",
@@ -450,7 +477,7 @@ TEST_CASE("Atlas rebuild remaps source fibers and refreshes link endpoints")
 
     CHECK(readText(atlasDir / "metadata.json").find("\"version\": 4") != std::string::npos);
     CHECK(readText(atlasDir / "mappings" / "fibers" / "a.json")
-              .find("\"version\": 3") != std::string::npos);
+              .find("\"version\": 4") != std::string::npos);
     const auto loaded = vc::atlas::Atlas::load(atlasDir);
     CHECK(loaded.metadata.version == 4);
     REQUIRE(loaded.links.size() == 1);
@@ -475,8 +502,11 @@ TEST_CASE("Lasagna atlas export is derived from native atlas metadata and mappin
 {
     const fs::path root = tempRoot("vc_atlas_lasagna_export");
     writeValidLasagnaAtlasFixture(root, "fiber_atlas");
+    const fs::path fiberPath = root / "fibers" / "fiber.json";
+    const std::string fiberBefore = readText(fiberPath);
 
     const auto exported = vc::atlas::loadLasagnaAtlasExport(root / "atlases" / "fiber_atlas", root);
+    CHECK(readText(fiberPath) == fiberBefore);
     CHECK(exported.atlas.metadata.zeroWindingColumn == 1);
     CHECK(exported.basePath == root / "atlases" / "fiber_atlas" / "base_mesh" / "base.tifxyz");
     REQUIRE(exported.objects.size() == 1);
@@ -493,6 +523,37 @@ TEST_CASE("Lasagna atlas export is derived from native atlas metadata and mappin
     CHECK(compact.at("maps")[0].at("winding_offset").get<int>() == 0);
     CHECK(compact.at("maps")[0].at("mapping_path").get<std::string>() ==
           "mappings/fibers/fiber.json");
+}
+
+TEST_CASE("Lasagna atlas export rejects obsolete fiber mappings before compact export")
+{
+    const fs::path root = tempRoot("vc_atlas_lasagna_export_obsolete_mapping");
+    writeValidLasagnaAtlasFixture(root, "fiber_atlas");
+    writeText(root / "atlases" / "fiber_atlas" / "mappings" / "fibers" / "fiber.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadLasagnaAtlasExport(root / "atlases" / "fiber_atlas", root),
+        doctest::Contains("rebuild required"),
+        std::runtime_error);
+}
+
+TEST_CASE("Lasagna atlas export rejects v4 control anchors with stale world coordinates")
+{
+    const fs::path root = tempRoot("vc_atlas_lasagna_export_stale_control_world");
+    const fs::path atlasDir = root / "atlases" / "fiber_atlas";
+    saveSurface(atlasDir / "base_mesh" / "base.tifxyz", makeWrappedPlane(3, 3, 1.0));
+    writeText(root / "fibers" / "fiber.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[0,0,0],[1,0,0],[2,0,0]],"control_points":[[1,0,0]]})");
+    writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[{"source_index":1,"world":[1,0,0],"atlas":[1,1],"distance":0}],"control_anchors":[{"source_index":1,"world":[99,0,0],"atlas":[1,1],"distance":0}]})");
+    writeText(atlasDir / "metadata.json",
+              R"({"type":"vc3d_atlas","version":4,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})");
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::loadLasagnaAtlasExport(atlasDir, root),
+        doctest::Contains("world does not match source fiber control point"),
+        std::runtime_error);
 }
 
 TEST_CASE("Atlas 21 Lasagna export fixture resolves mappings and native base samples")
@@ -606,9 +667,9 @@ TEST_CASE("Lasagna atlas export derives winding offsets from links without rewri
     writeText(root / "fibers" / "linked.json",
               R"({"type":"vc3d_fiber","version":1,"line_points":[[1,0,0]],"control_points":[]})");
     writeText(atlasDir / "mappings" / "fibers" / "0_root.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/root.json","winding_offset":5,"line_anchors":[{"source_index":0,"world":[0,0,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/root.json","winding_offset":5,"line_anchors":[{"source_index":0,"world":[0,0,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
     writeText(atlasDir / "mappings" / "fibers" / "1_linked.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/linked.json","winding_offset":9,"line_anchors":[{"source_index":0,"world":[1,0,0],"atlas":[7,1],"distance":0}],"control_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/linked.json","winding_offset":9,"line_anchors":[{"source_index":0,"world":[1,0,0],"atlas":[7,1],"distance":0}],"control_anchors":[]})");
     writeText(atlasDir / "metadata.json",
               R"({"type":"vc3d_atlas","version":4,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
     writeText(atlasDir / "links.json",
@@ -645,10 +706,12 @@ TEST_CASE("Lasagna atlas export validates missing metadata base fibers and mappi
         std::runtime_error);
 
     const fs::path missingBase = root / "atlases" / "missing_base";
+    writeText(root / "fibers" / "fiber.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})");
     writeText(missingBase / "metadata.json",
               R"({"type":"vc3d_atlas","version":4,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})");
     writeText(missingBase / "mappings" / "fibers" / "fiber.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
     CHECK_THROWS_WITH_AS(
         vc::atlas::loadLasagnaAtlasExport(missingBase, root),
         doctest::Contains("base mesh does not exist"),
@@ -659,7 +722,7 @@ TEST_CASE("Lasagna atlas export validates missing metadata base fibers and mappi
     writeText(missingFiber / "metadata.json",
               R"({"type":"vc3d_atlas","version":4,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
     writeText(missingFiber / "mappings" / "fibers" / "fiber.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})");
     CHECK_THROWS_WITH_AS(
         vc::atlas::loadLasagnaAtlasExport(missingFiber, root),
         doctest::Contains("references missing fiber path"),
@@ -684,7 +747,7 @@ TEST_CASE("Lasagna atlas export rejects non-wrapped base shells")
     writeText(root / "fibers" / "fiber.json",
               R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})");
     writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
-              R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
     writeText(atlasDir / "metadata.json",
               R"({"type":"vc3d_atlas","version":4,"name":"nonwrapped","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
 

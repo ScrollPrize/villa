@@ -33,7 +33,7 @@ namespace {
 constexpr double kEpsilon = 1.0e-9;
 constexpr double kControlPointMatchEpsilon = 1.0e-8;
 constexpr int kAtlasMetadataVersion = 4;
-constexpr int kFiberMappingVersion = 3;
+constexpr int kFiberMappingVersion = 4;
 
 bool atlasDebugEnabled()
 {
@@ -275,6 +275,38 @@ FiberInput loadSourceFiberInput(const fs::path& fiberPath,
     input.linePoints = pointArrayFromJson(root, "line_points", fiberPath);
     validateFiberInputControlPoints(input);
     return input;
+}
+
+void validateMappingControlAnchorsAgainstFiber(const FiberMapping& mapping,
+                                               const FiberInput& fiber,
+                                               const fs::path& mappingPath)
+{
+    std::unordered_map<int, size_t> controlRowByLineIndex;
+    controlRowByLineIndex.reserve(fiber.controlLineIndices.size());
+    for (size_t controlIndex = 0; controlIndex < fiber.controlLineIndices.size(); ++controlIndex) {
+        controlRowByLineIndex.emplace(fiber.controlLineIndices[controlIndex], controlIndex);
+    }
+
+    const double maxDistanceSq = kControlPointMatchEpsilon * kControlPointMatchEpsilon;
+    for (size_t anchorIndex = 0; anchorIndex < mapping.controlAnchors.size(); ++anchorIndex) {
+        const AtlasAnchor& anchor = mapping.controlAnchors[anchorIndex];
+        const auto rowIt = controlRowByLineIndex.find(anchor.sourceIndex);
+        if (rowIt == controlRowByLineIndex.end()) {
+            throw std::runtime_error(
+                "atlas fiber mapping " + mappingPath.string() +
+                " control_anchors[" + std::to_string(anchorIndex) +
+                "] source_index " + std::to_string(anchor.sourceIndex) +
+                " does not identify a fiber control point line_points index; rebuild required");
+        }
+        const cv::Vec3d& expected = fiber.controlPoints[rowIt->second];
+        if (!finitePoint(anchor.world) ||
+            squaredDistance(anchor.world, expected) > maxDistanceSq) {
+            throw std::runtime_error(
+                "atlas fiber mapping " + mappingPath.string() +
+                " control_anchors[" + std::to_string(anchorIndex) +
+                "] world does not match source fiber control point; rebuild required");
+        }
+    }
 }
 
 fs::path inferVolpkgRootFromAtlasDir(const fs::path& atlasDir)
@@ -1028,6 +1060,26 @@ Atlas Atlas::load(const fs::path& atlasDir)
             for (const auto& anchor : root.value("control_anchors", nlohmann::json::array())) {
                 mapping.controlAnchors.push_back(anchorFromJson(anchor));
             }
+            if (mapping.fiberPath.empty()) {
+                throw std::runtime_error("atlas fiber mapping " + mappingPath.string() +
+                                         " references missing fiber path; rebuild required");
+            }
+            const fs::path volpkgRoot = inferVolpkgRootFromAtlasDir(atlasDir);
+            if (volpkgRoot.empty()) {
+                throw std::runtime_error("cannot validate atlas fiber mapping " +
+                                         mappingPath.string() +
+                                         " without a volume package root; rebuild required");
+            }
+            const fs::path fiberPath = resolveAtlasRelativePath(
+                atlasDir, volpkgRoot, mapping.fiberPath);
+            if (!fs::is_regular_file(fiberPath)) {
+                throw std::runtime_error("atlas fiber mapping " + mappingPath.string() +
+                                         " references missing fiber path: " +
+                                         mapping.fiberPath.generic_string() +
+                                         "; rebuild required");
+            }
+            const FiberInput sourceFiber = loadSourceFiberInput(fiberPath, mapping.fiberPath);
+            validateMappingControlAnchorsAgainstFiber(mapping, sourceFiber, mappingPath);
             atlas.fibers.push_back(std::move(mapping));
         }
     }
@@ -1349,6 +1401,8 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
                                      " references missing fiber path: " +
                                      mapping.fiberPath.generic_string());
         }
+        const FiberInput sourceFiber = loadSourceFiberInput(fiberPath, mapping.fiberPath);
+        validateMappingControlAnchorsAgainstFiber(mapping, sourceFiber, mappingFiles[i]);
 
         LasagnaAtlasObject object;
         object.id = mapping.fiberPath.generic_string();

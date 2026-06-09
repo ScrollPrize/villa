@@ -438,9 +438,9 @@ int main(int argc, char** argv)
     writeFile(volpkgRoot + QStringLiteral("/fibers/fiber.json"),
               QByteArrayLiteral(R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})"));
     writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/mappings/fibers/fiber.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}]})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}]})"));
     writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/metadata.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":3,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})"));
 
     const QString projectPath = volpkgRoot + QStringLiteral("/project.volpkg");
     writeFile(projectPath, QByteArrayLiteral(R"({"name":"atlas-test","version":1})"));
@@ -532,6 +532,21 @@ int main(int argc, char** argv)
     require(panel._submittedOutputNames.contains(QStringLiteral("atlas_v002.tifxyz")),
             "Atlas fallback launch should reserve submitted-name collisions");
 
+    const QString obsoleteMappingAtlas = volpkgRoot + QStringLiteral("/atlases/obsolete_mapping");
+    require(QDir().mkpath(obsoleteMappingAtlas + QStringLiteral("/base_mesh/base.tifxyz")),
+            "Failed to create obsolete-mapping base directory");
+    require(QDir().mkpath(obsoleteMappingAtlas + QStringLiteral("/mappings/fibers")),
+            "Failed to create obsolete-mapping mappings directory");
+    writeWrappedTifxyz(obsoleteMappingAtlas + QStringLiteral("/base_mesh/base.tifxyz"));
+    writeFile(obsoleteMappingAtlas + QStringLiteral("/metadata.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"obsolete_mapping","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
+    writeFile(obsoleteMappingAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":3,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})"));
+    panel._atlasDirPath = obsoleteMappingAtlas;
+    panel.startAtlasOptimization(&state, &statusBar);
+    require(statusBar.currentMessage().contains(QStringLiteral("rebuild required")),
+            "Atlas launch should reject obsolete mappings before compact export");
+
     panel._atlasDirPath = volpkgRoot + QStringLiteral("/atlases/missing_atlas");
     panel.startAtlasOptimization(&state, &statusBar);
     require(statusBar.currentMessage().contains(QStringLiteral("Atlas directory not found")),
@@ -541,9 +556,9 @@ int main(int argc, char** argv)
     require(QDir().mkpath(missingBaseAtlas + QStringLiteral("/mappings/fibers")),
             "Failed to create missing-base atlas directory");
     writeFile(missingBaseAtlas + QStringLiteral("/metadata.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":3,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})"));
     writeFile(missingBaseAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})"));
     panel._atlasDirPath = missingBaseAtlas;
     panel.startAtlasOptimization(&state, &statusBar);
     require(statusBar.currentMessage().contains(QStringLiteral("base mesh does not exist")),
@@ -556,9 +571,9 @@ int main(int argc, char** argv)
             "Failed to create missing-fiber mappings directory");
     writeWrappedTifxyz(missingFiberAtlas + QStringLiteral("/base_mesh/base.tifxyz"));
     writeFile(missingFiberAtlas + QStringLiteral("/metadata.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":3,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
     writeFile(missingFiberAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":2,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})"));
     panel._atlasDirPath = missingFiberAtlas;
     panel.startAtlasOptimization(&state, &statusBar);
     require(statusBar.currentMessage().contains(QStringLiteral("references missing fiber path")),
@@ -569,7 +584,7 @@ int main(int argc, char** argv)
             "Failed to create missing-map base directory");
     writeWrappedTifxyz(missingMapAtlas + QStringLiteral("/base_mesh/base.tifxyz"));
     writeFile(missingMapAtlas + QStringLiteral("/metadata.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":3,"name":"missing_map","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"missing_map","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
     panel._atlasDirPath = missingMapAtlas;
     panel.startAtlasOptimization(&state, &statusBar);
     require(statusBar.currentMessage().contains(QStringLiteral("no fiber mappings directory")),

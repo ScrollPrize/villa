@@ -57,6 +57,25 @@ class FitServiceQueueTest(unittest.TestCase):
 			"atlas_result_v002.tifxyz",
 		)
 
+	def test_normalize_single_tifxyz_output_rewrites_path_and_meta(self):
+		with tempfile.TemporaryDirectory() as td:
+			out = fit_service.Path(td)
+			child = out / "winding_0000.tifxyz"
+			child.mkdir()
+			(child / "meta.json").write_text(
+				fit_service.json.dumps({"uuid": "winding_0000.tifxyz", "name": "winding_0000.tifxyz"}),
+				encoding="utf-8",
+			)
+
+			final = fit_service._normalize_single_tifxyz_output(out, "atlas_v003.tifxyz")
+
+			self.assertEqual(final, out / "atlas_v003.tifxyz")
+			self.assertFalse(child.exists())
+			self.assertTrue(final.is_dir())
+			meta = fit_service.json.loads((final / "meta.json").read_text(encoding="utf-8"))
+			self.assertEqual(meta["uuid"], "atlas_v003.tifxyz")
+			self.assertEqual(meta["name"], "atlas_v003.tifxyz")
+
 	def test_multi_result_archive_keeps_child_names(self):
 		self.assertEqual(
 			fit_service._result_archive_child_name("layer_0000.tifxyz", 2, "combined.tifxyz"),
@@ -327,7 +346,7 @@ class FitServiceObjectStoreTest(unittest.TestCase):
 					"hash": fit_service._hash_bytes(line_json),
 					"format": "vc3d_fiber_json",
 				}
-				map_json = b'{"type":"vc3d_atlas_fiber_mapping","version":2,"line_anchors":[]}'
+				map_json = b'{"type":"vc3d_atlas_fiber_mapping","version":4,"line_anchors":[]}'
 				map_ref = {
 					"type": "line-map",
 					"name": "atlas/mappings/fibers/fiber_a.json",

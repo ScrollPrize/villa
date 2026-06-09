@@ -115,7 +115,7 @@ class AtlasParserTest(unittest.TestCase):
 				mapping = root / "mapping.json"
 				mapping.write_text(json.dumps({
 					"type": "vc3d_atlas_fiber_mapping",
-					"version": 2,
+					"version": 4,
 					"fiber_path": "fibers/fiber.json",
 					"winding_offset": 99,
 					"line_anchors": [{
@@ -136,12 +136,12 @@ class AtlasParserTest(unittest.TestCase):
 					}],
 					"control_anchors": [{
 						"source_index": 0,
-						"world": [1.0, 1.0, 0.0],
+						"world": [10.0, 20.0, 30.0],
 						"atlas": [2.0, 1.0],
 						"distance": 0.0,
 					}, {
 						"source_index": 1,
-						"world": [2.0, 1.0, 0.0],
+						"world": [11.0, 21.0, 31.0],
 						"atlas": [8.0, 1.0],
 						"distance": 0.0,
 					}],
@@ -219,7 +219,7 @@ class AtlasParserTest(unittest.TestCase):
 			mapping = root / "mapping.json"
 			mapping.write_text(json.dumps({
 				"type": "vc3d_atlas_fiber_mapping",
-				"version": 2,
+				"version": 4,
 				"fiber_path": "fibers/fiber.json",
 				"line_anchors": [
 					{"source_index": 0, "world": [0.0, 1.0, 2.0], "atlas": [-50.0, 1.0], "distance": 0.0},
@@ -228,8 +228,8 @@ class AtlasParserTest(unittest.TestCase):
 					{"source_index": 4, "world": [4.0, 5.0, 6.0], "atlas": [80.0, 2.0], "distance": 0.0},
 				],
 				"control_anchors": [
-					{"source_index": 0, "world": [1.0, 2.0, 3.0], "atlas": [1.0, 1.0], "distance": 0.0},
-					{"source_index": 1, "world": [3.0, 4.0, 5.0], "atlas": [3.0, 2.0], "distance": 0.0},
+					{"source_index": 1, "world": [1.0, 2.0, 3.0], "atlas": [1.0, 1.0], "distance": 0.0},
+					{"source_index": 3, "world": [3.0, 4.0, 5.0], "atlas": [3.0, 2.0], "distance": 0.0},
 				],
 			}) + "\n", encoding="utf-8")
 			atlas_obj = {
@@ -257,7 +257,7 @@ class AtlasParserTest(unittest.TestCase):
 			self.assertEqual(init.metadata["period_columns"], 4)
 			self.assertEqual(init.metadata["crop_column_start"], -529)
 			self.assertEqual(init.metadata["crop_column_end"], 541)
-			self.assertEqual(init.atlas_lines.source_indices, (0, 1, 2))
+			self.assertEqual(init.atlas_lines.source_indices, (1, 3, 2))
 			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True, False])
 			self.assertEqual(init.metadata["control_point_sample_count"], 2)
 			self.assertEqual(init.metadata["other_line_point_sample_count"], 1)
@@ -284,7 +284,7 @@ class AtlasParserTest(unittest.TestCase):
 			mapping = root / "mapping.json"
 			mapping.write_text(json.dumps({
 				"type": "vc3d_atlas_fiber_mapping",
-				"version": 2,
+				"version": 4,
 				"fiber_path": "fibers/fiber.json",
 				"line_anchors": [],
 				"control_anchors": [
@@ -340,7 +340,7 @@ class AtlasParserTest(unittest.TestCase):
 			mapping = root / "mapping.json"
 			mapping.write_text(json.dumps({
 				"type": "vc3d_atlas_fiber_mapping",
-				"version": 2,
+				"version": 4,
 				"fiber_path": "fibers/fiber.json",
 				"line_anchors": [],
 				"control_anchors": [
@@ -376,7 +376,7 @@ class AtlasParserTest(unittest.TestCase):
 			hit = _sample_model_xyz(model_xyz, h, w)
 			self.assertTrue(torch.allclose(hit, init.atlas_lines.target_xyz, atol=1.0e-4))
 
-	def test_atlas_init_control_anchor_target_uses_control_points_not_line_index(self) -> None:
+	def test_atlas_init_source_index_is_line_point_index_not_control_row(self) -> None:
 		import tempfile
 		with tempfile.TemporaryDirectory() as td:
 			root = Path(td)
@@ -386,18 +386,23 @@ class AtlasParserTest(unittest.TestCase):
 			fiber.write_text(json.dumps({
 				"type": "vc3d_fiber",
 				"version": 1,
-				"line_points": [[9999.0, 9999.0, 9999.0], [4000.0, 4000.0, 0.0]],
+				"line_points": [
+					[9999.0, 9999.0, 9999.0],
+					[2000.0, 2000.0, 0.0],
+					[3000.0, 3000.0, 0.0],
+					[4000.0, 4000.0, 0.0],
+				],
 				"control_points": [[2000.0, 2000.0, 0.0], [4000.0, 4000.0, 0.0]],
 			}) + "\n", encoding="utf-8")
 			mapping = root / "mapping.json"
 			mapping.write_text(json.dumps({
 				"type": "vc3d_atlas_fiber_mapping",
-				"version": 2,
+				"version": 4,
 				"fiber_path": "fibers/fiber.json",
 				"line_anchors": [],
 				"control_anchors": [
-					{"source_index": 0, "world": [1111.0, 1111.0, 1111.0], "atlas": [2.0, 2.0], "distance": 0.0},
-					{"source_index": 1, "world": [4000.0, 4000.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
+					{"source_index": 1, "world": [2000.0, 2000.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 3, "world": [4000.0, 4000.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
 				],
 			}) + "\n", encoding="utf-8")
 			atlas_obj = {
@@ -422,13 +427,17 @@ class AtlasParserTest(unittest.TestCase):
 				winding_step=1,
 			)
 
+			self.assertEqual(init.atlas_lines.source_indices, (1, 3))
 			self.assertTrue(torch.allclose(
-				init.atlas_lines.target_xyz[0],
-				torch.tensor([2000.0, 2000.0, 0.0]),
+				init.atlas_lines.target_xyz,
+				torch.tensor([
+					[2000.0, 2000.0, 0.0],
+					[4000.0, 4000.0, 0.0],
+				]),
 				atol=1.0e-6,
 			))
 
-	def test_atlas_init_control_anchor_span_uses_nearest_line_indices(self) -> None:
+	def test_atlas_init_control_anchor_world_mismatch_fails(self) -> None:
 		import tempfile
 		with tempfile.TemporaryDirectory() as td:
 			root = Path(td)
@@ -439,24 +448,20 @@ class AtlasParserTest(unittest.TestCase):
 				"type": "vc3d_fiber",
 				"version": 1,
 				"line_points": [[float(i), 0.0, 0.0] for i in range(8)],
-				"control_points": [[2.1, 0.0, 0.0], [4.9, 0.0, 0.0]],
+				"control_points": [[2.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
 			}) + "\n", encoding="utf-8")
 			mapping = root / "mapping.json"
 			mapping.write_text(json.dumps({
 				"type": "vc3d_atlas_fiber_mapping",
-				"version": 2,
+				"version": 4,
 				"fiber_path": "fibers/fiber.json",
 				"line_anchors": [
-					{"source_index": 1, "world": [91.0, 0.0, 0.0], "atlas": [-20.0, 1.0], "distance": 0.0},
 					{"source_index": 2, "world": [92.0, 0.0, 0.0], "atlas": [2.0, 1.5], "distance": 0.0},
-					{"source_index": 3, "world": [93.0, 0.0, 0.0], "atlas": [3.0, 2.0], "distance": 0.0},
-					{"source_index": 4, "world": [94.0, 0.0, 0.0], "atlas": [4.0, 2.5], "distance": 0.0},
 					{"source_index": 5, "world": [95.0, 0.0, 0.0], "atlas": [5.0, 3.0], "distance": 0.0},
-					{"source_index": 6, "world": [96.0, 0.0, 0.0], "atlas": [30.0, 3.5], "distance": 0.0},
 				],
 				"control_anchors": [
-					{"source_index": 0, "world": [222.0, 0.0, 0.0], "atlas": [2.0, 1.0], "distance": 0.0},
-					{"source_index": 1, "world": [555.0, 0.0, 0.0], "atlas": [5.0, 3.0], "distance": 0.0},
+					{"source_index": 2, "world": [222.0, 0.0, 0.0], "atlas": [2.0, 1.0], "distance": 0.0},
+					{"source_index": 5, "world": [5.0, 0.0, 0.0], "atlas": [5.0, 3.0], "distance": 0.0},
 				],
 			}) + "\n", encoding="utf-8")
 			atlas_obj = {
@@ -474,25 +479,13 @@ class AtlasParserTest(unittest.TestCase):
 				}],
 			}
 
-			init = atlas.build_atlas_init(
-				atlas_obj,
-				device=torch.device("cpu"),
-				mesh_step=1,
-				winding_step=1,
-			)
-
-			self.assertEqual(init.atlas_lines.source_indices, (0, 1, 3, 4))
-			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True, False, False])
-			self.assertTrue(torch.allclose(
-				init.atlas_lines.target_xyz,
-				torch.tensor([
-					[2.1, 0.0, 0.0],
-					[4.9, 0.0, 0.0],
-					[3.0, 0.0, 0.0],
-					[4.0, 0.0, 0.0],
-				]),
-				atol=1.0e-6,
-			))
+			with self.assertRaisesRegex(ValueError, "world does not match"):
+				atlas.build_atlas_init(
+					atlas_obj,
+					device=torch.device("cpu"),
+					mesh_step=1,
+					winding_step=1,
+				)
 
 	def test_atlas_init_v3_control_anchor_uses_line_index_and_anchor_world(self) -> None:
 		import tempfile
@@ -505,12 +498,12 @@ class AtlasParserTest(unittest.TestCase):
 				"type": "vc3d_fiber",
 				"version": 1,
 				"line_points": [[float(i), 0.0, 0.0] for i in range(6)],
-				"control_points": [[900.0, 0.0, 0.0], [901.0, 0.0, 0.0]],
+				"control_points": [[2.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
 			}) + "\n", encoding="utf-8")
 			mapping = root / "mapping.json"
 			mapping.write_text(json.dumps({
 				"type": "vc3d_atlas_fiber_mapping",
-				"version": 3,
+				"version": 4,
 				"fiber_path": "fibers/fiber.json",
 				"line_anchors": [
 					{"source_index": 1, "world": [1.0, 0.0, 0.0], "atlas": [1.0, 1.0], "distance": 0.0},
@@ -519,8 +512,8 @@ class AtlasParserTest(unittest.TestCase):
 					{"source_index": 4, "world": [4.0, 0.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
 				],
 				"control_anchors": [
-					{"source_index": 2, "world": [222.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
-					{"source_index": 4, "world": [444.0, 0.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
+					{"source_index": 2, "world": [2.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 4, "world": [4.0, 0.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
 				],
 			}) + "\n", encoding="utf-8")
 			atlas_obj = {
@@ -550,8 +543,8 @@ class AtlasParserTest(unittest.TestCase):
 			self.assertTrue(torch.allclose(
 				init.atlas_lines.target_xyz,
 				torch.tensor([
-					[222.0, 0.0, 0.0],
-					[444.0, 0.0, 0.0],
+					[2.0, 0.0, 0.0],
+					[4.0, 0.0, 0.0],
 					[3.0, 0.0, 0.0],
 				]),
 				atol=1.0e-6,
@@ -573,14 +566,14 @@ class AtlasParserTest(unittest.TestCase):
 			mapping = root / "mapping.json"
 			mapping.write_text(json.dumps({
 				"type": "vc3d_atlas_fiber_mapping",
-				"version": 2,
+				"version": 4,
 				"fiber_path": "fibers/fiber.json",
 				"line_anchors": [
 					{"source_index": 1, "world": [99.0, 99.0, 99.0], "atlas": [1.0, 1.5], "distance": 0.0},
 				],
 				"control_anchors": [
 					{"source_index": 0, "world": [0.0, 0.0, 0.0], "atlas": [0.0, 1.0], "distance": 0.0},
-					{"source_index": 1, "world": [2.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 2, "world": [2.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
 				],
 			}) + "\n", encoding="utf-8")
 			atlas_obj = {
@@ -605,7 +598,7 @@ class AtlasParserTest(unittest.TestCase):
 				winding_step=1,
 			)
 
-			self.assertEqual(init.atlas_lines.source_indices, (0, 1, 1))
+			self.assertEqual(init.atlas_lines.source_indices, (0, 2, 1))
 			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True, False])
 			self.assertTrue(torch.allclose(
 				init.atlas_lines.target_xyz[2],
@@ -641,11 +634,42 @@ class AtlasParserTest(unittest.TestCase):
 			path = Path(td) / "mapping.json"
 			path.write_text(json.dumps({
 				"type": "vc3d_atlas_fiber_mapping",
-				"version": 2,
+				"version": 4,
 				"line_anchors": [{"source_index": 0, "atlas": [1.0, 2.0], "world": [0.0, 0.0, 0.0]}],
 			}), encoding="utf-8")
 			obj = atlas.load_vc3d_atlas_fiber_mapping(path)
 			self.assertEqual(obj["line_anchors"][0]["source_index"], 0)
+
+	def test_mapping_loader_rejects_obsolete_or_missing_versions(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			for name, payload in {
+				"missing.json": {
+					"type": "vc3d_atlas_fiber_mapping",
+					"line_anchors": [],
+				},
+				"v1.json": {
+					"type": "vc3d_atlas_fiber_mapping",
+					"version": 1,
+					"line_anchors": [],
+				},
+				"v2.json": {
+					"type": "vc3d_atlas_fiber_mapping",
+					"version": 2,
+					"line_anchors": [],
+				},
+				"v3.json": {
+					"type": "vc3d_atlas_fiber_mapping",
+					"version": 3,
+					"line_anchors": [],
+				},
+			}.items():
+				path = root / name
+				path.write_text(json.dumps(payload), encoding="utf-8")
+				with self.subTest(name=name):
+					with self.assertRaisesRegex(ValueError, "rebuild required"):
+						atlas.load_vc3d_atlas_fiber_mapping(path)
 
 	def test_atlas21_fixture_matches_cpp_base_samples(self) -> None:
 		fixture_root = _atlas21_fixture_root()

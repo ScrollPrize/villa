@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import shutil
@@ -139,6 +140,145 @@ def _scaled_xyz_for_export(
 	factor: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 	return volume_scale.scale_tifxyz_arrays(x, y, z, factor)
+
+
+def _atlas_records(results: dict) -> list[dict]:
+	records = results.get("records", [])
+	if isinstance(records, list):
+		return [r for r in records if isinstance(r, dict)]
+	out: list[dict] = []
+	fibers = results.get("fibers", [])
+	if isinstance(fibers, list):
+		for fiber in fibers:
+			if not isinstance(fiber, dict):
+				continue
+			points = fiber.get("control_points", [])
+			if isinstance(points, list):
+				out.extend(r for r in points if isinstance(r, dict))
+	return out
+
+
+def _atlas_scaled_xyz(value: object, factor: float) -> object:
+	if not isinstance(value, list) or len(value) < 3:
+		return value
+	out = copy.deepcopy(value)
+	for i in range(3):
+		try:
+			if out[i] is not None:
+				out[i] = float(out[i]) * float(factor)
+		except (TypeError, ValueError):
+			out[i] = None
+	return out
+
+
+def _atlas_summary(records: list[dict]) -> dict:
+	distances = []
+	for record in records:
+		if not bool(record.get("valid")):
+			continue
+		try:
+			d = float(record.get("distance"))
+		except (TypeError, ValueError):
+			continue
+		if math.isfinite(d):
+			distances.append(d)
+	total = len(records)
+	return {
+		"total_count": int(total),
+		"control_count": int(total),
+		"valid_count": int(len(distances)),
+		"max_distance": float(max(distances) if distances else 0.0),
+		"rms_distance": float(math.sqrt(sum(d * d for d in distances) / len(distances))) if distances else 0.0,
+	}
+
+
+def _atlas_results_for_export(
+	results: dict | None,
+	*,
+	export_factor: float,
+	layer_index: int | None = None,
+	single_segment_width: int | None = None,
+	single_segment_border: int = 0,
+) -> dict | None:
+	if not isinstance(results, dict):
+		return None
+	records: list[dict] = []
+	for src in _atlas_records(results):
+		raw_layer = src.get("layer_index", None)
+		src_layer = None
+		if raw_layer is not None:
+			try:
+				src_layer = int(raw_layer)
+			except (TypeError, ValueError):
+				src_layer = None
+		if layer_index is not None and src_layer is not None and src_layer != int(layer_index):
+			continue
+		if layer_index is not None and src_layer is None and int(layer_index) != 0:
+			continue
+		record = copy.deepcopy(src)
+		if single_segment_width is not None:
+			try:
+				offset_layer = int(src_layer or 0)
+				record["model_w"] = float(record["model_w"]) + offset_layer * (
+					int(single_segment_width) + int(single_segment_border)
+				)
+			except (KeyError, TypeError, ValueError):
+				record["model_w"] = None
+		records.append(record)
+
+	records.sort(key=lambda r: (
+		str(r.get("fiber_id", r.get("object_id", ""))),
+		int(r.get("layer_index", 0) or 0),
+		int(r.get("source_index", 0) or 0),
+	))
+	by_fiber: dict[str, list[dict]] = {}
+	for record in records:
+		fiber_id = str(record.get("fiber_id", record.get("object_id", "unknown")))
+		record["fiber_id"] = fiber_id
+		record["object_id"] = str(record.get("object_id", fiber_id))
+		by_fiber.setdefault(fiber_id, []).append(record)
+	fibers = []
+	for fiber_id in sorted(by_fiber):
+		points = by_fiber[fiber_id]
+		for i, record in enumerate(points):
+			record["control_index"] = int(i)
+		fibers.append({
+			"fiber_id": fiber_id,
+			"object_id": fiber_id,
+			"control_points": points,
+		})
+	return {
+		"format": "lasagna_atlas_control_points_results",
+		"version": int(results.get("version", 1)),
+		"summary": _atlas_summary(records),
+		"fibers": fibers,
+		"records": records,
+	}
+
+
+def _atlas_summary_for_meta(results: dict | None) -> dict | None:
+	if not isinstance(results, dict):
+		return None
+	summary = results.get("summary", {})
+	if not isinstance(summary, dict):
+		summary = _atlas_summary(_atlas_records(results))
+	return {
+		"path": "atlas_control_points_results.json",
+		"total_count": int(summary.get("total_count", 0)),
+		"control_count": int(summary.get("control_count", 0)),
+		"valid_count": int(summary.get("valid_count", 0)),
+		"max_distance": float(summary.get("max_distance", 0.0)),
+		"rms_distance": float(summary.get("rms_distance", 0.0)),
+	}
+
+
+def _write_atlas_control_results(out_dir: Path, results: dict | None) -> None:
+	if not isinstance(results, dict):
+		return
+	(out_dir / "atlas_control_points_results.json").write_text(
+		json.dumps(results, indent=2) + "\n",
+		encoding="utf-8",
+	)
 
 
 def _mark_segment_vertices(
@@ -748,7 +888,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 				  base_shape_zyx: tuple[int, int, int] | None = None,
 				  lasagna_base_shape_zyx: tuple[int, int, int] | None = None,
 				  extra_channels: dict[str, np.ndarray] | None = None,
-				  extra_channel_specs: list[dict] | None = None) -> None:
+				  extra_channel_specs: list[dict] | None = None,
+				  atlas_control_points_summary: dict | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError("x/y/z must have identical shapes")
@@ -770,6 +911,7 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 
 	meta = {
 		"uuid": str(out_dir.name),
+		"name": str(out_dir.name),
 		"type": "seg",
 		"format": "tifxyz",
 		"scale": [float(scale), float(scale)],
@@ -789,6 +931,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		meta["fit_config"] = fit_config
 	if job_spec is not None:
 		meta["lasagna_job"] = job_spec
+	if atlas_control_points_summary is not None:
+		meta["atlas_control_points_results"] = atlas_control_points_summary
 	if extra_channels:
 		meta["extra_channels"] = extra_channel_specs or [
 			{
@@ -900,6 +1044,14 @@ def _export_flatten_checkpoint(
 	out_dir = out_base / seg_name
 	x, y, z = _scaled_xyz_for_export(x, y, z, export_factor)
 	area = _get_area(x, y, z, xy_step_export, cfg.voxel_size_um)
+	atlas_control_points_results = st.get("_atlas_control_points_results_", None)
+	if not isinstance(atlas_control_points_results, dict):
+		atlas_control_points_results = None
+	atlas_control_export = _atlas_results_for_export(
+		atlas_control_points_results,
+		export_factor=export_factor,
+		layer_index=0,
+	)
 	_write_tifxyz(
 		out_dir=out_dir,
 		x=x,
@@ -914,9 +1066,11 @@ def _export_flatten_checkpoint(
 		area=area,
 		base_shape_zyx=output_base_shape_zyx,
 		lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+		atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export),
 	)
 	if model_params is not None:
 		(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
+	_write_atlas_control_results(out_dir, atlas_control_export)
 	_print_area(area)
 	print(f"[fit2tifxyz] exported {out_dir.name}", flush=True)
 	return 0
@@ -962,6 +1116,9 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 	corr_points_results = st.get("_corr_points_results_", None)
 	if not isinstance(corr_points_results, dict):
 		corr_points_results = None
+	atlas_control_points_results = st.get("_atlas_control_points_results_", None)
+	if not isinstance(atlas_control_points_results, dict):
+		atlas_control_points_results = None
 	approval_output_mask = st.get("_approval_inpaint_output_mask_", None)
 	if not isinstance(approval_output_mask, dict):
 		approval_output_mask = None
@@ -1093,6 +1250,12 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 		out_dir = out_base / seg_name
 		x_all, y_all, z_all = _scaled_xyz_for_export(x_all, y_all, z_all, export_factor)
 		area = _get_area(x_all, y_all, z_all, xy_step_export, cfg.voxel_size_um)
+		atlas_control_export = _atlas_results_for_export(
+			atlas_control_points_results,
+			export_factor=export_factor,
+			single_segment_width=Wm,
+			single_segment_border=BORDER_W,
+		)
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 					  job_spec=job_spec,
@@ -1100,7 +1263,8 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 					  base_shape_zyx=output_base_shape_zyx,
 					  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
 					  extra_channels=extra_all,
-					  extra_channel_specs=flow_gate_channel_specs)
+					  extra_channel_specs=flow_gate_channel_specs,
+					  atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export))
 		if approval_output_mask is not None:
 			_write_mask_debug_artifacts(
 				out_dir,
@@ -1118,6 +1282,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 		if corr_points_results is not None:
 			(out_dir / "corr_points_results.json").write_text(json.dumps(corr_points_results, indent=2) + "\n", encoding="utf-8")
+		_write_atlas_control_results(out_dir, atlas_control_export)
 	else:
 		# One tifxyz per depth layer (winding)
 		total_area = {"area_vx2": 0.0}
@@ -1157,6 +1322,11 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 				total_area["area_cm2"] += area["area_cm2"]
 			out_dir = out_base / f"{cfg.prefix}{d:04d}.tifxyz"
 			_check_cancel()
+			atlas_control_export = _atlas_results_for_export(
+				atlas_control_points_results,
+				export_factor=export_factor,
+				layer_index=d,
+			)
 			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, d=d_layer, scale=meta_scale,
 						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 						  job_spec=job_spec,
@@ -1164,7 +1334,8 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 						  base_shape_zyx=output_base_shape_zyx,
 						  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
 						  extra_channels=extra_layer,
-						  extra_channel_specs=flow_gate_channel_specs)
+						  extra_channel_specs=flow_gate_channel_specs,
+						  atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export))
 			if approval_output_mask is not None and mask_debug is not None:
 				_write_mask_debug_artifacts(
 					out_dir,
@@ -1181,6 +1352,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 				(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 			if corr_points_results is not None:
 				(out_dir / "corr_points_results.json").write_text(json.dumps(corr_points_results, indent=2) + "\n", encoding="utf-8")
+			_write_atlas_control_results(out_dir, atlas_control_export)
 		_print_area(total_area)
 
 	return 0

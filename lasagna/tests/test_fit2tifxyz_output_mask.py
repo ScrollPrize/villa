@@ -387,6 +387,107 @@ class CorrWindingResultsOutputMaskTest(unittest.TestCase):
 
 
 class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
+	def test_checkpoint_export_writes_atlas_control_results_and_meta_summary(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": _model_params(),
+			"_atlas_control_points_results_": {
+				"format": "lasagna_atlas_control_points_results",
+				"version": 1,
+				"summary": {
+					"total_count": 1,
+					"control_count": 1,
+					"valid_count": 1,
+					"max_distance": 2.0,
+					"rms_distance": 2.0,
+				},
+				"records": [{
+					"fiber_id": "fiber_a",
+					"object_id": "fiber_a",
+					"source_index": 3,
+					"control_index": 0,
+					"target_xyz": [1.0, 2.0, 3.0],
+					"mesh_xyz": [1.0, 2.0, 1.0],
+					"model_h": 1.0,
+					"model_w": 2.0,
+					"distance": 2.0,
+					"signed_delta": -2.0,
+					"valid": True,
+				}],
+				"fibers": [],
+			},
+		}
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			ckpt = root / "model.pt"
+			out = root / "out"
+			torch.save(state, ckpt)
+
+			fit2tifxyz.main(["--input", str(ckpt), "--output", str(out)])
+
+			tifxyz = out / "winding_0000.tifxyz"
+			meta = json.loads((tifxyz / "meta.json").read_text(encoding="utf-8"))
+			results = json.loads((tifxyz / "atlas_control_points_results.json").read_text(encoding="utf-8"))
+
+		self.assertEqual(meta["atlas_control_points_results"]["path"], "atlas_control_points_results.json")
+		self.assertEqual(meta["atlas_control_points_results"]["total_count"], 1)
+		self.assertEqual(meta["atlas_control_points_results"]["valid_count"], 1)
+		self.assertEqual(results["records"][0]["fiber_id"], "fiber_a")
+		self.assertEqual(results["records"][0]["mesh_xyz"], [1.0, 2.0, 1.0])
+		self.assertEqual(results["fibers"][0]["control_points"][0]["control_index"], 0)
+
+	def test_checkpoint_export_does_not_scale_atlas_control_results(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		params = _model_params()
+		params["lasagna_base_shape_zyx"] = [4, 4, 4]
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": params,
+			"_atlas_control_points_results_": {
+				"format": "lasagna_atlas_control_points_results",
+				"version": 1,
+				"records": [{
+					"fiber_id": "fiber_a",
+					"object_id": "fiber_a",
+					"source_index": 3,
+					"target_xyz": [1.0, 2.0, 3.0],
+					"mesh_xyz": [4.0, 5.0, 6.0],
+					"model_h": 1.0,
+					"model_w": 2.0,
+					"distance": 7.0,
+					"signed_delta": -8.0,
+					"valid": True,
+				}],
+			},
+		}
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			ckpt = root / "model.pt"
+			out = root / "out"
+			torch.save(state, ckpt)
+
+			fit2tifxyz.main([
+				"--input", str(ckpt),
+				"--output", str(out),
+				"--target-volume-shape-zyx", "8", "8", "8",
+			])
+
+			results = json.loads(
+				(out / "winding_0000.tifxyz" / "atlas_control_points_results.json")
+					.read_text(encoding="utf-8")
+			)
+
+		record = results["records"][0]
+		self.assertEqual(record["target_xyz"], [1.0, 2.0, 3.0])
+		self.assertEqual(record["mesh_xyz"], [4.0, 5.0, 6.0])
+		self.assertEqual(record["distance"], 7.0)
+		self.assertEqual(record["signed_delta"], -8.0)
+
 	def test_checkpoint_export_masks_xyz_d_and_area(self) -> None:
 		x, y, z = _plane_mesh(7, 7)
 		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]

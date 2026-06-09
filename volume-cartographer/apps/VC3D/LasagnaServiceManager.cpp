@@ -266,7 +266,7 @@ QString uniqueSegmentName(const QString& targetDir, const QString& requestedName
     return candidate;
 }
 
-void updateTifxyzUuid(const QString& tifxyzDir, const QString& name)
+void updateTifxyzMetadataIdentity(const QString& tifxyzDir, const QString& name)
 {
     QFile metaFile(QDir(tifxyzDir).filePath(QStringLiteral("meta.json")));
     if (!metaFile.open(QIODevice::ReadOnly)) {
@@ -279,6 +279,7 @@ void updateTifxyzUuid(const QString& tifxyzDir, const QString& name)
     }
     QJsonObject root = doc.object();
     root[QStringLiteral("uuid")] = name;
+    root[QStringLiteral("name")] = name;
     if (!metaFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         return;
     }
@@ -304,6 +305,7 @@ struct ResultsPlacementResult
     QString error;
     QString targetDir;
     QStringList placedNames;
+    QStringList warnings;
 };
 
 ResultsPlacementResult placeResultsArchive(const QByteArray& data,
@@ -362,8 +364,13 @@ ResultsPlacementResult placeResultsArchive(const QByteArray& data,
             result.error = QObject::tr("Refusing to overwrite existing segment: %1").arg(finalPath);
             return result;
         }
-        if (child.isDir() && finalName != child.fileName()) {
-            updateTifxyzUuid(child.absoluteFilePath(), finalName);
+        if (child.isDir() && finalName.endsWith(QStringLiteral(".tifxyz"))) {
+            updateTifxyzMetadataIdentity(child.absoluteFilePath(), finalName);
+            if (finalName != child.fileName()) {
+                result.warnings << QObject::tr(
+                    "Lasagna result name collision: requested %1, placed as %2.")
+                    .arg(child.fileName(), finalName);
+            }
         }
         if (!QDir().rename(child.absoluteFilePath(), finalPath)) {
             result.error = QObject::tr("Cannot place downloaded result: %1").arg(finalPath);
@@ -1950,6 +1957,10 @@ void LasagnaServiceManager::downloadResults(const QString& jobId,
                 std::cout << " as " << result.placedNames.join(QStringLiteral(", ")).toStdString();
             }
             std::cout << std::endl;
+            for (const QString& warning : result.warnings) {
+                std::cerr << "[lasagna] " << warning.toStdString() << std::endl;
+                emit statusMessage(warning);
+            }
             emit resultsPlaced(result.targetDir, result.placedNames);
             if (!jobId.isEmpty()) {
                 emit jobFinished(jobId, result.targetDir);

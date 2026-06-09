@@ -34,6 +34,7 @@
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/SurfaceRotationOverlayController.hpp"
 #include "overlays/AtlasOverlayController.hpp"
+#include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 #include "SurfaceAffineTransformController.hpp"
 
@@ -88,6 +89,7 @@ class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
+class AtlasControlPointsDock;
 
 class CWindow : public QMainWindow
 {
@@ -261,6 +263,7 @@ private:
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
+    AtlasControlPointsDock* _atlasControlDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceSearchDock{nullptr};
     VolumeViewerBase* _atlasViewer{nullptr};
@@ -305,6 +308,7 @@ private:
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
+    std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;

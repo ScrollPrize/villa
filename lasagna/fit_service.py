@@ -87,6 +87,38 @@ def _result_archive_child_name(child_name: str, child_count: int, output_name: s
     return child_name
 
 
+def _normalize_single_tifxyz_output(output_dir: Path, output_name: str) -> Path | None:
+    requested = str(output_name or "").strip()
+    if not requested:
+        return None
+    if not requested.endswith(".tifxyz"):
+        requested = f"{requested}.tifxyz"
+
+    children = [p for p in output_dir.iterdir() if p.name != ".lasagna_results.tar.gz"]
+    tifxyz_children = [p for p in children if p.is_dir() and p.name.endswith(".tifxyz")]
+    if len(children) != 1 or len(tifxyz_children) != 1:
+        return None
+
+    child = tifxyz_children[0]
+    final = output_dir / requested
+    if child != final:
+        if final.exists():
+            raise FileExistsError(f"requested output_name already exists: {final}")
+        child.rename(final)
+    meta_path = final / "meta.json"
+    if meta_path.is_file():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if isinstance(meta, dict):
+            meta["uuid"] = requested
+            meta["name"] = requested
+            meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"[fit-service] normalized tifxyz output: output_name={requested!r} path={final}",
+        flush=True,
+    )
+    return final
+
+
 def _default_object_store_dir() -> Path:
     return Path.home() / ".cache" / "lasagna" / "fit_service" / "objects"
 
@@ -1145,7 +1177,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     import tempfile
 
     print(
-        f"[fit-service] optimization worker starting: keys={sorted(body.keys())}",
+        f"[fit-service] optimization worker starting: output_name={str(body.get('output_name') or '').strip()!r} "
+        f"keys={sorted(body.keys())}",
         flush=True,
     )
 
@@ -1326,6 +1359,11 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             output_name = body.get("output_name")
             if output_name:
                 export_argv.extend(["--output-name", str(output_name)])
+            print(
+                f"[fit-service] exporting tifxyz: output_name={str(output_name or '').strip()!r} "
+                f"output_dir={output_dir}",
+                flush=True,
+            )
             voxel_size_um = config.get("voxel_size_um")
             if voxel_size_um is not None:
                 export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
@@ -1338,6 +1376,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 ])
             _check_cancel()
             fit2tifxyz.main(export_argv, cancel_fn=_check_cancel)
+            _normalize_single_tifxyz_output(Path(output_dir), str(output_name or ""))
             _check_cancel()
             save_s = time.perf_counter() - save_t0
             try:
@@ -1538,7 +1577,11 @@ class _Handler(BaseHTTPRequestHandler):
                 output_name=str(body.get("output_name") or ""),
             )
             _jobs.enqueue_body(job, body)
-            print(f"[fit-service] /optimize accepted as queued job {job.job_id}", flush=True)
+            print(
+                f"[fit-service] /optimize accepted as queued job {job.job_id}: "
+                f"output_name={job.output_name!r}",
+                flush=True,
+            )
             self._send_json({
                 "status": "started",
                 "job_id": job.job_id,

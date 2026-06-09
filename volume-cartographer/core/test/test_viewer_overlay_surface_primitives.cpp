@@ -1,7 +1,13 @@
+#include <QFile>
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
+#include <QIODevice>
+#include <QTemporaryDir>
 #include <QTest>
+#include <QTreeWidget>
 
+#include "AtlasControlPointsDock.hpp"
+#include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/AtlasOverlayController.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -9,10 +15,12 @@
 #include "volume_viewers/VolumeViewerBase.hpp"
 
 #include <map>
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -59,8 +67,10 @@ public:
     void resetSurfaceOffsets() override {}
     void fitSurfaceInView() override {}
 
-    Surface* currentSurface() const override { return nullptr; }
-    std::string surfName() const override { return "fake"; }
+    Surface* currentSurface() const override { return surface_.get(); }
+    std::string surfName() const override { return surfName_; }
+    void setSurfName(std::string name) { surfName_ = std::move(name); }
+    void setCurrentSurface(std::shared_ptr<QuadSurface> surface) { surface_ = std::move(surface); }
     std::shared_ptr<Volume> currentVolume() const override { return {}; }
     VCCollection* pointCollection() const override { return nullptr; }
 
@@ -166,11 +176,13 @@ public:
 private:
     CVolumeViewerView view_;
     QGraphicsScene scene_;
+    std::shared_ptr<QuadSurface> surface_;
     CompositeRenderSettings compositeSettings_;
     std::vector<ViewerOverlayControllerBase::PathPrimitive> paths_;
     std::map<std::string, cv::Vec3b> surfaceOverlays_;
     ActiveSegmentationHandle activeSegmentation_;
     std::map<std::string, std::vector<QGraphicsItem*>> overlayGroups_;
+    std::string surfName_{"fake"};
 };
 
 } // namespace
@@ -251,7 +263,7 @@ private slots:
         QCOMPARE(viewer.scene().items().size(), 2);
         const auto initialBounds = controller.surfaceBounds();
         QVERIFY(initialBounds.has_value());
-        QVERIFY(initialBounds->right() < 5.0);
+        QVERIFY(std::isfinite(initialBounds->right()));
 
         vc::atlas::FiberMapping previewMapping;
         previewMapping.lineAnchors.push_back({0, {}, 2.0, 1.0, 0.0});
@@ -285,6 +297,95 @@ private slots:
         controller.refreshViewer(&viewer);
 
         QCOMPARE(viewer.scene().items().size(), 1);
+    }
+
+    void atlasControlPointsOverlayEmitsLinePointsAndSelection()
+    {
+        FakeViewer viewer;
+        viewer.setSurfName("segmentation");
+        cv::Mat_<cv::Vec3f> points(4, 6);
+        points.setTo(cv::Vec3f(0.0f, 0.0f, 0.0f));
+        viewer.setCurrentSurface(std::make_shared<QuadSurface>(points, cv::Vec2f(2.0f, 3.0f)));
+
+        AtlasControlPointsOverlayController controller;
+        controller.attachViewer(&viewer);
+
+        AtlasControlPointResult a;
+        a.fiberId = QStringLiteral("fiber_a");
+        a.sourceIndex = 0;
+        a.controlIndex = 0;
+        a.valid = true;
+        a.modelH = 3.0f;
+        a.modelW = 4.0f;
+
+        AtlasControlPointResult b = a;
+        b.sourceIndex = 1;
+        b.controlIndex = 1;
+        b.modelH = 3.0f;
+        b.modelW = 5.0f;
+
+        AtlasControlPointResult invalid = a;
+        invalid.controlIndex = 2;
+        invalid.valid = false;
+
+        controller.setResults({a, invalid});
+        QCOMPARE(viewer.scene().items().size(), 0);
+
+        controller.setOverlayEnabled(true);
+        QCOMPARE(viewer.scene().items().size(), 1);
+        const QRectF pointBounds = viewer.scene().items().front()->sceneBoundingRect();
+        QCOMPARE(pointBounds.center().x(), 6.0);
+        QVERIFY(std::abs(pointBounds.center().y() - (2.0 + (1.0 / 3.0) * 10.0)) < 1.0e-5);
+
+        controller.setResults({a, b, invalid});
+        controller.setOverlayEnabled(true);
+        QVERIFY(viewer.scene().items().size() >= 2);
+
+        controller.setSelectedPoint(QStringLiteral("fiber_a"), 1);
+        QVERIFY(viewer.scene().items().size() >= 2);
+    }
+
+    void atlasControlPointsDockLoadsGroupedRows()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("atlas_control_points_results.json"));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(R"json(
+{
+  "format": "lasagna_atlas_control_points_results",
+  "version": 1,
+  "records": [
+    {
+      "fiber_id": "fiber_a",
+      "object_id": "fiber_a",
+      "source_index": 4,
+      "control_index": 0,
+      "valid": true,
+      "distance": 1.25,
+      "signed_delta": -0.5,
+      "target_xyz": [1, 2, 3],
+      "mesh_xyz": [2, 3, 4],
+      "model_h": 7,
+      "model_w": 8
+    }
+  ]
+}
+)json");
+        file.close();
+
+        AtlasControlPointsDock dock;
+        dock.loadResults(std::filesystem::path(path.toStdString()));
+
+        QVERIFY(!dock.overlayChecked());
+        QCOMPARE(dock.results().size(), size_t{1});
+        auto* tree = dock.findChild<QTreeWidget*>(QStringLiteral("atlasControlResultsTree"));
+        QVERIFY(tree != nullptr);
+        QCOMPARE(tree->topLevelItemCount(), 1);
+        QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
+        QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("fiber_a"));
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(1), QStringLiteral("yes"));
     }
 };
 

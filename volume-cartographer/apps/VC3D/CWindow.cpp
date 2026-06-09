@@ -96,6 +96,7 @@
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "CPointCollectionWidget.hpp"
+#include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
 #include "LineAnnotationController.hpp"
@@ -349,6 +350,30 @@ void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv:
         return;
     }
     viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
+}
+
+std::optional<cv::Vec2f> atlasControlGridToSurface(VolumeViewerBase* viewer,
+                                                   const AtlasControlPointResult& point)
+{
+    auto* quad = viewer ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
+    if (!quad ||
+        !std::isfinite(point.modelH) ||
+        !std::isfinite(point.modelW)) {
+        return std::nullopt;
+    }
+    const cv::Vec2f scale = quad->scale();
+    if (std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) {
+        return std::nullopt;
+    }
+    const cv::Vec3f center = quad->center();
+    const cv::Vec2f surface{
+        point.modelW / scale[0] - center[0],
+        point.modelH / scale[1] - center[1],
+    };
+    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) {
+        return std::nullopt;
+    }
+    return surface;
 }
 
 struct SurfaceFocusPoint {
@@ -949,6 +974,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _vectorOverlay = std::make_unique<VectorOverlayController>(_state, this);
     _viewerManager->setVectorOverlay(_vectorOverlay.get());
 
+    _atlasControlOverlay = std::make_unique<AtlasControlPointsOverlayController>(this);
+    _atlasControlOverlay->bindToViewerManager(_viewerManager.get());
+
     _planeSlicingOverlay = std::make_unique<PlaneSlicingOverlayController>(_state, this);
     _planeSlicingOverlay->bindToViewerManager(_viewerManager.get());
     _planeSlicingOverlay->setRotationSetter([this](const std::string& planeName, float degrees) {
@@ -1104,6 +1132,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                ui.dockWidgetDistanceTransform,
                                _atlasOverviewDock,
                                _atlasSearchDock,
+                               static_cast<QDockWidget*>(_atlasControlDock),
                                _atlasWorkspaceOverviewDock,
                                _atlasWorkspaceSearchDock,
                                static_cast<QDockWidget*>(_fiberSliceWidget) }) {
@@ -1133,6 +1162,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                ui.dockWidgetViewerControls,
                                _atlasOverviewDock,
                                _atlasSearchDock,
+                               static_cast<QDockWidget*>(_atlasControlDock),
                                _atlasWorkspaceOverviewDock,
                                _atlasWorkspaceSearchDock,
                                static_cast<QDockWidget*>(_fiberSliceWidget)  }) {
@@ -1166,6 +1196,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    ui.dockWidgetViewerControls,
                                    _atlasOverviewDock,
                                    _atlasSearchDock,
+                                   static_cast<QDockWidget*>(_atlasControlDock),
                                    _atlasWorkspaceOverviewDock,
                                    _atlasWorkspaceSearchDock,
                                    static_cast<QDockWidget*>(_fiberSliceWidget),
@@ -1442,6 +1473,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(_lasagnaDock);
     addDock(_atlasOverviewDock);
     addDock(_atlasSearchDock);
+    addDock(_atlasControlDock);
     addDock(_point_collection_widget);
     addDock(_fiberWidget);
     addDock(_fiberSliceWidget);
@@ -1817,6 +1849,9 @@ void CWindow::clearSurfaceSelection()
 
     if (_surfaceAffineTransforms) {
         _surfaceAffineTransforms->refresh();
+    }
+    if (_atlasControlDock) {
+        _atlasControlDock->clearResults();
     }
 }
 
@@ -3309,8 +3344,8 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
             const auto choice = QMessageBox::question(
                 this,
                 tr("Atlas Rebuild Required"),
-                tr("This atlas was saved with an older mapping format and must be rebuilt "
-                   "from its source fiber JSON using the selected Lasagna normal dataset.\n\n"
+                tr("This atlas was saved with an older or stale mapping format and must be rebuilt "
+                   "from its unchanged source fiber JSON using the selected Lasagna normal dataset.\n\n"
                    "Rebuild now?"),
                 QMessageBox::Yes | QMessageBox::No,
                 QMessageBox::No);
@@ -3871,6 +3906,43 @@ void CWindow::CreateWidgets(void)
     _point_collection_widget->setObjectName("pointCollectionDock");
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _point_collection_widget);
 
+    _atlasControlDock = new AtlasControlPointsDock(this);
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasControlDock);
+    connect(_atlasControlDock, &AtlasControlPointsDock::resultsChanged,
+            this, [this](const AtlasControlPointResults& results) {
+                if (_atlasControlOverlay) {
+                    _atlasControlOverlay->setResults(results);
+                    _atlasControlOverlay->setOverlayEnabled(_atlasControlDock && _atlasControlDock->overlayChecked());
+                }
+            });
+    connect(_atlasControlDock, &AtlasControlPointsDock::overlayToggled,
+            this, [this](bool enabled) {
+                if (_atlasControlOverlay) {
+                    _atlasControlOverlay->setOverlayEnabled(enabled);
+                }
+            });
+    connect(_atlasControlDock, &AtlasControlPointsDock::controlPointSelected,
+            this, [this](const AtlasControlPointResult& point) {
+                if (_atlasControlOverlay) {
+                    _atlasControlOverlay->setSelectedPoint(point.fiberId, point.controlIndex);
+                }
+            });
+    connect(_atlasControlDock, &AtlasControlPointsDock::controlPointActivated,
+            this, [this](const AtlasControlPointResult& point) {
+                if (_atlasControlOverlay) {
+                    _atlasControlOverlay->setSelectedPoint(point.fiberId, point.controlIndex);
+                }
+                if (std::isfinite(point.meshXyz[0]) &&
+                    std::isfinite(point.meshXyz[1]) &&
+                    std::isfinite(point.meshXyz[2])) {
+                    const std::string sourceId = _state ? _state->activeSurfaceId() : std::string{};
+                    centerFocusAt(point.meshXyz, cv::Vec3f(0.0f, 0.0f, 0.0f), sourceId);
+                }
+                if (const auto surfacePoint = atlasControlGridToSurface(segmentationBaseViewer(), point)) {
+                    centerViewerOnSurfacePointForNavigation(segmentationBaseViewer(), *surfacePoint);
+                }
+            });
+
     // Selection dock (removed per request; selection actions remain in the menu)
     if (_viewerManager) {
         for (auto* viewer : _viewerManager->baseViewers()) {
@@ -4009,6 +4081,7 @@ void CWindow::CreateWidgets(void)
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
+    _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _atlasControlDock);
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _fiberWidget);
 
     // Make Segmentation dock the active tab by default
@@ -4984,6 +5057,14 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
                 _point_collection_widget->clearCorrPointsResults();
             }
         }
+        if (_atlasControlDock) {
+            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
+            if (quadSurf && !quadSurf->path.empty()) {
+                _atlasControlDock->loadResults(quadSurf->path / "atlas_control_points_results.json");
+            } else {
+                _atlasControlDock->clearResults();
+            }
+        }
     }
 
     const bool activatingAxisAlignedPlane =
@@ -5082,6 +5163,14 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
                     quadSurf->path / "corr_points_results.json");
             } else {
                 _point_collection_widget->clearCorrPointsResults();
+            }
+        }
+        if (_atlasControlDock) {
+            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
+            if (quadSurf && !quadSurf->path.empty()) {
+                _atlasControlDock->loadResults(quadSurf->path / "atlas_control_points_results.json");
+            } else {
+                _atlasControlDock->clearResults();
             }
         }
 

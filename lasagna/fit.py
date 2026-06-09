@@ -2067,6 +2067,32 @@ def main(argv: list[str] | None = None) -> int:
 		corr_results = opt_loss_corr.get_last_results()
 		if corr_results is not None:
 			st["_corr_points_results_"] = corr_results
+		if data.atlas_lines is not None:
+			try:
+				import opt_loss_atlas_line
+
+				with torch.no_grad():
+					atlas_res = mdl(data, needs=model.ModelForwardNeeds(mesh_normals=True))
+					opt_loss_atlas_line.atlas_line_loss(
+						res=atlas_res,
+						stage_eff={"atlas_line_control": 1.0, "atlas_line_other": 1.0},
+						debug_payload=True,
+					)
+					atlas_control_results = opt_loss_atlas_line.atlas_control_points_results(
+						lines=data.atlas_lines,
+					)
+				if atlas_control_results is not None:
+					st["_atlas_control_points_results_"] = atlas_control_results
+					summary = atlas_control_results.get("summary", {})
+					print(
+						"[fit] saving atlas control point results "
+						f"total={summary.get('total_count', 0)} "
+						f"valid={summary.get('valid_count', 0)} "
+						f"rms={float(summary.get('rms_distance', 0.0)):.6g}",
+						flush=True,
+					)
+			except Exception as exc:
+				print(f"[fit] WARNING: failed to build atlas control point results: {exc}", flush=True)
 		if corr_point_roi_init is not None:
 			payload = copy.deepcopy(corr_point_roi_init.payload)
 			payload["output_radius_grid_points"] = int(data_cfg.corr_point_roi_output_radius)
