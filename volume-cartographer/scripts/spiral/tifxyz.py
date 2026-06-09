@@ -1,9 +1,9 @@
 
 import os
-import cv2
 import json
 import torch
 import numpy as np
+from PIL import Image
 from typing import Optional, Union, Literal
 from einops import rearrange
 import torch.nn.functional as F
@@ -275,11 +275,20 @@ def load_tifxyz(path):
         metadata = json.load(meta_json)
         scale = torch.tensor(metadata['scale'])
         uuid = metadata.get('uuid')
-    zyxs = torch.from_numpy(np.stack([
-        cv2.imread( f'{path}/{coord}.tif', flags=cv2.IMREAD_UNCHANGED)
-        for coord in 'zyx'
-    ], axis=-1)).to(torch.float32)
-    
+    zyxs_np = np.stack([np.array(Image.open(f'{path}/{coord}.tif')) for coord in 'zyx'], axis=-1)
+
+    # Some patches mark invalid vertices via mask.tif (mask == 0) rather than the -1 sentinel in
+    # x/y/z, so masked-out vertices can carry real coordinates. Force those to -1 so the standard
+    # validity logic (zyxs != -1) is correct. Patches without mask.tif are unaffected.
+    mask_path = f'{path}/mask.tif'
+    if os.path.exists(mask_path):
+        mask = np.array(Image.open(mask_path))
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        zyxs_np[mask == 0] = -1.0
+
+    zyxs = torch.from_numpy(zyxs_np).to(torch.float32)
+
     if os.path.exists(f'{path}/overlapping.json'):
         with open(f'{path}/overlapping.json', 'r') as overlapping_json:
             overlapping_ids = json.load(overlapping_json)['overlapping']
@@ -288,7 +297,7 @@ def load_tifxyz(path):
 
     winding_path = f'{path}/winding.tif'
     if os.path.exists(winding_path):
-        winding_np = cv2.imread(winding_path, flags=cv2.IMREAD_UNCHANGED)
+        winding_np = np.array(Image.open(winding_path))
         assert winding_np.shape[:2] == zyxs.shape[:2] and winding_np.ndim == 2 and winding_np.dtype == np.float32
         wt = torch.from_numpy(winding_np)
         if (torch.isnan(wt) | (wt == 0.)).all():  # all zero/NaN -> mark as single winding
@@ -304,9 +313,9 @@ def load_tifxyz(path):
 def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
-    cv2.imwrite(f'{path}/x.tif', zyxs[..., 2])
-    cv2.imwrite(f'{path}/y.tif', zyxs[..., 1])
-    cv2.imwrite(f'{path}/z.tif', zyxs[..., 0])
+    Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
+    Image.fromarray(np.asarray(zyxs[..., 1], dtype=np.float32)).save(f'{path}/y.tif')
+    Image.fromarray(np.asarray(zyxs[..., 0], dtype=np.float32)).save(f'{path}/z.tif')
     valid_vertex = np.any(zyxs != -1, axis=-1)
     valid_quad = valid_vertex[:-1, :-1] & valid_vertex[1:, :-1] & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
     area_vx2 = int(valid_quad.sum()) * step_size ** 2
