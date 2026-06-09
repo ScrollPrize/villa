@@ -43,7 +43,7 @@ pcl_json_paths = [
     # f'{dataset_path}/same_winding_annotations_fixed_merged.json',
 ]
 patches_path = f'{dataset_path}/patches'
-unverified_patches_path = None
+unverified_patches_path = os.environ.get('FIT_SPIRAL_UNVERIFIED_PATCHES_PATH', None)
 shell_path = f'{dataset_path}/s1_2um_outer'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'
 spiral_outward_sense = 'CW'  # CW | ACW
