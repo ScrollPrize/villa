@@ -110,7 +110,7 @@ default_config = {
     'unverified_num_patches_per_step': 120,
     'unverified_num_patches_per_step_for_dt': 80,
     'unverified_num_points_per_patch': 800,
-    'unverified_patch_exclusion_radius': 8.0,  # mask unverified-patch vertices within this of trusted geometry (downsampled voxels)
+    'unverified_patch_exclusion_radius': 16.0,  # mask unverified-patch vertices within this of trusted geometry (downsampled voxels)
     'winding_number_num_pcls': 48,
     'winding_number_num_patch_pairs_per_pcl': 4,
     'winding_number_adjacent_patches_only': True,
@@ -149,8 +149,8 @@ default_config = {
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
-    'loss_weight_unverified_patch_radius': 32.e0,
-    'loss_weight_unverified_patch_dt': 16.e0,
+    'loss_weight_unverified_patch_radius': 8.e0,
+    'loss_weight_unverified_patch_dt': 4.e0,
     'loss_weight_winding_number': 20.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
