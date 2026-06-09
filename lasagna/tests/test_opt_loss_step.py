@@ -68,6 +68,67 @@ class StepLossTest(unittest.TestCase):
 		self.assertLess(float(lm.max()), 1.0e-10)
 		self.assertLess(float(loss), 1.0e-10)
 
+	def test_step_regularizers_target_scale_uniform_grid_are_near_zero(self) -> None:
+		xyz = _planar_grid(4, 5, step=2.0)
+
+		terms = opt_loss_step.step_regularizer_loss(res=_step_result(xyz, mesh_step=2))
+
+		self.assertIn("smooth_step", terms)
+		self.assertIn("avg_step", terms)
+		self.assertLess(float(terms["smooth_step"][0]), 1.0e-10)
+		self.assertLess(float(terms["avg_step"][0]), 1.0e-10)
+
+	def test_wrong_scale_uniform_grid_has_avg_step_gradient_only(self) -> None:
+		base = _planar_grid(4, 5, step=1.0)
+		scale = torch.tensor(2.0, dtype=torch.float32, requires_grad=True)
+		xyz = base * scale
+
+		terms = opt_loss_step.step_regularizer_loss(res=_step_result(xyz, mesh_step=1))
+		smooth_loss = terms["smooth_step"][0]
+		avg_loss = terms["avg_step"][0]
+		avg_loss.backward()
+
+		self.assertLess(float(smooth_loss.detach()), 1.0e-10)
+		self.assertGreater(float(avg_loss.detach()), 0.1)
+		self.assertIsNotNone(scale.grad)
+		self.assertGreater(float(scale.grad), 0.1)
+
+	def test_nonuniform_grid_has_nonzero_smooth_step(self) -> None:
+		xyz = _planar_grid(5, 5, step=1.0)
+		xyz[0, 2, 2, 0] += 0.5
+
+		terms = opt_loss_step.step_regularizer_loss(res=_step_result(xyz, mesh_step=1))
+
+		self.assertGreater(float(terms["smooth_step"][0]), 1.0e-4)
+
+	def test_smooth_step_targets_are_differentiable(self) -> None:
+		xyz = _planar_grid(5, 5, step=1.0).requires_grad_()
+		edge_data = opt_loss_step._step_regularizer_edge_data(xyz)
+
+		smooth_targets, _avg_targets, _global_avg_step = opt_loss_step._step_regularizer_targets(
+			edge_data,
+			mesh_step=1.0,
+		)
+		target = smooth_targets["h"][0, 2, 1, 0]
+		target.backward()
+
+		self.assertTrue(smooth_targets["h"].requires_grad)
+		self.assertIsNotNone(xyz.grad)
+		self.assertGreater(float(xyz.grad.abs().sum()), 0.0)
+
+	def test_avg_step_targets_are_detached(self) -> None:
+		xyz = _planar_grid(5, 5, step=1.0).requires_grad_()
+		edge_data = opt_loss_step._step_regularizer_edge_data(xyz)
+
+		_smooth_targets, avg_targets, global_avg_step = opt_loss_step._step_regularizer_targets(
+			edge_data,
+			mesh_step=1.0,
+		)
+
+		self.assertTrue(global_avg_step.requires_grad)
+		for target in avg_targets.values():
+			self.assertFalse(target.requires_grad)
+
 	def test_step_loss_analysis_reports_uncropped_grid_stats(self) -> None:
 		xyz = _planar_grid(4, 5, step=2.0)[0]
 
@@ -110,9 +171,10 @@ class StepLossTest(unittest.TestCase):
 	def test_short_edge_normal_component_does_not_create_normal_expansion_gradient(self) -> None:
 		diff = torch.tensor([[[[0.5, 0.0, 0.4]]]], dtype=torch.float32, requires_grad=True)
 		direction = torch.tensor([[[[1.0, 0.0, 0.0]]]], dtype=torch.float32)
+		target = torch.ones(1, 1, 1, 1, dtype=torch.float32)
 		valid = torch.ones(1, 1, 1, 1, dtype=torch.bool)
 
-		pen = opt_loss_step._directional_step_penalty(diff, 1.0, direction, valid)
+		pen = opt_loss_step._directional_step_penalty(diff, target, direction, valid)
 		pen.sum().backward()
 
 		grad = diff.grad[0, 0, 0]
@@ -122,9 +184,10 @@ class StepLossTest(unittest.TestCase):
 	def test_long_edge_uses_full_3d_contraction(self) -> None:
 		diff = torch.tensor([[[[1.0, 0.0, 1.0]]]], dtype=torch.float32, requires_grad=True)
 		direction = torch.tensor([[[[1.0, 0.0, 0.0]]]], dtype=torch.float32)
+		target = torch.ones(1, 1, 1, 1, dtype=torch.float32)
 		valid = torch.ones(1, 1, 1, 1, dtype=torch.bool)
 
-		pen = opt_loss_step._directional_step_penalty(diff, 1.0, direction, valid)
+		pen = opt_loss_step._directional_step_penalty(diff, target, direction, valid)
 		pen.sum().backward()
 
 		grad = diff.grad[0, 0, 0]

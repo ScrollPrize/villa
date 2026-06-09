@@ -390,6 +390,8 @@ def _parse_opt_settings(
 lambda_global: dict[str, float] = {
 	"normal": 1.0,
 	"step": 0.0,
+	"smooth_step": 0.0,
+	"avg_step": 0.0,
 	"smooth": 0.0,
 	"winding_density": 0.0,
 	"data": 0.0,
@@ -1720,6 +1722,11 @@ def optimize(
 	Needs = fit_model.ModelForwardNeeds
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss, "needs": Needs()},
+		"step_regularizer": {
+			"loss": opt_loss_step.step_regularizer_loss,
+			"sub": ["smooth_step", "avg_step"],
+			"needs": Needs(),
+		},
 		"smooth": {"loss": opt_loss_smooth.smooth_loss, "needs": Needs()},
 		"winding_density": {
 			"loss": opt_loss_winding_density.winding_density_loss,
@@ -2387,6 +2394,7 @@ def optimize(
 						  shell_no: int | None = None) -> None:
 			nonlocal _status_rows, _status_legend_cols
 			label_map = {
+				"avg_step": "avg_st",
 				"cyl_bend": "c_bend",
 				"cyl_normal": "c_norm",
 				"cyl_outside": "c_out",
@@ -2413,6 +2421,7 @@ def optimize(
 				"pred_dt_pull_samples_m": "psampM",
 				"pred_dt_pull_prefix_mean": "pullpre",
 				"pred_dt_pull_weight_mean": "pullw",
+				"smooth_step": "sm_step",
 				"snap_surf_map": "smap",
 				"snaps_map_snap": "sms_los",
 				"snaps_map_snap_abs": "sms_abs",
@@ -2660,6 +2669,8 @@ def optimize(
 				"cyl_outside_pen_frac": "outside frac",
 				"cyl_outside_depth_max": "outside max",
 				"cyl_outside_depth_avg": "outside avg",
+				"smooth_step": "local same-direction step equalization loss",
+				"avg_step": "global average step-scale loss",
 				"atlas_line": "atlas line loss",
 				"atlas_line_control": "atlas control-anchor loss",
 				"atlas_line_other": "atlas in-span line-anchor loss",
@@ -2773,6 +2784,8 @@ def optimize(
 				"snaps_map_nsign": 179,
 				"snaps_map_scales": 180,
 				"snaps_map_repair": 181,
+				"smooth_step": 196,
+				"avg_step": 197,
 				"atlas_line": 182,
 				"atlas_line_control": 183,
 				"atlas_line_other": 184,

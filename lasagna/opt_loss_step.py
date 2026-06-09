@@ -63,11 +63,15 @@ def _w_edge_directions(diff_w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 
 def _directional_step_penalty(
 	diff: torch.Tensor,
-	target: float,
+	target: float | torch.Tensor,
 	direction: torch.Tensor,
 	direction_valid: torch.Tensor,
 ) -> torch.Tensor:
-	target_t = diff.new_tensor(float(target)).clamp_min(1.0e-12)
+	if torch.is_tensor(target):
+		target_t = target.to(device=diff.device, dtype=diff.dtype)
+	else:
+		target_t = diff.new_tensor(float(target))
+	target_t = target_t.clamp_min(1.0e-12)
 	length = _edge_length(diff)
 	projected = (diff * direction).sum(dim=-1, keepdim=True).abs()
 	short = torch.relu(target_t - projected).square() / target_t.square()
@@ -77,6 +81,146 @@ def _directional_step_penalty(
 	rel = (length - target_t) / target_t
 	fallback = rel * rel
 	return torch.where(direction_valid, directional, fallback)
+
+
+def _offset_slices(size: int, offset: int) -> tuple[slice, slice]:
+	if offset >= 0:
+		return slice(0, size - offset), slice(offset, size)
+	return slice(-offset, size), slice(0, size + offset)
+
+
+def _same_direction_local_average(length: torch.Tensor, offsets: tuple[tuple[int, int], ...]) -> torch.Tensor:
+	"""Differentiable same-direction 5-tap average with clipped boundaries."""
+	out = torch.zeros_like(length)
+	count = torch.zeros_like(length)
+	H = int(length.shape[1])
+	W = int(length.shape[2])
+	for dh, dw in offsets:
+		if abs(int(dh)) >= H or abs(int(dw)) >= W:
+			continue
+		src_h, dst_h = _offset_slices(H, int(dh))
+		src_w, dst_w = _offset_slices(W, int(dw))
+		out[:, dst_h, dst_w, :] = out[:, dst_h, dst_w, :] + length[:, src_h, src_w, :]
+		count[:, dst_h, dst_w, :] = count[:, dst_h, dst_w, :] + 1.0
+	return out / count.clamp_min(1.0)
+
+
+def _step_regularizer_edge_data(xyz: torch.Tensor) -> dict[str, dict[str, torch.Tensor]]:
+	diff_h_full = xyz[:, 1:, :, :] - xyz[:, :-1, :, :]
+	dir_h, valid_h = _h_edge_directions(diff_h_full)
+	diff_h = diff_h_full[:, :, :-1, :]
+
+	diff_w_full = xyz[:, :, 1:, :] - xyz[:, :, :-1, :]
+	dir_w, valid_w = _w_edge_directions(diff_w_full)
+	diff_w = diff_w_full[:, :-1, :, :]
+
+	diff_d1 = xyz[:, 1:, 1:, :] - xyz[:, :-1, :-1, :]
+	dir_d1, valid_d1 = _unit_directions(diff_d1)
+
+	diff_d2 = xyz[:, 1:, :-1, :] - xyz[:, :-1, 1:, :]
+	dir_d2, valid_d2 = _unit_directions(diff_d2)
+
+	return {
+		"h": {
+			"diff": diff_h,
+			"direction": dir_h,
+			"valid": valid_h,
+			"length": _edge_length(diff_h),
+			"equiv_scale": xyz.new_tensor(1.0),
+		},
+		"w": {
+			"diff": diff_w,
+			"direction": dir_w,
+			"valid": valid_w,
+			"length": _edge_length(diff_w),
+			"equiv_scale": xyz.new_tensor(1.0),
+		},
+		"diag": {
+			"diff": diff_d1,
+			"direction": dir_d1.detach(),
+			"valid": valid_d1,
+			"length": _edge_length(diff_d1),
+			"equiv_scale": xyz.new_tensor(math.sqrt(2.0)),
+		},
+		"anti_diag": {
+			"diff": diff_d2,
+			"direction": dir_d2.detach(),
+			"valid": valid_d2,
+			"length": _edge_length(diff_d2),
+			"equiv_scale": xyz.new_tensor(math.sqrt(2.0)),
+		},
+	}
+
+
+def _step_regularizer_targets(
+	edge_data: dict[str, dict[str, torch.Tensor]],
+	*,
+	mesh_step: float,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
+	smooth_offsets = {
+		"h": ((0, 0), (-1, 0), (1, 0), (-2, 0), (2, 0)),
+		"w": ((0, 0), (0, -1), (0, 1), (0, -2), (0, 2)),
+		"diag": ((0, 0), (-1, -1), (1, 1), (-2, -2), (2, 2)),
+		"anti_diag": ((0, 0), (-1, 1), (1, -1), (-2, 2), (2, -2)),
+	}
+	smooth_targets = {
+		name: _same_direction_local_average(edge_data[name]["length"], offsets)
+		for name, offsets in smooth_offsets.items()
+	}
+	equiv_lengths = [
+		edge_data[name]["length"] / edge_data[name]["equiv_scale"]
+		for name in ("h", "w", "diag", "anti_diag")
+	]
+	global_avg_step = torch.cat([v.reshape(-1) for v in equiv_lengths], dim=0).mean()
+	global_scale = edge_data["h"]["length"].new_tensor(float(mesh_step)) / global_avg_step.detach().clamp_min(1.0e-12)
+	avg_targets = {name: target.detach() * global_scale for name, target in smooth_targets.items()}
+	return smooth_targets, avg_targets, global_avg_step
+
+
+def _step_regularizer_maps_from_targets(
+	edge_data: dict[str, dict[str, torch.Tensor]],
+	targets: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+	penalties = []
+	for name in ("h", "w", "diag", "anti_diag"):
+		data = edge_data[name]
+		penalties.append(_directional_step_penalty(
+			data["diff"],
+			targets[name],
+			data["direction"],
+			data["valid"],
+		))
+	lm = sum(penalties) * 0.25
+	lm = lm.permute(0, 3, 1, 2)
+	mask = torch.ones_like(lm)
+	return lm, mask
+
+
+def step_regularizer_loss_maps(*, res: fit_model.FitResult3D) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+	"""Return grouped smooth/average step maps computed from one edge bundle."""
+	edge_data = _step_regularizer_edge_data(res.xyz_lr)
+	smooth_targets, avg_targets, _global_avg_step = _step_regularizer_targets(
+		edge_data,
+		mesh_step=float(res.params.mesh_step),
+	)
+	smooth_lm, smooth_mask = _step_regularizer_maps_from_targets(edge_data, smooth_targets)
+	avg_lm, avg_mask = _step_regularizer_maps_from_targets(edge_data, avg_targets)
+	return {
+		"smooth_step": (smooth_lm, smooth_mask),
+		"avg_step": (avg_lm, avg_mask),
+	}
+
+
+def step_regularizer_loss(
+	*,
+	res: fit_model.FitResult3D,
+) -> dict[str, tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]]:
+	"""Grouped local smooth-step and global average-step regularizer."""
+	maps = step_regularizer_loss_maps(res=res)
+	return {
+		name: (lm.mean(), (lm,), (mask,))
+		for name, (lm, mask) in maps.items()
+	}
 
 
 def step_loss_analysis(xyz: torch.Tensor, *, mesh_step: float) -> dict[str, float]:
