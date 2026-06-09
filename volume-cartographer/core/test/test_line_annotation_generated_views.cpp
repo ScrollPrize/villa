@@ -84,6 +84,37 @@ TEST_CASE("line annotation shift scroll uses viewer slice step size")
     CHECK(vc3d::line_annotation::shiftedLinePosition(2.0, -2, 5, 101) == 0.0);
 }
 
+TEST_CASE("line annotation straight shift scroll moves cut origin along plane normal")
+{
+    const cv::Vec3f origin{1.0f, 2.0f, 3.0f};
+    const cv::Vec3f normal{0.0f, 0.0f, 2.0f};
+    const double linePosition = 40.0;
+
+    const cv::Vec3f shifted =
+        vc3d::line_annotation::shiftedPlaneOriginAlongNormal(origin, normal, 3, 4);
+
+    CHECK(shifted[0] == doctest::Approx(1.0f));
+    CHECK(shifted[1] == doctest::Approx(2.0f));
+    CHECK(shifted[2] == doctest::Approx(15.0f));
+    CHECK(linePosition == doctest::Approx(40.0));
+    CHECK(cv::norm(normal - cv::Vec3f{0.0f, 0.0f, 2.0f}) == doctest::Approx(0.0f));
+}
+
+TEST_CASE("line annotation straight shift scroll clamps invalid step size but not line position")
+{
+    const cv::Vec3f origin{10.0f, 0.0f, 0.0f};
+    const cv::Vec3f normal{1.0f, 0.0f, 0.0f};
+    const double linePosition = 8.0;
+
+    const cv::Vec3f shifted =
+        vc3d::line_annotation::shiftedPlaneOriginAlongNormal(origin, normal, -2, 0);
+
+    CHECK(shifted[0] == doctest::Approx(8.0f));
+    CHECK(shifted[1] == doctest::Approx(0.0f));
+    CHECK(shifted[2] == doctest::Approx(0.0f));
+    CHECK(linePosition == doctest::Approx(8.0));
+}
+
 TEST_CASE("line annotation bottom shift scroll preserves generated slice spacing")
 {
     const double shiftedCenter = vc3d::line_annotation::shiftedLinePosition(50.0, 2, 3, 101);

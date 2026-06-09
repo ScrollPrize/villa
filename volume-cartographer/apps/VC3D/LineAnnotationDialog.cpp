@@ -17,6 +17,7 @@
 #include <QMdiSubWindow>
 #include <QPushButton>
 #include <QRect>
+#include <QResizeEvent>
 #include <QShortcut>
 #include <QTimer>
 #include <QVariantAnimation>
@@ -117,6 +118,28 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _initialDirectionCombo->setCurrentIndex(1);
     _initialDirectionCombo->installEventFilter(this);
     buttonLayout->addWidget(_initialDirectionCombo);
+    _reoptimizationCombo = new QComboBox(buttonRow);
+    _reoptimizationCombo->addItem(tr("auto-reopt"),
+                                  static_cast<int>(ReoptimizationMode::AutoReoptimize));
+    _reoptimizationCombo->addItem(tr("no optimization"),
+                                  static_cast<int>(ReoptimizationMode::NoOptimization));
+    _reoptimizationCombo->setCurrentIndex(0);
+    _reoptimizationCombo->installEventFilter(this);
+    buttonLayout->addWidget(_reoptimizationCombo);
+    connect(_reoptimizationCombo,
+            qOverload<int>(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                emit reoptimizationModeChanged(reoptimizationMode());
+            });
+    _shiftScrollCombo = new QComboBox(buttonRow);
+    _shiftScrollCombo->addItem(tr("along-line"),
+                               static_cast<int>(ShiftScrollMode::AlongLine));
+    _shiftScrollCombo->addItem(tr("straight"),
+                               static_cast<int>(ShiftScrollMode::StraightNormal));
+    _shiftScrollCombo->setCurrentIndex(0);
+    _shiftScrollCombo->installEventFilter(this);
+    buttonLayout->addWidget(_shiftScrollCombo);
     _sliceStepLabel = new QLabel(this);
     _sliceStepLabel->setText(tr("Step: %1").arg(_viewerManager ? _viewerManager->sliceStepSize() : 1));
     _sliceStepLabel->setToolTip(tr("Shift+Scroll step size. Use Shift+G / Shift+H to adjust."));
@@ -171,6 +194,65 @@ LineAnnotationDialog::InitialDirectionMode LineAnnotationDialog::initialDirectio
         return InitialDirectionMode::Sideways;
     }
     return static_cast<InitialDirectionMode>(_initialDirectionCombo->currentData().toInt());
+}
+
+LineAnnotationDialog::ReoptimizationMode LineAnnotationDialog::reoptimizationMode() const
+{
+    if (!_reoptimizationCombo) {
+        return ReoptimizationMode::AutoReoptimize;
+    }
+    return static_cast<ReoptimizationMode>(_reoptimizationCombo->currentData().toInt());
+}
+
+LineAnnotationDialog::ShiftScrollMode LineAnnotationDialog::shiftScrollMode() const
+{
+    if (!_shiftScrollCombo) {
+        return ShiftScrollMode::AlongLine;
+    }
+    return static_cast<ShiftScrollMode>(_shiftScrollCombo->currentData().toInt());
+}
+
+void LineAnnotationDialog::setGeneratedControlPoints(
+    std::vector<GeneratedOverlay::ControlPointMarker> controlPoints)
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+    _generatedViews.controlPoints = std::move(controlPoints);
+    _generatedControlIndex =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
+            _generatedViews.controlPoints);
+    rebuildGeneratedOverlays();
+}
+
+void LineAnnotationDialog::setOptimizationBusy(bool busy)
+{
+    auto* content = centralWidget();
+    if (!content) {
+        return;
+    }
+    if (!_optimizationOverlay) {
+        auto* overlay = new QWidget(content);
+        overlay->setObjectName(QStringLiteral("lineAnnotationOptimizationOverlay"));
+        overlay->setAttribute(Qt::WA_StyledBackground, true);
+        overlay->setStyleSheet(QStringLiteral(
+            "#lineAnnotationOptimizationOverlay { background-color: rgba(32, 32, 32, 120); }"
+            "#lineAnnotationOptimizationOverlay QLabel { color: white; font-weight: 600; }"));
+        auto* layout = new QVBoxLayout(overlay);
+        layout->setContentsMargins(0, 0, 0, 0);
+        auto* label = new QLabel(tr("Optimizing..."), overlay);
+        label->setAlignment(Qt::AlignCenter);
+        layout->addStretch(1);
+        layout->addWidget(label);
+        layout->addStretch(1);
+        overlay->hide();
+        _optimizationOverlay = overlay;
+    }
+    updateOptimizationOverlayGeometry();
+    _optimizationOverlay->setVisible(busy);
+    if (busy) {
+        _optimizationOverlay->raise();
+    }
 }
 
 CChunkedVolumeViewer* LineAnnotationDialog::addPane(
@@ -245,6 +327,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     _hasGeneratedViews = false;
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
+    _currentCutStraightOffsetActive = false;
     _generatedControlIndex = {};
     _haveInitialCurrentCutCamera = false;
     _initialStripCameras.clear();
@@ -434,6 +517,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             _generatedViews.controlPoints);
     _hasGeneratedViews = true;
     _currentCutFollowsStripMouse = true;
+    _currentCutStraightOffsetActive = false;
     if (!replacingGeneratedViews) {
         _currentCutManualRotation = cv::Matx33f::eye();
         _currentCutManualRotationActive = false;
@@ -477,6 +561,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
             if (modifiers.testFlag(Qt::ControlModifier)) {
                 return scaleBottomSliceLineStepByScrollSteps(steps);
+            }
+            if (shiftScrollMode() == ShiftScrollMode::StraightNormal) {
+                return shiftCurrentCutPlaneStraightByScrollSteps(steps);
             }
             return shiftCurrentLinePositionByScrollSteps(steps);
         });
@@ -745,7 +832,7 @@ void LineAnnotationDialog::setCurrentLinePosition(double position)
     if (!currentChanged && !bottomChanged) {
         return;
     }
-    if (currentChanged && _generatedViews.currentCutSurface) {
+    if (currentChanged && _generatedViews.currentCutSurface && !_currentCutStraightOffsetActive) {
         _currentLinePosition = position;
         (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
     } else {
@@ -860,7 +947,34 @@ bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
         steps,
         sliceStepSize,
         static_cast<int>(_generatedViews.linePoints.size()));
+    _currentCutStraightOffsetActive = false;
     setCurrentLinePosition(position);
+    return true;
+}
+
+bool LineAnnotationDialog::shiftCurrentCutPlaneStraightByScrollSteps(int steps)
+{
+    if (!_hasGeneratedViews || !_generatedViews.currentCutSurface) {
+        return true;
+    }
+    auto* plane = _generatedViews.currentCutSurface.get();
+    const int sliceStepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
+    const cv::Vec3f origin = plane->origin();
+    const cv::Vec3f normal = plane->normal({0.0f, 0.0f, 0.0f});
+    const cv::Vec3f shiftedOrigin =
+        vc3d::line_annotation::shiftedPlaneOriginAlongNormal(origin,
+                                                             normal,
+                                                             steps,
+                                                             sliceStepSize);
+    if (!finitePoint(shiftedOrigin)) {
+        return true;
+    }
+    plane->setOrigin(shiftedOrigin);
+    _currentCutStraightOffsetActive = true;
+    if (_currentCutViewer) {
+        _currentCutViewer->renderVisible(true, "line annotation current cut straight shift");
+    }
+    rebuildGeneratedDynamicOverlays();
     return true;
 }
 
@@ -1067,6 +1181,7 @@ void LineAnnotationDialog::resetGeneratedViews()
     _bottomSliceLineStep = state.bottomSliceLineStep;
     _currentCutManualRotation = state.currentCutManualRotation;
     _currentCutManualRotationActive = state.currentCutManualRotationActive;
+    _currentCutStraightOffsetActive = false;
     _bottomSliceStepWheelAccum = 0;
     _currentCutFollowsStripMouse = true;
     updateBottomSliceStepLabel();
@@ -1386,12 +1501,29 @@ void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)
     QMainWindow::keyPressEvent(event);
 }
 
+void LineAnnotationDialog::resizeEvent(QResizeEvent* event)
+{
+    QMainWindow::resizeEvent(event);
+    updateOptimizationOverlayGeometry();
+}
+
 bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 {
     if (!event) {
         return false;
     }
     if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
+        if (shiftScrollMode() == ShiftScrollMode::StraightNormal &&
+            _currentCutStraightOffsetActive) {
+            _currentCutStraightOffsetActive = false;
+            _currentCutManualRotation = cv::Matx33f::eye();
+            _currentCutManualRotationActive = false;
+            (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
+            if (_currentCutViewer) {
+                _currentCutViewer->renderVisible(true, "line annotation current cut snap to line");
+            }
+            rebuildGeneratedDynamicOverlays();
+        }
         if (_currentCutFollowsStripMouse) {
             setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
             setCurrentCutFollowsStripMouse(false);
@@ -1442,4 +1574,15 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
         _currentCutViewer->setFixedWidth(std::max(1, _generatedTopWidget->height()));
     }
     return QMainWindow::eventFilter(watched, event);
+}
+
+void LineAnnotationDialog::updateOptimizationOverlayGeometry()
+{
+    if (!_optimizationOverlay || !centralWidget()) {
+        return;
+    }
+    _optimizationOverlay->setGeometry(centralWidget()->rect());
+    if (_optimizationOverlay->isVisible()) {
+        _optimizationOverlay->raise();
+    }
 }

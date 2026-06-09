@@ -109,6 +109,7 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string fiberManualHvTag;
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
+    bool controlPointsDirtySinceOptimization = false;
     std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
 };
 
@@ -925,6 +926,33 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         }
         startOptimization(session, true);
     });
+    connect(dialog,
+            &LineAnnotationDialog::reoptimizationModeChanged,
+            this,
+            [this, surfaceName](LineAnnotationDialog::ReoptimizationMode mode) {
+                if (mode != LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
+                    return;
+                }
+                auto* pane = paneForSurface(surfaceName);
+                if (!pane || !pane->session) {
+                    return;
+                }
+                auto& session = *pane->session;
+                if (!session.controlPointsDirtySinceOptimization) {
+                    return;
+                }
+                if (session.taskState == LineAnnotationSession::TaskState::Running) {
+                    showError(tr("Line optimization is already running."));
+                    return;
+                }
+                if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
+                    return;
+                }
+                if (!ensureDatasetForSession(session)) {
+                    return;
+                }
+                startOptimization(session, true);
+            });
     connect(dialog, &QObject::destroyed, this, [this, surfaceName]() {
         cleanupSurfaceName(surfaceName);
     });
@@ -3007,6 +3035,7 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
     session.focusedLinePosition = 0.0;
     session.focusedControlPoint = seedPoint;
     session.controlPoints = {{0.0, seedPoint, true, -1}};
+    session.controlPointsDirtySinceOptimization = false;
     startOptimization(session);
 }
 
@@ -3066,6 +3095,24 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     session.focusedLinePosition = linePosition;
     session.focusedControlPoint = clicked;
+    const bool autoReoptimize =
+        !pane->dialog ||
+        pane->dialog->reoptimizationMode() ==
+            LineAnnotationDialog::ReoptimizationMode::AutoReoptimize;
+    if (!autoReoptimize) {
+        const std::string noReoptEventName = editedExistingControl
+            ? "control_edit_no_reopt"
+            : "control_add_no_reopt";
+        writeLineDebugJson(noReoptEventName,
+                           session.controlPoints,
+                           linePointsToJson(session.optimizedLine));
+        session.controlPointsDirtySinceOptimization = true;
+        if (pane->dialog) {
+            pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
+        }
+        return;
+    }
+
     std::vector<cv::Vec3d> currentLinePoints;
     currentLinePoints.reserve(session.optimizedLine.points.size());
     for (const auto& point : session.optimizedLine.points) {
@@ -3203,7 +3250,19 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     writeLineDebugJson("control_delete",
                        session.controlPoints,
                        linePointsToJson(session.optimizedLine));
-    startOptimization(session, true);
+    const bool autoReoptimize =
+        !pane->dialog ||
+        pane->dialog->reoptimizationMode() ==
+            LineAnnotationDialog::ReoptimizationMode::AutoReoptimize;
+    if (autoReoptimize) {
+        startOptimization(session, true);
+        return;
+    }
+
+    session.controlPointsDirtySinceOptimization = true;
+    if (pane->dialog) {
+        pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
+    }
 }
 
 bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& session)
@@ -3284,6 +3343,9 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     auto* watcher = new QFutureWatcher<OptimizationTaskResult>(this);
     session.watcher = watcher;
     const std::string surfaceName = session.surfaceName;
+    if (auto* pane = paneForSurface(surfaceName); pane && pane->dialog) {
+        pane->dialog->setOptimizationBusy(true);
+    }
     connect(watcher,
             &QFutureWatcher<OptimizationTaskResult>::finished,
             this,
@@ -3370,6 +3432,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         session.optimizationReport = task.result.report;
         session.optimizedLine = std::move(task.result.line);
         session.controlPoints = std::move(task.controlPoints);
+        session.controlPointsDirtySinceOptimization = false;
         for (auto& control : session.controlPoints) {
             double bestDistance = std::numeric_limits<double>::infinity();
             int bestIndex = -1;
@@ -3407,6 +3470,9 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         if (!session.suppressGeneratedViews) {
             if (!materializeGeneratedViews(session)) {
                 session.taskState = LineAnnotationSession::TaskState::Failed;
+                if (pane->dialog) {
+                    pane->dialog->setOptimizationBusy(false);
+                }
                 return;
             }
         }
@@ -3427,11 +3493,17 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         if (callback) {
             callback(session);
         }
+        if (pane->dialog) {
+            pane->dialog->setOptimizationBusy(false);
+        }
         return;
     }
 
     session.taskState = LineAnnotationSession::TaskState::Failed;
     session.error = task.error;
+    if (pane->dialog) {
+        pane->dialog->setOptimizationBusy(false);
+    }
     showError(tr("Lasagna line optimization failed: %1")
                   .arg(QString::fromStdString(task.error)));
 }

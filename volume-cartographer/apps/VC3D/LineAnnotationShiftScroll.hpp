@@ -4,6 +4,8 @@
 #include <cmath>
 #include <limits>
 
+#include <opencv2/core.hpp>
+
 namespace vc3d::line_annotation {
 
 constexpr double kDefaultBottomCrossSliceLineStep = 10.0;
@@ -28,6 +30,25 @@ inline double shiftedLinePosition(double currentPosition,
     const double delta = static_cast<double>(scrollSteps) *
                          static_cast<double>(shiftScrollLineStepSize(viewerSliceStepSize));
     return std::clamp(currentPosition + delta, 0.0, maxLinePosition);
+}
+
+inline cv::Vec3f shiftedPlaneOriginAlongNormal(const cv::Vec3f& currentOrigin,
+                                               const cv::Vec3f& planeNormal,
+                                               int scrollSteps,
+                                               int viewerSliceStepSize)
+{
+    const float n = cv::norm(planeNormal);
+    if (!std::isfinite(currentOrigin[0]) ||
+        !std::isfinite(currentOrigin[1]) ||
+        !std::isfinite(currentOrigin[2]) ||
+        !std::isfinite(planeNormal[0]) ||
+        !std::isfinite(planeNormal[1]) ||
+        !std::isfinite(planeNormal[2]) ||
+        n <= 1.0e-6f) {
+        return currentOrigin;
+    }
+    const float delta = static_cast<float>(scrollSteps * shiftScrollLineStepSize(viewerSliceStepSize));
+    return currentOrigin + planeNormal * (delta / n);
 }
 
 inline double bottomCrossSliceLinePosition(double centerPosition,

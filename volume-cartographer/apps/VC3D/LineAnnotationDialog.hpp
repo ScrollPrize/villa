@@ -23,6 +23,7 @@ class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
 class QPushButton;
+class QResizeEvent;
 class QVariantAnimation;
 class QVBoxLayout;
 class QWheelEvent;
@@ -38,6 +39,14 @@ public:
     enum class InitialDirectionMode {
         Sideways,
         ZInOut,
+    };
+    enum class ReoptimizationMode {
+        AutoReoptimize,
+        NoOptimization,
+    };
+    enum class ShiftScrollMode {
+        AlongLine,
+        StraightNormal,
     };
     using GeneratedControlPointContextResult =
         vc3d::line_annotation::GeneratedControlPointContextResult;
@@ -69,6 +78,10 @@ public:
         const QPoint& globalPos);
     const std::vector<Pane>& panes() const { return _panes; }
     InitialDirectionMode initialDirectionMode() const;
+    ReoptimizationMode reoptimizationMode() const;
+    ShiftScrollMode shiftScrollMode() const;
+    void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
+    void setOptimizationBusy(bool busy);
 
 signals:
     void paneClosed(const std::string& surfaceName);
@@ -81,9 +94,11 @@ signals:
                                               cv::Vec3f volumePoint);
     void showAsMeshRequested();
     void fullOptimizationRequested();
+    void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
@@ -105,6 +120,7 @@ private:
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
+    bool shiftCurrentCutPlaneStraightByScrollSteps(int steps);
     bool shiftBottomSlicesByScrollSteps(int steps);
     bool scaleBottomSliceLineStepByScrollSteps(int steps);
     bool handleBottomSliceStepWheel(QWheelEvent* event);
@@ -143,15 +159,19 @@ private:
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
     void renderBottomSlicePlanes(const char* reason);
+    void updateOptimizationOverlayGeometry();
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _initialDirectionCombo = nullptr;
+    QComboBox* _reoptimizationCombo = nullptr;
+    QComboBox* _shiftScrollCombo = nullptr;
     QLabel* _sliceStepLabel = nullptr;
     QLabel* _bottomSliceStepLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
     QPushButton* _fullOptimizationButton = nullptr;
     QPushButton* _resetViewsButton = nullptr;
+    QPointer<QWidget> _optimizationOverlay;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
@@ -174,6 +194,7 @@ private:
     bool _currentCutFollowsStripMouse = true;
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
+    bool _currentCutStraightOffsetActive = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     bool _haveInitialCurrentCutCamera = false;
