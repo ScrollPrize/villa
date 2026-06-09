@@ -32,11 +32,11 @@ from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
 # PHercParis4
-dataset_path = '/home/paul/projects/vesuvius-scrolls/spiral/dataset'
+dataset_path = '/ephemeral/paul/spiral/dataset'
 scroll_zarr_path = None
 normal_nx_zarr_path = f'{dataset_path}/normals/las_008_nx.ome.zarr'
 normal_ny_zarr_path = f'{dataset_path}/normals/las_008_ny.ome.zarr'
-grad_mag_zarr_path = None
+grad_mag_zarr_path = '/ephemeral/paul/spiral/las_008_grad_mag.ome.zarr'
 normal_zarr_group = '4'
 pcl_json_paths = [
     f'{dataset_path}/rel_windings_new_reordered.json',
@@ -45,11 +45,11 @@ pcl_json_paths = [
 patches_path = f'{dataset_path}/patches'
 unverified_patches_path = None
 shell_path = f'{dataset_path}/s1_2um_outer'
-tracks_dbm_path = None
+tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 10_000, 13_000
+z_begin, z_end = 7000, 16500
 voxel_size_um = 2.4 * 4  # before downsampling
 
 # # PHerc0172
@@ -2895,6 +2895,29 @@ def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks
     )
 
 
+def get_track_satisfied_counts_in_chunks(slice_to_spiral_transform, dr_per_winding, tracks, chunk_size=500_000):
+    # Memory-safe wrapper around get_track_satisfied_counts for very large track
+    # sets (the full z-range has tens of millions of tracks, whose flat point
+    # tensors do not fit in GPU memory at once). Every per-track quantity
+    # (winding-mode, unwrap, satisfaction) is independent across tracks, so
+    # splitting the track list into contiguous chunks of whole tracks and
+    # concatenating the per-track results yields identical satisfied/total
+    # counts to a single pass. Returns only the two tensors the metric needs:
+    # (satisfied_counts, total_counts), each 1-D int64 over the valid tracks.
+    sat_parts, tot_parts = [], []
+    for start in range(0, len(tracks), chunk_size):
+        chunk = tracks[start:start + chunk_size]
+        _, sat, tot, _, _ = get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, chunk)
+        sat_parts.append(sat)
+        tot_parts.append(tot)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    if not sat_parts:
+        empty = torch.zeros(0, dtype=torch.int64)
+        return empty, empty
+    return torch.cat(sat_parts), torch.cat(tot_parts)
+
+
 def get_partially_supported_tracks(
     slice_to_spiral_transform, dr_per_winding, tracks,
     lower_fraction=0.5, upper_fraction=0.95,
@@ -4486,18 +4509,30 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             satisfied_point_ratio = satisfied_points / max(total_points, 1)
             print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
         if tracks:
-            _, track_satisfied_counts, track_total_counts, _, _ = get_track_satisfied_counts(
-                slice_to_spiral_transform, dr_per_winding, tracks,
-            )
-            track_fully_satisfied = (track_satisfied_counts == track_total_counts)
-            fully_satisfied_tracks = int(track_fully_satisfied.sum().item())
-            num_valid_tracks = int(track_total_counts.numel())
-            fully_satisfied_track_ratio = fully_satisfied_tracks / max(num_valid_tracks, 1)
-            print(f'satisfied_tracks = {fully_satisfied_tracks}/{num_valid_tracks} ({fully_satisfied_track_ratio * 100:.1f}%)')
-            track_satisfied_points = int(track_satisfied_counts.sum().item())
-            track_total_points = int(track_total_counts.sum().item())
-            track_satisfied_point_ratio = track_satisfied_points / max(track_total_points, 1)
-            print(f'satisfied_track_points = {track_satisfied_points}/{track_total_points} ({track_satisfied_point_ratio * 100:.1f}%)')
+            # Free the patch/pcl eval tensors before the (much larger) track eval,
+            # and chunk the track eval so the full track set does not have to be
+            # materialised on the GPU at once. Guard against OOM so that a failure
+            # to compute the secondary track metric never prevents the mesh/overlay
+            # from being saved.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                track_satisfied_counts, track_total_counts = get_track_satisfied_counts_in_chunks(
+                    slice_to_spiral_transform, dr_per_winding, tracks,
+                )
+                track_fully_satisfied = (track_satisfied_counts == track_total_counts)
+                fully_satisfied_tracks = int(track_fully_satisfied.sum().item())
+                num_valid_tracks = int(track_total_counts.numel())
+                fully_satisfied_track_ratio = fully_satisfied_tracks / max(num_valid_tracks, 1)
+                print(f'satisfied_tracks = {fully_satisfied_tracks}/{num_valid_tracks} ({fully_satisfied_track_ratio * 100:.1f}%)')
+                track_satisfied_points = int(track_satisfied_counts.sum().item())
+                track_total_points = int(track_total_counts.sum().item())
+                track_satisfied_point_ratio = track_satisfied_points / max(track_total_points, 1)
+                print(f'satisfied_track_points = {track_satisfied_points}/{track_total_points} ({track_satisfied_point_ratio * 100:.1f}%)')
+            except torch.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print('WARNING: skipped satisfied_tracks metric (CUDA OOM during track evaluation)')
         # Unverified patches are reported entirely separately so they never inflate the verified
         # satisfaction numbers.
         unverified_patch_satisfaction_entries = []
