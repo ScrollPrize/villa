@@ -10,7 +10,7 @@ import PrizeCard from '@site/src/components/PrizeCard';
 
   <meta
     name="description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
   />
 
   <meta property="og:type" content="website" />
@@ -18,7 +18,7 @@ import PrizeCard from '@site/src/components/PrizeCard';
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
   />
   <meta
     property="og:image"
@@ -30,7 +30,7 @@ import PrizeCard from '@site/src/components/PrizeCard';
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
   />
   <meta
     property="twitter:image"
@@ -38,9 +38,25 @@ import PrizeCard from '@site/src/components/PrizeCard';
   />
 </head>
 
-Vesuvius Challenge has awarded **\$1,781,500** in prizes!
+Vesuvius Challenge has awarded **\$1,793,500** in prizes!
 
 This page lists all the prizes awarded so far:
+
+### \$12,000 Progress Prizes (May, 2026)
+
+**Goal:** Improve the tools and training methods needed to read the scrolls.<br/>
+**Announcement:** <a href="https://scrollprize.substack.com/p/the-hard-parts-are-getting-clearer">Blog post</a>
+
+<div className="flex flex-row flex-wrap">
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/Hob3rMallow/scrollfiesta_public">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$10,000</div><span className="font-bold">Scroll Fiesta</span>: Ben Kyles</div>
+    <div className="text-sm text-gray-300">An automatic mesher of surface predictions that attempts to fix topological mistakes.</div>
+  </a>
+  <a className="max-w-[200px] mr-4 mb-4 text-gray-100 bg-[#444] hover:bg-[#555] hover:text-[unset] p-4 rounded-lg flex flex-col justify-between" href="https://github.com/ScrollPrize/villa/tree/main/vesuvius">
+    <div className="mb-4"><div className="text-sm font-bold text-gray-300">\$2,000</div><span className="font-bold">3D augmentations</span>: Paulo Sergio Camillo</div>
+    <div className="text-sm text-gray-300">Scroll Decohesion, Realistic Warp, and Squeeze transforms for training ML models on CT scans.</div>
+  </a>
+</div>
 
 ### \$200,000 Kaggle Surface Detection (March, 2026) {#surface-detection-kaggle-winners}
 

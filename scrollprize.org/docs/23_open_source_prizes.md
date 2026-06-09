@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,793,500 awarded in prizes"
   />
   <meta
     property="twitter:image"
