@@ -223,6 +223,37 @@ def get_env_config_overrides():
     return overrides
 
 
+# The per-step object-sample counts above are tuned for the z 7000-16500 range
+# (~9500 un-downsampled slices). For a smaller/larger z-range each loss term sees
+# proportionally fewer/more objects, so scale_counts_for_z_range() scales these
+# counts linearly with the number of slices (points-PER-object stays fixed).
+reference_z_range_num_slices = 9500
+z_range_scaled_count_keys = (
+    'num_patches_per_step',
+    'num_patches_per_step_for_dt',
+    'unverified_num_patches_per_step',
+    'unverified_num_patches_per_step_for_dt',
+    'winding_number_num_pcls',
+    'unattached_pcl_num_per_step',
+    'track_num_per_step',
+    'normals_num_points',
+    'pcl_normals_num_points',
+    'dense_normals_num_points',
+    'regularisation_num_points',
+    'shell_num_samples',
+)
+
+
+def scale_counts_for_z_range(config):
+    # z_begin/z_end have already been divided by downsample_factor; multiply back so
+    # the scale is expressed in (and matches) un-downsampled slice counts.
+    num_slices = (z_end - z_begin) * downsample_factor
+    scale = num_slices / reference_z_range_num_slices
+    for key in z_range_scaled_count_keys:
+        config[key] = max(1, round(config[key] * scale))
+    return scale, num_slices
+
+
 def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False):
 
     # Note this is not differentiable wrt dr_per_winding nor inter_point_spacing!
@@ -5313,6 +5344,13 @@ def main():
 if __name__ == '__main__':
     config = dict(default_config)
     config.update(get_env_config_overrides())
+    z_range_scale, z_range_num_slices = scale_counts_for_z_range(config)
+    print(
+        f'scaled per-step counts by {z_range_scale:.3f} for the {z_range_num_slices}-slice '
+        f'z-range [{z_begin * downsample_factor}, {z_end * downsample_factor}) '
+        f'(reference {reference_z_range_num_slices} slices):\n  '
+        + '\n  '.join(f'{k}={config[k]}' for k in z_range_scaled_count_keys)
+    )
     wandb.init(project='scrolls', config=config)
     cfg = wandb.config
     main()
