@@ -136,6 +136,7 @@ private:
     void createAtlasWorkspace();
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
     void refreshAtlasOverviewDocks();
+    void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
     void startAtlasFiberIntersectionSearch();
     void cancelAtlasFiberIntersectionSearch();
@@ -265,6 +266,7 @@ private:
     QDockWidget* _atlasSearchDock{nullptr};
     AtlasControlPointsDock* _atlasControlDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
+    QDockWidget* _atlasWorkspaceFiberDock{nullptr};
     QDockWidget* _atlasWorkspaceSearchDock{nullptr};
     VolumeViewerBase* _atlasViewer{nullptr};
     std::optional<std::filesystem::path> _currentAtlasDir;

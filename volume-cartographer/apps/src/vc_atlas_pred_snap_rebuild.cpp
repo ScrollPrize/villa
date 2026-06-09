@@ -1,3 +1,5 @@
+#include "../VC3D/FiberSliceGeometry.hpp"
+
 #include "vc/atlas/Atlas.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -21,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -222,11 +225,36 @@ vc::atlas::FiberInput fiberInputFromMapping(const vc::atlas::FiberMapping& mappi
 {
     vc::atlas::FiberInput input;
     input.fiberPath = mapping.fiberPath;
-    input.controlPoints.reserve(mapping.controlAnchors.size());
-    input.controlLineIndices.reserve(mapping.controlAnchors.size());
+    std::vector<const vc::atlas::AtlasAnchor*> lineAnchors;
+    lineAnchors.reserve(mapping.lineAnchors.size());
+    for (const auto& anchor : mapping.lineAnchors) {
+        lineAnchors.push_back(&anchor);
+    }
+    std::sort(lineAnchors.begin(),
+              lineAnchors.end(),
+              [](const vc::atlas::AtlasAnchor* a, const vc::atlas::AtlasAnchor* b) {
+                  return a->sourceIndex < b->sourceIndex;
+              });
+    input.linePoints.reserve(lineAnchors.size());
+    for (const auto* anchor : lineAnchors) {
+        input.linePoints.push_back(anchor->world);
+    }
+
+    std::vector<const vc::atlas::AtlasAnchor*> controlAnchors;
+    controlAnchors.reserve(mapping.controlAnchors.size());
     for (const auto& anchor : mapping.controlAnchors) {
-        input.controlPoints.push_back(anchor.world);
-        input.controlLineIndices.push_back(anchor.sourceIndex);
+        controlAnchors.push_back(&anchor);
+    }
+    std::sort(controlAnchors.begin(),
+              controlAnchors.end(),
+              [](const vc::atlas::AtlasAnchor* a, const vc::atlas::AtlasAnchor* b) {
+                  return a->sourceIndex < b->sourceIndex;
+              });
+    input.controlPoints.reserve(controlAnchors.size());
+    input.controlLineIndices.reserve(controlAnchors.size());
+    for (const auto* anchor : controlAnchors) {
+        input.controlPoints.push_back(anchor->world);
+        input.controlLineIndices.push_back(anchor->sourceIndex);
     }
     return input;
 }
@@ -466,6 +494,336 @@ void saveControlDebugImage(const fs::path& outputPath,
     }
 }
 
+struct FiberSliceDebugAxes {
+    cv::Vec3d origin{0.0, 0.0, 0.0};
+    cv::Vec3d normal{0.0, 0.0, 1.0};
+    cv::Vec3d horizontal{1.0, 0.0, 0.0};
+    cv::Vec3d up{0.0, 1.0, 0.0};
+};
+
+struct FiberSliceDebugPoint {
+    double u = 0.0;
+    double v = 0.0;
+};
+
+struct FiberSliceDebugBounds {
+    bool valid = false;
+    double minU = 0.0;
+    double maxU = 0.0;
+    double minV = 0.0;
+    double maxV = 0.0;
+
+    void add(const FiberSliceDebugPoint& point)
+    {
+        if (!std::isfinite(point.u) || !std::isfinite(point.v)) {
+            return;
+        }
+        if (!valid) {
+            minU = maxU = point.u;
+            minV = maxV = point.v;
+            valid = true;
+            return;
+        }
+        minU = std::min(minU, point.u);
+        maxU = std::max(maxU, point.u);
+        minV = std::min(minV, point.v);
+        maxV = std::max(maxV, point.v);
+    }
+};
+
+std::optional<FiberSliceDebugAxes> fittedFiberSliceAxes(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<cv::Vec3d>& controlPoints)
+{
+    namespace fslice = vc3d::fiber_slice;
+
+    const fslice::ControlSpanSelection span =
+        fslice::selectControlSpan(linePoints, controlPoints);
+    if (!span.valid) {
+        return std::nullopt;
+    }
+    const fslice::PlaneFit fit = fslice::fitLeastSquaresPlane(span, linePoints);
+    if (!fit.valid) {
+        return std::nullopt;
+    }
+
+    const cv::Vec3d up = normalizedOrZero(fit.upHint);
+    const cv::Vec3d normal = normalizedOrZero(fit.normal);
+    const cv::Vec3d horizontal = normalizedOrZero(up.cross(normal));
+    if (!validNormal(up) || !validNormal(normal) || !validNormal(horizontal)) {
+        return std::nullopt;
+    }
+
+    return FiberSliceDebugAxes{fit.origin, normal, horizontal, up};
+}
+
+std::optional<FiberSliceDebugPoint> projectToFiberSliceDebug(
+    const cv::Vec3d& point,
+    const FiberSliceDebugAxes& axes)
+{
+    if (!finitePoint(point)) {
+        return std::nullopt;
+    }
+    const vc3d::fiber_slice::Plane plane{axes.origin, axes.normal};
+    const cv::Vec3d projected = vc3d::fiber_slice::projectPointToPlane(point, plane);
+    const cv::Vec3d delta = projected - axes.origin;
+    return FiberSliceDebugPoint{delta.dot(axes.horizontal), delta.dot(axes.up)};
+}
+
+struct FiberSliceDebugOverlay {
+    FiberSliceDebugPoint control;
+    std::optional<FiberSliceDebugPoint> outward;
+    std::optional<FiberSliceDebugPoint> inward;
+    std::optional<FiberSliceDebugPoint> snap;
+};
+
+void saveFiberSliceFitDebugImage(const fs::path& outputPath,
+                                 const vc::atlas::FiberInput& input,
+                                 const vc::atlas::FiberMapping& mapping,
+                                 const QuadSurface& baseSurface,
+                                 const vc::lasagna::LasagnaNormalSampler& sampler,
+                                 const vc::atlas::AtlasPredSnapSet& generated,
+                                 double predDtStepVx)
+{
+    const auto axes = fittedFiberSliceAxes(input.linePoints, input.controlPoints);
+    if (!axes) {
+        return;
+    }
+
+    std::vector<std::optional<FiberSliceDebugPoint>> linePoints;
+    linePoints.reserve(input.linePoints.size());
+    FiberSliceDebugBounds bounds;
+    for (const cv::Vec3d& point : input.linePoints) {
+        std::optional<FiberSliceDebugPoint> projected =
+            projectToFiberSliceDebug(point, *axes);
+        if (projected) {
+            bounds.add(*projected);
+        }
+        linePoints.push_back(projected);
+    }
+
+    std::vector<FiberSliceDebugOverlay> overlays;
+    overlays.reserve(input.controlPoints.size());
+    for (size_t controlIndex = 0; controlIndex < input.controlPoints.size(); ++controlIndex) {
+        const cv::Vec3d& controlPoint = input.controlPoints[controlIndex];
+        const auto controlProjected = projectToFiberSliceDebug(controlPoint, *axes);
+        if (!controlProjected) {
+            continue;
+        }
+        bounds.add(*controlProjected);
+
+        FiberSliceDebugOverlay overlay;
+        overlay.control = *controlProjected;
+
+        const int sourceIndex = controlIndex < input.controlLineIndices.size()
+            ? input.controlLineIndices[controlIndex]
+            : static_cast<int>(controlIndex);
+        const vc::atlas::AtlasAnchor* anchor = findControlAnchor(mapping, sourceIndex);
+        if (anchor) {
+            const auto baseNormal = vc::atlas::atlasAnchorBaseNormal(*anchor, mapping, baseSurface);
+            const auto normalSample = sampler.sampleNormal(controlPoint);
+            if (baseNormal && normalSample.valid && validNormal(normalSample.normal)) {
+                cv::Vec3d alignedNormal = normalizedOrZero(normalSample.normal);
+                if (alignedNormal.dot(*baseNormal) < 0.0) {
+                    alignedNormal *= -1.0;
+                }
+                const TraceStats outward = traceDirection(controlPoint,
+                                                          alignedNormal,
+                                                          predDtStepVx,
+                                                          kOutwardWindingLimit,
+                                                          sampler,
+                                                          false,
+                                                          "outward");
+                const TraceStats inward = traceDirection(controlPoint,
+                                                         -alignedNormal,
+                                                         predDtStepVx,
+                                                         kInwardWindingLimit,
+                                                         sampler,
+                                                         false,
+                                                         "inward");
+                if (outward.lastPoint) {
+                    overlay.outward = projectToFiberSliceDebug(*outward.lastPoint, *axes);
+                    if (overlay.outward) {
+                        bounds.add(*overlay.outward);
+                    }
+                }
+                if (inward.lastPoint) {
+                    overlay.inward = projectToFiberSliceDebug(*inward.lastPoint, *axes);
+                    if (overlay.inward) {
+                        bounds.add(*overlay.inward);
+                    }
+                }
+            }
+        }
+
+        const auto* result = generatedPointForControl(generated, controlPoint);
+        if (result && result->predSnapPoint) {
+            overlay.snap = projectToFiberSliceDebug(*result->predSnapPoint, *axes);
+            if (overlay.snap) {
+                bounds.add(*overlay.snap);
+            }
+        }
+        overlays.push_back(std::move(overlay));
+    }
+
+    if (!bounds.valid) {
+        return;
+    }
+
+    constexpr int kPaddingPx = 96;
+    const double spanU = std::max(bounds.maxU - bounds.minU, 1.0);
+    const double spanV = std::max(bounds.maxV - bounds.minV, 1.0);
+    const double predDtSpacingVx = predDtStepVx * 2.0;
+    if (!std::isfinite(predDtSpacingVx) || predDtSpacingVx <= 0.0) {
+        return;
+    }
+    const double scale = 1.0 / predDtSpacingVx;
+
+    const double imageWidthDouble = std::ceil(spanU * scale) + 2.0 * kPaddingPx;
+    const double imageHeightDouble = std::ceil(spanV * scale) + 2.0 * kPaddingPx;
+    if (!std::isfinite(imageWidthDouble) || !std::isfinite(imageHeightDouble) ||
+        imageWidthDouble <= 0.0 || imageHeightDouble <= 0.0 ||
+        imageWidthDouble > static_cast<double>(std::numeric_limits<int>::max()) ||
+        imageHeightDouble > static_cast<double>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("fiber slice debug image dimensions are not representable for " +
+                                 outputPath.string());
+    }
+    const int imageWidth = static_cast<int>(imageWidthDouble);
+    const int imageHeight = static_cast<int>(imageHeightDouble);
+    const double centerU = 0.5 * (bounds.minU + bounds.maxU);
+    const double centerV = 0.5 * (bounds.minV + bounds.maxV);
+
+    auto toImagePoint = [&](const FiberSliceDebugPoint& point) {
+        const double x = static_cast<double>(imageWidth) * 0.5 + (point.u - centerU) * scale;
+        const double y = static_cast<double>(imageHeight) * 0.5 - (point.v - centerV) * scale;
+        return cv::Point2d{x, y};
+    };
+
+    cv::Mat image(imageHeight, imageWidth, CV_8UC3, cv::Scalar(0, 0, 0));
+    constexpr int kSubpixelShift = 4;
+    constexpr int kSubpixelScale = 1 << kSubpixelShift;
+    auto toSubpixelPoint = [](const cv::Point2d& point) {
+        return cv::Point{
+            static_cast<int>(std::lround(point.x * static_cast<double>(kSubpixelScale))),
+            static_cast<int>(std::lround(point.y * static_cast<double>(kSubpixelScale)))};
+    };
+
+    auto drawImageLine = [&](const cv::Point2d& a,
+                             const cv::Point2d& b,
+                             const cv::Scalar& color,
+                             int thickness) {
+        if (!std::isfinite(a.x) || !std::isfinite(a.y) ||
+            !std::isfinite(b.x) || !std::isfinite(b.y)) {
+            return;
+        }
+        cv::line(image,
+                 toSubpixelPoint(a),
+                 toSubpixelPoint(b),
+                 color,
+                 thickness,
+                 cv::LINE_AA,
+                 kSubpixelShift);
+    };
+    auto drawLine = [&](const FiberSliceDebugPoint& a,
+                        const FiberSliceDebugPoint& b,
+                        const cv::Scalar& color,
+                        int thickness) {
+        drawImageLine(toImagePoint(a), toImagePoint(b), color, thickness);
+    };
+    auto drawSearchVector = [&](const FiberSliceDebugPoint& a,
+                                const FiberSliceDebugPoint& b,
+                                const cv::Scalar& color) {
+        constexpr double kSearchVectorDisplayScale = 4.0;
+        const cv::Point2d pa = toImagePoint(a);
+        const cv::Point2d pb = toImagePoint(b);
+        const cv::Point2d delta{pb.x - pa.x, pb.y - pa.y};
+        const cv::Point2d displayEnd{
+            pa.x + delta.x * kSearchVectorDisplayScale,
+            pa.y + delta.y * kSearchVectorDisplayScale};
+        drawImageLine(pa, displayEnd, color, 1);
+
+        if (pb.x >= -2.0 && pb.x < static_cast<double>(imageWidth) + 2.0 &&
+            pb.y >= -2.0 && pb.y < static_cast<double>(imageHeight) + 2.0) {
+            cv::circle(image,
+                       toSubpixelPoint(pb),
+                       2 * kSubpixelScale,
+                       color,
+                       -1,
+                       cv::LINE_AA,
+                       kSubpixelShift);
+        }
+    };
+    auto drawCircle = [&](const FiberSliceDebugPoint& point,
+                          int radius,
+                          const cv::Scalar& color) {
+        const cv::Point2d p = toImagePoint(point);
+        if (p.x < -static_cast<double>(radius) ||
+            p.x >= static_cast<double>(imageWidth + radius) ||
+            p.y < -static_cast<double>(radius) ||
+            p.y >= static_cast<double>(imageHeight + radius)) {
+            return;
+        }
+        cv::circle(image,
+                   toSubpixelPoint(p),
+                   radius * kSubpixelScale,
+                   color,
+                   -1,
+                   cv::LINE_AA,
+                   kSubpixelShift);
+    };
+    auto drawCross = [&](const FiberSliceDebugPoint& point,
+                         int radius,
+                         const cv::Scalar& color) {
+        const cv::Point2d p = toImagePoint(point);
+        if (p.x < -static_cast<double>(radius) ||
+            p.x >= static_cast<double>(imageWidth + radius) ||
+            p.y < -static_cast<double>(radius) ||
+            p.y >= static_cast<double>(imageHeight + radius)) {
+            return;
+        }
+        drawImageLine({p.x - static_cast<double>(radius), p.y - static_cast<double>(radius)},
+                      {p.x + static_cast<double>(radius), p.y + static_cast<double>(radius)},
+                      color,
+                      1);
+        drawImageLine({p.x - static_cast<double>(radius), p.y + static_cast<double>(radius)},
+                      {p.x + static_cast<double>(radius), p.y - static_cast<double>(radius)},
+                      color,
+                      1);
+    };
+
+    std::optional<FiberSliceDebugPoint> previousLinePoint;
+    for (const auto& point : linePoints) {
+        if (!point) {
+            previousLinePoint.reset();
+            continue;
+        }
+        if (previousLinePoint) {
+            drawLine(*previousLinePoint, *point, cv::Scalar(190, 190, 190), 1);
+        }
+        previousLinePoint = point;
+    }
+
+    for (const FiberSliceDebugOverlay& overlay : overlays) {
+        if (overlay.outward) {
+            drawSearchVector(overlay.control, *overlay.outward, cv::Scalar(0, 0, 255));
+        }
+        if (overlay.inward) {
+            drawSearchVector(overlay.control, *overlay.inward, cv::Scalar(255, 255, 0));
+        }
+    }
+    for (const FiberSliceDebugOverlay& overlay : overlays) {
+        if (overlay.snap) {
+            drawCross(*overlay.snap, 7, cv::Scalar(0, 165, 255));
+        }
+        drawCircle(overlay.control, 3, cv::Scalar(0, 255, 0));
+    }
+
+    fs::create_directories(outputPath.parent_path());
+    if (!cv::imwrite(outputPath.string(), image)) {
+        throw std::runtime_error("failed to write debug image: " + outputPath.string());
+    }
+}
+
 void printControlDebug(const vc::atlas::FiberInput& input,
                        const vc::atlas::FiberMapping& mapping,
                        const QuadSurface& baseSurface,
@@ -573,6 +931,14 @@ void saveFiberDebugImages(const fs::path& debugImagesDir,
                           double predDtStepVx)
 {
     const fs::path fiberDir = debugImagesDir / safeDebugName(mapping.fiberPath);
+    saveFiberSliceFitDebugImage(fiberDir / "fiber_slice_fit.tif",
+                                input,
+                                mapping,
+                                baseSurface,
+                                sampler,
+                                generated,
+                                predDtStepVx);
+
     for (size_t controlIndex = 0; controlIndex < input.controlPoints.size(); ++controlIndex) {
         const cv::Vec3d& controlPoint = input.controlPoints[controlIndex];
         const int sourceIndex = controlIndex < input.controlLineIndices.size()
@@ -611,7 +977,7 @@ void saveFiberDebugImages(const fs::path& debugImagesDir,
                                                  "inward");
 
         std::ostringstream filename;
-        filename << "cp_" << std::setw(6) << std::setfill('0') << controlIndex << ".png";
+        filename << "cp_" << std::setw(6) << std::setfill('0') << controlIndex << ".tif";
         saveControlDebugImage(fiberDir / filename.str(),
                               controlPoint,
                               alignedNormal,

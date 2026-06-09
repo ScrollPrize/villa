@@ -578,6 +578,45 @@ QDockWidget* createAtlasOverviewDock(QWidget* parent)
     return dock;
 }
 
+QDockWidget* createAtlasFiberDock(QWidget* parent)
+{
+    auto* dock = new QDockWidget(QObject::tr("Atlas Fibers"), parent);
+    auto* content = new QWidget(dock);
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(6);
+
+    auto* current = new QLabel(QObject::tr("No atlas selected"), content);
+    current->setObjectName(QStringLiteral("atlasFiberCurrentLabel"));
+    current->setWordWrap(true);
+    layout->addWidget(current);
+
+    auto* table = new QTableWidget(content);
+    table->setObjectName(QStringLiteral("atlasFiberTable"));
+    table->setColumnCount(4);
+    table->setHorizontalHeaderLabels({
+        QObject::tr("Fiber"),
+        QObject::tr("Controls"),
+        QObject::tr("Pred snaps"),
+        QObject::tr("Saved fiber"),
+    });
+    table->setAlternatingRowColors(true);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSortingEnabled(true);
+    table->verticalHeader()->setVisible(false);
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    layout->addWidget(table, 1);
+
+    dock->setWidget(content);
+    return dock;
+}
+
 QDockWidget* createAtlasSearchDock(QWidget* parent)
 {
     auto* dock = new QDockWidget(QObject::tr("Atlas Object Search"), parent);
@@ -894,6 +933,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 _fiberIntersectionIndex.clear();
                 _fiberIntersectionCache.clear();
                 refreshAtlasOverviewDocks();
+                updateAtlasFiberDocks();
                 updateAtlasSearchDocks();
                 if (!pkg) return;
                 pkg->setSegmentsChangedCallback(
@@ -2397,6 +2437,10 @@ void CWindow::createAtlasWorkspace()
     _atlasWorkspaceOverviewDock->setObjectName(QStringLiteral("dockWidgetAtlasOverviewAtlas"));
     _atlasWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasWorkspaceOverviewDock);
 
+    _atlasWorkspaceFiberDock = createAtlasFiberDock(this);
+    _atlasWorkspaceFiberDock->setObjectName(QStringLiteral("dockWidgetAtlasFibersAtlas"));
+    _atlasWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasWorkspaceFiberDock);
+
     _atlasWorkspaceSearchDock = createAtlasSearchDock(this);
     _atlasWorkspaceSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearchAtlas"));
     _atlasWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasWorkspaceSearchDock);
@@ -2435,6 +2479,38 @@ void CWindow::createAtlasWorkspace()
     };
     connectOverview(_atlasOverviewDock);
     connectOverview(_atlasWorkspaceOverviewDock);
+
+    if (_atlasWorkspaceFiberDock && _atlasWorkspaceFiberDock->widget()) {
+        if (auto* table = _atlasWorkspaceFiberDock->widget()->findChild<QTableWidget*>(QStringLiteral("atlasFiberTable"))) {
+            auto openFromItem = [this, table](QTableWidgetItem* item) {
+                if (!item || !_lineAnnotationController) {
+                    return;
+                }
+                bool ok = false;
+                const uint64_t fiberId = item->data(Qt::UserRole).toULongLong(&ok);
+                if (!ok || fiberId == 0) {
+                    return;
+                }
+                if (_fiberWidget) {
+                    _fiberWidget->selectFiber(fiberId);
+                }
+                if (_fiberSliceWidget) {
+                    _fiberSliceWidget->selectFiber(fiberId);
+                }
+                _lineAnnotationController->openFiber(fiberId);
+            };
+            connect(table,
+                    &QTableWidget::cellDoubleClicked,
+                    this,
+                    [table, openFromItem](int row, int /*column*/) {
+                        openFromItem(table->item(row, 0));
+                    });
+            connect(table,
+                    &QTableWidget::itemDoubleClicked,
+                    this,
+                    openFromItem);
+        }
+    }
 
     auto connectSearchDock = [this](QDockWidget* dock) {
         if (!dock || !dock->widget()) {
@@ -2509,6 +2585,7 @@ void CWindow::createAtlasWorkspace()
     connectSearchDock(_atlasSearchDock);
     connectSearchDock(_atlasWorkspaceSearchDock);
     refreshAtlasOverviewDocks();
+    updateAtlasFiberDocks();
     updateAtlasSearchDocks();
 }
 
@@ -2566,6 +2643,115 @@ void CWindow::refreshAtlasOverviewDocks()
 
     populate(_atlasOverviewDock);
     populate(_atlasWorkspaceOverviewDock);
+}
+
+void CWindow::updateAtlasFiberDocks()
+{
+    if (!_atlasWorkspaceFiberDock || !_atlasWorkspaceFiberDock->widget()) {
+        return;
+    }
+
+    auto* label = _atlasWorkspaceFiberDock->widget()->findChild<QLabel*>(QStringLiteral("atlasFiberCurrentLabel"));
+    auto* table = _atlasWorkspaceFiberDock->widget()->findChild<QTableWidget*>(QStringLiteral("atlasFiberTable"));
+    if (!table) {
+        return;
+    }
+
+    table->setSortingEnabled(false);
+    table->setRowCount(0);
+
+    if (!_currentAtlasDir) {
+        if (label) {
+            label->setText(tr("No atlas selected"));
+        }
+        table->setSortingEnabled(true);
+        return;
+    }
+
+    vc::atlas::Atlas atlas;
+    try {
+        auto vpkg = _state ? _state->vpkg() : nullptr;
+        std::filesystem::path volpkgRoot;
+        if (vpkg) {
+            volpkgRoot = vpkg->path().empty()
+                ? std::filesystem::path(vpkg->getVolpkgDirectory())
+                : vpkg->path().parent_path();
+        }
+        atlas = volpkgRoot.empty()
+            ? vc::atlas::Atlas::load(*_currentAtlasDir)
+            : vc::atlas::Atlas::load(*_currentAtlasDir, volpkgRoot);
+    } catch (const std::exception& ex) {
+        if (label) {
+            label->setText(tr("Atlas: %1 (could not load: %2)")
+                .arg(QString::fromStdString(_currentAtlasName.empty()
+                         ? _currentAtlasDir->filename().string()
+                         : _currentAtlasName),
+                     QString::fromStdString(ex.what())));
+        }
+        table->setSortingEnabled(true);
+        return;
+    }
+
+    if (label) {
+        label->setText(tr("Atlas: %1 (%2 mapped fibers)")
+            .arg(QString::fromStdString(atlas.metadata.name.empty()
+                     ? _currentAtlasDir->filename().string()
+                     : atlas.metadata.name))
+            .arg(static_cast<int>(atlas.fibers.size())));
+    }
+
+    table->setRowCount(static_cast<int>(atlas.fibers.size()));
+    int row = 0;
+    for (const auto& mapping : atlas.fibers) {
+        const std::optional<uint64_t> matchedFiberId = _lineAnnotationController
+            ? _lineAnnotationController->fiberIdForAtlasPath(mapping.fiberPath)
+            : std::nullopt;
+        const uint64_t fiberId = matchedFiberId.value_or(0);
+
+        int snapTotal = 0;
+        int snapFound = 0;
+        try {
+            const auto predSnapSet = vc::atlas::loadAtlasPredSnapSet(
+                vc::atlas::atlasPredSnapAttachmentPath(*_currentAtlasDir, mapping.fiberPath));
+            snapTotal = static_cast<int>(predSnapSet.points.size());
+            snapFound = static_cast<int>(std::count_if(predSnapSet.points.begin(),
+                                                       predSnapSet.points.end(),
+                                                       [](const vc::atlas::AtlasPredSnapPoint& point) {
+                                                           return point.predSnapPoint.has_value();
+                                                       }));
+        } catch (const std::exception&) {
+            snapTotal = -1;
+            snapFound = -1;
+        }
+
+        const std::filesystem::path fiberNamePath = mapping.fiberPath.filename();
+        const std::string fiberLabel = fiberNamePath.empty()
+            ? mapping.fiberPath.generic_string()
+            : fiberNamePath.string();
+        auto* pathItem = new QTableWidgetItem(QString::fromStdString(fiberLabel));
+        pathItem->setToolTip(QString::fromStdString(mapping.fiberPath.generic_string()));
+        pathItem->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(fiberId));
+        auto* controlsItem = numericItem(static_cast<double>(mapping.controlAnchors.size()), 0);
+        controlsItem->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(fiberId));
+        auto* snapsItem = new QTableWidgetItem(
+            snapTotal < 0
+                ? tr("missing")
+                : tr("%1/%2").arg(snapFound).arg(snapTotal));
+        snapsItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        snapsItem->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(fiberId));
+        auto* savedItem = new QTableWidgetItem(
+            fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
+        savedItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        savedItem->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(fiberId));
+
+        table->setItem(row, 0, pathItem);
+        table->setItem(row, 1, controlsItem);
+        table->setItem(row, 2, snapsItem);
+        table->setItem(row, 3, savedItem);
+        ++row;
+    }
+
+    table->setSortingEnabled(true);
 }
 
 void CWindow::updateAtlasSearchDocks()
@@ -3356,6 +3542,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
             }
         }
         refreshAtlasOverviewDocks();
+        updateAtlasFiberDocks();
         updateAtlasSearchDocks();
         if (_workspaceTabs && _atlasWorkspaceWindow) {
             _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
@@ -4042,6 +4229,7 @@ void CWindow::CreateWidgets(void)
             if (_fiberSliceWidget) {
                 _fiberSliceWidget->setFibers(entries);
             }
+            updateAtlasFiberDocks();
         };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
             if (!widget || !_lineAnnotationController) {

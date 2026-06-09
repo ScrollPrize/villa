@@ -1093,18 +1093,8 @@ void LineAnnotationController::openFiber(uint64_t fiberId)
         session->focusedLinePosition =
             session->controlPoints[static_cast<size_t>(seedControl)].linePosition;
     }
-    if (_currentAtlasDir && !it->fileName.empty()) {
-        session->atlasDir = *_currentAtlasDir;
-        session->atlasFiberPath = fs::path("fibers") / it->fileName;
-        try {
-            session->predSnapSet = vc::atlas::loadAtlasPredSnapSet(
-                vc::atlas::atlasPredSnapAttachmentPath(*session->atlasDir,
-                                                       session->atlasFiberPath));
-        } catch (const std::exception& ex) {
-            Logger()->warn("Could not load pred-snap attachment for {}: {}",
-                           session->atlasFiberPath.string(),
-                           ex.what());
-        }
+    if (_currentAtlasDir) {
+        attachAtlasPredSnaps(*it, *session, *_currentAtlasDir);
     }
 
     CChunkedVolumeViewer::CameraState camera;
@@ -2087,25 +2077,15 @@ void LineAnnotationController::rebuildIntersectionInspection()
                                                              targetSide.editSessionName,
                                                              targetCallback);
 
-        auto attachAtlasPredSnaps = [this](const StoredFiber& fiber,
-                                           const std::shared_ptr<LineAnnotationSession>& session) {
+        auto attachAtlasPredSnapsForInspection = [this](const StoredFiber& fiber,
+                                                        const std::shared_ptr<LineAnnotationSession>& session) {
             if (!_intersectionInspection || !_intersectionInspection->atlasDir || !session) {
                 return;
             }
-            session->atlasDir = *_intersectionInspection->atlasDir;
-            session->atlasFiberPath = fs::path("fibers") / fiber.fileName;
-            try {
-                session->predSnapSet = vc::atlas::loadAtlasPredSnapSet(
-                    vc::atlas::atlasPredSnapAttachmentPath(*session->atlasDir,
-                                                           session->atlasFiberPath));
-            } catch (const std::exception& ex) {
-                Logger()->warn("Could not load pred-snap attachment for {}: {}",
-                               session->atlasFiberPath.string(),
-                               ex.what());
-            }
+            attachAtlasPredSnaps(fiber, *session, *_intersectionInspection->atlasDir);
         };
-        attachAtlasPredSnaps(*sourceIt, sourceSide.editSession);
-        attachAtlasPredSnaps(*targetIt, targetSide.editSession);
+        attachAtlasPredSnapsForInspection(*sourceIt, sourceSide.editSession);
+        attachAtlasPredSnapsForInspection(*targetIt, targetSide.editSession);
 
         const bool sourceIsH = vc3d::line_annotation::firstFiberDisplaysAsH(
             sourceIt->hvClassification,
@@ -3106,6 +3086,19 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
     return snapshots;
 }
 
+std::optional<uint64_t> LineAnnotationController::fiberIdForAtlasPath(
+    const fs::path& atlasFiberPath) const
+{
+    const std::string targetKey = vc::atlas::atlasFiberPathKey(atlasFiberPath);
+    for (const auto& fiber : _fibers) {
+        const auto keys = atlasPathKeysForFiber(fiber);
+        if (std::find(keys.begin(), keys.end(), targetKey) != keys.end()) {
+            return fiber.id;
+        }
+    }
+    return std::nullopt;
+}
+
 void LineAnnotationController::onSurfaceChanged(std::string name,
                                                 std::shared_ptr<Surface> surf,
                                                 bool /*isEditUpdate*/)
@@ -3307,9 +3300,6 @@ void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& s
     }
 
     fs::path atlasFiberPath = session.atlasFiberPath;
-    if (atlasFiberPath.empty() && !session.fiberFileName.empty()) {
-        atlasFiberPath = fs::path("fibers") / session.fiberFileName;
-    }
     if (atlasFiberPath.empty()) {
         return;
     }
@@ -4155,6 +4145,109 @@ fs::path LineAnnotationController::fiberPath(const StoredFiber& fiber) const
             fiber.username, fiber.startedAt, fiber.sequence);
     }
     return fibersDir() / (std::to_string(fiber.id) + ".json");
+}
+
+fs::path LineAnnotationController::currentVolpkgRoot() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    const auto vpkg = _state->vpkg();
+    const fs::path projectPath = vpkg->path();
+    if (!projectPath.empty()) {
+        return projectPath.parent_path();
+    }
+    return fs::path(vpkg->getVolpkgDirectory());
+}
+
+std::vector<std::string> LineAnnotationController::atlasPathKeysForFiber(
+    const StoredFiber& fiber) const
+{
+    std::vector<std::string> keys;
+    auto addKey = [&keys](const fs::path& path) {
+        if (path.empty()) {
+            return;
+        }
+        const std::string key = vc::atlas::atlasFiberPathKey(path);
+        if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+            keys.push_back(key);
+        }
+    };
+
+    if (!fiber.fileName.empty()) {
+        addKey(fs::path("fibers") / fiber.fileName);
+        addKey(fs::path(fiber.fileName));
+    }
+
+    const fs::path absoluteFiberPath = fiberPath(fiber);
+    addKey(absoluteFiberPath);
+
+    const fs::path volpkgRoot = currentVolpkgRoot();
+    if (!volpkgRoot.empty()) {
+        std::error_code ec;
+        const fs::path relativePath = fs::relative(absoluteFiberPath, volpkgRoot, ec);
+        if (!ec && !relativePath.empty()) {
+            addKey(relativePath);
+        }
+    }
+    return keys;
+}
+
+std::optional<fs::path> LineAnnotationController::resolveAtlasFiberPath(
+    const StoredFiber& fiber,
+    const fs::path& atlasDir) const
+{
+    if (atlasDir.empty()) {
+        return std::nullopt;
+    }
+
+    const fs::path volpkgRoot = currentVolpkgRoot();
+    vc::atlas::Atlas atlas = volpkgRoot.empty()
+        ? vc::atlas::Atlas::load(atlasDir)
+        : vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    const auto keys = atlasPathKeysForFiber(fiber);
+    for (const auto& mapping : atlas.fibers) {
+        const std::string mappingKey = vc::atlas::atlasFiberPathKey(mapping.fiberPath);
+        if (std::find(keys.begin(), keys.end(), mappingKey) != keys.end()) {
+            return mapping.fiberPath;
+        }
+    }
+    return std::nullopt;
+}
+
+void LineAnnotationController::attachAtlasPredSnaps(
+    const StoredFiber& fiber,
+    LineAnnotationSession& session,
+    const fs::path& atlasDir)
+{
+    session.atlasDir = atlasDir;
+    session.atlasFiberPath.clear();
+    session.predSnapSet = {};
+
+    std::optional<fs::path> atlasFiberPath;
+    try {
+        atlasFiberPath = resolveAtlasFiberPath(fiber, atlasDir);
+    } catch (const std::exception& ex) {
+        Logger()->warn("Could not resolve atlas fiber mapping for {}: {}",
+                       fiberPath(fiber).string(),
+                       ex.what());
+        return;
+    }
+
+    if (!atlasFiberPath) {
+        Logger()->warn("Could not find atlas mapping for fiber {}", fiberPath(fiber).string());
+        return;
+    }
+
+    session.atlasFiberPath = *atlasFiberPath;
+    try {
+        session.predSnapSet = vc::atlas::loadAtlasPredSnapSet(
+            vc::atlas::atlasPredSnapAttachmentPath(atlasDir, *atlasFiberPath));
+    } catch (const std::exception& ex) {
+        Logger()->warn("Could not load pred-snap attachment for {}: {}",
+                       atlasFiberPath->string(),
+                       ex.what());
+    }
 }
 
 uint64_t LineAnnotationController::nextFiberId() const

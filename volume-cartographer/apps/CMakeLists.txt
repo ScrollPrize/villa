@@ -135,7 +135,10 @@ target_link_libraries(vc_lasagna_line_probe vc_lasagna)
 add_executable(vc_atlas_inspect src/vc_atlas_inspect.cpp)
 target_link_libraries(vc_atlas_inspect vc_atlas)
 
-add_executable(vc_atlas_pred_snap_rebuild src/vc_atlas_pred_snap_rebuild.cpp)
+add_executable(vc_atlas_pred_snap_rebuild
+    src/vc_atlas_pred_snap_rebuild.cpp
+    VC3D/FiberSliceGeometry.cpp
+)
 target_link_libraries(vc_atlas_pred_snap_rebuild vc_atlas)
 
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)

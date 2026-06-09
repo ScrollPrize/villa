@@ -116,6 +116,8 @@ public:
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
     [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths() const;
+    [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
+        const std::filesystem::path& atlasFiberPath) const;
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
@@ -213,6 +215,14 @@ private:
     [[nodiscard]] std::filesystem::path fibersDir() const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
+    [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
+    [[nodiscard]] std::vector<std::string> atlasPathKeysForFiber(const StoredFiber& fiber) const;
+    [[nodiscard]] std::optional<std::filesystem::path> resolveAtlasFiberPath(
+        const StoredFiber& fiber,
+        const std::filesystem::path& atlasDir) const;
+    void attachAtlasPredSnaps(const StoredFiber& fiber,
+                              LineAnnotationSession& session,
+                              const std::filesystem::path& atlasDir);
     [[nodiscard]] uint64_t nextFiberId() const;
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
