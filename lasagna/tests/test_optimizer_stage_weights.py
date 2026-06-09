@@ -25,9 +25,23 @@ class OptimizerStageWeightsTest(unittest.TestCase):
 		self.assertEqual(stages[0].global_opt.args["atlas_debug_obj_interval"], 1)
 		self.assertFalse(stages[0].global_opt.args["atlas_debug_objs"])
 		self.assertAlmostEqual(stages[0].global_opt.args["corr_splat_sigma"], 4.0, delta=1.0e-12)
-		self.assertAlmostEqual(stages[0].global_opt.base_eff["smooth_step"], 10.0, delta=1.0e-12)
-		self.assertAlmostEqual(stages[0].global_opt.base_eff["avg_step"], 0.1, delta=1.0e-12)
-		self.assertAlmostEqual(stages[0].global_opt.base_eff["step"], 0.0, delta=1.0e-12)
+		self.assertIn("smooth_step", cfg["base"])
+		self.assertIn("avg_step", cfg["base"])
+		self.assertAlmostEqual(
+			stages[0].global_opt.base_eff["smooth_step"],
+			float(cfg["base"]["smooth_step"]),
+			delta=1.0e-12,
+		)
+		self.assertAlmostEqual(
+			stages[0].global_opt.base_eff["avg_step"],
+			float(cfg["base"]["avg_step"]),
+			delta=1.0e-12,
+		)
+		self.assertAlmostEqual(
+			stages[0].global_opt.base_eff["step"],
+			float(cfg["base"].get("step", 0.0)),
+			delta=1.0e-12,
+		)
 		self.assertEqual(stages[1].name, "atlas_line_fit")
 		self.assertTrue(stages[1].global_opt.steps_auto)
 		self.assertAlmostEqual(stages[1].global_opt.args["corr_splat_sigma"], 4.0, delta=1.0e-12)

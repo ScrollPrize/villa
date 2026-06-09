@@ -89,8 +89,7 @@ def _offset_slices(size: int, offset: int) -> tuple[slice, slice]:
 	return slice(-offset, size), slice(0, size + offset)
 
 
-def _same_direction_local_average(length: torch.Tensor, offsets: tuple[tuple[int, int], ...]) -> torch.Tensor:
-	"""Differentiable same-direction 5-tap average with clipped boundaries."""
+def _offset_average(length: torch.Tensor, offsets: tuple[tuple[int, int], ...]) -> tuple[torch.Tensor, torch.Tensor]:
 	out = torch.zeros_like(length)
 	count = torch.zeros_like(length)
 	H = int(length.shape[1])
@@ -102,7 +101,25 @@ def _same_direction_local_average(length: torch.Tensor, offsets: tuple[tuple[int
 		src_w, dst_w = _offset_slices(W, int(dw))
 		out[:, dst_h, dst_w, :] = out[:, dst_h, dst_w, :] + length[:, src_h, src_w, :]
 		count[:, dst_h, dst_w, :] = count[:, dst_h, dst_w, :] + 1.0
-	return out / count.clamp_min(1.0)
+	return out, count
+
+
+def _all_direction_local_average(edge_data: dict[str, dict[str, torch.Tensor]]) -> torch.Tensor:
+	"""Differentiable 5-tap local average of equivalent step across all directions."""
+	offsets = {
+		"h": ((0, 0), (-1, 0), (1, 0), (-2, 0), (2, 0)),
+		"w": ((0, 0), (0, -1), (0, 1), (0, -2), (0, 2)),
+		"diag": ((0, 0), (-1, -1), (1, 1), (-2, -2), (2, 2)),
+		"anti_diag": ((0, 0), (-1, 1), (1, -1), (-2, 2), (2, -2)),
+	}
+	total = torch.zeros_like(edge_data["h"]["length"])
+	count = torch.zeros_like(total)
+	for name in ("h", "w", "diag", "anti_diag"):
+		equiv_length = edge_data[name]["length"] / edge_data[name]["equiv_scale"]
+		part, part_count = _offset_average(equiv_length, offsets[name])
+		total = total + part
+		count = count + part_count
+	return total / count.clamp_min(1.0)
 
 
 def _step_regularizer_edge_data(xyz: torch.Tensor) -> dict[str, dict[str, torch.Tensor]]:
@@ -157,15 +174,10 @@ def _step_regularizer_targets(
 	*,
 	mesh_step: float,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
-	smooth_offsets = {
-		"h": ((0, 0), (-1, 0), (1, 0), (-2, 0), (2, 0)),
-		"w": ((0, 0), (0, -1), (0, 1), (0, -2), (0, 2)),
-		"diag": ((0, 0), (-1, -1), (1, 1), (-2, -2), (2, 2)),
-		"anti_diag": ((0, 0), (-1, 1), (1, -1), (-2, 2), (2, -2)),
-	}
+	local_avg_step = _all_direction_local_average(edge_data)
 	smooth_targets = {
-		name: _same_direction_local_average(edge_data[name]["length"], offsets)
-		for name, offsets in smooth_offsets.items()
+		name: local_avg_step * edge_data[name]["equiv_scale"]
+		for name in ("h", "w", "diag", "anti_diag")
 	}
 	equiv_lengths = [
 		edge_data[name]["length"] / edge_data[name]["equiv_scale"]

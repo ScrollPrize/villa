@@ -101,6 +101,14 @@ class StepLossTest(unittest.TestCase):
 
 		self.assertGreater(float(terms["smooth_step"][0]), 1.0e-4)
 
+	def test_cross_direction_step_mismatch_has_nonzero_smooth_step(self) -> None:
+		xyz = _planar_grid(5, 5, step=1.0)
+		xyz[..., 0] *= 2.0
+
+		terms = opt_loss_step.step_regularizer_loss(res=_step_result(xyz, mesh_step=1))
+
+		self.assertGreater(float(terms["smooth_step"][0]), 1.0e-2)
+
 	def test_smooth_step_targets_are_differentiable(self) -> None:
 		xyz = _planar_grid(5, 5, step=1.0).requires_grad_()
 		edge_data = opt_loss_step._step_regularizer_edge_data(xyz)

@@ -5,7 +5,7 @@
   },
   "base": {
     "normal": 1.0,
-    "smooth_step": 1000.0,
+    "smooth_step": 10.0,
     "avg_step": 0.1,
     "step": 1.0,
     "smooth": 10.0,
