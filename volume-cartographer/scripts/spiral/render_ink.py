@@ -16,6 +16,7 @@ import re
 import json
 import glob
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
 import numpy as np
@@ -58,7 +59,8 @@ def max_composite(tif_paths):
 @click.option('--group-idx', type=int, default=1, show_default=True)
 @click.option('--num-slices', type=int, default=5, show_default=True)
 @click.option('--chunk-width', type=int, default=4000, show_default=True, help='Target width (px) per horizontal strip')
-def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, chunk_width):
+@click.option('--num-processes', '-j', type=int, default=1, show_default=True, help='Number of meshes to render concurrently')
+def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, chunk_width, num_processes):
     meshes = sorted(
         (winding_idx(name), name)
         for name in os.listdir(meshes_dir)
@@ -73,12 +75,10 @@ def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, chunk_
     os.makedirs(collect_dir, exist_ok=True)
 
     print(f'Found {len(meshes)} _spliced mesh(es) in {meshes_dir}')
-    composites = []  # (winding_idx, composite array)
-    for i, (widx, name) in enumerate(meshes):
+
+    def render(widx, name):
         mesh_path = os.path.join(meshes_dir, name)
         per_mesh_ink = os.path.join(mesh_path, 'ink')
-
-        print(f'[{i + 1}/{len(meshes)}] {name}: rendering ink')
         os.makedirs(per_mesh_ink, exist_ok=True)
         subprocess.run([
             vc_render_bin,
@@ -90,14 +90,27 @@ def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, chunk_
             '--num-slices', str(num_slices),
         ], check=True)
         tif_paths = sorted(glob.glob(os.path.join(per_mesh_ink, '*.tif')))
-
         if not tif_paths:
-            print(f'[{i + 1}/{len(meshes)}] {name}: WARNING no tifs produced, skipping')
-            continue
-        composites.append((widx, max_composite(tif_paths)))
+            return None
+        return max_composite(tif_paths)
+
+    composites = []  # (winding_idx, composite array)
+    with ThreadPoolExecutor(max_workers=max(1, num_processes)) as pool:
+        futures = {pool.submit(render, widx, name): (widx, name) for widx, name in meshes}
+        for n, future in enumerate(as_completed(futures)):
+            widx, name = futures[future]
+            comp = future.result()
+            if comp is None:
+                print(f'[{n + 1}/{len(meshes)}] {name}: WARNING no tifs produced, skipping')
+                continue
+            composites.append((widx, comp))
+            print(f'[{n + 1}/{len(meshes)}] {name}: rendered ink')
 
     if not composites:
         raise click.ClickException('No composites produced')
+
+    # Restore winding order for the horizontal packing below.
+    composites.sort(key=lambda wc: wc[0])
 
     # Greedily pack whole per-winding composites into horizontal strips of ~chunk_width px.
     chunk = []  # (winding_idx, composite array)
