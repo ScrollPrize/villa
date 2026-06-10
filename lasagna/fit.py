@@ -1807,6 +1807,21 @@ def main(argv: list[str] | None = None) -> int:
 		st = torch.load(model_cfg.model_input, map_location=device, weights_only=False)
 		loaded_snap_surf_map_state = st.get("_snap_surf_map_state_") if isinstance(st, dict) else None
 		mdl = model.Model3D.from_checkpoint(st, device=device)
+		if isinstance(cfg.get("atlas"), dict):
+			atlas_init = atlas_mod.build_atlas_init(
+				cfg["atlas"],
+				device=device,
+				mesh_step=int(getattr(mdl.params, "mesh_step", model_cfg.mesh_step)),
+				winding_step=int(getattr(mdl.params, "winding_step", model_cfg.winding_step)),
+			)
+			atlas_lines_3d = atlas_init.atlas_lines
+			fit_config["_atlas_init_"] = copy.deepcopy(atlas_init.metadata)
+			print(
+				"[fit] model-init=model: restored atlas lines from object refs "
+				f"samples={atlas_init.metadata['line_sample_count']} "
+				f"period_columns={atlas_init.metadata['period_columns']}",
+				flush=True,
+			)
 		if self_map_init != "off":
 			checkpoint_model_w = getattr(mdl.params, "model_w", None)
 			model_w_wraps = (

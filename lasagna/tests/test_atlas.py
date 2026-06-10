@@ -268,6 +268,77 @@ class AtlasParserTest(unittest.TestCase):
 				3,
 			))
 
+	def test_atlas_init_appends_pred_snap_samples_at_control_mapping(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=4, cols=5, row_step=10.0, col_step=5.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+				"control_points": [[1.0, 2.0, 3.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [],
+				"control_anchors": [{
+					"source_index": 0,
+					"world": [1.0, 2.0, 3.0],
+					"atlas": [2.0, 1.0],
+					"distance": 0.0,
+				}],
+			}) + "\n", encoding="utf-8")
+			pred_snap = root / "pred_snap.json"
+			pred_snap.write_text(json.dumps({
+				"type": "vc3d_atlas_pred_snap_points",
+				"version": 1,
+				"fiber_path": "fibers/fiber.json",
+				"entries": {
+					"1_2_3": {
+						"control_point": [1.0, 2.0, 3.0],
+						"pred_snap_point": [7.0, 8.0, 9.0],
+					}
+				},
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"pred_snap_path": str(pred_snap),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=1,
+				winding_step=1,
+			)
+
+			self.assertEqual(init.metadata["control_point_sample_count"], 1)
+			self.assertEqual(init.metadata["pred_snap_sample_count"], 1)
+			self.assertEqual(init.metadata["other_line_point_sample_count"], 0)
+			self.assertEqual(init.atlas_lines.source_indices, (0, 0))
+			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, False])
+			self.assertEqual(init.atlas_lines.is_snap_point.tolist(), [False, True])
+			self.assertTrue(torch.allclose(init.atlas_lines.target_xyz[1], torch.tensor([7.0, 8.0, 9.0])))
+			self.assertAlmostEqual(float(init.atlas_lines.model_h[0]), float(init.atlas_lines.model_h[1]), delta=1.0e-6)
+			self.assertAlmostEqual(float(init.atlas_lines.model_w[0]), float(init.atlas_lines.model_w[1]), delta=1.0e-6)
+
 	def test_atlas_init_mesh_step_coarsens_base_and_remaps_anchor_coords(self) -> None:
 		import tempfile
 		with tempfile.TemporaryDirectory() as td:

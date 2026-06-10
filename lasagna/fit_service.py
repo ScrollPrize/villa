@@ -933,8 +933,15 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     cfg = spec.get("config", {})
     if not isinstance(cfg, dict):
         raise ValueError("job_spec.config must be an object")
+    atlas_reopt_cfg = cfg.get("atlas_reopt")
+    if not isinstance(atlas_reopt_cfg, dict):
+        atlas_reopt_cfg = {}
+    atlas_ref_source = str(atlas_reopt_cfg.get("source") or "").strip().lower()
+    prefer_request_atlas = atlas_ref_source in {"request", "selected_atlas", "current_atlas"}
+
     resolved = dict(body)
     resolved_cfg = dict(cfg)
+    resolved_cfg.pop("atlas_reopt", None)
     external_surfaces_raw = resolved_cfg.get("external_surfaces")
     if external_surfaces_raw is not None:
         if not isinstance(external_surfaces_raw, list):
@@ -963,7 +970,10 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     )
     atlas_ref = spec.get("atlas")
     model_atlas_ref = model_job_spec.get("atlas") if isinstance(model_job_spec, dict) else None
-    if model_atlas_ref not in (None, {}, ""):
+    if prefer_request_atlas and atlas_ref not in (None, {}, ""):
+        if model_atlas_ref not in (None, {}, "") and model_atlas_ref != atlas_ref:
+            print("[fit-service] request job_spec.atlas overrides model _object_refs_ atlas", flush=True)
+    elif model_atlas_ref not in (None, {}, ""):
         if atlas_ref not in (None, {}, "") and atlas_ref != model_atlas_ref:
             print("[fit-service] model _object_refs_ atlas overrides request job_spec.atlas", flush=True)
         atlas_ref = model_atlas_ref

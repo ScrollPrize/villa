@@ -883,6 +883,7 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 				  model_source: Path | None = None,
 				  copy_model: bool = False, fit_config: dict | None = None,
 				  job_spec: dict | None = None,
+				  object_refs: dict | None = None,
 				  area: dict | None = None,
 				  components: list[list[int]] | None = None,
 				  base_shape_zyx: tuple[int, int, int] | None = None,
@@ -931,6 +932,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		meta["fit_config"] = fit_config
 	if job_spec is not None:
 		meta["lasagna_job"] = job_spec
+	if object_refs is not None:
+		meta["object_refs"] = object_refs
 	if atlas_control_points_summary is not None:
 		meta["atlas_control_points_results"] = atlas_control_points_summary
 	if extra_channels:
@@ -991,6 +994,7 @@ def _export_flatten_checkpoint(
 	model_params: dict | None,
 	fit_config: dict | None,
 	job_spec: dict | None,
+	object_refs: dict | None,
 	export_factor: float = 1.0,
 	lasagna_base_shape_zyx: tuple[int, int, int] | None = None,
 	output_base_shape_zyx: tuple[int, int, int] | None = None,
@@ -1063,6 +1067,7 @@ def _export_flatten_checkpoint(
 		copy_model=cfg.copy_model,
 		fit_config=fit_config,
 		job_spec=job_spec,
+		object_refs=object_refs,
 		area=area,
 		base_shape_zyx=output_base_shape_zyx,
 		lasagna_base_shape_zyx=lasagna_base_shape_zyx,
@@ -1113,6 +1118,9 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 	job_spec = st.get("_job_spec_", None)
 	if not isinstance(job_spec, dict):
 		job_spec = None
+	object_refs = st.get("_object_refs_", None)
+	if not isinstance(object_refs, dict):
+		object_refs = None
 	corr_points_results = st.get("_corr_points_results_", None)
 	if not isinstance(corr_points_results, dict):
 		corr_points_results = None
@@ -1135,6 +1143,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 		model_params=model_params,
 		fit_config=fit_config,
 		job_spec=job_spec,
+		object_refs=object_refs,
 		export_factor=export_factor,
 		lasagna_base_shape_zyx=lasagna_base_shape_zyx,
 		output_base_shape_zyx=output_base_shape_zyx,
@@ -1259,6 +1268,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 					  job_spec=job_spec,
+					  object_refs=object_refs,
 					  area=area, components=components if D > 1 else None,
 					  base_shape_zyx=output_base_shape_zyx,
 					  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
@@ -1330,6 +1340,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 			_write_tifxyz(out_dir=out_dir, x=x, y=y, z=z, d=d_layer, scale=meta_scale,
 						  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
 						  job_spec=job_spec,
+						  object_refs=object_refs,
 						  area=area,
 						  base_shape_zyx=output_base_shape_zyx,
 						  lasagna_base_shape_zyx=lasagna_base_shape_zyx,

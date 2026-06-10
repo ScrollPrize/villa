@@ -168,6 +168,38 @@ class AtlasLineLossTest(unittest.TestCase):
 		self.assertGreater(int(payload.normal_proxy_valid.sum()), int(payload.valid.sum()))
 		self.assertTrue(torch.isfinite(payload.normal_proxy_target_xyz[payload.normal_proxy_valid]).all().item())
 
+	def test_atlas_line_snap_weight_selects_only_snap_samples(self) -> None:
+		opt_loss_atlas_line.reset_state()
+		xyz = _plane_grid().requires_grad_(True)
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor([
+				[1.0, 1.0, 1.0],
+				[2.0, 1.0, 2.0],
+				[1.0, 2.0, 3.0],
+			], dtype=torch.float32),
+			normal_xyz=torch.tensor([
+				[0.0, 0.0, -1.0],
+				[0.0, 0.0, -1.0],
+				[0.0, 0.0, -1.0],
+			], dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0, 2.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0, 1.0], dtype=torch.float32),
+			is_control_point=torch.tensor([True, False, False]),
+			is_snap_point=torch.tensor([False, False, True]),
+		)
+
+		result = opt_loss_atlas_line.atlas_line_loss(
+			res=_result(xyz, lines),
+			stage_eff={"atlas_line_snap": 1.0},
+		)
+		stats = opt_loss_atlas_line.last_stats()
+		self.assertAlmostEqual(stats["atlas_line_control_valid"], 0.0, delta=1.0e-12)
+		self.assertAlmostEqual(stats["atlas_line_other_valid"], 0.0, delta=1.0e-12)
+		self.assertAlmostEqual(stats["atlas_line_snap_valid"], 1.0, delta=1.0e-12)
+		self.assertGreater(float(result["atlas_line_snap"][0].detach()), 0.0)
+		self.assertEqual(float(result["atlas_line_control"][0].detach()), 0.0)
+		self.assertEqual(float(result["atlas_line_other"][0].detach()), 0.0)
+
 	def test_debug_payload_omits_invalid_samples(self) -> None:
 		opt_loss_atlas_line.reset_state()
 		xyz = _plane_grid().requires_grad_(True)
