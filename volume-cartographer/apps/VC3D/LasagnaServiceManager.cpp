@@ -1079,6 +1079,7 @@ void LasagnaServiceManager::processNextArtifactUpload()
     const QJsonObject jobSpec = requestConfig[QStringLiteral("job_spec")].toObject();
     appendObjectRefIfNew(refs, refKeys, jobSpec[QStringLiteral("model")].toObject());
     appendObjectRefIfNew(refs, refKeys, jobSpec[QStringLiteral("atlas")].toObject());
+    collectObjectRefs(refs, refKeys, jobSpec[QStringLiteral("object_refs")]);
     collectObjectRefs(refs, refKeys,
                       jobSpec[QStringLiteral("config")].toObject()[QStringLiteral("atlas")]);
     for (const QJsonValue& value : jobSpec[QStringLiteral("linked_surfaces")].toArray()) {
@@ -1164,6 +1165,34 @@ void LasagnaServiceManager::processNextArtifactUpload()
             missing.insert(objectRefKey(value.toObject()));
         }
         auto uploads = std::make_shared<QJsonArray>();
+        QSet<QString> uploadable;
+        for (const QJsonValue& value : objects) {
+            const QJsonObject ref = value.toObject()[QStringLiteral("object")].toObject();
+            if (!ref.isEmpty()) {
+                uploadable.insert(objectRefKey(ref));
+            }
+        }
+        QStringList unresolved;
+        for (const QString& key : std::as_const(missing)) {
+            if (!uploadable.contains(key)) {
+                const QStringList parts = key.split(QLatin1Char('\n'));
+                unresolved.append(parts.size() >= 3
+                    ? QStringLiteral("%1 %2 %3").arg(parts[0], parts[1], parts[2])
+                    : key);
+            }
+        }
+        if (!unresolved.isEmpty()) {
+            const QString msg = tr("Missing Lasagna artifact(s) with no local upload source: %1")
+                .arg(unresolved.join(QStringLiteral("; ")));
+            updateLocalUploadJob(localJobId, {
+                {QStringLiteral("state"), QStringLiteral("error")},
+                {QStringLiteral("error"), msg},
+            });
+            emit optimizationError(msg);
+            finishActiveArtifactUpload();
+            processNextArtifactUpload();
+            return;
+        }
         for (const QJsonValue& value : objects) {
             const QJsonObject upload = value.toObject();
             if (missing.contains(objectRefKey(upload[QStringLiteral("object")].toObject()))) {

@@ -200,8 +200,10 @@ struct LasagnaAtlasObject {
     std::string id;
     std::filesystem::path fiberPath;
     std::filesystem::path mappingPath;
+    std::filesystem::path predSnapAttachmentPath;
     std::filesystem::path fiberRelativePath;
     std::filesystem::path mappingRelativePath;
+    std::filesystem::path predSnapAttachmentRelativePath;
     int windingOffset = 0;
 };
 

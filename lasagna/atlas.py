@@ -83,6 +83,37 @@ def load_vc3d_atlas_fiber_mapping(path: str | Path) -> dict[str, Any]:
 	return obj
 
 
+def load_vc3d_atlas_pred_snap_points(path: str | Path) -> list[dict[str, tuple[float, float, float]]]:
+	obj = _load_json_path(path, label="vc3d_atlas_pred_snap_points")
+	if obj.get("type", "vc3d_atlas_pred_snap_points") != "vc3d_atlas_pred_snap_points":
+		raise ValueError(f"unsupported pred-snap JSON type at {path}: {obj.get('type')!r}")
+	if int(obj.get("version", 0)) != 1:
+		raise ValueError(f"unsupported pred-snap JSON version at {path}: {obj.get('version')!r}")
+	entries = obj.get("entries", {})
+	if entries is None:
+		return []
+	if not isinstance(entries, dict):
+		raise ValueError(f"vc3d_atlas_pred_snap_points entries must be an object: {path}")
+	out: list[dict[str, tuple[float, float, float]]] = []
+	for key, item in entries.items():
+		if not isinstance(item, dict):
+			raise ValueError(f"pred-snap entry {key!r} must be an object: {path}")
+		control = item.get("control_point")
+		snap = item.get("pred_snap_point")
+		if not (isinstance(control, list) and len(control) == 3):
+			raise ValueError(f"pred-snap entry {key!r} requires control_point [x,y,z]: {path}")
+		if snap is None:
+			continue
+		if not (isinstance(snap, list) and len(snap) == 3):
+			raise ValueError(f"pred-snap entry {key!r} pred_snap_point must be [x,y,z] or null: {path}")
+		control_p = tuple(float(v) for v in control)
+		snap_p = tuple(float(v) for v in snap)
+		if not (all(math.isfinite(v) for v in control_p) and all(math.isfinite(v) for v in snap_p)):
+			continue
+		out.append({"control_point": control_p, "pred_snap_point": snap_p})
+	return out
+
+
 def _validate_wrapped_base(xyz: torch.Tensor, valid: torch.Tensor) -> int:
 	if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
 		raise ValueError(f"atlas base shell must have shape (H,W,3), got {tuple(xyz.shape)}")
@@ -346,6 +377,7 @@ def build_atlas_init(
 	source_indices: list[int] = []
 	actual_us: list[float] = []
 	is_control_points: list[bool] = []
+	is_snap_points: list[bool] = []
 
 	maps = atlas_obj.get("maps", [])
 	if not isinstance(maps, list):
@@ -417,6 +449,33 @@ def build_atlas_init(
 			object_ids.append(object_id)
 			source_indices.append(source_index)
 			is_control_points.append(True)
+			is_snap_points.append(False)
+
+		pred_snap_path = map_entry.get("pred_snap_path")
+		if pred_snap_path:
+			control_by_point: list[tuple[tuple[float, float, float], int, float, float]] = [
+				(target, source_index, atlas_v, actual_u)
+				for source_index, atlas_v, actual_u, target in control_samples
+			]
+			for snap in load_vc3d_atlas_pred_snap_points(str(pred_snap_path)):
+				control = snap["control_point"]
+				match: tuple[int, float, float] | None = None
+				for target, source_index, atlas_v, actual_u in control_by_point:
+					if _same_point(control, target):
+						match = (source_index, atlas_v, actual_u)
+						break
+				if match is None:
+					raise ValueError(
+						f"pred-snap entry control_point {control} does not match a control anchor: {pred_snap_path}"
+					)
+				source_index, atlas_v, actual_u = match
+				actual_us.append(float(actual_u))
+				mapped_rows.append(float(atlas_v))
+				targets.append(snap["pred_snap_point"])
+				object_ids.append(object_id)
+				source_indices.append(source_index)
+				is_control_points.append(False)
+				is_snap_points.append(True)
 
 		for anchor in mapping.get("line_anchors", []):
 			if not isinstance(anchor, dict):
@@ -439,6 +498,7 @@ def build_atlas_init(
 			object_ids.append(object_id)
 			source_indices.append(source_index)
 			is_control_points.append(False)
+			is_snap_points.append(False)
 
 	if not targets:
 		raise ValueError("atlas config produced no usable line anchors")
@@ -497,6 +557,7 @@ def build_atlas_init(
 		object_ids=tuple(object_ids),
 		source_indices=tuple(source_indices),
 		is_control_point=torch.tensor(is_control_points, device=device, dtype=torch.bool),
+		is_snap_point=torch.tensor(is_snap_points, device=device, dtype=torch.bool),
 		atlas_winding_model_ranges=atlas_winding_model_ranges,
 	)
 
@@ -526,7 +587,8 @@ def build_atlas_init(
 		"atlas_u_offset": float(atlas_u_offset),
 		"line_sample_count": int(target_t.shape[0]),
 		"control_point_sample_count": int(sum(1 for v in is_control_points if v)),
-		"other_line_point_sample_count": int(sum(1 for v in is_control_points if not v)),
+		"pred_snap_sample_count": int(sum(1 for v in is_snap_points if v)),
+		"other_line_point_sample_count": int(sum(1 for is_ctl, is_snap in zip(is_control_points, is_snap_points) if not is_ctl and not is_snap)),
 	}
 	meta.update(resample_meta)
 	return AtlasInit(model=mdl, atlas_lines=lines, metadata=meta)

@@ -243,6 +243,15 @@ QJsonArray linkedSurfacesFromMeta(const std::filesystem::path& segPath)
     return meta[QStringLiteral("linked_surfaces")].toArray();
 }
 
+QJsonObject objectRefsFromMeta(const std::filesystem::path& segPath)
+{
+    QFile metaFile(QString::fromStdString((segPath / "meta.json").string()));
+    if (!metaFile.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    return QJsonDocument::fromJson(metaFile.readAll()).object()[QStringLiteral("object_refs")].toObject();
+}
+
 QStringList linkedSurfaceNamesFromRefs(const QJsonArray& refs)
 {
     QStringList names;
@@ -467,10 +476,12 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
     QSet<QString> lineIds;
     QHash<QString, QJsonObject> lineRefsById;
     QHash<QString, QJsonObject> mapRefsByObjectKey;
+    QHash<QString, QJsonObject> predSnapRefsByObjectKey;
     for (const vc::atlas::LasagnaAtlasObject& object : atlasExport.objects) {
         const QString lineId = QString::fromStdString(object.id);
         const QString fiberRel = QString::fromStdString(object.fiberRelativePath.generic_string());
         const QString mapRel = QString::fromStdString(object.mappingRelativePath.generic_string());
+        const QString predSnapRel = QString::fromStdString(object.predSnapAttachmentRelativePath.generic_string());
 
         QJsonObject lineUpload = fileArtifactForPath(
             object.fiberPath,
@@ -508,6 +519,25 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
 
         lineRefsById.insert(lineId, lineRef);
         mapRefsByObjectKey.insert(lineId + QStringLiteral("\n") + mapRel, mapRef);
+        if (!predSnapRel.isEmpty() && std::filesystem::is_regular_file(object.predSnapAttachmentPath)) {
+            QJsonObject snapUpload = fileArtifactForPath(
+                object.predSnapAttachmentPath,
+                QStringLiteral("atlas-pred-snap"),
+                safeAtlasObjectName(atlasName, predSnapRel, QString::fromStdString(object.predSnapAttachmentPath.filename().string())),
+                QStringLiteral("vc3d_atlas_pred_snap_points_json"),
+                &out->rawBytes);
+            if (snapUpload.isEmpty()) {
+                if (error) {
+                    *error = QObject::tr("Cannot pack atlas pred-snap JSON: %1")
+                        .arg(QString::fromStdString(object.predSnapAttachmentPath.string()));
+                }
+                return false;
+            }
+            ++out->fileCount;
+            const QJsonObject snapRef = snapUpload[QStringLiteral("object")].toObject();
+            appendUploadIfNew(snapUpload);
+            predSnapRefsByObjectKey.insert(lineId + QStringLiteral("\n") + predSnapRel, snapRef);
+        }
         if (!lineIds.contains(lineId)) {
             lineIds.insert(lineId);
         }
@@ -537,6 +567,12 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
         const QString key = lineId + QStringLiteral("\n") + mapRel;
         if (mapRefsByObjectKey.contains(key)) {
             mapEntry[QStringLiteral("map_ref")] = mapRefsByObjectKey.value(key);
+        }
+        const QString predSnapRel = mapEntry[QStringLiteral("pred_snap_path")].toString();
+        const QString predSnapKey = lineId + QStringLiteral("\n") + predSnapRel;
+        if (predSnapRefsByObjectKey.contains(predSnapKey)) {
+            mapEntry[QStringLiteral("pred_snap_ref")] = predSnapRefsByObjectKey.value(predSnapKey);
+            mapEntry.remove(QStringLiteral("pred_snap_path"));
         }
         maps.append(mapEntry);
     }
@@ -2422,6 +2458,12 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         }
     }
     const QJsonArray volumeShapeZyx = volumeShapeZyxForState(state);
+    const QJsonObject atlasReoptConfig = config[QStringLiteral("atlas_reopt")].toObject();
+    const QString atlasReoptSource = atlasReoptConfig[QStringLiteral("source")].toString().trimmed().toLower();
+    const bool refreshReoptAtlas = !isNewModel && (
+        atlasReoptSource == QStringLiteral("selected_atlas") ||
+        atlasReoptSource == QStringLiteral("current_atlas") ||
+        atlasReoptSource == QStringLiteral("request"));
 
     QJsonObject request;
     request[QStringLiteral("data_input")] = dataInput;
@@ -2466,6 +2508,46 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         }
         objectUploads.append(upload);
     };
+    auto appendDirectoryCandidateForRef = [&](const QJsonObject& ref,
+                                              const std::filesystem::path& localPath) {
+        const QString type = ref[QStringLiteral("type")].toString();
+        const QString format = ref[QStringLiteral("format")].toString();
+        qint64 extraBytes = 0;
+        int extraFiles = 0;
+        QJsonObject upload = segmentArtifactForPath(localPath, type, format, &extraBytes, &extraFiles);
+        QJsonObject uploadRef = upload[QStringLiteral("object")].toObject();
+        if (upload.isEmpty() || uploadRef[QStringLiteral("hash")].toString() != ref[QStringLiteral("hash")].toString()) {
+            return;
+        }
+        uploadRef[QStringLiteral("name")] = ref[QStringLiteral("name")].toString();
+        upload[QStringLiteral("object")] = uploadRef;
+        rawTifxyzBytes += extraBytes;
+        tifxyzFileCount += extraFiles;
+        appendUploadIfNew(upload);
+    };
+    auto appendFileCandidateForRef = [&](const QJsonObject& ref,
+                                         const std::filesystem::path& localPath) {
+        const QString type = ref[QStringLiteral("type")].toString();
+        const QString format = ref[QStringLiteral("format")].toString();
+        QFile f(QString::fromStdString(localPath.string()));
+        if (!f.open(QIODevice::ReadOnly)) {
+            return;
+        }
+        const QByteArray bytes = f.readAll();
+        if (md5Ref(bytes) != ref[QStringLiteral("hash")].toString()) {
+            return;
+        }
+        QJsonObject upload;
+        upload[QStringLiteral("object")] = makeObjectRef(
+            type,
+            ref[QStringLiteral("name")].toString(),
+            ref[QStringLiteral("hash")].toString(),
+            format);
+        upload[QStringLiteral("_local_payload")] = QStringLiteral("file");
+        upload[QStringLiteral("_local_path")] = QString::fromStdString(localPath.string());
+        rawModelBytes += bytes.size();
+        appendUploadIfNew(upload);
+    };
 
     if (sendTifxyz) {
         QJsonObject currentSegmentUpload = segmentArtifactForPath(segPath, &rawTifxyzBytes, &tifxyzFileCount);
@@ -2502,6 +2584,73 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
                 }
             }
         }
+    }
+    const QJsonObject inheritedObjectRefs = sendTifxyz ? objectRefsFromMeta(segPath) : QJsonObject{};
+    if (!inheritedObjectRefs.isEmpty()) {
+        jobSpec[QStringLiteral("object_refs")] = inheritedObjectRefs;
+        QSet<QString> inheritedRefKeys;
+        for (const QJsonValue& value : inheritedObjectRefs[QStringLiteral("objects")].toArray()) {
+            const QJsonObject ref = value.toObject();
+            inheritedRefKeys.insert(objectRefKeyForUpload(ref));
+            const QString type = ref[QStringLiteral("type")].toString();
+            const QString name = ref[QStringLiteral("name")].toString();
+            if (type == QStringLiteral("tifxyz_segment") || type == QStringLiteral("atlas-base")) {
+                if (name.isEmpty() || outputSegmentsPath.empty()) {
+                    continue;
+                }
+                const std::filesystem::path localPath = outputSegmentsPath / name.toStdString();
+                if (std::filesystem::exists(localPath) && std::filesystem::is_directory(localPath)) {
+                    appendDirectoryCandidateForRef(ref, localPath);
+                }
+            } else if (type == QStringLiteral("lasagna_model") && !modelPath.isEmpty()) {
+                appendFileCandidateForRef(ref, std::filesystem::path(modelPath.toStdString()));
+            }
+        }
+        if (!_atlasDirPath.isEmpty()) {
+            AtlasRequestArtifacts atlasArtifacts;
+            QString atlasError;
+            if (buildAtlasRequestArtifacts(
+                    std::filesystem::path(_atlasDirPath.toStdString()),
+                    volpkgRootForState(state),
+                    &atlasArtifacts,
+                    &atlasError)) {
+                for (const QJsonValue& value : atlasArtifacts.uploads) {
+                    const QJsonObject upload = value.toObject();
+                    const QJsonObject ref = upload[QStringLiteral("object")].toObject();
+                    if (inheritedRefKeys.contains(objectRefKeyForUpload(ref))) {
+                        appendUploadIfNew(upload);
+                    }
+                }
+            }
+        }
+    }
+    if (refreshReoptAtlas) {
+        if (_atlasDirPath.isEmpty()) {
+            auto msg = tr("Atlas re-optimize config requires a selected atlas directory.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 7000);
+            return;
+        }
+        AtlasRequestArtifacts atlasArtifacts;
+        QString atlasError;
+        if (!buildAtlasRequestArtifacts(
+                std::filesystem::path(_atlasDirPath.toStdString()),
+                volpkgRootForState(state),
+                &atlasArtifacts,
+                &atlasError)) {
+            showLasagnaConfigError(atlasError, statusBar, 7000);
+            return;
+        }
+        jobSpec[QStringLiteral("atlas")] = atlasArtifacts.atlasRef;
+        for (const QJsonValue& value : atlasArtifacts.uploads) {
+            appendUploadIfNew(value.toObject());
+        }
+        rawTifxyzBytes += atlasArtifacts.rawBytes;
+        tifxyzFileCount += atlasArtifacts.fileCount;
+        std::cerr << "[lasagna] atlas reopt refresh: atlas=" << _atlasDirPath.toStdString()
+                  << " files=" << atlasArtifacts.fileCount
+                  << " raw=" << bytesToMiB(atlasArtifacts.rawBytes) << " MiB"
+                  << std::endl;
     }
 
     if (sendModelData) {

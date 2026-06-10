@@ -119,6 +119,18 @@ class OptimizerStageWeightsTest(unittest.TestCase):
 		self.assertAlmostEqual(opt.eff["atlas_line_control"], 0.6, delta=1.0e-12)
 		self.assertAlmostEqual(opt.eff["atlas_line_other"], 0.125, delta=1.0e-12)
 
+	def test_atlas_line_snap_rejects_combined_atlas_line_terms(self) -> None:
+		with self.assertRaisesRegex(ValueError, "atlas_line_snap cannot be combined"):
+			optimizer.load_stages_cfg({
+				"base": {
+					"atlas_line_snap": 1.0,
+					"atlas_line_control": 0.5,
+				},
+				"stages": [
+					{"name": "stage0", "steps": 1, "params": ["mesh_ms"]},
+				],
+			})
+
 	def test_step_regularizer_split_weights_parse_independently(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"base": {

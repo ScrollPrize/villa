@@ -2086,8 +2086,13 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
         object.id = mapping.fiberPath.generic_string();
         object.fiberPath = fiberPath;
         object.mappingPath = mappingFiles[i];
+        object.predSnapAttachmentPath = atlasPredSnapAttachmentPath(atlasDir, mapping.fiberPath);
         object.fiberRelativePath = mapping.fiberPath;
         object.mappingRelativePath = fs::relative(mappingFiles[i], atlasDir).lexically_normal();
+        if (fs::is_regular_file(object.predSnapAttachmentPath)) {
+            object.predSnapAttachmentRelativePath =
+                fs::relative(object.predSnapAttachmentPath, atlasDir).lexically_normal();
+        }
         object.windingOffset = mapping.windingOffset;
         exportData.objects.push_back(std::move(object));
     }
@@ -2105,13 +2110,17 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
                 {"fiber_path", object.fiberRelativePath.generic_string()},
             });
         }
-        maps.push_back({
+        nlohmann::json mapEntry = {
             {"object_type", "line"},
             {"object_id", object.id},
             {"fiber_path", object.fiberRelativePath.generic_string()},
             {"mapping_path", object.mappingRelativePath.generic_string()},
             {"winding_offset", object.windingOffset},
-        });
+        };
+        if (!object.predSnapAttachmentRelativePath.empty()) {
+            mapEntry["pred_snap_path"] = object.predSnapAttachmentRelativePath.generic_string();
+        }
+        maps.push_back(std::move(mapEntry));
     }
 
     exportData.compactJson = {

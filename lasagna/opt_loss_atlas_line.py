@@ -584,7 +584,7 @@ def atlas_line_loss(
 		item = _zero_item(res)
 		if debug_payload:
 			_last_debug_payload = _empty_debug_payload(res=res, lines=lines)
-		return {"atlas_line": item, "atlas_line_control": item, "atlas_line_other": item}
+		return {"atlas_line": item, "atlas_line_control": item, "atlas_line_other": item, "atlas_line_snap": item}
 
 	_ensure_state(res=res)
 	assert _rows is not None and _cols is not None and _frac_h is not None and _frac_w is not None
@@ -601,26 +601,36 @@ def atlas_line_loss(
 		control_k = torch.zeros(K, device=device, dtype=torch.bool)
 	else:
 		control_k = is_control.to(device=device, dtype=torch.bool).view(K)
-	other_k = ~control_k
+	is_snap = getattr(lines, "is_snap_point", None)
+	if is_snap is None:
+		snap_k = torch.zeros(K, device=device, dtype=torch.bool)
+	else:
+		snap_k = is_snap.to(device=device, dtype=torch.bool).view(K)
+	other_k = ~(control_k | snap_k)
 	if stage_eff is None:
 		process_control = True
 		process_other = True
+		process_snap = True
 	else:
 		legacy_weight = float(stage_eff.get("atlas_line", 0.0)) > 0.0
 		process_control = legacy_weight or float(stage_eff.get("atlas_line_control", 0.0)) > 0.0
 		process_other = legacy_weight or float(stage_eff.get("atlas_line_other", 0.0)) > 0.0
-	active_k = (control_k & process_control) | (other_k & process_other)
+		process_snap = float(stage_eff.get("atlas_line_snap", 0.0)) > 0.0
+	active_k = (control_k & process_control) | (other_k & process_other) | (snap_k & process_snap)
 	zero_item = _zero_item(res)
 
 	valid = torch.zeros((D, K), device=device, dtype=torch.bool)
 	valid_control = torch.zeros_like(valid)
 	valid_other = torch.zeros_like(valid)
+	valid_snap = torch.zeros_like(valid)
 	combined_item = zero_item
 	control_item = zero_item
 	other_item = zero_item
+	snap_item = zero_item
 	combined_active_verts = 0.0
 	control_active_verts = 0.0
 	other_active_verts = 0.0
+	snap_active_verts = 0.0
 	signed_delta_mean = 0.0
 	if debug_payload:
 		_last_debug_payload = _empty_debug_payload(res=res, lines=lines)
@@ -673,8 +683,10 @@ def atlas_line_loss(
 		valid = valid.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active)
 		active_control = control_k.index_select(0, active_idx).view(1, K_active).expand(D, K_active)
 		active_other = other_k.index_select(0, active_idx).view(1, K_active).expand(D, K_active)
+		active_snap = snap_k.index_select(0, active_idx).view(1, K_active).expand(D, K_active)
 		valid_control = valid_control.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active & active_control)
 		valid_other = valid_other.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active & active_other)
+		valid_snap = valid_snap.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active & active_snap)
 
 		signed_delta = ((target - hit_xyz) * model_n).sum(dim=-1)
 		h_cont = hit_rows.to(dtype=res.xyz_lr.dtype) + u
@@ -689,6 +701,7 @@ def atlas_line_loss(
 		mask_flat = valid_active.to(dtype=res.xyz_lr.dtype).reshape(-1)
 		control_flat = active_control.reshape(-1)
 		other_flat = active_other.reshape(-1)
+		snap_flat = active_snap.reshape(-1)
 		with torch.no_grad():
 			if bool(valid_active.any().detach().cpu()):
 				signed_delta_mean = float(signed_delta[valid_active].mean().detach().cpu())
@@ -762,6 +775,18 @@ def atlas_line_loss(
 			mask_p=mask_flat * other_flat.to(dtype=res.xyz_lr.dtype),
 		)
 		other_item = (other_loss, other_maps, other_masks)
+		snap_loss, snap_maps, snap_masks, snap_active_verts, _snap_proxy_target_map, _snap_proxy_valid_map = _loss_from_splats(
+			res=res,
+			d_p=d_flat,
+			h_floor_p=h_floor_flat,
+			w_floor_p=w_floor_flat,
+			h_cont_p=h_cont_flat,
+			w_cont_p=w_cont_flat,
+			signed_delta_p=signed_flat,
+			normal_p=normal_flat,
+			mask_p=mask_flat * snap_flat.to(dtype=res.xyz_lr.dtype),
+		)
+		snap_item = (snap_loss, snap_maps, snap_masks)
 
 		with torch.no_grad():
 			next_rows = _rows.clone()
@@ -782,6 +807,7 @@ def atlas_line_loss(
 		valid_count = float(valid.to(dtype=torch.float32).sum().detach().cpu())
 		control_count = float(valid_control.to(dtype=torch.float32).sum().detach().cpu())
 		other_count = float(valid_other.to(dtype=torch.float32).sum().detach().cpu())
+		snap_count = float(valid_snap.to(dtype=torch.float32).sum().detach().cpu())
 		_last_stats = {
 			"atlas_line_samples": float(D * K),
 			"atlas_line_valid": valid_count,
@@ -794,10 +820,14 @@ def atlas_line_loss(
 			"atlas_line_other_valid": other_count,
 			"atlas_line_other_rms": float(torch.sqrt(other_item[0]).detach().cpu()),
 			"atlas_line_other_active_vertices": other_active_verts,
+			"atlas_line_snap_valid": snap_count,
+			"atlas_line_snap_rms": float(torch.sqrt(snap_item[0]).detach().cpu()),
+			"atlas_line_snap_active_vertices": snap_active_verts,
 		}
 
 	return {
 		"atlas_line": combined_item,
 		"atlas_line_control": control_item,
 		"atlas_line_other": other_item,
+		"atlas_line_snap": snap_item,
 	}

@@ -131,12 +131,13 @@ def _hash_bytes(data: bytes) -> str:
     return "md5:" + hashlib.md5(data).hexdigest()
 
 
-_SINGLE_FILE_OBJECT_TYPES = {"lasagna_model", "line", "line-map", "atlas"}
+_SINGLE_FILE_OBJECT_TYPES = {"lasagna_model", "line", "line-map", "atlas", "atlas-pred-snap"}
 _DIRECTORY_OBJECT_TYPES = {"tifxyz_segment", "atlas-base"}
 _SUPPORTED_OBJECT_TYPES = _SINGLE_FILE_OBJECT_TYPES | _DIRECTORY_OBJECT_TYPES
 _SUPPORTED_OBJECT_FORMATS = {
     "line": {"vc3d_fiber_json"},
     "line-map": {"vc3d_atlas_fiber_mapping_json"},
+    "atlas-pred-snap": {"vc3d_atlas_pred_snap_points_json"},
     "atlas-base": {"tifxyz"},
     "atlas": {"lasagna_atlas_json"},
 }
@@ -182,7 +183,7 @@ def _object_payload_path(ref: dict[str, str]) -> Path:
     base = _object_dir(ref)
     if ref["type"] == "lasagna_model":
         return base / "model.pt"
-    if ref["type"] in {"line", "line-map", "atlas"}:
+    if ref["type"] in {"line", "line-map", "atlas", "atlas-pred-snap"}:
         return base / "data.json"
     return base / "segment"
 
@@ -231,7 +232,7 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
             actual_hash = _hash_bytes(data)
             if actual_hash != ref["hash"]:
                 raise ValueError(f"object hash mismatch: declared {ref['hash']} actual {actual_hash}")
-            if ref["type"] in {"line", "line-map", "atlas"}:
+            if ref["type"] in {"line", "line-map", "atlas", "atlas-pred-snap"}:
                 try:
                     json.loads(data.decode("utf-8"))
                 except Exception as exc:
@@ -320,6 +321,9 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
         if not isinstance(map_ref, dict):
             raise ValueError(f"atlas JSON maps[{i}] requires map_ref")
         item["map_path"] = str(_resolve_object_ref(map_ref))
+        pred_snap_ref = item.get("pred_snap_ref")
+        if isinstance(pred_snap_ref, dict):
+            item["pred_snap_path"] = str(_resolve_object_ref(pred_snap_ref))
         obj_ref = item.get("object_ref")
         if isinstance(obj_ref, dict):
             item["object_path"] = str(_resolve_object_ref(obj_ref))
@@ -329,6 +333,56 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
             if line_obj is not None and line_obj.get("path"):
                 item["object_path"] = str(line_obj["path"])
     return resolved
+
+
+def _object_refs_from_value(value: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            try:
+                ref = _validate_object_ref(item)
+            except Exception:
+                ref = None
+            if ref is not None:
+                key = (ref["type"], ref["name"], ref["hash"])
+                if key not in seen:
+                    seen.add(key)
+                    out.append(ref)
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return out
+
+
+def _checkpoint_object_refs(model_path: str | None) -> dict[str, Any] | None:
+    if not model_path:
+        return None
+    try:
+        import torch
+        st = torch.load(str(model_path), map_location="cpu", weights_only=False)
+    except Exception as exc:
+        print(f"[fit-service] WARNING: failed to inspect model object refs: {exc}", flush=True)
+        return None
+    if not isinstance(st, dict):
+        return None
+    refs = st.get("_object_refs_")
+    return refs if isinstance(refs, dict) else None
+
+
+def _normalize_object_refs(job_spec: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(job_spec, dict):
+        return None
+    return {
+        "version": 1,
+        "objects": _object_refs_from_value(job_spec),
+        "job_spec": json.loads(json.dumps(job_spec)),
+    }
 
 
 def _truthy_config_bool(value: Any) -> bool:
@@ -515,9 +569,15 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     cfg = spec.get("config", {})
     if not isinstance(cfg, dict):
         raise ValueError("job_spec.config must be an object")
+    atlas_reopt_cfg = cfg.get("atlas_reopt")
+    if not isinstance(atlas_reopt_cfg, dict):
+        atlas_reopt_cfg = {}
+    atlas_ref_source = str(atlas_reopt_cfg.get("source") or "").strip().lower()
+    prefer_request_atlas = atlas_ref_source in {"request", "selected_atlas", "current_atlas"}
 
     resolved = dict(body)
     resolved_cfg = dict(cfg)
+    resolved_cfg.pop("atlas_reopt", None)
     external_surfaces_raw = resolved_cfg.get("external_surfaces")
     if external_surfaces_raw is not None:
         if not isinstance(external_surfaces_raw, list):
@@ -532,21 +592,39 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             external_surfaces.append(surface)
         resolved_cfg["external_surfaces"] = external_surfaces
 
-    resolved["config"] = resolved_cfg
-    resolved["_job_spec_"] = {
+    model_ref = spec.get("model")
+    model_object_refs: dict[str, Any] | None = None
+    if model_ref not in (None, {}, ""):
+        resolved_model_path = str(_resolve_object_ref(model_ref))
+        resolved["model_input"] = resolved_model_path
+        model_object_refs = _checkpoint_object_refs(resolved_model_path)
+
+    model_job_spec = (
+        model_object_refs.get("job_spec")
+        if isinstance(model_object_refs, dict) and isinstance(model_object_refs.get("job_spec"), dict)
+        else None
+    )
+    atlas_ref = spec.get("atlas")
+    model_atlas_ref = model_job_spec.get("atlas") if isinstance(model_job_spec, dict) else None
+    if prefer_request_atlas and atlas_ref not in (None, {}, ""):
+        if model_atlas_ref not in (None, {}, "") and model_atlas_ref != atlas_ref:
+            print("[fit-service] request job_spec.atlas overrides model _object_refs_ atlas", flush=True)
+    elif model_atlas_ref not in (None, {}, ""):
+        if atlas_ref not in (None, {}, "") and atlas_ref != model_atlas_ref:
+            print("[fit-service] model _object_refs_ atlas overrides request job_spec.atlas", flush=True)
+        atlas_ref = model_atlas_ref
+
+    effective_job_spec = {
         "model": spec.get("model"),
-        "atlas": spec.get("atlas"),
+        "atlas": atlas_ref,
         "linked_surfaces": spec.get("linked_surfaces", []),
         "config": cfg,
     }
     if "volume_shape_zyx" in spec:
-        resolved["_job_spec_"]["volume_shape_zyx"] = spec.get("volume_shape_zyx")
+        effective_job_spec["volume_shape_zyx"] = spec.get("volume_shape_zyx")
+    resolved["config"] = resolved_cfg
+    resolved["_job_spec_"] = effective_job_spec
 
-    model_ref = spec.get("model")
-    if model_ref not in (None, {}, ""):
-        resolved["model_input"] = str(_resolve_object_ref(model_ref))
-
-    atlas_ref = spec.get("atlas")
     if atlas_ref not in (None, {}, ""):
         resolved_cfg["atlas"] = _resolve_lasagna_atlas_ref(atlas_ref)
 
@@ -555,6 +633,23 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         linked_refs = []
     if not isinstance(linked_refs, list):
         raise ValueError("job_spec.linked_surfaces must be a list")
+
+    object_refs = _normalize_object_refs(effective_job_spec)
+    if object_refs is not None:
+        # Include explicit object_refs from the request as query-only refs. They
+        # may contain refs inherited from an exported tifxyz meta.json that are
+        # not part of the new job_spec surface area.
+        request_object_refs = spec.get("object_refs")
+        if isinstance(request_object_refs, dict):
+            merged = list(object_refs["objects"])
+            seen = {(r["type"], r["name"], r["hash"]) for r in merged}
+            for ref in _object_refs_from_value(request_object_refs.get("objects", [])):
+                key = (ref["type"], ref["name"], ref["hash"])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(ref)
+            object_refs["objects"] = merged
+        resolved["_object_refs_"] = object_refs
 
     return resolved
 
@@ -1340,6 +1435,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     st = torch.load(str(model_output), map_location="cpu", weights_only=False)
                     if isinstance(st, dict):
                         st["_job_spec_"] = job_spec
+                        object_refs = body.get("_object_refs_")
+                        if isinstance(object_refs, dict):
+                            st["_object_refs_"] = object_refs
                         torch.save(st, str(model_output))
             finally:
                 opt_mod.optimize = _orig_optimize

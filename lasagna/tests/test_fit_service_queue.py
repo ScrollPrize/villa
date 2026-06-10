@@ -413,6 +413,28 @@ class FitServiceObjectStoreTest(unittest.TestCase):
 			finally:
 				fit_service._object_store_dir = old_store
 
+	def test_atlas_pred_snap_object_upload_and_resolution(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				snap_json = b'{"type":"vc3d_atlas_pred_snap_points","version":1,"fiber_path":"fibers/fiber_a.json","entries":{}}'
+				snap_ref = {
+					"type": "atlas-pred-snap",
+					"name": "atlas/attachments/pred_snap_points/fiber_a.json",
+					"hash": fit_service._hash_bytes(snap_json),
+					"format": "vc3d_atlas_pred_snap_points_json",
+				}
+				stored = fit_service._store_uploaded_object({
+					"object": snap_ref,
+					"data": fit_service.base64.b64encode(snap_json).decode("ascii"),
+				})
+				self.assertEqual(stored, snap_ref)
+				self.assertTrue(fit_service._object_present(snap_ref))
+				self.assertEqual(fit_service._resolve_object_ref(snap_ref).read_bytes(), snap_json)
+			finally:
+				fit_service._object_store_dir = old_store
+
 
 if __name__ == "__main__":
 	unittest.main()
