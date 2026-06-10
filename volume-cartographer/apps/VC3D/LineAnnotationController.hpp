@@ -67,6 +67,7 @@ public:
         double automaticCertainty = 0.0;
         std::string automaticHvTag;
         std::string manualHvTag;
+        std::vector<std::string> tags;
     };
 
     struct FiberSnapshotWithPath {
@@ -100,6 +101,7 @@ public:
     void deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
+    void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
     void createAtlasFromFiber(uint64_t fiberId);
@@ -113,6 +115,7 @@ public:
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    [[nodiscard]] std::vector<std::string> knownFiberTags() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
     [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths() const;
@@ -150,6 +153,7 @@ private:
         std::vector<cv::Vec3d> linePoints;
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
+        std::vector<std::string> tags;
         bool needsSave = false;
     };
 
@@ -207,6 +211,7 @@ private:
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
     void emitFiberSummaries();
+    void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersDir() const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
@@ -251,6 +256,7 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    std::vector<std::string> _knownFiberTags;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
     DatasetPicker _datasetPicker;

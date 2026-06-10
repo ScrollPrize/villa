@@ -2,12 +2,16 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
+#include <QLineEdit>
 #include <QListView>
 #include <QPushButton>
 
 #include <cstdlib>
 #include <iostream>
+#include <initializer_list>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,6 +37,23 @@ bool sameIds(const std::vector<uint64_t>& actual, const std::vector<uint64_t>& e
     return actual == expected;
 }
 
+CFiberWidget::FiberEntry makeFiber(uint64_t id,
+                                   const std::string& fileName,
+                                   int controlPoints,
+                                   int linePoints,
+                                   double length,
+                                   std::initializer_list<std::string> tags = {})
+{
+    CFiberWidget::FiberEntry fiber;
+    fiber.id = id;
+    fiber.fileName = fileName;
+    fiber.controlPointCount = controlPoints;
+    fiber.linePointCount = linePoints;
+    fiber.lengthVx = length;
+    fiber.tags = tags;
+    return fiber;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -46,10 +67,11 @@ int main(int argc, char** argv)
 
     CFiberWidget widget;
     widget.setFibers({
-        {1, "fibers/1.json", 2, 20, 12.0},
-        {2, "kb_20260605T184821587_000002.json", 3, 30, 24.0},
-        {3, "fibers/3.json", 4, 40, 36.0},
+        makeFiber(1, "fibers/1.json", 2, 20, 12.0, {"source-a"}),
+        makeFiber(2, "kb_20260605T184821587_000002.json", 3, 30, 24.0, {"review"}),
+        makeFiber(3, "fibers/3.json", 4, 40, 36.0),
     });
+    widget.setKnownTags({"review", "source-a", "todo"});
 
     auto* listView = widget.findChild<QListView*>();
     require(listView != nullptr, "Fiber list view was not found");
@@ -77,8 +99,12 @@ int main(int argc, char** argv)
 
     int sliceRequests = 0;
     int renameRequests = 0;
+    int tagRequests = 0;
     uint64_t requestedSliceFiberId = 0;
     uint64_t requestedRenameFiberId = 0;
+    uint64_t requestedTagFiberId = 0;
+    QString requestedTag;
+    bool requestedTagEnabled = false;
     QObject::connect(&widget,
                      &CFiberWidget::fiberSliceRequested,
                      &widget,
@@ -93,6 +119,15 @@ int main(int argc, char** argv)
                          ++renameRequests;
                          requestedRenameFiberId = fiberId;
                      });
+    QObject::connect(&widget,
+                     &CFiberWidget::fiberTagChanged,
+                     &widget,
+                     [&](uint64_t fiberId, QString tag, bool enabled) {
+                         ++tagRequests;
+                         requestedTagFiberId = fiberId;
+                         requestedTag = tag;
+                         requestedTagEnabled = enabled;
+                     });
     auto* showSliceAction = widget.createShowFiberSliceAction(&widget);
     require(showSliceAction->isEnabled(), "Single selection should enable Show fiber slice action");
     showSliceAction->trigger();
@@ -103,6 +138,38 @@ int main(int argc, char** argv)
     renameAction->trigger();
     require(renameRequests == 1, "Rename JSON file action did not emit one request");
     require(requestedRenameFiberId == 2, "Rename JSON file emitted the wrong fiber ID");
+
+    auto tagCheckboxes = widget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
+    require(tagCheckboxes.size() == 3, "Known tags did not create three checkboxes");
+    QCheckBox* reviewCheckbox = nullptr;
+    QCheckBox* todoCheckbox = nullptr;
+    for (auto* checkbox : tagCheckboxes) {
+        if (checkbox->text() == QStringLiteral("review")) {
+            reviewCheckbox = checkbox;
+        } else if (checkbox->text() == QStringLiteral("todo")) {
+            todoCheckbox = checkbox;
+        }
+    }
+    require(reviewCheckbox != nullptr, "Review tag checkbox was not found");
+    require(todoCheckbox != nullptr, "Todo tag checkbox was not found");
+    require(reviewCheckbox->isChecked(), "Selected fiber tag should be checked");
+    require(!todoCheckbox->isChecked(), "Unchecked known tag should not be checked");
+    todoCheckbox->setChecked(true);
+    require(tagRequests == 1, "Checking a tag did not emit one tag request");
+    require(requestedTagFiberId == 2, "Tag check emitted the wrong fiber ID");
+    require(requestedTag == QStringLiteral("todo"), "Tag check emitted the wrong tag");
+    require(requestedTagEnabled, "Tag check should enable the tag");
+
+    auto* newTagEdit = widget.findChild<QLineEdit*>(QStringLiteral("fiberNewTagEdit"));
+    auto* addTagButton = widget.findChild<QPushButton*>(QStringLiteral("fiberAddTagButton"));
+    require(newTagEdit != nullptr, "New tag text field was not found");
+    require(addTagButton != nullptr, "Add tag button was not found");
+    newTagEdit->setText(QStringLiteral("needs-proofread"));
+    addTagButton->click();
+    require(tagRequests == 2, "Adding a tag did not emit a second tag request");
+    require(requestedTagFiberId == 2, "Added tag emitted the wrong fiber ID");
+    require(requestedTag == QStringLiteral("needs-proofread"), "Added tag emitted the wrong tag");
+    require(requestedTagEnabled, "Added tag should enable the tag");
 
     widget.selectFibers({1, 3});
     require(widget.selectedFiberId() == 0, "Multi-selection should not expose a single selected fiber");
@@ -116,6 +183,8 @@ int main(int argc, char** argv)
     require(!multiShowSliceAction->isEnabled(), "Multi-selection should disable Show fiber slice action");
     auto* multiRenameAction = widget.createRenameFiberFileAction(&widget);
     require(!multiRenameAction->isEnabled(), "Multi-selection should disable Rename JSON file action");
+    require(!newTagEdit->isEnabled(), "Multi-selection should disable new tag text field");
+    require(!addTagButton->isEnabled(), "Multi-selection should disable add tag button");
 
     int confirmations = 0;
     int batchDeletes = 0;

@@ -14,6 +14,8 @@
 class QLabel;
 class QButtonGroup;
 class QAction;
+class QLineEdit;
+class QVBoxLayout;
 
 class CFiberWidget : public QDockWidget
 {
@@ -33,6 +35,7 @@ public:
         double automaticCertainty = 0.0;
         std::string automaticHvTag;
         std::string manualHvTag;
+        std::vector<std::string> tags;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);
@@ -47,6 +50,7 @@ public:
     QAction* createShowFiberSliceAction(QObject* parent);
     QAction* createRenameFiberFileAction(QObject* parent);
     void setFibers(const std::vector<FiberEntry>& fibers);
+    void setKnownTags(const std::vector<std::string>& tags);
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
@@ -55,6 +59,7 @@ signals:
     void fiberOpenRequested(uint64_t fiberId);
     void deleteFibersRequested(std::vector<uint64_t> fiberIds);
     void manualHvTagChanged(uint64_t fiberId, QString tag);
+    void fiberTagChanged(uint64_t fiberId, QString tag, bool enabled);
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void newAtlasFromFiberRequested(uint64_t fiberId);
     void fiberSliceRequested(uint64_t fiberId);
@@ -67,6 +72,7 @@ private slots:
     void onManualHvButtonClicked(int id);
     void onManualHvResetClicked();
     void onRecalculateHvScoreClicked();
+    void onAddTagClicked();
     void showContextMenu(const QPoint& pos);
 
 private:
@@ -74,6 +80,9 @@ private:
     QStandardItem* findFiberItem(uint64_t fiberId);
     const FiberEntry* selectedFiber() const;
     void updateClassificationUi();
+    void rebuildTagList();
+    void applyTagLocally(uint64_t fiberId, const std::string& tag, bool enabled);
+    void requestFiberTagChange(const QString& tag, bool enabled);
     void requestDeleteSelectedFibers();
     void requestShowFiberSlice();
     void requestRenameFiberFile();
@@ -82,12 +91,18 @@ private:
 
     uint64_t _selectedFiberId = 0;
     std::vector<FiberEntry> _fibers;
+    std::vector<std::string> _knownTags;
     std::function<bool(const std::vector<uint64_t>&)> _deleteConfirmationForTesting;
 
     QListView* _listView;
     QStandardItemModel* _model;
+    QLabel* _nameLabel;
     QLabel* _scoreLabel;
     QLabel* _autoLabel;
+    QWidget* _tagListWidget;
+    QVBoxLayout* _tagListLayout;
+    QLineEdit* _newTagEdit;
+    QPushButton* _addTagButton;
     QButtonGroup* _manualHvGroup;
     QPushButton* _manualHButton;
     QPushButton* _manualVButton;

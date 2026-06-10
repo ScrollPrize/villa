@@ -4004,13 +4004,16 @@ void CWindow::CreateWidgets(void)
                     fiber.automaticCertainty,
                     fiber.automaticHvTag,
                     fiber.manualHvTag,
+                    fiber.tags,
                 });
             }
             if (_fiberWidget) {
                 _fiberWidget->setFibers(entries);
+                _fiberWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
             }
             if (_fiberSliceWidget) {
                 _fiberSliceWidget->setFibers(entries);
+                _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
             }
         };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
@@ -4033,6 +4036,10 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::manualHvTagChanged,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::setFiberManualHvTag);
+            connect(widget,
+                    &CFiberWidget::fiberTagChanged,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::setFiberTag);
             connect(widget,
                     &CFiberWidget::hvScoreRecalculationRequested,
                     _lineAnnotationController.get(),

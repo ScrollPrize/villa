@@ -3,9 +3,11 @@
 #include <QAbstractItemView>
 #include <QAction>
 #include <QButtonGroup>
+#include <QCheckBox>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QSignalBlocker>
@@ -13,6 +15,27 @@
 
 #include <algorithm>
 #include <utility>
+
+namespace {
+
+void addUniqueSorted(std::vector<std::string>& values, const std::string& value)
+{
+    if (value.empty()) {
+        return;
+    }
+    if (std::find(values.begin(), values.end(), value) != values.end()) {
+        return;
+    }
+    values.push_back(value);
+    std::sort(values.begin(), values.end());
+}
+
+bool containsTag(const std::vector<std::string>& tags, const std::string& tag)
+{
+    return std::find(tags.begin(), tags.end(), tag) != tags.end();
+}
+
+} // namespace
 
 CFiberWidget::CFiberWidget(QWidget* parent)
     : QDockWidget(tr("Fibers"), parent)
@@ -26,6 +49,38 @@ void CFiberWidget::setupUi()
 {
     auto* mainWidget = new QWidget(this);
     auto* layout = new QVBoxLayout(mainWidget);
+
+    _nameLabel = new QLabel(mainWidget);
+    _nameLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(_nameLabel);
+
+    _scoreLabel = new QLabel(mainWidget);
+    _scoreLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(_scoreLabel);
+
+    _autoLabel = new QLabel(mainWidget);
+    _autoLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(_autoLabel);
+
+    layout->addWidget(new QLabel(tr("Tags:"), mainWidget));
+    _tagListWidget = new QWidget(mainWidget);
+    _tagListLayout = new QVBoxLayout(_tagListWidget);
+    _tagListLayout->setContentsMargins(0, 0, 0, 0);
+    _tagListLayout->setSpacing(2);
+    layout->addWidget(_tagListWidget);
+
+    auto* addTagLayout = new QHBoxLayout();
+    _newTagEdit = new QLineEdit(mainWidget);
+    _newTagEdit->setObjectName(QStringLiteral("fiberNewTagEdit"));
+    _newTagEdit->setPlaceholderText(tr("New tag"));
+    _addTagButton = new QPushButton(tr("Add"), mainWidget);
+    _addTagButton->setObjectName(QStringLiteral("fiberAddTagButton"));
+    addTagLayout->addWidget(_newTagEdit, 1);
+    addTagLayout->addWidget(_addTagButton);
+    layout->addLayout(addTagLayout);
+
+    connect(_newTagEdit, &QLineEdit::returnPressed, this, &CFiberWidget::onAddTagClicked);
+    connect(_addTagButton, &QPushButton::clicked, this, &CFiberWidget::onAddTagClicked);
 
     _model = new QStandardItemModel(this);
     _listView = new QListView(mainWidget);
@@ -41,14 +96,6 @@ void CFiberWidget::setupUi()
             this, &CFiberWidget::onDoubleClicked);
     connect(_listView, &QWidget::customContextMenuRequested,
             this, &CFiberWidget::showContextMenu);
-
-    _scoreLabel = new QLabel(mainWidget);
-    _scoreLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    layout->addWidget(_scoreLabel);
-
-    _autoLabel = new QLabel(mainWidget);
-    _autoLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    layout->addWidget(_autoLabel);
 
     auto* manualLayout = new QHBoxLayout();
     manualLayout->addWidget(new QLabel(tr("Manual:"), mainWidget));
@@ -180,6 +227,11 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
     std::sort(_fibers.begin(), _fibers.end(), [](const FiberEntry& a, const FiberEntry& b) {
         return a.id < b.id;
     });
+    for (const auto& fiber : _fibers) {
+        for (const auto& tag : fiber.tags) {
+            addUniqueSorted(_knownTags, tag);
+        }
+    }
 
     _model->clear();
     for (const auto& fiber : _fibers) {
@@ -193,6 +245,20 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
         selectFibers(previousSelection);
     }
     _deleteButton->setEnabled(canDeleteSelection());
+    updateClassificationUi();
+}
+
+void CFiberWidget::setKnownTags(const std::vector<std::string>& tags)
+{
+    _knownTags.clear();
+    for (const auto& tag : tags) {
+        addUniqueSorted(_knownTags, tag);
+    }
+    for (const auto& fiber : _fibers) {
+        for (const auto& tag : fiber.tags) {
+            addUniqueSorted(_knownTags, tag);
+        }
+    }
     updateClassificationUi();
 }
 
@@ -302,6 +368,22 @@ void CFiberWidget::onRecalculateHvScoreClicked()
     emit hvScoreRecalculationRequested(_selectedFiberId);
 }
 
+void CFiberWidget::onAddTagClicked()
+{
+    if (_selectedFiberId == 0) {
+        return;
+    }
+    const QString tag = _newTagEdit ? _newTagEdit->text().trimmed() : QString();
+    if (tag.isEmpty()) {
+        return;
+    }
+    _newTagEdit->clear();
+    addUniqueSorted(_knownTags, tag.toStdString());
+    applyTagLocally(_selectedFiberId, tag.toStdString(), true);
+    emit fiberTagChanged(_selectedFiberId, tag, true);
+    rebuildTagList();
+}
+
 const CFiberWidget::FiberEntry* CFiberWidget::selectedFiber() const
 {
     const auto it = std::find_if(_fibers.begin(), _fibers.end(), [this](const FiberEntry& fiber) {
@@ -310,15 +392,82 @@ const CFiberWidget::FiberEntry* CFiberWidget::selectedFiber() const
     return it == _fibers.end() ? nullptr : &*it;
 }
 
+void CFiberWidget::rebuildTagList()
+{
+    if (!_tagListLayout || !_tagListWidget) {
+        return;
+    }
+
+    while (auto* item = _tagListLayout->takeAt(0)) {
+        delete item->widget();
+        delete item;
+    }
+
+    const FiberEntry* fiber = selectedFiber();
+    const bool hasSelection = fiber != nullptr;
+    for (const auto& tag : _knownTags) {
+        auto* checkbox = new QCheckBox(QString::fromStdString(tag), _tagListWidget);
+        checkbox->setObjectName(QStringLiteral("fiberTagCheckBox"));
+        checkbox->setEnabled(hasSelection);
+        checkbox->setChecked(hasSelection && containsTag(fiber->tags, tag));
+        connect(checkbox, &QCheckBox::toggled, this, [this, tagText = QString::fromStdString(tag)](bool checked) {
+            requestFiberTagChange(tagText, checked);
+        });
+        _tagListLayout->addWidget(checkbox);
+    }
+    _tagListLayout->addStretch(1);
+
+    const bool canEditTags = hasSelection;
+    if (_newTagEdit) {
+        _newTagEdit->setEnabled(canEditTags);
+    }
+    if (_addTagButton) {
+        _addTagButton->setEnabled(canEditTags);
+    }
+}
+
+void CFiberWidget::requestFiberTagChange(const QString& tag, bool enabled)
+{
+    if (_selectedFiberId == 0) {
+        return;
+    }
+    applyTagLocally(_selectedFiberId, tag.toStdString(), enabled);
+    emit fiberTagChanged(_selectedFiberId, tag, enabled);
+}
+
+void CFiberWidget::applyTagLocally(uint64_t fiberId, const std::string& tag, bool enabled)
+{
+    auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const FiberEntry& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (it == _fibers.end()) {
+        return;
+    }
+    if (enabled) {
+        addUniqueSorted(it->tags, tag);
+    } else {
+        it->tags.erase(std::remove(it->tags.begin(), it->tags.end(), tag), it->tags.end());
+    }
+}
+
 void CFiberWidget::updateClassificationUi()
 {
     const FiberEntry* fiber = selectedFiber();
     const bool hasSelection = fiber != nullptr;
 
     if (!hasSelection) {
+        _nameLabel->setText(tr("No fiber selected"));
         _scoreLabel->setText(tr("z dist: -    control len: -\nH score: -    V score: -"));
         _autoLabel->setText(tr("Auto: -"));
     } else {
+        const QString name = QString::fromStdString(fiber->fileName).isEmpty()
+            ? tr("Fiber %1").arg(fiber->id)
+            : QString::fromStdString(fiber->fileName);
+        _nameLabel->setText(tr("%1\ncp=%2    pts=%3    len=%4 vx")
+                                .arg(name)
+                                .arg(fiber->controlPointCount)
+                                .arg(fiber->linePointCount)
+                                .arg(fiber->lengthVx, 0, 'f', 1));
         _scoreLabel->setText(tr("z dist: %1    control len: %2\nH score: %3    V score: %4")
                                  .arg(fiber->hvZDistance, 0, 'f', 2)
                                  .arg(fiber->hvFiberLength, 0, 'f', 2)
@@ -341,6 +490,7 @@ void CFiberWidget::updateClassificationUi()
     _manualVButton->setEnabled(hasSelection);
     _manualResetButton->setEnabled(hasSelection && fiber->manualHvTag != "");
     _recalculateScoreButton->setEnabled(hasSelection);
+    rebuildTagList();
 }
 
 void CFiberWidget::showContextMenu(const QPoint& pos)
