@@ -6,9 +6,13 @@ Mesh folders are named `wXXX[_suffix]` (e.g. `w020_spliced_erode_r2`). Only the
 `_spliced` variants are processed. For each, this runs vc_render_tifxyz to render
 --num-slices layer tifs into a per-mesh `ink/` subfolder and max-composites them.
 The per-winding composites are then concatenated horizontally (whole tifs, never
-chopped) into chunks of about --chunk-width px, renormalised to their
-95th-percentile intensity, and written as 8-bit jpgs to an `ink/` folder
-alongside the meshes, named after their winding range, e.g. `w010-022.jpg`.
+chopped) into images, renormalised to their 95th-percentile intensity, and written
+as 8-bit jpgs to an `ink/` folder alongside the meshes, named after their winding
+range, e.g. `w010-027.jpg`.
+
+How many windings land in each image is a fixed function of the absolute winding
+number (WINDINGS_PER_IMAGE below), not the rendered image widths, so the tiling is
+reproducible run-to-run.
 """
 
 import os
@@ -40,6 +44,25 @@ def winding_idx(name):
     return int(m.group(1)) if m else None
 
 
+# Number of windings packed into each successive image, starting from winding 0.
+# After this fixed schedule is exhausted, every further winding gets its own image.
+WINDINGS_PER_IMAGE = (18, 10, 8, 7, 6) + (5,) * 2 + (4,) * 5 + (3,) * 9 + (2,) * 20
+
+
+def image_bin(widx, base):
+    """Map a winding number to an image-tile index using WINDINGS_PER_IMAGE (then 1
+    winding per image thereafter), counting from `base` (the first winding present
+    in the data). Keying off the winding number keeps the tiling reproducible
+    regardless of per-winding image widths."""
+    offset = widx - base
+    start = 0
+    for bin_idx, size in enumerate(WINDINGS_PER_IMAGE):
+        if offset < start + size:
+            return bin_idx
+        start += size
+    return len(WINDINGS_PER_IMAGE) + (offset - start)
+
+
 def max_composite(tif_paths):
     composite = None
     for tif_path in tif_paths:
@@ -58,9 +81,8 @@ def max_composite(tif_paths):
 @click.option('--scale', type=float, default=0.25, show_default=True)
 @click.option('--group-idx', type=int, default=1, show_default=True)
 @click.option('--num-slices', type=int, default=5, show_default=True)
-@click.option('--chunk-width', type=int, default=4000, show_default=True, help='Target width (px) per horizontal strip')
 @click.option('--num-processes', '-j', type=int, default=1, show_default=True, help='Number of meshes to render concurrently')
-def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, chunk_width, num_processes):
+def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, num_processes):
     meshes = sorted(
         (winding_idx(name), name)
         for name in os.listdir(meshes_dir)
@@ -109,32 +131,22 @@ def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, chunk_
     if not composites:
         raise click.ClickException('No composites produced')
 
-    # Restore winding order for the horizontal packing below.
-    composites.sort(key=lambda wc: wc[0])
+    # Group whole per-winding composites into images by their fixed schedule bin,
+    # counted from the first winding present, so the tiling is reproducible.
+    base = min(widx for widx, _ in composites)
+    bins = {}  # image_bin -> [(winding_idx, composite array)]
+    for widx, comp in composites:
+        bins.setdefault(image_bin(widx, base), []).append((widx, comp))
 
-    # Greedily pack whole per-winding composites into horizontal strips of ~chunk_width px.
-    chunk = []  # (winding_idx, composite array)
-    chunk_w = 0
-
-    def flush():
-        if not chunk:
-            return
+    for bin_idx in sorted(bins):
+        chunk = sorted(bins[bin_idx], key=lambda wc: wc[0])
         lo, hi = chunk[0][0], chunk[-1][0]
         out_path = os.path.join(collect_dir, f'w{lo:03d}-{hi:03d}.jpg')
         strip = np.concatenate([c for _, c in chunk], axis=1).astype(np.float32)
         p95 = np.percentile(strip, 95)
         strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
         Image.fromarray(strip.astype(np.uint8)).save(out_path, quality=95)
-        print(f'wrote {out_path} ({len(chunk)} windings, {chunk_w}px wide, p95={p95:.1f})')
-
-    for widx, comp in composites:
-        w = comp.shape[1]
-        if chunk and chunk_w + w > chunk_width:
-            flush()
-            chunk, chunk_w = [], 0
-        chunk.append((widx, comp))
-        chunk_w += w
-    flush()
+        print(f'wrote {out_path} ({len(chunk)} windings, {strip.shape[1]}px wide, p95={p95:.1f})')
 
     print(f'Done. Strips in {collect_dir}')
 
