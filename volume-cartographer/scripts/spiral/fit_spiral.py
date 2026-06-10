@@ -112,9 +112,9 @@ default_config = {
     'unverified_num_patches_per_step_for_dt': 80,
     'unverified_num_points_per_patch': 800,
     'unverified_patch_exclusion_radius': 16.0,  # mask unverified-patch vertices within this of trusted geometry (downsampled voxels)
-    'winding_number_num_pcls': 48,
-    'winding_number_num_patch_pairs_per_pcl': 4,
-    'winding_number_adjacent_patches_only': True,
+    'rel_winding_num_pcls': 48,
+    'rel_winding_num_patch_pairs_per_pcl': 4,
+    'rel_winding_adjacent_patches_only': True,
     'unattached_pcl_num_per_step': 84,
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 4.,
@@ -152,7 +152,7 @@ default_config = {
     'loss_weight_patch_dt': 16.e0,
     'loss_weight_unverified_patch_radius': 8.e0,
     'loss_weight_unverified_patch_dt': 4.e0,
-    'loss_weight_winding_number': 20.,
+    'loss_weight_rel_winding': 20.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_track_radius': 200.,
@@ -235,7 +235,7 @@ z_range_scaled_count_keys = (
     'num_patches_per_step_for_dt',
     'unverified_num_patches_per_step',
     'unverified_num_patches_per_step_for_dt',
-    'winding_number_num_pcls',
+    'rel_winding_num_pcls',
     'unattached_pcl_num_per_step',
     'track_num_per_step',
     'normals_num_points',
@@ -1550,7 +1550,7 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points):
     ]
 
 
-def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
+def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
     # cross-patch pcl exposes its attached points grouped by patch
@@ -1573,24 +1573,27 @@ def get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, pat
     # Each entry: (ls1, ls2, pid1, pid2, winding_diff) where ls* is a list of 4 L-shape ij strips
     strip_pairs = []
 
-    num_pcls_per_step = min(cfg['winding_number_num_pcls'], len(point_collections))
+    # Single-point pcls (possible only for winding_is_absolute pcls) can't form a
+    # cross-patch pair, so exclude them from the candidate pool before sampling.
+    candidate_pcls = [pcl for pcl in point_collections if len(pcl['points']) > 1]
+    num_pcls_per_step = min(cfg['rel_winding_num_pcls'], len(candidate_pcls))
     if num_pcls_per_step <= 0:
         return torch.zeros([], device='cuda')
-    selected_idxs = np.random.choice(len(point_collections), num_pcls_per_step, replace=False)
-    selected_pcls = [point_collections[i] for i in selected_idxs]
+    selected_idxs = np.random.choice(len(candidate_pcls), num_pcls_per_step, replace=False)
+    selected_pcls = [candidate_pcls[i] for i in selected_idxs]
 
     for pcl in selected_pcls:
         # Pair patches either only with their immediate neighbour in the pcl's
         # patch ordering (first-seen order; built in main()),
         # or with every other patch.
-        if cfg['winding_number_adjacent_patches_only']:
+        if cfg['rel_winding_adjacent_patches_only']:
             cross_pairs = [(p1, p2) for p1, p2 in zip(pcl['points_by_patch'], list(pcl['points_by_patch'])[1:])]
         else:
             cross_pairs = list(itertools.combinations(pcl['points_by_patch'], r=2))
         if not cross_pairs:
             continue
 
-        num_pairs_for_pcl = min(len(cross_pairs), cfg['winding_number_num_patch_pairs_per_pcl'])
+        num_pairs_for_pcl = min(len(cross_pairs), cfg['rel_winding_num_patch_pairs_per_pcl'])
         if num_pairs_for_pcl <= 0:
             continue
         chosen = np.random.choice(len(cross_pairs), num_pairs_for_pcl, replace=False)
@@ -4766,8 +4769,8 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             )
             losses['sym_dirichlet'] = sym_dirichlet_loss * cfg['loss_weight_sym_dirichlet']
 
-        if cfg['loss_weight_winding_number'] > 0 and point_collections:
-            losses['winding_number'] = get_patch_winding_number_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_winding_number']
+        if cfg['loss_weight_rel_winding'] > 0 and point_collections:
+            losses['rel_winding'] = get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_rel_winding']
 
         if cfg['loss_weight_pcl_normals'] > 0 and pcl_normal_samples is not None:
             losses['pcl_normals'] = get_pcl_normals_loss(
@@ -5158,11 +5161,21 @@ def prepare_point_collections(patches):
     # A pcl can fall into both sets. When it does, the unattached entry is an independent copy
     # so its z-roi trimming / annotation normalisation cannot perturb the cross-patch entry's
     # points_by_patch (which is built from all attached points, regardless of z).
+    # Exception: pcls flagged metadata.winding_is_absolute carry absolute winding annotations
+    # and are always consumed as cross-patch pcls (never unattached), retained even when they
+    # hold a single point; we assert that every one of their points attached to a patch.
     cross_patch_point_collections = {}
     unattached_point_collections = {}
     for pid, pcl in point_collections.items():
         num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
         num_unattached = len(pcl['points']) - num_attached
+        if pcl.get('metadata', {}).get('winding_is_absolute', False):
+            assert num_unattached == 0, (
+                f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_unattached} of '
+                f'{len(pcl["points"])} points not attached to any patch; expected all attached'
+            )
+            cross_patch_point_collections[pid] = pcl
+            continue
         if num_attached >= 2:
             cross_patch_point_collections[pid] = pcl
         if num_unattached >= 1:
