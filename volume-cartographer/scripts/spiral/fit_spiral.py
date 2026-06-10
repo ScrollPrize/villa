@@ -44,6 +44,7 @@ pcl_json_paths = [
 ]
 patches_path = f'{dataset_path}/patches'
 unverified_patches_path = os.environ.get('FIT_SPIRAL_UNVERIFIED_PATCHES_PATH', None)
+run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
 shell_path = f'{dataset_path}/s1_2um_outer'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'
 spiral_outward_sense = 'CW'  # CW | ACW
@@ -3434,7 +3435,8 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl
     )
 
     step_size = grid_spacing * downsample_factor
-    out_dir = f'{out_path}/meshes/{name}'
+    tag_suffix = f'_{run_tag}' if run_tag else ''
+    out_dir = f'{out_path}/meshes/{name}{tag_suffix}'
     os.makedirs(out_dir, exist_ok=True)
     for uuid_suffix, variant_zyxs in [('', scroll_zyxs), ('_spliced', spliced_scroll_zyxs)]:
         offset = 0
@@ -3447,7 +3449,7 @@ def save_mesh(slice_to_spiral_transform, dr_per_winding, patches, unattached_pcl
                 save_tifxyz(
                     winding_zyxs,
                     out_dir,
-                    uuid=f'w{winding_idx:03d}{uuid_suffix}',
+                    uuid=f'w{winding_idx:03d}{uuid_suffix}{tag_suffix}',
                     step_size=step_size,
                     voxel_size_um=voxel_size_um * downsample_factor,
                     source=f'fit_spiral {name}{uuid_suffix}',
@@ -5353,7 +5355,6 @@ def main():
     out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{len(patches)}-patch'
     if not wandb.run.name.startswith('dummy-'):
         out_path += '_' + wandb.run.name
-    run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
     if run_tag:
         out_path += f'_{run_tag}'
     os.makedirs(out_path, exist_ok=True)
