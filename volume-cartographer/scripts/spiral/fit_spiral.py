@@ -115,6 +115,8 @@ default_config = {
     'rel_winding_num_pcls': 48,
     'rel_winding_num_patch_pairs_per_pcl': 4,
     'rel_winding_adjacent_patches_only': True,
+    'abs_winding_num_pcls': 48,
+    'abs_winding_num_points_per_pcl': 4,
     'unattached_pcl_num_per_step': 84,
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 4.,
@@ -153,6 +155,7 @@ default_config = {
     'loss_weight_unverified_patch_radius': 8.e0,
     'loss_weight_unverified_patch_dt': 4.e0,
     'loss_weight_rel_winding': 20.,
+    'loss_weight_abs_winding': 20.,
     'loss_weight_unattached_pcl_radius': 8.e0,
     'loss_weight_unattached_pcl_dt': 16.e0,
     'loss_weight_track_radius': 200.,
@@ -236,6 +239,7 @@ z_range_scaled_count_keys = (
     'unverified_num_patches_per_step',
     'unverified_num_patches_per_step_for_dt',
     'rel_winding_num_pcls',
+    'abs_winding_num_pcls',
     'unattached_pcl_num_per_step',
     'track_num_per_step',
     'normals_num_points',
@@ -1670,6 +1674,98 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     pair_mask = m2[:, :, None] & m1[:, None, :]
     err = (diff - expected_diff).abs()
     return (err * pair_mask).sum() / pair_mask.sum().clamp(min=1)
+
+
+def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections):
+    # For PCL points carrying an absolute winding annotation (only pcls flagged
+    # metadata.winding_is_absolute), pin the spiral shifted-radius at each annotated
+    # point to its absolute target, winding_annotation * dr_per_winding (the spiral has
+    # radius 0 at winding 0 and grows at dr_per_winding, so shifted_radius == winding *
+    # dr_per_winding). This mirrors get_patch_rel_winding_loss, but anchors each point's
+    # absolute winding instead of regressing a pair's winding difference: we sample some
+    # absolute-winding pcls, some attached points within each, build 4 L-shaped strips
+    # per point (sampled in traversal order so _unwrap_track_shifted_radii can stitch
+    # theta=0 seam crossings), then drive every in-roi strip sample's shifted radius to
+    # the point's target. Each L starts at the annotated point, so its unwrapped
+    # shifted-radius keeps the true absolute scale at the anchor.
+
+    num_points_per_strip = cfg['num_points_per_patch'] // 2
+    num_strips_per_point = 4
+
+    # Each entry: (ls, pid, winding_annotation) where ls is a list of 4 L-shape ij strips.
+    strips = []
+
+    abs_pcls = [pcl for pcl in point_collections if pcl.get('metadata', {}).get('winding_is_absolute', False)]
+    num_pcls_per_step = min(cfg['abs_winding_num_pcls'], len(abs_pcls))
+    if num_pcls_per_step <= 0:
+        return torch.zeros([], device='cuda')
+    selected_idxs = np.random.choice(len(abs_pcls), num_pcls_per_step, replace=False)
+    selected_pcls = [abs_pcls[i] for i in selected_idxs]
+
+    for pcl in selected_pcls:
+        # An absolute-winding pcl's attached points, flattened across its patches.
+        attached = [p for pts in pcl['points_by_patch'].values() for p in pts]
+        if not attached:
+            continue
+        num_points_for_pcl = min(len(attached), cfg['abs_winding_num_points_per_pcl'])
+        chosen = np.random.choice(len(attached), num_points_for_pcl, replace=False)
+        for idx in chosen:
+            p = attached[idx]
+            pid = p['on_patch']['id']
+            i, j = int(p['on_patch']['ij'][0]), int(p['on_patch']['ij'][1])
+            ls = _sample_l_shapes_at_ij(patches_dict[pid], i, j, num_points_per_strip)
+            if ls is None:
+                continue
+            strips.append((ls, pid, p['winding_annotation']))
+
+    if not strips:
+        return torch.zeros([], device='cuda')
+
+    # Flatten: 4 strips per annotated point.
+    total_strips = len(strips) * num_strips_per_point
+    flat_ijs = np.empty([total_strips, num_points_per_strip, 2], dtype=np.float32)
+    flat_pids = []
+    for k, (ls, pid, _) in enumerate(strips):
+        base = k * num_strips_per_point
+        for s, strip in enumerate(ls):
+            flat_ijs[base + s] = strip
+        flat_pids.extend([pid] * num_strips_per_point)
+
+    # Batched GPU bilinear interp across all strips.
+    patch_idx_per_strip_np = np.fromiter(
+        (patch_atlas.id_to_idx[pid] for pid in flat_pids),
+        dtype=np.int64,
+        count=total_strips,
+    )
+    patch_idx_per_strip_gpu = torch.from_numpy(patch_idx_per_strip_np).cuda(non_blocking=True)
+    ijs_gpu = torch.from_numpy(flat_ijs).cuda(non_blocking=True)
+    patch_idx_per_sample = patch_idx_per_strip_gpu[:, None].expand(total_strips, num_points_per_strip)
+    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, ijs_gpu)
+
+    # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
+    # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
+    # needs the full sequential strip to stitch theta=0 crossings.
+    z_margin = cfg['patch_loss_z_margin']
+    z_mask = (flat_zyxs[..., 0] >= z_begin - z_margin) & (flat_zyxs[..., 0] < z_end + z_margin)
+
+    flat_spiral = slice_to_spiral_transform(flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
+    theta, _, shifted_radii = get_theta_and_radii(flat_spiral[..., 1:], dr_per_winding)
+    shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
+
+    # [num_points, 4, num_points_per_strip] -> pool each point's 4 strips into one set.
+    num_samples_per_point = num_strips_per_point * num_points_per_strip
+    shifted_radii = shifted_radii.reshape(len(strips), num_samples_per_point)
+    mask = z_mask.reshape(len(strips), num_samples_per_point)
+
+    winding_annotations = torch.tensor(
+        [s[2] for s in strips],
+        device='cuda',
+        dtype=torch.float32,
+    )
+    target_shifted = (winding_annotations * dr_per_winding)[:, None]
+
+    err = (shifted_radii - target_shifted).abs()
+    return (err * mask).sum() / mask.sum().clamp(min=1)
 
 
 class _UnattachedPclStripList(list):
@@ -4771,6 +4867,9 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
         if cfg['loss_weight_rel_winding'] > 0 and point_collections:
             losses['rel_winding'] = get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_rel_winding']
+
+        if cfg['loss_weight_abs_winding'] > 0 and point_collections:
+            losses['abs_winding'] = get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_abs_winding']
 
         if cfg['loss_weight_pcl_normals'] > 0 and pcl_normal_samples is not None:
             losses['pcl_normals'] = get_pcl_normals_loss(
