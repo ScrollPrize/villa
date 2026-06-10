@@ -767,17 +767,6 @@ void saveFiberSliceFitDebugImage(const fs::path& outputPath,
             pa.x + delta.x * kSearchVectorDisplayScale,
             pa.y + delta.y * kSearchVectorDisplayScale};
         drawImageLine(pa, displayEnd, color, 1);
-
-        if (pb.x >= -2.0 && pb.x < static_cast<double>(imageWidth) + 2.0 &&
-            pb.y >= -2.0 && pb.y < static_cast<double>(imageHeight) + 2.0) {
-            cv::circle(image,
-                       toSubpixelPoint(pb),
-                       2 * kSubpixelScale,
-                       color,
-                       -1,
-                       cv::LINE_AA,
-                       kSubpixelShift);
-        }
     };
     auto drawCircle = [&](const FiberSliceDebugPoint& point,
                           int radius,

@@ -2677,7 +2677,8 @@ void CWindow::createAtlasWorkspace()
     if (_atlasWorkspaceFiberDock && _atlasWorkspaceFiberDock->widget()) {
         if (auto* table = _atlasWorkspaceFiberDock->widget()->findChild<QTableWidget*>(QStringLiteral("atlasFiberTable"))) {
             auto openFromItem = [this, table](QTableWidgetItem* item) {
-                if (!item || !_lineAnnotationController) {
+                if (!item || !_lineAnnotationController ||
+                    table->property("vc_atlas_opening_fiber").toBool()) {
                     return;
                 }
                 bool ok = false;
@@ -2685,6 +2686,10 @@ void CWindow::createAtlasWorkspace()
                 if (!ok || fiberId == 0) {
                     return;
                 }
+                table->setProperty("vc_atlas_opening_fiber", true);
+                QTimer::singleShot(0, table, [table]() {
+                    table->setProperty("vc_atlas_opening_fiber", false);
+                });
                 if (_fiberWidget) {
                     _fiberWidget->selectFiber(fiberId);
                 }
