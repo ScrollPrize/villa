@@ -40,10 +40,10 @@ grad_mag_zarr_path = '/ephemeral/paul/spiral/las_008_grad_mag.ome.zarr'
 normal_zarr_group = '4'
 pcl_json_paths = [
     f'{dataset_path}/rel_windings_new_reordered.json',
-    # f'{dataset_path}/same_winding_annotations_fixed_merged.json',
+    f'{dataset_path}/new_same_wind.json',
 ]
 patches_path = f'{dataset_path}/patches'
-unverified_patches_path = os.environ.get('FIT_SPIRAL_UNVERIFIED_PATCHES_PATH', None)
+unverified_patches_path = f'{dataset_path}/unproofed_patches_trimmed_deduped'
 run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
 shell_path = f'{dataset_path}/s1_2um_outer'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'
@@ -101,7 +101,7 @@ default_config = {
     'num_patches_per_step': 360,
     'num_patches_per_step_for_dt': 240,
     'num_points_per_patch': 800,
-    'erode_patches': 0,  # if >0, erode every patch's valid region (verified + unverified) by this many grid cells
+    'erode_patches': 2,  # if >0, erode every patch's valid region (verified + unverified) by this many grid cells
     'unverified_patch_radius_loss_margin': 0.025,
     'unverified_patch_radius_loss_inv': False,
     'unverified_patch_radius_within_norm_p': 3.0,
