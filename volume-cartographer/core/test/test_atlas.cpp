@@ -446,6 +446,29 @@ TEST_CASE("Atlas pred-snap search starts inside by direct maximum climb")
     CHECK(snap->predDtValue.value() == doctest::Approx(175.0));
 }
 
+TEST_CASE("Atlas pred-snap search policy can favor deeper inward hits")
+{
+    auto sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
+        if (x >= 0.30) return 166.0;
+        if (x <= -0.40) return 170.0;
+        return 80.0;
+    });
+    sampling.outwardWindingLimit = 0.25;
+    sampling.inwardWindingLimit = 0.5;
+    sampling.inwardFirstHitWeight = 0.25;
+
+    const auto snap = vc::atlas::findAtlasPredSnapPoint(
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        sampling);
+
+    REQUIRE(snap.has_value());
+    REQUIRE(snap->predSnapPoint.has_value());
+    CHECK(snap->direction == vc::atlas::AtlasPredSnapDirection::Inside);
+    CHECK((*snap->predSnapPoint)[0] == doctest::Approx(-0.40).epsilon(0.05));
+    CHECK(snap->weightedFirstHitWindingDistance.value() == doctest::Approx(0.10).epsilon(0.05));
+}
+
 TEST_CASE("Atlas pred-snap generation uses control source line indices for anchors")
 {
     vc::atlas::FiberInput fiber;

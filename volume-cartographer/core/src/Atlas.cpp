@@ -1555,15 +1555,24 @@ std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
         return std::nullopt;
     }
 
-    constexpr double kOutwardWindingLimit = 0.5;
-    constexpr double kInwardWindingLimit = 0.25;
-    constexpr double kInwardFirstHitWeight = 4.0;
+    const double outwardWindingLimit =
+        std::isfinite(sampling.outwardWindingLimit) && sampling.outwardWindingLimit > 0.0
+            ? sampling.outwardWindingLimit
+            : 0.5;
+    const double inwardWindingLimit =
+        std::isfinite(sampling.inwardWindingLimit) && sampling.inwardWindingLimit > 0.0
+            ? sampling.inwardWindingLimit
+            : 0.25;
+    const double inwardFirstHitWeight =
+        std::isfinite(sampling.inwardFirstHitWeight) && sampling.inwardFirstHitWeight > 0.0
+            ? sampling.inwardFirstHitWeight
+            : 4.0;
 
     const auto startPredDt = sampling.samplePredDt(controlPoint);
     const auto outwardSamples =
-        tracePredSnapDirection(controlPoint, normal, kOutwardWindingLimit, sampling);
+        tracePredSnapDirection(controlPoint, normal, outwardWindingLimit, sampling);
     const auto inwardSamples =
-        tracePredSnapDirection(controlPoint, -normal, kInwardWindingLimit, sampling);
+        tracePredSnapDirection(controlPoint, -normal, inwardWindingLimit, sampling);
 
     AtlasPredSnapPoint result;
     result.controlPoint = controlPoint;
@@ -1592,7 +1601,7 @@ std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
     const bool chooseInward =
         inwardHit &&
         (!outwardHit ||
-         inwardHit->windingDistance * kInwardFirstHitWeight < outwardHit->windingDistance);
+         inwardHit->windingDistance * inwardFirstHitWeight < outwardHit->windingDistance);
     const auto& chosenHit = chooseInward ? *inwardHit : *outwardHit;
     const PredSnapTraceSample best =
         climbPredDtMaximumAlongNormal(chosenHit, normal, sampling);
@@ -1602,7 +1611,7 @@ std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
         ? AtlasPredSnapDirection::Inside
         : AtlasPredSnapDirection::Outside;
     result.weightedFirstHitWindingDistance = chooseInward
-        ? chosenHit.windingDistance * kInwardFirstHitWeight
+        ? chosenHit.windingDistance * inwardFirstHitWeight
         : chosenHit.windingDistance;
     return result;
 }

@@ -186,6 +186,9 @@ struct AtlasPredSnapSampling {
     std::function<std::optional<double>(const cv::Vec3d&)> samplePredDt;
     std::function<double(const cv::Vec3d&, const cv::Vec3d&, double)> windingDistance;
     double predDtStepVx = 0.05;
+    double outwardWindingLimit = 0.5;
+    double inwardWindingLimit = 0.25;
+    double inwardFirstHitWeight = 4.0;
 };
 
 struct AtlasPredSnapAttachmentReport {

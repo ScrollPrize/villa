@@ -63,6 +63,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <locale>
 #include <map>
 #include <sstream>
@@ -123,6 +124,7 @@ struct LineAnnotationController::IntersectionInspectionSession {
         bool sourceSide = true;
         std::string surfaceName;
         QPointer<CChunkedVolumeViewer> viewer;
+        QPointer<QLabel> controlPointInfoLabel;
         std::vector<cv::Vec3d> linePoints;
         std::vector<cv::Vec3f> lineUpVectors;
         std::vector<vc::lasagna::LineControlPoint> controlPoints;
@@ -158,6 +160,7 @@ namespace {
 
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
+constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 using Clock = std::chrono::steady_clock;
 
 bool atlasDebugEnabled()
@@ -223,6 +226,98 @@ cv::Vec3d toVec3d(const cv::Vec3f& v)
 bool approximatelyEqual(double a, double b)
 {
     return std::abs(a - b) <= 1.0e-9;
+}
+
+std::optional<size_t> controlPointIndexAtLinePosition(
+    const std::vector<vc::lasagna::LineControlPoint>& controls,
+    double linePosition)
+{
+    if (!std::isfinite(linePosition)) {
+        return std::nullopt;
+    }
+    std::optional<size_t> bestIndex;
+    double bestDistance = kControlPointLabelLinePositionTolerance;
+    for (size_t i = 0; i < controls.size(); ++i) {
+        const double controlPosition = controls[i].linePosition;
+        if (!std::isfinite(controlPosition)) {
+            continue;
+        }
+        const double distance = std::abs(controlPosition - linePosition);
+        if (distance <= bestDistance) {
+            bestDistance = distance;
+            bestIndex = i;
+        }
+    }
+    return bestIndex;
+}
+
+QString controlPointInfoText(const std::vector<vc::lasagna::LineControlPoint>& controls,
+                             double linePosition)
+{
+    const auto index = controlPointIndexAtLinePosition(controls, linePosition);
+    if (!index) {
+        return {};
+    }
+    const auto& point = controls[*index].volumePoint;
+    return QStringLiteral("CP %1  pos [%2, %3, %4]")
+        .arg(static_cast<qulonglong>(*index))
+        .arg(point[0], 0, 'f', 2)
+        .arg(point[1], 0, 'f', 2)
+        .arg(point[2], 0, 'f', 2);
+}
+
+void positionControlPointInfoLabel(QLabel* label)
+{
+    if (!label) {
+        return;
+    }
+    auto* parent = qobject_cast<QWidget*>(label->parentWidget());
+    if (!parent) {
+        return;
+    }
+    constexpr int margin = 8;
+    label->adjustSize();
+    label->move(margin, std::max(margin, parent->height() - label->height() - margin));
+    label->raise();
+}
+
+QLabel* createControlPointInfoLabel(
+    QWidget* parent,
+    const std::vector<vc::lasagna::LineControlPoint>& controls,
+    double linePosition)
+{
+    if (!parent) {
+        return nullptr;
+    }
+    auto* label = new QLabel(parent);
+    label->setObjectName(QStringLiteral("intersectionControlPointInfo"));
+    label->setAttribute(Qt::WA_TransparentForMouseEvents);
+    label->setStyleSheet(QStringLiteral(
+        "QLabel#intersectionControlPointInfo {"
+        " color: white;"
+        " background: rgba(0, 0, 0, 180);"
+        " padding: 3px 6px;"
+        " border-radius: 3px;"
+        " font-weight: 600;"
+        "}"));
+    const QString text = controlPointInfoText(controls, linePosition);
+    label->setText(text);
+    label->setVisible(!text.isEmpty());
+    positionControlPointInfoLabel(label);
+    return label;
+}
+
+void updateControlPointInfoLabel(QLabel* label,
+                                 const std::vector<vc::lasagna::LineControlPoint>& controls,
+                                 double linePosition)
+{
+    if (!label) {
+        return;
+    }
+    const QString text = controlPointInfoText(controls, linePosition);
+    label->setText(text);
+    label->setVisible(!text.isEmpty());
+    positionControlPointInfoLabel(label);
 }
 
 std::optional<std::string> normalizedFiberJsonFileNameInput(const QString& input, QString* error)
@@ -1844,6 +1939,9 @@ bool LineAnnotationController::updateIntersectionFollowSlice(bool sourceSideFlag
     surface->id = follow.surfaceName;
     _state->setSurface(follow.surfaceName, surface, false, true);
     follow.linePosition = linePosition;
+    updateControlPointInfoLabel(follow.controlPointInfoLabel,
+                                follow.controlPoints,
+                                follow.linePosition);
     if (auto* viewer = follow.viewer.data()) {
         viewer->centerOnVolumePoint(toVec3f(origin), false);
         viewer->renderVisible(true, reason);
@@ -1881,6 +1979,9 @@ void LineAnnotationController::toggleIntersectionFollowSlice(bool sourceSideFlag
         follow.followsMouse = false;
     } else {
         follow.followsMouse = true;
+        updateControlPointInfoLabel(follow.controlPointInfoLabel,
+                                    follow.controlPoints,
+                                    std::numeric_limits<double>::quiet_NaN());
     }
 }
 
@@ -1923,6 +2024,14 @@ bool LineAnnotationController::handleIntersectionFollowKeyPress(int key,
 
 bool LineAnnotationController::eventFilter(QObject* watched, QEvent* event)
 {
+    if (_intersectionInspection && event && event->type() == QEvent::Resize) {
+        if (auto* widget = qobject_cast<QWidget*>(watched)) {
+            if (auto* label = widget->findChild<QLabel*>(
+                    QStringLiteral("intersectionControlPointInfo"))) {
+                positionControlPointInfoLabel(label);
+            }
+        }
+    }
     if (_intersectionInspection && event && event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (watched) {
@@ -2287,8 +2396,15 @@ void LineAnnotationController::rebuildIntersectionInspection()
             if (!viewer) {
                 throw std::runtime_error("Could not create intersection slice viewer");
             }
+            QPointer<QLabel> controlPointInfoLabel;
             if (auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject())) {
                 viewerWidget->installEventFilter(this);
+                if (spec.editableCurrentCross && spec.editSession) {
+                    controlPointInfoLabel = createControlPointInfoLabel(
+                        viewerWidget,
+                        spec.editSession->controlPoints,
+                        spec.editLinePosition);
+                }
                 if (spec.hasFollowSide) {
                     viewerWidget->setProperty("vc_intersection_follow_source_side", spec.sourceFollow);
                 }
@@ -2336,6 +2452,10 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     follow.lineUpVectors = followSide.lineViews.lineUpVectors;
                     follow.controlPoints = followSide.editSession->controlPoints;
                     follow.linePosition = followSide.focusLinePosition;
+                    follow.controlPointInfoLabel = controlPointInfoLabel;
+                    updateControlPointInfoLabel(follow.controlPointInfoLabel,
+                                                follow.controlPoints,
+                                                std::numeric_limits<double>::quiet_NaN());
                 }
                 if (spec.shiftScroll) {
                     chunkedViewer->setProperty("vc_show_custom_normal_offset", true);

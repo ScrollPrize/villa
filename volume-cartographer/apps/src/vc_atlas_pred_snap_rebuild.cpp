@@ -1,4 +1,5 @@
 #include "../VC3D/FiberSliceGeometry.hpp"
+#include "../VC3D/LineAnnotationFiberClassification.hpp"
 
 #include "vc/atlas/Atlas.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -35,6 +36,12 @@ constexpr double kOutwardWindingLimit = 0.5;
 constexpr double kInwardWindingLimit = 0.25;
 constexpr double kInwardFirstHitWeight = 4.0;
 constexpr int kMaxTraceSteps = 1024;
+
+struct PredSnapSearchPolicy {
+    double outwardWindingLimit = kOutwardWindingLimit;
+    double inwardWindingLimit = kInwardWindingLimit;
+    double inwardFirstHitWeight = kInwardFirstHitWeight;
+};
 
 struct Options {
     fs::path atlasDir;
@@ -257,6 +264,55 @@ vc::atlas::FiberInput fiberInputFromMapping(const vc::atlas::FiberMapping& mappi
         input.controlLineIndices.push_back(anchor->sourceIndex);
     }
     return input;
+}
+
+bool fiberInputIsVertical(const vc::atlas::FiberInput& input)
+{
+    const auto controlClassification =
+        vc3d::line_annotation::classifyFiberHv(input.controlPoints);
+    if (controlClassification.valid) {
+        return controlClassification.automaticTag == vc3d::line_annotation::FiberHvTag::V;
+    }
+    const auto lineClassification =
+        vc3d::line_annotation::classifyFiberHv(input.linePoints);
+    return lineClassification.valid &&
+           lineClassification.automaticTag == vc3d::line_annotation::FiberHvTag::V;
+}
+
+PredSnapSearchPolicy predSnapSearchPolicyForFiber(const vc::atlas::FiberInput& input)
+{
+    if (!fiberInputIsVertical(input)) {
+        return {};
+    }
+    return PredSnapSearchPolicy{
+        kInwardWindingLimit,
+        kOutwardWindingLimit,
+        1.0 / kInwardFirstHitWeight,
+    };
+}
+
+vc::atlas::AtlasPredSnapSampling predSnapSamplingFromSampler(
+    const vc::lasagna::LasagnaNormalSampler& sampler,
+    double predDtStepVx,
+    const PredSnapSearchPolicy& policy)
+{
+    vc::atlas::AtlasPredSnapSampling sampling;
+    sampling.sampleNormal = [&sampler](const cv::Vec3d& point) {
+        return sampler.sampleNormal(point);
+    };
+    sampling.samplePredDt = [&sampler](const cv::Vec3d& point) {
+        return sampler.samplePredDt(point);
+    };
+    sampling.windingDistance = [&sampler](const cv::Vec3d& a,
+                                          const cv::Vec3d& b,
+                                          double stepVx) {
+        return sampler.windingDistance(a, b, stepVx);
+    };
+    sampling.predDtStepVx = predDtStepVx;
+    sampling.outwardWindingLimit = policy.outwardWindingLimit;
+    sampling.inwardWindingLimit = policy.inwardWindingLimit;
+    sampling.inwardFirstHitWeight = policy.inwardFirstHitWeight;
+    return sampling;
 }
 
 const vc::atlas::AtlasAnchor* findControlAnchor(const vc::atlas::FiberMapping& mapping,
@@ -583,7 +639,8 @@ void saveFiberSliceFitDebugImage(const fs::path& outputPath,
                                  const QuadSurface& baseSurface,
                                  const vc::lasagna::LasagnaNormalSampler& sampler,
                                  const vc::atlas::AtlasPredSnapSet& generated,
-                                 double predDtStepVx)
+                                 double predDtStepVx,
+                                 const PredSnapSearchPolicy& policy)
 {
     const auto axes = fittedFiberSliceAxes(input.linePoints, input.controlPoints);
     if (!axes) {
@@ -630,14 +687,14 @@ void saveFiberSliceFitDebugImage(const fs::path& outputPath,
                 const TraceStats outward = traceDirection(controlPoint,
                                                           alignedNormal,
                                                           predDtStepVx,
-                                                          kOutwardWindingLimit,
+                                                          policy.outwardWindingLimit,
                                                           sampler,
                                                           false,
                                                           "outward");
                 const TraceStats inward = traceDirection(controlPoint,
                                                          -alignedNormal,
                                                          predDtStepVx,
-                                                         kInwardWindingLimit,
+                                                         policy.inwardWindingLimit,
                                                          sampler,
                                                          false,
                                                          "inward");
@@ -741,17 +798,6 @@ void saveFiberSliceFitDebugImage(const fs::path& outputPath,
             pa.x + delta.x * kSearchVectorDisplayScale,
             pa.y + delta.y * kSearchVectorDisplayScale};
         drawImageLine(pa, displayEnd, color, 1);
-
-        if (pb.x >= -2.0 && pb.x < static_cast<double>(imageWidth) + 2.0 &&
-            pb.y >= -2.0 && pb.y < static_cast<double>(imageHeight) + 2.0) {
-            cv::circle(image,
-                       toSubpixelPoint(pb),
-                       2 * kSubpixelScale,
-                       color,
-                       -1,
-                       cv::LINE_AA,
-                       kSubpixelShift);
-        }
     };
     auto drawCircle = [&](const FiberSliceDebugPoint& point,
                           int radius,
@@ -830,6 +876,7 @@ void printControlDebug(const vc::atlas::FiberInput& input,
                        const vc::lasagna::LasagnaNormalSampler& sampler,
                        const vc::atlas::AtlasPredSnapSet& generated,
                        double predDtStepVx,
+                       const PredSnapSearchPolicy& policy,
                        bool traceSamples)
 {
     for (size_t controlIndex = 0; controlIndex < input.controlPoints.size(); ++controlIndex) {
@@ -889,19 +936,19 @@ void printControlDebug(const vc::atlas::FiberInput& input,
         const TraceStats outward = traceDirection(controlPoint,
                                                   alignedNormal,
                                                   predDtStepVx,
-                                                  kOutwardWindingLimit,
+                                                  policy.outwardWindingLimit,
                                                   sampler,
                                                   traceSamples,
                                                   "outward");
         const TraceStats inward = traceDirection(controlPoint,
                                                  -alignedNormal,
                                                  predDtStepVx,
-                                                 kInwardWindingLimit,
+                                                 policy.inwardWindingLimit,
                                                  sampler,
                                                  traceSamples,
                                                  "inward");
         printTraceSummary("outward", outward);
-        printTraceSummary("inward", inward, kInwardFirstHitWeight);
+        printTraceSummary("inward", inward, policy.inwardFirstHitWeight);
 
         const auto* result = generatedPointForControl(generated, controlPoint);
         if (!result) {
@@ -928,7 +975,8 @@ void saveFiberDebugImages(const fs::path& debugImagesDir,
                           const QuadSurface& baseSurface,
                           const vc::lasagna::LasagnaNormalSampler& sampler,
                           const vc::atlas::AtlasPredSnapSet& generated,
-                          double predDtStepVx)
+                          double predDtStepVx,
+                          const PredSnapSearchPolicy& policy)
 {
     const fs::path fiberDir = debugImagesDir / safeDebugName(mapping.fiberPath);
     saveFiberSliceFitDebugImage(fiberDir / "fiber_slice_fit.tif",
@@ -937,7 +985,8 @@ void saveFiberDebugImages(const fs::path& debugImagesDir,
                                 baseSurface,
                                 sampler,
                                 generated,
-                                predDtStepVx);
+                                predDtStepVx,
+                                policy);
 
     for (size_t controlIndex = 0; controlIndex < input.controlPoints.size(); ++controlIndex) {
         const cv::Vec3d& controlPoint = input.controlPoints[controlIndex];
@@ -964,14 +1013,14 @@ void saveFiberDebugImages(const fs::path& debugImagesDir,
         const TraceStats outward = traceDirection(controlPoint,
                                                   alignedNormal,
                                                   predDtStepVx,
-                                                  kOutwardWindingLimit,
+                                                  policy.outwardWindingLimit,
                                                   sampler,
                                                   false,
                                                   "outward");
         const TraceStats inward = traceDirection(controlPoint,
                                                  -alignedNormal,
                                                  predDtStepVx,
-                                                 kInwardWindingLimit,
+                                                 policy.inwardWindingLimit,
                                                  sampler,
                                                  false,
                                                  "inward");
@@ -1056,6 +1105,10 @@ int main(int argc, char** argv)
 
             ++fibersProcessed;
             const vc::atlas::FiberInput input = fiberInputFromMapping(mapping);
+            const PredSnapSearchPolicy searchPolicy = predSnapSearchPolicyForFiber(input);
+            const bool verticalFiber = fiberInputIsVertical(input);
+            const vc::atlas::AtlasPredSnapSampling predSnapSampling =
+                predSnapSamplingFromSampler(sampler, predDtStepVx, searchPolicy);
             const fs::path attachmentPath =
                 vc::atlas::atlasPredSnapAttachmentPath(options.atlasDir,
                                                        mapping.fiberPath);
@@ -1063,11 +1116,15 @@ int main(int argc, char** argv)
                 std::cout << "\nfiber=" << mapping.fiberPath
                           << " controls=" << input.controlPoints.size()
                           << " control_anchors=" << mapping.controlAnchors.size()
+                          << " hv=" << (verticalFiber ? "V" : "H")
+                          << " outward_limit=" << optionalDoubleString(searchPolicy.outwardWindingLimit)
+                          << " inward_limit=" << optionalDoubleString(searchPolicy.inwardWindingLimit)
+                          << " inward_weight=" << optionalDoubleString(searchPolicy.inwardFirstHitWeight)
                           << " attachment=" << attachmentPath << '\n';
             }
 
             vc::atlas::AtlasPredSnapSet generated =
-                vc::atlas::generateAtlasPredSnapSet(input, mapping, baseSurface, sampler);
+                vc::atlas::generateAtlasPredSnapSet(input, mapping, baseSurface, predSnapSampling);
             if (!options.debugImagesDir.empty()) {
                 saveFiberDebugImages(options.debugImagesDir,
                                      input,
@@ -1075,7 +1132,8 @@ int main(int argc, char** argv)
                                      baseSurface,
                                      sampler,
                                      generated,
-                                     predDtStepVx);
+                                     predDtStepVx,
+                                     searchPolicy);
             }
             if (options.verbose) {
                 printControlDebug(input,
@@ -1084,6 +1142,7 @@ int main(int argc, char** argv)
                                   sampler,
                                   generated,
                                   predDtStepVx,
+                                  searchPolicy,
                                   options.traceSamples);
             }
 
