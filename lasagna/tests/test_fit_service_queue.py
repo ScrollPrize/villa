@@ -2,6 +2,7 @@ import time
 import threading
 import tempfile
 import unittest
+import io
 from unittest import mock
 
 import fit_service
@@ -81,6 +82,34 @@ class FitServiceQueueTest(unittest.TestCase):
 			fit_service._result_archive_child_name("layer_0000.tifxyz", 2, "combined.tifxyz"),
 			"layer_0000.tifxyz",
 		)
+
+	def test_results_archive_rejects_result_symlink(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = fit_service.Path(td)
+			model = root / "model_reopt.pt"
+			model.write_bytes(b"checkpoint-bytes")
+			out = root / "out"
+			out.mkdir()
+			seg = out / "atlas_v031.tifxyz"
+			seg.mkdir()
+			(seg / "meta.json").write_text("{}", encoding="utf-8")
+			(seg / "model.pt").symlink_to(model)
+
+			with self.assertRaisesRegex(ValueError, "result contains unsupported symlink: .*model\\.pt ->"):
+				fit_service._pack_results_archive(out, "atlas_v031.tifxyz")
+
+	def test_results_archive_rejects_broken_model_symlink(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = fit_service.Path(td)
+			out = root / "out"
+			out.mkdir()
+			seg = out / "atlas_v032.tifxyz"
+			seg.mkdir()
+			(seg / "meta.json").write_text("{}", encoding="utf-8")
+			(seg / "model.pt").symlink_to(root / "missing_model.pt")
+
+			with self.assertRaisesRegex(ValueError, "result contains unsupported symlink: .*model\\.pt ->"):
+				fit_service._pack_results_archive(out, "atlas_v032.tifxyz")
 
 	def test_reorder_waiting_jobs_changes_execution_order(self):
 		queue = fit_service._JobQueue()
@@ -410,6 +439,87 @@ class FitServiceObjectStoreTest(unittest.TestCase):
 				self.assertTrue(fit_service.Path(resolved["maps"][0]["map_path"]).is_file())
 				self.assertEqual(resolved["maps"][0]["winding_offset"], -2)
 				self.assertEqual(body["_job_spec_"]["atlas"], atlas_ref)
+			finally:
+				fit_service._object_store_dir = old_store
+
+	def test_model_saved_atlas_ref_overrides_request_atlas_ref(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				import torch
+
+				base_files = {"x.tif": b"x", "y.tif": b"y", "z.tif": b"z", "meta.json": b"{}"}
+				base_ref = {
+					"type": "atlas-base",
+					"name": "atlas/base_mesh.tifxyz",
+					"hash": fit_service._segment_manifest_hash(base_files),
+					"format": "tifxyz",
+				}
+				fit_service._store_uploaded_object({
+					"object": base_ref,
+					"files": {
+						name: fit_service.base64.b64encode(data).decode("ascii")
+						for name, data in base_files.items()
+					},
+				})
+				saved_atlas_obj = {
+					"type": "lasagna_atlas",
+					"version": 1,
+					"name": "saved_atlas",
+					"base": {"ref": base_ref, "path": None},
+					"metadata": {},
+					"objects": {"line": []},
+					"maps": [],
+				}
+				saved_atlas_json = fit_service.json.dumps(saved_atlas_obj).encode("utf-8")
+				saved_atlas_ref = {
+					"type": "atlas",
+					"name": "atlas/saved_atlas.json",
+					"hash": fit_service._hash_bytes(saved_atlas_json),
+					"format": "lasagna_atlas_json",
+				}
+				fit_service._store_uploaded_object({
+					"object": saved_atlas_ref,
+					"data": fit_service.base64.b64encode(saved_atlas_json).decode("ascii"),
+				})
+
+				buf = io.BytesIO()
+				torch.save({
+					"_object_refs_": {
+						"version": 1,
+						"objects": [base_ref, saved_atlas_ref],
+						"job_spec": {"atlas": saved_atlas_ref},
+					},
+				}, buf)
+				model_bytes = buf.getvalue()
+				model_ref = {
+					"type": "lasagna_model",
+					"name": "sheet_v001.tifxyz/model.pt",
+					"hash": fit_service._hash_bytes(model_bytes),
+				}
+				fit_service._store_uploaded_object({
+					"object": model_ref,
+					"data": fit_service.base64.b64encode(model_bytes).decode("ascii"),
+				})
+				request_atlas_ref = {
+					"type": "atlas",
+					"name": "atlas/request_atlas.json",
+					"hash": "md5:" + "1" * 32,
+					"format": "lasagna_atlas_json",
+				}
+
+				body = fit_service._body_with_resolved_job_spec({
+					"job_spec": {
+						"model": model_ref,
+						"atlas": request_atlas_ref,
+						"config": {"args": {"model-init": "model"}},
+					}
+				})
+
+				self.assertEqual(body["_job_spec_"]["atlas"], saved_atlas_ref)
+				self.assertEqual(body["config"]["atlas"]["name"], "saved_atlas")
+				self.assertNotIn(request_atlas_ref, body["_object_refs_"]["objects"])
 			finally:
 				fit_service._object_store_dir = old_store
 

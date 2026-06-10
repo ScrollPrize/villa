@@ -26,6 +26,7 @@ class AtlasLineDebugPayload:
 	model_normal: torch.Tensor
 	signed_delta: torch.Tensor
 	is_control: torch.Tensor
+	is_snap: torch.Tensor
 	sample_model_h: torch.Tensor
 	sample_model_w: torch.Tensor
 	normal_proxy_target_xyz: torch.Tensor
@@ -79,6 +80,16 @@ def _xyz_list(values: torch.Tensor) -> list[float | None]:
 	return [_finite_float(v) for v in vals]
 
 
+def _snap_status(*, valid: bool | None, signed_delta: float | None) -> str:
+	if valid is None:
+		return "-"
+	if not valid:
+		return "invalid"
+	if signed_delta is None:
+		return "valid"
+	return "valid fw" if signed_delta >= 0.0 else "valid bw"
+
+
 def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None = None) -> dict | None:
 	"""Build JSON-safe final atlas-control feedback from an atlas-line debug payload."""
 	payload = _last_debug_payload if payload is None else payload
@@ -100,6 +111,11 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 		control_k = torch.zeros(K, dtype=torch.bool)
 	else:
 		control_k = is_control.detach().cpu().to(dtype=torch.bool).view(K)
+	is_snap = getattr(lines, "is_snap_point", None)
+	if is_snap is None:
+		snap_k = torch.zeros(K, dtype=torch.bool)
+	else:
+		snap_k = is_snap.detach().cpu().to(dtype=torch.bool).view(K)
 	object_ids = _atlas_object_ids(lines, K)
 	source_indices = _atlas_source_indices(lines, K)
 
@@ -110,6 +126,11 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 	model_h = payload.sample_model_h.detach().cpu().to(dtype=torch.float32)
 	model_w = payload.sample_model_w.detach().cpu().to(dtype=torch.float32)
 	D = int(valid.shape[0])
+
+	snap_by_key: dict[tuple[str, int], int] = {}
+	for k in range(K):
+		if bool(snap_k[k]):
+			snap_by_key.setdefault((object_ids[k], int(source_indices[k])), k)
 
 	records: list[dict] = []
 	for d in range(D):
@@ -122,6 +143,18 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 			distance = None
 			if ok:
 				distance = float(torch.linalg.vector_norm(target - mesh).item())
+			snap_idx = snap_by_key.get((object_ids[k], int(source_indices[k])))
+			snap_valid = None
+			snap_delta = None
+			if snap_idx is not None:
+				snap_target = target_xyz[d, snap_idx]
+				snap_mesh = hit_xyz[d, snap_idx]
+				snap_valid = (
+					bool(valid[d, snap_idx])
+					and bool(torch.isfinite(snap_target).all())
+					and bool(torch.isfinite(snap_mesh).all())
+				)
+				snap_delta = _finite_float(signed_delta[d, snap_idx].item())
 			record = {
 				"fiber_id": object_ids[k],
 				"object_id": object_ids[k],
@@ -134,6 +167,10 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 				"distance": _finite_float(distance),
 				"signed_delta": _finite_float(signed_delta[d, k].item()),
 				"valid": ok,
+				"snap_valid": snap_valid,
+				"snap_direction": None if snap_valid is None or snap_delta is None else ("fw" if snap_delta >= 0.0 else "bw"),
+				"snap_signed_delta": snap_delta,
+				"snap_status": _snap_status(valid=snap_valid, signed_delta=snap_delta),
 			}
 			if D != 1:
 				record["layer_index"] = int(d)
@@ -196,6 +233,7 @@ def _empty_debug_payload(*, res: fit_model.FitResult3D, lines) -> AtlasLineDebug
 		model_normal=torch.full((D, K, 3), float("nan"), dtype=torch.float32),
 		signed_delta=torch.full((D, K), float("nan"), dtype=torch.float32),
 		is_control=torch.zeros((D, K), dtype=torch.bool),
+		is_snap=torch.zeros((D, K), dtype=torch.bool),
 		sample_model_h=torch.full((D, K), float("nan"), dtype=torch.float32),
 		sample_model_w=torch.full((D, K), float("nan"), dtype=torch.float32),
 		normal_proxy_target_xyz=torch.full(tuple(res.xyz_lr.shape), float("nan"), dtype=torch.float32),
@@ -729,6 +767,7 @@ def atlas_line_loss(
 				sample_w_full = torch.full((D, K), float("nan"), dtype=torch.float32)
 				valid_full = torch.zeros((D, K), dtype=torch.bool)
 				control_full = control_k.view(1, K).expand(D, K).detach().cpu().to(dtype=torch.bool)
+				snap_full = snap_k.view(1, K).expand(D, K).detach().cpu().to(dtype=torch.bool)
 				target_full[:, idx_cpu] = target.detach().cpu().to(dtype=torch.float32)
 				hit_full[:, idx_cpu] = hit_xyz.detach().cpu().to(dtype=torch.float32)
 				normal_full[:, idx_cpu] = model_n.detach().cpu().to(dtype=torch.float32)
@@ -744,6 +783,7 @@ def atlas_line_loss(
 					model_normal=normal_full,
 					signed_delta=signed_full,
 					is_control=control_full,
+					is_snap=snap_full,
 					sample_model_h=sample_h_full,
 					sample_model_w=sample_w_full,
 					normal_proxy_target_xyz=proxy_target_map.detach().cpu().to(dtype=torch.float32),

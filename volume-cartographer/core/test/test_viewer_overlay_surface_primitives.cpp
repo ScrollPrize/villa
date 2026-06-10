@@ -365,6 +365,9 @@ private slots:
       "valid": true,
       "distance": 1.25,
       "signed_delta": -0.5,
+      "snap_status": "valid fw",
+      "snap_valid": true,
+      "snap_direction": "fw",
       "target_xyz": [1, 2, 3],
       "mesh_xyz": [2, 3, 4],
       "model_h": 7,
@@ -385,7 +388,11 @@ private slots:
         QCOMPARE(tree->topLevelItemCount(), 1);
         QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
         QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("fiber_a"));
+        QCOMPARE(tree->columnCount(), 5);
         QCOMPARE(tree->topLevelItem(0)->child(0)->text(1), QStringLiteral("yes"));
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(2), QStringLiteral("valid fw"));
+        QVERIFY(tree->headerItem()->text(3) != QStringLiteral("Target XYZ"));
+        QVERIFY(tree->headerItem()->text(4) != QStringLiteral("Mesh XYZ"));
     }
 };
 

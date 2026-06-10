@@ -30,6 +30,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -85,6 +86,40 @@ def _result_archive_child_name(child_name: str, child_count: int, output_name: s
     if requested and int(child_count) == 1:
         return requested
     return child_name
+
+
+def _pack_results_archive(output_dir: Path, output_name: str = "") -> bytes:
+    import io
+
+    def add_path(path: Path, arcname: str) -> None:
+        if path.is_symlink():
+            try:
+                target = os.readlink(path)
+            except OSError:
+                target = "(unreadable target)"
+            raise ValueError(f"result contains unsupported symlink: {path} -> {target}")
+        tar.add(str(path), arcname=arcname, recursive=False)
+
+    buf = io.BytesIO()
+    children = sorted(output_dir.iterdir())
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for child in children:
+            arcname = _result_archive_child_name(child.name, len(children), output_name)
+            add_path(child, arcname)
+            if child.is_dir():
+                for root, dirs, files in os.walk(child, followlinks=False):
+                    root_path = Path(root)
+                    rel_root = root_path.relative_to(child)
+                    rel_prefix = "" if str(rel_root) == "." else rel_root.as_posix()
+                    for name in sorted(dirs):
+                        path = root_path / name
+                        rel = name if not rel_prefix else f"{rel_prefix}/{name}"
+                        add_path(path, f"{arcname}/{rel}")
+                    for name in sorted(files):
+                        path = root_path / name
+                        rel = name if not rel_prefix else f"{rel_prefix}/{name}"
+                        add_path(path, f"{arcname}/{rel}")
+    return buf.getvalue()
 
 
 def _normalize_single_tifxyz_output(output_dir: Path, output_name: str) -> Path | None:
@@ -569,15 +604,8 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     cfg = spec.get("config", {})
     if not isinstance(cfg, dict):
         raise ValueError("job_spec.config must be an object")
-    atlas_reopt_cfg = cfg.get("atlas_reopt")
-    if not isinstance(atlas_reopt_cfg, dict):
-        atlas_reopt_cfg = {}
-    atlas_ref_source = str(atlas_reopt_cfg.get("source") or "").strip().lower()
-    prefer_request_atlas = atlas_ref_source in {"request", "selected_atlas", "current_atlas"}
-
     resolved = dict(body)
     resolved_cfg = dict(cfg)
-    resolved_cfg.pop("atlas_reopt", None)
     external_surfaces_raw = resolved_cfg.get("external_surfaces")
     if external_surfaces_raw is not None:
         if not isinstance(external_surfaces_raw, list):
@@ -606,10 +634,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     )
     atlas_ref = spec.get("atlas")
     model_atlas_ref = model_job_spec.get("atlas") if isinstance(model_job_spec, dict) else None
-    if prefer_request_atlas and atlas_ref not in (None, {}, ""):
-        if model_atlas_ref not in (None, {}, "") and model_atlas_ref != atlas_ref:
-            print("[fit-service] request job_spec.atlas overrides model _object_refs_ atlas", flush=True)
-    elif model_atlas_ref not in (None, {}, ""):
+    if model_atlas_ref not in (None, {}, ""):
         if atlas_ref not in (None, {}, "") and atlas_ref != model_atlas_ref:
             print("[fit-service] model _object_refs_ atlas overrides request job_spec.atlas", flush=True)
         atlas_ref = model_atlas_ref
@@ -1327,8 +1352,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             job.add_tmp_dir(results_tmp)
             output_dir = results_tmp
 
-        # model_output goes into temp dir. Flatten forces --copy-model during
-        # export so the resulting tifxyz remains self-contained after cleanup.
+        # model_output goes into temp dir. fit2tifxyz always copies model.pt
+        # into the exported tifxyz so results remain self-contained.
         if not model_output:
             model_output = str(Path(tmp_dir) / "model_reopt.pt")
 
@@ -1452,8 +1477,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             export_argv = ["--input", str(model_output), "--output", str(output_dir)]
             if body.get("single_segment"):
                 export_argv.append("--single-segment")
-            if body.get("copy_model") or model_init == "flatten":
-                export_argv.append("--copy-model")
             output_name = body.get("output_name")
             if output_name:
                 export_argv.extend(["--output-name", str(output_name)])
@@ -1606,9 +1629,6 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_results(self, job: _JobState) -> None:
         """Package finished optimization results as tar.gz and send them."""
-        import tarfile
-        import io
-
         snap = job.snapshot(_jobs.queue_position(job.job_id))
         if snap["state"] != "finished":
             self._send_json({"error": "no finished results available"}, 404)
@@ -1623,16 +1643,16 @@ class _Handler(BaseHTTPRequestHandler):
         # so the tar contains e.g. "winding_combined_v004.tifxyz/meta.json".
         # Extracting in the local paths dir recreates the tifxyz subdirectory.
         pack_t0 = time.perf_counter()
-        buf = io.BytesIO()
         out_path = Path(output_dir)
-        children = sorted(out_path.iterdir())
         requested_output_name = str(snap.get("output_name") or "").strip()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for child in children:
-                arcname = _result_archive_child_name(child.name, len(children), requested_output_name)
-                tar.add(str(child), arcname=arcname)
-
-        data = buf.getvalue()
+        try:
+            data = _pack_results_archive(out_path, requested_output_name)
+        except Exception as exc:
+            msg = f"failed to pack results: {exc}"
+            print(f"[fit-service] ERROR: {msg}", flush=True)
+            job.set_error(msg)
+            self._send_json({"error": msg}, 500)
+            return
         pack_s = time.perf_counter() - pack_t0
         self.send_response(200)
         self.send_header("Content-Type", "application/gzip")

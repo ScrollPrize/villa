@@ -2090,7 +2090,11 @@ def main(argv: list[str] | None = None) -> int:
 					atlas_res = mdl(data, needs=model.ModelForwardNeeds(mesh_normals=True))
 					opt_loss_atlas_line.atlas_line_loss(
 						res=atlas_res,
-						stage_eff={"atlas_line_control": 1.0, "atlas_line_other": 1.0},
+						stage_eff={
+							"atlas_line_control": 1.0,
+							"atlas_line_other": 1.0,
+							"atlas_line_snap": 1.0,
+						},
 						debug_payload=True,
 					)
 					atlas_control_results = opt_loss_atlas_line.atlas_control_points_results(

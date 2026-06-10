@@ -58,24 +58,9 @@ QString fmtFloat(float value, int precision = 4)
     return std::isfinite(value) ? QString::number(value, 'f', precision) : QStringLiteral("-");
 }
 
-QString fmtVec3(const cv::Vec3f& value)
+QString fmtSnapStatus(const AtlasControlPointResult& point)
 {
-    if (!std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2])) {
-        return QStringLiteral("-");
-    }
-    return QStringLiteral("%1, %2, %3")
-        .arg(QString::number(value[0], 'f', 2),
-             QString::number(value[1], 'f', 2),
-             QString::number(value[2], 'f', 2));
-}
-
-QString fmtModel(float h, float w)
-{
-    if (!std::isfinite(h) || !std::isfinite(w)) {
-        return QStringLiteral("-");
-    }
-    return QStringLiteral("%1, %2")
-        .arg(QString::number(h, 'f', 2), QString::number(w, 'f', 2));
+    return point.hasSnapStatus ? point.snapStatus : QStringLiteral("-");
 }
 
 AtlasControlPointResult parsePoint(const QJsonObject& obj)
@@ -90,6 +75,9 @@ AtlasControlPointResult parsePoint(const QJsonObject& obj)
     point.valid = obj.value(QStringLiteral("valid")).toBool(false);
     point.distance = jsonFloat(obj, QStringLiteral("distance"));
     point.signedDelta = jsonFloat(obj, QStringLiteral("signed_delta"));
+    point.hasSnapStatus = obj.contains(QStringLiteral("snap_status"));
+    point.snapStatus = jsonString(obj, QStringLiteral("snap_status"), QStringLiteral("-"));
+    point.snapValid = obj.value(QStringLiteral("snap_valid")).toBool(false);
     point.targetXyz = jsonVec3(obj, QStringLiteral("target_xyz"));
     point.meshXyz = jsonVec3(obj, QStringLiteral("mesh_xyz"));
     point.modelH = jsonFloat(obj, QStringLiteral("model_h"));
@@ -120,15 +108,13 @@ AtlasControlPointsDock::AtlasControlPointsDock(QWidget* parent)
 
     _tree = new QTreeWidget(content);
     _tree->setObjectName(QStringLiteral("atlasControlResultsTree"));
-    _tree->setColumnCount(7);
+    _tree->setColumnCount(5);
     _tree->setHeaderLabels({
         tr("Control/Source"),
         tr("Valid"),
+        tr("Snap"),
         tr("Distance"),
         tr("Signed Delta"),
-        tr("Target XYZ"),
-        tr("Mesh XYZ"),
-        tr("Model H/W"),
     });
     _tree->header()->setStretchLastSection(false);
     _tree->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
@@ -275,11 +261,9 @@ void AtlasControlPointsDock::rebuildTree()
         row->setData(0, kPointIndexRole, i);
         row->setText(0, QStringLiteral("%1 / %2").arg(point.controlIndex).arg(point.sourceIndex));
         row->setText(1, point.valid ? tr("yes") : tr("no"));
-        row->setText(2, fmtFloat(point.distance));
-        row->setText(3, fmtFloat(point.signedDelta));
-        row->setText(4, fmtVec3(point.targetXyz));
-        row->setText(5, fmtVec3(point.meshXyz));
-        row->setText(6, fmtModel(point.modelH, point.modelW));
+        row->setText(2, fmtSnapStatus(point));
+        row->setText(3, fmtFloat(point.distance));
+        row->setText(4, fmtFloat(point.signedDelta));
     }
     _tree->expandAll();
 }
