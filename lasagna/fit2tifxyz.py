@@ -51,7 +51,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	g.add_argument("--single-segment", action="store_true", default=False,
 		help="Export all windings into a single tifxyz")
 	g.add_argument("--copy-model", action="store_true", default=False,
-		help="Copy model checkpoint instead of symlink")
+		help="Deprecated no-op; model checkpoints are always copied")
 	g.add_argument("--output-name", default=None, help="Override tifxyz directory name")
 	g.add_argument("--voxel-size-um", type=float, default=None,
 		help="Voxel size in micrometers (for area calculation)")
@@ -972,10 +972,9 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		dest = out_dir / "model.pt"
 		if dest.is_symlink() or dest.exists():
 			dest.unlink()
-		if copy_model:
-			shutil.copy2(str(model_source.resolve()), str(dest))
-		else:
-			dest.symlink_to(model_source.resolve())
+		shutil.copy2(str(model_source.resolve()), str(dest))
+		if dest.is_symlink() or not dest.is_file():
+			raise RuntimeError(f"failed to create regular model file: {dest}")
 
 
 def _as_numpy_float32(value: object, *, name: str) -> np.ndarray:

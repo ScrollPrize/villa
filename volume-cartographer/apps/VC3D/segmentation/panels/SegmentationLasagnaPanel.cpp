@@ -243,13 +243,64 @@ QJsonArray linkedSurfacesFromMeta(const std::filesystem::path& segPath)
     return meta[QStringLiteral("linked_surfaces")].toArray();
 }
 
-QJsonObject objectRefsFromMeta(const std::filesystem::path& segPath)
+QJsonObject segmentMetaFromPath(const std::filesystem::path& segPath)
 {
     QFile metaFile(QString::fromStdString((segPath / "meta.json").string()));
     if (!metaFile.open(QIODevice::ReadOnly)) {
         return {};
     }
-    return QJsonDocument::fromJson(metaFile.readAll()).object()[QStringLiteral("object_refs")].toObject();
+    return QJsonDocument::fromJson(metaFile.readAll()).object();
+}
+
+QJsonObject objectRefsFromMeta(const std::filesystem::path& segPath)
+{
+    return segmentMetaFromPath(segPath)[QStringLiteral("object_refs")].toObject();
+}
+
+QJsonObject firstObjectRefOfType(const QJsonObject& objectRefs, const QString& type)
+{
+    for (const QJsonValue& value : objectRefs[QStringLiteral("objects")].toArray()) {
+        const QJsonObject ref = value.toObject();
+        if (ref[QStringLiteral("type")].toString() == type &&
+            !ref[QStringLiteral("name")].toString().isEmpty() &&
+            !ref[QStringLiteral("hash")].toString().isEmpty()) {
+            return ref;
+        }
+    }
+    return {};
+}
+
+QJsonObject modelRefFromMeta(const QJsonObject& meta)
+{
+    QJsonObject ref = meta[QStringLiteral("lasagna_job")].toObject()[QStringLiteral("model")].toObject();
+    if (!ref.isEmpty()) {
+        return ref;
+    }
+    ref = meta[QStringLiteral("job_spec")].toObject()[QStringLiteral("model")].toObject();
+    if (!ref.isEmpty()) {
+        return ref;
+    }
+    return firstObjectRefOfType(meta[QStringLiteral("object_refs")].toObject(), QStringLiteral("lasagna_model"));
+}
+
+QString localModelPathFromMeta(const std::filesystem::path& segPath, const QJsonObject& meta)
+{
+    const QString source = meta[QStringLiteral("model_source")].toString().trimmed();
+    if (source.isEmpty()) {
+        return {};
+    }
+    std::filesystem::path path(source.toStdString());
+    if (path.is_relative()) {
+        path = segPath / path;
+    }
+    if (!std::filesystem::exists(path) || !std::filesystem::is_regular_file(path)) {
+        return {};
+    }
+    try {
+        return QString::fromStdString(std::filesystem::canonical(path).string());
+    } catch (const std::filesystem::filesystem_error&) {
+        return QString::fromStdString(std::filesystem::absolute(path).lexically_normal().string());
+    }
 }
 
 QStringList linkedSurfaceNamesFromRefs(const QJsonArray& refs)
@@ -2204,7 +2255,10 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
 
     const bool isOffsetMode = (launchMode == LasagnaMode::Offset);
 
+    const QJsonObject selectedSegmentMeta = !segPath.empty() ? segmentMetaFromPath(segPath) : QJsonObject{};
+    const QJsonObject inheritedModelRef = modelRefFromMeta(selectedSegmentMeta);
     QString modelPath;
+    QString brokenModelSymlinkTarget;
     if (!segPath.empty()) {
         auto modelFile = segPath / "model.pt";
         if (std::filesystem::exists(modelFile)) {
@@ -2212,6 +2266,18 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
                 modelPath = QString::fromStdString(std::filesystem::canonical(modelFile).string());
             } catch (const std::filesystem::filesystem_error&) {
             }
+        } else {
+            std::error_code symlinkEc;
+            if (std::filesystem::is_symlink(modelFile, symlinkEc)) {
+                std::error_code readEc;
+                const auto target = std::filesystem::read_symlink(modelFile, readEc);
+                brokenModelSymlinkTarget = readEc
+                    ? QStringLiteral("(unreadable symlink target)")
+                    : QString::fromStdString(target.string());
+            }
+        }
+        if (modelPath.isEmpty() && !selectedSegmentMeta.isEmpty()) {
+            modelPath = localModelPathFromMeta(segPath, selectedSegmentMeta);
         }
     }
 
@@ -2463,17 +2529,25 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         }
     }
     const QJsonArray volumeShapeZyx = volumeShapeZyxForState(state);
-    const QJsonObject atlasReoptConfig = config[QStringLiteral("atlas_reopt")].toObject();
-    const QString atlasReoptSource = atlasReoptConfig[QStringLiteral("source")].toString().trimmed().toLower();
-    const bool refreshReoptAtlas = !isNewModel && (
-        atlasReoptSource == QStringLiteral("selected_atlas") ||
-        atlasReoptSource == QStringLiteral("current_atlas") ||
-        atlasReoptSource == QStringLiteral("request"));
+    const QString modelInit = args[QStringLiteral("model-init")].toString().trimmed().toLower();
+    if (!isNewModel &&
+        modelInit == QStringLiteral("model") &&
+        modelPath.isEmpty() &&
+        inheritedModelRef.isEmpty()) {
+        auto msg = tr("Re-optimize requires a model.pt or a Lasagna model object ref in the selected segment metadata.");
+        if (!brokenModelSymlinkTarget.isEmpty()) {
+            msg = tr("Re-optimize cannot use model.pt because it is a broken symlink to %1. Re-run/export the segment so model.pt is copied, or use a segment with a Lasagna model object ref.")
+                .arg(brokenModelSymlinkTarget);
+        }
+        std::cerr << "[lasagna] " << msg.toStdString()
+                  << " segment=" << segPath.string() << std::endl;
+        showStatus(msg, 7000);
+        return;
+    }
 
     QJsonObject request;
     request[QStringLiteral("data_input")] = dataInput;
     request[QStringLiteral("single_segment")] = true;
-    request[QStringLiteral("copy_model")] = true;
     request[QStringLiteral("config_name")] = QFileInfo(configPath).fileName();
     if (!outputName.isEmpty()) {
         request[QStringLiteral("output_name")] = outputName;
@@ -2590,7 +2664,9 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             }
         }
     }
-    const QJsonObject inheritedObjectRefs = sendTifxyz ? objectRefsFromMeta(segPath) : QJsonObject{};
+    const QJsonObject inheritedObjectRefs = sendTifxyz
+        ? selectedSegmentMeta[QStringLiteral("object_refs")].toObject()
+        : QJsonObject{};
     if (!inheritedObjectRefs.isEmpty()) {
         jobSpec[QStringLiteral("object_refs")] = inheritedObjectRefs;
         QSet<QString> inheritedRefKeys;
@@ -2629,35 +2705,6 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             }
         }
     }
-    if (refreshReoptAtlas) {
-        if (_atlasDirPath.isEmpty()) {
-            auto msg = tr("Atlas re-optimize config requires a selected atlas directory.");
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 7000);
-            return;
-        }
-        AtlasRequestArtifacts atlasArtifacts;
-        QString atlasError;
-        if (!buildAtlasRequestArtifacts(
-                std::filesystem::path(_atlasDirPath.toStdString()),
-                volpkgRootForState(state),
-                &atlasArtifacts,
-                &atlasError)) {
-            showLasagnaConfigError(atlasError, statusBar, 7000);
-            return;
-        }
-        jobSpec[QStringLiteral("atlas")] = atlasArtifacts.atlasRef;
-        for (const QJsonValue& value : atlasArtifacts.uploads) {
-            appendUploadIfNew(value.toObject());
-        }
-        rawTifxyzBytes += atlasArtifacts.rawBytes;
-        tifxyzFileCount += atlasArtifacts.fileCount;
-        std::cerr << "[lasagna] atlas reopt refresh: atlas=" << _atlasDirPath.toStdString()
-                  << " files=" << atlasArtifacts.fileCount
-                  << " raw=" << bytesToMiB(atlasArtifacts.rawBytes) << " MiB"
-                  << std::endl;
-    }
-
     if (sendModelData) {
         const QString modelRefName = QString::fromStdString(segPath.filename().string())
             + QStringLiteral("/model.pt");
@@ -2671,6 +2718,8 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         }
         jobSpec[QStringLiteral("model")] = modelUpload[QStringLiteral("object")].toObject();
         appendUploadIfNew(modelUpload);
+    } else if (!isNewModel && !inheritedModelRef.isEmpty()) {
+        jobSpec[QStringLiteral("model")] = inheritedModelRef;
     }
     if (!linkedSurfaces.isEmpty()) {
         QJsonArray externalSurfaces;

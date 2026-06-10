@@ -112,6 +112,8 @@ int main(int argc, char** argv)
     settings.setValue(QStringLiteral("lasagna_offset_value"), -1.25);
     const QString altConfigPath = tempDir.filePath(QStringLiteral("alt_config.json"));
     writeFile(altConfigPath, QByteArrayLiteral(R"({"args":{"alternate":1}})"));
+    const QString reoptModelConfigPath = tempDir.filePath(QStringLiteral("reopt_model.json"));
+    writeFile(reoptModelConfigPath, QByteArrayLiteral(R"({"args":{"model-init":"model"}})"));
 
     SegmentationLasagnaPanel panel(QStringLiteral("test-lasagna"));
     panel.restoreSettings(settings);
@@ -426,6 +428,96 @@ int main(int argc, char** argv)
             "New Model launch should send the saved wraps width value");
     require(wrapJobArgs[QStringLiteral("model-w-unit")].toString() == QStringLiteral("wraps"),
             "New Model launch should send the wraps width unit");
+
+    const QString externalModelPath = tempDir.filePath(QStringLiteral("external_model.pt"));
+    writeFile(externalModelPath, QByteArrayLiteral("external-model"));
+    const QString segNoModelDir = tempDir.filePath(QStringLiteral("sheet_no_model.tifxyz"));
+    require(QDir().mkpath(segNoModelDir), "Failed to create no-model tifxyz segment");
+    writeFile(segNoModelDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
+    writeFile(segNoModelDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
+    writeFile(segNoModelDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
+    writeFile(segNoModelDir + QStringLiteral("/meta.json"),
+              QByteArray(R"({"model_source":")") +
+                  externalModelPath.toUtf8().replace("\\", "\\\\").replace("\"", "\\\"") +
+                  QByteArrayLiteral(R"("})"));
+    auto noModelSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+    noModelSurface->path = std::filesystem::path(segNoModelDir.toStdString());
+    state.setSurface("segmentation", noModelSurface, true);
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
+        reoptModelConfigPath,
+        4,
+        5,
+        6);
+    QJsonObject modelSourceJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    require(!g_lastLasagnaOptimizationRequest.contains(QStringLiteral("copy_model")),
+            "Re-optimize should not send deprecated copy_model request flag");
+    require(modelSourceJobSpec[QStringLiteral("model")].toObject()[QStringLiteral("type")].toString() ==
+                QStringLiteral("lasagna_model"),
+            "Re-optimize should derive job_spec.model from meta.json model_source when model.pt is absent");
+    bool uploadedModelSource = false;
+    for (const QJsonValue& value : g_lastLasagnaOptimizationRequest[QStringLiteral("_objects")].toArray()) {
+        uploadedModelSource = uploadedModelSource ||
+            value.toObject()[QStringLiteral("object")].toObject()[QStringLiteral("type")].toString() ==
+                QStringLiteral("lasagna_model");
+    }
+    require(uploadedModelSource,
+            "Re-optimize should upload the local model_source model when model.pt is absent");
+
+    const QString segModelRefDir = tempDir.filePath(QStringLiteral("sheet_model_ref.tifxyz"));
+    require(QDir().mkpath(segModelRefDir), "Failed to create model-ref tifxyz segment");
+    writeFile(segModelRefDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
+    writeFile(segModelRefDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
+    writeFile(segModelRefDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
+    writeFile(segModelRefDir + QStringLiteral("/meta.json"),
+              QByteArrayLiteral(R"({"object_refs":{"version":1,"objects":[{"type":"lasagna_model","name":"sheet_model_ref.tifxyz/model.pt","hash":"md5:22222222222222222222222222222222"}]}})"));
+    auto modelRefSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+    modelRefSurface->path = std::filesystem::path(segModelRefDir.toStdString());
+    state.setSurface("segmentation", modelRefSurface, true);
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
+        reoptModelConfigPath,
+        4,
+        5,
+        6);
+    QJsonObject modelRefJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    require(!g_lastLasagnaOptimizationRequest.contains(QStringLiteral("copy_model")),
+            "Re-optimize with model ref should not send deprecated copy_model request flag");
+    require(modelRefJobSpec[QStringLiteral("model")].toObject()[QStringLiteral("hash")].toString() ==
+                QStringLiteral("md5:22222222222222222222222222222222"),
+            "Re-optimize should derive job_spec.model from meta.json object_refs when no local model is present");
+
+    const QString segBrokenModelDir = tempDir.filePath(QStringLiteral("sheet_broken_model.tifxyz"));
+    require(QDir().mkpath(segBrokenModelDir), "Failed to create broken-model tifxyz segment");
+    writeFile(segBrokenModelDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
+    writeFile(segBrokenModelDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
+    writeFile(segBrokenModelDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
+    writeFile(segBrokenModelDir + QStringLiteral("/meta.json"), QByteArrayLiteral("{}"));
+    std::error_code symlinkErr;
+    std::filesystem::create_symlink(
+        std::filesystem::path(tempDir.filePath(QStringLiteral("missing_model.pt")).toStdString()),
+        std::filesystem::path((segBrokenModelDir + QStringLiteral("/model.pt")).toStdString()),
+        symlinkErr);
+    require(!symlinkErr, "Failed to create broken model symlink");
+    auto brokenModelSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+    brokenModelSurface->path = std::filesystem::path(segBrokenModelDir.toStdString());
+    state.setSurface("segmentation", brokenModelSurface, true);
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
+        reoptModelConfigPath,
+        4,
+        5,
+        6);
+    require(statusBar.currentMessage().contains(QStringLiteral("broken symlink")),
+            "Re-optimize should reject a broken local model.pt symlink");
+
+    state.setSurface("segmentation", surface, true);
 
     const QString volpkgRoot = tempDir.filePath(QStringLiteral("sample.volpkg"));
     require(QDir().mkpath(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/base_mesh/base.tifxyz")),

@@ -488,6 +488,29 @@ class Fit2TifxyzOutputMaskSmokeTest(unittest.TestCase):
 		self.assertEqual(record["distance"], 7.0)
 		self.assertEqual(record["signed_delta"], -8.0)
 
+	def test_checkpoint_export_copies_model_without_copy_model_flag(self) -> None:
+		x, y, z = _plane_mesh(3, 3)
+		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
+		state = {
+			"mesh_flat": torch.from_numpy(mesh_flat.astype(np.float32)),
+			"_model_params_": _model_params(),
+		}
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			ckpt = root / "model.pt"
+			out = root / "out"
+			torch.save(state, ckpt)
+			source_bytes = ckpt.read_bytes()
+
+			fit2tifxyz.main(["--input", str(ckpt), "--output", str(out)])
+
+			exported_model = out / "winding_0000.tifxyz" / "model.pt"
+			self.assertTrue(exported_model.exists())
+			self.assertFalse(exported_model.is_symlink())
+			self.assertTrue(exported_model.is_file())
+			self.assertEqual(exported_model.read_bytes(), source_bytes)
+
 	def test_checkpoint_export_masks_xyz_d_and_area(self) -> None:
 		x, y, z = _plane_mesh(7, 7)
 		mesh_flat = np.stack([x, y, z], axis=0)[:, None, :, :]
