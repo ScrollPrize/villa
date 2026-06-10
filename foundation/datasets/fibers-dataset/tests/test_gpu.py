@@ -39,3 +39,25 @@ def test_vesselness_parity():
     res_cp = tools.detect_vesselness(volume_cp)
     
     np.testing.assert_allclose(res_np, cp.asnumpy(res_cp), rtol=1e-3, atol=1e-4)
+
+def test_tiled_parity():
+    """Tiled execution matches the dense path when the halo covers the filter support."""
+    np.random.seed(42)
+    volume_np = np.random.rand(64, 64, 64).astype(np.float32)
+
+    # Default gauss_sigma=2 -> smoothing support 4*sigma=8 voxels (+2 for the
+    # finite-difference Hessian), fully inside halo=16.
+    res_dense = tools.detect_vesselness(volume_np.copy())
+    res_tiled = tools.detect_vesselness_tiled(volume_np.copy(), block_size=32, halo=16)
+
+    np.testing.assert_allclose(res_dense, res_tiled, rtol=1e-3, atol=1e-4)
+
+def test_tiled_parity_ridges():
+    """Same parity check for the ridge filter."""
+    np.random.seed(7)
+    volume_np = np.random.rand(64, 64, 64).astype(np.float32)
+
+    res_dense = tools.detect_ridges(volume_np.copy())
+    res_tiled = tools.detect_ridges_tiled(volume_np.copy(), block_size=32, halo=16)
+
+    np.testing.assert_allclose(res_dense, res_tiled, rtol=1e-3, atol=1e-4)

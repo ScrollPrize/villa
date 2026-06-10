@@ -37,10 +37,18 @@ def divide_nonzero(array1, array2, eps=1e-10):
     denominator[denominator == 0] = eps
     return xp.divide(array1, denominator)
 
-def normalize(volume):
+def normalize(volume, norm_range=None):
+    """
+    Min-max normalize in place. If norm_range is given as (min, max), use it
+    instead of the volume's own extrema (needed for tiled execution, where each
+    block must be normalized against the global range to match dense results).
+    """
     xp, _ = get_backend(volume)
-    minim = xp.min(volume)
-    maxim = xp.max(volume)
+    if norm_range is None:
+        minim = xp.min(volume)
+        maxim = xp.max(volume)
+    else:
+        minim, maxim = norm_range
     volume -= minim
     volume /= (maxim - minim)
     return volume
@@ -137,11 +145,11 @@ def denoise_3d(volume, h=0.03):
 def adjust_contrast(volume, kernel_size=8):
     return equalize_adapthist(volume, kernel_size, clip_limit=0.01, nbins=256)
 
-def hessian(volume, gauss_sigma=2, sigma=6):
+def hessian(volume, gauss_sigma=2, sigma=6, norm_range=None):
     xp, xndimage = get_backend(volume)
     # N.B. this only returns the upper triangular matrix to save time
     volume = xndimage.gaussian_filter(volume, sigma=gauss_sigma)
-    volume = normalize(volume)
+    volume = normalize(volume, norm_range=norm_range)
     
     joint_hessian = xp.zeros((volume.shape[0], volume.shape[1], volume.shape[2], 3, 3), dtype=float)
     
@@ -208,9 +216,9 @@ def compute_eigenvalues_3x3_batch(J):
     eigenvalues = xp.sort(eigenvalues, axis=-1)
     return eigenvalues
 
-def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6):
+def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6, norm_range=None):
     xp, _ = get_backend(volume)
-    joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
+    joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma, norm_range=norm_range)
     eigvals = compute_eigenvalues_3x3_batch(joint_hessian)
     # Sort in increasing size of the absolute value of the eigenvalues
     idxs = xp.argsort(xp.abs(eigvals), axis=-1)
@@ -236,7 +244,7 @@ def detect_ridges(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=
  
     return ridges
 
-def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6):
+def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, sigma=6, norm_range=None):
     """
     Detect vesselness using the Frangi filter.
     
@@ -252,7 +260,7 @@ def detect_vesselness(volume, gamma=1.5, beta1=0.5, beta2=0.5, gauss_sigma=2, si
     - vesselness: 3D array representing vesselness probability at each voxel.
     """
     xp, _ = get_backend(volume)
-    joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma)
+    joint_hessian, zero_mask = hessian(volume, gauss_sigma, sigma, norm_range=norm_range)
     eigvals = compute_eigenvalues_3x3_batch(joint_hessian)
     # Sort eigenvalues by magnitude (ascending order)
     idxs = xp.argsort(xp.abs(eigvals), axis=-1)
@@ -363,84 +371,84 @@ def detect_edges(volume, filter):
     
     return first_derivative, det, gradient
 
-def detect_ridges_tiled(volume, block_size=128, halo=16, **kwargs):
+def _smoothed_global_range(volume, gauss_sigma, block_size, halo):
     """
-    Run detect_ridges in blocks to fit in GPU memory.
+    Min/max of the Gaussian-smoothed volume, computed tile-by-tile.
+    Matches the dense path exactly when halo covers the filter support
+    (truncate * gauss_sigma, i.e. 8 voxels for the default gauss_sigma=2).
+    """
+    xp, xndimage = get_backend(volume)
+    Z, Y, X = volume.shape
+    gmin, gmax = xp.inf, -xp.inf
+    for z in range(0, Z, block_size):
+        for y in range(0, Y, block_size):
+            for x in range(0, X, block_size):
+                z0, z1 = max(0, z - halo), min(Z, z + block_size + halo)
+                y0, y1 = max(0, y - halo), min(Y, y + block_size + halo)
+                x0, x1 = max(0, x - halo), min(X, x + block_size + halo)
+                smoothed = xndimage.gaussian_filter(volume[z0:z1, y0:y1, x0:x1], sigma=gauss_sigma)
+                interior = smoothed[z - z0:z - z0 + min(block_size, Z - z),
+                                    y - y0:y - y0 + min(block_size, Y - y),
+                                    x - x0:x - x0 + min(block_size, X - x)]
+                gmin = min(gmin, float(interior.min()))
+                gmax = max(gmax, float(interior.max()))
+                if HAS_CUPY and isinstance(volume, cp.ndarray):
+                    del smoothed
+                    cp.get_default_memory_pool().free_all_blocks()
+    return gmin, gmax
+
+def _detect_tiled(volume, filter_fn, block_size=128, halo=16, **kwargs):
+    """
+    Run a volumetric filter in blocks with a halo to fit in GPU memory.
+    Each block is processed with `halo` voxels of context on every side,
+    then cropped back to the interior before write-back. A first pass
+    computes the global normalization range of the smoothed volume so
+    per-block normalization matches the dense path.
     """
     xp, _ = get_backend(volume)
     Z, Y, X = volume.shape
     result = xp.zeros((Z, Y, X), dtype=volume.dtype)
-    
+
+    if kwargs.get('norm_range') is None:
+        gauss_sigma = kwargs.get('gauss_sigma', 2)
+        kwargs['norm_range'] = _smoothed_global_range(volume, gauss_sigma, block_size, halo)
+
     for z in range(0, Z, block_size):
         for y in range(0, Y, block_size):
             for x in range(0, X, block_size):
-                # Calculate coordinates with halo
+                # Block coordinates with halo
                 z0, z1 = max(0, z - halo), min(Z, z + block_size + halo)
                 y0, y1 = max(0, y - halo), min(Y, y + block_size + halo)
                 x0, x1 = max(0, x - halo), min(X, x + block_size + halo)
-                
-                # Extract block
+
                 block = volume[z0:z1, y0:y1, x0:x1]
-                
-                # Process block
-                block_res = detect_ridges(block, **kwargs)
-                
-                # Calculate crop boundaries
+                block_res = filter_fn(block, **kwargs)
+
+                # Crop the halo off and write back the interior
                 bz0 = z - z0
                 bz1 = bz0 + min(block_size, Z - z)
                 by0 = y - y0
                 by1 = by0 + min(block_size, Y - y)
                 bx0 = x - x0
                 bx1 = bx0 + min(block_size, X - x)
-                
-                # Write back
                 result[z:z+bz1-bz0, y:y+by1-by0, x:x+bx1-bx0] = block_res[bz0:bz1, by0:by1, bx0:bx1]
-                
+
                 # Free memory aggressively inside loop if using CuPy
                 if HAS_CUPY and isinstance(volume, cp.ndarray):
                     del block
                     del block_res
                     cp.get_default_memory_pool().free_all_blocks()
-                
+
     return result
+
+def detect_ridges_tiled(volume, block_size=128, halo=16, **kwargs):
+    """
+    Run detect_ridges in blocks to fit in GPU memory.
+    """
+    return _detect_tiled(volume, detect_ridges, block_size, halo, **kwargs)
 
 def detect_vesselness_tiled(volume, block_size=128, halo=16, **kwargs):
     """
     Run detect_vesselness in blocks to fit in GPU memory.
     """
-    xp, _ = get_backend(volume)
-    Z, Y, X = volume.shape
-    result = xp.zeros((Z, Y, X), dtype=volume.dtype)
-    
-    for z in range(0, Z, block_size):
-        for y in range(0, Y, block_size):
-            for x in range(0, X, block_size):
-                # Calculate coordinates with halo
-                z0, z1 = max(0, z - halo), min(Z, z + block_size + halo)
-                y0, y1 = max(0, y - halo), min(Y, y + block_size + halo)
-                x0, x1 = max(0, x - halo), min(X, x + block_size + halo)
-                
-                # Extract block
-                block = volume[z0:z1, y0:y1, x0:x1]
-                
-                # Process block
-                block_res = detect_vesselness(block, **kwargs)
-                
-                # Calculate crop boundaries
-                bz0 = z - z0
-                bz1 = bz0 + min(block_size, Z - z)
-                by0 = y - y0
-                by1 = by0 + min(block_size, Y - y)
-                bx0 = x - x0
-                bx1 = bx0 + min(block_size, X - x)
-                
-                # Write back
-                result[z:z+bz1-bz0, y:y+by1-by0, x:x+bx1-bx0] = block_res[bz0:bz1, by0:by1, bx0:bx1]
-                
-                # Free memory aggressively inside loop if using CuPy
-                if HAS_CUPY and isinstance(volume, cp.ndarray):
-                    del block
-                    del block_res
-                    cp.get_default_memory_pool().free_all_blocks()
-                
-    return result
+    return _detect_tiled(volume, detect_vesselness, block_size, halo, **kwargs)
