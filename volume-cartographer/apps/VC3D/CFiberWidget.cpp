@@ -11,6 +11,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QSignalBlocker>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -380,7 +381,10 @@ void CFiberWidget::onAddTagClicked()
     _newTagEdit->clear();
     addUniqueSorted(_knownTags, tag.toStdString());
     applyTagLocally(_selectedFiberId, tag.toStdString(), true);
-    emit fiberTagChanged(_selectedFiberId, tag, true);
+    const uint64_t fiberId = _selectedFiberId;
+    QTimer::singleShot(0, this, [this, fiberId, tag]() {
+        emit fiberTagChanged(fiberId, tag, true);
+    });
     rebuildTagList();
 }
 
@@ -431,8 +435,11 @@ void CFiberWidget::requestFiberTagChange(const QString& tag, bool enabled)
     if (_selectedFiberId == 0) {
         return;
     }
+    const uint64_t fiberId = _selectedFiberId;
     applyTagLocally(_selectedFiberId, tag.toStdString(), enabled);
-    emit fiberTagChanged(_selectedFiberId, tag, enabled);
+    QTimer::singleShot(0, this, [this, fiberId, tag, enabled]() {
+        emit fiberTagChanged(fiberId, tag, enabled);
+    });
 }
 
 void CFiberWidget::applyTagLocally(uint64_t fiberId, const std::string& tag, bool enabled)
