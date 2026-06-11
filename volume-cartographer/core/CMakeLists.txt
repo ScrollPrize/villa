@@ -138,6 +138,7 @@ target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 add_library(vc_lasagna
     src/lasagna/Dataset.cpp
     src/lasagna/EclMaxflow.cpp
+    src/lasagna/EclMaxflowCut.cpp
     src/lasagna/LasagnaNormalSampler.cpp
     src/lasagna/LineViewBuilder.cpp
     src/lasagna/LineOptimizer.cpp

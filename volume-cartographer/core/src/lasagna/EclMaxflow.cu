@@ -6,7 +6,6 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "maxflow.cu"
@@ -54,8 +53,9 @@ EclMaxflowResult runEclMaxflow(
     const MaxflowGraph& graph,
     int32_t sourceNode,
     int32_t sinkNode,
-    int runs)
+    const EclMaxflowOptions& options)
 {
+    const int runs = options.runs;
     if (runs <= 0) {
         throw std::runtime_error("ECL-MaxFlow runs must be positive");
     }
@@ -101,25 +101,26 @@ EclMaxflowResult runEclMaxflow(
     checkCuda(cudaMemcpy(d_g.nlist, nlist.data(), static_cast<size_t>(edges) * sizeof(int), cudaMemcpyHostToDevice),
               "cudaMemcpy d_g.nlist");
 
-    std::vector<std::vector<std::pair<int, int>>> incoming(static_cast<size_t>(nodes));
+    std::vector<int> rnindex(static_cast<size_t>(nodes) + 1, 0);
     for (int v = 0; v < nodes; ++v) {
         for (int e = nindex[static_cast<size_t>(v)]; e < nindex[static_cast<size_t>(v) + 1]; ++e) {
             const int nbor = nlist[static_cast<size_t>(e)];
-            incoming[static_cast<size_t>(nbor)].push_back({e, v});
+            ++rnindex[static_cast<size_t>(nbor) + 1];
         }
     }
-
-    std::vector<int> rnindex(static_cast<size_t>(nodes) + 1, 0);
+    for (size_t i = 1; i < rnindex.size(); ++i) {
+        rnindex[i] += rnindex[i - 1];
+    }
     std::vector<int> rnlist(static_cast<size_t>(edges), 0);
     std::vector<int> retoe(static_cast<size_t>(edges), 0);
-    int reidx = 0;
+    std::vector<int> cursor = rnindex;
     for (int v = 0; v < nodes; ++v) {
-        for (const auto& [edge, src] : incoming[static_cast<size_t>(v)]) {
-            rnlist[static_cast<size_t>(reidx)] = src;
-            retoe[static_cast<size_t>(reidx)] = edge;
-            ++reidx;
+        for (int e = nindex[static_cast<size_t>(v)]; e < nindex[static_cast<size_t>(v) + 1]; ++e) {
+            const int nbor = nlist[static_cast<size_t>(e)];
+            const int reidx = cursor[static_cast<size_t>(nbor)]++;
+            rnlist[static_cast<size_t>(reidx)] = v;
+            retoe[static_cast<size_t>(reidx)] = e;
         }
-        rnindex[static_cast<size_t>(v) + 1] = reidx;
     }
 
     int* d_rnindex = nullptr;
@@ -163,12 +164,33 @@ EclMaxflowResult runEclMaxflow(
     cudaFree(d_retoe);
 
     const double med = median(runtimes);
-    return {
+    EclMaxflowResult result{
         maxFlow,
         med,
         med > 0.0 ? 0.000000001 * static_cast<double>(edges) / med : 0.0,
         runs,
     };
+    if (options.computeMinCut) {
+        result.minCut = computeMinCutFromFinalFlow(
+            graph,
+            flow,
+            sourceNode,
+            sinkNode,
+            options.storeSourceReachable,
+            options.storeCutEdges);
+    }
+    return result;
+}
+
+EclMaxflowResult runEclMaxflow(
+    const MaxflowGraph& graph,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    int runs)
+{
+    EclMaxflowOptions options;
+    options.runs = runs;
+    return runEclMaxflow(graph, sourceNode, sinkNode, options);
 }
 
 } // namespace vc::lasagna

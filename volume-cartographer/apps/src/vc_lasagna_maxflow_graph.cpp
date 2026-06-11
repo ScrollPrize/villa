@@ -1,19 +1,25 @@
 #include "vc/lasagna/MaxflowGraph.hpp"
 #include "vc/lasagna/EclMaxflow.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <locale>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -22,7 +28,9 @@ void printUsage(const char* argv0)
     std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> "
               << "--src x,y,z [--src x,y,z ...] --sink x,y,z [--sink x,y,z ...] "
               << "[--margin-base-voxels 1000] [--threshold 110] "
-              << "[--run-ecl] [--runs N]\n";
+              << "[--run-ecl] [--runs N] [--terminal-flood-depth 10] "
+              << "[--terminal-flood-capacity 1024] [--terminal-flood-decay 2] "
+              << "[--terminal-region-iterations 0] [--terminal-flood-sweep]\n";
 }
 
 vc::lasagna::MaxflowDouble3 parsePoint(const std::string& value, const char* name)
@@ -121,8 +129,615 @@ struct FlowRunResult {
     bool skipped = false;
     std::string error;
     vc::lasagna::EclMaxflowResult flow;
+    vc::lasagna::EclTerminalExpansion sourceExpansion;
+    vc::lasagna::EclTerminalExpansion sinkExpansion;
+    bool usedTerminalFlood = false;
+    int terminalFloodDepth = 0;
+    int terminalFloodCapacity = 0;
+    int terminalFloodDecay = 0;
+    uint64_t sourceFloodNodes = 0;
+    uint64_t sinkFloodNodes = 0;
+    int64_t sourceFloodTerminalCapacity = 0;
+    int64_t sinkFloodTerminalCapacity = 0;
+    bool usedTerminalRegions = false;
+    uint64_t terminalRegionIterations = 0;
+    int32_t terminalEdgeCapacity = 0;
+    bool terminalExpansionLimitReached = false;
     double wallSeconds = 0.0;
 };
+
+struct TerminalFlood {
+    std::vector<int32_t> distance;
+    std::vector<int32_t> shellCapacity;
+    uint64_t nodes = 0;
+    int64_t totalShellCapacity = 0;
+};
+
+enum class FloodScheduleKind {
+    Geometric,
+    Linear
+};
+
+struct FloodSchedule {
+    FloodScheduleKind kind = FloodScheduleKind::Geometric;
+    int startCapacity = 1024;
+    double factor = 2.0;
+    int step = 1;
+    int maxDepth = 10;
+    std::string label;
+};
+
+struct TerminalBoundary {
+    int64_t capacity = 0;
+    uint64_t regionNodes = 0;
+    bool touchesOpposite = false;
+    std::vector<int32_t> frontier;
+};
+
+uint64_t countRegionNodes(const std::vector<uint8_t>& region)
+{
+    return static_cast<uint64_t>(std::count(region.begin(), region.end(), static_cast<uint8_t>(1)));
+}
+
+int32_t terminalEdgeCapacityForGraph(const vc::lasagna::MaxflowGraph& graph)
+{
+    std::vector<int64_t> incoming(static_cast<size_t>(graph.stats.graphNodes), 0);
+    int64_t maxIncident = 0;
+    for (uint64_t node = 0; node < graph.stats.graphNodes; ++node) {
+        int64_t outgoing = 0;
+        for (uint64_t edge = graph.nindex[static_cast<size_t>(node)];
+             edge < graph.nindex[static_cast<size_t>(node) + 1];
+             ++edge) {
+            outgoing += graph.capacity[static_cast<size_t>(edge)];
+            incoming[static_cast<size_t>(graph.nlist[static_cast<size_t>(edge)])] +=
+                graph.capacity[static_cast<size_t>(edge)];
+        }
+        maxIncident = std::max(maxIncident, outgoing);
+    }
+    for (const int64_t value : incoming) {
+        maxIncident = std::max(maxIncident, value);
+    }
+    if (maxIncident >= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return std::numeric_limits<int32_t>::max();
+    }
+    return static_cast<int32_t>(std::max<int64_t>(1, maxIncident + 1));
+}
+
+int32_t geometricCapacity(int baseCapacity, double decay, int distance)
+{
+    double cap = static_cast<double>(baseCapacity);
+    for (int i = 0; i < distance; ++i) {
+        cap /= decay;
+        if (cap < 1.0) {
+            return 0;
+        }
+    }
+    if (cap > std::numeric_limits<int32_t>::max()) {
+        return std::numeric_limits<int32_t>::max();
+    }
+    return static_cast<int32_t>(cap);
+}
+
+int32_t scheduleCapacity(const FloodSchedule& schedule, int distance)
+{
+    if (distance > schedule.maxDepth) {
+        return 0;
+    }
+    if (schedule.kind == FloodScheduleKind::Linear) {
+        const int64_t cap = static_cast<int64_t>(schedule.startCapacity) -
+                            static_cast<int64_t>(schedule.step) * distance;
+        return cap > 0 ? static_cast<int32_t>(std::min<int64_t>(
+                             cap,
+                             std::numeric_limits<int32_t>::max()))
+                       : 0;
+    }
+    return geometricCapacity(schedule.startCapacity, schedule.factor, distance);
+}
+
+int depthUntilOneGeometric(int startCapacity, double factor)
+{
+    int depth = 0;
+    while (geometricCapacity(startCapacity, factor, depth) > 1 &&
+           depth < std::numeric_limits<int>::max() / 2) {
+        ++depth;
+    }
+    return depth;
+}
+
+int depthUntilOneLinear(int startCapacity, int step)
+{
+    if (step <= 0) {
+        return 0;
+    }
+    return static_cast<int>((static_cast<int64_t>(startCapacity) - 1) / step);
+}
+
+TerminalFlood terminalFlood(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t seedNode,
+    const FloodSchedule& schedule)
+{
+    if (seedNode < 0 || seedNode >= static_cast<int64_t>(graph.stats.graphNodes)) {
+        throw std::runtime_error("terminal flood seed is outside graph");
+    }
+    if (schedule.maxDepth < 0) {
+        throw std::runtime_error("terminal flood depth must be non-negative");
+    }
+    if (schedule.startCapacity <= 0) {
+        throw std::runtime_error("terminal flood capacity must be positive");
+    }
+    if (schedule.kind == FloodScheduleKind::Geometric && !(schedule.factor > 1.0)) {
+        throw std::runtime_error("terminal flood decay must be greater than 1");
+    }
+    if (schedule.kind == FloodScheduleKind::Linear && schedule.step <= 0) {
+        throw std::runtime_error("terminal flood linear step must be positive");
+    }
+
+    TerminalFlood flood;
+    flood.distance.assign(static_cast<size_t>(graph.stats.graphNodes), -1);
+    flood.shellCapacity.assign(static_cast<size_t>(graph.stats.graphNodes), 0);
+    std::deque<int32_t> queue;
+    flood.distance[static_cast<size_t>(seedNode)] = 0;
+    queue.push_back(seedNode);
+
+    while (!queue.empty()) {
+        const int32_t node = queue.front();
+        queue.pop_front();
+        const int dist = flood.distance[static_cast<size_t>(node)];
+        const int32_t cap = scheduleCapacity(schedule, dist);
+        if (cap > 0) {
+            flood.shellCapacity[static_cast<size_t>(node)] = cap;
+            ++flood.nodes;
+            flood.totalShellCapacity += cap;
+        }
+        if (dist >= schedule.maxDepth) {
+            continue;
+        }
+        for (uint64_t edge = graph.nindex[static_cast<size_t>(node)];
+             edge < graph.nindex[static_cast<size_t>(node) + 1];
+             ++edge) {
+            const int32_t dst = graph.nlist[static_cast<size_t>(edge)];
+            if (flood.distance[static_cast<size_t>(dst)] < 0) {
+                flood.distance[static_cast<size_t>(dst)] = dist + 1;
+                queue.push_back(dst);
+            }
+        }
+    }
+    return flood;
+}
+
+TerminalFlood terminalFlood(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t seedNode,
+    int maxDepth,
+    int baseCapacity,
+    int decay)
+{
+    FloodSchedule schedule;
+    schedule.kind = FloodScheduleKind::Geometric;
+    schedule.startCapacity = baseCapacity;
+    schedule.factor = static_cast<double>(decay);
+    schedule.maxDepth = maxDepth;
+    return terminalFlood(graph, seedNode, schedule);
+}
+
+vc::lasagna::MaxflowGraph buildTerminalFloodGraph(
+    const vc::lasagna::MaxflowGraph& base,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    const TerminalFlood& sourceFlood,
+    const TerminalFlood& sinkFlood,
+    int32_t terminalCapacity)
+{
+    vc::lasagna::MaxflowGraph graph;
+    const uint64_t baseNodes = base.stats.graphNodes;
+    const uint64_t sourceSuper = baseNodes;
+    const uint64_t sinkSuper = baseNodes + 1;
+    graph.stats = base.stats;
+    graph.stats.graphNodes = baseNodes + 2;
+    graph.nindex.assign(static_cast<size_t>(graph.stats.graphNodes) + 1, 0);
+
+    for (uint64_t node = 0; node < baseNodes; ++node) {
+        graph.nindex[static_cast<size_t>(node) + 1] =
+            base.nindex[static_cast<size_t>(node) + 1] - base.nindex[static_cast<size_t>(node)];
+        if (static_cast<int32_t>(node) == sinkNode) {
+            ++graph.nindex[static_cast<size_t>(node) + 1];
+        }
+    }
+    ++graph.nindex[static_cast<size_t>(sourceSuper) + 1];
+    for (size_t i = 1; i < graph.nindex.size(); ++i) {
+        graph.nindex[i] += graph.nindex[i - 1];
+    }
+
+    graph.stats.directedEdges = base.stats.directedEdges + 2;
+    graph.nlist.assign(static_cast<size_t>(graph.stats.directedEdges), 0);
+    graph.capacity.assign(static_cast<size_t>(graph.stats.directedEdges), 1);
+    std::vector<uint64_t> cursor = graph.nindex;
+    for (uint64_t node = 0; node < baseNodes; ++node) {
+        for (uint64_t edge = base.nindex[static_cast<size_t>(node)];
+             edge < base.nindex[static_cast<size_t>(node) + 1];
+             ++edge) {
+            const int32_t dst = base.nlist[static_cast<size_t>(edge)];
+            const uint64_t out = cursor[static_cast<size_t>(node)]++;
+            graph.nlist[static_cast<size_t>(out)] = dst;
+            int32_t capacity = base.capacity[static_cast<size_t>(edge)];
+            const int32_t sourceDist = sourceFlood.distance[static_cast<size_t>(node)];
+            const int32_t dstSourceDist = sourceFlood.distance[static_cast<size_t>(dst)];
+            if (sourceDist >= 0 && dstSourceDist == sourceDist + 1) {
+                capacity = std::max(capacity, sourceFlood.shellCapacity[static_cast<size_t>(node)]);
+            }
+            const int32_t sinkDist = sinkFlood.distance[static_cast<size_t>(node)];
+            const int32_t dstSinkDist = sinkFlood.distance[static_cast<size_t>(dst)];
+            if (dstSinkDist >= 0 && sinkDist == dstSinkDist + 1) {
+                capacity = std::max(capacity, sinkFlood.shellCapacity[static_cast<size_t>(dst)]);
+            }
+            graph.capacity[static_cast<size_t>(out)] = capacity;
+        }
+        if (static_cast<int32_t>(node) == sinkNode) {
+            const uint64_t out = cursor[static_cast<size_t>(node)]++;
+            graph.nlist[static_cast<size_t>(out)] = static_cast<int32_t>(sinkSuper);
+            graph.capacity[static_cast<size_t>(out)] = terminalCapacity;
+        }
+    }
+    const uint64_t out = cursor[static_cast<size_t>(sourceSuper)]++;
+    graph.nlist[static_cast<size_t>(out)] = sourceNode;
+    graph.capacity[static_cast<size_t>(out)] = terminalCapacity;
+    return graph;
+}
+
+vc::lasagna::EclMaxflowResult runEclWithTerminalFlood(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    int runs,
+    int floodDepth,
+    int floodCapacity,
+    int floodDecay,
+    FlowRunResult& result)
+{
+    const auto sourceFlood = terminalFlood(graph, sourceNode, floodDepth, floodCapacity, floodDecay);
+    const auto sinkFlood = terminalFlood(graph, sinkNode, floodDepth, floodCapacity, floodDecay);
+    result.usedTerminalFlood = true;
+    result.terminalFloodDepth = floodDepth;
+    result.terminalFloodCapacity = floodCapacity;
+    result.terminalFloodDecay = floodDecay;
+    result.sourceFloodNodes = sourceFlood.nodes;
+    result.sinkFloodNodes = sinkFlood.nodes;
+    result.sourceFloodTerminalCapacity = sourceFlood.totalShellCapacity;
+    result.sinkFloodTerminalCapacity = sinkFlood.totalShellCapacity;
+
+    const auto terminalGraph = buildTerminalFloodGraph(
+        graph,
+        sourceNode,
+        sinkNode,
+        sourceFlood,
+        sinkFlood,
+        std::numeric_limits<int32_t>::max() / 4);
+    vc::lasagna::EclMaxflowOptions eclOptions;
+    eclOptions.runs = runs;
+    eclOptions.computeMinCut = false;
+    return vc::lasagna::runEclMaxflow(
+        terminalGraph,
+        static_cast<int32_t>(graph.stats.graphNodes),
+        static_cast<int32_t>(graph.stats.graphNodes + 1),
+        eclOptions);
+}
+
+vc::lasagna::EclMaxflowResult runEclWithTerminalFloodSchedule(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    int runs,
+    const FloodSchedule& schedule)
+{
+    const auto sourceFlood = terminalFlood(graph, sourceNode, schedule);
+    const auto sinkFlood = terminalFlood(graph, sinkNode, schedule);
+    const auto terminalGraph = buildTerminalFloodGraph(
+        graph,
+        sourceNode,
+        sinkNode,
+        sourceFlood,
+        sinkFlood,
+        std::numeric_limits<int32_t>::max() / 4);
+    vc::lasagna::EclMaxflowOptions eclOptions;
+    eclOptions.runs = runs;
+    eclOptions.computeMinCut = false;
+    return vc::lasagna::runEclMaxflow(
+        terminalGraph,
+        static_cast<int32_t>(graph.stats.graphNodes),
+        static_cast<int32_t>(graph.stats.graphNodes + 1),
+        eclOptions);
+}
+
+vc::lasagna::EclMaxflowResult runEclWithTerminalFloodScheduleQuiet(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    int runs,
+    const FloodSchedule& schedule)
+{
+    std::fflush(stdout);
+    const int savedStdout = dup(STDOUT_FILENO);
+    const int devNull = open("/dev/null", O_WRONLY);
+    if (savedStdout < 0 || devNull < 0) {
+        if (savedStdout >= 0) close(savedStdout);
+        if (devNull >= 0) close(devNull);
+        return runEclWithTerminalFloodSchedule(graph, sourceNode, sinkNode, runs, schedule);
+    }
+    dup2(devNull, STDOUT_FILENO);
+    close(devNull);
+
+    try {
+        auto result = runEclWithTerminalFloodSchedule(graph, sourceNode, sinkNode, runs, schedule);
+        std::fflush(stdout);
+        dup2(savedStdout, STDOUT_FILENO);
+        close(savedStdout);
+        return result;
+    } catch (...) {
+        std::fflush(stdout);
+        dup2(savedStdout, STDOUT_FILENO);
+        close(savedStdout);
+        throw;
+    }
+}
+
+std::vector<FloodSchedule> makeFloodSweepSchedules()
+{
+    const std::vector<int> starts{128, 256, 512, 1024};
+    const std::vector<double> factors{4.0, 2.0, 1.5, 1.25};
+    const std::vector<int> linearSteps{1, 4, 16};
+
+    std::vector<FloodSchedule> schedules;
+    for (int start : starts) {
+        for (double factor : factors) {
+            FloodSchedule schedule;
+            schedule.kind = FloodScheduleKind::Geometric;
+            schedule.startCapacity = start;
+            schedule.factor = factor;
+            schedule.maxDepth = depthUntilOneGeometric(start, factor);
+            std::ostringstream label;
+            label << "geom start=" << start << " factor=" << factor
+                  << " depth=" << schedule.maxDepth;
+            schedule.label = label.str();
+            schedules.push_back(std::move(schedule));
+        }
+        for (int step : linearSteps) {
+            FloodSchedule schedule;
+            schedule.kind = FloodScheduleKind::Linear;
+            schedule.startCapacity = start;
+            schedule.step = step;
+            schedule.maxDepth = depthUntilOneLinear(start, step);
+            std::ostringstream label;
+            label << "linear start=" << start << " step=" << step
+                  << " depth=" << schedule.maxDepth;
+            schedule.label = label.str();
+            schedules.push_back(std::move(schedule));
+        }
+    }
+    return schedules;
+}
+
+const char* scheduleKindName(FloodScheduleKind kind)
+{
+    switch (kind) {
+    case FloodScheduleKind::Geometric:
+        return "geom";
+    case FloodScheduleKind::Linear:
+        return "linear";
+    }
+    return "unknown";
+}
+
+std::string scheduleParamString(const FloodSchedule& schedule)
+{
+    std::ostringstream out;
+    if (schedule.kind == FloodScheduleKind::Geometric) {
+        out << schedule.factor;
+    } else {
+        out << schedule.step;
+    }
+    return out.str();
+}
+
+std::string ratioString(int64_t numerator, int64_t denominator)
+{
+    if (denominator == 0) {
+        return "inf";
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3)
+        << static_cast<double>(numerator) / static_cast<double>(denominator);
+    return out.str();
+}
+
+TerminalBoundary terminalBoundary(
+    const vc::lasagna::MaxflowGraph& graph,
+    const std::vector<uint8_t>& region,
+    const std::vector<uint8_t>& oppositeRegion,
+    vc::lasagna::EclTerminalSide side)
+{
+    TerminalBoundary boundary;
+    boundary.regionNodes = countRegionNodes(region);
+    std::vector<uint8_t> inFrontier(region.size(), 0);
+    const auto addFrontier = [&](int32_t node) {
+        const size_t idx = static_cast<size_t>(node);
+        if (oppositeRegion[idx] != 0) {
+            boundary.touchesOpposite = true;
+            return;
+        }
+        if (region[idx] == 0 && inFrontier[idx] == 0) {
+            inFrontier[idx] = 1;
+            boundary.frontier.push_back(node);
+        }
+    };
+
+    for (uint64_t src = 0; src < graph.stats.graphNodes; ++src) {
+        for (uint64_t edge = graph.nindex[static_cast<size_t>(src)];
+             edge < graph.nindex[static_cast<size_t>(src) + 1];
+             ++edge) {
+            const int32_t dst = graph.nlist[static_cast<size_t>(edge)];
+            if (side == vc::lasagna::EclTerminalSide::Source) {
+                if (region[static_cast<size_t>(src)] != 0 && region[static_cast<size_t>(dst)] == 0) {
+                    boundary.capacity += graph.capacity[static_cast<size_t>(edge)];
+                    addFrontier(dst);
+                }
+            } else {
+                if (region[static_cast<size_t>(src)] == 0 && region[static_cast<size_t>(dst)] != 0) {
+                    boundary.capacity += graph.capacity[static_cast<size_t>(edge)];
+                    addFrontier(static_cast<int32_t>(src));
+                }
+            }
+        }
+    }
+    return boundary;
+}
+
+vc::lasagna::MaxflowGraph buildTerminalRegionGraph(
+    const vc::lasagna::MaxflowGraph& base,
+    const std::vector<uint8_t>& sourceRegion,
+    const std::vector<uint8_t>& sinkRegion,
+    int32_t terminalCapacity)
+{
+    vc::lasagna::MaxflowGraph graph;
+    const uint64_t baseNodes = base.stats.graphNodes;
+    const uint64_t sourceSuper = baseNodes;
+    const uint64_t sinkSuper = baseNodes + 1;
+    graph.stats = base.stats;
+    graph.stats.graphNodes = baseNodes + 2;
+    graph.nindex.assign(static_cast<size_t>(graph.stats.graphNodes) + 1, 0);
+
+    uint64_t terminalEdges = 0;
+    for (uint64_t node = 0; node < baseNodes; ++node) {
+        graph.nindex[static_cast<size_t>(node) + 1] =
+            base.nindex[static_cast<size_t>(node) + 1] - base.nindex[static_cast<size_t>(node)];
+        if (sinkRegion[static_cast<size_t>(node)] != 0) {
+            ++graph.nindex[static_cast<size_t>(node) + 1];
+            ++terminalEdges;
+        }
+        if (sourceRegion[static_cast<size_t>(node)] != 0) {
+            ++graph.nindex[static_cast<size_t>(sourceSuper) + 1];
+            ++terminalEdges;
+        }
+    }
+    for (size_t i = 1; i < graph.nindex.size(); ++i) {
+        graph.nindex[i] += graph.nindex[i - 1];
+    }
+
+    graph.stats.directedEdges = base.stats.directedEdges + terminalEdges;
+    graph.nlist.assign(static_cast<size_t>(graph.stats.directedEdges), 0);
+    graph.capacity.assign(static_cast<size_t>(graph.stats.directedEdges), 1);
+    std::vector<uint64_t> cursor = graph.nindex;
+    for (uint64_t node = 0; node < baseNodes; ++node) {
+        for (uint64_t edge = base.nindex[static_cast<size_t>(node)];
+             edge < base.nindex[static_cast<size_t>(node) + 1];
+             ++edge) {
+            const uint64_t out = cursor[static_cast<size_t>(node)]++;
+            graph.nlist[static_cast<size_t>(out)] = base.nlist[static_cast<size_t>(edge)];
+            graph.capacity[static_cast<size_t>(out)] = base.capacity[static_cast<size_t>(edge)];
+        }
+        if (sinkRegion[static_cast<size_t>(node)] != 0) {
+            const uint64_t out = cursor[static_cast<size_t>(node)]++;
+            graph.nlist[static_cast<size_t>(out)] = static_cast<int32_t>(sinkSuper);
+            graph.capacity[static_cast<size_t>(out)] = terminalCapacity;
+        }
+        if (sourceRegion[static_cast<size_t>(node)] != 0) {
+            const uint64_t out = cursor[static_cast<size_t>(sourceSuper)]++;
+            graph.nlist[static_cast<size_t>(out)] = static_cast<int32_t>(node);
+            graph.capacity[static_cast<size_t>(out)] = terminalCapacity;
+        }
+    }
+    return graph;
+}
+
+vc::lasagna::EclMaxflowResult runEclWithTerminalExpansion(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    int runs,
+    uint64_t maxIterations,
+    FlowRunResult& result)
+{
+    std::vector<uint8_t> sourceRegion(static_cast<size_t>(graph.stats.graphNodes), 0);
+    std::vector<uint8_t> sinkRegion(static_cast<size_t>(graph.stats.graphNodes), 0);
+    sourceRegion[static_cast<size_t>(sourceNode)] = 1;
+    sinkRegion[static_cast<size_t>(sinkNode)] = 1;
+    result.terminalEdgeCapacity = terminalEdgeCapacityForGraph(graph);
+
+    vc::lasagna::EclMaxflowResult flow;
+    for (uint64_t iter = 0; iter <= maxIterations; ++iter) {
+        const auto terminalGraph = buildTerminalRegionGraph(
+            graph,
+            sourceRegion,
+            sinkRegion,
+            result.terminalEdgeCapacity);
+        vc::lasagna::EclMaxflowOptions eclOptions;
+        eclOptions.runs = runs;
+        eclOptions.computeMinCut = false;
+        flow = vc::lasagna::runEclMaxflow(
+            terminalGraph,
+            static_cast<int32_t>(graph.stats.graphNodes),
+            static_cast<int32_t>(graph.stats.graphNodes + 1),
+            eclOptions);
+
+        const auto sourceBoundary = terminalBoundary(
+            graph,
+            sourceRegion,
+            sinkRegion,
+            vc::lasagna::EclTerminalSide::Source);
+        const auto sinkBoundary = terminalBoundary(
+            graph,
+            sinkRegion,
+            sourceRegion,
+            vc::lasagna::EclTerminalSide::Sink);
+        result.sourceExpansion.valid = true;
+        result.sourceExpansion.side = vc::lasagna::EclTerminalSide::Source;
+        result.sourceExpansion.iterations = iter;
+        result.sourceExpansion.regionNodes = sourceBoundary.regionNodes;
+        result.sourceExpansion.finalBoundaryCapacity = sourceBoundary.capacity;
+        result.sourceExpansion.finalBoundaryIsMinCut = sourceBoundary.capacity == flow.maxFlow;
+        result.sourceExpansion.touchedOppositeTerminal = sourceBoundary.touchesOpposite;
+        result.sinkExpansion.valid = true;
+        result.sinkExpansion.side = vc::lasagna::EclTerminalSide::Sink;
+        result.sinkExpansion.iterations = iter;
+        result.sinkExpansion.regionNodes = sinkBoundary.regionNodes;
+        result.sinkExpansion.finalBoundaryCapacity = sinkBoundary.capacity;
+        result.sinkExpansion.finalBoundaryIsMinCut = sinkBoundary.capacity == flow.maxFlow;
+        result.sinkExpansion.touchedOppositeTerminal = sinkBoundary.touchesOpposite;
+
+        if (iter == maxIterations) {
+            result.terminalExpansionLimitReached =
+                sourceBoundary.capacity == flow.maxFlow || sinkBoundary.capacity == flow.maxFlow;
+            break;
+        }
+
+        bool absorbed = false;
+        if (sourceBoundary.capacity == flow.maxFlow && !sourceBoundary.touchesOpposite) {
+            for (int32_t node : sourceBoundary.frontier) {
+                if (sourceRegion[static_cast<size_t>(node)] == 0) {
+                    sourceRegion[static_cast<size_t>(node)] = 1;
+                    ++result.sourceExpansion.absorbedNodes;
+                    absorbed = true;
+                }
+            }
+        }
+        if (sinkBoundary.capacity == flow.maxFlow && !sinkBoundary.touchesOpposite) {
+            for (int32_t node : sinkBoundary.frontier) {
+                if (sinkRegion[static_cast<size_t>(node)] == 0) {
+                    sinkRegion[static_cast<size_t>(node)] = 1;
+                    ++result.sinkExpansion.absorbedNodes;
+                    absorbed = true;
+                }
+            }
+        }
+        if (!absorbed) {
+            break;
+        }
+        result.terminalRegionIterations = iter + 1;
+    }
+    result.sourceExpansion.regionNodes = countRegionNodes(sourceRegion);
+    result.sinkExpansion.regionNodes = countRegionNodes(sinkRegion);
+    return flow;
+}
 
 } // namespace
 
@@ -138,6 +753,11 @@ int main(int argc, char** argv)
         vc::lasagna::MaxflowManifestBuildOptions options;
         bool runEcl = false;
         int runs = 1;
+        int terminalFloodDepth = 10;
+        int terminalFloodCapacity = 1024;
+        int terminalFloodDecay = 2;
+        uint64_t terminalRegionIterations = 0;
+        bool terminalFloodSweep = false;
 
         manifestPath = argv[1];
         for (int i = 2; i < argc; ++i) {
@@ -163,6 +783,31 @@ int main(int argc, char** argv)
                 runEcl = true;
             } else if (arg == "--runs") {
                 runs = parsePositiveInt(requireValue("--runs"), "runs");
+            } else if (arg == "--terminal-flood-depth") {
+                const auto parsed = parseNonNegativeInt64(
+                    requireValue("--terminal-flood-depth"),
+                    "terminal-flood-depth");
+                if (parsed > std::numeric_limits<int>::max()) {
+                    throw std::invalid_argument("terminal-flood-depth must fit int32");
+                }
+                terminalFloodDepth = static_cast<int>(parsed);
+            } else if (arg == "--terminal-flood-capacity") {
+                terminalFloodCapacity = parsePositiveInt(
+                    requireValue("--terminal-flood-capacity"),
+                    "terminal-flood-capacity");
+            } else if (arg == "--terminal-flood-decay") {
+                terminalFloodDecay = parsePositiveInt(
+                    requireValue("--terminal-flood-decay"),
+                    "terminal-flood-decay");
+                if (terminalFloodDecay <= 1) {
+                    throw std::invalid_argument("terminal-flood-decay must be greater than 1");
+                }
+            } else if (arg == "--terminal-region-iterations") {
+                terminalRegionIterations = static_cast<uint64_t>(parseNonNegativeInt64(
+                    requireValue("--terminal-region-iterations"),
+                    "terminal-region-iterations"));
+            } else if (arg == "--terminal-flood-sweep") {
+                terminalFloodSweep = true;
             } else if (arg == "--help" || arg == "-h") {
                 printUsage(argv[0]);
                 return 0;
@@ -220,6 +865,84 @@ int main(int argc, char** argv)
         std::cout << "graph pipeline total time seconds: " << std::chrono::duration<double>(wallTime).count() << '\n';
 
         if (runEcl) {
+            if (terminalFloodSweep) {
+                const auto schedules = makeFloodSweepSchedules();
+                std::cout << "ECL-MaxFlow flood sweep results:\n";
+                std::cout << "  available: " << (vc::lasagna::eclMaxflowAvailable() ? "yes" : "no") << '\n';
+                std::cout << "  schedules: " << schedules.size() << '\n';
+
+                std::cout << std::left
+                          << std::setw(8) << "kind"
+                          << std::setw(8) << "start"
+                          << std::setw(9) << "param"
+                          << std::setw(8) << "depth";
+                for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                    for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                        std::ostringstream col;
+                        col << "s" << sourceIndex << "_t" << sinkIndex;
+                        std::cout << std::setw(12) << col.str();
+                    }
+                }
+                if (report.sinks.size() >= 2) {
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        std::ostringstream col;
+                        col << "s" << sourceIndex << "_t0/t1";
+                        std::cout << std::setw(12) << col.str();
+                    }
+                }
+                std::cout << '\n';
+
+                for (const auto& schedule : schedules) {
+                    std::vector<std::vector<int64_t>> flows(
+                        report.sources.size(),
+                        std::vector<int64_t>(report.sinks.size(), 0));
+                    std::vector<std::vector<std::string>> cells(
+                        report.sources.size(),
+                        std::vector<std::string>(report.sinks.size()));
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                            const int32_t sourceNode = report.sources[sourceIndex].node;
+                            const int32_t sinkNode = report.sinks[sinkIndex].node;
+                            if (sourceNode == sinkNode) {
+                                cells[sourceIndex][sinkIndex] = "skip";
+                                continue;
+                            }
+                            try {
+                                const auto flow = runEclWithTerminalFloodScheduleQuiet(
+                                    graph,
+                                    sourceNode,
+                                    sinkNode,
+                                    runs,
+                                    schedule);
+                                flows[sourceIndex][sinkIndex] = flow.maxFlow;
+                                cells[sourceIndex][sinkIndex] = std::to_string(flow.maxFlow);
+                            } catch (const std::exception& e) {
+                                cells[sourceIndex][sinkIndex] = "error";
+                            }
+                        }
+                    }
+
+                    std::cout << std::left
+                              << std::setw(8) << scheduleKindName(schedule.kind)
+                              << std::setw(8) << schedule.startCapacity
+                              << std::setw(9) << scheduleParamString(schedule)
+                              << std::setw(8) << schedule.maxDepth;
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                            std::cout << std::setw(12) << cells[sourceIndex][sinkIndex];
+                        }
+                    }
+                    if (report.sinks.size() >= 2) {
+                        for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                            std::cout << std::setw(12)
+                                      << ratioString(flows[sourceIndex][0], flows[sourceIndex][1]);
+                        }
+                    }
+                    std::cout << '\n';
+                }
+                return 0;
+            }
+
             std::vector<FlowRunResult> flowResults;
             flowResults.reserve(report.sources.size() * report.sinks.size());
             for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
@@ -237,11 +960,48 @@ int main(int argc, char** argv)
                     }
                     try {
                         const auto flowStart = std::chrono::steady_clock::now();
-                        result.flow = vc::lasagna::runEclMaxflow(
-                            graph,
-                            result.sourceNode,
-                            result.sinkNode,
-                            runs);
+                        if (terminalFloodDepth > 0) {
+                            result.flow = runEclWithTerminalFlood(
+                                graph,
+                                result.sourceNode,
+                                result.sinkNode,
+                                runs,
+                                terminalFloodDepth,
+                                terminalFloodCapacity,
+                                terminalFloodDecay,
+                                result);
+                        } else if (terminalRegionIterations > 0) {
+                            result.usedTerminalRegions = true;
+                            result.flow = runEclWithTerminalExpansion(
+                                graph,
+                                result.sourceNode,
+                                result.sinkNode,
+                                runs,
+                                terminalRegionIterations,
+                                result);
+                        } else {
+                            result.flow = vc::lasagna::runEclMaxflow(
+                                graph,
+                                result.sourceNode,
+                                result.sinkNode,
+                                runs);
+                            result.sourceExpansion =
+                                vc::lasagna::expandTerminalRegionAcrossMinCutBoundaries(
+                                    graph,
+                                    result.sourceNode,
+                                    result.sinkNode,
+                                    result.flow.maxFlow,
+                                    vc::lasagna::EclTerminalSide::Source,
+                                    terminalRegionIterations);
+                            result.sinkExpansion =
+                                vc::lasagna::expandTerminalRegionAcrossMinCutBoundaries(
+                                    graph,
+                                    result.sinkNode,
+                                    result.sourceNode,
+                                    result.flow.maxFlow,
+                                    vc::lasagna::EclTerminalSide::Sink,
+                                    terminalRegionIterations);
+                        }
                         result.wallSeconds = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - flowStart).count();
                     } catch (const std::exception& e) {
@@ -266,7 +1026,52 @@ int main(int argc, char** argv)
                               << " runs=" << result.flow.runs
                               << " median_runtime_seconds=" << result.flow.medianRuntimeSeconds
                               << " throughput_gigaedges_per_second=" << result.flow.throughputGigaEdgesPerSecond
-                              << " wall_time_seconds=" << result.wallSeconds << '\n';
+                              << " wall_time_seconds=" << result.wallSeconds;
+                    if (result.usedTerminalFlood) {
+                        std::cout << " terminal_flood_mode=yes"
+                                  << " terminal_flood_depth=" << result.terminalFloodDepth
+                                  << " terminal_flood_capacity=" << result.terminalFloodCapacity
+                                  << " terminal_flood_decay=" << result.terminalFloodDecay
+                                  << " terminal_seed_capacity=infinite"
+                                  << " source_flood_nodes=" << result.sourceFloodNodes
+                                  << " source_flood_shell_capacity_sum="
+                                  << result.sourceFloodTerminalCapacity
+                                  << " sink_flood_nodes=" << result.sinkFloodNodes
+                                  << " sink_flood_shell_capacity_sum="
+                                  << result.sinkFloodTerminalCapacity;
+                    }
+                    if (result.usedTerminalRegions) {
+                        std::cout << " terminal_region_mode=yes"
+                                  << " terminal_edge_capacity=" << result.terminalEdgeCapacity
+                                  << " terminal_region_iterations=" << result.terminalRegionIterations
+                                  << " terminal_expansion_limit_reached="
+                                  << (result.terminalExpansionLimitReached ? "yes" : "no");
+                    }
+                    if (result.flow.minCut.valid) {
+                        std::cout << " min_cut_capacity=" << result.flow.minCut.cutCapacity
+                                  << " min_cut_directed_edges=" << result.flow.minCut.cutDirectedEdges
+                                  << " min_cut_source_side_nodes=" << result.flow.minCut.sourceReachableNodes
+                                  << " min_cut_sink_side_nodes=" << result.flow.minCut.sinkSideNodes;
+                    }
+                    if (result.sourceExpansion.valid) {
+                        std::cout << " source_terminal_region_nodes=" << result.sourceExpansion.regionNodes
+                                  << " source_terminal_absorbed_nodes=" << result.sourceExpansion.absorbedNodes
+                                  << " source_terminal_iterations=" << result.sourceExpansion.iterations
+                                  << " source_terminal_boundary_capacity="
+                                  << result.sourceExpansion.finalBoundaryCapacity
+                                  << " source_terminal_boundary_is_min_cut="
+                                  << (result.sourceExpansion.finalBoundaryIsMinCut ? "yes" : "no");
+                    }
+                    if (result.sinkExpansion.valid) {
+                        std::cout << " sink_terminal_region_nodes=" << result.sinkExpansion.regionNodes
+                                  << " sink_terminal_absorbed_nodes=" << result.sinkExpansion.absorbedNodes
+                                  << " sink_terminal_iterations=" << result.sinkExpansion.iterations
+                                  << " sink_terminal_boundary_capacity="
+                                  << result.sinkExpansion.finalBoundaryCapacity
+                                  << " sink_terminal_boundary_is_min_cut="
+                                  << (result.sinkExpansion.finalBoundaryIsMinCut ? "yes" : "no");
+                    }
+                    std::cout << '\n';
                 }
             }
         }

@@ -146,6 +146,82 @@ TEST_CASE("nearest passable node maps base points to voxel-rank ids")
     CHECK_FALSE(nearest.exact);
 }
 
+TEST_CASE("residual min-cut identifies the source-side region and cut frontier")
+{
+    const auto graph = build(std::vector<uint8_t>{1, 1}, {1, 1, 2});
+    REQUIRE(graph.stats.directedEdges == 2);
+
+    std::vector<int> flow(static_cast<size_t>(graph.stats.directedEdges), 0);
+    for (uint64_t edge = graph.nindex[0]; edge < graph.nindex[1]; ++edge) {
+        if (graph.nlist[static_cast<size_t>(edge)] == 1) {
+            flow[static_cast<size_t>(edge)] = 1;
+        }
+    }
+
+    const auto cut = vc::lasagna::computeMinCutFromFinalFlow(
+        graph,
+        flow,
+        0,
+        1,
+        true,
+        true);
+    CHECK(cut.valid);
+    CHECK(cut.sourceReachableNodes == 1);
+    CHECK(cut.sinkSideNodes == 1);
+    CHECK(cut.cutDirectedEdges == 1);
+    CHECK(cut.cutCapacity == 1);
+    REQUIRE(cut.sourceReachable.size() == 2);
+    CHECK(cut.sourceReachable[0] == 1);
+    CHECK(cut.sourceReachable[1] == 0);
+    REQUIRE(cut.cutEdges.size() == 1);
+    CHECK(cut.cutEdges[0].sourceSideNode == 0);
+    CHECK(cut.cutEdges[0].sinkSideNode == 1);
+    CHECK(cut.cutEdges[0].capacity == 1);
+}
+
+TEST_CASE("terminal expansion absorbs adjacent minimum-cut boundaries")
+{
+    const auto graph = build(std::vector<uint8_t>{1, 1, 1}, {1, 1, 3});
+
+    const auto sourceExpansion = vc::lasagna::expandTerminalRegionAcrossMinCutBoundaries(
+        graph,
+        0,
+        2,
+        1,
+        vc::lasagna::EclTerminalSide::Source,
+        10,
+        true);
+    CHECK(sourceExpansion.valid);
+    CHECK(sourceExpansion.regionNodes == 2);
+    CHECK(sourceExpansion.absorbedNodes == 1);
+    CHECK(sourceExpansion.finalBoundaryCapacity == 1);
+    CHECK(sourceExpansion.finalBoundaryIsMinCut);
+    CHECK(sourceExpansion.touchedOppositeTerminal);
+    REQUIRE(sourceExpansion.region.size() == 3);
+    CHECK(sourceExpansion.region[0] == 1);
+    CHECK(sourceExpansion.region[1] == 1);
+    CHECK(sourceExpansion.region[2] == 0);
+
+    const auto sinkExpansion = vc::lasagna::expandTerminalRegionAcrossMinCutBoundaries(
+        graph,
+        2,
+        0,
+        1,
+        vc::lasagna::EclTerminalSide::Sink,
+        10,
+        true);
+    CHECK(sinkExpansion.valid);
+    CHECK(sinkExpansion.regionNodes == 2);
+    CHECK(sinkExpansion.absorbedNodes == 1);
+    CHECK(sinkExpansion.finalBoundaryCapacity == 1);
+    CHECK(sinkExpansion.finalBoundaryIsMinCut);
+    CHECK(sinkExpansion.touchedOppositeTerminal);
+    REQUIRE(sinkExpansion.region.size() == 3);
+    CHECK(sinkExpansion.region[0] == 0);
+    CHECK(sinkExpansion.region[1] == 1);
+    CHECK(sinkExpansion.region[2] == 1);
+}
+
 TEST_CASE("ECL maxflow runs on a tiny graph when CUDA is available")
 {
     if (!vc::lasagna::eclMaxflowAvailable()) {
@@ -157,4 +233,6 @@ TEST_CASE("ECL maxflow runs on a tiny graph when CUDA is available")
     const auto result = vc::lasagna::runEclMaxflow(graph, 0, 1, 1);
     CHECK(result.maxFlow == 1);
     CHECK(result.runs == 1);
+    CHECK(result.minCut.valid);
+    CHECK(result.minCut.cutCapacity == result.maxFlow);
 }
