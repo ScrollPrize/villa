@@ -2,9 +2,11 @@
 #include <doctest/doctest.h>
 
 #include "vc/lasagna/EclMaxflow.hpp"
+#include "vc/lasagna/LaplaceAmgx.hpp"
 #include "vc/lasagna/MaxflowGraph.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace {
@@ -235,4 +237,105 @@ TEST_CASE("ECL maxflow runs on a tiny graph when CUDA is available")
     CHECK(result.runs == 1);
     CHECK(result.minCut.valid);
     CHECK(result.minCut.cutCapacity == result.maxFlow);
+}
+
+TEST_CASE("screened Laplace assembly eliminates a chain endpoint source")
+{
+    const auto graph = build(std::vector<uint8_t>{1, 1, 1}, {1, 1, 3});
+    const auto system = vc::lasagna::assembleScreenedLaplaceSystem(
+        graph,
+        0,
+        0.25);
+
+    CHECK(system.lambda == doctest::Approx(0.25));
+    CHECK(system.sourceRegion.nodes == std::vector<int32_t>{0});
+    CHECK(system.nodeToUnknown == std::vector<int32_t>{-1, 0, 1});
+    CHECK(system.unknownToNode == std::vector<int32_t>{1, 2});
+    CHECK(system.rowOffsets == std::vector<int32_t>{0, 2, 4});
+    CHECK(system.columns == std::vector<int32_t>{0, 1, 1, 0});
+    REQUIRE(system.values.size() == 4);
+    CHECK(system.values[0] == doctest::Approx(2.25));
+    CHECK(system.values[1] == doctest::Approx(-1.0));
+    CHECK(system.values[2] == doctest::Approx(1.25));
+    CHECK(system.values[3] == doctest::Approx(-1.0));
+    REQUIRE(system.rhs.size() == 2);
+    CHECK(system.rhs[0] == doctest::Approx(1.0));
+    CHECK(system.rhs[1] == doctest::Approx(0.0));
+}
+
+TEST_CASE("screened Laplace reports value one for sink inside source region")
+{
+    const auto graph = build(std::vector<uint8_t>{1, 1, 1}, {1, 1, 3});
+    const auto system = vc::lasagna::assembleScreenedLaplaceSystem(
+        graph,
+        0,
+        0.25,
+        1);
+
+    CHECK(system.sourceRegion.nodes == std::vector<int32_t>{0, 1});
+    CHECK(vc::lasagna::laplaceValueForNode(system, std::vector<double>{0.4}, 1) ==
+          doctest::Approx(1.0));
+    CHECK(vc::lasagna::laplaceValueForNode(system, std::vector<double>{0.4}, 2) ==
+          doctest::Approx(0.4));
+}
+
+TEST_CASE("screened Laplace source depth clamps BFS nodes")
+{
+    const auto graph = build(std::vector<uint8_t>{1, 1, 1, 1}, {1, 1, 4});
+    const auto region = vc::lasagna::buildLaplaceSourceRegion(graph, 1, 1);
+
+    CHECK(region.nodes == std::vector<int32_t>{0, 1, 2});
+    REQUIRE(region.mask.size() == 4);
+    CHECK(region.mask[0] == 1);
+    CHECK(region.mask[1] == 1);
+    CHECK(region.mask[2] == 1);
+    CHECK(region.mask[3] == 0);
+}
+
+TEST_CASE("screened Laplace rejects invalid source and sink nodes")
+{
+    const auto graph = build(std::vector<uint8_t>{1, 1}, {1, 1, 2});
+
+    CHECK_THROWS_AS(
+        vc::lasagna::assembleScreenedLaplaceSystem(graph, -1, 0.25),
+        std::runtime_error);
+    const auto system = vc::lasagna::assembleScreenedLaplaceSystem(graph, 0, 0.25);
+    CHECK_THROWS_AS(
+        vc::lasagna::laplaceValueForNode(system, std::vector<double>{0.5}, 3),
+        std::runtime_error);
+}
+
+TEST_CASE("AMGX screened Laplace solves a tiny chain when enabled")
+{
+    if (!vc::lasagna::laplaceAmgxAvailable()) {
+        MESSAGE("AMGX unavailable; skipping screened Laplace smoke path");
+        return;
+    }
+
+    const auto graph = build(std::vector<uint8_t>{1, 1, 1, 1}, {1, 1, 4});
+    vc::lasagna::LaplaceAmgxOptions weakLeak;
+    weakLeak.lambda = 1.0 / (64.0 * 64.0);
+    vc::lasagna::LaplaceAmgxResult weak;
+    try {
+        weak = vc::lasagna::solveScreenedLaplaceAmgx(graph, 0, weakLeak);
+    } catch (const std::exception& e) {
+        const std::string message = e.what();
+        if (message.find("AMGX_resources_create_simple") != std::string::npos ||
+            message.find("no CUDA-capable device") != std::string::npos) {
+            MESSAGE("AMGX runtime unavailable; skipping screened Laplace smoke path: " << e.what());
+            return;
+        }
+        throw;
+    }
+    REQUIRE(weak.success);
+    REQUIRE(weak.valuesByNode.size() == 4);
+    CHECK(weak.valuesByNode[0] == doctest::Approx(1.0));
+    CHECK(weak.valuesByNode[1] > weak.valuesByNode[2]);
+    CHECK(weak.valuesByNode[2] > weak.valuesByNode[3]);
+
+    vc::lasagna::LaplaceAmgxOptions strongLeak;
+    strongLeak.lambda = 1.0 / (8.0 * 8.0);
+    const auto strong = vc::lasagna::solveScreenedLaplaceAmgx(graph, 0, strongLeak);
+    REQUIRE(strong.success);
+    CHECK(strong.valuesByNode[3] < weak.valuesByNode[3]);
 }

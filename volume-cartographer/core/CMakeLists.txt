@@ -139,6 +139,7 @@ add_library(vc_lasagna
     src/lasagna/Dataset.cpp
     src/lasagna/EclMaxflow.cpp
     src/lasagna/EclMaxflowCut.cpp
+    src/lasagna/LaplaceAmgx.cpp
     src/lasagna/LasagnaNormalSampler.cpp
     src/lasagna/LineViewBuilder.cpp
     src/lasagna/LineOptimizer.cpp
@@ -157,6 +158,10 @@ if(VC_ENABLE_ECL_MAXFLOW)
         CUDA_SEPARABLE_COMPILATION OFF)
     set_property(TARGET vc_lasagna PROPERTY CUDA_STANDARD 20)
     set_property(TARGET vc_lasagna PROPERTY CUDA_STANDARD_REQUIRED ON)
+endif()
+if(VC_ENABLE_AMGX)
+    target_compile_definitions(vc_lasagna PUBLIC VC_ENABLE_AMGX=1)
+    target_link_libraries(vc_lasagna PRIVATE AMGX::amgx)
 endif()
 target_link_libraries(vc_lasagna PUBLIC vc_core PRIVATE Ceres::ceres)
 

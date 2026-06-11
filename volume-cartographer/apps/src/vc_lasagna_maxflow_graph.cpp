@@ -1,5 +1,6 @@
 #include "vc/lasagna/MaxflowGraph.hpp"
 #include "vc/lasagna/EclMaxflow.hpp"
+#include "vc/lasagna/LaplaceAmgx.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -8,10 +9,12 @@
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <locale>
+#include <cmath>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,6 +26,9 @@
 
 namespace {
 
+constexpr double kDefaultLaplaceSolverTolerance = 1.0e-8;
+constexpr double kLaplaceRatioConfidenceFactor = 100.0;
+
 void printUsage(const char* argv0)
 {
     std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> "
@@ -31,7 +37,11 @@ void printUsage(const char* argv0)
               << "[--run-ecl] [--runs N] [--terminal-flood-depth 10] "
               << "[--terminal-flood-capacity 1024] [--terminal-flood-decay 2] "
               << "[--terminal-region-iterations 0] [--terminal-flood-sweep] "
-              << "[--terminal-fringe-sweep]\n";
+              << "[--terminal-fringe-sweep] [--run-laplace-amgx] "
+              << "[--laplace-lambda-sweep 0.015625,0.0078125,...] "
+              << "[--laplace-adaptive-lambda] [--laplace-adaptive-start-lambda 0.00048828125] "
+              << "[--laplace-length-sweep 8,16,32,...] "
+              << "[--laplace-source-depth 0] [--amgx-config file]\n";
 }
 
 vc::lasagna::MaxflowDouble3 parsePoint(const std::string& value, const char* name)
@@ -75,6 +85,55 @@ int parsePositiveInt(const std::string& value, const char* name)
         throw std::invalid_argument(std::string(name) + " must be a positive int32 value");
     }
     return static_cast<int>(parsed);
+}
+
+double parsePositiveDouble(const std::string& value, const char* name)
+{
+    size_t consumed = 0;
+    double parsed = 0.0;
+    try {
+        parsed = std::stod(value, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string(name) + " must be a positive number");
+    }
+    if (consumed != value.size() || !std::isfinite(parsed) || parsed <= 0.0) {
+        throw std::invalid_argument(std::string(name) + " must be a positive number");
+    }
+    return parsed;
+}
+
+std::vector<double> parsePositiveDoubleList(const std::string& value, const char* name)
+{
+    std::vector<double> parsed;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t comma = value.find(',', start);
+        const std::string item = value.substr(
+            start,
+            comma == std::string::npos ? std::string::npos : comma - start);
+        if (item.empty()) {
+            throw std::invalid_argument(std::string(name) + " must not contain empty entries");
+        }
+        size_t consumed = 0;
+        double number = 0.0;
+        try {
+            number = std::stod(item, &consumed);
+        } catch (const std::exception&) {
+            throw std::invalid_argument(std::string(name) + " must contain positive numbers");
+        }
+        if (consumed != item.size() || !std::isfinite(number) || number <= 0.0) {
+            throw std::invalid_argument(std::string(name) + " must contain positive numbers");
+        }
+        parsed.push_back(number);
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    if (parsed.empty()) {
+        throw std::invalid_argument(std::string(name) + " must contain at least one value");
+    }
+    return parsed;
 }
 
 std::string boxToString(const vc::lasagna::MaxflowBox3& box)
@@ -777,6 +836,61 @@ std::string ratioString(int64_t numerator, int64_t denominator)
     return out.str();
 }
 
+std::string ratioString(double numerator, double denominator)
+{
+    if (denominator == 0.0) {
+        return "inf";
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(6)
+        << numerator / denominator;
+    return out.str();
+}
+
+std::string laplaceRatioString(double numerator, double denominator)
+{
+    constexpr double noiseFloor = kDefaultLaplaceSolverTolerance * kLaplaceRatioConfidenceFactor;
+    const std::string ratio = ratioString(numerator, denominator);
+    if (std::max(std::abs(numerator), std::abs(denominator)) < noiseFloor) {
+        return "(" + ratio + ")";
+    }
+    return ratio;
+}
+
+std::string valueString(double value)
+{
+    std::ostringstream out;
+    out << std::scientific << std::setprecision(6) << value;
+    return out.str();
+}
+
+double laplaceConfidenceFloor()
+{
+    return kDefaultLaplaceSolverTolerance * kLaplaceRatioConfidenceFactor;
+}
+
+struct LaplaceCliEvaluation {
+    double lambda = 0.0;
+    std::string status;
+    double solveSeconds = 0.0;
+    bool solved = false;
+    std::vector<double> sinkValues;
+    double maxAbsSinkValue = 0.0;
+    double minAbsSinkValue = 0.0;
+};
+
+bool laplaceAccepted(const LaplaceCliEvaluation& evaluation)
+{
+    return evaluation.solved && evaluation.maxAbsSinkValue >= laplaceConfidenceFloor();
+}
+
+bool laplaceFastStop(const LaplaceCliEvaluation& evaluation)
+{
+    return evaluation.sinkValues.size() == 2 &&
+           laplaceAccepted(evaluation) &&
+           evaluation.minAbsSinkValue < laplaceConfidenceFloor();
+}
+
 TerminalBoundary terminalBoundary(
     const vc::lasagna::MaxflowGraph& graph,
     const std::vector<uint8_t>& region,
@@ -986,6 +1100,25 @@ int main(int argc, char** argv)
         uint64_t terminalRegionIterations = 0;
         bool terminalFloodSweep = false;
         bool terminalFringeSweep = false;
+        bool runLaplaceAmgx = false;
+        bool laplaceAdaptiveLambda = false;
+        double laplaceAdaptiveStartLambda = 1.0 / 2048.0;
+        std::vector<double> laplaceLambdas{
+            1.0 / 64.0,
+            1.0 / 128.0,
+            1.0 / 256.0,
+            1.0 / 512.0,
+            1.0 / 1024.0,
+            1.0 / 2048.0,
+            1.0 / 4096.0,
+            1.0 / 8192.0,
+            1.0 / 16384.0,
+            1.0 / 32768.0,
+            1.0 / 65536.0,
+            1.0 / 131072.0,
+        };
+        int laplaceSourceDepth = 0;
+        std::filesystem::path amgxConfigPath;
 
         manifestPath = argv[1];
         for (int i = 2; i < argc; ++i) {
@@ -1038,6 +1171,37 @@ int main(int argc, char** argv)
                 terminalFloodSweep = true;
             } else if (arg == "--terminal-fringe-sweep") {
                 terminalFringeSweep = true;
+            } else if (arg == "--run-laplace-amgx") {
+                runLaplaceAmgx = true;
+            } else if (arg == "--laplace-adaptive-lambda") {
+                laplaceAdaptiveLambda = true;
+            } else if (arg == "--laplace-adaptive-start-lambda") {
+                laplaceAdaptiveStartLambda = parsePositiveDouble(
+                    requireValue("--laplace-adaptive-start-lambda"),
+                    "laplace-adaptive-start-lambda");
+            } else if (arg == "--laplace-lambda-sweep") {
+                laplaceLambdas = parsePositiveDoubleList(
+                    requireValue("--laplace-lambda-sweep"),
+                    "laplace-lambda-sweep");
+            } else if (arg == "--laplace-length-sweep") {
+                const auto lengths = parsePositiveDoubleList(
+                    requireValue("--laplace-length-sweep"),
+                    "laplace-length-sweep");
+                laplaceLambdas.clear();
+                laplaceLambdas.reserve(lengths.size());
+                for (double length : lengths) {
+                    laplaceLambdas.push_back(1.0 / (length * length));
+                }
+            } else if (arg == "--laplace-source-depth") {
+                const auto parsed = parseNonNegativeInt64(
+                    requireValue("--laplace-source-depth"),
+                    "laplace-source-depth");
+                if (parsed > std::numeric_limits<int>::max()) {
+                    throw std::invalid_argument("laplace-source-depth must fit int32");
+                }
+                laplaceSourceDepth = static_cast<int>(parsed);
+            } else if (arg == "--amgx-config") {
+                amgxConfigPath = requireValue("--amgx-config");
             } else if (arg == "--help" || arg == "-h") {
                 printUsage(argv[0]);
                 return 0;
@@ -1048,6 +1212,7 @@ int main(int argc, char** argv)
         if (options.sourcesBase.empty() || options.sinksBase.empty()) {
             throw std::invalid_argument("--src and --sink are required");
         }
+        std::sort(laplaceLambdas.begin(), laplaceLambdas.end(), std::greater<double>());
         options.sourceBase = options.sourcesBase.front();
         options.sinkBase = options.sinksBase.front();
 
@@ -1093,6 +1258,213 @@ int main(int argc, char** argv)
         std::cout << "contraction ratio: " << stats.contractionRatio << '\n';
         std::cout << "graph build time seconds: " << stats.buildTime.count() << '\n';
         std::cout << "graph pipeline total time seconds: " << std::chrono::duration<double>(wallTime).count() << '\n';
+
+        if (runLaplaceAmgx) {
+            std::cout << "AMGX screened-Laplace results:\n";
+            std::cout << "  available: " << (vc::lasagna::laplaceAmgxAvailable() ? "yes" : "no") << '\n';
+            std::cout << "  source_depth: " << laplaceSourceDepth << '\n';
+            std::cout << "  confidence_floor: " << valueString(laplaceConfidenceFloor()) << '\n';
+            if (laplaceAdaptiveLambda) {
+                std::cout << "  adaptive_start_lambda: " << valueString(laplaceAdaptiveStartLambda) << '\n';
+                std::cout << "  adaptive_bracket_factor: 16\n";
+                std::cout << "  adaptive_min_refine_factor: 2\n";
+            } else {
+                std::cout << "  lambdas: ";
+                for (size_t i = 0; i < laplaceLambdas.size(); ++i) {
+                    if (i != 0) {
+                        std::cout << ",";
+                    }
+                    std::cout << valueString(laplaceLambdas[i]);
+                }
+                std::cout << '\n';
+            }
+
+            const auto evaluateLaplace = [&](
+                                             int32_t sourceNode,
+                                             double lambda) -> LaplaceCliEvaluation {
+                LaplaceCliEvaluation evaluation;
+                evaluation.lambda = lambda;
+                evaluation.sinkValues.assign(report.sinks.size(), 0.0);
+                try {
+                    vc::lasagna::LaplaceAmgxOptions laplaceOptions;
+                    laplaceOptions.lambda = lambda;
+                    laplaceOptions.sourceDepth = laplaceSourceDepth;
+                    laplaceOptions.configPath = amgxConfigPath;
+                    const auto result = vc::lasagna::solveScreenedLaplaceAmgx(
+                        graph,
+                        sourceNode,
+                        laplaceOptions);
+                    evaluation.status = result.status;
+                    evaluation.solveSeconds = result.solveSeconds;
+                    evaluation.solved = result.success;
+                    for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                        const int32_t sinkNode = report.sinks[sinkIndex].node;
+                        if (sinkNode < 0 ||
+                            static_cast<uint64_t>(sinkNode) >= graph.stats.graphNodes) {
+                            throw std::runtime_error("Laplace sink node is outside graph");
+                        }
+                        evaluation.sinkValues[sinkIndex] =
+                            result.valuesByNode[static_cast<size_t>(sinkNode)];
+                    }
+                    if (!evaluation.sinkValues.empty()) {
+                        evaluation.minAbsSinkValue = std::numeric_limits<double>::infinity();
+                        for (double value : evaluation.sinkValues) {
+                            const double absValue = std::abs(value);
+                            evaluation.maxAbsSinkValue = std::max(evaluation.maxAbsSinkValue, absValue);
+                            evaluation.minAbsSinkValue = std::min(evaluation.minAbsSinkValue, absValue);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    evaluation.status = e.what();
+                }
+                return evaluation;
+            };
+
+            const auto printLaplaceHeader = [&](bool includeNote) {
+                std::cout << std::left
+                          << std::setw(8) << "source"
+                          << std::setw(14) << "lambda"
+                          << std::setw(14) << "status"
+                          << std::setw(14) << "solve_s";
+                if (includeNote) {
+                    std::cout << std::setw(12) << "note";
+                }
+                for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                    std::ostringstream col;
+                    col << "t" << sinkIndex;
+                    std::cout << std::setw(16) << col.str();
+                }
+                if (report.sinks.size() >= 2) {
+                    std::cout << std::setw(16) << "t0/t1";
+                }
+                std::cout << '\n';
+            };
+
+            const auto printLaplaceRow = [&](
+                                             size_t sourceIndex,
+                                             const LaplaceCliEvaluation& evaluation,
+                                             const char* note) {
+                std::cout << std::left
+                          << std::setw(8) << sourceIndex
+                          << std::setw(14) << valueString(evaluation.lambda)
+                          << std::setw(14) << (evaluation.solved ? evaluation.status : "error")
+                          << std::setw(14) << valueString(evaluation.solveSeconds);
+                if (note != nullptr) {
+                    std::cout << std::setw(12) << note;
+                }
+                for (double value : evaluation.sinkValues) {
+                    std::cout << std::setw(16) << (evaluation.solved ? valueString(value) : "-");
+                }
+                if (report.sinks.size() >= 2) {
+                    std::cout << std::setw(16)
+                              << (evaluation.solved
+                                      ? laplaceRatioString(evaluation.sinkValues[0], evaluation.sinkValues[1])
+                                      : "-");
+                }
+                if (!evaluation.solved && !evaluation.status.empty()) {
+                    std::cout << "  " << evaluation.status;
+                }
+                std::cout << '\n';
+            };
+
+            printLaplaceHeader(laplaceAdaptiveLambda);
+
+            for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                const int32_t sourceNode = report.sources[sourceIndex].node;
+                if (laplaceAdaptiveLambda) {
+                    constexpr double bracketFactor = 16.0;
+                    constexpr double minRefineFactor = 2.0;
+                    constexpr int maxProbeSteps = 16;
+                    constexpr int maxRefineSteps = 16;
+
+                    LaplaceCliEvaluation best;
+                    bool haveBest = false;
+                    double rejectedHigh = 0.0;
+                    double acceptedLow = 0.0;
+
+                    auto start = evaluateLaplace(sourceNode, laplaceAdaptiveStartLambda);
+                    printLaplaceRow(sourceIndex, start, "start");
+                    if (laplaceFastStop(start)) {
+                        printLaplaceRow(sourceIndex, start, "best");
+                        continue;
+                    }
+                    if (laplaceAccepted(start)) {
+                        best = start;
+                        haveBest = true;
+                        acceptedLow = start.lambda;
+                        double probeLambda = start.lambda;
+                        for (int step = 0; step < maxProbeSteps; ++step) {
+                            probeLambda *= bracketFactor;
+                            auto probe = evaluateLaplace(sourceNode, probeLambda);
+                            printLaplaceRow(sourceIndex, probe, "probe_up");
+                            if (laplaceFastStop(probe)) {
+                                best = probe;
+                                haveBest = true;
+                                acceptedLow = probe.lambda;
+                                break;
+                            }
+                            if (laplaceAccepted(probe)) {
+                                best = probe;
+                                haveBest = true;
+                                acceptedLow = probe.lambda;
+                            } else {
+                                rejectedHigh = probe.lambda;
+                                break;
+                            }
+                        }
+                    } else {
+                        rejectedHigh = start.lambda;
+                        double probeLambda = start.lambda;
+                        for (int step = 0; step < maxProbeSteps; ++step) {
+                            probeLambda /= bracketFactor;
+                            auto probe = evaluateLaplace(sourceNode, probeLambda);
+                            printLaplaceRow(sourceIndex, probe, "probe_down");
+                            if (laplaceAccepted(probe)) {
+                                best = probe;
+                                haveBest = true;
+                                acceptedLow = probe.lambda;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (haveBest && rejectedHigh > acceptedLow && acceptedLow > 0.0) {
+                        for (int step = 0;
+                             step < maxRefineSteps && rejectedHigh / acceptedLow > minRefineFactor;
+                             ++step) {
+                            const double midLambda = std::sqrt(rejectedHigh * acceptedLow);
+                            auto refine = evaluateLaplace(sourceNode, midLambda);
+                            printLaplaceRow(sourceIndex, refine, "refine");
+                            if (laplaceFastStop(refine)) {
+                                best = refine;
+                                acceptedLow = refine.lambda;
+                                break;
+                            }
+                            if (laplaceAccepted(refine)) {
+                                best = refine;
+                                acceptedLow = refine.lambda;
+                            } else {
+                                rejectedHigh = refine.lambda;
+                            }
+                        }
+                    }
+
+                    if (haveBest) {
+                        printLaplaceRow(sourceIndex, best, "best");
+                    } else {
+                        std::cout << "adaptive source[" << sourceIndex
+                                  << "] found no accepted lambda\n";
+                    }
+                    continue;
+                }
+
+                for (double lambda : laplaceLambdas) {
+                    const auto evaluation = evaluateLaplace(sourceNode, lambda);
+                    printLaplaceRow(sourceIndex, evaluation, nullptr);
+                }
+            }
+            return 0;
+        }
 
         if (runEcl) {
             if (terminalFloodSweep) {
