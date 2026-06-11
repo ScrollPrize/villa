@@ -522,6 +522,122 @@ TEST_CASE("Atlas pred-snap generation uses control source line indices for ancho
     CHECK((*set.points[0].predSnapPoint)[0] == doctest::Approx(1.10).epsilon(0.05));
 }
 
+TEST_CASE("Atlas pred-snap candidate generation returns first hits and deduplicates")
+{
+    const cv::Vec3d control{0.0, 0.0, 0.0};
+    const cv::Vec3d normal{1.0, 0.0, 0.0};
+    auto sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
+        if (x >= 0.20) return 170.0;
+        if (x <= -0.35) return 168.0;
+        return 80.0;
+    });
+
+    const auto candidates =
+        vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
+    REQUIRE(candidates.size() == 2);
+    CHECK(candidates[0].direction == vc::atlas::AtlasPredSnapDirection::Outside);
+    CHECK(candidates[0].point[0] == doctest::Approx(0.20).epsilon(0.05));
+    CHECK(candidates[1].direction == vc::atlas::AtlasPredSnapDirection::Inside);
+    CHECK(candidates[1].point[0] == doctest::Approx(-0.35).epsilon(0.05));
+
+    sampling = predSnapSamplingForXInside([](double) -> std::optional<double> {
+        return 170.0;
+    });
+    const auto deduped =
+        vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
+    REQUIRE(deduped.size() == 1);
+    CHECK(deduped[0].point[0] == doctest::Approx(0.0));
+}
+
+TEST_CASE("Atlas snap rank cache keys track candidates and options")
+{
+    const std::vector<cv::Vec3d> a{{1.0, 2.0, 3.0}};
+    const std::vector<cv::Vec3d> b{{4.0, 5.0, 6.0}};
+    const nlohmann::json options = {{"threshold", 165}, {"solver_tolerance", 1.0e-6}};
+    const std::string key1 =
+        vc::atlas::atlasSnapRankTermCacheKey("dataset.lasagna.json", options, a, b);
+    const std::string key2 =
+        vc::atlas::atlasSnapRankTermCacheKey("dataset.lasagna.json", options, a, b);
+    CHECK(key1 == key2);
+
+    const std::vector<cv::Vec3d> changedB{{4.0, 5.0, 7.0}};
+    const std::string key3 =
+        vc::atlas::atlasSnapRankTermCacheKey("dataset.lasagna.json", options, a, changedB);
+    CHECK(key1 != key3);
+
+    const std::string key4 =
+        vc::atlas::atlasSnapRankTermCacheKey(
+            "dataset.lasagna.json",
+            nlohmann::json{{"threshold", 166}, {"solver_tolerance", 1.0e-6}},
+            a,
+            b);
+    CHECK(key1 != key4);
+}
+
+TEST_CASE("Atlas link expansion creates six pair terms for four bracketing controls")
+{
+    vc::atlas::Atlas atlas;
+    vc::atlas::FiberMapping first;
+    first.fiberPath = fs::path("fibers") / "a.json";
+    first.controlAnchors.push_back({10, {10.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    first.controlAnchors.push_back({30, {30.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    vc::atlas::FiberMapping second;
+    second.fiberPath = fs::path("fibers") / "b.json";
+    second.controlAnchors.push_back({15, {15.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    second.controlAnchors.push_back({35, {35.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    atlas.fibers = {first, second};
+    atlas.links.push_back({{first.fiberPath, 20, 0.0, 0.0, 0.0},
+                           {second.fiberPath, 25, 0.0, 0.0, 0.0},
+                           0});
+
+    std::unordered_map<std::string, vc::atlas::AtlasPredSnapSet> sets;
+    for (const auto& mapping : atlas.fibers) {
+        vc::atlas::AtlasPredSnapSet set;
+        set.fiberPath = mapping.fiberPath;
+        for (const auto& anchor : mapping.controlAnchors) {
+            vc::atlas::AtlasPredSnapPoint point;
+            point.fiberPath = mapping.fiberPath;
+            point.controlPoint = anchor.world;
+            point.predSnapPoint = anchor.world;
+            point.candidates.push_back({anchor.world, std::nullopt, std::nullopt, std::nullopt});
+            set.points.push_back(point);
+        }
+        sets.emplace(vc::atlas::atlasFiberPathKey(mapping.fiberPath), std::move(set));
+    }
+
+    const auto problem = vc::atlas::buildAtlasSnapOptimizationProblem(atlas, sets);
+    CHECK(problem.controls.size() == 4);
+    CHECK(problem.terms.size() == 6);
+}
+
+TEST_CASE("Atlas snap optimizer maximizes normalized pair scores and respects fixed controls")
+{
+    vc::atlas::AtlasSnapOptimizationProblem problem;
+    problem.controls = {
+        {"a", {}, 0, {}, {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}}, false, false},
+        {"b", {}, 0, {}, {{0.0, 1.0, 0.0}, {1.0, 1.0, 0.0}}, false, false},
+        {"c", {}, 0, {}, {{9.0, 9.0, 9.0}}, true, true},
+    };
+    problem.terms = {
+        {"ab", 0, 1},
+        {"ac", 0, 2},
+    };
+
+    vc::atlas::AtlasSnapPairMatrix ab;
+    ab.id = "ab";
+    ab.normalizedValues = {{0.0, 0.1}, {0.2, 1.0}};
+    vc::atlas::AtlasSnapPairMatrix ac;
+    ac.id = "ac";
+    ac.normalizedValues = {{0.0}, {0.5}};
+
+    const auto result = vc::atlas::optimizeAtlasSnapCandidates(problem, {ab, ac});
+    REQUIRE(result.selectedCandidateIndices.size() == 3);
+    CHECK(result.selectedCandidateIndices[0] == 1);
+    CHECK(result.selectedCandidateIndices[1] == 1);
+    CHECK(result.selectedCandidateIndices[2] == 0);
+    CHECK(result.objective == doctest::Approx(1.5));
+}
+
 TEST_CASE("Atlas base normal orientation uses central ring perimeter")
 {
     auto inwardWoundCylinder = makeWrappedCylinder(9, 32, 10.0, true);

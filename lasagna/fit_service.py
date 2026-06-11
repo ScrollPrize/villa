@@ -13,6 +13,7 @@ Endpoints:
     GET  /jobs/{id}/results -> download one job's results
     POST /jobs/{id}/cancel -> cancel an upload/waiting/running job
     POST /jobs/reorder    -> reorder upload/waiting jobs
+    POST /laplace/rank    -> synchronous AMGX screened-Laplace snap ranking
     POST /optimize        -> legacy queue wrapper
     POST /stop            -> request cancellation of the running job
     POST /export_vis      -> export multi-layer OBJ visualization (JSON body)
@@ -493,6 +494,27 @@ def _append_capture_jsonl(job: "_JobState", name: str, value: Any) -> None:
     path.mkdir(parents=True, exist_ok=True)
     with (path / name).open("a", encoding="utf-8") as out:
         out.write(json.dumps(value, sort_keys=True) + "\n")
+
+
+def _handle_laplace_rank_body(raw_body: Any) -> tuple[int, dict[str, Any]]:
+    try:
+        body = _validate_laplace_rank_request(raw_body)
+    except Exception as exc:
+        return 400, {"error": f"bad json: {exc}"}
+    try:
+        return 200, _rank_laplace_snap_pairs(body)
+    except _LaplaceRankUnavailable as exc:
+        return 503, {
+            "error": str(exc),
+            "code": "vc_lasagna_amgx_unavailable",
+        }
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[fit-service] /laplace/rank error: {tb}", file=sys.stderr, flush=True)
+        return 500, {
+            "error": str(exc),
+            "code": "laplace_rank_failed",
+        }
 
 
 _SINGLE_FILE_OBJECT_TYPES = {"lasagna_model", "line", "line-map", "atlas", "atlas-pred-snap"}
@@ -2155,7 +2177,17 @@ class _Handler(BaseHTTPRequestHandler):
         parts = self._job_path_parts()
         path = "/" + "/".join(parts)
 
-        if path == "/optimize":
+        if path == "/laplace/rank":
+            print("[fit-service] /laplace/rank POST received", flush=True)
+            try:
+                raw_body = self._read_json("laplace rank request")
+            except Exception as exc:
+                self._send_json({"error": f"bad json: {exc}"}, 400)
+                return
+            status, response = _handle_laplace_rank_body(raw_body)
+            self._send_json(response, status)
+
+        elif path == "/optimize":
             print("[fit-service] /optimize POST received", flush=True)
             try:
                 body = self._read_json("optimize request")
