@@ -21,6 +21,23 @@ import fit_data
 import opt_loss_pred_dt
 
 
+def _plane_xyz(*, depth: int, height: int, width: int, step: float = 2.0) -> torch.Tensor:
+	y, x = torch.meshgrid(
+		torch.arange(height, dtype=torch.float32) * float(step),
+		torch.arange(width, dtype=torch.float32) * float(step),
+		indexing="ij",
+	)
+	z = torch.zeros_like(x)
+	plane = torch.stack([x, y, z], dim=-1)
+	return plane.view(1, height, width, 3).expand(depth, height, width, 3).clone()
+
+
+def _normal_grid(*, depth: int, height: int, width: int) -> torch.Tensor:
+	n = torch.zeros((depth, height, width, 3), dtype=torch.float32)
+	n[..., 2] = 1.0
+	return n
+
+
 class DenseBatchFlowAutobuildTest(unittest.TestCase):
 	def setUp(self) -> None:
 		dense_batch_flow._LIB = None
@@ -621,6 +638,133 @@ class DenseBatchFlowAutobuildTest(unittest.TestCase):
 		self.assertEqual(stats["pred_dt_flow_layers_no_sources"], 1.0)
 		self.assertEqual(stats["pred_dt_flow_layers_with_flow"], 2.0)
 		self.assertEqual(stats["pred_dt_layer_2_corr_sources"], 2.0)
+
+	def test_atlas_snap_seed_extraction_filters_and_uniques_sources(self) -> None:
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor(
+				[
+					[0.0, 0.0, 1.0],
+					[0.0, 2.0, 10.0],
+					[4.0, 2.0, 1.0],
+					[2.0, 2.0, 1.0],
+					[2.0, 2.0, 1.5],
+				],
+				dtype=torch.float32,
+			),
+			normal_xyz=torch.zeros((5, 3), dtype=torch.float32),
+			model_h=torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([0.0, 0.0, 2.0, 1.0, 1.0], dtype=torch.float32),
+			is_snap_point=torch.tensor([False, True, True, True, True], dtype=torch.bool),
+		)
+		res = SimpleNamespace(
+			xyz_lr=_plane_xyz(depth=1, height=3, width=3),
+			normals=_normal_grid(depth=1, height=3, width=3),
+			data=SimpleNamespace(atlas_lines=lines),
+		)
+		xyz_hr = _plane_xyz(depth=1, height=5, width=5, step=1.0)[0]
+		pred_img = np.full((5, 5), 160, dtype=np.uint8)
+		pred_img[2, 4] = 90
+
+		xy, stats, debug = opt_loss_pred_dt._atlas_snap_source_xy(
+			res=res,
+			xyz_img=xyz_hr,
+			pred_img=pred_img,
+			cfg={
+				"atlas_snap_seed_enabled": True,
+				"atlas_snap_seed_target_distance": 2.0,
+				"anticipatory_pull": {
+					"inlier_zero": 80.0,
+					"inlier_one": 120.0,
+				},
+			},
+			sub_h=2,
+			sub_w=2,
+			layer_index=0,
+		)
+
+		np.testing.assert_array_equal(xy, np.array([[2, 2]], dtype=np.int32))
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_candidates"], 4.0)
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_target_accepted"], 3.0)
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_pred_dt_accepted"], 2.0)
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_unique"], 1.0)
+		self.assertEqual(debug["valid"].tolist(), [False, False, True, True])
+
+	def test_flow_gate_uses_atlas_snap_sources_when_corr_seeding_disabled(self) -> None:
+		D, Hm, Wm = 1, 3, 3
+		He, We = 5, 5
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor(
+				[
+					[2.0, 2.0, 1.0],
+					[4.0, 2.0, 1.0],
+				],
+				dtype=torch.float32,
+			),
+			normal_xyz=torch.zeros((2, 3), dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_snap_point=torch.tensor([True, True], dtype=torch.bool),
+		)
+		corr = fit_data.CorrPoints3D(
+			points_xyz_winda=torch.tensor([[0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+			collection_idx=torch.zeros((1,), dtype=torch.int64),
+			point_ids=torch.zeros((1,), dtype=torch.int64),
+			is_absolute=torch.ones((1,), dtype=torch.bool),
+		)
+		res = SimpleNamespace(
+			xyz_hr=_plane_xyz(depth=D, height=He, width=We, step=1.0),
+			xyz_lr=_plane_xyz(depth=D, height=Hm, width=Wm),
+			normals=_normal_grid(depth=D, height=Hm, width=Wm),
+			mask_lr=torch.ones((D, 1, Hm, Wm), dtype=torch.float32),
+			params=SimpleNamespace(
+				subsample_mesh=2,
+				subsample_winding=2,
+				depth_windings=(0,),
+			),
+			data=SimpleNamespace(atlas_lines=lines, corr_points=corr),
+			data_s=SimpleNamespace(pred_dt=torch.full((1, 1, D, He, We), 160.0, dtype=torch.float32)),
+		)
+		calls: list[dict] = []
+
+		def fake_compute_flow_grid(image_u8, *, source_xy, extra_source_xy, query_xy, **kwargs):
+			calls.append({
+				"source_xy": tuple(source_xy),
+				"extra_source_xy": np.asarray(extra_source_xy, dtype=np.int32).copy(),
+			})
+			query_flow = np.ones((query_xy.shape[0],), dtype=np.float32)
+			dense_flow = np.ones(image_u8.shape, dtype=np.float32)
+			metadata = {
+				"accepted_source_count": 1 + int(extra_source_xy.shape[0]),
+				"source_edge_count": 0,
+				"seeded_node_count": 0,
+			}
+			return query_flow, dense_flow, metadata
+
+		opt_loss_pred_dt.configure_flow_gate(
+			cfg={
+				"enabled": True,
+				"debug": False,
+				"atlas_snap_seed_enabled": True,
+				"corr_seed_enabled": False,
+				"atlas_snap_seed_target_distance": 2.0,
+			},
+			stage_name="test",
+			seed_xyz=None,
+			out_dir=None,
+		)
+		try:
+			with mock.patch.object(dense_batch_flow, "compute_flow_grid", side_effect=fake_compute_flow_grid):
+				_weight, _pull = opt_loss_pred_dt._flow_gate_weight(res)
+				stats = opt_loss_pred_dt.flow_gate_last_stats()
+		finally:
+			opt_loss_pred_dt.configure_flow_gate(cfg=None, stage_name="test", seed_xyz=None, out_dir=None)
+
+		self.assertEqual(len(calls), 1)
+		self.assertEqual(calls[0]["source_xy"], (2, 2))
+		np.testing.assert_array_equal(calls[0]["extra_source_xy"], np.array([[4, 2]], dtype=np.int32))
+		self.assertEqual(stats["pred_dt_layer_0_corr_sources"], 0.0)
+		self.assertEqual(stats["pred_dt_layer_0_atlas_snap_sources"], 2.0)
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_unique"], 2.0)
 
 	def test_anticipatory_pull_loss_map_writes_correct_layer(self) -> None:
 		xyz_lr = torch.zeros((2, 2, 2, 3), dtype=torch.float32)
