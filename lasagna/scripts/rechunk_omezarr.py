@@ -11,28 +11,23 @@ _LASAGNA_DIR = Path(__file__).resolve().parents[1]
 if str(_LASAGNA_DIR) not in sys.path:
 	sys.path.insert(0, str(_LASAGNA_DIR))
 
-from tensorstore_omezarr import (
-	TensorStoreConfig,
-	normalize_chunk,
-	rebuild_normal_pair_in_place,
-	rebuild_scalar_in_place,
-	rechunk_normal_pair_in_place,
-	rechunk_normal_pair_out_of_place,
-	rechunk_scalar_in_place,
-	rechunk_scalar_out_of_place,
-)
-
 
 def _parse_chunk(value: str) -> tuple[int, int, int]:
 	parts = [p.strip() for p in value.split(",")]
 	if len(parts) == 1:
-		return normalize_chunk(int(parts[0]))
+		c = int(parts[0])
+		if c <= 0:
+			raise argparse.ArgumentTypeError("chunk size must be positive")
+		return (c, c, c)
 	if len(parts) != 3:
 		raise argparse.ArgumentTypeError("chunk size must be N or Z,Y,X")
 	try:
-		return normalize_chunk((int(parts[0]), int(parts[1]), int(parts[2])))
+		chunk = (int(parts[0]), int(parts[1]), int(parts[2]))
 	except ValueError as exc:
-		raise argparse.ArgumentTypeError(str(exc)) from exc
+		raise argparse.ArgumentTypeError("chunk size values must be integers") from exc
+	if min(chunk) <= 0:
+		raise argparse.ArgumentTypeError("chunk size values must be positive")
+	return chunk
 
 
 def _cache_bytes(value: str) -> int:
@@ -66,13 +61,40 @@ def main() -> None:
 	parser.add_argument("--cache-bytes", type=_cache_bytes, default=4 << 30, help="Total TensorStore cache budget split across worker processes.")
 	parser.add_argument("--file-io-threads", type=int, default=2, help="TensorStore file I/O concurrency per worker process.")
 	parser.add_argument("--data-copy-threads", type=int, default=1, help="TensorStore data copy concurrency per worker process.")
+	parser.add_argument("--debug-chunks", action="store_true", help="Process one planned scalar chunk, print details, skip all writes, and exit.")
 	args = parser.parse_args()
+
+	if args.debug_chunks:
+		print(
+			f"[debug-chunks cli] parsed args input={args.input} output={args.output} "
+			f"in_place={args.in_place} rebuild_scales_only={args.rebuild_scales_only} "
+			f"data_level={args.data_level} levels={args.levels} chunk_size={args.chunk_size} "
+			f"cache_bytes={args.cache_bytes} file_io_threads={args.file_io_threads} "
+			f"data_copy_threads={args.data_copy_threads} workers={args.workers}",
+			flush=True,
+		)
+		print("[debug-chunks cli] importing tensorstore_omezarr", flush=True)
+
+	from tensorstore_omezarr import (
+		TensorStoreConfig,
+		debug_rechunk_scalar_one_chunk,
+		rebuild_normal_pair_in_place,
+		rebuild_scalar_in_place,
+		rechunk_normal_pair_in_place,
+		rechunk_normal_pair_out_of_place,
+		rechunk_scalar_in_place,
+		rechunk_scalar_out_of_place,
+	)
+
+	if args.debug_chunks:
+		print("[debug-chunks cli] imported tensorstore_omezarr", flush=True)
 
 	cfg = TensorStoreConfig(
 		cache_pool_bytes=int(args.cache_bytes),
 		file_io_threads=int(args.file_io_threads),
 		data_copy_threads=int(args.data_copy_threads),
 		workers=int(args.workers),
+		debug_chunks=bool(args.debug_chunks),
 	)
 
 	if args.rebuild_scales_only and not args.in_place:
@@ -87,6 +109,8 @@ def main() -> None:
 		raise SystemExit("out-of-place normal-pair operation requires --normal-output")
 
 	if args.normal_pair is not None:
+		if args.debug_chunks and not args.rebuild_scales_only:
+			raise SystemExit("--debug-chunks for --normal-pair is currently only supported with --rebuild-scales-only")
 		if args.rebuild_scales_only:
 			rebuild_normal_pair_in_place(
 				nx_root=args.input,
@@ -116,6 +140,16 @@ def main() -> None:
 				cfg=cfg,
 				overwrite=bool(args.overwrite),
 			)
+		return
+
+	if args.debug_chunks and not args.rebuild_scales_only:
+		debug_rechunk_scalar_one_chunk(
+			src_root=args.input,
+			chunk=args.chunk_size,
+			data_level=int(args.data_level),
+			cfg=cfg,
+			label=args.input.name,
+		)
 		return
 
 	if args.rebuild_scales_only:
