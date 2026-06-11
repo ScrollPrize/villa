@@ -1925,6 +1925,8 @@ def optimize(
 						hr_prefetch_channels=frozenset({"pred_dt"}),
 						prefetch_pred_dt_flow=True,
 					))
+					if bool(pred_dt_flow_gate_cfg_.get("atlas_snap_seed_enabled", False)):
+						needs = needs.merged(Needs(mesh_normals=True))
 		return needs
 
 	def _prefetch_grad_summary(needs: fit_model.ModelForwardNeeds) -> str:
@@ -2847,6 +2849,10 @@ def optimize(
 			def _fmt_val(k: str, v: float) -> str:
 				return format_progress_value(v)
 			verbose_map_status = bool((stage_args or {}).get("verbose_map_status", (stage_args or {}).get("debug_map_status", False)))
+			verbose_pred_dt_flow_status = bool((stage_args or {}).get(
+				"verbose_pred_dt_flow_status",
+				(stage_args or {}).get("debug_pred_dt_flow_status", False),
+			))
 			visible_map_status_keys = {
 				"snaps_map_snap",
 				"snaps_map_snap_abs",
@@ -2862,10 +2868,36 @@ def optimize(
 					"snaps_map_area_smooth",
 					"snaps_map_samples",
 				}
+			hidden_pred_dt_flow_status_prefixes = (
+				"pred_dt_atlas_snap_seed_",
+				"pred_dt_corr_seed_",
+				"pred_dt_flow_",
+				"pred_dt_layer_",
+			)
+			visible_pred_dt_status_keys = {
+				"pred_dt_gate_gt01",
+			}
+			verbose_atlas_line_status = bool((stage_args or {}).get(
+				"verbose_atlas_line_status",
+				(stage_args or {}).get("debug_atlas_line_status", False),
+			))
+			visible_atlas_line_status_keys = {
+				"atlas_line",
+				"atlas_line_control",
+				"atlas_line_other",
+				"atlas_line_snap",
+			}
 			def _show_status_key(k: str) -> bool:
-				if not str(k).startswith("snaps_map_"):
-					return True
-				return verbose_map_status or k in visible_map_status_keys
+				ks = str(k)
+				if ks.startswith("snaps_map_"):
+					return verbose_map_status or ks in visible_map_status_keys
+				if ks.startswith(hidden_pred_dt_flow_status_prefixes):
+					return verbose_pred_dt_flow_status
+				if ks.startswith("pred_dt_gate_") or ks.startswith("pred_dt_pull_"):
+					return verbose_pred_dt_flow_status or ks in visible_pred_dt_status_keys
+				if ks.startswith("atlas_line_"):
+					return verbose_atlas_line_status or ks in visible_atlas_line_status_keys
+				return True
 			tv_keys = sorted((k for k in tv.keys() if _show_status_key(k)), key=_sort_key)
 			pv_keys = sorted(pv.keys())
 			cols = tv_keys + [f"p:{k}" for k in pv_keys]

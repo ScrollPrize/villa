@@ -1,0 +1,56 @@
+{
+  "args": {
+    "model-init": "model",
+    "mesh-step": 50,
+    "tifxyz-flow-gate-channels": true
+  },
+  "base": {
+    "normal": 1.0,
+    "smooth_step": 10.0,
+    "avg_step": 0.1,
+    "step": 1.0,
+    "smooth": 10.0,
+    "bend": 100.0,
+    "atlas_line_snap": 0.0001,
+    "pred_dt": 0.001
+  },
+  "stages": [
+    {
+      "name": "atlas_reopt_snap_flow_speculative",
+      "opt": {
+        "steps": 500,
+        "lr": 1.0,
+        "params": ["mesh_ms"],
+        "args": {
+          "atlas_debug_objs": false,
+          "atlas_debug_obj_interval": 1,
+          "corr_splat_sigma": 4.0,
+          "status_interval": 10,
+          "pred_dt_flow_gate": {
+            "enabled": true,
+            "debug": true,
+            "gate_factor": 1.0,
+            "backtrack_distance": 50.0,
+            "local_boost": 0.5,
+            "debug_layer_interval": 0,
+            "debug_vis_interval": 1,
+            "atlas_snap_seed_enabled": true,
+            "corr_seed_enabled": false,
+            "anticipatory_pull": {
+              "enabled": true,
+              "samples": 8,
+              "inlier_zero": 80.0,
+              "inlier_one": 120.0,
+              "loss_weight": 2.0,
+              "_debug_roi_center_xyz": [17499, 13412, 51144],
+              "debug_roi_k": 8,
+              "debug_roi_root_min": 0.5,
+              "debug_roi_tip_max": 0.5,
+              "debug_slice_upsample": 8
+            }
+          }
+        }
+      }
+    }
+  ]
+}

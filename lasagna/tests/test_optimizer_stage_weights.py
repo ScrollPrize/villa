@@ -131,6 +131,27 @@ class OptimizerStageWeightsTest(unittest.TestCase):
 				],
 			})
 
+	def test_atlas_snap_flow_speculative_config_parses_snap_plus_pred_dt(self) -> None:
+		cfg_path = Path(ROOT) / "configs" / "atlas_reopt_snap_flow_speculative.json"
+		cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+		stages = optimizer.load_stages_cfg(cfg)
+
+		self.assertTrue(cfg["args"].get("tifxyz-flow-gate-channels"))
+		self.assertEqual(len(stages), 1)
+		opt = stages[0].global_opt
+		self.assertGreater(opt.eff["atlas_line_snap"], 0.0)
+		self.assertGreater(opt.eff["pred_dt"], 0.0)
+		self.assertEqual(opt.eff["atlas_line_control"], 0.0)
+		self.assertEqual(opt.eff["atlas_line_other"], 0.0)
+		gate = opt.args["pred_dt_flow_gate"]
+		self.assertTrue(gate["enabled"])
+		self.assertTrue(gate["debug"])
+		self.assertEqual(gate["debug_layer_interval"], 0)
+		self.assertEqual(gate["debug_vis_interval"], 10)
+		self.assertTrue(gate["atlas_snap_seed_enabled"])
+		self.assertFalse(gate["corr_seed_enabled"])
+		self.assertTrue(gate["anticipatory_pull"]["enabled"])
+
 	def test_step_regularizer_split_weights_parse_independently(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"base": {

@@ -231,7 +231,7 @@ def _corr_point_source_xy(
 	if xyz_img.ndim != 3 or xyz_img.shape[-1] != 3:
 		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
 	He, We, _ = xyz_img.shape
-	if He <= 0 or We <= 0:
+	if He < 2 or We < 2:
 		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
 
 	default_distance = max(2.0, 1.5 * float(max(1, sub_h, sub_w)))
@@ -304,6 +304,188 @@ def _corr_point_source_xy(
 	if xy.shape[0] > 1:
 		xy = np.unique(xy, axis=0)
 	stats["pred_dt_corr_seed_unique"] = float(int(xy.shape[0]))
+	return xy, stats, debug
+
+
+def _bilinear_at_points(
+	grid: torch.Tensor,
+	row: torch.Tensor,
+	col: torch.Tensor,
+	frac_h: torch.Tensor,
+	frac_w: torch.Tensor,
+) -> torch.Tensor:
+	v00 = grid[row, col]
+	v10 = grid[row + 1, col]
+	v01 = grid[row, col + 1]
+	v11 = grid[row + 1, col + 1]
+	return (
+		v00 * (1.0 - frac_h).unsqueeze(-1) * (1.0 - frac_w).unsqueeze(-1)
+		+ v10 * frac_h.unsqueeze(-1) * (1.0 - frac_w).unsqueeze(-1)
+		+ v01 * (1.0 - frac_h).unsqueeze(-1) * frac_w.unsqueeze(-1)
+		+ v11 * frac_h.unsqueeze(-1) * frac_w.unsqueeze(-1)
+	)
+
+
+def _atlas_snap_source_xy(
+	*,
+	res: fit_model.FitResult3D,
+	xyz_img: torch.Tensor,
+	pred_img: np.ndarray,
+	cfg: dict,
+	sub_h: int,
+	sub_w: int,
+	layer_index: int,
+) -> tuple[np.ndarray, dict[str, float], dict[str, np.ndarray]]:
+	"""Project atlas pred-snap anchors to rendered-surface pixels for flow seeds."""
+	stats: dict[str, float] = {
+		"pred_dt_atlas_snap_seed_candidates": 0.0,
+		"pred_dt_atlas_snap_seed_target_accepted": 0.0,
+		"pred_dt_atlas_snap_seed_pred_dt_accepted": 0.0,
+		"pred_dt_atlas_snap_seed_unique": 0.0,
+	}
+	def empty_debug(surface_distance: float | None = None, min_inlier: float | None = None) -> dict[str, np.ndarray]:
+		debug = {
+			"xy": np.zeros((0, 2), dtype=np.int32),
+			"distance": np.zeros((0,), dtype=np.float32),
+			"inlier": np.zeros((0,), dtype=np.float32),
+			"valid": np.zeros((0,), dtype=np.bool_),
+		}
+		if surface_distance is not None:
+			debug["surface_distance"] = np.asarray([surface_distance], dtype=np.float32)
+		if min_inlier is not None:
+			debug["min_inlier"] = np.asarray([min_inlier], dtype=np.float32)
+		return debug
+
+	if not bool(cfg.get("atlas_snap_seed_enabled", False)):
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	lines = getattr(res.data, "atlas_lines", None)
+	if lines is None:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	K = int(getattr(lines, "target_xyz").shape[0])
+	if K <= 0:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	is_snap = getattr(lines, "is_snap_point", None)
+	if is_snap is None:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	snap = is_snap.to(device=xyz_img.device, dtype=torch.bool).view(K)
+	if not bool(snap.any().detach().cpu()):
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	if res.normals is None:
+		raise RuntimeError("pred_dt_flow_gate atlas_snap_seed_enabled requires model normals")
+	if xyz_img.ndim != 3 or xyz_img.shape[-1] != 3:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	if pred_img.ndim != 2:
+		raise RuntimeError(f"pred_dt_flow_gate expected 2D pred_dt image for atlas snap seeds, got {tuple(pred_img.shape)}")
+	He, We, _ = xyz_img.shape
+	if He <= 0 or We <= 0:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	d = int(layer_index)
+	if d < 0 or d >= int(res.xyz_lr.shape[0]):
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+	Hm = int(res.xyz_lr.shape[1])
+	Wm = int(res.xyz_lr.shape[2])
+	if Hm < 2 or Wm < 2:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug()
+
+	default_distance = max(2.0, 1.5 * float(max(1, sub_h, sub_w)))
+	max_distance = float(cfg.get(
+		"atlas_snap_seed_target_distance",
+		cfg.get("corr_seed_surface_distance", default_distance),
+	))
+	pull_cfg = cfg.get("anticipatory_pull", None)
+	pull_cfg = pull_cfg if isinstance(pull_cfg, dict) else {}
+	inlier_zero = float(pull_cfg.get("inlier_zero", 80.0))
+	inlier_one = float(pull_cfg.get("inlier_one", 120.0))
+	if inlier_one <= inlier_zero:
+		raise ValueError("pred_dt_flow_gate atlas snap seeding requires inlier_one > inlier_zero")
+	min_inlier = float(cfg.get("atlas_snap_seed_min_inlier", 0.5))
+	stats["pred_dt_atlas_snap_seed_target_distance"] = max_distance
+	stats["pred_dt_atlas_snap_seed_min_inlier"] = min_inlier
+	if max_distance < 0.0:
+		return np.zeros((0, 2), dtype=np.int32), stats, empty_debug(max_distance, min_inlier)
+
+	idx = torch.nonzero(snap, as_tuple=False).flatten()
+	stats["pred_dt_atlas_snap_seed_candidates"] = float(int(idx.numel()))
+	target = lines.target_xyz.to(device=xyz_img.device, dtype=xyz_img.dtype).index_select(0, idx)
+	h = lines.model_h.to(device=xyz_img.device, dtype=torch.float32).index_select(0, idx)
+	w = lines.model_w.to(device=xyz_img.device, dtype=torch.float32).index_select(0, idx)
+	finite = torch.isfinite(target).all(dim=-1) & torch.isfinite(h) & torch.isfinite(w)
+	hc = h.clamp(0.0, float(Hm - 1))
+	wc = w.clamp(0.0, float(Wm - 1))
+	row = torch.floor(hc).to(dtype=torch.long).clamp(0, Hm - 2)
+	col = torch.floor(wc).to(dtype=torch.long).clamp(0, Wm - 2)
+	frac_h = (hc - row.to(dtype=torch.float32)).to(device=xyz_img.device, dtype=xyz_img.dtype).clamp(0.0, 1.0)
+	frac_w = (wc - col.to(dtype=torch.float32)).to(device=xyz_img.device, dtype=xyz_img.dtype).clamp(0.0, 1.0)
+
+	n0 = _bilinear_at_points(res.normals[d].detach().to(device=xyz_img.device, dtype=xyz_img.dtype), row, col, frac_h, frac_w)
+	n_norm = n0.norm(dim=-1, keepdim=True)
+	n0 = n0 / n_norm.clamp_min(1.0e-8)
+	n_valid = torch.isfinite(n0).all(dim=-1) & (n_norm.squeeze(-1) > 1.0e-8)
+	h_hr = (h.to(device=xyz_img.device, dtype=xyz_img.dtype) * float(sub_h)).clamp(0.0, float(He - 1))
+	w_hr = (w.to(device=xyz_img.device, dtype=xyz_img.dtype) * float(sub_w)).clamp(0.0, float(We - 1))
+	row_hr = torch.floor(h_hr).to(dtype=torch.long).clamp(0, He - 2)
+	col_hr = torch.floor(w_hr).to(dtype=torch.long).clamp(0, We - 2)
+	frac_h_hr = (h_hr - row_hr.to(dtype=xyz_img.dtype)).clamp(0.0, 1.0)
+	frac_w_hr = (w_hr - col_hr.to(dtype=xyz_img.dtype)).clamp(0.0, 1.0)
+	M00 = xyz_img[row_hr, col_hr]
+	M10 = xyz_img[row_hr + 1, col_hr]
+	M01 = xyz_img[row_hr, col_hr + 1]
+	M11 = xyz_img[row_hr + 1, col_hr + 1]
+	u1, v1 = fit_model.Model3D._ray_bilinear_intersect(target, n0, M00, M10, M01, M11, frac_h_hr, frac_w_hr)
+	finite1 = torch.isfinite(u1) & torch.isfinite(v1)
+	step_h = torch.where(u1 < 0.0, torch.full_like(row_hr, -1), torch.where(u1 > 1.0, torch.ones_like(row_hr), torch.zeros_like(row_hr)))
+	step_w = torch.where(v1 < 0.0, torch.full_like(col_hr, -1), torch.where(v1 > 1.0, torch.ones_like(col_hr), torch.zeros_like(col_hr)))
+	row2 = torch.where(finite1, (row_hr + step_h).clamp(0, He - 2), row_hr)
+	col2 = torch.where(finite1, (col_hr + step_w).clamp(0, We - 2), col_hr)
+	frac_h1 = torch.where(finite1, u1.clamp(0.0, 1.0), frac_h_hr)
+	frac_w1 = torch.where(finite1, v1.clamp(0.0, 1.0), frac_w_hr)
+	Q00 = xyz_img[row2, col2]
+	Q10 = xyz_img[row2 + 1, col2]
+	Q01 = xyz_img[row2, col2 + 1]
+	Q11 = xyz_img[row2 + 1, col2 + 1]
+	u2, v2 = fit_model.Model3D._ray_bilinear_intersect(target, n0, Q00, Q10, Q01, Q11, frac_h1, frac_w1)
+	in_quad = torch.isfinite(u2) & torch.isfinite(v2) & (u2 >= 0.0) & (u2 <= 1.0) & (v2 >= 0.0) & (v2 <= 1.0)
+	u = u2.clamp(0.0, 1.0)
+	v = v2.clamp(0.0, 1.0)
+	hit = (
+		Q00 * (1.0 - u).unsqueeze(-1) * (1.0 - v).unsqueeze(-1)
+		+ Q10 * u.unsqueeze(-1) * (1.0 - v).unsqueeze(-1)
+		+ Q01 * (1.0 - u).unsqueeze(-1) * v.unsqueeze(-1)
+		+ Q11 * u.unsqueeze(-1) * v.unsqueeze(-1)
+	)
+	distance = (target - hit).norm(dim=-1)
+	target_valid = finite & n_valid & in_quad & torch.isfinite(hit).all(dim=-1) & torch.isfinite(distance) & (distance <= max_distance)
+	stats["pred_dt_atlas_snap_seed_target_accepted"] = float(int(target_valid.sum().detach().cpu()))
+	h_cont = row2.to(dtype=xyz_img.dtype) + u
+	w_cont = col2.to(dtype=xyz_img.dtype) + v
+	source_y = torch.round(h_cont).to(dtype=torch.long).clamp(0, He - 1)
+	source_x = torch.round(w_cont).to(dtype=torch.long).clamp(0, We - 1)
+	pred_t = torch.as_tensor(pred_img, device=xyz_img.device, dtype=xyz_img.dtype)
+	pred_value = pred_t[source_y, source_x]
+	inlier = ((pred_value - inlier_zero) / (inlier_one - inlier_zero)).clamp(0.0, 1.0)
+	pred_valid = inlier >= min_inlier
+	accepted = target_valid & pred_valid
+	stats["pred_dt_atlas_snap_seed_pred_dt_accepted"] = float(int(accepted.sum().detach().cpu()))
+	if bool(target_valid.any().detach().cpu()):
+		valid_dist = distance[target_valid]
+		stats["pred_dt_atlas_snap_seed_mean_distance"] = float(valid_dist.mean().detach().cpu())
+		stats["pred_dt_atlas_snap_seed_max_distance"] = float(valid_dist.max().detach().cpu())
+
+	all_xy = torch.stack([source_x, source_y], dim=1).detach().cpu().numpy().astype(np.int32, copy=False)
+	debug = {
+		"xy": all_xy,
+		"distance": distance.detach().cpu().numpy().astype(np.float32, copy=False),
+		"inlier": inlier.detach().cpu().numpy().astype(np.float32, copy=False),
+		"valid": accepted.detach().cpu().numpy().astype(np.bool_, copy=False),
+		"surface_distance": np.asarray([max_distance], dtype=np.float32),
+		"min_inlier": np.asarray([min_inlier], dtype=np.float32),
+	}
+	if not bool(accepted.any().detach().cpu()):
+		return np.zeros((0, 2), dtype=np.int32), stats, debug
+	xy = all_xy[debug["valid"]]
+	if xy.shape[0] > 1:
+		xy = np.unique(xy, axis=0)
+	stats["pred_dt_atlas_snap_seed_unique"] = float(int(xy.shape[0]))
 	return xy, stats, debug
 
 
@@ -1627,6 +1809,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			"pred_dt_flow_layers": float(D),
 			"pred_dt_flow_layers_with_seed": 0.0,
 			"pred_dt_flow_layers_with_corr": 0.0,
+			"pred_dt_flow_layers_with_atlas_snap": 0.0,
 			"pred_dt_flow_layers_with_flow": 0.0,
 			"pred_dt_flow_layers_no_sources": 0.0,
 			"pred_dt_corr_seed_cxx_accepted": 0.0,
@@ -1794,12 +1977,25 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				winding_value=winding,
 			)
 			corr_count = int(corr_source_xy.shape[0])
+			atlas_source_xy, atlas_seed_stats, _atlas_seed_debug = _atlas_snap_source_xy(
+				res=res,
+				xyz_img=xyz_hr,
+				pred_img=pred_img,
+				cfg=cfg,
+				sub_h=sub_h,
+				sub_w=sub_w,
+				layer_index=d,
+			)
+			atlas_count = int(atlas_source_xy.shape[0])
 			if seed_present:
 				stats["pred_dt_flow_layers_with_seed"] += 1.0
 			if corr_count > 0:
 				stats["pred_dt_flow_layers_with_corr"] += 1.0
+			if atlas_count > 0:
+				stats["pred_dt_flow_layers_with_atlas_snap"] += 1.0
 			stats[f"pred_dt_layer_{d}_seed_sources"] = 1.0 if seed_present else 0.0
 			stats[f"pred_dt_layer_{d}_corr_sources"] = float(corr_count)
+			stats[f"pred_dt_layer_{d}_atlas_snap_sources"] = float(atlas_count)
 			for key, value in corr_seed_stats.items():
 				value_f = float(value)
 				stats[f"pred_dt_layer_{d}_{key}"] = float(value)
@@ -1807,14 +2003,28 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					stats[key] = stats.get(key, 0.0) + value_f
 				else:
 					stats[key] = max(stats.get(key, value_f), value_f)
+			for key, value in atlas_seed_stats.items():
+				value_f = float(value)
+				stats[f"pred_dt_layer_{d}_{key}"] = value_f
+				if key.endswith(("candidates", "accepted", "unique")):
+					stats[key] = stats.get(key, 0.0) + value_f
+				else:
+					stats[key] = max(stats.get(key, value_f), value_f)
 
 			primary_xy: tuple[int, int] | None = None
-			extra_source_xy = corr_source_xy
+			seed_sets = [arr for arr in (corr_source_xy, atlas_source_xy) if int(arr.shape[0]) > 0]
+			all_extra_source_xy = (
+				np.concatenate(seed_sets, axis=0).astype(np.int32, copy=False)
+				if seed_sets else np.zeros((0, 2), dtype=np.int32)
+			)
+			if all_extra_source_xy.shape[0] > 1:
+				all_extra_source_xy = np.unique(all_extra_source_xy, axis=0)
+			extra_source_xy = all_extra_source_xy
 			if source_x is not None and source_y is not None:
 				primary_xy = (int(source_x), int(source_y))
-			elif corr_count > 0:
-				primary_xy = (int(corr_source_xy[0, 0]), int(corr_source_xy[0, 1]))
-				extra_source_xy = corr_source_xy[1:]
+			elif all_extra_source_xy.shape[0] > 0:
+				primary_xy = (int(all_extra_source_xy[0, 0]), int(all_extra_source_xy[0, 1]))
+				extra_source_xy = all_extra_source_xy[1:]
 			done("flow_sampling", _t)
 
 			if primary_xy is None:
