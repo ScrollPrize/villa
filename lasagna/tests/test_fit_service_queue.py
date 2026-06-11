@@ -3,6 +3,7 @@ import threading
 import tempfile
 import unittest
 import io
+import types
 from unittest import mock
 
 import fit_service
@@ -43,6 +44,51 @@ class FitServiceQueueTest(unittest.TestCase):
 		self.assertEqual(queue.snapshot(j1.job_id)["state"], "upload")
 		self.assertIn("queue_generation", queue.legacy_status())
 		self.assertEqual(queue.snapshot_response()["queue_generation"], queue.generation)
+
+	def test_laplace_rank_rejects_malformed_request_before_import(self):
+		with mock.patch.object(fit_service.importlib, "import_module") as import_module:
+			status, body = fit_service._handle_laplace_rank_body({"manifest": "/tmp/data.json", "jobs": [{}]})
+
+		self.assertEqual(status, 400)
+		self.assertIn("side_a", body["error"])
+		import_module.assert_not_called()
+
+	def test_laplace_rank_missing_binding_returns_503(self):
+		request = {
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [{"id": "a", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+			"options": {},
+		}
+		with mock.patch.object(fit_service.importlib, "import_module", side_effect=ImportError("missing")):
+			status, body = fit_service._handle_laplace_rank_body(request)
+
+		self.assertEqual(status, 503)
+		self.assertEqual(body["code"], "vc_lasagna_amgx_unavailable")
+		self.assertIn("vc_lasagna_amgx", body["error"])
+
+	def test_laplace_rank_passes_binding_response_through_without_ratios(self):
+		request = {
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6], [7, 8, 9]]}],
+			"options": {"debug_dir": "/tmp/laplace-debug"},
+		}
+		binding_response = {
+			"results": [{
+				"id": "cache-key",
+				"status": "success",
+				"selected_lambda": 0.25,
+				"values": [{"value": 0.5}],
+				"debug_dir": "/tmp/laplace-debug/request/cache-key",
+			}]
+		}
+		module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value=binding_response))
+		with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+			status, body = fit_service._handle_laplace_rank_body(request)
+
+		self.assertEqual(status, 200)
+		module.rank_snap_pairs.assert_called_once_with(request)
+		self.assertEqual(body["results"], binding_response["results"])
+		self.assertNotIn("ratios", body["results"][0])
 
 	def test_enqueue_body_reports_requested_output_name(self):
 		queue = fit_service._JobQueue()

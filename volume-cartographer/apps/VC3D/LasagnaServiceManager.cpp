@@ -737,6 +737,77 @@ bool LasagnaServiceManager::isRunning() const
     return _process && _process->state() == QProcess::Running && _serviceReady;
 }
 
+void LasagnaServiceManager::rankLaplaceSnapPairs(
+    const QJsonObject& request,
+    std::function<void(const QJsonObject&)> onSuccess,
+    std::function<void(const QString&)> onError)
+{
+    if (!isRunning()) {
+        const QString msg = tr("Lasagna service is not running.");
+        if (onError) {
+            onError(msg);
+        }
+        return;
+    }
+
+    QUrl url(QStringLiteral("%1/laplace/rank").arg(baseUrl()));
+    QNetworkRequest req = fitServiceRequest(url);
+    req.setRawHeader(kVc3dSourceHeader, localSourceName().toUtf8());
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    const quint64 generation = _requestGeneration;
+    QNetworkReply* reply = _nam->post(
+        req, QJsonDocument(request).toJson(QJsonDocument::Compact));
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, generation, onSuccess = std::move(onSuccess), onError = std::move(onError)]() mutable {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
+        const QByteArray bytes = reply->readAll();
+        reply->deleteLater();
+
+        auto fail = [&](const QString& msg) {
+            _lastError = msg;
+            if (onError) {
+                onError(msg);
+            }
+        };
+
+        if (isTransportError(reply)) {
+            fail(tr("Laplace rank request failed: %1").arg(reply->errorString()));
+            return;
+        }
+        if (!validateApiVersion(reply, tr("Laplace rank request"))) {
+            if (onError) {
+                onError(_lastError);
+            }
+            return;
+        }
+
+        QJsonParseError parseError;
+        const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            fail(tr("Laplace rank returned malformed JSON at byte %1: %2")
+                     .arg(parseError.offset)
+                     .arg(parseError.errorString()));
+            return;
+        }
+        const QJsonObject obj = doc.object();
+        if (reply->error() != QNetworkReply::NoError ||
+            obj.contains(QStringLiteral("error"))) {
+            const QString serviceError = obj[QStringLiteral("error")].toString(reply->errorString());
+            const QString code = obj[QStringLiteral("code")].toString();
+            fail(code.isEmpty()
+                     ? tr("Laplace rank failed: %1").arg(serviceError)
+                     : tr("Laplace rank failed (%1): %2").arg(code, serviceError));
+            return;
+        }
+        if (onSuccess) {
+            onSuccess(obj);
+        }
+    });
+}
+
 bool LasagnaServiceManager::validateApiVersion(QNetworkReply* reply, const QString& context)
 {
     const QByteArray got = reply->rawHeader(kFitServiceApiVersionHeader);

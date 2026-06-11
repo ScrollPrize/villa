@@ -140,6 +140,7 @@ add_library(vc_lasagna
     src/lasagna/EclMaxflow.cpp
     src/lasagna/EclMaxflowCut.cpp
     src/lasagna/LaplaceAmgx.cpp
+    src/lasagna/LaplaceRank.cpp
     src/lasagna/LasagnaNormalSampler.cpp
     src/lasagna/LineViewBuilder.cpp
     src/lasagna/LineOptimizer.cpp

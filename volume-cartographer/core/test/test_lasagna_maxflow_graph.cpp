@@ -3,9 +3,11 @@
 
 #include "vc/lasagna/EclMaxflow.hpp"
 #include "vc/lasagna/LaplaceAmgx.hpp"
+#include "vc/lasagna/LaplaceRank.hpp"
 #include "vc/lasagna/MaxflowGraph.hpp"
 
 #include <cstdint>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -303,6 +305,58 @@ TEST_CASE("screened Laplace rejects invalid source and sink nodes")
     CHECK_THROWS_AS(
         vc::lasagna::laplaceValueForNode(system, std::vector<double>{0.5}, 3),
         std::runtime_error);
+}
+
+TEST_CASE("Laplace snap ranking chooses the smaller side as targets")
+{
+    const auto roles = vc::lasagna::selectLaplaceRankRoles(1, 2);
+    CHECK(roles.solveSide == vc::lasagna::LaplaceRankSide::SideB);
+    CHECK(roles.targetSide == vc::lasagna::LaplaceRankSide::SideA);
+    CHECK(roles.solveCount == 2);
+    CHECK(roles.targetCount == 1);
+
+    const auto tie = vc::lasagna::selectLaplaceRankRoles(2, 2);
+    CHECK(tie.solveSide == vc::lasagna::LaplaceRankSide::SideA);
+    CHECK(tie.targetSide == vc::lasagna::LaplaceRankSide::SideB);
+}
+
+TEST_CASE("Laplace snap ranking accepts a pair-set by max absolute matrix value")
+{
+    vc::lasagna::LaplaceRankEvaluation weak;
+    weak.solved = true;
+    weak.values = {1.0e-9, -2.0e-9, 9.0e-7};
+    for (double value : weak.values) {
+        weak.maxAbsValue = std::max(weak.maxAbsValue, std::abs(value));
+    }
+    CHECK_FALSE(vc::lasagna::laplaceRankAccepted(weak, 1.0e-6));
+
+    vc::lasagna::LaplaceRankEvaluation accepted = weak;
+    accepted.values.push_back(-2.5e-6);
+    accepted.maxAbsValue = 2.5e-6;
+    CHECK(vc::lasagna::laplaceRankAccepted(accepted, 1.0e-6));
+}
+
+TEST_CASE("Laplace snap ranking selects one synchronized lambda per pair-set")
+{
+    std::vector<double> probes;
+    const auto selected = vc::lasagna::selectAdaptiveLaplaceRankLambda(
+        1.0 / 2048.0,
+        1.0e-6,
+        [&](double lambda) {
+            probes.push_back(lambda);
+            vc::lasagna::LaplaceRankEvaluation evaluation;
+            evaluation.lambda = lambda;
+            evaluation.solved = true;
+            evaluation.status = "success";
+            evaluation.values = {5.0e-10 / lambda, 1.0e-9 / lambda};
+            evaluation.maxAbsValue = std::max(std::abs(evaluation.values[0]), std::abs(evaluation.values[1]));
+            return evaluation;
+        });
+
+    REQUIRE(probes.size() > 1);
+    CHECK(vc::lasagna::laplaceRankAccepted(selected, 1.0e-6));
+    CHECK(selected.values.size() == 2);
+    CHECK(selected.maxAbsValue >= 1.0e-6);
 }
 
 TEST_CASE("AMGX screened Laplace solves a tiny chain when enabled")

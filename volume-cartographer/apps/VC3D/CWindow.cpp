@@ -22,6 +22,7 @@
 #include <QVBoxLayout>
 #include <QCursor>
 #include <QEvent>
+#include <QEventLoop>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QSettings>
@@ -37,6 +38,8 @@
 #include <QClipboard>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPointF>
 #include <QMessageBox>
 #include <QtConcurrent/QtConcurrent>
@@ -563,6 +566,23 @@ QString absoluteSegmentPathForClipboard(const std::filesystem::path& segmentPath
     return QString::fromStdString(path.lexically_normal().string());
 }
 
+QJsonObject toQtJsonObject(const nlohmann::json& json)
+{
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(
+        QByteArray::fromStdString(json.dump()), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        throw std::runtime_error("failed to convert JSON object for Qt");
+    }
+    return doc.object();
+}
+
+nlohmann::json fromQtJsonObject(const QJsonObject& object)
+{
+    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    return nlohmann::json::parse(bytes.constData());
+}
+
 QDockWidget* createAtlasOverviewDock(QWidget* parent)
 {
     auto* dock = new QDockWidget(QObject::tr("Atlas Overview"), parent);
@@ -590,6 +610,11 @@ QDockWidget* createAtlasFiberDock(QWidget* parent)
     current->setObjectName(QStringLiteral("atlasFiberCurrentLabel"));
     current->setWordWrap(true);
     layout->addWidget(current);
+
+    auto* optimize = new QPushButton(QObject::tr("Optimize snap cands"), content);
+    optimize->setObjectName(QStringLiteral("atlasOptimizeSnapCandidatesButton"));
+    optimize->setEnabled(false);
+    layout->addWidget(optimize);
 
     auto* table = new QTableWidget(content);
     table->setObjectName(QStringLiteral("atlasFiberTable"));
@@ -2440,6 +2465,13 @@ void CWindow::createAtlasWorkspace()
     _atlasWorkspaceFiberDock = createAtlasFiberDock(this);
     _atlasWorkspaceFiberDock->setObjectName(QStringLiteral("dockWidgetAtlasFibersAtlas"));
     _atlasWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasWorkspaceFiberDock);
+    if (auto* optimize = _atlasWorkspaceFiberDock->widget()
+            ? _atlasWorkspaceFiberDock->widget()->findChild<QPushButton*>(
+                  QStringLiteral("atlasOptimizeSnapCandidatesButton"))
+            : nullptr) {
+        connect(optimize, &QPushButton::clicked,
+                this, &CWindow::optimizeAtlasSnapCandidates);
+    }
 
     _atlasWorkspaceSearchDock = createAtlasSearchDock(this);
     _atlasWorkspaceSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearchAtlas"));
@@ -2658,7 +2690,22 @@ void CWindow::updateAtlasFiberDocks()
 
     auto* label = _atlasWorkspaceFiberDock->widget()->findChild<QLabel*>(QStringLiteral("atlasFiberCurrentLabel"));
     auto* table = _atlasWorkspaceFiberDock->widget()->findChild<QTableWidget*>(QStringLiteral("atlasFiberTable"));
+    auto* optimize = _atlasWorkspaceFiberDock->widget()->findChild<QPushButton*>(
+        QStringLiteral("atlasOptimizeSnapCandidatesButton"));
+    auto updateOptimizeEnabled = [&]() {
+        bool hasManifest = false;
+        if (_state && _state->vpkg()) {
+            const auto manifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
+            hasManifest = !manifestPath.empty() && std::filesystem::exists(manifestPath);
+        }
+        if (optimize) {
+            optimize->setEnabled(_currentAtlasDir.has_value() &&
+                                 hasManifest &&
+                                 LasagnaServiceManager::instance().isRunning());
+        }
+    };
     if (!table) {
+        updateOptimizeEnabled();
         return;
     }
 
@@ -2669,6 +2716,7 @@ void CWindow::updateAtlasFiberDocks()
         if (label) {
             label->setText(tr("No atlas selected"));
         }
+        updateOptimizeEnabled();
         table->setSortingEnabled(true);
         return;
     }
@@ -2693,6 +2741,7 @@ void CWindow::updateAtlasFiberDocks()
                          : _currentAtlasName),
                      QString::fromStdString(ex.what())));
         }
+        updateOptimizeEnabled();
         table->setSortingEnabled(true);
         return;
     }
@@ -2757,6 +2806,128 @@ void CWindow::updateAtlasFiberDocks()
     }
 
     table->setSortingEnabled(true);
+    updateOptimizeEnabled();
+}
+
+void CWindow::optimizeAtlasSnapCandidates()
+{
+    if (!_currentAtlasDir || !_state || !_state->vpkg()) {
+        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before optimizing snap candidates."));
+        return;
+    }
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+    if (manifestPath.empty() || !std::filesystem::exists(manifestPath)) {
+        QMessageBox::warning(this,
+                             tr("Atlas"),
+                             tr("Select a local Lasagna dataset before optimizing snap candidates."));
+        return;
+    }
+    auto& manager = LasagnaServiceManager::instance();
+    if (!manager.isRunning()) {
+        QMessageBox::warning(this,
+                             tr("Atlas"),
+                             tr("Start or connect the Lasagna service before optimizing snap candidates."));
+        updateAtlasFiberDocks();
+        return;
+    }
+
+    const std::filesystem::path atlasDir = *_currentAtlasDir;
+    const std::filesystem::path volpkgRoot = vpkg->path().empty()
+        ? std::filesystem::path(vpkg->getVolpkgDirectory())
+        : vpkg->path().parent_path();
+    if (statusBar()) {
+        statusBar()->showMessage(tr("Optimizing atlas snap candidates..."), 3000);
+    }
+    if (auto* button = _atlasWorkspaceFiberDock && _atlasWorkspaceFiberDock->widget()
+            ? _atlasWorkspaceFiberDock->widget()->findChild<QPushButton*>(
+                  QStringLiteral("atlasOptimizeSnapCandidatesButton"))
+            : nullptr) {
+        button->setEnabled(false);
+    }
+
+    auto* watcher = new QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>(this);
+    connect(watcher, &QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>::finished,
+            this, [this, watcher, atlasDir]() {
+        watcher->deleteLater();
+        try {
+            const vc::atlas::AtlasSnapOptimizeReport report = watcher->result();
+            updateAtlasFiberDocks();
+            displayAtlasFromDirectory(atlasDir);
+            if (statusBar()) {
+                statusBar()->showMessage(
+                    tr("Optimized snap candidates: %1 controls, %2 pair terms, %3 ranked, %4 cached.")
+                        .arg(report.controls)
+                        .arg(report.pairTerms)
+                        .arg(report.rankJobsRequested)
+                        .arg(report.cacheHits),
+                    6000);
+            }
+        } catch (const std::exception& ex) {
+            updateAtlasFiberDocks();
+            QMessageBox::warning(
+                this,
+                tr("Atlas Snap Candidates"),
+                tr("Could not optimize snap candidates: %1")
+                    .arg(QString::fromStdString(ex.what())));
+        }
+    });
+
+    QPointer<CWindow> self(this);
+    watcher->setFuture(QtConcurrent::run([self, atlasDir, volpkgRoot, manifestPath]() {
+        vc::lasagna::LasagnaDataset dataset =
+            vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        if (!sampler.hasPredDtChannel()) {
+            throw std::runtime_error("selected Lasagna dataset has no pred_dt channel");
+        }
+
+        vc::atlas::AtlasSnapOptimizeOptions options;
+        options.rankOptions = {
+            {"threshold", 165},
+            {"margin_base_voxels", 4},
+            {"source_depth", 1},
+            {"adaptive_start_lambda", 1.0 / 2048.0},
+            {"solver_tolerance", 1.0e-6},
+            {"confidence_factor", 1.0},
+        };
+        const auto ranker = [self](const nlohmann::json& request) -> nlohmann::json {
+            if (!self) {
+                throw std::runtime_error("window closed before rank request completed");
+            }
+            QJsonObject qtRequest = toQtJsonObject(request);
+            QJsonObject qtResponse;
+            QString error;
+            QMetaObject::invokeMethod(
+                self.data(),
+                [&qtRequest, &qtResponse, &error]() {
+                    QEventLoop loop;
+                    LasagnaServiceManager::instance().rankLaplaceSnapPairs(
+                        qtRequest,
+                        [&](const QJsonObject& response) {
+                            qtResponse = response;
+                            loop.quit();
+                        },
+                        [&](const QString& message) {
+                            error = message;
+                            loop.quit();
+                        });
+                    loop.exec();
+                },
+                Qt::BlockingQueuedConnection);
+            if (!error.isEmpty()) {
+                throw std::runtime_error(error.toStdString());
+            }
+            return fromQtJsonObject(qtResponse);
+        };
+        return vc::atlas::optimizeAtlasPredSnapCandidates(
+            atlasDir,
+            volpkgRoot,
+            manifestPath,
+            sampler,
+            ranker,
+            options);
+    }));
 }
 
 void CWindow::updateAtlasSearchDocks()
@@ -4090,6 +4261,10 @@ void CWindow::CreateWidgets(void)
         LasagnaServiceManager::instance().stopOptimization();
         statusBar()->showMessage(tr("Lasagna optimization stop requested."), 3000);
     });
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::serviceStarted,
+            this, &CWindow::updateAtlasFiberDocks);
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::serviceStopped,
+            this, &CWindow::updateAtlasFiberDocks);
 
     // Add only the segments placed by lasagna instead of rescanning every surface.
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::resultsPlaced,

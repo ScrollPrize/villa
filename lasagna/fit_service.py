@@ -13,6 +13,7 @@ Endpoints:
     GET  /jobs/{id}/results -> download one job's results
     POST /jobs/{id}/cancel -> cancel an upload/waiting/running job
     POST /jobs/reorder    -> reorder upload/waiting jobs
+    POST /laplace/rank    -> synchronous AMGX screened-Laplace snap ranking
     POST /optimize        -> legacy queue wrapper
     POST /stop            -> request cancellation of the running job
     POST /export_vis      -> export multi-layer OBJ visualization (JSON body)
@@ -24,6 +25,7 @@ import atexit
 import base64
 import getpass
 import hashlib
+import importlib
 import json
 import os
 import shutil
@@ -164,6 +166,84 @@ def _object_store_root() -> Path:
 
 def _hash_bytes(data: bytes) -> str:
     return "md5:" + hashlib.md5(data).hexdigest()
+
+
+class _LaplaceRankUnavailable(RuntimeError):
+    pass
+
+
+def _validate_laplace_rank_point(value: Any, label: str) -> None:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"{label} point must be [x, y, z]")
+    for axis, coord in zip(("x", "y", "z"), value):
+        if not isinstance(coord, (int, float)):
+            raise ValueError(f"{label} point {axis} must be numeric")
+
+
+def _validate_laplace_rank_points(value: Any, label: str) -> None:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list of points")
+    if not value:
+        raise ValueError(f"{label} must contain at least one point")
+    for point in value:
+        _validate_laplace_rank_point(point, label)
+
+
+def _validate_laplace_rank_request(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise ValueError("laplace rank request must be an object")
+    manifest = body.get("manifest")
+    if not isinstance(manifest, str) or not manifest.strip():
+        raise ValueError("manifest must be a non-empty path string")
+    jobs = body.get("jobs")
+    if not isinstance(jobs, list):
+        raise ValueError("jobs must be a list")
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            raise ValueError(f"jobs[{index}] must be an object")
+        _validate_laplace_rank_points(job.get("side_a"), f"jobs[{index}].side_a")
+        _validate_laplace_rank_points(job.get("side_b"), f"jobs[{index}].side_b")
+        if "id" in job and not isinstance(job["id"], str):
+            raise ValueError(f"jobs[{index}].id must be a string")
+    options = body.get("options", {})
+    if options is not None and not isinstance(options, dict):
+        raise ValueError("options must be an object or null")
+    return body
+
+
+def _rank_laplace_snap_pairs(body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        module = importlib.import_module("vc_lasagna_amgx")
+    except ImportError as exc:
+        raise _LaplaceRankUnavailable(
+            "vc_lasagna_amgx is not installed; install volume-cartographer with "
+            "VC_ENABLE_AMGX=ON to use /laplace/rank"
+        ) from exc
+    result = module.rank_snap_pairs(body)
+    if not isinstance(result, dict):
+        raise RuntimeError("vc_lasagna_amgx.rank_snap_pairs returned a non-object response")
+    return result
+
+
+def _handle_laplace_rank_body(raw_body: Any) -> tuple[int, dict[str, Any]]:
+    try:
+        body = _validate_laplace_rank_request(raw_body)
+    except Exception as exc:
+        return 400, {"error": f"bad json: {exc}"}
+    try:
+        return 200, _rank_laplace_snap_pairs(body)
+    except _LaplaceRankUnavailable as exc:
+        return 503, {
+            "error": str(exc),
+            "code": "vc_lasagna_amgx_unavailable",
+        }
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[fit-service] /laplace/rank error: {tb}", file=sys.stderr, flush=True)
+        return 500, {
+            "error": str(exc),
+            "code": "laplace_rank_failed",
+        }
 
 
 _SINGLE_FILE_OBJECT_TYPES = {"lasagna_model", "line", "line-map", "atlas", "atlas-pred-snap"}
@@ -1682,7 +1762,17 @@ class _Handler(BaseHTTPRequestHandler):
         parts = self._job_path_parts()
         path = "/" + "/".join(parts)
 
-        if path == "/optimize":
+        if path == "/laplace/rank":
+            print("[fit-service] /laplace/rank POST received", flush=True)
+            try:
+                raw_body = self._read_json("laplace rank request")
+            except Exception as exc:
+                self._send_json({"error": f"bad json: {exc}"}, 400)
+                return
+            status, response = _handle_laplace_rank_body(raw_body)
+            self._send_json(response, status)
+
+        elif path == "/optimize":
             print("[fit-service] /optimize POST received", flush=True)
             try:
                 body = self._read_json("optimize request")

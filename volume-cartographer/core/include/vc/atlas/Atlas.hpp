@@ -164,10 +164,19 @@ enum class AtlasPredSnapDirection {
     Outside,
 };
 
+struct AtlasPredSnapCandidate {
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    std::optional<double> predDtValue;
+    std::optional<AtlasPredSnapDirection> direction;
+    std::optional<double> windingDistance;
+};
+
 struct AtlasPredSnapPoint {
     std::filesystem::path fiberPath;
     cv::Vec3d controlPoint{0.0, 0.0, 0.0};
     std::optional<cv::Vec3d> predSnapPoint;
+    std::vector<AtlasPredSnapCandidate> candidates;
+    std::optional<int> selectedCandidateIndex;
     AtlasPredSnapSource source = AtlasPredSnapSource::Auto;
     std::optional<double> predDtValue;
     std::optional<AtlasPredSnapDirection> direction;
@@ -195,6 +204,55 @@ struct AtlasPredSnapAttachmentReport {
     size_t fibersChecked = 0;
     size_t attachmentsCreated = 0;
 };
+
+struct AtlasSnapCandidateSet {
+    std::string id;
+    std::filesystem::path fiberPath;
+    int sourceIndex = 0;
+    cv::Vec3d controlPoint{0.0, 0.0, 0.0};
+    std::vector<cv::Vec3d> candidates;
+    bool fixed = false;
+    bool manual = false;
+};
+
+struct AtlasSnapPairTerm {
+    std::string id;
+    size_t firstControl = 0;
+    size_t secondControl = 0;
+};
+
+struct AtlasSnapPairMatrix {
+    std::string id;
+    std::vector<std::vector<double>> rawValues;
+    std::vector<std::vector<double>> normalizedValues;
+    nlohmann::json metadata;
+};
+
+struct AtlasSnapOptimizationProblem {
+    std::vector<AtlasSnapCandidateSet> controls;
+    std::vector<AtlasSnapPairTerm> terms;
+};
+
+struct AtlasSnapOptimizationResult {
+    std::vector<size_t> selectedCandidateIndices;
+    double objective = 0.0;
+};
+
+struct AtlasSnapOptimizeOptions {
+    nlohmann::json rankOptions = nlohmann::json::object();
+    size_t exhaustiveAssignmentLimit = 1000000;
+};
+
+struct AtlasSnapOptimizeReport {
+    size_t controls = 0;
+    size_t variableControls = 0;
+    size_t pairTerms = 0;
+    size_t cacheHits = 0;
+    size_t rankJobsRequested = 0;
+    double objective = 0.0;
+};
+
+using AtlasSnapPairRanker = std::function<nlohmann::json(const nlohmann::json& request)>;
 
 struct LasagnaAtlasObject {
     std::string id;
@@ -286,6 +344,10 @@ std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& base
                                                         int startColumn = 0);
 
 bool atlasPredDtIsInside(double predDtValue);
+std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
+    const cv::Vec3d& controlPoint,
+    const cv::Vec3d& alignedNormal,
+    const AtlasPredSnapSampling& sampling);
 std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
     const cv::Vec3d& controlPoint,
     const cv::Vec3d& alignedNormal,
@@ -329,6 +391,32 @@ AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
     const std::filesystem::path& atlasDir,
     const std::filesystem::path& volpkgRoot,
     const vc::lasagna::LasagnaNormalSampler& sampler);
+std::filesystem::path atlasPredSnapRankCachePath(
+    const std::filesystem::path& atlasDir);
+std::string atlasSnapRankTermCacheKey(
+    const std::filesystem::path& manifestPath,
+    const nlohmann::json& rankOptions,
+    const std::vector<cv::Vec3d>& sideA,
+    const std::vector<cv::Vec3d>& sideB);
+AtlasSnapOptimizationProblem buildAtlasSnapOptimizationProblem(
+    const Atlas& atlas,
+    const std::unordered_map<std::string, AtlasPredSnapSet>& predSnapSets);
+AtlasSnapPairMatrix atlasSnapPairMatrixFromRankResult(
+    const AtlasSnapPairTerm& term,
+    size_t sideACount,
+    size_t sideBCount,
+    const nlohmann::json& result);
+AtlasSnapOptimizationResult optimizeAtlasSnapCandidates(
+    const AtlasSnapOptimizationProblem& problem,
+    const std::vector<AtlasSnapPairMatrix>& matrices,
+    const AtlasSnapOptimizeOptions& options = {});
+AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
+    const std::filesystem::path& atlasDir,
+    const std::filesystem::path& volpkgRoot,
+    const std::filesystem::path& manifestPath,
+    const vc::lasagna::LasagnaNormalSampler& sampler,
+    const AtlasSnapPairRanker& ranker,
+    const AtlasSnapOptimizeOptions& options = {});
 
 void validateFiberInputControlPoints(FiberInput& fiber);
 bool atlasLoadErrorRequiresRebuild(const std::exception& ex);

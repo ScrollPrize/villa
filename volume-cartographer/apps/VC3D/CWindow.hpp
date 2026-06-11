@@ -138,6 +138,7 @@ private:
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
+    void optimizeAtlasSnapCandidates();
     void startAtlasFiberIntersectionSearch();
     void cancelAtlasFiberIntersectionSearch();
     void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results);

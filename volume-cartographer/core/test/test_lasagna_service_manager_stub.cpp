@@ -79,3 +79,13 @@ void LasagnaServiceManager::fetchDatasets()
 {
     emit datasetsReceived(QJsonArray{});
 }
+
+void LasagnaServiceManager::rankLaplaceSnapPairs(
+    const QJsonObject&,
+    std::function<void(const QJsonObject&)> onSuccess,
+    std::function<void(const QString&)>)
+{
+    if (onSuccess) {
+        onSuccess(QJsonObject{{QStringLiteral("results"), QJsonArray{}}});
+    }
+}
