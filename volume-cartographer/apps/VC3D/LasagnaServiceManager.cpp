@@ -755,19 +755,44 @@ void LasagnaServiceManager::rankLaplaceSnapPairs(
     req.setRawHeader(kVc3dSourceHeader, localSourceName().toUtf8());
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     const quint64 generation = _requestGeneration;
-    QNetworkReply* reply = _nam->post(
-        req, QJsonDocument(request).toJson(QJsonDocument::Compact));
+    const QByteArray body = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    auto timer = std::make_shared<QElapsedTimer>();
+    timer->start();
+    std::cout << "[lasagna] laplace rank request:"
+              << " jobs=" << request.value(QStringLiteral("jobs")).toArray().size()
+              << " bytes=" << body.size()
+              << " url=" << url.toString().toStdString()
+              << std::endl;
+    QNetworkReply* reply = _nam->post(req, body);
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, generation, onSuccess = std::move(onSuccess), onError = std::move(onError)]() mutable {
+            [this,
+             reply,
+             generation,
+             timer,
+             onSuccess = std::move(onSuccess),
+             onError = std::move(onError)]() mutable {
         if (generation != _requestGeneration) {
             reply->deleteLater();
             return;
         }
         const QByteArray bytes = reply->readAll();
+        const QVariant status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+        std::cout << "[lasagna] laplace rank response:"
+                  << " elapsed=" << elapsedSeconds(*timer) << "s";
+        if (status.isValid()) {
+            std::cout << " http=" << status.toInt();
+        } else {
+            std::cout << " http=<none>";
+        }
+        std::cout << " error=" << reply->error()
+                  << " bytes=" << bytes.size()
+                  << std::endl;
         reply->deleteLater();
 
         auto fail = [&](const QString& msg) {
             _lastError = msg;
+            std::cerr << "[lasagna] laplace rank error: "
+                      << msg.toStdString() << std::endl;
             if (onError) {
                 onError(msg);
             }

@@ -1248,13 +1248,13 @@ fs::path atlasPredSnapAttachmentPath(const fs::path& atlasDir, const fs::path& f
     return atlasDir / "attachments" / "pred_snap_points" / (safe + ".json");
 }
 
-bool atlasPredDtIsInside(double predDtValue)
+bool atlasPredDtIsInside(double predDtValue, double threshold)
 {
-    constexpr double kDisplayThreshold = 165.0;
-    constexpr double kDisplayMax = 255.0;
-    constexpr double kPredDtMax = 175.0;
-    constexpr double kPredDtThreshold = kDisplayThreshold * kPredDtMax / kDisplayMax;
-    return std::isfinite(predDtValue) && predDtValue >= kPredDtThreshold;
+    if (!std::isfinite(threshold)) {
+        threshold = 110.0;
+    }
+    threshold = std::clamp(threshold, 0.0, 255.0);
+    return std::isfinite(predDtValue) && predDtValue >= threshold;
 }
 
 namespace {
@@ -1455,10 +1455,11 @@ std::vector<PredSnapTraceSample> tracePredSnapDirection(
 }
 
 std::optional<PredSnapTraceSample> firstInsidePredSnapHit(
-    const std::vector<PredSnapTraceSample>& samples)
+    const std::vector<PredSnapTraceSample>& samples,
+    double predDtThreshold)
 {
     for (const auto& sample : samples) {
-        if (sample.predDt && atlasPredDtIsInside(*sample.predDt)) {
+        if (sample.predDt && atlasPredDtIsInside(*sample.predDt, predDtThreshold)) {
             return sample;
         }
     }
@@ -1483,8 +1484,11 @@ PredSnapTraceSample climbPredDtMaximumAlongNormal(
     const double stepVx = std::isfinite(sampling.predDtStepVx) && sampling.predDtStepVx > 0.0
         ? sampling.predDtStepVx
         : 0.05;
+    const double predDtThreshold = std::isfinite(sampling.predDtThreshold)
+        ? sampling.predDtThreshold
+        : 110.0;
     if (!sampling.samplePredDt || !validNormal(unitNormal) ||
-        !seed.predDt || !atlasPredDtIsInside(*seed.predDt)) {
+        !seed.predDt || !atlasPredDtIsInside(*seed.predDt, predDtThreshold)) {
         return seed;
     }
 
@@ -1495,7 +1499,7 @@ PredSnapTraceSample climbPredDtMaximumAlongNormal(
         for (double sign : {1.0, -1.0}) {
             const cv::Vec3d point = current.point + unitNormal * (sign * stepVx);
             const auto predDt = sampling.samplePredDt(point);
-            if (!predDt || !atlasPredDtIsInside(*predDt)) {
+            if (!predDt || !atlasPredDtIsInside(*predDt, predDtThreshold)) {
                 continue;
             }
             if (!best.predDt || *predDt > *best.predDt + 1.0e-9) {
@@ -1628,6 +1632,9 @@ std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
     if (!validNormal(normal)) {
         return candidates;
     }
+    const double predDtThreshold = std::isfinite(sampling.predDtThreshold)
+        ? sampling.predDtThreshold
+        : 110.0;
 
     std::unordered_set<std::string> seen;
     auto addCandidate = [&](const PredSnapTraceSample& hit,
@@ -1649,7 +1656,7 @@ std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
     };
 
     const auto startPredDt = sampling.samplePredDt(controlPoint);
-    if (startPredDt && atlasPredDtIsInside(*startPredDt)) {
+    if (startPredDt && atlasPredDtIsInside(*startPredDt, predDtThreshold)) {
         addCandidate({controlPoint, 0.0, startPredDt}, AtlasPredSnapDirection::Outside, 0.0);
         return candidates;
     }
@@ -1657,14 +1664,14 @@ std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
     constexpr double kCandidateWindingLimit = 1.0;
     if (const auto outwardHit =
             firstInsidePredSnapHit(tracePredSnapDirection(
-                controlPoint, normal, kCandidateWindingLimit, sampling))) {
+                controlPoint, normal, kCandidateWindingLimit, sampling), predDtThreshold)) {
         addCandidate(*outwardHit,
                      AtlasPredSnapDirection::Outside,
                      outwardHit->windingDistance);
     }
     if (const auto inwardHit =
             firstInsidePredSnapHit(tracePredSnapDirection(
-                controlPoint, -normal, kCandidateWindingLimit, sampling))) {
+                controlPoint, -normal, kCandidateWindingLimit, sampling), predDtThreshold)) {
         addCandidate(*inwardHit,
                      AtlasPredSnapDirection::Inside,
                      inwardHit->windingDistance);
@@ -1698,6 +1705,9 @@ std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
         std::isfinite(sampling.inwardFirstHitWeight) && sampling.inwardFirstHitWeight > 0.0
             ? sampling.inwardFirstHitWeight
             : 4.0;
+    const double predDtThreshold = std::isfinite(sampling.predDtThreshold)
+        ? sampling.predDtThreshold
+        : 110.0;
 
     const auto startPredDt = sampling.samplePredDt(controlPoint);
     const auto outwardSamples =
@@ -1710,7 +1720,7 @@ std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
     result.source = AtlasPredSnapSource::Auto;
     result.searchNormal = normal;
 
-    if (startPredDt && atlasPredDtIsInside(*startPredDt)) {
+    if (startPredDt && atlasPredDtIsInside(*startPredDt, predDtThreshold)) {
         PredSnapTraceSample fallback{controlPoint, 0.0, startPredDt};
         const PredSnapTraceSample best =
             climbPredDtMaximumAlongNormal(fallback, normal, sampling);
@@ -1723,8 +1733,8 @@ std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
         return result;
     }
 
-    const auto outwardHit = firstInsidePredSnapHit(outwardSamples);
-    const auto inwardHit = firstInsidePredSnapHit(inwardSamples);
+    const auto outwardHit = firstInsidePredSnapHit(outwardSamples, predDtThreshold);
+    const auto inwardHit = firstInsidePredSnapHit(inwardSamples, predDtThreshold);
     if (!outwardHit && !inwardHit) {
         return result;
     }
@@ -1892,7 +1902,22 @@ AtlasPredSnapSet mergeAtlasPredSnapSetByControlPoint(AtlasPredSnapSet existing,
             point.fiberPath = merged.fiberPath;
             merged.points.push_back(std::move(point));
         } else {
-            merged.points.push_back(generatedPoint);
+            AtlasPredSnapPoint point = generatedPoint;
+            if (it != byKey.end() && it->second.predSnapPoint) {
+                for (size_t i = 0; i < point.candidates.size(); ++i) {
+                    if (norm(point.candidates[i].point - *it->second.predSnapPoint) <=
+                        kControlPointMatchEpsilon) {
+                        point.selectedCandidateIndex = static_cast<int>(i);
+                        point.predSnapPoint = point.candidates[i].point;
+                        point.predDtValue = point.candidates[i].predDtValue;
+                        point.direction = point.candidates[i].direction;
+                        point.weightedFirstHitWindingDistance =
+                            point.candidates[i].windingDistance;
+                        break;
+                    }
+                }
+            }
+            merged.points.push_back(std::move(point));
         }
     }
     return merged;
@@ -2054,6 +2079,20 @@ nlohmann::json pointsJson(const std::vector<cv::Vec3d>& points)
     return out;
 }
 
+std::string pointsString(const std::vector<cv::Vec3d>& points)
+{
+    std::ostringstream out;
+    out << '[';
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << vecString(points[i]);
+    }
+    out << ']';
+    return out.str();
+}
+
 std::string controlIdFor(const fs::path& fiberPath, int sourceIndex)
 {
     return atlasFiberPathKey(fiberPath) + "#" + std::to_string(sourceIndex);
@@ -2134,6 +2173,130 @@ const FiberMapping* mappingForPath(const Atlas& atlas, const fs::path& fiberPath
     return nullptr;
 }
 
+nlohmann::json controlDebugJson(const AtlasSnapCandidateSet& control)
+{
+    return {
+        {"id", control.id},
+        {"fiber_path", control.fiberPath.generic_string()},
+        {"source_index", control.sourceIndex},
+        {"manual", control.manual},
+        {"fixed", control.fixed},
+        {"control_point", pointJson(control.controlPoint)},
+        {"candidate_count", control.candidates.size()},
+        {"candidates", pointsJson(control.candidates)},
+    };
+}
+
+nlohmann::json termDebugJson(
+    const AtlasSnapPairTerm& term,
+    const AtlasSnapOptimizationProblem& problem)
+{
+    nlohmann::json out = {
+        {"term_id", term.id},
+        {"first_control_index", term.firstControl},
+        {"second_control_index", term.secondControl},
+    };
+    if (term.firstControl < problem.controls.size()) {
+        out["first_control"] = controlDebugJson(problem.controls[term.firstControl]);
+    }
+    if (term.secondControl < problem.controls.size()) {
+        out["second_control"] = controlDebugJson(problem.controls[term.secondControl]);
+    }
+    return out;
+}
+
+std::string controlDebugString(const AtlasSnapCandidateSet& control)
+{
+    std::ostringstream out;
+    out << "id=" << control.id
+        << " fiber=" << control.fiberPath.generic_string()
+        << " source_index=" << control.sourceIndex
+        << " manual=" << (control.manual ? "true" : "false")
+        << " fixed=" << (control.fixed ? "true" : "false")
+        << " control_point=" << vecString(control.controlPoint)
+        << " candidate_count=" << control.candidates.size()
+        << " candidates=" << pointsString(control.candidates);
+    return out.str();
+}
+
+std::string termDebugString(
+    const AtlasSnapPairTerm& term,
+    const AtlasSnapOptimizationProblem& problem)
+{
+    std::ostringstream out;
+    out << "term=" << term.id;
+    if (term.firstControl < problem.controls.size()) {
+        out << " first={" << controlDebugString(problem.controls[term.firstControl]) << '}';
+    } else {
+        out << " first_index=" << term.firstControl;
+    }
+    if (term.secondControl < problem.controls.size()) {
+        out << " second={" << controlDebugString(problem.controls[term.secondControl]) << '}';
+    } else {
+        out << " second_index=" << term.secondControl;
+    }
+    return out.str();
+}
+
+nlohmann::json effectiveRankOptions(const AtlasSnapOptimizeOptions& options)
+{
+    nlohmann::json rankOptions = options.rankOptions;
+    if (!rankOptions.is_object()) {
+        throw std::runtime_error("atlas snap optimizer requires rankOptions to be a JSON object");
+    }
+    if (!rankOptions.contains("amgx_config")) {
+        rankOptions["amgx_config"] = nullptr;
+    }
+
+    for (const char* key : {"adaptive_start_lambda", "solver_tolerance", "confidence_factor"}) {
+        if (rankOptions.contains(key)) {
+            throw std::runtime_error(
+                std::string("atlas snap rank option is server-owned and must not be supplied: ") +
+                key + "; rank_options=" + rankOptions.dump());
+        }
+    }
+
+    const std::array<const char*, 4> requiredKeys{
+        "threshold",
+        "margin_base_voxels",
+        "source_depth",
+        "amgx_config",
+    };
+    for (const char* key : requiredKeys) {
+        if (!rankOptions.contains(key)) {
+            throw std::runtime_error(
+                std::string("atlas snap rank cache requires explicit rank option: ") +
+                key + "; rank_options=" + rankOptions.dump());
+        }
+        if (std::string_view(key) != "amgx_config" && rankOptions[key].is_null()) {
+            throw std::runtime_error(
+                std::string("atlas snap rank option must not be null: ") +
+                key + "; rank_options=" + rankOptions.dump());
+        }
+    }
+
+    const auto threshold = rankOptions["threshold"].get<int>();
+    if (threshold < 0 || threshold > 255) {
+        throw std::runtime_error("atlas snap rank option threshold must be in [0, 255]");
+    }
+    if (threshold != options.predDtThreshold) {
+        throw std::runtime_error(
+            "atlas snap candidate threshold and rank threshold differ; cache would be ambiguous");
+    }
+    const auto margin = rankOptions["margin_base_voxels"].get<int64_t>();
+    if (margin < 0) {
+        throw std::runtime_error("atlas snap rank option margin_base_voxels must be non-negative");
+    }
+    const auto sourceDepth = rankOptions["source_depth"].get<int64_t>();
+    if (sourceDepth < 0) {
+        throw std::runtime_error("atlas snap rank option source_depth must be non-negative");
+    }
+    if (!rankOptions["amgx_config"].is_null() && !rankOptions["amgx_config"].is_string()) {
+        throw std::runtime_error("atlas snap rank option amgx_config must be a path string or null");
+    }
+    return rankOptions;
+}
+
 double matrixValueForAssignment(const AtlasSnapPairMatrix& matrix, size_t a, size_t b)
 {
     if (a >= matrix.normalizedValues.size() ||
@@ -2142,6 +2305,18 @@ double matrixValueForAssignment(const AtlasSnapPairMatrix& matrix, size_t a, siz
     }
     const double value = matrix.normalizedValues[a][b];
     return std::isfinite(value) ? value : 0.0;
+}
+
+bool matrixHasNonZeroContribution(const AtlasSnapPairMatrix& matrix)
+{
+    for (const auto& row : matrix.normalizedValues) {
+        for (double value : row) {
+            if (std::isfinite(value) && std::abs(value) > 0.0) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 double assignmentScore(const AtlasSnapOptimizationProblem& problem,
@@ -2184,7 +2359,8 @@ std::string atlasSnapRankTermCacheKey(
             fs::last_write_time(manifestPath, ec).time_since_epoch().count();
     }
     nlohmann::json key = {
-        {"schema", 1},
+        {"schema", 2},
+        {"rank_algorithm", "laplace_rank_fixed_lambda_search_v1"},
         {"manifest", manifestIdentity},
         {"options", rankOptions.is_null() ? nlohmann::json::object() : rankOptions},
         {"side_a", pointsJson(sideA)},
@@ -2238,6 +2414,34 @@ AtlasSnapOptimizationProblem buildAtlasSnapOptimizationProblem(
     }
 
     std::unordered_set<std::string> termIds;
+    auto addPairTerm = [&](size_t first, size_t second) {
+        if (first == second) {
+            return;
+        }
+        const std::string id = termIdFor(first, second);
+        if (termIds.insert(id).second) {
+            const auto ordered = std::minmax(first, second);
+            problem.terms.push_back({id, ordered.first, ordered.second});
+        }
+    };
+
+    for (const auto& mapping : atlas.fibers) {
+        std::vector<int> indices;
+        indices.reserve(mapping.controlAnchors.size());
+        for (const auto& anchor : mapping.controlAnchors) {
+            indices.push_back(anchor.sourceIndex);
+        }
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+        for (size_t i = 1; i < indices.size(); ++i) {
+            const auto first = controlIndexForEndpoint(problem, mapping.fiberPath, indices[i - 1]);
+            const auto second = controlIndexForEndpoint(problem, mapping.fiberPath, indices[i]);
+            if (first && second) {
+                addPairTerm(*first, *second);
+            }
+        }
+    }
+
     for (size_t linkIndex = 0; linkIndex < atlas.links.size(); ++linkIndex) {
         const AtlasLink& link = atlas.links[linkIndex];
         const auto* firstMapping = mappingForPath(atlas, link.first.fiberPath);
@@ -2266,10 +2470,7 @@ AtlasSnapOptimizationProblem buildAtlasSnapOptimizationProblem(
         controls.erase(std::unique(controls.begin(), controls.end()), controls.end());
         for (size_t i = 0; i < controls.size(); ++i) {
             for (size_t j = i + 1; j < controls.size(); ++j) {
-                const std::string id = termIdFor(controls[i], controls[j]);
-                if (termIds.insert(id).second) {
-                    problem.terms.push_back({id, controls[i], controls[j]});
-                }
+                addPairTerm(controls[i], controls[j]);
             }
         }
         (void)linkIndex;
@@ -2290,8 +2491,21 @@ AtlasSnapPairMatrix atlasSnapPairMatrixFromRankResult(
     matrix.metadata = result;
     if (!result.is_object() || result.value("status", std::string{}) != "success") {
         std::string message = "rank result failed";
+        std::string code;
         if (result.contains("error") && result["error"].is_object()) {
+            code = result["error"].value("code", std::string{});
             message = result["error"].value("message", message);
+        }
+        const bool zeroContribution =
+            code == "no_accepted_lambda" ||
+            (code == "rank_failed" &&
+             (message.find("pred_dt crop contains no passable voxels") != std::string::npos ||
+              message.find("source/sink point is outside the pred_dt crop") != std::string::npos));
+        if (zeroContribution) {
+            matrix.metadata["raw_matrix"] = matrix.rawValues;
+            matrix.metadata["normalized_matrix"] = matrix.normalizedValues;
+            matrix.metadata["zero_contribution"] = true;
+            return matrix;
         }
         throw std::runtime_error("atlas snap pair " + term.id + ": " + message);
     }
@@ -2466,18 +2680,60 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
     const fs::path volpkgRoot = volpkgRootIn.empty()
         ? inferVolpkgRootFromAtlasDir(atlasDir)
         : volpkgRootIn;
+    std::cerr << "[atlas-snap] loading atlas=" << atlasDir.string()
+              << " volpkg_root=" << volpkgRoot.string()
+              << std::endl;
     Atlas atlas = Atlas::load(atlasDir, volpkgRoot);
+    std::cerr << "[atlas-snap] loaded atlas"
+              << " fibers=" << atlas.fibers.size()
+              << " links=" << atlas.links.size()
+              << std::endl;
+    std::cerr << "[atlas-snap] loading base mesh="
+              << (atlasDir / atlas.metadata.baseMeshPath).string()
+              << std::endl;
     QuadSurface baseSurface(atlasDir / atlas.metadata.baseMeshPath);
+    const nlohmann::json rankOptions = effectiveRankOptions(options);
+    const double predDtThreshold = rankOptions.value("threshold", options.predDtThreshold);
+    std::cerr << "[atlas-snap] pred_dt threshold=" << predDtThreshold
+              << " rank_options=" << rankOptions.dump()
+              << std::endl;
+
+    AtlasPredSnapSampling sampling;
+    sampling.sampleNormal = [&sampler](const cv::Vec3d& point) {
+        return sampler.sampleNormal(point);
+    };
+    sampling.samplePredDt = [&sampler](const cv::Vec3d& point) {
+        return sampler.samplePredDt(point);
+    };
+    sampling.windingDistance = [&sampler](const cv::Vec3d& a,
+                                          const cv::Vec3d& b,
+                                          double stepVx) {
+        return sampler.windingDistance(a, b, stepVx);
+    };
+    sampling.predDtThreshold = predDtThreshold;
+    const auto predDtSpacing = sampler.predDtSpacing();
+    if (!predDtSpacing || !std::isfinite(*predDtSpacing) || *predDtSpacing <= 0.0) {
+        throw std::runtime_error("Lasagna pred_dt channel has no valid spacing");
+    }
+    sampling.predDtStepVx = 0.5 * *predDtSpacing;
 
     std::unordered_map<std::string, AtlasPredSnapSet> setsByFiber;
     for (const auto& mapping : atlas.fibers) {
         const fs::path fiberPath = resolveAtlasRelativePath(atlasDir, volpkgRoot, mapping.fiberPath);
+        std::cerr << "[atlas-snap] generating candidates fiber="
+                  << mapping.fiberPath.generic_string()
+                  << " controls=" << mapping.controlAnchors.size()
+                  << std::endl;
         const FiberInput input = loadSourceFiberInput(fiberPath, mapping.fiberPath);
         AtlasPredSnapSet set = ensureAtlasPredSnapSet(atlasDir,
                                                       input,
                                                       mapping,
                                                       baseSurface,
-                                                      sampler);
+                                                      sampling);
+        std::cerr << "[atlas-snap] generated candidates fiber="
+                  << mapping.fiberPath.generic_string()
+                  << " points=" << set.points.size()
+                  << std::endl;
         setsByFiber[atlasFiberPathKey(mapping.fiberPath)] = std::move(set);
     }
 
@@ -2492,27 +2748,57 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
     const fs::path cachePath = atlasPredSnapRankCachePath(atlasDir);
     if (fs::is_regular_file(cachePath)) {
         try {
+            std::cerr << "[atlas-snap] reading rank cache="
+                      << cachePath.string()
+                      << std::endl;
             cache = readJsonFile(cachePath);
             if (!cache.is_object() ||
                 cache.value("type", std::string{}) != "vc3d_atlas_pred_snap_rank_cache" ||
                 cache.value("version", 0) != 1 ||
                 !cache.contains("entries") ||
                 !cache["entries"].is_object()) {
+                std::cerr << "[atlas-snap] rank cache has unexpected schema; ignoring entries"
+                          << std::endl;
                 cache["entries"] = nlohmann::json::object();
             }
+        } catch (const std::exception& ex) {
+            std::cerr << "[atlas-snap] could not read rank cache; ignoring: "
+                      << ex.what() << std::endl;
+            cache["entries"] = nlohmann::json::object();
         } catch (...) {
+            std::cerr << "[atlas-snap] could not read rank cache; ignoring unknown error"
+                      << std::endl;
             cache["entries"] = nlohmann::json::object();
         }
     }
 
     AtlasSnapOptimizeReport report;
     report.controls = problem.controls.size();
+    report.links = atlas.links.size();
     for (const auto& control : problem.controls) {
         if (!control.fixed && control.candidates.size() > 1) {
             ++report.variableControls;
         }
+        if (control.fixed) {
+            ++report.fixedControls;
+        }
+        if (control.manual) {
+            ++report.manualControls;
+        }
+        if (control.fixed && !control.manual && control.candidates.size() <= 1) {
+            ++report.singletonControls;
+        }
     }
     report.pairTerms = problem.terms.size();
+    std::cerr << "[atlas-snap] built optimization problem"
+              << " controls=" << report.controls
+              << " variables=" << report.variableControls
+              << " fixed=" << report.fixedControls
+              << " manual=" << report.manualControls
+              << " singleton_auto=" << report.singletonControls
+              << " links=" << report.links
+              << " pair_terms=" << report.pairTerms
+              << std::endl;
 
     std::vector<AtlasSnapPairMatrix> matrices;
     nlohmann::json jobs = nlohmann::json::array();
@@ -2522,16 +2808,30 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
         const auto& first = problem.controls[term.firstControl];
         const auto& second = problem.controls[term.secondControl];
         if (first.candidates.empty() || second.candidates.empty()) {
+            ++report.skippedPairTerms;
             continue;
         }
         const std::string key = atlasSnapRankTermCacheKey(
-            manifestPath, options.rankOptions, first.candidates, second.candidates);
+            manifestPath, rankOptions, first.candidates, second.candidates);
         const auto cacheIt = cache["entries"].find(key);
         if (cacheIt != cache["entries"].end() && cacheIt->is_object() &&
             cacheIt->contains("rank_result")) {
-            matrices.push_back(atlasSnapPairMatrixFromRankResult(
-                term, first.candidates.size(), second.candidates.size(),
-                (*cacheIt)["rank_result"]));
+            try {
+                AtlasSnapPairMatrix matrix = atlasSnapPairMatrixFromRankResult(
+                    term, first.candidates.size(), second.candidates.size(),
+                    (*cacheIt)["rank_result"]);
+                if (matrix.metadata.value("zero_contribution", false)) {
+                    ++report.zeroContributionTerms;
+                } else {
+                    ++report.successfulPairTerms;
+                }
+                matrices.push_back(std::move(matrix));
+            } catch (const std::exception& ex) {
+                std::ostringstream message;
+                message << "cached " << ex.what() << "; "
+                        << termDebugString(term, problem);
+                throw std::runtime_error(message.str());
+            }
             ++report.cacheHits;
             continue;
         }
@@ -2539,33 +2839,65 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             {"id", term.id},
             {"side_a", pointsJson(first.candidates)},
             {"side_b", pointsJson(second.candidates)},
+            {"debug", termDebugJson(term, problem)},
         });
         missingTerms.push_back(&term);
         missingKeys.push_back(key);
     }
 
+    std::cerr << "[atlas-snap] rank cache summary"
+              << " hits=" << report.cacheHits
+              << " misses=" << missingTerms.size()
+              << " skipped=" << report.skippedPairTerms
+              << std::endl;
+
     if (!jobs.empty()) {
         nlohmann::json request = {
             {"manifest", manifestPath.string()},
             {"jobs", jobs},
-            {"options", options.rankOptions.is_null() ? nlohmann::json::object() : options.rankOptions},
+            {"options", rankOptions},
         };
+        std::cerr << "[atlas-snap] sending rank request jobs="
+                  << missingTerms.size()
+                  << " manifest=" << manifestPath.string()
+                  << " options=" << request["options"].dump()
+                  << std::endl;
         const nlohmann::json response = ranker(request);
         const auto& results = response.at("results");
         if (!results.is_array() || results.size() != missingTerms.size()) {
             throw std::runtime_error("atlas snap ranker returned an unexpected result count");
         }
+        std::cerr << "[atlas-snap] parsing rank response results="
+                  << results.size()
+                  << std::endl;
         for (size_t i = 0; i < missingTerms.size(); ++i) {
             const auto& term = *missingTerms[i];
             const auto& first = problem.controls[term.firstControl];
             const auto& second = problem.controls[term.secondControl];
-            AtlasSnapPairMatrix matrix = atlasSnapPairMatrixFromRankResult(
-                term, first.candidates.size(), second.candidates.size(), results.at(i));
+            const auto& result = results.at(i);
+            AtlasSnapPairMatrix matrix;
+            try {
+                matrix = atlasSnapPairMatrixFromRankResult(
+                    term, first.candidates.size(), second.candidates.size(), result);
+            } catch (const std::exception& ex) {
+                std::cerr << "[atlas-snap] rank result failed "
+                          << termDebugString(term, problem)
+                          << " result=" << result.dump()
+                          << std::endl;
+                std::ostringstream message;
+                message << ex.what() << "; " << termDebugString(term, problem);
+                throw std::runtime_error(message.str());
+            }
+            if (matrix.metadata.value("zero_contribution", false)) {
+                ++report.zeroContributionTerms;
+            } else {
+                ++report.successfulPairTerms;
+            }
             cache["entries"][missingKeys[i]] = {
                 {"schema", 1},
                 {"source_job_id", term.id},
                 {"manifest", manifestPath.lexically_normal().generic_string()},
-                {"rank_options", options.rankOptions},
+                {"rank_options", rankOptions},
                 {"side_a", pointsJson(first.candidates)},
                 {"side_b", pointsJson(second.candidates)},
                 {"rank_result", matrix.metadata},
@@ -2573,12 +2905,51 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             matrices.push_back(std::move(matrix));
         }
         report.rankJobsRequested = missingTerms.size();
+        std::cerr << "[atlas-snap] writing rank cache="
+                  << cachePath.string()
+                  << " entries=" << cache["entries"].size()
+                  << std::endl;
         writeJsonFile(cachePath, cache);
     }
 
+    std::unordered_set<std::string> nonZeroMatrixIds;
+    for (const auto& matrix : matrices) {
+        if (matrixHasNonZeroContribution(matrix)) {
+            nonZeroMatrixIds.insert(matrix.id);
+        }
+    }
+    std::vector<uint8_t> scoredControls(problem.controls.size(), 0);
+    for (const auto& term : problem.terms) {
+        if (nonZeroMatrixIds.find(term.id) == nonZeroMatrixIds.end()) {
+            continue;
+        }
+        if (term.firstControl < scoredControls.size()) {
+            scoredControls[term.firstControl] = 1;
+        }
+        if (term.secondControl < scoredControls.size()) {
+            scoredControls[term.secondControl] = 1;
+        }
+    }
+    for (size_t i = 0; i < problem.controls.size(); ++i) {
+        const auto& control = problem.controls[i];
+        if (!control.fixed && control.candidates.size() > 1 && !scoredControls[i]) {
+            ++report.unscoredVariableControls;
+        }
+    }
+
+    std::cerr << "[atlas-snap] running discrete optimizer"
+              << " matrices=" << matrices.size()
+              << " successful_terms=" << report.successfulPairTerms
+              << " zero_contribution_terms=" << report.zeroContributionTerms
+              << " skipped_terms=" << report.skippedPairTerms
+              << " unscored_variables=" << report.unscoredVariableControls
+              << std::endl;
     const AtlasSnapOptimizationResult optimized =
         optimizeAtlasSnapCandidates(problem, matrices, options);
     report.objective = optimized.objective;
+    std::cerr << "[atlas-snap] discrete optimizer finished"
+              << " objective=" << report.objective
+              << std::endl;
 
     std::unordered_map<std::string, AtlasPredSnapSet*> mutableSets;
     for (auto& [key, set] : setsByFiber) {
@@ -2604,6 +2975,10 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             pointIt->selectedCandidateIndex.reset();
             continue;
         }
+        if (!control.fixed && control.candidates.size() > 1 &&
+            controlIndex < scoredControls.size() && !scoredControls[controlIndex]) {
+            continue;
+        }
         const size_t selected = controlIndex < optimized.selectedCandidateIndices.size()
             ? std::min(optimized.selectedCandidateIndices[controlIndex],
                        control.candidates.size() - 1)
@@ -2619,6 +2994,9 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
     }
     for (const auto& [key, set] : setsByFiber) {
         (void)key;
+        std::cerr << "[atlas-snap] saving pred snap attachment="
+                  << atlasPredSnapAttachmentPath(atlasDir, set.fiberPath).string()
+                  << std::endl;
         saveAtlasPredSnapSet(atlasPredSnapAttachmentPath(atlasDir, set.fiberPath), set);
     }
     return report;

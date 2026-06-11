@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -430,22 +431,10 @@ void writeDebugArtifacts(
         }
         options.sourceDepth = static_cast<int>(sourceDepth);
     }
-    if (raw.contains("adaptive_start_lambda") && !raw["adaptive_start_lambda"].is_null()) {
-        options.adaptiveStartLambda = requireFiniteDouble(raw["adaptive_start_lambda"], "adaptive_start_lambda");
-        if (options.adaptiveStartLambda <= 0.0) {
-            throw std::invalid_argument("adaptive_start_lambda must be positive");
-        }
-    }
-    if (raw.contains("solver_tolerance") && !raw["solver_tolerance"].is_null()) {
-        options.solverTolerance = requireFiniteDouble(raw["solver_tolerance"], "solver_tolerance");
-        if (options.solverTolerance <= 0.0) {
-            throw std::invalid_argument("solver_tolerance must be positive");
-        }
-    }
-    if (raw.contains("confidence_factor") && !raw["confidence_factor"].is_null()) {
-        options.confidenceFactor = requireFiniteDouble(raw["confidence_factor"], "confidence_factor");
-        if (options.confidenceFactor <= 0.0) {
-            throw std::invalid_argument("confidence_factor must be positive");
+    for (const char* key : {"adaptive_start_lambda", "solver_tolerance", "confidence_factor"}) {
+        if (raw.contains(key)) {
+            throw std::invalid_argument(
+                std::string(key) + " is server-owned and must not be supplied");
         }
     }
     if (raw.contains("amgx_config") && !raw["amgx_config"].is_null()) {
@@ -580,6 +569,54 @@ void writeDebugArtifacts(
     };
 }
 
+[[nodiscard]] std::string rankResultErrorCode(const nlohmann::json& result)
+{
+    if (result.contains("error") && result["error"].is_object()) {
+        return result["error"].value("code", std::string{});
+    }
+    return {};
+}
+
+void logRankJobProgress(size_t index,
+                        size_t count,
+                        const nlohmann::json& result,
+                        double elapsedSeconds)
+{
+    std::cerr << "[fit-service] /laplace/rank pair "
+              << (index + 1) << "/" << count
+              << " id=" << result.value("id", std::string{"<missing>"})
+              << " status=" << result.value("status", std::string{"<missing>"});
+    const std::string code = rankResultErrorCode(result);
+    if (!code.empty()) {
+        std::cerr << " code=" << code;
+    }
+    if (result.contains("graph") && result["graph"].is_object()) {
+        const auto& graph = result["graph"];
+        if (graph.contains("graph_nodes") && graph["graph_nodes"].is_number_unsigned()) {
+            std::cerr << " nodes=" << graph["graph_nodes"].get<uint64_t>();
+        }
+        if (graph.contains("passable_voxels") && graph["passable_voxels"].is_number_unsigned()) {
+            std::cerr << " passable=" << graph["passable_voxels"].get<uint64_t>();
+        }
+    }
+    if (result.contains("selected_lambda") && result["selected_lambda"].is_number()) {
+        std::cerr << " lambda=" << result["selected_lambda"].get<double>();
+    } else if (result.contains("rejected_lambda") && result["rejected_lambda"].is_number()) {
+        std::cerr << " rejected_lambda=" << result["rejected_lambda"].get<double>();
+    }
+    if (result.contains("max_abs_value") && result["max_abs_value"].is_number()) {
+        std::cerr << " max_abs=" << result["max_abs_value"].get<double>();
+    }
+    if (result.contains("solve_seconds_total") &&
+        result["solve_seconds_total"].is_number()) {
+        std::cerr << " solve_s=" << result["solve_seconds_total"].get<double>();
+    }
+    if (result.contains("debug_dir") && result["debug_dir"].is_string()) {
+        std::cerr << " debug_dir=" << result["debug_dir"].get<std::string>();
+    }
+    std::cerr << " elapsed_s=" << elapsedSeconds << std::endl;
+}
+
 [[nodiscard]] bool isAmgxRuntimeUnavailable(std::string_view message)
 {
     return message.find("AMGX_") != std::string_view::npos ||
@@ -671,12 +708,21 @@ void addResolvedContext(
         return out;
     }
     if (!laplaceRankAccepted(selected, confidenceFloor)) {
+        std::ostringstream message;
+        message << "adaptive lambda search found no accepted value"
+                << "; selected_status=" << (selected.status.empty() ? "<empty>" : selected.status)
+                << "; selected_lambda=" << selected.lambda
+                << "; max_abs_value=" << selected.maxAbsValue
+                << "; confidence_floor=" << confidenceFloor
+                << "; solved=" << (selected.solved ? "true" : "false");
         auto out = errorResult(
             job,
             "no_accepted_lambda",
-            selected.status.empty() ? "adaptive lambda search found no accepted value"
-                                    : selected.status);
+            message.str());
         out["selected_lambda"] = nullptr;
+        out["rejected_lambda"] = selected.lambda;
+        out["max_abs_value"] = selected.maxAbsValue;
+        out["solve_seconds_total"] = selected.solveSecondsTotal;
         addResolvedContext(out, job, report, roles, confidenceFloor);
         if (!debugJobDir.empty()) {
             out["debug_dir"] = debugJobDir.string();
@@ -824,15 +870,42 @@ nlohmann::json rankSnapPairsJson(const nlohmann::json& request)
     const auto jobs = parseJobs(request);
 
     nlohmann::json results = nlohmann::json::array();
+    std::cerr << "[fit-service] /laplace/rank batch start"
+              << " request_id=" << options.requestId
+              << " jobs=" << jobs.size()
+              << " manifest=" << manifestPath.string()
+              << " threshold=" << static_cast<int>(options.threshold)
+              << " margin_base_voxels=" << options.marginBaseVoxels
+              << " source_depth=" << options.sourceDepth
+              << " adaptive_start_lambda=" << options.adaptiveStartLambda
+              << " confidence_floor=" << (options.solverTolerance * options.confidenceFactor)
+              << " debug_dir="
+              << (options.debugDir.empty() ? std::string{"<none>"} : options.debugDir.string())
+              << std::endl;
+    const auto batchStart = std::chrono::steady_clock::now();
     for (size_t i = 0; i < jobs.size(); ++i) {
+        const auto jobStart = std::chrono::steady_clock::now();
+        nlohmann::json result;
         try {
-            results.push_back(rankJob(manifestPath, jobs[i], options, i));
+            result = rankJob(manifestPath, jobs[i], options, i);
         } catch (const std::exception& e) {
-            results.push_back(errorResult(jobs[i], "rank_failed", e.what()));
+            result = errorResult(jobs[i], "rank_failed", e.what());
         }
+        const double elapsedSeconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - jobStart).count();
+        logRankJobProgress(i, jobs.size(), result, elapsedSeconds);
+        results.push_back(std::move(result));
     }
+    const double batchSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - batchStart).count();
+    std::cerr << "[fit-service] /laplace/rank batch finished"
+              << " request_id=" << options.requestId
+              << " jobs=" << jobs.size()
+              << " elapsed_s=" << batchSeconds
+              << std::endl;
     return {
         {"results", results},
+        {"options", optionsJson(options)},
         {"request_id", options.requestId},
     };
 }

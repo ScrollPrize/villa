@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace vc::lasagna {
@@ -62,6 +63,37 @@ void checkDirectedEdges(uint64_t value)
 [[nodiscard]] int64_t clampInt64(int64_t value, int64_t lo, int64_t hi)
 {
     return std::min(std::max(value, lo), hi);
+}
+
+[[nodiscard]] std::string pointString(const MaxflowDouble3& point)
+{
+    std::ostringstream out;
+    out << '(' << point.x << ", " << point.y << ", " << point.z << ')';
+    return out.str();
+}
+
+[[nodiscard]] std::string intPointString(const MaxflowInt3& point)
+{
+    std::ostringstream out;
+    out << '(' << point.x << ", " << point.y << ", " << point.z << ')';
+    return out.str();
+}
+
+[[nodiscard]] std::string boxString(const MaxflowBox3& box)
+{
+    std::ostringstream out;
+    out << '[' << intPointString(box.begin) << " -> " << intPointString(box.end) << ')';
+    return out.str();
+}
+
+[[nodiscard]] std::string shapeString(const std::array<size_t, 3>& shapeZYX)
+{
+    std::ostringstream out;
+    out << "(z=" << shapeZYX[0]
+        << ", y=" << shapeZYX[1]
+        << ", x=" << shapeZYX[2]
+        << ')';
+    return out.str();
 }
 
 [[nodiscard]] MaxflowBox3 baseCropForShape(
@@ -413,7 +445,7 @@ MaxflowPredDtVolume loadPredDtPassability(
                                 throw std::runtime_error("Lasagna pred_dt chunk is smaller than expected");
                             }
                             const size_t dst = ((z - z0) * cropY + (y - y0)) * cropX + (x - x0);
-                            const bool passable = static_cast<uint8_t>((*chunk)[src]) > options.threshold;
+                            const bool passable = static_cast<uint8_t>((*chunk)[src]) >= options.threshold;
                             volume.passable[dst] = passable ? 1 : 0;
                             volume.passableVoxels += passable ? 1U : 0U;
                         }
@@ -495,7 +527,16 @@ MaxflowTerminal findNearestPassableNode(
         }
     }
     if (best.node < 0) {
-        throw std::runtime_error("pred_dt crop contains no passable voxels");
+        std::ostringstream message;
+        message << "pred_dt crop contains no passable voxels"
+                << "; point_base_xyz=" << pointString(pointBase)
+                << "; pred_dt_spacing_base=" << predDtSpacingBase
+                << "; initial_pred_voxel_xyz=" << intPointString(pred)
+                << "; local_pred_voxel_xyz=" << intPointString({localX, localY, localZ})
+                << "; crop_pred_xyz=" << boxString(cropPredXYZ)
+                << "; crop_shape_zyx=" << shapeString(shapeZYX)
+                << "; passable_buffer_voxels=" << passableZYX.size();
+        throw std::runtime_error(message.str());
     }
     return best;
 }

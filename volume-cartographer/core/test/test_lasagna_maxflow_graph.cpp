@@ -6,6 +6,8 @@
 #include "vc/lasagna/LaplaceRank.hpp"
 #include "vc/lasagna/MaxflowGraph.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <cmath>
 #include <string>
@@ -334,6 +336,24 @@ TEST_CASE("Laplace snap ranking accepts a pair-set by max absolute matrix value"
     accepted.values.push_back(-2.5e-6);
     accepted.maxAbsValue = 2.5e-6;
     CHECK(vc::lasagna::laplaceRankAccepted(accepted, 1.0e-6));
+}
+
+TEST_CASE("Laplace snap ranking rejects client-owned lambda search options")
+{
+    const nlohmann::json request = {
+        {"manifest", "missing.lasagna.json"},
+        {"jobs", nlohmann::json::array()},
+        {"options", {
+            {"threshold", 110},
+            {"margin_base_voxels", 1000},
+            {"source_depth", 0},
+            {"adaptive_start_lambda", 1.0 / 2048.0},
+        }},
+    };
+    CHECK_THROWS_WITH_AS(
+        vc::lasagna::rankSnapPairsJson(request),
+        doctest::Contains("adaptive_start_lambda is server-owned"),
+        std::invalid_argument);
 }
 
 TEST_CASE("Laplace snap ranking selects one synchronized lambda per pair-set")

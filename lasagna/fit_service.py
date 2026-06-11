@@ -172,6 +172,9 @@ class _LaplaceRankUnavailable(RuntimeError):
     pass
 
 
+_DEFAULT_LAPLACE_RANK_DEBUG_DIR = Path("laplace_rank_debug") / "atlas_snap"
+
+
 def _validate_laplace_rank_point(value: Any, label: str) -> None:
     if not isinstance(value, list) or len(value) != 3:
         raise ValueError(f"{label} point must be [x, y, z]")
@@ -211,6 +214,45 @@ def _validate_laplace_rank_request(body: Any) -> dict[str, Any]:
     return body
 
 
+def _resolve_laplace_rank_manifest(manifest: str) -> str:
+    """Resolve rank manifests using the same service dataset model as /datasets."""
+    path = Path(manifest)
+    if path.exists():
+        return str(path)
+    if _data_dir:
+        data_dir = Path(_data_dir)
+        candidates: list[Path] = []
+        if path.is_absolute():
+            candidates.append(data_dir / path.name)
+        else:
+            candidates.append(data_dir / path)
+            candidates.append(data_dir / path.name)
+        for candidate in candidates:
+            if candidate.exists():
+                resolved = str(candidate.resolve())
+                print(
+                    f"[fit-service] /laplace/rank resolved manifest {manifest!r} -> {resolved!r}",
+                    flush=True,
+                )
+                return resolved
+    return manifest
+
+
+def _resolve_laplace_rank_debug_dir(options: Any) -> Any:
+    updated = dict(options) if isinstance(options, dict) else {}
+    debug_dir = updated.get("debug_dir")
+    if not isinstance(debug_dir, str) or not debug_dir.strip():
+        debug_dir = str(_DEFAULT_LAPLACE_RANK_DEBUG_DIR)
+    path = Path(debug_dir)
+    resolved = str(path if path.is_absolute() else (Path.cwd() / path).resolve())
+    updated["debug_dir"] = resolved
+    print(
+        f"[fit-service] /laplace/rank debug_dir {debug_dir!r} -> {resolved!r}",
+        flush=True,
+    )
+    return updated
+
+
 def _rank_laplace_snap_pairs(body: dict[str, Any]) -> dict[str, Any]:
     try:
         module = importlib.import_module("vc_lasagna_amgx")
@@ -231,6 +273,9 @@ def _handle_laplace_rank_body(raw_body: Any) -> tuple[int, dict[str, Any]]:
     except Exception as exc:
         return 400, {"error": f"bad json: {exc}"}
     try:
+        body = dict(body)
+        body["manifest"] = _resolve_laplace_rank_manifest(body["manifest"])
+        body["options"] = _resolve_laplace_rank_debug_dir(body.get("options", {}))
         return 200, _rank_laplace_snap_pairs(body)
     except _LaplaceRankUnavailable as exc:
         return 503, {

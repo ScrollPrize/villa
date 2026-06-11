@@ -3,6 +3,7 @@ import threading
 import tempfile
 import unittest
 import io
+import os
 import types
 from unittest import mock
 
@@ -89,6 +90,96 @@ class FitServiceQueueTest(unittest.TestCase):
 		module.rank_snap_pairs.assert_called_once_with(request)
 		self.assertEqual(body["results"], binding_response["results"])
 		self.assertNotIn("ratios", body["results"][0])
+
+	def test_laplace_rank_resolves_relative_debug_dir_against_server_cwd(self):
+		request = {
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+			"options": {"debug_dir": "laplace_rank_debug/atlas_snap"},
+		}
+		module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
+		old_cwd = os.getcwd()
+		with tempfile.TemporaryDirectory() as td:
+			try:
+				os.chdir(td)
+				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+					status, _body = fit_service._handle_laplace_rank_body(request)
+			finally:
+				os.chdir(old_cwd)
+
+		self.assertEqual(status, 200)
+		sent = module.rank_snap_pairs.call_args.args[0]
+		self.assertEqual(
+			sent["options"]["debug_dir"],
+			str((fit_service.Path(td) / "laplace_rank_debug" / "atlas_snap").resolve()),
+		)
+
+	def test_laplace_rank_defaults_debug_dir_to_server_cwd(self):
+		request = {
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+			"options": {},
+		}
+		module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
+		old_cwd = os.getcwd()
+		with tempfile.TemporaryDirectory() as td:
+			try:
+				os.chdir(td)
+				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+					status, _body = fit_service._handle_laplace_rank_body(request)
+			finally:
+				os.chdir(old_cwd)
+
+		self.assertEqual(status, 200)
+		sent = module.rank_snap_pairs.call_args.args[0]
+		self.assertEqual(
+			sent["options"]["debug_dir"],
+			str((fit_service.Path(td) / "laplace_rank_debug" / "atlas_snap").resolve()),
+		)
+
+	def test_laplace_rank_resolves_relative_manifest_against_data_dir(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_data_dir = fit_service._data_dir
+			fit_service._data_dir = td
+			try:
+				manifest = fit_service.Path(td) / "data.lasagna.json"
+				manifest.write_text("{}", encoding="utf-8")
+				request = {
+					"manifest": "data.lasagna.json",
+					"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+				}
+				module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
+				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+					status, _body = fit_service._handle_laplace_rank_body(request)
+
+				self.assertEqual(status, 200)
+				sent = module.rank_snap_pairs.call_args.args[0]
+				self.assertEqual(sent["manifest"], str(manifest.resolve()))
+				self.assertEqual(request["manifest"], "data.lasagna.json")
+			finally:
+				fit_service._data_dir = old_data_dir
+
+	def test_laplace_rank_recovers_client_absolute_manifest_with_data_dir_basename(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_data_dir = fit_service._data_dir
+			fit_service._data_dir = td
+			try:
+				manifest = fit_service.Path(td) / "data.lasagna.json"
+				manifest.write_text("{}", encoding="utf-8")
+				request = {
+					"manifest": "/client/only/path/data.lasagna.json",
+					"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+				}
+				module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
+				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+					status, _body = fit_service._handle_laplace_rank_body(request)
+
+				self.assertEqual(status, 200)
+				sent = module.rank_snap_pairs.call_args.args[0]
+				self.assertEqual(sent["manifest"], str(manifest.resolve()))
+				self.assertEqual(request["manifest"], "/client/only/path/data.lasagna.json")
+			finally:
+				fit_service._data_dir = old_data_dir
 
 	def test_enqueue_body_reports_requested_output_name(self):
 		queue = fit_service._JobQueue()

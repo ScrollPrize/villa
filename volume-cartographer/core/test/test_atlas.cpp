@@ -532,11 +532,34 @@ TEST_CASE("Atlas pred-snap candidate generation returns first hits and deduplica
     CHECK(deduped[0].point[0] == doctest::Approx(0.0));
 }
 
+TEST_CASE("Atlas pred-snap candidate threshold is configurable")
+{
+    const cv::Vec3d control{0.0, 0.0, 0.0};
+    const cv::Vec3d normal{1.0, 0.0, 0.0};
+    auto sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
+        return x >= 0.20 ? 114.0 : 80.0;
+    });
+
+    sampling.predDtThreshold = 110.0;
+    auto candidates = vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates[0].point[0] == doctest::Approx(0.20).epsilon(0.05));
+
+    sampling.predDtThreshold = 120.0;
+    candidates = vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
+    CHECK(candidates.empty());
+}
+
 TEST_CASE("Atlas snap rank cache keys track candidates and options")
 {
     const std::vector<cv::Vec3d> a{{1.0, 2.0, 3.0}};
     const std::vector<cv::Vec3d> b{{4.0, 5.0, 6.0}};
-    const nlohmann::json options = {{"threshold", 165}, {"solver_tolerance", 1.0e-6}};
+    const nlohmann::json options = {
+        {"threshold", 110},
+        {"margin_base_voxels", 1000},
+        {"source_depth", 0},
+        {"amgx_config", nullptr},
+    };
     const std::string key1 =
         vc::atlas::atlasSnapRankTermCacheKey("dataset.lasagna.json", options, a, b);
     const std::string key2 =
@@ -551,10 +574,50 @@ TEST_CASE("Atlas snap rank cache keys track candidates and options")
     const std::string key4 =
         vc::atlas::atlasSnapRankTermCacheKey(
             "dataset.lasagna.json",
-            nlohmann::json{{"threshold", 166}, {"solver_tolerance", 1.0e-6}},
+            nlohmann::json{
+                {"threshold", 111},
+                {"margin_base_voxels", 1000},
+                {"source_depth", 0},
+                {"amgx_config", nullptr},
+            },
             a,
             b);
     CHECK(key1 != key4);
+}
+
+TEST_CASE("Atlas optimization adds adjacent control terms along fibers")
+{
+    vc::atlas::Atlas atlas;
+    vc::atlas::FiberMapping mapping;
+    mapping.fiberPath = fs::path("fibers") / "a.json";
+    mapping.controlAnchors.push_back({10, {10.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    mapping.controlAnchors.push_back({30, {30.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    mapping.controlAnchors.push_back({50, {50.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    mapping.controlAnchors.push_back({70, {70.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    atlas.fibers = {mapping};
+
+    vc::atlas::AtlasPredSnapSet set;
+    set.fiberPath = mapping.fiberPath;
+    for (const auto& anchor : mapping.controlAnchors) {
+        vc::atlas::AtlasPredSnapPoint point;
+        point.fiberPath = mapping.fiberPath;
+        point.controlPoint = anchor.world;
+        point.predSnapPoint = anchor.world;
+        point.candidates.push_back({anchor.world, std::nullopt, std::nullopt, std::nullopt});
+        set.points.push_back(point);
+    }
+    std::unordered_map<std::string, vc::atlas::AtlasPredSnapSet> sets;
+    sets.emplace(vc::atlas::atlasFiberPathKey(mapping.fiberPath), std::move(set));
+
+    const auto problem = vc::atlas::buildAtlasSnapOptimizationProblem(atlas, sets);
+    CHECK(problem.controls.size() == 4);
+    REQUIRE(problem.terms.size() == 3);
+    CHECK(problem.terms[0].firstControl == 0);
+    CHECK(problem.terms[0].secondControl == 1);
+    CHECK(problem.terms[1].firstControl == 1);
+    CHECK(problem.terms[1].secondControl == 2);
+    CHECK(problem.terms[2].firstControl == 2);
+    CHECK(problem.terms[2].secondControl == 3);
 }
 
 TEST_CASE("Atlas link expansion creates six pair terms for four bracketing controls")
@@ -621,6 +684,29 @@ TEST_CASE("Atlas snap optimizer maximizes normalized pair scores and respects fi
     CHECK(result.objective == doctest::Approx(1.5));
 }
 
+TEST_CASE("Atlas snap pair rank no-accepted-lambda becomes zero contribution")
+{
+    const vc::atlas::AtlasSnapPairTerm term{"ab", 0, 1};
+    const nlohmann::json result = {
+        {"id", "ab"},
+        {"status", "error"},
+        {"error", {
+            {"code", "no_accepted_lambda"},
+            {"message", "adaptive lambda search found no accepted value"},
+        }},
+    };
+
+    const auto matrix =
+        vc::atlas::atlasSnapPairMatrixFromRankResult(term, 2, 1, result);
+    REQUIRE(matrix.rawValues.size() == 2);
+    REQUIRE(matrix.normalizedValues.size() == 2);
+    CHECK(matrix.rawValues[0][0] == doctest::Approx(0.0));
+    CHECK(matrix.rawValues[1][0] == doctest::Approx(0.0));
+    CHECK(matrix.normalizedValues[0][0] == doctest::Approx(0.0));
+    CHECK(matrix.normalizedValues[1][0] == doctest::Approx(0.0));
+    CHECK(matrix.metadata.value("zero_contribution", false));
+}
+
 TEST_CASE("Atlas base normal orientation uses central ring perimeter")
 {
     auto inwardWoundCylinder = makeWrappedCylinder(9, 32, 10.0, true);
@@ -672,6 +758,12 @@ TEST_CASE("Atlas pred-snap attachments are coordinate keyed and ignore stale rec
     oldAutoNull.controlPoint = {4.0, 5.0, 6.0};
     oldAutoNull.source = vc::atlas::AtlasPredSnapSource::Auto;
     existing.points.push_back(oldAutoNull);
+    vc::atlas::AtlasPredSnapPoint oldAutoSelected;
+    oldAutoSelected.fiberPath = fiberPath;
+    oldAutoSelected.controlPoint = {7.0, 8.0, 9.0};
+    oldAutoSelected.predSnapPoint = cv::Vec3d{7.0, 8.0, 11.0};
+    oldAutoSelected.source = vc::atlas::AtlasPredSnapSource::Auto;
+    existing.points.push_back(oldAutoSelected);
 
     vc::atlas::AtlasPredSnapSet generated;
     generated.fiberPath = fiberPath;
@@ -685,21 +777,34 @@ TEST_CASE("Atlas pred-snap attachments are coordinate keyed and ignore stale rec
     added.controlPoint = {4.0, 5.0, 6.0};
     added.predSnapPoint = cv::Vec3d{4.0, 5.0, 7.0};
     generated.points.push_back(added);
+    vc::atlas::AtlasPredSnapPoint preservedAuto;
+    preservedAuto.fiberPath = fiberPath;
+    preservedAuto.controlPoint = oldAutoSelected.controlPoint;
+    preservedAuto.predSnapPoint = cv::Vec3d{7.0, 8.0, 10.0};
+    preservedAuto.candidates.push_back(
+        {cv::Vec3d{7.0, 8.0, 10.0}, std::nullopt, std::nullopt, std::nullopt});
+    preservedAuto.candidates.push_back(
+        {cv::Vec3d{7.0, 8.0, 11.0}, std::nullopt, std::nullopt, std::nullopt});
+    preservedAuto.selectedCandidateIndex = 0;
+    generated.points.push_back(preservedAuto);
 
     auto merged = vc::atlas::mergeAtlasPredSnapSetByControlPoint(std::move(existing), generated);
-    REQUIRE(merged.points.size() == 2);
+    REQUIRE(merged.points.size() == 3);
     CHECK(merged.points[0].source == vc::atlas::AtlasPredSnapSource::Manual);
     REQUIRE(merged.points[0].predSnapPoint.has_value());
     CHECK((*merged.points[0].predSnapPoint)[2] == doctest::Approx(4.0));
     CHECK(merged.points[1].controlPoint[0] == doctest::Approx(4.0));
     REQUIRE(merged.points[1].predSnapPoint.has_value());
     CHECK((*merged.points[1].predSnapPoint)[2] == doctest::Approx(7.0));
+    CHECK(merged.points[2].selectedCandidateIndex == 1);
+    REQUIRE(merged.points[2].predSnapPoint.has_value());
+    CHECK((*merged.points[2].predSnapPoint)[2] == doctest::Approx(11.0));
 
     const fs::path attachmentPath =
         vc::atlas::atlasPredSnapAttachmentPath(atlasDir, fiberPath);
     vc::atlas::saveAtlasPredSnapSet(attachmentPath, merged);
     const auto loaded = vc::atlas::loadAtlasPredSnapSet(attachmentPath);
-    REQUIRE(loaded.points.size() == 2);
+    REQUIRE(loaded.points.size() == 3);
     CHECK(loaded.fiberPath == fiberPath);
 
     const auto rootJson = nlohmann::json::parse(readText(attachmentPath));

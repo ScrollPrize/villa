@@ -194,6 +194,7 @@ struct AtlasPredSnapSampling {
     std::function<vc::lasagna::NormalSample(const cv::Vec3d&)> sampleNormal;
     std::function<std::optional<double>(const cv::Vec3d&)> samplePredDt;
     std::function<double(const cv::Vec3d&, const cv::Vec3d&, double)> windingDistance;
+    double predDtThreshold = 110.0;
     double predDtStepVx = 0.05;
     double outwardWindingLimit = 0.5;
     double inwardWindingLimit = 0.25;
@@ -240,15 +241,24 @@ struct AtlasSnapOptimizationResult {
 
 struct AtlasSnapOptimizeOptions {
     nlohmann::json rankOptions = nlohmann::json::object();
+    int predDtThreshold = 110;
     size_t exhaustiveAssignmentLimit = 1000000;
 };
 
 struct AtlasSnapOptimizeReport {
     size_t controls = 0;
+    size_t fixedControls = 0;
+    size_t manualControls = 0;
+    size_t singletonControls = 0;
+    size_t links = 0;
     size_t variableControls = 0;
+    size_t unscoredVariableControls = 0;
     size_t pairTerms = 0;
+    size_t skippedPairTerms = 0;
     size_t cacheHits = 0;
     size_t rankJobsRequested = 0;
+    size_t successfulPairTerms = 0;
+    size_t zeroContributionTerms = 0;
     double objective = 0.0;
 };
 
@@ -343,7 +353,7 @@ std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& base
                                                         int unwrapCount,
                                                         int startColumn = 0);
 
-bool atlasPredDtIsInside(double predDtValue);
+bool atlasPredDtIsInside(double predDtValue, double threshold = 110.0);
 std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
     const cv::Vec3d& controlPoint,
     const cv::Vec3d& alignedNormal,
