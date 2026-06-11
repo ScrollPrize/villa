@@ -30,7 +30,8 @@ void printUsage(const char* argv0)
               << "[--margin-base-voxels 1000] [--threshold 110] "
               << "[--run-ecl] [--runs N] [--terminal-flood-depth 10] "
               << "[--terminal-flood-capacity 1024] [--terminal-flood-decay 2] "
-              << "[--terminal-region-iterations 0] [--terminal-flood-sweep]\n";
+              << "[--terminal-region-iterations 0] [--terminal-flood-sweep] "
+              << "[--terminal-fringe-sweep]\n";
 }
 
 vc::lasagna::MaxflowDouble3 parsePoint(const std::string& value, const char* name)
@@ -153,6 +154,11 @@ struct TerminalFlood {
     int64_t totalShellCapacity = 0;
 };
 
+struct TerminalFringeRegions {
+    std::vector<uint8_t> sourceRegion;
+    std::vector<uint8_t> sinkRegion;
+};
+
 enum class FloodScheduleKind {
     Geometric,
     Linear
@@ -174,6 +180,12 @@ struct TerminalBoundary {
     std::vector<int32_t> frontier;
 };
 
+vc::lasagna::MaxflowGraph buildTerminalRegionGraph(
+    const vc::lasagna::MaxflowGraph& base,
+    const std::vector<uint8_t>& sourceRegion,
+    const std::vector<uint8_t>& sinkRegion,
+    int32_t terminalCapacity);
+
 uint64_t countRegionNodes(const std::vector<uint8_t>& region)
 {
     return static_cast<uint64_t>(std::count(region.begin(), region.end(), static_cast<uint8_t>(1)));
@@ -181,26 +193,21 @@ uint64_t countRegionNodes(const std::vector<uint8_t>& region)
 
 int32_t terminalEdgeCapacityForGraph(const vc::lasagna::MaxflowGraph& graph)
 {
-    std::vector<int64_t> incoming(static_cast<size_t>(graph.stats.graphNodes), 0);
-    int64_t maxIncident = 0;
+    int64_t totalCapacity = 0;
     for (uint64_t node = 0; node < graph.stats.graphNodes; ++node) {
-        int64_t outgoing = 0;
         for (uint64_t edge = graph.nindex[static_cast<size_t>(node)];
              edge < graph.nindex[static_cast<size_t>(node) + 1];
              ++edge) {
-            outgoing += graph.capacity[static_cast<size_t>(edge)];
-            incoming[static_cast<size_t>(graph.nlist[static_cast<size_t>(edge)])] +=
-                graph.capacity[static_cast<size_t>(edge)];
+            totalCapacity += graph.capacity[static_cast<size_t>(edge)];
         }
-        maxIncident = std::max(maxIncident, outgoing);
     }
-    for (const int64_t value : incoming) {
-        maxIncident = std::max(maxIncident, value);
+    const int64_t safeCap = std::min<int64_t>(
+        totalCapacity + 1,
+        std::numeric_limits<int32_t>::max() / 16);
+    if (safeCap <= 0) {
+        return 1;
     }
-    if (maxIncident >= static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
-        return std::numeric_limits<int32_t>::max();
-    }
-    return static_cast<int32_t>(std::max<int64_t>(1, maxIncident + 1));
+    return static_cast<int32_t>(safeCap);
 }
 
 int32_t geometricCapacity(int baseCapacity, double decay, int distance)
@@ -412,7 +419,7 @@ vc::lasagna::EclMaxflowResult runEclWithTerminalFlood(
         sinkNode,
         sourceFlood,
         sinkFlood,
-        std::numeric_limits<int32_t>::max() / 4);
+        terminalEdgeCapacityForGraph(graph));
     vc::lasagna::EclMaxflowOptions eclOptions;
     eclOptions.runs = runs;
     eclOptions.computeMinCut = false;
@@ -438,7 +445,7 @@ vc::lasagna::EclMaxflowResult runEclWithTerminalFloodSchedule(
         sinkNode,
         sourceFlood,
         sinkFlood,
-        std::numeric_limits<int32_t>::max() / 4);
+        terminalEdgeCapacityForGraph(graph));
     vc::lasagna::EclMaxflowOptions eclOptions;
     eclOptions.runs = runs;
     eclOptions.computeMinCut = false;
@@ -481,6 +488,158 @@ vc::lasagna::EclMaxflowResult runEclWithTerminalFloodScheduleQuiet(
     }
 }
 
+TerminalFringeRegions terminalFringeRegions(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    int maxDepth)
+{
+    if (sourceNode < 0 || sourceNode >= static_cast<int64_t>(graph.stats.graphNodes)) {
+        throw std::runtime_error("terminal fringe source is outside graph");
+    }
+    if (sinkNode < 0 || sinkNode >= static_cast<int64_t>(graph.stats.graphNodes)) {
+        throw std::runtime_error("terminal fringe sink is outside graph");
+    }
+    if (maxDepth < 0) {
+        throw std::runtime_error("terminal fringe depth must be non-negative");
+    }
+
+    TerminalFringeRegions regions;
+    const size_t nodeCount = static_cast<size_t>(graph.stats.graphNodes);
+    regions.sourceRegion.assign(nodeCount, 0);
+    regions.sinkRegion.assign(nodeCount, 0);
+    regions.sourceRegion[static_cast<size_t>(sourceNode)] = 1;
+    regions.sinkRegion[static_cast<size_t>(sinkNode)] = 1;
+
+    std::vector<int32_t> sourceFrontier{sourceNode};
+    std::vector<int32_t> sinkFrontier{sinkNode};
+    std::vector<uint8_t> sourceProposal(nodeCount, 0);
+    std::vector<uint8_t> sinkProposal(nodeCount, 0);
+
+    const auto collectProposals = [&graph](
+                                      const std::vector<int32_t>& frontier,
+                                      const std::vector<uint8_t>& ownRegion,
+                                      const std::vector<uint8_t>& otherRegion,
+                                      std::vector<uint8_t>& proposal,
+                                      std::vector<int32_t>& proposed) {
+        for (const int32_t node : frontier) {
+            if (otherRegion[static_cast<size_t>(node)] != 0) {
+                continue;
+            }
+            for (uint64_t edge = graph.nindex[static_cast<size_t>(node)];
+                 edge < graph.nindex[static_cast<size_t>(node) + 1];
+                 ++edge) {
+                const int32_t dst = graph.nlist[static_cast<size_t>(edge)];
+                const size_t dstIndex = static_cast<size_t>(dst);
+                if (ownRegion[dstIndex] == 0 && proposal[dstIndex] == 0) {
+                    proposal[dstIndex] = 1;
+                    proposed.push_back(dst);
+                }
+            }
+        }
+    };
+
+    for (int depth = 0; depth < maxDepth; ++depth) {
+        if (sourceFrontier.empty() && sinkFrontier.empty()) {
+            break;
+        }
+
+        std::vector<int32_t> sourceProposed;
+        std::vector<int32_t> sinkProposed;
+        collectProposals(
+            sourceFrontier,
+            regions.sourceRegion,
+            regions.sinkRegion,
+            sourceProposal,
+            sourceProposed);
+        collectProposals(
+            sinkFrontier,
+            regions.sinkRegion,
+            regions.sourceRegion,
+            sinkProposal,
+            sinkProposed);
+
+        for (const int32_t node : sourceProposed) {
+            regions.sourceRegion[static_cast<size_t>(node)] = 1;
+        }
+        for (const int32_t node : sinkProposed) {
+            regions.sinkRegion[static_cast<size_t>(node)] = 1;
+        }
+
+        std::vector<int32_t> nextSourceFrontier;
+        std::vector<int32_t> nextSinkFrontier;
+        for (const int32_t node : sourceProposed) {
+            if (regions.sinkRegion[static_cast<size_t>(node)] == 0) {
+                nextSourceFrontier.push_back(node);
+            }
+        }
+        for (const int32_t node : sinkProposed) {
+            if (regions.sourceRegion[static_cast<size_t>(node)] == 0) {
+                nextSinkFrontier.push_back(node);
+            }
+        }
+
+        sourceFrontier = std::move(nextSourceFrontier);
+        sinkFrontier = std::move(nextSinkFrontier);
+    }
+    return regions;
+}
+
+vc::lasagna::EclMaxflowResult runEclWithTerminalFringe(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    int runs,
+    int fringeDepth)
+{
+    const auto regions = terminalFringeRegions(graph, sourceNode, sinkNode, fringeDepth);
+    const auto terminalGraph = buildTerminalRegionGraph(
+        graph,
+        regions.sourceRegion,
+        regions.sinkRegion,
+        1);
+    vc::lasagna::EclMaxflowOptions eclOptions;
+    eclOptions.runs = runs;
+    eclOptions.computeMinCut = false;
+    return vc::lasagna::runEclMaxflow(
+        terminalGraph,
+        static_cast<int32_t>(graph.stats.graphNodes),
+        static_cast<int32_t>(graph.stats.graphNodes + 1),
+        eclOptions);
+}
+
+vc::lasagna::EclMaxflowResult runEclWithTerminalFringeQuiet(
+    const vc::lasagna::MaxflowGraph& graph,
+    int32_t sourceNode,
+    int32_t sinkNode,
+    int runs,
+    int fringeDepth)
+{
+    std::fflush(stdout);
+    const int savedStdout = dup(STDOUT_FILENO);
+    const int devNull = open("/dev/null", O_WRONLY);
+    if (savedStdout < 0 || devNull < 0) {
+        if (savedStdout >= 0) close(savedStdout);
+        if (devNull >= 0) close(devNull);
+        return runEclWithTerminalFringe(graph, sourceNode, sinkNode, runs, fringeDepth);
+    }
+    dup2(devNull, STDOUT_FILENO);
+    close(devNull);
+
+    try {
+        auto result = runEclWithTerminalFringe(graph, sourceNode, sinkNode, runs, fringeDepth);
+        std::fflush(stdout);
+        dup2(savedStdout, STDOUT_FILENO);
+        close(savedStdout);
+        return result;
+    } catch (...) {
+        std::fflush(stdout);
+        dup2(savedStdout, STDOUT_FILENO);
+        close(savedStdout);
+        throw;
+    }
+}
+
 std::vector<FloodSchedule> makeFloodSweepSchedules()
 {
     const std::vector<int> starts{128, 256, 512, 1024};
@@ -501,6 +660,29 @@ std::vector<FloodSchedule> makeFloodSweepSchedules()
             schedule.label = label.str();
             schedules.push_back(std::move(schedule));
         }
+        for (int step : linearSteps) {
+            FloodSchedule schedule;
+            schedule.kind = FloodScheduleKind::Linear;
+            schedule.startCapacity = start;
+            schedule.step = step;
+            schedule.maxDepth = depthUntilOneLinear(start, step);
+            std::ostringstream label;
+            label << "linear start=" << start << " step=" << step
+                  << " depth=" << schedule.maxDepth;
+            schedule.label = label.str();
+            schedules.push_back(std::move(schedule));
+        }
+    }
+    return schedules;
+}
+
+std::vector<FloodSchedule> makeLinearSweepSchedules()
+{
+    const std::vector<int> starts{128, 256, 512, 1024};
+    const std::vector<int> linearSteps{1, 4, 16};
+
+    std::vector<FloodSchedule> schedules;
+    for (int start : starts) {
         for (int step : linearSteps) {
             FloodSchedule schedule;
             schedule.kind = FloodScheduleKind::Linear;
@@ -758,6 +940,7 @@ int main(int argc, char** argv)
         int terminalFloodDecay = 2;
         uint64_t terminalRegionIterations = 0;
         bool terminalFloodSweep = false;
+        bool terminalFringeSweep = false;
 
         manifestPath = argv[1];
         for (int i = 2; i < argc; ++i) {
@@ -808,6 +991,8 @@ int main(int argc, char** argv)
                     "terminal-region-iterations"));
             } else if (arg == "--terminal-flood-sweep") {
                 terminalFloodSweep = true;
+            } else if (arg == "--terminal-fringe-sweep") {
+                terminalFringeSweep = true;
             } else if (arg == "--help" || arg == "-h") {
                 printUsage(argv[0]);
                 return 0;
@@ -936,6 +1121,127 @@ int main(int argc, char** argv)
                         for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
                             std::cout << std::setw(12)
                                       << ratioString(flows[sourceIndex][0], flows[sourceIndex][1]);
+                        }
+                    }
+                    std::cout << '\n';
+                }
+                return 0;
+            }
+
+            if (terminalFringeSweep) {
+                const auto schedules = makeLinearSweepSchedules();
+                std::cout << "ECL-MaxFlow linear flood vs hard fringe sweep results:\n";
+                std::cout << "  available: " << (vc::lasagna::eclMaxflowAvailable() ? "yes" : "no") << '\n';
+                std::cout << "  schedules: " << schedules.size() << '\n';
+
+                std::cout << std::left
+                          << std::setw(8) << "start"
+                          << std::setw(8) << "step"
+                          << std::setw(8) << "depth";
+                for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                    for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                        std::ostringstream col;
+                        col << "lin_s" << sourceIndex << "_t" << sinkIndex;
+                        std::cout << std::setw(14) << col.str();
+                    }
+                }
+                if (report.sinks.size() >= 2) {
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        std::ostringstream col;
+                        col << "lin_s" << sourceIndex << "_t0/t1";
+                        std::cout << std::setw(14) << col.str();
+                    }
+                }
+                for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                    for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                        std::ostringstream col;
+                        col << "fr_s" << sourceIndex << "_t" << sinkIndex;
+                        std::cout << std::setw(14) << col.str();
+                    }
+                }
+                if (report.sinks.size() >= 2) {
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        std::ostringstream col;
+                        col << "fr_s" << sourceIndex << "_t0/t1";
+                        std::cout << std::setw(14) << col.str();
+                    }
+                }
+                std::cout << '\n';
+
+                for (const auto& schedule : schedules) {
+                    std::vector<std::vector<int64_t>> linearFlows(
+                        report.sources.size(),
+                        std::vector<int64_t>(report.sinks.size(), 0));
+                    std::vector<std::vector<int64_t>> fringeFlows(
+                        report.sources.size(),
+                        std::vector<int64_t>(report.sinks.size(), 0));
+                    std::vector<std::vector<std::string>> linearCells(
+                        report.sources.size(),
+                        std::vector<std::string>(report.sinks.size()));
+                    std::vector<std::vector<std::string>> fringeCells(
+                        report.sources.size(),
+                        std::vector<std::string>(report.sinks.size()));
+
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                            const int32_t sourceNode = report.sources[sourceIndex].node;
+                            const int32_t sinkNode = report.sinks[sinkIndex].node;
+                            if (sourceNode == sinkNode) {
+                                linearCells[sourceIndex][sinkIndex] = "skip";
+                                fringeCells[sourceIndex][sinkIndex] = "skip";
+                                continue;
+                            }
+                            try {
+                                const auto flow = runEclWithTerminalFloodScheduleQuiet(
+                                    graph,
+                                    sourceNode,
+                                    sinkNode,
+                                    runs,
+                                    schedule);
+                                linearFlows[sourceIndex][sinkIndex] = flow.maxFlow;
+                                linearCells[sourceIndex][sinkIndex] = std::to_string(flow.maxFlow);
+                            } catch (const std::exception&) {
+                                linearCells[sourceIndex][sinkIndex] = "error";
+                            }
+                            try {
+                                const auto flow = runEclWithTerminalFringeQuiet(
+                                    graph,
+                                    sourceNode,
+                                    sinkNode,
+                                    runs,
+                                    schedule.maxDepth);
+                                fringeFlows[sourceIndex][sinkIndex] = flow.maxFlow;
+                                fringeCells[sourceIndex][sinkIndex] = std::to_string(flow.maxFlow);
+                            } catch (const std::exception&) {
+                                fringeCells[sourceIndex][sinkIndex] = "error";
+                            }
+                        }
+                    }
+
+                    std::cout << std::left
+                              << std::setw(8) << schedule.startCapacity
+                              << std::setw(8) << schedule.step
+                              << std::setw(8) << schedule.maxDepth;
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                            std::cout << std::setw(14) << linearCells[sourceIndex][sinkIndex];
+                        }
+                    }
+                    if (report.sinks.size() >= 2) {
+                        for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                            std::cout << std::setw(14)
+                                      << ratioString(linearFlows[sourceIndex][0], linearFlows[sourceIndex][1]);
+                        }
+                    }
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                            std::cout << std::setw(14) << fringeCells[sourceIndex][sinkIndex];
+                        }
+                    }
+                    if (report.sinks.size() >= 2) {
+                        for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                            std::cout << std::setw(14)
+                                      << ratioString(fringeFlows[sourceIndex][0], fringeFlows[sourceIndex][1]);
                         }
                     }
                     std::cout << '\n';
