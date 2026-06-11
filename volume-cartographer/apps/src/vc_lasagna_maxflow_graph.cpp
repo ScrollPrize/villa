@@ -157,6 +157,15 @@ struct TerminalFlood {
 struct TerminalFringeRegions {
     std::vector<uint8_t> sourceRegion;
     std::vector<uint8_t> sinkRegion;
+    bool saturated = false;
+    int saturationDepth = -1;
+    int appliedDepth = 0;
+};
+
+struct TerminalFringeStats {
+    bool saturated = false;
+    int saturationDepth = -1;
+    int appliedDepth = 0;
 };
 
 enum class FloodScheduleKind {
@@ -522,8 +531,10 @@ TerminalFringeRegions terminalFringeRegions(
                                       const std::vector<uint8_t>& otherRegion,
                                       std::vector<uint8_t>& proposal,
                                       std::vector<int32_t>& proposed) {
+        bool touchesOther = false;
         for (const int32_t node : frontier) {
             if (otherRegion[static_cast<size_t>(node)] != 0) {
+                touchesOther = true;
                 continue;
             }
             for (uint64_t edge = graph.nindex[static_cast<size_t>(node)];
@@ -531,12 +542,17 @@ TerminalFringeRegions terminalFringeRegions(
                  ++edge) {
                 const int32_t dst = graph.nlist[static_cast<size_t>(edge)];
                 const size_t dstIndex = static_cast<size_t>(dst);
+                if (otherRegion[dstIndex] != 0) {
+                    touchesOther = true;
+                    continue;
+                }
                 if (ownRegion[dstIndex] == 0 && proposal[dstIndex] == 0) {
                     proposal[dstIndex] = 1;
                     proposed.push_back(dst);
                 }
             }
         }
+        return touchesOther;
     };
 
     for (int depth = 0; depth < maxDepth; ++depth) {
@@ -546,24 +562,45 @@ TerminalFringeRegions terminalFringeRegions(
 
         std::vector<int32_t> sourceProposed;
         std::vector<int32_t> sinkProposed;
-        collectProposals(
+        bool touchesOther = collectProposals(
             sourceFrontier,
             regions.sourceRegion,
             regions.sinkRegion,
             sourceProposal,
             sourceProposed);
-        collectProposals(
+        touchesOther = collectProposals(
             sinkFrontier,
             regions.sinkRegion,
             regions.sourceRegion,
             sinkProposal,
-            sinkProposed);
+            sinkProposed) || touchesOther;
+
+        for (const int32_t node : sourceProposed) {
+            if (sinkProposal[static_cast<size_t>(node)] != 0) {
+                touchesOther = true;
+                break;
+            }
+        }
+
+        if (touchesOther) {
+            for (const int32_t node : sourceProposed) {
+                sourceProposal[static_cast<size_t>(node)] = 0;
+            }
+            for (const int32_t node : sinkProposed) {
+                sinkProposal[static_cast<size_t>(node)] = 0;
+            }
+            regions.saturated = true;
+            regions.saturationDepth = depth + 1;
+            break;
+        }
 
         for (const int32_t node : sourceProposed) {
             regions.sourceRegion[static_cast<size_t>(node)] = 1;
+            sourceProposal[static_cast<size_t>(node)] = 0;
         }
         for (const int32_t node : sinkProposed) {
             regions.sinkRegion[static_cast<size_t>(node)] = 1;
+            sinkProposal[static_cast<size_t>(node)] = 0;
         }
 
         std::vector<int32_t> nextSourceFrontier;
@@ -581,6 +618,7 @@ TerminalFringeRegions terminalFringeRegions(
 
         sourceFrontier = std::move(nextSourceFrontier);
         sinkFrontier = std::move(nextSinkFrontier);
+        regions.appliedDepth = depth + 1;
     }
     return regions;
 }
@@ -590,9 +628,15 @@ vc::lasagna::EclMaxflowResult runEclWithTerminalFringe(
     int32_t sourceNode,
     int32_t sinkNode,
     int runs,
-    int fringeDepth)
+    int fringeDepth,
+    TerminalFringeStats* stats = nullptr)
 {
     const auto regions = terminalFringeRegions(graph, sourceNode, sinkNode, fringeDepth);
+    if (stats != nullptr) {
+        stats->saturated = regions.saturated;
+        stats->saturationDepth = regions.saturationDepth;
+        stats->appliedDepth = regions.appliedDepth;
+    }
     const auto terminalGraph = buildTerminalRegionGraph(
         graph,
         regions.sourceRegion,
@@ -613,7 +657,8 @@ vc::lasagna::EclMaxflowResult runEclWithTerminalFringeQuiet(
     int32_t sourceNode,
     int32_t sinkNode,
     int runs,
-    int fringeDepth)
+    int fringeDepth,
+    TerminalFringeStats* stats = nullptr)
 {
     std::fflush(stdout);
     const int savedStdout = dup(STDOUT_FILENO);
@@ -621,13 +666,13 @@ vc::lasagna::EclMaxflowResult runEclWithTerminalFringeQuiet(
     if (savedStdout < 0 || devNull < 0) {
         if (savedStdout >= 0) close(savedStdout);
         if (devNull >= 0) close(devNull);
-        return runEclWithTerminalFringe(graph, sourceNode, sinkNode, runs, fringeDepth);
+        return runEclWithTerminalFringe(graph, sourceNode, sinkNode, runs, fringeDepth, stats);
     }
     dup2(devNull, STDOUT_FILENO);
     close(devNull);
 
     try {
-        auto result = runEclWithTerminalFringe(graph, sourceNode, sinkNode, runs, fringeDepth);
+        auto result = runEclWithTerminalFringe(graph, sourceNode, sinkNode, runs, fringeDepth, stats);
         std::fflush(stdout);
         dup2(savedStdout, STDOUT_FILENO);
         close(savedStdout);
@@ -1153,9 +1198,21 @@ int main(int argc, char** argv)
                     }
                 }
                 for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                    std::ostringstream col;
+                    col << "fr_depth_s" << sourceIndex;
+                    std::cout << std::setw(14) << col.str();
+                }
+                for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
                     for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
                         std::ostringstream col;
                         col << "fr_s" << sourceIndex << "_t" << sinkIndex;
+                        std::cout << std::setw(14) << col.str();
+                    }
+                }
+                for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                    for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                        std::ostringstream col;
+                        col << "fr_sat_s" << sourceIndex << "_t" << sinkIndex;
                         std::cout << std::setw(14) << col.str();
                     }
                 }
@@ -1181,6 +1238,41 @@ int main(int argc, char** argv)
                     std::vector<std::vector<std::string>> fringeCells(
                         report.sources.size(),
                         std::vector<std::string>(report.sinks.size()));
+                    std::vector<std::vector<std::string>> fringeSaturationCells(
+                        report.sources.size(),
+                        std::vector<std::string>(report.sinks.size()));
+                    std::vector<int> commonFringeDepth(
+                        report.sources.size(),
+                        schedule.maxDepth);
+
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        const int32_t sourceNode = report.sources[sourceIndex].node;
+                        for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                            const int32_t sinkNode = report.sinks[sinkIndex].node;
+                            if (sourceNode == sinkNode) {
+                                fringeSaturationCells[sourceIndex][sinkIndex] = "skip";
+                                continue;
+                            }
+                            try {
+                                const auto regions = terminalFringeRegions(
+                                    graph,
+                                    sourceNode,
+                                    sinkNode,
+                                    schedule.maxDepth);
+                                if (regions.saturated) {
+                                    fringeSaturationCells[sourceIndex][sinkIndex] =
+                                        std::to_string(regions.saturationDepth);
+                                    commonFringeDepth[sourceIndex] = std::min(
+                                        commonFringeDepth[sourceIndex],
+                                        std::max(0, regions.saturationDepth - 1));
+                                } else {
+                                    fringeSaturationCells[sourceIndex][sinkIndex] = "-";
+                                }
+                            } catch (const std::exception&) {
+                                fringeSaturationCells[sourceIndex][sinkIndex] = "error";
+                            }
+                        }
+                    }
 
                     for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
                         for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
@@ -1209,7 +1301,7 @@ int main(int argc, char** argv)
                                     sourceNode,
                                     sinkNode,
                                     runs,
-                                    schedule.maxDepth);
+                                    commonFringeDepth[sourceIndex]);
                                 fringeFlows[sourceIndex][sinkIndex] = flow.maxFlow;
                                 fringeCells[sourceIndex][sinkIndex] = std::to_string(flow.maxFlow);
                             } catch (const std::exception&) {
@@ -1234,8 +1326,16 @@ int main(int argc, char** argv)
                         }
                     }
                     for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        std::cout << std::setw(14) << commonFringeDepth[sourceIndex];
+                    }
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
                         for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
                             std::cout << std::setw(14) << fringeCells[sourceIndex][sinkIndex];
+                        }
+                    }
+                    for (size_t sourceIndex = 0; sourceIndex < report.sources.size(); ++sourceIndex) {
+                        for (size_t sinkIndex = 0; sinkIndex < report.sinks.size(); ++sinkIndex) {
+                            std::cout << std::setw(14) << fringeSaturationCells[sourceIndex][sinkIndex];
                         }
                     }
                     if (report.sinks.size() >= 2) {
