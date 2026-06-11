@@ -161,6 +161,8 @@ vc_add_test(NAME test_fiber_slice_geometry
     LIBS doctest::doctest vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
+
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
 
