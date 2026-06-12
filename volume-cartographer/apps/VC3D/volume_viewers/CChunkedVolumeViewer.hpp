@@ -66,6 +66,11 @@ public:
         cv::Vec3f normal{0, 0, 1};
         Surface* surface = nullptr;
     };
+    struct ReplayRenderState {
+        std::uint64_t cachedPreviewSerial = 0;
+        std::uint64_t interactiveRenderSerial = 0;
+        std::uint64_t stableRenderSerial = 0;
+    };
     using ShiftScrollOverride = std::function<bool(int, QPointF, Qt::KeyboardModifiers)>;
 
     CChunkedVolumeViewer(CState* state, ViewerManager* manager, QWidget* parent = nullptr);
@@ -97,10 +102,12 @@ public:
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
     void applyCameraState(const CameraState& state, bool forceRender = true);
+    void applyInteractiveCameraState(const CameraState& state);
     // Render-bench helpers: true when no render is running/queued/pending; count of
     // remote chunk fetches still outstanding. Used by replay to settle each frame.
     bool isRenderQuiescent() const;
     std::size_t chunkFetchesInFlight() const;
+    ReplayRenderState replayRenderState() const;
     int datasetScaleIndex() const override { return _dsScaleIdx; }
     float datasetScaleFactor() const override { return _dsScale; }
     Surface* currentSurface() const override;
@@ -264,7 +271,10 @@ private:
     void rebuildChunkArray();
     void syncCameraTransform();
     bool renderInteractiveAxisAlignedSlicePreview();
-    void updateInteractivePreviewFromStableFrame(float newSurfX, float newSurfY, float newScale);
+    bool updateInteractivePreviewFromStableFrame(float newSurfX,
+                                                 float newSurfY,
+                                                 float newScale,
+                                                 bool allowStableTransform = true);
     bool shouldRefreshInteractivePreview();
     void resizeFramebuffer();
     void recalcPyramidLevel();
@@ -353,6 +363,9 @@ private:
     std::atomic<bool> _renderWorkerBusy{false};
     bool _renderPendingAfterWorker = false;
     std::uint64_t _renderSerial = 0;
+    std::uint64_t _replayCachedPreviewSerial = 0;
+    std::uint64_t _replayInteractiveRenderSerial = 0;
+    std::uint64_t _replayStableRenderSerial = 0;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;

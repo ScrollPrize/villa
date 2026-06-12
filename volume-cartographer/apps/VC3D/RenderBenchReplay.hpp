@@ -55,4 +55,7 @@ private:
     // maxFrameMs elapses. Returns true if it settled, false on timeout or if the
     // viewer is destroyed mid-settle.
     static bool settleFrame(QPointer<CChunkedVolumeViewer> viewer, int maxFrameMs, int quietWindowMs);
+    // Replay-only visual isolation: hide docks, maximize the segmentation
+    // subwindow, and disable overlays/intersections before viewport pinning.
+    static void prepareBenchmarkView(CWindow& window, QPointer<CChunkedVolumeViewer> viewer);
 };

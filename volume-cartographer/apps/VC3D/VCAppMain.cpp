@@ -191,7 +191,7 @@ auto main(int argc, char* argv[]) -> int
 
     QCommandLineOption replayOption(
         "replay",
-        "Replay a recorded navigation timeline (implies --profile), then exit.",
+        "Replay a recorded navigation timeline, then exit.",
         "file");
     parser.addOption(replayOption);
 
@@ -212,7 +212,7 @@ auto main(int argc, char* argv[]) -> int
     benchOptions.replayPath = parser.value(replayOption).trimmed();
     benchOptions.replayWarm = parser.isSet(replayWarmOption);
 
-    if (parser.isSet(profileOption) || !benchOptions.replayPath.isEmpty()) {
+    if (parser.isSet(profileOption)) {
         SetProfileLoggingEnabled(true);
         Logger()->info("[vc3d-profile] enabled");
     }

@@ -963,6 +963,38 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     emit overlaysUpdated();
 }
 
+void CChunkedVolumeViewer::applyInteractiveCameraState(const CameraState& state)
+{
+    if (_closing) {
+        return;
+    }
+
+    const bool allowStableTransform =
+        std::abs(state.zOffset - _zOff) < 1.0e-6f &&
+        cv::norm(state.zOffsetWorldDir - _zOffWorldDir) < 1.0e-6f;
+
+    _surfacePtrX = state.surfacePtrX;
+    _surfacePtrY = state.surfacePtrY;
+    _scale = state.scale;
+    _zOff = state.zOffset;
+    _zOffWorldDir = state.zOffsetWorldDir;
+    recalcPyramidLevel();
+    _genCacheDirty = true;
+    resizeFramebuffer();
+
+    markInteractiveMotion(1.0);
+    prefetchVisibleSurfaceChunks();
+    if (updateInteractivePreviewFromStableFrame(
+            _surfacePtrX, _surfacePtrY, _scale, allowStableTransform)) {
+        ++_replayCachedPreviewSerial;
+    }
+
+    _renderPending = false;
+    submitRender("interactive camera state preview");
+    scheduleRender("interactive camera state final render");
+    emit overlaysUpdated();
+}
+
 bool CChunkedVolumeViewer::isRenderQuiescent() const
 {
     return !_renderWorkerBusy.load(std::memory_order_acquire)
@@ -975,6 +1007,15 @@ bool CChunkedVolumeViewer::isRenderQuiescent() const
 std::size_t CChunkedVolumeViewer::chunkFetchesInFlight() const
 {
     return _chunkArray ? _chunkArray->stats().remoteFetchesInFlight : 0;
+}
+
+CChunkedVolumeViewer::ReplayRenderState CChunkedVolumeViewer::replayRenderState() const
+{
+    ReplayRenderState state;
+    state.cachedPreviewSerial = _replayCachedPreviewSerial;
+    state.interactiveRenderSerial = _replayInteractiveRenderSerial;
+    state.stableRenderSerial = _replayStableRenderSerial;
+    return state;
 }
 
 void CChunkedVolumeViewer::rebuildChunkArray()
@@ -1781,24 +1822,26 @@ bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
     return true;
 }
 
-void CChunkedVolumeViewer::updateInteractivePreviewFromStableFrame(float newSurfX,
+bool CChunkedVolumeViewer::updateInteractivePreviewFromStableFrame(float newSurfX,
                                                                    float newSurfY,
-                                                                   float newScale)
+                                                                   float newScale,
+                                                                   bool allowStableTransform)
 {
     resizeFramebuffer();
     if (renderInteractiveAxisAlignedSlicePreview())
-        return;
+        return true;
 
     if (!_stableFramebufferValid || _stableFramebuffer.isNull() ||
         _stableFramebuffer.size() != _framebuffer.size() ||
-        _stableScale <= 0.0f || newScale <= 0.0f) {
+        _stableScale <= 0.0f || newScale <= 0.0f ||
+        !allowStableTransform) {
         syncCameraTransform();
         if (_interactivePreview)
             updateIntersectionPreviewTransform();
         else
             renderIntersections("interactive preview fallback no stable frame");
         _view->viewport()->update();
-        return;
+        return false;
     }
 
     const int w = _framebuffer.width();
@@ -1826,6 +1869,7 @@ void CChunkedVolumeViewer::updateInteractivePreviewFromStableFrame(float newSurf
         renderIntersections("interactive preview transformed stable frame");
     emit overlaysUpdated();
     _view->viewport()->update();
+    return true;
 }
 
 bool CChunkedVolumeViewer::shouldRefreshInteractivePreview()
@@ -2725,6 +2769,11 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
 
     _framebuffer = std::move(result->framebuffer);
     syncCameraTransform();
+    if (_interactivePreview) {
+        _replayInteractiveRenderSerial = result->serial;
+    } else {
+        _replayStableRenderSerial = result->serial;
+    }
     if (_interactivePreview)
         updateIntersectionPreviewTransform();
     else
