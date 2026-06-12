@@ -1,9 +1,15 @@
+import tempfile
 import unittest
+from pathlib import Path
+
+import numpy as np
 
 from tensorstore_omezarr import (
+	LevelMeta,
 	_aligned_scalar_scale_job_chunk,
 	_first_chunk_job,
 	_iter_chunk_jobs_for_z_range,
+	_source_region_has_materialized_chunks,
 )
 
 
@@ -42,6 +48,34 @@ class TensorStoreOmeZarrTests(unittest.TestCase):
 	def test_chunk_job_iterator_is_lazy(self):
 		jobs = _iter_chunk_jobs_for_z_range((10_000_000, 10_000_000, 10_000_000), (32, 32, 32), 0, 10_000_000)
 		self.assertEqual(next(jobs), (0, 32, 0, 32, 0, 32))
+
+	def test_source_region_missing_chunks_can_be_skipped(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			meta = LevelMeta(
+				shape=(512, 512, 512),
+				chunks=(256, 256, 256),
+				dtype=np.dtype("uint8"),
+				fill_value=0,
+				compressor_config=None,
+				dimension_separator="/",
+			)
+			self.assertFalse(_source_region_has_materialized_chunks(tmp, meta, 0, 32, 0, 32, 0, 32))
+			chunk_path = Path(tmp) / "0" / "0" / "0"
+			chunk_path.parent.mkdir(parents=True)
+			chunk_path.write_bytes(b"x")
+			self.assertTrue(_source_region_has_materialized_chunks(tmp, meta, 0, 32, 0, 32, 0, 32))
+
+	def test_nonzero_fill_source_region_cannot_be_skipped(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			meta = LevelMeta(
+				shape=(512, 512, 512),
+				chunks=(256, 256, 256),
+				dtype=np.dtype("uint8"),
+				fill_value=7,
+				compressor_config=None,
+				dimension_separator="/",
+			)
+			self.assertTrue(_source_region_has_materialized_chunks(tmp, meta, 0, 32, 0, 32, 0, 32))
 
 
 if __name__ == "__main__":

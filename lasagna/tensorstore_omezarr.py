@@ -52,6 +52,7 @@ class LevelMeta:
 	dtype: np.dtype
 	fill_value: int | float
 	compressor_config: dict | None
+	dimension_separator: str
 
 
 def _rss_mib() -> float | None:
@@ -97,12 +98,16 @@ def level_meta(level_path: str | Path) -> LevelMeta:
 	dtype = np.dtype(meta["dtype"])
 	fill_value = meta.get("fill_value", 0)
 	compressor_cfg = meta.get("compressor")
+	dimension_separator = str(meta.get("dimension_separator", "."))
+	if dimension_separator not in {".", "/"}:
+		dimension_separator = "."
 	return LevelMeta(
 		shape=(shape[0], shape[1], shape[2]),
 		chunks=(chunks[0], chunks[1], chunks[2]),
 		dtype=dtype,
 		fill_value=fill_value,
 		compressor_config=compressor_cfg,
+		dimension_separator=dimension_separator,
 	)
 
 
@@ -158,6 +163,47 @@ def _debug_read_array(prefix: str, store, z0: int, z1: int, y0: int, y1: int, x0
 		f"shape={arr.shape} dtype={arr.dtype} nbytes={arr.nbytes / float(1 << 20):.1f}MiB",
 	)
 	return arr
+
+
+def _fill_value_is_zero(value) -> bool:
+	try:
+		return float(value) == 0.0
+	except (TypeError, ValueError):
+		return value in {None, "0"}
+
+
+def _chunk_file_path(level_path: str | Path, meta: LevelMeta, zi: int, yi: int, xi: int) -> Path:
+	level_path = Path(level_path)
+	if meta.dimension_separator == "/":
+		return level_path / str(zi) / str(yi) / str(xi)
+	return level_path / f"{zi}.{yi}.{xi}"
+
+
+def _source_region_has_materialized_chunks(
+	level_path: str | Path,
+	meta: LevelMeta,
+	z0: int,
+	z1: int,
+	y0: int,
+	y1: int,
+	x0: int,
+	x1: int,
+) -> bool:
+	if not _fill_value_is_zero(meta.fill_value):
+		return True
+	if z1 <= z0 or y1 <= y0 or x1 <= x0:
+		return False
+	cz, cy, cx = meta.chunks
+	zi0, yi0, xi0 = int(z0) // cz, int(y0) // cy, int(x0) // cx
+	zi1 = (int(z1) - 1) // cz
+	yi1 = (int(y1) - 1) // cy
+	xi1 = (int(x1) - 1) // cx
+	for zi in range(zi0, zi1 + 1):
+		for yi in range(yi0, yi1 + 1):
+			for xi in range(xi0, xi1 + 1):
+				if _chunk_file_path(level_path, meta, zi, yi, xi).is_file():
+					return True
+	return False
 
 
 def _write_array(store, z0: int, y0: int, x0: int, data: np.ndarray, *, fill_value=0) -> None:
@@ -298,10 +344,17 @@ def _process_copy_shard(payload: dict, cfg_values: dict, progress_q) -> None:
 	ctx = tensorstore_context(cfg)
 	src_store = open_tensorstore(payload["src_path"], ctx, read=True, write=False)
 	dst_store = open_tensorstore(payload["dst_path"], ctx, read=False, write=True)
+	src_meta = level_meta(payload["src_path"])
 	meta = level_meta(payload["dst_path"])
 	pending = 0
 	for job in _iter_chunk_jobs_for_z_range(meta.shape, meta.chunks, payload["z0"], payload["z1"]):
 		z0, z1, y0, y1, x0, x1 = job
+		if not _source_region_has_materialized_chunks(payload["src_path"], src_meta, z0, z1, y0, y1, x0, x1):
+			pending += 1
+			if pending >= 16:
+				_progress_emit(progress_q, pending)
+				pending = 0
+			continue
 		data = _read_array(src_store, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
 		_write_array(dst_store, z0, y0, x0, data, fill_value=meta.fill_value)
 		pending += 1
@@ -326,6 +379,12 @@ def _process_scalar_scale_shard(payload: dict, cfg_values: dict, progress_q) -> 
 		sz1 = min(src_meta.shape[0], z1 * 2)
 		sy1 = min(src_meta.shape[1], y1 * 2)
 		sx1 = min(src_meta.shape[2], x1 * 2)
+		if not _source_region_has_materialized_chunks(payload["src_path"], src_meta, sz0, sz1, sy0, sy1, sx0, sx1):
+			pending += 1
+			if pending >= 16:
+				_progress_emit(progress_q, pending)
+				pending = 0
+			continue
 		slab = _read_array(src_store, sz0, sz1, sy0, sy1, sx0, sx1).astype(np.uint8, copy=False)
 		down = _mean_pool2x_u8(slab, zero_overrides=zero_overrides)
 		_write_array(dst_store, z0, y0, x0, down, fill_value=dst_meta.fill_value)
@@ -357,6 +416,12 @@ def _process_scalar_scale_source_chunk_shard(payload: dict, cfg_values: dict, pr
 				f"source job start is not destination-chunk aligned: "
 				f"job={(z0, y0, x0)} dst_chunks={dst_meta.chunks}"
 			)
+		if not _source_region_has_materialized_chunks(payload["src_path"], src_meta, z0, z1, y0, y1, x0, x1):
+			pending += _chunk_count(shape_div2((z1 - z0, y1 - y0, x1 - x0), 1), dst_meta.chunks)
+			if pending >= 1:
+				_progress_emit(progress_q, pending)
+				pending = 0
+			continue
 		slab = _read_array(src_store, z0, z1, y0, y1, x0, x1).astype(np.uint8, copy=False)
 		down = _mean_pool2x_u8(slab, zero_overrides=zero_overrides)
 		written = _write_array_by_chunks(
@@ -383,6 +448,7 @@ def _process_normal_scale_shard(payload: dict, cfg_values: dict, progress_q) -> 
 	nx_dst = open_tensorstore(payload["nx_dst_path"], ctx, read=False, write=True)
 	ny_dst = open_tensorstore(payload["ny_dst_path"], ctx, read=False, write=True)
 	src_meta = level_meta(payload["nx_src_path"])
+	ny_src_meta = level_meta(payload["ny_src_path"])
 	dst_meta = level_meta(payload["nx_dst_path"])
 	pending = 0
 	for job in _iter_chunk_jobs_for_z_range(dst_meta.shape, dst_meta.chunks, payload["z0"], payload["z1"]):
@@ -391,6 +457,14 @@ def _process_normal_scale_shard(payload: dict, cfg_values: dict, progress_q) -> 
 		sz1 = min(src_meta.shape[0], z1 * 2)
 		sy1 = min(src_meta.shape[1], y1 * 2)
 		sx1 = min(src_meta.shape[2], x1 * 2)
+		nx_has = _source_region_has_materialized_chunks(payload["nx_src_path"], src_meta, sz0, sz1, sy0, sy1, sx0, sx1)
+		ny_has = _source_region_has_materialized_chunks(payload["ny_src_path"], ny_src_meta, sz0, sz1, sy0, sy1, sx0, sx1)
+		if not nx_has and not ny_has:
+			pending += 1
+			if pending >= 16:
+				_progress_emit(progress_q, pending)
+				pending = 0
+			continue
 		nx_slab = _read_array(nx_src, sz0, sz1, sy0, sy1, sx0, sx1).astype(np.uint8, copy=False)
 		ny_slab = _read_array(ny_src, sz0, sz1, sy0, sy1, sx0, sx1).astype(np.uint8, copy=False)
 		nx_down, ny_down = _moment_pool2x_normals(nx_slab, ny_slab)
