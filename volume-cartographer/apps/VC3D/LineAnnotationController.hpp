@@ -73,6 +73,8 @@ public:
     struct FiberSnapshotWithPath {
         std::filesystem::path fiberPath;
         vc::atlas::FiberPolyline fiber;
+        uint64_t storedFiberId = 0;
+        std::vector<std::string> tags;
     };
 
     using DatasetPicker =
