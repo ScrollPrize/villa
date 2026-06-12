@@ -7,6 +7,9 @@
 
 #include <qapplication.h>
 #include <QCommandLineParser>
+#include <QElapsedTimer>
+#include <QEvent>
+#include <QObject>
 
 #include "CWindow.hpp"
 #include "VCSettings.hpp"
@@ -28,6 +31,60 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+
+namespace
+{
+QString eventTypeName(QEvent::Type type)
+{
+    switch (type) {
+    case QEvent::None: return QStringLiteral("None");
+    case QEvent::Timer: return QStringLiteral("Timer");
+    case QEvent::MouseButtonPress: return QStringLiteral("MouseButtonPress");
+    case QEvent::MouseButtonRelease: return QStringLiteral("MouseButtonRelease");
+    case QEvent::MouseButtonDblClick: return QStringLiteral("MouseButtonDblClick");
+    case QEvent::MouseMove: return QStringLiteral("MouseMove");
+    case QEvent::KeyPress: return QStringLiteral("KeyPress");
+    case QEvent::KeyRelease: return QStringLiteral("KeyRelease");
+    case QEvent::FocusIn: return QStringLiteral("FocusIn");
+    case QEvent::FocusOut: return QStringLiteral("FocusOut");
+    case QEvent::Paint: return QStringLiteral("Paint");
+    case QEvent::Move: return QStringLiteral("Move");
+    case QEvent::Resize: return QStringLiteral("Resize");
+    case QEvent::Close: return QStringLiteral("Close");
+    case QEvent::Show: return QStringLiteral("Show");
+    case QEvent::Hide: return QStringLiteral("Hide");
+    case QEvent::Wheel: return QStringLiteral("Wheel");
+    case QEvent::DeferredDelete: return QStringLiteral("DeferredDelete");
+    case QEvent::UpdateRequest: return QStringLiteral("UpdateRequest");
+    case QEvent::UpdateLater: return QStringLiteral("UpdateLater");
+    case QEvent::MetaCall: return QStringLiteral("MetaCall");
+    default:
+        return QStringLiteral("type:%1").arg(static_cast<int>(type));
+    }
+}
+
+class VCApplication : public QApplication
+{
+public:
+    using QApplication::QApplication;
+
+    bool notify(QObject* receiver, QEvent* event) override
+    {
+        QElapsedTimer timer;
+        timer.start();
+        const bool handled = QApplication::notify(receiver, event);
+        const qint64 elapsedMs = timer.elapsed();
+        if (elapsedMs >= 25 && receiver && event) {
+            Logger()->info("[vc3d-event] slow notify ms={} event='{}' receiverClass='{}' receiverName='{}'",
+                           elapsedMs,
+                           eventTypeName(event->type()).toStdString(),
+                           receiver->metaObject() ? receiver->metaObject()->className() : "<unknown>",
+                           receiver->objectName().toStdString());
+        }
+        return handled;
+    }
+};
+}
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <sys/resource.h>
@@ -153,7 +210,7 @@ auto main(int argc, char* argv[]) -> int
         qputenv("QT_WIDGETS_RHI", "0");
     }
 
-    QApplication app(argc, argv);
+    VCApplication app(argc, argv);
     QApplication::setOrganizationName("Vesuvius Challenge");
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));

@@ -132,6 +132,12 @@ bool directPresentUsesRepaint()
     return mode && std::string_view(mode) == "repaint";
 }
 
+bool intersectionRenderingDisabledForLatencyDebug()
+{
+    const char* mode = std::getenv("VC3D_DISABLE_INTERSECTIONS");
+    return !mode || std::string_view(mode) != "0";
+}
+
 int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
 {
     int axis = 0;
@@ -893,6 +899,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _replayRenderResultQueue = std::make_shared<ReplayRenderResultQueue>();
 
     _renderTimer = new QTimer(this);
+    _renderTimer->setObjectName(QString::fromStdString(_surfName + ":render"));
     _renderTimer->setSingleShot(true);
     _renderTimer->setInterval(16);
     connect(_renderTimer, &QTimer::timeout, this, [this]() {
@@ -916,6 +923,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     });
 
     _settleRenderTimer = new QTimer(this);
+    _settleRenderTimer->setObjectName(QString::fromStdString(_surfName + ":settle-render"));
     _settleRenderTimer->setSingleShot(true);
     _settleRenderTimer->setInterval(kInteractionSettleMs);
     connect(_settleRenderTimer, &QTimer::timeout, this, [this]() {
@@ -929,6 +937,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     });
 
     _intersectionRenderTimer = new QTimer(this);
+    _intersectionRenderTimer->setObjectName(QString::fromStdString(_surfName + ":intersection-render"));
     _intersectionRenderTimer->setSingleShot(true);
     _intersectionRenderTimer->setInterval(50);
     connect(_intersectionRenderTimer, &QTimer::timeout, this, [this]() {
@@ -941,6 +950,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     });
 
     _resizeRenderTimer = new QTimer(this);
+    _resizeRenderTimer->setObjectName(QString::fromStdString(_surfName + ":resize-render"));
     _resizeRenderTimer->setSingleShot(true);
     _resizeRenderTimer->setInterval(kResizeSettleMs);
     connect(_resizeRenderTimer, &QTimer::timeout, this, [this]() {
@@ -949,6 +959,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     });
 
     _statusTimer = new QTimer(this);
+    _statusTimer->setObjectName(QString::fromStdString(_surfName + ":status"));
     _statusTimer->setInterval(500);
     connect(_statusTimer, &QTimer::timeout, this, [this]() {
         updateStatusLabel();
@@ -1752,6 +1763,10 @@ void CChunkedVolumeViewer::requestRender(const char* reason, std::source_locatio
 void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::source_location caller)
 {
     if (_closing) {
+        return;
+    }
+    if (intersectionRenderingDisabledForLatencyDebug()) {
+        clearIntersectionItems();
         return;
     }
     if (ProfileLoggingEnabled()) {
@@ -2956,7 +2971,9 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
 
     const int workersInFlight = _renderWorkersInFlight.load(std::memory_order_acquire);
     const bool launchConcurrentPreview = _interactivePreview && workersInFlight > 0;
-    if (workersInFlight > 0 && !launchConcurrentPreview) {
+    const bool launchConcurrentDirect = _directInteractionRenderRequest && workersInFlight > 0;
+    const bool launchConcurrent = launchConcurrentPreview || launchConcurrentDirect;
+    if (workersInFlight > 0 && !launchConcurrent) {
         if (traceRender) {
             Logger()->info("[vc3d-render] queue surf='{}' reason='{}' inFlight={} direct={} pendingAfterWorker={}",
                            _surfName,
@@ -2977,8 +2994,9 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
     _renderWorkersInFlight.fetch_add(1, std::memory_order_acq_rel);
-    if (launchConcurrentPreview) {
-        Logger()->info("[vc3d-render] launch concurrent preview surf='{}' inFlight={} reason='{}'",
+    if (launchConcurrent) {
+        Logger()->info("[vc3d-render] launch concurrent {} surf='{}' inFlight={} reason='{}'",
+                       launchConcurrentDirect ? "direct" : "preview",
                        _surfName,
                        workersInFlight,
                        reason ? reason : "");
@@ -3044,7 +3062,7 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
                        ctx.serial,
                        reasonView,
                        workersInFlight,
-                       launchConcurrentPreview ? "y" : "n",
+                       launchConcurrent ? "y" : "n",
                        ctx.interactivePreview ? "y" : "n",
                        ctx.startLevel,
                        ctx.fbW,
@@ -3181,9 +3199,8 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     _stableSurfY = result->surfacePtrY;
     _stableScale = result->scale;
     _stableFramebufferValid = !_stableFramebuffer.isNull();
-    if (!resultInteractive && !result->directInteractionRender) {
-        emit overlaysUpdated();
-    }
+    // Disabled while debugging focus/pan latency: render completion should not
+    // run generated/annotation overlay refresh work in front of interaction.
     auto& replayTiming = resultInteractive ? _replayInteractiveTiming : _replayStableTiming;
     replayTiming.serial = result->serial;
     replayTiming.workerStartMs = workerStartMs;
@@ -4902,6 +4919,13 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
 void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_location caller)
 {
     ProfileScope profile("renderIntersections", reason, caller);
+    if (intersectionRenderingDisabledForLatencyDebug()) {
+        clearIntersectionItems();
+        if (profile.enabled()) {
+            profile.setDetails("action=disabled_for_latency_debug");
+        }
+        return;
+    }
     if (profile.enabled()) {
         profile.setDetails(std::format(
             "surf='{}' targets={} viewport={} scale={:.4f} zOff={:.3f}",
