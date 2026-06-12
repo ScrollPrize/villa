@@ -225,7 +225,6 @@ private:
     const std::vector<FiberPolyline>& fibers,
     const std::vector<uint64_t>& sourceFiberIds,
     const std::vector<uint64_t>& targetFiberIds,
-    FiberSpatialIndex& index,
     FiberIntersectionCache* cache,
     const FiberIntersectionBroadPhaseOptions& broad,
     const FiberIntersectionCeresOptions& ceres,

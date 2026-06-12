@@ -722,11 +722,23 @@ QDockWidget* createAtlasSearchDock(QWidget* parent)
     maxDistance->setObjectName(QStringLiteral("atlasSearchMaxDistanceSpin"));
     maxDistance->setRange(1.0, 100000.0);
     maxDistance->setDecimals(2);
-    maxDistance->setValue(vc::atlas::FiberIntersectionBroadPhaseOptions{}.maxDistance);
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        maxDistance->setValue(settings.value(
+            vc3d::settings::atlas::SEARCH_MAX_DISTANCE,
+            vc::atlas::FiberIntersectionBroadPhaseOptions{}.maxDistance).toDouble());
+    }
     maxDistance->setSuffix(QObject::tr(" vx"));
     maxDistance->setToolTip(QObject::tr(
         "Broad-phase segment radius in original voxel coordinates. Segment pairs farther apart than this are not sent to Ceres."));
     form->addRow(QObject::tr("Max straight distance"), maxDistance);
+
+    auto* groupByFiber = new QCheckBox(QObject::tr("Group results by fiber"), content);
+    groupByFiber->setObjectName(QStringLiteral("atlasSearchGroupByFiberCheck"));
+    groupByFiber->setChecked(true);
+    groupByFiber->setToolTip(QObject::tr(
+        "Show each fiber as a group with all matching fiber pairs beneath it."));
+    form->addRow(QString(), groupByFiber);
     layout->addLayout(form);
 
     auto* buttons = new QHBoxLayout();
@@ -1009,7 +1021,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 if (_lineAnnotationController) {
                     _lineAnnotationController->setCurrentAtlasDirectory(std::nullopt);
                 }
-                _fiberIntersectionIndex.clear();
                 _fiberIntersectionCache.clear();
                 refreshAtlasOverviewDocks();
                 updateAtlasSearchDocks();
@@ -1050,7 +1061,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this,
             [this](uint64_t fiberId, uint64_t) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
-                _fiberIntersectionIndex.removeFiber(fiberId);
                 updateAtlasSearchDocks();
             });
     connect(_lineAnnotationController.get(),
@@ -1059,7 +1069,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](std::vector<uint64_t> fiberIds) {
                 for (uint64_t fiberId : fiberIds) {
                     _fiberIntersectionCache.pruneFiber(fiberId);
-                    _fiberIntersectionIndex.removeFiber(fiberId);
                 }
                 updateAtlasSearchDocks();
             });
@@ -1256,6 +1265,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                static_cast<QDockWidget*>(_atlasControlDock),
                                _atlasWorkspaceOverviewDock,
                                _atlasWorkspaceSearchDock,
+                               static_cast<QDockWidget*>(_atlasWorkspaceFiberDock),
                                static_cast<QDockWidget*>(_fiberSliceWidget) }) {
         if (dock) {
             dock->setMinimumWidth(250);
@@ -1286,6 +1296,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                static_cast<QDockWidget*>(_atlasControlDock),
                                _atlasWorkspaceOverviewDock,
                                _atlasWorkspaceSearchDock,
+                               static_cast<QDockWidget*>(_atlasWorkspaceFiberDock),
                                static_cast<QDockWidget*>(_fiberSliceWidget)  }) {
         ensureDockWidgetFeatures(dock);
         // Connect dock widget signals to trigger state saving
@@ -1320,6 +1331,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    static_cast<QDockWidget*>(_atlasControlDock),
                                    _atlasWorkspaceOverviewDock,
                                    _atlasWorkspaceSearchDock,
+                                   static_cast<QDockWidget*>(_atlasWorkspaceFiberDock),
                                    static_cast<QDockWidget*>(_fiberSliceWidget),
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
             if (!dock) continue;
@@ -1595,6 +1607,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(_atlasOverviewDock);
     addDock(_atlasSearchDock);
     addDock(_atlasControlDock);
+    addDock(_atlasWorkspaceFiberDock);
     addDock(_point_collection_widget);
     addDock(_fiberWidget);
     addDock(_fiberSliceWidget);
@@ -2519,6 +2532,13 @@ void CWindow::createAtlasWorkspace()
     _atlasWorkspaceSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearchAtlas"));
     _atlasWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasWorkspaceSearchDock);
 
+    _atlasWorkspaceFiberDock = new CFiberWidget(_atlasWorkspaceWindow);
+    _atlasWorkspaceFiberDock->setObjectName(QStringLiteral("dockWidgetAtlasFibersAtlas"));
+    _atlasWorkspaceFiberDock->setWindowTitle(tr("Atlas Fibers"));
+    _atlasWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasWorkspaceFiberDock);
+    _atlasWorkspaceWindow->tabifyDockWidget(_atlasWorkspaceOverviewDock, _atlasWorkspaceFiberDock);
+    _atlasWorkspaceFiberDock->raise();
+
     _atlasOverviewDock = createAtlasOverviewDock(this);
     _atlasOverviewDock->setObjectName(QStringLiteral("dockWidgetAtlasOverview"));
     _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasOverviewDock);
@@ -2569,6 +2589,47 @@ void CWindow::createAtlasWorkspace()
                     QOverload<int>::of(&QComboBox::currentIndexChanged),
                     this,
                     [this]() { updateAtlasSearchDocks(); });
+        }
+        if (auto* maxDistance =
+                dock->widget()->findChild<QDoubleSpinBox*>(QStringLiteral("atlasSearchMaxDistanceSpin"))) {
+            connect(maxDistance,
+                    QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                    this,
+                    [this, dock](double value) {
+                        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                        settings.setValue(vc3d::settings::atlas::SEARCH_MAX_DISTANCE, value);
+                        for (auto* otherDock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+                            if (!otherDock || otherDock == dock || !otherDock->widget()) {
+                                continue;
+                            }
+                            if (auto* otherSpin = otherDock->widget()->findChild<QDoubleSpinBox*>(
+                                    QStringLiteral("atlasSearchMaxDistanceSpin"))) {
+                                const QSignalBlocker blocker(otherSpin);
+                                otherSpin->setValue(value);
+                            }
+                        }
+                    });
+        }
+        if (auto* groupByFiber =
+                dock->widget()->findChild<QCheckBox*>(QStringLiteral("atlasSearchGroupByFiberCheck"))) {
+            connect(groupByFiber,
+                    &QCheckBox::toggled,
+                    this,
+                    [this, dock](bool checked) {
+                        for (auto* otherDock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+                            if (!otherDock || otherDock == dock || !otherDock->widget()) {
+                                continue;
+                            }
+                            if (auto* otherCheck = otherDock->widget()->findChild<QCheckBox*>(
+                                    QStringLiteral("atlasSearchGroupByFiberCheck"))) {
+                                const QSignalBlocker blocker(otherCheck);
+                                otherCheck->setChecked(checked);
+                            }
+                        }
+                        if (!_atlasSearchCancelFlag && !_atlasSearchResults.empty()) {
+                            populateAtlasSearchResults(_atlasSearchResults);
+                        }
+                    });
         }
         if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
             auto openFromItem = [this, tree](QTreeWidgetItem* item) {
@@ -2677,6 +2738,19 @@ void CWindow::refreshAtlasOverviewDocks()
                 auto* fiberCount = new QTreeWidgetItem(item);
                 fiberCount->setText(0, tr("Fiber count"));
                 fiberCount->setText(1, QString::number(static_cast<int>(atlas.fibers.size())));
+
+                auto* fibersRoot = new QTreeWidgetItem(item);
+                fibersRoot->setText(0, tr("Fibers"));
+                fibersRoot->setText(1, QString::number(static_cast<int>(atlas.fibers.size())));
+                for (const auto& mapping : atlas.fibers) {
+                    auto* fiberItem = new QTreeWidgetItem(fibersRoot);
+                    fiberItem->setText(0, QString::fromStdString(mapping.fiberPath.generic_string()));
+                    fiberItem->setText(
+                        1,
+                        tr("%1 line anchors, %2 control anchors")
+                            .arg(static_cast<int>(mapping.lineAnchors.size()))
+                            .arg(static_cast<int>(mapping.controlAnchors.size())));
+                }
 
                 auto* coveredSize = new QTreeWidgetItem(item);
                 coveredSize->setText(0, tr("Object covered atlas size"));
@@ -3149,7 +3223,6 @@ void CWindow::startAtlasFiberIntersectionSearch()
                 updateAtlasSearchDocks();
             });
 
-    vc::atlas::FiberSpatialIndex* index = &_fiberIntersectionIndex;
     vc::atlas::FiberIntersectionCache* cache = &_fiberIntersectionCache;
     QPointer<CWindow> self(this);
     auto cancelFlag = _atlasSearchCancelFlag;
@@ -3157,7 +3230,6 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                           sourceFiberIds = std::move(sourceFiberIds),
                                           targetFiberIds = std::move(targetFiberIds),
                                           lasagnaManifestPath = std::move(lasagnaManifestPath),
-                                          index,
                                           cache,
                                           broad,
                                           ceres,
@@ -3218,7 +3290,6 @@ void CWindow::startAtlasFiberIntersectionSearch()
         return vc::atlas::searchFiberIntersections(fibers,
                                                    sourceFiberIds,
                                                    targetFiberIds,
-                                                   *index,
                                                    cache,
                                                    broad,
                                                    ceres,
@@ -3307,25 +3378,75 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
             tr("Src idx"),
             tr("Tgt idx"),
         });
+        const bool groupByFiber = [&]() {
+            if (auto* check = dock->widget()->findChild<QCheckBox*>(
+                    QStringLiteral("atlasSearchGroupByFiberCheck"))) {
+                return check->isChecked();
+            }
+            return true;
+        }();
+
+        auto fillResultRow = [&](QTreeWidgetItem* row, int resultIndex) {
+            const auto& result = _atlasSearchResults[static_cast<size_t>(resultIndex)];
+            row->setData(0, ATLAS_SEARCH_RESULT_INDEX_ROLE, resultIndex);
+            row->setText(0, QString::number(displayedDistance(result), 'f', 3));
+            row->setTextAlignment(0, Qt::AlignRight | Qt::AlignVCenter);
+            row->setText(1, fiberLabel(result.sourceFiberId));
+            row->setText(2, fiberLabel(result.targetFiberId));
+            row->setText(3, QString::number(arclengthFraction(result.sourceFiberId,
+                                                              result.sourceArclength),
+                                            'f',
+                                            6));
+            row->setTextAlignment(3, Qt::AlignRight | Qt::AlignVCenter);
+            row->setText(4, QString::number(arclengthFraction(result.targetFiberId,
+                                                              result.targetArclength),
+                                            'f',
+                                            6));
+            row->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
+        };
+
+        if (!groupByFiber) {
+            for (int rowIndex = 0; rowIndex < static_cast<int>(_atlasSearchResults.size()); ++rowIndex) {
+                auto* row = new QTreeWidgetItem(tree);
+                fillResultRow(row, rowIndex);
+                if (!countedResultRows) {
+                    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                                              static_cast<std::size_t>(rowIndex) + 1,
+                                              finishTotal);
+                }
+            }
+            if (_atlasSearchResults.empty() && !countedResultRows) {
+                updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                                          1,
+                                          finishTotal);
+            }
+            countedResultRows = true;
+            tree->resizeColumnToContents(0);
+            tree->resizeColumnToContents(1);
+            tree->resizeColumnToContents(2);
+            continue;
+        }
 
         struct FiberGroup {
             uint64_t fiberId = 0;
             std::vector<int> resultIndices;
-            int closeCount = 0;
+            std::set<uint64_t> partnerFiberIds;
+            std::set<uint64_t> closePartnerFiberIds;
         };
         std::map<uint64_t, FiberGroup> groupsByFiber;
         for (int row = 0; row < static_cast<int>(_atlasSearchResults.size()); ++row) {
             const auto& result = _atlasSearchResults[static_cast<size_t>(row)];
-            auto addToGroup = [&](uint64_t fiberId) {
+            auto addToGroup = [&](uint64_t fiberId, uint64_t partnerFiberId) {
                 auto& group = groupsByFiber[fiberId];
                 group.fiberId = fiberId;
                 group.resultIndices.push_back(row);
+                group.partnerFiberIds.insert(partnerFiberId);
                 if (displayedDistance(result) < ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD) {
-                    ++group.closeCount;
+                    group.closePartnerFiberIds.insert(partnerFiberId);
                 }
             };
-            addToGroup(result.sourceFiberId);
-            addToGroup(result.targetFiberId);
+            addToGroup(result.sourceFiberId, result.targetFiberId);
+            addToGroup(result.targetFiberId, result.sourceFiberId);
             if (!countedResultRows) {
                 updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
                                           static_cast<std::size_t>(row) + 1,
@@ -3353,8 +3474,11 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
             groups.push_back(std::move(group));
         }
         std::sort(groups.begin(), groups.end(), [&](const FiberGroup& a, const FiberGroup& b) {
-            if (a.closeCount != b.closeCount) {
-                return a.closeCount > b.closeCount;
+            if (a.closePartnerFiberIds.size() != b.closePartnerFiberIds.size()) {
+                return a.closePartnerFiberIds.size() > b.closePartnerFiberIds.size();
+            }
+            if (a.partnerFiberIds.size() != b.partnerFiberIds.size()) {
+                return a.partnerFiberIds.size() > b.partnerFiberIds.size();
             }
             return fiberLabel(a.fiberId) < fiberLabel(b.fiberId);
         });
@@ -3363,9 +3487,10 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
             auto* root = new QTreeWidgetItem(tree);
             root->setText(
                 0,
-                tr("%1 - %2 below 0.5 windings, %3 total")
+                tr("%1 - %2 pairs below 0.5 windings, %3 total pairs, %4 intersections")
                     .arg(fiberLabel(group.fiberId))
-                    .arg(group.closeCount)
+                    .arg(static_cast<int>(group.closePartnerFiberIds.size()))
+                    .arg(static_cast<int>(group.partnerFiberIds.size()))
                     .arg(static_cast<int>(group.resultIndices.size())));
             root->setData(0,
                           ATLAS_SEARCH_FIBER_ID_ROLE,
@@ -3374,23 +3499,8 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
             root->setFlags(root->flags() & ~Qt::ItemIsSelectable);
 
             for (int resultIndex : group.resultIndices) {
-                const auto& result = _atlasSearchResults[static_cast<size_t>(resultIndex)];
                 auto* row = new QTreeWidgetItem(root);
-                row->setData(0, ATLAS_SEARCH_RESULT_INDEX_ROLE, resultIndex);
-                row->setText(0, QString::number(displayedDistance(result), 'f', 3));
-                row->setTextAlignment(0, Qt::AlignRight | Qt::AlignVCenter);
-                row->setText(1, fiberLabel(result.sourceFiberId));
-                row->setText(2, fiberLabel(result.targetFiberId));
-                row->setText(3, QString::number(arclengthFraction(result.sourceFiberId,
-                                                                  result.sourceArclength),
-                                                'f',
-                                                6));
-                row->setTextAlignment(3, Qt::AlignRight | Qt::AlignVCenter);
-                row->setText(4, QString::number(arclengthFraction(result.targetFiberId,
-                                                                  result.targetArclength),
-                                                'f',
-                                                6));
-                row->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
+                fillResultRow(row, resultIndex);
             }
         }
         if (_atlasSearchResults.empty() && !countedResultRows) {
@@ -4503,6 +4613,10 @@ void CWindow::CreateWidgets(void)
                 _fiberSliceWidget->setFibers(entries);
                 _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
             }
+            if (_atlasWorkspaceFiberDock) {
+                _atlasWorkspaceFiberDock->setFibers(entries);
+                _atlasWorkspaceFiberDock->setKnownTags(_lineAnnotationController->knownFiberTags());
+            }
         };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
             if (!widget || !_lineAnnotationController) {
@@ -4546,6 +4660,9 @@ void CWindow::CreateWidgets(void)
                         if (_fiberSliceWidget) {
                             _fiberSliceWidget->selectFiber(fiberId);
                         }
+                        if (_atlasWorkspaceFiberDock) {
+                            _atlasWorkspaceFiberDock->selectFiber(fiberId);
+                        }
                         switchToFiberSliceWorkspace();
                         if (_lineAnnotationController) {
                             _lineAnnotationController->showFiberSlice(fiberId, _fiberSliceMdiArea);
@@ -4558,6 +4675,7 @@ void CWindow::CreateWidgets(void)
                 updateFiberList);
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
+        connectFiberWidget(_atlasWorkspaceFiberDock);
         updateFiberList(_lineAnnotationController->fiberSummaries());
     }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
@@ -4574,6 +4692,11 @@ void CWindow::CreateWidgets(void)
     if (_fiberSliceWidget) {
         connect(_fiberSliceWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
         connect(_fiberSliceWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    }
+    ensureDockWidgetFeatures(_atlasWorkspaceFiberDock);
+    if (_atlasWorkspaceFiberDock) {
+        connect(_atlasWorkspaceFiberDock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+        connect(_atlasWorkspaceFiberDock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
     }
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Fibers together
@@ -6702,5 +6825,8 @@ void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
     }
     if (_fiberSliceWidget) {
         _fiberSliceWidget->selectFiber(fiberId);
+    }
+    if (_atlasWorkspaceFiberDock) {
+        _atlasWorkspaceFiberDock->selectFiber(fiberId);
     }
 }

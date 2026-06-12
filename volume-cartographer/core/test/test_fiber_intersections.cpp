@@ -27,6 +27,21 @@ vc::atlas::FiberPolyline fiber(uint64_t id,
     return {id, generation, std::move(points)};
 }
 
+vc::atlas::FiberIntersectionCandidate normalizedCandidateForPair(
+    vc::atlas::FiberIntersectionCandidate candidate,
+    uint64_t sourceFiberId,
+    uint64_t targetFiberId)
+{
+    if (candidate.sourceFiberId == targetFiberId &&
+        candidate.targetFiberId == sourceFiberId) {
+        std::swap(candidate.sourceFiberId, candidate.targetFiberId);
+        std::swap(candidate.sourceGeneration, candidate.targetGeneration);
+        std::swap(candidate.sourceSegmentIndex, candidate.targetSegmentIndex);
+        std::swap(candidate.sourceArclength, candidate.targetArclength);
+    }
+    return candidate;
+}
+
 } // namespace
 
 TEST_CASE("Fiber R-tree candidate search uses straight segment distance")
@@ -154,7 +169,6 @@ TEST_CASE("Fiber point R-tree coverage suppresses same-target repeated hits only
 
 TEST_CASE("Fiber intersection search runs two-sided discovery and preserves distinct minima")
 {
-    vc::atlas::FiberSpatialIndex index;
     vc::atlas::FiberIntersectionCache cache;
     auto source = fiber(1, 1, {p(0, 0, 0), p(400, 0, 0)});
     auto target = fiber(2, 1, {
@@ -175,7 +189,6 @@ TEST_CASE("Fiber intersection search runs two-sided discovery and preserves dist
         {source, target},
         {1},
         {2},
-        index,
         &cache,
         broad,
         ceres);
@@ -190,6 +203,72 @@ TEST_CASE("Fiber intersection search runs two-sided discovery and preserves dist
     std::sort(sourceArclengths.begin(), sourceArclengths.end());
     CHECK(sourceArclengths[0] == doctest::Approx(100.0).epsilon(1e-5));
     CHECK(sourceArclengths[1] == doctest::Approx(300.0).epsilon(1e-5));
+}
+
+TEST_CASE("Fiber intersection search matches legacy indexed candidate refinement")
+{
+    vc::atlas::FiberIntersectionCache cache;
+    auto source = fiber(1, 1, {p(0, 0, 0), p(400, 0, 0)});
+    auto target = fiber(2, 1, {
+        p(100, -20, 0),
+        p(100, 20, 0),
+        p(300, 20, 0),
+        p(300, -20, 0),
+    });
+    auto distractor = fiber(3, 1, {p(0, 80, 0), p(400, 80, 0)});
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    broad.maxDistance = 1.0;
+    broad.maxSampleSpacing = 1.0;
+    broad.clusterArclength = 2.0;
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+    ceres.deduplicateArclength = 2.0;
+
+    const auto results = vc::atlas::searchFiberIntersections(
+        {source, target, distractor},
+        {1},
+        {2},
+        &cache,
+        broad,
+        ceres);
+
+    vc::atlas::FiberSpatialIndex legacyIndex;
+    legacyIndex.upsertCommitted(source);
+    legacyIndex.upsertCommitted(target);
+    legacyIndex.upsertCommitted(distractor);
+
+    std::vector<vc::atlas::FiberIntersectionCandidate> legacyCandidates;
+    for (const auto& candidate : legacyIndex.candidatesForFiber(source, broad)) {
+        if (candidate.targetFiberId == target.id) {
+            legacyCandidates.push_back(candidate);
+        }
+    }
+    for (const auto& candidate : legacyIndex.candidatesForFiber(target, broad)) {
+        if (candidate.targetFiberId == source.id) {
+            legacyCandidates.push_back(
+                normalizedCandidateForPair(candidate, source.id, target.id));
+        }
+    }
+
+    std::vector<vc::atlas::FiberIntersectionResult> legacyResults;
+    for (const auto& candidate : legacyCandidates) {
+        legacyResults.push_back(vc::atlas::refineFiberIntersectionCandidate(source,
+                                                                            target,
+                                                                            candidate,
+                                                                            ceres));
+    }
+    legacyResults = vc::atlas::deduplicateFiberIntersectionResults(
+        std::move(legacyResults),
+        ceres.deduplicateArclength);
+
+    REQUIRE(results.size() == legacyResults.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        CHECK(results[i].sourceFiberId == legacyResults[i].sourceFiberId);
+        CHECK(results[i].targetFiberId == legacyResults[i].targetFiberId);
+        CHECK(results[i].sourceArclength == doctest::Approx(legacyResults[i].sourceArclength).epsilon(1e-5));
+        CHECK(results[i].targetArclength == doctest::Approx(legacyResults[i].targetArclength).epsilon(1e-5));
+        CHECK(results[i].candidateDistance == doctest::Approx(legacyResults[i].candidateDistance).epsilon(1e-5));
+    }
 }
 
 TEST_CASE("Atlas search phase progress maps four equal phases")
@@ -220,7 +299,6 @@ TEST_CASE("Atlas search phase progress maps four equal phases")
 
 TEST_CASE("Fiber intersection search reports pair progress and cancels")
 {
-    vc::atlas::FiberSpatialIndex index;
     vc::atlas::FiberIntersectionCache cache;
     auto sourceA = fiber(1, 1, {p(0, 0, 0), p(10, 0, 0)});
     auto sourceB = fiber(2, 1, {p(0, 10, 0), p(10, 10, 0)});
@@ -230,6 +308,8 @@ TEST_CASE("Fiber intersection search reports pair progress and cancels")
     broad.maxDistance = 0.25;
     vc::atlas::FiberIntersectionCeresOptions ceres;
 
+    std::vector<size_t> buildCompleted;
+    std::vector<size_t> buildTotals;
     std::vector<size_t> completed;
     std::vector<size_t> totals;
     std::vector<vc::atlas::AtlasSearchProgressPhase> phases;
@@ -237,12 +317,16 @@ TEST_CASE("Fiber intersection search reports pair progress and cancels")
         {sourceA, sourceB, target},
         {1, 2, 999},
         {3},
-        index,
         &cache,
         broad,
         ceres,
         nullptr,
         [&](vc::atlas::AtlasSearchProgressPhase phase, size_t done, size_t total) {
+            if (phase == vc::atlas::AtlasSearchProgressPhase::BuildSpatialIndex) {
+                buildCompleted.push_back(done);
+                buildTotals.push_back(total);
+                return;
+            }
             if (phase != vc::atlas::AtlasSearchProgressPhase::SearchPairs) {
                 return;
             }
@@ -251,10 +335,14 @@ TEST_CASE("Fiber intersection search reports pair progress and cancels")
             totals.push_back(total);
         });
 
-    CHECK(phases.size() == 4);
-    CHECK(completed == std::vector<size_t>{0, 1, 2, 3});
-    CHECK(std::all_of(totals.begin(), totals.end(), [](size_t total) {
+    CHECK(buildCompleted == std::vector<size_t>{0, 1, 2, 3});
+    CHECK(std::all_of(buildTotals.begin(), buildTotals.end(), [](size_t total) {
         return total == 3;
+    }));
+    CHECK(phases.size() == 7);
+    CHECK(completed == std::vector<size_t>{0, 1, 2, 3, 4, 5, 6});
+    CHECK(std::all_of(totals.begin(), totals.end(), [](size_t total) {
+        return total == 6;
     }));
 
     bool cancel = false;
@@ -263,7 +351,6 @@ TEST_CASE("Fiber intersection search reports pair progress and cancels")
         {sourceA, sourceB, target},
         {1, 2},
         {3},
-        index,
         &cache,
         broad,
         ceres,
@@ -282,12 +369,13 @@ TEST_CASE("Fiber intersection search reports pair progress and cancels")
         });
 
     CHECK(canceledResults.empty());
-    CHECK(completed == std::vector<size_t>{0, 1});
+    REQUIRE(completed.size() >= 2);
+    CHECK(completed.front() == 0);
+    CHECK(completed.back() >= 1);
 }
 
 TEST_CASE("Fiber intersection search ignores extensions outside outer control points")
 {
-    vc::atlas::FiberSpatialIndex index;
     vc::atlas::FiberIntersectionCache cache;
     auto source = fiber(1, 1, {p(0, 0, 0), p(10, 0, 0)});
     source.controlPoints = {
@@ -316,7 +404,6 @@ TEST_CASE("Fiber intersection search ignores extensions outside outer control po
         {source, target},
         {1},
         {2},
-        index,
         &cache,
         broad,
         ceres);

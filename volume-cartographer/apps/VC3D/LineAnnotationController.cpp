@@ -2950,7 +2950,6 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
         if (fibers.size() != 2) {
             throw std::runtime_error("The edited intersection fibers are no longer both loaded");
         }
-        vc::atlas::FiberSpatialIndex index;
         vc::atlas::FiberIntersectionCache cache;
         vc::atlas::FiberIntersectionBroadPhaseOptions broad;
         vc::atlas::FiberIntersectionCeresOptions ceres;
@@ -2958,7 +2957,6 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
             fibers,
             {sourceId},
             {targetId},
-            index,
             &cache,
             broad,
             ceres);

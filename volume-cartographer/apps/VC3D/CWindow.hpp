@@ -272,10 +272,10 @@ private:
     AtlasControlPointsDock* _atlasControlDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceSearchDock{nullptr};
+    CFiberWidget* _atlasWorkspaceFiberDock{nullptr};
     VolumeViewerBase* _atlasViewer{nullptr};
     std::optional<std::filesystem::path> _currentAtlasDir;
     std::string _currentAtlasName;
-    vc::atlas::FiberSpatialIndex _fiberIntersectionIndex;
     vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
     std::vector<vc::atlas::FiberIntersectionResult> _atlasSearchResults;
     std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _atlasSearchFiberSnapshotsByRuntimeId;
