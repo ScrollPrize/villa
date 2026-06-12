@@ -13,6 +13,7 @@
 
 #include "CState.hpp"
 #include "CWindow.hpp"
+#include "ViewerManager.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -35,7 +36,7 @@ constexpr int kReadyTimeoutMs = 60000;     // wait for volume/surface to come up
 constexpr int kMaxFrameMsLocal = 30000;    // per-keyframe settle ceiling, local data
 constexpr int kMaxFrameMsRemote = 180000;  // per-keyframe ceiling for S3 (slow/flaky net)
 constexpr int kQuietWindowMs = 150;        // continuous quiescence before "settled"
-constexpr int kPumpSliceMs = 5;            // event-loop poll granularity
+constexpr int kPumpSliceMs = 0;            // replay poll should not wait for more platform events
 
 struct StageTiming {
     qint64 wallMs = -1;
@@ -49,6 +50,11 @@ struct FrameTiming {
     StageTiming interactiveRender;
     StageTiming stableRender;
     StageTiming fullSettle;
+    CChunkedVolumeViewer::ReplayRenderState::InterfaceTiming interactiveInterface;
+    CChunkedVolumeViewer::ReplayRenderState::InterfaceTiming stableInterface;
+    qint64 processEventsTotalMs = 0;
+    qint64 processEventsMaxMs = 0;
+    int processEventsCalls = 0;
     int datasetLevel = 0;
     int recordedDatasetLevel = 0;
     int framebufferW = 0;
@@ -76,7 +82,7 @@ std::string formatCpu(const StageTiming& timing)
         return "-";
     }
     std::ostringstream out;
-    out << std::fixed << std::setprecision(1) << timing.cpuMs;
+    out << std::fixed << std::setprecision(0) << timing.cpuMs;
     return out.str();
 }
 
@@ -95,16 +101,73 @@ std::string formatThreadingFactor(const StageTiming& timing)
 
 void appendStageHeader(std::ostringstream& out, const char* prefix)
 {
-    out << std::setw(6) << (std::string(prefix) + "w")
-        << std::setw(7) << (std::string(prefix) + "c")
-        << std::setw(5) << (std::string(prefix) + "x");
+    out << std::setw(5) << (std::string(prefix) + "w")
+        << std::setw(6) << (std::string(prefix) + "c")
+        << std::setw(6) << (std::string(prefix) + "x");
 }
 
 void appendStageRow(std::ostringstream& out, const StageTiming& timing)
 {
-    out << std::setw(6) << formatWall(timing)
-        << std::setw(7) << formatCpu(timing)
-        << std::setw(5) << formatThreadingFactor(timing);
+    out << std::setw(5) << formatWall(timing)
+        << std::setw(6) << formatCpu(timing)
+        << std::setw(6) << formatThreadingFactor(timing);
+}
+
+std::string formatMs(qint64 value)
+{
+    if (value < 0) {
+        return "-";
+    }
+    return std::to_string(value);
+}
+
+void appendInterfaceHeader(std::ostringstream& out)
+{
+    out << std::setw(5) << "irw"
+        << std::setw(5) << "iqd"
+        << std::setw(5) << "iup"
+        << std::setw(5) << "rq"
+        << std::setw(5) << "se"
+        << std::setw(5) << "rt"
+        << std::setw(5) << "sb"
+        << std::setw(5) << "wk"
+        << std::setw(4) << "ca"
+        << std::setw(5) << "la"
+        << std::setw(4) << "ci"
+        << std::setw(5) << "li"
+        << std::setw(5) << "rw"
+        << std::setw(5) << "qd"
+        << std::setw(5) << "gw"
+        << std::setw(5) << "up"
+        << std::setw(5) << "pt"
+        << std::setw(5) << "it"
+        << std::setw(5) << "dw";
+}
+
+void appendInterfaceRow(
+    std::ostringstream& out,
+    const CChunkedVolumeViewer::ReplayRenderState::InterfaceTiming& interactive,
+    const CChunkedVolumeViewer::ReplayRenderState::InterfaceTiming& timing)
+{
+    out << std::setw(5) << formatMs(interactive.workerMs)
+        << std::setw(5) << formatMs(interactive.queueMs)
+        << std::setw(5) << formatMs(interactive.updateToPaintMs)
+        << std::setw(5) << formatMs(timing.requestMs)
+        << std::setw(5) << formatMs(timing.settleMs)
+        << std::setw(5) << formatMs(timing.renderTimerMs)
+        << std::setw(5) << formatMs(timing.submitMs)
+        << std::setw(5) << formatMs(timing.workerStartMs)
+        << std::setw(4) << timing.activeChunkReadyResets
+        << std::setw(5) << formatMs(timing.lastActiveChunkReadyMs)
+        << std::setw(4) << timing.idleChunkReadyResets
+        << std::setw(5) << formatMs(timing.lastIdleChunkReadyMs)
+        << std::setw(5) << formatMs(timing.workerMs)
+        << std::setw(5) << formatMs(timing.queueMs)
+        << std::setw(5) << formatMs(timing.guiMs)
+        << std::setw(5) << formatMs(timing.updateToPaintMs)
+        << std::setw(5) << formatMs(timing.paintTotalMs)
+        << std::setw(5) << formatMs(timing.paintSceneItemsMs)
+        << std::setw(5) << formatMs(timing.paintDrawMs);
 }
 
 std::string timingTableHeader()
@@ -117,18 +180,22 @@ std::string timingTableHeader()
     appendStageHeader(out, "i");
     appendStageHeader(out, "s");
     appendStageHeader(out, "q");
+    appendInterfaceHeader(out);
     out
+        << std::setw(5) << "ep"
+        << std::setw(5) << "em"
+        << std::setw(5) << "ec"
         << std::setw(4) << "ds"
         << std::setw(4) << "rd"
-        << std::setw(11) << "fb"
-        << std::setw(8) << "scale"
-        << std::setw(8) << "zoff";
+        << std::setw(10) << "fb"
+        << std::setw(6) << "scale"
+        << std::setw(6) << "zoff";
     return out.str();
 }
 
 std::string timingTableLegend()
 {
-    return "legend: fr=frame ok=settled c=cached i=interactive s=stable q=quiet; w=wall_ms c=cpu_ms x=cpu/wall; rd=recorded_ds";
+    return "legend: fr=frame ok=settled c=cached i=interactive s=stable q=quiet; w=wall c=cpu x=cpu/wall; irw=interactive renderer iqd=interactive queued cb iup=interactive update->paint rq=stable requested se=settled rt=render timer sb=submitted wk=worker start ca=active chunk resets la=last active chunk ci=idle chunk resets li=last idle chunk rw=stable renderer qd=queued cb gw=gui handoff up=update->paint pt=paint total it=scene/items dw=fb draw; ep=processEvents total em=max ec=calls; rd=recorded_ds";
 }
 
 std::string timingTableSeparator()
@@ -149,12 +216,16 @@ std::string timingTableRow(const FrameTiming& timing)
     appendStageRow(out, timing.interactiveRender);
     appendStageRow(out, timing.stableRender);
     appendStageRow(out, timing.fullSettle);
+    appendInterfaceRow(out, timing.interactiveInterface, timing.stableInterface);
     out
+        << std::setw(5) << timing.processEventsTotalMs
+        << std::setw(5) << timing.processEventsMaxMs
+        << std::setw(5) << timing.processEventsCalls
         << std::setw(4) << timing.datasetLevel
         << std::setw(4) << timing.recordedDatasetLevel
-        << std::setw(11) << fb.str()
-        << std::setw(8) << std::fixed << std::setprecision(3) << timing.scale
-        << std::setw(8) << std::fixed << std::setprecision(2) << timing.zOffset;
+        << std::setw(10) << fb.str()
+        << std::setw(6) << std::fixed << std::setprecision(3) << timing.scale
+        << std::setw(6) << std::fixed << std::setprecision(2) << timing.zOffset;
     return out.str();
 }
 
@@ -235,7 +306,6 @@ bool RenderBenchReplay::waitForCondition(const std::function<bool()>& pred, int 
         if (t.elapsed() >= timeoutMs)
             return pred();
         QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
-        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
     }
     return true;
 }
@@ -248,7 +318,6 @@ bool RenderBenchReplay::settleFrame(QPointer<CChunkedVolumeViewer> viewer, int m
     bool quietRunning = false;
     forever {
         QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
-        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
 
         if (!viewer)
             return false;  // viewer torn down mid-settle
@@ -276,7 +345,15 @@ void RenderBenchReplay::prepareBenchmarkView(CWindow& window, QPointer<CChunkedV
     }
 
     window.switchToMainWorkspace();
-    window.showMaximized();
+    if (_targetWindowSize.isValid()) {
+        window.showNormal();
+        window.setGeometry(0, 0, _targetWindowSize.width(), _targetWindowSize.height());
+        window.resize(_targetWindowSize);
+        Logger()->info("[vc3d-replay] replay window size forced to {}x{}",
+                       _targetWindowSize.width(), _targetWindowSize.height());
+    } else {
+        window.showMaximized();
+    }
     window.raise();
     window.activateWindow();
 
@@ -284,22 +361,94 @@ void RenderBenchReplay::prepareBenchmarkView(CWindow& window, QPointer<CChunkedV
         window.toggleFocusedView();
     }
 
+    QMdiSubWindow* replaySubWindow = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
+    QMdiArea* replayMdiArea = replaySubWindow ? replaySubWindow->mdiArea() : nullptr;
+
+    int disabledViewers = 0;
     if (window._viewerManager) {
+        window._viewerManager->setSegmentationEditActive(false);
         window._viewerManager->setOverlayVolume(nullptr, std::string{});
+        window._viewerManager->setOverlayOpacity(0.0f);
+        window._viewerManager->setHighlightedSurfaceIds({});
+
+        for (auto* baseViewer : window._viewerManager->baseViewers()) {
+            if (!baseViewer) {
+                continue;
+            }
+            const bool targetViewer = baseViewer == viewer.data();
+            baseViewer->setOverlayVolume(nullptr);
+            baseViewer->setOverlayOpacity(0.0f);
+            baseViewer->setPlaneIntersectionLinesVisible(false);
+            baseViewer->setIntersects({});
+            baseViewer->setIntersectionOpacity(0.0f);
+            baseViewer->setIntersectionThickness(0.0f);
+            baseViewer->setHighlightedSurfaceIds({});
+            baseViewer->setSurfaceOverlayEnabled(false);
+            baseViewer->setSurfaceOverlays({});
+            baseViewer->setShowDirectionHints(false);
+            baseViewer->setShowSurfaceNormals(false);
+            baseViewer->setSegmentationEditActive(false);
+            baseViewer->setSegmentationIntersectionDeferral(false);
+            baseViewer->setLinkedCursorVolumePoint(std::nullopt);
+            baseViewer->setBBoxMode(false);
+            baseViewer->clearSelections();
+            baseViewer->clearAllOverlayGroups();
+
+            if (auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(baseViewer)) {
+                chunked->setReplaySuppressViewportUpdates(!targetViewer);
+            }
+            ++disabledViewers;
+        }
+    } else {
+        viewer->setOverlayVolume(nullptr);
+        viewer->setPlaneIntersectionLinesVisible(false);
+        viewer->setIntersects({});
+        viewer->setSurfaceOverlayEnabled(false);
+        viewer->setSurfaceOverlays({});
+        viewer->setShowDirectionHints(false);
+        viewer->setShowSurfaceNormals(false);
+        viewer->clearAllOverlayGroups();
+        disabledViewers = 1;
     }
 
-    viewer->setOverlayVolume(nullptr);
-    viewer->setPlaneIntersectionLinesVisible(false);
-    viewer->setIntersects({});
-    viewer->setSurfaceOverlayEnabled(false);
-    viewer->setSurfaceOverlays({});
-    viewer->setShowDirectionHints(false);
-    viewer->setShowSurfaceNormals(false);
-    viewer->clearAllOverlayGroups();
+    int hiddenSubWindows = 0;
+    auto hideNonReplaySubWindows = [&](QMdiArea* mdiArea) {
+        if (!mdiArea) {
+            return;
+        }
+        const bool replayArea = mdiArea == replayMdiArea;
+        for (auto* subWindow : mdiArea->subWindowList()) {
+            if (!subWindow || subWindow == replaySubWindow) {
+                continue;
+            }
+            subWindow->hide();
+            subWindow->setUpdatesEnabled(false);
+            if (auto* child = subWindow->widget()) {
+                child->setUpdatesEnabled(false);
+            }
+            ++hiddenSubWindows;
+        }
+        if (!replayArea) {
+            mdiArea->setUpdatesEnabled(false);
+            if (auto* viewport = mdiArea->viewport()) {
+                viewport->setUpdatesEnabled(false);
+            }
+        }
+    };
+    hideNonReplaySubWindows(window.mdiArea);
+    hideNonReplaySubWindows(window._fiberSliceMdiArea);
+    hideNonReplaySubWindows(window._intersectionsMdiArea);
 
-    if (auto* subWindow = qobject_cast<QMdiSubWindow*>(viewer->parentWidget())) {
+    Logger()->info("[vc3d-replay] disabled replay drawing overlays on {} viewers; hid {} non-target subwindows",
+                   disabledViewers, hiddenSubWindows);
+
+    if (auto* subWindow = replaySubWindow) {
         if (auto* mdi = subWindow->mdiArea()) {
             mdi->setActiveSubWindow(subWindow);
+        }
+        subWindow->setUpdatesEnabled(true);
+        if (auto* child = subWindow->widget()) {
+            child->setUpdatesEnabled(true);
         }
         subWindow->show();
         subWindow->showMaximized();
@@ -316,7 +465,6 @@ void RenderBenchReplay::prepareBenchmarkView(CWindow& window, QPointer<CChunkedV
 
     for (int i = 0; i < 5; ++i) {
         QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
-        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
     }
 }
 
@@ -402,6 +550,8 @@ void RenderBenchReplay::run(CWindow& window)
                            _header.viewportW, _header.viewportH,
                            got.width(), got.height());
         }
+        viewer->setReplaySuppressViewportUpdates(false);
+        viewer->setReplayPollRenderResults(true);
     }
 
     // Remote (S3) data streams chunks in over the network and can stall on a
@@ -449,8 +599,16 @@ void RenderBenchReplay::run(CWindow& window)
             if (state.interactiveRenderSerial != startState.interactiveRenderSerial) {
                 mark(timing.interactiveRender);
             }
+            if (state.interactiveTiming.serial != 0 &&
+                state.interactiveTiming.serial != startState.interactiveTiming.serial) {
+                timing.interactiveInterface = state.interactiveTiming;
+            }
             if (state.stableRenderSerial != startState.stableRenderSerial) {
                 mark(timing.stableRender);
+            }
+            if (state.stableTiming.serial != 0 &&
+                state.stableTiming.serial != startState.stableTiming.serial) {
+                timing.stableInterface = state.stableTiming;
             }
         };
 
@@ -458,13 +616,19 @@ void RenderBenchReplay::run(CWindow& window)
         sampleMilestones();
 
         forever {
+            QElapsedTimer pumpTimer;
+            pumpTimer.start();
             QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
-            QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+            const qint64 pumpMs = pumpTimer.elapsed();
+            timing.processEventsTotalMs += pumpMs;
+            timing.processEventsMaxMs = std::max(timing.processEventsMaxMs, pumpMs);
+            ++timing.processEventsCalls;
 
             if (!viewer) {
                 mark(timing.fullSettle);
                 break;
             }
+            viewer->drainReplayRenderResults();
             sampleMilestones();
 
             const bool quiescent = viewer->isRenderQuiescent()
@@ -515,9 +679,8 @@ void RenderBenchReplay::run(CWindow& window)
     for (std::size_t i = 0; i < _keyframes.size(); ++i) {
         FrameTiming timing = driveFrame(static_cast<int>(i), _keyframes[i]);
         timings.push_back(timing);
-        std::cout << timingTableRow(timing) << '\n';
+        std::cout << timingTableRow(timing) << std::endl;
     }
-    std::cout << std::flush;
 
     std::vector<qint64> wallMs;
     std::vector<double> cpuMs;

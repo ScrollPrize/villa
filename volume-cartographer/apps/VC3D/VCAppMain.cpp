@@ -20,6 +20,7 @@
 
 #include <opencv2/core.hpp>
 #include <iostream>
+#include <string_view>
 #include <thread>
 #include <omp.h>
 #include <blosc.h>
@@ -123,6 +124,18 @@ auto main(int argc, char* argv[]) -> int
         qputenv("VC_DISABLE_FETCHINTERACTIVE_DEDUP", "1");
     }
 
+    auto hasCommandLineFlag = [argc, argv](std::string_view flag) {
+        for (int i = 1; i < argc; ++i) {
+            if (argv[i] && std::string_view(argv[i]) == flag) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (hasCommandLineFlag("--replay-offscreen-4k")) {
+        qputenv("QT_QPA_PLATFORM", "offscreen");
+    }
+
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
     // Floating dock widgets become unmovable after initial drag on Wayland.
     // Force XCB (X11/XWayland) platform to restore full functionality.
@@ -200,6 +213,11 @@ auto main(int argc, char* argv[]) -> int
         "With --replay, run a discarded warm-up pass before the timed pass.");
     parser.addOption(replayWarmOption);
 
+    QCommandLineOption replayOffscreen4kOption(
+        "replay-offscreen-4k",
+        "With --replay, use Qt offscreen platform and a 3840x2160 replay window.");
+    parser.addOption(replayOffscreen4kOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
@@ -211,6 +229,9 @@ auto main(int argc, char* argv[]) -> int
     benchOptions.recordPath = parser.value(recordOption).trimmed();
     benchOptions.replayPath = parser.value(replayOption).trimmed();
     benchOptions.replayWarm = parser.isSet(replayWarmOption);
+    if (parser.isSet(replayOffscreen4kOption)) {
+        benchOptions.replayWindowSize = QSize(3840, 2160);
+    }
 
     if (parser.isSet(profileOption)) {
         SetProfileLoggingEnabled(true);

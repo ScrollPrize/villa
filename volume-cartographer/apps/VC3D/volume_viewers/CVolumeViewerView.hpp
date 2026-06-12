@@ -35,6 +35,12 @@ public:
 signals:
     void sendResized();
     void sendScrolled();
+    void sendDirectFramebufferPainted(qint64 drawMs);
+    void sendViewportPaintProfile(qint64 totalMs,
+                                  qint64 backgroundMs,
+                                  qint64 framebufferDrawMs,
+                                  qint64 foregroundMs,
+                                  qint64 sceneItemsMs);
     void sendZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers);
     void sendVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
@@ -61,6 +67,7 @@ protected:
     void drawForeground(QPainter* painter, const QRectF& sceneRect) override;
     /// Paint framebuffer directly, bypassing QGraphicsPixmapItem
     void drawBackground(QPainter* painter, const QRectF& rect) override;
+    void paintEvent(QPaintEvent* event) override;
 
 public:
     void setDirectFramebuffer(const QImage* fb) { _directFb = fb; }
@@ -82,6 +89,9 @@ private:
     bool _scrollPanDisabled = false;
     bool _sceneWidgetMouseCapture = false;
     int _wheelAccum = 0;  // fractional wheel delta accumulator
+    qint64 _lastPaintBackgroundMs = -1;
+    qint64 _lastPaintFramebufferDrawMs = -1;
+    qint64 _lastPaintForegroundMs = -1;
     mutable QFont _cachedFont;
     mutable bool _scalebarCacheDirty = true;
     mutable double _cachedBarPx = 0;

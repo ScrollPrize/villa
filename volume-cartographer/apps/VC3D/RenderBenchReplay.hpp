@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QPointer>
+#include <QSize>
 #include <QString>
 
 #include <functional>
@@ -37,6 +38,7 @@ public:
     bool load(const QString& path);
 
     void setWarmPass(bool warm) { _warm = warm; }
+    void setTargetWindowSize(const QSize& size) { _targetWindowSize = size; }
 
     // Opens the recorded volume+segment in the window, then replays every
     // keyframe. Calls QApplication::quit() on completion. Blocking (pumps the
@@ -45,6 +47,7 @@ public:
 
 private:
     bool _warm = false;
+    QSize _targetWindowSize;
     Header _header;
     std::vector<Keyframe> _keyframes;
 
@@ -57,5 +60,5 @@ private:
     static bool settleFrame(QPointer<CChunkedVolumeViewer> viewer, int maxFrameMs, int quietWindowMs);
     // Replay-only visual isolation: hide docks, maximize the segmentation
     // subwindow, and disable overlays/intersections before viewport pinning.
-    static void prepareBenchmarkView(CWindow& window, QPointer<CChunkedVolumeViewer> viewer);
+    void prepareBenchmarkView(CWindow& window, QPointer<CChunkedVolumeViewer> viewer);
 };

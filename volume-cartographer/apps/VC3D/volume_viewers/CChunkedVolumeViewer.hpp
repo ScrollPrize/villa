@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -67,9 +68,32 @@ public:
         Surface* surface = nullptr;
     };
     struct ReplayRenderState {
+        struct InterfaceTiming {
+            std::uint64_t serial = 0;
+            qint64 requestMs = -1;
+            qint64 settleMs = -1;
+            qint64 renderTimerMs = -1;
+            qint64 submitMs = -1;
+            qint64 workerStartMs = -1;
+            int activeChunkReadyResets = 0;
+            qint64 lastActiveChunkReadyMs = -1;
+            int idleChunkReadyResets = 0;
+            qint64 lastIdleChunkReadyMs = -1;
+            qint64 workerMs = -1;
+            qint64 queueMs = -1;
+            qint64 guiMs = -1;
+            qint64 updateToPaintMs = -1;
+            qint64 paintDrawMs = -1;
+            qint64 paintTotalMs = -1;
+            qint64 paintBackgroundMs = -1;
+            qint64 paintForegroundMs = -1;
+            qint64 paintSceneItemsMs = -1;
+        };
         std::uint64_t cachedPreviewSerial = 0;
         std::uint64_t interactiveRenderSerial = 0;
         std::uint64_t stableRenderSerial = 0;
+        InterfaceTiming interactiveTiming;
+        InterfaceTiming stableTiming;
     };
     using ShiftScrollOverride = std::function<bool(int, QPointF, Qt::KeyboardModifiers)>;
 
@@ -103,6 +127,9 @@ public:
     CameraState cameraState() const;
     void applyCameraState(const CameraState& state, bool forceRender = true);
     void applyInteractiveCameraState(const CameraState& state);
+    void setReplaySuppressViewportUpdates(bool suppress);
+    void setReplayPollRenderResults(bool poll) { _replayPollRenderResults = poll; }
+    int drainReplayRenderResults();
     // Render-bench helpers: true when no render is running/queued/pending; count of
     // remote chunk fetches still outstanding. Used by replay to settle each frame.
     bool isRenderQuiescent() const;
@@ -303,6 +330,7 @@ private:
     struct RenderContext;
     struct RenderResult;
     struct GeneratedSurfaceCache;
+    struct ReplayRenderResultQueue;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
@@ -366,10 +394,20 @@ private:
     std::uint64_t _replayCachedPreviewSerial = 0;
     std::uint64_t _replayInteractiveRenderSerial = 0;
     std::uint64_t _replayStableRenderSerial = 0;
+    ReplayRenderState::InterfaceTiming _replayInteractiveTiming;
+    ReplayRenderState::InterfaceTiming _replayStableTiming;
+    QElapsedTimer _replayFrameTimer;
+    std::chrono::steady_clock::time_point _replayFrameStartedAt;
+    std::uint64_t _replayPaintPendingSerial = 0;
+    bool _replayPaintPendingInteractive = false;
+    QElapsedTimer _replayPaintTimer;
+    std::shared_ptr<ReplayRenderResultQueue> _replayRenderResultQueue;
+    bool _replayPollRenderResults = false;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
+    bool _replaySuppressViewportUpdates = false;
 
     struct SurfaceChunkPrefetchCache {
         Surface* surface = nullptr;

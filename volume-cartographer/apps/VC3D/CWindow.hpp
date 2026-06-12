@@ -6,6 +6,7 @@
 #include <opencv2/core/mat.hpp>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QSize>
 #include <QString>
 #include <memory>
 #include <optional>
@@ -56,6 +57,7 @@ struct RenderBenchOptions {
     QString recordPath;   // non-empty: record camera-state timeline to this file
     QString replayPath;   // non-empty: replay a recorded timeline then quit
     bool replayWarm = false;
+    QSize replayWindowSize;  // valid: force replay top-level window size
 };
 
 struct AtlasSearchFiberSnapshot {

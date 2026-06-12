@@ -2,9 +2,11 @@
 
 #include <QGraphicsView>
 #include <QGraphicsProxyWidget>
+#include <QElapsedTimer>
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QPainter>
+#include <QPaintEvent>
 #include <QScrollBar>
 #include <cmath>
 #include <algorithm>
@@ -23,6 +25,8 @@ double CVolumeViewerView::chooseNiceLength(double nominal) const
 
 void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
 {
+    QElapsedTimer timer;
+    timer.start();
     QGraphicsView::drawForeground(p, sceneRect);
     const double dpr = devicePixelRatioF();
     const double m11 = transform().m11();
@@ -79,6 +83,7 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
     p->restore();
 
     drawTiltHandle(p);
+    _lastPaintForegroundMs = timer.elapsed();
 }
 
 CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
@@ -202,10 +207,33 @@ void CVolumeViewerView::drawTiltHandle(QPainter* p) const
 
 void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/)
 {
+    QElapsedTimer backgroundTimer;
+    backgroundTimer.start();
     if (_directFb && !_directFb->isNull()) {
+        QElapsedTimer timer;
+        timer.start();
         painter->resetTransform();
         painter->drawImage(0, 0, *_directFb);
+        _lastPaintFramebufferDrawMs = timer.elapsed();
+        emit sendDirectFramebufferPainted(_lastPaintFramebufferDrawMs);
     }
+    _lastPaintBackgroundMs = backgroundTimer.elapsed();
+}
+
+void CVolumeViewerView::paintEvent(QPaintEvent* event)
+{
+    _lastPaintBackgroundMs = -1;
+    _lastPaintFramebufferDrawMs = -1;
+    _lastPaintForegroundMs = -1;
+
+    QElapsedTimer timer;
+    timer.start();
+    QGraphicsView::paintEvent(event);
+    const qint64 totalMs = timer.elapsed();
+    const qint64 bgMs = std::max<qint64>(0, _lastPaintBackgroundMs);
+    const qint64 fgMs = std::max<qint64>(0, _lastPaintForegroundMs);
+    const qint64 itemMs = std::max<qint64>(0, totalMs - bgMs - fgMs);
+    emit sendViewportPaintProfile(totalMs, bgMs, _lastPaintFramebufferDrawMs, fgMs, itemMs);
 }
 
 void CVolumeViewerView::scrollContentsBy(int dx, int dy)

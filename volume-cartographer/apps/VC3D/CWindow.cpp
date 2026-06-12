@@ -1414,6 +1414,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         _benchReplay = std::make_unique<RenderBenchReplay>();
         if (_benchReplay->load(_benchOptions.replayPath)) {
             _benchReplay->setWarmPass(_benchOptions.replayWarm);
+            _benchReplay->setTargetWindowSize(_benchOptions.replayWindowSize);
             QTimer::singleShot(0, this, [this] { _benchReplay->run(*this); });
         } else {
             _benchReplay.reset();

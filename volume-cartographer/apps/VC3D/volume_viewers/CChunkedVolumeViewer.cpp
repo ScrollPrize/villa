@@ -35,9 +35,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -709,6 +711,11 @@ std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::sha
 
 } // namespace
 
+struct CChunkedVolumeViewer::ReplayRenderResultQueue {
+    std::mutex mutex;
+    std::deque<std::shared_ptr<RenderResult>> results;
+};
+
 struct CChunkedVolumeViewer::GeneratedSurfaceCache {
     std::mutex mutex;
     bool valid = false;
@@ -764,11 +771,46 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
             });
     connect(_view, &CVolumeViewerView::sendKeyPress, this, &CChunkedVolumeViewer::onKeyPress);
     connect(_view, &CVolumeViewerView::sendKeyRelease, this, &CChunkedVolumeViewer::onKeyRelease);
+    connect(_view, &CVolumeViewerView::sendDirectFramebufferPainted, this,
+            [this](qint64 drawMs) {
+                if (_replayPaintPendingSerial == 0 || !_replayPaintTimer.isValid()) {
+                    return;
+                }
+                auto& timing = _replayPaintPendingInteractive
+                    ? _replayInteractiveTiming
+                    : _replayStableTiming;
+                if (timing.serial == _replayPaintPendingSerial) {
+                    timing.updateToPaintMs = _replayPaintTimer.elapsed();
+                    timing.paintDrawMs = drawMs;
+                }
+            });
+    connect(_view, &CVolumeViewerView::sendViewportPaintProfile, this,
+            [this](qint64 totalMs,
+                   qint64 backgroundMs,
+                   qint64 framebufferDrawMs,
+                   qint64 foregroundMs,
+                   qint64 sceneItemsMs) {
+                if (_replayPaintPendingSerial == 0) {
+                    return;
+                }
+                auto& timing = _replayPaintPendingInteractive
+                    ? _replayInteractiveTiming
+                    : _replayStableTiming;
+                if (timing.serial == _replayPaintPendingSerial) {
+                    timing.paintTotalMs = totalMs;
+                    timing.paintBackgroundMs = backgroundMs;
+                    timing.paintDrawMs = framebufferDrawMs;
+                    timing.paintForegroundMs = foregroundMs;
+                    timing.paintSceneItemsMs = sceneItemsMs;
+                }
+                _replayPaintPendingSerial = 0;
+            });
 
     _scene = new QGraphicsScene(this);
     _scene->setItemIndexMethod(QGraphicsScene::NoIndex);
     _view->setScene(_scene);
     _view->setDirectFramebuffer(&_framebuffer);
+    _replayRenderResultQueue = std::make_shared<ReplayRenderResultQueue>();
 
     _renderTimer = new QTimer(this);
     _renderTimer->setSingleShot(true);
@@ -782,6 +824,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
             return;
         }
         _renderPending = false;
+        if (!_interactivePreview && _replayFrameTimer.isValid()) {
+            _replayStableTiming.renderTimerMs = _replayFrameTimer.elapsed();
+        }
         const std::string reason = ProfileLoggingEnabled()
             ? std::format("render timer fired; scheduledReason='{}'; scheduledCaller='{}'",
                           _pendingRenderReason, _pendingRenderCaller)
@@ -795,6 +840,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _settleRenderTimer->setInterval(kInteractionSettleMs);
     connect(_settleRenderTimer, &QTimer::timeout, this, [this]() {
         if (!_isPanning) {
+            if (_replayFrameTimer.isValid()) {
+                _replayStableTiming.settleMs = _replayFrameTimer.elapsed();
+            }
             _interactivePreview = false;
             scheduleRender("interaction settled");
         }
@@ -969,6 +1017,12 @@ void CChunkedVolumeViewer::applyInteractiveCameraState(const CameraState& state)
         return;
     }
 
+    _replayFrameTimer.restart();
+    _replayFrameStartedAt = std::chrono::steady_clock::now();
+    _replayInteractiveTiming = {};
+    _replayStableTiming = {};
+    _replayPaintPendingSerial = 0;
+
     const bool allowStableTransform =
         std::abs(state.zOffset - _zOff) < 1.0e-6f &&
         cv::norm(state.zOffsetWorldDir - _zOffWorldDir) < 1.0e-6f;
@@ -1015,7 +1069,41 @@ CChunkedVolumeViewer::ReplayRenderState CChunkedVolumeViewer::replayRenderState(
     state.cachedPreviewSerial = _replayCachedPreviewSerial;
     state.interactiveRenderSerial = _replayInteractiveRenderSerial;
     state.stableRenderSerial = _replayStableRenderSerial;
+    state.interactiveTiming = _replayInteractiveTiming;
+    state.stableTiming = _replayStableTiming;
     return state;
+}
+
+void CChunkedVolumeViewer::setReplaySuppressViewportUpdates(bool suppress)
+{
+    _replaySuppressViewportUpdates = suppress;
+    if (_view) {
+        _view->setUpdatesEnabled(!suppress);
+        if (_view->viewport()) {
+            _view->viewport()->setUpdatesEnabled(!suppress);
+        }
+    }
+}
+
+int CChunkedVolumeViewer::drainReplayRenderResults()
+{
+    if (!_replayRenderResultQueue) {
+        return 0;
+    }
+
+    std::deque<std::shared_ptr<RenderResult>> pending;
+    {
+        std::lock_guard<std::mutex> lock(_replayRenderResultQueue->mutex);
+        pending.swap(_replayRenderResultQueue->results);
+    }
+
+    int drained = 0;
+    while (!pending.empty()) {
+        finishRenderOnMainThread(std::move(pending.front()));
+        pending.pop_front();
+        ++drained;
+    }
+    return drained;
 }
 
 void CChunkedVolumeViewer::rebuildChunkArray()
@@ -1049,14 +1137,17 @@ void CChunkedVolumeViewer::rebuildChunkArray()
             if (!volume || guard->_volume != volume || guard->_closing)
                 return;
             if (guard->_interactivePreview) {
-                if (guard->_settleRenderTimer)
-                    guard->_settleRenderTimer->start(kChunkReadyActiveDelayMs);
                 return;
             }
             // Coalesce: (re)start the render timer on the longer idle window so a
             // burst of arriving chunks collapses into one re-render once they
             // stop, instead of one full-frame render per chunk at the 16ms tick.
             guard->_renderPending = true;
+            if (guard->_replayFrameTimer.isValid()) {
+                ++guard->_replayStableTiming.idleChunkReadyResets;
+                guard->_replayStableTiming.lastIdleChunkReadyMs =
+                    guard->_replayFrameTimer.elapsed();
+            }
             if (guard->_renderTimer)
                 guard->_renderTimer->start(kChunkReadyIdleDelayMs);
         }, Qt::QueuedConnection);
@@ -1481,6 +1572,9 @@ void CChunkedVolumeViewer::scheduleRender(const char* reason, std::source_locati
     syncCameraTransform();
     _renderPending = true;
     if (_interactivePreview) {
+        if (_replayFrameTimer.isValid() && _replayStableTiming.requestMs < 0) {
+            _replayStableTiming.requestMs = _replayFrameTimer.elapsed();
+        }
         if (_settleRenderTimer)
             _settleRenderTimer->start();
         profile.setDetails("action=settle_timer");
@@ -2291,6 +2385,7 @@ struct CChunkedVolumeViewer::RenderContext {
     float overlayWindowLow = 0.0f;
     float overlayWindowHigh = 255.0f;
     bool interactivePreview = false;
+    std::chrono::steady_clock::time_point replayFrameStartedAt;
     std::shared_ptr<GeneratedSurfaceCache> genCache;
     bool genCacheDirty = false;
     std::string profileReason;
@@ -2303,12 +2398,17 @@ struct CChunkedVolumeViewer::RenderResult {
     float surfacePtrX = 0.0f;
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
+    bool interactivePreview = false;
     qint64 renderFrameElapsedMs = 0;
+    std::chrono::steady_clock::time_point replayFrameStartedAt;
+    std::chrono::steady_clock::time_point workerStartedAt;
+    std::chrono::steady_clock::time_point workerFinishedAt;
 };
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
 {
     QElapsedTimer renderTimer;
+    renderTimer.start();
     // Sub-phase timing (only meaningful under --profile). gen = surface coords,
     // sample = chunk sample/decode, blit = colormap LUT + framebuffer write.
     const bool profilePhases = ProfileLoggingEnabled();
@@ -2316,7 +2416,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     bool phaseGenCached = false;
     QElapsedTimer phaseTimer;
     if (ProfileLoggingEnabled()) {
-        renderTimer.start();
         Logger()->info("[vc3d-profile] renderFrame begin reason='{}' caller='{}' serial={} surf='{}' size={}x{} level={} interactive={} overlay={} composite={} planeComposite={}",
                        ctx.profileReason, ctx.profileCaller, ctx.serial,
                        ctx.surf ? ctx.surf->id : std::string(""),
@@ -2329,13 +2428,17 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.surfacePtrX = ctx.surfacePtrX;
     result.surfacePtrY = ctx.surfacePtrY;
     result.scale = ctx.scale;
+    result.interactivePreview = ctx.interactivePreview;
+    result.replayFrameStartedAt = ctx.replayFrameStartedAt;
     result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
     result.framebuffer.fill(QColor(64, 64, 64));
 
     auto finishRenderFrameProfile = [&]() {
-        if (!ProfileLoggingEnabled() || !renderTimer.isValid())
+        if (renderTimer.isValid()) {
+            result.renderFrameElapsedMs = renderTimer.elapsed();
+        }
+        if (!ProfileLoggingEnabled())
             return;
-        result.renderFrameElapsedMs = renderTimer.elapsed();
         Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} gen_ms={} genCached={} sample_ms={} blit_ms={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
                        result.renderFrameElapsedMs, phaseGenMs, phaseGenCached,
                        phaseSampleMs, phaseBlitMs, ctx.profileReason, ctx.profileCaller,
@@ -2720,6 +2823,7 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     ctx.overlayWindowLow = _overlayWindowLow;
     ctx.overlayWindowHigh = _overlayWindowHigh;
     ctx.interactivePreview = _interactivePreview;
+    ctx.replayFrameStartedAt = _replayFrameStartedAt;
     ctx.genCache = _genSurfaceCache;
     ctx.genCacheDirty = _genCacheDirty;
     if (ProfileLoggingEnabled()) {
@@ -2727,6 +2831,13 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         ctx.profileCaller = profileCaller(caller);
     }
     _genCacheDirty = false;
+    if (_replayFrameTimer.isValid()) {
+        auto& timing = ctx.interactivePreview ? _replayInteractiveTiming : _replayStableTiming;
+        timing.submitMs = _replayFrameTimer.elapsed();
+        if (!ctx.interactivePreview && timing.requestMs < 0) {
+            timing.requestMs = timing.submitMs;
+        }
+    }
     if (profile.enabled()) {
         profile.setDetails(std::format(
             "action=worker_start serial={} size={}x{} level={} interactive={}",
@@ -2734,9 +2845,25 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     }
 
     QPointer<CChunkedVolumeViewer> guard(this);
-    (void)QtConcurrent::run([guard, ctx = std::move(ctx)]() mutable {
+    const bool pollReplayResults = _replayPollRenderResults;
+    auto replayQueue = _replayRenderResultQueue;
+    (void)QtConcurrent::run([guard,
+                             ctx = std::move(ctx),
+                             pollReplayResults,
+                             replayQueue = std::move(replayQueue)]() mutable {
+        const auto workerStartedAt = std::chrono::steady_clock::now();
         auto result = std::make_shared<RenderResult>(renderFrame(std::move(ctx)));
-        QMetaObject::invokeMethod(qApp, [guard, result = std::move(result)]() mutable {
+        result->workerStartedAt = workerStartedAt;
+        result->workerFinishedAt = std::chrono::steady_clock::now();
+        if (pollReplayResults && replayQueue) {
+            std::lock_guard<std::mutex> lock(replayQueue->mutex);
+            replayQueue->results.push_back(std::move(result));
+            return;
+        }
+        if (!guard) {
+            return;
+        }
+        QMetaObject::invokeMethod(guard, [guard, result = std::move(result)]() mutable {
             if (guard)
                 guard->finishRenderOnMainThread(std::move(result));
         }, Qt::QueuedConnection);
@@ -2745,6 +2872,7 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
 
 void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult> result)
 {
+    const auto finishEnteredAt = std::chrono::steady_clock::now();
     ProfileScope profile("finishRenderOnMainThread", "render worker finished",
                          std::source_location::current());
     if (profile.enabled()) {
@@ -2767,9 +2895,23 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
         return;
     }
 
+    QElapsedTimer finishTimer;
+    finishTimer.start();
+    const bool resultInteractive = result->interactivePreview;
+    const qint64 queueMs = result->workerFinishedAt.time_since_epoch().count() != 0
+        ? std::chrono::duration_cast<std::chrono::milliseconds>(
+              finishEnteredAt - result->workerFinishedAt).count()
+        : -1;
+    const qint64 workerStartMs =
+        result->workerStartedAt.time_since_epoch().count() != 0 &&
+        result->replayFrameStartedAt.time_since_epoch().count() != 0
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                  result->workerStartedAt - result->replayFrameStartedAt).count()
+            : -1;
+
     _framebuffer = std::move(result->framebuffer);
     syncCameraTransform();
-    if (_interactivePreview) {
+    if (resultInteractive) {
         _replayInteractiveRenderSerial = result->serial;
     } else {
         _replayStableRenderSerial = result->serial;
@@ -2806,7 +2948,18 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     _stableScale = result->scale;
     _stableFramebufferValid = !_stableFramebuffer.isNull();
     emit overlaysUpdated();
-    _view->viewport()->update();
+    auto& replayTiming = resultInteractive ? _replayInteractiveTiming : _replayStableTiming;
+    replayTiming.serial = result->serial;
+    replayTiming.workerStartMs = workerStartMs;
+    replayTiming.workerMs = result->renderFrameElapsedMs;
+    replayTiming.queueMs = queueMs;
+    replayTiming.guiMs = finishTimer.elapsed();
+    _replayPaintPendingSerial = result->serial;
+    _replayPaintPendingInteractive = resultInteractive;
+    _replayPaintTimer.restart();
+    if (!_replaySuppressViewportUpdates) {
+        _view->viewport()->update();
+    }
     updateStatusLabel();
 
     if (_renderPendingAfterWorker) {
@@ -2891,8 +3044,6 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
                     if (!volume || guard->_overlayVolume != volume || guard->_closing)
                         return;
                     if (guard->_interactivePreview) {
-                        if (guard->_settleRenderTimer)
-                            guard->_settleRenderTimer->start(kChunkReadyActiveDelayMs);
                         return;
                     }
                     guard->scheduleRender("overlay chunk ready");
