@@ -15,6 +15,7 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QBrush>
+#include <QElapsedTimer>
 #include <QVector>
 
 #include <algorithm>
@@ -23,6 +24,7 @@
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Logging.hpp"
 
 ViewerOverlayControllerBase::PathPrimitive
 ViewerOverlayControllerBase::PathPrimitive::densify(float samplingInterval) const
@@ -937,15 +939,33 @@ void ViewerOverlayControllerBase::rebuildOverlay(VolumeViewerBase* viewer)
         return;
     }
 
+    QElapsedTimer timer;
+    timer.start();
+    auto logIfSlow = [&](const char* action, size_t primitiveCount) {
+        const qint64 elapsedMs = timer.elapsed();
+        if (elapsedMs < 5) {
+            return;
+        }
+        Logger()->info("[vc3d-overlay] rebuild group='{}' surf='{}' action={} ms={} prims={}",
+                       _overlayGroupKey,
+                       viewer->surfName(),
+                       action,
+                       elapsedMs,
+                       primitiveCount);
+    };
+
     if (!isOverlayEnabledFor(viewer)) {
         viewer->clearOverlayGroup(_overlayGroupKey);
+        logIfSlow("clear", 0);
         return;
     }
 
     OverlayBuilder builder(viewer);
     collectPrimitives(viewer, builder);
     auto primitives = builder.takePrimitives();
+    const size_t primitiveCount = primitives.size();
     applyPrimitives(viewer, _overlayGroupKey, std::move(primitives));
+    logIfSlow("apply", primitiveCount);
 }
 
 void ViewerOverlayControllerBase::detachAllViewers()

@@ -392,7 +392,7 @@ private:
     float _stableSurfY = 0.0f;
     float _stableScale = 1.0f;
     bool _stableFramebufferValid = false;
-    std::atomic<bool> _renderWorkerBusy{false};
+    std::atomic<int> _renderWorkersInFlight{0};
     bool _renderPendingAfterWorker = false;
     bool _directInteractionRenderRequest = false;
     bool _directInteractionPendingAfterWorker = false;
@@ -407,6 +407,11 @@ private:
     std::uint64_t _replayPaintPendingSerial = 0;
     bool _replayPaintPendingInteractive = false;
     QElapsedTimer _replayPaintTimer;
+    std::uint64_t _tracePaintPendingSerial = 0;
+    std::string _tracePaintPendingReason;
+    QElapsedTimer _tracePaintTimer;
+    QElapsedTimer _traceDispatcherBlockTimer;
+    bool _traceDispatcherBlockPending = false;
     std::shared_ptr<ReplayRenderResultQueue> _replayRenderResultQueue;
     bool _replayPollRenderResults = false;
     cv::Mat_<uint8_t> _values;

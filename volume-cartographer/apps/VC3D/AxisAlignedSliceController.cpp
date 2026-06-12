@@ -15,7 +15,10 @@
 #include <QSettings>
 #include <QLoggingCategory>
 #include <cmath>
+#include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 #include <opencv2/core.hpp>
 
 Q_LOGGING_CATEGORY(lcAxisSlices2, "vc.axis_aligned");
@@ -327,6 +330,8 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
 
     POI* focus = _state->poi("focus");
     cv::Vec3f origin = focus ? focus->p : cv::Vec3f(0, 0, 0);
+    std::vector<std::pair<std::string, std::shared_ptr<Surface>>> surfaceUpdates;
+    surfaceUpdates.reserve(3);
 
     auto xyNormalFromTilt = [this]() {
         const double tiltLen = _enabled ? std::min(1.0, std::hypot(_xyTilt.x(), _xyTilt.y())) : 0.0;
@@ -398,12 +403,12 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             }
         }
 
-        _state->setSurface(planeName, planeShared, false, true);
         return planeShared;
     };
 
     // Always update the XY plane
     auto xyPlane = configurePlane("xy plane", xyNormalFromTilt());
+    surfaceUpdates.emplace_back("xy plane", xyPlane);
 
     // Resolve segment so we can decide whether to fall back to canonical axes.
     QuadSurface* segment = nullptr;
@@ -418,8 +423,8 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
     const bool useCanonical = _enabled || !segment;
 
     if (useCanonical) {
-        configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
-        configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt);
+        surfaceUpdates.emplace_back("seg xz", configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt));
+        surfaceUpdates.emplace_back("seg yz", configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt));
     } else {
         auto segXZShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface("seg xz"));
         auto segYZShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface("seg yz"));
@@ -436,8 +441,8 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         const auto frame = segmentSliceFrameAtFocus(*segment, origin, patchIndex);
         if (!frame) {
             if (!hadSegmentPlanes) {
-                configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
-                configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt);
+                surfaceUpdates.emplace_back("seg xz", configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt));
+                surfaceUpdates.emplace_back("seg yz", configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt));
             }
         } else {
             // Use the closest safe surface point as origin for the slicing planes,
@@ -450,9 +455,16 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             segXZShared->setInPlaneRotation(0.0f);
             segYZShared->setInPlaneRotation(0.0f);
 
-            _state->setSurface("seg xz", segXZShared, false, true);
-            _state->setSurface("seg yz", segYZShared, false, true);
+            surfaceUpdates.emplace_back("seg xz", segXZShared);
+            surfaceUpdates.emplace_back("seg yz", segYZShared);
         }
+    }
+
+    for (const auto& [name, surface] : surfaceUpdates) {
+        _state->setSurface(name, surface, true, true);
+    }
+    for (const auto& [name, surface] : surfaceUpdates) {
+        _state->setSurface(name, surface, false, true);
     }
 
     if (_planeSlicingOverlay) {

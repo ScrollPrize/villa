@@ -2,6 +2,7 @@
 
 #include <QGraphicsView>
 #include <QPointF>
+#include <QString>
 
 class CVolumeViewerView : public QGraphicsView
 {
@@ -41,6 +42,7 @@ signals:
                                   qint64 framebufferDrawMs,
                                   qint64 foregroundMs,
                                   qint64 sceneItemsMs);
+    void sendViewportEventObserved(QString eventName);
     void sendZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers);
     void sendVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
@@ -67,6 +69,7 @@ protected:
     void drawForeground(QPainter* painter, const QRectF& sceneRect) override;
     /// Paint framebuffer directly, bypassing QGraphicsPixmapItem
     void drawBackground(QPainter* painter, const QRectF& rect) override;
+    bool event(QEvent* event) override;
     void paintEvent(QPaintEvent* event) override;
 
 public:

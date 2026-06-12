@@ -2147,7 +2147,10 @@ void CWindow::selectLasagnaOutputSegment(const QString& outputName)
     }
 }
 
-bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId)
+bool CWindow::centerFocusAt(const cv::Vec3f& position,
+                            const cv::Vec3f& normal,
+                            const std::string& sourceId,
+                            bool recenterSegmentation)
 {
     if (!_state) {
         return false;
@@ -2169,9 +2172,13 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
     }
     focus->surfacePtr.reset();
 
+    focus->suppressViewerRecenter = true;
     focus->suppressTransientPlaneIntersections = true;
     _state->setPOI("focus", focus);
-    recenterSegmentationViewerNear(position);
+
+    if (recenterSegmentation) {
+        recenterSegmentationViewerNear(position);
+    }
 
     // Get surface for orientation - look up by ID
     Surface* orientationSource = _state->surfaceRaw(focus->surfaceId);
@@ -5016,7 +5023,19 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
         if (_state && surf) {
             surfId = _state->findSurfaceId(surf);
         }
-        centerFocusAt(vol_loc, normal, surfId);
+        auto* originViewer = qobject_cast<CChunkedVolumeViewer*>(sender());
+        auto* segViewer = segmentationViewer();
+        const bool clickedSegmentation =
+            originViewer == segViewer ||
+            surfId == "segmentation" ||
+            (segViewer && surf && segViewer->currentSurface() == surf);
+        Logger()->info("[vc3d-focus] ctrl-click source='{}' clickedSeg={} pos=({:.1f},{:.1f},{:.1f})",
+                       surfId,
+                       clickedSegmentation ? "y" : "n",
+                       vol_loc[0],
+                       vol_loc[1],
+                       vol_loc[2]);
+        centerFocusAt(vol_loc, normal, surfId, !clickedSegmentation);
     }
     else {
     }

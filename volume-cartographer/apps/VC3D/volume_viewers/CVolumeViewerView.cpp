@@ -11,6 +11,26 @@
 #include <cmath>
 #include <algorithm>
 
+namespace
+{
+QString interestingEventName(QEvent::Type type)
+{
+    switch (type) {
+    case QEvent::UpdateRequest:
+        return QStringLiteral("UpdateRequest");
+    case QEvent::UpdateLater:
+        return QStringLiteral("UpdateLater");
+    case QEvent::Paint:
+        return QStringLiteral("Paint");
+    case QEvent::Timer:
+        return QStringLiteral("Timer");
+    case QEvent::MetaCall:
+        return QStringLiteral("MetaCall");
+    default:
+        return {};
+    }
+}
+}
 
 
 double CVolumeViewerView::chooseNiceLength(double nominal) const
@@ -218,6 +238,17 @@ void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/
         emit sendDirectFramebufferPainted(_lastPaintFramebufferDrawMs);
     }
     _lastPaintBackgroundMs = backgroundTimer.elapsed();
+}
+
+bool CVolumeViewerView::event(QEvent* event)
+{
+    if (event) {
+        const QString name = interestingEventName(event->type());
+        if (!name.isEmpty()) {
+            emit sendViewportEventObserved(name);
+        }
+    }
+    return QGraphicsView::event(event);
 }
 
 void CVolumeViewerView::paintEvent(QPaintEvent* event)
@@ -517,6 +548,12 @@ void CVolumeViewerView::leaveEvent(QEvent *event)
 
 bool CVolumeViewerView::viewportEvent(QEvent* event)
 {
+    if (event) {
+        const QString name = interestingEventName(event->type());
+        if (!name.isEmpty()) {
+            emit sendViewportEventObserved(QStringLiteral("viewport:") + name);
+        }
+    }
     if (event && event->type() == QEvent::Leave) {
         emit sendMouseLeftView();
     }

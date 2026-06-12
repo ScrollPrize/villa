@@ -17,6 +17,7 @@
 #include "vc/core/util/Surface.hpp"
 
 #include <QApplication>
+#include <QAbstractEventDispatcher>
 #include <QCursor>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -38,6 +39,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -47,6 +49,7 @@
 #include <queue>
 #include <source_location>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 
 #include <opencv2/imgproc.hpp>
@@ -114,6 +117,19 @@ struct IntersectionStyleHash {
 bool isSupportedStreamingCompositeMethod(const std::string& method)
 {
     return method == "mean" || method == "max" || method == "min" || method == "alpha";
+}
+
+bool traceRenderReason(std::string_view reason)
+{
+    return reason.find("current surface edit") != std::string_view::npos ||
+           reason.find("pan") != std::string_view::npos ||
+           reason.find("focus") != std::string_view::npos;
+}
+
+bool directPresentUsesRepaint()
+{
+    const char* mode = std::getenv("VC3D_DIRECT_PRESENT");
+    return mode && std::string_view(mode) == "repaint";
 }
 
 int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
@@ -773,6 +789,14 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendKeyRelease, this, &CChunkedVolumeViewer::onKeyRelease);
     connect(_view, &CVolumeViewerView::sendDirectFramebufferPainted, this,
             [this](qint64 drawMs) {
+                if (_tracePaintPendingSerial != 0 && _tracePaintTimer.isValid()) {
+                    Logger()->info("[vc3d-render] paint surf='{}' serial={} reason='{}' update_to_paint_ms={} draw_ms={}",
+                                   _surfName,
+                                   _tracePaintPendingSerial,
+                                   _tracePaintPendingReason,
+                                   _tracePaintTimer.elapsed(),
+                                   drawMs);
+                }
                 if (_replayPaintPendingSerial == 0 || !_replayPaintTimer.isValid()) {
                     return;
                 }
@@ -790,6 +814,19 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
                    qint64 framebufferDrawMs,
                    qint64 foregroundMs,
                    qint64 sceneItemsMs) {
+                if (_tracePaintPendingSerial != 0) {
+                    Logger()->info("[vc3d-render] paint-total surf='{}' serial={} reason='{}' total_ms={} bg_ms={} fb_ms={} fg_ms={} items_ms={}",
+                                   _surfName,
+                                   _tracePaintPendingSerial,
+                                   _tracePaintPendingReason,
+                                   totalMs,
+                                   backgroundMs,
+                                   framebufferDrawMs,
+                                   foregroundMs,
+                                   sceneItemsMs);
+                    _tracePaintPendingSerial = 0;
+                    _tracePaintPendingReason.clear();
+                }
                 if (_replayPaintPendingSerial == 0) {
                     return;
                 }
@@ -805,6 +842,49 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
                 }
                 _replayPaintPendingSerial = 0;
             });
+    connect(_view, &CVolumeViewerView::sendViewportEventObserved, this,
+            [this](const QString& eventName) {
+                if (_tracePaintPendingSerial == 0 || !_tracePaintTimer.isValid()) {
+                    return;
+                }
+                Logger()->info("[vc3d-render] viewport-event surf='{}' serial={} reason='{}' event='{}' since_present_ms={}",
+                               _surfName,
+                               _tracePaintPendingSerial,
+                               _tracePaintPendingReason,
+                               eventName.toStdString(),
+                               _tracePaintTimer.elapsed());
+            });
+    if (auto* dispatcher = QAbstractEventDispatcher::instance(QApplication::instance()->thread())) {
+        connect(dispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]() {
+            if (_tracePaintPendingSerial == 0 || !_tracePaintTimer.isValid()) {
+                _traceDispatcherBlockPending = false;
+                return;
+            }
+            _traceDispatcherBlockPending = true;
+            _traceDispatcherBlockTimer.restart();
+            Logger()->info("[vc3d-render] dispatcher-about-to-block surf='{}' serial={} reason='{}' since_present_ms={}",
+                           _surfName,
+                           _tracePaintPendingSerial,
+                           _tracePaintPendingReason,
+                           _tracePaintTimer.elapsed());
+        });
+        connect(dispatcher, &QAbstractEventDispatcher::awake, this, [this]() {
+            if (!_traceDispatcherBlockPending) {
+                return;
+            }
+            const qint64 blockedMs = _traceDispatcherBlockTimer.isValid()
+                ? _traceDispatcherBlockTimer.elapsed()
+                : -1;
+            Logger()->info("[vc3d-render] dispatcher-awake surf='{}' serial={} reason='{}' blocked_ms={} pending={} since_present_ms={}",
+                           _surfName,
+                           _tracePaintPendingSerial,
+                           _tracePaintPendingReason,
+                           blockedMs,
+                           _tracePaintPendingSerial != 0 ? "y" : "n",
+                           _tracePaintTimer.isValid() ? _tracePaintTimer.elapsed() : -1);
+            _traceDispatcherBlockPending = false;
+        });
+    }
 
     _scene = new QGraphicsScene(this);
     _scene->setItemIndexMethod(QGraphicsScene::NoIndex);
@@ -1086,7 +1166,7 @@ void CChunkedVolumeViewer::applyDirectCameraState(const CameraState& state)
 
 bool CChunkedVolumeViewer::isRenderQuiescent() const
 {
-    return !_renderWorkerBusy.load(std::memory_order_acquire)
+    return _renderWorkersInFlight.load(std::memory_order_acquire) == 0
         && !_renderPendingAfterWorker
         && !_renderPending
         && !(_renderTimer && _renderTimer->isActive())
@@ -1319,15 +1399,29 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
 
     _surfWeak = surf;
     if (isSameCurrentSurface && isEditUpdate) {
+        QElapsedTimer editTimer;
+        editTimer.start();
         _genCacheDirty = true;
         _zOffWorldDir = {0, 0, 0};
         _stableFramebufferValid = false;
         updateContentBounds();
         updateFocusMarker();
+        const qint64 prepMs = editTimer.elapsed();
         if (_suppressNextSurfaceEditRender) {
             _suppressNextSurfaceEditRender = false;
         } else {
-            scheduleRender("current surface edit update");
+            editTimer.restart();
+            prefetchVisibleSurfaceChunks();
+            const qint64 prefetchMs = editTimer.elapsed();
+            Logger()->info("[vc3d-render] surface-edit surf='{}' prep_ms={} prefetch_ms={} ptr=({:.1f},{:.1f}) scale={:.4f} inFlight={}",
+                           _surfName,
+                           prepMs,
+                           prefetchMs,
+                           _surfacePtrX,
+                           _surfacePtrY,
+                           _scale,
+                           _renderWorkersInFlight.load(std::memory_order_acquire));
+            submitDirectInteractionRender("current surface edit preview");
         }
         scheduleIntersectionRender("current surface edit update");
         return;
@@ -1470,7 +1564,6 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     if (poi->suppressViewerRecenter) {
         updateFocusMarker(poi);
         updateStatusLabel();
-        emit overlaysUpdated();
         return;
     }
 
@@ -2445,11 +2538,15 @@ struct CChunkedVolumeViewer::RenderContext {
     float overlayWindowLow = 0.0f;
     float overlayWindowHigh = 255.0f;
     bool interactivePreview = false;
+    bool directInteractionRender = false;
     std::chrono::steady_clock::time_point replayFrameStartedAt;
     std::shared_ptr<GeneratedSurfaceCache> genCache;
     bool genCacheDirty = false;
     std::string profileReason;
     std::string profileCaller;
+    std::string traceReason;
+    std::string viewerSurfaceName;
+    std::chrono::steady_clock::time_point submittedAt;
 };
 
 struct CChunkedVolumeViewer::RenderResult {
@@ -2459,10 +2556,14 @@ struct CChunkedVolumeViewer::RenderResult {
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
     bool interactivePreview = false;
+    bool directInteractionRender = false;
     qint64 renderFrameElapsedMs = 0;
     std::chrono::steady_clock::time_point replayFrameStartedAt;
+    std::chrono::steady_clock::time_point submittedAt;
     std::chrono::steady_clock::time_point workerStartedAt;
     std::chrono::steady_clock::time_point workerFinishedAt;
+    std::string traceReason;
+    std::string viewerSurfaceName;
 };
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
@@ -2489,7 +2590,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.surfacePtrY = ctx.surfacePtrY;
     result.scale = ctx.scale;
     result.interactivePreview = ctx.interactivePreview;
+    result.directInteractionRender = ctx.directInteractionRender;
     result.replayFrameStartedAt = ctx.replayFrameStartedAt;
+    result.submittedAt = ctx.submittedAt;
+    result.traceReason = ctx.traceReason;
+    result.viewerSurfaceName = ctx.viewerSurfaceName;
     result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
     result.framebuffer.fill(QColor(64, 64, 64));
 
@@ -2819,11 +2924,14 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
 void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location caller)
 {
     ProfileScope profile("submitRender", reason, caller);
+    const std::string_view reasonView(reason ? reason : "");
+    const bool traceRender = traceRenderReason(reasonView);
+    const auto submittedAt = std::chrono::steady_clock::now();
     if (profile.enabled()) {
         profile.setDetails(std::format(
             "surf='{}' volume={} chunkArray={} busy={}",
             _surfName, bool(_volume), bool(_chunkArray),
-            _renderWorkerBusy.load(std::memory_order_acquire)));
+            _renderWorkersInFlight.load(std::memory_order_acquire)));
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
@@ -2846,7 +2954,17 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
 
-    if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+    const int workersInFlight = _renderWorkersInFlight.load(std::memory_order_acquire);
+    const bool launchConcurrentPreview = _interactivePreview && workersInFlight > 0;
+    if (workersInFlight > 0 && !launchConcurrentPreview) {
+        if (traceRender) {
+            Logger()->info("[vc3d-render] queue surf='{}' reason='{}' inFlight={} direct={} pendingAfterWorker={}",
+                           _surfName,
+                           reasonView,
+                           workersInFlight,
+                           _directInteractionRenderRequest ? "y" : "n",
+                           _renderPendingAfterWorker ? "y" : "n");
+        }
         if (_directInteractionRenderRequest) {
             _renderPendingAfterWorker = true;
             _directInteractionPendingAfterWorker = true;
@@ -2857,6 +2975,13 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         _renderPendingAfterWorker = true;
         profile.setDetails("action=queued_after_worker");
         return;
+    }
+    _renderWorkersInFlight.fetch_add(1, std::memory_order_acq_rel);
+    if (launchConcurrentPreview) {
+        Logger()->info("[vc3d-render] launch concurrent preview surf='{}' inFlight={} reason='{}'",
+                       _surfName,
+                       workersInFlight,
+                       reason ? reason : "");
     }
 
     _chunkArray->beginViewRequest();
@@ -2889,9 +3014,13 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     ctx.overlayWindowLow = _overlayWindowLow;
     ctx.overlayWindowHigh = _overlayWindowHigh;
     ctx.interactivePreview = _interactivePreview;
+    ctx.directInteractionRender = _directInteractionRenderRequest;
     ctx.replayFrameStartedAt = _replayFrameStartedAt;
     ctx.genCache = _genSurfaceCache;
     ctx.genCacheDirty = _genCacheDirty;
+    ctx.traceReason = std::string(reasonView);
+    ctx.viewerSurfaceName = _surfName;
+    ctx.submittedAt = submittedAt;
     if (ProfileLoggingEnabled()) {
         ctx.profileReason = reason ? reason : "";
         ctx.profileCaller = profileCaller(caller);
@@ -2909,6 +3038,21 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
             "action=worker_start serial={} size={}x{} level={} interactive={}",
             ctx.serial, ctx.fbW, ctx.fbH, ctx.startLevel, ctx.interactivePreview));
     }
+    if (traceRender) {
+        Logger()->info("[vc3d-render] submit surf='{}' serial={} reason='{}' inFlightBefore={} concurrent={} interactive={} level={} fb={}x{} ptr=({:.1f},{:.1f}) scale={:.4f}",
+                       _surfName,
+                       ctx.serial,
+                       reasonView,
+                       workersInFlight,
+                       launchConcurrentPreview ? "y" : "n",
+                       ctx.interactivePreview ? "y" : "n",
+                       ctx.startLevel,
+                       ctx.fbW,
+                       ctx.fbH,
+                       ctx.surfacePtrX,
+                       ctx.surfacePtrY,
+                       ctx.scale);
+    }
 
     QPointer<CChunkedVolumeViewer> guard(this);
     const bool pollReplayResults = _replayPollRenderResults;
@@ -2921,6 +3065,20 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         auto result = std::make_shared<RenderResult>(renderFrame(std::move(ctx)));
         result->workerStartedAt = workerStartedAt;
         result->workerFinishedAt = std::chrono::steady_clock::now();
+        if (!result->traceReason.empty()) {
+            const qint64 submitToWorkerMs =
+                result->submittedAt.time_since_epoch().count() != 0
+                    ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                          result->workerStartedAt - result->submittedAt).count()
+                    : -1;
+            Logger()->info("[vc3d-render] worker-done surf='{}' serial={} reason='{}' submit_to_worker_ms={} worker_ms={} interactive={}",
+                           result->viewerSurfaceName,
+                           result->serial,
+                           result->traceReason,
+                           submitToWorkerMs,
+                           result->renderFrameElapsedMs,
+                           result->interactivePreview ? "y" : "n");
+        }
         if (pollReplayResults && replayQueue) {
             std::lock_guard<std::mutex> lock(replayQueue->mutex);
             replayQueue->results.push_back(std::move(result));
@@ -2947,13 +3105,23 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             bool(result), result ? result->serial : 0, _renderSerial,
             _renderPendingAfterWorker));
     }
-    _renderWorkerBusy.store(false, std::memory_order_release);
+    const int workersRemaining =
+        std::max(0, _renderWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel) - 1);
     if (_closing) {
         profile.setDetails("action=drop_closing");
         return;
     }
     if (!result || result->serial != _renderSerial) {
-        if (_renderPendingAfterWorker) {
+        if (result && !result->traceReason.empty()) {
+            Logger()->info("[vc3d-render] drop-stale surf='{}' serial={} currentSerial={} reason='{}' workersRemaining={} pendingAfterWorker={}",
+                           _surfName,
+                           result->serial,
+                           _renderSerial,
+                           result->traceReason,
+                           workersRemaining,
+                           _renderPendingAfterWorker ? "y" : "n");
+        }
+        if (_renderPendingAfterWorker && workersRemaining == 0) {
             _renderPendingAfterWorker = false;
             scheduleRender("stale render result had pending worker");
         }
@@ -3013,7 +3181,9 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     _stableSurfY = result->surfacePtrY;
     _stableScale = result->scale;
     _stableFramebufferValid = !_stableFramebuffer.isNull();
-    emit overlaysUpdated();
+    if (!resultInteractive && !result->directInteractionRender) {
+        emit overlaysUpdated();
+    }
     auto& replayTiming = resultInteractive ? _replayInteractiveTiming : _replayStableTiming;
     replayTiming.serial = result->serial;
     replayTiming.workerStartMs = workerStartMs;
@@ -3023,12 +3193,79 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     _replayPaintPendingSerial = result->serial;
     _replayPaintPendingInteractive = resultInteractive;
     _replayPaintTimer.restart();
+    if (!result->traceReason.empty()) {
+        const qint64 submitToFinishMs =
+            result->submittedAt.time_since_epoch().count() != 0
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                      finishEnteredAt - result->submittedAt).count()
+                : -1;
+        Logger()->info("[vc3d-render] finish surf='{}' serial={} reason='{}' submit_to_finish_ms={} queue_ms={} gui_ms={} worker_ms={} interactive={} fb={}x{}",
+                       _surfName,
+                       result->serial,
+                       result->traceReason,
+                       submitToFinishMs,
+                       queueMs,
+                       replayTiming.guiMs,
+                       result->renderFrameElapsedMs,
+                       resultInteractive ? "y" : "n",
+                       _framebuffer.width(),
+                       _framebuffer.height());
+        _tracePaintPendingSerial = result->serial;
+        _tracePaintPendingReason = result->traceReason;
+        _tracePaintTimer.restart();
+    }
     if (!_replaySuppressViewportUpdates) {
-        _view->viewport()->update();
+        const bool useRepaint = result->directInteractionRender && directPresentUsesRepaint();
+        if (!result->traceReason.empty()) {
+            Logger()->info("[vc3d-render] present surf='{}' serial={} reason='{}' direct={} mode={}",
+                           _surfName,
+                           result->serial,
+                           result->traceReason,
+                           result->directInteractionRender ? "y" : "n",
+                           useRepaint ? "repaint" : "update");
+        }
+        if (useRepaint) {
+            _view->viewport()->repaint();
+        } else {
+            _view->viewport()->update();
+            if (result->directInteractionRender && _tracePaintPendingSerial != 0) {
+                const std::uint64_t serial = _tracePaintPendingSerial;
+                const std::string reason = _tracePaintPendingReason;
+                const auto presentedAt = std::chrono::steady_clock::now();
+                auto elapsedSincePresent = [presentedAt]() {
+                    return std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - presentedAt).count();
+                };
+                QTimer::singleShot(0, this, [this, serial, reason, elapsedSincePresent]() {
+                    Logger()->info("[vc3d-render] gui-zero surf='{}' serial={} reason='{}' pending={} since_present_ms={}",
+                                   _surfName,
+                                   serial,
+                                   reason,
+                                   _tracePaintPendingSerial == serial ? "y" : "n",
+                                   elapsedSincePresent());
+                });
+                QTimer::singleShot(16, this, [this, serial, reason, elapsedSincePresent]() {
+                    Logger()->info("[vc3d-render] gui-16ms surf='{}' serial={} reason='{}' pending={} since_present_ms={}",
+                                   _surfName,
+                                   serial,
+                                   reason,
+                                   _tracePaintPendingSerial == serial ? "y" : "n",
+                                   elapsedSincePresent());
+                });
+                QTimer::singleShot(100, this, [this, serial, reason, elapsedSincePresent]() {
+                    Logger()->info("[vc3d-render] gui-100ms surf='{}' serial={} reason='{}' pending={} since_present_ms={}",
+                                   _surfName,
+                                   serial,
+                                   reason,
+                                   _tracePaintPendingSerial == serial ? "y" : "n",
+                                   elapsedSincePresent());
+                });
+            }
+        }
     }
     updateStatusLabel();
 
-    if (_renderPendingAfterWorker) {
+    if (_renderPendingAfterWorker && workersRemaining == 0) {
         _renderPendingAfterWorker = false;
         if (_directInteractionPendingAfterWorker) {
             _directInteractionPendingAfterWorker = false;
@@ -3817,6 +4054,11 @@ void CChunkedVolumeViewer::updateFocusMarker(POI* poi)
 
     _focusMarker->setPos(scenePos);
     _focusMarker->show();
+    _focusMarker->update();
+    _scene->update(_focusMarker->sceneBoundingRect().adjusted(-4.0, -4.0, 4.0, 4.0));
+    if (_view && _view->viewport()) {
+        _view->viewport()->update();
+    }
 }
 
 cv::Vec3f CChunkedVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
