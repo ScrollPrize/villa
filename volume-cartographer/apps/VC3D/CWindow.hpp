@@ -50,6 +50,7 @@ class Surface;
 class QuadSurface;
 class RenderBenchRecorder;
 class RenderBenchReplay;
+class QTreeWidget;
 
 // Render-bench profiling modes (see RenderBenchRecorder/RenderBenchReplay).
 struct RenderBenchOptions {
@@ -61,6 +62,8 @@ struct RenderBenchOptions {
 struct AtlasSearchFiberSnapshot {
     std::filesystem::path fiberPath;
     vc::atlas::FiberPolyline fiber;
+    uint64_t storedFiberId = 0;
+    std::vector<std::string> tags;
 };
 
 #define MAX_RECENT_VOLPKG 10
@@ -83,7 +86,6 @@ class QMenu;
 class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
-class QTableWidget;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
@@ -144,8 +146,8 @@ private:
     void clearAtlasSearchPreviewState();
     void updateAtlasSearchPreviewCandidates();
     void setAtlasSearchHoverResult(std::optional<int> sortedResultIndex);
-    void updateAtlasSearchSelectionFromTable(QTableWidget* sourceTable);
-    void syncAtlasSearchTableSelection(QTableWidget* sourceTable);
+    void updateAtlasSearchSelectionFromTree(QTreeWidget* sourceTree);
+    void syncAtlasSearchTreeSelection(QTreeWidget* sourceTree);
     void updateAtlasSearchPreviewRequests();
     void requestAtlasSearchPreviewLine(int sortedResultIndex);
     void switchToLasagnaWorkspace();

@@ -3171,7 +3171,8 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
             try {
                 if (auto fiber = loadFiberFile(entry.path())) {
                     const fs::path path = relativeFiberPath(*fiber);
-                    byPath[path] = FiberSnapshotWithPath{path, snapshotForFiber(*fiber)};
+                    byPath[path] = FiberSnapshotWithPath{
+                        path, snapshotForFiber(*fiber), fiber->id, fiber->tags};
                 }
             } catch (const std::exception& ex) {
                 Logger()->warn("Skipping invalid VC3D fiber file {} during atlas search: {}",
@@ -3183,7 +3184,8 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
 
     for (const auto& fiber : _fibers) {
         const fs::path path = relativeFiberPath(fiber);
-        byPath[path] = FiberSnapshotWithPath{path, snapshotForFiber(fiber)};
+        byPath[path] = FiberSnapshotWithPath{
+            path, snapshotForFiber(fiber), fiber.id, fiber.tags};
     }
 
     std::vector<fs::path> orderedPaths;
