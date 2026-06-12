@@ -888,6 +888,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](std::shared_ptr<VolumePkg> pkg) {
                 _currentAtlasDir.reset();
                 _currentAtlasName.clear();
+                if (_lineAnnotationController) {
+                    _lineAnnotationController->setCurrentAtlasDirectory(std::nullopt);
+                }
                 _fiberIntersectionIndex.clear();
                 _fiberIntersectionCache.clear();
                 refreshAtlasOverviewDocks();
@@ -3271,9 +3274,32 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
         if (!_atlasWorkspaceWindow || !_atlasViewer) {
             createAtlasWorkspace();
         }
-        const auto atlas = vc::atlas::Atlas::load(atlasDir);
+        auto vpkg = _state ? _state->vpkg() : nullptr;
+        if (!vpkg) {
+            throw std::runtime_error("No volume package is loaded");
+        }
+        const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+        if (manifestPath.empty()) {
+            throw std::runtime_error(
+                "No local Lasagna normal dataset is selected; atlas pred-snap attachments are required");
+        }
+        if (!std::filesystem::exists(manifestPath)) {
+            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
+        }
+        const std::filesystem::path volpkgRoot = vpkg->path().empty()
+            ? std::filesystem::path(vpkg->getVolpkgDirectory())
+            : vpkg->path().parent_path();
+        auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+        vc::lasagna::LasagnaDataset dataset =
+            vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
+        atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
         _currentAtlasDir = atlasDir;
         _currentAtlasName = atlas.metadata.name;
+        if (_lineAnnotationController) {
+            _lineAnnotationController->setCurrentAtlasDirectory(_currentAtlasDir);
+        }
         const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
         auto baseSurface = std::make_shared<QuadSurface>(basePath);
         const auto* points = baseSurface->rawPointsPtr();
@@ -3370,6 +3396,10 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                 vc::lasagna::LasagnaDataset dataset =
                     vc::lasagna::LasagnaDataset::open(manifestPath);
                 vc::lasagna::LasagnaNormalSampler sampler(dataset);
+                if (!sampler.hasPredDtChannel()) {
+                    throw std::runtime_error(
+                        "Selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
+                }
                 vc::atlas::rebuildAtlasFromSourceFibers(
                     atlasDir, volpkgRoot, sampler);
                 displayAtlasFromDirectory(atlasDir);

@@ -123,6 +123,7 @@ public:
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
+    void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
 signals:
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
@@ -183,6 +184,8 @@ private:
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
+    void handleGeneratedPredSnapPoint(const std::string& surfaceName,
+                                      cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
     void startOptimization(LineAnnotationSession& session,
                            bool fullOptimization = false,
@@ -259,6 +262,7 @@ private:
     std::vector<std::string> _knownFiberTags;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
+    std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
 };

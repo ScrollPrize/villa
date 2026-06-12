@@ -4,6 +4,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/lasagna/Manifest.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
 #include <nlohmann/json.hpp>
@@ -14,8 +15,10 @@
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -32,7 +35,7 @@ namespace {
 
 constexpr double kEpsilon = 1.0e-9;
 constexpr double kControlPointMatchEpsilon = 1.0e-8;
-constexpr int kAtlasMetadataVersion = 4;
+constexpr int kAtlasMetadataVersion = 5;
 constexpr int kFiberMappingVersion = 4;
 
 bool atlasDebugEnabled()
@@ -311,8 +314,9 @@ void validateMappingControlAnchorsAgainstFiber(const FiberMapping& mapping,
 
 fs::path inferVolpkgRootFromAtlasDir(const fs::path& atlasDir)
 {
-    if (atlasDir.parent_path().filename() == "atlases") {
-        return atlasDir.parent_path().parent_path();
+    const fs::path normalized = atlasDir.lexically_normal();
+    if (normalized.parent_path().filename() == "atlases") {
+        return normalized.parent_path().parent_path();
     }
     return {};
 }
@@ -997,6 +1001,11 @@ void Atlas::save(const fs::path& atlasDir) const
 
 Atlas Atlas::load(const fs::path& atlasDir)
 {
+    return Atlas::load(atlasDir, inferVolpkgRootFromAtlasDir(atlasDir));
+}
+
+Atlas Atlas::load(const fs::path& atlasDir, const fs::path& volpkgRootIn)
+{
     Atlas atlas;
     const auto metadata = readJsonFile(atlasDir / "metadata.json");
     atlas.metadata.type = metadata.value("type", std::string{});
@@ -1064,7 +1073,9 @@ Atlas Atlas::load(const fs::path& atlasDir)
                 throw std::runtime_error("atlas fiber mapping " + mappingPath.string() +
                                          " references missing fiber path; rebuild required");
             }
-            const fs::path volpkgRoot = inferVolpkgRootFromAtlasDir(atlasDir);
+            const fs::path volpkgRoot = volpkgRootIn.empty()
+                ? inferVolpkgRootFromAtlasDir(atlasDir)
+                : volpkgRootIn;
             if (volpkgRoot.empty()) {
                 throw std::runtime_error("cannot validate atlas fiber mapping " +
                                          mappingPath.string() +
@@ -1134,6 +1145,8 @@ Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
     rebuilt.metadata.version = kAtlasMetadataVersion;
     rebuilt.links = legacy.links;
     rebuilt.fibers.reserve(legacy.fibers.size());
+    std::vector<FiberInput> rebuiltInputs;
+    rebuiltInputs.reserve(legacy.fibers.size());
 
     for (const auto& oldMapping : legacy.fibers) {
         if (oldMapping.fiberPath.empty()) {
@@ -1144,6 +1157,7 @@ Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
         const FiberInput input = loadSourceFiberInput(fiberPath, oldMapping.fiberPath);
         rebuilt.fibers.push_back(
             mapFiberToBaseSurface(input, baseSurface, baseIndex, normalSampler, options));
+        rebuiltInputs.push_back(input);
     }
 
     auto refreshEndpoint = [&rebuilt](AtlasLinkEndpoint& endpoint) {
@@ -1182,6 +1196,17 @@ Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
     }
     layoutAtlasObjects(rebuilt, atlasHorizontalPeriodColumns(baseSurface));
     rebuilt.save(atlasDir);
+    if (const auto* predSampler =
+            dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(&normalSampler);
+        predSampler && predSampler->hasPredDtChannel()) {
+        for (size_t i = 0; i < rebuilt.fibers.size() && i < rebuiltInputs.size(); ++i) {
+            (void)ensureAtlasPredSnapSet(atlasDir,
+                                         rebuiltInputs[i],
+                                         rebuilt.fibers[i],
+                                         baseSurface,
+                                         *predSampler);
+        }
+    }
     return rebuilt;
 }
 
@@ -1201,6 +1226,650 @@ std::string sanitizeAtlasName(std::string name)
 std::string atlasFiberPathKey(const fs::path& path)
 {
     return path.lexically_normal().generic_string();
+}
+
+std::string atlasPredSnapControlPointKey(const cv::Vec3d& point)
+{
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::setprecision(17)
+        << point[0] << ',' << point[1] << ',' << point[2];
+    return out.str();
+}
+
+fs::path atlasPredSnapAttachmentPath(const fs::path& atlasDir, const fs::path& fiberPath)
+{
+    std::string safe = fiberPath.stem().empty()
+        ? std::string("fiber")
+        : fiberPath.stem().string();
+    safe = sanitizeAtlasName(safe);
+    return atlasDir / "attachments" / "pred_snap_points" / (safe + ".json");
+}
+
+bool atlasPredDtIsInside(double predDtValue)
+{
+    constexpr double kDisplayThreshold = 165.0;
+    constexpr double kDisplayMax = 255.0;
+    constexpr double kPredDtMax = 175.0;
+    constexpr double kPredDtThreshold = kDisplayThreshold * kPredDtMax / kDisplayMax;
+    return std::isfinite(predDtValue) && predDtValue >= kPredDtThreshold;
+}
+
+namespace {
+
+std::string predSnapSourceString(AtlasPredSnapSource source)
+{
+    return source == AtlasPredSnapSource::Manual ? "manual" : "auto";
+}
+
+AtlasPredSnapSource predSnapSourceFromString(const std::string& value)
+{
+    return value == "manual" ? AtlasPredSnapSource::Manual : AtlasPredSnapSource::Auto;
+}
+
+std::string predSnapDirectionString(AtlasPredSnapDirection direction)
+{
+    return direction == AtlasPredSnapDirection::Inside ? "inside" : "outside";
+}
+
+AtlasPredSnapDirection predSnapDirectionFromString(const std::string& value)
+{
+    return value == "inside" ? AtlasPredSnapDirection::Inside : AtlasPredSnapDirection::Outside;
+}
+
+nlohmann::json predSnapPointJson(const AtlasPredSnapPoint& point)
+{
+    nlohmann::json root;
+    root["fiber_path"] = point.fiberPath.generic_string();
+    root["control_point"] = pointJson(point.controlPoint);
+    if (point.predSnapPoint) {
+        root["pred_snap_point"] = pointJson(*point.predSnapPoint);
+    } else {
+        root["pred_snap_point"] = nullptr;
+    }
+    root["source"] = predSnapSourceString(point.source);
+    if (point.predDtValue) {
+        root["pred_dt_value"] = *point.predDtValue;
+    }
+    if (point.direction) {
+        root["direction"] = predSnapDirectionString(*point.direction);
+    }
+    if (point.weightedFirstHitWindingDistance) {
+        root["weighted_first_hit_winding_distance"] =
+            *point.weightedFirstHitWindingDistance;
+    }
+    if (point.searchNormal) {
+        root["search_normal"] = pointJson(*point.searchNormal);
+    }
+    if (!point.generatedAtUtc.empty()) {
+        root["generated_at_utc"] = point.generatedAtUtc;
+    }
+    return root;
+}
+
+AtlasPredSnapPoint predSnapPointFromJson(const nlohmann::json& root,
+                                         const fs::path& fallbackFiberPath)
+{
+    AtlasPredSnapPoint point;
+    point.fiberPath = root.value("fiber_path", fallbackFiberPath.generic_string());
+    point.controlPoint = pointFromJson(root.at("control_point"));
+    if (root.contains("pred_snap_point") && !root["pred_snap_point"].is_null()) {
+        point.predSnapPoint = pointFromJson(root["pred_snap_point"]);
+    }
+    point.source = predSnapSourceFromString(root.value("source", std::string("auto")));
+    if (root.contains("pred_dt_value") && root["pred_dt_value"].is_number()) {
+        point.predDtValue = root["pred_dt_value"].get<double>();
+    }
+    if (root.contains("direction") && root["direction"].is_string()) {
+        point.direction = predSnapDirectionFromString(root["direction"].get<std::string>());
+    }
+    if (root.contains("weighted_first_hit_winding_distance") &&
+        root["weighted_first_hit_winding_distance"].is_number()) {
+        point.weightedFirstHitWindingDistance =
+            root["weighted_first_hit_winding_distance"].get<double>();
+    }
+    if (root.contains("search_normal") && root["search_normal"].is_array()) {
+        point.searchNormal = pointFromJson(root["search_normal"]);
+    }
+    point.generatedAtUtc = root.value("generated_at_utc", std::string{});
+    return point;
+}
+
+cv::Vec3d normalizedPredSnapNormal(const cv::Vec3d& normal)
+{
+    if (!finitePoint(normal)) {
+        return {0.0, 0.0, 0.0};
+    }
+    const double n = norm(normal);
+    if (!(n > kEpsilon) || !std::isfinite(n)) {
+        return {0.0, 0.0, 0.0};
+    }
+    return normal * (1.0 / n);
+}
+
+struct PredSnapTraceSample {
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    double windingDistance = 0.0;
+    std::optional<double> predDt;
+};
+
+std::vector<PredSnapTraceSample> tracePredSnapDirection(
+    const cv::Vec3d& start,
+    const cv::Vec3d& unitDirection,
+    double maxWinding,
+    const AtlasPredSnapSampling& sampling)
+{
+    std::vector<PredSnapTraceSample> samples;
+    const double stepVx = std::isfinite(sampling.predDtStepVx) && sampling.predDtStepVx > 0.0
+        ? sampling.predDtStepVx
+        : 0.05;
+    if (!sampling.samplePredDt || !sampling.windingDistance ||
+        !finitePoint(start) || !validNormal(unitDirection) ||
+        !(maxWinding > 0.0) || !std::isfinite(maxWinding)) {
+        return samples;
+    }
+
+    constexpr int kMaxSteps = 1024;
+    cv::Vec3d previous = start;
+    double accumulated = 0.0;
+    for (int step = 1; step <= kMaxSteps && accumulated <= maxWinding + 1.0e-9; ++step) {
+        const cv::Vec3d current = start + unitDirection * (stepVx * static_cast<double>(step));
+        const double segmentWinding = sampling.windingDistance(previous, current, stepVx);
+        if (!std::isfinite(segmentWinding) || segmentWinding < 0.0) {
+            break;
+        }
+        accumulated += segmentWinding;
+        if (accumulated > maxWinding + 1.0e-9) {
+            break;
+        }
+        samples.push_back({current, accumulated, sampling.samplePredDt(current)});
+        previous = current;
+        if (segmentWinding <= kEpsilon && step > 16) {
+            break;
+        }
+    }
+    return samples;
+}
+
+std::optional<PredSnapTraceSample> firstInsidePredSnapHit(
+    const std::vector<PredSnapTraceSample>& samples)
+{
+    for (const auto& sample : samples) {
+        if (sample.predDt && atlasPredDtIsInside(*sample.predDt)) {
+            return sample;
+        }
+    }
+    return std::nullopt;
+}
+
+PredSnapTraceSample climbPredDtMaximumAlongNormal(
+    const PredSnapTraceSample& seed,
+    const cv::Vec3d& unitNormal,
+    const AtlasPredSnapSampling& sampling)
+{
+    const double stepVx = std::isfinite(sampling.predDtStepVx) && sampling.predDtStepVx > 0.0
+        ? sampling.predDtStepVx
+        : 0.05;
+    if (!sampling.samplePredDt || !validNormal(unitNormal) ||
+        !seed.predDt || !atlasPredDtIsInside(*seed.predDt)) {
+        return seed;
+    }
+
+    constexpr int kMaxSteps = 1024;
+    PredSnapTraceSample current = seed;
+    for (int step = 0; step < kMaxSteps; ++step) {
+        PredSnapTraceSample best = current;
+        for (double sign : {1.0, -1.0}) {
+            const cv::Vec3d point = current.point + unitNormal * (sign * stepVx);
+            const auto predDt = sampling.samplePredDt(point);
+            if (!predDt || !atlasPredDtIsInside(*predDt)) {
+                continue;
+            }
+            if (!best.predDt || *predDt > *best.predDt + 1.0e-9) {
+                best = {point, current.windingDistance, predDt};
+            }
+        }
+        if (norm(best.point - current.point) <= kEpsilon) {
+            break;
+        }
+        current = best;
+    }
+    return current;
+}
+
+std::optional<cv::Vec3d> baseNormalForAnchor(const AtlasAnchor& anchor,
+                                             const FiberMapping& mapping,
+                                             const QuadSurface& baseSurface,
+                                             double outwardSign = 1.0)
+{
+    const auto* points = baseSurface.rawPointsPtr();
+    if (!points || points->empty()) {
+        return std::nullopt;
+    }
+    const int periodColumns = atlasHorizontalPeriodColumns(baseSurface);
+    const double u = normalizeAtlasU(actualAtlasU(anchor, mapping, periodColumns),
+                                     periodColumns);
+    const double v = anchor.atlasV;
+    if (!std::isfinite(u) || !std::isfinite(v) ||
+        u < 0.0 || v < 0.0 ||
+        u >= static_cast<double>(points->cols) ||
+        v >= static_cast<double>(points->rows)) {
+        return std::nullopt;
+    }
+    const cv::Vec3f normal = grid_normal(*points, cv::Vec3f(static_cast<float>(u),
+                                                            static_cast<float>(v),
+                                                            0.0f));
+    if (!finitePoint(normal) || cv::norm(normal) <= 1.0e-6f) {
+        return std::nullopt;
+    }
+    return normalizedPredSnapNormal(toVec3d(normal) * outwardSign);
+}
+
+double ringPerimeterWithNormalOffset(const cv::Mat_<cv::Vec3f>& points,
+                                     int row,
+                                     int periodColumns,
+                                     double offset)
+{
+    double perimeter = 0.0;
+    bool havePrevious = false;
+    cv::Vec3d first{0.0, 0.0, 0.0};
+    cv::Vec3d previous{0.0, 0.0, 0.0};
+    for (int col = 0; col < periodColumns; ++col) {
+        const cv::Vec3f p = points(row, col);
+        if (!finitePoint(p)) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const cv::Vec3f n = grid_normal(points, cv::Vec3f(static_cast<float>(col),
+                                                          static_cast<float>(row),
+                                                          0.0f));
+        if (!finitePoint(n) || cv::norm(n) <= 1.0e-6f) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const cv::Vec3d current = toVec3d(p) + normalizedPredSnapNormal(toVec3d(n)) * offset;
+        if (!havePrevious) {
+            first = current;
+            havePrevious = true;
+        } else {
+            perimeter += norm(current - previous);
+        }
+        previous = current;
+    }
+    if (!havePrevious) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    perimeter += norm(first - previous);
+    return perimeter;
+}
+
+double atlasBaseNormalOutwardSign(const QuadSurface& baseSurface)
+{
+    const auto* points = baseSurface.rawPointsPtr();
+    if (!points || points->rows < 5 || points->cols < 5) {
+        return 1.0;
+    }
+    const int periodColumns = atlasHorizontalPeriodColumns(baseSurface);
+    if (periodColumns < 4) {
+        return 1.0;
+    }
+    const int row = points->rows / 2;
+    double edgeSum = 0.0;
+    int edgeCount = 0;
+    for (int col = 0; col < periodColumns; ++col) {
+        const cv::Vec3f a = (*points)(row, col);
+        const cv::Vec3f b = (*points)(row, (col + 1) % periodColumns);
+        if (!finitePoint(a) || !finitePoint(b)) {
+            continue;
+        }
+        const double edge = norm(toVec3d(b) - toVec3d(a));
+        if (std::isfinite(edge) && edge > kEpsilon) {
+            edgeSum += edge;
+            ++edgeCount;
+        }
+    }
+    if (edgeCount == 0) {
+        return 1.0;
+    }
+    const double eps = std::clamp(edgeSum / static_cast<double>(edgeCount), 0.5, 4.0);
+    const double plus = ringPerimeterWithNormalOffset(*points, row, periodColumns, eps);
+    const double minus = ringPerimeterWithNormalOffset(*points, row, periodColumns, -eps);
+    if (!std::isfinite(plus) || !std::isfinite(minus) ||
+        std::abs(plus - minus) <= 1.0e-6) {
+        return 1.0;
+    }
+    return plus > minus ? 1.0 : -1.0;
+}
+
+} // namespace
+
+std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
+    const cv::Vec3d& controlPoint,
+    const cv::Vec3d& alignedNormal,
+    const AtlasPredSnapSampling& sampling)
+{
+    if (!sampling.samplePredDt || !sampling.windingDistance ||
+        !finitePoint(controlPoint) || !validNormal(alignedNormal)) {
+        return std::nullopt;
+    }
+    const cv::Vec3d normal = normalizedPredSnapNormal(alignedNormal);
+    if (!validNormal(normal)) {
+        return std::nullopt;
+    }
+
+    constexpr double kOutwardWindingLimit = 0.5;
+    constexpr double kInwardWindingLimit = 0.25;
+    constexpr double kInwardFirstHitWeight = 4.0;
+
+    const auto startPredDt = sampling.samplePredDt(controlPoint);
+    const auto outwardSamples =
+        tracePredSnapDirection(controlPoint, normal, kOutwardWindingLimit, sampling);
+    const auto inwardSamples =
+        tracePredSnapDirection(controlPoint, -normal, kInwardWindingLimit, sampling);
+
+    AtlasPredSnapPoint result;
+    result.controlPoint = controlPoint;
+    result.source = AtlasPredSnapSource::Auto;
+    result.searchNormal = normal;
+
+    if (startPredDt && atlasPredDtIsInside(*startPredDt)) {
+        PredSnapTraceSample fallback{controlPoint, 0.0, startPredDt};
+        const PredSnapTraceSample best =
+            climbPredDtMaximumAlongNormal(fallback, normal, sampling);
+        result.predSnapPoint = best.point;
+        result.predDtValue = best.predDt;
+        result.direction = (best.point - controlPoint).dot(normal) < 0.0
+            ? AtlasPredSnapDirection::Inside
+            : AtlasPredSnapDirection::Outside;
+        result.weightedFirstHitWindingDistance = 0.0;
+        return result;
+    }
+
+    const auto outwardHit = firstInsidePredSnapHit(outwardSamples);
+    const auto inwardHit = firstInsidePredSnapHit(inwardSamples);
+    if (!outwardHit && !inwardHit) {
+        return result;
+    }
+
+    const bool chooseInward =
+        inwardHit &&
+        (!outwardHit ||
+         inwardHit->windingDistance * kInwardFirstHitWeight < outwardHit->windingDistance);
+    const auto& chosenHit = chooseInward ? *inwardHit : *outwardHit;
+    const PredSnapTraceSample best =
+        climbPredDtMaximumAlongNormal(chosenHit, normal, sampling);
+    result.predSnapPoint = best.point;
+    result.predDtValue = best.predDt;
+    result.direction = (best.point - controlPoint).dot(normal) < 0.0
+        ? AtlasPredSnapDirection::Inside
+        : AtlasPredSnapDirection::Outside;
+    result.weightedFirstHitWindingDistance = chooseInward
+        ? chosenHit.windingDistance * kInwardFirstHitWeight
+        : chosenHit.windingDistance;
+    return result;
+}
+
+AtlasPredSnapSet generateAtlasPredSnapSet(const FiberInput& fiber,
+                                          const FiberMapping& mapping,
+                                          const QuadSurface& baseSurface,
+                                          const AtlasPredSnapSampling& sampling)
+{
+    AtlasPredSnapSet set;
+    set.fiberPath = fiber.fiberPath.empty() ? mapping.fiberPath : fiber.fiberPath;
+    set.points.reserve(fiber.controlPoints.size());
+    const double baseOutwardSign = atlasBaseNormalOutwardSign(baseSurface);
+    for (size_t controlIndex = 0; controlIndex < fiber.controlPoints.size(); ++controlIndex) {
+        const cv::Vec3d& controlPoint = fiber.controlPoints[controlIndex];
+        AtlasPredSnapPoint point;
+        point.fiberPath = set.fiberPath;
+        point.controlPoint = controlPoint;
+        point.source = AtlasPredSnapSource::Auto;
+
+        const int controlSourceIndex =
+            controlIndex < fiber.controlLineIndices.size()
+                ? fiber.controlLineIndices[controlIndex]
+                : static_cast<int>(controlIndex);
+        const auto anchorIt = std::find_if(
+            mapping.controlAnchors.begin(),
+            mapping.controlAnchors.end(),
+            [controlSourceIndex](const AtlasAnchor& anchor) {
+                return anchor.sourceIndex == controlSourceIndex;
+            });
+        if (anchorIt == mapping.controlAnchors.end() || !sampling.sampleNormal) {
+            set.points.push_back(std::move(point));
+            continue;
+        }
+
+        const auto normalSample = sampling.sampleNormal(controlPoint);
+        const auto baseNormal = baseNormalForAnchor(*anchorIt,
+                                                    mapping,
+                                                    baseSurface,
+                                                    baseOutwardSign);
+        if (!normalSample.valid || !validNormal(normalSample.normal) || !baseNormal) {
+            set.points.push_back(std::move(point));
+            continue;
+        }
+
+        cv::Vec3d alignedNormal = normalizedPredSnapNormal(normalSample.normal);
+        if (alignedNormal.dot(*baseNormal) < 0.0) {
+            alignedNormal *= -1.0;
+        }
+        if (auto found = findAtlasPredSnapPoint(controlPoint, alignedNormal, sampling)) {
+            found->fiberPath = set.fiberPath;
+            found->controlPoint = controlPoint;
+            set.points.push_back(std::move(*found));
+        } else {
+            set.points.push_back(std::move(point));
+        }
+    }
+    return set;
+}
+
+AtlasPredSnapSet generateAtlasPredSnapSet(const FiberInput& fiber,
+                                          const FiberMapping& mapping,
+                                          const QuadSurface& baseSurface,
+                                          const vc::lasagna::LasagnaNormalSampler& sampler)
+{
+    AtlasPredSnapSampling sampling;
+    sampling.sampleNormal = [&sampler](const cv::Vec3d& point) {
+        return sampler.sampleNormal(point);
+    };
+    sampling.samplePredDt = [&sampler](const cv::Vec3d& point) {
+        return sampler.samplePredDt(point);
+    };
+    sampling.windingDistance = [&sampler](const cv::Vec3d& a,
+                                          const cv::Vec3d& b,
+                                          double stepVx) {
+        return sampler.windingDistance(a, b, stepVx);
+    };
+    const auto predDtSpacing = sampler.predDtSpacing();
+    if (!predDtSpacing || !std::isfinite(*predDtSpacing) || *predDtSpacing <= 0.0) {
+        throw std::runtime_error("Lasagna pred_dt channel has no valid spacing");
+    }
+    sampling.predDtStepVx = 0.5 * *predDtSpacing;
+    return generateAtlasPredSnapSet(fiber, mapping, baseSurface, sampling);
+}
+
+AtlasPredSnapSet loadAtlasPredSnapSet(const fs::path& attachmentPath)
+{
+    AtlasPredSnapSet set;
+    if (!fs::exists(attachmentPath)) {
+        return set;
+    }
+    const auto root = readJsonFile(attachmentPath);
+    if (root.value("type", std::string{}) != "vc3d_atlas_pred_snap_points" ||
+        root.value("version", 0) != 1) {
+        throw std::runtime_error("unsupported atlas pred-snap attachment: " +
+                                 attachmentPath.string());
+    }
+    set.fiberPath = root.value("fiber_path", std::string{});
+    if (root.contains("entries") && root["entries"].is_object()) {
+        for (const auto& item : root["entries"].items()) {
+            (void)item;
+            try {
+                set.points.push_back(predSnapPointFromJson(item.value(), set.fiberPath));
+            } catch (const std::exception&) {
+                throw;
+            }
+        }
+    }
+    return set;
+}
+
+void saveAtlasPredSnapSet(const fs::path& attachmentPath, const AtlasPredSnapSet& set)
+{
+    nlohmann::json root;
+    root["type"] = "vc3d_atlas_pred_snap_points";
+    root["version"] = 1;
+    root["fiber_path"] = set.fiberPath.generic_string();
+    root["entries"] = nlohmann::json::object();
+    for (const auto& point : set.points) {
+        root["entries"][atlasPredSnapControlPointKey(point.controlPoint)] =
+            predSnapPointJson(point);
+    }
+    writeJsonFile(attachmentPath, root);
+}
+
+AtlasPredSnapSet mergeAtlasPredSnapSetByControlPoint(AtlasPredSnapSet existing,
+                                                     const AtlasPredSnapSet& generated)
+{
+    std::unordered_map<std::string, AtlasPredSnapPoint> byKey;
+    byKey.reserve(existing.points.size());
+    for (auto& point : existing.points) {
+        byKey[atlasPredSnapControlPointKey(point.controlPoint)] = std::move(point);
+    }
+
+    AtlasPredSnapSet merged;
+    merged.fiberPath = !generated.fiberPath.empty() ? generated.fiberPath : existing.fiberPath;
+    merged.points.reserve(generated.points.size());
+    for (const auto& generatedPoint : generated.points) {
+        const std::string key = atlasPredSnapControlPointKey(generatedPoint.controlPoint);
+        auto it = byKey.find(key);
+        if (it != byKey.end() && it->second.source == AtlasPredSnapSource::Manual) {
+            AtlasPredSnapPoint point = std::move(it->second);
+            point.fiberPath = merged.fiberPath;
+            merged.points.push_back(std::move(point));
+        } else {
+            merged.points.push_back(generatedPoint);
+        }
+    }
+    return merged;
+}
+
+AtlasPredSnapSet ensureAtlasPredSnapSet(const fs::path& atlasDir,
+                                        const FiberInput& fiber,
+                                        const FiberMapping& mapping,
+                                        const QuadSurface& baseSurface,
+                                        const AtlasPredSnapSampling& sampling)
+{
+    const fs::path fiberPath = fiber.fiberPath.empty() ? mapping.fiberPath : fiber.fiberPath;
+    const fs::path attachmentPath = atlasPredSnapAttachmentPath(atlasDir, fiberPath);
+    AtlasPredSnapSet existing = loadAtlasPredSnapSet(attachmentPath);
+    AtlasPredSnapSet generated = generateAtlasPredSnapSet(fiber, mapping, baseSurface, sampling);
+    AtlasPredSnapSet merged = mergeAtlasPredSnapSetByControlPoint(std::move(existing), generated);
+    saveAtlasPredSnapSet(attachmentPath, merged);
+    return merged;
+}
+
+AtlasPredSnapSet ensureAtlasPredSnapSet(const fs::path& atlasDir,
+                                        const FiberInput& fiber,
+                                        const FiberMapping& mapping,
+                                        const QuadSurface& baseSurface,
+                                        const vc::lasagna::LasagnaNormalSampler& sampler)
+{
+    AtlasPredSnapSampling sampling;
+    sampling.sampleNormal = [&sampler](const cv::Vec3d& point) {
+        return sampler.sampleNormal(point);
+    };
+    sampling.samplePredDt = [&sampler](const cv::Vec3d& point) {
+        return sampler.samplePredDt(point);
+    };
+    sampling.windingDistance = [&sampler](const cv::Vec3d& a,
+                                          const cv::Vec3d& b,
+                                          double stepVx) {
+        return sampler.windingDistance(a, b, stepVx);
+    };
+    const auto predDtSpacing = sampler.predDtSpacing();
+    if (!predDtSpacing || !std::isfinite(*predDtSpacing) || *predDtSpacing <= 0.0) {
+        throw std::runtime_error("Lasagna pred_dt channel has no valid spacing");
+    }
+    sampling.predDtStepVx = 0.5 * *predDtSpacing;
+    return ensureAtlasPredSnapSet(atlasDir, fiber, mapping, baseSurface, sampling);
+}
+
+AtlasPredSnapSet setManualAtlasPredSnapPoint(const fs::path& atlasDir,
+                                             const fs::path& fiberPath,
+                                             const cv::Vec3d& controlPoint,
+                                             const cv::Vec3d& predSnapPoint,
+                                             std::optional<double> predDtValue)
+{
+    const fs::path attachmentPath = atlasPredSnapAttachmentPath(atlasDir, fiberPath);
+    AtlasPredSnapSet set = loadAtlasPredSnapSet(attachmentPath);
+    if (set.fiberPath.empty()) {
+        set.fiberPath = fiberPath;
+    }
+    const std::string key = atlasPredSnapControlPointKey(controlPoint);
+    auto it = std::find_if(set.points.begin(), set.points.end(), [&key](const AtlasPredSnapPoint& point) {
+        return atlasPredSnapControlPointKey(point.controlPoint) == key;
+    });
+    AtlasPredSnapPoint point;
+    point.fiberPath = fiberPath;
+    point.controlPoint = controlPoint;
+    point.predSnapPoint = predSnapPoint;
+    point.source = AtlasPredSnapSource::Manual;
+    point.predDtValue = predDtValue;
+    if (it == set.points.end()) {
+        set.points.push_back(std::move(point));
+    } else {
+        *it = std::move(point);
+    }
+    saveAtlasPredSnapSet(attachmentPath, set);
+    return set;
+}
+
+AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
+    const fs::path& atlasDir,
+    const fs::path& volpkgRootIn,
+    const vc::lasagna::LasagnaNormalSampler& sampler)
+{
+    if (!sampler.hasPredDtChannel()) {
+        throw std::runtime_error(
+            "selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
+    }
+
+    const fs::path volpkgRoot = volpkgRootIn.empty()
+        ? inferVolpkgRootFromAtlasDir(atlasDir)
+        : volpkgRootIn;
+    if (volpkgRoot.empty()) {
+        throw std::runtime_error("cannot generate atlas pred-snap attachments without a volume package root");
+    }
+
+    Atlas atlas = Atlas::load(atlasDir, volpkgRoot);
+    if (atlas.metadata.baseMeshPath.empty()) {
+        throw std::runtime_error("cannot generate atlas pred-snap attachments without base_mesh_path");
+    }
+    QuadSurface baseSurface(atlasDir / atlas.metadata.baseMeshPath);
+    const auto* points = baseSurface.rawPointsPtr();
+    if (!points || points->empty()) {
+        throw std::runtime_error("cannot generate atlas pred-snap attachments: base mesh has no valid grid");
+    }
+
+    AtlasPredSnapAttachmentReport report;
+    for (const auto& mapping : atlas.fibers) {
+        if (mapping.fiberPath.empty()) {
+            continue;
+        }
+        ++report.fibersChecked;
+        const fs::path attachmentPath =
+            atlasPredSnapAttachmentPath(atlasDir, mapping.fiberPath);
+        const bool existed = fs::exists(attachmentPath);
+        const fs::path fiberPath =
+            resolveAtlasRelativePath(atlasDir, volpkgRoot, mapping.fiberPath);
+        const FiberInput input = loadSourceFiberInput(fiberPath, mapping.fiberPath);
+        (void)ensureAtlasPredSnapSet(atlasDir, input, mapping, baseSurface, sampler);
+        if (!existed && fs::exists(attachmentPath)) {
+            ++report.attachmentsCreated;
+        }
+    }
+    return report;
 }
 
 std::vector<std::string> atlasMappedFiberPathKeys(const Atlas& atlas)
@@ -1330,7 +1999,7 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
     exportData.volpkgRoot = volpkgRootIn.empty()
         ? inferVolpkgRootFromAtlasDir(atlasDir)
         : volpkgRootIn;
-    exportData.atlas = Atlas::load(atlasDir);
+    exportData.atlas = Atlas::load(atlasDir, exportData.volpkgRoot);
     exportData.baseRelativePath = exportData.atlas.metadata.baseMeshPath;
     if (exportData.baseRelativePath.empty()) {
         throw std::runtime_error("Atlas metadata is missing base_mesh_path.");
@@ -1764,6 +2433,16 @@ std::optional<cv::Vec3d> atlasAnchorBasePoint(const AtlasAnchor& anchor,
     return atlasBasePointAt(actualAtlasU(anchor, fiber, periodColumns),
                             anchor.atlasV,
                             baseSurface);
+}
+
+std::optional<cv::Vec3d> atlasAnchorBaseNormal(const AtlasAnchor& anchor,
+                                               const FiberMapping& fiber,
+                                               const QuadSurface& baseSurface)
+{
+    return baseNormalForAnchor(anchor,
+                               fiber,
+                               baseSurface,
+                               atlasBaseNormalOutwardSign(baseSurface));
 }
 
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)

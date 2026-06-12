@@ -81,6 +81,7 @@ public:
     ReoptimizationMode reoptimizationMode() const;
     ShiftScrollMode shiftScrollMode() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
+    void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setOptimizationBusy(bool busy);
 
 signals:
@@ -92,6 +93,8 @@ signals:
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
+    void generatedPredSnapPointRequested(const std::string& surfaceName,
+                                         cv::Vec3f volumePoint);
     void showAsMeshRequested();
     void fullOptimizationRequested();
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
