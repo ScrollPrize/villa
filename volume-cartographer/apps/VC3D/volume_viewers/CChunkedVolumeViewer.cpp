@@ -1049,6 +1049,41 @@ void CChunkedVolumeViewer::applyInteractiveCameraState(const CameraState& state)
     emit overlaysUpdated();
 }
 
+void CChunkedVolumeViewer::applyDirectCameraState(const CameraState& state)
+{
+    if (_closing) {
+        return;
+    }
+
+    _replayFrameTimer.restart();
+    _replayFrameStartedAt = std::chrono::steady_clock::now();
+    _replayInteractiveTiming = {};
+    _replayStableTiming = {};
+    _replayPaintPendingSerial = 0;
+
+    _interactivePreview = false;
+    if (_settleRenderTimer) {
+        _settleRenderTimer->stop();
+    }
+
+    _surfacePtrX = state.surfacePtrX;
+    _surfacePtrY = state.surfacePtrY;
+    _scale = state.scale;
+    _zOff = state.zOffset;
+    _zOffWorldDir = state.zOffsetWorldDir;
+    recalcPyramidLevel();
+    _genCacheDirty = true;
+    _stableFramebufferValid = false;
+    resizeFramebuffer();
+
+    if (_renderTimer && _renderTimer->isActive()) {
+        _renderTimer->stop();
+    }
+    _renderPending = false;
+    renderVisible(true, "direct camera state applied");
+    emit overlaysUpdated();
+}
+
 bool CChunkedVolumeViewer::isRenderQuiescent() const
 {
     return !_renderWorkerBusy.load(std::memory_order_acquire)
@@ -1389,8 +1424,8 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         }
     }
     updateFocusMarker();
-    scheduleRender("current surface changed");
-    renderIntersections("current surface changed");
+    submitDirectInteractionRender("current surface changed");
+    scheduleIntersectionRender("current surface changed");
 }
 
 void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std::shared_ptr<Surface>& surf)
@@ -1432,6 +1467,13 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
         return;
     }
 
+    if (poi->suppressViewerRecenter) {
+        updateFocusMarker(poi);
+        updateStatusLabel();
+        emit overlaysUpdated();
+        return;
+    }
+
     auto surf = _surfWeak.lock();
     const bool isPlaneSurface = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
@@ -1445,9 +1487,9 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     updateFocusMarker(poi);
     updateStatusLabel();
     emit overlaysUpdated();
-    scheduleRender("focus POI changed");
+    submitDirectInteractionRender("focus POI changed");
     if (!isPlaneSurface || !poi->suppressTransientPlaneIntersections)
-        renderIntersections("focus POI changed");
+        scheduleIntersectionRender("focus POI changed");
 }
 
 void CChunkedVolumeViewer::ensureDefaultSurface()
@@ -1586,6 +1628,24 @@ void CChunkedVolumeViewer::scheduleRender(const char* reason, std::source_locati
     } else {
         profile.setDetails("action=already_scheduled");
     }
+}
+
+void CChunkedVolumeViewer::submitDirectInteractionRender(const char* reason, std::source_location caller)
+{
+    if (_closing) {
+        return;
+    }
+    _interactivePreview = false;
+    if (_settleRenderTimer) {
+        _settleRenderTimer->stop();
+    }
+    if (_renderTimer && _renderTimer->isActive()) {
+        _renderTimer->stop();
+    }
+    _renderPending = false;
+    _directInteractionRenderRequest = true;
+    renderVisible(true, reason, caller);
+    _directInteractionRenderRequest = false;
 }
 
 void CChunkedVolumeViewer::requestRender(const char* reason, std::source_location caller)
@@ -2787,6 +2847,12 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     }
 
     if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        if (_directInteractionRenderRequest) {
+            _renderPendingAfterWorker = true;
+            _directInteractionPendingAfterWorker = true;
+            profile.setDetails("action=queued_direct_after_worker");
+            return;
+        }
         ++_renderSerial;
         _renderPendingAfterWorker = true;
         profile.setDetails("action=queued_after_worker");
@@ -2964,7 +3030,12 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
 
     if (_renderPendingAfterWorker) {
         _renderPendingAfterWorker = false;
-        scheduleRender("worker finished with pending render");
+        if (_directInteractionPendingAfterWorker) {
+            _directInteractionPendingAfterWorker = false;
+            renderVisible(true, "worker finished with pending direct interaction render");
+        } else {
+            scheduleRender("worker finished with pending render");
+        }
     }
     if (profile.enabled()) {
         profile.setDetails(std::format(
@@ -3092,7 +3163,6 @@ void CChunkedVolumeViewer::setOverlayWindow(float low, float high)
 
 void CChunkedVolumeViewer::panByF(float dx, float dy)
 {
-    markInteractiveMotion(std::hypot(double(dx), double(dy)));
     const float invScale = _panSensitivity / _scale;
     _surfacePtrX -= dx * invScale;
     _surfacePtrY -= dy * invScale;
@@ -3101,9 +3171,7 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
         _surfacePtrY = std::clamp(_surfacePtrY, _contentMinV, _contentMaxV);
     }
     prefetchVisibleSurfaceChunks();
-    if (shouldRefreshInteractivePreview())
-        updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
-    scheduleRender("pan");
+    submitDirectInteractionRender("pan");
     refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
@@ -3112,10 +3180,6 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
     if (steps == 0)
         return;
-    const double zoomMotionPx = std::hypot(double(_view->viewport()->width()),
-                                          double(_view->viewport()->height())) *
-                                0.08 * std::abs(double(steps));
-    markInteractiveMotion(zoomMotionPx);
     const float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
     const float newScale = std::clamp(_scale * factor, kMinScale, kMaxScale);
     if (std::abs(newScale - _scale) < _scale * 1e-6f)
@@ -3135,9 +3199,7 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _genCacheDirty = true;
     resizeFramebuffer();
     prefetchVisibleSurfaceChunks();
-    if (shouldRefreshInteractivePreview())
-        updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
-    scheduleRender("zoom");
+    submitDirectInteractionRender("zoom");
     refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
@@ -3153,14 +3215,10 @@ void CChunkedVolumeViewer::notifyInteractiveViewChange(double motionPx)
     if (!_volume || !_chunkArray)
         return;
 
-    markInteractiveMotion(motionPx);
+    (void)motionPx;
     _genCacheDirty = true;
     prefetchVisibleSurfaceChunks();
-    if (shouldRefreshInteractivePreview()) {
-        _renderPending = false;
-        submitRender("interactive view change preview");
-    }
-    scheduleRender("interactive view change final render");
+    submitDirectInteractionRender("interactive view change");
     emit overlaysUpdated();
 }
 
@@ -3234,8 +3292,6 @@ void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool for
     if (!std::isfinite(point[0]) || !std::isfinite(point[1]))
         return;
 
-    const float oldSurfacePtrX = _surfacePtrX;
-    const float oldSurfacePtrY = _surfacePtrY;
     _surfacePtrX = point[0];
     _surfacePtrY = point[1];
     _genCacheDirty = true;
@@ -3243,13 +3299,7 @@ void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool for
         _stableFramebufferValid = false;
         renderVisible(true, "center on surface point");
     } else {
-        const double motionPx = std::hypot(double(_surfacePtrX - oldSurfacePtrX),
-                                          double(_surfacePtrY - oldSurfacePtrY)) *
-                                double(std::max(_scale, kMinScale));
-        markInteractiveMotion(motionPx);
-        if (shouldRefreshInteractivePreview())
-            updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
-        scheduleRender("center on surface point");
+        submitDirectInteractionRender("center on surface point");
     }
     emit overlaysUpdated();
 }
@@ -3344,7 +3394,6 @@ void CChunkedVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
     _smoothedPanDx = 0.0f;
     _smoothedPanDy = 0.0f;
     _lastInteractivePreviewMs = -1;
-    markInteractiveMotion(0.0);
     _lastPanSceneF = _view->mapToScene(_view->mapFromGlobal(QCursor::pos()));
 }
 
@@ -3358,7 +3407,7 @@ void CChunkedVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
     _lastInteractivePreviewMs = -1;
     if (_settleRenderTimer)
         _settleRenderTimer->stop();
-    scheduleRender("pan released");
+    submitDirectInteractionRender("pan released");
 }
 
 void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)

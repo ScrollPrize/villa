@@ -127,6 +127,7 @@ public:
     CameraState cameraState() const;
     void applyCameraState(const CameraState& state, bool forceRender = true);
     void applyInteractiveCameraState(const CameraState& state);
+    void applyDirectCameraState(const CameraState& state);
     void setReplaySuppressViewportUpdates(bool suppress);
     void setReplayPollRenderResults(bool poll) { _replayPollRenderResults = poll; }
     int drainReplayRenderResults();
@@ -294,6 +295,9 @@ private:
     void submitRender(
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
+    void submitDirectInteractionRender(
+        const char* reason = "internal caller",
+        std::source_location caller = std::source_location::current());
     void updateStatusLabel();
     void rebuildChunkArray();
     void syncCameraTransform();
@@ -390,6 +394,8 @@ private:
     bool _stableFramebufferValid = false;
     std::atomic<bool> _renderWorkerBusy{false};
     bool _renderPendingAfterWorker = false;
+    bool _directInteractionRenderRequest = false;
+    bool _directInteractionPendingAfterWorker = false;
     std::uint64_t _renderSerial = 0;
     std::uint64_t _replayCachedPreviewSerial = 0;
     std::uint64_t _replayInteractiveRenderSerial = 0;

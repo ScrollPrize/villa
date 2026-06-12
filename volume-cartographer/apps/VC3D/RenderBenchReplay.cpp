@@ -612,7 +612,7 @@ void RenderBenchReplay::run(CWindow& window)
             }
         };
 
-        viewer->applyInteractiveCameraState(cs);
+        viewer->applyDirectCameraState(cs);
         sampleMilestones();
 
         forever {

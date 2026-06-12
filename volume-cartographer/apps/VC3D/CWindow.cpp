@@ -5522,9 +5522,9 @@ void CWindow::onFocusPOIChanged(std::string name, POI* poi)
             _surfacePanel->refreshFiltersOnly();
         }
 
-        _axisAlignedSliceController->applyOrientation();
-
         if (!poi->suppressViewerRecenter) {
+            _axisAlignedSliceController->applyOrientation();
+
             const cv::Vec3f focusPosition = poi->p;
             QTimer::singleShot(0, this, [this, focusPosition]() {
                 recenterPlaneViewersOn(focusPosition);
@@ -6079,7 +6079,9 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         secondaryCanonical = segYZCanonical;
     }
 
-    // Helper to configure a plane with Z-up in-plane rotation
+    // Helper to configure a plane with Z-up in-plane rotation. The caller
+    // publishes the resulting planes as a batch so viewers never render a
+    // transient focus state where only one slice plane has been updated.
     const auto configureFocusPlane = [&](const std::string& planeName,
                                          const cv::Vec3f& normal) {
         auto planeShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface(planeName));
@@ -6102,7 +6104,7 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
             }
         }
 
-        _state->setSurface(planeName, planeShared);
+        return planeShared;
     };
 
     // Set focus POI first — this triggers applySlicePlaneOrientation() which
@@ -6114,10 +6116,12 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
     focus->p = focusPos;
     focus->n = N;
     focus->surfacePtr.reset();
+    focus->suppressViewerRecenter = true;
+    focus->suppressTransientPlaneIntersections = true;
     _state->setPOI("focus", focus);
 
-    // Now set our PCA-derived planes (overriding what applySlicePlaneOrientation set)
-    configureFocusPlane(primaryName, N);
+    // Now prepare our PCA-derived planes (overriding what applySlicePlaneOrientation set)
+    auto primaryPlane = configureFocusPlane(primaryName, N);
 
     // Set secondary plane: component of other canonical axis orthogonal to N
     cv::Vec3f secNormal = normalizeOrZero(secondaryCanonical - N * N.dot(secondaryCanonical));
@@ -6128,7 +6132,12 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
             secNormal = normalizeOrZero(crossProduct(N, cv::Vec3f(0, 1, 0)));
         }
     }
-    configureFocusPlane(secondaryName, secNormal);
+    auto secondaryPlane = configureFocusPlane(secondaryName, secNormal);
+
+    _state->setSurface(primaryName, primaryPlane, true);
+    _state->setSurface(secondaryName, secondaryPlane, true);
+    _state->setSurface(primaryName, primaryPlane);
+    _state->setSurface(secondaryName, secondaryPlane);
 
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->refreshAll();
