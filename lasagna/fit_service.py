@@ -26,7 +26,9 @@ import getpass
 import hashlib
 import importlib
 import json
+import multiprocessing
 import os
+import queue
 import shutil
 import socket
 import subprocess
@@ -174,6 +176,7 @@ class _LaplaceRankUnavailable(RuntimeError):
 
 
 _DEFAULT_LAPLACE_RANK_DEBUG_DIR = Path("laplace_rank_debug") / "atlas_snap"
+_DEFAULT_LAPLACE_RANK_PARALLEL_JOBS = 4
 
 
 def _validate_laplace_rank_point(value: Any, label: str) -> None:
@@ -254,10 +257,197 @@ def _resolve_laplace_rank_debug_dir(options: Any) -> Any:
     return updated
 
 
+def _laplace_rank_max_parallel_jobs(options: Any) -> int:
+    if not isinstance(options, dict):
+        return _DEFAULT_LAPLACE_RANK_PARALLEL_JOBS
+    raw = options.get("max_parallel_jobs")
+    if raw is None:
+        return _DEFAULT_LAPLACE_RANK_PARALLEL_JOBS
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("options.max_parallel_jobs must be a positive integer") from None
+    if parsed < 1:
+        raise ValueError("options.max_parallel_jobs must be a positive integer")
+    return parsed
+
+
+def _laplace_rank_single_request(body: dict[str, Any], index: int) -> dict[str, Any]:
+    jobs = body.get("jobs")
+    if not isinstance(jobs, list):
+        raise ValueError("jobs must be a list")
+    options = dict(body.get("options") or {})
+    parent_request_id = str(options.get("request_id") or "rank")
+    options["request_id"] = f"{parent_request_id}_p{index:05d}"
+    options["max_parallel_jobs"] = 1
+    request = dict(body)
+    request["jobs"] = [jobs[index]]
+    request["options"] = options
+    return request
+
+
+def _laplace_rank_error_result(rank_id: str, message: str) -> dict[str, Any]:
+    return {
+        "id": rank_id,
+        "status": "error",
+        "error": {
+            "code": "rank_failed",
+            "message": message,
+        },
+    }
+
+
+def _laplace_rank_worker_main(index: int, request: dict[str, Any], event_queue: Any) -> None:
+    try:
+        module = importlib.import_module("vc_lasagna_amgx")
+        result = module.rank_snap_pairs(request)
+        event_queue.put({"kind": "done", "index": index, "result": result})
+    except BaseException as exc:
+        event_queue.put({
+            "kind": "error",
+            "index": index,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        })
+
+
+def _extract_single_laplace_rank_result(
+    body: dict[str, Any],
+    index: int,
+    child_result: Any,
+) -> dict[str, Any]:
+    jobs = body.get("jobs")
+    rank_id = f"job_{index}"
+    if isinstance(jobs, list) and index < len(jobs) and isinstance(jobs[index], dict):
+        rank_id = str(jobs[index].get("id") or rank_id)
+    if not isinstance(child_result, dict):
+        return _laplace_rank_error_result(
+            rank_id,
+            "vc_lasagna_amgx.rank_snap_pairs returned a non-object response",
+        )
+    results = child_result.get("results")
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+        return _laplace_rank_error_result(
+            rank_id,
+            "vc_lasagna_amgx.rank_snap_pairs returned no result for the child job",
+        )
+    return results[0]
+
+
+def _rank_laplace_snap_pairs_process_batch(
+    body: dict[str, Any],
+    max_workers: int,
+    progress_callback: Any | None,
+) -> dict[str, Any]:
+    jobs = body.get("jobs")
+    if not isinstance(jobs, list):
+        raise ValueError("jobs must be a list")
+    total = len(jobs)
+    if total == 0:
+        return {"results": [], "options": dict(body.get("options") or {})}
+
+    worker_count = min(total, max_workers)
+    print(
+        f"[fit-service] laplace rank process batch: jobs={total} workers={worker_count}",
+        flush=True,
+    )
+
+    ctx = multiprocessing.get_context("spawn")
+    event_queue = ctx.Queue()
+    active: dict[int, multiprocessing.Process] = {}
+    finished: set[int] = set()
+    results: list[Any] = [None] * total
+    next_index = 0
+    completed = 0
+
+    def start_more() -> None:
+        nonlocal next_index
+        while len(active) < worker_count and next_index < total:
+            index = next_index
+            next_index += 1
+            request = _laplace_rank_single_request(body, index)
+            proc = ctx.Process(
+                target=_laplace_rank_worker_main,
+                args=(index, request, event_queue),
+            )
+            proc.start()
+            active[index] = proc
+
+    def finish_one(index: int, result: dict[str, Any]) -> None:
+        nonlocal completed
+        if index in finished:
+            return
+        finished.add(index)
+        proc = active.pop(index, None)
+        if proc is not None:
+            proc.join(timeout=1.0)
+        results[index] = result
+        completed += 1
+        if progress_callback is not None:
+            keep_running = progress_callback({
+                "index": index,
+                "id": result.get("id") or f"job_{index}",
+                "result": result,
+                "completed": completed,
+                "total": total,
+            })
+            if keep_running is False:
+                raise RuntimeError("progress callback requested cancellation")
+
+    try:
+        start_more()
+        while completed < total:
+            try:
+                message = event_queue.get(timeout=0.2)
+            except queue.Empty:
+                for index, proc in list(active.items()):
+                    if proc.exitcode is not None and index not in finished:
+                        finish_one(
+                            index,
+                            _laplace_rank_error_result(
+                                str(jobs[index].get("id") or f"job_{index}")
+                                if isinstance(jobs[index], dict) else f"job_{index}",
+                                f"laplace rank worker exited with code {proc.exitcode}",
+                            ),
+                        )
+                        start_more()
+                continue
+
+            index = int(message.get("index"))
+            kind = str(message.get("kind") or "")
+            if kind == "done":
+                finish_one(index, _extract_single_laplace_rank_result(body, index, message.get("result")))
+            elif kind == "error":
+                rank_id = str(jobs[index].get("id") or f"job_{index}") if isinstance(jobs[index], dict) else f"job_{index}"
+                finish_one(index, _laplace_rank_error_result(rank_id, str(message.get("error") or "rank failed")))
+            start_more()
+    except Exception:
+        for proc in active.values():
+            if proc.is_alive():
+                proc.terminate()
+        for proc in active.values():
+            proc.join(timeout=2.0)
+        raise
+    finally:
+        event_queue.close()
+
+    options = dict(body.get("options") or {})
+    options["max_parallel_jobs"] = max_workers
+    return {"results": results, "options": options}
+
+
 def _rank_laplace_snap_pairs(
     body: dict[str, Any],
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
+    jobs = body.get("jobs")
+    max_parallel_jobs = _laplace_rank_max_parallel_jobs(body.get("options", {}))
+    if isinstance(jobs, list) and len(jobs) > 1 and max_parallel_jobs > 1:
+        return _rank_laplace_snap_pairs_process_batch(
+            body,
+            max_parallel_jobs,
+            progress_callback,
+        )
     try:
         module = importlib.import_module("vc_lasagna_amgx")
     except ImportError as exc:
