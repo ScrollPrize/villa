@@ -181,6 +181,54 @@ class FitServiceQueueTest(unittest.TestCase):
 			finally:
 				fit_service._data_dir = old_data_dir
 
+	def test_queued_laplace_rank_records_out_of_order_events(self):
+		queue = fit_service._JobQueue()
+		request = {
+			"job_type": "laplace_rank",
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [
+				{"id": "term-0", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]},
+				{"id": "term-1", "side_a": [[7, 8, 9]], "side_b": [[10, 11, 12]]},
+			],
+			"options": {},
+		}
+
+		def fake_rank(body, progress_callback=None):
+			results = [
+				{"id": "term-0", "status": "success", "values": []},
+				{"id": "term-1", "status": "success", "values": []},
+			]
+			progress_callback({
+				"index": 1,
+				"id": "term-1",
+				"result": results[1],
+				"completed": 1,
+				"total": 2,
+			})
+			progress_callback({
+				"index": 0,
+				"id": "term-0",
+				"result": results[0],
+				"completed": 2,
+				"total": 2,
+			})
+			return {"results": results}
+
+		with mock.patch.object(fit_service, "_rank_laplace_snap_pairs", side_effect=fake_rank):
+			job = queue.create_upload(source="vc3d", config_name="")
+			queue.enqueue_body(job, request)
+			snap = self.wait_for_state(queue, job.job_id, "finished")
+
+		self.assertEqual(snap["config_name"], "laplace_rank")
+		events = job.events_after(0)
+		self.assertEqual([event["seq"] for event in events], [1, 2])
+		self.assertEqual([event["index"] for event in events], [1, 0])
+		self.assertEqual(events[0]["type"], "laplace_rank_result")
+		result_path = fit_service.Path(snap["output_dir"]) / "rank_result.json"
+		self.assertTrue(result_path.is_file())
+		result = fit_service.json.loads(result_path.read_text(encoding="utf-8"))
+		self.assertEqual([item["id"] for item in result["results"]], ["term-0", "term-1"])
+
 	def test_enqueue_body_reports_requested_output_name(self):
 		queue = fit_service._JobQueue()
 		j1 = queue.create_upload(source="a", config_name="one.json")
