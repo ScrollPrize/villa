@@ -105,6 +105,21 @@ struct FiberIntersectionResult {
     std::string message;
 };
 
+enum class AtlasSearchProgressPhase {
+    PrepareInputs = 0,
+    BuildSpatialIndex = 1,
+    SearchPairs = 2,
+    FinishResults = 3,
+};
+
+[[nodiscard]] int atlasSearchPhaseProgressPercent(AtlasSearchProgressPhase phase,
+                                                  size_t completed,
+                                                  size_t total);
+
+using FiberIntersectionProgressCallback =
+    std::function<void(AtlasSearchProgressPhase phase, size_t completed, size_t total)>;
+using FiberIntersectionCancelCallback = std::function<bool()>;
+
 class FiberSpatialIndex {
 public:
     void clear();
@@ -115,7 +130,8 @@ public:
     [[nodiscard]] uint64_t generation(uint64_t fiberId) const;
     [[nodiscard]] std::vector<FiberIntersectionCandidate> candidatesForFiber(
         const FiberPolyline& source,
-        const FiberIntersectionBroadPhaseOptions& options) const;
+        const FiberIntersectionBroadPhaseOptions& options,
+        FiberIntersectionCancelCallback cancelCallback = {}) const;
 
 private:
     struct Impl;
@@ -193,7 +209,8 @@ private:
     const FiberPolyline& target,
     const FiberIntersectionCandidate& candidate,
     const FiberIntersectionCeresOptions& options,
-    const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr);
+    const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr,
+    FiberIntersectionCancelCallback cancelCallback = {});
 
 [[nodiscard]] std::vector<FiberIntersectionResult> deduplicateFiberIntersectionResults(
     std::vector<FiberIntersectionResult> results,
@@ -212,6 +229,8 @@ private:
     FiberIntersectionCache* cache,
     const FiberIntersectionBroadPhaseOptions& broad,
     const FiberIntersectionCeresOptions& ceres,
-    const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr);
+    const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr,
+    FiberIntersectionProgressCallback progressCallback = {},
+    FiberIntersectionCancelCallback cancelCallback = {});
 
 } // namespace vc::atlas

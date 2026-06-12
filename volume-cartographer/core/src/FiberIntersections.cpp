@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <future>
 #include <limits>
 #include <optional>
 #include <set>
@@ -372,11 +371,15 @@ struct JointIntersectionResidual {
     const FiberPolyline& target;
     FiberIntersectionCeresOptions options;
     const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr;
+    FiberIntersectionCancelCallback cancelCallback;
 
     bool operator()(const double* const sourceS,
                     const double* const targetS,
                     double* residuals) const
     {
+        if (cancelCallback && cancelCallback()) {
+            return false;
+        }
         const FiberSample a = sampleFiber(source, sourceS[0]);
         const FiberSample b = sampleFiber(target, targetS[0]);
         if (windingSampler) {
@@ -448,6 +451,24 @@ FiberIntersectionResult normalizedResultForPair(FiberIntersectionResult result,
     }
     return result;
 }
+
+class FiberIntersectionCancelIterationCallback final : public ceres::IterationCallback {
+public:
+    explicit FiberIntersectionCancelIterationCallback(FiberIntersectionCancelCallback cancelCallback)
+        : cancelCallback_(std::move(cancelCallback))
+    {
+    }
+
+    ceres::CallbackReturnType operator()(const ceres::IterationSummary& /*summary*/) override
+    {
+        return cancelCallback_ && cancelCallback_()
+            ? ceres::SOLVER_ABORT
+            : ceres::SOLVER_CONTINUE;
+    }
+
+private:
+    FiberIntersectionCancelCallback cancelCallback_;
+};
 
 } // namespace
 
@@ -590,9 +611,26 @@ uint64_t FiberSpatialIndex::generation(uint64_t fiberId) const
     return it == impl_->generations.end() ? 0 : it->second;
 }
 
+int atlasSearchPhaseProgressPercent(AtlasSearchProgressPhase phase, size_t completed, size_t total)
+{
+    constexpr int kPhaseCount = 4;
+    constexpr int kPercentMax = 100;
+    const int phaseIndex = std::clamp(static_cast<int>(phase), 0, kPhaseCount - 1);
+    const int phaseBase = (phaseIndex * kPercentMax) / kPhaseCount;
+    const int phaseEnd = ((phaseIndex + 1) * kPercentMax) / kPhaseCount;
+    const int phaseSpan = phaseEnd - phaseBase;
+    if (total == 0) {
+        return phaseBase + (completed > 0 ? phaseSpan : 0);
+    }
+    const size_t clampedCompleted = std::min(completed, total);
+    const double fraction = static_cast<double>(clampedCompleted) / static_cast<double>(total);
+    return phaseBase + static_cast<int>(std::round(fraction * static_cast<double>(phaseSpan)));
+}
+
 std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
     const FiberPolyline& source,
-    const FiberIntersectionBroadPhaseOptions& options) const
+    const FiberIntersectionBroadPhaseOptions& options,
+    FiberIntersectionCancelCallback cancelCallback) const
 {
     if (!impl_) {
         return {};
@@ -647,6 +685,9 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
         double bestDistanceSq = squaredDistance(sourceSamples[sourceIndex].position,
                                                 targetSamples[targetIndex].position);
         for (;;) {
+            if (cancelCallback && cancelCallback()) {
+                break;
+            }
             int bestSourceIndex = sourceIndex;
             int bestTargetIndex = targetIndex;
             for (int ds = -1; ds <= 1; ++ds) {
@@ -707,6 +748,9 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
         const int stride = sanitizedSeedStride(options.seedStride);
 
         auto processSourceIndex = [&](int sourceIndex) {
+            if (cancelCallback && cancelCallback()) {
+                return;
+            }
             processed[static_cast<size_t>(sourceIndex)] = 1;
             const auto& sourceSample = sourceSamples[static_cast<size_t>(sourceIndex)];
             pointHits.clear();
@@ -738,6 +782,9 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
             });
 
             for (const auto& hit : hits) {
+                if (cancelCallback && cancelCallback()) {
+                    return;
+                }
                 auto& coverage = coverageByTarget[hit.entry.fiberId];
                 if (coverage.empty()) {
                     coverage.assign(sourceSamples.size(), -1);
@@ -758,6 +805,9 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
                                                 hit.entry.denseSampleIndex,
                                                 hit.entry.fiberId,
                                                 hit.entry.generation);
+                if (cancelCallback && cancelCallback()) {
+                    return;
+                }
                 if (direct.candidate.straightDistance > maxDistance) {
                     continue;
                 }
@@ -773,9 +823,15 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
         };
 
         for (size_t i = 0; i < sourceSamples.size(); i += static_cast<size_t>(stride)) {
+            if (cancelCallback && cancelCallback()) {
+                return;
+            }
             processSourceIndex(static_cast<int>(i));
         }
         for (size_t i = 0; i < sourceSamples.size(); ++i) {
+            if (cancelCallback && cancelCallback()) {
+                return;
+            }
             if (!processed[i]) {
                 processSourceIndex(static_cast<int>(i));
             }
@@ -783,8 +839,17 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
     };
 
     scanTree(impl_->committedTree, true, 0);
+    if (cancelCallback && cancelCallback()) {
+        return {};
+    }
     scanTree(impl_->recentTrees[0], false, 0);
+    if (cancelCallback && cancelCallback()) {
+        return {};
+    }
     scanTree(impl_->recentTrees[1], false, 1);
+    if (cancelCallback && cancelCallback()) {
+        return {};
+    }
     return clusterCandidates(std::move(candidates), options.clusterArclength);
 }
 
@@ -878,8 +943,22 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
     const FiberPolyline& target,
     const FiberIntersectionCandidate& candidate,
     const FiberIntersectionCeresOptions& options,
-    const vc::lasagna::LasagnaNormalSampler* windingSampler)
+    const vc::lasagna::LasagnaNormalSampler* windingSampler,
+    FiberIntersectionCancelCallback cancelCallback)
 {
+    if (cancelCallback && cancelCallback()) {
+        FiberIntersectionResult result;
+        result.sourceFiberId = source.id;
+        result.sourceGeneration = source.generation;
+        result.targetFiberId = target.id;
+        result.targetGeneration = target.generation;
+        result.candidateDistance = candidate.straightDistance;
+        result.sourceArclength = candidate.sourceArclength;
+        result.targetArclength = candidate.targetArclength;
+        result.message = "canceled";
+        return result;
+    }
+
     const auto sourceLengths = cumulativeArclengths(source);
     const auto targetLengths = cumulativeArclengths(target);
     const ArclengthDomain sourceDomain = activeArclengthDomain(source, sourceLengths);
@@ -893,7 +972,7 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
                                                         5,
                                                         1,
                                                         1>(
-        new JointIntersectionResidual{source, target, options, windingSampler});
+        new JointIntersectionResidual{source, target, options, windingSampler, cancelCallback});
     problem.AddResidualBlock(residual, nullptr, &sourceS, &targetS);
     problem.SetParameterLowerBound(&sourceS, 0, sourceDomain.start);
     problem.SetParameterUpperBound(&sourceS, 0, sourceDomain.end);
@@ -909,6 +988,10 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
     solverOptions.linear_solver_type = ceres::DENSE_QR;
     solverOptions.logging_type = ceres::SILENT;
     solverOptions.minimizer_progress_to_stdout = false;
+    FiberIntersectionCancelIterationCallback cancelIterationCallback(cancelCallback);
+    if (cancelCallback) {
+        solverOptions.callbacks.push_back(&cancelIterationCallback);
+    }
     ceres::Solver::Summary summary;
     ceres::Solve(solverOptions, &problem, &summary);
 
@@ -1012,16 +1095,31 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     FiberIntersectionCache* cache,
     const FiberIntersectionBroadPhaseOptions& broad,
     const FiberIntersectionCeresOptions& ceres,
-    const vc::lasagna::LasagnaNormalSampler* windingSampler)
+    const vc::lasagna::LasagnaNormalSampler* windingSampler,
+    FiberIntersectionProgressCallback progressCallback,
+    FiberIntersectionCancelCallback cancelCallback)
 {
     if (windingSampler) {
         cache = nullptr;
     }
 
     std::unordered_map<uint64_t, const FiberPolyline*> byId;
+    if (progressCallback) {
+        progressCallback(AtlasSearchProgressPhase::BuildSpatialIndex, 0, fibers.size());
+    }
+    size_t indexedFibers = 0;
     for (const auto& fiber : fibers) {
+        if (cancelCallback && cancelCallback()) {
+            return {};
+        }
         byId[fiber.id] = &fiber;
         index.upsertCommitted(fiber);
+        ++indexedFibers;
+        if (progressCallback) {
+            progressCallback(AtlasSearchProgressPhase::BuildSpatialIndex,
+                             indexedFibers,
+                             fibers.size());
+        }
     }
 
     std::unordered_set<uint64_t> sourceSet(sourceFiberIds.begin(), sourceFiberIds.end());
@@ -1029,27 +1127,55 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     std::set<std::pair<uint64_t, uint64_t>> searchedPairs;
     std::vector<FiberIntersectionResult> allResults;
     std::unordered_map<uint64_t, std::vector<FiberIntersectionCandidate>> candidateCache;
+    const size_t pairTotal = sourceFiberIds.size() * targetFiberIds.size();
+    size_t completedPairs = 0;
+    if (progressCallback) {
+        progressCallback(AtlasSearchProgressPhase::SearchPairs, 0, pairTotal);
+    }
 
     auto candidatesFor = [&](const FiberPolyline& fiber) -> const std::vector<FiberIntersectionCandidate>& {
         auto it = candidateCache.find(fiber.id);
         if (it == candidateCache.end()) {
-            it = candidateCache.emplace(fiber.id, index.candidatesForFiber(fiber, broad)).first;
+            it = candidateCache.emplace(fiber.id,
+                                        index.candidatesForFiber(fiber,
+                                                                 broad,
+                                                                 cancelCallback)).first;
         }
         return it->second;
     };
 
-    for (uint64_t sourceId : sourceFiberIds) {
-        auto sourceIt = byId.find(sourceId);
-        if (sourceIt == byId.end()) {
-            continue;
+    auto reportPairFinished = [&]() {
+        if (completedPairs < pairTotal) {
+            ++completedPairs;
         }
-        const FiberPolyline& source = *sourceIt->second;
+        if (progressCallback) {
+            progressCallback(AtlasSearchProgressPhase::SearchPairs, completedPairs, pairTotal);
+        }
+    };
+
+    for (uint64_t sourceId : sourceFiberIds) {
+        if (cancelCallback && cancelCallback()) {
+            break;
+        }
+        auto sourceIt = byId.find(sourceId);
+        bool sourceCanceled = false;
         for (uint64_t targetId : targetFiberIds) {
+            if (cancelCallback && cancelCallback()) {
+                sourceCanceled = true;
+                break;
+            }
+            if (sourceIt == byId.end()) {
+                reportPairFinished();
+                continue;
+            }
+            const FiberPolyline& source = *sourceIt->second;
             if (targetId == sourceId) {
+                reportPairFinished();
                 continue;
             }
             auto targetIt = byId.find(targetId);
             if (targetIt == byId.end()) {
+                reportPairFinished();
                 continue;
             }
             const FiberPolyline& target = *targetIt->second;
@@ -1058,6 +1184,7 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
             if (sourceSet.count(target.id) &&
                 targetSet.count(source.id) &&
                 searchedPairs.count({a, b})) {
+                reportPairFinished();
                 continue;
             }
 
@@ -1074,41 +1201,59 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
                 }
                 allResults.insert(allResults.end(), pairResults.begin(), pairResults.end());
                 searchedPairs.insert({a, b});
+                reportPairFinished();
                 continue;
             }
 
             std::vector<FiberIntersectionCandidate> pairCandidates;
             for (const auto& c : candidatesFor(source)) {
+                if (cancelCallback && cancelCallback()) {
+                    sourceCanceled = true;
+                    break;
+                }
                 if (c.targetFiberId == target.id) {
                     pairCandidates.push_back(c);
                 }
             }
+            if (sourceCanceled) {
+                reportPairFinished();
+                break;
+            }
             for (const auto& c : candidatesFor(target)) {
+                if (cancelCallback && cancelCallback()) {
+                    sourceCanceled = true;
+                    break;
+                }
                 if (c.targetFiberId == source.id) {
                     pairCandidates.push_back(normalizedCandidateForPair(c, source.id, target.id));
                 }
             }
+            if (sourceCanceled) {
+                reportPairFinished();
+                break;
+            }
             pairCandidates = clusterCandidates(std::move(pairCandidates), broad.clusterArclength);
             if (pairCandidates.empty()) {
                 searchedPairs.insert({a, b});
+                reportPairFinished();
                 continue;
             }
 
-            std::vector<std::future<FiberIntersectionResult>> futures;
-            futures.reserve(pairCandidates.size());
             for (const auto& c : pairCandidates) {
-                futures.push_back(std::async(std::launch::async,
-                                             [&source, &target, c, ceres, windingSampler]() {
-                                                 return refineFiberIntersectionCandidate(
-                                                     source,
-                                                     target,
-                                                     c,
-                                                     ceres,
-                                                     windingSampler);
-                                             }));
+                if (cancelCallback && cancelCallback()) {
+                    sourceCanceled = true;
+                    break;
+                }
+                pairResults.push_back(refineFiberIntersectionCandidate(source,
+                                                                       target,
+                                                                       c,
+                                                                       ceres,
+                                                                       windingSampler,
+                                                                       cancelCallback));
             }
-            for (auto& future : futures) {
-                pairResults.push_back(future.get());
+            if (sourceCanceled) {
+                reportPairFinished();
+                break;
             }
             pairResults = deduplicateFiberIntersectionResults(std::move(pairResults),
                                                               ceres.deduplicateArclength);
@@ -1123,6 +1268,10 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
             }
             allResults.insert(allResults.end(), pairResults.begin(), pairResults.end());
             searchedPairs.insert({a, b});
+            reportPairFinished();
+        }
+        if (sourceCanceled) {
+            break;
         }
     }
 

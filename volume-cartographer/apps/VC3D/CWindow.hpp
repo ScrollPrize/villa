@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 
 #include <opencv2/core/mat.hpp>
 #include <QComboBox>
@@ -141,6 +142,9 @@ private:
     void updateAtlasSearchDocks();
     void startAtlasFiberIntersectionSearch();
     void cancelAtlasFiberIntersectionSearch();
+    void updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
+                                   std::size_t completed,
+                                   std::size_t total);
     void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results);
     void openAtlasSearchResult(int sortedResultIndex);
     void clearAtlasSearchPreviewState();
@@ -281,6 +285,11 @@ private:
     std::set<int> _atlasSearchSelectedResults;
     std::set<int> _atlasSearchPreviewRequestedResults;
     bool _atlasSearchCancelRequested{false};
+    std::shared_ptr<std::atomic_bool> _atlasSearchCancelFlag;
+    vc::atlas::AtlasSearchProgressPhase _atlasSearchProgressPhase{
+        vc::atlas::AtlasSearchProgressPhase::PrepareInputs};
+    std::size_t _atlasSearchPhaseCompleted{0};
+    std::size_t _atlasSearchPhaseTotal{0};
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
     QMdiArea* _intersectionsMdiArea{nullptr};

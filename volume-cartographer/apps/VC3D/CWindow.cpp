@@ -72,6 +72,7 @@
 #include <QPointer>
 #include <QListView>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include "vc/core/types/Segmentation.hpp"
@@ -206,6 +207,33 @@ bool atlasSearchDebugEnabled()
 {
     const char* value = std::getenv("VC_ATLAS_SEARCH_DEBUG");
     return value && *value != '\0' && std::string_view(value) != "0";
+}
+
+QString atlasSearchModeName(int searchMode)
+{
+    return searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
+        ? QStringLiteral("non_atlas_only")
+        : QStringLiteral("atlas_to_non_atlas");
+}
+
+int atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase phase)
+{
+    return static_cast<int>(phase) + 1;
+}
+
+QString atlasSearchPhaseAction(vc::atlas::AtlasSearchProgressPhase phase)
+{
+    switch (phase) {
+    case vc::atlas::AtlasSearchProgressPhase::PrepareInputs:
+        return QObject::tr("Preparing inputs");
+    case vc::atlas::AtlasSearchProgressPhase::BuildSpatialIndex:
+        return QObject::tr("Building spatial index");
+    case vc::atlas::AtlasSearchProgressPhase::SearchPairs:
+        return QObject::tr("Searching pairs");
+    case vc::atlas::AtlasSearchProgressPhase::FinishResults:
+        return QObject::tr("Finishing results");
+    }
+    return QObject::tr("Searching");
 }
 
 QStringList atlasSearchTagList(const QString& text)
@@ -2735,6 +2763,13 @@ void CWindow::updateAtlasSearchDocks()
 void CWindow::cancelAtlasFiberIntersectionSearch()
 {
     _atlasSearchCancelRequested = true;
+    if (_atlasSearchCancelFlag) {
+        _atlasSearchCancelFlag->store(true, std::memory_order_relaxed);
+    }
+    qInfo().noquote() << QStringLiteral("[atlas-search] cancel requested phase=%1 completed=%2 total=%3")
+        .arg(atlasSearchPhaseNumber(_atlasSearchProgressPhase))
+        .arg(static_cast<qulonglong>(_atlasSearchPhaseCompleted))
+        .arg(static_cast<qulonglong>(_atlasSearchPhaseTotal));
     clearAtlasSearchPreviewState();
     for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
         if (!dock || !dock->widget()) {
@@ -2742,14 +2777,58 @@ void CWindow::cancelAtlasFiberIntersectionSearch()
         }
         if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
             progress->setRange(0, 100);
-            progress->setValue(0);
-            progress->setFormat(tr("Canceled"));
+            progress->setValue(vc::atlas::atlasSearchPhaseProgressPercent(
+                _atlasSearchProgressPhase,
+                _atlasSearchPhaseCompleted,
+                _atlasSearchPhaseTotal));
+            progress->setFormat(tr("Canceling: phase %1/4 %2 (%3 / %4)")
+                                    .arg(atlasSearchPhaseNumber(_atlasSearchProgressPhase))
+                                    .arg(atlasSearchPhaseAction(_atlasSearchProgressPhase))
+                                    .arg(static_cast<qulonglong>(_atlasSearchPhaseCompleted))
+                                    .arg(static_cast<qulonglong>(_atlasSearchPhaseTotal)));
         }
         if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
             cancel->setEnabled(false);
         }
         if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
             tree->clear();
+        }
+    }
+}
+
+void CWindow::updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
+                                        std::size_t completed,
+                                        std::size_t total)
+{
+    _atlasSearchProgressPhase = phase;
+    _atlasSearchPhaseCompleted = total == 0 ? completed : std::min(completed, total);
+    _atlasSearchPhaseTotal = total;
+
+    const int percent = vc::atlas::atlasSearchPhaseProgressPercent(
+        phase,
+        _atlasSearchPhaseCompleted,
+        total);
+    const QString action = atlasSearchPhaseAction(phase);
+    const QString format = _atlasSearchCancelRequested
+        ? tr("Canceling: phase %1/4 %2 (%3 / %4)")
+              .arg(atlasSearchPhaseNumber(phase))
+              .arg(action)
+              .arg(static_cast<qulonglong>(_atlasSearchPhaseCompleted))
+              .arg(static_cast<qulonglong>(total))
+        : tr("Phase %1/4: %2 (%3 / %4)")
+              .arg(atlasSearchPhaseNumber(phase))
+              .arg(action)
+              .arg(static_cast<qulonglong>(_atlasSearchPhaseCompleted))
+              .arg(static_cast<qulonglong>(total));
+
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
+            progress->setRange(0, 100);
+            progress->setValue(percent);
+            progress->setFormat(format);
         }
     }
 }
@@ -2880,6 +2959,13 @@ void CWindow::startAtlasFiberIntersectionSearch()
     std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> snapshotsByRuntimeId;
     fibers.reserve(fiberSnapshots.size());
     snapshotsByRuntimeId.reserve(fiberSnapshots.size());
+    _atlasSearchCancelRequested = false;
+    qInfo().noquote() << QStringLiteral("[atlas-search] phase=1 prepare_inputs start total=%1")
+        .arg(static_cast<qulonglong>(fiberSnapshots.size()));
+    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::PrepareInputs,
+                              0,
+                              fiberSnapshots.size());
+    std::size_t preparedFibers = 0;
     for (const auto& snapshot : fiberSnapshots) {
         const uint64_t fiberId = runtimeIds.idForPath(snapshot.fiberPath);
         auto fiber = snapshot.fiber;
@@ -2904,7 +2990,14 @@ void CWindow::startAtlasFiberIntersectionSearch()
                      QString::number(static_cast<int>(snapshot.fiber.controlPoints.size())),
                      inAtlas ? QStringLiteral("source_atlas") : QStringLiteral("target_non_atlas"));
         }
+        ++preparedFibers;
+        updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::PrepareInputs,
+                                  preparedFibers,
+                                  fiberSnapshots.size());
     }
+    qInfo().noquote() << QStringLiteral("[atlas-search] phase=1 prepare_inputs end completed=%1 total=%2")
+        .arg(static_cast<qulonglong>(preparedFibers))
+        .arg(static_cast<qulonglong>(fiberSnapshots.size()));
     if (!requiredTags.isEmpty()) {
         auto keepTagged = [&snapshotsByRuntimeId, &requiredTags](std::vector<uint64_t>& ids) {
             ids.erase(std::remove_if(ids.begin(),
@@ -2939,6 +3032,13 @@ void CWindow::startAtlasFiberIntersectionSearch()
             .arg(atlasSearchIdListString(sourceFiberIds),
                  atlasSearchIdListString(targetFiberIds));
     }
+    const std::size_t pairTotal = sourceFiberIds.size() * targetFiberIds.size();
+    qInfo().noquote() << QStringLiteral("[atlas-search] start mode=%1 saved_fibers=%2 sources=%3 targets=%4 pairs=%5")
+        .arg(atlasSearchModeName(searchMode))
+        .arg(static_cast<qulonglong>(fiberSnapshots.size()))
+        .arg(static_cast<qulonglong>(sourceFiberIds.size()))
+        .arg(static_cast<qulonglong>(targetFiberIds.size()))
+        .arg(static_cast<qulonglong>(pairTotal));
 
     vc::atlas::FiberIntersectionCeresOptions ceres;
 
@@ -2958,6 +3058,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
     _atlasSearchFiberSnapshotsByRuntimeId = std::move(snapshotsByRuntimeId);
     _atlasSearchLasagnaManifestPath = lasagnaManifestPath;
     _atlasSearchCancelRequested = false;
+    _atlasSearchCancelFlag = std::make_shared<std::atomic_bool>(false);
     for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
         if (!dock || !dock->widget()) {
             continue;
@@ -2968,16 +3069,13 @@ void CWindow::startAtlasFiberIntersectionSearch()
         if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
             cancel->setEnabled(true);
         }
-        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
-            progress->setRange(0, 0);
-            progress->setFormat(tr("Searching candidates and refining"));
-        }
         if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
             tree->clear();
         }
     }
     _atlasSearchResults.clear();
 
+    const auto searchStart = std::chrono::steady_clock::now();
     auto* watcher = new QFutureWatcher<std::vector<vc::atlas::FiberIntersectionResult>>(this);
     connect(watcher,
             &QFutureWatcher<std::vector<vc::atlas::FiberIntersectionResult>>::finished,
@@ -2987,6 +3085,8 @@ void CWindow::startAtlasFiberIntersectionSearch()
              sourceFiberIds,
              targetFiberIds,
              fiberPathById = std::move(fiberPathById),
+             cancelFlag = _atlasSearchCancelFlag,
+             searchStart,
              debugSearch]() {
                 const auto results = watcher->result();
                 if (debugSearch) {
@@ -3009,19 +3109,50 @@ void CWindow::startAtlasFiberIntersectionSearch()
                     }
                 }
                 watcher->deleteLater();
-                if (!_atlasSearchCancelRequested) {
+                const bool canceled = cancelFlag && cancelFlag->load(std::memory_order_relaxed);
+                if (!canceled && !_atlasSearchCancelRequested) {
                     populateAtlasSearchResults(results);
                     if (statusBar()) {
                         statusBar()->showMessage(tr("Atlas object search found %1 result(s)")
                                                      .arg(static_cast<int>(results.size())),
                                                  3000);
                     }
+                } else {
+                    qInfo().noquote() << QStringLiteral("[atlas-search] phase=4 finishing_results start total=1");
+                    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                                              1,
+                                              1);
+                    qInfo().noquote() << QStringLiteral("[atlas-search] phase=4 finishing_results end completed=1 total=1");
+                    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+                        if (!dock || !dock->widget()) {
+                            continue;
+                        }
+                        if (auto* progress = dock->widget()->findChild<QProgressBar*>(
+                                QStringLiteral("atlasSearchProgressBar"))) {
+                            progress->setFormat(tr("Canceled"));
+                        }
+                    }
+                    if (statusBar()) {
+                        statusBar()->showMessage(tr("Atlas object search canceled"), 3000);
+                    }
+                }
+                const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - searchStart).count();
+                qInfo().noquote() << QStringLiteral("[atlas-search] final result_count=%1 canceled=%2 elapsed_ms=%3")
+                    .arg(static_cast<qulonglong>(results.size()))
+                    .arg(canceled || _atlasSearchCancelRequested ? QStringLiteral("yes") : QStringLiteral("no"))
+                    .arg(static_cast<qlonglong>(elapsedMs));
+                _atlasSearchCancelRequested = false;
+                if (_atlasSearchCancelFlag == cancelFlag) {
+                    _atlasSearchCancelFlag.reset();
                 }
                 updateAtlasSearchDocks();
             });
 
     vc::atlas::FiberSpatialIndex* index = &_fiberIntersectionIndex;
     vc::atlas::FiberIntersectionCache* cache = &_fiberIntersectionCache;
+    QPointer<CWindow> self(this);
+    auto cancelFlag = _atlasSearchCancelFlag;
     watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
                                           sourceFiberIds = std::move(sourceFiberIds),
                                           targetFiberIds = std::move(targetFiberIds),
@@ -3029,10 +3160,61 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                           index,
                                           cache,
                                           broad,
-                                          ceres]() mutable {
+                                          ceres,
+                                          self,
+                                          cancelFlag]() mutable {
         vc::lasagna::LasagnaDataset dataset =
             vc::lasagna::LasagnaDataset::open(lasagnaManifestPath);
         vc::lasagna::LasagnaNormalSampler windingSampler(dataset);
+        bool phase2Started = false;
+        bool phase2Ended = false;
+        bool phase3Started = false;
+        bool phase3Ended = false;
+        auto progressCallback = [self,
+                                 cancelFlag,
+                                 &phase2Started,
+                                 &phase2Ended,
+                                 &phase3Started,
+                                 &phase3Ended](vc::atlas::AtlasSearchProgressPhase phase,
+                                               std::size_t completed,
+                                               std::size_t total) {
+            bool* started = nullptr;
+            bool* ended = nullptr;
+            if (phase == vc::atlas::AtlasSearchProgressPhase::BuildSpatialIndex) {
+                started = &phase2Started;
+                ended = &phase2Ended;
+            } else if (phase == vc::atlas::AtlasSearchProgressPhase::SearchPairs) {
+                started = &phase3Started;
+                ended = &phase3Ended;
+            }
+            if (started && !*started && completed == 0) {
+                *started = true;
+                qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 %2 start total=%3")
+                    .arg(atlasSearchPhaseNumber(phase))
+                    .arg(atlasSearchPhaseAction(phase).toLower().replace(QChar(' '), QChar('_')))
+                    .arg(static_cast<qulonglong>(total));
+            }
+            if (ended && !*ended && (completed >= total)) {
+                *ended = true;
+                qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 %2 end completed=%3 total=%4")
+                    .arg(atlasSearchPhaseNumber(phase))
+                    .arg(atlasSearchPhaseAction(phase).toLower().replace(QChar(' '), QChar('_')))
+                    .arg(static_cast<qulonglong>(completed))
+                    .arg(static_cast<qulonglong>(total));
+            }
+            if (!self) {
+                return;
+            }
+            QMetaObject::invokeMethod(self.data(), [self, cancelFlag, phase, completed, total]() {
+                if (!self || self->_atlasSearchCancelFlag != cancelFlag) {
+                    return;
+                }
+                self->updateAtlasSearchProgress(phase, completed, total);
+            }, Qt::QueuedConnection);
+        };
+        auto cancelCallback = [cancelFlag]() {
+            return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
+        };
         return vc::atlas::searchFiberIntersections(fibers,
                                                    sourceFiberIds,
                                                    targetFiberIds,
@@ -3040,7 +3222,9 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                                    cache,
                                                    broad,
                                                    ceres,
-                                                   &windingSampler);
+                                                   &windingSampler,
+                                                   std::move(progressCallback),
+                                                   std::move(cancelCallback));
     }));
 }
 
@@ -3096,14 +3280,16 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
     _atlasSearchSelectedResults.clear();
     _atlasSearchPreviewRequestedResults.clear();
 
+    const std::size_t finishTotal = std::max<std::size_t>(1, _atlasSearchResults.size());
+    qInfo().noquote() << QStringLiteral("[atlas-search] phase=4 finishing_results start total=%1")
+        .arg(static_cast<qulonglong>(finishTotal));
+    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                              0,
+                              finishTotal);
+    bool countedResultRows = false;
     for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
         if (!dock || !dock->widget()) {
             continue;
-        }
-        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
-            progress->setRange(0, 100);
-            progress->setValue(100);
-            progress->setFormat(tr("Done"));
         }
         auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"));
         if (!tree) {
@@ -3140,6 +3326,11 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
             };
             addToGroup(result.sourceFiberId);
             addToGroup(result.targetFiberId);
+            if (!countedResultRows) {
+                updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                                          static_cast<std::size_t>(row) + 1,
+                                          finishTotal);
+            }
         }
 
         std::vector<FiberGroup> groups;
@@ -3202,10 +3393,30 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
                 row->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
             }
         }
+        if (_atlasSearchResults.empty() && !countedResultRows) {
+            updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                                      1,
+                                      finishTotal);
+        }
+        countedResultRows = true;
         tree->expandAll();
         tree->resizeColumnToContents(0);
         tree->resizeColumnToContents(1);
         tree->resizeColumnToContents(2);
+    }
+    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
+                              finishTotal,
+                              finishTotal);
+    qInfo().noquote() << QStringLiteral("[atlas-search] phase=4 finishing_results end completed=%1 total=%2")
+        .arg(static_cast<qulonglong>(finishTotal))
+        .arg(static_cast<qulonglong>(finishTotal));
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
+            progress->setFormat(tr("Done"));
+        }
     }
     updateAtlasSearchPreviewCandidates();
 }

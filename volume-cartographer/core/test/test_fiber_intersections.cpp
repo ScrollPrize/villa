@@ -192,6 +192,99 @@ TEST_CASE("Fiber intersection search runs two-sided discovery and preserves dist
     CHECK(sourceArclengths[1] == doctest::Approx(300.0).epsilon(1e-5));
 }
 
+TEST_CASE("Atlas search phase progress maps four equal phases")
+{
+    using vc::atlas::AtlasSearchProgressPhase;
+
+    CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
+              AtlasSearchProgressPhase::PrepareInputs,
+              0,
+              4) == 0);
+    CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
+              AtlasSearchProgressPhase::PrepareInputs,
+              4,
+              4) == 25);
+    CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
+              AtlasSearchProgressPhase::BuildSpatialIndex,
+              4,
+              4) == 50);
+    CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
+              AtlasSearchProgressPhase::SearchPairs,
+              12,
+              12) == 75);
+    CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
+              AtlasSearchProgressPhase::FinishResults,
+              3,
+              3) == 100);
+}
+
+TEST_CASE("Fiber intersection search reports pair progress and cancels")
+{
+    vc::atlas::FiberSpatialIndex index;
+    vc::atlas::FiberIntersectionCache cache;
+    auto sourceA = fiber(1, 1, {p(0, 0, 0), p(10, 0, 0)});
+    auto sourceB = fiber(2, 1, {p(0, 10, 0), p(10, 10, 0)});
+    auto target = fiber(3, 1, {p(100, 100, 0), p(110, 100, 0)});
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    broad.maxDistance = 0.25;
+    vc::atlas::FiberIntersectionCeresOptions ceres;
+
+    std::vector<size_t> completed;
+    std::vector<size_t> totals;
+    std::vector<vc::atlas::AtlasSearchProgressPhase> phases;
+    (void)vc::atlas::searchFiberIntersections(
+        {sourceA, sourceB, target},
+        {1, 2, 999},
+        {3},
+        index,
+        &cache,
+        broad,
+        ceres,
+        nullptr,
+        [&](vc::atlas::AtlasSearchProgressPhase phase, size_t done, size_t total) {
+            if (phase != vc::atlas::AtlasSearchProgressPhase::SearchPairs) {
+                return;
+            }
+            phases.push_back(phase);
+            completed.push_back(done);
+            totals.push_back(total);
+        });
+
+    CHECK(phases.size() == 4);
+    CHECK(completed == std::vector<size_t>{0, 1, 2, 3});
+    CHECK(std::all_of(totals.begin(), totals.end(), [](size_t total) {
+        return total == 3;
+    }));
+
+    bool cancel = false;
+    completed.clear();
+    const auto canceledResults = vc::atlas::searchFiberIntersections(
+        {sourceA, sourceB, target},
+        {1, 2},
+        {3},
+        index,
+        &cache,
+        broad,
+        ceres,
+        nullptr,
+        [&](vc::atlas::AtlasSearchProgressPhase phase, size_t done, size_t /*total*/) {
+            if (phase != vc::atlas::AtlasSearchProgressPhase::SearchPairs) {
+                return;
+            }
+            completed.push_back(done);
+            if (done > 0) {
+                cancel = true;
+            }
+        },
+        [&cancel]() {
+            return cancel;
+        });
+
+    CHECK(canceledResults.empty());
+    CHECK(completed == std::vector<size_t>{0, 1});
+}
+
 TEST_CASE("Fiber intersection search ignores extensions outside outer control points")
 {
     vc::atlas::FiberSpatialIndex index;
