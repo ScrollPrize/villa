@@ -632,10 +632,16 @@ void logRankJobProgress(size_t index,
 
 [[nodiscard]] bool isAmgxRuntimeUnavailable(std::string_view message)
 {
-    return message.find("AMGX_") != std::string_view::npos ||
-           message.find("AMGX support is disabled") != std::string_view::npos ||
+    return message.find("AMGX support is disabled") != std::string_view::npos ||
            message.find("no CUDA-capable device") != std::string_view::npos ||
-           message.find("Cuda failure") != std::string_view::npos;
+           message.find("bad initialization or already destroyed") != std::string_view::npos;
+}
+
+[[nodiscard]] bool isAmgxCudaFailure(std::string_view message)
+{
+    return message.find("AMGX_") != std::string_view::npos ||
+           message.find("Cuda failure") != std::string_view::npos ||
+           message.find("CUDA failure") != std::string_view::npos;
 }
 
 void addResolvedContext(
@@ -710,7 +716,9 @@ void addResolvedContext(
     } catch (const std::exception& e) {
         auto out = errorResult(
             job,
-            isAmgxRuntimeUnavailable(e.what()) ? "amgx_unavailable" : "rank_failed",
+            isAmgxRuntimeUnavailable(e.what()) ? "amgx_unavailable"
+                : isAmgxCudaFailure(e.what()) ? "cuda_failure"
+                                              : "rank_failed",
             e.what());
         out["selected_lambda"] = nullptr;
         addResolvedContext(out, job, report, roles, confidenceFloor);

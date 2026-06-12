@@ -740,7 +740,8 @@ bool LasagnaServiceManager::isRunning() const
 void LasagnaServiceManager::rankLaplaceSnapPairs(
     const QJsonObject& request,
     std::function<void(const QJsonObject&)> onSuccess,
-    std::function<void(const QString&)> onError)
+    std::function<void(const QString&)> onError,
+    std::function<void(int, const QJsonObject&)> onPartialResult)
 {
     if (!isRunning()) {
         const QString msg = tr("Lasagna service is not running.");
@@ -775,7 +776,8 @@ void LasagnaServiceManager::rankLaplaceSnapPairs(
              timer,
              jobCount,
              onSuccess = std::move(onSuccess),
-             onError = std::move(onError)]() mutable {
+             onError = std::move(onError),
+             onPartialResult = std::move(onPartialResult)]() mutable {
         if (generation != _requestGeneration) {
             reply->deleteLater();
             return;
@@ -854,6 +856,7 @@ void LasagnaServiceManager::rankLaplaceSnapPairs(
             int receivedResults{0};
             QJsonArray results;
             QSet<int> seenIndices;
+            int finishedPollsWaitingForEvents{0};
             bool done{false};
         };
         auto state = std::make_shared<RankPollState>();
@@ -877,7 +880,14 @@ void LasagnaServiceManager::rankLaplaceSnapPairs(
             _completedJobIds.insert(state->jobId);
             fail(msg);
         };
-        *poll = [this, generation, state, pollTimer, poll, finishWithError, onSuccess]() {
+        *poll = [this,
+                 generation,
+                 state,
+                 pollTimer,
+                 poll,
+                 finishWithError,
+                 onSuccess,
+                 onPartialResult]() {
             if (state->done || generation != _requestGeneration) {
                 return;
             }
@@ -887,7 +897,14 @@ void LasagnaServiceManager::rankLaplaceSnapPairs(
             QNetworkRequest eventsReq = fitServiceRequest(eventsUrl);
             QNetworkReply* eventsReply = _nam->get(eventsReq);
             connect(eventsReply, &QNetworkReply::finished, this,
-                    [this, eventsReply, generation, state, pollTimer, finishWithError, onSuccess]() {
+                    [this,
+                     eventsReply,
+                     generation,
+                     state,
+                     pollTimer,
+                     finishWithError,
+                     onSuccess,
+                     onPartialResult]() {
                 if (state->done || generation != _requestGeneration) {
                     eventsReply->deleteLater();
                     return;
@@ -925,7 +942,11 @@ void LasagnaServiceManager::rankLaplaceSnapPairs(
                         state->seenIndices.insert(index);
                         ++state->receivedResults;
                     }
-                    state->results.replace(index, event[QStringLiteral("result")]);
+                    const QJsonValue resultValue = event[QStringLiteral("result")];
+                    state->results.replace(index, resultValue);
+                    if (onPartialResult) {
+                        onPartialResult(index, resultValue.toObject());
+                    }
                 }
 
                 QUrl statusUrl(QStringLiteral("%1/jobs/%2").arg(baseUrl(), state->jobId));
@@ -959,8 +980,17 @@ void LasagnaServiceManager::rankLaplaceSnapPairs(
                     const QString stateText = statusObj[QStringLiteral("state")].toString();
                     if (stateText == QStringLiteral("finished")) {
                         if (state->receivedResults != state->expectedResults) {
+                            ++state->finishedPollsWaitingForEvents;
+                            std::cerr << "[lasagna] queued laplace rank finished but waiting for events:"
+                                      << " received=" << state->receivedResults
+                                      << " expected=" << state->expectedResults
+                                      << " poll=" << state->finishedPollsWaitingForEvents
+                                      << std::endl;
+                            if (state->finishedPollsWaitingForEvents < 10) {
+                                return;
+                            }
                             (*finishWithError)(
-                                tr("Laplace rank finished with %1/%2 result events")
+                                tr("Laplace rank finished with %1/%2 result events after waiting")
                                     .arg(state->receivedResults)
                                     .arg(state->expectedResults));
                             return;

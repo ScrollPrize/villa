@@ -97,7 +97,8 @@ public:
     void rankLaplaceSnapPairs(
         const QJsonObject& request,
         std::function<void(const QJsonObject&)> onSuccess,
-        std::function<void(const QString&)> onError);
+        std::function<void(const QString&)> onError,
+        std::function<void(int, const QJsonObject&)> onPartialResult = {});
 
 signals:
     void serviceStarted();

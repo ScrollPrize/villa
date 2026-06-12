@@ -176,7 +176,7 @@ class _LaplaceRankUnavailable(RuntimeError):
 
 
 _DEFAULT_LAPLACE_RANK_DEBUG_DIR = Path("laplace_rank_debug") / "atlas_snap"
-_DEFAULT_LAPLACE_RANK_PARALLEL_JOBS = 4
+_DEFAULT_LAPLACE_RANK_PARALLEL_JOBS = 1
 
 
 def _validate_laplace_rank_point(value: Any, label: str) -> None:

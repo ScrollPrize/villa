@@ -1693,57 +1693,23 @@ std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
         return std::nullopt;
     }
 
-    const double outwardWindingLimit =
-        std::isfinite(sampling.outwardWindingLimit) && sampling.outwardWindingLimit > 0.0
-            ? sampling.outwardWindingLimit
-            : 0.5;
-    const double inwardWindingLimit =
-        std::isfinite(sampling.inwardWindingLimit) && sampling.inwardWindingLimit > 0.0
-            ? sampling.inwardWindingLimit
-            : 0.25;
-    const double inwardFirstHitWeight =
-        std::isfinite(sampling.inwardFirstHitWeight) && sampling.inwardFirstHitWeight > 0.0
-            ? sampling.inwardFirstHitWeight
-            : 4.0;
-    const double predDtThreshold = std::isfinite(sampling.predDtThreshold)
-        ? sampling.predDtThreshold
-        : 110.0;
-
-    const auto startPredDt = sampling.samplePredDt(controlPoint);
-    const auto outwardSamples =
-        tracePredSnapDirection(controlPoint, normal, outwardWindingLimit, sampling);
-    const auto inwardSamples =
-        tracePredSnapDirection(controlPoint, -normal, inwardWindingLimit, sampling);
-
     AtlasPredSnapPoint result;
     result.controlPoint = controlPoint;
     result.source = AtlasPredSnapSource::Auto;
     result.searchNormal = normal;
 
-    if (startPredDt && atlasPredDtIsInside(*startPredDt, predDtThreshold)) {
-        PredSnapTraceSample fallback{controlPoint, 0.0, startPredDt};
-        const PredSnapTraceSample best =
-            climbPredDtMaximumAlongNormal(fallback, normal, sampling);
-        result.predSnapPoint = best.point;
-        result.predDtValue = best.predDt;
-        result.direction = (best.point - controlPoint).dot(normal) < 0.0
-            ? AtlasPredSnapDirection::Inside
-            : AtlasPredSnapDirection::Outside;
-        result.weightedFirstHitWindingDistance = 0.0;
+    const std::vector<AtlasPredSnapCandidate> candidates =
+        findAtlasPredSnapCandidates(controlPoint, normal, sampling);
+    if (candidates.empty()) {
         return result;
     }
 
-    const auto outwardHit = firstInsidePredSnapHit(outwardSamples, predDtThreshold);
-    const auto inwardHit = firstInsidePredSnapHit(inwardSamples, predDtThreshold);
-    if (!outwardHit && !inwardHit) {
-        return result;
-    }
-
-    const bool chooseInward =
-        inwardHit &&
-        (!outwardHit ||
-         inwardHit->windingDistance * inwardFirstHitWeight < outwardHit->windingDistance);
-    const auto& chosenHit = chooseInward ? *inwardHit : *outwardHit;
+    const AtlasPredSnapCandidate& chosen = candidates.front();
+    const PredSnapTraceSample chosenHit{
+        chosen.point,
+        chosen.windingDistance.value_or(0.0),
+        chosen.predDtValue,
+    };
     const PredSnapTraceSample best =
         climbPredDtMaximumAlongNormal(chosenHit, normal, sampling);
     result.predSnapPoint = best.point;
@@ -1751,9 +1717,7 @@ std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
     result.direction = (best.point - controlPoint).dot(normal) < 0.0
         ? AtlasPredSnapDirection::Inside
         : AtlasPredSnapDirection::Outside;
-    result.weightedFirstHitWindingDistance = chooseInward
-        ? chosenHit.windingDistance * inwardFirstHitWeight
-        : chosenHit.windingDistance;
+    result.weightedFirstHitWindingDistance = chosenHit.windingDistance;
     return result;
 }
 
@@ -2498,9 +2462,13 @@ AtlasSnapPairMatrix atlasSnapPairMatrixFromRankResult(
         }
         const bool zeroContribution =
             code == "no_accepted_lambda" ||
+            code == "cuda_failure" ||
             (code == "rank_failed" &&
              (message.find("pred_dt crop contains no passable voxels") != std::string::npos ||
-              message.find("source/sink point is outside the pred_dt crop") != std::string::npos));
+              message.find("source/sink point is outside the pred_dt crop") != std::string::npos ||
+              message.find("AMGX_") != std::string::npos ||
+              message.find("Cuda failure") != std::string::npos ||
+              message.find("CUDA failure") != std::string::npos));
         if (zeroContribution) {
             matrix.metadata["raw_matrix"] = matrix.rawValues;
             matrix.metadata["normalized_matrix"] = matrix.normalizedValues;
@@ -2852,6 +2820,50 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
               << std::endl;
 
     if (!jobs.empty()) {
+        auto cacheRankResult = [&](size_t index, const nlohmann::json& result) {
+            if (index >= missingTerms.size()) {
+                std::cerr << "[atlas-snap] ignoring out-of-range partial rank result"
+                          << " index=" << index
+                          << " expected=" << missingTerms.size()
+                          << std::endl;
+                return;
+            }
+            const auto& term = *missingTerms[index];
+            const auto& first = problem.controls[term.firstControl];
+            const auto& second = problem.controls[term.secondControl];
+            AtlasSnapPairMatrix matrix;
+            try {
+                matrix = atlasSnapPairMatrixFromRankResult(
+                    term, first.candidates.size(), second.candidates.size(), result);
+            } catch (const std::exception& ex) {
+                std::cerr << "[atlas-snap] not caching partial rank result "
+                          << termDebugString(term, problem)
+                          << " error=" << ex.what()
+                          << std::endl;
+                return;
+            }
+            cache["entries"][missingKeys[index]] = {
+                {"schema", 1},
+                {"source_job_id", term.id},
+                {"manifest", manifestPath.lexically_normal().generic_string()},
+                {"rank_options", rankOptions},
+                {"side_a", pointsJson(first.candidates)},
+                {"side_b", pointsJson(second.candidates)},
+                {"rank_result", matrix.metadata},
+            };
+            try {
+                writeJsonFile(cachePath, cache);
+                std::cerr << "[atlas-snap] cached partial rank result"
+                          << " index=" << index
+                          << " id=" << term.id
+                          << " entries=" << cache["entries"].size()
+                          << std::endl;
+            } catch (const std::exception& ex) {
+                std::cerr << "[atlas-snap] could not write partial rank cache: "
+                          << ex.what()
+                          << std::endl;
+            }
+        };
         nlohmann::json request = {
             {"manifest", manifestPath.string()},
             {"jobs", jobs},
@@ -2862,7 +2874,7 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
                   << " manifest=" << manifestPath.string()
                   << " options=" << request["options"].dump()
                   << std::endl;
-        const nlohmann::json response = ranker(request);
+        const nlohmann::json response = ranker(request, cacheRankResult);
         const auto& results = response.at("results");
         if (!results.is_array() || results.size() != missingTerms.size()) {
             throw std::runtime_error("atlas snap ranker returned an unexpected result count");

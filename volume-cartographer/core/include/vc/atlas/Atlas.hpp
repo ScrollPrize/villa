@@ -196,9 +196,8 @@ struct AtlasPredSnapSampling {
     std::function<double(const cv::Vec3d&, const cv::Vec3d&, double)> windingDistance;
     double predDtThreshold = 110.0;
     double predDtStepVx = 0.05;
-    double outwardWindingLimit = 0.5;
-    double inwardWindingLimit = 0.25;
-    double inwardFirstHitWeight = 4.0;
+    double outwardWindingLimit = 1.0;
+    double inwardWindingLimit = 1.0;
 };
 
 struct AtlasPredSnapAttachmentReport {
@@ -262,7 +261,11 @@ struct AtlasSnapOptimizeReport {
     double objective = 0.0;
 };
 
-using AtlasSnapPairRanker = std::function<nlohmann::json(const nlohmann::json& request)>;
+using AtlasSnapPairRankProgress =
+    std::function<void(size_t resultIndex, const nlohmann::json& result)>;
+using AtlasSnapPairRanker = std::function<nlohmann::json(
+    const nlohmann::json& request,
+    const AtlasSnapPairRankProgress& onResult)>;
 
 struct LasagnaAtlasObject {
     std::string id;

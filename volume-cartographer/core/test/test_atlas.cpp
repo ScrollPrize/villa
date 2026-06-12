@@ -379,7 +379,7 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     CHECK(loaded.fibers[0].lineAnchors[0].atlasV == doctest::Approx(5.0));
 }
 
-TEST_CASE("Atlas pred-snap search applies winding limits and inward weighting")
+TEST_CASE("Atlas pred-snap search emits +/-1 winding candidates without direction weighting")
 {
     const cv::Vec3d control{0.0, 0.0, 0.0};
     const cv::Vec3d normal{1.0, 0.0, 0.0};
@@ -389,6 +389,15 @@ TEST_CASE("Atlas pred-snap search applies winding limits and inward weighting")
         if (x <= -0.10) return 170.0;
         return 80.0;
     });
+    auto candidates = vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
+    REQUIRE(candidates.size() == 2);
+    REQUIRE(candidates[0].direction.has_value());
+    REQUIRE(candidates[1].direction.has_value());
+    CHECK(*candidates[0].direction == vc::atlas::AtlasPredSnapDirection::Outside);
+    CHECK(candidates[0].point[0] == doctest::Approx(0.30).epsilon(0.05));
+    CHECK(*candidates[1].direction == vc::atlas::AtlasPredSnapDirection::Inside);
+    CHECK(candidates[1].point[0] == doctest::Approx(-0.10).epsilon(0.05));
+
     auto snap = vc::atlas::findAtlasPredSnapPoint(control, normal, sampling);
     REQUIRE(snap.has_value());
     REQUIRE(snap->predSnapPoint.has_value());
@@ -410,18 +419,26 @@ TEST_CASE("Atlas pred-snap search applies winding limits and inward weighting")
         if (x <= -0.05) return 170.0;
         return 80.0;
     });
+    candidates = vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
+    REQUIRE(candidates.size() == 2);
+    CHECK(candidates[0].point[0] == doctest::Approx(0.30).epsilon(0.05));
+    CHECK(candidates[1].point[0] == doctest::Approx(-0.05).epsilon(0.05));
+
     snap = vc::atlas::findAtlasPredSnapPoint(control, normal, sampling);
     REQUIRE(snap.has_value());
     REQUIRE(snap->predSnapPoint.has_value());
-    CHECK(snap->direction == vc::atlas::AtlasPredSnapDirection::Inside);
-    CHECK((*snap->predSnapPoint)[0] == doctest::Approx(-0.05).epsilon(0.05));
-    CHECK(snap->weightedFirstHitWindingDistance.value() == doctest::Approx(0.20).epsilon(0.05));
+    CHECK(snap->direction == vc::atlas::AtlasPredSnapDirection::Outside);
+    CHECK((*snap->predSnapPoint)[0] == doctest::Approx(0.30).epsilon(0.05));
+    CHECK(snap->weightedFirstHitWindingDistance.value() == doctest::Approx(0.30).epsilon(0.05));
 
     sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
-        if (x >= 0.55) return 166.0;
-        if (x <= -0.30) return 170.0;
+        if (x >= 1.05) return 166.0;
+        if (x <= -1.05) return 170.0;
         return 80.0;
     });
+    candidates = vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
+    CHECK(candidates.empty());
+
     snap = vc::atlas::findAtlasPredSnapPoint(control, normal, sampling);
     REQUIRE(snap.has_value());
     CHECK_FALSE(snap->predSnapPoint.has_value());

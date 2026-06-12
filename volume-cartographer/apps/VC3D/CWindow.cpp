@@ -3014,7 +3014,9 @@ void CWindow::optimizeAtlasSnapCandidates()
                 {"amgx_config", nullptr},
             };
             const auto ranker =
-                [self, serviceManifestPath](const nlohmann::json& request) -> nlohmann::json {
+                [self, serviceManifestPath](
+                    const nlohmann::json& request,
+                    const vc::atlas::AtlasSnapPairRankProgress& onResult) -> nlohmann::json {
                     if (!self) {
                         throw std::runtime_error("window closed before rank request completed");
                     }
@@ -3031,7 +3033,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                     QString error;
                     QMetaObject::invokeMethod(
                         self.data(),
-                        [&qtRequest, &qtResponse, &error]() {
+                        [&qtRequest, &qtResponse, &error, &onResult]() {
                             QEventLoop loop;
                             LasagnaServiceManager::instance().rankLaplaceSnapPairs(
                                 qtRequest,
@@ -3042,6 +3044,23 @@ void CWindow::optimizeAtlasSnapCandidates()
                                 [&](const QString& message) {
                                     error = message;
                                     loop.quit();
+                                },
+                                [&](int index, const QJsonObject& result) {
+                                    if (!onResult) {
+                                        return;
+                                    }
+                                    try {
+                                        onResult(static_cast<size_t>(index),
+                                                 fromQtJsonObject(result));
+                                    } catch (const std::exception& ex) {
+                                        std::cerr << "[atlas-snap] partial rank result callback failed: "
+                                                  << ex.what()
+                                                  << std::endl;
+                                    } catch (...) {
+                                        std::cerr << "[atlas-snap] partial rank result callback failed: "
+                                                  << "unknown non-standard exception"
+                                                  << std::endl;
+                                    }
                                 });
                             loop.exec();
                         },
