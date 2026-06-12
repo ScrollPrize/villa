@@ -20,6 +20,17 @@ class FitServiceQueueTest(unittest.TestCase):
 			time.sleep(0.01)
 		self.fail(f"job {job_id} did not reach {state}")
 
+	def run_laplace_rank_job(self, request):
+		job = fit_service._JobState(
+			job_id=fit_service.uuid.uuid4().hex[:12],
+			sequence=1,
+			source="vc3d",
+			config_name="laplace_rank",
+		)
+		self.addCleanup(job.cleanup_tmp_dirs, keep_results=False)
+		fit_service._run_laplace_rank_job(job, request)
+		return job, job.snapshot()
+
 	def test_fifo_sequence_and_stable_job_ids(self):
 		queue = fit_service._JobQueue()
 		seen = []
@@ -46,29 +57,45 @@ class FitServiceQueueTest(unittest.TestCase):
 		self.assertIn("queue_generation", queue.legacy_status())
 		self.assertEqual(queue.snapshot_response()["queue_generation"], queue.generation)
 
-	def test_laplace_rank_rejects_malformed_request_before_import(self):
-		with mock.patch.object(fit_service.importlib, "import_module") as import_module:
-			status, body = fit_service._handle_laplace_rank_body({"manifest": "/tmp/data.json", "jobs": [{}]})
+	def test_laplace_rank_direct_endpoint_returns_404(self):
+		handler = object.__new__(fit_service._Handler)
+		handler._validate_api_version = lambda: True
+		handler._job_path_parts = lambda: ["laplace", "rank"]
+		sent = []
+		handler._send_json = lambda body, status=200: sent.append((status, body))
 
-		self.assertEqual(status, 400)
-		self.assertIn("side_a", body["error"])
+		fit_service._Handler.do_POST(handler)
+
+		self.assertEqual(sent, [(404, {"error": "not found"})])
+
+	def test_laplace_rank_rejects_malformed_queued_request_before_import(self):
+		with mock.patch.object(fit_service.importlib, "import_module") as import_module:
+			_job, snap = self.run_laplace_rank_job({
+				"job_type": "laplace_rank",
+				"manifest": "/tmp/data.json",
+				"jobs": [{}],
+			})
+
+		self.assertEqual(snap["state"], "error")
+		self.assertIn("side_a", snap["error"])
 		import_module.assert_not_called()
 
-	def test_laplace_rank_missing_binding_returns_503(self):
+	def test_laplace_rank_missing_binding_errors_queued_job(self):
 		request = {
+			"job_type": "laplace_rank",
 			"manifest": "/tmp/data.lasagna.json",
 			"jobs": [{"id": "a", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
 			"options": {},
 		}
 		with mock.patch.object(fit_service.importlib, "import_module", side_effect=ImportError("missing")):
-			status, body = fit_service._handle_laplace_rank_body(request)
+			_job, snap = self.run_laplace_rank_job(request)
 
-		self.assertEqual(status, 503)
-		self.assertEqual(body["code"], "vc_lasagna_amgx_unavailable")
-		self.assertIn("vc_lasagna_amgx", body["error"])
+		self.assertEqual(snap["state"], "error")
+		self.assertIn("vc_lasagna_amgx", snap["error"])
 
-	def test_laplace_rank_passes_binding_response_through_without_ratios(self):
+	def test_laplace_rank_queued_job_writes_binding_response_without_ratios(self):
 		request = {
+			"job_type": "laplace_rank",
 			"manifest": "/tmp/data.lasagna.json",
 			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6], [7, 8, 9]]}],
 			"options": {"debug_dir": "/tmp/laplace-debug"},
@@ -84,15 +111,21 @@ class FitServiceQueueTest(unittest.TestCase):
 		}
 		module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value=binding_response))
 		with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
-			status, body = fit_service._handle_laplace_rank_body(request)
+			_job, snap = self.run_laplace_rank_job(request)
 
-		self.assertEqual(status, 200)
-		module.rank_snap_pairs.assert_called_once_with(request)
+		self.assertEqual(snap["state"], "finished")
+		sent = module.rank_snap_pairs.call_args.args[0]
+		self.assertEqual(sent["manifest"], request["manifest"])
+		self.assertEqual(sent["options"]["debug_dir"], request["options"]["debug_dir"])
+		self.assertIn("progress_callback", module.rank_snap_pairs.call_args.kwargs)
+		result_path = fit_service.Path(snap["output_dir"]) / "rank_result.json"
+		body = fit_service.json.loads(result_path.read_text(encoding="utf-8"))
 		self.assertEqual(body["results"], binding_response["results"])
 		self.assertNotIn("ratios", body["results"][0])
 
 	def test_laplace_rank_resolves_relative_debug_dir_against_server_cwd(self):
 		request = {
+			"job_type": "laplace_rank",
 			"manifest": "/tmp/data.lasagna.json",
 			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
 			"options": {"debug_dir": "laplace_rank_debug/atlas_snap"},
@@ -103,11 +136,11 @@ class FitServiceQueueTest(unittest.TestCase):
 			try:
 				os.chdir(td)
 				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
-					status, _body = fit_service._handle_laplace_rank_body(request)
+					_job, snap = self.run_laplace_rank_job(request)
 			finally:
 				os.chdir(old_cwd)
 
-		self.assertEqual(status, 200)
+		self.assertEqual(snap["state"], "finished")
 		sent = module.rank_snap_pairs.call_args.args[0]
 		self.assertEqual(
 			sent["options"]["debug_dir"],
@@ -116,6 +149,7 @@ class FitServiceQueueTest(unittest.TestCase):
 
 	def test_laplace_rank_defaults_debug_dir_to_server_cwd(self):
 		request = {
+			"job_type": "laplace_rank",
 			"manifest": "/tmp/data.lasagna.json",
 			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
 			"options": {},
@@ -126,11 +160,11 @@ class FitServiceQueueTest(unittest.TestCase):
 			try:
 				os.chdir(td)
 				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
-					status, _body = fit_service._handle_laplace_rank_body(request)
+					_job, snap = self.run_laplace_rank_job(request)
 			finally:
 				os.chdir(old_cwd)
 
-		self.assertEqual(status, 200)
+		self.assertEqual(snap["state"], "finished")
 		sent = module.rank_snap_pairs.call_args.args[0]
 		self.assertEqual(
 			sent["options"]["debug_dir"],
@@ -150,9 +184,9 @@ class FitServiceQueueTest(unittest.TestCase):
 				}
 				module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
 				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
-					status, _body = fit_service._handle_laplace_rank_body(request)
+					_job, snap = self.run_laplace_rank_job(request)
 
-				self.assertEqual(status, 200)
+				self.assertEqual(snap["state"], "finished")
 				sent = module.rank_snap_pairs.call_args.args[0]
 				self.assertEqual(sent["manifest"], str(manifest.resolve()))
 				self.assertEqual(request["manifest"], "data.lasagna.json")
@@ -172,9 +206,9 @@ class FitServiceQueueTest(unittest.TestCase):
 				}
 				module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
 				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
-					status, _body = fit_service._handle_laplace_rank_body(request)
+					_job, snap = self.run_laplace_rank_job(request)
 
-				self.assertEqual(status, 200)
+				self.assertEqual(snap["state"], "finished")
 				sent = module.rank_snap_pairs.call_args.args[0]
 				self.assertEqual(sent["manifest"], str(manifest.resolve()))
 				self.assertEqual(request["manifest"], "/client/only/path/data.lasagna.json")

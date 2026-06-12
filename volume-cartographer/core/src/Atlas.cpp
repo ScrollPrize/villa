@@ -1476,7 +1476,7 @@ std::string roundedPredSnapCandidateKey(const cv::Vec3d& point)
     return out.str();
 }
 
-PredSnapTraceSample climbPredDtMaximumAlongNormal(
+PredSnapTraceSample refinePredSnapCandidateAlongNormal(
     const PredSnapTraceSample& seed,
     const cv::Vec3d& unitNormal,
     const AtlasPredSnapSampling& sampling)
@@ -1487,7 +1487,7 @@ PredSnapTraceSample climbPredDtMaximumAlongNormal(
     const double predDtThreshold = std::isfinite(sampling.predDtThreshold)
         ? sampling.predDtThreshold
         : 110.0;
-    if (!sampling.samplePredDt || !validNormal(unitNormal) ||
+    if (!sampling.samplePredDt || !validNormal(unitNormal) || !finitePoint(seed.point) ||
         !seed.predDt || !atlasPredDtIsInside(*seed.predDt, predDtThreshold)) {
         return seed;
     }
@@ -1496,15 +1496,16 @@ PredSnapTraceSample climbPredDtMaximumAlongNormal(
     PredSnapTraceSample current = seed;
     for (int step = 0; step < kMaxSteps; ++step) {
         PredSnapTraceSample best = current;
-        for (double sign : {1.0, -1.0}) {
+        for (const double sign : {1.0, -1.0}) {
             const cv::Vec3d point = current.point + unitNormal * (sign * stepVx);
             const auto predDt = sampling.samplePredDt(point);
-            if (!predDt || !atlasPredDtIsInside(*predDt, predDtThreshold)) {
+            if (!predDt || !atlasPredDtIsInside(*predDt, predDtThreshold) ||
+                (best.predDt && *predDt <= *best.predDt)) {
                 continue;
             }
-            if (!best.predDt || *predDt > *best.predDt + 1.0e-9) {
-                best = {point, current.windingDistance, predDt};
-            }
+            best.point = point;
+            best.predDt = predDt;
+            best.windingDistance = seed.windingDistance;
         }
         if (norm(best.point - current.point) <= kEpsilon) {
             break;
@@ -1637,9 +1638,7 @@ std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
         : 110.0;
 
     std::unordered_set<std::string> seen;
-    auto addCandidate = [&](const PredSnapTraceSample& hit,
-                            AtlasPredSnapDirection direction,
-                            double windingDistance) {
+    auto addCandidate = [&](const PredSnapTraceSample& hit, double windingDistance) {
         if (!finitePoint(hit.point)) {
             return;
         }
@@ -1647,17 +1646,21 @@ std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
         if (!seen.insert(key).second) {
             return;
         }
+        const PredSnapTraceSample refined =
+            refinePredSnapCandidateAlongNormal(hit, normal, sampling);
         AtlasPredSnapCandidate candidate;
-        candidate.point = hit.point;
-        candidate.predDtValue = hit.predDt;
-        candidate.direction = direction;
+        candidate.point = refined.point;
+        candidate.predDtValue = refined.predDt;
+        candidate.direction = (refined.point - controlPoint).dot(normal) < 0.0
+            ? AtlasPredSnapDirection::Inside
+            : AtlasPredSnapDirection::Outside;
         candidate.windingDistance = windingDistance;
         candidates.push_back(std::move(candidate));
     };
 
     const auto startPredDt = sampling.samplePredDt(controlPoint);
     if (startPredDt && atlasPredDtIsInside(*startPredDt, predDtThreshold)) {
-        addCandidate({controlPoint, 0.0, startPredDt}, AtlasPredSnapDirection::Outside, 0.0);
+        addCandidate({controlPoint, 0.0, startPredDt}, 0.0);
         return candidates;
     }
 
@@ -1665,60 +1668,14 @@ std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
     if (const auto outwardHit =
             firstInsidePredSnapHit(tracePredSnapDirection(
                 controlPoint, normal, kCandidateWindingLimit, sampling), predDtThreshold)) {
-        addCandidate(*outwardHit,
-                     AtlasPredSnapDirection::Outside,
-                     outwardHit->windingDistance);
+        addCandidate(*outwardHit, outwardHit->windingDistance);
     }
     if (const auto inwardHit =
             firstInsidePredSnapHit(tracePredSnapDirection(
                 controlPoint, -normal, kCandidateWindingLimit, sampling), predDtThreshold)) {
-        addCandidate(*inwardHit,
-                     AtlasPredSnapDirection::Inside,
-                     inwardHit->windingDistance);
+        addCandidate(*inwardHit, inwardHit->windingDistance);
     }
     return candidates;
-}
-
-std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
-    const cv::Vec3d& controlPoint,
-    const cv::Vec3d& alignedNormal,
-    const AtlasPredSnapSampling& sampling)
-{
-    if (!sampling.samplePredDt || !sampling.windingDistance ||
-        !finitePoint(controlPoint) || !validNormal(alignedNormal)) {
-        return std::nullopt;
-    }
-    const cv::Vec3d normal = normalizedPredSnapNormal(alignedNormal);
-    if (!validNormal(normal)) {
-        return std::nullopt;
-    }
-
-    AtlasPredSnapPoint result;
-    result.controlPoint = controlPoint;
-    result.source = AtlasPredSnapSource::Auto;
-    result.searchNormal = normal;
-
-    const std::vector<AtlasPredSnapCandidate> candidates =
-        findAtlasPredSnapCandidates(controlPoint, normal, sampling);
-    if (candidates.empty()) {
-        return result;
-    }
-
-    const AtlasPredSnapCandidate& chosen = candidates.front();
-    const PredSnapTraceSample chosenHit{
-        chosen.point,
-        chosen.windingDistance.value_or(0.0),
-        chosen.predDtValue,
-    };
-    const PredSnapTraceSample best =
-        climbPredDtMaximumAlongNormal(chosenHit, normal, sampling);
-    result.predSnapPoint = best.point;
-    result.predDtValue = best.predDt;
-    result.direction = (best.point - controlPoint).dot(normal) < 0.0
-        ? AtlasPredSnapDirection::Inside
-        : AtlasPredSnapDirection::Outside;
-    result.weightedFirstHitWindingDistance = chosenHit.windingDistance;
-    return result;
 }
 
 AtlasPredSnapSet generateAtlasPredSnapSet(const FiberInput& fiber,

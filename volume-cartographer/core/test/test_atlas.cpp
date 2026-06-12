@@ -398,21 +398,13 @@ TEST_CASE("Atlas pred-snap search emits +/-1 winding candidates without directio
     CHECK(*candidates[1].direction == vc::atlas::AtlasPredSnapDirection::Inside);
     CHECK(candidates[1].point[0] == doctest::Approx(-0.10).epsilon(0.05));
 
-    auto snap = vc::atlas::findAtlasPredSnapPoint(control, normal, sampling);
-    REQUIRE(snap.has_value());
-    REQUIRE(snap->predSnapPoint.has_value());
-    CHECK(snap->direction == vc::atlas::AtlasPredSnapDirection::Outside);
-    CHECK((*snap->predSnapPoint)[0] == doctest::Approx(0.30).epsilon(0.05));
-    CHECK(snap->weightedFirstHitWindingDistance.value() == doctest::Approx(0.30).epsilon(0.05));
-
     sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
         if (x >= 0.20) return 114.0;
         return 80.0;
     });
-    snap = vc::atlas::findAtlasPredSnapPoint(control, normal, sampling);
-    REQUIRE(snap.has_value());
-    REQUIRE(snap->predSnapPoint.has_value());
-    CHECK((*snap->predSnapPoint)[0] == doctest::Approx(0.20).epsilon(0.05));
+    candidates = vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates[0].point[0] == doctest::Approx(0.20).epsilon(0.05));
 
     sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
         if (x >= 0.30) return 166.0;
@@ -424,13 +416,6 @@ TEST_CASE("Atlas pred-snap search emits +/-1 winding candidates without directio
     CHECK(candidates[0].point[0] == doctest::Approx(0.30).epsilon(0.05));
     CHECK(candidates[1].point[0] == doctest::Approx(-0.05).epsilon(0.05));
 
-    snap = vc::atlas::findAtlasPredSnapPoint(control, normal, sampling);
-    REQUIRE(snap.has_value());
-    REQUIRE(snap->predSnapPoint.has_value());
-    CHECK(snap->direction == vc::atlas::AtlasPredSnapDirection::Outside);
-    CHECK((*snap->predSnapPoint)[0] == doctest::Approx(0.30).epsilon(0.05));
-    CHECK(snap->weightedFirstHitWindingDistance.value() == doctest::Approx(0.30).epsilon(0.05));
-
     sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
         if (x >= 1.05) return 166.0;
         if (x <= -1.05) return 170.0;
@@ -438,52 +423,79 @@ TEST_CASE("Atlas pred-snap search emits +/-1 winding candidates without directio
     });
     candidates = vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
     CHECK(candidates.empty());
-
-    snap = vc::atlas::findAtlasPredSnapPoint(control, normal, sampling);
-    REQUIRE(snap.has_value());
-    CHECK_FALSE(snap->predSnapPoint.has_value());
 }
 
-TEST_CASE("Atlas pred-snap search starts inside by direct maximum climb")
+TEST_CASE("Atlas pred-snap candidate search refines start-inside seed to local maximum")
 {
     const auto sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
         if (x < 0.0) return 175.0;
         if (x >= 0.20) return 170.0;
         return 166.0;
     });
-    const auto snap = vc::atlas::findAtlasPredSnapPoint(
+    const auto candidates = vc::atlas::findAtlasPredSnapCandidates(
         {0.0, 0.0, 0.0},
         {1.0, 0.0, 0.0},
         sampling);
 
-    REQUIRE(snap.has_value());
-    REQUIRE(snap->predSnapPoint.has_value());
-    CHECK(snap->direction == vc::atlas::AtlasPredSnapDirection::Inside);
-    CHECK((*snap->predSnapPoint)[0] == doctest::Approx(-0.05).epsilon(0.05));
-    CHECK(snap->predDtValue.value() == doctest::Approx(175.0));
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates[0].direction == vc::atlas::AtlasPredSnapDirection::Inside);
+    CHECK(candidates[0].point[0] == doctest::Approx(-0.05).epsilon(0.05));
+    REQUIRE(candidates[0].windingDistance.has_value());
+    CHECK(*candidates[0].windingDistance == doctest::Approx(0.0));
+    REQUIRE(candidates[0].predDtValue.has_value());
+    CHECK(*candidates[0].predDtValue == doctest::Approx(175.0));
 }
 
-TEST_CASE("Atlas pred-snap search policy can favor deeper inward hits")
+TEST_CASE("Atlas pred-snap candidate refinement can climb beyond first-hit search range")
 {
-    auto sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
-        if (x >= 0.30) return 166.0;
-        if (x <= -0.40) return 170.0;
-        return 80.0;
+    const auto sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
+        if (x < 0.0) return 80.0;
+        if (x < 1.20) return 120.0 + x;
+        if (x < 1.25) return 200.0;
+        return 190.0;
     });
-    sampling.outwardWindingLimit = 0.25;
-    sampling.inwardWindingLimit = 0.5;
-    sampling.inwardFirstHitWeight = 0.25;
-
-    const auto snap = vc::atlas::findAtlasPredSnapPoint(
+    const auto candidates = vc::atlas::findAtlasPredSnapCandidates(
         {0.0, 0.0, 0.0},
         {1.0, 0.0, 0.0},
         sampling);
 
-    REQUIRE(snap.has_value());
-    REQUIRE(snap->predSnapPoint.has_value());
-    CHECK(snap->direction == vc::atlas::AtlasPredSnapDirection::Inside);
-    CHECK((*snap->predSnapPoint)[0] == doctest::Approx(-0.40).epsilon(0.05));
-    CHECK(snap->weightedFirstHitWindingDistance.value() == doctest::Approx(0.10).epsilon(0.05));
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates[0].direction == vc::atlas::AtlasPredSnapDirection::Outside);
+    CHECK(candidates[0].point[0] == doctest::Approx(1.20).epsilon(0.05));
+    REQUIRE(candidates[0].windingDistance.has_value());
+    CHECK(*candidates[0].windingDistance == doctest::Approx(0.0));
+    REQUIRE(candidates[0].predDtValue.has_value());
+    CHECK(*candidates[0].predDtValue == doctest::Approx(200.0));
+}
+
+TEST_CASE("Atlas pred-snap candidate search refines inward and outward hits independently")
+{
+    const auto sampling = predSnapSamplingForXInside([](double x) -> std::optional<double> {
+        if (x >= 0.35 && x < 0.40) return 180.0;
+        if (x >= 0.20) return 130.0 + x;
+        if (x <= -0.25 && x > -0.30) return 175.0;
+        if (x <= -0.15) return 125.0 - x;
+        return 80.0;
+    });
+    const auto candidates = vc::atlas::findAtlasPredSnapCandidates(
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        sampling);
+
+    REQUIRE(candidates.size() == 2);
+    CHECK(candidates[0].direction == vc::atlas::AtlasPredSnapDirection::Outside);
+    CHECK(candidates[0].point[0] == doctest::Approx(0.35).epsilon(0.05));
+    REQUIRE(candidates[0].windingDistance.has_value());
+    CHECK(*candidates[0].windingDistance == doctest::Approx(0.20).epsilon(0.05));
+    REQUIRE(candidates[0].predDtValue.has_value());
+    CHECK(*candidates[0].predDtValue == doctest::Approx(180.0));
+
+    CHECK(candidates[1].direction == vc::atlas::AtlasPredSnapDirection::Inside);
+    CHECK(candidates[1].point[0] == doctest::Approx(-0.25).epsilon(0.05));
+    REQUIRE(candidates[1].windingDistance.has_value());
+    CHECK(*candidates[1].windingDistance == doctest::Approx(0.15).epsilon(0.05));
+    REQUIRE(candidates[1].predDtValue.has_value());
+    CHECK(*candidates[1].predDtValue == doctest::Approx(175.0));
 }
 
 TEST_CASE("Atlas pred-snap generation uses control source line indices for anchors")

@@ -275,7 +275,6 @@ private:
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceFiberDock{nullptr};
     QDockWidget* _atlasWorkspaceSearchDock{nullptr};
-    CFiberWidget* _atlasWorkspaceFiberDock{nullptr};
     VolumeViewerBase* _atlasViewer{nullptr};
     std::optional<std::filesystem::path> _currentAtlasDir;
     std::string _currentAtlasName;

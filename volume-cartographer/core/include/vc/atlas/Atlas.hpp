@@ -361,10 +361,6 @@ std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
     const cv::Vec3d& controlPoint,
     const cv::Vec3d& alignedNormal,
     const AtlasPredSnapSampling& sampling);
-std::optional<AtlasPredSnapPoint> findAtlasPredSnapPoint(
-    const cv::Vec3d& controlPoint,
-    const cv::Vec3d& alignedNormal,
-    const AtlasPredSnapSampling& sampling);
 AtlasPredSnapSet generateAtlasPredSnapSet(
     const FiberInput& fiber,
     const FiberMapping& mapping,

@@ -715,23 +715,6 @@ QString absoluteSegmentPathForClipboard(const std::filesystem::path& segmentPath
     return QString::fromStdString(path.lexically_normal().string());
 }
 
-QJsonObject toQtJsonObject(const nlohmann::json& json)
-{
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(
-        QByteArray::fromStdString(json.dump()), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-        throw std::runtime_error("failed to convert JSON object for Qt");
-    }
-    return doc.object();
-}
-
-nlohmann::json fromQtJsonObject(const QJsonObject& object)
-{
-    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
-    return nlohmann::json::parse(bytes.constData());
-}
-
 QDockWidget* createAtlasOverviewDock(QWidget* parent)
 {
     auto* dock = new QDockWidget(QObject::tr("Atlas Overview"), parent);
@@ -2660,17 +2643,12 @@ void CWindow::createAtlasWorkspace()
         connect(optimize, &QPushButton::clicked,
                 this, &CWindow::optimizeAtlasSnapCandidates);
     }
+    _atlasWorkspaceWindow->tabifyDockWidget(_atlasWorkspaceOverviewDock, _atlasWorkspaceFiberDock);
+    _atlasWorkspaceFiberDock->raise();
 
     _atlasWorkspaceSearchDock = createAtlasSearchDock(this);
     _atlasWorkspaceSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearchAtlas"));
     _atlasWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasWorkspaceSearchDock);
-
-    _atlasWorkspaceFiberDock = new CFiberWidget(_atlasWorkspaceWindow);
-    _atlasWorkspaceFiberDock->setObjectName(QStringLiteral("dockWidgetAtlasFibersAtlas"));
-    _atlasWorkspaceFiberDock->setWindowTitle(tr("Atlas Fibers"));
-    _atlasWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasWorkspaceFiberDock);
-    _atlasWorkspaceWindow->tabifyDockWidget(_atlasWorkspaceOverviewDock, _atlasWorkspaceFiberDock);
-    _atlasWorkspaceFiberDock->raise();
 
     _atlasOverviewDock = createAtlasOverviewDock(this);
     _atlasOverviewDock->setObjectName(QStringLiteral("dockWidgetAtlasOverview"));
@@ -3080,185 +3058,6 @@ void CWindow::updateAtlasFiberDocks()
 
     table->setSortingEnabled(true);
     updateOptimizeEnabled();
-}
-
-void CWindow::optimizeAtlasSnapCandidates()
-{
-    if (!_currentAtlasDir || !_state || !_state->vpkg()) {
-        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before optimizing snap candidates."));
-        return;
-    }
-    auto vpkg = _state->vpkg();
-    const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-    if (manifestPath.empty() || !std::filesystem::exists(manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Select a local Lasagna dataset before optimizing snap candidates."));
-        return;
-    }
-    auto& manager = LasagnaServiceManager::instance();
-    if (!manager.isRunning()) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Start or connect the Lasagna service before optimizing snap candidates."));
-        updateAtlasFiberDocks();
-        return;
-    }
-
-    const std::filesystem::path atlasDir = *_currentAtlasDir;
-    const std::filesystem::path volpkgRoot = vpkg->path().empty()
-        ? std::filesystem::path(vpkg->getVolpkgDirectory())
-        : vpkg->path().parent_path();
-    const std::string serviceManifestPath = manager.isExternal()
-        ? manifestPath.filename().generic_string()
-        : manifestPath.string();
-    if (statusBar()) {
-        statusBar()->showMessage(tr("Optimizing atlas snap candidates..."), 3000);
-    }
-    if (auto* button = _atlasWorkspaceFiberDock && _atlasWorkspaceFiberDock->widget()
-            ? _atlasWorkspaceFiberDock->widget()->findChild<QPushButton*>(
-                  QStringLiteral("atlasOptimizeSnapCandidatesButton"))
-            : nullptr) {
-        button->setEnabled(false);
-    }
-
-    auto* watcher = new QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>(this);
-    connect(watcher, &QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>::finished,
-            this, [this, watcher, atlasDir]() {
-        watcher->deleteLater();
-        try {
-            const vc::atlas::AtlasSnapOptimizeReport report = watcher->result();
-            updateAtlasFiberDocks();
-            displayAtlasFromDirectory(atlasDir);
-            if (statusBar()) {
-                statusBar()->showMessage(
-                    tr("Optimized snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 requested, %7 cached.")
-                        .arg(report.controls)
-                        .arg(report.successfulPairTerms)
-                        .arg(report.zeroContributionTerms)
-                        .arg(report.skippedPairTerms)
-                        .arg(report.pairTerms)
-                        .arg(report.rankJobsRequested)
-                        .arg(report.cacheHits),
-                    6000);
-            }
-        } catch (const std::exception& ex) {
-            updateAtlasFiberDocks();
-            const QString message = extractFutureExceptionMessage(ex);
-            std::cerr << "[atlas-snap] optimize failed: "
-                      << message.toStdString() << std::endl;
-            QMessageBox::warning(
-                this,
-                tr("Atlas Snap Candidates"),
-                tr("Could not optimize snap candidates: %1")
-                    .arg(message));
-        }
-    });
-
-    QPointer<CWindow> self(this);
-    watcher->setFuture(QtConcurrent::run([self,
-                                           atlasDir,
-                                           volpkgRoot,
-                                           manifestPath,
-                                           serviceManifestPath]() {
-        try {
-            std::cerr << "[atlas-snap] optimize start"
-                      << " atlas=" << atlasDir.string()
-                      << " volpkg_root=" << volpkgRoot.string()
-                      << " manifest=" << manifestPath.string()
-                      << " service_manifest=" << serviceManifestPath
-                      << std::endl;
-            vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(manifestPath);
-            vc::lasagna::LasagnaNormalSampler sampler(dataset);
-            if (!sampler.hasPredDtChannel()) {
-                throw std::runtime_error("selected Lasagna dataset has no pred_dt channel: " +
-                                         manifestPath.string());
-            }
-
-            vc::atlas::AtlasSnapOptimizeOptions options;
-            options.predDtThreshold = 110;
-            options.rankOptions = {
-                {"threshold", options.predDtThreshold},
-                {"margin_base_voxels", 1000},
-                {"source_depth", 0},
-                {"amgx_config", nullptr},
-            };
-            const auto ranker = [self, serviceManifestPath](const nlohmann::json& request) -> nlohmann::json {
-                if (!self) {
-                    throw std::runtime_error("window closed before rank request completed");
-                }
-                nlohmann::json serviceRequest = request;
-                serviceRequest["manifest"] = serviceManifestPath;
-                const size_t jobCount = serviceRequest.value("jobs", nlohmann::json::array()).size();
-                std::cerr << "[atlas-snap] requesting laplace rank jobs="
-                          << jobCount
-                          << " service_manifest=" << serviceManifestPath
-                          << std::endl;
-                QJsonObject qtRequest = toQtJsonObject(serviceRequest);
-                QJsonObject qtResponse;
-                QString error;
-                QMetaObject::invokeMethod(
-                    self.data(),
-                    [&qtRequest, &qtResponse, &error]() {
-                        QEventLoop loop;
-                        LasagnaServiceManager::instance().rankLaplaceSnapPairs(
-                            qtRequest,
-                            [&](const QJsonObject& response) {
-                                qtResponse = response;
-                                loop.quit();
-                            },
-                            [&](const QString& message) {
-                                error = message;
-                                loop.quit();
-                            });
-                        loop.exec();
-                    },
-                    Qt::BlockingQueuedConnection);
-                if (!error.isEmpty()) {
-                    std::cerr << "[atlas-snap] laplace rank failed: "
-                              << error.toStdString() << std::endl;
-                    throw std::runtime_error(error.toStdString());
-                }
-                std::cerr << "[atlas-snap] laplace rank response received"
-                          << std::endl;
-                return fromQtJsonObject(qtResponse);
-            };
-            vc::atlas::AtlasSnapOptimizeReport report =
-                vc::atlas::optimizeAtlasPredSnapCandidates(
-                    atlasDir,
-                    volpkgRoot,
-                    manifestPath,
-                    sampler,
-                    ranker,
-                    options);
-            std::cerr << "[atlas-snap] optimize finished"
-                      << " controls=" << report.controls
-                      << " variables=" << report.variableControls
-                      << " unscored_variables=" << report.unscoredVariableControls
-                      << " fixed=" << report.fixedControls
-                      << " manual=" << report.manualControls
-                      << " singleton_auto=" << report.singletonControls
-                      << " links=" << report.links
-                      << " pair_terms=" << report.pairTerms
-                      << " successful_terms=" << report.successfulPairTerms
-                      << " zero_contribution_terms=" << report.zeroContributionTerms
-                      << " skipped_terms=" << report.skippedPairTerms
-                      << " ranked=" << report.rankJobsRequested
-                      << " cached=" << report.cacheHits
-                      << " objective=" << report.objective
-                      << std::endl;
-            return report;
-        } catch (const std::exception& ex) {
-            std::cerr << "[atlas-snap] optimize exception: "
-                      << ex.what() << std::endl;
-            throw;
-        } catch (...) {
-            std::cerr << "[atlas-snap] optimize exception: unknown non-standard exception"
-                      << std::endl;
-            throw;
-        }
-    }));
 }
 
 void CWindow::updateAtlasSearchDocks()
@@ -5320,10 +5119,6 @@ void CWindow::CreateWidgets(void)
                 _fiberSliceWidget->setFibers(entries);
                 _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
             }
-            if (_atlasWorkspaceFiberDock) {
-                _atlasWorkspaceFiberDock->setFibers(entries);
-                _atlasWorkspaceFiberDock->setKnownTags(_lineAnnotationController->knownFiberTags());
-            }
             updateAtlasFiberDocks();
         };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
@@ -5368,9 +5163,6 @@ void CWindow::CreateWidgets(void)
                         if (_fiberSliceWidget) {
                             _fiberSliceWidget->selectFiber(fiberId);
                         }
-                        if (_atlasWorkspaceFiberDock) {
-                            _atlasWorkspaceFiberDock->selectFiber(fiberId);
-                        }
                         switchToFiberSliceWorkspace();
                         if (_lineAnnotationController) {
                             _lineAnnotationController->showFiberSlice(fiberId, _fiberSliceMdiArea);
@@ -5383,7 +5175,6 @@ void CWindow::CreateWidgets(void)
                 updateFiberList);
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
-        connectFiberWidget(_atlasWorkspaceFiberDock);
         updateFiberList(_lineAnnotationController->fiberSummaries());
     }
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
@@ -7533,8 +7324,5 @@ void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
     }
     if (_fiberSliceWidget) {
         _fiberSliceWidget->selectFiber(fiberId);
-    }
-    if (_atlasWorkspaceFiberDock) {
-        _atlasWorkspaceFiberDock->selectFiber(fiberId);
     }
 }
