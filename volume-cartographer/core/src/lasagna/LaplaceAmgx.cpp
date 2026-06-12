@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -118,6 +119,12 @@ AmgxRuntime& amgxRuntime()
 {
     static AmgxRuntime runtime;
     return runtime;
+}
+
+std::mutex& amgxSolveMutex()
+{
+    static std::mutex mutex;
+    return mutex;
 }
 #endif
 
@@ -303,6 +310,7 @@ LaplaceAmgxResult solveScreenedLaplaceAmgx(
     throw std::runtime_error("AMGX support is disabled; configure with -DVC_ENABLE_AMGX=ON");
 #else
     amgxRuntime();
+    std::lock_guard<std::mutex> amgxLock(amgxSolveMutex());
 
     LaplaceAmgxResult result;
     result.valuesByNode.assign(static_cast<size_t>(graph.stats.graphNodes), 1.0);
