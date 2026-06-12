@@ -24,12 +24,14 @@ import atexit
 import base64
 import getpass
 import hashlib
+import importlib
 import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -38,7 +40,7 @@ import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import volume_scale
 
@@ -51,6 +53,8 @@ _data_dir: str | None = None  # Set via --data-dir CLI flag
 _object_store_dir: Path | None = None  # Set via --object-store-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
+_capture_jobs: bool = False  # Set via --capture-jobs
+_capture_dir: Path | None = None  # Set via --capture-dir
 _API_VERSION = "2"
 _API_VERSION_HEADER = "X-Fit-Service-API-Version"
 _VC3D_SOURCE_HEADER = "X-VC3D-Source"
@@ -85,6 +89,40 @@ def _result_archive_child_name(child_name: str, child_count: int, output_name: s
     if requested and int(child_count) == 1:
         return requested
     return child_name
+
+
+def _pack_results_archive(output_dir: Path, output_name: str = "") -> bytes:
+    import io
+
+    def add_path(path: Path, arcname: str) -> None:
+        if path.is_symlink():
+            try:
+                target = os.readlink(path)
+            except OSError:
+                target = "(unreadable target)"
+            raise ValueError(f"result contains unsupported symlink: {path} -> {target}")
+        tar.add(str(path), arcname=arcname, recursive=False)
+
+    buf = io.BytesIO()
+    children = sorted(output_dir.iterdir())
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for child in children:
+            arcname = _result_archive_child_name(child.name, len(children), output_name)
+            add_path(child, arcname)
+            if child.is_dir():
+                for root, dirs, files in os.walk(child, followlinks=False):
+                    root_path = Path(root)
+                    rel_root = root_path.relative_to(child)
+                    rel_prefix = "" if str(rel_root) == "." else rel_root.as_posix()
+                    for name in sorted(dirs):
+                        path = root_path / name
+                        rel = name if not rel_prefix else f"{rel_prefix}/{name}"
+                        add_path(path, f"{arcname}/{rel}")
+                    for name in sorted(files):
+                        path = root_path / name
+                        rel = name if not rel_prefix else f"{rel_prefix}/{name}"
+                        add_path(path, f"{arcname}/{rel}")
+    return buf.getvalue()
 
 
 def _normalize_single_tifxyz_output(output_dir: Path, output_name: str) -> Path | None:
@@ -131,12 +169,149 @@ def _hash_bytes(data: bytes) -> str:
     return "md5:" + hashlib.md5(data).hexdigest()
 
 
-_SINGLE_FILE_OBJECT_TYPES = {"lasagna_model", "line", "line-map", "atlas"}
+class _LaplaceRankUnavailable(RuntimeError):
+    pass
+
+
+_DEFAULT_LAPLACE_RANK_DEBUG_DIR = Path("laplace_rank_debug") / "atlas_snap"
+
+
+def _validate_laplace_rank_point(value: Any, label: str) -> None:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"{label} point must be [x, y, z]")
+    for axis, coord in zip(("x", "y", "z"), value):
+        if not isinstance(coord, (int, float)):
+            raise ValueError(f"{label} point {axis} must be numeric")
+
+
+def _validate_laplace_rank_points(value: Any, label: str) -> None:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list of points")
+    if not value:
+        raise ValueError(f"{label} must contain at least one point")
+    for point in value:
+        _validate_laplace_rank_point(point, label)
+
+
+def _validate_laplace_rank_request(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise ValueError("laplace rank request must be an object")
+    manifest = body.get("manifest")
+    if not isinstance(manifest, str) or not manifest.strip():
+        raise ValueError("manifest must be a non-empty path string")
+    jobs = body.get("jobs")
+    if not isinstance(jobs, list):
+        raise ValueError("jobs must be a list")
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            raise ValueError(f"jobs[{index}] must be an object")
+        _validate_laplace_rank_points(job.get("side_a"), f"jobs[{index}].side_a")
+        _validate_laplace_rank_points(job.get("side_b"), f"jobs[{index}].side_b")
+        if "id" in job and not isinstance(job["id"], str):
+            raise ValueError(f"jobs[{index}].id must be a string")
+    options = body.get("options", {})
+    if options is not None and not isinstance(options, dict):
+        raise ValueError("options must be an object or null")
+    return body
+
+
+def _resolve_laplace_rank_manifest(manifest: str) -> str:
+    """Resolve rank manifests using the same service dataset model as /datasets."""
+    path = Path(manifest)
+    if path.exists():
+        return str(path)
+    if _data_dir:
+        data_dir = Path(_data_dir)
+        candidates: list[Path] = []
+        if path.is_absolute():
+            candidates.append(data_dir / path.name)
+        else:
+            candidates.append(data_dir / path)
+            candidates.append(data_dir / path.name)
+        for candidate in candidates:
+            if candidate.exists():
+                resolved = str(candidate.resolve())
+                print(
+                    f"[fit-service] laplace rank resolved manifest {manifest!r} -> {resolved!r}",
+                    flush=True,
+                )
+                return resolved
+    return manifest
+
+
+def _resolve_laplace_rank_debug_dir(options: Any) -> Any:
+    updated = dict(options) if isinstance(options, dict) else {}
+    debug_dir = updated.get("debug_dir")
+    if not isinstance(debug_dir, str) or not debug_dir.strip():
+        debug_dir = str(_DEFAULT_LAPLACE_RANK_DEBUG_DIR)
+    path = Path(debug_dir)
+    resolved = str(path if path.is_absolute() else (Path.cwd() / path).resolve())
+    updated["debug_dir"] = resolved
+    print(
+        f"[fit-service] laplace rank debug_dir {debug_dir!r} -> {resolved!r}",
+        flush=True,
+    )
+    return updated
+
+
+def _rank_laplace_snap_pairs(
+    body: dict[str, Any],
+    progress_callback: Any | None = None,
+) -> dict[str, Any]:
+    try:
+        module = importlib.import_module("vc_lasagna_amgx")
+    except ImportError as exc:
+        raise _LaplaceRankUnavailable(
+            "vc_lasagna_amgx is not installed; install volume-cartographer with "
+            "VC_ENABLE_AMGX=ON to use queued laplace ranking"
+        ) from exc
+    if progress_callback is None:
+        result = module.rank_snap_pairs(body)
+    else:
+        result = module.rank_snap_pairs(body, progress_callback=progress_callback)
+    if not isinstance(result, dict):
+        raise RuntimeError("vc_lasagna_amgx.rank_snap_pairs returned a non-object response")
+    return result
+
+
+def _capture_root() -> Path:
+    return _capture_dir or (Path.cwd() / "job_captures")
+
+
+def _capture_active(body: dict[str, Any] | None = None) -> bool:
+    if _capture_jobs:
+        return True
+    if isinstance(body, dict) and bool(body.get("capture_job")):
+        return True
+    return False
+
+
+def _write_capture_json(job: "_JobState", name: str, value: Any) -> None:
+    if not _capture_active(getattr(job, "_body_for_capture", None)):
+        return
+    path = _capture_root() / job.job_id
+    path.mkdir(parents=True, exist_ok=True)
+    tmp = path / f".{name}.tmp"
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path / name)
+
+
+def _append_capture_jsonl(job: "_JobState", name: str, value: Any) -> None:
+    if not _capture_active(getattr(job, "_body_for_capture", None)):
+        return
+    path = _capture_root() / job.job_id
+    path.mkdir(parents=True, exist_ok=True)
+    with (path / name).open("a", encoding="utf-8") as out:
+        out.write(json.dumps(value, sort_keys=True) + "\n")
+
+
+_SINGLE_FILE_OBJECT_TYPES = {"lasagna_model", "line", "line-map", "atlas", "atlas-pred-snap"}
 _DIRECTORY_OBJECT_TYPES = {"tifxyz_segment", "atlas-base"}
 _SUPPORTED_OBJECT_TYPES = _SINGLE_FILE_OBJECT_TYPES | _DIRECTORY_OBJECT_TYPES
 _SUPPORTED_OBJECT_FORMATS = {
     "line": {"vc3d_fiber_json"},
     "line-map": {"vc3d_atlas_fiber_mapping_json"},
+    "atlas-pred-snap": {"vc3d_atlas_pred_snap_points_json"},
     "atlas-base": {"tifxyz"},
     "atlas": {"lasagna_atlas_json"},
 }
@@ -182,7 +357,7 @@ def _object_payload_path(ref: dict[str, str]) -> Path:
     base = _object_dir(ref)
     if ref["type"] == "lasagna_model":
         return base / "model.pt"
-    if ref["type"] in {"line", "line-map", "atlas"}:
+    if ref["type"] in {"line", "line-map", "atlas", "atlas-pred-snap"}:
         return base / "data.json"
     return base / "segment"
 
@@ -231,7 +406,7 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
             actual_hash = _hash_bytes(data)
             if actual_hash != ref["hash"]:
                 raise ValueError(f"object hash mismatch: declared {ref['hash']} actual {actual_hash}")
-            if ref["type"] in {"line", "line-map", "atlas"}:
+            if ref["type"] in {"line", "line-map", "atlas", "atlas-pred-snap"}:
                 try:
                     json.loads(data.decode("utf-8"))
                 except Exception as exc:
@@ -320,6 +495,9 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
         if not isinstance(map_ref, dict):
             raise ValueError(f"atlas JSON maps[{i}] requires map_ref")
         item["map_path"] = str(_resolve_object_ref(map_ref))
+        pred_snap_ref = item.get("pred_snap_ref")
+        if isinstance(pred_snap_ref, dict):
+            item["pred_snap_path"] = str(_resolve_object_ref(pred_snap_ref))
         obj_ref = item.get("object_ref")
         if isinstance(obj_ref, dict):
             item["object_path"] = str(_resolve_object_ref(obj_ref))
@@ -329,6 +507,56 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
             if line_obj is not None and line_obj.get("path"):
                 item["object_path"] = str(line_obj["path"])
     return resolved
+
+
+def _object_refs_from_value(value: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            try:
+                ref = _validate_object_ref(item)
+            except Exception:
+                ref = None
+            if ref is not None:
+                key = (ref["type"], ref["name"], ref["hash"])
+                if key not in seen:
+                    seen.add(key)
+                    out.append(ref)
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return out
+
+
+def _checkpoint_object_refs(model_path: str | None) -> dict[str, Any] | None:
+    if not model_path:
+        return None
+    try:
+        import torch
+        st = torch.load(str(model_path), map_location="cpu", weights_only=False)
+    except Exception as exc:
+        print(f"[fit-service] WARNING: failed to inspect model object refs: {exc}", flush=True)
+        return None
+    if not isinstance(st, dict):
+        return None
+    refs = st.get("_object_refs_")
+    return refs if isinstance(refs, dict) else None
+
+
+def _normalize_object_refs(job_spec: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(job_spec, dict):
+        return None
+    return {
+        "version": 1,
+        "objects": _object_refs_from_value(job_spec),
+        "job_spec": json.loads(json.dumps(job_spec)),
+    }
 
 
 def _truthy_config_bool(value: Any) -> bool:
@@ -515,7 +743,6 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     cfg = spec.get("config", {})
     if not isinstance(cfg, dict):
         raise ValueError("job_spec.config must be an object")
-
     resolved = dict(body)
     resolved_cfg = dict(cfg)
     external_surfaces_raw = resolved_cfg.get("external_surfaces")
@@ -532,21 +759,36 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             external_surfaces.append(surface)
         resolved_cfg["external_surfaces"] = external_surfaces
 
-    resolved["config"] = resolved_cfg
-    resolved["_job_spec_"] = {
+    model_ref = spec.get("model")
+    model_object_refs: dict[str, Any] | None = None
+    if model_ref not in (None, {}, ""):
+        resolved_model_path = str(_resolve_object_ref(model_ref))
+        resolved["model_input"] = resolved_model_path
+        model_object_refs = _checkpoint_object_refs(resolved_model_path)
+
+    model_job_spec = (
+        model_object_refs.get("job_spec")
+        if isinstance(model_object_refs, dict) and isinstance(model_object_refs.get("job_spec"), dict)
+        else None
+    )
+    atlas_ref = spec.get("atlas")
+    model_atlas_ref = model_job_spec.get("atlas") if isinstance(model_job_spec, dict) else None
+    if model_atlas_ref not in (None, {}, ""):
+        if atlas_ref not in (None, {}, "") and atlas_ref != model_atlas_ref:
+            print("[fit-service] model _object_refs_ atlas overrides request job_spec.atlas", flush=True)
+        atlas_ref = model_atlas_ref
+
+    effective_job_spec = {
         "model": spec.get("model"),
-        "atlas": spec.get("atlas"),
+        "atlas": atlas_ref,
         "linked_surfaces": spec.get("linked_surfaces", []),
         "config": cfg,
     }
     if "volume_shape_zyx" in spec:
-        resolved["_job_spec_"]["volume_shape_zyx"] = spec.get("volume_shape_zyx")
+        effective_job_spec["volume_shape_zyx"] = spec.get("volume_shape_zyx")
+    resolved["config"] = resolved_cfg
+    resolved["_job_spec_"] = effective_job_spec
 
-    model_ref = spec.get("model")
-    if model_ref not in (None, {}, ""):
-        resolved["model_input"] = str(_resolve_object_ref(model_ref))
-
-    atlas_ref = spec.get("atlas")
     if atlas_ref not in (None, {}, ""):
         resolved_cfg["atlas"] = _resolve_lasagna_atlas_ref(atlas_ref)
 
@@ -555,6 +797,23 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         linked_refs = []
     if not isinstance(linked_refs, list):
         raise ValueError("job_spec.linked_surfaces must be a list")
+
+    object_refs = _normalize_object_refs(effective_job_spec)
+    if object_refs is not None:
+        # Include explicit object_refs from the request as query-only refs. They
+        # may contain refs inherited from an exported tifxyz meta.json that are
+        # not part of the new job_spec surface area.
+        request_object_refs = spec.get("object_refs")
+        if isinstance(request_object_refs, dict):
+            merged = list(object_refs["objects"])
+            seen = {(r["type"], r["name"], r["hash"]) for r in merged}
+            for ref in _object_refs_from_value(request_object_refs.get("objects", [])):
+                key = (ref["type"], ref["name"], ref["hash"])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(ref)
+            object_refs["objects"] = merged
+        resolved["_object_refs_"] = object_refs
 
     return resolved
 
@@ -726,6 +985,8 @@ def _write_announcement(host: str, port: int) -> None:
         "port": port,
         "pid": pid,
         "data_dir": _data_dir or "",
+        "capture_jobs": _capture_jobs,
+        "capture_dir": str(_capture_root()) if _capture_jobs else "",
         "datasets": [d["name"] for d in datasets],
     }
     _announce_file = _ANNOUNCE_DIR / f"{pid}.json"
@@ -818,6 +1079,9 @@ class _JobState:
         self._output_dir: str | None = None
         self._results_tmp: str | None = None  # temp dir to clean up after download
         self._tmp_dirs: list[str] = []
+        self._events: list[dict[str, Any]] = []
+        self._next_event_seq = 1
+        self._body_for_capture: dict[str, Any] | None = None
         now = time.time()
         self.submitted_at = now
         self.started_at: float | None = None
@@ -846,6 +1110,23 @@ class _JobState:
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
             }
+
+    def set_capture_body(self, body: dict[str, Any]) -> None:
+        with self._lock:
+            self._body_for_capture = json.loads(json.dumps(body))
+
+    def add_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            stored = dict(event)
+            stored["seq"] = self._next_event_seq
+            self._next_event_seq += 1
+            self._events.append(stored)
+        _append_capture_jsonl(self, "events.jsonl", stored)
+        return stored
+
+    def events_after(self, after: int = 0) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(event) for event in self._events if int(event.get("seq", 0)) > after]
 
     def set_waiting(self) -> None:
         with self._lock:
@@ -975,7 +1256,9 @@ class _JobQueue:
     def enqueue_body(self, job: _JobState, body: dict[str, Any]) -> None:
         with self._cv:
             source = str(body.get("source") or job.source or "").strip()
-            config_name = str(body.get("config_name") or job.config_name or "").strip()
+            config_name = str(
+                body.get("config_name") or body.get("job_type") or job.config_name or ""
+            ).strip()
             output_name = str(body.get("output_name") or job.output_name or "").strip()
             if source:
                 job.source = source
@@ -984,6 +1267,16 @@ class _JobQueue:
             if output_name:
                 job.output_name = output_name
             self._bodies[job.job_id] = body
+            job.set_capture_body(body)
+            _write_capture_json(job, "request.json", body)
+            _write_capture_json(job, "metadata.json", {
+                "job_id": job.job_id,
+                "sequence": job.sequence,
+                "source": job.source,
+                "config_name": job.config_name,
+                "output_name": job.output_name,
+                "submitted_at": job.submitted_at,
+            })
             job.set_waiting()
             self._bump_generation_locked()
             self._cv.notify_all()
@@ -1149,7 +1442,10 @@ class _JobQueue:
                 job.set_running("starting", 0, 0, 0.0)
                 self._bump_generation_locked()
             try:
-                _run_optimization(job, body)
+                if str(body.get("job_type") or "") == "laplace_rank":
+                    _run_laplace_rank_job(job, body)
+                else:
+                    _run_optimization(job, body)
             finally:
                 job.cleanup_tmp_dirs(keep_results=True)
                 with self._cv:
@@ -1165,6 +1461,95 @@ _jobs = _JobQueue()
 # ---------------------------------------------------------------------------
 # Optimization runner (called in background thread)
 # ---------------------------------------------------------------------------
+
+def _run_laplace_rank_job(job: _JobState, body: dict[str, Any]) -> None:
+    print(
+        f"[fit-service] laplace rank worker starting: job_id={job.job_id}",
+        flush=True,
+    )
+    results_tmp = tempfile.mkdtemp(prefix="laplace_rank_results_")
+    job.add_tmp_dir(results_tmp)
+    output_dir = Path(results_tmp)
+    total = len(body.get("jobs", [])) if isinstance(body.get("jobs"), list) else 0
+    job.set_running(
+        "laplace_rank",
+        0,
+        total,
+        0.0,
+        stage_progress=0.0,
+        overall_progress=0.0,
+        stage_name="Atlas snap rank",
+    )
+    try:
+        request = _validate_laplace_rank_request(body)
+        request = dict(request)
+        request["manifest"] = _resolve_laplace_rank_manifest(request["manifest"])
+        request["options"] = _resolve_laplace_rank_debug_dir(request.get("options", {}))
+        _write_capture_json(job, "resolved_request.json", request)
+
+        def _progress(event: dict[str, Any]) -> bool:
+            completed = int(event.get("completed") or 0)
+            event_total = int(event.get("total") or total or 0)
+            index = int(event.get("index") or 0)
+            result = event.get("result")
+            rank_id = str(event.get("id") or "")
+            if not isinstance(result, dict):
+                result = {}
+            stored = job.add_event({
+                "type": "laplace_rank_result",
+                "index": index,
+                "id": rank_id,
+                "result": result,
+            })
+            _write_capture_json(job, "partial_events.json", job.events_after(0))
+            progress = (float(completed) / float(event_total)) if event_total > 0 else 1.0
+            job.set_running(
+                "laplace_rank",
+                completed,
+                event_total,
+                0.0,
+                stage_progress=progress,
+                overall_progress=progress,
+                stage_name=f"Atlas snap rank {completed}/{event_total}",
+            )
+            print(
+                f"[fit-service] laplace rank event: job_id={job.job_id} "
+                f"seq={stored['seq']} index={index} id={rank_id} "
+                f"{completed}/{event_total}",
+                flush=True,
+            )
+            return not job.cancelled
+
+        result = _rank_laplace_snap_pairs(request, progress_callback=_progress)
+        if job.cancelled:
+            job.set_cancelled()
+            _write_capture_json(job, "error.json", {"error": "cancelled"})
+            return
+        (output_dir / "rank_result.json").write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        _write_capture_json(job, "final_result.json", result)
+        job.set_running(
+            "laplace_rank",
+            total,
+            total,
+            0.0,
+            stage_progress=1.0,
+            overall_progress=1.0,
+            stage_name="Atlas snap rank complete",
+        )
+        job.set_finished(str(output_dir), results_tmp=results_tmp)
+    except Exception as exc:
+        if job.cancelled:
+            job.set_cancelled()
+            _write_capture_json(job, "error.json", {"error": "cancelled"})
+        else:
+            tb = traceback.format_exc()
+            print(f"[fit-service] laplace rank worker error: {tb}", file=sys.stderr, flush=True)
+            job.set_error(str(exc))
+            _write_capture_json(job, "error.json", {"error": str(exc), "traceback": tb})
+
 
 def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     """Run fit.py then fit2tifxyz.py based on the request body.
@@ -1232,8 +1617,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             job.add_tmp_dir(results_tmp)
             output_dir = results_tmp
 
-        # model_output goes into temp dir. Flatten forces --copy-model during
-        # export so the resulting tifxyz remains self-contained after cleanup.
+        # model_output goes into temp dir. fit2tifxyz always copies model.pt
+        # into the exported tifxyz so results remain self-contained.
         if not model_output:
             model_output = str(Path(tmp_dir) / "model_reopt.pt")
 
@@ -1340,6 +1725,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     st = torch.load(str(model_output), map_location="cpu", weights_only=False)
                     if isinstance(st, dict):
                         st["_job_spec_"] = job_spec
+                        object_refs = body.get("_object_refs_")
+                        if isinstance(object_refs, dict):
+                            st["_object_refs_"] = object_refs
                         torch.save(st, str(model_output))
             finally:
                 opt_mod.optimize = _orig_optimize
@@ -1354,8 +1742,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             export_argv = ["--input", str(model_output), "--output", str(output_dir)]
             if body.get("single_segment"):
                 export_argv.append("--single-segment")
-            if body.get("copy_model") or model_init == "flatten":
-                export_argv.append("--copy-model")
             output_name = body.get("output_name")
             if output_name:
                 export_argv.extend(["--output-name", str(output_name)])
@@ -1497,6 +1883,24 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 snap["queue_generation"] = _jobs.generation
                 self._send_json(snap)
+        elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "events":
+            job = _jobs.job(parts[1])
+            if job is None:
+                self._send_json({"error": "job not found"}, 404)
+                return
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                after = int((query.get("after") or ["0"])[0])
+            except (TypeError, ValueError):
+                self._send_json({"error": "after must be an integer"}, 400)
+                return
+            events = job.events_after(after)
+            self._send_json({
+                "job_id": job.job_id,
+                "events": events,
+                "last_seq": max([after] + [int(event.get("seq", after)) for event in events]),
+                "queue_generation": _jobs.generation,
+            })
         elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "results":
             job = _jobs.job(parts[1])
             if job is None:
@@ -1508,9 +1912,6 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_results(self, job: _JobState) -> None:
         """Package finished optimization results as tar.gz and send them."""
-        import tarfile
-        import io
-
         snap = job.snapshot(_jobs.queue_position(job.job_id))
         if snap["state"] != "finished":
             self._send_json({"error": "no finished results available"}, 404)
@@ -1525,16 +1926,16 @@ class _Handler(BaseHTTPRequestHandler):
         # so the tar contains e.g. "winding_combined_v004.tifxyz/meta.json".
         # Extracting in the local paths dir recreates the tifxyz subdirectory.
         pack_t0 = time.perf_counter()
-        buf = io.BytesIO()
         out_path = Path(output_dir)
-        children = sorted(out_path.iterdir())
         requested_output_name = str(snap.get("output_name") or "").strip()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for child in children:
-                arcname = _result_archive_child_name(child.name, len(children), requested_output_name)
-                tar.add(str(child), arcname=arcname)
-
-        data = buf.getvalue()
+        try:
+            data = _pack_results_archive(out_path, requested_output_name)
+        except Exception as exc:
+            msg = f"failed to pack results: {exc}"
+            print(f"[fit-service] ERROR: {msg}", flush=True)
+            job.set_error(msg)
+            self._send_json({"error": msg}, 500)
+            return
         pack_s = time.perf_counter() - pack_t0
         self.send_response(200)
         self.send_header("Content-Type", "application/gzip")
@@ -1634,7 +2035,11 @@ class _Handler(BaseHTTPRequestHandler):
                 body = self._read_json(f"job {job.job_id} request")
                 if not isinstance(body, dict):
                     raise ValueError("job request must be an object")
-                body = _body_with_resolved_job_spec(body)
+                if str(body.get("job_type") or "") == "laplace_rank":
+                    body = dict(_validate_laplace_rank_request(body))
+                    body["job_type"] = "laplace_rank"
+                else:
+                    body = _body_with_resolved_job_spec(body)
             except Exception as exc:
                 job.set_error(f"bad json: {exc}")
                 self._send_json({"error": f"bad json: {exc}", "job_id": job.job_id}, 400)
@@ -1787,6 +2192,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global _data_dir, _object_store_dir, _gpu_pause_enabled, _sparse_prefetch_backend
+    global _capture_jobs, _capture_dir
 
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
     p.add_argument("--port", type=int, default=9999, help="Port (default 9999)")
@@ -1801,6 +2207,10 @@ def main() -> None:
                    choices=("tensorstore", "python-zarr"),
                    default="tensorstore",
                    help="Sparse streaming prefetch backend for fit jobs")
+    p.add_argument("--capture-jobs", action="store_true", default=False,
+                   help="Capture queued job requests, events, and final results")
+    p.add_argument("--capture-dir", default=None,
+                   help="Directory for captured queued jobs (default: ./job_captures)")
     args = p.parse_args()
 
     if args.data_dir:
@@ -1810,6 +2220,9 @@ def main() -> None:
     if args.no_gpu_pause:
         _gpu_pause_enabled = False
     _sparse_prefetch_backend = str(args.sparse_prefetch_backend)
+    _capture_jobs = bool(args.capture_jobs)
+    if args.capture_dir:
+        _capture_dir = Path(args.capture_dir).resolve()
 
     datasets = _list_datasets()
     if not datasets:

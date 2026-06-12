@@ -737,6 +737,262 @@ bool LasagnaServiceManager::isRunning() const
     return _process && _process->state() == QProcess::Running && _serviceReady;
 }
 
+void LasagnaServiceManager::rankLaplaceSnapPairs(
+    const QJsonObject& request,
+    std::function<void(const QJsonObject&)> onSuccess,
+    std::function<void(const QString&)> onError)
+{
+    if (!isRunning()) {
+        const QString msg = tr("Lasagna service is not running.");
+        if (onError) {
+            onError(msg);
+        }
+        return;
+    }
+
+    QUrl url(QStringLiteral("%1/jobs").arg(baseUrl()));
+    QNetworkRequest req = fitServiceRequest(url);
+    req.setRawHeader(kVc3dSourceHeader, localSourceName().toUtf8());
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    const quint64 generation = _requestGeneration;
+    QJsonObject jobRequest = request;
+    jobRequest[QStringLiteral("job_type")] = QStringLiteral("laplace_rank");
+    jobRequest[QStringLiteral("config_name")] = QStringLiteral("Atlas snap rank");
+    const QByteArray body = QJsonDocument(jobRequest).toJson(QJsonDocument::Compact);
+    const int jobCount = request.value(QStringLiteral("jobs")).toArray().size();
+    auto timer = std::make_shared<QElapsedTimer>();
+    timer->start();
+    std::cout << "[lasagna] queued laplace rank request:"
+              << " jobs=" << jobCount
+              << " bytes=" << body.size()
+              << " url=" << url.toString().toStdString()
+              << std::endl;
+    QNetworkReply* reply = _nam->post(req, body);
+    connect(reply, &QNetworkReply::finished, this,
+            [this,
+             reply,
+             generation,
+             timer,
+             jobCount,
+             onSuccess = std::move(onSuccess),
+             onError = std::move(onError)]() mutable {
+        if (generation != _requestGeneration) {
+            reply->deleteLater();
+            return;
+        }
+        const QByteArray bytes = reply->readAll();
+        const QVariant status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+        std::cout << "[lasagna] queued laplace rank submit response:"
+                  << " elapsed=" << elapsedSeconds(*timer) << "s";
+        if (status.isValid()) {
+            std::cout << " http=" << status.toInt();
+        } else {
+            std::cout << " http=<none>";
+        }
+        std::cout << " error=" << reply->error()
+                  << " bytes=" << bytes.size()
+                  << std::endl;
+        reply->deleteLater();
+
+        auto fail = [this, onError](const QString& msg) {
+            _lastError = msg;
+            std::cerr << "[lasagna] queued laplace rank error: "
+                      << msg.toStdString() << std::endl;
+            if (onError) {
+                onError(msg);
+            }
+        };
+
+        if (isTransportError(reply)) {
+            fail(tr("Laplace rank submit failed: %1").arg(reply->errorString()));
+            return;
+        }
+        if (!validateApiVersion(reply, tr("Laplace rank submit"))) {
+            if (onError) {
+                onError(_lastError);
+            }
+            return;
+        }
+
+        QJsonParseError parseError;
+        const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            fail(tr("Laplace rank submit returned malformed JSON at byte %1: %2")
+                     .arg(parseError.offset)
+                     .arg(parseError.errorString()));
+            return;
+        }
+        const QJsonObject obj = doc.object();
+        if (reply->error() != QNetworkReply::NoError ||
+            obj.contains(QStringLiteral("error"))) {
+            const QString serviceError = obj[QStringLiteral("error")].toString(reply->errorString());
+            const QString code = obj[QStringLiteral("code")].toString();
+            fail(code.isEmpty()
+                     ? tr("Laplace rank submit failed: %1").arg(serviceError)
+                     : tr("Laplace rank submit failed (%1): %2").arg(code, serviceError));
+            return;
+        }
+        const QString jobId = obj[QStringLiteral("job_id")].toString();
+        if (jobId.isEmpty()) {
+            fail(tr("Laplace rank submit returned no job id"));
+            return;
+        }
+
+        _submittedJobIds.insert(jobId);
+        _activeJobId = jobId;
+        _optimizationRunning = true;
+        _pollTimer->start();
+        emit jobStarted(jobId);
+        emit optimizationStarted();
+        fetchJobs();
+
+        struct RankPollState
+        {
+            QString jobId;
+            int afterSeq{0};
+            int expectedResults{0};
+            int receivedResults{0};
+            QJsonArray results;
+            QSet<int> seenIndices;
+            bool done{false};
+        };
+        auto state = std::make_shared<RankPollState>();
+        state->jobId = jobId;
+        state->expectedResults = jobCount;
+        for (int i = 0; i < jobCount; ++i) {
+            state->results.append(QJsonValue());
+        }
+
+        auto* pollTimer = new QTimer(this);
+        pollTimer->setInterval(kPollIntervalMs);
+        auto poll = std::make_shared<std::function<void()>>();
+        auto finishWithError = std::make_shared<std::function<void(const QString&)>>();
+        *finishWithError = [this, pollTimer, state, fail](const QString& msg) {
+            if (state->done) {
+                return;
+            }
+            state->done = true;
+            pollTimer->stop();
+            pollTimer->deleteLater();
+            _completedJobIds.insert(state->jobId);
+            fail(msg);
+        };
+        *poll = [this, generation, state, pollTimer, poll, finishWithError, onSuccess]() {
+            if (state->done || generation != _requestGeneration) {
+                return;
+            }
+            QUrl eventsUrl(QStringLiteral("%1/jobs/%2/events?after=%3")
+                               .arg(baseUrl(), state->jobId)
+                               .arg(state->afterSeq));
+            QNetworkRequest eventsReq = fitServiceRequest(eventsUrl);
+            QNetworkReply* eventsReply = _nam->get(eventsReq);
+            connect(eventsReply, &QNetworkReply::finished, this,
+                    [this, eventsReply, generation, state, pollTimer, finishWithError, onSuccess]() {
+                if (state->done || generation != _requestGeneration) {
+                    eventsReply->deleteLater();
+                    return;
+                }
+                const QByteArray eventBytes = eventsReply->readAll();
+                if (isTransportError(eventsReply) ||
+                    !validateApiVersion(eventsReply, tr("Laplace rank events")) ||
+                    eventsReply->error() != QNetworkReply::NoError) {
+                    const QString msg = tr("Laplace rank event poll failed: %1")
+                                            .arg(eventsReply->errorString());
+                    eventsReply->deleteLater();
+                    (*finishWithError)(msg);
+                    return;
+                }
+                QJsonParseError eventParseError;
+                const QJsonDocument eventDoc = QJsonDocument::fromJson(eventBytes, &eventParseError);
+                eventsReply->deleteLater();
+                if (eventParseError.error != QJsonParseError::NoError || !eventDoc.isObject()) {
+                    (*finishWithError)(tr("Laplace rank events returned malformed JSON"));
+                    return;
+                }
+                const QJsonObject eventRoot = eventDoc.object();
+                const QJsonArray events = eventRoot[QStringLiteral("events")].toArray();
+                for (const QJsonValue& value : events) {
+                    const QJsonObject event = value.toObject();
+                    state->afterSeq = std::max(state->afterSeq, event[QStringLiteral("seq")].toInt());
+                    if (event[QStringLiteral("type")].toString() != QStringLiteral("laplace_rank_result")) {
+                        continue;
+                    }
+                    const int index = event[QStringLiteral("index")].toInt(-1);
+                    if (index < 0 || index >= state->expectedResults) {
+                        continue;
+                    }
+                    if (!state->seenIndices.contains(index)) {
+                        state->seenIndices.insert(index);
+                        ++state->receivedResults;
+                    }
+                    state->results.replace(index, event[QStringLiteral("result")]);
+                }
+
+                QUrl statusUrl(QStringLiteral("%1/jobs/%2").arg(baseUrl(), state->jobId));
+                QNetworkRequest statusReq = fitServiceRequest(statusUrl);
+                QNetworkReply* statusReply = _nam->get(statusReq);
+                connect(statusReply, &QNetworkReply::finished, this,
+                        [this, statusReply, generation, state, pollTimer, finishWithError, onSuccess]() {
+                    if (state->done || generation != _requestGeneration) {
+                        statusReply->deleteLater();
+                        return;
+                    }
+                    const QByteArray statusBytes = statusReply->readAll();
+                    if (isTransportError(statusReply) ||
+                        !validateApiVersion(statusReply, tr("Laplace rank status")) ||
+                        statusReply->error() != QNetworkReply::NoError) {
+                        const QString msg = tr("Laplace rank status poll failed: %1")
+                                                .arg(statusReply->errorString());
+                        statusReply->deleteLater();
+                        (*finishWithError)(msg);
+                        return;
+                    }
+                    QJsonParseError statusParseError;
+                    const QJsonDocument statusDoc = QJsonDocument::fromJson(statusBytes, &statusParseError);
+                    statusReply->deleteLater();
+                    if (statusParseError.error != QJsonParseError::NoError || !statusDoc.isObject()) {
+                        (*finishWithError)(tr("Laplace rank status returned malformed JSON"));
+                        return;
+                    }
+                    const QJsonObject statusObj = statusDoc.object();
+                    updateCachedJobFromStatus(statusObj);
+                    const QString stateText = statusObj[QStringLiteral("state")].toString();
+                    if (stateText == QStringLiteral("finished")) {
+                        if (state->receivedResults != state->expectedResults) {
+                            (*finishWithError)(
+                                tr("Laplace rank finished with %1/%2 result events")
+                                    .arg(state->receivedResults)
+                                    .arg(state->expectedResults));
+                            return;
+                        }
+                        state->done = true;
+                        pollTimer->stop();
+                        pollTimer->deleteLater();
+                        _completedJobIds.insert(state->jobId);
+                        QJsonObject response;
+                        response[QStringLiteral("results")] = state->results;
+                        if (onSuccess) {
+                            onSuccess(response);
+                        }
+                    } else if (stateText == QStringLiteral("error") ||
+                               stateText == QStringLiteral("cancelled")) {
+                        QString msg = statusObj[QStringLiteral("error")].toString();
+                        if (msg.isEmpty()) {
+                            msg = stateText == QStringLiteral("cancelled")
+                                ? tr("Laplace rank cancelled")
+                                : tr("Laplace rank failed");
+                        }
+                        (*finishWithError)(msg);
+                    }
+                });
+            });
+        };
+        connect(pollTimer, &QTimer::timeout, this, [poll]() { (*poll)(); });
+        (*poll)();
+        pollTimer->start();
+    });
+}
+
 bool LasagnaServiceManager::validateApiVersion(QNetworkReply* reply, const QString& context)
 {
     const QByteArray got = reply->rawHeader(kFitServiceApiVersionHeader);

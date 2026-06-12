@@ -467,10 +467,13 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
     QSet<QString> lineIds;
     QHash<QString, QJsonObject> lineRefsById;
     QHash<QString, QJsonObject> mapRefsByObjectKey;
+    QHash<QString, QJsonObject> predSnapRefsByObjectKey;
     for (const vc::atlas::LasagnaAtlasObject& object : atlasExport.objects) {
         const QString lineId = QString::fromStdString(object.id);
         const QString fiberRel = QString::fromStdString(object.fiberRelativePath.generic_string());
         const QString mapRel = QString::fromStdString(object.mappingRelativePath.generic_string());
+        const QString predSnapRel =
+            QString::fromStdString(object.predSnapAttachmentRelativePath.generic_string());
 
         QJsonObject lineUpload = fileArtifactForPath(
             object.fiberPath,
@@ -508,6 +511,29 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
 
         lineRefsById.insert(lineId, lineRef);
         mapRefsByObjectKey.insert(lineId + QStringLiteral("\n") + mapRel, mapRef);
+        if (!predSnapRel.isEmpty() &&
+            std::filesystem::is_regular_file(object.predSnapAttachmentPath)) {
+            QJsonObject snapUpload = fileArtifactForPath(
+                object.predSnapAttachmentPath,
+                QStringLiteral("atlas-pred-snap"),
+                safeAtlasObjectName(
+                    atlasName,
+                    predSnapRel,
+                    QString::fromStdString(object.predSnapAttachmentPath.filename().string())),
+                QStringLiteral("vc3d_atlas_pred_snap_points_json"),
+                &out->rawBytes);
+            if (snapUpload.isEmpty()) {
+                if (error) {
+                    *error = QObject::tr("Cannot pack atlas pred-snap JSON: %1")
+                        .arg(QString::fromStdString(object.predSnapAttachmentPath.string()));
+                }
+                return false;
+            }
+            ++out->fileCount;
+            const QJsonObject snapRef = snapUpload[QStringLiteral("object")].toObject();
+            appendUploadIfNew(snapUpload);
+            predSnapRefsByObjectKey.insert(lineId + QStringLiteral("\n") + predSnapRel, snapRef);
+        }
         if (!lineIds.contains(lineId)) {
             lineIds.insert(lineId);
         }
@@ -537,6 +563,12 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
         const QString key = lineId + QStringLiteral("\n") + mapRel;
         if (mapRefsByObjectKey.contains(key)) {
             mapEntry[QStringLiteral("map_ref")] = mapRefsByObjectKey.value(key);
+        }
+        const QString predSnapRel = mapEntry[QStringLiteral("pred_snap_path")].toString();
+        const QString predSnapKey = lineId + QStringLiteral("\n") + predSnapRel;
+        if (predSnapRefsByObjectKey.contains(predSnapKey)) {
+            mapEntry[QStringLiteral("pred_snap_ref")] = predSnapRefsByObjectKey.value(predSnapKey);
+            mapEntry.remove(QStringLiteral("pred_snap_path"));
         }
         maps.append(mapEntry);
     }
@@ -865,7 +897,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 
     panelLayout->addWidget(_atlasGroup);
 
-    _atlasBtn = new QPushButton(tr("Send Atlas"), this);
+    _atlasBtn = new QPushButton(tr("Send Atlas Jobs"), this);
     panelLayout->addWidget(_atlasBtn);
 
     // =======================================================================
@@ -1488,7 +1520,7 @@ QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
 
     addConfigRow(tr("Atlas:"), _compactAtlasCombo);
     addConfigRow(tr("Atlas cfg:"), _compactAtlasConfigCombo);
-    _compactAtlasBtn = new QPushButton(tr("Send Atlas"), _compactView);
+    _compactAtlasBtn = new QPushButton(tr("Send Atlas Jobs"), _compactView);
     layout->addWidget(_compactAtlasBtn);
 
     layout->addWidget(new QLabel(tr("Linked Surfaces"), _compactView));

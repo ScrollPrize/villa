@@ -140,6 +140,7 @@ private:
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
     void refreshAtlasOverviewDocks();
     void updateAtlasSearchDocks();
+    void optimizeAtlasSnapCandidates();
     void startAtlasFiberIntersectionSearch();
     void cancelAtlasFiberIntersectionSearch();
     void updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,

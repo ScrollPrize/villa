@@ -36,8 +36,11 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QClipboard>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPointF>
 #include <QMessageBox>
 #include <QtConcurrent/QtConcurrent>
@@ -68,6 +71,7 @@
 #include <QPushButton>
 #include <QItemSelectionModel>
 #include <QItemSelection>
+#include <QUnhandledException>
 #include "utils/Json.hpp"
 #include <QPointer>
 #include <QListView>
@@ -207,6 +211,40 @@ bool atlasSearchDebugEnabled()
 {
     const char* value = std::getenv("VC_ATLAS_SEARCH_DEBUG");
     return value && *value != '\0' && std::string_view(value) != "0";
+}
+
+QString extractFutureExceptionMessage(const std::exception& e)
+{
+    if (auto* unhandled = dynamic_cast<const QUnhandledException*>(&e)) {
+        const std::exception_ptr ptr = unhandled->exception();
+        if (ptr) {
+            try {
+                std::rethrow_exception(ptr);
+            } catch (const std::exception& inner) {
+                return QString::fromStdString(inner.what());
+            } catch (...) {
+                return QObject::tr("Unknown non-standard exception");
+            }
+        }
+    }
+    return QString::fromStdString(e.what());
+}
+
+QJsonObject toQtJsonObject(const nlohmann::json& json)
+{
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(
+        QByteArray::fromStdString(json.dump()), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        throw std::runtime_error("failed to convert JSON object for Qt");
+    }
+    return doc.object();
+}
+
+nlohmann::json fromQtJsonObject(const QJsonObject& object)
+{
+    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    return nlohmann::json::parse(bytes.constData());
 }
 
 QString atlasSearchModeName(int searchMode)
@@ -672,7 +710,19 @@ QString absoluteSegmentPathForClipboard(const std::filesystem::path& segmentPath
 QDockWidget* createAtlasOverviewDock(QWidget* parent)
 {
     auto* dock = new QDockWidget(QObject::tr("Atlas Overview"), parent);
-    auto* atlasTree = new QTreeWidget(dock);
+    auto* content = new QWidget(dock);
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(6);
+
+    auto* rankSnap = new QPushButton(QObject::tr("Rank via Fit-Service"), content);
+    rankSnap->setObjectName(QStringLiteral("atlasRankSnapButton"));
+    rankSnap->setToolTip(QObject::tr(
+        "Run atlas pred-snap ranking through the Lasagna fit-service job queue."));
+    rankSnap->setEnabled(false);
+    layout->addWidget(rankSnap);
+
+    auto* atlasTree = new QTreeWidget(content);
     atlasTree->setObjectName(QStringLiteral("atlasOverviewTree"));
     atlasTree->setColumnCount(2);
     atlasTree->setHeaderLabels({QObject::tr("Atlas"), QObject::tr("Value")});
@@ -680,7 +730,9 @@ QDockWidget* createAtlasOverviewDock(QWidget* parent)
     atlasTree->setRootIsDecorated(true);
     atlasTree->setSelectionMode(QAbstractItemView::SingleSelection);
     atlasTree->header()->setStretchLastSection(true);
-    dock->setWidget(atlasTree);
+    layout->addWidget(atlasTree, 1);
+
+    dock->setWidget(content);
     return dock;
 }
 
@@ -2551,12 +2603,16 @@ void CWindow::createAtlasWorkspace()
     _atlasSearchDock->hide();
 
     auto connectOverview = [this](QDockWidget* dock) {
-        if (!dock) {
+        if (!dock || !dock->widget()) {
             return;
         }
-        auto* tree = qobject_cast<QTreeWidget*>(dock->widget());
+        auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasOverviewTree"));
         if (!tree) {
             return;
+        }
+        if (auto* rankSnap = dock->widget()->findChild<QPushButton*>(
+                QStringLiteral("atlasRankSnapButton"))) {
+            connect(rankSnap, &QPushButton::clicked, this, &CWindow::optimizeAtlasSnapCandidates);
         }
         connect(tree, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem* item, int) {
             while (item && item->data(0, Qt::UserRole).toString().isEmpty()) {
@@ -2719,10 +2775,10 @@ void CWindow::refreshAtlasOverviewDocks()
         : std::filesystem::path{};
 
     auto populate = [this, &volpkgRoot](QDockWidget* dock) {
-        if (!dock) {
+        if (!dock || !dock->widget()) {
             return;
         }
-        auto* tree = qobject_cast<QTreeWidget*>(dock->widget());
+        auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasOverviewTree"));
         if (!tree) {
             return;
         }
@@ -2832,6 +2888,208 @@ void CWindow::updateAtlasSearchDocks()
             cancel->setEnabled(false);
         }
     }
+
+    for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* rankSnap = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasRankSnapButton"))) {
+            rankSnap->setEnabled(atlasUsable);
+        }
+    }
+}
+
+void CWindow::optimizeAtlasSnapCandidates()
+{
+    if (!_currentAtlasDir || !_state || !_state->vpkg()) {
+        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before ranking snap candidates."));
+        return;
+    }
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+    if (manifestPath.empty() || !std::filesystem::exists(manifestPath)) {
+        QMessageBox::warning(this,
+                             tr("Atlas"),
+                             tr("Select a local Lasagna dataset before ranking snap candidates."));
+        return;
+    }
+
+    auto& manager = LasagnaServiceManager::instance();
+    if (manager.isExternal()) {
+        if (!manager.isRunning()) {
+            QMessageBox::warning(this,
+                                 tr("Atlas"),
+                                 tr("Connect the external Lasagna service before ranking snap candidates."));
+            return;
+        }
+    } else if (!manager.ensureServiceRunning()) {
+        QMessageBox::warning(this,
+                             tr("Atlas"),
+                             tr("Failed to start Lasagna service: %1").arg(manager.lastError()));
+        return;
+    }
+
+    const std::filesystem::path atlasDir = *_currentAtlasDir;
+    const std::filesystem::path volpkgRoot = vpkg->path().empty()
+        ? std::filesystem::path(vpkg->getVolpkgDirectory())
+        : vpkg->path().parent_path();
+    const std::string serviceManifestPath = manager.isExternal()
+        ? manifestPath.filename().generic_string()
+        : manifestPath.string();
+    if (statusBar()) {
+        statusBar()->showMessage(tr("Ranking atlas snap candidates..."), 3000);
+    }
+    for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* button = dock->widget()->findChild<QPushButton*>(
+                QStringLiteral("atlasRankSnapButton"))) {
+            button->setEnabled(false);
+        }
+    }
+
+    auto* watcher = new QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>(this);
+    connect(watcher,
+            &QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>::finished,
+            this,
+            [this, watcher, atlasDir]() {
+        watcher->deleteLater();
+        try {
+            const vc::atlas::AtlasSnapOptimizeReport report = watcher->result();
+            refreshAtlasOverviewDocks();
+            displayAtlasFromDirectory(atlasDir);
+            if (statusBar()) {
+                statusBar()->showMessage(
+                    tr("Ranked snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 queued, %7 cached.")
+                        .arg(report.controls)
+                        .arg(report.successfulPairTerms)
+                        .arg(report.zeroContributionTerms)
+                        .arg(report.skippedPairTerms)
+                        .arg(report.pairTerms)
+                        .arg(report.rankJobsRequested)
+                        .arg(report.cacheHits),
+                    6000);
+            }
+        } catch (const std::exception& ex) {
+            refreshAtlasOverviewDocks();
+            updateAtlasSearchDocks();
+            const QString message = extractFutureExceptionMessage(ex);
+            std::cerr << "[atlas-snap] rank failed: "
+                      << message.toStdString() << std::endl;
+            QMessageBox::warning(
+                this,
+                tr("Atlas Snap Candidates"),
+                tr("Could not rank snap candidates: %1").arg(message));
+        }
+    });
+
+    QPointer<CWindow> self(this);
+    watcher->setFuture(QtConcurrent::run([self,
+                                           atlasDir,
+                                           volpkgRoot,
+                                           manifestPath,
+                                           serviceManifestPath]() {
+        try {
+            std::cerr << "[atlas-snap] rank start"
+                      << " atlas=" << atlasDir.string()
+                      << " volpkg_root=" << volpkgRoot.string()
+                      << " manifest=" << manifestPath.string()
+                      << " service_manifest=" << serviceManifestPath
+                      << std::endl;
+            vc::lasagna::LasagnaDataset dataset =
+                vc::lasagna::LasagnaDataset::open(manifestPath);
+            vc::lasagna::LasagnaNormalSampler sampler(dataset);
+            if (!sampler.hasPredDtChannel()) {
+                throw std::runtime_error("selected Lasagna dataset has no pred_dt channel: " +
+                                         manifestPath.string());
+            }
+
+            vc::atlas::AtlasSnapOptimizeOptions options;
+            options.predDtThreshold = 110;
+            options.rankOptions = {
+                {"threshold", options.predDtThreshold},
+                {"margin_base_voxels", 1000},
+                {"source_depth", 0},
+                {"amgx_config", nullptr},
+            };
+            const auto ranker =
+                [self, serviceManifestPath](const nlohmann::json& request) -> nlohmann::json {
+                    if (!self) {
+                        throw std::runtime_error("window closed before rank request completed");
+                    }
+                    nlohmann::json serviceRequest = request;
+                    serviceRequest["manifest"] = serviceManifestPath;
+                    const size_t jobCount =
+                        serviceRequest.value("jobs", nlohmann::json::array()).size();
+                    std::cerr << "[atlas-snap] requesting laplace rank jobs="
+                              << jobCount
+                              << " service_manifest=" << serviceManifestPath
+                              << std::endl;
+                    QJsonObject qtRequest = toQtJsonObject(serviceRequest);
+                    QJsonObject qtResponse;
+                    QString error;
+                    QMetaObject::invokeMethod(
+                        self.data(),
+                        [&qtRequest, &qtResponse, &error]() {
+                            QEventLoop loop;
+                            LasagnaServiceManager::instance().rankLaplaceSnapPairs(
+                                qtRequest,
+                                [&](const QJsonObject& response) {
+                                    qtResponse = response;
+                                    loop.quit();
+                                },
+                                [&](const QString& message) {
+                                    error = message;
+                                    loop.quit();
+                                });
+                            loop.exec();
+                        },
+                        Qt::BlockingQueuedConnection);
+                    if (!error.isEmpty()) {
+                        std::cerr << "[atlas-snap] laplace rank failed: "
+                                  << error.toStdString() << std::endl;
+                        throw std::runtime_error(error.toStdString());
+                    }
+                    std::cerr << "[atlas-snap] laplace rank response received"
+                              << std::endl;
+                    return fromQtJsonObject(qtResponse);
+                };
+
+            vc::atlas::AtlasSnapOptimizeReport report =
+                vc::atlas::optimizeAtlasPredSnapCandidates(
+                    atlasDir,
+                    volpkgRoot,
+                    manifestPath,
+                    sampler,
+                    ranker,
+                    options);
+            std::cerr << "[atlas-snap] rank finished"
+                      << " controls=" << report.controls
+                      << " variables=" << report.variableControls
+                      << " fixed=" << report.fixedControls
+                      << " manual=" << report.manualControls
+                      << " singleton_auto=" << report.singletonControls
+                      << " links=" << report.links
+                      << " pair_terms=" << report.pairTerms
+                      << " successful_terms=" << report.successfulPairTerms
+                      << " zero_contribution_terms=" << report.zeroContributionTerms
+                      << " skipped_terms=" << report.skippedPairTerms
+                      << " queued=" << report.rankJobsRequested
+                      << " cached=" << report.cacheHits
+                      << " objective=" << report.objective
+                      << std::endl;
+            return report;
+        } catch (const std::exception& ex) {
+            std::cerr << "[atlas-snap] rank exception: "
+                      << ex.what() << std::endl;
+            throw;
+        } catch (...) {
+            std::cerr << "[atlas-snap] rank exception: unknown non-standard exception"
+                      << std::endl;
+            throw;
+        }
+    }));
 }
 
 void CWindow::cancelAtlasFiberIntersectionSearch()
