@@ -1,6 +1,7 @@
 # Python venvs, IDE files, build artifacts
 **/.venv*/
 **/.idea/*
+**/__pycache__/
 *.pyc
 node_modules/.yarn-integrity
 **/*.egg-info*/
