@@ -368,6 +368,8 @@ private slots:
       "snap_status": "valid fw",
       "snap_valid": true,
       "snap_direction": "fw",
+      "snap_signed_delta": 0.25,
+      "snap_target_xyz": [9, 8, 7],
       "target_xyz": [1, 2, 3],
       "mesh_xyz": [2, 3, 4],
       "model_h": 7,
@@ -388,11 +390,13 @@ private slots:
         QCOMPARE(tree->topLevelItemCount(), 1);
         QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
         QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("fiber_a"));
-        QCOMPARE(tree->columnCount(), 5);
+        QCOMPARE(tree->columnCount(), 7);
         QCOMPARE(tree->topLevelItem(0)->child(0)->text(1), QStringLiteral("yes"));
         QCOMPARE(tree->topLevelItem(0)->child(0)->text(2), QStringLiteral("valid fw"));
-        QVERIFY(tree->headerItem()->text(3) != QStringLiteral("Target XYZ"));
-        QVERIFY(tree->headerItem()->text(4) != QStringLiteral("Mesh XYZ"));
+        QCOMPARE(tree->headerItem()->text(3), QStringLiteral("Snap Delta"));
+        QCOMPARE(tree->headerItem()->text(4), QStringLiteral("Snap XYZ"));
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(3), QStringLiteral("0.2500"));
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(4), QStringLiteral("9.0, 8.0, 7.0"));
     }
 };
 

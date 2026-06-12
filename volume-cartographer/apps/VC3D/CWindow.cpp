@@ -541,6 +541,11 @@ bool isValidSurfacePoint(const cv::Vec3f& point)
         && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
 }
 
+bool isFiniteVec3(const cv::Vec3f& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
 std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row, int col)
 {
     const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
@@ -5036,13 +5041,18 @@ void CWindow::CreateWidgets(void)
                 if (_atlasControlOverlay) {
                     _atlasControlOverlay->setSelectedPoint(point.fiberId, point.controlIndex);
                 }
-                if (std::isfinite(point.meshXyz[0]) &&
-                    std::isfinite(point.meshXyz[1]) &&
-                    std::isfinite(point.meshXyz[2])) {
-                    const std::string sourceId = _state ? _state->activeSurfaceId() : std::string{};
-                    centerFocusAt(point.meshXyz, cv::Vec3f(0.0f, 0.0f, 0.0f), sourceId);
+                const cv::Vec3f* focusPoint = nullptr;
+                if (isFiniteVec3(point.snapTargetXyz)) {
+                    focusPoint = &point.snapTargetXyz;
+                } else if (isFiniteVec3(point.meshXyz)) {
+                    focusPoint = &point.meshXyz;
                 }
-                if (const auto surfacePoint = atlasControlGridToSurface(segmentationBaseViewer(), point)) {
+
+                if (focusPoint) {
+                    const std::string sourceId = _state ? _state->activeSurfaceId() : std::string{};
+                    centerFocusAt(*focusPoint, cv::Vec3f(0.0f, 0.0f, 0.0f), sourceId);
+                    recenterPlaneViewersOn(*focusPoint);
+                } else if (const auto surfacePoint = atlasControlGridToSurface(segmentationBaseViewer(), point)) {
                     centerViewerOnSurfacePointForNavigation(segmentationBaseViewer(), *surfacePoint);
                 }
             });

@@ -19,6 +19,8 @@ struct AtlasControlPointResult {
     QString snapStatus;
     bool snapValid = false;
     bool hasSnapStatus = false;
+    float snapSignedDelta = NAN;
+    cv::Vec3f snapTargetXyz{NAN, NAN, NAN};
     cv::Vec3f targetXyz{NAN, NAN, NAN};
     cv::Vec3f meshXyz{NAN, NAN, NAN};
     float modelH = NAN;

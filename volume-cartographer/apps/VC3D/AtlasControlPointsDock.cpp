@@ -58,6 +58,17 @@ QString fmtFloat(float value, int precision = 4)
     return std::isfinite(value) ? QString::number(value, 'f', precision) : QStringLiteral("-");
 }
 
+QString fmtVec3(const cv::Vec3f& point)
+{
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+        return QStringLiteral("-");
+    }
+    return QStringLiteral("%1, %2, %3")
+        .arg(QString::number(point[0], 'f', 1))
+        .arg(QString::number(point[1], 'f', 1))
+        .arg(QString::number(point[2], 'f', 1));
+}
+
 QString fmtSnapStatus(const AtlasControlPointResult& point)
 {
     return point.hasSnapStatus ? point.snapStatus : QStringLiteral("-");
@@ -78,6 +89,8 @@ AtlasControlPointResult parsePoint(const QJsonObject& obj)
     point.hasSnapStatus = obj.contains(QStringLiteral("snap_status"));
     point.snapStatus = jsonString(obj, QStringLiteral("snap_status"), QStringLiteral("-"));
     point.snapValid = obj.value(QStringLiteral("snap_valid")).toBool(false);
+    point.snapSignedDelta = jsonFloat(obj, QStringLiteral("snap_signed_delta"));
+    point.snapTargetXyz = jsonVec3(obj, QStringLiteral("snap_target_xyz"));
     point.targetXyz = jsonVec3(obj, QStringLiteral("target_xyz"));
     point.meshXyz = jsonVec3(obj, QStringLiteral("mesh_xyz"));
     point.modelH = jsonFloat(obj, QStringLiteral("model_h"));
@@ -108,11 +121,13 @@ AtlasControlPointsDock::AtlasControlPointsDock(QWidget* parent)
 
     _tree = new QTreeWidget(content);
     _tree->setObjectName(QStringLiteral("atlasControlResultsTree"));
-    _tree->setColumnCount(5);
+    _tree->setColumnCount(7);
     _tree->setHeaderLabels({
         tr("Control/Source"),
         tr("Valid"),
         tr("Snap"),
+        tr("Snap Delta"),
+        tr("Snap XYZ"),
         tr("Distance"),
         tr("Signed Delta"),
     });
@@ -262,8 +277,10 @@ void AtlasControlPointsDock::rebuildTree()
         row->setText(0, QStringLiteral("%1 / %2").arg(point.controlIndex).arg(point.sourceIndex));
         row->setText(1, point.valid ? tr("yes") : tr("no"));
         row->setText(2, fmtSnapStatus(point));
-        row->setText(3, fmtFloat(point.distance));
-        row->setText(4, fmtFloat(point.signedDelta));
+        row->setText(3, fmtFloat(point.snapSignedDelta));
+        row->setText(4, fmtVec3(point.snapTargetXyz));
+        row->setText(5, fmtFloat(point.distance));
+        row->setText(6, fmtFloat(point.signedDelta));
     }
     _tree->expandAll();
 }

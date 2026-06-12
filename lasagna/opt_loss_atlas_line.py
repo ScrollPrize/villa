@@ -146,6 +146,7 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 			snap_idx = snap_by_key.get((object_ids[k], int(source_indices[k])))
 			snap_valid = None
 			snap_delta = None
+			snap_target_xyz = None
 			if snap_idx is not None:
 				snap_target = target_xyz[d, snap_idx]
 				snap_mesh = hit_xyz[d, snap_idx]
@@ -155,6 +156,7 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 					and bool(torch.isfinite(snap_mesh).all())
 				)
 				snap_delta = _finite_float(signed_delta[d, snap_idx].item())
+				snap_target_xyz = _xyz_list(snap_target)
 			record = {
 				"fiber_id": object_ids[k],
 				"object_id": object_ids[k],
@@ -170,6 +172,7 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 				"snap_valid": snap_valid,
 				"snap_direction": None if snap_valid is None or snap_delta is None else ("fw" if snap_delta >= 0.0 else "bw"),
 				"snap_signed_delta": snap_delta,
+				"snap_target_xyz": snap_target_xyz,
 				"snap_status": _snap_status(valid=snap_valid, signed_delta=snap_delta),
 			}
 			if D != 1:
