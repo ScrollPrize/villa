@@ -362,6 +362,26 @@ struct GMConfig {
     double   ransac_max_thresh{10.0};
     double   ransac_mad_k{3.0};
     uint32_t ransac_seed{0};
+    // Self-calibrating RANSAC gates (default on). A first ungated fit of
+    // every edge yields a per-merge consensus: the median pair-scale and the
+    // median centroid shift across edges. Edges whose ungated model is an
+    // outlier vs that consensus are re-fit under consensus-relative gates.
+    // This rejects two pathologies seen with fused windings — degenerate
+    // near-identity "stacked" placements (shift << consensus) and wild-scale
+    // "diagonal" models (scale far from consensus) — without baking in a
+    // wrap-width or scale constant. It auto-disables for co-located patch
+    // merges, where the consensus shift is itself ~0.
+    bool     ransac_autogate{true};
+    double   ransac_autogate_scale_k{1.8};    // accept scale in
+                                              // [consensus/k, consensus*k]
+    double   ransac_autogate_shift_frac{0.35};// min shift = frac * consensus
+    // Manual gate overrides (cells / unitless scale). Each, when > 0, pins the
+    // corresponding bound and takes precedence over the consensus value. With
+    // autogate off, these are applied directly in a single fit (the prior
+    // behavior). 0 = derive from consensus (autogate on) or disable (off).
+    double   ransac_min_shift{0.0};
+    double   ransac_scale_min{0.0};
+    double   ransac_scale_max{0.0};
     // Per-surface RBF anchor count cap. 0 = no cap (current behavior). When
     // set, surfaces whose union-of-incident-edge anchor count exceeds the cap
     // are spatially decimated by keeping one original anchor per coarse cell
@@ -658,7 +678,9 @@ struct GMRansac {
 GMRansac gmRansacSimilarity(const std::vector<cv::Vec2d>& src,
                             const std::vector<cv::Vec2d>& dst,
                             int iters, double min_t, double max_t,
-                            double mad_k, uint32_t seed)
+                            double mad_k, uint32_t seed,
+                            double min_shift = 0.0,
+                            double scale_min = 0.0, double scale_max = 0.0)
 {
     const int N = (int)src.size();
     GMRansac R; R.inlier.assign(N, 1);
@@ -676,6 +698,10 @@ GMRansac gmRansacSimilarity(const std::vector<cv::Vec2d>& src,
     double mad = gmMedianInPlace(dev) * 1.4826;
     double thresh = std::min(max_t, std::max(min_t, mad_k * mad));
 
+    cv::Vec2d centroid(0, 0);
+    for (int i = 0; i < N; ++i) centroid += src[i];
+    centroid *= 1.0 / N;
+
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> uni(0, N - 1);
     int best_cnt = -1;
@@ -689,6 +715,14 @@ GMRansac gmRansacSimilarity(const std::vector<cv::Vec2d>& src,
         d2[0] = dst[i]; d2[1] = dst[j];
         cv::Matx23d Mh;
         try { Mh = gmFitSimilarity(s2, d2); } catch (...) { continue; }
+        if (min_shift > 0.0 &&
+            cv::norm(gmApplyAffine(Mh, centroid) - centroid) < min_shift)
+            continue;  // degenerate near-identity (stacked) placement
+        if (scale_max > 0.0) {
+            const double sh = gmSimilarityScale(Mh);
+            if (sh < scale_min || sh > scale_max)
+                continue;  // wild-scale diagonal model
+        }
         int cnt = 0;
         std::vector<uint8_t> inl(N, 0);
         for (int k = 0; k < N; ++k) {
@@ -726,13 +760,29 @@ GMRansac gmRansacSimilarity(const std::vector<cv::Vec2d>& src,
 
 struct GMEdgeRun {
     std::string a, b;
-    std::vector<cv::Vec2d> pA, pB;
+    std::vector<cv::Vec2d> pA, pB;          // RANSAC inliers (consumed downstream)
+    std::vector<cv::Vec2d> pA_all, pB_all;  // full anchor set (transient; kept
+                                            // only until the auto-gate re-fit,
+                                            // then cleared to free memory)
     cv::Matx23d M_pair;
     double sigma_in{1.0};
     double thresh{0.0};
     int n_in{0}, n_total{0};
     int real_overlap_a{-1}, real_overlap_b{-1};
 };
+
+// Centroid shift (cells) a pair model implies on its own anchor set: the mean
+// |M*p - p| over the source anchors. ~0 for a stacked/co-located placement,
+// ~one wrap width for a true winding-advance seam.
+inline double gmCentroidShift(const cv::Matx23d& M,
+                              const std::vector<cv::Vec2d>& src)
+{
+    if (src.empty()) return 0.0;
+    cv::Vec2d c(0, 0);
+    for (const auto& p : src) c += p;
+    c *= 1.0 / src.size();
+    return cv::norm(gmApplyAffine(M, c) - c);
+}
 
 // Joint per-surface AFFINE bundle adjustment: 6 dof per surface (m00, m01, t0,
 // m10, m11, t1), ref pinned to identity. Each anchor pair on edge (a, b)
@@ -1741,10 +1791,21 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
 
     std::cout << "[2/6] per-edge overlap+anchors+RANSAC similarity\n";
     std::vector<GMEdgeRun> edge_runs;
+    std::vector<json> edge_json_pre;   // parallel to edge_runs; finalized below
     edge_runs.reserve(st.cfg.edges.size());
+    edge_json_pre.reserve(st.cfg.edges.size());
     for (const auto& n : st.names)
         st.real_overlap_native[n] = Mat1b::zeros(st.surfs.at(n).H, st.surfs.at(n).W);
     std::vector<GMEdgeSpec> dropped_edges;
+
+    // With autogate on (default), the first per-edge fit is ungated; the
+    // consensus pass below derives gates and re-fits outliers. With autogate
+    // off, the manual gate values are applied directly here (prior behavior).
+    const bool autogate = st.cfg.ransac_autogate;
+    const double fit_min_shift = autogate ? 0.0 : st.cfg.ransac_min_shift;
+    const double fit_scale_min = autogate ? 0.0 : st.cfg.ransac_scale_min;
+    const double fit_scale_max = autogate ? 0.0 : st.cfg.ransac_scale_max;
+
     for (const auto& e : st.cfg.edges) {
         if (!st.surfs.count(e.a) || !st.surfs.count(e.b))
             throw std::runtime_error("global mode: unknown surface in edge "
@@ -1766,7 +1827,8 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
 
             GMRansac R = gmRansacSimilarity(pA, pB,
                 st.cfg.ransac_iters, st.cfg.ransac_min_thresh, st.cfg.ransac_max_thresh,
-                st.cfg.ransac_mad_k, st.cfg.ransac_seed);
+                st.cfg.ransac_mad_k, st.cfg.ransac_seed,
+                fit_min_shift, fit_scale_min, fit_scale_max);
 
             GMEdgeRun er;
             er.a = e.a; er.b = e.b;
@@ -1775,8 +1837,12 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
             er.pA.reserve(R.n_in); er.pB.reserve(R.n_in);
             for (size_t i = 0; i < pA.size(); ++i)
                 if (R.inlier[i]) { er.pA.push_back(pA[i]); er.pB.push_back(pB[i]); }
+            // Keep the full anchor set for a possible consensus re-fit (the
+            // inliers above are biased toward whichever population won this
+            // ungated fit, so a re-fit must start from all anchors).
+            if (autogate) { er.pA_all = std::move(pA); er.pB_all = std::move(pB); }
 
-            // Accumulate real-overlap masks per surface.
+            // Accumulate real-overlap masks per surface (independent of fit).
             if (!pr.realA.empty() && pr.realA.size() == st.real_overlap_native[e.a].size()) {
                 int oA = 0;
                 Mat1b& dst = st.real_overlap_native[e.a];
@@ -1794,25 +1860,7 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
                 er.real_overlap_b = oB;
             }
 
-            const double pair_sc = gmSimilarityScale(er.M_pair);
-            std::cout << "    inliers=" << er.n_in << "/" << er.n_total
-                      << "  (thresh=" << std::fixed << std::setprecision(2) << er.thresh
-                      << ")  pair scale=" << std::fixed << std::setprecision(4) << pair_sc
-                      << "  sigma_in=" << std::fixed << std::setprecision(2) << er.sigma_in
-                      << "  real-overlap A=" << er.real_overlap_a
-                      << " B=" << er.real_overlap_b << "\n";
-            std::cout.unsetf(std::ios::fixed);
-            st.total_inliers += er.n_in;
-
-            json ej = pr.edge_json;
-            ej["ransac_inliers"] = er.n_in;
-            ej["ransac_total"]   = er.n_total;
-            ej["ransac_thresh"]  = er.thresh;
-            ej["ransac_sigma_in"]= er.sigma_in;
-            ej["pair_scale"]     = pair_sc;
-            ej["real_overlap_A"] = er.real_overlap_a;
-            ej["real_overlap_B"] = er.real_overlap_b;
-            st.edges_json.push_back(std::move(ej));
+            edge_json_pre.push_back(std::move(pr.edge_json));
             edge_runs.push_back(std::move(er));
         } catch (const std::exception& ex) {
             std::cout << "    WARN: " << ex.what() << " — dropping edge\n";
@@ -1828,6 +1876,96 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
         kept.reserve(edge_runs.size());
         for (const auto& er : edge_runs) kept.push_back({er.a, er.b});
         gmCheckConnected(st.cfg.surfaces, kept);
+    }
+
+    // [2.5] Self-calibrating gate: derive per-merge consensus from the ungated
+    // fits and re-fit the edges that contradict it. The median is robust to a
+    // minority of bad (stacked / wild) edges, and collapses the gate to a
+    // no-op when the merge genuinely has no advance (co-located patches).
+    if (autogate && !edge_runs.empty()) {
+        std::vector<double> scales, shifts;
+        scales.reserve(edge_runs.size());
+        shifts.reserve(edge_runs.size());
+        for (const auto& er : edge_runs) {
+            scales.push_back(gmSimilarityScale(er.M_pair));
+            shifts.push_back(gmCentroidShift(er.M_pair, er.pA_all));
+        }
+        std::vector<double> sc_s = scales, sh_s = shifts;
+        const double cons_scale = gmMedianInPlace(sc_s);
+        const double cons_shift = gmMedianInPlace(sh_s);
+        const double K = std::max(st.cfg.ransac_autogate_scale_k, 1.0001);
+        const double scale_lo = (st.cfg.ransac_scale_min > 0.0)
+            ? st.cfg.ransac_scale_min : cons_scale / K;
+        const double scale_hi = (st.cfg.ransac_scale_max > 0.0)
+            ? st.cfg.ransac_scale_max : cons_scale * K;
+        const double min_shift = (st.cfg.ransac_min_shift > 0.0)
+            ? st.cfg.ransac_min_shift
+            : cons_shift * st.cfg.ransac_autogate_shift_frac;
+        std::cout << "  auto-gate: consensus scale=" << std::fixed
+                  << std::setprecision(4) << cons_scale
+                  << " shift=" << std::setprecision(1) << cons_shift
+                  << " cells -> accept scale in [" << std::setprecision(3)
+                  << scale_lo << ", " << scale_hi << "], min_shift="
+                  << std::setprecision(1) << min_shift << " cells\n";
+        std::cout.unsetf(std::ios::fixed);
+        for (size_t k = 0; k < edge_runs.size(); ++k) {
+            GMEdgeRun& er = edge_runs[k];
+            const bool bad_scale = scales[k] < scale_lo || scales[k] > scale_hi;
+            const bool bad_shift = (min_shift > 0.0) && (shifts[k] < min_shift);
+            if (!bad_scale && !bad_shift) continue;
+            GMRansac R2 = gmRansacSimilarity(er.pA_all, er.pB_all,
+                st.cfg.ransac_iters, st.cfg.ransac_min_thresh,
+                st.cfg.ransac_max_thresh, st.cfg.ransac_mad_k, st.cfg.ransac_seed,
+                min_shift, scale_lo, scale_hi);
+            std::cout << "    re-fit " << er.a << "<->" << er.b << " (scale "
+                      << std::fixed << std::setprecision(3) << scales[k]
+                      << ", shift " << std::setprecision(1) << shifts[k] << " -> ";
+            if (R2.n_in > 0) {
+                er.M_pair = R2.M; er.sigma_in = R2.sigma_in; er.thresh = R2.thresh;
+                er.n_in = R2.n_in;
+                er.pA.clear(); er.pB.clear();
+                er.pA.reserve(R2.n_in); er.pB.reserve(R2.n_in);
+                for (size_t i = 0; i < er.pA_all.size(); ++i)
+                    if (R2.inlier[i]) { er.pA.push_back(er.pA_all[i]);
+                                        er.pB.push_back(er.pB_all[i]); }
+                std::cout << "scale " << std::setprecision(3)
+                          << gmSimilarityScale(er.M_pair) << ", shift "
+                          << std::setprecision(1)
+                          << gmCentroidShift(er.M_pair, er.pA_all)
+                          << ", inliers " << er.n_in << "/" << er.n_total << ")\n";
+            } else {
+                std::cout << "no hypothesis passed the gate; keeping original)\n";
+            }
+            std::cout.unsetf(std::ios::fixed);
+        }
+    }
+
+    // [2.6] Finalize: free the transient anchor sets, tally inliers, print the
+    // per-edge summary (reflecting any re-fit), and emit edge JSON.
+    for (size_t k = 0; k < edge_runs.size(); ++k) {
+        GMEdgeRun& er = edge_runs[k];
+        er.pA_all.clear(); er.pA_all.shrink_to_fit();
+        er.pB_all.clear(); er.pB_all.shrink_to_fit();
+        const double pair_sc = gmSimilarityScale(er.M_pair);
+        std::cout << "    " << er.a << "<->" << er.b
+                  << ": inliers=" << er.n_in << "/" << er.n_total
+                  << "  (thresh=" << std::fixed << std::setprecision(2) << er.thresh
+                  << ")  pair scale=" << std::setprecision(4) << pair_sc
+                  << "  sigma_in=" << std::setprecision(2) << er.sigma_in
+                  << "  real-overlap A=" << er.real_overlap_a
+                  << " B=" << er.real_overlap_b << "\n";
+        std::cout.unsetf(std::ios::fixed);
+        st.total_inliers += er.n_in;
+
+        json ej = std::move(edge_json_pre[k]);
+        ej["ransac_inliers"] = er.n_in;
+        ej["ransac_total"]   = er.n_total;
+        ej["ransac_thresh"]  = er.thresh;
+        ej["ransac_sigma_in"]= er.sigma_in;
+        ej["pair_scale"]     = pair_sc;
+        ej["real_overlap_A"] = er.real_overlap_a;
+        ej["real_overlap_B"] = er.real_overlap_b;
+        st.edges_json.push_back(std::move(ej));
     }
 
     std::cout << "[3/6] joint affine fit (ref=" << st.ref
@@ -2097,6 +2235,12 @@ int gmBlendAndRasterize(GMAlignState& st, const fs::path& obj2tifxyz,
             {"ransac_max_thresh", cfg.ransac_max_thresh},
             {"ransac_mad_k", cfg.ransac_mad_k},
             {"ransac_seed", cfg.ransac_seed},
+            {"ransac_autogate", cfg.ransac_autogate},
+            {"ransac_autogate_scale_k", cfg.ransac_autogate_scale_k},
+            {"ransac_autogate_shift_frac", cfg.ransac_autogate_shift_frac},
+            {"ransac_min_shift", cfg.ransac_min_shift},
+            {"ransac_scale_min", cfg.ransac_scale_min},
+            {"ransac_scale_max", cfg.ransac_scale_max},
             {"idw_k", kIdwK},
             {"step_size", kStepSize},
             {"anchor_bin_size", kAnchorBinSize},
@@ -2210,6 +2354,34 @@ int main(int argc, char** argv)
          "Per-edge RANSAC MAD multiplier (clamped to [min, max] threshold).")
         ("ransac-seed", po::value<uint32_t>()->default_value(defaults.ransac_seed),
          "Per-edge RANSAC RNG seed (0 = nondeterministic).")
+        ("ransac-autogate", po::value<bool>()->default_value(defaults.ransac_autogate),
+         "Self-calibrating RANSAC gates (default on). Fits every edge ungated, "
+         "takes the median pair-scale and median centroid-shift across edges "
+         "as the per-merge consensus, then re-fits only the edges that "
+         "contradict it (stacked windings, wild-scale models). Adapts to wrap "
+         "width and cross-resolution merges, and disables itself for "
+         "co-located patch merges (consensus shift ~0). Pass "
+         "--ransac-autogate=false for the prior fixed-gate behavior.")
+        ("ransac-autogate-scale-k", po::value<double>()->default_value(defaults.ransac_autogate_scale_k),
+         "Auto-gate scale tolerance: accept hypotheses with scale in "
+         "[consensus/k, consensus*k]. Default 1.8.")
+        ("ransac-autogate-shift-frac", po::value<double>()->default_value(defaults.ransac_autogate_shift_frac),
+         "Auto-gate minimum shift as a fraction of the consensus shift. "
+         "Default 0.35.")
+        ("ransac-min-shift", po::value<double>()->default_value(defaults.ransac_min_shift),
+         "Manual override: reject RANSAC hypotheses whose A->B centroid shift "
+         "is below this many cells. >0 pins the auto-gate minimum shift; with "
+         "--ransac-autogate=false it is applied directly. 0 = derive from "
+         "consensus (default).")
+        ("ransac-scale-min", po::value<double>()->default_value(defaults.ransac_scale_min),
+         "Manual override: lower bound on hypothesis similarity scale. >0 "
+         "pins the auto-gate lower scale bound. 0 = derive from consensus "
+         "(default).")
+        ("ransac-scale-max", po::value<double>()->default_value(defaults.ransac_scale_max),
+         "Manual override: upper bound on hypothesis similarity scale. >0 "
+         "pins the auto-gate upper scale bound. With --ransac-autogate=false, "
+         "the manual scale gate is active only when this is >0. 0 = derive "
+         "from consensus (default).")
         ("anchor-cap", po::value<int>()->default_value(defaults.anchor_cap),
          "Per-surface RBF anchor count cap. If >0 and a surface's union of "
          "incident-edge anchors exceeds this count, spatially decimate them by "
@@ -2251,6 +2423,12 @@ int main(int argc, char** argv)
     cfg.ransac_max_thresh     = vm["ransac-max-thresh"].as<double>();
     cfg.ransac_mad_k          = vm["ransac-mad-k"].as<double>();
     cfg.ransac_seed           = vm["ransac-seed"].as<uint32_t>();
+    cfg.ransac_autogate       = vm["ransac-autogate"].as<bool>();
+    cfg.ransac_autogate_scale_k    = vm["ransac-autogate-scale-k"].as<double>();
+    cfg.ransac_autogate_shift_frac = vm["ransac-autogate-shift-frac"].as<double>();
+    cfg.ransac_min_shift      = vm["ransac-min-shift"].as<double>();
+    cfg.ransac_scale_min      = vm["ransac-scale-min"].as<double>();
+    cfg.ransac_scale_max      = vm["ransac-scale-max"].as<double>();
     cfg.anchor_cap            = vm["anchor-cap"].as<int>();
     {
         const std::string pd = vm["paths-dir"].as<std::string>();
