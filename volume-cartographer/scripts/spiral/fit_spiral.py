@@ -549,6 +549,11 @@ class CartesianFlowField(nn.Module):
                 resolution,
             ]
         ])
+        # Sparse-gradient sampling state (see get_sampler / _SparseAccumTrilinearSample):
+        # the most recent grad-enabled field materialisation, and the shared buffer its
+        # samplers' backward passes accumulate the field gradient into.
+        self._pending_field = None
+        self._field_grad_acc = None
 
     def get_sampler(self, t):
         # Returns a callable mapping normalised zyx points in [0, 1] to flow velocity at time t.
@@ -560,6 +565,27 @@ class CartesianFlowField(nn.Module):
             # Time-invariant: HR flow is already at the target resolution, so skip interpolating it.
             lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')[0] * self.flow_scales[0]
             field = lr_upsampled + hr_flow[0] * self.flow_scales[1]
+            if not field.requires_grad:
+                return lambda y: sample_field(y, field)
+            # Training path: sample a detached view through _SparseAccumTrilinearSample so
+            # each backward node costs O(points) instead of O(field). The field gradient
+            # lands in _field_grad_acc and is chained into the flow parameters once per
+            # step by apply_accumulated_field_grad(). Only valid time-invariant: with
+            # multiple timesteps each sampler would materialise a different field, and the
+            # single pending graph could not chain them all.
+            if self._field_grad_acc is None or self._field_grad_acc.shape != field.shape:
+                self._field_grad_acc = torch.zeros_like(field)
+            else:
+                self._field_grad_acc.zero_()
+            self._pending_field = field
+            field_detached = field.detach()
+            acc = self._field_grad_acc
+
+            def sample(normalised_zyx):
+                flat = normalised_zyx.reshape(-1, 3)
+                return _SparseAccumTrilinearSample.apply(flat, field_detached, acc).view(*normalised_zyx.shape[:-1], 3)
+
+            return sample
         else:
             t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (cfg['num_flow_timesteps'] - 1)
             t_idx_before = int(t_scaled)
@@ -572,6 +598,15 @@ class CartesianFlowField(nn.Module):
                 for flow_interpolated in flows_interpolated
             )
         return lambda y: sample_field(y, field)
+
+    def apply_accumulated_field_grad(self):
+        # Backpropagate the sparse-accumulated field gradient through the (linear)
+        # LR-upsample + HR-scale materialisation into the flow parameters. Call once per
+        # optimisation step, after loss.backward() and before optimiser.step(); no-op if
+        # no grad-enabled sampler was built since the last call.
+        if self._pending_field is not None:
+            self._pending_field.backward(gradient=self._field_grad_acc)
+            self._pending_field = None
 
 
 class CylindricalFlowField(nn.Module):
@@ -727,6 +762,12 @@ class CylindricalFlowField(nn.Module):
             )
         return sample
 
+    def apply_accumulated_field_grad(self):
+        # The cylindrical lattice is sampled directly via gathers on its parameters (no
+        # materialised cartesian field), so there is nothing to chain; this exists to
+        # mirror CartesianFlowField's interface for the training loop.
+        pass
+
 
 def sample_field(normalised_zyx, field_for_grid_sample):
     # normalised_zyx :: *, zyx in [0, 1]; field_for_grid_sample :: zyx, z, y, x
@@ -740,6 +781,74 @@ def sample_field(normalised_zyx, field_for_grid_sample):
         padding_mode='border',
     )  # 1, zyx, n, 1, 1
     return field_samples.squeeze(0).squeeze(-2).squeeze(-1).T.view(*orig_shape[:-1], 3)  # *, zyx
+
+
+class _SparseAccumTrilinearSample(torch.autograd.Function):
+    # Trilinear sampling of a (zyx, z, y, x) field at normalised [0, 1] zyx points,
+    # matching sample_field / F.grid_sample(align_corners=True, padding_mode='border')
+    # exactly, but with the field gradient scattered sparsely (8 index_add_ calls of
+    # O(num_points)) into a shared dense accumulation buffer instead of autograd's
+    # fresh field-sized dense gradient per backward node. Each RK4 integration makes
+    # 12 sampler calls and a training step makes ~14 transform invocations, so the
+    # per-node zero + accumulate over the ~300M-element field otherwise dominates the
+    # whole step. The buffer is chained into the flow parameters once per step via
+    # CartesianFlowField.apply_accumulated_field_grad().
+
+    @staticmethod
+    def _corners(pts, field):
+        # Shared forward/backward index + weight setup. align_corners=True maps
+        # [0, 1] -> [0, size - 1]; border padding clamps the coordinate.
+        shape = torch.tensor(field.shape[1:], device=pts.device, dtype=pts.dtype)  # z, y, x
+        coord_raw = pts * (shape - 1)
+        coord = coord_raw.clamp(min=torch.zeros_like(shape), max=shape - 1)
+        lo = coord.floor().clamp(max=shape - 2).to(torch.int64)
+        frac = coord - lo.to(coord.dtype)
+        Y, X = field.shape[2], field.shape[3]
+        base = (lo[:, 0] * Y + lo[:, 1]) * X + lo[:, 2]
+        return coord_raw, shape, frac, base, (Y * X, X, 1)
+
+    @staticmethod
+    def forward(ctx, pts, field, acc):
+        # pts :: n, 3 normalised zyx in [0, 1]; field :: 3, z, y, x (detached); acc like field
+        ctx.set_materialize_grads(False)
+        _, _, frac, base, strides = _SparseAccumTrilinearSample._corners(pts, field)
+        flat_field = field.reshape(3, -1)
+        out = torch.zeros(pts.shape[0], 3, device=pts.device, dtype=pts.dtype)
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    w = ((frac[:, 0] if dz else 1 - frac[:, 0])
+                         * (frac[:, 1] if dy else 1 - frac[:, 1])
+                         * (frac[:, 2] if dx else 1 - frac[:, 2]))
+                    idx = base + dz * strides[0] + dy * strides[1] + dx * strides[2]
+                    out += flat_field[:, idx].T * w[:, None]
+        ctx.save_for_backward(pts, field)
+        ctx.acc = acc  # mutated in backward, so it cannot go through save_for_backward
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if grad_out is None:
+            return None, None, None
+        pts, field = ctx.saved_tensors
+        coord_raw, shape, frac, base, strides = _SparseAccumTrilinearSample._corners(pts, field)
+        flat_field = field.reshape(3, -1)
+        acc_flat = ctx.acc.reshape(3, -1)
+        grad_coord = torch.zeros_like(pts)
+        f = [(1 - frac[:, 0], frac[:, 0]), (1 - frac[:, 1], frac[:, 1]), (1 - frac[:, 2], frac[:, 2])]
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    w = f[0][dz] * f[1][dy] * f[2][dx]
+                    idx = base + dz * strides[0] + dy * strides[1] + dx * strides[2]
+                    acc_flat.index_add_(1, idx, (grad_out * w[:, None]).T)
+                    v_dot_g = (flat_field[:, idx].T * grad_out).sum(dim=-1)
+                    grad_coord[:, 0] += v_dot_g * ((1.0 if dz else -1.0) * f[1][dy] * f[2][dx])
+                    grad_coord[:, 1] += v_dot_g * ((1.0 if dy else -1.0) * f[0][dz] * f[2][dx])
+                    grad_coord[:, 2] += v_dot_g * ((1.0 if dx else -1.0) * f[0][dz] * f[1][dy])
+        # grid_sample's border padding passes zero gradient to clipped coordinates
+        unclipped = (coord_raw >= 0) & (coord_raw <= shape - 1)
+        return grad_coord * unclipped.to(grad_coord.dtype) * (shape - 1), None, None
 
 
 class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
@@ -882,6 +991,35 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         return transformed_zyx
 
 
+def expm_2x2(L):
+    # Closed-form matrix exponential for (..., 2, 2) matrices:
+    #   exp(L) = e^m (cosh(s) I + sinh(s)/s (L - m I)),  m = tr(L)/2,  s^2 = ((a-d)/2)^2 + bc
+    # (cos/sin when s^2 < 0). Exact, unlike torch.linalg.matrix_exp's Pade route, and avoids
+    # that op's per-call host synchronisation, which otherwise stalls the CPU's ability to
+    # queue ahead of the GPU on every transform invocation.
+    # sqrt has an infinite derivative at 0, and torch.where's backward turns the resulting
+    # 0 * inf into NaN, so the small-|s2| branch must compute on a safe substitute while the
+    # series branch stays a polynomial in s2 (this matters at init, where L == 0 exactly).
+    a, b = L[..., 0, 0], L[..., 0, 1]
+    c, d = L[..., 1, 0], L[..., 1, 1]
+    m = 0.5 * (a + d)
+    s2 = (0.5 * (a - d)) ** 2 + b * c
+    small = s2.abs() < 1e-8
+    s = torch.where(small, torch.ones_like(s2), s2).abs().sqrt()
+    pos = s2 >= 0
+    cosh_term = torch.where(small, 1.0 + s2 / 2.0, torch.where(pos, torch.cosh(s), torch.cos(s)))
+    sinc_term = torch.where(small, 1.0 + s2 / 6.0, torch.where(pos, torch.sinh(s), torch.sin(s)) / s)
+    em = torch.exp(m)
+    f_diag = em * cosh_term
+    f_off = em * sinc_term
+    out = torch.empty_like(L)
+    out[..., 0, 0] = f_diag + f_off * (a - m)
+    out[..., 0, 1] = f_off * b
+    out[..., 1, 0] = f_off * c
+    out[..., 1, 1] = f_diag + f_off * (d - m)
+    return out
+
+
 class VaryingLinearTransform(pyro.distributions.transforms.Transform):
 
     # This applies a z-dependent 2x2 linear transform M(z) on yx, parametrised
@@ -913,7 +1051,7 @@ class VaryingLinearTransform(pyro.distributions.transforms.Transform):
             # In log-space, scaling by truncate_frac gives a geodesic interpolation
             # towards the identity at frac=0
             logits = logits * self.truncate_frac
-        M = torch.linalg.matrix_exp(logits)
+        M = expm_2x2(logits)
         yx_out = (M @ input_zyx[..., 1:, None]).squeeze(-1)
         return torch.cat([zs, yx_out], dim=-1)
 
@@ -4983,6 +5121,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
         loss = sum(losses.values())
 
         loss.backward()
+        spiral_and_transform.flow_field.apply_accumulated_field_grad()
         optimiser.step()
         optimiser.zero_grad(set_to_none=True)
         lr_scheduler.step()
@@ -5117,6 +5256,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 loss = sum(losses.values())
 
                 loss.backward()
+                spiral_and_transform.flow_field.apply_accumulated_field_grad()
                 optimiser.step()
                 optimiser.zero_grad(set_to_none=True)
 

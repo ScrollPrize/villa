@@ -53,3 +53,4 @@ volume-cartographer/AGENTS.md
 /volume-cartographer/.ccache/
 /.ccache/
 /lasagna/snap_surf_objs
+/volume-cartographer/scripts/spiral/bench
