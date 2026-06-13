@@ -2,6 +2,7 @@
 
 #include <QDialog>
 #include <QString>
+#include <QStringList>
 #include <QLineEdit>
 #include <QDoubleSpinBox>
 #include <QSpinBox>
@@ -594,6 +595,39 @@ private:
     QComboBox* cbEnergy_{nullptr};
     QDoubleSpinBox* spKeepPercent_{nullptr};
     QCheckBox* cbInpaint_{nullptr};
+    QLineEdit* edtOutput_{nullptr};
+    QString defaultOutput_;
+};
+
+// Runs vc_straighten on a tifxyz surface (tifxyz -> tifxyz, no OBJ round-trip).
+// Exposes the four pipeline stages and the few parameters that matter; the
+// rest use the tool's CLI defaults.
+class StraightenDialog : public QDialog {
+    Q_OBJECT
+public:
+    StraightenDialog(QWidget* parent, const QString& defaultOutputPath);
+
+    QString outputPath() const;
+    // CLI args (without input/output) derived from the dialog state. Always
+    // emits an explicit --overlap-pairs so the tool never falls back to its
+    // implicit "no flags = full pipeline" default.
+    QStringList toArgs() const;
+
+private:
+    static bool s_haveSession;
+    static bool s_unbend;
+    static double s_unbendSmoothCols;
+    static int s_overlapPasses;
+    static bool s_orthogonalize;
+    static bool s_trim;
+    static double s_trimMaxEdge;
+
+    QCheckBox* cbUnbend_{nullptr};
+    QDoubleSpinBox* spUnbendSmooth_{nullptr};
+    QSpinBox* spOverlap_{nullptr};
+    QCheckBox* cbOrtho_{nullptr};
+    QCheckBox* cbTrim_{nullptr};
+    QDoubleSpinBox* spTrimMaxEdge_{nullptr};
     QLineEdit* edtOutput_{nullptr};
     QString defaultOutput_;
 };

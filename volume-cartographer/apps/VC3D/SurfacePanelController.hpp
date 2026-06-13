@@ -120,6 +120,7 @@ signals:
     void visLasagnaObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
+    void straightenRequested(const QString& segmentId);
     void abfFlattenRequested(const QString& segmentId);
     void recalcAreaRequested(const QStringList& segmentIds);
     void exportTifxyzChunksRequested(const QString& segmentId);
