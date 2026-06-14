@@ -655,7 +655,7 @@ def main(patches_path, tolerance, min_overlap_points, min_diff_points, query_str
                 hue = (collection_id * 0.6180339887) % 1.0
                 color = list(colorsys.hsv_to_rgb(hue, 0.65, 0.95))
                 points = {
-                    str(pid): {'p': p, 'creation_time': 0, 'wind_a': None}
+                    str(pid): {'p': p, 'creation_time': 0, 'wind_a': 0}
                     for pid, p in enumerate(points_xyz)
                 }
                 collections[str(collection_id)] = {
