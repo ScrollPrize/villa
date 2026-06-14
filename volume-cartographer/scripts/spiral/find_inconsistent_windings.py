@@ -52,7 +52,10 @@ arrival point and the winding the BFS tree already assigns there. A nonzero
 holonomy means the relative-winding annotations do not close around that loop,
 i.e. a winding inconsistency in the graph itself (independent of, and detectable
 without, the absolute anchors). These are reported under "loops" in the output
-(disable with --no-detect-loops).
+(disable with --no-detect-loops). For each inconsistent loop we additionally
+reconstruct the full cycle it closes -- the BFS-tree path between its two patches
+plus the closing edge -- and record it under "loop_cycles" as an ordered patch/pcl
+stack, which plot_winding_graph renders one loop at a time.
 
 Each within-patch winding delta is measured along a strip that follows a
 fringe-avoiding shortest path through the patch's *valid quads only* (a weighted
@@ -388,6 +391,83 @@ def build_rel_adjacency(cross_patch_pcls, patches):
     return adjacency
 
 
+def build_loop_cycles(loops, tree_edge_by_child):
+    """For each inconsistent loop (a non-tree relative edge whose winding holonomy
+    is nonzero), reconstruct the full fundamental cycle it closes: the BFS-tree
+    path between the edge's two patches, plus the closing edge itself.
+
+    Returns a list of cycle dicts. Each lists `patches` as an ordered stack -- the
+    departure patch P at the top, walking up the tree to the lowest common ancestor
+    and back down to the arrival patch R at the bottom -- with one `steps` entry per
+    consecutive pair (the relative-pcl tree edge between them, with its winding
+    delta oriented in walk order) and a single `closing_step` for the non-tree edge
+    that loops R back up to P. plot_winding_graph renders each as a vertical
+    patch/pcl stack; precomputing it here keeps the tree-walking reconstruction next
+    to the BFS that produced the tree."""
+    def path_to_root(p):
+        """Patch ids from p up to the seed (root) via tree-edge parent pointers."""
+        path = [p]
+        while True:
+            hop = tree_edge_by_child.get(path[-1])
+            if hop is None:  # reached the seed (no tree edge into it)
+                break
+            path.append(hop['from_patch'])
+        return path
+
+    def tree_step(a, b):
+        """Step record for walking the tree edge between adjacent patches a -> b
+        (a, b are parent/child in some order; orient the pcl delta along a -> b)."""
+        hop = tree_edge_by_child.get(b)
+        if hop is not None and hop['from_patch'] == a:
+            return {'from_patch': a, 'to_patch': b,
+                    'rel_pcl_id': hop['rel_pcl_id'], 'rel_pcl_name': hop['rel_pcl_name'],
+                    'from_point_id': hop['from_point_id'], 'to_point_id': hop['to_point_id'],
+                    'from_zyx_downsampled': hop['from_zyx_downsampled'],
+                    'to_zyx_downsampled': hop['to_zyx_downsampled'],
+                    'edge_winding_delta': hop['edge_winding_delta'], 'kind': 'tree'}
+        hop = tree_edge_by_child.get(a)
+        assert hop is not None and hop['from_patch'] == b, (a, b)
+        # Stored as b -> a; we walk a -> b, so swap the points (and their coords) and
+        # negate the delta.
+        return {'from_patch': a, 'to_patch': b,
+                'rel_pcl_id': hop['rel_pcl_id'], 'rel_pcl_name': hop['rel_pcl_name'],
+                'from_point_id': hop['to_point_id'], 'to_point_id': hop['from_point_id'],
+                'from_zyx_downsampled': hop['to_zyx_downsampled'],
+                'to_zyx_downsampled': hop['from_zyx_downsampled'],
+                'edge_winding_delta': -hop['edge_winding_delta'], 'kind': 'tree'}
+
+    cycles = []
+    for L in loops:
+        if not L.get('is_inconsistent'):
+            continue
+        P, R = L['from_patch'], L['to_patch']
+        pp, pr = path_to_root(P), path_to_root(R)
+        pr_index = {pid: i for i, pid in enumerate(pr)}
+        lca_i = next(i for i, pid in enumerate(pp) if pid in pr_index)
+        lca = pp[lca_i]
+        # P .. LCA (up P's branch) then LCA-exclusive .. R (down R's branch, reversed).
+        patches = pp[:lca_i + 1] + pr[:pr_index[lca]][::-1]
+        cycles.append({
+            'closing_rel_pcl_id': L['rel_pcl_id'],
+            'closing_rel_pcl_name': L['rel_pcl_name'],
+            'loop_winding_delta': L['loop_winding_delta'],
+            'loop_winding_residual': L['loop_winding_residual'],
+            'from_patch': P, 'to_patch': R, 'lca': lca,
+            'patches': patches,
+            'steps': [tree_step(a, b) for a, b in zip(patches, patches[1:])],
+            # the non-tree edge, drawn as one arrow from R (bottom) back up to P (top).
+            'closing_step': {
+                'from_patch': R, 'to_patch': P,
+                'rel_pcl_id': L['rel_pcl_id'], 'rel_pcl_name': L['rel_pcl_name'],
+                'from_point_id': L['to_point_id'], 'to_point_id': L['from_point_id'],
+                'from_zyx_downsampled': L['to_zyx_downsampled'],
+                'to_zyx_downsampled': L['from_zyx_downsampled'],
+                'edge_winding_delta': -L['edge_winding_delta'], 'kind': 'closing',
+            },
+        })
+    return cycles
+
+
 def parse_z_range(z_range):
     lo, hi = (int(v) for v in z_range.split(','))
     if lo >= hi:
@@ -523,6 +603,7 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
     # non-tree edge close the loop and measure its winding holonomy.
     reached = {patch_id: {'acc': 0, 'entry_ij': seed_ij, 'hops': 0}}
     tree_edges = set()   # undirected keys of edges used to grow the BFS tree
+    tree_edge_by_child = {}  # child patch -> tree-edge hop record that first reached it (full BFS tree)
     loops = []           # non-tree closures: each carries the cycle's winding holonomy
     loops_seen = set()   # undirected keys already recorded as a loop (skip the reverse dir)
     num_loops_unmeasurable = 0
@@ -668,6 +749,7 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
                 'intra_patch_strip_num_points': strip['strip_num_points'],
                 'intra_patch_strip_num_invalid_dropped': strip['strip_num_invalid_dropped'],
             }
+            tree_edge_by_child[R] = hop_record
             queue.append({'patch': R, 'entry_ij': edge['to_ij'], 'acc': acc2,
                           'hops': hops + 1, 'path': path + [hop_record]})
 
@@ -686,6 +768,22 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
               + (f', {num_loops_unmeasurable} unmeasurable' if num_loops_unmeasurable else ''))
         if num_inconsistent_loops:
             print('WARNING: relative-winding loops do not close (winding inconsistency in the graph)!')
+
+    # Full BFS tree: every reached patch (depth + acc = winding(seed) - winding(entry))
+    # and the relative-pcl edge that first reached it. The "votes" only record the
+    # subtree of patches leading to absolute anchors; emitting the whole tree lets
+    # plot_winding_graph draw the entire graph -- and therefore every detected loop,
+    # including loops whose patches no voter passed through.
+    tree = {
+        'nodes': {pid: {'depth': info['hops'], 'acc': info['acc']}
+                  for pid, info in reached.items()},
+        'edges': tree_edge_by_child,
+    }
+
+    # Per-loop view: each inconsistent loop's full closed cycle (tree path between
+    # its two patches + the closing edge), as an ordered patch/pcl stack that
+    # plot_winding_graph renders one loop at a time.
+    loop_cycles = build_loop_cycles(loops, tree_edge_by_child)
 
     out = {
         'checkpoint': os.path.abspath(checkpoint),
@@ -718,6 +816,8 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
         'num_loops_unmeasurable': num_loops_unmeasurable,
         'votes': votes,
         'loops': loops,
+        'tree': tree,
+        'loop_cycles': loop_cycles,
     }
 
     if output is None:
