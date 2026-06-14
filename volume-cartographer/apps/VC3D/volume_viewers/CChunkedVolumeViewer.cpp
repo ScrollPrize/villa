@@ -1021,7 +1021,7 @@ void CChunkedVolumeViewer::quiesceForClose()
         _statusTimer->stop();
 
     _renderPending = false;
-    _renderPendingAfterWorker = false;
+    _pendingRenderJob.reset();
     ++_renderSerial;
 
     if (_chunkCbId != 0 && _chunkArray) {
@@ -1178,7 +1178,7 @@ void CChunkedVolumeViewer::applyDirectCameraState(const CameraState& state)
 bool CChunkedVolumeViewer::isRenderQuiescent() const
 {
     return _renderWorkersInFlight.load(std::memory_order_acquire) == 0
-        && !_renderPendingAfterWorker
+        && !_pendingRenderJob.has_value()
         && !_renderPending
         && !(_renderTimer && _renderTimer->isActive())
         && !(_settleRenderTimer && _settleRenderTimer->isActive());
@@ -1762,32 +1762,19 @@ void CChunkedVolumeViewer::requestRender(const char* reason, std::source_locatio
 
 void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::source_location caller)
 {
+    (void)reason;
+    (void)caller;
     if (_closing) {
         return;
     }
-    if (intersectionRenderingDisabledForLatencyDebug()) {
-        clearIntersectionItems();
-        return;
+    if (_intersectionRenderTimer) {
+        _intersectionRenderTimer->stop();
     }
-    if (ProfileLoggingEnabled()) {
-        _pendingIntersectionReason = reason ? reason : "";
-        _pendingIntersectionCaller = profileCaller(caller);
-    }
-    ProfileScope profile("scheduleIntersectionRender", reason, caller);
-    if (profile.enabled()) {
-        profile.setDetails(std::format("surf='{}' targets={}", _surfName, _intersectTgts.size()));
-    }
-    if (_deferSegmentationIntersections && dynamic_cast<PlaneSurface*>(currentSurface())) {
-        _deferredSegmentationIntersectionsDirty = true;
-        profile.setDetails("action=deferred_segmentation_edit");
-        return;
-    }
-    if (_intersectionRenderTimer && !_intersectionRenderTimer->isActive()) {
-        _intersectionRenderTimer->start();
-        profile.setDetails("action=intersection_timer_start");
-    } else {
-        profile.setDetails("action=already_scheduled");
-    }
+    clearIntersectionItems();
+    _lastIntersectFp = {};
+    _intersectionGeometryCache = {};
+    _flattenedIntersectionCache = {};
+    _flattenedIntersectionDirtyCells.reset();
 }
 
 void CChunkedVolumeViewer::setSegmentationIntersectionDeferral(bool active)
@@ -2192,6 +2179,13 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
     int startLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
+    (void)origin;
+    (void)vxStep;
+    (void)vyStep;
+    (void)startLevel;
+    (void)options;
+    return;
+
     const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
     const bool prefetchOverlay = shouldPrefetchRemoteVolumeHalo(_overlayVolume);
     if (_interactivePreview || _framebuffer.isNull() ||
@@ -2254,6 +2248,11 @@ void CChunkedVolumeViewer::prefetchPlaneNormalNeighbors(
     int startLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
+    (void)plane;
+    (void)startLevel;
+    (void)options;
+    return;
+
     const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
     const bool prefetchOverlay = shouldSpeculativelyPrefetchVolume(_overlayVolume);
     if (_framebuffer.isNull() || (!prefetchBase && !prefetchOverlay))
@@ -2349,6 +2348,13 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
     int fbW,
     int fbH)
 {
+    (void)surf;
+    (void)startLevel;
+    (void)options;
+    (void)fbW;
+    (void)fbH;
+    return;
+
     const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
     const bool prefetchOverlay = shouldPrefetchRemoteVolumeHalo(_overlayVolume);
     if (_interactivePreview || fbW <= 0 || fbH <= 0 ||
@@ -2412,6 +2418,9 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
 
 void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
 {
+    (void)priorityOffset;
+    return;
+
     if (!shouldSpeculativelyPrefetchVolume(_volume) ||
         !_chunkArray || _framebuffer.isNull() || _framebuffer.width() <= 0 ||
         _framebuffer.height() <= 0) {
@@ -2530,6 +2539,7 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
 }
 
 struct CChunkedVolumeViewer::RenderContext {
+    PendingRenderJob renderJob;
     std::uint64_t serial = 0;
     int fbW = 0;
     int fbH = 0;
@@ -2566,6 +2576,7 @@ struct CChunkedVolumeViewer::RenderContext {
 
 struct CChunkedVolumeViewer::RenderResult {
     std::uint64_t serial = 0;
+    PendingRenderJob renderJob;
     QImage framebuffer;
     float surfacePtrX = 0.0f;
     float surfacePtrY = 0.0f;
@@ -2601,6 +2612,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     }
     RenderResult result;
     result.serial = ctx.serial;
+    result.renderJob = ctx.renderJob;
     result.surfacePtrX = ctx.surfacePtrX;
     result.surfacePtrY = ctx.surfacePtrY;
     result.scale = ctx.scale;
@@ -2936,113 +2948,163 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     return result;
 }
 
-void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location caller)
+std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::captureRenderJob(
+    const char* reason,
+    std::source_location caller,
+    const std::shared_ptr<Surface>& surf,
+    int fbW,
+    int fbH,
+    std::chrono::steady_clock::time_point submittedAt)
 {
-    ProfileScope profile("submitRender", reason, caller);
+    if (!surf || !_volume || !_chunkArray || fbW <= 0 || fbH <= 0) {
+        return std::nullopt;
+    }
+
+    PendingRenderJob job;
+    job.requestId = ++_renderRequestSerial;
+    job.fbW = fbW;
+    job.fbH = fbH;
+    job.surfacePtrX = _surfacePtrX;
+    job.surfacePtrY = _surfacePtrY;
+    job.scale = _scale;
+    job.zOff = _zOff;
+    job.zOffWorldDir = _zOffWorldDir;
+    job.startLevel = renderStartLevel(dynamic_cast<PlaneSurface*>(surf.get()) == nullptr);
+    job.samplingMethod = _samplingMethod;
+    job.compositeSettings = _compositeSettings;
+    job.windowLow = _windowLow;
+    job.windowHigh = _windowHigh;
+    job.baseColormapId = _baseColormapId;
+    job.surf = surf;
+    job.surfaceName = _surfName;
+    job.chunkArray = _chunkArray;
+    job.overlayVolume = _overlayVolume;
+    job.overlayChunkArray = _overlayChunkArray;
+    job.overlayOpacity = _overlayOpacity;
+    job.overlayColormapId = _overlayColormapId;
+    job.overlayWindowLow = _overlayWindowLow;
+    job.overlayWindowHigh = _overlayWindowHigh;
+    job.interactivePreview = _interactivePreview;
+    job.directInteractionRender = _directInteractionRenderRequest;
+    job.replayFrameStartedAt = _replayFrameStartedAt;
+    job.genCache = _genSurfaceCache;
+    job.genCacheDirty = _genCacheDirty;
     const std::string_view reasonView(reason ? reason : "");
-    const bool traceRender = traceRenderReason(reasonView);
-    const auto submittedAt = std::chrono::steady_clock::now();
-    if (profile.enabled()) {
-        profile.setDetails(std::format(
-            "surf='{}' volume={} chunkArray={} busy={}",
-            _surfName, bool(_volume), bool(_chunkArray),
-            _renderWorkersInFlight.load(std::memory_order_acquire)));
+    if (traceRenderReason(reasonView)) {
+        job.traceReason = std::string(reasonView);
     }
-    if (_closing) {
-        profile.setDetails("action=skip closing");
+    job.submittedAt = submittedAt;
+    if (ProfileLoggingEnabled()) {
+        job.profileReason = reason ? reason : "";
+        job.profileCaller = profileCaller(caller);
+    }
+    return job;
+}
+
+bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob& a,
+                                                          const PendingRenderJob& b)
+{
+    auto vecEqual = [](const cv::Vec3f& lhs, const cv::Vec3f& rhs) {
+        return lhs[0] == rhs[0] && lhs[1] == rhs[1] && lhs[2] == rhs[2];
+    };
+    return a.fbW == b.fbW &&
+           a.fbH == b.fbH &&
+           a.surfacePtrX == b.surfacePtrX &&
+           a.surfacePtrY == b.surfacePtrY &&
+           a.scale == b.scale &&
+           a.zOff == b.zOff &&
+           vecEqual(a.zOffWorldDir, b.zOffWorldDir) &&
+           a.startLevel == b.startLevel &&
+           a.samplingMethod == b.samplingMethod &&
+           a.compositeSettings == b.compositeSettings &&
+           a.windowLow == b.windowLow &&
+           a.windowHigh == b.windowHigh &&
+           a.baseColormapId == b.baseColormapId &&
+           a.surf.get() == b.surf.get() &&
+           a.surfaceName == b.surfaceName &&
+           a.chunkArray.get() == b.chunkArray.get() &&
+           a.overlayVolume.get() == b.overlayVolume.get() &&
+           a.overlayChunkArray.get() == b.overlayChunkArray.get() &&
+           a.overlayOpacity == b.overlayOpacity &&
+           a.overlayColormapId == b.overlayColormapId &&
+           a.overlayWindowLow == b.overlayWindowLow &&
+           a.overlayWindowHigh == b.overlayWindowHigh &&
+           a.interactivePreview == b.interactivePreview &&
+           a.genCacheDirty == b.genCacheDirty;
+}
+
+void CChunkedVolumeViewer::submitPendingRenderJobIfNeeded()
+{
+    if (_closing ||
+        _renderWorkersInFlight.load(std::memory_order_acquire) > 0 ||
+        !_pendingRenderJob) {
         return;
     }
 
-    auto surf = _surfWeak.lock();
-    if (!surf || !_volume || !_chunkArray) {
-        profile.setDetails("action=skip missing_input");
-        return;
-    }
-
-    resizeFramebuffer();
-    const int fbW = _framebuffer.width();
-    const int fbH = _framebuffer.height();
-    if (fbW <= 0 || fbH <= 0) {
-        if (profile.enabled()) {
-            profile.setDetails(std::format("action=skip invalid_framebuffer size={}x{}", fbW, fbH));
-        }
-        return;
-    }
-
-    const int workersInFlight = _renderWorkersInFlight.load(std::memory_order_acquire);
-    const bool launchConcurrentPreview = _interactivePreview && workersInFlight > 0;
-    const bool launchConcurrentDirect = _directInteractionRenderRequest && workersInFlight > 0;
-    const bool launchConcurrent = launchConcurrentPreview || launchConcurrentDirect;
-    if (workersInFlight > 0 && !launchConcurrent) {
-        if (traceRender) {
-            Logger()->info("[vc3d-render] queue surf='{}' reason='{}' inFlight={} direct={} pendingAfterWorker={}",
+    auto job = std::move(*_pendingRenderJob);
+    _pendingRenderJob.reset();
+    if (_displayedRenderJob &&
+        renderJobsEquivalentForDisplay(job, *_displayedRenderJob)) {
+        if (!job.traceReason.empty()) {
+            Logger()->info("[vc3d-render] drop-pending-same surf='{}' request={} reason='{}'",
                            _surfName,
-                           reasonView,
-                           workersInFlight,
-                           _directInteractionRenderRequest ? "y" : "n",
-                           _renderPendingAfterWorker ? "y" : "n");
+                           job.requestId,
+                           job.traceReason);
         }
-        if (_directInteractionRenderRequest) {
-            _renderPendingAfterWorker = true;
-            _directInteractionPendingAfterWorker = true;
-            profile.setDetails("action=queued_direct_after_worker");
-            return;
-        }
-        ++_renderSerial;
-        _renderPendingAfterWorker = true;
-        profile.setDetails("action=queued_after_worker");
         return;
     }
-    _renderWorkersInFlight.fetch_add(1, std::memory_order_acq_rel);
-    if (launchConcurrent) {
-        Logger()->info("[vc3d-render] launch concurrent {} surf='{}' inFlight={} reason='{}'",
-                       launchConcurrentDirect ? "direct" : "preview",
-                       _surfName,
-                       workersInFlight,
-                       reason ? reason : "");
+
+    submitRenderJob(std::move(job));
+}
+
+void CChunkedVolumeViewer::submitRenderJob(PendingRenderJob job)
+{
+    const int workersInFlight = _renderWorkersInFlight.load(std::memory_order_acquire);
+    if (workersInFlight > 0) {
+        _pendingRenderJob = std::move(job);
+        return;
     }
 
-    _chunkArray->beginViewRequest();
-    if (_overlayChunkArray)
-        _overlayChunkArray->beginViewRequest();
+    _renderWorkersInFlight.fetch_add(1, std::memory_order_acq_rel);
 
-    prefetchVisibleSurfaceChunks();
+    job.chunkArray->beginViewRequest();
+    if (job.overlayChunkArray)
+        job.overlayChunkArray->beginViewRequest();
 
     RenderContext ctx;
+    ctx.renderJob = job;
     ctx.serial = ++_renderSerial;
-    ctx.fbW = fbW;
-    ctx.fbH = fbH;
-    ctx.surfacePtrX = _surfacePtrX;
-    ctx.surfacePtrY = _surfacePtrY;
-    ctx.scale = _scale;
-    ctx.zOff = _zOff;
-    ctx.zOffWorldDir = _zOffWorldDir;
-    ctx.startLevel = renderStartLevel(dynamic_cast<PlaneSurface*>(surf.get()) == nullptr);
-    ctx.samplingMethod = _samplingMethod;
-    ctx.compositeSettings = _compositeSettings;
-    ctx.windowLow = _windowLow;
-    ctx.windowHigh = _windowHigh;
-    ctx.baseColormapId = _baseColormapId;
-    ctx.surf = std::move(surf);
-    ctx.chunkArray = _chunkArray;
-    ctx.overlayVolume = _overlayVolume;
-    ctx.overlayChunkArray = _overlayChunkArray;
-    ctx.overlayOpacity = _overlayOpacity;
-    ctx.overlayColormapId = _overlayColormapId;
-    ctx.overlayWindowLow = _overlayWindowLow;
-    ctx.overlayWindowHigh = _overlayWindowHigh;
-    ctx.interactivePreview = _interactivePreview;
-    ctx.directInteractionRender = _directInteractionRenderRequest;
-    ctx.replayFrameStartedAt = _replayFrameStartedAt;
-    ctx.genCache = _genSurfaceCache;
-    ctx.genCacheDirty = _genCacheDirty;
-    ctx.traceReason = std::string(reasonView);
-    ctx.viewerSurfaceName = _surfName;
-    ctx.submittedAt = submittedAt;
-    if (ProfileLoggingEnabled()) {
-        ctx.profileReason = reason ? reason : "";
-        ctx.profileCaller = profileCaller(caller);
-    }
+    ctx.fbW = job.fbW;
+    ctx.fbH = job.fbH;
+    ctx.surfacePtrX = job.surfacePtrX;
+    ctx.surfacePtrY = job.surfacePtrY;
+    ctx.scale = job.scale;
+    ctx.zOff = job.zOff;
+    ctx.zOffWorldDir = job.zOffWorldDir;
+    ctx.startLevel = job.startLevel;
+    ctx.samplingMethod = job.samplingMethod;
+    ctx.compositeSettings = job.compositeSettings;
+    ctx.windowLow = job.windowLow;
+    ctx.windowHigh = job.windowHigh;
+    ctx.baseColormapId = job.baseColormapId;
+    ctx.surf = job.surf;
+    ctx.chunkArray = job.chunkArray;
+    ctx.overlayVolume = job.overlayVolume;
+    ctx.overlayChunkArray = job.overlayChunkArray;
+    ctx.overlayOpacity = job.overlayOpacity;
+    ctx.overlayColormapId = job.overlayColormapId;
+    ctx.overlayWindowLow = job.overlayWindowLow;
+    ctx.overlayWindowHigh = job.overlayWindowHigh;
+    ctx.interactivePreview = job.interactivePreview;
+    ctx.directInteractionRender = job.directInteractionRender;
+    ctx.replayFrameStartedAt = job.replayFrameStartedAt;
+    ctx.genCache = job.genCache;
+    ctx.genCacheDirty = job.genCacheDirty;
+    ctx.profileReason = job.profileReason;
+    ctx.profileCaller = job.profileCaller;
+    ctx.traceReason = job.traceReason;
+    ctx.viewerSurfaceName = job.surfaceName;
+    ctx.submittedAt = job.submittedAt;
     _genCacheDirty = false;
     if (_replayFrameTimer.isValid()) {
         auto& timing = ctx.interactivePreview ? _replayInteractiveTiming : _replayStableTiming;
@@ -3051,18 +3113,13 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
             timing.requestMs = timing.submitMs;
         }
     }
-    if (profile.enabled()) {
-        profile.setDetails(std::format(
-            "action=worker_start serial={} size={}x{} level={} interactive={}",
-            ctx.serial, ctx.fbW, ctx.fbH, ctx.startLevel, ctx.interactivePreview));
-    }
-    if (traceRender) {
-        Logger()->info("[vc3d-render] submit surf='{}' serial={} reason='{}' inFlightBefore={} concurrent={} interactive={} level={} fb={}x{} ptr=({:.1f},{:.1f}) scale={:.4f}",
+    if (!ctx.traceReason.empty()) {
+        Logger()->info("[vc3d-render] submit surf='{}' serial={} request={} reason='{}' inFlightBefore={} concurrent=n interactive={} level={} fb={}x{} ptr=({:.1f},{:.1f}) scale={:.4f}",
                        _surfName,
                        ctx.serial,
-                       reasonView,
+                       job.requestId,
+                       ctx.traceReason,
                        workersInFlight,
-                       launchConcurrent ? "y" : "n",
                        ctx.interactivePreview ? "y" : "n",
                        ctx.startLevel,
                        ctx.fbW,
@@ -3089,9 +3146,10 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
                     ? std::chrono::duration_cast<std::chrono::milliseconds>(
                           result->workerStartedAt - result->submittedAt).count()
                     : -1;
-            Logger()->info("[vc3d-render] worker-done surf='{}' serial={} reason='{}' submit_to_worker_ms={} worker_ms={} interactive={}",
+            Logger()->info("[vc3d-render] worker-done surf='{}' serial={} request={} reason='{}' submit_to_worker_ms={} worker_ms={} interactive={}",
                            result->viewerSurfaceName,
                            result->serial,
+                           result->renderJob.requestId,
                            result->traceReason,
                            submitToWorkerMs,
                            result->renderFrameElapsedMs,
@@ -3112,6 +3170,80 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     });
 }
 
+void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location caller)
+{
+    ProfileScope profile("submitRender", reason, caller);
+    const std::string_view reasonView(reason ? reason : "");
+    const bool traceRender = traceRenderReason(reasonView);
+    const auto submittedAt = std::chrono::steady_clock::now();
+    if (profile.enabled()) {
+        profile.setDetails(std::format(
+            "surf='{}' volume={} chunkArray={} busy={}",
+            _surfName, bool(_volume), bool(_chunkArray),
+            _renderWorkersInFlight.load(std::memory_order_acquire)));
+    }
+    if (_closing) {
+        profile.setDetails("action=skip closing");
+        return;
+    }
+
+    auto surf = _surfWeak.lock();
+    if (!surf || !_volume || !_chunkArray) {
+        profile.setDetails("action=skip missing_input");
+        return;
+    }
+
+    const int workersInFlight = _renderWorkersInFlight.load(std::memory_order_acquire);
+    if (workersInFlight > 0) {
+        const int fbW = !_framebuffer.isNull()
+            ? _framebuffer.width()
+            : (_view && _view->viewport() ? std::max(1, _view->viewport()->width()) : 1);
+        const int fbH = !_framebuffer.isNull()
+            ? _framebuffer.height()
+            : (_view && _view->viewport() ? std::max(1, _view->viewport()->height()) : 1);
+        auto job = captureRenderJob(reason, caller, surf, fbW, fbH, submittedAt);
+        if (!job) {
+            profile.setDetails("action=skip invalid_pending_job");
+            return;
+        }
+        if (traceRender) {
+            Logger()->info("[vc3d-render] queue-latest surf='{}' request={} reason='{}' inFlight={} direct={} replaced={}",
+                           _surfName,
+                           job->requestId,
+                           reasonView,
+                           workersInFlight,
+                           _directInteractionRenderRequest ? "y" : "n",
+                           _pendingRenderJob ? "y" : "n");
+        }
+        _pendingRenderJob = std::move(*job);
+        profile.setDetails("action=queued_latest_after_worker");
+        return;
+    }
+
+    resizeFramebuffer();
+    const int fbW = _framebuffer.width();
+    const int fbH = _framebuffer.height();
+    if (fbW <= 0 || fbH <= 0) {
+        if (profile.enabled()) {
+            profile.setDetails(std::format("action=skip invalid_framebuffer size={}x{}", fbW, fbH));
+        }
+        return;
+    }
+
+    auto job = captureRenderJob(reason, caller, surf, fbW, fbH, submittedAt);
+    if (!job) {
+        profile.setDetails("action=skip invalid_job");
+        return;
+    }
+    if (profile.enabled()) {
+        profile.setDetails(std::format(
+            "action=worker_start serial={} size={}x{} level={} interactive={}",
+            _renderSerial + 1, job->fbW, job->fbH, job->startLevel, job->interactivePreview));
+    }
+
+    submitRenderJob(std::move(*job));
+}
+
 void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult> result)
 {
     const auto finishEnteredAt = std::chrono::steady_clock::now();
@@ -3119,9 +3251,9 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
                          std::source_location::current());
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "result={} serial={} currentSerial={} pendingAfterWorker={}",
+            "result={} serial={} currentSerial={} pending={}",
             bool(result), result ? result->serial : 0, _renderSerial,
-            _renderPendingAfterWorker));
+            _pendingRenderJob.has_value()));
     }
     const int workersRemaining =
         std::max(0, _renderWorkersInFlight.fetch_sub(1, std::memory_order_acq_rel) - 1);
@@ -3131,17 +3263,17 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     }
     if (!result || result->serial != _renderSerial) {
         if (result && !result->traceReason.empty()) {
-            Logger()->info("[vc3d-render] drop-stale surf='{}' serial={} currentSerial={} reason='{}' workersRemaining={} pendingAfterWorker={}",
+            Logger()->info("[vc3d-render] drop-stale surf='{}' serial={} currentSerial={} request={} reason='{}' workersRemaining={} pending={}",
                            _surfName,
                            result->serial,
                            _renderSerial,
+                           result->renderJob.requestId,
                            result->traceReason,
                            workersRemaining,
-                           _renderPendingAfterWorker ? "y" : "n");
+                           _pendingRenderJob ? "y" : "n");
         }
-        if (_renderPendingAfterWorker && workersRemaining == 0) {
-            _renderPendingAfterWorker = false;
-            scheduleRender("stale render result had pending worker");
+        if (workersRemaining == 0) {
+            submitPendingRenderJobIfNeeded();
         }
         profile.setDetails("action=drop_stale_result");
         return;
@@ -3162,38 +3294,14 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             : -1;
 
     _framebuffer = std::move(result->framebuffer);
+    _displayedRenderJob = result->renderJob;
     syncCameraTransform();
     if (resultInteractive) {
         _replayInteractiveRenderSerial = result->serial;
     } else {
         _replayStableRenderSerial = result->serial;
     }
-    if (_interactivePreview)
-        updateIntersectionPreviewTransform();
-    else
-        scheduleIntersectionRender("stable render finished");
-    if (!_interactivePreview) {
-        if (auto surf = _surfWeak.lock()) {
-            const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
-            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-                const int startLevel = renderStartLevel(false);
-                const cv::Vec3f vx = plane->basisX();
-                const cv::Vec3f vy = plane->basisY();
-                const cv::Vec3f n = plane->normal({0, 0, 0});
-                const float halfW = static_cast<float>(_framebuffer.width()) * 0.5f / _scale;
-                const float halfH = static_cast<float>(_framebuffer.height()) * 0.5f / _scale;
-                const cv::Vec3f origin = vx * (_surfacePtrX - halfW)
-                                       + vy * (_surfacePtrY - halfH)
-                                       + plane->origin()
-                                       + n * _zOff;
-                prefetchPlaneHalo(origin, vx / _scale, vy / _scale, startLevel, options);
-                prefetchPlaneNormalNeighbors(*plane, startLevel, options);
-            } else {
-                prefetchSurfaceHalo(*surf, renderStartLevel(true), options,
-                                    _framebuffer.width(), _framebuffer.height());
-            }
-        }
-    }
+    clearIntersectionItems();
     _stableFramebuffer = _framebuffer.copy();
     _stableSurfX = result->surfacePtrX;
     _stableSurfY = result->surfacePtrY;
@@ -3216,9 +3324,10 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
                 ? std::chrono::duration_cast<std::chrono::milliseconds>(
                       finishEnteredAt - result->submittedAt).count()
                 : -1;
-        Logger()->info("[vc3d-render] finish surf='{}' serial={} reason='{}' submit_to_finish_ms={} queue_ms={} gui_ms={} worker_ms={} interactive={} fb={}x{}",
+        Logger()->info("[vc3d-render] finish surf='{}' serial={} request={} reason='{}' submit_to_finish_ms={} queue_ms={} gui_ms={} worker_ms={} interactive={} fb={}x{}",
                        _surfName,
                        result->serial,
+                       result->renderJob.requestId,
                        result->traceReason,
                        submitToFinishMs,
                        queueMs,
@@ -3234,9 +3343,10 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     if (!_replaySuppressViewportUpdates) {
         const bool useRepaint = result->directInteractionRender && directPresentUsesRepaint();
         if (!result->traceReason.empty()) {
-            Logger()->info("[vc3d-render] present surf='{}' serial={} reason='{}' direct={} mode={}",
+            Logger()->info("[vc3d-render] present surf='{}' serial={} request={} reason='{}' direct={} mode={}",
                            _surfName,
                            result->serial,
+                           result->renderJob.requestId,
                            result->traceReason,
                            result->directInteractionRender ? "y" : "n",
                            useRepaint ? "repaint" : "update");
@@ -3282,14 +3392,8 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     }
     updateStatusLabel();
 
-    if (_renderPendingAfterWorker && workersRemaining == 0) {
-        _renderPendingAfterWorker = false;
-        if (_directInteractionPendingAfterWorker) {
-            _directInteractionPendingAfterWorker = false;
-            renderVisible(true, "worker finished with pending direct interaction render");
-        } else {
-            scheduleRender("worker finished with pending render");
-        }
+    if (workersRemaining == 0) {
+        submitPendingRenderJobIfNeeded();
     }
     if (profile.enabled()) {
         profile.setDetails(std::format(
@@ -4918,6 +5022,20 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
 
 void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_location caller)
 {
+    (void)reason;
+    (void)caller;
+    if (!_closing) {
+        if (_intersectionRenderTimer) {
+            _intersectionRenderTimer->stop();
+        }
+        clearIntersectionItems();
+        _lastIntersectFp = {};
+        _intersectionGeometryCache = {};
+        _flattenedIntersectionCache = {};
+        _flattenedIntersectionDirtyCells.reset();
+    }
+    return;
+
     ProfileScope profile("renderIntersections", reason, caller);
     if (intersectionRenderingDisabledForLatencyDebug()) {
         clearIntersectionItems();

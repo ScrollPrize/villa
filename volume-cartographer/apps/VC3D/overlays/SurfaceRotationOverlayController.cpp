@@ -421,6 +421,8 @@ std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::currentSourceSurf
 void SurfaceRotationOverlayController::ensureWidgetForTarget()
 {
     clearWidgets();
+    return;
+
     if (!_rotateActive) {
         return;
     }

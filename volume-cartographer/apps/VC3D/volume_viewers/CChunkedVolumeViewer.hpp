@@ -331,9 +331,54 @@ private:
                              int fbW,
                              int fbH);
     void prefetchVisibleSurfaceChunks(int priorityOffset = 0);
+    struct GeneratedSurfaceCache;
+    struct PendingRenderJob {
+        std::uint64_t requestId = 0;
+        int fbW = 0;
+        int fbH = 0;
+        float surfacePtrX = 0.0f;
+        float surfacePtrY = 0.0f;
+        float scale = 1.0f;
+        float zOff = 0.0f;
+        cv::Vec3f zOffWorldDir{0, 0, 0};
+        int startLevel = 0;
+        vc::Sampling samplingMethod = vc::Sampling::Trilinear;
+        CompositeRenderSettings compositeSettings;
+        float windowLow = 0.0f;
+        float windowHigh = 255.0f;
+        std::string baseColormapId;
+        std::shared_ptr<Surface> surf;
+        std::string surfaceName;
+        std::shared_ptr<vc::render::ChunkCache> chunkArray;
+        std::shared_ptr<Volume> overlayVolume;
+        std::shared_ptr<vc::render::ChunkCache> overlayChunkArray;
+        float overlayOpacity = 0.0f;
+        std::string overlayColormapId;
+        float overlayWindowLow = 0.0f;
+        float overlayWindowHigh = 255.0f;
+        bool interactivePreview = false;
+        bool directInteractionRender = false;
+        std::chrono::steady_clock::time_point replayFrameStartedAt;
+        std::shared_ptr<GeneratedSurfaceCache> genCache;
+        bool genCacheDirty = false;
+        std::string profileReason;
+        std::string profileCaller;
+        std::string traceReason;
+        std::chrono::steady_clock::time_point submittedAt;
+    };
+    std::optional<PendingRenderJob> captureRenderJob(
+        const char* reason,
+        std::source_location caller,
+        const std::shared_ptr<Surface>& surf,
+        int fbW,
+        int fbH,
+        std::chrono::steady_clock::time_point submittedAt);
+    void submitRenderJob(PendingRenderJob job);
+    void submitPendingRenderJobIfNeeded();
+    static bool renderJobsEquivalentForDisplay(const PendingRenderJob& a,
+                                               const PendingRenderJob& b);
     struct RenderContext;
     struct RenderResult;
-    struct GeneratedSurfaceCache;
     struct ReplayRenderResultQueue;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
@@ -393,10 +438,11 @@ private:
     float _stableScale = 1.0f;
     bool _stableFramebufferValid = false;
     std::atomic<int> _renderWorkersInFlight{0};
-    bool _renderPendingAfterWorker = false;
+    std::optional<PendingRenderJob> _pendingRenderJob;
+    std::optional<PendingRenderJob> _displayedRenderJob;
     bool _directInteractionRenderRequest = false;
-    bool _directInteractionPendingAfterWorker = false;
     std::uint64_t _renderSerial = 0;
+    std::uint64_t _renderRequestSerial = 0;
     std::uint64_t _replayCachedPreviewSerial = 0;
     std::uint64_t _replayInteractiveRenderSerial = 0;
     std::uint64_t _replayStableRenderSerial = 0;

@@ -234,7 +234,7 @@ private slots:
         QVERIFY(sawPoint);
     }
 
-    void atlasOverlayControllerEmitsLineAndAnchorPoints()
+    void atlasOverlayControllerRebuildSuppressedByOverlayKillSwitch()
     {
         FakeViewer viewer;
 
@@ -260,7 +260,7 @@ private slots:
         controller.attachViewer(&viewer);
         controller.setAtlas(atlas, surface, range);
 
-        QCOMPARE(viewer.scene().items().size(), 2);
+        QCOMPARE(viewer.scene().items().size(), 0);
         const auto initialBounds = controller.surfaceBounds();
         QVERIFY(initialBounds.has_value());
         QVERIFY(std::isfinite(initialBounds->right()));
@@ -281,12 +281,10 @@ private slots:
         controller.setSearchPreviewFiber({0, previewMapping});
         controller.setSearchPreviewFiber({1, shiftedPreviewMapping});
 
-        // Saved atlas line + saved control point group + two cross markers
-        // (two line strips each) + two line-only preview mappings.
-        QCOMPARE(viewer.scene().items().size(), 8);
+        QCOMPARE(viewer.scene().items().size(), 0);
 
         controller.clearSearchPreviews();
-        QCOMPARE(viewer.scene().items().size(), 2);
+        QCOMPARE(viewer.scene().items().size(), 0);
 
         vc::atlas::Atlas updatedAtlas;
         vc::atlas::FiberMapping updatedMapping;
@@ -296,10 +294,10 @@ private slots:
         controller.setAtlas(updatedAtlas, surface, range);
         controller.refreshViewer(&viewer);
 
-        QCOMPARE(viewer.scene().items().size(), 1);
+        QCOMPARE(viewer.scene().items().size(), 0);
     }
 
-    void atlasControlPointsOverlayEmitsLinePointsAndSelection()
+    void atlasControlPointsOverlayRebuildSuppressedByOverlayKillSwitch()
     {
         FakeViewer viewer;
         viewer.setSurfName("segmentation");
@@ -332,17 +330,14 @@ private slots:
         QCOMPARE(viewer.scene().items().size(), 0);
 
         controller.setOverlayEnabled(true);
-        QCOMPARE(viewer.scene().items().size(), 1);
-        const QRectF pointBounds = viewer.scene().items().front()->sceneBoundingRect();
-        QCOMPARE(pointBounds.center().x(), 6.0);
-        QVERIFY(std::abs(pointBounds.center().y() - (2.0 + (1.0 / 3.0) * 10.0)) < 1.0e-5);
+        QCOMPARE(viewer.scene().items().size(), 0);
 
         controller.setResults({a, b, invalid});
         controller.setOverlayEnabled(true);
-        QVERIFY(viewer.scene().items().size() >= 2);
+        QCOMPARE(viewer.scene().items().size(), 0);
 
         controller.setSelectedPoint(QStringLiteral("fiber_a"), 1);
-        QVERIFY(viewer.scene().items().size() >= 2);
+        QCOMPARE(viewer.scene().items().size(), 0);
     }
 
     void atlasControlPointsDockLoadsGroupedRows()

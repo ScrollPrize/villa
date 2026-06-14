@@ -1862,11 +1862,8 @@ bool LineAnnotationController::updateIntersectionFollowSlice(bool sourceSideFlag
     follow.linePosition = linePosition;
     if (auto* viewer = follow.viewer.data()) {
         viewer->centerOnVolumePoint(toVec3f(origin), false);
-        viewer->renderVisible(true, reason);
-        if (_fiberSliceOverlay) {
-            _fiberSliceOverlay->refreshViewer(viewer);
-        }
     }
+    (void)reason;
     return true;
 }
 
@@ -2435,6 +2432,10 @@ void LineAnnotationController::rebuildIntersectionInspection()
                             if (!chunkedViewer || !_state || !session) {
                                 return;
                             }
+                            chunkedViewer->clearOverlayGroup(
+                                "line_annotation_overlay_" + surfaceName);
+                            return;
+
                             double linePosition = fixedLinePosition;
                             if (useFollowPosition && _intersectionInspection) {
                                 const auto& follow = sourceFollowFlag
@@ -2563,6 +2564,9 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     if (!chunkedViewer || !session) {
                         return;
                     }
+                    chunkedViewer->clearOverlayGroup("line_annotation_overlay_" + key);
+                    return;
+
                     vc3d::line_annotation::GeneratedViews views;
                     views.linePoints = generatedLinePoints(linePoints);
                     views.lineUpVectors = lineUpVectors;

@@ -938,6 +938,8 @@ void ViewerOverlayControllerBase::rebuildOverlay(VolumeViewerBase* viewer)
     if (!viewer) {
         return;
     }
+    viewer->clearOverlayGroup(_overlayGroupKey);
+    return;
 
     QElapsedTimer timer;
     timer.start();

@@ -169,11 +169,15 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                            const std::string& surfaceName,
                            const GeneratedOverlay& overlay)
 {
+    (void)overlay;
     if (!viewer) {
         return;
     }
 
     const auto key = "line_annotation_overlay_" + surfaceName;
+    viewer->clearOverlayGroup(key);
+    return;
+
     std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
     primitives.reserve(3);
 
