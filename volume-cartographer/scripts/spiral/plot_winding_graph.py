@@ -20,24 +20,33 @@ preserved). Pass --no-loops to hide them.
 
 Layout (the stylised picture the result implies):
 
-  * x-axis = absolute model winding number. A patch's *entry* point sits at
+  * x-axis = absolute model winding number. A patch's *entry* point has winding
     `seed_model_winding - acc`, where acc = winding(seed) - winding(entry) is
     rebuilt by walking the path hops (acc -= intra_patch_strip_delta + edge_delta
-    per hop, exactly as the BFS accumulates it). Integer x are the theta=0 seams.
+    per hop, exactly as the BFS accumulates it). Every recorded winding delta is
+    an integer seam count, so a point's winding number is the integer w0 - acc.
+    Integer x are the theta=0 seams (the transitions between windings); a winding
+    is the *range* between two consecutive seams. We therefore draw each point
+    half a winding in from its seam -- at its band centre, x = winding + 0.5 --
+    and label each winding number there too. Points (entries, departures,
+    anchors) thus sit *inside* their winding, never on a boundary; the seams
+    carry only tick marks.
   * y = one row per patch. Rows are ordered by BFS depth (the seed on top); the
     patches at a given depth each take their own slot, stacked just below one
     another, so a depth occupies several slightly-offset rows and no two patches
     ever share a row. Depth bands are shaded alternately and depth numbers run
     down the right edge.
-  * Each patch is a short horizontal line spanning the winding extent of its
-    known points (entry, the departure point of each outgoing edge, any anchors),
-    with a crimson tick at each integer winding (theta=0 seam) genuinely crossed
-    *between* those known points. The crossings come from the integer seam-count
-    deltas recorded on the within-patch strips (intra_patch_strip_delta /
-    anchor_to_entry_delta), so a patch with a single known winding-point shows
-    none. (A short min-width line is still drawn for such a patch so it stays
-    visible, but it carries no tick.) Its full patch id is listed in a left-hand
-    column, aligned to its row.
+  * Each patch is a short horizontal line spanning its known points (entry, the
+    departure point of each outgoing edge, any anchors), each placed at its band
+    centre. The line pokes seg_min_width past the extreme stars on each side, so it
+    extends a little beyond its end points while staying inside the bounding
+    windings (with the default it reaches the 1/4 and 3/4 marks of its first and
+    last winding box); a single-winding patch becomes a short stub centred in its
+    one band. A crimson tick marks each integer winding (theta=0 seam) genuinely
+    crossed *between* those known points; the crossings come from the integer
+    seam-count deltas recorded on the within-patch strips (intra_patch_strip_delta
+    / anchor_to_entry_delta), so a single-winding patch shows none. Its full patch
+    id is listed in a left-hand column, aligned to its row.
   * Each relative-pcl edge runs from the parent's departure point (entry winding +
     intra_patch_strip_delta) to the child's entry point; its horizontal run equals
     the edge's winding delta (e minus d), so it stays near-vertical in x.
@@ -237,7 +246,7 @@ function info(el) {
     return 'inconsistent loop — rel pcl ' + d.pcl + ' "' + (d.pclName || '') + '"'
          + '\npoint ' + d.fromPoint + ' on ' + d.from
          + '\n  ↔ point ' + d.toPoint + ' on ' + d.to
-         + '\nwinding holonomy ' + d.holo + '   (edge Δ ' + d.edgeDelta + ')';
+         + '\nwinding holonomy ' + d.holo + '   (edge Δwinding ' + d.edgeDelta + ')';
   if (d.kind === 'anchor')
     return 'abs anchor — pcl ' + d.pcl + ' "' + (d.pclName || '') + '"  point ' + d.point
          + '\nannotation ' + d.annotation + ' → seed ' + d.vote + xyz(d) + '\non patch ' + d.patch;
@@ -378,11 +387,12 @@ def write_html(geom, output_html):
         y = node_y[pid]
         xl, xr, yc = X(lo), X(hi), Y(y)
         is_seed = pid == seed
-        # winding span of the known points (integers, post-rounding). A patch whose
+        # winding span of the known points. Points sit at band centres (winding +
+        # 0.5), so the winding number a centre belongs to is floor(x). A patch whose
         # span covers more than one winding crosses theta=0, so a single winding
         # number is meaningless -- the hover reports the range instead.
         rlo, rhi = node_raw_extent[pid]
-        wlo, whi = int(round(rlo)), int(round(rhi))
+        wlo, whi = int(math.floor(rlo)), int(math.floor(rhi))
         P.append(f'<g class="patch{" seed" if is_seed else ""}" data-kind="patch" data-patch="{a(pid)}" '
                  f'data-depth="{nodes[pid]["depth"]}" data-winding-lo="{wlo}" data-winding-hi="{whi}">')
         P.append(f'<line class="hit" x1="{xl:.1f}" y1="{yc:.1f}" x2="{xr:.1f}" y2="{yc:.1f}"/>')
@@ -450,9 +460,15 @@ def write_html(geom, output_html):
 
     # --------------------------------------------------------------- bottom axis
     Bp = [f'<svg class="inner" width="{PW:.0f}" height="{BH}" xmlns="http://www.w3.org/2000/svg">']
+    # Tick marks sit on the integer seams (theta=0, the transitions between
+    # windings)...
     for n in range(seam_lo, seam_hi + 1):
         xx = X(n)
         Bp.append(f'<line class="atick" x1="{xx:.1f}" y1="0" x2="{xx:.1f}" y2="7"/>')
+    # ...but the winding number labels the *range* between two seams, so it is
+    # centred in the gap (at n + 0.5), not on the seam at the winding's start.
+    for n in range(seam_lo, seam_hi):
+        xx = X(n + 0.5)
         Bp.append(f'<text class="albl" x="{xx:.1f}" y="21" text-anchor="middle">{n}</text>')
     Bp.append('</svg>')
 
@@ -505,10 +521,10 @@ def write_html(geom, output_html):
               help='winding_votes json written by find_inconsistent_windings.py.')
 @click.option('--output', default=None, type=click.Path(dir_okay=False),
               help='Output image path (default: winding_graph_<patch>.png next to the votes json).')
-@click.option('--seg-min-width', default=0.18, type=float,
-              help='How far (in windings) each end of a patch line pokes out past its extreme known '
-                   'points, so the ends clear the abs-winding seams (and a single-point patch is '
-                   'still visible).')
+@click.option('--seg-min-width', default=0.25, type=float,
+              help='How far (in windings, must be < 0.5) each end of a patch line pokes past its '
+                   'extreme known point. The default 0.25 runs the ends to the 1/4 and 3/4 marks of '
+                   'the first / last winding box; it also gives a single-winding patch a visible stub.')
 @click.option('--slot-height', default=1.0, type=float,
               help='Vertical spacing between adjacent patch rows (each patch gets its own row).')
 @click.option('--depth-gap', default=0.8, type=float,
@@ -546,9 +562,13 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
     w0 = meta['seed_model_winding']
 
     # --- per-patch x coordinates: entry, the departure of each outgoing edge,
-    #     and any anchors sitting on the patch (all as absolute model winding). ---
+    #     and any anchors sitting on the patch. The point's winding number is the
+    #     integer w0 - acc; we plot it at that winding's band CENTRE (winding +
+    #     0.5) so it sits inside the winding range rather than on the seam. Every
+    #     departure / anchor / edge offset is an integer winding delta, so they
+    #     inherit the +0.5 and land on band centres too. ---
     def entry_x(pid):
-        return w0 - nodes[pid]['acc']
+        return w0 - nodes[pid]['acc'] + 0.5
 
     departure_x = {}      # child_patch -> x of the departure point on its parent
     point_xs = defaultdict(list)
@@ -565,15 +585,17 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
         anchors_by_patch[v['abs_patch_id']].append((ax, v))
         point_xs[v['abs_patch_id']].append(ax)
 
-    # patch segment extent [lo, hi]. node_raw_extent keeps the *unpadded* span of
-    # the known points: theta=0 ticks are drawn over that, since the gaps between
-    # known points are integer seam-crossing counts (intra_patch_strip_delta /
-    # anchor_to_entry_delta), so integers strictly inside the raw span are exactly
-    # the genuine crossings. node_extent pads both ends by seg_min_width so the line
-    # always pokes out a little past its extreme known points (the abs-winding
-    # seams) -- this is what gives a single-known-point patch a visible length, and
-    # for a multi-winding patch it keeps the ends clear of the seam lines. Ticks use
-    # the raw span, so the padding never fakes a crossing.
+    # patch segment extent [lo, hi]. node_raw_extent keeps the band-centre span of
+    # the known points (the extreme stars): theta=0 ticks are drawn over that, since
+    # the gaps between known points are integer seam-crossing counts
+    # (intra_patch_strip_delta / anchor_to_entry_delta), so integers strictly inside
+    # the band-centre span are exactly the genuine crossings. node_extent then pokes
+    # each end seg_min_width past the extreme star, so the line runs a little beyond
+    # its end points (and a single-winding patch, whose raw span is zero, becomes a
+    # visible stub centred in its band). seg_min_width < 0.5 keeps both ends inside
+    # the bounding windings -- with the default 0.25 the ends land at the 1/4 and 3/4
+    # marks of the first / last winding box. Ticks use the raw span, so the poke
+    # never fakes a crossing.
     node_extent = {}
     node_raw_extent = {}
     for pid in nodes:
@@ -709,7 +731,17 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
                     fontsize=label_fontsize, color='0.10' if pid == seed else '0.35',
                     fontweight='bold' if pid == seed else 'normal', zorder=5)
 
-    ax.set_xlabel('absolute model winding number  (integer = theta=0 seam)')
+    ax.set_xlabel('absolute model winding number  (number sits in its winding; ticks = theta=0 seams)')
+    # x ticks: the integer seams (theta=0, transitions between windings) carry the
+    # tick marks, but each winding number labels the *range* between two seams, so
+    # it is centred in the gap (at n + 0.5) rather than on the seam at its start.
+    seam_lo, seam_hi = int(np.floor(x_lo)), int(np.ceil(x_hi))
+    gaps = list(range(seam_lo, seam_hi))
+    ax.set_xticks([n + 0.5 for n in gaps])
+    ax.set_xticklabels([str(n) for n in gaps])
+    ax.set_xticks(list(range(seam_lo, seam_hi + 1)), minor=True)
+    ax.tick_params(axis='x', which='major', length=0)
+    ax.tick_params(axis='x', which='minor', length=5)
     # BFS-depth scale on the right edge (the left edge is the patch-id column).
     depths_sorted = sorted(depth_band)
     ax.set_yticks([0.5 * (depth_band[d][0] + depth_band[d][1]) for d in depths_sorted])
@@ -783,7 +815,7 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
         for pid in ordered:
             mark = ' [seed]' if pid == seed else (' [anchor]' if pid in anchors_by_patch else '')
             print(f'  {node_id[pid]:3d}: d{nodes[pid]["depth"]:<2d} '
-                  f'w={entry_x(pid):6.2f}  {pid}{mark}')
+                  f'w={entry_x(pid) - 0.5:6.2f}  {pid}{mark}')
 
 
 if __name__ == '__main__':
