@@ -333,7 +333,7 @@ def build_main_html(geom):
         return esc(str(s), quote=True)
 
     def xyz_attrs(zyx):
-        """data-x/y/z (volume xyz) from a downsampled [z, y, x] triple, if present."""
+        """data-x/y/z (full-res volume xyz) from a raw, un-downsampled [z, y, x] triple, if present."""
         if not zyx or len(zyx) != 3:
             return ''
         z, y, x = zyx
@@ -404,7 +404,7 @@ def build_main_html(geom):
         cx, cy = X(departure_x[child]), Y(node_y[parent])
         P.append(f'<g class="dot" data-kind="dot" data-patch="{a(parent)}" data-to="{a(child)}" '
                  f'data-pcl="{a(h["rel_pcl_id"])}" data-pcl-name="{a(h.get("rel_pcl_name") or "")}" '
-                 f'data-point="{a(h["from_point_id"])}"{xyz_attrs(h.get("from_zyx_downsampled"))}>')
+                 f'data-point="{a(h["from_point_id"])}"{xyz_attrs(h.get("from_zyx_raw"))}>')
         P.append(f'<circle class="hitdot" cx="{cx:.1f}" cy="{cy:.1f}" r="6"/>')
         P.append(f'<circle class="depdot" cx="{cx:.1f}" cy="{cy:.1f}" r="2.4"/>')
         P.append('</g>')
@@ -420,7 +420,7 @@ def build_main_html(geom):
                      f'data-point="{a(v["abs_point_id"])}" '
                      f'data-annotation="{v["abs_winding_annotation"]:g}" '
                      f'data-vote="{v["expected_seed_winding_rounded"]}"'
-                     f'{xyz_attrs(v.get("abs_zyx_downsampled"))}>')
+                     f'{xyz_attrs(v.get("abs_zyx_raw"))}>')
             P.append(f'<polygon class="star" points="{_star_points(cx, yc, 8)}" fill="{col}"/>')
             if annotate_votes:
                 P.append(f'<text class="votelabel" x="{cx:.1f}" y="{yc - 11:.1f}" fill="{col}" '
@@ -676,8 +676,8 @@ def build_loops_html(cycles, total, ncols=6):
         return esc(str(s), quote=True)
 
     def xyz_attrs(zyx, prefix=''):
-        """data-[prefix]x/y/z (volume xyz) from a downsampled [z, y, x] triple, if
-        present. prefix='from-'/'to-' tags the two ends of a pcl edge."""
+        """data-[prefix]x/y/z (full-res volume xyz) from a raw, un-downsampled [z, y, x]
+        triple, if present. prefix='from-'/'to-' tags the two ends of a pcl edge."""
         if not zyx or len(zyx) != 3:
             return ''
         z, y, x = zyx
@@ -707,13 +707,13 @@ def build_loops_html(cycles, total, ncols=6):
         top_pt, bot_pt = [None] * m, [None] * m
         for j, st in enumerate(steps):
             bot_pt[j] = (st['rel_pcl_id'], st.get('rel_pcl_name'), st['from_point_id'],
-                         patches[j], st.get('from_zyx_downsampled'))
+                         patches[j], st.get('from_zyx_raw'))
             top_pt[j + 1] = (st['rel_pcl_id'], st.get('rel_pcl_name'), st['to_point_id'],
-                             patches[j + 1], st.get('to_zyx_downsampled'))
+                             patches[j + 1], st.get('to_zyx_raw'))
         bot_pt[m - 1] = (cs['rel_pcl_id'], cs.get('rel_pcl_name'), cs['from_point_id'],
-                         patches[m - 1], cs.get('from_zyx_downsampled'))
+                         patches[m - 1], cs.get('from_zyx_raw'))
         top_pt[0] = (cs['rel_pcl_id'], cs.get('rel_pcl_name'), cs['to_point_id'],
-                     patches[0], cs.get('to_zyx_downsampled'))
+                     patches[0], cs.get('to_zyx_raw'))
 
         S = [f'<svg class="loop" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
              f'xmlns="http://www.w3.org/2000/svg">']
@@ -729,8 +729,8 @@ def build_loops_html(cycles, total, ncols=6):
                      f'data-from="{a(st["from_patch"])}" data-to="{a(st["to_patch"])}" '
                      f'data-from-point="{a(st["from_point_id"])}" data-to-point="{a(st["to_point_id"])}" '
                      f'data-delta="{st["edge_winding_delta"]:+d}"'
-                     f'{xyz_attrs(st.get("from_zyx_downsampled"), "from-")}'
-                     f'{xyz_attrs(st.get("to_zyx_downsampled"), "to-")}>')
+                     f'{xyz_attrs(st.get("from_zyx_raw"), "from-")}'
+                     f'{xyz_attrs(st.get("to_zyx_raw"), "to-")}>')
             S.append(f'<line class="tedge" x1="{CX}" y1="{ya:.1f}" x2="{CX}" y2="{mid - NAMEGAP:.1f}"/>')
             S.append(f'<line class="tedge" x1="{CX}" y1="{mid + NAMEGAP:.1f}" x2="{CX}" y2="{yb:.1f}"/>')
             S.append(f'<text class="elbl" x="{CX}" y="{mid:.1f}" text-anchor="middle">{esc(txt)}</text>')
@@ -744,8 +744,8 @@ def build_loops_html(cycles, total, ncols=6):
                  f'data-from="{a(cs["from_patch"])}" data-to="{a(cs["to_patch"])}" '
                  f'data-from-point="{a(cs["from_point_id"])}" data-to-point="{a(cs["to_point_id"])}" '
                  f'data-delta="{cs["edge_winding_delta"]:+d}" data-holo="{c["loop_winding_delta"]:+d}"'
-                 f'{xyz_attrs(cs.get("from_zyx_downsampled"), "from-")}'
-                 f'{xyz_attrs(cs.get("to_zyx_downsampled"), "to-")}>')
+                 f'{xyz_attrs(cs.get("from_zyx_raw"), "from-")}'
+                 f'{xyz_attrs(cs.get("to_zyx_raw"), "to-")}>')
         S.append(f'<path class="closing" d="M {CX},{yb0:.1f} C {CX + BOW},{yb0:.1f} '
                  f'{CX + BOW},{yt0:.1f} {CX},{yt0:.1f}" marker-end="url(#ahm)"/>')
         S.append(f'<text class="clbl" x="{RLBL}" y="{midc:.1f}">{esc(ctxt)}</text>')

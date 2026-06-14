@@ -332,7 +332,9 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches):
                     'winding': int(round(w)),
                     'ij': np.array(p['on_patch']['ij'], dtype=np.float32),
                     'distance': float(p['on_patch'].get('distance', float('nan'))),
-                    'zyx': p['zyx'],
+                    # Raw (full-resolution, un-downsampled) [z, y, x]; point['p'] is the
+                    # raw [x, y, z] straight from the pcl json (point['zyx'] is /df).
+                    'zyx': np.asarray(p['p'], dtype=np.float32)[::-1],
                 })
     return anchors
 
@@ -371,10 +373,11 @@ def build_rel_adjacency(cross_patch_pcls, patches):
             dwind = int(round(wb - wa))
             ija = np.array(pa['on_patch']['ij'], dtype=np.float32)
             ijb = np.array(pb['on_patch']['ij'], dtype=np.float32)
-            # Downsampled (model-space) [z, y, x] of each attached point, so the
-            # departure/arrival dots can be located in the volume later.
-            za = np.asarray(pa['zyx'], dtype=np.float32)
-            zb = np.asarray(pb['zyx'], dtype=np.float32)
+            # Raw (full-resolution, un-downsampled) [z, y, x] of each attached point, so
+            # the departure/arrival dots can be located in the full-res volume later.
+            # point['p'] is the raw [x, y, z] from the pcl json (point['zyx'] is /df).
+            za = np.asarray(pa['p'], dtype=np.float32)[::-1]
+            zb = np.asarray(pb['p'], dtype=np.float32)[::-1]
             common = {'pcl_id': int(pid), 'pcl_name': pcl.get('name'), 'source_file': pcl.get('source_file')}
             adjacency.setdefault(ida, []).append({
                 **common, 'neighbor': idb, 'from_ij': ija, 'to_ij': ijb,
@@ -422,8 +425,8 @@ def build_loop_cycles(loops, tree_edge_by_child):
             return {'from_patch': a, 'to_patch': b,
                     'rel_pcl_id': hop['rel_pcl_id'], 'rel_pcl_name': hop['rel_pcl_name'],
                     'from_point_id': hop['from_point_id'], 'to_point_id': hop['to_point_id'],
-                    'from_zyx_downsampled': hop['from_zyx_downsampled'],
-                    'to_zyx_downsampled': hop['to_zyx_downsampled'],
+                    'from_zyx_raw': hop['from_zyx_raw'],
+                    'to_zyx_raw': hop['to_zyx_raw'],
                     'edge_winding_delta': hop['edge_winding_delta'], 'kind': 'tree'}
         hop = tree_edge_by_child.get(a)
         assert hop is not None and hop['from_patch'] == b, (a, b)
@@ -432,8 +435,8 @@ def build_loop_cycles(loops, tree_edge_by_child):
         return {'from_patch': a, 'to_patch': b,
                 'rel_pcl_id': hop['rel_pcl_id'], 'rel_pcl_name': hop['rel_pcl_name'],
                 'from_point_id': hop['to_point_id'], 'to_point_id': hop['from_point_id'],
-                'from_zyx_downsampled': hop['to_zyx_downsampled'],
-                'to_zyx_downsampled': hop['from_zyx_downsampled'],
+                'from_zyx_raw': hop['to_zyx_raw'],
+                'to_zyx_raw': hop['from_zyx_raw'],
                 'edge_winding_delta': -hop['edge_winding_delta'], 'kind': 'tree'}
 
     cycles = []
@@ -460,8 +463,8 @@ def build_loop_cycles(loops, tree_edge_by_child):
                 'from_patch': R, 'to_patch': P,
                 'rel_pcl_id': L['rel_pcl_id'], 'rel_pcl_name': L['rel_pcl_name'],
                 'from_point_id': L['to_point_id'], 'to_point_id': L['from_point_id'],
-                'from_zyx_downsampled': L['to_zyx_downsampled'],
-                'to_zyx_downsampled': L['from_zyx_downsampled'],
+                'from_zyx_raw': L['to_zyx_raw'],
+                'to_zyx_raw': L['from_zyx_raw'],
                 'edge_winding_delta': -L['edge_winding_delta'], 'kind': 'closing',
             },
         })
@@ -625,7 +628,7 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
             'abs_patch_id': path[-1]['to_patch'] if path else patch_id,
             'abs_ij': anchor['ij'].tolist(),
             'abs_distance_to_patch': anchor['distance'],
-            'abs_zyx_downsampled': _to_py(anchor['zyx']),
+            'abs_zyx_raw': _to_py(anchor['zyx']),
             # winding(seed) = acc_seed_minus_entry + abs_winding + anchor_to_entry_delta
             'acc_seed_minus_entry': acc,
             'anchor_to_entry_delta': anchor_strip['delta_windings'],
@@ -698,8 +701,8 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
                     'to_ij': edge['to_ij'].tolist(),
                     'from_point_id': edge['from_point_id'],
                     'to_point_id': edge['to_point_id'],
-                    'from_zyx_downsampled': _to_py(edge['from_zyx']),
-                    'to_zyx_downsampled': _to_py(edge['to_zyx']),
+                    'from_zyx_raw': _to_py(edge['from_zyx']),
+                    'to_zyx_raw': _to_py(edge['to_zyx']),
                     'edge_winding_delta': edge['winding_delta'],
                     'from_depth': hops,
                     'to_depth': rstate['hops'],
@@ -739,8 +742,8 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
                 'to_ij': edge['to_ij'].tolist(),
                 'from_point_id': edge['from_point_id'],
                 'to_point_id': edge['to_point_id'],
-                'from_zyx_downsampled': _to_py(edge['from_zyx']),
-                'to_zyx_downsampled': _to_py(edge['to_zyx']),
+                'from_zyx_raw': _to_py(edge['from_zyx']),
+                'to_zyx_raw': _to_py(edge['to_zyx']),
                 'edge_winding_delta': edge['winding_delta'],
                 'intra_patch_strip_delta': strip['delta_windings'],
                 'intra_patch_residual_unwrapped_delta': strip['residual_unwrapped_delta_windings'],
@@ -800,7 +803,7 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
         'seed': {
             'ij': seed_ij.tolist(),
             'zyx_downsampled': seed_zyx_ds.tolist(),
-            'xyz_downsampled': [float(seed_zyx_ds[2]), float(seed_zyx_ds[1]), float(seed_zyx_ds[0])],
+            'xyz_raw': [float(seed_zyx_ds[2] * df), float(seed_zyx_ds[1] * df), float(seed_zyx_ds[0] * df)],
         },
         'dr_per_winding': dr_value,
         'model_raw_winding_at_seed': seed_model_winding,
