@@ -22,8 +22,7 @@ centre of S's grid):
 
   0. Direct votes: every absolute anchor attached to S votes for the seed's
      winding, propagating its absolute number from the anchor to the seed along
-     a within-patch strip (theta=0-unwrapped spiral-space radii), exactly as
-     before.
+     a within-patch strip by counting discrete theta=0 branch crossings.
   1. Long-range votes: BFS the patch graph backwards from S. Relative pcls
      supply the edges -- for each relative pcl we walk its attached points in
      annotation order and connect each *consecutive* cross-patch pair (so the
@@ -34,8 +33,8 @@ centre of S's grid):
      vote, propagated back to the seed through the accumulated chain.
 
 Concretely, with strip_delta(P, a, b) := winding(b) - winding(a) measured by the
-theta=0-unwrapped spiral-space radial gap of a within-P ij strip, each BFS state
-is (patch P, entry point q on P, acc) with acc := winding(seed) - winding(q):
+integer theta=0 branch transport of a within-P ij strip, each BFS state is
+(patch P, entry point q on P, acc) with acc := winding(seed) - winding(q):
 
   * a vote from anchor a (absolute winding w) on P is
         winding(seed) = acc + w + strip_delta(P, a, q);
@@ -50,13 +49,12 @@ Each within-patch winding delta is measured along a strip that follows a
 fringe-avoiding shortest path through the patch's *valid quads only* (a weighted
 Dijkstra on the quad grid, exactly like connect_overlapping_patches.py but within
 one patch), then transforms that path to spiral space and theta=0-unwraps its
-shifted radii. Sampling only valid quads keeps theta continuous so the unwrap
-counts real seam crossings (and whole windings on multi-winding patches) instead
-of being thrown off by the wild theta swings of invalid regions. The endpoints
-(annotated point / seed) are spliced onto the path's ends so the delta is between
-the true points. The unwrap is what lets two locally-annotated points either side
-of theta=0 (annotation difference 0, but ~dr apart in raw shifted radius) reconcile
-correctly, and what accumulates the winding changes across a multi-winding patch.
+shifted radii. Sampling only valid quads keeps theta continuous so seam-crossing
+counts reflect real branch transport (and whole windings on multi-winding patches)
+instead of being thrown off by the wild theta swings of invalid regions. The
+endpoints (annotated point / seed) are spliced onto the path's ends so the delta
+is between the true points. The residual unwrapped shifted-radius gap is retained
+as a diagnostic, but propagation uses the integer seam-crossing delta.
 
 The transform's flow field is shaped by the checkpoint's own z-range; the
 --z-range arg only filters patches/pcls (and must lie within the checkpoint's
@@ -233,16 +231,17 @@ def _polyline_ijs(points, step_size):
 
 def strip_winding_delta(transform, dr, graph, from_ij, to_ij, step_size):
     """Winding-number delta winding(to) - winding(from) between two ij points on
-    one patch, measured in theta=0-unwrapped spiral space along a fringe-avoiding
-    path through valid quads only.
+    one patch, measured as the integer theta=0 branch transport along a
+    fringe-avoiding path through valid quads only.
 
     Routes from `from_ij` to `to_ij` via a weighted Dijkstra on the patch's
     valid-quad grid (connect_overlapping_patches' medial-axis weighting, so the
     path hugs the middle of valid strips), splices the true endpoints onto the
     path's ends, samples the polyline at <= `step_size` (grid/vertex units),
-    transforms to spiral space, unwraps shifted-radii across the theta=0 seam and
-    returns the delta `to` minus `from`, with diagnostics. Returns None if the two
-    points are not connected through valid quads, or fewer than 2 samples survive.
+    transforms to spiral space, counts theta=0 seam crossings and returns the
+    discrete winding delta `to` minus `from`, with diagnostics. Returns None if
+    the two points are not connected through valid quads, or fewer than 2 samples
+    survive.
 
     Confining the strip to valid quads keeps theta continuous, so the unwrap
     (fit_spiral._unwrap_track_shifted_radii) stitches only genuine theta=0 seam
@@ -273,11 +272,20 @@ def strip_winding_delta(transform, dr, graph, from_ij, to_ij, step_size):
 
     spiral = transform(zyx)
     theta, _, shifted = fs.get_theta_and_radii(spiral[..., 1:], dr)
-    shifted_uw = fs._unwrap_track_shifted_radii(theta[None], shifted[None], dr)[0]
+    theta_diffs = theta.detach()[1:] - theta.detach()[:-1]
+    step_adjustment_windings = (
+        (theta_diffs > np.pi).to(shifted.dtype)
+        - (theta_diffs < -np.pi).to(shifted.dtype)
+    )
+    cumulative_adjustment_windings = step_adjustment_windings.sum()
+    delta_windings = int(round(float((-cumulative_adjustment_windings).item())))
 
-    delta_windings = float(((shifted_uw[-1] - shifted_uw[0]) / dr).item())
+    shifted_uw = fs._unwrap_track_shifted_radii(theta[None], shifted[None], dr)[0]
+    residual_windings = float(((shifted_uw[-1] - shifted_uw[0]) / dr).item())
     return {
         'delta_windings': delta_windings,
+        'residual_unwrapped_delta_windings': residual_windings,
+        'unwrap_adjustment_windings': float(cumulative_adjustment_windings.item()),
         'from_raw_winding': float((shifted[0] / dr).item()),
         'to_raw_winding': float((shifted[-1] / dr).item()),
         'strip_num_path_quads': len(centres),
@@ -499,6 +507,8 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
             # winding(seed) = acc_seed_minus_entry + abs_winding + anchor_to_entry_delta
             'acc_seed_minus_entry': acc,
             'anchor_to_entry_delta': anchor_strip['delta_windings'],
+            'anchor_to_entry_residual_unwrapped_delta': anchor_strip['residual_unwrapped_delta_windings'],
+            'anchor_to_entry_unwrap_adjustment': anchor_strip['unwrap_adjustment_windings'],
             'anchor_strip_num_path_quads': anchor_strip['strip_num_path_quads'],
             'anchor_strip_num_points': anchor_strip['strip_num_points'],
             'anchor_strip_num_invalid_dropped': anchor_strip['strip_num_invalid_dropped'],
@@ -555,6 +565,8 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
                 'to_point_id': edge['to_point_id'],
                 'edge_winding_delta': edge['winding_delta'],
                 'intra_patch_strip_delta': strip['delta_windings'],
+                'intra_patch_residual_unwrapped_delta': strip['residual_unwrapped_delta_windings'],
+                'intra_patch_unwrap_adjustment': strip['unwrap_adjustment_windings'],
                 'intra_patch_strip_num_path_quads': strip['strip_num_path_quads'],
                 'intra_patch_strip_num_points': strip['strip_num_points'],
                 'intra_patch_strip_num_invalid_dropped': strip['strip_num_invalid_dropped'],
