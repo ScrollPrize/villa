@@ -316,7 +316,8 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches):
                     'pcl_name': pcl.get('name'),
                     'source_file': pcl.get('source_file'),
                     'point_id': int(p['id']),
-                    'winding': w,
+                    # Absolute-winding annotations are integer winding numbers.
+                    'winding': int(round(w)),
                     'ij': np.array(p['on_patch']['ij'], dtype=np.float32),
                     'distance': float(p['on_patch'].get('distance', float('nan'))),
                     'zyx': p['zyx'],
@@ -353,18 +354,27 @@ def build_rel_adjacency(cross_patch_pcls, patches):
             if ida == idb:
                 continue
             wa, wb = float(pa['winding_annotation']), float(pb['winding_annotation'])
+            # Relative-winding annotations are integers; the edge delta is the integer
+            # number of windings between the two attached points.
+            dwind = int(round(wb - wa))
             ija = np.array(pa['on_patch']['ij'], dtype=np.float32)
             ijb = np.array(pb['on_patch']['ij'], dtype=np.float32)
+            # Downsampled (model-space) [z, y, x] of each attached point, so the
+            # departure/arrival dots can be located in the volume later.
+            za = np.asarray(pa['zyx'], dtype=np.float32)
+            zb = np.asarray(pb['zyx'], dtype=np.float32)
             common = {'pcl_id': int(pid), 'pcl_name': pcl.get('name'), 'source_file': pcl.get('source_file')}
             adjacency.setdefault(ida, []).append({
                 **common, 'neighbor': idb, 'from_ij': ija, 'to_ij': ijb,
                 'from_point_id': int(pa['id']), 'to_point_id': int(pb['id']),
-                'winding_delta': wb - wa,
+                'from_zyx': za, 'to_zyx': zb,
+                'winding_delta': dwind,
             })
             adjacency.setdefault(idb, []).append({
                 **common, 'neighbor': ida, 'from_ij': ijb, 'to_ij': ija,
                 'from_point_id': int(pb['id']), 'to_point_id': int(pa['id']),
-                'winding_delta': wa - wb,
+                'from_zyx': zb, 'to_zyx': za,
+                'winding_delta': -dwind,
             })
     return adjacency
 
@@ -451,11 +461,17 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
     seed_zyx_ds, seed_valid = patch.ij_to_zyx(torch.from_numpy(seed_ij).to(device))
     assert bool(seed_valid.item())
     seed_zyx_ds = seed_zyx_ds.cpu().numpy()
-    seed_model_winding = float(
+    seed_model_winding_raw = float(
         winding_at_points(transform, dr, torch.from_numpy(seed_zyx_ds).to(device)[None])[0].item()
     )
+    # Every other winding quantity here is integer (relative-pcl deltas, theta=0
+    # strip adjustments, absolute anchors). Round the model's continuous seed winding
+    # to match, so all reported windings -- and every patch's entry position -- are
+    # clean integers.
+    seed_model_winding = int(round(seed_model_winding_raw))
     print(f'patch {patch_id}: grid {tuple(patch.zyxs.shape[:2])}; '
-          f'seed at grid-centre vertex ij={seed_ij.tolist()}; model raw winding = {seed_model_winding:.3f}')
+          f'seed at grid-centre vertex ij={seed_ij.tolist()}; '
+          f'model raw winding = {seed_model_winding_raw:.3f} (rounded to {seed_model_winding})')
 
     # --- build the absolute anchors and the relative-pcl patch graph ---
     abs_anchors_by_patch = build_abs_anchors_by_patch(cross_patch_pcls, patches)
@@ -487,7 +503,9 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
     votes = {}
     voter_details = []
     visited = {patch_id}
-    queue = deque([{'patch': patch_id, 'entry_ij': seed_ij, 'acc': 0.0, 'hops': 0, 'path': []}])
+    # acc = winding(seed) - winding(entry); integer throughout (sum of integer
+    # strip + edge deltas), so the predicted seed windings come out as integers.
+    queue = deque([{'patch': patch_id, 'entry_ij': seed_ij, 'acc': 0, 'hops': 0, 'path': []}])
 
     def record_vote(expected, anchor, hops, acc, anchor_strip, path):
         expected_int = int(np.round(expected))
@@ -563,6 +581,8 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
                 'to_ij': edge['to_ij'].tolist(),
                 'from_point_id': edge['from_point_id'],
                 'to_point_id': edge['to_point_id'],
+                'from_zyx_downsampled': _to_py(edge['from_zyx']),
+                'to_zyx_downsampled': _to_py(edge['to_zyx']),
                 'edge_winding_delta': edge['winding_delta'],
                 'intra_patch_strip_delta': strip['delta_windings'],
                 'intra_patch_residual_unwrapped_delta': strip['residual_unwrapped_delta_windings'],
