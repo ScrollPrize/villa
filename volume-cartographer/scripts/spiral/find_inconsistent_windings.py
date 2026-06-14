@@ -41,9 +41,18 @@ integer theta=0 branch transport of a within-P ij strip, each BFS state is
   * crossing a relative edge (P:d -> R:e, edge_delta = wind_a(e) - wind_a(d)) sets
         acc' = acc - strip_delta(P, q, d) - edge_delta,  entry q' = e.
 
-BFS marks each patch visited the first (fewest-hops) time it is reached, so the
-graph is explored without looping; --max-hops bounds the edge depth (0 = direct
-anchors only, the original behaviour).
+BFS marks each patch visited the first (fewest-hops) time it is reached, so it
+explores a spanning tree of the reachable patches; --max-hops bounds the edge
+depth (0 = direct anchors only, the original behaviour).
+
+Relative edges that are *not* used as tree edges (they reconnect two patches both
+already reached) are not discarded: each such edge closes a cycle, and we measure
+its winding holonomy -- the difference between the winding it implies for the
+arrival point and the winding the BFS tree already assigns there. A nonzero
+holonomy means the relative-winding annotations do not close around that loop,
+i.e. a winding inconsistency in the graph itself (independent of, and detectable
+without, the absolute anchors). These are reported under "loops" in the output
+(disable with --no-detect-loops).
 
 Each within-patch winding delta is measured along a strip that follows a
 fringe-avoiding shortest path through the patch's *valid quads only* (a weighted
@@ -411,9 +420,16 @@ def parse_z_range(z_range):
               help='Maximum number of relative-pcl edges to traverse from the seed patch (BFS depth). '
                    '0 = direct absolute anchors on the seed patch only (original behaviour); '
                    'omit for unlimited (BFS to every reachable patch).')
+@click.option('--detect-loops/--no-detect-loops', default=True,
+              help='Check every non-tree relative edge (one that reconnects two already-reached '
+                   'patches) for winding holonomy: compare the winding it implies for the arrival '
+                   'point against the winding the BFS tree already assigns there. A nonzero '
+                   'difference is a loop that does not close -- a winding inconsistency in the '
+                   'relative-edge graph itself. Recorded under "loops" in the output.')
 @click.option('--output', default=None, type=click.Path(dir_okay=False),
               help='Output json path (default: winding_votes_<patch>.json next to the checkpoint).')
-def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, medial_weight, max_hops, output):
+def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, medial_weight, max_hops,
+         detect_loops, output):
     torch.set_grad_enabled(False)
     device = torch.device('cuda')
 
@@ -502,7 +518,14 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
     # unvisited neighbour. See module docstring for the propagation algebra.
     votes = {}
     voter_details = []
-    visited = {patch_id}
+    # reached[P] = {'acc', 'entry_ij', 'hops'} for the first (tree) time P is reached;
+    # acc = winding(seed) - winding(entry). Retaining the entry point lets a later
+    # non-tree edge close the loop and measure its winding holonomy.
+    reached = {patch_id: {'acc': 0, 'entry_ij': seed_ij, 'hops': 0}}
+    tree_edges = set()   # undirected keys of edges used to grow the BFS tree
+    loops = []           # non-tree closures: each carries the cycle's winding holonomy
+    loops_seen = set()   # undirected keys already recorded as a loop (skip the reverse dir)
+    num_loops_unmeasurable = 0
     # acc = winding(seed) - winding(entry); integer throughout (sum of integer
     # strip + edge deltas), so the predicted seed windings come out as integers.
     queue = deque([{'patch': patch_id, 'entry_ij': seed_ij, 'acc': 0, 'hops': 0, 'path': []}])
@@ -558,19 +581,73 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
             expected = acc + anchor['winding'] + anchor_strip['delta_windings']
             record_vote(expected, anchor, hops, acc, anchor_strip, path)
 
-        # (b) expand to unvisited neighbours along relative edges.
-        if max_hops is not None and hops >= max_hops:
-            continue
+        # (b) relative edges: grow the BFS tree into unreached neighbours, and check
+        #     edges that reconnect an already-reached patch for loop holonomy.
         for edge in rel_adjacency.get(P, []):
             R = edge['neighbor']
-            if R in visited:
+            edge_key = (edge['pcl_id'], frozenset((edge['from_point_id'], edge['to_point_id'])))
+
+            if R in reached:
+                # Non-tree edge -> it closes a cycle. Express winding(seed) - winding(e)
+                # at the edge's arrival point e two ways and difference them:
+                #   * via this edge from P: acc - strip(P, q->d) - edge_delta
+                #   * via R's stored tree path: acc_R - strip(R, entry_R->e)
+                # The gap is the cycle's winding holonomy (0 == the loop closes).
+                if (not detect_loops) or edge_key in tree_edges or edge_key in loops_seen:
+                    continue
+                strip = strip_winding_delta(transform, dr, graph_P, q, edge['from_ij'], step_size)
+                rstate = reached[R]
+                rstrip = strip_winding_delta(transform, dr, graph_for(R), rstate['entry_ij'],
+                                             edge['to_ij'], step_size)
+                if strip is None or rstrip is None:
+                    num_loops_unmeasurable += 1
+                    continue  # can't measure one side; the reverse direction may still succeed
+                acc_arrival_via_edge = acc - strip['delta_windings'] - edge['winding_delta']
+                acc_arrival_via_tree = rstate['acc'] - rstrip['delta_windings']
+                holonomy = acc_arrival_via_edge - acc_arrival_via_tree
+                holonomy_int = int(round(holonomy))
+                loops_seen.add(edge_key)
+                loops.append({
+                    'rel_pcl_id': edge['pcl_id'],
+                    'rel_pcl_name': edge['pcl_name'],
+                    'rel_source_file': edge['source_file'],
+                    'from_patch': P,
+                    'to_patch': R,
+                    'from_ij': edge['from_ij'].tolist(),
+                    'to_ij': edge['to_ij'].tolist(),
+                    'from_point_id': edge['from_point_id'],
+                    'to_point_id': edge['to_point_id'],
+                    'from_zyx_downsampled': _to_py(edge['from_zyx']),
+                    'to_zyx_downsampled': _to_py(edge['to_zyx']),
+                    'edge_winding_delta': edge['winding_delta'],
+                    'from_depth': hops,
+                    'to_depth': rstate['hops'],
+                    # winding(seed) - winding(entry) of each end, so the plot can place the
+                    # loop's departure (from_patch) and arrival (to_patch) ends in x.
+                    'from_acc': acc,
+                    'to_acc': rstate['acc'],
+                    'intra_patch_strip_delta_from': strip['delta_windings'],
+                    'intra_patch_strip_delta_to': rstrip['delta_windings'],
+                    'loop_winding_delta': holonomy_int,
+                    'loop_winding_residual': float(holonomy),
+                    'is_inconsistent': holonomy_int != 0,
+                })
+                if holonomy_int != 0:
+                    print(f'  LOOP inconsistency: rel pcl {edge["pcl_id"]} ({edge["pcl_name"]!r}) '
+                          f'reconnects {P} (d{hops}) <-> {R} (d{rstate["hops"]}): winding holonomy '
+                          f'{holonomy_int:+d} (residual {holonomy:+.3f})')
+                continue
+
+            # Unreached neighbour: grow the tree into it (bounded by --max-hops).
+            if max_hops is not None and hops >= max_hops:
                 continue
             # Propagate within P from the entry point to the edge's departure point.
             strip = strip_winding_delta(transform, dr, graph_P, q, edge['from_ij'], step_size)
             if strip is None:
                 continue  # can't carry the winding across this edge; another path may reach R
             acc2 = acc - strip['delta_windings'] - edge['winding_delta']
-            visited.add(R)
+            tree_edges.add(edge_key)
+            reached[R] = {'acc': acc2, 'entry_ij': edge['to_ij'], 'hops': hops + 1}
             hop_record = {
                 'rel_pcl_id': edge['pcl_id'],
                 'rel_pcl_name': edge['pcl_name'],
@@ -596,11 +673,19 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
 
     agreeing = sorted(votes.keys(), key=lambda k: int(k))
     num_direct = sum(1 for v in voter_details if v['hops'] == 0)
-    print(f'\nreached {len(visited)} patch(es); {len(voter_details)} vote(s) '
+    print(f'\nreached {len(reached)} patch(es); {len(voter_details)} vote(s) '
           f'({num_direct} direct, {len(voter_details) - num_direct} long-range) '
           f'across winding number(s): {", ".join(agreeing) if agreeing else "(none)"}')
     if len(agreeing) > 1:
         print('WARNING: votes disagree on the seed winding number!')
+
+    num_inconsistent_loops = sum(1 for L in loops if L['is_inconsistent'])
+    if detect_loops:
+        print(f'checked {len(loops)} non-tree relative-edge loop(s): '
+              f'{num_inconsistent_loops} with nonzero winding holonomy'
+              + (f', {num_loops_unmeasurable} unmeasurable' if num_loops_unmeasurable else ''))
+        if num_inconsistent_loops:
+            print('WARNING: relative-winding loops do not close (winding inconsistency in the graph)!')
 
     out = {
         'checkpoint': os.path.abspath(checkpoint),
@@ -613,6 +698,7 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
         'step_size': step_size,
         'medial_weight': medial_weight,
         'max_hops': max_hops,
+        'detect_loops': detect_loops,
         'seed': {
             'ij': seed_ij.tolist(),
             'zyx_downsampled': seed_zyx_ds.tolist(),
@@ -623,11 +709,15 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
         'num_absolute_pcls': num_abs_pcls,
         'num_relative_pcls': num_rel_pcls,
         'num_relative_cross_patch_edges': num_rel_edges,
-        'num_patches_reached': len(visited),
+        'num_patches_reached': len(reached),
         'num_direct_votes': num_direct,
         'num_long_range_votes': len(voter_details) - num_direct,
         'votes_agree': len(agreeing) <= 1,
+        'num_loops_checked': len(loops),
+        'num_inconsistent_loops': num_inconsistent_loops,
+        'num_loops_unmeasurable': num_loops_unmeasurable,
         'votes': votes,
+        'loops': loops,
     }
 
     if output is None:

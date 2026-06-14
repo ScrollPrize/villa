@@ -10,6 +10,14 @@ The recorded subgraph is the union of every voter's path: a tree rooted at the
 seed patch, whose edges are the relative-winding pcls actually traversed and
 whose terminal patches carry the absolute anchors that voted.
 
+find_inconsistent_windings also records "loops": non-tree relative edges whose
+winding holonomy is nonzero (the cycle they close does not return to the same
+winding -- an inconsistency in the relative annotations themselves). We overlay
+each such loop whose two patches are both already in the tree as a dashed magenta
+chord between the edge's two end points, without touching the tree layout (the
+loop's patches are only drawn if the tree already places them, so structure is
+preserved). Pass --no-loops to hide them.
+
 Layout (the stylised picture the result implies):
 
   * x-axis = absolute model winding number. A patch's *entry* point sits at
@@ -98,7 +106,9 @@ def load_graph(votes):
         'votes_agree': votes['votes_agree'],
         'max_hops': votes['max_hops'],
     }
-    return nodes, edges, all_voters, meta
+    # Non-tree loop closures (older votes files may not have them).
+    loops = votes.get('loops', [])
+    return nodes, edges, all_voters, meta, loops
 
 
 def assign_slots(depth_to_nodes, node_extent, slot_height, depth_gap):
@@ -164,6 +174,7 @@ svg.inner { display: block; will-change: transform; }
 .band { fill: #f2f2f2; }
 .seam { stroke: #ededed; stroke-width: 1; }
 .edgeline { stroke: #999; stroke-width: 1.1; fill: none; }
+.loopline { stroke: #c026d3; stroke-width: 1.3; fill: none; opacity: .7; stroke-dasharray: 5 3; }
 .depdot { fill: #888; }
 .hitdot { fill: transparent; }
 .patchline { stroke: #000; stroke-width: 1.8; }
@@ -179,9 +190,10 @@ svg.inner { display: block; will-change: transform; }
 .albl { font-size: 11px; fill: #333; }
 .atick { stroke: #333; stroke-width: 1; }
 .band, .seam, .votelabel, .lbl, .dlbl, .albl, .atick { pointer-events: none; }
-.patch, .edge, .anchor, .dot { cursor: pointer; }
+.patch, .edge, .anchor, .dot, .loop { cursor: pointer; }
 .patch.hl .patchline, .patch.hl .cap { stroke: #ff8c00; }
 .edge.hl .edgeline { stroke: #ff8c00; stroke-width: 2.4; }
+.loop.hl .loopline { stroke: #ff8c00; stroke-width: 2.6; opacity: 1; }
 .anchor.hl .star { stroke: #ff8c00; stroke-width: 2; }
 .dot.hl .depdot { fill: #ff8c00; }
 .tooltip { position: fixed; pointer-events: none; display: none; z-index: 10;
@@ -217,7 +229,15 @@ function info(el) {
     return 'patch ' + d.patch + '\ndepth ' + d.depth + '   ' + w;
   }
   if (d.kind === 'edge')
-    return 'edge ' + d.from + '\n  → ' + d.to + '\nΔwinding ' + d.edgeDelta + '   strip ' + d.stripDelta;
+    return 'edge — rel pcl ' + d.pcl + ' "' + (d.pclName || '') + '"'
+         + '\npoint ' + d.fromPoint + ' on ' + d.from
+         + '\n  → point ' + d.toPoint + ' on ' + d.to
+         + '\nΔwinding ' + d.edgeDelta + '   strip ' + d.stripDelta;
+  if (d.kind === 'loop')
+    return 'inconsistent loop — rel pcl ' + d.pcl + ' "' + (d.pclName || '') + '"'
+         + '\npoint ' + d.fromPoint + ' on ' + d.from
+         + '\n  ↔ point ' + d.toPoint + ' on ' + d.to
+         + '\nwinding holonomy ' + d.holo + '   (edge Δ ' + d.edgeDelta + ')';
   if (d.kind === 'anchor')
     return 'abs anchor — pcl ' + d.pcl + ' "' + (d.pclName || '') + '"  point ' + d.point
          + '\nannotation ' + d.annotation + ' → seed ' + d.vote + xyz(d) + '\non patch ' + d.patch;
@@ -228,7 +248,7 @@ function info(el) {
 }
 // Per-element mouse handling. The data-* attributes are the hook for richer
 // behaviour later; for now we highlight + show a tooltip and log clicks.
-document.querySelectorAll('.patch, .edge, .anchor, .dot').forEach(el => {
+document.querySelectorAll('.patch, .edge, .anchor, .dot, .loop').forEach(el => {
   el.addEventListener('mouseenter', () => {
     el.classList.add('hl');
     tip.textContent = info(el);
@@ -266,6 +286,8 @@ def write_html(geom, output_html):
     vote_counts = geom['vote_counts']
     node_id = geom['node_id']
     title = geom['title']
+    loops = geom['loops']
+    loop_color = geom['loop_color']
     x_lo, x_hi, y_min = geom['x_lo'], geom['x_hi'], geom['y_min']
     slot_height, depth_gap = geom['slot_height'], geom['depth_gap']
     annotate_votes, label_mode = geom['annotate_votes'], geom['label_mode']
@@ -327,9 +349,27 @@ def write_html(geom, output_html):
         x1, y1 = X(departure_x[child]), Y(node_y[parent])
         x2, y2 = X(ex[child]), Y(node_y[child])
         P.append(f'<g class="edge" data-kind="edge" data-from="{a(parent)}" data-to="{a(child)}" '
+                 f'data-pcl="{a(h["rel_pcl_id"])}" data-pcl-name="{a(h.get("rel_pcl_name") or "")}" '
+                 f'data-from-point="{a(h["from_point_id"])}" data-to-point="{a(h["to_point_id"])}" '
                  f'data-edge-delta="{h["edge_winding_delta"]:g}" data-strip-delta="{h["intra_patch_strip_delta"]:g}">')
         P.append(f'<line class="hit" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
         P.append(f'<line class="edgeline" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
+        P.append('</g>')
+
+    # inconsistent loops: dashed magenta chords between the edge's two ends. Drawn
+    # before the patches so a patch line always reads on top; the holonomy and the
+    # source pcl are on hover.
+    for L in loops:
+        h = L['loop']
+        x1, y1 = X(L['x_from']), Y(L['y_from'])
+        x2, y2 = X(L['x_to']), Y(L['y_to'])
+        P.append(f'<g class="loop" data-kind="loop" data-from="{a(h["from_patch"])}" '
+                 f'data-to="{a(h["to_patch"])}" data-pcl="{a(h["rel_pcl_id"])}" '
+                 f'data-pcl-name="{a(h.get("rel_pcl_name") or "")}" '
+                 f'data-from-point="{a(h["from_point_id"])}" data-to-point="{a(h["to_point_id"])}" '
+                 f'data-holo="{h["loop_winding_delta"]:g}" data-edge-delta="{h["edge_winding_delta"]:g}">')
+        P.append(f'<line class="hit" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
+        P.append(f'<line class="loopline" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
         P.append('</g>')
 
     # patches: horizontal line + end caps + crimson seam ticks.
@@ -425,6 +465,10 @@ def write_html(geom, output_html):
         '<span class="item"><svg width="22" height="12"><line x1="1" y1="6" x2="21" y2="6" '
         'stroke="#999" stroke-width="1.4"/></svg>relative-pcl edge</span>',
     ]
+    if loops:
+        leg.append(f'<span class="item"><svg width="22" height="12"><line x1="1" y1="6" x2="21" y2="6" '
+                   f'stroke="{loop_color}" stroke-width="1.6" stroke-dasharray="5 3"/></svg>'
+                   f'loop (winding holonomy &ne; 0)</span>')
     for w in vote_windings:
         col = vote_color[w]
         leg.append(f'<span class="item"><svg width="16" height="16"><polygon '
@@ -472,6 +516,10 @@ def write_html(geom, output_html):
 @click.option('--annotate-votes/--no-annotate-votes', default=True,
               help='Label each absolute anchor with "annotation->vote" (the abs winding it carries '
                    'and the seed winding it then implies).')
+@click.option('--loops/--no-loops', 'show_loops', default=True,
+              help='Overlay inconsistent loops (non-tree relative edges with nonzero winding '
+                   'holonomy) as dashed magenta chords. Only loops whose two patches are both in '
+                   'the drawn tree are shown; the layout is unaffected.')
 @click.option('--label', 'label_mode', type=click.Choice(['patch', 'id', 'none']), default='patch',
               help='Left-hand column content per row: the patch id (folder name), a compact integer '
                    'id (id->patch mapping printed to stdout), or nothing.')
@@ -487,11 +535,12 @@ def write_html(geom, output_html):
               help='Vertical scale of the HTML plot, in pixels per patch row (slot-height units).')
 @click.option('--html-label-width', default=260, type=int,
               help='Width (px) of the pinned left-hand patch-name column in the HTML.')
-def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_votes, label_mode,
-         label_fontsize, dpi, want_html, html_output, html_px_per_winding, html_row_px, html_label_width):
+def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_votes, show_loops,
+         label_mode, label_fontsize, dpi, want_html, html_output, html_px_per_winding, html_row_px,
+         html_label_width):
     with open(votes_path) as f:
         votes = json.load(f)
-    nodes, edges, voters, meta = load_graph(votes)
+    nodes, edges, voters, meta, loops = load_graph(votes)
 
     seed = meta['seed']
     w0 = meta['seed_model_winding']
@@ -542,6 +591,29 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
     ordered = sorted(nodes, key=lambda p: -node_y[p])
     node_id = {pid: i for i, pid in enumerate(ordered)}
 
+    # --- inconsistent loops (non-tree edges with nonzero winding holonomy) ---
+    # Place each loop end at its point's absolute model winding:
+    #   departure on from_patch = entry_x(from_patch) + intra_patch_strip_delta_from
+    #   arrival   on to_patch   = entry_x(to_patch)   + intra_patch_strip_delta_to
+    # The tree layout already fixes both patches' rows/x, so this only overlays
+    # chords -- it never adds or moves a node. Loops touching an off-tree patch (a
+    # reached patch no voter passed through) are skipped, and counted for the title.
+    num_inconsistent_loops = sum(1 for L in loops if L.get('is_inconsistent'))
+    drawable_loops = []
+    if show_loops:
+        for L in loops:
+            if not L.get('is_inconsistent'):
+                continue
+            a, b = L['from_patch'], L['to_patch']
+            if a not in nodes or b not in nodes:
+                continue
+            drawable_loops.append({
+                'loop': L,
+                'x_from': entry_x(a) + L['intra_patch_strip_delta_from'],
+                'x_to': entry_x(b) + L['intra_patch_strip_delta_to'],
+                'y_from': node_y[a], 'y_to': node_y[b],
+            })
+
     # --- vote colour map: one colour per distinct rounded predicted seed winding.
     #     A hand-picked palette of deep, saturated colours -- all clearly legible
     #     (as both star and text) on a white background, no pale yellows/greens. ---
@@ -587,6 +659,15 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
                 color='0.6', lw=0.9, alpha=0.8, zorder=1, solid_capstyle='round')
         # a small dot at the departure point on the parent (where the pcl leaves).
         ax.plot([departure_x[child]], [node_y[parent]], marker='o', ms=2.0, color='0.5', zorder=2)
+
+    # inconsistent loops: dashed magenta chords between the edge's two ends. Drawn
+    # under the patches so they never obscure a patch line; the holonomy is on hover
+    # (HTML) and in the json -- here we just show the loop exists and where it lands.
+    LOOP_COLOR = '#c026d3'
+    for L in drawable_loops:
+        ax.plot([L['x_from'], L['x_to']], [L['y_from'], L['y_to']],
+                color=LOOP_COLOR, lw=1.0, alpha=0.6, ls=(0, (4, 2)),
+                zorder=2.5, solid_capstyle='round')
 
     # patches: short horizontal lines with end-caps and theta=0 ticks.
     cap = 0.18 * slot_height
@@ -640,10 +721,14 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
     ax.set_ylim(y_min - slot_height, slot_height)
 
     agree = 'AGREE' if meta['votes_agree'] else 'DISAGREE'
+    loops_note = ''
+    if show_loops and num_inconsistent_loops:
+        loops_note = (f"; {num_inconsistent_loops} inconsistent loop(s) "
+                      f"({len(drawable_loops)} shown)")
     title = (f"winding graph for seed {seed}\n"
              f"{len(nodes)} patches shown ({meta['num_patches_reached']} reached); "
              f"{meta['num_direct_votes']} direct + {meta['num_long_range_votes']} long-range votes; "
-             f"votes {agree} ({', '.join(str(w) for w in vote_windings)}); "
+             f"votes {agree} ({', '.join(str(w) for w in vote_windings)}){loops_note}; "
              f"dr/winding={meta['dr_per_winding']:.3f}")
     ax.set_title(title, fontsize=10)
 
@@ -652,6 +737,9 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
                Line2D([0], [0], color='crimson', linestyle='none', marker='|', markersize=10,
                       markeredgewidth=1.4, label='theta=0 seam crossing'),
                Line2D([0], [0], color='0.6', lw=0.9, label='relative-pcl edge')]
+    if show_loops and drawable_loops:
+        handles.append(Line2D([0], [0], color=LOOP_COLOR, lw=1.2, ls=(0, (4, 2)),
+                              label='loop (winding holonomy ≠ 0)'))
     handles.append(Line2D([], [], linestyle='none', label='abs winding annotation implying seed winding ='))
     for w in vote_windings:
         handles.append(Line2D([0], [0], marker='*', color=vote_color[w], lw=0,
@@ -685,6 +773,7 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
             'slot_height': slot_height, 'depth_gap': depth_gap,
             'annotate_votes': annotate_votes, 'label_mode': label_mode,
             'px_per_winding': html_px_per_winding, 'row_px': html_row_px, 'label_width': html_label_width,
+            'loops': drawable_loops, 'loop_color': '#c026d3',
         }
         write_html(geom, html_output)
         print(f'wrote {html_output}')
