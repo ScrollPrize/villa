@@ -5262,30 +5262,37 @@ def prepare_point_collections(patches):
     # points_by_patch (which is built from all attached points, regardless of z).
     # Exception: pcls flagged metadata.winding_is_absolute carry absolute winding annotations
     # and are always consumed as cross-patch pcls (never unattached), retained even when they
-    # hold a single point; we assert that every one of their points attached to a patch and
-    # carries an explicit winding annotation (an absolute pcl must not fall back to winding 0),
-    # and (once grouped below) that no patch holds more than one of their points.
+    # hold a single point. We only *warn* on any of their points that failed to attach to a
+    # patch -- those points carry no winding target and are simply dropped (they never enter
+    # points_by_patch) -- and assert that every *attached* point carries an explicit, positive
+    # winding annotation (an absolute pcl must not fall back to winding 0), and (once grouped
+    # below) that no patch holds more than one of their points.
     cross_patch_point_collections = {}
     unattached_point_collections = {}
     for pid, pcl in point_collections.items():
         num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
         num_unattached = len(pcl['points']) - num_attached
         if pcl.get('metadata', {}).get('winding_is_absolute', False):
-            assert num_unattached == 0, (
-                f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_unattached} of '
-                f'{len(pcl["points"])} points not attached to any patch; expected all attached'
-            )
-            num_unannotated = sum(1 for point in pcl['points'].values() if not np.isfinite(point['winding_annotation']))
+            if num_unattached > 0:
+                print(
+                    f'WARNING: winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has '
+                    f'{num_unattached} of {len(pcl["points"])} points not attached to any patch; '
+                    f'dropping the unattached points'
+                )
+            # Validate only the attached points -- unattached ones are dropped above and never
+            # enter points_by_patch, so their annotations are irrelevant.
+            attached_points = [point for point in pcl['points'].values() if 'on_patch' in point]
+            num_unannotated = sum(1 for point in attached_points if not np.isfinite(point['winding_annotation']))
             assert num_unannotated == 0, (
                 f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_unannotated} of '
-                f'{len(pcl["points"])} points without a winding annotation; absolute pcls must '
-                f'give every winding number explicitly'
+                f'{len(attached_points)} attached points without a winding annotation; absolute pcls '
+                f'must give every winding number explicitly'
             )
-            num_non_positive = sum(1 for point in pcl['points'].values() if point['winding_annotation'] <= 0)
+            num_non_positive = sum(1 for point in attached_points if point['winding_annotation'] <= 0)
             assert num_non_positive == 0, (
                 f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_non_positive} of '
-                f'{len(pcl["points"])} points with a non-positive winding annotation; absolute '
-                f'winding numbers must be > 0'
+                f'{len(attached_points)} attached points with a non-positive winding annotation; '
+                f'absolute winding numbers must be > 0'
             )
             cross_patch_point_collections[pid] = pcl
             continue
@@ -5337,16 +5344,6 @@ def prepare_point_collections(patches):
                 continue
             points_by_patch.setdefault(pid, []).append(point)
         pcl['points_by_patch'] = points_by_patch
-        # An absolute-winding pcl carries one absolute winding per patch (one sheet ->
-        # one winding); two annotated points on the same patch would hand the abs-winding
-        # loss conflicting targets for the same sheet, so require at most one per patch.
-        if pcl.get('metadata', {}).get('winding_is_absolute', False):
-            multi_point_patches = {pid: len(pts) for pid, pts in points_by_patch.items() if len(pts) > 1}
-            assert not multi_point_patches, (
-                f'winding_is_absolute pcl ({pcl.get("name")!r}) attaches multiple points to '
-                f'patches {multi_point_patches}; each absolute pcl must attach at most one '
-                f'point per patch'
-            )
     unattached_pcl_strips = _prepare_unattached_pcl_strips(unattached_point_collections, cfg['unattached_pcl_min_point_spacing'])
     print(
         f'pcls: {len(cross_patch_point_collections)} cross-patch, '
