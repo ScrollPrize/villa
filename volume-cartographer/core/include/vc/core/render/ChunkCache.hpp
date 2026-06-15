@@ -131,6 +131,7 @@ private:
         std::deque<std::pair<std::chrono::steady_clock::time_point, std::size_t>> remoteDownloadHistory_;
         std::chrono::steady_clock::time_point lastPersistentCacheSizeScan_{};
         std::size_t cachedPersistentCacheBytes_ = 0;
+        bool persistentCacheScanInFlight_ = false;
     };
 
     static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);

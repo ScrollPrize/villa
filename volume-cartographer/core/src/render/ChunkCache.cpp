@@ -51,6 +51,16 @@ utils::ThreadPool& persistentCacheWriterPool()
     return pool;
 }
 
+utils::ThreadPool& persistentCacheScannerPool()
+{
+    // Walking the persistent cache directory to total its on-disk size can
+    // take long enough to stutter a UI thread that polls stats() on a timer.
+    // Run the scan here so stats() never blocks on the filesystem walk, and
+    // keep it off the writer pool so a slow scan does not stall writeback.
+    static utils::ThreadPool pool(1);
+    return pool;
+}
+
 std::string fetchErrorMessage(const ChunkFetchResult& fetch)
 {
     if (!fetch.message.empty())
@@ -250,7 +260,7 @@ ChunkCache::Stats ChunkCache::stats() const
 {
     auto state = state_;
     std::optional<std::filesystem::path> persistentPath;
-    bool scanPersistentCacheBytes = false;
+    bool startScan = false;
     Stats result;
     {
         std::lock_guard lock(state->mutex_);
@@ -269,18 +279,30 @@ ChunkCache::Stats ChunkCache::stats() const
         result.remoteDownloadBytesPerSecond =
             static_cast<double>(recentBytes) /
             std::chrono::duration<double>(kDownloadStatsWindow).count();
+        // Always report the last computed on-disk size. The recursive walk that
+        // refreshes it runs on a background thread (below), so stats() never
+        // blocks its caller (e.g. the UI status-bar timer) on the filesystem.
         result.persistentCacheBytes = state->cachedPersistentCacheBytes_;
         persistentPath = state->options_.persistentCachePath;
-        scanPersistentCacheBytes = persistentPath.has_value() &&
+        const bool scanDue = persistentPath.has_value() &&
             (state->lastPersistentCacheSizeScan_ == std::chrono::steady_clock::time_point{} ||
              now - state->lastPersistentCacheSizeScan_ >= kPersistentCacheSizeScanInterval);
-        if (scanPersistentCacheBytes)
+        if (scanDue && !state->persistentCacheScanInFlight_) {
+            startScan = true;
+            state->persistentCacheScanInFlight_ = true;
             state->lastPersistentCacheSizeScan_ = now;
+        }
     }
-    if (scanPersistentCacheBytes) {
-        result.persistentCacheBytes = persistentCacheBytes(persistentPath);
-        std::lock_guard lock(state->mutex_);
-        state->cachedPersistentCacheBytes_ = result.persistentCacheBytes;
+    if (startScan) {
+        std::weak_ptr<State> weakState = state;
+        persistentCacheScannerPool().enqueue([weakState, persistentPath] {
+            const std::size_t bytes = persistentCacheBytes(persistentPath);
+            if (auto state = weakState.lock()) {
+                std::lock_guard lock(state->mutex_);
+                state->cachedPersistentCacheBytes_ = bytes;
+                state->persistentCacheScanInFlight_ = false;
+            }
+        });
     }
     return result;
 }
