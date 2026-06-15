@@ -10288,15 +10288,16 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
             }
         }
         if (source_component_mask != nullptr) {
-            CV_Assert(white_domain.type() == CV_8U);
+            CV_Assert(dense_flow_result.flow_gate_component_regions.type() ==
+                      CV_32S);
             for (int y = 0; y < height; ++y) {
-                const std::uint8_t* src_row =
-                    white_domain.ptr<std::uint8_t>(y);
+                const int* src_row =
+                    dense_flow_result.flow_gate_component_regions.ptr<int>(y);
                 float* dst_row =
                     source_component_mask +
                     static_cast<std::size_t>(y) * width;
                 for (int x = 0; x < width; ++x) {
-                    dst_row[x] = src_row[x] != 0 ? 255.0f : 0.0f;
+                    dst_row[x] = static_cast<float>(src_row[x]);
                 }
             }
         }

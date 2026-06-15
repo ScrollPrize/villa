@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import time
 
@@ -12,6 +11,14 @@ import dense_batch_flow
 import model as fit_model
 from opt_loss_dir import _vertex_normals
 from opt_loss_station import _intersect_single_quad
+from progress_table import (
+	ProgressColumn,
+	format_progress_value,
+	print_progress_legend,
+	progress_header,
+	progress_row,
+	progress_widths,
+)
 
 _INNER_FACTOR = 0.0  # penalty reduction for points inside the predicted surface
 _flow_gate_cfg: dict | None = None
@@ -24,6 +31,7 @@ _flow_gate_last_timing: dict[str, float] = {}
 _flow_gate_last_channels: dict | None = None
 _flow_gate_seed_hw_cache: tuple[int, int, float, float] | None = None
 _flow_gate_jpg_warned: bool = False
+_atlas_snap_report_legend_printed: set[tuple[str, int]] = set()
 _pred_dt_normal_source: str = "model"
 
 
@@ -1306,10 +1314,11 @@ def configure_flow_gate(
 	out_dir: str | None,
 	capture_channels: bool = False,
 ) -> None:
-	global _flow_gate_cfg, _flow_gate_stage, _flow_gate_seed_xyz, _flow_gate_out_dir, _flow_gate_debug_counts, _flow_gate_last_stats, _flow_gate_last_channels, _flow_gate_seed_hw_cache
+	global _flow_gate_cfg, _flow_gate_stage, _flow_gate_seed_xyz, _flow_gate_out_dir, _flow_gate_debug_counts, _flow_gate_last_stats, _flow_gate_last_channels, _flow_gate_seed_hw_cache, _atlas_snap_report_legend_printed
 	_flow_gate_last_stats = {}
 	_flow_gate_last_channels = None
 	_flow_gate_seed_hw_cache = None
+	_atlas_snap_report_legend_printed = set()
 	if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
 		_flow_gate_cfg = None
 		_flow_gate_stage = str(stage_name)
@@ -1351,6 +1360,164 @@ def _xy_key(value: object) -> tuple[int, int] | None:
 		return None
 
 
+def _unique_xy_rows(*arrays: np.ndarray) -> np.ndarray:
+	out: list[tuple[int, int]] = []
+	seen: set[tuple[int, int]] = set()
+	for arr in arrays:
+		xy = np.asarray(arr, dtype=np.int32).reshape(-1, 2)
+		for x, y in xy:
+			key = (int(x), int(y))
+			if key in seen:
+				continue
+			seen.add(key)
+			out.append(key)
+	if not out:
+		return np.zeros((0, 2), dtype=np.int32)
+	return np.asarray(out, dtype=np.int32)
+
+
+_ATLAS_SNAP_REPORT_COLUMNS = (
+	ProgressColumn("idx", "idx", "atlas snap sample index", min_width=3),
+	ProgressColumn("src", "src", "source line point index", min_width=4),
+	ProgressColumn("x", "x", "render-space x pixel", min_width=3),
+	ProgressColumn("y", "y", "render-space y pixel", min_width=3),
+	ProgressColumn("ok", "ok", "accepted as a flow seed candidate", min_width=2),
+	ProgressColumn(
+		"use",
+		"use",
+		"flow source use: pri primary, ext extra, acc accepted but not used, no rejected",
+		min_width=3,
+	),
+	ProgressColumn("why", "why", "accept/reject reason", min_width=6),
+	ProgressColumn("dist", "dist", "surface projection distance", min_width=7),
+	ProgressColumn("dt", "dt", "pred-dt value at seed pixel", min_width=5),
+	ProgressColumn("inl", "inl", "pred-dt inlier score", min_width=5),
+	ProgressColumn("area", "area", "flow component pixel count under this source", min_width=5),
+	ProgressColumn("obj", "obj", "object alias; see alias lines above", min_width=3),
+)
+
+
+def _atlas_snap_report_float(value: object) -> str:
+	if value is None:
+		return "-"
+	try:
+		v = float(value)
+	except (TypeError, ValueError):
+		return "-"
+	if not np.isfinite(v):
+		return "-"
+	return format_progress_value(v)
+
+
+def _atlas_snap_report_bool(value: object) -> str:
+	return "Y" if bool(value) else "N"
+
+
+def _atlas_snap_report_use(value: object) -> str:
+	raw = str(value)
+	return {
+		"primary": "pri",
+		"extra": "ext",
+		"accepted_not_passed_to_flow": "acc",
+		"not_used": "no",
+	}.get(raw, raw[:3] if raw else "-")
+
+
+def _atlas_snap_report_obj(value: object) -> str:
+	raw = str(value) if value is not None else "-"
+	if not raw or raw == "None":
+		return "-"
+	return Path(raw).name
+
+
+def _atlas_snap_report_row_values(
+	rec: dict[str, object],
+	*,
+	object_aliases: dict[str, str],
+) -> dict[str, str]:
+	xy = _xy_key(rec.get("source_xy"))
+	obj_name = _atlas_snap_report_obj(rec.get("object_id"))
+	return {
+		"idx": str(rec.get("sample_index", "-")),
+		"src": str(rec.get("source_index", "-")),
+		"x": "-" if xy is None else str(int(xy[0])),
+		"y": "-" if xy is None else str(int(xy[1])),
+		"ok": _atlas_snap_report_bool(rec.get("accepted", False)),
+		"use": _atlas_snap_report_use(rec.get("flow_source")),
+		"why": str(rec.get("reason", "-"))[:16] or "-",
+		"dist": _atlas_snap_report_float(rec.get("surface_distance")),
+		"dt": _atlas_snap_report_float(rec.get("pred_dt_value")),
+		"inl": _atlas_snap_report_float(rec.get("inlier")),
+		"area": _atlas_snap_report_float(rec.get("seed_area")),
+		"obj": object_aliases.get(obj_name, obj_name),
+	}
+
+
+def _flow_component_area_at_xy(
+	labels: np.ndarray | None,
+	xy: tuple[int, int] | None,
+) -> tuple[int | None, int | None]:
+	if labels is None or xy is None:
+		return None, None
+	arr = np.asarray(labels)
+	if arr.ndim != 2:
+		return None, None
+	x, y = int(xy[0]), int(xy[1])
+	if y < 0 or x < 0 or y >= int(arr.shape[0]) or x >= int(arr.shape[1]):
+		return None, None
+	label = int(round(float(arr[y, x])))
+	if label <= 0:
+		return label, 0
+	return label, int(np.count_nonzero(np.rint(arr).astype(np.int64, copy=False) == label))
+
+
+def _print_atlas_snap_seed_report_table(
+	*,
+	stage_name: str,
+	layer_index: int,
+	winding: int,
+	records: list[dict[str, object]],
+	accepted_count: int,
+	used_count: int,
+	flow_status: str,
+) -> None:
+	global _atlas_snap_report_legend_printed
+	prefix = "[pred_dt_flow_gate]"
+	print(
+		f"{prefix} {stage_name}: atlas snap seeds "
+		f"layer={layer_index} winding={winding} samples={len(records)} "
+		f"accepted={accepted_count} used={used_count} flow={flow_status}",
+		flush=True,
+	)
+	legend_key = (str(stage_name), int(layer_index))
+	if legend_key not in _atlas_snap_report_legend_printed:
+		print_progress_legend(
+			prefix=prefix,
+			items=[(col.label, col.description) for col in _ATLAS_SNAP_REPORT_COLUMNS],
+			cols_per_row=2,
+		)
+		_atlas_snap_report_legend_printed.add(legend_key)
+	object_names = sorted({
+		_atlas_snap_report_obj(rec.get("object_id"))
+		for rec in records
+		if _atlas_snap_report_obj(rec.get("object_id")) != "-"
+	})
+	object_aliases = {name: f"o{i}" for i, name in enumerate(object_names)}
+	for name in object_names:
+		print(f"{prefix} atlas snap obj {object_aliases[name]}={name}", flush=True)
+	row_values = [
+		_atlas_snap_report_row_values(rec, object_aliases=object_aliases)
+		for rec in records
+	]
+	widths = progress_widths(_ATLAS_SNAP_REPORT_COLUMNS, {})
+	for values in row_values:
+		for col in _ATLAS_SNAP_REPORT_COLUMNS:
+			widths[col.key] = max(int(widths[col.key]), len(values.get(col.key, "")))
+	print(f"{prefix} {progress_header(_ATLAS_SNAP_REPORT_COLUMNS, widths)}", flush=True)
+	for values in row_values:
+		print(f"{prefix} {progress_row(_ATLAS_SNAP_REPORT_COLUMNS, widths, values)}", flush=True)
+
+
 def _write_atlas_snap_seed_report(
 	*,
 	stage_name: str,
@@ -1362,6 +1529,7 @@ def _write_atlas_snap_seed_report(
 	extra_source_xy: np.ndarray,
 	flow_status: str,
 	flow_source_value: int | None = None,
+	source_component_mask_hr: np.ndarray | None = None,
 	out_dir: Path | None,
 ) -> None:
 	if not atlas_seed_debug:
@@ -1399,55 +1567,24 @@ def _write_atlas_snap_seed_report(
 		rec["flow_status"] = flow_status
 		if flow_source_value is not None:
 			rec["flow_source_value"] = int(flow_source_value)
+		label, area = _flow_component_area_at_xy(source_component_mask_hr, xy)
+		if label is not None:
+			rec["flow_component_label"] = int(label)
+		if area is not None:
+			rec["seed_area"] = int(area)
 		records.append(rec)
 	if not records:
 		return
 
-	report_path: Path | None = None
-	if out_dir is not None:
-		out_dir.mkdir(parents=True, exist_ok=True)
-		header = {
-			"stage": str(stage_name),
-			"debug_index": int(debug_index),
-			"layer_index": int(layer_index),
-			"winding": int(winding),
-			"primary_xy": None if primary_key is None else [primary_key[0], primary_key[1]],
-			"extra_source_count": int(len(extra_keys)),
-			"flow_status": str(flow_status),
-			"flow_source_value": None if flow_source_value is None else int(flow_source_value),
-			"sample_count": int(len(records)),
-			"accepted_count": int(accepted_count),
-			"used_count": int(used_count),
-		}
-		for suffix in (
-			f"{stage_name}_{debug_index:06d}_layer{layer_index:03d}",
-			f"{stage_name}_layer{layer_index:03d}",
-		):
-			report_path = out_dir / f"pred_dt_flow_gate_{suffix}_atlas_snap_seed_report.jsonl"
-			with report_path.open("w", encoding="utf-8") as f:
-				f.write(json.dumps(header, sort_keys=True))
-				f.write("\n")
-				for rec in records:
-					f.write(json.dumps(rec, sort_keys=True))
-					f.write("\n")
-
-	print(
-		f"[pred_dt_flow_gate] {stage_name}: atlas snap seed report "
-		f"layer={layer_index} winding={winding} samples={len(records)} "
-		f"accepted={accepted_count} used={used_count} flow_status={flow_status}"
-		+ (f" path={report_path}" if report_path is not None else ""),
-		flush=True,
+	_print_atlas_snap_seed_report_table(
+		stage_name=str(stage_name),
+		layer_index=int(layer_index),
+		winding=int(winding),
+		records=records,
+		accepted_count=int(accepted_count),
+		used_count=int(used_count),
+		flow_status=str(flow_status),
 	)
-	for rec in records:
-		print(
-			f"[pred_dt_flow_gate] {stage_name}: atlas snap sample "
-			f"layer={layer_index} object={rec.get('object_id')} source_index={rec.get('source_index')} "
-			f"sample_index={rec.get('sample_index')} xy={rec.get('source_xy')} "
-			f"accepted={rec.get('accepted')} flow_source={rec.get('flow_source')} "
-			f"reason={rec.get('reason')} dist={rec.get('surface_distance')} "
-			f"pred_dt={rec.get('pred_dt_value')} inlier={rec.get('inlier')}",
-			flush=True,
-		)
 
 
 def flow_gate_last_stats() -> dict[str, float]:
@@ -1491,6 +1628,7 @@ def _flow_seed_overlay_panel(
 	base_u8: np.ndarray,
 	*,
 	source_xy: tuple[int, int] | None,
+	extra_source_xy: np.ndarray | None = None,
 	corr_seed_debug: dict[str, np.ndarray] | None,
 	source_edge_mask: np.ndarray | None,
 	flow_metadata: dict | None,
@@ -1605,7 +1743,11 @@ def _flow_seed_overlay_panel(
 
 	if source_xy is not None:
 		draw_cross(int(source_xy[0]), int(source_xy[1]), (64, 224, 255))
-		put_text("seed", int(source_xy[0]) + 6, int(source_xy[1]) + 12, (64, 224, 255))
+		put_text("src", int(source_xy[0]) + 6, int(source_xy[1]) + 12, (64, 224, 255))
+	if extra_source_xy is not None:
+		extra_xy = np.asarray(extra_source_xy, dtype=np.int32).reshape(-1, 2)
+		for x, y in extra_xy:
+			draw_cross(int(x), int(y), (255, 224, 64))
 	if pil_image is not None:
 		panel = np.asarray(pil_image, dtype=np.uint8)
 	return panel
@@ -1852,6 +1994,7 @@ def _write_flow_gate_weight_jpg(
 	source_edge_mask_hr: np.ndarray | None,
 	source_component_mask_hr: np.ndarray | None,
 	source_xy: tuple[int, int] | None,
+	extra_source_xy: np.ndarray | None = None,
 	corr_seed_debug: dict[str, np.ndarray] | None,
 	flow_metadata: dict | None,
 	out_dir: Path | None,
@@ -1879,6 +2022,7 @@ def _write_flow_gate_weight_jpg(
 	right_panel = _flow_seed_overlay_panel(
 		(greedy_direct_vis * 255.0 + 0.5).astype(np.uint8),
 		source_xy=source_xy,
+		extra_source_xy=extra_source_xy,
 		corr_seed_debug=corr_seed_debug,
 		source_edge_mask=source_edge_mask_hr,
 		flow_metadata=flow_metadata,
@@ -2208,19 +2352,21 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					stats[key] = max(stats.get(key, value_f), value_f)
 
 			primary_xy: tuple[int, int] | None = None
-			seed_sets = [arr for arr in (corr_source_xy, atlas_source_xy) if int(arr.shape[0]) > 0]
-			all_extra_source_xy = (
-				np.concatenate(seed_sets, axis=0).astype(np.int32, copy=False)
-				if seed_sets else np.zeros((0, 2), dtype=np.int32)
+			explicit_source_xy = _unique_xy_rows(corr_source_xy, atlas_source_xy)
+			seed_source_xy = (
+				np.asarray([[int(source_x), int(source_y)]], dtype=np.int32)
+				if source_x is not None and source_y is not None
+				else np.zeros((0, 2), dtype=np.int32)
 			)
-			if all_extra_source_xy.shape[0] > 1:
-				all_extra_source_xy = np.unique(all_extra_source_xy, axis=0)
-			extra_source_xy = all_extra_source_xy
-			if source_x is not None and source_y is not None:
-				primary_xy = (int(source_x), int(source_y))
-			elif all_extra_source_xy.shape[0] > 0:
-				primary_xy = (int(all_extra_source_xy[0, 0]), int(all_extra_source_xy[0, 1]))
-				extra_source_xy = all_extra_source_xy[1:]
+			all_source_xy = _unique_xy_rows(explicit_source_xy, seed_source_xy)
+			if explicit_source_xy.shape[0] > 0:
+				primary_xy = (int(explicit_source_xy[0, 0]), int(explicit_source_xy[0, 1]))
+				extra_source_xy = all_source_xy[1:]
+			elif seed_source_xy.shape[0] > 0:
+				primary_xy = (int(seed_source_xy[0, 0]), int(seed_source_xy[0, 1]))
+				extra_source_xy = np.zeros((0, 2), dtype=np.int32)
+			else:
+				extra_source_xy = np.zeros((0, 2), dtype=np.int32)
 			done("flow_sampling", _t)
 
 			if primary_xy is None:
@@ -2236,6 +2382,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						primary_xy=primary_xy,
 						extra_source_xy=extra_source_xy,
 						flow_status="no_sources",
+						source_component_mask_hr=None,
 						out_dir=_flow_gate_out_dir,
 					)
 				if write_layer_debug:
@@ -2302,6 +2449,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						primary_xy=primary_xy,
 						extra_source_xy=extra_source_xy,
 						flow_status="flow_called",
+						source_component_mask_hr=flow["source_component_mask_hr"],
 						out_dir=_flow_gate_out_dir,
 					)
 			except RuntimeError as exc:
@@ -2328,6 +2476,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						extra_source_xy=extra_source_xy,
 						flow_status="flow_skipped_source_outside_domain",
 						flow_source_value=source_value,
+						source_component_mask_hr=None,
 						out_dir=_flow_gate_out_dir,
 					)
 				if write_layer_debug:
@@ -2375,6 +2524,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 						source_edge_mask_hr=None,
 						source_component_mask_hr=None,
 						source_xy=primary_xy,
+						extra_source_xy=extra_source_xy,
 						corr_seed_debug=corr_seed_debug,
 						flow_metadata=None,
 						out_dir=_flow_gate_out_dir,
@@ -2510,6 +2660,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					source_edge_mask_hr=flow["source_edge_mask_hr"],
 					source_component_mask_hr=flow["source_component_mask_hr"],
 					source_xy=primary_xy,
+					extra_source_xy=extra_source_xy,
 					corr_seed_debug=corr_seed_debug,
 					flow_metadata=flow_metadata,
 					out_dir=_flow_gate_out_dir,

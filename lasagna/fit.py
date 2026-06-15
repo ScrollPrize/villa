@@ -25,6 +25,9 @@ import volume_scale
 
 
 _SHELL_STEP_ANALYSIS_ENABLED = False
+_ATLAS_LINE_ATTACHMENT_STATE_KEY = "_atlas_line_attachment_state_"
+_ATLAS_LINE_ATTACHMENT_STATE_FORMAT = "lasagna_atlas_line_attachment_state"
+_ATLAS_LINE_TERMS = ("atlas_line", "atlas_line_control", "atlas_line_other", "atlas_line_snap")
 
 
 def _stage_start(label: str) -> float:
@@ -43,6 +46,194 @@ def _truthy_config_bool(value: object) -> bool:
 	if isinstance(value, str):
 		return value.strip().lower() in {"1", "true", "yes", "on"}
 	return False
+
+
+def _cpu_float_tensor_1d(value: torch.Tensor, *, name: str, count: int | None = None) -> torch.Tensor:
+	t = value.detach().cpu().to(dtype=torch.float32).reshape(-1).contiguous()
+	if count is not None and int(t.numel()) != int(count):
+		raise ValueError(f"{name} expected {count} values, got {int(t.numel())}")
+	if not bool(torch.isfinite(t).all()):
+		raise ValueError(f"{name} contains non-finite values")
+	return t
+
+
+def _cpu_float_tensor_2d(value: torch.Tensor, *, name: str, shape: tuple[int, int] | None = None) -> torch.Tensor:
+	t = value.detach().cpu().to(dtype=torch.float32)
+	if t.ndim != 2:
+		raise ValueError(f"{name} expected a 2D tensor, got shape {tuple(t.shape)}")
+	if shape is not None and tuple(int(v) for v in t.shape) != tuple(shape):
+		raise ValueError(f"{name} expected shape {shape}, got {tuple(t.shape)}")
+	if not bool(torch.isfinite(t).all()):
+		raise ValueError(f"{name} contains non-finite values")
+	return t.contiguous()
+
+
+def _cpu_bool_tensor_1d(value: torch.Tensor | None, *, name: str, count: int) -> torch.Tensor:
+	if value is None:
+		return torch.zeros(int(count), dtype=torch.bool)
+	t = value.detach().cpu().to(dtype=torch.bool).reshape(-1).contiguous()
+	if int(t.numel()) != int(count):
+		raise ValueError(f"{name} expected {count} values, got {int(t.numel())}")
+	return t
+
+
+def _atlas_line_attachment_state_from_debug_payload(
+	*,
+	lines: fit_data.AtlasLines3D,
+	payload: object,
+) -> dict:
+	K = int(lines.target_xyz.shape[0])
+	sample_h = getattr(payload, "sample_model_h", None)
+	sample_w = getattr(payload, "sample_model_w", None)
+	if not isinstance(sample_h, torch.Tensor) or not isinstance(sample_w, torch.Tensor):
+		raise ValueError("atlas attachment persistence requires sample_model_h/sample_model_w debug tensors")
+	sample_h = sample_h.detach().cpu().to(dtype=torch.float32)
+	sample_w = sample_w.detach().cpu().to(dtype=torch.float32)
+	if sample_h.ndim != 2 or sample_w.ndim != 2:
+		raise ValueError(
+			"atlas attachment persistence requires sample_model_h/sample_model_w with shape (D,K)"
+		)
+	if int(sample_h.shape[0]) != 1 or int(sample_w.shape[0]) != 1:
+		raise ValueError(
+			f"atlas attachment persistence requires depth-1 debug payload, got "
+			f"sample_model_h={tuple(sample_h.shape)} sample_model_w={tuple(sample_w.shape)}"
+		)
+	if int(sample_h.shape[1]) != K or int(sample_w.shape[1]) != K:
+		raise ValueError(
+			f"atlas attachment persistence sample count mismatch: lines={K} "
+			f"sample_model_h={tuple(sample_h.shape)} sample_model_w={tuple(sample_w.shape)}"
+		)
+	object_ids = [str(v) for v in (getattr(lines, "object_ids", ()) or ())]
+	if len(object_ids) != K:
+		object_ids = ["unknown" for _ in range(K)]
+	source_indices = [int(v) for v in (getattr(lines, "source_indices", ()) or ())]
+	if len(source_indices) != K:
+		source_indices = [int(i) for i in range(K)]
+	return {
+		"format": _ATLAS_LINE_ATTACHMENT_STATE_FORMAT,
+		"version": 1,
+		"target_xyz": _cpu_float_tensor_2d(lines.target_xyz, name="target_xyz", shape=(K, 3)),
+		"normal_xyz": _cpu_float_tensor_2d(lines.normal_xyz, name="normal_xyz", shape=(K, 3)),
+		"model_h": _cpu_float_tensor_1d(sample_h[0], name="model_h", count=K),
+		"model_w": _cpu_float_tensor_1d(sample_w[0], name="model_w", count=K),
+		"object_ids": object_ids,
+		"source_indices": source_indices,
+		"is_control_point": _cpu_bool_tensor_1d(getattr(lines, "is_control_point", None), name="is_control_point", count=K),
+		"is_snap_point": _cpu_bool_tensor_1d(getattr(lines, "is_snap_point", None), name="is_snap_point", count=K),
+		"atlas_winding_model_ranges": [
+			[int(winding), float(start_w), float(end_w)]
+			for winding, start_w, end_w in (getattr(lines, "atlas_winding_model_ranges", ()) or ())
+		],
+	}
+
+
+def _atlas_lines_from_attachment_state(state: object, *, device: torch.device) -> fit_data.AtlasLines3D:
+	if not isinstance(state, dict):
+		raise ValueError("atlas reopt requires _atlas_line_attachment_state_ checkpoint state")
+	if state.get("format") != _ATLAS_LINE_ATTACHMENT_STATE_FORMAT or int(state.get("version", -1)) != 1:
+		raise ValueError("atlas reopt requires valid _atlas_line_attachment_state_ checkpoint state")
+	try:
+		target_xyz = torch.as_tensor(state["target_xyz"], device=device, dtype=torch.float32)
+		normal_xyz = torch.as_tensor(state["normal_xyz"], device=device, dtype=torch.float32)
+		model_h = torch.as_tensor(state["model_h"], device=device, dtype=torch.float32).reshape(-1)
+		model_w = torch.as_tensor(state["model_w"], device=device, dtype=torch.float32).reshape(-1)
+	except KeyError as exc:
+		raise ValueError("atlas reopt requires valid _atlas_line_attachment_state_ checkpoint state") from exc
+	K = int(model_h.numel())
+	if target_xyz.shape != (K, 3) or normal_xyz.shape != (K, 3) or int(model_w.numel()) != K:
+		raise ValueError("atlas reopt requires valid _atlas_line_attachment_state_ checkpoint state")
+	if not bool(torch.isfinite(target_xyz).all() and torch.isfinite(normal_xyz).all()
+				and torch.isfinite(model_h).all() and torch.isfinite(model_w).all()):
+		raise ValueError("atlas reopt requires finite _atlas_line_attachment_state_ coordinates")
+	object_ids = tuple(str(v) for v in state.get("object_ids", ()))
+	source_indices = tuple(int(v) for v in state.get("source_indices", ()))
+	if len(object_ids) != K:
+		raise ValueError("atlas reopt requires _atlas_line_attachment_state_.object_ids to match attachments")
+	if len(source_indices) != K:
+		raise ValueError("atlas reopt requires _atlas_line_attachment_state_.source_indices to match attachments")
+	is_control = torch.as_tensor(state.get("is_control_point", torch.zeros(K, dtype=torch.bool)), device=device, dtype=torch.bool).reshape(-1)
+	is_snap = torch.as_tensor(state.get("is_snap_point", torch.zeros(K, dtype=torch.bool)), device=device, dtype=torch.bool).reshape(-1)
+	if int(is_control.numel()) != K or int(is_snap.numel()) != K:
+		raise ValueError("atlas reopt requires _atlas_line_attachment_state_ flags to match attachments")
+	ranges_raw = state.get("atlas_winding_model_ranges", ())
+	ranges: list[tuple[int, float, float]] = []
+	for item in ranges_raw or ():
+		if not isinstance(item, (list, tuple)) or len(item) != 3:
+			raise ValueError("atlas reopt requires valid _atlas_line_attachment_state_.atlas_winding_model_ranges")
+		ranges.append((int(item[0]), float(item[1]), float(item[2])))
+	return fit_data.AtlasLines3D(
+		target_xyz=target_xyz,
+		normal_xyz=normal_xyz,
+		model_h=model_h,
+		model_w=model_w,
+		object_ids=object_ids,
+		source_indices=source_indices,
+		is_control_point=is_control,
+		is_snap_point=is_snap,
+		atlas_winding_model_ranges=tuple(ranges),
+	)
+
+
+def _stages_use_atlas_line_terms(stages: list[optimizer.Stage] | tuple[optimizer.Stage, ...]) -> bool:
+	for stage in stages:
+		if stage.children and _stages_use_atlas_line_terms(stage.children):
+			return True
+		if stage.global_opt is None:
+			continue
+		if int(stage.global_opt.steps) <= 0:
+			continue
+		if any(float(stage.global_opt.eff.get(name, 0.0)) > 0.0 for name in _ATLAS_LINE_TERMS):
+			return True
+	return False
+
+
+def _checkpoint_atlas_lines_for_reopt(
+	*,
+	checkpoint_state: object,
+	stages: list[optimizer.Stage],
+	device: torch.device,
+) -> fit_data.AtlasLines3D | None:
+	if not _stages_use_atlas_line_terms(stages):
+		return None
+	if not isinstance(checkpoint_state, dict) or _ATLAS_LINE_ATTACHMENT_STATE_KEY not in checkpoint_state:
+		raise ValueError(
+			"atlas reopt with active atlas-line terms requires checkpoint "
+			"_atlas_line_attachment_state_; rerun model-init=atlas to create a model-owned attachment state"
+		)
+	return _atlas_lines_from_attachment_state(
+		checkpoint_state[_ATLAS_LINE_ATTACHMENT_STATE_KEY],
+		device=device,
+	)
+
+
+def _populate_atlas_checkpoint_state(st: dict, *, mdl: object, data: fit_data.FitData3D) -> dict | None:
+	if data.atlas_lines is None:
+		return None
+	import opt_loss_atlas_line
+
+	with torch.no_grad():
+		atlas_res = mdl(data, needs=model.ModelForwardNeeds(mesh_normals=True))
+		opt_loss_atlas_line.atlas_line_loss(
+			res=atlas_res,
+			stage_eff={
+				"atlas_line_control": 1.0,
+				"atlas_line_other": 1.0,
+				"atlas_line_snap": 1.0,
+			},
+			debug_payload=True,
+		)
+		atlas_debug_payload = opt_loss_atlas_line.last_debug_payload()
+		st[_ATLAS_LINE_ATTACHMENT_STATE_KEY] = _atlas_line_attachment_state_from_debug_payload(
+			lines=data.atlas_lines,
+			payload=atlas_debug_payload,
+		)
+		atlas_control_results = opt_loss_atlas_line.atlas_control_points_results(
+			lines=data.atlas_lines,
+			payload=atlas_debug_payload,
+		)
+	if atlas_control_results is not None:
+		st["_atlas_control_points_results_"] = atlas_control_results
+	return atlas_control_results
 
 
 @dataclass(frozen=True)
@@ -1562,6 +1753,7 @@ def main(argv: list[str] | None = None) -> int:
 
 	tifxyz_init = getattr(args, "tifxyz_init", None)
 	loaded_snap_surf_map_state: dict | None = None
+	loaded_model_checkpoint: dict | None = None
 	atlas_lines_3d: fit_data.AtlasLines3D | None = None
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
@@ -1805,23 +1997,9 @@ def main(argv: list[str] | None = None) -> int:
 	else:
 		print(f"[fit] model-init=model: loading checkpoint {model_cfg.model_input}", flush=True)
 		st = torch.load(model_cfg.model_input, map_location=device, weights_only=False)
+		loaded_model_checkpoint = st if isinstance(st, dict) else None
 		loaded_snap_surf_map_state = st.get("_snap_surf_map_state_") if isinstance(st, dict) else None
 		mdl = model.Model3D.from_checkpoint(st, device=device)
-		if isinstance(cfg.get("atlas"), dict):
-			atlas_init = atlas_mod.build_atlas_init(
-				cfg["atlas"],
-				device=device,
-				mesh_step=int(getattr(mdl.params, "mesh_step", model_cfg.mesh_step)),
-				winding_step=int(getattr(mdl.params, "winding_step", model_cfg.winding_step)),
-			)
-			atlas_lines_3d = atlas_init.atlas_lines
-			fit_config["_atlas_init_"] = copy.deepcopy(atlas_init.metadata)
-			print(
-				"[fit] model-init=model: restored atlas lines from object refs "
-				f"samples={atlas_init.metadata['line_sample_count']} "
-				f"period_columns={atlas_init.metadata['period_columns']}",
-				flush=True,
-			)
 		if self_map_init != "off":
 			checkpoint_model_w = getattr(mdl.params, "model_w", None)
 			model_w_wraps = (
@@ -1942,6 +2120,18 @@ def main(argv: list[str] | None = None) -> int:
 			f"snap_surf_map_args={args_snap_map}",
 			flush=True,
 		)
+	if model_init == "model":
+		atlas_lines_3d = _checkpoint_atlas_lines_for_reopt(
+			checkpoint_state=loaded_model_checkpoint,
+			stages=stages,
+			device=device,
+		)
+		if atlas_lines_3d is not None:
+			print(
+				"[fit] model-init=model: restored atlas lines from checkpoint "
+				f"{_ATLAS_LINE_ATTACHMENT_STATE_KEY} samples={int(atlas_lines_3d.target_xyz.shape[0])}",
+				flush=True,
+			)
 	_stage_done("load_optimizer_stages", _t)
 
 	# --- Streaming data loader ---
@@ -2083,35 +2273,16 @@ def main(argv: list[str] | None = None) -> int:
 		if corr_results is not None:
 			st["_corr_points_results_"] = corr_results
 		if data.atlas_lines is not None:
-			try:
-				import opt_loss_atlas_line
-
-				with torch.no_grad():
-					atlas_res = mdl(data, needs=model.ModelForwardNeeds(mesh_normals=True))
-					opt_loss_atlas_line.atlas_line_loss(
-						res=atlas_res,
-						stage_eff={
-							"atlas_line_control": 1.0,
-							"atlas_line_other": 1.0,
-							"atlas_line_snap": 1.0,
-						},
-						debug_payload=True,
-					)
-					atlas_control_results = opt_loss_atlas_line.atlas_control_points_results(
-						lines=data.atlas_lines,
-					)
-				if atlas_control_results is not None:
-					st["_atlas_control_points_results_"] = atlas_control_results
-					summary = atlas_control_results.get("summary", {})
-					print(
-						"[fit] saving atlas control point results "
-						f"total={summary.get('total_count', 0)} "
-						f"valid={summary.get('valid_count', 0)} "
-						f"rms={float(summary.get('rms_distance', 0.0)):.6g}",
-						flush=True,
-					)
-			except Exception as exc:
-				print(f"[fit] WARNING: failed to build atlas control point results: {exc}", flush=True)
+			atlas_control_results = _populate_atlas_checkpoint_state(st, mdl=mdl, data=data)
+			if atlas_control_results is not None:
+				summary = atlas_control_results.get("summary", {})
+				print(
+					"[fit] saving atlas control point results "
+					f"total={summary.get('total_count', 0)} "
+					f"valid={summary.get('valid_count', 0)} "
+					f"rms={float(summary.get('rms_distance', 0.0)):.6g}",
+					flush=True,
+				)
 		if corr_point_roi_init is not None:
 			payload = copy.deepcopy(corr_point_roi_init.payload)
 			payload["output_radius_grid_points"] = int(data_cfg.corr_point_roi_output_radius)

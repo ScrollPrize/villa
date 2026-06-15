@@ -18,7 +18,7 @@
     {
       "name": "atlas_reopt_snap_flow_speculative",
       "opt": {
-        "steps": 500,
+        "steps": 100,
         "lr": 1.0,
         "params": ["mesh_ms"],
         "args": {
