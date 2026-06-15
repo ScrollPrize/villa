@@ -29,8 +29,9 @@ centre of S's grid):
      edge set stays a chain; more distant patches are reached transitively).
      Crossing an edge from patch P (departure point d) to patch R (arrival point
      e) costs the within-P strip delta from the entry point to d, plus the edge's
-     wind_a difference (e minus d). At every patch reached, its absolute anchors
-     vote, propagated back to the seed through the accumulated chain.
+     wind_a difference (e minus d), adjusted when the two adjacent PCL points
+     straddle theta=0. At every patch reached, its absolute anchors vote,
+     propagated back to the seed through the accumulated chain.
 
 Concretely, with strip_delta(P, a, b) := winding(b) - winding(a) measured by the
 integer theta=0 branch transport of a within-P ij strip, each BFS state is
@@ -38,7 +39,8 @@ integer theta=0 branch transport of a within-P ij strip, each BFS state is
 
   * a vote from anchor a (absolute winding w) on P is
         winding(seed) = acc + w + strip_delta(P, a, q);
-  * crossing a relative edge (P:d -> R:e, edge_delta = wind_a(e) - wind_a(d)) sets
+  * crossing a relative edge (P:d -> R:e, edge_delta = wind_a(e) - wind_a(d),
+    with the adjacent-PCL theta=0 seam adjustment applied) sets
         acc' = acc - strip_delta(P, q, d) - edge_delta,  entry q' = e.
 
 BFS marks each patch visited the first (fewest-hops) time it is reached, so it
@@ -342,7 +344,23 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches):
     return anchors
 
 
-def build_rel_adjacency(cross_patch_pcls, patches):
+def pcl_edge_unwrap_adjustment_windings(transform, dr, pa, pb):
+    """Unwrap the adjacent PCL segment pa -> pb and return only its theta=0
+    cumulative branch-cut adjustment in winding units."""
+    device = dr.device
+    zyx = torch.as_tensor(
+        np.stack([pa['zyx'], pb['zyx']], axis=0).astype(np.float32),
+        device=device,
+    )
+    with torch.no_grad():
+        spiral = transform(zyx)
+        theta, _, _ = fs.get_theta_and_radii(spiral[..., 1:], dr)
+        zero_shifted = torch.zeros_like(theta)
+        adjustments = fs._unwrap_track_shifted_radii(theta[None], zero_shifted[None], dr)[0]
+    return int(round(float((adjustments[-1] / dr).item())))
+
+
+def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
     """patch_id -> list of relative-winding edges leaving that patch.
 
     For each relative-winding pcl we order its attached points by annotation
@@ -350,9 +368,10 @@ def build_rel_adjacency(cross_patch_pcls, patches):
     different (loaded) patches. Each such pair yields a pair of directed edges,
     one per direction. An edge records the departure point (`from_ij`) on this
     patch, the arrival point (`to_ij`) on the neighbour, and the edge's winding
-    delta = wind_a(arrival) - wind_a(departure). Only consecutive pairs are used,
-    so the edge set stays a chain through the pcl's points; more distant patches
-    are reached transitively by BFS."""
+    delta = wind_a(arrival) - wind_a(departure), corrected for any theta=0 seam
+    crossing between the adjacent PCL points. Only consecutive pairs are used, so
+    the edge set stays a chain through the pcl's points; more distant patches are
+    reached transitively by BFS."""
     adjacency = {}
     for pid, pcl in cross_patch_pcls.items():
         if pcl.get('metadata', {}).get('winding_is_absolute', False):
@@ -372,8 +391,14 @@ def build_rel_adjacency(cross_patch_pcls, patches):
                 continue
             wa, wb = float(pa['winding_annotation']), float(pb['winding_annotation'])
             # Relative-winding annotations are integers; the edge delta is the integer
-            # number of windings between the two attached points.
-            dwind = int(round(wb - wa))
+            # number of windings between the two attached points, expressed in the
+            # local theta branch frame. The unwrap helper returns c, the cumulative
+            # shifted-radius adjustment; the diagnostic's integer branch transport
+            # convention is -c (same sign as strip_winding_delta).
+            raw_dwind = int(round(wb - wa))
+            unwrap_adjustment = pcl_edge_unwrap_adjustment_windings(transform, dr, pa, pb)
+            branch_delta = -unwrap_adjustment
+            dwind = raw_dwind + branch_delta
             ija = np.array(pa['on_patch']['ij'], dtype=np.float32)
             ijb = np.array(pb['on_patch']['ij'], dtype=np.float32)
             # Raw (full-resolution, un-downsampled) [z, y, x] of each attached point, so
@@ -387,12 +412,18 @@ def build_rel_adjacency(cross_patch_pcls, patches):
                 'from_point_id': int(pa['id']), 'to_point_id': int(pb['id']),
                 'from_zyx': za, 'to_zyx': zb,
                 'winding_delta': dwind,
+                'raw_winding_delta': raw_dwind,
+                'pcl_unwrap_adjustment': unwrap_adjustment,
+                'pcl_branch_delta': branch_delta,
             })
             adjacency.setdefault(idb, []).append({
                 **common, 'neighbor': ida, 'from_ij': ijb, 'to_ij': ija,
                 'from_point_id': int(pb['id']), 'to_point_id': int(pa['id']),
                 'from_zyx': zb, 'to_zyx': za,
                 'winding_delta': -dwind,
+                'raw_winding_delta': -raw_dwind,
+                'pcl_unwrap_adjustment': -unwrap_adjustment,
+                'pcl_branch_delta': -branch_delta,
             })
     return adjacency
 
@@ -437,7 +468,11 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn):
                     'from_ij': hop['from_ij'], 'to_ij': hop['to_ij'],
                     'from_zyx_raw': hop['from_zyx_raw'],
                     'to_zyx_raw': hop['to_zyx_raw'],
-                    'edge_winding_delta': hop['edge_winding_delta'], 'kind': 'tree'}
+                    'edge_winding_delta': hop['edge_winding_delta'],
+                    'raw_edge_winding_delta': hop['raw_edge_winding_delta'],
+                    'pcl_unwrap_adjustment': hop['pcl_unwrap_adjustment'],
+                    'pcl_branch_delta': hop['pcl_branch_delta'],
+                    'kind': 'tree'}
         hop = tree_edge_by_child.get(a)
         assert hop is not None and hop['from_patch'] == b, (a, b)
         # Stored as b -> a; we walk a -> b, so swap the points (and their coords) and
@@ -448,7 +483,11 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn):
                 'from_ij': hop['to_ij'], 'to_ij': hop['from_ij'],
                 'from_zyx_raw': hop['to_zyx_raw'],
                 'to_zyx_raw': hop['from_zyx_raw'],
-                'edge_winding_delta': -hop['edge_winding_delta'], 'kind': 'tree'}
+                'edge_winding_delta': -hop['edge_winding_delta'],
+                'raw_edge_winding_delta': -hop['raw_edge_winding_delta'],
+                'pcl_unwrap_adjustment': -hop['pcl_unwrap_adjustment'],
+                'pcl_branch_delta': -hop['pcl_branch_delta'],
+                'kind': 'tree'}
 
     cycles = []
     for L in loops:
@@ -470,7 +509,11 @@ def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn):
             'from_ij': L['to_ij'], 'to_ij': L['from_ij'],
             'from_zyx_raw': L['to_zyx_raw'],
             'to_zyx_raw': L['from_zyx_raw'],
-            'edge_winding_delta': -L['edge_winding_delta'], 'kind': 'closing',
+            'edge_winding_delta': -L['edge_winding_delta'],
+            'raw_edge_winding_delta': -L['raw_edge_winding_delta'],
+            'pcl_unwrap_adjustment': -L['pcl_unwrap_adjustment'],
+            'pcl_branch_delta': -L['pcl_branch_delta'],
+            'kind': 'closing',
         }
         # Per patch: the within-patch winding delta between its two cycle points -- the
         # pcl-point where the edge above attaches (top) and where the edge below
@@ -601,7 +644,7 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
 
     # --- build the absolute anchors and the relative-pcl patch graph ---
     abs_anchors_by_patch = build_abs_anchors_by_patch(cross_patch_pcls, patches)
-    rel_adjacency = build_rel_adjacency(cross_patch_pcls, patches)
+    rel_adjacency = build_rel_adjacency(cross_patch_pcls, patches, transform, dr)
     num_abs_pcls = sum(1 for p in cross_patch_pcls.values()
                        if p.get('metadata', {}).get('winding_is_absolute', False))
     num_rel_pcls = len(cross_patch_pcls) - num_abs_pcls
@@ -731,6 +774,9 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
                     'from_zyx_raw': _to_py(edge['from_zyx']),
                     'to_zyx_raw': _to_py(edge['to_zyx']),
                     'edge_winding_delta': edge['winding_delta'],
+                    'raw_edge_winding_delta': edge['raw_winding_delta'],
+                    'pcl_unwrap_adjustment': edge['pcl_unwrap_adjustment'],
+                    'pcl_branch_delta': edge['pcl_branch_delta'],
                     'from_depth': hops,
                     'to_depth': rstate['hops'],
                     # winding(seed) - winding(entry) of each end, so the plot can place the
@@ -772,6 +818,9 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
                 'from_zyx_raw': _to_py(edge['from_zyx']),
                 'to_zyx_raw': _to_py(edge['to_zyx']),
                 'edge_winding_delta': edge['winding_delta'],
+                'raw_edge_winding_delta': edge['raw_winding_delta'],
+                'pcl_unwrap_adjustment': edge['pcl_unwrap_adjustment'],
+                'pcl_branch_delta': edge['pcl_branch_delta'],
                 'intra_patch_strip_delta': strip['delta_windings'],
                 'intra_patch_residual_unwrapped_delta': strip['residual_unwrapped_delta_windings'],
                 'intra_patch_unwrap_adjustment': strip['unwrap_adjustment_windings'],
