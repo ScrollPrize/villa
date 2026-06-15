@@ -3588,6 +3588,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onSlimFlatten(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::straightenRequested,
+            this, [this](const QString& segmentId) {
+                _segmentationCommandHandler->onStraighten(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::abfFlattenRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onABFFlatten(segmentId.toStdString());

@@ -120,6 +120,9 @@ target_link_libraries(vc_tifxyz_inp_mask vc_core)
 add_executable(vc_tifxyz_trim src/vc_tifxyz_trim.cpp)
 target_link_libraries(vc_tifxyz_trim vc_core opencv_core opencv_imgcodecs TIFF::TIFF)
 
+add_executable(vc_straighten src/vc_straighten.cpp)
+target_link_libraries(vc_straighten vc_core Boost::program_options opencv_core opencv_imgproc opencv_imgcodecs opencv_flann TIFF::TIFF)
+
 add_executable(vc_cut_windings src/vc_cut_windings.cpp)
 target_link_libraries(vc_cut_windings vc_core opencv_core)
 
@@ -244,6 +247,7 @@ if(VC_USE_PCH)
         vc_merge_tifxyz vc_merge_patch vc_visualize vc_volpkg_convert vc_transform_geom
         vc_gen_normalgrids vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning
         vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress
+        vc_straighten
     )
         target_precompile_headers(${_app} REUSE_FROM vc_common_pch)
     endforeach()
