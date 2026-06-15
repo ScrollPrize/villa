@@ -18,7 +18,10 @@ output, one loop at a time: each inconsistent loop is drawn on its own as a
 vertical stack of the patches around its cycle, with the relative-pcl tree edges
 as downward arrows between consecutive patches and one "closing" arrow bowing from
 the bottom patch back up to the top (the non-tree edge whose holonomy makes the
-loop inconsistent). The cycle reconstruction (patches + pcls in order) is
+loop inconsistent). Each pcl edge is labelled with its winding delta; each patch is
+labelled (in crimson, to the right of its line) with the within-patch winding delta
+between its two cycle points, when the strip across it crosses theta=0. The cycle
+reconstruction (patches + pcls in order, with the per-patch strip deltas) is
 precomputed by find_inconsistent_windings and stored under "loop_cycles" in the
 votes json; this per-loop view is always produced alongside the main graph.
 
@@ -549,13 +552,18 @@ def plot_loop_cycles(cycles, total, output, ncols=6, dpi=150):
         c = cycles[k]
         patches, steps = c['patches'], c['steps']
         m = len(patches)
+        pdeltas = c.get('patch_strip_deltas') or [None] * m
         ys = [-i for i in range(m)]
 
-        # patches: a dot per row, id labelled to the left.
+        # patches: a dot per row, id labelled to the left; the within-patch winding
+        # delta (when the strip across the patch crosses theta=0) in crimson to the right.
         for i, pid in enumerate(patches):
             ax.plot([0], [ys[i]], marker='o', ms=4, color='black', zorder=3)
             ax.text(-0.16, ys[i], _short_patch(pid), fontsize=6, va='center', ha='right',
                     zorder=4, fontweight='bold' if i in (0, m - 1) else 'normal')
+            if pdeltas[i]:
+                ax.text(0.12, ys[i], f"Δ{pdeltas[i]:+d}", fontsize=5, color='crimson',
+                        va='center', ha='left', zorder=4, fontweight='bold')
 
         # tree-edge pcls: downward arrows, label centred on the arrow (white bbox).
         for i, st in enumerate(steps):
@@ -589,7 +597,8 @@ def plot_loop_cycles(cycles, total, output, ncols=6, dpi=150):
 
     cap_note = '' if n == total else f' (showing {n} with the largest |holonomy|)'
     fig.suptitle(f'{total} inconsistent closed loop(s){cap_note}  --  patches stacked top-to-bottom, '
-                 f'relative-pcl edges as arrows (with Δwinding), magenta = closing edge (holonomy ≠ 0)',
+                 f'relative-pcl edges as arrows (with Δwinding), magenta = closing edge (holonomy ≠ 0); '
+                 f'crimson Δ = within-patch winding delta (theta=0 crossing)',
                  fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.99))
     fig.savefig(output, dpi=dpi, bbox_inches='tight')
@@ -614,6 +623,7 @@ svg.loop { display: block; margin: 0 auto; }
 .plbl.end { font-weight: 700; fill: #111; }
 .elbl { font-size: 9.5px; fill: #444; dominant-baseline: middle; }
 .clbl { font-size: 10px; fill: #c026d3; font-weight: 700; dominant-baseline: middle; }
+.pslbl { font-size: 9px; fill: crimson; font-weight: 700; dominant-baseline: middle; pointer-events: none; }
 .patchv { stroke: #000; stroke-width: 1.8; }
 .patchv.end { stroke-width: 2.6; }
 .tedge { stroke: #999; stroke-width: 1; fill: none; }
@@ -639,7 +649,8 @@ function xyz(px, py, pz) {
 }
 function info(el) {
   const d = el.dataset;
-  if (d.kind === 'patch') return 'patch ' + d.patch;
+  if (d.kind === 'patch') return 'patch ' + d.patch
+        + (d.stripDelta !== undefined ? '\nΔwinding across patch ' + d.stripDelta : '');
   if (d.kind === 'dot') return 'rel-pcl point — pcl ' + d.pcl + ' "' + (d.pclName || '') + '"  point ' + d.point
         + '\non patch ' + d.patch + xyz(d.x, d.y, d.z);
   if (d.kind === 'edge') return 'rel-pcl edge ' + d.pcl + ' "' + (d.pclName || '') + '"'
@@ -668,8 +679,10 @@ def build_loops_html(cycles, total, ncols=6):
     the lower from the edge below; each hoverable for its volume xyz). Each relative-
     pcl tree edge is two fine gray fragments running between adjacent patches' dots,
     with its pcl id + Δwinding in the gap between them; one magenta closing arrow bows
-    to the right from the bottom patch back up to the top. Each patch / edge / point /
-    closing edge is its own <g> carrying data-* attributes, with a hover tooltip."""
+    to the right from the bottom patch back up to the top. When the strip across a patch
+    between its two cycle points crosses theta=0, its winding delta is shown in crimson
+    just right of the patch line. Each patch / edge / point / closing edge is its own
+    <g> carrying data-* attributes, with a hover tooltip."""
     esc = html_lib.escape
 
     def a(s):
@@ -694,6 +707,9 @@ def build_loops_html(cycles, total, ncols=6):
     for c in cycles:
         patches, steps, cs = c['patches'], c['steps'], c['closing_step']
         m = len(patches)
+        # within-patch winding delta between each patch's two cycle points (older votes
+        # files predate this; fall back to no labels).
+        pdeltas = c.get('patch_strip_deltas') or [None] * m
         ys = [TOP + i * ROW for i in range(m)]
         H = TOP + (m - 1) * ROW + BOT
         W = RLBL + 96
@@ -758,10 +774,17 @@ def build_loops_html(cycles, total, ncols=6):
             is_end = i in (0, m - 1)
             pcls = 'patchv end' if is_end else 'patchv'
             lcls = 'plbl end' if is_end else 'plbl'
-            S.append(f'<g class="lpatch" data-kind="patch" data-patch="{a(pid)}">')
+            pd = pdeltas[i]
+            pd_attr = f' data-strip-delta="{pd:+d}"' if pd is not None else ''
+            S.append(f'<g class="lpatch" data-kind="patch" data-patch="{a(pid)}"{pd_attr}>')
             S.append(f'<line class="{pcls}" x1="{CX}" y1="{ys[i] - PHH:.1f}" '
                      f'x2="{CX}" y2="{ys[i] + PHH:.1f}"/>')
             S.append(f'<text class="{lcls}" x="{LBLX}" y="{ys[i]}" text-anchor="end">{esc(_short_patch(pid))}</text>')
+            # crimson within-patch Δwinding, just right of the line (only when nonzero:
+            # the strip across the patch crosses theta=0).
+            if pd:
+                S.append(f'<text class="pslbl" x="{CX + PHH + 3}" y="{ys[i]}" '
+                         f'text-anchor="start">&#916;{pd:+d}</text>')
             S.append('</g>')
             for yy, pt in ((ys[i] - PHH, top_pt[i]), (ys[i] + PHH, bot_pt[i])):
                 if pt is None:
@@ -790,6 +813,9 @@ def build_loops_html(cycles, total, ncols=6):
         'stroke="#999" stroke-width="1"/></svg>relative-pcl tree edge</span>'
         '<span class="item"><svg width="24" height="12"><line x1="1" y1="6" x2="17" y2="6" '
         'stroke="#c026d3" stroke-width="1.8" marker-end="url(#ahm)"/></svg>closing edge (holonomy ≠ 0)</span>'
+        '<span class="item"><svg width="22" height="14"><line x1="6" y1="2" x2="6" y2="12" '
+        'stroke="#000" stroke-width="2.2"/><text x="10" y="11" font-size="11" fill="crimson" '
+        'font-weight="700">&#916;</text></svg>within-patch &#916;winding (theta=0 crossing)</span>'
     )
     # Arrowhead markers, defined once and referenced from every loop svg.
     defs = ('<svg width="0" height="0" style="position:absolute"><defs>'

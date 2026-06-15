@@ -55,7 +55,10 @@ without, the absolute anchors). These are reported under "loops" in the output
 (disable with --no-detect-loops). For each inconsistent loop we additionally
 reconstruct the full cycle it closes -- the BFS-tree path between its two patches
 plus the closing edge -- and record it under "loop_cycles" as an ordered patch/pcl
-stack, which plot_winding_graph renders one loop at a time.
+stack, which plot_winding_graph renders one loop at a time. Each cycle additionally
+carries, per patch, the within-patch winding delta between its two cycle points (the
+strip across a patch may itself cross theta=0), measured the same way as the tree
+edges' intra-patch deltas.
 
 Each within-patch winding delta is measured along a strip that follows a
 fringe-avoiding shortest path through the patch's *valid quads only* (a weighted
@@ -394,7 +397,7 @@ def build_rel_adjacency(cross_patch_pcls, patches):
     return adjacency
 
 
-def build_loop_cycles(loops, tree_edge_by_child):
+def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn):
     """For each inconsistent loop (a non-tree relative edge whose winding holonomy
     is nonzero), reconstruct the full fundamental cycle it closes: the BFS-tree
     path between the edge's two patches, plus the closing edge itself.
@@ -404,7 +407,13 @@ def build_loop_cycles(loops, tree_edge_by_child):
     and back down to the arrival patch R at the bottom -- with one `steps` entry per
     consecutive pair (the relative-pcl tree edge between them, with its winding
     delta oriented in walk order) and a single `closing_step` for the non-tree edge
-    that loops R back up to P. plot_winding_graph renders each as a vertical
+    that loops R back up to P. It also carries `patch_strip_deltas`, one per patch
+    (aligned with `patches`): the within-patch winding delta between that patch's two
+    cycle points -- where the edge above attaches (top) and where the edge below
+    attaches (bottom) -- measured downward via `strip_delta_fn(patch, top_ij,
+    bot_ij)` (winding(bottom) - winding(top); None if unmeasurable). The strip
+    across a patch may itself cross theta=0, exactly like the tree edges'
+    intra_patch_strip_delta. plot_winding_graph renders each cycle as a vertical
     patch/pcl stack; precomputing it here keeps the tree-walking reconstruction next
     to the BFS that produced the tree."""
     def path_to_root(p):
@@ -425,6 +434,7 @@ def build_loop_cycles(loops, tree_edge_by_child):
             return {'from_patch': a, 'to_patch': b,
                     'rel_pcl_id': hop['rel_pcl_id'], 'rel_pcl_name': hop['rel_pcl_name'],
                     'from_point_id': hop['from_point_id'], 'to_point_id': hop['to_point_id'],
+                    'from_ij': hop['from_ij'], 'to_ij': hop['to_ij'],
                     'from_zyx_raw': hop['from_zyx_raw'],
                     'to_zyx_raw': hop['to_zyx_raw'],
                     'edge_winding_delta': hop['edge_winding_delta'], 'kind': 'tree'}
@@ -435,6 +445,7 @@ def build_loop_cycles(loops, tree_edge_by_child):
         return {'from_patch': a, 'to_patch': b,
                 'rel_pcl_id': hop['rel_pcl_id'], 'rel_pcl_name': hop['rel_pcl_name'],
                 'from_point_id': hop['to_point_id'], 'to_point_id': hop['from_point_id'],
+                'from_ij': hop['to_ij'], 'to_ij': hop['from_ij'],
                 'from_zyx_raw': hop['to_zyx_raw'],
                 'to_zyx_raw': hop['from_zyx_raw'],
                 'edge_winding_delta': -hop['edge_winding_delta'], 'kind': 'tree'}
@@ -450,6 +461,29 @@ def build_loop_cycles(loops, tree_edge_by_child):
         lca = pp[lca_i]
         # P .. LCA (up P's branch) then LCA-exclusive .. R (down R's branch, reversed).
         patches = pp[:lca_i + 1] + pr[:pr_index[lca]][::-1]
+        steps = [tree_step(a, b) for a, b in zip(patches, patches[1:])]
+        # the non-tree edge, drawn as one arrow from R (bottom) back up to P (top).
+        closing_step = {
+            'from_patch': R, 'to_patch': P,
+            'rel_pcl_id': L['rel_pcl_id'], 'rel_pcl_name': L['rel_pcl_name'],
+            'from_point_id': L['to_point_id'], 'to_point_id': L['from_point_id'],
+            'from_ij': L['to_ij'], 'to_ij': L['from_ij'],
+            'from_zyx_raw': L['to_zyx_raw'],
+            'to_zyx_raw': L['from_zyx_raw'],
+            'edge_winding_delta': -L['edge_winding_delta'], 'kind': 'closing',
+        }
+        # Per patch: the within-patch winding delta between its two cycle points -- the
+        # pcl-point where the edge above attaches (top) and where the edge below
+        # attaches (bottom). The loop endpoints take the closing edge for their outer
+        # end (the same top/bottom assignment plot_winding_graph draws). Measured
+        # downward (winding(bottom) - winding(top)) as integer theta=0 seam transport;
+        # None where the strip can't be measured.
+        m = len(patches)
+        patch_strip_deltas = []
+        for i in range(m):
+            top_ij = closing_step['to_ij'] if i == 0 else steps[i - 1]['to_ij']
+            bot_ij = closing_step['from_ij'] if i == m - 1 else steps[i]['from_ij']
+            patch_strip_deltas.append(strip_delta_fn(patches[i], top_ij, bot_ij))
         cycles.append({
             'closing_rel_pcl_id': L['rel_pcl_id'],
             'closing_rel_pcl_name': L['rel_pcl_name'],
@@ -457,16 +491,9 @@ def build_loop_cycles(loops, tree_edge_by_child):
             'loop_winding_residual': L['loop_winding_residual'],
             'from_patch': P, 'to_patch': R, 'lca': lca,
             'patches': patches,
-            'steps': [tree_step(a, b) for a, b in zip(patches, patches[1:])],
-            # the non-tree edge, drawn as one arrow from R (bottom) back up to P (top).
-            'closing_step': {
-                'from_patch': R, 'to_patch': P,
-                'rel_pcl_id': L['rel_pcl_id'], 'rel_pcl_name': L['rel_pcl_name'],
-                'from_point_id': L['to_point_id'], 'to_point_id': L['from_point_id'],
-                'from_zyx_raw': L['to_zyx_raw'],
-                'to_zyx_raw': L['from_zyx_raw'],
-                'edge_winding_delta': -L['edge_winding_delta'], 'kind': 'closing',
-            },
+            'steps': steps,
+            'patch_strip_deltas': patch_strip_deltas,
+            'closing_step': closing_step,
         })
     return cycles
 
@@ -786,7 +813,18 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
     # Per-loop view: each inconsistent loop's full closed cycle (tree path between
     # its two patches + the closing edge), as an ordered patch/pcl stack that
     # plot_winding_graph renders one loop at a time.
-    loop_cycles = build_loop_cycles(loops, tree_edge_by_child)
+    def loop_patch_strip_delta(pid, top_ij, bot_ij):
+        """Within-patch winding delta winding(bot) - winding(top) across patch `pid`
+        between two of its points, as the integer theta=0 seam transport along a
+        within-patch valid-quad strip (None if unmeasurable). Same machinery as the
+        BFS's intra_patch_strip_delta, used here for each loop patch's two cycle
+        points (which, at the LCA / loop endpoints, are not the BFS tree points)."""
+        s = strip_winding_delta(transform, dr, graph_for(pid),
+                                np.asarray(top_ij, dtype=np.float32),
+                                np.asarray(bot_ij, dtype=np.float32), step_size)
+        return None if s is None else s['delta_windings']
+
+    loop_cycles = build_loop_cycles(loops, tree_edge_by_child, loop_patch_strip_delta)
 
     out = {
         'checkpoint': os.path.abspath(checkpoint),
