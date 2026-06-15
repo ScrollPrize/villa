@@ -17,6 +17,7 @@
 #include "vc/core/util/Logging.hpp"
 
 #include <QMdiArea>
+#include <QTimer>
 #include <QThread>
 #include <QMdiSubWindow>
 #include <QSettings>
@@ -85,6 +86,22 @@ ViewerManager::ViewerManager(CState* state,
                 &CState::surfaceWillBeDeleted,
                 this,
                 &ViewerManager::handleSurfaceWillBeDeleted);
+    }
+
+    // The single render clock for the whole app: ~60Hz, free-running. Each tick
+    // services every viewer's pending render/intersection flags. This is the only
+    // timer in the render-scheduling system (viewers own none).
+    _globalClock = new QTimer(this);
+    _globalClock->setInterval(16);
+    connect(_globalClock, &QTimer::timeout, this, &ViewerManager::onGlobalTick);
+    _globalClock->start();
+}
+
+void ViewerManager::onGlobalTick()
+{
+    for (auto* v : _baseViewers) {
+        if (v)
+            v->serviceRenderTick();
     }
 }
 

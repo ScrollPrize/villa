@@ -54,7 +54,9 @@ namespace {
 
 constexpr float kMinScale = 0.002f;
 constexpr float kMaxScale = 128.0f;
-constexpr int kResizeSettleMs = 140;
+// Global clock is ~16ms/tick. Durations expressed in ticks for serviceRenderTick.
+constexpr int kGlobalTickMs = 16;
+constexpr int kStatusRefreshTicks = 5000 / kGlobalTickMs;           // ~313 ticks (5s)
 // Non-interactive chunk-ready coalescing. Chunks for one viewpoint trickle in
 // over many milliseconds; the default 16ms render debounce re-renders the whole
 // frame per chunk (~9-11x per viewpoint). Debounce chunk-ready re-renders on a
@@ -772,47 +774,10 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setScene(_scene);
     _view->setDirectFramebuffer(&_framebuffer);
 
-    _renderTimer = new QTimer(this);
-    _renderTimer->setSingleShot(true);
-    _renderTimer->setInterval(16);
-    connect(_renderTimer, &QTimer::timeout, this, [this]() {
-        if (!_renderPending)
-            return;
-        _renderPending = false;
-        const std::string reason = ProfileLoggingEnabled()
-            ? std::format("render timer fired; scheduledReason='{}'; scheduledCaller='{}'",
-                          _pendingRenderReason, _pendingRenderCaller)
-            : std::string("render timer fired");
-        submitRender(reason.c_str());
-        updateStatusLabel();
-    });
-
-    _intersectionRenderTimer = new QTimer(this);
-    _intersectionRenderTimer->setSingleShot(true);
-    _intersectionRenderTimer->setInterval(50);
-    connect(_intersectionRenderTimer, &QTimer::timeout, this, [this]() {
-        const std::string reason = ProfileLoggingEnabled()
-            ? std::format("intersection timer fired; scheduledReason='{}'; scheduledCaller='{}'",
-                          _pendingIntersectionReason, _pendingIntersectionCaller)
-            : std::string("intersection timer fired");
-        renderIntersections(reason.c_str());
-        emit overlaysUpdated();
-    });
-
-    _resizeRenderTimer = new QTimer(this);
-    _resizeRenderTimer->setSingleShot(true);
-    _resizeRenderTimer->setInterval(kResizeSettleMs);
-    connect(_resizeRenderTimer, &QTimer::timeout, this, [this]() {
-        scheduleRender("resize settled");
-        emit overlaysUpdated();
-    });
-
-    _statusTimer = new QTimer(this);
-    _statusTimer->setInterval(500);
-    connect(_statusTimer, &QTimer::timeout, this, [this]() {
-        updateStatusLabel();
-    });
-    _statusTimer->start();
+    // No per-viewer timers: ViewerManager's single global clock calls
+    // serviceRenderTick() ~60Hz, which drains _renderPending / _intersectionPending /
+    // the resize-settle + status-refresh countdowns. Start the periodic status poll.
+    _statusRefreshTicks = kStatusRefreshTicks;
 
     reloadPerfSettings();
 
@@ -868,14 +833,8 @@ void CChunkedVolumeViewer::quiesceForClose()
         _viewerManager->unregisterViewer(this);
     }
 
-    if (_renderTimer)
-        _renderTimer->stop();
-    if (_intersectionRenderTimer)
-        _intersectionRenderTimer->stop();
-    if (_resizeRenderTimer)
-        _resizeRenderTimer->stop();
-    if (_statusTimer)
-        _statusTimer->stop();
+    // Clear all pending tick work (the global clock will see nothing to do).
+    _intersectionPending = false;
 
     _renderPending = false;
     _renderPendingAfterWorker = false;
@@ -962,8 +921,7 @@ bool CChunkedVolumeViewer::isRenderQuiescent() const
 {
     return !_renderWorkerBusy.load(std::memory_order_acquire)
         && !_renderPendingAfterWorker
-        && !_renderPending
-        && !(_renderTimer && _renderTimer->isActive());
+        && !_renderPending;
 }
 
 std::size_t CChunkedVolumeViewer::chunkFetchesInFlight() const
@@ -1002,12 +960,10 @@ void CChunkedVolumeViewer::rebuildChunkArray()
             if (!volume || guard->_volume != volume || guard->_closing)
                 return;
             // Coalesce on the 16ms render debounce. Mark pending and arm the timer
-            // only if it isn't already running -- a burst of arriving chunks does NOT
-            // restart the timer, so repaints aren't starved for as long as chunks keep
-            // streaming (the old 250/500ms restart-on-arrival windows did exactly that).
+            // Mark pending; the global clock coalesces a burst of arriving chunks into
+            // one render (it doesn't restart anything), so repaints aren't starved for
+            // as long as chunks keep streaming.
             guard->_renderPending = true;
-            if (guard->_renderTimer && !guard->_renderTimer->isActive())
-                guard->_renderTimer->start();
         }, Qt::QueuedConnection);
     });
 }
@@ -1422,13 +1378,8 @@ void CChunkedVolumeViewer::scheduleRender(const char* reason, std::source_locati
             _surfName, _renderPending, _scale, _zOff));
     }
     syncCameraTransform();
-    _renderPending = true;
-    if (_renderTimer && !_renderTimer->isActive()) {
-        _renderTimer->start();
-        profile.setDetails("action=render_timer_start");
-    } else {
-        profile.setDetails("action=already_scheduled");
-    }
+    _renderPending = true;   // serviceRenderTick() (global clock) submits it next tick
+    profile.setDetails("action=render_pending");
 }
 
 void CChunkedVolumeViewer::requestRender(const char* reason, std::source_location caller)
@@ -1457,11 +1408,33 @@ void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::s
         profile.setDetails("action=deferred_segmentation_edit");
         return;
     }
-    if (_intersectionRenderTimer && !_intersectionRenderTimer->isActive()) {
-        _intersectionRenderTimer->start();
-        profile.setDetails("action=intersection_timer_start");
-    } else {
-        profile.setDetails("action=already_scheduled");
+    _intersectionPending = true;   // serviceRenderTick() renders it next tick
+    profile.setDetails("action=intersection_pending");
+}
+
+// Driven by ViewerManager's single global clock (~60Hz). Drains the pending flags:
+// submit a render and/or an intersection render, run the resize-settle countdown, and
+// poll the status bar periodically. The only place these flags are consumed.
+void CChunkedVolumeViewer::serviceRenderTick()
+{
+    if (_closing)
+        return;
+
+    if (_renderPending) {
+        _renderPending = false;
+        submitRender("global tick render");
+        updateStatusLabel();
+    }
+    if (_intersectionPending) {
+        _intersectionPending = false;
+        renderIntersections("global tick intersection");
+        emit overlaysUpdated();
+    }
+
+    // Periodic status refresh (background prefetch/download progress).
+    if (--_statusRefreshTicks <= 0) {
+        _statusRefreshTicks = kStatusRefreshTicks;
+        updateStatusLabel();
     }
 }
 
@@ -2429,8 +2402,6 @@ void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::so
         profile.setDetails("action=schedule");
         return;
     }
-    if (_renderTimer && _renderTimer->isActive())
-        _renderTimer->stop();
     _renderPending = false;
     submitRender("renderVisible force", caller);
     updateStatusLabel();
@@ -2723,11 +2694,10 @@ void CChunkedVolumeViewer::onResized()
     }
     resizeFramebuffer();
     _genCacheDirty = true;
-    if (_renderTimer && _renderTimer->isActive())
-        _renderTimer->stop();
-    _renderPending = false;
-    if (_resizeRenderTimer)
-        _resizeRenderTimer->start();
+    // Just mark pending: the global clock coalesces the resize-event burst into one
+    // render per tick, and the worker-busy + view-param fingerprint discard supersede
+    // any mid-drag render with the latest size -- no special resize-settle handling.
+    scheduleRender("resized");
     _view->viewport()->update();
 }
 

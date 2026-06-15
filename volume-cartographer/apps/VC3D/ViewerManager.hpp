@@ -16,6 +16,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
+class QTimer;
 class CChunkedVolumeViewer;
 class CState;
 class QWidget;
@@ -137,6 +138,7 @@ signals:
     void sliceStepSizeChanged(int size);
 
 private slots:
+    void onGlobalTick();
     void handleSurfacePatchIndexPrimeFinished();
     void handleSurfacePatchIndexTaskFinished();
     void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -184,6 +186,10 @@ private:
     bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<VolumeViewerBase*> _baseViewers;
+    // The ONE render clock for the whole app. Ticks ~60Hz; each tick services every
+    // viewer's pending render/intersection flags (coalescing: N events between ticks
+    // collapse to one render). Replaces the per-viewer debounce/settle/status timers.
+    QTimer* _globalClock{nullptr};
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};

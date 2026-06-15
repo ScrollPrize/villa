@@ -81,6 +81,7 @@ public:
     void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) override;
+    void serviceRenderTick() override;
     void invalidateVis() override;
     void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells) override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
@@ -315,12 +316,12 @@ private:
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
-    QTimer* _renderTimer = nullptr;
-    QTimer* _intersectionRenderTimer = nullptr;
-    QTimer* _resizeRenderTimer = nullptr;
-    QTimer* _statusTimer = nullptr;
+    // No per-viewer timers: ViewerManager's single global clock drives rendering via
+    // serviceRenderTick(), which drains these flags/countdowns (counts are in ticks).
     bool _closing = false;
     bool _renderPending = false;
+    bool _intersectionPending = false;
+    int  _statusRefreshTicks = 0;  // counts down to the periodic status refresh
     // A render was requested while this viewer was hidden (minimized MDI subwindow /
     // background tab). We skip the work and set this; showEvent re-renders so the
     // viewer catches up on whatever went stale while invisible.
