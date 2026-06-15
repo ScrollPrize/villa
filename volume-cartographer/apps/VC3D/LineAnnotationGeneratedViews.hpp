@@ -81,8 +81,12 @@ struct GeneratedViews {
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
+    cv::Vec3f focusPoint{std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::quiet_NaN()};
     int seedLineIndex = -1;
     int initialCenterIndex = 0;
+    bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
 };
@@ -542,7 +546,9 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
     std::optional<double> controlLinePositionRadius = std::nullopt)
 {
     GeneratedOverlay overlay;
-    overlay.pointMarker = interpolatedGeneratedLinePoint(views.linePoints, linePosition);
+    overlay.pointMarker = emphasized && finiteGeneratedPoint(views.focusPoint)
+        ? views.focusPoint
+        : interpolatedGeneratedLinePoint(views.linePoints, linePosition);
     overlay.emphasizedPointMarker = emphasized;
     if (!controlDistanceThreshold || !pointDistance) {
         return overlay;

@@ -2887,6 +2887,8 @@ void CWindow::createAtlasWorkspace()
                         if (!hasControlIndex || controlIndex < 0) {
                             return;
                         }
+                        bool hasSourceIndex = false;
+                        const int sourceIndex = item->data(0, ATLAS_CONTROL_SOURCE_INDEX_ROLE).toInt(&hasSourceIndex);
                         const uint64_t fiberId = itemFiberId(item);
                         QMenu menu(tree);
                         auto* showAction = menu.addAction(tr("Show in line annotation"));
@@ -2900,7 +2902,11 @@ void CWindow::createAtlasWorkspace()
                             if (_fiberSliceWidget) {
                                 _fiberSliceWidget->selectFiber(fiberId);
                             }
-                            _lineAnnotationController->openFiberAtControlPoint(fiberId, controlIndex);
+                            if (hasSourceIndex && sourceIndex >= 0) {
+                                _lineAnnotationController->openFiberAtLinePointIndex(fiberId, sourceIndex);
+                            } else {
+                                _lineAnnotationController->openFiberAtControlPoint(fiberId, controlIndex);
+                            }
                         }
                     });
         }

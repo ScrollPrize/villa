@@ -116,6 +116,7 @@ struct LineAnnotationController::LineAnnotationSession {
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
     bool controlPointsDirtySinceOptimization = false;
+    bool disableInitialGeneratedHoverFollow = false;
     std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
 };
 
@@ -1154,16 +1155,22 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
 void LineAnnotationController::openFiber(uint64_t fiberId)
 {
-    openFiberWithControlPoint(fiberId, std::nullopt);
+    openFiberWithControlPoint(fiberId, std::nullopt, std::nullopt);
 }
 
 void LineAnnotationController::openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex)
 {
-    openFiberWithControlPoint(fiberId, controlPointIndex);
+    openFiberWithControlPoint(fiberId, controlPointIndex, std::nullopt);
+}
+
+void LineAnnotationController::openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex)
+{
+    openFiberWithControlPoint(fiberId, std::nullopt, linePointIndex);
 }
 
 void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
-                                                         std::optional<int> controlPointIndex)
+                                                         std::optional<int> controlPointIndex,
+                                                         std::optional<int> linePointIndex)
 {
     auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
@@ -1185,6 +1192,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberFileName = it->fileName;
     session->fiberManualHvTag = it->manualHvTag;
     session->fiberTags = it->tags;
+    session->disableInitialGeneratedHoverFollow =
+        controlPointIndex.has_value() || linePointIndex.has_value();
     session->focusedLinePosition = static_cast<double>(it->linePoints.size() / 2);
     session->focusedControlPoint = it->controlPoints.empty()
         ? std::optional<cv::Vec3d>{}
@@ -1233,7 +1242,23 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         }
     }
     if (!session->controlPoints.empty()) {
-        if (controlPointIndex &&
+        if (linePointIndex &&
+            *linePointIndex >= 0 &&
+            *linePointIndex < static_cast<int>(it->linePoints.size())) {
+            double bestLineDistance = std::numeric_limits<double>::infinity();
+            for (size_t i = 0; i < session->controlPoints.size(); ++i) {
+                const auto& control = session->controlPoints[i];
+                if (!std::isfinite(control.linePosition)) {
+                    continue;
+                }
+                const double distance = std::abs(
+                    control.linePosition - static_cast<double>(*linePointIndex));
+                if (distance < bestLineDistance) {
+                    bestLineDistance = distance;
+                    seedControl = static_cast<int>(i);
+                }
+            }
+        } else if (controlPointIndex &&
             *controlPointIndex >= 0 &&
             *controlPointIndex < static_cast<int>(session->controlPoints.size())) {
             seedControl = *controlPointIndex;
@@ -1246,6 +1271,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
             session->controlPoints[static_cast<size_t>(seedControl)].optimizedIndex;
         session->focusedLinePosition =
             session->controlPoints[static_cast<size_t>(seedControl)].linePosition;
+        session->focusedControlPoint =
+            session->controlPoints[static_cast<size_t>(seedControl)].volumePoint;
     }
     if (_currentAtlasDir) {
         attachAtlasPredSnaps(*it, *session, *_currentAtlasDir);
@@ -1253,9 +1280,14 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
 
     CChunkedVolumeViewer::CameraState camera;
     camera.scale = 1.0f;
-    const cv::Vec3d origin = it->linePoints.empty()
-        ? cv::Vec3d{0.0, 0.0, 0.0}
-        : it->linePoints[it->linePoints.size() / 2];
+    const cv::Vec3d origin = session->focusedControlPoint.value_or(
+        it->linePoints.empty()
+            ? cv::Vec3d{0.0, 0.0, 0.0}
+            : it->linePoints[static_cast<size_t>(std::clamp(
+                  static_cast<int>(std::llround(session->focusedLinePosition)),
+                  0,
+                  static_cast<int>(it->linePoints.size() - 1)))]
+    );
     auto sourcePlane = std::make_shared<PlaneSurface>(
         cv::Vec3f{static_cast<float>(origin[0]),
                   static_cast<float>(origin[1]),
@@ -3948,6 +3980,11 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     const cv::Vec3f seedPoint{static_cast<float>(session.seedPoint[0]),
                               static_cast<float>(session.seedPoint[1]),
                               static_cast<float>(session.seedPoint[2])};
+    const cv::Vec3f focusPoint = session.focusedControlPoint
+        ? cv::Vec3f{static_cast<float>((*session.focusedControlPoint)[0]),
+                    static_cast<float>((*session.focusedControlPoint)[1]),
+                    static_cast<float>((*session.focusedControlPoint)[2])}
+        : seedPoint;
 
     LineAnnotationDialog::GeneratedViews generatedViews;
     generatedViews.lineSurfaceName = "line-surface";
@@ -3957,7 +3994,10 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
     generatedViews.seedPoint = seedPoint;
+    generatedViews.focusPoint = focusPoint;
     generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
+    generatedViews.initialCurrentCutFollowsStripMouse =
+        !session.disableInitialGeneratedHoverFollow;
     for (const auto& control : session.controlPoints) {
         LineAnnotationDialog::GeneratedOverlay::ControlPointMarker marker;
         marker.point = {static_cast<float>(control.volumePoint[0]),
