@@ -14,16 +14,22 @@ find_inconsistent_windings also records "loops": non-tree relative edges whose
 winding holonomy is nonzero (the cycle they close does not return to the same
 winding -- an inconsistency in the relative annotations themselves). Rather than
 overlay these on the (already busy) main graph, we render them in a separate
-output, one loop at a time: each inconsistent loop is drawn on its own as a
-vertical stack of the patches around its cycle, with the relative-pcl tree edges
-as downward arrows between consecutive patches and one "closing" arrow bowing from
-the bottom patch back up to the top (the non-tree edge whose holonomy makes the
-loop inconsistent). Each pcl edge is labelled with its winding delta; each patch is
-labelled (in crimson, to the right of its line) with the within-patch winding delta
-between its two cycle points, when the strip across it crosses theta=0. The cycle
-reconstruction (patches + pcls in order, with the per-patch strip deltas) is
-precomputed by find_inconsistent_windings and stored under "loop_cycles" in the
-votes json; this per-loop view is always produced alongside the main graph.
+output as vertical patch stacks. Every fundamental cycle is `spine + closing edge`
+and the BFS tree is fixed, so loops that share an ordered patch spine differ only
+in their closing edge; we collapse each such set into one diagram (keyed on the
+spine) to spend display slots on distinct spines rather than repeating the shared
+part. Each diagram is a vertical stack of the spine's patches, with the relative-pcl
+tree edges as downward arrows between consecutive patches and -- bowing from the
+bottom patch back up to the top -- one "closing" arrow per loop sharing the spine
+(the non-tree edge whose holonomy makes that loop inconsistent), fanned out and each
+labelled with its pcl id, winding delta and holonomy. Each tree edge is labelled with
+its winding delta; each patch is labelled (in crimson, to the right of its line) with
+the within-patch winding delta between its two cycle points, when the strip across it
+crosses theta=0 (at the two endpoint patches, only when every closing edge agrees).
+The per-loop cycle reconstruction (patches + pcls in order, with the per-patch strip
+deltas) is precomputed by find_inconsistent_windings and stored under "loop_cycles" in
+the votes json; the spine grouping happens here at render time. This view is always
+produced alongside the main graph.
 
 Layout (the stylised picture the result implies):
 
@@ -240,6 +246,12 @@ function xyz(d) {
   if (d.x === undefined) return '\nxyz (not recorded in this votes file)';
   return '\nxyz ' + Math.round(+d.x) + ', ' + Math.round(+d.y) + ', ' + Math.round(+d.z);
 }
+function deltaInfo(d) {
+  let s = '\nΔwinding ' + d.edgeDelta;
+  if (d.rawDelta !== undefined)
+    s += '  (raw ' + d.rawDelta + ', pcl ' + d.pclBranchDelta + ')';
+  return s;
+}
 function info(el) {
   const d = el.dataset;
   if (d.kind === 'patch') {
@@ -252,12 +264,13 @@ function info(el) {
     return 'edge — rel pcl ' + d.pcl + ' "' + (d.pclName || '') + '"'
          + '\npoint ' + d.fromPoint + ' on ' + d.from
          + '\n  → point ' + d.toPoint + ' on ' + d.to
-         + '\nΔwinding ' + d.edgeDelta + '   strip ' + d.stripDelta;
+         + deltaInfo(d) + '   strip ' + d.stripDelta;
   if (d.kind === 'loop')
     return 'inconsistent loop — rel pcl ' + d.pcl + ' "' + (d.pclName || '') + '"'
          + '\npoint ' + d.fromPoint + ' on ' + d.from
          + '\n  ↔ point ' + d.toPoint + ' on ' + d.to
-         + '\nwinding holonomy ' + d.holo + '   (edge Δwinding ' + d.edgeDelta + ')';
+         + '\nwinding holonomy ' + d.holo + '   (edge Δwinding ' + d.edgeDelta + ')'
+         + (d.rawDelta !== undefined ? '\nraw ' + d.rawDelta + ', pcl ' + d.pclBranchDelta : '');
   if (d.kind === 'anchor')
     return 'abs anchor — pcl ' + d.pcl + ' "' + (d.pclName || '') + '"  point ' + d.point
          + '\nannotation ' + d.annotation + ' → seed ' + d.vote + xyz(d) + '\non patch ' + d.patch;
@@ -342,6 +355,15 @@ def build_main_html(geom):
         z, y, x = zyx
         return f' data-x="{x:.2f}" data-y="{y:.2f}" data-z="{z:.2f}"'
 
+    def edge_delta_attrs(h):
+        if 'raw_edge_winding_delta' not in h:
+            return ''
+        return (
+            f' data-raw-delta="{h["raw_edge_winding_delta"]:+d}"'
+            f' data-pcl-branch-delta="{h["pcl_branch_delta"]:+d}"'
+            f' data-pcl-unwrap-adjustment="{h["pcl_unwrap_adjustment"]:+d}"'
+        )
+
     def odd_bands(width):
         """Shaded rects for odd depths, spanning `width` px -- reused per panel."""
         out = []
@@ -370,7 +392,8 @@ def build_main_html(geom):
         P.append(f'<g class="edge" data-kind="edge" data-from="{a(parent)}" data-to="{a(child)}" '
                  f'data-pcl="{a(h["rel_pcl_id"])}" data-pcl-name="{a(h.get("rel_pcl_name") or "")}" '
                  f'data-from-point="{a(h["from_point_id"])}" data-to-point="{a(h["to_point_id"])}" '
-                 f'data-edge-delta="{h["edge_winding_delta"]:g}" data-strip-delta="{h["intra_patch_strip_delta"]:g}">')
+                 f'data-edge-delta="{h["edge_winding_delta"]:g}" data-strip-delta="{h["intra_patch_strip_delta"]:g}"'
+                 f'{edge_delta_attrs(h)}>')
         P.append(f'<line class="hit" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
         P.append(f'<line class="edgeline" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
         P.append('</g>')
@@ -511,36 +534,113 @@ def _short_patch(pid, n=16):
     return s if len(s) <= n else '…' + s[-(n - 1):]
 
 
-def _select_loop_cycles(loop_cycles, max_cycles):
-    """Sort the inconsistent loops by |holonomy| (largest first) and optionally cap
-    the count. Returns (cycles, total, truncated) -- total is the full count before
-    any cap, for the caption / a truncation note."""
-    cycles = sorted(loop_cycles, key=lambda c: -abs(c.get('loop_winding_delta', 0)))
-    total = len(cycles)
-    truncated = bool(max_cycles and total > max_cycles)
+def _edge_delta_label(edge):
+    """Compact visible edge delta label."""
+    return f"Δ{edge['edge_winding_delta']:+d}"
+
+
+def _group_loop_cycles(loop_cycles, max_groups):
+    """Collapse the inconsistent loops that share an identical BFS-tree spine into one
+    diagram apiece, so N loops that differ only in their closing edge cost one display
+    slot instead of N.
+
+    Every fundamental cycle is `spine + closing edge`, and the BFS tree is fixed, so two
+    loops with the same ordered `patches` list share their entire spine: the patches, the
+    tree `steps`, and the *interior* per-patch strip deltas are identical (only the two
+    endpoint patches' strip deltas differ, since they depend on where the closing edge
+    attaches). We therefore key by `tuple(patches)`, draw the shared spine once, and fan
+    that spine's several closing edges as several purple bows. (Two distinct edges between
+    the same patch pair reached from opposite BFS sides would give reversed `patches`
+    tuples and stay separate; that does not arise in practice and is left unmerged.)
+
+    Returns (groups, total_loops, total_groups, truncated):
+      * groups: spine-group dicts. The set is *selected* by max |holonomy| (largest first)
+        and capped to `max_groups` (0 = all), then *ordered for display* by ascending spine
+        patch count (shortest loops first, worst holonomy breaking ties). Each carries the
+        shared `patches` / `steps` and a
+        `patch_strip_deltas` whose interior entries are the shared within-patch deltas and
+        whose [0] / [-1] (the endpoint patches P / R) hold the common value only when all
+        the group's closing edges agree there, else None. `variants` is one entry per
+        closing edge (sorted by |holonomy|), each with its `closing_step`,
+        `loop_winding_delta`, `loop_winding_residual` and the closing-edge-specific
+        `top_strip_delta` (patch P) / `bot_strip_delta` (patch R).
+      * total_loops: inconsistent-loop count before grouping (== len(loop_cycles)).
+      * total_groups: distinct-spine count before the `max_groups` cap.
+      * truncated: whether the cap dropped any spine.
+    """
+    groups_by_spine = {}
+    order = []
+    for c in loop_cycles:
+        key = tuple(c['patches'])
+        g = groups_by_spine.get(key)
+        if g is None:
+            g = {
+                'patches': c['patches'],
+                'steps': c['steps'],
+                # interior entries are the shared within-patch deltas; [0]/[-1] are
+                # resolved per group below (common value if the variants agree, else None).
+                'patch_strip_deltas': list(c.get('patch_strip_deltas') or [None] * len(c['patches'])),
+                'variants': [],
+            }
+            groups_by_spine[key] = g
+            order.append(key)
+        psd = c.get('patch_strip_deltas') or [None] * len(c['patches'])
+        g['variants'].append({
+            'closing_step': c['closing_step'],
+            'loop_winding_delta': c['loop_winding_delta'],
+            'loop_winding_residual': c.get('loop_winding_residual'),
+            'top_strip_delta': psd[0],
+            'bot_strip_delta': psd[-1],
+        })
+
+    groups = [groups_by_spine[k] for k in order]
+    for g in groups:
+        g['variants'].sort(key=lambda v: -abs(v.get('loop_winding_delta', 0)))
+        g['max_abs_holonomy'] = max(abs(v.get('loop_winding_delta', 0)) for v in g['variants'])
+        # Endpoint patch deltas (P at top, R at bottom) are closing-edge-specific; show
+        # one on the patch line only when every closing edge agrees, else leave it to the
+        # per-bow tooltip.
+        tops = {v['top_strip_delta'] for v in g['variants']}
+        bots = {v['bot_strip_delta'] for v in g['variants']}
+        g['patch_strip_deltas'][0] = next(iter(tops)) if len(tops) == 1 else None
+        g['patch_strip_deltas'][-1] = next(iter(bots)) if len(bots) == 1 else None
+
+    # Select which spines to show by max |holonomy| (largest first), then cap...
+    groups.sort(key=lambda g: -g['max_abs_holonomy'])
+    total_groups = len(groups)
+    total_loops = len(loop_cycles)
+    truncated = bool(max_groups and total_groups > max_groups)
     if truncated:
-        cycles = cycles[:max_cycles]
-    return cycles, total, truncated
+        groups = groups[:max_groups]
+    # ...but display the chosen spines by ascending patch count (shortest, simplest loops
+    # first), worst holonomy breaking ties.
+    groups.sort(key=lambda g: (len(g['patches']), -g['max_abs_holonomy']))
+    return groups, total_loops, total_groups, truncated
 
 
-def plot_loop_cycles(cycles, total, output, ncols=6, dpi=150):
-    """Render each inconsistent closed loop on its own, as a vertical patch stack
-    (matplotlib PNG). `cycles` are the (already selected) loops to draw; `total` is
-    the full count before any cap, used only for the caption.
+def plot_loop_cycles(groups, total_loops, total_groups, output, ncols=6, dpi=150):
+    """Render each shared-spine group on its own, as a vertical patch stack (matplotlib
+    PNG). `groups` are the (already selected) spine groups to draw; `total_loops` /
+    `total_groups` are the full counts before any cap, used only for the caption.
 
-    Each loop is a vertical stack of its patches (the departure patch at the top,
-    the arrival patch at the bottom), the relative-pcl tree edges as downward arrows
-    between consecutive patches (labelled with the pcl id and its Δwinding), and one
-    magenta 'closing' arrow bowing -- to the right, clear of the patch names -- from
-    the bottom patch back up to the top (the non-tree edge whose nonzero holonomy
-    makes the loop fail to close; labelled with its pcl id and Δwinding too)."""
-    n = len(cycles)
+    Each diagram is a vertical stack of the spine's patches (the departure patch P at the
+    top, the arrival patch R at the bottom), the relative-pcl tree edges as downward
+    arrows between consecutive patches (labelled with the pcl id and its Δwinding), and
+    -- bowing to the right, clear of the patch names -- one magenta 'closing' arrow per
+    loop that shares this spine: each is a non-tree edge whose nonzero holonomy makes
+    that loop fail to close, fanned by radius and listed (pcl id, Δwinding, holonomy) down
+    the right. The crimson per-patch Δwinding (within-patch theta=0 crossing) is shown
+    where defined; at the two endpoint patches it appears only when every closing edge in
+    the group agrees on it."""
+    n = len(groups)
     ncols = max(1, min(ncols, n))
     nrows = math.ceil(n / ncols)
-    max_patches = max(len(c['patches']) for c in cycles)
+    max_patches = max(len(g['patches']) for g in groups)
+    max_variants = max(len(g['variants']) for g in groups)
 
     LOOP_COLOR = '#c026d3'
-    cell_w, cell_h = 2.8, 0.34 * max_patches + 1.1
+    cell_w = 2.8 + 0.18 * max(0, max_variants - 1)
+    cell_h = 0.34 * max_patches + 0.13 * max(0, max_variants - 1) + 1.1
     fig, axes = plt.subplots(nrows, ncols, squeeze=False,
                              figsize=(ncols * cell_w, nrows * cell_h))
 
@@ -549,10 +649,10 @@ def plot_loop_cycles(cycles, total, output, ncols=6, dpi=150):
         ax.axis('off')
         if k >= n:
             continue
-        c = cycles[k]
-        patches, steps = c['patches'], c['steps']
-        m = len(patches)
-        pdeltas = c.get('patch_strip_deltas') or [None] * m
+        g = groups[k]
+        patches, steps, variants = g['patches'], g['steps'], g['variants']
+        m, nv = len(patches), len(variants)
+        pdeltas = g.get('patch_strip_deltas') or [None] * m
         ys = [-i for i in range(m)]
 
         # patches: a dot per row, id labelled to the left; the within-patch winding
@@ -571,39 +671,50 @@ def plot_loop_cycles(cycles, total, output, ncols=6, dpi=150):
                         arrowprops=dict(arrowstyle='-|>', color='0.45', lw=1.0,
                                         shrinkA=5, shrinkB=5), zorder=2)
             ax.text(0.0, 0.5 * (ys[i] + ys[i + 1]),
-                    f"pcl {st['rel_pcl_id']}  Δ{st['edge_winding_delta']:+d}",
+                    f"pcl {st['rel_pcl_id']}  {_edge_delta_label(st)}",
                     fontsize=5, color='0.3', va='center', ha='center', zorder=4,
                     bbox=dict(boxstyle='round,pad=0.1', facecolor='white',
                               edgecolor='none', alpha=0.85))
 
-        # closing edge: one arrow bowing to the RIGHT (clear of the patch names on the
-        # left) from the bottom patch back up to the top. arc3 'rad' is a fraction of
-        # the chord, so scale it by the stack height to keep the bow a roughly constant
-        # width regardless of how tall the loop is.
-        cs = c['closing_step']
-        rad = 0.7 / max(1, m - 1)
-        ax.add_patch(FancyArrowPatch(
-            (0, ys[-1]), (0, ys[0]), connectionstyle=f'arc3,rad={rad}',
-            arrowstyle='-|>', mutation_scale=12, color=LOOP_COLOR, lw=1.3,
-            shrinkA=6, shrinkB=6, zorder=2))
-        ax.text(0.9, 0.5 * (ys[0] + ys[-1]),
-                f"pcl {cs['rel_pcl_id']}  Δ{cs['edge_winding_delta']:+d}",
-                fontsize=5.5, color=LOOP_COLOR, va='center', ha='left',
-                fontweight='bold', zorder=4)
+        # closing edges: one magenta arrow per loop sharing this spine, each bowing to the
+        # RIGHT from the bottom patch back up to the top. arc3 'rad' is a fraction of the
+        # chord (scaled by stack height for a roughly constant width), fanned out per loop;
+        # each loop is also listed (pcl id, Δwinding, holonomy) down the right.
+        rad0 = 0.7 / max(1, m - 1)
+        y_top, y_bot = ys[0], ys[-1]
+        # the loop list is a magenta block centred vertically on the spine midpoint (a
+        # lone label sits exactly at the centre), spaced by lbl_step rows.
+        mid = 0.5 * (y_top + y_bot)
+        lbl_step = 0.6
+        lbl_ys = [mid + (t - (nv - 1) / 2.0) * lbl_step for t in range(nv)]
+        for t, var in enumerate(variants):
+            cs = var['closing_step']
+            rad = rad0 * (1.0 + 0.8 * t)
+            ax.add_patch(FancyArrowPatch(
+                (0, y_bot), (0, y_top), connectionstyle=f'arc3,rad={rad}',
+                arrowstyle='-|>', mutation_scale=11, color=LOOP_COLOR,
+                lw=1.3 if nv == 1 else 1.0, shrinkA=6, shrinkB=6, zorder=2,
+                alpha=1.0 if nv == 1 else 0.8))
+            ax.text(0.95, lbl_ys[t],
+                    f"pcl {cs['rel_pcl_id']}  {_edge_delta_label(cs)}  h{var['loop_winding_delta']:+d}",
+                    fontsize=5.5 if nv == 1 else 5.0, color=LOOP_COLOR, va='center',
+                    ha='left', fontweight='bold', zorder=4)
 
-        ax.set_title(f"holonomy {c['loop_winding_delta']:+d}", fontsize=7, color=LOOP_COLOR)
-        ax.set_xlim(-1.5, 1.9)
-        ax.set_ylim(ys[-1] - 0.6, 0.6)
+        ax.set_xlim(-1.5, 2.4 + 0.12 * max(0, nv - 1))
+        ax.set_ylim(min(y_bot, min(lbl_ys)) - 0.6, max(y_top, max(lbl_ys)) + 0.6)
 
-    cap_note = '' if n == total else f' (showing {n} with the largest |holonomy|)'
-    fig.suptitle(f'{total} inconsistent closed loop(s){cap_note}  --  patches stacked top-to-bottom, '
-                 f'relative-pcl edges as arrows (with Δwinding), magenta = closing edge (holonomy ≠ 0); '
+    cap_note = '' if n == total_groups else f' (showing the {n} with the largest |holonomy|)'
+    drawn_loops = sum(len(g['variants']) for g in groups)
+    fig.suptitle(f'{total_loops} inconsistent loop(s) in {total_groups} shared spine(s){cap_note}  --  '
+                 f'patches stacked top-to-bottom, relative-pcl edges as arrows (with Δwinding); '
+                 f'each magenta bow = one closing edge (holonomy ≠ 0), fanned per spine; '
                  f'crimson Δ = within-patch winding delta (theta=0 crossing)',
                  fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.99))
     fig.savefig(output, dpi=dpi, bbox_inches='tight')
     plt.close(fig)
-    print(f'wrote {output}  ({n} loop diagram(s) of {total})')
+    print(f'wrote {output}  ({n} spine diagram(s) of {total_groups}, '
+          f'covering {drawn_loops} of {total_loops} loop(s))')
 
 
 # CSS / JS for the per-loop HTML view (kept as plain strings; same pattern as the
@@ -615,9 +726,10 @@ html, body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, Helvetic
 .header .title { font-size: 13px; font-weight: 600; }
 .legend { margin-top: 6px; font-size: 12px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
 .legend .item { display: inline-flex; align-items: center; gap: 5px; }
-.grid { display: grid; gap: 10px; padding: 12px; }
-.cell { border: 1px solid #eee; border-radius: 6px; padding: 4px 6px 8px; }
-.cell .cap { font-size: 12px; font-weight: 700; color: #c026d3; text-align: center; margin-bottom: 2px; }
+/* flow layout: tiles keep their natural (per-spine) width/height and wrap to fit
+   the window, packed left-to-right so the |holonomy| ordering still reads in order. */
+.grid { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; padding: 12px; }
+.cell { flex: 0 0 auto; border: 1px solid #eee; border-radius: 6px; padding: 4px 6px 8px; }
 svg.loop { display: block; margin: 0 auto; }
 .plbl { font-size: 11px; fill: #333; dominant-baseline: middle; }
 .plbl.end { font-weight: 700; fill: #111; }
@@ -647,6 +759,12 @@ function xyz(px, py, pz) {
   if (px === undefined) return '  (xyz not recorded)';
   return '  xyz ' + Math.round(+px) + ', ' + Math.round(+py) + ', ' + Math.round(+pz);
 }
+function deltaInfo(d) {
+  let s = '\nΔwinding ' + d.delta;
+  if (d.rawDelta !== undefined)
+    s += '  (raw ' + d.rawDelta + ', pcl ' + d.pclBranchDelta + ')';
+  return s;
+}
 function info(el) {
   const d = el.dataset;
   if (d.kind === 'patch') return 'patch ' + d.patch
@@ -656,11 +774,13 @@ function info(el) {
   if (d.kind === 'edge') return 'rel-pcl edge ' + d.pcl + ' "' + (d.pclName || '') + '"'
         + '\npoint ' + d.fromPoint + ' on ' + d.from + xyz(d.fromX, d.fromY, d.fromZ)
         + '\n  →  point ' + d.toPoint + ' on ' + d.to + xyz(d.toX, d.toY, d.toZ)
-        + '\nΔwinding ' + d.delta;
+        + deltaInfo(d);
   if (d.kind === 'closing') return 'closing edge — rel-pcl ' + d.pcl + ' "' + (d.pclName || '') + '"'
         + '\npoint ' + d.fromPoint + ' on ' + d.from + xyz(d.fromX, d.fromY, d.fromZ)
         + '\n  →  point ' + d.toPoint + ' on ' + d.to + xyz(d.toX, d.toY, d.toZ)
-        + '\nΔwinding ' + d.delta + '\nwinding holonomy ' + d.holo + '  (loop does not close)';
+        + deltaInfo(d) + '\nwinding holonomy ' + d.holo + '  (loop does not close)'
+        + (d.topStripDelta !== undefined ? '\nΔ across ' + d.to + ' (top) ' + d.topStripDelta : '')
+        + (d.botStripDelta !== undefined ? '\nΔ across ' + d.from + ' (bottom) ' + d.botStripDelta : '');
   return '';
 }
 document.querySelectorAll('.lpatch, .ledge, .lclose, .ldot').forEach(el => {
@@ -671,18 +791,22 @@ document.querySelectorAll('.lpatch, .ledge, .lclose, .ldot').forEach(el => {
 """
 
 
-def build_loops_html(cycles, total, ncols=6):
-    """Build the per-loop view as an HTML document string -- embedded as a tab in
-    the combined page. One small inline SVG per loop in a grid: the patches stacked
-    vertically, each drawn as a short bold black vertical line with a black dot at
-    either end for the two pcl-points attaching there (the upper from the edge above,
-    the lower from the edge below; each hoverable for its volume xyz). Each relative-
-    pcl tree edge is two fine gray fragments running between adjacent patches' dots,
-    with its pcl id + Δwinding in the gap between them; one magenta closing arrow bows
-    to the right from the bottom patch back up to the top. When the strip across a patch
-    between its two cycle points crosses theta=0, its winding delta is shown in crimson
-    just right of the patch line. Each patch / edge / point / closing edge is its own
-    <g> carrying data-* attributes, with a hover tooltip."""
+def build_loops_html(groups, total_loops, total_groups):
+    """Build the per-loop view as an HTML document string -- embedded as a tab in the
+    combined page. One small inline SVG per *spine group*, flowed (flex-wrap) to fit the
+    window rather than forced into a rigid grid, since the tiles vary in width/height: the
+    shared spine's
+    patches stacked vertically, each a short bold black vertical line with a black dot at
+    either end for the pcl-points attaching there (the upper from the edge above, the
+    lower from the edge below; each hoverable for its volume xyz). Each relative-pcl tree
+    edge is two fine gray fragments running between adjacent patches' dots, with its pcl id
+    + Δwinding in the gap between them. The loops that share this spine differ only in their
+    closing edge, so those are fanned as several magenta bows -- one per loop -- to the
+    right, each listed (pcl id, Δwinding, holonomy) down the side. When the strip across a
+    patch between its two cycle points crosses theta=0, its winding delta is shown in
+    crimson just right of the patch line (at the two endpoint patches, only when every
+    closing edge agrees). Each patch / edge / point / closing edge is its own <g> carrying
+    data-* attributes, with a hover tooltip."""
     esc = html_lib.escape
 
     def a(s):
@@ -696,40 +820,75 @@ def build_loops_html(cycles, total, ncols=6):
         z, y, x = zyx
         return f' data-{prefix}x="{x:.2f}" data-{prefix}y="{y:.2f}" data-{prefix}z="{z:.2f}"'
 
+    def edge_delta_attrs(edge):
+        if 'raw_edge_winding_delta' not in edge:
+            return ''
+        return (
+            f' data-raw-delta="{edge["raw_edge_winding_delta"]:+d}"'
+            f' data-pcl-branch-delta="{edge["pcl_branch_delta"]:+d}"'
+            f' data-pcl-unwrap-adjustment="{edge["pcl_unwrap_adjustment"]:+d}"'
+        )
+
+    def strip_delta_attrs(var):
+        """The closing-edge-specific within-patch deltas at the spine's two endpoint
+        patches (P at the top, R at the bottom) -- carried on the bow for its tooltip."""
+        out = ''
+        if var.get('top_strip_delta') is not None:
+            out += f' data-top-strip-delta="{var["top_strip_delta"]:+d}"'
+        if var.get('bot_strip_delta') is not None:
+            out += f' data-bot-strip-delta="{var["bot_strip_delta"]:+d}"'
+        return out
+
     ROW, TOP, BOT, CX, BOW = 34, 16, 16, 150, 58
     # patch half-line height; pcl-point dot radius; half-gap left for the name.
     PHH, PR, NAMEGAP = 5.0, 2.6, 7
-    # the closing caption sits just right of the bow's apex (CX + 3/4·BOW), close to
-    # the line rather than out past its full width.
-    LBLX, RLBL = CX - 14, CX + BOW - 8
+    LBLX = CX - 14
+    # each extra closing bow widens by this fraction of BOW; the stacked closing labels
+    # (when there is more than one) step down by LBLSTEP.
+    BOW_STEP, LBLSTEP = 0.7, 14
 
     cells = []
-    for c in cycles:
-        patches, steps, cs = c['patches'], c['steps'], c['closing_step']
-        m = len(patches)
-        # within-patch winding delta between each patch's two cycle points (older votes
-        # files predate this; fall back to no labels).
-        pdeltas = c.get('patch_strip_deltas') or [None] * m
+    for g in groups:
+        patches, steps, variants = g['patches'], g['steps'], g['variants']
+        m, nv = len(patches), len(variants)
+        # within-patch winding delta between each patch's two cycle points (endpoint
+        # entries are None unless every closing edge agrees; older files: no labels).
+        pdeltas = g.get('patch_strip_deltas') or [None] * m
         ys = [TOP + i * ROW for i in range(m)]
-        H = TOP + (m - 1) * ROW + BOT
-        W = RLBL + 96
         midc = 0.5 * (ys[0] + ys[-1])
-        ctxt = f"pcl {cs['rel_pcl_id']}  Δ{cs['edge_winding_delta']:+d}"
+
+        max_bow = BOW * (1.0 + BOW_STEP * (nv - 1))
+        rlbl = CX + max_bow + 8                      # left edge of the closing-label column
+        # closing-edge labels: a vertical block centred on the spine midpoint (a lone label
+        # sits exactly at midc), so several read as a centred stack rather than top-anchored.
+        lbl_ys = [midc + (t - (nv - 1) / 2.0) * LBLSTEP for t in range(nv)]
+        # grow the canvas (shifting all y down) so a tall label block on a short spine is
+        # never clipped at the top; LBL_PAD covers the label text's own height.
+        LBL_PAD = 7
+        content_top = min(ys[0] - PHH, min(lbl_ys) - LBL_PAD)
+        content_bot = max(ys[-1] + PHH, max(lbl_ys) + LBL_PAD)
+        y_off = TOP - content_top
+        ys = [y + y_off for y in ys]
+        lbl_ys = [y + y_off for y in lbl_ys]
+        H = int(content_bot - content_top) + TOP + BOT
+        W = int(rlbl + 120)
 
         # the pcl-point attaching at each patch's top end (edge from above) and bottom
-        # end (edge below). Interior patches take the adjacent tree steps; the two loop
-        # endpoints take the closing edge for their outer end. Each is
-        # (pcl_id, pcl_name, point_id, patch_id, zyx) -> a hoverable black dot.
+        # end (edge below), from the shared tree steps. The two endpoint patches' outer
+        # ends belong to the closing edges; with a single closing edge that point is
+        # unambiguous and drawn as a dot, otherwise the bows + their tooltips carry it.
         top_pt, bot_pt = [None] * m, [None] * m
         for j, st in enumerate(steps):
             bot_pt[j] = (st['rel_pcl_id'], st.get('rel_pcl_name'), st['from_point_id'],
                          patches[j], st.get('from_zyx_raw'))
             top_pt[j + 1] = (st['rel_pcl_id'], st.get('rel_pcl_name'), st['to_point_id'],
                              patches[j + 1], st.get('to_zyx_raw'))
-        bot_pt[m - 1] = (cs['rel_pcl_id'], cs.get('rel_pcl_name'), cs['from_point_id'],
-                         patches[m - 1], cs.get('from_zyx_raw'))
-        top_pt[0] = (cs['rel_pcl_id'], cs.get('rel_pcl_name'), cs['to_point_id'],
-                     patches[0], cs.get('to_zyx_raw'))
+        if nv == 1:
+            cs0 = variants[0]['closing_step']
+            bot_pt[m - 1] = (cs0['rel_pcl_id'], cs0.get('rel_pcl_name'), cs0['from_point_id'],
+                             patches[m - 1], cs0.get('from_zyx_raw'))
+            top_pt[0] = (cs0['rel_pcl_id'], cs0.get('rel_pcl_name'), cs0['to_point_id'],
+                         patches[0], cs0.get('to_zyx_raw'))
 
         S = [f'<svg class="loop" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
              f'xmlns="http://www.w3.org/2000/svg">']
@@ -739,12 +898,13 @@ def build_loops_html(cycles, total, ncols=6):
         for i, st in enumerate(steps):
             ya, yb = ys[i] + PHH, ys[i + 1] - PHH   # the adjacent patches' end-dots
             mid = 0.5 * (ys[i] + ys[i + 1])
-            txt = f"pcl {st['rel_pcl_id']}  Δ{st['edge_winding_delta']:+d}"
+            txt = f"pcl {st['rel_pcl_id']}  {_edge_delta_label(st)}"
             S.append(f'<g class="ledge" data-kind="edge" data-pcl="{a(st["rel_pcl_id"])}" '
                      f'data-pcl-name="{a(st.get("rel_pcl_name") or "")}" '
                      f'data-from="{a(st["from_patch"])}" data-to="{a(st["to_patch"])}" '
                      f'data-from-point="{a(st["from_point_id"])}" data-to-point="{a(st["to_point_id"])}" '
                      f'data-delta="{st["edge_winding_delta"]:+d}"'
+                     f'{edge_delta_attrs(st)}'
                      f'{xyz_attrs(st.get("from_zyx_raw"), "from-")}'
                      f'{xyz_attrs(st.get("to_zyx_raw"), "to-")}>')
             S.append(f'<line class="tedge" x1="{CX}" y1="{ya:.1f}" x2="{CX}" y2="{mid - NAMEGAP:.1f}"/>')
@@ -752,20 +912,27 @@ def build_loops_html(cycles, total, ncols=6):
             S.append(f'<text class="elbl" x="{CX}" y="{mid:.1f}" text-anchor="middle">{esc(txt)}</text>')
             S.append('</g>')
 
-        # closing edge: bow to the right, from the bottom patch's bottom dot up into
-        # the top patch's top dot.
+        # closing edges: one magenta bow per loop sharing this spine, fanned to the right
+        # (wider per loop) from the bottom patch's bottom dot up into the top patch's top
+        # dot, each listed (pcl id, Δwinding, holonomy) down the right. Each is its own <g>.
         yb0, yt0 = ys[-1] + PHH, ys[0] - PHH
-        S.append(f'<g class="lclose" data-kind="closing" data-pcl="{a(cs["rel_pcl_id"])}" '
-                 f'data-pcl-name="{a(cs.get("rel_pcl_name") or "")}" '
-                 f'data-from="{a(cs["from_patch"])}" data-to="{a(cs["to_patch"])}" '
-                 f'data-from-point="{a(cs["from_point_id"])}" data-to-point="{a(cs["to_point_id"])}" '
-                 f'data-delta="{cs["edge_winding_delta"]:+d}" data-holo="{c["loop_winding_delta"]:+d}"'
-                 f'{xyz_attrs(cs.get("from_zyx_raw"), "from-")}'
-                 f'{xyz_attrs(cs.get("to_zyx_raw"), "to-")}>')
-        S.append(f'<path class="closing" d="M {CX},{yb0:.1f} C {CX + BOW},{yb0:.1f} '
-                 f'{CX + BOW},{yt0:.1f} {CX},{yt0:.1f}" marker-end="url(#ahm)"/>')
-        S.append(f'<text class="clbl" x="{RLBL}" y="{midc:.1f}">{esc(ctxt)}</text>')
-        S.append('</g>')
+        for t, var in enumerate(variants):
+            cs = var['closing_step']
+            bw = BOW * (1.0 + BOW_STEP * t)
+            ctxt = f"pcl {cs['rel_pcl_id']}  {_edge_delta_label(cs)}  h{var['loop_winding_delta']:+d}"
+            S.append(f'<g class="lclose" data-kind="closing" data-pcl="{a(cs["rel_pcl_id"])}" '
+                     f'data-pcl-name="{a(cs.get("rel_pcl_name") or "")}" '
+                     f'data-from="{a(cs["from_patch"])}" data-to="{a(cs["to_patch"])}" '
+                     f'data-from-point="{a(cs["from_point_id"])}" data-to-point="{a(cs["to_point_id"])}" '
+                     f'data-delta="{cs["edge_winding_delta"]:+d}" data-holo="{var["loop_winding_delta"]:+d}"'
+                     f'{strip_delta_attrs(var)}'
+                     f'{edge_delta_attrs(cs)}'
+                     f'{xyz_attrs(cs.get("from_zyx_raw"), "from-")}'
+                     f'{xyz_attrs(cs.get("to_zyx_raw"), "to-")}>')
+            S.append(f'<path class="closing" d="M {CX},{yb0:.1f} C {CX + bw:.1f},{yb0:.1f} '
+                     f'{CX + bw:.1f},{yt0:.1f} {CX},{yt0:.1f}" marker-end="url(#ahm)"/>')
+            S.append(f'<text class="clbl" x="{rlbl:.1f}" y="{lbl_ys[t]:.1f}">{esc(ctxt)}</text>')
+            S.append('</g>')
 
         # patches: a short bold black vertical line, a black pcl-point dot at each end
         # (top = edge from above, bottom = edge below; each hoverable for its xyz), and
@@ -797,13 +964,13 @@ def build_loops_html(cycles, total, ncols=6):
                 S.append(f'<circle class="pdot" cx="{CX}" cy="{yy:.1f}" r="{PR}"/>')
                 S.append('</g>')
         S.append('</svg>')
-        cells.append(f'<div class="cell"><div class="cap">holonomy {c["loop_winding_delta"]:+d}</div>'
-                     f'{"".join(S)}</div>')
+        cells.append(f'<div class="cell">{"".join(S)}</div>')
 
-    note = '' if len(cycles) == total else f' (showing {len(cycles)} with the largest |holonomy|)'
-    title = (f'{total} inconsistent closed loop(s){note} — each: patches (bold black lines) stacked '
-             f'top-to-bottom, relative-pcl edges as fine gray links (with Δwinding), '
-             f'magenta = closing edge (holonomy ≠ 0)')
+    note = ('' if len(groups) == total_groups
+            else f' (showing the {len(groups)} spine(s) with the largest |holonomy|)')
+    title = (f'{total_loops} inconsistent loop(s) in {total_groups} shared spine(s){note} — each: '
+             f'patches (bold black lines) stacked top-to-bottom, relative-pcl tree edges as fine gray '
+             f'links (with Δwinding); each magenta bow = one closing edge sharing the spine (holonomy ≠ 0)')
     legend = (
         '<span class="item"><svg width="20" height="14">'
         '<line x1="10" y1="2" x2="10" y2="12" stroke="#000" stroke-width="2.2"/>'
@@ -812,7 +979,8 @@ def build_loops_html(cycles, total, ncols=6):
         '<span class="item"><svg width="24" height="12"><line x1="4" y1="6" x2="20" y2="6" '
         'stroke="#999" stroke-width="1"/></svg>relative-pcl tree edge</span>'
         '<span class="item"><svg width="24" height="12"><line x1="1" y1="6" x2="17" y2="6" '
-        'stroke="#c026d3" stroke-width="1.8" marker-end="url(#ahm)"/></svg>closing edge (holonomy ≠ 0)</span>'
+        'stroke="#c026d3" stroke-width="1.8" marker-end="url(#ahm)"/></svg>closing edge — one per loop '
+        'sharing the spine (holonomy ≠ 0)</span>'
         '<span class="item"><svg width="22" height="14"><line x1="6" y1="2" x2="6" y2="12" '
         'stroke="#000" stroke-width="2.2"/><text x="10" y="11" font-size="11" fill="crimson" '
         'font-weight="700">&#916;</text></svg>within-patch &#916;winding (theta=0 crossing)</span>'
@@ -824,14 +992,13 @@ def build_loops_html(cycles, total, ncols=6):
             '<marker id="ahm" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto" '
             'markerUnits="userSpaceOnUse"><path d="M0,0 L6,3 L0,6 z" fill="#c026d3"/></marker>'
             '</defs></svg>')
-    grid_style = f'grid-template-columns: repeat({max(1, ncols)}, max-content); justify-content: start;'
     html_doc = (
         '<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
         '<title>loop cycles</title>\n'
         f'<style>{_LOOPS_CSS}</style></head>\n<body>\n{defs}\n'
         f'<div class="header"><div class="title">{esc(title)}</div>'
         f'<div class="legend">{legend}</div></div>\n'
-        f'<div class="grid" style="{grid_style}">{"".join(cells)}</div>\n'
+        f'<div class="grid">{"".join(cells)}</div>\n'
         f'<div class="tooltip"></div>\n'
         f'<script>{_LOOPS_JS}</script>\n'
         '</body></html>\n'
@@ -914,12 +1081,15 @@ def write_combined_html(main_doc, loops_doc, output_html, seed, loops_total):
 @click.option('--loops-output', default=None, type=click.Path(dir_okay=False),
               help='Output path for the per-loop view PNG (default: <votes>_loops.png next to the '
                    'votes json). The interactive version is a tab in the combined HTML page (see '
-                   '--html-output). Each inconsistent loop is drawn on its own as a patch/pcl stack.')
+                   '--html-output). Loops sharing a BFS-tree spine are drawn as one patch/pcl stack '
+                   'with their differing closing edges fanned as several magenta bows.')
 @click.option('--loops-ncols', default=6, type=int,
-              help='Number of loop diagrams per row in the per-loop view.')
+              help='Number of loop diagrams per row in the per-loop view PNG (the interactive HTML '
+                   'flows the tiles to fit the window instead).')
 @click.option('--max-loop-cycles', default=48, type=int,
-              help='Cap on how many inconsistent loops to draw in the per-loop view (those with the '
-                   'largest |holonomy| first); 0 = all. The full set is always in the votes json.')
+              help='Cap on how many shared-spine diagrams to draw in the per-loop view (those with the '
+                   'largest |holonomy| first); 0 = all. Each diagram may carry several closing edges, '
+                   'so this covers more than that many loops. The full set is always in the votes json.')
 @click.option('--label', 'label_mode', type=click.Choice(['patch', 'id', 'none']), default='patch',
               help='Left-hand column content per row: the patch id (folder name), a compact integer '
                    'id (id->patch mapping printed to stdout), or nothing.')
@@ -1137,20 +1307,21 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
     fig.savefig(output, dpi=dpi, bbox_inches='tight')
     print(f'wrote {output}  ({len(nodes)} patches, {len(edges)} edges, {len(voters)} votes)')
 
-    # --- per-loop view PNG: each inconsistent closed loop drawn on its own (the
-    #     interactive version is folded into the combined HTML below, as a tab) ---
+    # --- per-loop view PNG: loops sharing a BFS-tree spine collapsed into one diagram,
+    #     their differing closing edges fanned (the interactive version is folded into the
+    #     combined HTML below, as a tab) ---
     loops_selected = None
     if loop_cycles:
-        cycles, total, truncated = _select_loop_cycles(loop_cycles, max_loop_cycles)
+        groups, total_loops, total_groups, truncated = _group_loop_cycles(loop_cycles, max_loop_cycles)
         if truncated:
-            print(f'per-loop view: drawing the {max_loop_cycles} of {total} inconsistent loops '
-                  f'with the largest |holonomy|; all {total} are in the votes json')
+            print(f'per-loop view: drawing the {max_loop_cycles} of {total_groups} shared spine(s) '
+                  f'with the largest |holonomy|; all {total_loops} loops are in the votes json')
         if loops_output is None:
             base = os.path.splitext(os.path.basename(votes_path))[0]
             loops_output = os.path.join(os.path.dirname(os.path.abspath(votes_path)),
                                         f'{base}_loops.png')
-        plot_loop_cycles(cycles, total, loops_output, ncols=loops_ncols, dpi=dpi)
-        loops_selected = (cycles, total)
+        plot_loop_cycles(groups, total_loops, total_groups, loops_output, ncols=loops_ncols, dpi=dpi)
+        loops_selected = (groups, total_loops, total_groups)
     else:
         print('no "loop_cycles" in this votes file; the per-loop view will be absent '
               '(rerun find_inconsistent_windings.py if it predates this field)')
@@ -1173,8 +1344,7 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
             'px_per_winding': html_px_per_winding, 'row_px': html_row_px, 'label_width': html_label_width,
         }
         main_doc = build_main_html(geom)
-        loops_doc = (build_loops_html(loops_selected[0], loops_selected[1], ncols=loops_ncols)
-                     if loops_selected else None)
+        loops_doc = build_loops_html(*loops_selected) if loops_selected else None
         loops_total = loops_selected[1] if loops_selected else 0
         write_combined_html(main_doc, loops_doc, html_output, seed, loops_total)
         print(f'wrote {html_output}'
