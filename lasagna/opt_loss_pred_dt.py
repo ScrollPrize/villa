@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import time
 
@@ -335,7 +336,7 @@ def _atlas_snap_source_xy(
 	sub_h: int,
 	sub_w: int,
 	layer_index: int,
-) -> tuple[np.ndarray, dict[str, float], dict[str, np.ndarray]]:
+) -> tuple[np.ndarray, dict[str, float], dict[str, object]]:
 	"""Project atlas pred-snap anchors to rendered-surface pixels for flow seeds."""
 	stats: dict[str, float] = {
 		"pred_dt_atlas_snap_seed_candidates": 0.0,
@@ -343,12 +344,13 @@ def _atlas_snap_source_xy(
 		"pred_dt_atlas_snap_seed_pred_dt_accepted": 0.0,
 		"pred_dt_atlas_snap_seed_unique": 0.0,
 	}
-	def empty_debug(surface_distance: float | None = None, min_inlier: float | None = None) -> dict[str, np.ndarray]:
+	def empty_debug(surface_distance: float | None = None, min_inlier: float | None = None) -> dict[str, object]:
 		debug = {
 			"xy": np.zeros((0, 2), dtype=np.int32),
 			"distance": np.zeros((0,), dtype=np.float32),
 			"inlier": np.zeros((0,), dtype=np.float32),
 			"valid": np.zeros((0,), dtype=np.bool_),
+			"records": [],
 		}
 		if surface_distance is not None:
 			debug["surface_distance"] = np.asarray([surface_distance], dtype=np.float32)
@@ -454,7 +456,10 @@ def _atlas_snap_source_xy(
 		+ Q11 * u.unsqueeze(-1) * v.unsqueeze(-1)
 	)
 	distance = (target - hit).norm(dim=-1)
-	target_valid = finite & n_valid & in_quad & torch.isfinite(hit).all(dim=-1) & torch.isfinite(distance) & (distance <= max_distance)
+	hit_finite = torch.isfinite(hit).all(dim=-1)
+	distance_finite = torch.isfinite(distance)
+	within_distance = distance <= max_distance
+	target_valid = finite & n_valid & in_quad & hit_finite & distance_finite & within_distance
 	stats["pred_dt_atlas_snap_seed_target_accepted"] = float(int(target_valid.sum().detach().cpu()))
 	h_cont = row2.to(dtype=xyz_img.dtype) + u
 	w_cont = col2.to(dtype=xyz_img.dtype) + v
@@ -472,13 +477,89 @@ def _atlas_snap_source_xy(
 		stats["pred_dt_atlas_snap_seed_max_distance"] = float(valid_dist.max().detach().cpu())
 
 	all_xy = torch.stack([source_x, source_y], dim=1).detach().cpu().numpy().astype(np.int32, copy=False)
+	sample_indices = idx.detach().cpu().numpy().astype(np.int64, copy=False)
+	source_indices_raw = tuple(int(v) for v in (getattr(lines, "source_indices", ()) or ()))
+	object_ids_raw = tuple(str(v) for v in (getattr(lines, "object_ids", ()) or ()))
+	target_cpu = target.detach().cpu().numpy().astype(np.float32, copy=False)
+	hit_cpu = hit.detach().cpu().numpy().astype(np.float32, copy=False)
+	model_h_cpu = h.detach().cpu().numpy().astype(np.float32, copy=False)
+	model_w_cpu = w.detach().cpu().numpy().astype(np.float32, copy=False)
+	distance_cpu = distance.detach().cpu().numpy().astype(np.float32, copy=False)
+	pred_value_cpu = pred_value.detach().cpu().numpy().astype(np.float32, copy=False)
+	inlier_cpu = inlier.detach().cpu().numpy().astype(np.float32, copy=False)
+	finite_cpu = finite.detach().cpu().numpy().astype(np.bool_, copy=False)
+	n_valid_cpu = n_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
+	in_quad_cpu = in_quad.detach().cpu().numpy().astype(np.bool_, copy=False)
+	hit_finite_cpu = hit_finite.detach().cpu().numpy().astype(np.bool_, copy=False)
+	distance_finite_cpu = distance_finite.detach().cpu().numpy().astype(np.bool_, copy=False)
+	within_distance_cpu = within_distance.detach().cpu().numpy().astype(np.bool_, copy=False)
+	target_valid_cpu = target_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
+	pred_valid_cpu = pred_valid.detach().cpu().numpy().astype(np.bool_, copy=False)
+	accepted_cpu = accepted.detach().cpu().numpy().astype(np.bool_, copy=False)
+	def float_or_none(value: object) -> float | None:
+		try:
+			out = float(value)
+		except (TypeError, ValueError):
+			return None
+		return out if np.isfinite(out) else None
+
+	def xyz_or_none(values: np.ndarray) -> list[float | None]:
+		return [float_or_none(v) for v in np.asarray(values).reshape(3)]
+
+	records: list[dict[str, object]] = []
+	for rec_i, sample_index in enumerate(sample_indices.tolist()):
+		reason = "accepted"
+		if not bool(finite_cpu[rec_i]):
+			reason = "nonfinite_target_or_model_coord"
+		elif not bool(n_valid_cpu[rec_i]):
+			reason = "invalid_model_normal"
+		elif not bool(in_quad_cpu[rec_i]):
+			reason = "no_surface_intersection_near_model_coord"
+		elif not bool(hit_finite_cpu[rec_i]):
+			reason = "nonfinite_surface_hit"
+		elif not bool(distance_finite_cpu[rec_i]):
+			reason = "nonfinite_surface_distance"
+		elif not bool(within_distance_cpu[rec_i]):
+			reason = "surface_distance_too_large"
+		elif not bool(pred_valid_cpu[rec_i]):
+			reason = "pred_dt_inlier_too_low"
+		source_index = (
+			source_indices_raw[int(sample_index)]
+			if 0 <= int(sample_index) < len(source_indices_raw)
+			else int(sample_index)
+		)
+		object_id = (
+			object_ids_raw[int(sample_index)]
+			if 0 <= int(sample_index) < len(object_ids_raw)
+			else "unknown"
+		)
+		records.append({
+			"sample_index": int(sample_index),
+			"object_id": object_id,
+			"source_index": int(source_index),
+			"model_h": float_or_none(model_h_cpu[rec_i]),
+			"model_w": float_or_none(model_w_cpu[rec_i]),
+			"target_xyz": xyz_or_none(target_cpu[rec_i]),
+			"surface_hit_xyz": xyz_or_none(hit_cpu[rec_i]),
+			"source_xy": [int(all_xy[rec_i, 0]), int(all_xy[rec_i, 1])],
+			"surface_distance": float_or_none(distance_cpu[rec_i]),
+			"surface_distance_limit": float(max_distance),
+			"pred_dt_value": float_or_none(pred_value_cpu[rec_i]),
+			"inlier": float_or_none(inlier_cpu[rec_i]),
+			"min_inlier": float(min_inlier),
+			"target_valid": bool(target_valid_cpu[rec_i]),
+			"pred_valid": bool(pred_valid_cpu[rec_i]),
+			"accepted": bool(accepted_cpu[rec_i]),
+			"reason": reason,
+		})
 	debug = {
 		"xy": all_xy,
-		"distance": distance.detach().cpu().numpy().astype(np.float32, copy=False),
-		"inlier": inlier.detach().cpu().numpy().astype(np.float32, copy=False),
-		"valid": accepted.detach().cpu().numpy().astype(np.bool_, copy=False),
+		"distance": distance_cpu,
+		"inlier": inlier_cpu,
+		"valid": accepted_cpu,
 		"surface_distance": np.asarray([max_distance], dtype=np.float32),
 		"min_inlier": np.asarray([min_inlier], dtype=np.float32),
+		"records": records,
 	}
 	if not bool(accepted.any().detach().cpu()):
 		return np.zeros((0, 2), dtype=np.int32), stats, debug
@@ -1259,6 +1340,116 @@ def configure_pred_dt(*, normal_source: str | None = None) -> None:
 	_pred_dt_normal_source = src
 
 
+def _xy_key(value: object) -> tuple[int, int] | None:
+	try:
+		x, y = value  # type: ignore[misc]
+	except Exception:
+		return None
+	try:
+		return int(x), int(y)
+	except (TypeError, ValueError):
+		return None
+
+
+def _write_atlas_snap_seed_report(
+	*,
+	stage_name: str,
+	debug_index: int,
+	layer_index: int,
+	winding: int,
+	atlas_seed_debug: dict[str, object] | None,
+	primary_xy: tuple[int, int] | None,
+	extra_source_xy: np.ndarray,
+	flow_status: str,
+	flow_source_value: int | None = None,
+	out_dir: Path | None,
+) -> None:
+	if not atlas_seed_debug:
+		return
+	records_raw = atlas_seed_debug.get("records", [])
+	if not isinstance(records_raw, list):
+		return
+	primary_key = None if primary_xy is None else (int(primary_xy[0]), int(primary_xy[1]))
+	extra_keys = {
+		(int(x), int(y))
+		for x, y in np.asarray(extra_source_xy, dtype=np.int32).reshape(-1, 2)
+	}
+	records: list[dict[str, object]] = []
+	accepted_count = 0
+	used_count = 0
+	for item in records_raw:
+		if not isinstance(item, dict):
+			continue
+		rec = dict(item)
+		xy = _xy_key(rec.get("source_xy"))
+		accepted = bool(rec.get("accepted", False))
+		if accepted:
+			accepted_count += 1
+		flow_source = "not_used"
+		if accepted and xy is not None:
+			if primary_key is not None and xy == primary_key:
+				flow_source = "primary"
+			elif xy in extra_keys:
+				flow_source = "extra"
+			else:
+				flow_source = "accepted_not_passed_to_flow"
+		if flow_source in {"primary", "extra"}:
+			used_count += 1
+		rec["flow_source"] = flow_source
+		rec["flow_status"] = flow_status
+		if flow_source_value is not None:
+			rec["flow_source_value"] = int(flow_source_value)
+		records.append(rec)
+	if not records:
+		return
+
+	report_path: Path | None = None
+	if out_dir is not None:
+		out_dir.mkdir(parents=True, exist_ok=True)
+		header = {
+			"stage": str(stage_name),
+			"debug_index": int(debug_index),
+			"layer_index": int(layer_index),
+			"winding": int(winding),
+			"primary_xy": None if primary_key is None else [primary_key[0], primary_key[1]],
+			"extra_source_count": int(len(extra_keys)),
+			"flow_status": str(flow_status),
+			"flow_source_value": None if flow_source_value is None else int(flow_source_value),
+			"sample_count": int(len(records)),
+			"accepted_count": int(accepted_count),
+			"used_count": int(used_count),
+		}
+		for suffix in (
+			f"{stage_name}_{debug_index:06d}_layer{layer_index:03d}",
+			f"{stage_name}_layer{layer_index:03d}",
+		):
+			report_path = out_dir / f"pred_dt_flow_gate_{suffix}_atlas_snap_seed_report.jsonl"
+			with report_path.open("w", encoding="utf-8") as f:
+				f.write(json.dumps(header, sort_keys=True))
+				f.write("\n")
+				for rec in records:
+					f.write(json.dumps(rec, sort_keys=True))
+					f.write("\n")
+
+	print(
+		f"[pred_dt_flow_gate] {stage_name}: atlas snap seed report "
+		f"layer={layer_index} winding={winding} samples={len(records)} "
+		f"accepted={accepted_count} used={used_count} flow_status={flow_status}"
+		+ (f" path={report_path}" if report_path is not None else ""),
+		flush=True,
+	)
+	for rec in records:
+		print(
+			f"[pred_dt_flow_gate] {stage_name}: atlas snap sample "
+			f"layer={layer_index} object={rec.get('object_id')} source_index={rec.get('source_index')} "
+			f"sample_index={rec.get('sample_index')} xy={rec.get('source_xy')} "
+			f"accepted={rec.get('accepted')} flow_source={rec.get('flow_source')} "
+			f"reason={rec.get('reason')} dist={rec.get('surface_distance')} "
+			f"pred_dt={rec.get('pred_dt_value')} inlier={rec.get('inlier')}",
+			flush=True,
+		)
+
+
 def flow_gate_last_stats() -> dict[str, float]:
 	return dict(_flow_gate_last_stats)
 
@@ -1761,6 +1952,11 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 	write_jpg_debug = (
 		debug and debug_jpg_interval > 0 and (debug_index % debug_jpg_interval) == 0
 	)
+	write_atlas_snap_seed_report = (
+		debug
+		and bool(cfg.get("atlas_snap_seed_report", True))
+		and (write_layer_debug or write_jpg_debug or bool(cfg.get("atlas_snap_seed_report_every_step", False)))
+	)
 	return_flow_debug = write_layer_debug or write_jpg_debug
 	timing: dict[str, float] = {}
 	def mark(label: str) -> float:
@@ -1977,7 +2173,7 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 				winding_value=winding,
 			)
 			corr_count = int(corr_source_xy.shape[0])
-			atlas_source_xy, atlas_seed_stats, _atlas_seed_debug = _atlas_snap_source_xy(
+			atlas_source_xy, atlas_seed_stats, atlas_seed_debug = _atlas_snap_source_xy(
 				res=res,
 				xyz_img=xyz_hr,
 				pred_img=pred_img,
@@ -2030,6 +2226,18 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			if primary_xy is None:
 				stats["pred_dt_flow_layers_no_sources"] += 1.0
 				stats[f"pred_dt_layer_{d}_flow_called"] = 0.0
+				if write_atlas_snap_seed_report:
+					_write_atlas_snap_seed_report(
+						stage_name=stage_name,
+						debug_index=debug_index,
+						layer_index=d,
+						winding=int(winding),
+						atlas_seed_debug=atlas_seed_debug,
+						primary_xy=primary_xy,
+						extra_source_xy=extra_source_xy,
+						flow_status="no_sources",
+						out_dir=_flow_gate_out_dir,
+					)
 				if write_layer_debug:
 					_t = mark("write_layer_debug")
 					weight_hr = F.interpolate(
@@ -2084,6 +2292,18 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 			try:
 				flow = unpack_flow_outputs(_compute_flow_outputs_for_layer())
 				stats["pred_dt_flow_layers_with_flow"] += 1.0
+				if write_atlas_snap_seed_report:
+					_write_atlas_snap_seed_report(
+						stage_name=stage_name,
+						debug_index=debug_index,
+						layer_index=d,
+						winding=int(winding),
+						atlas_seed_debug=atlas_seed_debug,
+						primary_xy=primary_xy,
+						extra_source_xy=extra_source_xy,
+						flow_status="flow_called",
+						out_dir=_flow_gate_out_dir,
+					)
 			except RuntimeError as exc:
 				message = str(exc)
 				source_value = int(pred_img[primary_xy[1], primary_xy[0]]) if 0 <= primary_xy[1] < He and 0 <= primary_xy[0] < We else -1
@@ -2097,6 +2317,19 @@ def _flow_gate_weight(res: fit_model.FitResult3D) -> torch.Tensor | tuple[torch.
 					f"(source outside C++ flow domain, value={source_value})",
 					flush=True,
 				)
+				if write_atlas_snap_seed_report:
+					_write_atlas_snap_seed_report(
+						stage_name=stage_name,
+						debug_index=debug_index,
+						layer_index=d,
+						winding=int(winding),
+						atlas_seed_debug=atlas_seed_debug,
+						primary_xy=primary_xy,
+						extra_source_xy=extra_source_xy,
+						flow_status="flow_skipped_source_outside_domain",
+						flow_source_value=source_value,
+						out_dir=_flow_gate_out_dir,
+					)
 				if write_layer_debug:
 					_t = mark("write_layer_debug")
 					weight_hr = F.interpolate(

@@ -1545,6 +1545,48 @@ void SegmentationLasagnaPanel::setState(CState* state)
     updateLinkedSurfaceTables();
 }
 
+void SegmentationLasagnaPanel::setSelectedAtlasPath(const QString& path)
+{
+    if (path.isEmpty()) {
+        refreshAtlasComboFromState();
+        return;
+    }
+
+    _atlasDirPath = QFileInfo(path).absoluteFilePath();
+    const std::filesystem::path root = volpkgRootForState(_state);
+    if (!root.empty()) {
+        populateAtlasCombo(QString::fromStdString(root.string()), _atlasDirPath);
+    } else if (_atlasCombo) {
+        const QSignalBlocker blocker(_atlasCombo);
+        _atlasCombo->clear();
+        _atlasCombo->addItem(QFileInfo(_atlasDirPath).fileName(), _atlasDirPath);
+        _atlasCombo->setCurrentIndex(0);
+        syncCompactConfigCombos();
+    }
+
+    if (_atlasCombo) {
+        int selectedIndex = _atlasCombo->findData(_atlasDirPath);
+        if (selectedIndex < 0) {
+            const QFileInfo selectedInfo(_atlasDirPath);
+            for (int i = 0; i < _atlasCombo->count(); ++i) {
+                if (QFileInfo(_atlasCombo->itemData(i).toString()).absoluteFilePath() ==
+                    selectedInfo.absoluteFilePath()) {
+                    selectedIndex = i;
+                    break;
+                }
+            }
+        }
+        if (selectedIndex >= 0) {
+            const QSignalBlocker blocker(_atlasCombo);
+            _atlasCombo->setCurrentIndex(selectedIndex);
+            _atlasDirPath = _atlasCombo->currentData().toString();
+        }
+    }
+
+    writeSetting(QStringLiteral("lasagna_atlas_dir_path"), _atlasDirPath);
+    syncCompactConfigCombos();
+}
+
 QWidget* SegmentationLasagnaPanel::createCompactView(QWidget* parent)
 {
     if (_compactView) {

@@ -60,6 +60,7 @@ public:
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
+    void setSelectedAtlasPath(const QString& path);
     void setState(CState* state);
 
     void restoreSettings(QSettings& settings);

@@ -83,6 +83,7 @@
 #include "vc/core/types/Segmentation.hpp"
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <cctype>
 #include <string_view>
 #include <utility>
@@ -810,12 +811,25 @@ QDockWidget* createAtlasOverviewDock(QWidget* parent)
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(6);
 
+    auto* actions = new QHBoxLayout();
+    actions->setContentsMargins(0, 0, 0, 0);
+    actions->setSpacing(6);
+
+    auto* remap = new QPushButton(QObject::tr("Remap"), content);
+    remap->setObjectName(QStringLiteral("atlasRemapButton"));
+    remap->setToolTip(QObject::tr(
+        "Rebuild atlas fiber mappings from the saved source fibers using the selected Lasagna dataset."));
+    remap->setEnabled(false);
+    actions->addWidget(remap);
+
     auto* rankSnap = new QPushButton(QObject::tr("Rank via Fit-Service"), content);
     rankSnap->setObjectName(QStringLiteral("atlasRankSnapButton"));
     rankSnap->setToolTip(QObject::tr(
         "Run atlas pred-snap ranking through the Lasagna fit-service job queue."));
     rankSnap->setEnabled(false);
-    layout->addWidget(rankSnap);
+    actions->addWidget(rankSnap);
+
+    layout->addLayout(actions);
 
     auto* atlasTree = new QTreeWidget(content);
     atlasTree->setObjectName(QStringLiteral("atlasOverviewTree"));
@@ -2762,6 +2776,10 @@ void CWindow::createAtlasWorkspace()
                 QStringLiteral("atlasRankSnapButton"))) {
             connect(rankSnap, &QPushButton::clicked, this, &CWindow::optimizeAtlasSnapCandidates);
         }
+        if (auto* remap = dock->widget()->findChild<QPushButton*>(
+                QStringLiteral("atlasRemapButton"))) {
+            connect(remap, &QPushButton::clicked, this, &CWindow::remapCurrentAtlas);
+        }
         connect(tree, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem* item, int) {
             while (item && item->data(0, Qt::UserRole).toString().isEmpty()) {
                 item = item->parent();
@@ -3313,7 +3331,102 @@ void CWindow::updateAtlasSearchDocks()
         if (auto* rankSnap = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasRankSnapButton"))) {
             rankSnap->setEnabled(atlasUsable);
         }
+        if (auto* remap = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasRemapButton"))) {
+            remap->setEnabled(atlasUsable);
+        }
     }
+}
+
+void CWindow::remapCurrentAtlas()
+{
+    if (!_currentAtlasDir || !_state || !_state->vpkg()) {
+        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before remapping."));
+        return;
+    }
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+    if (manifestPath.empty() || !std::filesystem::exists(manifestPath)) {
+        QMessageBox::warning(this,
+                             tr("Atlas"),
+                             tr("Select a local Lasagna dataset before remapping."));
+        return;
+    }
+
+    const std::filesystem::path atlasDir = *_currentAtlasDir;
+    const std::filesystem::path volpkgRoot = vpkg->path().empty()
+        ? std::filesystem::path(vpkg->getVolpkgDirectory())
+        : vpkg->path().parent_path();
+
+    if (statusBar()) {
+        statusBar()->showMessage(tr("Remapping atlas fibers..."), 3000);
+    }
+    for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* button = dock->widget()->findChild<QPushButton*>(
+                QStringLiteral("atlasRemapButton"))) {
+            button->setEnabled(false);
+        }
+        if (auto* button = dock->widget()->findChild<QPushButton*>(
+                QStringLiteral("atlasRankSnapButton"))) {
+            button->setEnabled(false);
+        }
+    }
+
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher,
+            &QFutureWatcher<QString>::finished,
+            this,
+            [this, watcher, atlasDir]() {
+        watcher->deleteLater();
+        try {
+            const QString summary = watcher->result();
+            displayAtlasFromDirectory(atlasDir);
+            if (statusBar()) {
+                statusBar()->showMessage(tr("Remapped atlas fibers. %1").arg(summary), 7000);
+            }
+        } catch (const std::exception& ex) {
+            refreshAtlasOverviewDocks();
+            updateAtlasFiberDocks();
+            updateAtlasSearchDocks();
+            QMessageBox::warning(
+                this,
+                tr("Atlas Remap"),
+                tr("Could not remap atlas: %1").arg(QString::fromStdString(ex.what())));
+        }
+    });
+
+    watcher->setFuture(QtConcurrent::run([atlasDir, volpkgRoot, manifestPath]() -> QString {
+        std::cerr << "[atlas-remap] start"
+                  << " atlas=" << atlasDir.string()
+                  << " volpkg_root=" << volpkgRoot.string()
+                  << " manifest=" << manifestPath.string()
+                  << std::endl;
+        vc::lasagna::LasagnaDataset dataset =
+            vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        const vc::atlas::Atlas rebuilt =
+            vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
+
+        std::ostringstream summary;
+        summary.imbue(std::locale::classic());
+        summary << "fibers=" << rebuilt.fibers.size();
+        for (const auto& mapping : rebuilt.fibers) {
+            std::cerr << "[atlas-remap] fiber="
+                      << mapping.fiberPath.generic_string()
+                      << " line_anchors=" << mapping.lineAnchors.size()
+                      << " control_anchors=" << mapping.controlAnchors.size()
+                      << std::endl;
+            summary << " "
+                    << mapping.fiberPath.filename().string()
+                    << ":"
+                    << mapping.controlAnchors.size()
+                    << "cp";
+        }
+        std::cerr << "[atlas-remap] finished" << std::endl;
+        return QString::fromStdString(summary.str());
+    }));
 }
 
 void CWindow::optimizeAtlasSnapCandidates()
@@ -4561,6 +4674,10 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
         _currentAtlasName = atlas.metadata.name;
         if (_lineAnnotationController) {
             _lineAnnotationController->setCurrentAtlasDirectory(_currentAtlasDir);
+        }
+        if (_segmentationWidget && _segmentationWidget->lasagnaPanel()) {
+            _segmentationWidget->lasagnaPanel()->setSelectedAtlasPath(
+                QString::fromStdString(atlasDir.string()));
         }
         const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
         auto baseSurface = std::make_shared<QuadSurface>(basePath);

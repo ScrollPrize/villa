@@ -141,6 +141,7 @@ private:
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
+    void remapCurrentAtlas();
     void optimizeAtlasSnapCandidates();
     void startAtlasFiberIntersectionSearch();
     void cancelAtlasFiberIntersectionSearch();
