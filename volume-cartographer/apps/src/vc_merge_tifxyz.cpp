@@ -731,6 +731,22 @@ GMRansac gmRansacSimilarity(const std::vector<cv::Vec2d>& src,
         }
         if (cnt > best_cnt) { best_cnt = cnt; best_inl.swap(inl); }
     }
+    // If the shift/scale gate rejected every sampled hypothesis, best_cnt is
+    // still -1. Do NOT fall through to the gather/identity refit below: fitting
+    // the empty inlier set yields identity and then re-selects inliers by
+    // distance alone, silently re-admitting the very near-identity/contact
+    // model the gate was meant to reject. Report no inliers instead, so the
+    // caller keeps the prior model (auto-gate re-fit) or drops the edge. For
+    // ungated calls the gate-continue never fires, so best_cnt >= 0 and this
+    // guard is a no-op.
+    if (best_cnt < 0) {
+        R.M = cv::Matx23d::eye();
+        std::fill(R.inlier.begin(), R.inlier.end(), (uint8_t)0);
+        R.thresh = thresh;
+        R.sigma_in = 1.0;
+        R.n_in = 0;
+        return R;
+    }
     auto gather = [&](std::vector<cv::Vec2d>& sv, std::vector<cv::Vec2d>& dv){
         sv.clear(); dv.clear();
         for (int k = 0; k < N; ++k) if (best_inl[k]) { sv.push_back(src[k]); dv.push_back(dst[k]); }

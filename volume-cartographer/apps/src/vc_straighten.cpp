@@ -521,7 +521,10 @@ static double stageOverlapPairs(const Grid& g, const OverlapParams& pr,
     };
 
     // Spacing estimate: nearest cross-wrap (|du|>=minDu) neighbor distance.
-    {
+    // Skipped entirely when the user supplies --threshold, so an explicit
+    // override is honored even on sparse surfaces where the random sample
+    // would find too few cross-wrap neighbors to auto-calibrate.
+    if (pr.threshold <= 0.0) {
         std::mt19937 rng(pr.seed);
         const int nSample = std::min(30000, N);
         std::vector<int> sel(N); std::iota(sel.begin(), sel.end(), 0);
@@ -551,8 +554,7 @@ static double stageOverlapPairs(const Grid& g, const OverlapParams& pr,
         std::cout << "  cross-wrap nearest distance p25/p50/p75 = "
                   << percentile(nd, 25) << "/" << med << "/" << percentile(nd, 75)
                   << " voxels (" << (100.0 * nd.size() / nSample) << "% matched)\n";
-        const_cast<OverlapParams&>(pr).threshold =
-            (pr.threshold > 0) ? pr.threshold : pr.thresholdFactor * med;
+        const_cast<OverlapParams&>(pr).threshold = pr.thresholdFactor * med;
     }
     const double threshold = pr.threshold;
     const double thr2 = threshold * threshold;
