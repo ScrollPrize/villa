@@ -20,6 +20,7 @@
 #include <QCursor>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QShowEvent>
 #include <QGraphicsEllipseItem>
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
@@ -835,6 +836,17 @@ CChunkedVolumeViewer::~CChunkedVolumeViewer()
         _overlayChunkCbId = 0;
     }
     clearIntersectionItems();
+}
+
+void CChunkedVolumeViewer::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    // Render whatever went stale while this viewer was hidden (submitRender skipped
+    // renders + prefetch for invisible viewers).
+    if (_renderStaleWhileHidden && !_closing) {
+        _renderStaleWhileHidden = false;
+        scheduleRender("shown after hidden");
+    }
 }
 
 bool CChunkedVolumeViewer::eventFilter(QObject* watched, QEvent* event)
@@ -2242,6 +2254,14 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
+        return;
+    }
+    // Hidden viewer (minimized subwindow / background tab): skip the render AND its
+    // prefetch entirely. Mark stale so showEvent renders it when it becomes visible.
+    if (!isVisible()) {
+        _renderStaleWhileHidden = true;
+        _renderPending = false;
+        profile.setDetails("action=skip hidden");
         return;
     }
 

@@ -199,6 +199,7 @@ public:
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
@@ -320,6 +321,10 @@ private:
     QTimer* _statusTimer = nullptr;
     bool _closing = false;
     bool _renderPending = false;
+    // A render was requested while this viewer was hidden (minimized MDI subwindow /
+    // background tab). We skip the work and set this; showEvent re-renders so the
+    // viewer catches up on whatever went stale while invisible.
+    bool _renderStaleWhileHidden = false;
     bool _segmentationEditActive = false;
     bool _deferSegmentationIntersections = false;
     bool _deferredSegmentationIntersectionsDirty = false;
