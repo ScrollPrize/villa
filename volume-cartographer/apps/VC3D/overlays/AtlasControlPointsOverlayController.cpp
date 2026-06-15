@@ -18,9 +18,35 @@ constexpr const char* kOverlayGroup = "lasagna_atlas_control_points";
 
 bool finiteSurfacePoint(const AtlasControlPointResult& point)
 {
-    return point.valid &&
-           std::isfinite(point.modelH) &&
-           std::isfinite(point.modelW);
+    return (point.snapValid &&
+            std::isfinite(point.snapModelH) &&
+            std::isfinite(point.snapModelW)) ||
+           (point.valid &&
+            std::isfinite(point.modelH) &&
+            std::isfinite(point.modelW));
+}
+
+bool finiteVolumePoint(const cv::Vec3f& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+bool isPlaneViewer(VolumeViewerBase* viewer)
+{
+    if (!viewer) {
+        return false;
+    }
+    const std::string name = viewer->surfName();
+    return name == "xy plane" || name == "seg xz" || name == "seg yz" ||
+           name.rfind("line_annotation_slice_", 0) == 0;
+}
+
+bool isSelectedPoint(const std::optional<std::pair<QString, int>>& selected,
+                     const AtlasControlPointResult& point)
+{
+    return selected &&
+           selected->first == point.fiberId &&
+           selected->second == point.controlIndex;
 }
 
 std::optional<cv::Vec2f> gridPointToSurface(VolumeViewerBase* viewer,
@@ -34,10 +60,16 @@ std::optional<cv::Vec2f> gridPointToSurface(VolumeViewerBase* viewer,
     if (std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) {
         return std::nullopt;
     }
+    const float modelH = point.snapValid && std::isfinite(point.snapModelH)
+        ? point.snapModelH
+        : point.modelH;
+    const float modelW = point.snapValid && std::isfinite(point.snapModelW)
+        ? point.snapModelW
+        : point.modelW;
     const cv::Vec3f center = quad->center();
     const cv::Vec2f surface{
-        point.modelW / scale[0] - center[0],
-        point.modelH / scale[1] - center[1],
+        modelW / scale[0] - center[0],
+        modelH / scale[1] - center[1],
     };
     if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) {
         return std::nullopt;
@@ -62,6 +94,16 @@ ViewerOverlayControllerBase::OverlayStyle pointStyle()
     style.brushColor = QColor(255, 245, 120, 230);
     style.penWidth = 0.0;
     style.z = 78.0;
+    return style;
+}
+
+ViewerOverlayControllerBase::OverlayStyle snapTargetStyle()
+{
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = QColor(80, 255, 175, 220);
+    style.brushColor = QColor(80, 255, 175, 210);
+    style.penWidth = 0.0;
+    style.z = 80.0;
     return style;
 }
 
@@ -121,13 +163,32 @@ void AtlasControlPointsOverlayController::clearSelectedPoint()
 
 bool AtlasControlPointsOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    return viewer && _enabled && !_results.empty() && viewer->surfName() == "segmentation";
+    return viewer && _enabled && !_results.empty() &&
+           (viewer->surfName() == "segmentation" || isPlaneViewer(viewer));
 }
 
 void AtlasControlPointsOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                                                             OverlayBuilder& builder)
 {
     if (!isOverlayEnabledFor(viewer)) {
+        return;
+    }
+
+    if (isPlaneViewer(viewer)) {
+        const auto snapStyle = snapTargetStyle();
+        const auto selectedPointStyle = selectedStyle();
+        for (const auto& point : _results) {
+            if (!point.snapValid || !finiteVolumePoint(point.snapTargetXyz)) {
+                continue;
+            }
+            const QPointF scenePoint = viewer->volumeToScene(point.snapTargetXyz);
+            if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
+                continue;
+            }
+            builder.addPoint(scenePoint,
+                             isSelectedPoint(_selected, point) ? 5.5 : 3.5,
+                             isSelectedPoint(_selected, point) ? selectedPointStyle : snapStyle);
+        }
         return;
     }
 
@@ -164,9 +225,7 @@ void AtlasControlPointsOverlayController::collectPrimitives(VolumeViewerBase* vi
             if (!surface) {
                 continue;
             }
-            const bool selected = _selected &&
-                                  _selected->first == point->fiberId &&
-                                  _selected->second == point->controlIndex;
+            const bool selected = isSelectedPoint(_selected, *point);
             builder.addSurfacePoint(*surface,
                                     selected ? 5.5 : 3.5,
                                     selected ? selectedPointStyle : controlPointStyle);

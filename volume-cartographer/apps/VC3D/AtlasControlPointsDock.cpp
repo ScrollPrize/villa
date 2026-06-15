@@ -91,6 +91,9 @@ AtlasControlPointResult parsePoint(const QJsonObject& obj)
     point.snapValid = obj.value(QStringLiteral("snap_valid")).toBool(false);
     point.snapSignedDelta = jsonFloat(obj, QStringLiteral("snap_signed_delta"));
     point.snapTargetXyz = jsonVec3(obj, QStringLiteral("snap_target_xyz"));
+    point.snapMeshXyz = jsonVec3(obj, QStringLiteral("snap_mesh_xyz"));
+    point.snapModelH = jsonFloat(obj, QStringLiteral("snap_model_h"));
+    point.snapModelW = jsonFloat(obj, QStringLiteral("snap_model_w"));
     point.targetXyz = jsonVec3(obj, QStringLiteral("target_xyz"));
     point.meshXyz = jsonVec3(obj, QStringLiteral("mesh_xyz"));
     point.modelH = jsonFloat(obj, QStringLiteral("model_h"));

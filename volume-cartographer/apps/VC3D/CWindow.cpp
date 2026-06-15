@@ -517,10 +517,16 @@ std::optional<cv::Vec2f> atlasControlGridToSurface(VolumeViewerBase* viewer,
     if (std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) {
         return std::nullopt;
     }
+    const float modelH = point.snapValid && std::isfinite(point.snapModelH)
+        ? point.snapModelH
+        : point.modelH;
+    const float modelW = point.snapValid && std::isfinite(point.snapModelW)
+        ? point.snapModelW
+        : point.modelW;
     const cv::Vec3f center = quad->center();
     const cv::Vec2f surface{
-        point.modelW / scale[0] - center[0],
-        point.modelH / scale[1] - center[1],
+        modelW / scale[0] - center[0],
+        modelH / scale[1] - center[1],
     };
     if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) {
         return std::nullopt;

@@ -153,6 +153,9 @@ class AtlasLineLossTest(unittest.TestCase):
 		self.assertEqual(record["snap_status"], "valid fw")
 		self.assertAlmostEqual(record["snap_signed_delta"], 2.0, places=6)
 		self.assertEqual(record["snap_target_xyz"], [1.0, 1.0, 2.0])
+		self.assertEqual(record["snap_mesh_xyz"], [1.0, 1.0, 0.0])
+		self.assertAlmostEqual(record["snap_model_h"], 1.0, places=6)
+		self.assertAlmostEqual(record["snap_model_w"], 1.0, places=6)
 
 	def test_debug_payload_splits_control_other_and_normal_proxy(self) -> None:
 		opt_loss_atlas_line.reset_state()
