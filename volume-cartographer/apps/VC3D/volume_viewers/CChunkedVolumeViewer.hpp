@@ -353,6 +353,12 @@ private:
     std::atomic<bool> _renderWorkerBusy{false};
     bool _renderPendingAfterWorker = false;
     std::uint64_t _renderSerial = 0;
+    // Output-affecting view params of the render currently in flight. A submit that
+    // arrives while the worker is busy only DISCARDS that frame (bumps _renderSerial)
+    // when these change; a data-only refresh lets the in-flight frame finish and
+    // display instead of being thrown away (cuts discarded renders ~19%->5%).
+    std::size_t _inFlightParamsKey = 0;
+    std::size_t viewParamsKey() const;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;

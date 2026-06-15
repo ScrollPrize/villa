@@ -168,7 +168,12 @@ std::string normalizedVolumeCacheIdentity(const std::shared_ptr<Volume>& volume)
 
 bool shouldSpeculativelyPrefetchVolume(const std::shared_ptr<Volume>& volume)
 {
-    return volume && volume->isRemote();
+    // Demand-driven: render workers' tryGetChunk misses queue exactly what the
+    // requested frames need. Speculative visible-set/halo/neighbor warming wasted
+    // bandwidth on chunks that may never be sampled. (Disabled, not deleted, so the
+    // enumeration code path stays compiling.)
+    (void)volume;
+    return false;
 }
 
 bool shouldPrefetchRemoteVolumeHalo(const std::shared_ptr<Volume>& volume)
@@ -2609,6 +2614,35 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     return result;
 }
 
+// Hash of every output-affecting VIEW parameter (camera, sampling, window/level,
+// colormaps, overlay, composite settings) -- NOT chunk data. Two submits with the
+// same key produce the same pixels for the same resident data, so a submit that
+// lands while a worker is busy need not discard the in-flight frame unless this key
+// changed. FNV-1a over the raw bytes of the relevant scalars + string ids.
+std::size_t CChunkedVolumeViewer::viewParamsKey() const
+{
+    std::size_t h = 1469598103934665603ULL;
+    auto mix = [&h](const void* p, std::size_t n) {
+        const unsigned char* b = static_cast<const unsigned char*>(p);
+        for (std::size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+    };
+    auto mixF = [&](float v) { mix(&v, sizeof v); };
+    auto mixS = [&](const std::string& s) { mix(s.data(), s.size()); h ^= s.size(); h *= 1099511628211ULL; };
+    mixF(_surfacePtrX); mixF(_surfacePtrY); mixF(_scale); mixF(_zOff);
+    mix(&_zOffWorldDir, sizeof _zOffWorldDir);
+    mix(&_samplingMethod, sizeof _samplingMethod);
+    mixF(_windowLow); mixF(_windowHigh);
+    mixS(_baseColormapId);
+    mix(&_compositeSettings, sizeof _compositeSettings);
+    // overlay state (its presence/opacity/window/colormap changes pixels)
+    const void* ov = _overlayVolume.get(); mix(&ov, sizeof ov);
+    mixF(_overlayOpacity); mixF(_overlayWindowLow); mixF(_overlayWindowHigh);
+    mixS(_overlayColormapId);
+    int w = _framebuffer.width(), hh = _framebuffer.height();
+    mix(&w, sizeof w); mix(&hh, sizeof hh);
+    return h;
+}
+
 void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location caller)
 {
     ProfileScope profile("submitRender", reason, caller);
@@ -2639,12 +2673,21 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
 
+    const std::size_t paramsKey = viewParamsKey();
     if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
-        ++_renderSerial;
+        // A render is already in flight. Only DISCARD it (bump the serial so its
+        // result is dropped) when the view params changed -- a data-only refresh
+        // (chunks landed) lets the in-flight frame finish and display, and we just
+        // re-render once it does. Stops slow frames from being thrown away mid-stream.
+        if (paramsKey != _inFlightParamsKey)
+            ++_renderSerial;
         _renderPendingAfterWorker = true;
-        profile.setDetails("action=queued_after_worker");
+        profile.setDetails(paramsKey != _inFlightParamsKey
+                               ? "action=queued_after_worker view_changed"
+                               : "action=queued_after_worker data_only");
         return;
     }
+    _inFlightParamsKey = paramsKey;
 
     _chunkArray->beginViewRequest();
     if (_overlayChunkArray)
