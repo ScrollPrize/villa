@@ -263,9 +263,6 @@ private:
     void updateStatusLabel();
     void rebuildChunkArray();
     void syncCameraTransform();
-    bool renderInteractiveAxisAlignedSlicePreview();
-    void updateInteractivePreviewFromStableFrame(float newSurfX, float newSurfY, float newScale);
-    bool shouldRefreshInteractivePreview();
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
@@ -318,13 +315,11 @@ private:
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
     QTimer* _renderTimer = nullptr;
-    QTimer* _settleRenderTimer = nullptr;
     QTimer* _intersectionRenderTimer = nullptr;
     QTimer* _resizeRenderTimer = nullptr;
     QTimer* _statusTimer = nullptr;
     bool _closing = false;
     bool _renderPending = false;
-    bool _interactivePreview = false;
     bool _segmentationEditActive = false;
     bool _deferSegmentationIntersections = false;
     bool _deferredSegmentationIntersectionsDirty = false;
@@ -333,9 +328,6 @@ private:
     std::string _pendingRenderCaller;
     std::string _pendingIntersectionReason;
     std::string _pendingIntersectionCaller;
-    QElapsedTimer _interactionClock;
-    qint64 _lastInteractionMs = -1;
-    qint64 _lastInteractivePreviewMs = -1;
 
     std::shared_ptr<Volume> _volume;
     std::weak_ptr<Surface> _surfWeak;
@@ -345,11 +337,6 @@ private:
     vc::render::IChunkedArray::ChunkReadyCallbackId _chunkCbId = 0;
 
     QImage _framebuffer;
-    QImage _stableFramebuffer;
-    float _stableSurfX = 0.0f;
-    float _stableSurfY = 0.0f;
-    float _stableScale = 1.0f;
-    bool _stableFramebufferValid = false;
     std::atomic<bool> _renderWorkerBusy{false};
     bool _renderPendingAfterWorker = false;
     std::uint64_t _renderSerial = 0;
