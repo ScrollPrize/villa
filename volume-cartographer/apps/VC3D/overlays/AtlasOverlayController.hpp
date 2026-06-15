@@ -38,18 +38,19 @@ public:
     void setSearchPreviewHover(std::optional<int> resultIndex);
     void setSearchPreviewSelection(std::set<int> resultIndices);
     void setSearchPreviewFiber(SearchPreviewFiber fiber);
+    void setSelectedFiberPaths(std::set<std::string> fiberPathKeys);
+    void setSelectedControlPoint(std::optional<std::pair<std::string, int>> controlPoint);
 
     [[nodiscard]] std::optional<QRectF> surfaceBounds() const;
+    [[nodiscard]] std::optional<cv::Vec2f> atlasAnchorToSurface(
+        const vc::atlas::AtlasAnchor& anchor,
+        const vc::atlas::FiberMapping& fiber) const;
 
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    [[nodiscard]] std::optional<cv::Vec2f> atlasAnchorToSurface(
-        const vc::atlas::AtlasAnchor& anchor,
-        const vc::atlas::FiberMapping& fiber) const;
-
     std::optional<vc::atlas::Atlas> _atlas;
     std::shared_ptr<const QuadSurface> _displaySurface;
     vc::atlas::AtlasDisplayRange _displayRange;
@@ -57,4 +58,6 @@ private:
     std::map<int, vc::atlas::FiberMapping> _searchPreviewFibers;
     std::optional<int> _hoverSearchResult;
     std::set<int> _selectedSearchResults;
+    std::set<std::string> _selectedFiberPathKeys;
+    std::optional<std::pair<std::string, int>> _selectedControlPoint;
 };

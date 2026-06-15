@@ -535,7 +535,9 @@ generatedPredSnapMarkers(const std::vector<vc::lasagna::LineControlPoint>& contr
     std::unordered_map<std::string, const vc::atlas::AtlasPredSnapPoint*> snapsByControl;
     snapsByControl.reserve(predSnapSet.points.size());
     for (const auto& point : predSnapSet.points) {
-        if (point.predSnapPoint) {
+        if (point.predSnapPoint &&
+            (point.source == vc::atlas::AtlasPredSnapSource::Manual ||
+             point.source == vc::atlas::AtlasPredSnapSource::Optimized)) {
             snapsByControl[vc::atlas::atlasPredSnapControlPointKey(point.controlPoint)] = &point;
         }
     }
@@ -1152,6 +1154,17 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
 void LineAnnotationController::openFiber(uint64_t fiberId)
 {
+    openFiberWithControlPoint(fiberId, std::nullopt);
+}
+
+void LineAnnotationController::openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex)
+{
+    openFiberWithControlPoint(fiberId, controlPointIndex);
+}
+
+void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
+                                                         std::optional<int> controlPointIndex)
+{
     auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
     });
@@ -1220,7 +1233,11 @@ void LineAnnotationController::openFiber(uint64_t fiberId)
         }
     }
     if (!session->controlPoints.empty()) {
-        if (seedControl < 0) {
+        if (controlPointIndex &&
+            *controlPointIndex >= 0 &&
+            *controlPointIndex < static_cast<int>(session->controlPoints.size())) {
+            seedControl = *controlPointIndex;
+        } else if (seedControl < 0) {
             seedControl = 0;
         }
         session->controlPoints[static_cast<size_t>(seedControl)].isSeed = true;

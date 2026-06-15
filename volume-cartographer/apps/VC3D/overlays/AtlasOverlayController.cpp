@@ -32,6 +32,36 @@ ViewerOverlayControllerBase::OverlayStyle atlasAnchorStyle()
     return style;
 }
 
+ViewerOverlayControllerBase::OverlayStyle selectedAtlasLineStyle()
+{
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = QColor(80, 210, 255);
+    style.brushColor = Qt::transparent;
+    style.penWidth = 3.0;
+    style.z = 66.0;
+    return style;
+}
+
+ViewerOverlayControllerBase::OverlayStyle selectedAtlasAnchorStyle()
+{
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = QColor(80, 210, 255);
+    style.brushColor = QColor(80, 210, 255);
+    style.penWidth = 1.0;
+    style.z = 70.0;
+    return style;
+}
+
+ViewerOverlayControllerBase::OverlayStyle selectedAtlasControlStyle()
+{
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = QColor(255, 70, 80);
+    style.brushColor = QColor(255, 70, 80, 230);
+    style.penWidth = 1.5;
+    style.z = 74.0;
+    return style;
+}
+
 ViewerOverlayControllerBase::OverlayStyle searchCrossStyle(bool emphasized)
 {
     ViewerOverlayControllerBase::OverlayStyle style;
@@ -107,6 +137,8 @@ void AtlasOverlayController::clearAtlas()
     _searchPreviewFibers.clear();
     _hoverSearchResult.reset();
     _selectedSearchResults.clear();
+    _selectedFiberPathKeys.clear();
+    _selectedControlPoint.reset();
     refreshAll();
 }
 
@@ -116,6 +148,8 @@ void AtlasOverlayController::clearSearchPreviews()
     _searchPreviewFibers.clear();
     _hoverSearchResult.reset();
     _selectedSearchResults.clear();
+    _selectedFiberPathKeys.clear();
+    _selectedControlPoint.reset();
     refreshAll();
 }
 
@@ -152,6 +186,25 @@ void AtlasOverlayController::setSearchPreviewFiber(SearchPreviewFiber fiber)
         return;
     }
     _searchPreviewFibers[fiber.resultIndex] = std::move(fiber.mapping);
+    refreshAll();
+}
+
+void AtlasOverlayController::setSelectedFiberPaths(std::set<std::string> fiberPathKeys)
+{
+    if (_selectedFiberPathKeys == fiberPathKeys) {
+        return;
+    }
+    _selectedFiberPathKeys = std::move(fiberPathKeys);
+    refreshAll();
+}
+
+void AtlasOverlayController::setSelectedControlPoint(
+    std::optional<std::pair<std::string, int>> controlPoint)
+{
+    if (_selectedControlPoint == controlPoint) {
+        return;
+    }
+    _selectedControlPoint = std::move(controlPoint);
     refreshAll();
 }
 
@@ -222,7 +275,13 @@ void AtlasOverlayController::collectPrimitives(VolumeViewerBase* viewer,
 
     const auto lineStyle = atlasLineStyle();
     const auto anchorStyle = atlasAnchorStyle();
+    const auto selectedLineStyle = selectedAtlasLineStyle();
+    const auto selectedAnchorStyle = selectedAtlasAnchorStyle();
+    const auto selectedControlStyle = selectedAtlasControlStyle();
     for (const auto& fiber : _atlas->fibers) {
+        const std::string fiberPathKey = vc::atlas::atlasFiberPathKey(fiber.fiberPath);
+        const bool selectedFiber =
+            _selectedFiberPathKeys.find(fiberPathKey) != _selectedFiberPathKeys.end();
         const auto sourceRange = controlAnchorSourceRange(fiber);
         std::vector<cv::Vec2f> linePoints;
         linePoints.reserve(fiber.lineAnchors.size());
@@ -237,14 +296,24 @@ void AtlasOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             linePoints.push_back(*surfaceCoord);
         }
         if (linePoints.size() >= 2) {
-            builder.addSurfaceLineStrip(linePoints, false, lineStyle);
+            builder.addSurfaceLineStrip(linePoints,
+                                        false,
+                                        selectedFiber ? selectedLineStyle : lineStyle);
         }
         for (const auto& anchor : fiber.controlAnchors) {
             const auto surfaceCoord = atlasAnchorToSurface(anchor, fiber);
             if (!surfaceCoord) {
                 continue;
             }
-            builder.addSurfacePoint(*surfaceCoord, 4.0, anchorStyle);
+            const bool selectedControl =
+                _selectedControlPoint &&
+                _selectedControlPoint->first == fiberPathKey &&
+                _selectedControlPoint->second == anchor.sourceIndex;
+            builder.addSurfacePoint(*surfaceCoord,
+                                    selectedControl ? 6.5 : (selectedFiber ? 5.0 : 4.0),
+                                    selectedControl
+                                        ? selectedControlStyle
+                                        : (selectedFiber ? selectedAnchorStyle : anchorStyle));
         }
     }
 

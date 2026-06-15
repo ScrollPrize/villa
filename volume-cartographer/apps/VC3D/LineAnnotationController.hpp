@@ -99,6 +99,7 @@ public:
     void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void openFiber(uint64_t fiberId);
+    void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void deleteFiber(uint64_t fiberId);
     void deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
@@ -179,6 +180,7 @@ private:
                        cv::Vec3d sourceSliceNormal,
                        std::shared_ptr<LineAnnotationSession> session,
                        bool deferShowUntilGenerated = false);
+    void openFiberWithControlPoint(uint64_t fiberId, std::optional<int> controlPointIndex);
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
                         InitialDirectionMode directionMode);

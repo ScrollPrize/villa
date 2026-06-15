@@ -1261,12 +1261,26 @@ namespace {
 
 std::string predSnapSourceString(AtlasPredSnapSource source)
 {
-    return source == AtlasPredSnapSource::Manual ? "manual" : "auto";
+    switch (source) {
+    case AtlasPredSnapSource::Manual:
+        return "manual";
+    case AtlasPredSnapSource::Optimized:
+        return "optimized";
+    case AtlasPredSnapSource::Auto:
+    default:
+        return "auto";
+    }
 }
 
 AtlasPredSnapSource predSnapSourceFromString(const std::string& value)
 {
-    return value == "manual" ? AtlasPredSnapSource::Manual : AtlasPredSnapSource::Auto;
+    if (value == "manual") {
+        return AtlasPredSnapSource::Manual;
+    }
+    if (value == "optimized") {
+        return AtlasPredSnapSource::Optimized;
+    }
+    return AtlasPredSnapSource::Auto;
 }
 
 std::string predSnapDirectionString(AtlasPredSnapDirection direction)
@@ -1725,14 +1739,6 @@ AtlasPredSnapSet generateAtlasPredSnapSet(const FiberInput& fiber,
         }
         point.searchNormal = alignedNormal;
         point.candidates = findAtlasPredSnapCandidates(controlPoint, alignedNormal, sampling);
-        if (!point.candidates.empty()) {
-            point.selectedCandidateIndex = 0;
-            const auto& selected = point.candidates.front();
-            point.predSnapPoint = selected.point;
-            point.predDtValue = selected.predDtValue;
-            point.direction = selected.direction;
-            point.weightedFirstHitWindingDistance = selected.windingDistance;
-        }
         set.points.push_back(std::move(point));
     }
     return set;
@@ -1824,12 +1830,15 @@ AtlasPredSnapSet mergeAtlasPredSnapSetByControlPoint(AtlasPredSnapSet existing,
             merged.points.push_back(std::move(point));
         } else {
             AtlasPredSnapPoint point = generatedPoint;
-            if (it != byKey.end() && it->second.predSnapPoint) {
+            if (it != byKey.end() &&
+                it->second.source == AtlasPredSnapSource::Optimized &&
+                it->second.predSnapPoint) {
                 for (size_t i = 0; i < point.candidates.size(); ++i) {
                     if (norm(point.candidates[i].point - *it->second.predSnapPoint) <=
                         kControlPointMatchEpsilon) {
                         point.selectedCandidateIndex = static_cast<int>(i);
                         point.predSnapPoint = point.candidates[i].point;
+                        point.source = AtlasPredSnapSource::Optimized;
                         point.predDtValue = point.candidates[i].predDtValue;
                         point.direction = point.candidates[i].direction;
                         point.weightedFirstHitWindingDistance =
@@ -2326,7 +2335,10 @@ AtlasSnapOptimizationProblem buildAtlasSnapOptimizationProblem(
                     control.candidates.push_back(candidate.point);
                 }
             }
-            if (control.candidates.empty() && point.predSnapPoint) {
+            if (control.candidates.empty() &&
+                point.predSnapPoint &&
+                (point.source == AtlasPredSnapSource::Manual ||
+                 point.source == AtlasPredSnapSource::Optimized)) {
                 control.candidates.push_back(*point.predSnapPoint);
             }
             control.fixed = control.manual || control.candidates.size() <= 1;
@@ -2942,6 +2954,7 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
         if (control.candidates.empty()) {
             pointIt->predSnapPoint.reset();
             pointIt->selectedCandidateIndex.reset();
+            pointIt->source = AtlasPredSnapSource::Auto;
             continue;
         }
         if (!control.fixed && control.candidates.size() > 1 &&
@@ -2954,6 +2967,9 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             : 0;
         pointIt->predSnapPoint = control.candidates[selected];
         pointIt->selectedCandidateIndex = static_cast<int>(selected);
+        pointIt->source = control.manual
+            ? AtlasPredSnapSource::Manual
+            : AtlasPredSnapSource::Optimized;
         if (selected < pointIt->candidates.size()) {
             pointIt->predDtValue = pointIt->candidates[selected].predDtValue;
             pointIt->direction = pointIt->candidates[selected].direction;

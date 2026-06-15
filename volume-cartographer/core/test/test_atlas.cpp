@@ -530,8 +530,10 @@ TEST_CASE("Atlas pred-snap generation uses control source line indices for ancho
         sampling);
 
     REQUIRE(set.points.size() == 1);
-    REQUIRE(set.points[0].predSnapPoint.has_value());
-    CHECK((*set.points[0].predSnapPoint)[0] == doctest::Approx(1.10).epsilon(0.05));
+    CHECK_FALSE(set.points[0].predSnapPoint.has_value());
+    CHECK_FALSE(set.points[0].selectedCandidateIndex.has_value());
+    REQUIRE(set.points[0].candidates.size() == 1);
+    CHECK(set.points[0].candidates[0].point[0] == doctest::Approx(1.10).epsilon(0.05));
 }
 
 TEST_CASE("Atlas pred-snap candidate generation returns first hits and deduplicates")
@@ -793,6 +795,12 @@ TEST_CASE("Atlas pred-snap attachments are coordinate keyed and ignore stale rec
     oldAutoSelected.predSnapPoint = cv::Vec3d{7.0, 8.0, 11.0};
     oldAutoSelected.source = vc::atlas::AtlasPredSnapSource::Auto;
     existing.points.push_back(oldAutoSelected);
+    vc::atlas::AtlasPredSnapPoint oldOptimizedSelected;
+    oldOptimizedSelected.fiberPath = fiberPath;
+    oldOptimizedSelected.controlPoint = {12.0, 13.0, 14.0};
+    oldOptimizedSelected.predSnapPoint = cv::Vec3d{12.0, 13.0, 16.0};
+    oldOptimizedSelected.source = vc::atlas::AtlasPredSnapSource::Optimized;
+    existing.points.push_back(oldOptimizedSelected);
 
     vc::atlas::AtlasPredSnapSet generated;
     generated.fiberPath = fiberPath;
@@ -804,36 +812,47 @@ TEST_CASE("Atlas pred-snap attachments are coordinate keyed and ignore stale rec
     vc::atlas::AtlasPredSnapPoint added;
     added.fiberPath = fiberPath;
     added.controlPoint = {4.0, 5.0, 6.0};
-    added.predSnapPoint = cv::Vec3d{4.0, 5.0, 7.0};
+    added.candidates.push_back(
+        {cv::Vec3d{4.0, 5.0, 7.0}, std::nullopt, std::nullopt, std::nullopt});
     generated.points.push_back(added);
     vc::atlas::AtlasPredSnapPoint preservedAuto;
     preservedAuto.fiberPath = fiberPath;
     preservedAuto.controlPoint = oldAutoSelected.controlPoint;
-    preservedAuto.predSnapPoint = cv::Vec3d{7.0, 8.0, 10.0};
     preservedAuto.candidates.push_back(
         {cv::Vec3d{7.0, 8.0, 10.0}, std::nullopt, std::nullopt, std::nullopt});
     preservedAuto.candidates.push_back(
         {cv::Vec3d{7.0, 8.0, 11.0}, std::nullopt, std::nullopt, std::nullopt});
-    preservedAuto.selectedCandidateIndex = 0;
     generated.points.push_back(preservedAuto);
+    vc::atlas::AtlasPredSnapPoint preservedOptimized;
+    preservedOptimized.fiberPath = fiberPath;
+    preservedOptimized.controlPoint = oldOptimizedSelected.controlPoint;
+    preservedOptimized.candidates.push_back(
+        {cv::Vec3d{12.0, 13.0, 15.0}, std::nullopt, std::nullopt, std::nullopt});
+    preservedOptimized.candidates.push_back(
+        {cv::Vec3d{12.0, 13.0, 16.0}, std::nullopt, std::nullopt, std::nullopt});
+    generated.points.push_back(preservedOptimized);
 
     auto merged = vc::atlas::mergeAtlasPredSnapSetByControlPoint(std::move(existing), generated);
-    REQUIRE(merged.points.size() == 3);
+    REQUIRE(merged.points.size() == 4);
     CHECK(merged.points[0].source == vc::atlas::AtlasPredSnapSource::Manual);
     REQUIRE(merged.points[0].predSnapPoint.has_value());
     CHECK((*merged.points[0].predSnapPoint)[2] == doctest::Approx(4.0));
     CHECK(merged.points[1].controlPoint[0] == doctest::Approx(4.0));
-    REQUIRE(merged.points[1].predSnapPoint.has_value());
-    CHECK((*merged.points[1].predSnapPoint)[2] == doctest::Approx(7.0));
-    CHECK(merged.points[2].selectedCandidateIndex == 1);
-    REQUIRE(merged.points[2].predSnapPoint.has_value());
-    CHECK((*merged.points[2].predSnapPoint)[2] == doctest::Approx(11.0));
+    CHECK_FALSE(merged.points[1].predSnapPoint.has_value());
+    CHECK_FALSE(merged.points[1].selectedCandidateIndex.has_value());
+    CHECK(merged.points[2].source == vc::atlas::AtlasPredSnapSource::Auto);
+    CHECK_FALSE(merged.points[2].predSnapPoint.has_value());
+    CHECK_FALSE(merged.points[2].selectedCandidateIndex.has_value());
+    CHECK(merged.points[3].source == vc::atlas::AtlasPredSnapSource::Optimized);
+    CHECK(merged.points[3].selectedCandidateIndex == 1);
+    REQUIRE(merged.points[3].predSnapPoint.has_value());
+    CHECK((*merged.points[3].predSnapPoint)[2] == doctest::Approx(16.0));
 
     const fs::path attachmentPath =
         vc::atlas::atlasPredSnapAttachmentPath(atlasDir, fiberPath);
     vc::atlas::saveAtlasPredSnapSet(attachmentPath, merged);
     const auto loaded = vc::atlas::loadAtlasPredSnapSet(attachmentPath);
-    REQUIRE(loaded.points.size() == 3);
+    REQUIRE(loaded.points.size() == 4);
     CHECK(loaded.fiberPath == fiberPath);
 
     const auto rootJson = nlohmann::json::parse(readText(attachmentPath));

@@ -156,6 +156,7 @@ struct AtlasDirectoryInfo {
 
 enum class AtlasPredSnapSource {
     Auto,
+    Optimized,
     Manual,
 };
 
