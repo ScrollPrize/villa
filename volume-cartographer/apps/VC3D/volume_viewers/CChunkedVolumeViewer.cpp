@@ -4224,20 +4224,38 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         cacheRoi.width += padX * 2;
         cacheRoi.height += padY * 2;
 
-        _intersectionGeometryCache = {};
-        _intersectionGeometryCache.roi = cacheRoi;
-        _intersectionGeometryCache.planeOriginQ = fp.planeOriginQ;
-        _intersectionGeometryCache.planeNormalQ = fp.planeNormalQ;
-        _intersectionGeometryCache.planeBasisXQ = fp.planeBasisXQ;
-        _intersectionGeometryCache.planeBasisYQ = fp.planeBasisYQ;
-        _intersectionGeometryCache.indexSamplingStride = fp.indexSamplingStride;
-        _intersectionGeometryCache.patchCount = fp.patchCount;
-        _intersectionGeometryCache.surfaceCount = fp.surfaceCount;
-        _intersectionGeometryCache.targetHash = fp.targetHash;
-        _intersectionGeometryCache.targetGenerationHash = fp.targetGenerationHash;
-        _intersectionGeometryCache.intersections =
-            patchIndex->computePlaneIntersections(*plane, cacheRoi, targets);
-        _intersectionGeometryCache.valid = true;
+        // Only one compute in flight at a time; while it runs the current scene items
+        // stand as the preview. A later render with changed inputs waits for the
+        // in-flight result (dropped if stale via the gen token) and re-kicks.
+        if (_intersectComputeInFlight) {
+            if (profile.enabled()) profile.setDetails("action=compute_already_in_flight");
+            return;
+        }
+        // Heavy r-tree query + triangle clip -> worker. The QGraphicsItem build (Qt,
+        // main-thread-only) happens in finishPlaneIntersectionCompute when it lands.
+        const std::uint64_t gen = ++_intersectGen;
+        auto planeCopy = std::make_shared<PlaneSurface>(*plane);
+        auto targetsCopy = std::make_shared<std::unordered_set<SurfacePatchIndex::SurfacePtr>>(targets);
+        _intersectComputeInFlight = true;
+        _viewerManager->beginIndexRead();
+        QPointer<CChunkedVolumeViewer> guard(this);
+        ViewerManager* vm = _viewerManager;            // outlives viewers; always end the read
+        SurfacePatchIndex* idx = patchIndex;
+        (void)QtConcurrent::run([guard, vm, gen, cacheRoi, fp, planeCopy, targetsCopy, idx]() mutable {
+            auto out = std::make_shared<std::unordered_map<SurfacePatchIndex::SurfacePtr,
+                std::vector<SurfacePatchIndex::TriangleSegment>>>(
+                    idx->computePlaneIntersections(*planeCopy, cacheRoi, *targetsCopy));
+            QMetaObject::invokeMethod(qApp, [guard, vm, gen, cacheRoi, fp, out = std::move(out)]() mutable {
+                if (guard)
+                    guard->finishPlaneIntersectionCompute(gen, cacheRoi, fp, std::move(out));
+                else if (vm)
+                    vm->endIndexRead();                // viewer gone: still release the gate
+            }, Qt::QueuedConnection);
+        });
+        if (profile.enabled())
+            profile.setDetails(std::format("action=async_compute_kick gen={} roi={}",
+                                           gen, profileRect(cacheRoi)));
+        return;   // scene items rebuilt by finishPlaneIntersectionCompute -> re-entry
     }
 
     const auto& intersections = _intersectionGeometryCache.intersections;
@@ -4454,6 +4472,40 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             groupedPaths.size(), _intersectionItems.size(), profileRect(planeRoi),
             profileRect(_intersectionGeometryCache.roi), geometryCacheValid));
     }
+}
+
+// Worker finished computePlaneIntersections (main thread, via invokeMethod). Release
+// the index read-gate; then -- unless superseded -- publish the geometry into the
+// cache and re-run renderIntersections, which now hits the geometry cache and builds
+// the QGraphicsItems synchronously (cheap). A stale result (gen advanced because the
+// camera/surface/targets changed) is dropped; the next render re-kicks.
+void CChunkedVolumeViewer::finishPlaneIntersectionCompute(
+    std::uint64_t gen, cv::Rect cacheRoi, IntersectFingerprint fp,
+    std::shared_ptr<std::unordered_map<SurfacePatchIndex::SurfacePtr,
+        std::vector<SurfacePatchIndex::TriangleSegment>>> result)
+{
+    _intersectComputeInFlight = false;
+    if (_viewerManager)
+        _viewerManager->endIndexRead();              // release the gate (may apply a deferred swap)
+    if (_closing || gen != _intersectGen || !result)
+        return;                                      // superseded or shutting down
+
+    _intersectionGeometryCache = {};
+    _intersectionGeometryCache.roi = cacheRoi;
+    _intersectionGeometryCache.planeOriginQ = fp.planeOriginQ;
+    _intersectionGeometryCache.planeNormalQ = fp.planeNormalQ;
+    _intersectionGeometryCache.planeBasisXQ = fp.planeBasisXQ;
+    _intersectionGeometryCache.planeBasisYQ = fp.planeBasisYQ;
+    _intersectionGeometryCache.indexSamplingStride = fp.indexSamplingStride;
+    _intersectionGeometryCache.patchCount = fp.patchCount;
+    _intersectionGeometryCache.surfaceCount = fp.surfaceCount;
+    _intersectionGeometryCache.targetHash = fp.targetHash;
+    _intersectionGeometryCache.targetGenerationHash = fp.targetGenerationHash;
+    _intersectionGeometryCache.intersections = std::move(*result);
+    _intersectionGeometryCache.valid = true;
+    // Clear the fp memo so the cache-hit early-out doesn't skip the scene-item build.
+    _lastIntersectFp = {};
+    renderIntersections("async intersection ready");
 }
 
 void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)

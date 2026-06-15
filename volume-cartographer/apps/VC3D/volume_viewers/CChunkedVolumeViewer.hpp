@@ -452,6 +452,18 @@ private:
     };
     IntersectionGeometryCache _intersectionGeometryCache;
 
+    // Async plane-intersection compute. The r-tree query + triangle clip is heavy
+    // (~12% of the GUI tick); on a geometry-cache miss it runs on a worker and the
+    // QGraphicsItems are built on the main thread when the result lands. _intersectGen
+    // rises on every input change; a result whose gen no longer matches is dropped.
+    // One compute at a time; the current scene items stand as the preview meanwhile.
+    std::uint64_t _intersectGen = 0;
+    bool _intersectComputeInFlight = false;
+    void finishPlaneIntersectionCompute(
+        std::uint64_t gen, cv::Rect cacheRoi, IntersectFingerprint fp,
+        std::shared_ptr<std::unordered_map<SurfacePatchIndex::SurfacePtr,
+            std::vector<SurfacePatchIndex::TriangleSegment>>> result);
+
     struct FlattenedIntersectionLine {
         int planeIndex = 0;
         QPointF a;
