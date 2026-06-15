@@ -6840,7 +6840,12 @@ static void blit_sub(uint8_t *region, const uint8_t *src, int edge,
 // Decode one item (the sub^3 cube for a region) -> assemble 256^3 -> append.
 // Frees the item's raw buffers. Runs on a decode-pool thread (off the download
 // thread). The c3d decode + mc re-encode are the CPU cost we keep off the net.
-static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
+// `dense` and `tile` are PERSISTENT per-decoder-thread scratch (each CHUNK^3 =
+// 16MB), allocated once in decoder_main and reused. Per-call posix_memalign of a
+// 16MB buffer across N decode threads under heavy streaming drove the kernel into
+// direct page reclaim (native_queued_spin_lock_slowpath storm in profiling).
+static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it,
+                       uint8_t *dense, uint8_t *tile) {
     const char *codec = mc_zarr_inner_codec(v->lv[it->lod].z);
     const int edge = CHUNK / it->sub;
     const uint64_t key = rkey(it->lod, it->rz, it->ry, it->rx);
@@ -6857,20 +6862,14 @@ static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
         pthread_mutex_lock(&v->mu); inflight_del(v, key); pthread_mutex_unlock(&v->mu);
         return;
     }
-    uint8_t *dense = NULL;
-    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) goto done;
     double t_dec0 = mcv_now();
     if (it->sub == 1) {                                // c3d: chunk == region
         decode_inner(dec, codec, it->raw[0], it->rlen[0], dense, CHUNK);
     } else {                                           // v2: blit the cube
         memset(dense, 0, (size_t)CHUNK * CHUNK * CHUNK);
-        uint8_t *tile = malloc((size_t)edge * edge * edge);
-        if (tile) {
-            for (int k = 0; k < it->nsub; ++k) {
-                decode_inner(dec, codec, it->raw[k], it->rlen[k], tile, edge);
-                blit_sub(dense, tile, edge, it->oz[k], it->oy[k], it->ox[k]);
-            }
-            free(tile);
+        for (int k = 0; k < it->nsub; ++k) {
+            decode_inner(dec, codec, it->raw[k], it->rlen[k], tile, edge);
+            blit_sub(dense, tile, edge, it->oz[k], it->oy[k], it->ox[k]);
         }
     }
     double t_enc0 = mcv_now();
@@ -6880,8 +6879,6 @@ static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
     MCVLOG("decoded   lod%d region(%d,%d,%d) codec=%s decode=%.0fms encode=%.0fms",
            it->lod, it->rz, it->ry, it->rx, codec,
            t_enc0 - t_dec0, t_end - t_enc0);
-    free(dense);
-done:
     for (int k = 0; k < it->nsub; ++k) free(it->raw[k]);
     pthread_mutex_lock(&v->mu); inflight_del(v, key); pthread_mutex_unlock(&v->mu);  // single-flight clear
 }
@@ -6894,6 +6891,16 @@ static void *decoder_main(void *ud) {
     mc_thread_setname("mc-decode");        // distinguish in profilers
     c3d_decoder *dec = c3d_decoder_new();
     if (dec) c3d_decoder_set_denoise(dec, false);   // render cache: no denoise pass
+    // Persistent per-thread decode scratch (16MB each), allocated once and reused
+    // across every decode -- per-call 16MB allocs across the pool drove kernel page
+    // reclaim under heavy streaming. tile holds the sub-cube for v2 (edge<=128).
+    uint8_t *dense = NULL, *tile = NULL;
+    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK) ||
+        posix_memalign((void **)&tile,  64, (size_t)CHUNK * CHUNK * CHUNK)) {
+        free(dense); free(tile);
+        if (dec) c3d_decoder_free(dec);
+        return NULL;                                 // OOM at startup: this worker bows out
+    }
     for (;;) {
         pthread_mutex_lock(&v->mu);
         while (v->dq_head == v->dq_tail && !v->stop) pthread_cond_wait(&v->dq_ne, &v->mu);
@@ -6909,10 +6916,11 @@ static void *decoder_main(void *ud) {
         pthread_cond_signal(&v->dq_nf);                // wake a blocked producer
         pthread_mutex_unlock(&v->mu);
         atomic_fetch_add_explicit(&v->dec_active, 1, memory_order_relaxed);
-        decode_one(v, dec, &it);
+        decode_one(v, dec, &it, dense, tile);
         atomic_fetch_sub_explicit(&v->dec_active, 1, memory_order_relaxed);
         if (v->ready_cb) v->ready_cb(v->ready_ud);     // region became serveable
     }
+    free(dense); free(tile);
     if (dec) c3d_decoder_free(dec);
     return NULL;
 }
@@ -8066,6 +8074,7 @@ void mc_volume_freeze(mc_volume *v) {
 typedef struct { mc_volume *v; int me; } filler_arg;
 static void *filler_main(void *ud) {
     filler_arg *a = ud; mc_volume *v = a->v; int me = a->me; free(a);
+    mc_thread_setname("mc-fill");          // distinguish from the GUI thread in profilers
     uint64_t seen = 0;
     for (;;) {
         pthread_mutex_lock(&v->fill_mu);
