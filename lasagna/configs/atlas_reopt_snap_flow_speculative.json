@@ -28,7 +28,7 @@
           "status_interval": 10,
           "pred_dt_flow_gate": {
             "enabled": true,
-            "debug": true,
+            "debug": false,
             "gate_factor": 1.0,
             "backtrack_distance": 50.0,
             "local_boost": 0.5,
