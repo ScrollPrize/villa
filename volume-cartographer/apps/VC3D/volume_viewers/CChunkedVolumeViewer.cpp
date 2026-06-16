@@ -4915,7 +4915,9 @@ void CChunkedVolumeViewer::updateStatusLabel()
         items << QString("RAM %1/%2 GB")
             .arg(formatGigabytes(stats.decodedBytes))
             .arg(formatGigabytes(stats.decodedByteCapacity));
-        items << QString("disk %1").arg(formatByteSize(stats.persistentCacheBytes));
+        items << QString("disk %1%2")
+            .arg(formatByteSize(stats.persistentCacheBytes))
+            .arg(stats.persistentCacheScanInFlight ? "+" : "");
         if (stats.remoteFetchesInFlight > 0) {
             items << QString("downloading %1 @ %2")
                 .arg(stats.remoteFetchesInFlight)
