@@ -1293,6 +1293,14 @@ AtlasPredSnapDirection predSnapDirectionFromString(const std::string& value)
     return value == "inside" ? AtlasPredSnapDirection::Inside : AtlasPredSnapDirection::Outside;
 }
 
+void setPredSnapStatus(AtlasPredSnapPoint& point,
+                       std::string status,
+                       std::string reason)
+{
+    point.status = std::move(status);
+    point.statusReason = std::move(reason);
+}
+
 nlohmann::json predSnapCandidateJson(const AtlasPredSnapCandidate& candidate)
 {
     nlohmann::json root;
@@ -1329,6 +1337,9 @@ nlohmann::json predSnapPointJson(const AtlasPredSnapPoint& point)
 {
     nlohmann::json root;
     root["fiber_path"] = point.fiberPath.generic_string();
+    if (point.sourceIndex) {
+        root["source_index"] = *point.sourceIndex;
+    }
     root["control_point"] = pointJson(point.controlPoint);
     if (point.predSnapPoint) {
         root["pred_snap_point"] = pointJson(*point.predSnapPoint);
@@ -1345,6 +1356,12 @@ nlohmann::json predSnapPointJson(const AtlasPredSnapPoint& point)
         root["selected_candidate_index"] = *point.selectedCandidateIndex;
     }
     root["source"] = predSnapSourceString(point.source);
+    if (!point.status.empty()) {
+        root["status"] = point.status;
+    }
+    if (!point.statusReason.empty()) {
+        root["status_reason"] = point.statusReason;
+    }
     if (point.predDtValue) {
         root["pred_dt_value"] = *point.predDtValue;
     }
@@ -1369,6 +1386,9 @@ AtlasPredSnapPoint predSnapPointFromJson(const nlohmann::json& root,
 {
     AtlasPredSnapPoint point;
     point.fiberPath = root.value("fiber_path", fallbackFiberPath.generic_string());
+    if (root.contains("source_index") && root["source_index"].is_number_integer()) {
+        point.sourceIndex = root["source_index"].get<int>();
+    }
     point.controlPoint = pointFromJson(root.at("control_point"));
     if (root.contains("pred_snap_point") && !root["pred_snap_point"].is_null()) {
         point.predSnapPoint = pointFromJson(root["pred_snap_point"]);
@@ -1385,6 +1405,8 @@ AtlasPredSnapPoint predSnapPointFromJson(const nlohmann::json& root,
         point.selectedCandidateIndex = root["selected_candidate_index"].get<int>();
     }
     point.source = predSnapSourceFromString(root.value("source", std::string("auto")));
+    point.status = root.value("status", std::string{});
+    point.statusReason = root.value("status_reason", std::string{});
     if (root.contains("pred_dt_value") && root["pred_dt_value"].is_number()) {
         point.predDtValue = root["pred_dt_value"].get<double>();
     }
@@ -1706,6 +1728,9 @@ AtlasPredSnapSet generateAtlasPredSnapSet(const FiberInput& fiber,
         AtlasPredSnapPoint point;
         point.fiberPath = set.fiberPath;
         point.controlPoint = controlPoint;
+        point.sourceIndex = controlIndex < fiber.controlLineIndices.size()
+            ? std::optional<int>(fiber.controlLineIndices[controlIndex])
+            : std::optional<int>(static_cast<int>(controlIndex));
         point.source = AtlasPredSnapSource::Auto;
 
         const int controlSourceIndex =
@@ -1718,7 +1743,18 @@ AtlasPredSnapSet generateAtlasPredSnapSet(const FiberInput& fiber,
             [controlSourceIndex](const AtlasAnchor& anchor) {
                 return anchor.sourceIndex == controlSourceIndex;
             });
-        if (anchorIt == mapping.controlAnchors.end() || !sampling.sampleNormal) {
+        if (anchorIt == mapping.controlAnchors.end()) {
+            setPredSnapStatus(point,
+                              "missing_control_anchor",
+                              "mapping has no control anchor for source_index " +
+                                  std::to_string(controlSourceIndex));
+            set.points.push_back(std::move(point));
+            continue;
+        }
+        if (!sampling.sampleNormal) {
+            setPredSnapStatus(point,
+                              "normal_sampling_unavailable",
+                              "no normal sampler is available for pred-snap candidate generation");
             set.points.push_back(std::move(point));
             continue;
         }
@@ -1728,7 +1764,19 @@ AtlasPredSnapSet generateAtlasPredSnapSet(const FiberInput& fiber,
                                                     mapping,
                                                     baseSurface,
                                                     baseOutwardSign);
-        if (!normalSample.valid || !validNormal(normalSample.normal) || !baseNormal) {
+        if (!normalSample.valid || !validNormal(normalSample.normal)) {
+            std::string reason = "invalid Lasagna normal at control point";
+            if (!normalSample.reason.empty()) {
+                reason += ": " + normalSample.reason;
+            }
+            setPredSnapStatus(point, "invalid_lasagna_normal", std::move(reason));
+            set.points.push_back(std::move(point));
+            continue;
+        }
+        if (!baseNormal) {
+            setPredSnapStatus(point,
+                              "invalid_atlas_base_normal",
+                              "could not sample a valid atlas base normal at the control anchor");
             set.points.push_back(std::move(point));
             continue;
         }
@@ -1738,7 +1786,40 @@ AtlasPredSnapSet generateAtlasPredSnapSet(const FiberInput& fiber,
             alignedNormal *= -1.0;
         }
         point.searchNormal = alignedNormal;
+        const auto startPredDt = sampling.samplePredDt
+            ? sampling.samplePredDt(controlPoint)
+            : std::optional<double>{};
+        const double predDtThreshold = std::isfinite(sampling.predDtThreshold)
+            ? sampling.predDtThreshold
+            : 110.0;
+        const bool startsInside =
+            startPredDt && atlasPredDtIsInside(*startPredDt, predDtThreshold);
         point.candidates = findAtlasPredSnapCandidates(controlPoint, alignedNormal, sampling);
+        const size_t requiredCandidates = 1U;
+        if (point.candidates.size() < requiredCandidates) {
+            std::ostringstream reason;
+            reason << "candidate search produced " << point.candidates.size()
+                   << " candidate(s), but at least one usable candidate is required; "
+                   << "control point starts "
+                   << (startsInside ? "inside" : "outside")
+                   << " the acceptable pred-dt range";
+            if (!startPredDt) {
+                reason << "; start pred_dt unavailable";
+            } else {
+                reason << "; start pred_dt=" << *startPredDt
+                       << " threshold=" << predDtThreshold;
+            }
+            setPredSnapStatus(point, "insufficient_candidates_none", reason.str());
+        } else {
+            std::ostringstream reason;
+            reason << "candidate search produced " << point.candidates.size()
+                   << " usable candidate(s); at least one is required; control point starts "
+                   << (startsInside ? "inside" : "outside")
+                   << " the acceptable pred-dt range";
+            setPredSnapStatus(point,
+                              point.candidates.size() >= 2 ? "ready_two_sided" : "ready_single",
+                              reason.str());
+        }
         set.points.push_back(std::move(point));
     }
     return set;
@@ -1843,6 +1924,9 @@ AtlasPredSnapSet mergeAtlasPredSnapSetByControlPoint(AtlasPredSnapSet existing,
                         point.direction = point.candidates[i].direction;
                         point.weightedFirstHitWindingDistance =
                             point.candidates[i].windingDistance;
+                        setPredSnapStatus(point,
+                                          "optimized",
+                                          "previous optimized pred-snap point still matches a regenerated candidate");
                         break;
                     }
                 }
@@ -1914,6 +1998,7 @@ AtlasPredSnapSet setManualAtlasPredSnapPoint(const fs::path& atlasDir,
     point.controlPoint = controlPoint;
     point.predSnapPoint = predSnapPoint;
     point.source = AtlasPredSnapSource::Manual;
+    setPredSnapStatus(point, "manual", "manual pred-snap point");
     point.predDtValue = predDtValue;
     AtlasPredSnapCandidate candidate;
     candidate.point = predSnapPoint;
@@ -2111,6 +2196,9 @@ nlohmann::json controlDebugJson(const AtlasSnapCandidateSet& control)
         {"source_index", control.sourceIndex},
         {"manual", control.manual},
         {"fixed", control.fixed},
+        {"eligible", control.eligible},
+        {"status", control.status},
+        {"status_reason", control.statusReason},
         {"control_point", pointJson(control.controlPoint)},
         {"candidate_count", control.candidates.size()},
         {"candidates", pointsJson(control.candidates)},
@@ -2143,10 +2231,182 @@ std::string controlDebugString(const AtlasSnapCandidateSet& control)
         << " source_index=" << control.sourceIndex
         << " manual=" << (control.manual ? "true" : "false")
         << " fixed=" << (control.fixed ? "true" : "false")
+        << " eligible=" << (control.eligible ? "true" : "false")
+        << " status=" << control.status
+        << " reason=\"" << control.statusReason << '"'
         << " control_point=" << vecString(control.controlPoint)
         << " candidate_count=" << control.candidates.size()
         << " candidates=" << pointsString(control.candidates);
     return out.str();
+}
+
+bool predSnapPointCandidateReady(const AtlasPredSnapPoint& point)
+{
+    if (point.source == AtlasPredSnapSource::Manual && point.predSnapPoint) {
+        return true;
+    }
+    if (point.source == AtlasPredSnapSource::Optimized && point.predSnapPoint) {
+        return true;
+    }
+    if (!point.status.empty() &&
+        point.status != "ready_single" &&
+        point.status != "ready_inside" &&
+        point.status != "ready_two_sided" &&
+        point.status != "insufficient_candidates_outside" &&
+        point.status != "optimized") {
+        return false;
+    }
+    return !point.candidates.empty();
+}
+
+std::string predSnapPointStatus(const AtlasPredSnapPoint& point)
+{
+    if (point.status == "insufficient_candidates_outside") {
+        return point.candidates.empty()
+            ? "insufficient_candidates_none"
+            : (point.candidates.size() >= 2 ? "ready_two_sided" : "ready_single");
+    }
+    if (!point.status.empty()) {
+        return point.status;
+    }
+    if (point.source == AtlasPredSnapSource::Manual && point.predSnapPoint) {
+        return "manual";
+    }
+    if (point.predSnapPoint && point.source == AtlasPredSnapSource::Optimized) {
+        return "optimized";
+    }
+    if (predSnapPointCandidateReady(point)) {
+        return point.candidates.size() >= 2 ? "ready_two_sided" : "ready_single";
+    }
+    return "insufficient_candidates_none";
+}
+
+std::string predSnapPointStatusReason(const AtlasPredSnapPoint& point)
+{
+    if (point.status == "insufficient_candidates_outside") {
+        if (point.candidates.empty()) {
+            return "legacy outside candidate record has zero usable candidates and remains insufficient under the current snap rule";
+        }
+        return "legacy outside candidate record has at least one usable candidate and is ready under the current snap rule";
+    }
+    if (!point.statusReason.empty()) {
+        return point.statusReason;
+    }
+    if (point.source == AtlasPredSnapSource::Manual && point.predSnapPoint) {
+        return "manual pred-snap point";
+    }
+    if (point.predSnapPoint && point.source == AtlasPredSnapSource::Optimized) {
+        return "optimized pred-snap point";
+    }
+    if (predSnapPointCandidateReady(point)) {
+        return "candidate set is ready for snap optimization";
+    }
+    return "candidate set is not sufficient for snap optimization";
+}
+
+AtlasPredSnapPoint* predSnapPointForControl(AtlasPredSnapSet& set,
+                                            const cv::Vec3d& controlPoint)
+{
+    const std::string key = atlasPredSnapControlPointKey(controlPoint);
+    auto it = std::find_if(set.points.begin(),
+                           set.points.end(),
+                           [&key](const AtlasPredSnapPoint& point) {
+                               return atlasPredSnapControlPointKey(point.controlPoint) == key;
+                           });
+    return it == set.points.end() ? nullptr : &*it;
+}
+
+void propagateAtlasPredSnapStatuses(
+    const Atlas& atlas,
+    std::unordered_map<std::string, AtlasPredSnapSet>& setsByFiber)
+{
+    for (const auto& mapping : atlas.fibers) {
+        const std::string fiberKey = atlasFiberPathKey(mapping.fiberPath);
+        auto setIt = setsByFiber.find(fiberKey);
+        if (setIt == setsByFiber.end()) {
+            AtlasPredSnapSet set;
+            set.fiberPath = mapping.fiberPath;
+            setIt = setsByFiber.emplace(fiberKey, std::move(set)).first;
+        }
+        AtlasPredSnapSet& set = setIt->second;
+        if (set.fiberPath.empty()) {
+            set.fiberPath = mapping.fiberPath;
+        }
+
+        std::vector<const AtlasAnchor*> anchors;
+        anchors.reserve(mapping.controlAnchors.size());
+        for (const auto& anchor : mapping.controlAnchors) {
+            anchors.push_back(&anchor);
+        }
+        std::sort(anchors.begin(),
+                  anchors.end(),
+                  [](const AtlasAnchor* a, const AtlasAnchor* b) {
+                      return a->sourceIndex < b->sourceIndex;
+                  });
+
+        bool blocked = false;
+        int blockerSourceIndex = -1;
+        std::string blockerStatus;
+        for (const AtlasAnchor* anchor : anchors) {
+            AtlasPredSnapPoint* point = predSnapPointForControl(set, anchor->world);
+            if (!point) {
+                AtlasPredSnapPoint missing;
+                missing.fiberPath = set.fiberPath;
+                missing.sourceIndex = anchor->sourceIndex;
+                missing.controlPoint = anchor->world;
+                setPredSnapStatus(missing,
+                                  "missing_snap_record",
+                                  "no pred-snap attachment record exists for this atlas control");
+                set.points.push_back(std::move(missing));
+                point = &set.points.back();
+            }
+            point->fiberPath = set.fiberPath;
+            point->sourceIndex = anchor->sourceIndex;
+
+            if (blocked && point->source != AtlasPredSnapSource::Manual) {
+                point->predSnapPoint.reset();
+                point->selectedCandidateIndex.reset();
+                point->source = AtlasPredSnapSource::Auto;
+                std::ostringstream reason;
+                reason << "previous control in this fiber chain has status "
+                       << blockerStatus
+                       << " at source_index " << blockerSourceIndex;
+                setPredSnapStatus(*point, "blocked_by_previous_issue", reason.str());
+                continue;
+            }
+
+            if (point->source == AtlasPredSnapSource::Manual && point->predSnapPoint) {
+                setPredSnapStatus(*point, "manual", "manual pred-snap point");
+                blocked = false;
+                blockerSourceIndex = -1;
+                blockerStatus.clear();
+                continue;
+            }
+
+            if (!predSnapPointCandidateReady(*point)) {
+                if (point->status.empty() ||
+                    point->status == "insufficient_candidates_outside") {
+                    setPredSnapStatus(*point,
+                                      predSnapPointStatus(*point),
+                                      predSnapPointStatusReason(*point));
+                }
+                point->predSnapPoint.reset();
+                point->selectedCandidateIndex.reset();
+                point->source = AtlasPredSnapSource::Auto;
+                blocked = true;
+                blockerSourceIndex = anchor->sourceIndex;
+                blockerStatus = point->status;
+                continue;
+            }
+
+            if (point->status.empty() ||
+                point->status == "insufficient_candidates_outside") {
+                setPredSnapStatus(*point,
+                                  predSnapPointStatus(*point),
+                                  predSnapPointStatusReason(*point));
+            }
+        }
+    }
 }
 
 std::string termDebugString(
@@ -2330,6 +2590,8 @@ AtlasSnapOptimizationProblem buildAtlasSnapOptimizationProblem(
             control.sourceIndex = anchor.sourceIndex;
             control.controlPoint = point.controlPoint;
             control.manual = point.source == AtlasPredSnapSource::Manual;
+            control.status = predSnapPointStatus(point);
+            control.statusReason = predSnapPointStatusReason(point);
             for (const auto& candidate : point.candidates) {
                 if (finitePoint(candidate.point)) {
                     control.candidates.push_back(candidate.point);
@@ -2340,6 +2602,13 @@ AtlasSnapOptimizationProblem buildAtlasSnapOptimizationProblem(
                 (point.source == AtlasPredSnapSource::Manual ||
                  point.source == AtlasPredSnapSource::Optimized)) {
                 control.candidates.push_back(*point.predSnapPoint);
+            }
+            control.eligible =
+                point.source == AtlasPredSnapSource::Manual ||
+                (point.status != "blocked_by_previous_issue" &&
+                 predSnapPointCandidateReady(point));
+            if (!control.eligible) {
+                continue;
             }
             control.fixed = control.manual || control.candidates.size() <= 1;
             problem.controls.push_back(std::move(control));
@@ -2674,6 +2943,8 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
         setsByFiber[atlasFiberPathKey(mapping.fiberPath)] = std::move(set);
     }
 
+    propagateAtlasPredSnapStatuses(atlas, setsByFiber);
+
     AtlasSnapOptimizationProblem problem =
         buildAtlasSnapOptimizationProblem(atlas, setsByFiber);
 
@@ -2899,6 +3170,10 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             nonZeroMatrixIds.insert(matrix.id);
         }
     }
+    std::unordered_map<std::string, const AtlasSnapPairMatrix*> matricesByIdForStatus;
+    for (const auto& matrix : matrices) {
+        matricesByIdForStatus[matrix.id] = &matrix;
+    }
     std::vector<uint8_t> scoredControls(problem.controls.size(), 0);
     for (const auto& term : problem.terms) {
         if (nonZeroMatrixIds.find(term.id) == nonZeroMatrixIds.end()) {
@@ -2911,11 +3186,123 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             scoredControls[term.secondControl] = 1;
         }
     }
+    std::unordered_map<size_t, std::pair<std::string, std::string>> inactiveControlStatuses;
     for (size_t i = 0; i < problem.controls.size(); ++i) {
         const auto& control = problem.controls[i];
         if (!control.fixed && control.candidates.size() > 1 && !scoredControls[i]) {
             ++report.unscoredVariableControls;
+            std::vector<std::string> failures;
+            for (const auto& term : problem.terms) {
+                if (term.firstControl != i && term.secondControl != i) {
+                    continue;
+                }
+                const auto matrixIt = matricesByIdForStatus.find(term.id);
+                if (matrixIt == matricesByIdForStatus.end() || !matrixIt->second) {
+                    failures.push_back(term.id + ": no rank result");
+                    continue;
+                }
+                const auto& metadata = matrixIt->second->metadata;
+                if (metadata.contains("error") && metadata["error"].is_object()) {
+                    const std::string code =
+                        metadata["error"].value("code", std::string("rank_failed"));
+                    const std::string message =
+                        metadata["error"].value("message", std::string("rank failed"));
+                    failures.push_back(term.id + ": " + code + ": " + message);
+                } else if (metadata.value("zero_contribution", false)) {
+                    failures.push_back(term.id + ": zero_contribution");
+                }
+            }
+            std::string reason =
+                "all diffusion/rank pair terms involving this control failed or contributed zero";
+            if (!failures.empty()) {
+                reason += "; ";
+                for (size_t j = 0; j < failures.size(); ++j) {
+                    if (j > 0) {
+                        reason += " | ";
+                    }
+                    reason += failures[j];
+                }
+            }
+            inactiveControlStatuses.emplace(
+                i,
+                std::make_pair(
+                    std::string("diffusion_failed"),
+                    std::move(reason)));
         }
+    }
+
+    for (const auto& mapping : atlas.fibers) {
+        std::vector<int> indices;
+        indices.reserve(mapping.controlAnchors.size());
+        for (const auto& anchor : mapping.controlAnchors) {
+            indices.push_back(anchor.sourceIndex);
+        }
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+
+        bool blocked = false;
+        int blockerSourceIndex = -1;
+        std::string blockerStatus;
+        for (int sourceIndex : indices) {
+            const auto idx =
+                controlIndexForEndpoint(problem, mapping.fiberPath, sourceIndex);
+            if (!idx) {
+                blocked = true;
+                blockerSourceIndex = sourceIndex;
+                blockerStatus = "not_eligible";
+                continue;
+            }
+            const auto& control = problem.controls[*idx];
+            if (blocked && !control.manual) {
+                std::ostringstream reason;
+                reason << "previous control in this fiber chain has status "
+                       << blockerStatus
+                       << " at source_index " << blockerSourceIndex;
+                inactiveControlStatuses.emplace(
+                    *idx,
+                    std::make_pair(std::string("blocked_by_previous_issue"),
+                                   reason.str()));
+                continue;
+            }
+            const auto inactiveIt = inactiveControlStatuses.find(*idx);
+            if (inactiveIt != inactiveControlStatuses.end()) {
+                blocked = true;
+                blockerSourceIndex = sourceIndex;
+                blockerStatus = inactiveIt->second.first;
+                continue;
+            }
+            if (control.manual) {
+                blocked = false;
+                blockerSourceIndex = -1;
+                blockerStatus.clear();
+            }
+        }
+    }
+
+    if (!inactiveControlStatuses.empty()) {
+        const size_t beforeTerms = problem.terms.size();
+        problem.terms.erase(
+            std::remove_if(problem.terms.begin(),
+                           problem.terms.end(),
+                           [&inactiveControlStatuses](const AtlasSnapPairTerm& term) {
+                               return inactiveControlStatuses.find(term.firstControl) !=
+                                          inactiveControlStatuses.end() ||
+                                      inactiveControlStatuses.find(term.secondControl) !=
+                                          inactiveControlStatuses.end();
+                           }),
+            problem.terms.end());
+        report.skippedPairTerms += beforeTerms - problem.terms.size();
+        matrices.erase(
+            std::remove_if(matrices.begin(),
+                           matrices.end(),
+                           [&problem](const AtlasSnapPairMatrix& matrix) {
+                               return std::none_of(problem.terms.begin(),
+                                                   problem.terms.end(),
+                                                   [&matrix](const AtlasSnapPairTerm& term) {
+                                                       return term.id == matrix.id;
+                                                   });
+                           }),
+            matrices.end());
     }
 
     std::cerr << "[atlas-snap] running discrete optimizer"
@@ -2951,14 +3338,29 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
         if (pointIt == setIt->second->points.end()) {
             continue;
         }
+        const auto inactiveIt = inactiveControlStatuses.find(controlIndex);
+        if (inactiveIt != inactiveControlStatuses.end()) {
+            pointIt->predSnapPoint.reset();
+            pointIt->selectedCandidateIndex.reset();
+            pointIt->source = AtlasPredSnapSource::Auto;
+            pointIt->predDtValue.reset();
+            pointIt->direction.reset();
+            pointIt->weightedFirstHitWindingDistance.reset();
+            setPredSnapStatus(*pointIt,
+                              inactiveIt->second.first,
+                              inactiveIt->second.second);
+            continue;
+        }
         if (control.candidates.empty()) {
             pointIt->predSnapPoint.reset();
             pointIt->selectedCandidateIndex.reset();
             pointIt->source = AtlasPredSnapSource::Auto;
-            continue;
-        }
-        if (!control.fixed && control.candidates.size() > 1 &&
-            controlIndex < scoredControls.size() && !scoredControls[controlIndex]) {
+            setPredSnapStatus(*pointIt,
+                              control.status.empty() ? "insufficient_candidates_none"
+                                                     : control.status,
+                              control.statusReason.empty()
+                                  ? "no usable snap candidates"
+                                  : control.statusReason);
             continue;
         }
         const size_t selected = controlIndex < optimized.selectedCandidateIndices.size()
@@ -2970,6 +3372,10 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
         pointIt->source = control.manual
             ? AtlasPredSnapSource::Manual
             : AtlasPredSnapSource::Optimized;
+        setPredSnapStatus(*pointIt,
+                          control.manual ? "manual" : "optimized",
+                          control.manual ? "manual pred-snap point"
+                                         : "selected by atlas snap discrete optimizer");
         if (selected < pointIt->candidates.size()) {
             pointIt->predDtValue = pointIt->candidates[selected].predDtValue;
             pointIt->direction = pointIt->candidates[selected].direction;

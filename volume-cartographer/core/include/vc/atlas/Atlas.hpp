@@ -174,11 +174,14 @@ struct AtlasPredSnapCandidate {
 
 struct AtlasPredSnapPoint {
     std::filesystem::path fiberPath;
+    std::optional<int> sourceIndex;
     cv::Vec3d controlPoint{0.0, 0.0, 0.0};
     std::optional<cv::Vec3d> predSnapPoint;
     std::vector<AtlasPredSnapCandidate> candidates;
     std::optional<int> selectedCandidateIndex;
     AtlasPredSnapSource source = AtlasPredSnapSource::Auto;
+    std::string status;
+    std::string statusReason;
     std::optional<double> predDtValue;
     std::optional<AtlasPredSnapDirection> direction;
     std::optional<double> weightedFirstHitWindingDistance;
@@ -214,6 +217,9 @@ struct AtlasSnapCandidateSet {
     std::vector<cv::Vec3d> candidates;
     bool fixed = false;
     bool manual = false;
+    bool eligible = true;
+    std::string status;
+    std::string statusReason;
 };
 
 struct AtlasSnapPairTerm {

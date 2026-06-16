@@ -533,6 +533,8 @@ TEST_CASE("Atlas pred-snap generation uses control source line indices for ancho
     CHECK_FALSE(set.points[0].predSnapPoint.has_value());
     CHECK_FALSE(set.points[0].selectedCandidateIndex.has_value());
     REQUIRE(set.points[0].candidates.size() == 1);
+    CHECK(set.points[0].status == "ready_single");
+    CHECK(set.points[0].statusReason.find("at least one is required") != std::string::npos);
     CHECK(set.points[0].candidates[0].point[0] == doctest::Approx(1.10).epsilon(0.05));
 }
 
@@ -561,6 +563,41 @@ TEST_CASE("Atlas pred-snap candidate generation returns first hits and deduplica
         vc::atlas::findAtlasPredSnapCandidates(control, normal, sampling);
     REQUIRE(deduped.size() == 1);
     CHECK(deduped[0].point[0] == doctest::Approx(0.0));
+}
+
+TEST_CASE("Atlas pred-snap generation marks zero candidates as insufficient")
+{
+    vc::atlas::FiberInput fiber;
+    fiber.fiberPath = fs::path("fibers") / "fiber.json";
+    fiber.linePoints = {
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+    };
+    fiber.controlPoints = {
+        {0.0, 0.0, 0.0},
+    };
+    vc::atlas::validateFiberInputControlPoints(fiber);
+
+    vc::atlas::FiberMapping mapping;
+    mapping.fiberPath = fiber.fiberPath;
+    mapping.controlAnchors.push_back({0, fiber.controlPoints[0], 0.0, 0.0, 0.0});
+
+    auto sampling = predSnapSamplingForXInside([](double) -> std::optional<double> {
+        return 80.0;
+    });
+    auto baseSurface = makeWrappedPlane(6, 6, 0.0);
+
+    const auto set = vc::atlas::generateAtlasPredSnapSet(
+        fiber,
+        mapping,
+        *baseSurface,
+        sampling);
+
+    REQUIRE(set.points.size() == 1);
+    CHECK(set.points[0].candidates.empty());
+    CHECK(set.points[0].status == "insufficient_candidates_none");
+    CHECK(set.points[0].statusReason.find("at least one usable candidate is required") !=
+          std::string::npos);
 }
 
 TEST_CASE("Atlas pred-snap candidate threshold is configurable")
@@ -634,6 +671,7 @@ TEST_CASE("Atlas optimization adds adjacent control terms along fibers")
         point.fiberPath = mapping.fiberPath;
         point.controlPoint = anchor.world;
         point.predSnapPoint = anchor.world;
+        point.status = "ready_inside";
         point.candidates.push_back({anchor.world, std::nullopt, std::nullopt, std::nullopt});
         set.points.push_back(point);
     }
@@ -676,6 +714,7 @@ TEST_CASE("Atlas link expansion creates six pair terms for four bracketing contr
             point.fiberPath = mapping.fiberPath;
             point.controlPoint = anchor.world;
             point.predSnapPoint = anchor.world;
+            point.status = "ready_inside";
             point.candidates.push_back({anchor.world, std::nullopt, std::nullopt, std::nullopt});
             set.points.push_back(point);
         }
@@ -685,6 +724,44 @@ TEST_CASE("Atlas link expansion creates six pair terms for four bracketing contr
     const auto problem = vc::atlas::buildAtlasSnapOptimizationProblem(atlas, sets);
     CHECK(problem.controls.size() == 4);
     CHECK(problem.terms.size() == 6);
+}
+
+TEST_CASE("Atlas optimization problem skips snap controls with failed status")
+{
+    vc::atlas::Atlas atlas;
+    vc::atlas::FiberMapping mapping;
+    mapping.fiberPath = fs::path("fibers") / "a.json";
+    mapping.controlAnchors.push_back({10, {10.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    mapping.controlAnchors.push_back({30, {30.0, 0.0, 0.0}, 0.0, 0.0, 0.0});
+    atlas.fibers = {mapping};
+
+    vc::atlas::AtlasPredSnapSet set;
+    set.fiberPath = mapping.fiberPath;
+
+    vc::atlas::AtlasPredSnapPoint ready;
+    ready.fiberPath = mapping.fiberPath;
+    ready.controlPoint = mapping.controlAnchors[0].world;
+    ready.status = "ready_two_sided";
+    ready.candidates.push_back({{10.0, 0.0, 1.0}, std::nullopt, std::nullopt, 0.1});
+    ready.candidates.push_back({{10.0, 0.0, -1.0}, std::nullopt, std::nullopt, 0.2});
+    set.points.push_back(ready);
+
+    vc::atlas::AtlasPredSnapPoint failed;
+    failed.fiberPath = mapping.fiberPath;
+    failed.controlPoint = mapping.controlAnchors[1].world;
+    failed.status = "invalid_lasagna_normal";
+    failed.statusReason = "invalid Lasagna normal at control point";
+    failed.candidates.push_back({{30.0, 0.0, 1.0}, std::nullopt, std::nullopt, 0.1});
+    failed.candidates.push_back({{30.0, 0.0, -1.0}, std::nullopt, std::nullopt, 0.2});
+    set.points.push_back(failed);
+
+    std::unordered_map<std::string, vc::atlas::AtlasPredSnapSet> sets;
+    sets.emplace(vc::atlas::atlasFiberPathKey(mapping.fiberPath), std::move(set));
+
+    const auto problem = vc::atlas::buildAtlasSnapOptimizationProblem(atlas, sets);
+    REQUIRE(problem.controls.size() == 1);
+    CHECK(problem.controls[0].sourceIndex == 10);
+    CHECK(problem.terms.empty());
 }
 
 TEST_CASE("Atlas snap optimizer maximizes normalized pair scores and respects fixed controls")
@@ -775,9 +852,12 @@ TEST_CASE("Atlas pred-snap attachments are coordinate keyed and ignore stale rec
     existing.fiberPath = fiberPath;
     vc::atlas::AtlasPredSnapPoint manual;
     manual.fiberPath = fiberPath;
+    manual.sourceIndex = 3;
     manual.controlPoint = {1.0, 2.0, 3.0};
     manual.predSnapPoint = cv::Vec3d{1.0, 2.0, 4.0};
     manual.source = vc::atlas::AtlasPredSnapSource::Manual;
+    manual.status = "manual";
+    manual.statusReason = "manual pred-snap point";
     existing.points.push_back(manual);
     vc::atlas::AtlasPredSnapPoint stale;
     stale.fiberPath = fiberPath;
@@ -854,6 +934,9 @@ TEST_CASE("Atlas pred-snap attachments are coordinate keyed and ignore stale rec
     const auto loaded = vc::atlas::loadAtlasPredSnapSet(attachmentPath);
     REQUIRE(loaded.points.size() == 4);
     CHECK(loaded.fiberPath == fiberPath);
+    CHECK(loaded.points[0].sourceIndex == 3);
+    CHECK(loaded.points[0].status == "manual");
+    CHECK(loaded.points[0].statusReason == "manual pred-snap point");
 
     const auto rootJson = nlohmann::json::parse(readText(attachmentPath));
     CHECK(rootJson["type"] == "vc3d_atlas_pred_snap_points");

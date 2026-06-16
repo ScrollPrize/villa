@@ -294,6 +294,39 @@ std::optional<double> predSnapDisplayWinding(const vc::atlas::AtlasPredSnapPoint
     return point.weightedFirstHitWindingDistance;
 }
 
+QString predSnapStatusLabel(const vc::atlas::AtlasPredSnapPoint* point)
+{
+    if (!point) {
+        return QObject::tr("missing");
+    }
+    if (!point->status.empty()) {
+        return QString::fromStdString(point->status);
+    }
+    if (isResolvedAtlasPredSnap(*point)) {
+        return point->source == vc::atlas::AtlasPredSnapSource::Manual
+            ? QObject::tr("manual")
+            : QObject::tr("optimized");
+    }
+    if (point->candidates.empty()) {
+        return QObject::tr("no_candidates");
+    }
+    return QObject::tr("unassigned");
+}
+
+QString predSnapStatusReason(const vc::atlas::AtlasPredSnapPoint* point)
+{
+    if (!point) {
+        return QObject::tr("No pred-snap attachment record for this control point.");
+    }
+    if (!point->statusReason.empty()) {
+        return QString::fromStdString(point->statusReason);
+    }
+    if (isResolvedAtlasPredSnap(*point)) {
+        return QObject::tr("Snap point is assigned.");
+    }
+    return QObject::tr("Snap point is not assigned.");
+}
+
 std::set<std::string> atlasSelectedFiberPathKeys(QTreeWidget* tree)
 {
     std::set<std::string> pathKeys;
@@ -865,7 +898,7 @@ QDockWidget* createAtlasFiberDock(QWidget* parent)
 
     auto* tree = new QTreeWidget(content);
     tree->setObjectName(QStringLiteral("atlasFiberTree"));
-    tree->setColumnCount(7);
+    tree->setColumnCount(9);
     tree->setHeaderLabels({
         QObject::tr("Fiber"),
         QObject::tr("Source"),
@@ -873,6 +906,8 @@ QDockWidget* createAtlasFiberDock(QWidget* parent)
         QObject::tr("Snap"),
         QObject::tr("Snap wind"),
         QObject::tr("Snap XYZ"),
+        QObject::tr("Status"),
+        QObject::tr("Reason"),
         QObject::tr("Saved fiber"),
     });
     tree->setAlternatingRowColors(true);
@@ -3227,7 +3262,8 @@ void CWindow::updateAtlasFiberDocks()
         fiberItem->setText(0, QString::fromStdString(fiberLabel));
         fiberItem->setText(1, tr("%1 controls").arg(static_cast<int>(mapping.controlAnchors.size())));
         fiberItem->setText(3, snapTotal < 0 ? tr("missing") : tr("%1/%2").arg(snapFound).arg(snapTotal));
-        fiberItem->setText(6, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
+        fiberItem->setText(6, snapTotal < 0 ? tr("missing") : tr("%1 records").arg(snapTotal));
+        fiberItem->setText(8, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
         fiberItem->setToolTip(0, QString::fromStdString(mapping.fiberPath.generic_string()));
         fiberItem->setData(0, ATLAS_FIBER_ID_ROLE, QVariant::fromValue<qulonglong>(fiberId));
         fiberItem->setData(0, ATLAS_FIBER_PATH_KEY_ROLE, fiberPathKey);
@@ -3257,7 +3293,9 @@ void CWindow::updateAtlasFiberDocks()
             row->setText(5, snapResolved
                 ? formatAtlasVec3(*snap->predSnapPoint)
                 : QStringLiteral("-"));
-            row->setText(6, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
+            row->setText(6, predSnapStatusLabel(snap));
+            row->setText(7, predSnapStatusReason(snap));
+            row->setText(8, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
             row->setData(0, ATLAS_FIBER_ID_ROLE, QVariant::fromValue<qulonglong>(fiberId));
             row->setData(0, ATLAS_FIBER_PATH_KEY_ROLE, fiberPathKey);
             row->setData(0, ATLAS_CONTROL_INDEX_ROLE, controlIndex);
@@ -3267,6 +3305,8 @@ void CWindow::updateAtlasFiberDocks()
                 row->setData(0, ATLAS_SURFACE_Y_ROLE, (*surfaceCoord)[1]);
             }
             row->setToolTip(0, tr("Control point: %1").arg(formatAtlasVec3(anchor.world)));
+            row->setToolTip(6, predSnapStatusReason(snap));
+            row->setToolTip(7, predSnapStatusReason(snap));
             if (snapResolved) {
                 row->setToolTip(5, tr("Snap target: %1").arg(formatAtlasVec3(*snap->predSnapPoint)));
             }
