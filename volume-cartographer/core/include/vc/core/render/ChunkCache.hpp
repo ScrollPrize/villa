@@ -44,6 +44,7 @@ public:
         std::size_t decodedBytes = 0;
         std::size_t decodedByteCapacity = 0;
         std::size_t persistentCacheBytes = 0;
+        bool persistentCacheEnabled = false;
         bool persistentCacheScanInFlight = false;
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;

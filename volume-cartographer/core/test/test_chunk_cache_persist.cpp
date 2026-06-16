@@ -217,6 +217,7 @@ TEST_CASE("stats: persistentCacheBytes reflects the on-disk size")
     auto s = waitForStats(*c, [](const ChunkCache::Stats& s) {
         return !s.persistentCacheScanInFlight && s.persistentCacheBytes >= 64;
     });
+    CHECK(s.persistentCacheEnabled);
     CHECK(s.persistentCacheBytes >= 64);
     CHECK_FALSE(s.persistentCacheScanInFlight);
     fs::remove_all(persist);

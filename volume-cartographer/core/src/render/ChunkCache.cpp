@@ -268,6 +268,7 @@ ChunkCache::Stats ChunkCache::stats() const
         result.remoteDownloadBytesPerSecond =
             static_cast<double>(recentBytes) /
             std::chrono::duration<double>(kDownloadStatsWindow).count();
+        result.persistentCacheEnabled = state->options_.persistentCachePath.has_value();
     }
     const auto persistentBytes = state->persistentCacheBytes_.load(std::memory_order_acquire);
     result.persistentCacheBytes = persistentBytes > 0 ? static_cast<std::size_t>(persistentBytes) : 0;
