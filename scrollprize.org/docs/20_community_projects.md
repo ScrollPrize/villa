@@ -366,6 +366,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Improving scroll alignment with image registration](https://github.com/Paul-G2/VesuviusScrollAlignment) Scripts and a report showing how image registration can improve the alignment of scroll volumes scanned at different energies and resolutions, by Paul Geiger
 
+- [TrustKernel](https://github.com/haI-9000/vesuvius-compute) — Autonomous cryptographically-verified scroll scanning agent with IBM quantum attestation, running live at ericstalker.com
+
 ### 📦 Materials
 
 - [CT scanning campfire scrolls](https://dl.ash2txt.org/community-uploads/waynewaynehello/) Ahron Wayne replicated the carbonization process of a papyrus scroll and scanned it with his personal CT scanner
