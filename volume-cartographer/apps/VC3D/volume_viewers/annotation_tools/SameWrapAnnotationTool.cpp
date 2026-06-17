@@ -457,9 +457,6 @@ std::optional<cv::Vec3f> colorDistinctFromVisibleCollections(
         }
     }
 
-    if (avoidedColors.empty()) {
-        return mostDistinctColor(avoidedColors, paletteUsage);
-    }
     return mostDistinctColor(avoidedColors, paletteUsage);
 }
 
