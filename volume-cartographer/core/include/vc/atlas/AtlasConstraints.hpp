@@ -23,8 +23,8 @@ struct AtlasConstraintExportOptions {
     double closeAtlasWindingThreshold = 0.1;
     double lineMaxWindingStep = 0.25;
     double crossWindingTarget = 1.0;
-    double crossWindingTolerance = 0.1;
-    double crossZThreshold = 25.0;
+    double crossWindingTolerance = 0.2;
+    double crossZThreshold = 4000.0;
     double intersectionMaxDistance = 500.0;
     double intersectionMaxSampleSpacing = 100.0;
     int intersectionSeedStride = 100;

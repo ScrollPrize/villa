@@ -227,6 +227,10 @@ TEST_CASE("JSON round-trip preserves data")
 TEST_CASE("JSON round-trip preserves per-point fields")
 {
     PointCollections c;
+    const uint64_t aId = c.addCollection("a");
+    const uint64_t bId = c.addCollection("b");
+    c.setCollectionWindingsLinked(aId, {bId});
+    c.setCollectionWindingsLinked(bId, {aId});
     auto p = c.addPoint("a", {1.5f, 2.5f, 3.5f});
     p.winding_annotation = 4.0f;
     p.fiber_dir = "h";
@@ -247,6 +251,7 @@ TEST_CASE("JSON round-trip preserves per-point fields")
     bool saw_link = false;
     bool saw_h = false;
     bool saw_unknown_dir = false;
+    bool saw_collection_link = false;
     for (const auto& q : loaded.getPoints("a")) {
         if (std::isnan(q.winding_annotation)) {
             nan_winding++;
@@ -258,12 +263,20 @@ TEST_CASE("JSON round-trip preserves per-point fields")
             saw_h = q.fiber_dir == "h";
         }
     }
+    for (const auto& [id, col] : loaded.getAllCollections()) {
+        (void)id;
+        if (col.name == "a") {
+            saw_collection_link =
+                col.windings_linked.size() == 1 && col.windings_linked.front() == bId;
+        }
+    }
     CHECK(with_winding == 1);
     CHECK(nan_winding == 1);
     CHECK(seen_pos == cv::Vec3f(1.5f, 2.5f, 3.5f));  // float position survives
     CHECK(saw_link);
     CHECK(saw_h);
     CHECK(saw_unknown_dir);
+    CHECK(saw_collection_link);
 }
 
 TEST_CASE("old point JSON defaults links and fiber direction")
@@ -295,6 +308,7 @@ TEST_CASE("old point JSON defaults links and fiber direction")
     CHECK(points.front().links.empty());
     CHECK(points.front().fiber_dir.empty());
     CHECK(loaded.getAllCollections().begin()->second.metadata.absolute_winding_number);
+    CHECK(loaded.getAllCollections().begin()->second.windings_linked.empty());
 }
 
 TEST_CASE("loadFromJSON rejects bad input and returns false")

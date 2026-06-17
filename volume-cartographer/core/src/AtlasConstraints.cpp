@@ -17,7 +17,6 @@
 #include <limits>
 #include <map>
 #include <numeric>
-#include <queue>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -147,6 +146,7 @@ struct Graph {
     std::vector<ExportPoint> points;
     std::vector<GraphEdge> edges;
     std::vector<std::vector<size_t>> adjacency;
+    int periodColumns = 0;
 };
 
 std::string pointKey(size_t fiber, double sourcePosition)
@@ -426,6 +426,7 @@ Graph buildGraph(const LasagnaAtlasExport& exportData,
     }
 
     Graph graph;
+    graph.periodColumns = period;
     std::unordered_map<std::string, size_t> idByKey;
     std::vector<std::vector<size_t>> nodeByFiberPosition(fibers.size());
     for (size_t i = 0; i < fibers.size(); ++i) {
@@ -618,117 +619,120 @@ std::vector<std::vector<size_t>> lineCoverPaths(Graph& graph, size_t beamWidth)
     return paths;
 }
 
-struct Dsu {
-    std::vector<size_t> parent;
-    explicit Dsu(size_t n) : parent(n)
-    {
-        std::iota(parent.begin(), parent.end(), 0);
-    }
-    size_t find(size_t x)
-    {
-        while (parent[x] != x) {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        return x;
-    }
-    void unite(size_t a, size_t b)
-    {
-        a = find(a);
-        b = find(b);
-        if (a != b) {
-            parent[b] = a;
-        }
-    }
-};
-
 std::vector<std::vector<size_t>> crossWindingChains(const Graph& graph,
                                                     const AtlasConstraintExportOptions& options)
 {
-    struct Candidate {
-        size_t a = 0;
-        size_t b = 0;
-        double windingError = 0.0;
-        double zDelta = 0.0;
+    auto betterNext = [&](size_t candidate,
+                          size_t currentBest,
+                          double candidateError,
+                          double bestError,
+                          double candidateZDelta,
+                          double bestZDelta) {
+        if (std::abs(candidateError - bestError) > kEpsilon) {
+            return candidateError < bestError;
+        }
+        if (std::abs(candidateZDelta - bestZDelta) > kEpsilon) {
+            return candidateZDelta < bestZDelta;
+        }
+        return graph.points[candidate].stableKey < graph.points[currentBest].stableKey;
     };
-    std::vector<Candidate> candidates;
-    for (size_t i = 0; i < graph.points.size(); ++i) {
-        for (size_t j = i + 1; j < graph.points.size(); ++j) {
-            const double dw = graph.points[j].continuousWinding - graph.points[i].continuousWinding;
-            const double windingError = std::abs(std::abs(dw) - options.crossWindingTarget);
-            const double zDelta = std::abs(graph.points[j].world[2] - graph.points[i].world[2]);
-            if (windingError <= options.crossWindingTolerance &&
-                zDelta <= options.crossZThreshold) {
-                candidates.push_back({i, j, windingError, zDelta});
-            }
-        }
-    }
-    std::sort(candidates.begin(), candidates.end(), [&](const Candidate& a, const Candidate& b) {
-        return std::tie(a.windingError,
-                        a.zDelta,
-                        graph.points[a.a].stableKey,
-                        graph.points[a.b].stableKey) <
-               std::tie(b.windingError,
-                        b.zDelta,
-                        graph.points[b.a].stableKey,
-                        graph.points[b.b].stableKey);
-    });
 
-    Dsu dsu(graph.points.size());
-    std::vector<int> degree(graph.points.size(), 0);
-    std::vector<std::vector<size_t>> selectedAdj(graph.points.size());
-    for (const auto& c : candidates) {
-        if (degree[c.a] >= 2 || degree[c.b] >= 2 || dsu.find(c.a) == dsu.find(c.b)) {
-            continue;
-        }
-        ++degree[c.a];
-        ++degree[c.b];
-        selectedAdj[c.a].push_back(c.b);
-        selectedAdj[c.b].push_back(c.a);
-        dsu.unite(c.a, c.b);
-    }
+    std::vector<std::vector<size_t>> candidates;
+    for (size_t start = 0; start < graph.points.size(); ++start) {
+        std::vector<size_t> chain;
+        std::unordered_set<size_t> used;
+        size_t current = start;
+        chain.push_back(current);
+        used.insert(current);
 
-    std::vector<char> seen(graph.points.size(), 0);
-    std::vector<std::vector<size_t>> chains;
-    for (size_t i = 0; i < graph.points.size(); ++i) {
-        if (seen[i] || selectedAdj[i].empty()) {
-            continue;
-        }
-        std::vector<size_t> component;
-        std::queue<size_t> q;
-        q.push(i);
-        seen[i] = 1;
-        while (!q.empty()) {
-            const size_t n = q.front();
-            q.pop();
-            component.push_back(n);
-            for (size_t next : selectedAdj[n]) {
-                if (!seen[next]) {
-                    seen[next] = 1;
-                    q.push(next);
+        while (true) {
+            std::optional<size_t> best;
+            double bestError = std::numeric_limits<double>::infinity();
+            double bestZDelta = std::numeric_limits<double>::infinity();
+            for (size_t next = 0; next < graph.points.size(); ++next) {
+                if (used.count(next)) {
+                    continue;
+                }
+                const double dw =
+                    graph.points[next].continuousWinding - graph.points[current].continuousWinding;
+                const double windingError = std::abs(dw - options.crossWindingTarget);
+                const double zDelta =
+                    std::abs(graph.points[next].world[2] - graph.points[current].world[2]);
+                if (windingError > options.crossWindingTolerance ||
+                    zDelta > options.crossZThreshold) {
+                    continue;
+                }
+                if (!best ||
+                    betterNext(next, *best, windingError, bestError, zDelta, bestZDelta)) {
+                    best = next;
+                    bestError = windingError;
+                    bestZDelta = zDelta;
                 }
             }
-        }
-        std::sort(component.begin(), component.end(), [&](size_t a, size_t b) {
-            if (graph.points[a].continuousWinding != graph.points[b].continuousWinding) {
-                return graph.points[a].continuousWinding < graph.points[b].continuousWinding;
+            if (!best) {
+                break;
             }
-            return graph.points[a].stableKey < graph.points[b].stableKey;
-        });
-        if (component.size() >= 2) {
-            chains.push_back(std::move(component));
+            current = *best;
+            chain.push_back(current);
+            used.insert(current);
+        }
+
+        if (chain.size() >= 2) {
+            candidates.push_back(std::move(chain));
         }
     }
+
+    auto containedSet = [](const std::vector<size_t>& chain) {
+        std::vector<size_t> nodes = chain;
+        std::sort(nodes.begin(), nodes.end());
+        nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+        return nodes;
+    };
+    std::sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
+        if (a.size() != b.size()) {
+            return a.size() > b.size();
+        }
+        const auto& firstA = graph.points[a.front()];
+        const auto& firstB = graph.points[b.front()];
+        if (std::abs(firstA.continuousWinding - firstB.continuousWinding) > kEpsilon) {
+            return firstA.continuousWinding < firstB.continuousWinding;
+        }
+        return pathTieKey(graph, a) < pathTieKey(graph, b);
+    });
+
+    std::vector<std::vector<size_t>> chains;
+    std::unordered_set<size_t> usedInKeptChain;
+    for (auto& chain : candidates) {
+        auto nodes = containedSet(chain);
+        bool overlapsKept = false;
+        for (size_t node : nodes) {
+            if (usedInKeptChain.count(node)) {
+                overlapsKept = true;
+                break;
+            }
+        }
+        if (overlapsKept) {
+            continue;
+        }
+        for (size_t node : nodes) {
+            usedInKeptChain.insert(node);
+        }
+        chains.push_back(std::move(chain));
+    }
+
+    std::sort(chains.begin(), chains.end(), [&](const auto& a, const auto& b) {
+        return pathTieKey(graph, a) < pathTieKey(graph, b);
+    });
     return chains;
 }
 
-void addCollectionForPath(PointCollections& collections,
-                          const Graph& graph,
-                          const std::string& name,
-                          const std::vector<size_t>& path)
+uint64_t addCollectionForPath(PointCollections& collections,
+                              const Graph& graph,
+                              const std::string& name,
+                              const std::vector<size_t>& path)
 {
     if (path.empty()) {
-        return;
+        return 0;
     }
     const uint64_t collectionId = collections.addCollection(name);
     CollectionMetadata metadata;
@@ -758,6 +762,25 @@ void addCollectionForPath(PointCollections& collections,
             points[i].links.push_back(points[i + 1].id);
         }
         collections.updatePoint(points[i]);
+    }
+    return collectionId;
+}
+
+void linkGeneratedCollectionWindings(PointCollections& collections,
+                                     const std::vector<uint64_t>& collectionIds)
+{
+    if (collectionIds.empty()) {
+        return;
+    }
+    const uint64_t root = collectionIds.front();
+    std::vector<uint64_t> rootLinks;
+    rootLinks.reserve(collectionIds.size() - 1);
+    for (size_t i = 1; i < collectionIds.size(); ++i) {
+        rootLinks.push_back(collectionIds[i]);
+    }
+    collections.setCollectionWindingsLinked(root, rootLinks);
+    for (size_t i = 1; i < collectionIds.size(); ++i) {
+        collections.setCollectionWindingsLinked(collectionIds[i], {root});
     }
 }
 
@@ -824,6 +847,15 @@ cv::Point debugPoint(const ExportPoint& point, const DebugCanvasTransform& trans
     const int x = 24 + static_cast<int>(std::llround((point.atlasU - transform.minU) * transform.scale));
     const int y = transform.height - 24 -
         static_cast<int>(std::llround((point.atlasV - transform.minV) * transform.scale));
+    return {std::clamp(x, 0, transform.width - 1),
+            std::clamp(y, 0, transform.height - 1)};
+}
+
+cv::Point debugUvPoint(double u, double v, const DebugCanvasTransform& transform)
+{
+    const int x = 24 + static_cast<int>(std::llround((u - transform.minU) * transform.scale));
+    const int y = transform.height - 24 -
+        static_cast<int>(std::llround((v - transform.minV) * transform.scale));
     return {std::clamp(x, 0, transform.width - 1),
             std::clamp(y, 0, transform.height - 1)};
 }
@@ -939,6 +971,139 @@ void writeDebugMat(const cv::Mat& image, const fs::path& path)
     }
 }
 
+double wrappedCrossDebugU(const Graph& graph, const ExportPoint& point)
+{
+    if (graph.periodColumns <= 0 || !std::isfinite(point.continuousWinding)) {
+        return point.atlasU;
+    }
+    const double windingInPeriod =
+        point.continuousWinding - std::floor(point.continuousWinding);
+    return windingInPeriod * static_cast<double>(graph.periodColumns);
+}
+
+struct WrappedDebugPoint {
+    double u = 0.0;
+    double v = 0.0;
+};
+
+std::vector<WrappedDebugPoint> wrappedDebugGroupPoints(const Graph& graph,
+                                                       const std::vector<size_t>& group,
+                                                       bool minimizeLineLength)
+{
+    std::vector<WrappedDebugPoint> out;
+    out.reserve(group.size());
+    const double period = static_cast<double>(graph.periodColumns);
+    for (size_t node : group) {
+        if (node >= graph.points.size()) {
+            continue;
+        }
+        const auto& point = graph.points[node];
+        double u = wrappedCrossDebugU(graph, point);
+        if (minimizeLineLength && period > 0.0 && !out.empty() && std::isfinite(u)) {
+            const double shift = std::round((out.back().u - u) / period);
+            u += shift * period;
+        }
+        out.push_back({u, point.atlasV});
+    }
+    return out;
+}
+
+std::optional<DebugCanvasTransform> debugWrappedTransform(
+    const Graph& graph,
+    const std::vector<std::vector<size_t>>& groups,
+    bool minimizeGroupLineLength,
+    const std::vector<std::vector<size_t>>& extraGroups = {},
+    bool minimizeExtraGroupLineLength = false)
+{
+    double minU = std::numeric_limits<double>::infinity();
+    double minV = std::numeric_limits<double>::infinity();
+    double maxU = -std::numeric_limits<double>::infinity();
+    double maxV = -std::numeric_limits<double>::infinity();
+    auto accumulate = [&](const std::vector<std::vector<size_t>>& sourceGroups,
+                          bool minimizeLineLength) {
+        for (const auto& group : sourceGroups) {
+            for (const auto& point : wrappedDebugGroupPoints(graph, group, minimizeLineLength)) {
+                const double u = point.u;
+                const double v = point.v;
+                if (!std::isfinite(u) || !std::isfinite(v)) {
+                    continue;
+                }
+                minU = std::min(minU, u);
+                minV = std::min(minV, v);
+                maxU = std::max(maxU, u);
+                maxV = std::max(maxV, v);
+            }
+        }
+    };
+    accumulate(groups, minimizeGroupLineLength);
+    accumulate(extraGroups, minimizeExtraGroupLineLength);
+    if (!std::isfinite(minU) || !std::isfinite(minV) ||
+        !std::isfinite(maxU) || !std::isfinite(maxV)) {
+        return std::nullopt;
+    }
+    const double spanU = std::max(1.0, maxU - minU);
+    const double spanV = std::max(1.0, maxV - minV);
+    const double longSide = std::max(spanU, spanV);
+    const double scale = std::clamp(1400.0 / longSide, 1.0, 64.0);
+    DebugCanvasTransform transform;
+    transform.minU = minU;
+    transform.minV = minV;
+    transform.scale = scale;
+    transform.width = std::clamp(static_cast<int>(std::ceil(spanU * scale)) + 48, 128, 2048);
+    transform.height = std::clamp(static_cast<int>(std::ceil(spanV * scale)) + 48, 128, 2048);
+    return transform;
+}
+
+void drawWrappedDebugGroup(cv::Mat& image,
+                           const Graph& graph,
+                           const DebugCanvasTransform& transform,
+                           const std::vector<size_t>& group,
+                           size_t groupIndex,
+                           uint64_t colorSalt,
+                           bool connectSegments,
+                           bool minimizeLineLength)
+{
+    const cv::Scalar color = debugColor(groupIndex, colorSalt);
+    const auto points = wrappedDebugGroupPoints(graph, group, minimizeLineLength);
+    if (connectSegments) {
+        for (size_t i = 1; i < points.size(); ++i) {
+            cv::line(image,
+                     debugUvPoint(points[i - 1].u, points[i - 1].v, transform),
+                     debugUvPoint(points[i].u, points[i].v, transform),
+                     color,
+                     2,
+                     cv::LINE_AA);
+        }
+    }
+    for (const auto& point : points) {
+        drawDebugMarker(image,
+                        debugUvPoint(point.u, point.v, transform),
+                        color,
+                        groupIndex);
+    }
+}
+
+void drawWrappedDebugGroups(cv::Mat& image,
+                            const Graph& graph,
+                            const DebugCanvasTransform& transform,
+                            const std::vector<std::vector<size_t>>& groups,
+                            uint64_t colorSalt,
+                            bool connectSegments,
+                            bool minimizeLineLength)
+{
+    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+        drawWrappedDebugGroup(
+            image,
+            graph,
+            transform,
+            groups[groupIndex],
+            groupIndex,
+            colorSalt,
+            connectSegments,
+            minimizeLineLength);
+    }
+}
+
 size_t writeDebugImage(const Graph& graph,
                        const std::vector<std::vector<size_t>>& lineGroups,
                        const std::vector<std::vector<size_t>>& crossGroups,
@@ -1014,6 +1179,27 @@ size_t writeDebugDirectory(const Graph& graph,
         drawDebugGroups(image, graph, *transform, crossGroups, 0xc4055ULL, false);
         writeDebugMat(image, debugDir / "cross.tif");
         ++written;
+
+        const auto wrappedTransform = debugWrappedTransform(graph, crossGroups, true);
+        if (wrappedTransform) {
+            cv::Mat wrappedImage = blankDebugImage(*wrappedTransform);
+            drawWrappedDebugGroups(
+                wrappedImage, graph, *wrappedTransform, crossGroups, 0x9c2055ULL, true, true);
+            writeDebugMat(wrappedImage, debugDir / "cross_wrapped.tif");
+            ++written;
+        }
+    }
+    if (!lineGroups.empty() && !crossGroups.empty()) {
+        const auto wrappedTransform = debugWrappedTransform(graph, lineGroups, false, crossGroups, true);
+        if (wrappedTransform) {
+            cv::Mat wrappedImage = blankDebugImage(*wrappedTransform);
+            drawWrappedDebugGroups(
+                wrappedImage, graph, *wrappedTransform, lineGroups, 0x11efeULL, true, false);
+            drawWrappedDebugGroups(
+                wrappedImage, graph, *wrappedTransform, crossGroups, 0x9c2055ULL, true, true);
+            writeDebugMat(wrappedImage, debugDir / "lines_cross_wrapped.tif");
+            ++written;
+        }
     }
 
     for (size_t i = 0; i < lineGroups.size(); ++i) {
@@ -1031,6 +1217,18 @@ size_t writeDebugDirectory(const Graph& graph,
         name << "cross_" << std::setw(6) << std::setfill('0') << i << ".tif";
         writeDebugMat(image, debugDir / name.str());
         ++written;
+
+        const std::vector<std::vector<size_t>> singleGroup = {crossGroups[i]};
+        const auto wrappedTransform = debugWrappedTransform(graph, singleGroup, true);
+        if (wrappedTransform) {
+            cv::Mat wrappedImage = blankDebugImage(*wrappedTransform);
+            drawWrappedDebugGroup(
+                wrappedImage, graph, *wrappedTransform, crossGroups[i], i, 0x9c2055ULL, true, true);
+            std::ostringstream wrappedName;
+            wrappedName << "cross_wrapped_" << std::setw(6) << std::setfill('0') << i << ".tif";
+            writeDebugMat(wrappedImage, debugDir / wrappedName.str());
+            ++written;
+        }
     }
     return written;
 }
@@ -1076,6 +1274,7 @@ AtlasConstraintExportResult exportAtlasConstraints(
 
     std::vector<std::vector<size_t>> linePaths;
     std::vector<std::vector<size_t>> crossChains;
+    std::vector<uint64_t> generatedCollectionIds;
 
     if (options.exportLineConstraints) {
         linePaths = lineCoverPaths(graph, options.greedyBeamWidth);
@@ -1083,7 +1282,11 @@ AtlasConstraintExportResult exportAtlasConstraints(
         for (const auto& path : linePaths) {
             std::ostringstream name;
             name << "atlas_line_" << std::setw(6) << std::setfill('0') << index++;
-            addCollectionForPath(result.collections, graph, name.str(), path);
+            const uint64_t collectionId =
+                addCollectionForPath(result.collections, graph, name.str(), path);
+            if (collectionId != 0) {
+                generatedCollectionIds.push_back(collectionId);
+            }
             ++result.report.lineCollections;
             result.report.linePoints += path.size();
         }
@@ -1095,11 +1298,16 @@ AtlasConstraintExportResult exportAtlasConstraints(
         for (const auto& chain : crossChains) {
             std::ostringstream name;
             name << "atlas_cross_" << std::setw(6) << std::setfill('0') << index++;
-            addCollectionForPath(result.collections, graph, name.str(), chain);
+            const uint64_t collectionId =
+                addCollectionForPath(result.collections, graph, name.str(), chain);
+            if (collectionId != 0) {
+                generatedCollectionIds.push_back(collectionId);
+            }
             ++result.report.crossCollections;
             result.report.crossPoints += chain.size();
         }
     }
+    linkGeneratedCollectionWindings(result.collections, generatedCollectionIds);
     if (!options.debugImagesDir.empty()) {
         result.report.debugImagesWritten += writeDebugImage(
             graph,

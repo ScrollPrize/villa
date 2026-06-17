@@ -2,6 +2,7 @@
 #include "vc_test.hpp"
 
 #include "vc/atlas/Atlas.hpp"
+#include "vc/atlas/AtlasConstraints.hpp"
 #include "vc/atlas/FiberHvClassification.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
@@ -2200,6 +2201,90 @@ TEST_CASE("Atlas layout reports conflicting redundant links deterministically")
         CHECK(forwardConflicts[i].existingOffset == reverseConflicts[i].existingOffset);
         CHECK(forwardConflicts[i].candidateOffset == reverseConflicts[i].candidateOffset);
     }
+}
+
+TEST_CASE("Atlas constraints cross groups walk only positive one-winding steps")
+{
+    const fs::path root = tempRoot("atlas_constraints_cross_walk");
+    vc::atlas::LasagnaAtlasExport exportData;
+    exportData.atlas.metadata.zeroWindingColumn = 0;
+    exportData.atlasDir = root / "atlases" / "a";
+    exportData.volpkgRoot = root;
+
+    auto addFiber = [&](size_t index, double winding, double z) {
+        const fs::path rel = fs::path("fibers") / ("f" + std::to_string(index) + ".json");
+        const fs::path abs = root / rel;
+        std::ostringstream json;
+        json.imbue(std::locale::classic());
+        json << "{\"type\":\"vc3d_fiber\",\"version\":1,"
+             << "\"line_points\":[[" << index << ",0," << z << "]],"
+             << "\"control_points\":[[" << index << ",0," << z << "]]}";
+        writeText(abs, json.str());
+
+        vc::atlas::FiberMapping mapping;
+        mapping.fiberPath = rel;
+        mapping.controlAnchors.push_back({
+            0,
+            cv::Vec3d(static_cast<double>(index), 0.0, z),
+            winding * 3.0,
+            1.0,
+            0.0});
+        exportData.atlas.fibers.push_back(std::move(mapping));
+
+        vc::atlas::LasagnaAtlasObject object;
+        object.fiberPath = abs;
+        object.fiberRelativePath = rel;
+        exportData.objects.push_back(std::move(object));
+    };
+
+    addFiber(0, 0.0, 10.0);
+    addFiber(1, 1.0, 10.0);
+    addFiber(2, 2.0, 10.0);
+    addFiber(3, 0.95, 10.0);
+
+    vc::atlas::AtlasConstraintExportOptions options;
+    options.closeCycles = false;
+    options.exportLineConstraints = false;
+    options.exportCrossWindingConstraints = true;
+    options.crossWindingTarget = 1.0;
+    options.crossWindingTolerance = 0.1;
+    options.crossZThreshold = 1.0;
+
+    const auto result = vc::atlas::exportAtlasConstraints(
+        exportData,
+        makeWrappedPlane(2, 3, 0.0).get(),
+        nullptr,
+        options);
+
+    bool sawCross = false;
+    std::unordered_set<std::string> usedCrossPointPositions;
+    for (const auto& [collectionId, collection] : result.collections.getAllCollections()) {
+        (void)collectionId;
+        if (collection.name.rfind("atlas_cross_", 0) != 0) {
+            continue;
+        }
+        sawCross = true;
+        std::vector<ColPoint> points;
+        for (const auto& [pointId, point] : collection.points) {
+            (void)pointId;
+            points.push_back(point);
+        }
+        std::sort(points.begin(), points.end(), [](const ColPoint& a, const ColPoint& b) {
+            return a.id < b.id;
+        });
+        REQUIRE(points.size() >= 2);
+        for (size_t i = 1; i < points.size(); ++i) {
+            CHECK(points[i].winding_annotation - points[i - 1].winding_annotation ==
+                  doctest::Approx(1.0).epsilon(0.11));
+        }
+        for (const auto& point : points) {
+            std::ostringstream key;
+            key.imbue(std::locale::classic());
+            key << point.p[0] << ',' << point.p[1] << ',' << point.p[2];
+            CHECK(usedCrossPointPositions.insert(key.str()).second);
+        }
+    }
+    CHECK(sawCross);
 }
 
 TEST_CASE("Atlas preview incremental target offset matches full temporary layout")

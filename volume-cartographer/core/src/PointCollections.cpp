@@ -133,6 +133,14 @@ void to_json(Json& j, const PointCollections::Collection& c) {
         }
         j["tags"] = std::move(tags_obj);
     }
+
+    if (!c.windings_linked.empty()) {
+        Json linked = Json::array();
+        for (const uint64_t id : c.windings_linked) {
+            linked.push_back(Json(id));
+        }
+        j["windings_linked"] = std::move(linked);
+    }
 }
 
 void from_json(const Json& j, PointCollections::Collection& c) {
@@ -173,6 +181,16 @@ void from_json(const Json& j, PointCollections::Collection& c) {
         for (auto it = tags_obj.begin(); it != tags_obj.end(); ++it) {
             if ((*it).is_string()) {
                 c.tags[it.key()] = (*it).get_string();
+            }
+        }
+    }
+
+    c.windings_linked.clear();
+    if (j.contains("windings_linked") && j.at("windings_linked").is_array()) {
+        Json linked = j.at("windings_linked");
+        for (const auto& id : linked) {
+            if (id.is_number_integer()) {
+                c.windings_linked.push_back(id.get_uint64());
             }
         }
     }
@@ -340,6 +358,14 @@ std::optional<std::string> PointCollections::getCollectionTag(uint64_t collectio
         if (it != tags.end()) return it->second;
     }
     return std::nullopt;
+}
+
+void PointCollections::setCollectionWindingsLinked(uint64_t collectionId, const std::vector<uint64_t>& linkedCollectionIds)
+{
+    if (_collections.count(collectionId)) {
+        _collections.at(collectionId).windings_linked = linkedCollectionIds;
+        onCollectionChanged(collectionId);
+    }
 }
 
 std::optional<ColPoint> PointCollections::getPoint(uint64_t pointId) const
