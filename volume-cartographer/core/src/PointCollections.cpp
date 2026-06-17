@@ -43,6 +43,16 @@ void to_json(Json& j, const ColPoint& p) {
     } else {
         j["wind_a"] = nullptr;
     }
+    if (!p.links.empty()) {
+        Json links = Json::array();
+        for (const uint64_t linkedId : p.links) {
+            links.push_back(Json(linkedId));
+        }
+        j["links"] = std::move(links);
+    }
+    if (p.fiber_dir == "h" || p.fiber_dir == "v") {
+        j["fiber_dir"] = Json(p.fiber_dir);
+    }
 }
 
 void from_json(const Json& j, ColPoint& p) {
@@ -57,6 +67,22 @@ void from_json(const Json& j, ColPoint& p) {
     } else {
         p.creation_time = 0;
     }
+    p.links.clear();
+    if (j.contains("links") && j.at("links").is_array()) {
+        Json links = j.at("links");
+        for (const auto& linked : links) {
+            if (linked.is_number_integer()) {
+                p.links.push_back(linked.get_uint64());
+            }
+        }
+    }
+    p.fiber_dir.clear();
+    if (j.contains("fiber_dir") && j.at("fiber_dir").is_string()) {
+        const std::string dir = j.at("fiber_dir").get_string();
+        if (dir == "h" || dir == "v") {
+            p.fiber_dir = dir;
+        }
+    }
 }
 
 void to_json(Json& j, const CollectionMetadata& m) {
@@ -66,7 +92,11 @@ void to_json(Json& j, const CollectionMetadata& m) {
 }
 
 void from_json(const Json& j, CollectionMetadata& m) {
-    m.absolute_winding_number = j.at("winding_is_absolute").get_bool();
+    if (j.contains("winding_is_absolute") && j.at("winding_is_absolute").is_boolean()) {
+        m.absolute_winding_number = j.at("winding_is_absolute").get_bool();
+    } else {
+        m.absolute_winding_number = true;
+    }
 }
 
 void to_json(Json& j, const PointCollections::Collection& c) {
@@ -102,6 +132,14 @@ void to_json(Json& j, const PointCollections::Collection& c) {
             tags_obj[key] = Json(val);
         }
         j["tags"] = std::move(tags_obj);
+    }
+
+    if (!c.windings_linked.empty()) {
+        Json linked = Json::array();
+        for (const uint64_t id : c.windings_linked) {
+            linked.push_back(Json(id));
+        }
+        j["windings_linked"] = std::move(linked);
     }
 }
 
@@ -143,6 +181,16 @@ void from_json(const Json& j, PointCollections::Collection& c) {
         for (auto it = tags_obj.begin(); it != tags_obj.end(); ++it) {
             if ((*it).is_string()) {
                 c.tags[it.key()] = (*it).get_string();
+            }
+        }
+    }
+
+    c.windings_linked.clear();
+    if (j.contains("windings_linked") && j.at("windings_linked").is_array()) {
+        Json linked = j.at("windings_linked");
+        for (const auto& id : linked) {
+            if (id.is_number_integer()) {
+                c.windings_linked.push_back(id.get_uint64());
             }
         }
     }
@@ -327,6 +375,14 @@ std::optional<std::string> PointCollections::getCollectionTag(uint64_t collectio
         if (it != tags.end()) return it->second;
     }
     return std::nullopt;
+}
+
+void PointCollections::setCollectionWindingsLinked(uint64_t collectionId, const std::vector<uint64_t>& linkedCollectionIds)
+{
+    if (_collections.count(collectionId)) {
+        _collections.at(collectionId).windings_linked = linkedCollectionIds;
+        onCollectionChanged(collectionId);
+    }
 }
 
 std::optional<ColPoint> PointCollections::getPoint(uint64_t pointId) const

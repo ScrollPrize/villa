@@ -2,6 +2,9 @@ import time
 import threading
 import tempfile
 import unittest
+import io
+import os
+import types
 from unittest import mock
 
 import fit_service
@@ -16,6 +19,17 @@ class FitServiceQueueTest(unittest.TestCase):
 				return snap
 			time.sleep(0.01)
 		self.fail(f"job {job_id} did not reach {state}")
+
+	def run_laplace_rank_job(self, request):
+		job = fit_service._JobState(
+			job_id=fit_service.uuid.uuid4().hex[:12],
+			sequence=1,
+			source="vc3d",
+			config_name="laplace_rank",
+		)
+		self.addCleanup(job.cleanup_tmp_dirs, keep_results=False)
+		fit_service._run_laplace_rank_job(job, request)
+		return job, job.snapshot()
 
 	def test_fifo_sequence_and_stable_job_ids(self):
 		queue = fit_service._JobQueue()
@@ -42,6 +56,212 @@ class FitServiceQueueTest(unittest.TestCase):
 		self.assertEqual(queue.snapshot(j1.job_id)["state"], "upload")
 		self.assertIn("queue_generation", queue.legacy_status())
 		self.assertEqual(queue.snapshot_response()["queue_generation"], queue.generation)
+
+	def test_laplace_rank_direct_endpoint_returns_404(self):
+		handler = object.__new__(fit_service._Handler)
+		handler._validate_api_version = lambda: True
+		handler._job_path_parts = lambda: ["laplace", "rank"]
+		sent = []
+		handler._send_json = lambda body, status=200: sent.append((status, body))
+
+		fit_service._Handler.do_POST(handler)
+
+		self.assertEqual(sent, [(404, {"error": "not found"})])
+
+	def test_laplace_rank_rejects_malformed_queued_request_before_import(self):
+		with mock.patch.object(fit_service.importlib, "import_module") as import_module:
+			_job, snap = self.run_laplace_rank_job({
+				"job_type": "laplace_rank",
+				"manifest": "/tmp/data.json",
+				"jobs": [{}],
+			})
+
+		self.assertEqual(snap["state"], "error")
+		self.assertIn("side_a", snap["error"])
+		import_module.assert_not_called()
+
+	def test_laplace_rank_missing_binding_errors_queued_job(self):
+		request = {
+			"job_type": "laplace_rank",
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [{"id": "a", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+			"options": {},
+		}
+		with mock.patch.object(fit_service.importlib, "import_module", side_effect=ImportError("missing")):
+			_job, snap = self.run_laplace_rank_job(request)
+
+		self.assertEqual(snap["state"], "error")
+		self.assertIn("vc_lasagna_amgx", snap["error"])
+
+	def test_laplace_rank_queued_job_writes_binding_response_without_ratios(self):
+		request = {
+			"job_type": "laplace_rank",
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6], [7, 8, 9]]}],
+			"options": {"debug_dir": "/tmp/laplace-debug"},
+		}
+		binding_response = {
+			"results": [{
+				"id": "cache-key",
+				"status": "success",
+				"selected_lambda": 0.25,
+				"values": [{"value": 0.5}],
+				"debug_dir": "/tmp/laplace-debug/request/cache-key",
+			}]
+		}
+		module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value=binding_response))
+		with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+			_job, snap = self.run_laplace_rank_job(request)
+
+		self.assertEqual(snap["state"], "finished")
+		sent = module.rank_snap_pairs.call_args.args[0]
+		self.assertEqual(sent["manifest"], request["manifest"])
+		self.assertEqual(sent["options"]["debug_dir"], request["options"]["debug_dir"])
+		self.assertIn("progress_callback", module.rank_snap_pairs.call_args.kwargs)
+		result_path = fit_service.Path(snap["output_dir"]) / "rank_result.json"
+		body = fit_service.json.loads(result_path.read_text(encoding="utf-8"))
+		self.assertEqual(body["results"], binding_response["results"])
+		self.assertNotIn("ratios", body["results"][0])
+
+	def test_laplace_rank_resolves_relative_debug_dir_against_server_cwd(self):
+		request = {
+			"job_type": "laplace_rank",
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+			"options": {"debug_dir": "laplace_rank_debug/atlas_snap"},
+		}
+		module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
+		old_cwd = os.getcwd()
+		with tempfile.TemporaryDirectory() as td:
+			try:
+				os.chdir(td)
+				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+					_job, snap = self.run_laplace_rank_job(request)
+			finally:
+				os.chdir(old_cwd)
+
+		self.assertEqual(snap["state"], "finished")
+		sent = module.rank_snap_pairs.call_args.args[0]
+		self.assertEqual(
+			sent["options"]["debug_dir"],
+			str((fit_service.Path(td) / "laplace_rank_debug" / "atlas_snap").resolve()),
+		)
+
+	def test_laplace_rank_defaults_debug_dir_to_server_cwd(self):
+		request = {
+			"job_type": "laplace_rank",
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+			"options": {},
+		}
+		module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
+		old_cwd = os.getcwd()
+		with tempfile.TemporaryDirectory() as td:
+			try:
+				os.chdir(td)
+				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+					_job, snap = self.run_laplace_rank_job(request)
+			finally:
+				os.chdir(old_cwd)
+
+		self.assertEqual(snap["state"], "finished")
+		sent = module.rank_snap_pairs.call_args.args[0]
+		self.assertEqual(
+			sent["options"]["debug_dir"],
+			str((fit_service.Path(td) / "laplace_rank_debug" / "atlas_snap").resolve()),
+		)
+
+	def test_laplace_rank_resolves_relative_manifest_against_data_dir(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_data_dir = fit_service._data_dir
+			fit_service._data_dir = td
+			try:
+				manifest = fit_service.Path(td) / "data.lasagna.json"
+				manifest.write_text("{}", encoding="utf-8")
+				request = {
+					"manifest": "data.lasagna.json",
+					"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+				}
+				module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
+				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+					_job, snap = self.run_laplace_rank_job(request)
+
+				self.assertEqual(snap["state"], "finished")
+				sent = module.rank_snap_pairs.call_args.args[0]
+				self.assertEqual(sent["manifest"], str(manifest.resolve()))
+				self.assertEqual(request["manifest"], "data.lasagna.json")
+			finally:
+				fit_service._data_dir = old_data_dir
+
+	def test_laplace_rank_recovers_client_absolute_manifest_with_data_dir_basename(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_data_dir = fit_service._data_dir
+			fit_service._data_dir = td
+			try:
+				manifest = fit_service.Path(td) / "data.lasagna.json"
+				manifest.write_text("{}", encoding="utf-8")
+				request = {
+					"manifest": "/client/only/path/data.lasagna.json",
+					"jobs": [{"id": "cache-key", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]}],
+				}
+				module = types.SimpleNamespace(rank_snap_pairs=mock.Mock(return_value={"results": []}))
+				with mock.patch.object(fit_service.importlib, "import_module", return_value=module):
+					_job, snap = self.run_laplace_rank_job(request)
+
+				self.assertEqual(snap["state"], "finished")
+				sent = module.rank_snap_pairs.call_args.args[0]
+				self.assertEqual(sent["manifest"], str(manifest.resolve()))
+				self.assertEqual(request["manifest"], "/client/only/path/data.lasagna.json")
+			finally:
+				fit_service._data_dir = old_data_dir
+
+	def test_queued_laplace_rank_records_out_of_order_events(self):
+		queue = fit_service._JobQueue()
+		request = {
+			"job_type": "laplace_rank",
+			"manifest": "/tmp/data.lasagna.json",
+			"jobs": [
+				{"id": "term-0", "side_a": [[1, 2, 3]], "side_b": [[4, 5, 6]]},
+				{"id": "term-1", "side_a": [[7, 8, 9]], "side_b": [[10, 11, 12]]},
+			],
+			"options": {},
+		}
+
+		def fake_rank(body, progress_callback=None):
+			results = [
+				{"id": "term-0", "status": "success", "values": []},
+				{"id": "term-1", "status": "success", "values": []},
+			]
+			progress_callback({
+				"index": 1,
+				"id": "term-1",
+				"result": results[1],
+				"completed": 1,
+				"total": 2,
+			})
+			progress_callback({
+				"index": 0,
+				"id": "term-0",
+				"result": results[0],
+				"completed": 2,
+				"total": 2,
+			})
+			return {"results": results}
+
+		with mock.patch.object(fit_service, "_rank_laplace_snap_pairs", side_effect=fake_rank):
+			job = queue.create_upload(source="vc3d", config_name="")
+			queue.enqueue_body(job, request)
+			snap = self.wait_for_state(queue, job.job_id, "finished")
+
+		self.assertEqual(snap["config_name"], "laplace_rank")
+		events = job.events_after(0)
+		self.assertEqual([event["seq"] for event in events], [1, 2])
+		self.assertEqual([event["index"] for event in events], [1, 0])
+		self.assertEqual(events[0]["type"], "laplace_rank_result")
+		result_path = fit_service.Path(snap["output_dir"]) / "rank_result.json"
+		self.assertTrue(result_path.is_file())
+		result = fit_service.json.loads(result_path.read_text(encoding="utf-8"))
+		self.assertEqual([item["id"] for item in result["results"]], ["term-0", "term-1"])
 
 	def test_enqueue_body_reports_requested_output_name(self):
 		queue = fit_service._JobQueue()
@@ -81,6 +301,34 @@ class FitServiceQueueTest(unittest.TestCase):
 			fit_service._result_archive_child_name("layer_0000.tifxyz", 2, "combined.tifxyz"),
 			"layer_0000.tifxyz",
 		)
+
+	def test_results_archive_rejects_result_symlink(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = fit_service.Path(td)
+			model = root / "model_reopt.pt"
+			model.write_bytes(b"checkpoint-bytes")
+			out = root / "out"
+			out.mkdir()
+			seg = out / "atlas_v031.tifxyz"
+			seg.mkdir()
+			(seg / "meta.json").write_text("{}", encoding="utf-8")
+			(seg / "model.pt").symlink_to(model)
+
+			with self.assertRaisesRegex(ValueError, "result contains unsupported symlink: .*model\\.pt ->"):
+				fit_service._pack_results_archive(out, "atlas_v031.tifxyz")
+
+	def test_results_archive_rejects_broken_model_symlink(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = fit_service.Path(td)
+			out = root / "out"
+			out.mkdir()
+			seg = out / "atlas_v032.tifxyz"
+			seg.mkdir()
+			(seg / "meta.json").write_text("{}", encoding="utf-8")
+			(seg / "model.pt").symlink_to(root / "missing_model.pt")
+
+			with self.assertRaisesRegex(ValueError, "result contains unsupported symlink: .*model\\.pt ->"):
+				fit_service._pack_results_archive(out, "atlas_v032.tifxyz")
 
 	def test_reorder_waiting_jobs_changes_execution_order(self):
 		queue = fit_service._JobQueue()
@@ -410,6 +658,109 @@ class FitServiceObjectStoreTest(unittest.TestCase):
 				self.assertTrue(fit_service.Path(resolved["maps"][0]["map_path"]).is_file())
 				self.assertEqual(resolved["maps"][0]["winding_offset"], -2)
 				self.assertEqual(body["_job_spec_"]["atlas"], atlas_ref)
+			finally:
+				fit_service._object_store_dir = old_store
+
+	def test_model_saved_atlas_ref_overrides_request_atlas_ref(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				import torch
+
+				base_files = {"x.tif": b"x", "y.tif": b"y", "z.tif": b"z", "meta.json": b"{}"}
+				base_ref = {
+					"type": "atlas-base",
+					"name": "atlas/base_mesh.tifxyz",
+					"hash": fit_service._segment_manifest_hash(base_files),
+					"format": "tifxyz",
+				}
+				fit_service._store_uploaded_object({
+					"object": base_ref,
+					"files": {
+						name: fit_service.base64.b64encode(data).decode("ascii")
+						for name, data in base_files.items()
+					},
+				})
+				saved_atlas_obj = {
+					"type": "lasagna_atlas",
+					"version": 1,
+					"name": "saved_atlas",
+					"base": {"ref": base_ref, "path": None},
+					"metadata": {},
+					"objects": {"line": []},
+					"maps": [],
+				}
+				saved_atlas_json = fit_service.json.dumps(saved_atlas_obj).encode("utf-8")
+				saved_atlas_ref = {
+					"type": "atlas",
+					"name": "atlas/saved_atlas.json",
+					"hash": fit_service._hash_bytes(saved_atlas_json),
+					"format": "lasagna_atlas_json",
+				}
+				fit_service._store_uploaded_object({
+					"object": saved_atlas_ref,
+					"data": fit_service.base64.b64encode(saved_atlas_json).decode("ascii"),
+				})
+
+				buf = io.BytesIO()
+				torch.save({
+					"_object_refs_": {
+						"version": 1,
+						"objects": [base_ref, saved_atlas_ref],
+						"job_spec": {"atlas": saved_atlas_ref},
+					},
+				}, buf)
+				model_bytes = buf.getvalue()
+				model_ref = {
+					"type": "lasagna_model",
+					"name": "sheet_v001.tifxyz/model.pt",
+					"hash": fit_service._hash_bytes(model_bytes),
+				}
+				fit_service._store_uploaded_object({
+					"object": model_ref,
+					"data": fit_service.base64.b64encode(model_bytes).decode("ascii"),
+				})
+				request_atlas_ref = {
+					"type": "atlas",
+					"name": "atlas/request_atlas.json",
+					"hash": "md5:" + "1" * 32,
+					"format": "lasagna_atlas_json",
+				}
+
+				body = fit_service._body_with_resolved_job_spec({
+					"job_spec": {
+						"model": model_ref,
+						"atlas": request_atlas_ref,
+						"config": {"args": {"model-init": "model"}},
+					}
+				})
+
+				self.assertEqual(body["_job_spec_"]["atlas"], saved_atlas_ref)
+				self.assertEqual(body["config"]["atlas"]["name"], "saved_atlas")
+				self.assertNotIn(request_atlas_ref, body["_object_refs_"]["objects"])
+			finally:
+				fit_service._object_store_dir = old_store
+
+	def test_atlas_pred_snap_object_upload_and_resolution(self):
+		with tempfile.TemporaryDirectory() as td:
+			old_store = fit_service._object_store_dir
+			fit_service._object_store_dir = fit_service.Path(td)
+			try:
+				snap_json = b'{"type":"vc3d_atlas_pred_snap_points","version":1,"fiber_path":"fibers/fiber_a.json","entries":{}}'
+				snap_ref = {
+					"type": "atlas-pred-snap",
+					"name": "atlas/attachments/pred_snap_points/fiber_a.json",
+					"hash": fit_service._hash_bytes(snap_json),
+					"format": "vc3d_atlas_pred_snap_points_json",
+				}
+				stored = fit_service._store_uploaded_object({
+					"object": snap_ref,
+					"data": fit_service.base64.b64encode(snap_json).decode("ascii"),
+				})
+				self.assertEqual(stored, snap_ref)
+				self.assertTrue(fit_service._object_present(snap_ref))
+				self.assertEqual(fit_service._resolve_object_ref(snap_ref).read_bytes(), snap_json)
 			finally:
 				fit_service._object_store_dir = old_store
 

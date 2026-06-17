@@ -423,6 +423,45 @@ TEST_CASE("line annotation generated strip overlay includes controls and current
     CHECK(overlay.seedLineIndex == -1);
 }
 
+TEST_CASE("line annotation generated overlays include pred-snap connector endpoints")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.linePoints = {
+        {0.0f, 0.0f, 0.0f},
+        {1.0f, 0.0f, 0.0f},
+        {2.0f, 0.0f, 0.0f},
+    };
+    views.controlPoints = {
+        {{1.0f, 0.0f, 0.0f}, 1.0, false},
+    };
+    views.predSnapPoints = {
+        {{1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 1.0f}, 1.0, 0, true},
+    };
+
+    const auto overlay = vc3d::line_annotation::makeGeneratedStripOverlay(views, 1.0, {});
+
+    REQUIRE(overlay.predSnapPoints.size() == 1);
+    CHECK(overlay.predSnapPoints[0].controlIndex == 0);
+    CHECK(overlay.predSnapPoints[0].controlPoint[0] == doctest::Approx(1.0f));
+    CHECK(overlay.predSnapPoints[0].snapPoint[2] == doctest::Approx(1.0f));
+}
+
+TEST_CASE("line annotation nearest generated control point supports shift pred-snap updates")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 0.0, false},
+        {{5.0f, 0.0f, 0.0f}, 5.0, false},
+    };
+
+    const auto nearest = vc3d::line_annotation::nearestGeneratedControlPointIndex(
+        controls,
+        {4.5f, 0.0f, 0.0f});
+
+    REQUIRE(nearest.has_value());
+    CHECK(*nearest == 1);
+}
+
 TEST_CASE("line annotation generated strip static and dynamic overlays split ownership")
 {
     vc3d::line_annotation::GeneratedViews views;
@@ -547,6 +586,34 @@ TEST_CASE("line annotation generated cross slice filters controls by viewport th
     CHECK(overlay.controlPoints.size() == 2);
     CHECK(overlay.controlPoints[0].linePosition == doctest::Approx(0.0));
     CHECK(overlay.controlPoints[1].linePosition == doctest::Approx(0.5));
+}
+
+TEST_CASE("line annotation generated cross slice marker uses explicit focus point")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.linePoints = {
+        {0.0f, 0.0f, 0.0f},
+        {10.0f, 0.0f, 0.0f},
+    };
+    views.focusPoint = {2.0f, 3.0f, 4.0f};
+
+    const auto focused = vc3d::line_annotation::makeGeneratedCrossSliceOverlay(
+        views,
+        0.5,
+        true,
+        std::nullopt,
+        {});
+    CHECK(focused.pointMarker[0] == doctest::Approx(2.0f));
+    CHECK(focused.pointMarker[1] == doctest::Approx(3.0f));
+    CHECK(focused.pointMarker[2] == doctest::Approx(4.0f));
+
+    const auto plain = vc3d::line_annotation::makeGeneratedCrossSliceOverlay(
+        views,
+        0.5,
+        false,
+        std::nullopt,
+        {});
+    CHECK(plain.pointMarker[0] == doctest::Approx(5.0f));
 }
 
 TEST_CASE("line annotation generated cross slice filters indexed candidates then plane distance")

@@ -73,10 +73,15 @@ public:
     struct FiberSnapshotWithPath {
         std::filesystem::path fiberPath;
         vc::atlas::FiberPolyline fiber;
+        uint64_t storedFiberId = 0;
+        vc3d::line_annotation::FiberHvClassification hvClassification;
+        std::string manualHvTag;
+        std::vector<std::string> tags;
     };
 
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
+    using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
     using OptimizationTaskFactory =
         std::function<OptimizationTaskResult(std::filesystem::path,
                                              std::vector<vc::lasagna::LineControlPoint>,
@@ -97,6 +102,8 @@ public:
     void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void openFiber(uint64_t fiberId);
+    void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
+    void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void deleteFiber(uint64_t fiberId);
     void deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
@@ -119,10 +126,14 @@ public:
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
     [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths() const;
+    [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
+        const std::filesystem::path& atlasFiberPath) const;
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
+    void setVolumeSelectorFactory(VolumeSelectorFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
+    void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
 signals:
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
@@ -165,6 +176,8 @@ private:
         std::shared_ptr<LineAnnotationSession> session;
     };
 
+    VolumeSelectorFactory _volumeSelectorFactory;
+
     std::string nextSurfaceName();
     void cleanupSurfaceName(const std::string& surfaceName);
     void launchSession(SourceKind sourceKind,
@@ -174,6 +187,9 @@ private:
                        cv::Vec3d sourceSliceNormal,
                        std::shared_ptr<LineAnnotationSession> session,
                        bool deferShowUntilGenerated = false);
+    void openFiberWithControlPoint(uint64_t fiberId,
+                                   std::optional<int> controlPointIndex,
+                                   std::optional<int> linePointIndex = std::nullopt);
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
                         InitialDirectionMode directionMode);
@@ -183,6 +199,8 @@ private:
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
+    void handleGeneratedPredSnapPoint(const std::string& surfaceName,
+                                      cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
     void startOptimization(LineAnnotationSession& session,
                            bool fullOptimization = false,
@@ -215,6 +233,14 @@ private:
     [[nodiscard]] std::filesystem::path fibersDir() const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
+    [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
+    [[nodiscard]] std::vector<std::string> atlasPathKeysForFiber(const StoredFiber& fiber) const;
+    [[nodiscard]] std::optional<std::filesystem::path> resolveAtlasFiberPath(
+        const StoredFiber& fiber,
+        const std::filesystem::path& atlasDir) const;
+    void attachAtlasPredSnaps(const StoredFiber& fiber,
+                              LineAnnotationSession& session,
+                              const std::filesystem::path& atlasDir);
     [[nodiscard]] uint64_t nextFiberId() const;
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
@@ -259,6 +285,7 @@ private:
     std::vector<std::string> _knownFiberTags;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
+    std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
 };

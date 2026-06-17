@@ -5,9 +5,21 @@ a single Ceres refinement per candidate.
 
 ## Spatial Index
 
-`vc::atlas::FiberSpatialIndex` keeps one committed global segment R-tree and two
-recent single-fiber R-trees. Segment entries store the fiber id, generation,
-segment index, endpoints, arclength range, and segment AABB.
+Atlas search builds a fresh one-shot point R-tree for each search run. The
+search index is append-only for that run, stores dense samples by fiber id, and
+is created with the requested `maxSampleSpacing` before pair search starts.
+This keeps phase 2 progress tied to inserting the current fiber snapshot and
+avoids hidden rebuilds during pair search.
+
+Pair search precomputes per-fiber candidate lists and then refines requested
+source/target pairs through a dynamic worker queue. Phase 3 progress counts
+both candidate-list scans and requested pair slots, so the UI continues to
+advance during candidate preparation as well as Ceres refinement.
+
+`vc::atlas::FiberSpatialIndex` remains available for legacy/incremental
+candidate queries. It keeps one committed global point R-tree and two recent
+single-fiber point R-trees. Point entries store the fiber id, generation, dense
+sample index, segment index, position, and arclength.
 
 Committed entries are generation checked at query time. If a fiber has a recent
 single-fiber tree, committed entries for that fiber are skipped so edits can
@@ -19,9 +31,10 @@ Saved VC3D fiber JSON now carries a `generation` field. Legacy fiber files that
 do not have the field load as generation `1`. New fibers start at generation
 `1`; saving an existing fiber increments its generation.
 
-Deleting a fiber removes it from the in-memory search index and prunes any cache
-entries that mention that fiber. Saving a fiber prunes cache/index entries for
-that fiber so the next query uses the new generation.
+Deleting or saving a fiber prunes any atlas-search cache entries that mention
+that fiber. Atlas search builds its in-memory index from the current fiber
+snapshot on the next run, so there is no long-lived atlas search index to
+update.
 
 ## Candidate Search
 
@@ -110,7 +123,8 @@ annotation views.
 
 ## Live Editing Preparation
 
-The spatial index exposes recent-fiber updates separately from committed global
-updates, so a transient edited fiber can be queried without inserting it into
-the committed global tree. The two recent trees keep the last edited/updated
-fibers available for fast reuse when switching between edit targets.
+The legacy `FiberSpatialIndex` exposes recent-fiber updates separately from
+committed global updates, so a transient edited fiber can be queried without
+inserting it into the committed global tree. The two recent trees keep the last
+edited/updated fibers available for fast reuse when switching between edit
+targets.

@@ -10,6 +10,7 @@
 #include <QString>
 #include <QStringList>
 #include <QTimer>
+#include <functional>
 #include <memory>
 
 class QNetworkAccessManager;
@@ -88,6 +89,16 @@ public:
 
     /** Fetch available datasets from the connected service (GET /datasets). */
     void fetchDatasets();
+
+    /**
+     * Queue Laplace snap-ranking jobs through the fit service.
+     * Completion callbacks are invoked on the Qt event thread.
+     */
+    void rankLaplaceSnapPairs(
+        const QJsonObject& request,
+        std::function<void(const QJsonObject&)> onSuccess,
+        std::function<void(const QString&)> onError,
+        std::function<void(int, const QJsonObject&)> onPartialResult = {});
 
 signals:
     void serviceStarted();

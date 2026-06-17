@@ -42,8 +42,23 @@ option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
 option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
+option(VC_ENABLE_ECL_MAXFLOW "Build CUDA ECL-MaxFlow integration for Lasagna maxflow" OFF)
+option(VC_ENABLE_AMGX "Build external AMGX-backed Lasagna screened-Laplace solver" OFF)
+set(AMGX_ROOT "" CACHE PATH "External AMGX installation prefix")
 set(VC_CCACHE_PCH_SLOPPINESS "pch_defines,time_macros" CACHE STRING
     "ccache sloppiness required when VC_USE_PCH and VC_USE_CCACHE are both ON")
+
+if(VC_ENABLE_ECL_MAXFLOW)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(NOT CMAKE_CUDA_COMPILER)
+        message(FATAL_ERROR "VC_ENABLE_ECL_MAXFLOW=ON requires a CUDA compiler")
+    endif()
+    enable_language(CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
+        set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures for ECL-MaxFlow" FORCE)
+    endif()
+endif()
 
 set(_vc_build_types Debug Release RelWithDebInfo MinSizeRel QuickBuild)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -370,6 +385,35 @@ if(NOT TARGET Blosc::blosc)
     set_target_properties(Blosc::blosc PROPERTIES
         IMPORTED_LOCATION "${BLOSC_LIBRARY}"
         INTERFACE_INCLUDE_DIRECTORIES "${BLOSC_INCLUDE_DIR}")
+endif()
+
+if(VC_ENABLE_AMGX)
+    if(DEFINED AMGX_INCLUDE_DIR AND "${AMGX_INCLUDE_DIR}" STREQUAL "")
+        unset(AMGX_INCLUDE_DIR CACHE)
+    endif()
+    if(DEFINED AMGX_LIBRARY AND "${AMGX_LIBRARY}" STREQUAL "")
+        unset(AMGX_LIBRARY CACHE)
+    endif()
+    find_path(AMGX_INCLUDE_DIR
+        NAMES amgx_c.h
+        HINTS "${AMGX_ROOT}" "$ENV{AMGX_ROOT}"
+        PATH_SUFFIXES include)
+    find_library(AMGX_LIBRARY
+        NAMES amgxsh amgx
+        HINTS "${AMGX_ROOT}" "$ENV{AMGX_ROOT}"
+        PATH_SUFFIXES lib lib64)
+    if(NOT AMGX_INCLUDE_DIR OR NOT AMGX_LIBRARY)
+        message(FATAL_ERROR
+            "VC_ENABLE_AMGX=ON requires external AMGX. Set AMGX_ROOT or "
+            "AMGX_INCLUDE_DIR and AMGX_LIBRARY.")
+    endif()
+    if(NOT TARGET AMGX::amgx)
+        add_library(AMGX::amgx UNKNOWN IMPORTED)
+        set_target_properties(AMGX::amgx PROPERTIES
+            IMPORTED_LOCATION "${AMGX_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${AMGX_INCLUDE_DIR}")
+    endif()
+    message(STATUS "Using AMGX include=${AMGX_INCLUDE_DIR} library=${AMGX_LIBRARY}")
 endif()
 pkg_check_modules(zstd REQUIRED IMPORTED_TARGET libzstd)
 pkg_check_modules(lz4 REQUIRED IMPORTED_TARGET liblz4)

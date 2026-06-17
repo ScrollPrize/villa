@@ -45,7 +45,10 @@ public:
         view_.setScene(&scene_);
     }
 
-    QPointF volumeToScene(const cv::Vec3f&) override { return {}; }
+    QPointF volumeToScene(const cv::Vec3f& point) override
+    {
+        return {point[0] * 10.0 + 1.0, point[1] * 10.0 + 2.0};
+    }
     cv::Vec3f sceneToVolume(const QPointF&) const override { return {}; }
     cv::Vec2f sceneToSurfaceCoords(const QPointF&) const override { return {}; }
     QPointF surfaceCoordsToScene(float surfX, float surfY) const override
@@ -319,16 +322,23 @@ private slots:
         a.valid = true;
         a.modelH = 3.0f;
         a.modelW = 4.0f;
+        a.snapValid = true;
+        a.snapTargetXyz = cv::Vec3f(9.0f, 8.0f, 7.0f);
+        a.snapModelH = 3.0f;
+        a.snapModelW = 5.0f;
 
         AtlasControlPointResult b = a;
         b.sourceIndex = 1;
         b.controlIndex = 1;
         b.modelH = 3.0f;
         b.modelW = 5.0f;
+        b.snapTargetXyz = cv::Vec3f(10.0f, 8.0f, 7.0f);
+        b.snapModelW = 6.0f;
 
         AtlasControlPointResult invalid = a;
         invalid.controlIndex = 2;
         invalid.valid = false;
+        invalid.snapValid = false;
 
         controller.setResults({a, invalid});
         QCOMPARE(viewer.scene().items().size(), 0);
@@ -336,7 +346,7 @@ private slots:
         controller.setOverlayEnabled(true);
         QCOMPARE(viewer.scene().items().size(), 1);
         const QRectF pointBounds = viewer.scene().items().front()->sceneBoundingRect();
-        QCOMPARE(pointBounds.center().x(), 6.0);
+        QCOMPARE(pointBounds.center().x(), 11.0);
         QVERIFY(std::abs(pointBounds.center().y() - (2.0 + (1.0 / 3.0) * 10.0)) < 1.0e-5);
 
         controller.setResults({a, b, invalid});
@@ -345,6 +355,35 @@ private slots:
 
         controller.setSelectedPoint(QStringLiteral("fiber_a"), 1);
         QVERIFY(viewer.scene().items().size() >= 2);
+    }
+
+    void atlasControlPointsOverlayShowsSnapTargetsOnPlaneViewers()
+    {
+        FakeViewer viewer;
+        viewer.setSurfName("xy plane");
+
+        AtlasControlPointsOverlayController controller;
+        controller.attachViewer(&viewer);
+
+        AtlasControlPointResult point;
+        point.fiberId = QStringLiteral("fiber_a");
+        point.controlIndex = 0;
+        point.valid = true;
+        point.snapValid = true;
+        point.snapTargetXyz = cv::Vec3f(9.0f, 8.0f, 7.0f);
+        point.modelH = 3.0f;
+        point.modelW = 4.0f;
+
+        controller.setResults({point});
+        controller.setOverlayEnabled(true);
+        QCOMPARE(viewer.scene().items().size(), 1);
+
+        const QRectF bounds = viewer.scene().items().front()->sceneBoundingRect();
+        QVERIFY(std::abs(bounds.center().x() - 91.0) < 0.75);
+        QVERIFY(std::abs(bounds.center().y() - 82.0) < 0.75);
+
+        controller.setSelectedPoint(QStringLiteral("fiber_a"), 0);
+        QCOMPARE(viewer.scene().items().size(), 1);
     }
 
     void atlasControlPointsDockLoadsGroupedRows()
@@ -367,6 +406,14 @@ private slots:
       "valid": true,
       "distance": 1.25,
       "signed_delta": -0.5,
+      "snap_status": "valid fw",
+      "snap_valid": true,
+      "snap_direction": "fw",
+      "snap_signed_delta": 0.25,
+      "snap_target_xyz": [9, 8, 7],
+      "snap_mesh_xyz": [10, 9, 8],
+      "snap_model_h": 11,
+      "snap_model_w": 12,
       "target_xyz": [1, 2, 3],
       "mesh_xyz": [2, 3, 4],
       "model_h": 7,
@@ -387,7 +434,18 @@ private slots:
         QCOMPARE(tree->topLevelItemCount(), 1);
         QCOMPARE(tree->topLevelItem(0)->childCount(), 1);
         QCOMPARE(tree->topLevelItem(0)->text(0), QStringLiteral("fiber_a"));
+        QCOMPARE(tree->columnCount(), 7);
         QCOMPARE(tree->topLevelItem(0)->child(0)->text(1), QStringLiteral("yes"));
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(2), QStringLiteral("valid fw"));
+        QCOMPARE(tree->headerItem()->text(3), QStringLiteral("Snap Delta"));
+        QCOMPARE(tree->headerItem()->text(4), QStringLiteral("Snap XYZ"));
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(3), QStringLiteral("0.2500"));
+        QCOMPARE(tree->topLevelItem(0)->child(0)->text(4), QStringLiteral("9.0, 8.0, 7.0"));
+        QCOMPARE(dock.results().front().snapMeshXyz[0], 10.0f);
+        QCOMPARE(dock.results().front().snapMeshXyz[1], 9.0f);
+        QCOMPARE(dock.results().front().snapMeshXyz[2], 8.0f);
+        QCOMPARE(dock.results().front().snapModelH, 11.0f);
+        QCOMPARE(dock.results().front().snapModelW, 12.0f);
     }
 };
 
