@@ -1164,15 +1164,8 @@ void drawDebugGroups(cv::Mat& image,
 
 void writeDebugMat(const cv::Mat& image, const fs::path& path)
 {
-    std::string ext = path.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    std::vector<int> params;
-    if (ext == ".tif" || ext == ".tiff") {
-        params = {cv::IMWRITE_TIFF_COMPRESSION, cv::IMWRITE_TIFF_COMPRESSION_LZW};
-    }
-    if (!cv::imwrite(path.string(), image, params)) {
+    // Write uncompressed; LZW (cv::IMWRITE_TIFF_COMPRESSION_LZW) requires OpenCV >= 4.7.
+    if (!cv::imwrite(path.string(), image)) {
         throw std::runtime_error("failed to write debug image: " + path.string());
     }
 }
