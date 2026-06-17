@@ -5,6 +5,7 @@
 #include <QPointer>
 
 #include <memory>
+#include <functional>
 #include <map>
 #include <limits>
 #include <string>
@@ -59,8 +60,11 @@ public:
 
     using GeneratedOverlay = vc3d::line_annotation::GeneratedOverlay;
     using GeneratedViews = vc3d::line_annotation::GeneratedViews;
+    using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
 
-    explicit LineAnnotationDialog(ViewerManager* viewerManager, QWidget* parent = nullptr);
+    explicit LineAnnotationDialog(ViewerManager* viewerManager,
+                                  VolumeSelectorFactory volumeSelectorFactory = {},
+                                  QWidget* parent = nullptr);
 
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
                                   const QString& title,

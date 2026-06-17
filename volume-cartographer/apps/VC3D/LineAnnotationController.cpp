@@ -914,6 +914,11 @@ void LineAnnotationController::setOptimizationTaskFactoryForTesting(Optimization
     _optimizationTaskFactory = std::move(factory);
 }
 
+void LineAnnotationController::setVolumeSelectorFactory(VolumeSelectorFactory factory)
+{
+    _volumeSelectorFactory = std::move(factory);
+}
+
 void LineAnnotationController::setSurfacePanel(SurfacePanelController* panel)
 {
     _surfacePanel = panel;
@@ -1044,7 +1049,7 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
     session->deferShowUntilGenerated = deferShowUntilGenerated;
     _state->setSurface(surfaceName, std::move(sourceSurface));
-    auto* dialog = new LineAnnotationDialog(_viewerManager, nullptr);
+    auto* dialog = new LineAnnotationDialog(_viewerManager, _volumeSelectorFactory, nullptr);
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
         dialog->deleteLater();
         _state->setSurface(surfaceName, nullptr);
@@ -2945,6 +2950,13 @@ void LineAnnotationController::rebuildIntersectionInspection()
             auto* title = new QLabel(tr("Intersection decision"), pane);
             title->setObjectName(QStringLiteral("intersectionDecisionTitle"));
             layout->addWidget(title);
+
+            if (_volumeSelectorFactory) {
+                if (auto* volumeSelector = _volumeSelectorFactory(pane)) {
+                    volumeSelector->setObjectName(QStringLiteral("intersectionDecisionVolumeSelector"));
+                    layout->addWidget(volumeSelector);
+                }
+            }
 
             auto* hLabel = new QLabel(
                 tr("H: %1 - %2").arg(fiberDisplayName(*hSide.fiber), hvSummary(*hSide.fiber)),

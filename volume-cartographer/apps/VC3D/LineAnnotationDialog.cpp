@@ -113,7 +113,9 @@ cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
 
 } // namespace
 
-LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget* parent)
+LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
+                                           VolumeSelectorFactory volumeSelectorFactory,
+                                           QWidget* parent)
     : QMainWindow(parent)
     , _viewerManager(viewerManager)
 {
@@ -162,6 +164,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _shiftScrollCombo->setCurrentIndex(0);
     _shiftScrollCombo->installEventFilter(this);
     buttonLayout->addWidget(_shiftScrollCombo);
+    if (volumeSelectorFactory) {
+        if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
+            volumeSelector->installEventFilter(this);
+            buttonLayout->addWidget(volumeSelector);
+        }
+    }
     _sliceStepLabel = new QLabel(this);
     _sliceStepLabel->setText(tr("Step: %1").arg(_viewerManager ? _viewerManager->sliceStepSize() : 1));
     _sliceStepLabel->setToolTip(tr("Shift+Scroll step size. Use Shift+G / Shift+H to adjust."));

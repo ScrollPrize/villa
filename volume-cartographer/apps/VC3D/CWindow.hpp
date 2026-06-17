@@ -7,6 +7,7 @@
 #include <opencv2/core/mat.hpp>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QPointer>
 #include <QString>
 #include <memory>
 #include <optional>
@@ -191,6 +192,7 @@ private:
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
     void syncVolumeSelectionControls(const QString& activeVolumeId = QString());
+    QWidget* createAnnotationVolumeSelector(QWidget* parent);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
     bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId);
@@ -226,6 +228,8 @@ private slots:
     CChunkedVolumeViewer* segmentationViewer() const;
     VolumeViewerBase* segmentationBaseViewer() const;
     VolumeViewerBase* activeBaseViewer() const;
+    std::vector<QComboBox*> volumeSelectionControls() const;
+    void connectVolumeSelector(QComboBox* selector);
     void clearSurfaceSelection();
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
@@ -246,7 +250,7 @@ private:
     CState* _state;
 
     QComboBox* volSelect{nullptr};
-    QComboBox* _intersectionsVolumeSelect{nullptr};
+    std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
     QComboBox* cmbSegmentationDir;
 
 
@@ -276,7 +280,6 @@ private:
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
-    QDockWidget* _intersectionsVolumeDock{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     AtlasControlPointsDock* _atlasControlDock{nullptr};

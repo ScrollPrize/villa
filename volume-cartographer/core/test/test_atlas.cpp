@@ -1,6 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "vc_test.hpp"
 
+#include "../src/AtlasConstraintsDetail.hpp"
+
 #include "vc/atlas/Atlas.hpp"
 #include "vc/atlas/AtlasConstraints.hpp"
 #include "vc/atlas/FiberHvClassification.hpp"
@@ -379,6 +381,59 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     CHECK(loaded.fibers[0].windingOffset == 0);
     REQUIRE(loaded.fibers[0].lineAnchors.size() == 1);
     CHECK(loaded.fibers[0].lineAnchors[0].atlasV == doctest::Approx(5.0));
+}
+
+TEST_CASE("Atlas temporary link dedupe uses unordered fiber arclength endpoints")
+{
+    using vc::atlas::detail::containsLinkDedupEntry;
+    using vc::atlas::detail::makeLinkDedupEntry;
+
+    constexpr double threshold = 4.0;
+    std::vector<vc::atlas::detail::LinkDedupEntry> baseLinks;
+    baseLinks.push_back(*makeLinkDedupEntry(0, 10.0, 1, 20.0));
+
+    const auto reversedInside = makeLinkDedupEntry(1, 24.0, 0, 14.0);
+    REQUIRE(reversedInside.has_value());
+    CHECK(containsLinkDedupEntry(baseLinks, *reversedInside, threshold));
+
+    const auto reversedOutside = makeLinkDedupEntry(1, 24.01, 0, 14.0);
+    REQUIRE(reversedOutside.has_value());
+    CHECK_FALSE(containsLinkDedupEntry(baseLinks, *reversedOutside, threshold));
+
+    std::vector<vc::atlas::detail::LinkDedupEntry> acceptedTemps;
+    const auto firstTemp = makeLinkDedupEntry(0, 40.0, 1, 60.0);
+    REQUIRE(firstTemp.has_value());
+    if (!containsLinkDedupEntry(acceptedTemps, *firstTemp, threshold)) {
+        acceptedTemps.push_back(*firstTemp);
+    }
+
+    const auto duplicateTemp = makeLinkDedupEntry(1, 63.5, 0, 43.5);
+    REQUIRE(duplicateTemp.has_value());
+    if (!containsLinkDedupEntry(acceptedTemps, *duplicateTemp, threshold)) {
+        acceptedTemps.push_back(*duplicateTemp);
+    }
+
+    const auto distinctTemp = makeLinkDedupEntry(1, 64.01, 0, 43.5);
+    REQUIRE(distinctTemp.has_value());
+    if (!containsLinkDedupEntry(acceptedTemps, *distinctTemp, threshold)) {
+        acceptedTemps.push_back(*distinctTemp);
+    }
+
+    REQUIRE(acceptedTemps.size() == 2);
+    CHECK(acceptedTemps[0].arclengthA == doctest::Approx(40.0));
+    CHECK(acceptedTemps[1].arclengthA == doctest::Approx(43.5));
+}
+
+TEST_CASE("Atlas source index to arclength interpolation clamps finite indices")
+{
+    using vc::atlas::detail::sourceIndexToArclength;
+
+    const std::vector<double> cumulative{0.0, 2.0, 5.0};
+    CHECK(*sourceIndexToArclength(cumulative, 1.5) == doctest::Approx(3.5));
+    CHECK(*sourceIndexToArclength(cumulative, -3.0) == doctest::Approx(0.0));
+    CHECK(*sourceIndexToArclength(cumulative, 9.0) == doctest::Approx(5.0));
+    CHECK_FALSE(sourceIndexToArclength(cumulative, std::numeric_limits<double>::infinity()));
+    CHECK_FALSE(sourceIndexToArclength({}, 1.0));
 }
 
 TEST_CASE("Atlas pred-snap search emits +/-1 winding candidates without direction weighting")
@@ -2241,6 +2296,8 @@ TEST_CASE("Atlas constraints cross groups walk only positive one-winding steps")
     addFiber(1, 1.0, 10.0);
     addFiber(2, 2.0, 10.0);
     addFiber(3, 0.95, 10.0);
+    addFiber(4, 5.0, 10.0);
+    addFiber(5, 6.0, 10.0);
 
     vc::atlas::AtlasConstraintExportOptions options;
     options.closeCycles = false;
@@ -2257,6 +2314,7 @@ TEST_CASE("Atlas constraints cross groups walk only positive one-winding steps")
         options);
 
     bool sawCross = false;
+    int zeroWindingAnnotations = 0;
     std::unordered_set<std::string> usedCrossPointPositions;
     for (const auto& [collectionId, collection] : result.collections.getAllCollections()) {
         (void)collectionId;
@@ -2282,9 +2340,13 @@ TEST_CASE("Atlas constraints cross groups walk only positive one-winding steps")
             key.imbue(std::locale::classic());
             key << point.p[0] << ',' << point.p[1] << ',' << point.p[2];
             CHECK(usedCrossPointPositions.insert(key.str()).second);
+            if (std::abs(point.winding_annotation) < 1.0e-5f) {
+                ++zeroWindingAnnotations;
+            }
         }
     }
     CHECK(sawCross);
+    CHECK(zeroWindingAnnotations == 1);
 }
 
 TEST_CASE("Atlas preview incremental target offset matches full temporary layout")

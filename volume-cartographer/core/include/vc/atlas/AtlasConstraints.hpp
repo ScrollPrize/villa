@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace vc::lasagna {
 class LasagnaNormalSampler;
@@ -48,9 +50,23 @@ struct AtlasConstraintExportReport {
     size_t skippedLargeLineSteps = 0;
 };
 
+struct AtlasConstraintLinkDebugRow {
+    std::string kind;
+    std::filesystem::path firstFiber;
+    std::filesystem::path secondFiber;
+    double firstSource = 0.0;
+    double secondSource = 0.0;
+    double firstWinding = 0.0;
+    double secondWinding = 0.0;
+    double atlasWindingDelta = 0.0;
+    std::optional<double> signedWindingDistance;
+    std::optional<int> desiredWindingDelta;
+};
+
 struct AtlasConstraintExportResult {
     PointCollections collections;
     AtlasConstraintExportReport report;
+    std::vector<AtlasConstraintLinkDebugRow> linkDebugRows;
 };
 
 [[nodiscard]] AtlasConstraintExportResult exportAtlasConstraints(

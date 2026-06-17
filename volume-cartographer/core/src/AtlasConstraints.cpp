@@ -1,5 +1,7 @@
 #include "vc/atlas/AtlasConstraints.hpp"
 
+#include "AtlasConstraintsDetail.hpp"
+
 #include "vc/atlas/FiberHvClassification.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -17,6 +19,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -221,6 +224,32 @@ std::optional<ExportPoint> interpolateMappedPoint(size_t fiberIndex,
     return p;
 }
 
+std::optional<double> sourceIndexToArclength(const LoadedFiber& fiber, double sourceIndex)
+{
+    return detail::sourceIndexToArclength(fiber.cumulativeArclength, sourceIndex);
+}
+
+std::optional<double> linkEndpointArclengthForDedup(const LoadedFiber& fiber,
+                                                    const AtlasLinkEndpoint& endpoint)
+{
+    if (std::isfinite(endpoint.arclength) &&
+        (endpoint.arclength > 0.0 || endpoint.sourceIndex == 0)) {
+        return endpoint.arclength;
+    }
+    return sourceIndexToArclength(fiber, static_cast<double>(endpoint.sourceIndex));
+}
+
+std::optional<detail::LinkDedupEntry> linkDedupEntry(size_t firstFiber,
+                                                     double firstArclength,
+                                                     size_t secondFiber,
+                                                     double secondArclength)
+{
+    return detail::makeLinkDedupEntry(firstFiber,
+                                      firstArclength,
+                                      secondFiber,
+                                      secondArclength);
+}
+
 void addUniquePosition(std::map<double, bool>& positions, double pos)
 {
     if (std::isfinite(pos)) {
@@ -233,17 +262,19 @@ struct TemporaryLink {
     double firstPosition = 0.0;
     size_t secondFiber = 0;
     double secondPosition = 0.0;
+    std::optional<double> signedWindingDistance;
+    double atlasWindingDelta = 0.0;
 };
 
 std::vector<TemporaryLink> temporaryCycleClosingLinks(
     const LasagnaAtlasExport& exportData,
     const QuadSurface& baseSurface,
-    const vc::lasagna::LasagnaNormalSampler* sampler,
     const std::vector<LoadedFiber>& fibers,
     const AtlasConstraintExportOptions& options,
-    const std::unordered_map<std::string, size_t>& fiberIndexByKey)
+    const std::unordered_map<std::string, size_t>& fiberIndexByKey,
+    const std::unordered_map<std::string, size_t>& atlasMappingIndexByKey)
 {
-    if (!options.closeCycles || !sampler || fibers.size() < 2) {
+    if (!options.closeCycles || fibers.size() < 2) {
         return {};
     }
 
@@ -280,45 +311,86 @@ std::vector<TemporaryLink> temporaryCycleClosingLinks(
         &cache,
         broad,
         ceres,
-        sampler);
+        nullptr);
+
+    std::vector<detail::LinkDedupEntry> baseLinkDedupEntries;
+    baseLinkDedupEntries.reserve(exportData.atlas.links.size());
+    for (const auto& link : exportData.atlas.links) {
+        const auto firstIt = fiberIndexByKey.find(atlasFiberPathKey(link.first.fiberPath));
+        const auto secondIt = fiberIndexByKey.find(atlasFiberPathKey(link.second.fiberPath));
+        if (firstIt == fiberIndexByKey.end() || secondIt == fiberIndexByKey.end()) {
+            continue;
+        }
+        const size_t a = firstIt->second;
+        const size_t b = secondIt->second;
+        if (a >= fibers.size() || b >= fibers.size()) {
+            continue;
+        }
+        const auto firstMappingIt =
+            atlasMappingIndexByKey.find(atlasFiberPathKey(link.first.fiberPath));
+        const auto secondMappingIt =
+            atlasMappingIndexByKey.find(atlasFiberPathKey(link.second.fiberPath));
+        if (firstMappingIt == atlasMappingIndexByKey.end() ||
+            secondMappingIt == atlasMappingIndexByKey.end() ||
+            firstMappingIt->second == secondMappingIt->second) {
+            continue;
+        }
+        const auto firstArclength = linkEndpointArclengthForDedup(fibers[a], link.first);
+        const auto secondArclength = linkEndpointArclengthForDedup(fibers[b], link.second);
+        if (!firstArclength || !secondArclength) {
+            continue;
+        }
+        if (auto entry = linkDedupEntry(firstMappingIt->second,
+                                        *firstArclength,
+                                        secondMappingIt->second,
+                                        *secondArclength)) {
+            baseLinkDedupEntries.push_back(*entry);
+        }
+    }
 
     std::vector<TemporaryLink> links;
+    std::vector<detail::LinkDedupEntry> acceptedTempDedupEntries;
+    acceptedTempDedupEntries.reserve(results.size());
     for (const auto& result : results) {
         if (result.sourceFiberId == 0 || result.targetFiberId == 0 ||
             result.sourceFiberId > fibers.size() || result.targetFiberId > fibers.size()) {
             continue;
         }
-        const size_t a = static_cast<size_t>(result.sourceFiberId - 1);
-        const size_t b = static_cast<size_t>(result.targetFiberId - 1);
-        const auto& sourceMapping = exportData.atlas.fibers[a];
-        const auto& targetMapping = exportData.atlas.fibers[b];
-        const bool sourceIsH = firstFiberDisplaysAsH(
-            fibers[a].hv,
-            fibers[a].manualHvTag,
-            fibers[b].hv,
-            fibers[b].manualHvTag,
-            fiberIndexByKey.at(atlasFiberPathKey(sourceMapping.fiberPath)) <
-                fiberIndexByKey.at(atlasFiberPathKey(targetMapping.fiberPath)));
-        const double sourcePosition = sourceIndexAtArclength(fibers[a], result.sourceArclength);
-        const double targetPosition = sourceIndexAtArclength(fibers[b], result.targetArclength);
-        try {
-            const auto display = signedAtlasSearchWindingDisplay(
-                result.windingDistance,
-                sourceIsH,
-                sourcePosition,
-                targetPosition,
-                result.sourcePoint,
-                result.targetPoint,
-                sourceMapping,
-                targetMapping,
-                baseSurface);
-            if (display.signedWindingDistance < options.closeMinSignedWinding ||
-                display.signedWindingDistance > options.closeMaxSignedWinding) {
-                continue;
-            }
-        } catch (const std::exception&) {
+        if (result.sourceFiberId == result.targetFiberId) {
             continue;
         }
+        const size_t sourceObjectIndex = static_cast<size_t>(result.sourceFiberId - 1);
+        const size_t targetObjectIndex = static_cast<size_t>(result.targetFiberId - 1);
+        const std::string sourceKey = atlasFiberPathKey(fibers[sourceObjectIndex].input.fiberPath);
+        const std::string targetKey = atlasFiberPathKey(fibers[targetObjectIndex].input.fiberPath);
+        if (sourceKey == targetKey) {
+            continue;
+        }
+        const auto sourceMappingIt = atlasMappingIndexByKey.find(sourceKey);
+        const auto targetMappingIt = atlasMappingIndexByKey.find(targetKey);
+        if (sourceMappingIt == atlasMappingIndexByKey.end() ||
+            targetMappingIt == atlasMappingIndexByKey.end() ||
+            sourceMappingIt->second == targetMappingIt->second) {
+            continue;
+        }
+        const size_t a = sourceMappingIt->second;
+        const size_t b = targetMappingIt->second;
+        const auto candidateDedupEntry =
+            linkDedupEntry(a, result.sourceArclength, b, result.targetArclength);
+        if (!candidateDedupEntry) {
+            continue;
+        }
+        if (detail::containsLinkDedupEntry(baseLinkDedupEntries,
+                                           *candidateDedupEntry,
+                                           options.intersectionDeduplicateArclength)) {
+            continue;
+        }
+        const auto& sourceMapping = exportData.atlas.fibers[a];
+        const auto& targetMapping = exportData.atlas.fibers[b];
+        const double sourcePosition =
+            sourceIndexAtArclength(fibers[sourceObjectIndex], result.sourceArclength);
+        const double targetPosition =
+            sourceIndexAtArclength(fibers[targetObjectIndex], result.targetArclength);
 
         const int period = atlasHorizontalPeriodColumns(baseSurface);
         const auto pa = interpolateMappedPoint(
@@ -336,17 +408,131 @@ std::vector<TemporaryLink> temporaryCycleClosingLinks(
             exportData.atlas.metadata,
             period);
         if (!pa || !pb ||
-            std::abs(pa->continuousWinding - pb->continuousWinding) >=
+            std::abs(pa->continuousWinding - pb->continuousWinding) >
                 options.closeAtlasWindingThreshold) {
             continue;
         }
-        links.push_back({a, pa->sourcePosition, b, pb->sourcePosition});
+        if (pa->stableKey == pb->stableKey ||
+            detail::containsLinkDedupEntry(acceptedTempDedupEntries,
+                                           *candidateDedupEntry,
+                                           options.intersectionDeduplicateArclength)) {
+            continue;
+        }
+        acceptedTempDedupEntries.push_back(*candidateDedupEntry);
+        links.push_back({a,
+                         pa->sourcePosition,
+                         b,
+                         pb->sourcePosition,
+                         std::nullopt,
+                         pb->continuousWinding - pa->continuousWinding});
     }
     std::sort(links.begin(), links.end(), [](const TemporaryLink& a, const TemporaryLink& b) {
         return std::tie(a.firstFiber, a.firstPosition, a.secondFiber, a.secondPosition) <
                std::tie(b.firstFiber, b.firstPosition, b.secondFiber, b.secondPosition);
     });
     return links;
+}
+
+std::optional<size_t> mappingIndexForFiberPath(const LasagnaAtlasExport& exportData,
+                                               const fs::path& fiberPath)
+{
+    const std::string key = atlasFiberPathKey(fiberPath);
+    for (size_t i = 0; i < exportData.atlas.fibers.size(); ++i) {
+        if (atlasFiberPathKey(exportData.atlas.fibers[i].fiberPath) == key) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ExportPoint> linkDebugPoint(const LasagnaAtlasExport& exportData,
+                                          const QuadSurface& baseSurface,
+                                          size_t fiberIndex,
+                                          double sourcePosition)
+{
+    const int period = atlasHorizontalPeriodColumns(baseSurface);
+    if (fiberIndex >= exportData.atlas.fibers.size()) {
+        return std::nullopt;
+    }
+    return interpolateMappedPoint(fiberIndex,
+                                  exportData.atlas.fibers[fiberIndex],
+                                  sourcePosition,
+                                  {},
+                                  exportData.atlas.metadata,
+                                  period);
+}
+
+std::vector<AtlasConstraintLinkDebugRow> buildLinkDebugRows(
+    const LasagnaAtlasExport& exportData,
+    const QuadSurface& baseSurface,
+    const std::vector<TemporaryLink>& temporaryLinks)
+{
+    std::vector<AtlasConstraintLinkDebugRow> rows;
+    rows.reserve(exportData.atlas.links.size() + temporaryLinks.size());
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    for (const auto& link : exportData.atlas.links) {
+        AtlasConstraintLinkDebugRow row;
+        row.kind = "base";
+        row.firstFiber = link.first.fiberPath;
+        row.secondFiber = link.second.fiberPath;
+        row.firstSource = nan;
+        row.secondSource = nan;
+        row.firstWinding = nan;
+        row.secondWinding = nan;
+        row.atlasWindingDelta = nan;
+        row.desiredWindingDelta = link.desiredWindingDelta;
+
+        const auto firstIndex = mappingIndexForFiberPath(exportData, link.first.fiberPath);
+        const auto secondIndex = mappingIndexForFiberPath(exportData, link.second.fiberPath);
+        if (firstIndex) {
+            if (const auto point = linkDebugPoint(
+                    exportData, baseSurface, *firstIndex, static_cast<double>(link.first.sourceIndex))) {
+                row.firstSource = point->sourcePosition;
+                row.firstWinding = point->continuousWinding;
+            }
+        }
+        if (secondIndex) {
+            if (const auto point = linkDebugPoint(
+                    exportData, baseSurface, *secondIndex, static_cast<double>(link.second.sourceIndex))) {
+                row.secondSource = point->sourcePosition;
+                row.secondWinding = point->continuousWinding;
+            }
+        }
+        if (std::isfinite(row.firstWinding) && std::isfinite(row.secondWinding)) {
+            row.atlasWindingDelta = row.secondWinding - row.firstWinding;
+        }
+        rows.push_back(std::move(row));
+    }
+
+    for (const auto& link : temporaryLinks) {
+        AtlasConstraintLinkDebugRow row;
+        row.kind = "temp";
+        row.firstFiber = exportData.atlas.fibers[link.firstFiber].fiberPath;
+        row.secondFiber = exportData.atlas.fibers[link.secondFiber].fiberPath;
+        row.firstSource = link.firstPosition;
+        row.secondSource = link.secondPosition;
+        row.firstWinding = nan;
+        row.secondWinding = nan;
+        row.atlasWindingDelta = link.atlasWindingDelta;
+        row.signedWindingDistance = link.signedWindingDistance;
+        if (const auto point = linkDebugPoint(
+                exportData, baseSurface, link.firstFiber, link.firstPosition)) {
+            row.firstSource = point->sourcePosition;
+            row.firstWinding = point->continuousWinding;
+        }
+        if (const auto point = linkDebugPoint(
+                exportData, baseSurface, link.secondFiber, link.secondPosition)) {
+            row.secondSource = point->sourcePosition;
+            row.secondWinding = point->continuousWinding;
+        }
+        if (std::isfinite(row.firstWinding) && std::isfinite(row.secondWinding)) {
+            row.atlasWindingDelta = row.secondWinding - row.firstWinding;
+        }
+        rows.push_back(std::move(row));
+    }
+
+    return rows;
 }
 
 size_t addGraphPoint(Graph& graph,
@@ -384,13 +570,15 @@ void addGraphEdge(Graph& graph, size_t a, size_t b, double credit, bool positive
 Graph buildGraph(const LasagnaAtlasExport& exportData,
                  const QuadSurface& baseSurface,
                  const std::vector<LoadedFiber>& fibers,
+                 const std::unordered_map<std::string, size_t>& fiberIndexByKey,
+                 const std::unordered_map<std::string, size_t>& atlasMappingIndexByKey,
                  const std::vector<TemporaryLink>& temporaryLinks,
                  const AtlasConstraintExportOptions& options,
                  AtlasConstraintExportReport& report)
 {
     (void)options;
     const int period = atlasHorizontalPeriodColumns(baseSurface);
-    std::vector<std::map<double, bool>> fiberPositions(fibers.size());
+    std::vector<std::map<double, bool>> fiberPositions(exportData.atlas.fibers.size());
     for (size_t i = 0; i < exportData.atlas.fibers.size(); ++i) {
         const auto& mapping = exportData.atlas.fibers[i];
         for (const auto& anchor : mapping.controlAnchors) {
@@ -399,16 +587,11 @@ Graph buildGraph(const LasagnaAtlasExport& exportData,
     }
 
     auto addLinkEndpoint = [&](const AtlasLinkEndpoint& endpoint) {
-        const auto it = std::find_if(
-            exportData.atlas.fibers.begin(),
-            exportData.atlas.fibers.end(),
-            [&](const FiberMapping& mapping) {
-                return atlasFiberPathKey(mapping.fiberPath) == atlasFiberPathKey(endpoint.fiberPath);
-            });
-        if (it == exportData.atlas.fibers.end()) {
+        const auto it = atlasMappingIndexByKey.find(atlasFiberPathKey(endpoint.fiberPath));
+        if (it == atlasMappingIndexByKey.end()) {
             return;
         }
-        const size_t idx = static_cast<size_t>(std::distance(exportData.atlas.fibers.begin(), it));
+        const size_t idx = it->second;
         const auto snapped = nearestControlSourcePosition(
             exportData.atlas.fibers[idx],
             static_cast<double>(endpoint.sourceIndex));
@@ -428,9 +611,15 @@ Graph buildGraph(const LasagnaAtlasExport& exportData,
     Graph graph;
     graph.periodColumns = period;
     std::unordered_map<std::string, size_t> idByKey;
-    std::vector<std::vector<size_t>> nodeByFiberPosition(fibers.size());
-    for (size_t i = 0; i < fibers.size(); ++i) {
-        const auto tag = effectiveFiberHvTag(fibers[i].hv, fibers[i].manualHvTag);
+    std::vector<std::vector<size_t>> nodeByFiberPosition(exportData.atlas.fibers.size());
+    for (size_t i = 0; i < exportData.atlas.fibers.size(); ++i) {
+        const std::string fiberKey = atlasFiberPathKey(exportData.atlas.fibers[i].fiberPath);
+        const auto loadedIt = fiberIndexByKey.find(fiberKey);
+        if (loadedIt == fiberIndexByKey.end() || loadedIt->second >= fibers.size()) {
+            continue;
+        }
+        const auto& loaded = fibers[loadedIt->second];
+        const auto tag = effectiveFiberHvTag(loaded.hv, loaded.manualHvTag);
         const std::string dir = fiberHvTagToPointCollectionString(tag);
         for (const auto& [position, ignored] : fiberPositions[i]) {
             (void)ignored;
@@ -462,21 +651,21 @@ Graph buildGraph(const LasagnaAtlasExport& exportData,
     }
 
     auto nodeForEndpoint = [&](const AtlasLinkEndpoint& endpoint) -> std::optional<size_t> {
-        for (size_t i = 0; i < exportData.atlas.fibers.size(); ++i) {
-            if (atlasFiberPathKey(exportData.atlas.fibers[i].fiberPath) ==
-                atlasFiberPathKey(endpoint.fiberPath)) {
-                const auto snapped = nearestControlSourcePosition(
-                    exportData.atlas.fibers[i],
-                    static_cast<double>(endpoint.sourceIndex));
-                if (!snapped) {
-                    return std::nullopt;
-                }
-                const auto key = pointKey(i, *snapped);
-                const auto it = idByKey.find(key);
-                if (it != idByKey.end()) {
-                    return it->second;
-                }
-            }
+        const auto mappingIt = atlasMappingIndexByKey.find(atlasFiberPathKey(endpoint.fiberPath));
+        if (mappingIt == atlasMappingIndexByKey.end()) {
+            return std::nullopt;
+        }
+        const size_t mappingIndex = mappingIt->second;
+        const auto snapped = nearestControlSourcePosition(
+            exportData.atlas.fibers[mappingIndex],
+            static_cast<double>(endpoint.sourceIndex));
+        if (!snapped) {
+            return std::nullopt;
+        }
+        const auto key = pointKey(mappingIndex, *snapped);
+        const auto it = idByKey.find(key);
+        if (it != idByKey.end()) {
+            return it->second;
         }
         return std::nullopt;
     };
@@ -729,7 +918,8 @@ std::vector<std::vector<size_t>> crossWindingChains(const Graph& graph,
 uint64_t addCollectionForPath(PointCollections& collections,
                               const Graph& graph,
                               const std::string& name,
-                              const std::vector<size_t>& path)
+                              const std::vector<size_t>& path,
+                              double windingBase)
 {
     if (path.empty()) {
         return 0;
@@ -740,7 +930,6 @@ uint64_t addCollectionForPath(PointCollections& collections,
     collections.setCollectionMetadata(collectionId, metadata);
     std::vector<ColPoint> points;
     points.reserve(path.size());
-    const double baseWinding = graph.points[path.front()].continuousWinding;
     for (size_t node : path) {
         const auto& gp = graph.points[node];
         ColPoint point = collections.addPoint(
@@ -749,7 +938,7 @@ uint64_t addCollectionForPath(PointCollections& collections,
                       static_cast<float>(gp.world[1]),
                       static_cast<float>(gp.world[2])));
         point.creation_time = 0;
-        point.winding_annotation = static_cast<float>(gp.continuousWinding - baseWinding);
+        point.winding_annotation = static_cast<float>(gp.continuousWinding - windingBase);
         point.fiber_dir = gp.fiberDir;
         collections.updatePoint(point);
         points.push_back(point);
@@ -782,6 +971,23 @@ void linkGeneratedCollectionWindings(PointCollections& collections,
     for (size_t i = 1; i < collectionIds.size(); ++i) {
         collections.setCollectionWindingsLinked(collectionIds[i], {root});
     }
+}
+
+std::optional<double> firstGeneratedWindingBase(const Graph& graph,
+                                                const std::vector<std::vector<size_t>>& linePaths,
+                                                const std::vector<std::vector<size_t>>& crossChains)
+{
+    for (const auto& path : linePaths) {
+        if (!path.empty()) {
+            return graph.points[path.front()].continuousWinding;
+        }
+    }
+    for (const auto& chain : crossChains) {
+        if (!chain.empty()) {
+            return graph.points[chain.front()].continuousWinding;
+        }
+    }
+    return std::nullopt;
 }
 
 uint64_t mix64(uint64_t value)
@@ -1241,6 +1447,7 @@ AtlasConstraintExportResult exportAtlasConstraints(
     const vc::lasagna::LasagnaNormalSampler* windingSampler,
     const AtlasConstraintExportOptions& options)
 {
+    (void)windingSampler;
     if (!baseSurface) {
         throw std::runtime_error("atlas constraints export requires a base surface");
     }
@@ -1254,20 +1461,35 @@ AtlasConstraintExportResult exportAtlasConstraints(
     for (size_t i = 0; i < exportData.objects.size(); ++i) {
         const auto& object = exportData.objects[i];
         fibers.push_back(loadFiberForConstraints(object.fiberPath, object.fiberRelativePath));
-        fiberIndexByKey[atlasFiberPathKey(object.fiberRelativePath)] = i;
+        const std::string key = atlasFiberPathKey(object.fiberRelativePath);
+        if (!fiberIndexByKey.emplace(key, i).second) {
+            throw std::runtime_error("duplicate atlas export object fiber path: " + key);
+        }
+    }
+
+    std::unordered_map<std::string, size_t> atlasMappingIndexByKey;
+    atlasMappingIndexByKey.reserve(exportData.atlas.fibers.size());
+    for (size_t i = 0; i < exportData.atlas.fibers.size(); ++i) {
+        const std::string key = atlasFiberPathKey(exportData.atlas.fibers[i].fiberPath);
+        if (!atlasMappingIndexByKey.emplace(key, i).second) {
+            throw std::runtime_error("duplicate atlas fiber mapping path: " + key);
+        }
     }
 
     const auto temporaryLinks = temporaryCycleClosingLinks(
         exportData,
         *baseSurface,
-        windingSampler,
         fibers,
         options,
-        fiberIndexByKey);
+        fiberIndexByKey,
+        atlasMappingIndexByKey);
+    result.linkDebugRows = buildLinkDebugRows(exportData, *baseSurface, temporaryLinks);
     Graph graph = buildGraph(
         exportData,
         *baseSurface,
         fibers,
+        fiberIndexByKey,
+        atlasMappingIndexByKey,
         temporaryLinks,
         options,
         result.report);
@@ -1278,12 +1500,20 @@ AtlasConstraintExportResult exportAtlasConstraints(
 
     if (options.exportLineConstraints) {
         linePaths = lineCoverPaths(graph, options.greedyBeamWidth);
+    }
+    if (options.exportCrossWindingConstraints) {
+        crossChains = crossWindingChains(graph, options);
+    }
+
+    const auto windingBase = firstGeneratedWindingBase(graph, linePaths, crossChains);
+
+    if (options.exportLineConstraints && windingBase) {
         size_t index = 0;
         for (const auto& path : linePaths) {
             std::ostringstream name;
             name << "atlas_line_" << std::setw(6) << std::setfill('0') << index++;
             const uint64_t collectionId =
-                addCollectionForPath(result.collections, graph, name.str(), path);
+                addCollectionForPath(result.collections, graph, name.str(), path, *windingBase);
             if (collectionId != 0) {
                 generatedCollectionIds.push_back(collectionId);
             }
@@ -1292,14 +1522,13 @@ AtlasConstraintExportResult exportAtlasConstraints(
         }
     }
 
-    if (options.exportCrossWindingConstraints) {
-        crossChains = crossWindingChains(graph, options);
+    if (options.exportCrossWindingConstraints && windingBase) {
         size_t index = 0;
         for (const auto& chain : crossChains) {
             std::ostringstream name;
             name << "atlas_cross_" << std::setw(6) << std::setfill('0') << index++;
             const uint64_t collectionId =
-                addCollectionForPath(result.collections, graph, name.str(), chain);
+                addCollectionForPath(result.collections, graph, name.str(), chain, *windingBase);
             if (collectionId != 0) {
                 generatedCollectionIds.push_back(collectionId);
             }

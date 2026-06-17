@@ -1623,6 +1623,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                                                            _viewerManager.get(),
                                                                            this,
                                                                            this);
+    _lineAnnotationController->setVolumeSelectorFactory(
+        [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::atlasCreated,
             this,
@@ -5280,21 +5282,6 @@ void CWindow::CreateWidgets(void)
             }
         });
 
-        _intersectionsVolumeDock = new QDockWidget(tr("Volume"), _intersectionsWorkspaceWindow);
-        _intersectionsVolumeDock->setObjectName(QStringLiteral("dockWidgetIntersectionsVolume"));
-        _intersectionsVolumeDock->setAllowedAreas(Qt::LeftDockWidgetArea |
-                                                  Qt::RightDockWidgetArea |
-                                                  Qt::TopDockWidgetArea);
-        auto* volumeContainer = new QWidget(_intersectionsVolumeDock);
-        auto* volumeLayout = new QVBoxLayout(volumeContainer);
-        volumeLayout->setContentsMargins(4, 4, 4, 4);
-        auto* volumeSelector = new VolumeSelector(volumeContainer);
-        volumeSelector->setLabelVisible(false);
-        _intersectionsVolumeSelect = volumeSelector->comboBox();
-        volumeLayout->addWidget(volumeSelector);
-        volumeLayout->addStretch(1);
-        _intersectionsVolumeDock->setWidget(volumeContainer);
-        _intersectionsWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _intersectionsVolumeDock);
     }
 
     createAtlasWorkspace();
@@ -6194,30 +6181,7 @@ void CWindow::CreateWidgets(void)
     // Initialize surface overlay dropdown (will be populated when surfaces load)
     updateSurfaceOverlayDropdown();
 
-    auto connectVolumeSelector = [this](QComboBox* selector) {
-        if (!selector) {
-            return;
-        }
-        connect(
-            selector, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, selector](const int& index) {
-                auto vpkg = _state->vpkg();
-                if (vpkg && index >= 0) {
-                    const QString volumeId = selector->currentData().toString();
-                    std::shared_ptr<Volume> newVolume;
-                    try {
-                        newVolume = vpkg->volume(volumeId.toStdString());
-                    } catch (const std::out_of_range&) {
-                        QMessageBox::warning(this, "Error", "Could not load volume.");
-                        syncVolumeSelectionControls();
-                        return;
-                    }
-                    setVolume(newVolume);
-                    syncVolumeSelectionControls(volumeId);
-                }
-            });
-    };
     connectVolumeSelector(volSelect);
-    connectVolumeSelector(_intersectionsVolumeSelect);
 
     auto* filterDropdown = ui.btnFilterDropdown;
     auto* cmbPointSetFilter = ui.cmbPointSetFilter;
@@ -6677,6 +6641,62 @@ void CWindow::OpenVolume(const QString& path)
     }
 }
 
+std::vector<QComboBox*> CWindow::volumeSelectionControls() const
+{
+    std::vector<QComboBox*> selectors;
+    if (volSelect) {
+        selectors.push_back(volSelect);
+    }
+    for (const auto& selector : _annotationVolumeSelects) {
+        if (selector) {
+            selectors.push_back(selector.data());
+        }
+    }
+    return selectors;
+}
+
+void CWindow::connectVolumeSelector(QComboBox* selector)
+{
+    if (!selector) {
+        return;
+    }
+    connect(selector,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            [this, selector](const int& index) {
+                auto vpkg = _state->vpkg();
+                if (vpkg && index >= 0) {
+                    const QString volumeId = selector->currentData().toString();
+                    std::shared_ptr<Volume> newVolume;
+                    try {
+                        newVolume = vpkg->volume(volumeId.toStdString());
+                    } catch (const std::out_of_range&) {
+                        QMessageBox::warning(this, "Error", "Could not load volume.");
+                        syncVolumeSelectionControls();
+                        return;
+                    }
+                    setVolume(newVolume);
+                    syncVolumeSelectionControls(volumeId);
+                }
+            });
+}
+
+QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)
+{
+    auto* volumeSelector = new VolumeSelector(parent);
+    volumeSelector->setLabelVisible(false);
+    volumeSelector->setBrowseEnabled(false);
+    if (auto* combo = volumeSelector->comboBox()) {
+        combo->setObjectName(QStringLiteral("annotationVolumeSelect"));
+        combo->setMinimumWidth(130);
+        combo->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        _annotationVolumeSelects.push_back(QPointer<QComboBox>(combo));
+        connectVolumeSelector(combo);
+    }
+    refreshVolumeSelectionUi();
+    return volumeSelector;
+}
+
 void CWindow::syncVolumeSelectionControls(const QString& activeVolumeId)
 {
     QString targetId = activeVolumeId;
@@ -6684,7 +6704,7 @@ void CWindow::syncVolumeSelectionControls(const QString& activeVolumeId)
         targetId = QString::fromStdString(_state->currentVolumeId());
     }
 
-    for (QComboBox* selector : {volSelect, _intersectionsVolumeSelect}) {
+    for (QComboBox* selector : volumeSelectionControls()) {
         if (!selector) {
             continue;
         }
@@ -6699,7 +6719,8 @@ void CWindow::syncVolumeSelectionControls(const QString& activeVolumeId)
 
 void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 {
-    if ((!volSelect && !_intersectionsVolumeSelect) || !_state || !_state->vpkg()) {
+    const auto selectors = volumeSelectionControls();
+    if (selectors.empty() || !_state || !_state->vpkg()) {
         return;
     }
 
@@ -6707,7 +6728,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
     QString currentComboId;
-    for (QComboBox* selector : {volSelect, _intersectionsVolumeSelect}) {
+    for (QComboBox* selector : selectors) {
         if (selector && selector->currentIndex() >= 0) {
             currentComboId = selector->currentData().toString();
             if (!currentComboId.isEmpty()) {
@@ -6772,7 +6793,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         activeCandidate = orderedIds.front();
     }
 
-    for (QComboBox* selector : {volSelect, _intersectionsVolumeSelect}) {
+    for (QComboBox* selector : selectors) {
         if (!selector) {
             continue;
         }
@@ -6792,7 +6813,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 
     QString activeId;
-    for (QComboBox* selector : {volSelect, _intersectionsVolumeSelect}) {
+    for (QComboBox* selector : selectors) {
         if (selector && selector->count() > 0) {
             activeId = selector->currentData().toString();
             break;
@@ -6907,10 +6928,12 @@ auto CWindow::can_change_volume_() -> bool
         return true;
     }
     // Also allow switching when volSelect has multiple remote volumes
-    if (_state && _state->currentVolume() &&
-        ((volSelect && volSelect->count() > 1) ||
-         (_intersectionsVolumeSelect && _intersectionsVolumeSelect->count() > 1))) {
-        return true;
+    if (_state && _state->currentVolume()) {
+        for (QComboBox* selector : volumeSelectionControls()) {
+            if (selector && selector->count() > 1) {
+                return true;
+            }
+        }
     }
     return false;
 }

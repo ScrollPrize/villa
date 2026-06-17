@@ -1,17 +1,18 @@
 #include "vc/atlas/AtlasConstraints.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <cstdlib>
+#include <cmath>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <locale>
-#include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -25,6 +26,7 @@ struct Options {
     fs::path lasagnaManifest;
     fs::path output;
     vc::atlas::AtlasConstraintExportOptions exportOptions;
+    bool printLinkTable = false;
 };
 
 void printUsage(const char* argv0)
@@ -39,6 +41,7 @@ void printUsage(const char* argv0)
         << "  --fiber-path PATH                     Base directory for atlas fiber JSON paths\n"
         << "  --debug-image PATH                    Write one debug image; extension selects format\n"
         << "  --dbg-dir DIR                         Write aggregate/per-constraint LZW TIFFs, including wrapped cross overlays\n"
+        << "  --link-table                          Print base and temporary atlas link debug table\n"
         << "  --line-max-step W                     Max on-fiber point spacing in windings (default 0.25)\n"
         << "  --cross-target W                      Cross-winding target distance (default 1.0)\n"
         << "  --cross-tolerance W                   Cross-winding tolerance (default 0.2)\n"
@@ -118,6 +121,10 @@ Options parseArgs(int argc, char** argv)
             options.exportOptions.exportCrossWindingConstraints = false;
             continue;
         }
+        if (arg == "--link-table") {
+            options.printLinkTable = true;
+            continue;
+        }
         if (auto value = optionValue(arg, "--output", i, argc, argv); !value.empty()) {
             options.output = value;
             continue;
@@ -180,10 +187,6 @@ Options parseArgs(int argc, char** argv)
 void resolveProjectContext(Options& options)
 {
     if (options.projectVolpkgJson.empty()) {
-        if (options.lasagnaManifest.empty() && options.exportOptions.closeCycles) {
-            throw std::runtime_error(
-                "missing Lasagna manifest; pass --lasagna-manifest, provide project.volpkg.json, or use --no-cycle-close");
-        }
         return;
     }
     const auto pkg = VolumePkg::load(options.projectVolpkgJson);
@@ -199,9 +202,61 @@ void resolveProjectContext(Options& options)
     if (options.lasagnaManifest.empty()) {
         options.lasagnaManifest = pkg->selectedLasagnaDatasetPath();
     }
-    if (options.lasagnaManifest.empty() && options.exportOptions.closeCycles) {
-        throw std::runtime_error(
-            "missing Lasagna manifest; set selected Lasagna dataset in project, pass --lasagna-manifest, or use --no-cycle-close");
+}
+
+std::string formatDouble(double value)
+{
+    if (!std::isfinite(value)) {
+        return "nan";
+    }
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::fixed << std::setprecision(6) << value;
+    return out.str();
+}
+
+std::string formatOptionalDouble(const std::optional<double>& value)
+{
+    return value ? formatDouble(*value) : "";
+}
+
+std::string formatOptionalInt(const std::optional<int>& value)
+{
+    return value ? std::to_string(*value) : "";
+}
+
+void printLinkTable(const std::vector<vc::atlas::AtlasConstraintLinkDebugRow>& rows)
+{
+    if (rows.empty()) {
+        std::cout << "link_table: no links\n";
+        return;
+    }
+    std::cout << "link_table:\n";
+    std::cout << std::left
+              << std::setw(6) << "kind"
+              << std::setw(34) << "first_fiber"
+              << std::setw(12) << "first_src"
+              << std::setw(14) << "first_w"
+              << std::setw(34) << "second_fiber"
+              << std::setw(12) << "second_src"
+              << std::setw(14) << "second_w"
+              << std::setw(14) << "atlas_dw"
+              << std::setw(12) << "desired_dw"
+              << std::setw(14) << "signed_w"
+              << '\n';
+    for (const auto& row : rows) {
+        std::cout << std::left
+                  << std::setw(6) << row.kind
+                  << std::setw(34) << row.firstFiber.string()
+                  << std::setw(12) << formatDouble(row.firstSource)
+                  << std::setw(14) << formatDouble(row.firstWinding)
+                  << std::setw(34) << row.secondFiber.string()
+                  << std::setw(12) << formatDouble(row.secondSource)
+                  << std::setw(14) << formatDouble(row.secondWinding)
+                  << std::setw(14) << formatDouble(row.atlasWindingDelta)
+                  << std::setw(12) << formatOptionalInt(row.desiredWindingDelta)
+                  << std::setw(14) << formatOptionalDouble(row.signedWindingDistance)
+                  << '\n';
     }
 }
 
@@ -221,17 +276,10 @@ int main(int argc, char** argv)
                 options.fiberPathRoot);
         QuadSurface baseSurface(exportData.basePath);
 
-        std::unique_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
-        std::optional<vc::lasagna::LasagnaDataset> dataset;
-        if (options.exportOptions.closeCycles) {
-            dataset = vc::lasagna::LasagnaDataset::open(options.lasagnaManifest);
-            sampler = std::make_unique<vc::lasagna::LasagnaNormalSampler>(*dataset);
-        }
-
         auto result = vc::atlas::exportAtlasConstraints(
             exportData,
             &baseSurface,
-            sampler.get(),
+            nullptr,
             options.exportOptions);
         if (!result.collections.saveToJSON(options.output.string())) {
             throw std::runtime_error("failed to write " + options.output.string());
@@ -247,6 +295,9 @@ int main(int argc, char** argv)
                   << " cross_points=" << result.report.crossPoints
                   << " debug_images=" << result.report.debugImagesWritten
                   << '\n';
+        if (options.printLinkTable) {
+            printLinkTable(result.linkDebugRows);
+        }
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "vc_atlas_constraints_export: " << ex.what() << '\n';

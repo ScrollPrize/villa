@@ -81,6 +81,7 @@ public:
 
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
+    using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
     using OptimizationTaskFactory =
         std::function<OptimizationTaskResult(std::filesystem::path,
                                              std::vector<vc::lasagna::LineControlPoint>,
@@ -130,6 +131,7 @@ public:
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
+    void setVolumeSelectorFactory(VolumeSelectorFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
@@ -173,6 +175,8 @@ private:
         QPointer<LineAnnotationDialog> dialog;
         std::shared_ptr<LineAnnotationSession> session;
     };
+
+    VolumeSelectorFactory _volumeSelectorFactory;
 
     std::string nextSurfaceName();
     void cleanupSurfaceName(const std::string& surfaceName);
