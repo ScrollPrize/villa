@@ -1,6 +1,8 @@
 #include "SeedingWidget.hpp"
 #include <iostream>
 #include "CState.hpp"
+#include "ViewerManager.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QMessageBox>
@@ -21,19 +23,200 @@
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Logging.hpp"
 
 #include "vc/ui/VCCollection.hpp"
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
 #include <functional>
+#include <limits>
+#include <unordered_set>
 
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
+
+
+namespace {
+struct SegmentTriangleHit {
+    float pathT = 0.0f;
+    float distanceSq = std::numeric_limits<float>::max();
+    cv::Vec3f point{0, 0, 0};
+};
+
+float clampFloat(float v, float lo, float hi)
+{
+    return std::max(lo, std::min(hi, v));
+}
+
+bool segmentTriangleIntersectionT(const cv::Vec3f& p0,
+                                  const cv::Vec3f& p1,
+                                  const std::array<cv::Vec3f, 3>& tri,
+                                  float& outT)
+{
+    constexpr float kEps = 1e-6f;
+    const cv::Vec3f dir = p1 - p0;
+    const cv::Vec3f edge1 = tri[1] - tri[0];
+    const cv::Vec3f edge2 = tri[2] - tri[0];
+    const cv::Vec3f h = dir.cross(edge2);
+    const float a = edge1.dot(h);
+    if (std::abs(a) < kEps) {
+        return false;
+    }
+
+    const float f = 1.0f / a;
+    const cv::Vec3f s = p0 - tri[0];
+    const float u = f * s.dot(h);
+    if (u < -kEps || u > 1.0f + kEps) {
+        return false;
+    }
+
+    const cv::Vec3f q = s.cross(edge1);
+    const float v = f * dir.dot(q);
+    if (v < -kEps || u + v > 1.0f + kEps) {
+        return false;
+    }
+
+    const float t = f * edge2.dot(q);
+    if (t < -kEps || t > 1.0f + kEps) {
+        return false;
+    }
+
+    outT = clampFloat(t, 0.0f, 1.0f);
+    return true;
+}
+
+float pointTriangleDistanceSq(const cv::Vec3f& p,
+                              const cv::Vec3f& a,
+                              const cv::Vec3f& b,
+                              const cv::Vec3f& c)
+{
+    const cv::Vec3f ab = b - a;
+    const cv::Vec3f ac = c - a;
+    const cv::Vec3f ap = p - a;
+    const float d1 = ab.dot(ap);
+    const float d2 = ac.dot(ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return (p - a).dot(p - a);
+
+    const cv::Vec3f bp = p - b;
+    const float d3 = ab.dot(bp);
+    const float d4 = ac.dot(bp);
+    if (d3 >= 0.0f && d4 <= d3) return (p - b).dot(p - b);
+
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        const float v = d1 / (d1 - d3);
+        const cv::Vec3f proj = a + v * ab;
+        return (p - proj).dot(p - proj);
+    }
+
+    const cv::Vec3f cp = p - c;
+    const float d5 = ab.dot(cp);
+    const float d6 = ac.dot(cp);
+    if (d6 >= 0.0f && d5 <= d6) return (p - c).dot(p - c);
+
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        const float w = d2 / (d2 - d6);
+        const cv::Vec3f proj = a + w * ac;
+        return (p - proj).dot(p - proj);
+    }
+
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        const cv::Vec3f proj = b + w * (c - b);
+        return (p - proj).dot(p - proj);
+    }
+
+    const cv::Vec3f n = ab.cross(ac);
+    const float n2 = n.dot(n);
+    if (n2 <= 1e-12f) {
+        return std::min({(p - a).dot(p - a), (p - b).dot(p - b), (p - c).dot(p - c)});
+    }
+    const float dist = (p - a).dot(n) / std::sqrt(n2);
+    return dist * dist;
+}
+
+SegmentTriangleHit segmentSegmentClosestOnFirst(const cv::Vec3f& p1,
+                                                const cv::Vec3f& q1,
+                                                const cv::Vec3f& p2,
+                                                const cv::Vec3f& q2)
+{
+    const cv::Vec3f d1 = q1 - p1;
+    const cv::Vec3f d2 = q2 - p2;
+    const cv::Vec3f r = p1 - p2;
+    const float a = d1.dot(d1);
+    const float e = d2.dot(d2);
+    const float f = d2.dot(r);
+    float s = 0.0f;
+    float t = 0.0f;
+
+    if (a <= 1e-12f && e <= 1e-12f) {
+        return {0.0f, (p1 - p2).dot(p1 - p2), p1};
+    }
+    if (a <= 1e-12f) {
+        t = clampFloat(f / e, 0.0f, 1.0f);
+    } else {
+        const float c = d1.dot(r);
+        if (e <= 1e-12f) {
+            s = clampFloat(-c / a, 0.0f, 1.0f);
+        } else {
+            const float b = d1.dot(d2);
+            const float denom = a * e - b * b;
+            if (denom != 0.0f) {
+                s = clampFloat((b * f - c * e) / denom, 0.0f, 1.0f);
+            }
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = clampFloat(-c / a, 0.0f, 1.0f);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = clampFloat((b - c) / a, 0.0f, 1.0f);
+            }
+        }
+    }
+
+    const cv::Vec3f c1 = p1 + d1 * s;
+    const cv::Vec3f c2 = p2 + d2 * t;
+    return {s, (c1 - c2).dot(c1 - c2), c1};
+}
+
+SegmentTriangleHit closestSegmentTriangleHit(const cv::Vec3f& p0,
+                                             const cv::Vec3f& p1,
+                                             const std::array<cv::Vec3f, 3>& tri)
+{
+    float t = 0.0f;
+    if (segmentTriangleIntersectionT(p0, p1, tri, t)) {
+        return {t, 0.0f, p0 + (p1 - p0) * t};
+    }
+
+    SegmentTriangleHit best{0.0f, pointTriangleDistanceSq(p0, tri[0], tri[1], tri[2]), p0};
+    const float endDistSq = pointTriangleDistanceSq(p1, tri[0], tri[1], tri[2]);
+    if (endDistSq < best.distanceSq) {
+        best = {1.0f, endDistSq, p1};
+    }
+
+    const std::array<std::pair<cv::Vec3f, cv::Vec3f>, 3> edges = {{
+        {tri[0], tri[1]}, {tri[1], tri[2]}, {tri[2], tri[0]}
+    }};
+    for (const auto& edge : edges) {
+        SegmentTriangleHit candidate = segmentSegmentClosestOnFirst(p0, p1, edge.first, edge.second);
+        if (candidate.distanceSq < best.distanceSq) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+} // namespace
 
 
 
@@ -200,11 +383,6 @@ void SeedingWidget::setupUI()
     resetPointsButton->setEnabled(false);
     mainLayout->addWidget(resetPointsButton);
 
-    // Label Wraps mode toggle
-    labelWrapsButton = new QPushButton("Start Label Wraps", this);
-    labelWrapsButton->setToolTip("Enable 'Label Wraps' mode: draw a line to auto-create a new collection with winding labels. Hold Shift for decreasing order.");
-    mainLayout->addWidget(labelWrapsButton);
-
     // Neural Trace from Scratch section
     auto neuralTraceGroup = new QGroupBox("Neural Trace (Python)", this);
     auto neuralLayout = new QVBoxLayout(neuralTraceGroup);
@@ -317,10 +495,9 @@ void SeedingWidget::setupUI()
             currentMode = Mode::PointMode;
             modeButton->setText("Switch to Draw Mode");
             infoLabel->setText("Point Mode: Set a focus point to begin");
-            // Turning off Draw Mode should also disable Label Wraps
+            // Turning off Draw Mode should also disable relative winding annotation.
             if (labelWrapsMode) {
-                labelWrapsMode = false;
-                if (labelWrapsButton) labelWrapsButton->setText("Start Label Wraps");
+                setRelWindingAnnotationMode(false);
             }
         }
         updateModeUI();
@@ -334,10 +511,6 @@ void SeedingWidget::setupUI()
     connect(expandSeedsButton, &QPushButton::clicked, this, &SeedingWidget::onExpandSeedsClicked);
     connect(resetPointsButton, &QPushButton::clicked, this, &SeedingWidget::onResetPointsClicked);
     connect(cancelButton, &QPushButton::clicked, this, &SeedingWidget::onCancelClicked);
-    connect(labelWrapsButton, &QPushButton::clicked, [this]() {
-        setLabelWrapsMode(!labelWrapsMode);
-    });
-
     // Connect neural trace signals
     connect(_btnNeuralTrace, &QPushButton::clicked, this, &SeedingWidget::onNeuralTraceClicked);
     connect(_neuralCheckpointBrowse, &QToolButton::clicked, this, &SeedingWidget::onNeuralCheckpointBrowseClicked);
@@ -390,6 +563,23 @@ void SeedingWidget::setState(CState* state)
 {
     _state = state;
     updateButtonStates();
+}
+
+void SeedingWidget::setViewerManager(ViewerManager* viewerManager)
+{
+    _viewerManager = viewerManager;
+}
+
+void SeedingWidget::setRelWindingIntersectionSource(int source)
+{
+    _relWindingIntersectionSource = source == static_cast<int>(RelWindingIntersectionSource::Patches)
+        ? RelWindingIntersectionSource::Patches
+        : RelWindingIntersectionSource::CurrentVolume;
+}
+
+void SeedingWidget::setRelWindingPatchTolerance(double tolerance)
+{
+    _relWindingPatchTolerance = std::max(0.0, tolerance);
 }
 
 void SeedingWidget::onCollectionsAdded(const std::vector<uint64_t>& collectionIds)
@@ -1453,36 +1643,52 @@ void SeedingWidget::finalizePath()
 
 void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
 {
+    const bool usePatchIntersections =
+        _relWindingIntersectionSource == RelWindingIntersectionSource::Patches;
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (!isDrawing || currentPath.points.size() < 2 || !currentVolume) {
+    if (!isDrawing || currentPath.points.size() < 2 || (!usePatchIntersections && !currentVolume)) {
         isDrawing = false;
         currentPath.points.clear();
         displayPaths();
         return;
     }
 
-    // Ensure distance transform available for center-of-band selection
-    computeDistanceTransform();
+    if (!usePatchIntersections) {
+        // Ensure distance transform available for center-of-band selection.
+        computeDistanceTransform();
+    }
 
-    // Create a new target collection
+    // Create a new target collection.
     std::string newColName = _point_collection->generateNewCollectionName("wraps");
     uint64_t newColId = _point_collection->addCollection(newColName);
 
-    // Analyze the just-drawn path and add peaks to the new collection
-    findPeaksAlongPathToCollection(currentPath, newColName);
+    int addedPoints = 0;
+    if (usePatchIntersections) {
+        addedPoints = findPatchIntersectionsAlongPathToCollection(currentPath, newColName);
+    } else {
+        findPeaksAlongPathToCollection(currentPath, newColName);
+        const auto& collections = _point_collection->getAllCollections();
+        const auto it = collections.find(newColId);
+        if (it != collections.end()) {
+            addedPoints = static_cast<int>(it->second.points.size());
+        }
+    }
 
-    // Auto fill winding annotations in chosen direction
-    _point_collection->autoFillWindingNumbers(
-        newColId,
-        shiftHeld ? VCCollection::WindingFillMode::Decremental : VCCollection::WindingFillMode::Incremental
-    );
+    if (addedPoints > 0) {
+        // Auto fill winding annotations in chosen direction.
+        _point_collection->autoFillWindingNumbers(
+            newColId,
+            shiftHeld ? VCCollection::WindingFillMode::Decremental : VCCollection::WindingFillMode::Incremental
+        );
+    }
 
-    // Reset drawing path and refresh view
+    // Reset drawing path and refresh view.
     isDrawing = false;
     currentPath.points.clear();
     displayPaths();
 
-    infoLabel->setText(QString("Label Wraps: added points to '%1' (%2)")
+    infoLabel->setText(QString("Rel winding annotation: added %1 point(s) to '%2' (%3)")
+                           .arg(addedPoints)
                            .arg(QString::fromStdString(newColName))
                            .arg(shiftHeld ? "decreasing" : "increasing"));
     updateButtonStates();
@@ -1560,20 +1766,222 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
     }
 }
 
-void SeedingWidget::setLabelWrapsMode(bool active)
+std::vector<std::shared_ptr<QuadSurface>> SeedingWidget::relWindingPatchSurfaces() const
 {
+    std::vector<std::shared_ptr<QuadSurface>> surfaces;
+    std::unordered_set<QuadSurface*> seen;
+    auto addSurface = [&](const std::shared_ptr<QuadSurface>& surface) {
+        if (!surface || seen.find(surface.get()) != seen.end()) {
+            return;
+        }
+        seen.insert(surface.get());
+        surfaces.push_back(surface);
+    };
+
+    auto package = _state ? _state->vpkg() : nullptr;
+    if (package) {
+        auto ids = package->getLoadedSurfaceIDs();
+        std::sort(ids.begin(), ids.end());
+        for (const auto& id : ids) {
+            addSurface(package->getSurface(id));
+        }
+    }
+
+    if (!surfaces.empty() || !_state) {
+        return surfaces;
+    }
+
+    auto names = _state->surfaceNames();
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) {
+        if (name == "segmentation" || name == "line-surface" || name == "line-side-slice" ||
+            name.rfind("line_annotation_slice_", 0) == 0) {
+            continue;
+        }
+        addSurface(std::dynamic_pointer_cast<QuadSurface>(_state->surface(name)));
+    }
+    return surfaces;
+}
+
+int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimitive& path,
+                                                               const std::string& collectionName)
+{
+    if (!_viewerManager || !_point_collection || path.points.size() < 2 || !_relWindingDrawViewer) {
+        return 0;
+    }
+
+    auto* plane = dynamic_cast<PlaneSurface*>(_relWindingDrawViewer->currentSurface());
+    if (!plane) {
+        return 0;
+    }
+
+    auto* patchIndex = _viewerManager->surfacePatchIndex();
+    auto* editPatchIndex = _viewerManager->activeSegmentationEditSurfacePatchIndex();
+    if ((!patchIndex || patchIndex->empty()) && (!editPatchIndex || editPatchIndex->empty())) {
+        return 0;
+    }
+
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> targetSurfaces;
+    for (const auto& surface : relWindingPatchSurfaces()) {
+        if (!surface) {
+            continue;
+        }
+        if ((patchIndex && patchIndex->containsSurface(surface)) ||
+            (editPatchIndex && editPatchIndex->containsSurface(surface))) {
+            targetSurfaces.insert(surface);
+        }
+    }
+    if (targetSurfaces.empty()) {
+        return 0;
+    }
+
+    struct PathHit {
+        SurfacePatchIndex::SurfacePtr surface;
+        float pathDistance = 0.0f;
+        float distanceSq = std::numeric_limits<float>::max();
+        cv::Vec3f point{0, 0, 0};
+    };
+
+    const float tolerance = static_cast<float>(std::max(0.0, _relWindingPatchTolerance));
+    const float toleranceSq = tolerance * tolerance;
+
+    std::vector<cv::Vec3f> pathPlane;
+    pathPlane.reserve(path.points.size());
+    float minX = std::numeric_limits<float>::max();
+    float minY = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float maxY = std::numeric_limits<float>::lowest();
+    for (const cv::Vec3f& point : path.points) {
+        const cv::Vec3f projected = plane->project(point, 1.0f, 1.0f);
+        if (!std::isfinite(projected[0]) || !std::isfinite(projected[1])) {
+            continue;
+        }
+        pathPlane.push_back(cv::Vec3f(projected[0], projected[1], 0.0f));
+        minX = std::min(minX, projected[0]);
+        minY = std::min(minY, projected[1]);
+        maxX = std::max(maxX, projected[0]);
+        maxY = std::max(maxY, projected[1]);
+    }
+    if (pathPlane.size() < 2) {
+        return 0;
+    }
+
+    const float roiPad = std::max(2.0f, tolerance + 2.0f);
+    cv::Rect planeRoi{static_cast<int>(std::floor(minX - roiPad)),
+                      static_cast<int>(std::floor(minY - roiPad)),
+                      std::max(1, static_cast<int>(std::ceil(maxX - minX + roiPad * 2.0f))),
+                      std::max(1, static_cast<int>(std::ceil(maxY - minY + roiPad * 2.0f)))};
+
+    std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<SurfacePatchIndex::TriangleSegment>> intersections;
+    auto appendIntersections = [&](SurfacePatchIndex* index) {
+        if (!index || index->empty()) {
+            return;
+        }
+        auto partial = index->computePlaneIntersections(*plane, planeRoi, targetSurfaces);
+        for (auto& [surface, segments] : partial) {
+            auto& out = intersections[surface];
+            out.insert(out.end(), segments.begin(), segments.end());
+        }
+    };
+    appendIntersections(patchIndex);
+    appendIntersections(editPatchIndex);
+    if (intersections.empty()) {
+        return 0;
+    }
+
+    std::vector<PathHit> hits;
+    float cumulativeDistance = 0.0f;
+    for (std::size_t i = 0; i + 1 < pathPlane.size(); ++i) {
+        const cv::Vec3f p0 = pathPlane[i];
+        const cv::Vec3f p1 = pathPlane[i + 1];
+        const float segmentLength = cv::norm(p1 - p0);
+        if (!std::isfinite(segmentLength) || segmentLength <= 1e-6f) {
+            continue;
+        }
+
+        for (const auto& [surface, segments] : intersections) {
+            for (const auto& segment : segments) {
+                const cv::Vec3f aProj = plane->project(segment.world[0], 1.0f, 1.0f);
+                const cv::Vec3f bProj = plane->project(segment.world[1], 1.0f, 1.0f);
+                if (!std::isfinite(aProj[0]) || !std::isfinite(aProj[1]) ||
+                    !std::isfinite(bProj[0]) || !std::isfinite(bProj[1])) {
+                    continue;
+                }
+                const cv::Vec3f a(aProj[0], aProj[1], 0.0f);
+                const cv::Vec3f b(bProj[0], bProj[1], 0.0f);
+                const auto hit = segmentSegmentClosestOnFirst(p0, p1, a, b);
+                if (hit.distanceSq <= toleranceSq) {
+                    hits.push_back({surface,
+                                    cumulativeDistance + hit.pathT * segmentLength,
+                                    hit.distanceSq,
+                                    plane->coord({0, 0, 0}, {hit.point[0], hit.point[1], 0.0f})});
+                }
+            }
+        }
+
+        cumulativeDistance += segmentLength;
+    }
+
+    if (hits.empty()) {
+        return 0;
+    }
+
+    std::sort(hits.begin(), hits.end(), [](const PathHit& a, const PathHit& b) {
+        if (a.pathDistance != b.pathDistance) {
+            return a.pathDistance < b.pathDistance;
+        }
+        const std::string aId = a.surface ? a.surface->id : std::string();
+        const std::string bId = b.surface ? b.surface->id : std::string();
+        return aId < bId;
+    });
+
+    const float mergeDistance = std::max(1e-3f, tolerance);
+    std::vector<PathHit> selected;
+    selected.reserve(hits.size());
+    for (const PathHit& hit : hits) {
+        bool merged = false;
+        for (PathHit& existing : selected) {
+            if (existing.surface == hit.surface &&
+                std::abs(existing.pathDistance - hit.pathDistance) <= mergeDistance) {
+                if (hit.distanceSq < existing.distanceSq) {
+                    existing = hit;
+                }
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            selected.push_back(hit);
+        }
+    }
+
+    std::sort(selected.begin(), selected.end(), [](const PathHit& a, const PathHit& b) {
+        return a.pathDistance < b.pathDistance;
+    });
+
+    for (const PathHit& hit : selected) {
+        _point_collection->addPoint(collectionName, hit.point);
+    }
+    return static_cast<int>(selected.size());
+}
+
+void SeedingWidget::setRelWindingAnnotationMode(bool active)
+{
+    if (labelWrapsMode == active) {
+        return;
+    }
+
     labelWrapsMode = active;
     if (labelWrapsMode) {
         currentMode = Mode::DrawMode;
-        infoLabel->setText("Label Wraps: draw a path; release to create a labeled collection. Hold Shift for decreasing order.");
-        labelWrapsButton->setText("Stop Label Wraps");
+        infoLabel->setText("Rel winding annotation: draw a path; release to create a labeled collection. Hold Shift for decreasing order.");
     } else {
         // Revert to default UI language; keep currentMode as-is
         infoLabel->setText("Point Mode: Set a focus point to begin");
-        labelWrapsButton->setText("Start Label Wraps");
     }
     updateModeUI();
     displayPaths();
+    emit relWindingAnnotationModeChanged(labelWrapsMode);
 }
 
 QColor SeedingWidget::generatePathColor()
@@ -1674,7 +2082,8 @@ void SeedingWidget::onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::Mous
     if (currentMode != Mode::DrawMode || button != Qt::LeftButton) {
         return;
     }
-    
+
+    _relWindingDrawViewer = qobject_cast<CChunkedVolumeViewer*>(sender());
     startDrawing(vol_point);
 }
 
