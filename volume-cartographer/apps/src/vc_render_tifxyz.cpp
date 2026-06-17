@@ -264,12 +264,10 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
                     float u0, float v0, cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec3f>& normals)
 {
     surf->gen(&points, &normals, size, cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
-    // NOTE: do NOT mutate `normals` here. gen() returns a view into the
-    // surface's shared per-instance scratch buffer (_genNormalsScratch), and
-    // the tile loop calls genTile() concurrently on one `surf` under OpenMP.
-    // Writing into that aliased view races with other threads' gen() calls
-    // (which realloc/overwrite the scratch) -> SIGSEGV. --flip-normals is
-    // applied later in prepareBaseAndDirs() on the thread-private clone.
+    // NOTE: do NOT mutate `normals` here. gen() returns a view into a scratch
+    // buffer it reuses across calls (thread_local per worker), so the next
+    // gen() on this thread overwrites it. --flip-normals is applied later in
+    // prepareBaseAndDirs() on the thread-private clone instead.
 }
 
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
