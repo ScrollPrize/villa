@@ -169,6 +169,22 @@ TEST_CASE("locate with SurfaceFilter include and exclude")
     q2.surfaces.exclude = &excl;
     auto rs2 = idx.locateAll(q2);
     for (const auto& r : rs2) CHECK(r.surface != a);
+
+    std::unordered_set<QuadSurface*> rawIncl{a.get()};
+    SurfacePatchIndex::PointQuery q3;
+    q3.worldPoint = q.worldPoint;
+    q3.tolerance = q.tolerance;
+    q3.surfaces.includeRaw = &rawIncl;
+    auto rs3 = idx.locateAll(q3);
+    for (const auto& r : rs3) CHECK(r.surface == a);
+
+    std::unordered_set<QuadSurface*> rawExcl{a.get()};
+    SurfacePatchIndex::PointQuery q4;
+    q4.worldPoint = q.worldPoint;
+    q4.tolerance = q.tolerance;
+    q4.surfaces.excludeRaw = &rawExcl;
+    auto rs4 = idx.locateAll(q4);
+    for (const auto& r : rs4) CHECK(r.surface != a);
 }
 
 TEST_CASE("forEachTriangle with patchFilter accepts/rejects bounds")

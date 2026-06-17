@@ -186,7 +186,8 @@ struct RawSurfaceFilter {
             return false;
         }
         if (hasInclude) {
-            if (rejectAllIncludes || include.find(surface) == include.end()) {
+            const bool included = include.find(surface) != include.end();
+            if (rejectAllIncludes || !included) {
                 return false;
             }
         }
@@ -199,7 +200,11 @@ RawSurfaceFilter makeRawSurfaceFilter(const SurfacePatchIndex::SurfaceFilter& fi
     RawSurfaceFilter raw;
     raw.only = filter.only ? filter.only.get() : nullptr;
 
-    if (filter.include) {
+    if (filter.includeRaw) {
+        raw.hasInclude = true;
+        raw.include = *filter.includeRaw;
+        raw.rejectAllIncludes = raw.include.empty();
+    } else if (filter.include) {
         raw.hasInclude = true;
         raw.include.reserve(filter.include->size());
         for (const auto& surface : *filter.include) {
@@ -210,6 +215,9 @@ RawSurfaceFilter makeRawSurfaceFilter(const SurfacePatchIndex::SurfaceFilter& fi
         raw.rejectAllIncludes = raw.include.empty();
     }
 
+    if (filter.excludeRaw) {
+        raw.exclude = *filter.excludeRaw;
+    }
     if (filter.exclude) {
         raw.exclude.reserve(filter.exclude->size());
         for (const auto& surface : *filter.exclude) {
@@ -1846,7 +1854,9 @@ SurfacePatchIndex::Impl::collectMappedEntriesForRebuild(QuadSurface* surface,
     return entries;
 }
 
-void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding)
+void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
+                                 float bboxPadding,
+                                 bool useMappedSurfaces)
 {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
@@ -1863,7 +1873,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
             continue;
         }
         std::shared_ptr<MappedTifxyzSurface> mapped;
-        if (!surface->path.empty()) {
+        if (useMappedSurfaces && !surface->path.empty()) {
             try {
                 mapped = std::make_shared<MappedTifxyzSurface>(surface->path);
             } catch (const std::exception& e) {
