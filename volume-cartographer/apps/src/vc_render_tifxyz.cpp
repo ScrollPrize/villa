@@ -41,6 +41,7 @@ using Json = utils::Json;
 
 static FILE* g_logFile = nullptr;       // non-null when --log-path active
 static std::string g_logPrefix;         // e.g. "[part 2/8] " — prepended when logging to file
+static bool g_flipNormals = false;      // negate surface normals (--flip-normals); reverses slice ordering along the normal
 static std::atomic<bool> g_logRunning{false};
 static std::thread g_logFlushThread;
 
@@ -263,6 +264,13 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
                     float u0, float v0, cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec3f>& normals)
 {
     surf->gen(&points, &normals, size, cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
+    if (g_flipNormals)
+        for (int y = 0; y < normals.rows; y++)
+            for (int x = 0; x < normals.cols; x++) {
+                cv::Vec3f& n = normals(y, x);
+                if (std::isnan(n[0])) continue;
+                n = -n;
+            }
 }
 
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
@@ -1063,6 +1071,15 @@ int main(int argc, char *argv[])
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
         ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
         ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
+        // The geometric normal is N = dP/dU x dP/dV (see grid_normal in Geometry.cpp),
+        // so (U, V, N) is right-handed. With the standard segment orientation (V down-screen
+        // aligned with +z, text readable, U winding outside->inside) that normal points toward
+        // the OUTSIDE of the scroll, i.e. behind the surface as the reader views it. Our
+        // convention is the opposite: w / layer number should increase going IN FRONT of the
+        // surface (toward the viewer / toward the scroll center), which makes (U, V, w) a
+        // left-handed frame. So --flip-normals is usually what we want: it negates N so the
+        // slice stack grows in front of the sheet rather than behind it.
+        ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals (reverses slice ordering along the normal)")
         ("zarr-output", po::value<std::string>(), "Output path for .zarr (optional)")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
@@ -1228,6 +1245,7 @@ int main(int argc, char *argv[])
     float scale_seg = parsed["scale-segmentation"].as<float>();
     double rotate_angle = parsed["rotate"].as<double>();
     int flip_axis = parsed["flip"].as<int>();
+    g_flipNormals = parsed["flip-normals"].as<bool>();
     const bool quickTif = parsed["quick-tif"].as<bool>();
 
     // --- Load affines ---
@@ -1372,6 +1390,7 @@ int main(int argc, char *argv[])
         logPrintf(stdout, "Rotation: %.0f degrees\n", rotate_angle);
     }
     if (flip_axis >= 0) logPrintf(stdout, "Flip: %s\n", flip_axis == 0 ? "V" : flip_axis == 1 ? "H" : "Both");
+    if (g_flipNormals) logPrintf(stdout, "Flip normals: on\n");
 
     if (wantZarr) {
         if (auto p = std::filesystem::path(zarrOutputArg).parent_path(); !p.empty())
