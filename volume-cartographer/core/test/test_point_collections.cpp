@@ -229,8 +229,11 @@ TEST_CASE("JSON round-trip preserves per-point fields")
     PointCollections c;
     auto p = c.addPoint("a", {1.5f, 2.5f, 3.5f});
     p.winding_annotation = 4.0f;
+    p.fiber_dir = "h";
     c.updatePoint(p);
-    c.addPoint("a", {9, 9, 9});  // leaves winding_annotation NaN
+    auto linked = c.addPoint("a", {9, 9, 9});  // leaves winding_annotation NaN
+    p.links.push_back(linked.id);
+    c.updatePoint(p);
 
     const fs::path tmp = fs::temp_directory_path() /
         ("pc_fields_" + std::to_string(::getpid()) + ".json");
@@ -241,13 +244,57 @@ TEST_CASE("JSON round-trip preserves per-point fields")
 
     int with_winding = 0, nan_winding = 0;
     cv::Vec3f seen_pos{};
+    bool saw_link = false;
+    bool saw_h = false;
+    bool saw_unknown_dir = false;
     for (const auto& q : loaded.getPoints("a")) {
-        if (std::isnan(q.winding_annotation)) { nan_winding++; }
-        else { with_winding++; seen_pos = q.p; }
+        if (std::isnan(q.winding_annotation)) {
+            nan_winding++;
+            saw_unknown_dir = saw_unknown_dir || q.fiber_dir.empty();
+        } else {
+            with_winding++;
+            seen_pos = q.p;
+            saw_link = q.links.size() == 1 && q.links.front() == linked.id;
+            saw_h = q.fiber_dir == "h";
+        }
     }
     CHECK(with_winding == 1);
     CHECK(nan_winding == 1);
     CHECK(seen_pos == cv::Vec3f(1.5f, 2.5f, 3.5f));  // float position survives
+    CHECK(saw_link);
+    CHECK(saw_h);
+    CHECK(saw_unknown_dir);
+}
+
+TEST_CASE("old point JSON defaults links and fiber direction")
+{
+    const fs::path tmp = fs::temp_directory_path() /
+        ("pc_old_fields_" + std::to_string(::getpid()) + ".json");
+    std::ofstream out(tmp);
+    out << R"({
+        "vc_pointcollections_json_version": "1",
+        "collections": {
+            "1": {
+                "name": "old",
+                "points": {
+                    "2": {"p": [1, 2, 3], "wind_a": null, "creation_time": 0}
+                },
+                "metadata": {},
+                "color": [1, 1, 1]
+            }
+        }
+    })";
+    out.close();
+
+    PointCollections loaded;
+    REQUIRE(loaded.loadFromJSON(tmp.string()));
+    fs::remove(tmp);
+
+    const auto points = loaded.getPoints("old");
+    REQUIRE(points.size() == 1);
+    CHECK(points.front().links.empty());
+    CHECK(points.front().fiber_dir.empty());
+    CHECK(loaded.getAllCollections().begin()->second.metadata.absolute_winding_number);
 }
 
 TEST_CASE("loadFromJSON rejects bad input and returns false")

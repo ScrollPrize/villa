@@ -168,6 +168,7 @@ target_link_libraries(vc_lasagna PUBLIC vc_core PRIVATE Ceres::ceres)
 
 add_library(vc_atlas
     src/Atlas.cpp
+    src/AtlasConstraints.cpp
     src/FiberIntersections.cpp
 )
 target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)

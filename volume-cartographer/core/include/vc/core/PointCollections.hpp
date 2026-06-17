@@ -18,6 +18,8 @@ struct ColPoint
     cv::Vec3f p = {0,0,0};
     float winding_annotation = NAN;
     int64_t creation_time = 0;
+    std::vector<uint64_t> links;
+    std::string fiber_dir;
 };
 
 struct CollectionMetadata

@@ -339,6 +339,39 @@ fs::path resolveAtlasRelativePath(const fs::path& atlasDir,
     return (atlasDir / jsonPath).lexically_normal();
 }
 
+fs::path resolveAtlasFiberPath(const fs::path& atlasDir,
+                               const fs::path& volpkgRoot,
+                               const fs::path& fiberPathRoot,
+                               const fs::path& jsonPath)
+{
+    if (jsonPath.empty() || jsonPath.is_absolute() || fiberPathRoot.empty()) {
+        return resolveAtlasRelativePath(atlasDir, volpkgRoot, jsonPath);
+    }
+
+    std::vector<fs::path> candidates;
+    candidates.push_back((fiberPathRoot / jsonPath).lexically_normal());
+
+    auto relativeIt = jsonPath.begin();
+    if (relativeIt != jsonPath.end() && relativeIt->string() == "fibers") {
+        fs::path withoutFibers;
+        ++relativeIt;
+        for (; relativeIt != jsonPath.end(); ++relativeIt) {
+            withoutFibers /= *relativeIt;
+        }
+        if (!withoutFibers.empty()) {
+            candidates.push_back((fiberPathRoot / withoutFibers).lexically_normal());
+        }
+    }
+
+    candidates.push_back((fiberPathRoot / jsonPath.filename()).lexically_normal());
+    for (const auto& candidate : candidates) {
+        if (fs::is_regular_file(candidate)) {
+            return candidate;
+        }
+    }
+    return candidates.front();
+}
+
 std::vector<fs::path> sortedAtlasFiberMappingFiles(const fs::path& atlasDir)
 {
     const fs::path mappingsDir = atlasDir / "mappings" / "fibers";
@@ -1008,6 +1041,13 @@ Atlas Atlas::load(const fs::path& atlasDir)
 
 Atlas Atlas::load(const fs::path& atlasDir, const fs::path& volpkgRootIn)
 {
+    return Atlas::load(atlasDir, volpkgRootIn, {});
+}
+
+Atlas Atlas::load(const fs::path& atlasDir,
+                  const fs::path& volpkgRootIn,
+                  const fs::path& fiberPathRoot)
+{
     Atlas atlas;
     const auto metadata = readJsonFile(atlasDir / "metadata.json");
     atlas.metadata.type = metadata.value("type", std::string{});
@@ -1078,13 +1118,13 @@ Atlas Atlas::load(const fs::path& atlasDir, const fs::path& volpkgRootIn)
             const fs::path volpkgRoot = volpkgRootIn.empty()
                 ? inferVolpkgRootFromAtlasDir(atlasDir)
                 : volpkgRootIn;
-            if (volpkgRoot.empty()) {
+            if (volpkgRoot.empty() && fiberPathRoot.empty()) {
                 throw std::runtime_error("cannot validate atlas fiber mapping " +
                                          mappingPath.string() +
                                          " without a volume package root; rebuild required");
             }
-            const fs::path fiberPath = resolveAtlasRelativePath(
-                atlasDir, volpkgRoot, mapping.fiberPath);
+            const fs::path fiberPath = resolveAtlasFiberPath(
+                atlasDir, volpkgRoot, fiberPathRoot, mapping.fiberPath);
             if (!fs::is_regular_file(fiberPath)) {
                 throw std::runtime_error("atlas fiber mapping " + mappingPath.string() +
                                          " references missing fiber path: " +
@@ -3523,7 +3563,8 @@ std::vector<AtlasDirectoryInfo> discoverAtlasDirectories(const fs::path& volpkgR
 }
 
 LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
-                                          const fs::path& volpkgRootIn)
+                                          const fs::path& volpkgRootIn,
+                                          const fs::path& fiberPathRoot)
 {
     if (atlasDir.empty() || !fs::is_directory(atlasDir)) {
         throw std::runtime_error("Atlas directory not found: " + atlasDir.string());
@@ -3537,7 +3578,7 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
     exportData.volpkgRoot = volpkgRootIn.empty()
         ? inferVolpkgRootFromAtlasDir(atlasDir)
         : volpkgRootIn;
-    exportData.atlas = Atlas::load(atlasDir, exportData.volpkgRoot);
+    exportData.atlas = Atlas::load(atlasDir, exportData.volpkgRoot, fiberPathRoot);
     exportData.baseRelativePath = exportData.atlas.metadata.baseMeshPath;
     if (exportData.baseRelativePath.empty()) {
         throw std::runtime_error("Atlas metadata is missing base_mesh_path.");
@@ -3601,8 +3642,8 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
             throw std::runtime_error("Atlas mapping " + mappingFiles[i].string() +
                                      " references missing fiber path: ");
         }
-        const fs::path fiberPath = resolveAtlasRelativePath(
-            atlasDir, exportData.volpkgRoot, mapping.fiberPath);
+        const fs::path fiberPath = resolveAtlasFiberPath(
+            atlasDir, exportData.volpkgRoot, fiberPathRoot, mapping.fiberPath);
         if (!fs::is_regular_file(fiberPath)) {
             throw std::runtime_error("Atlas mapping " + mappingFiles[i].string() +
                                      " references missing fiber path: " +

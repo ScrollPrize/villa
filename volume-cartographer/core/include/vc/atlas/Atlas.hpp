@@ -77,6 +77,9 @@ struct Atlas {
     static Atlas load(const std::filesystem::path& atlasDir);
     static Atlas load(const std::filesystem::path& atlasDir,
                       const std::filesystem::path& volpkgRoot);
+    static Atlas load(const std::filesystem::path& atlasDir,
+                      const std::filesystem::path& volpkgRoot,
+                      const std::filesystem::path& fiberPathRoot);
 };
 
 struct AtlasCoveredSize {
@@ -329,7 +332,8 @@ std::vector<AtlasDirectoryInfo> discoverAtlasDirectories(
     const std::filesystem::path& volpkgRoot);
 LasagnaAtlasExport loadLasagnaAtlasExport(
     const std::filesystem::path& atlasDir,
-    const std::filesystem::path& volpkgRoot = {});
+    const std::filesystem::path& volpkgRoot = {},
+    const std::filesystem::path& fiberPathRoot = {});
 std::filesystem::path uniqueAtlasDirectory(const std::filesystem::path& volpkgRoot,
                                            const std::string& baseName);
 std::filesystem::path initShellDirectoryFromManifest(

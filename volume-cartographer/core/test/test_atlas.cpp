@@ -2,6 +2,7 @@
 #include "vc_test.hpp"
 
 #include "vc/atlas/Atlas.hpp"
+#include "vc/atlas/FiberHvClassification.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/lasagna/Manifest.hpp"
@@ -906,6 +907,20 @@ TEST_CASE("Atlas search signed winding display uses H outward normal")
     CHECK(swappedDisplay.signedWindingDistance == doctest::Approx(-2.25));
 }
 
+TEST_CASE("Fiber H/V classification uses manual tag before automatic score")
+{
+    const std::vector<cv::Vec3d> horizontal{{0.0, 0.0, 0.0}, {10.0, 0.0, 0.0}};
+    const std::vector<cv::Vec3d> vertical{{0.0, 0.0, 0.0}, {0.0, 0.0, 10.0}};
+
+    const auto hAuto = vc::atlas::classifyFiberHv(horizontal);
+    const auto vAuto = vc::atlas::classifyFiberHv(vertical);
+    CHECK(hAuto.automaticTag == vc::atlas::FiberHvTag::H);
+    CHECK(vAuto.automaticTag == vc::atlas::FiberHvTag::V);
+    CHECK(vc::atlas::effectiveFiberHvTag(hAuto, "V") == vc::atlas::FiberHvTag::V);
+    CHECK(vc::atlas::effectiveFiberHvTag(vAuto, "H") == vc::atlas::FiberHvTag::H);
+    CHECK(vc::atlas::firstFiberDisplaysAsH(vAuto, "H", hAuto, "V"));
+}
+
 TEST_CASE("Atlas search signed winding display fails on missing signing data")
 {
     auto surface = makeWrappedPlane(5, 4, 0.0);
@@ -1246,6 +1261,22 @@ TEST_CASE("Lasagna atlas export is derived from native atlas metadata and mappin
     CHECK(compact.at("maps")[0].at("winding_offset").get<int>() == 0);
     CHECK(compact.at("maps")[0].at("mapping_path").get<std::string>() ==
           "mappings/fibers/fiber.json");
+}
+
+TEST_CASE("Lasagna atlas export can resolve fibers from explicit fiber path root")
+{
+    const fs::path root = tempRoot("vc_atlas_lasagna_export_fiber_root");
+    writeValidLasagnaAtlasFixture(root, "fiber_atlas");
+    const fs::path detachedAtlas = root / "detached_atlas";
+    fs::rename(root / "atlases" / "fiber_atlas", detachedAtlas);
+
+    const auto exported = vc::atlas::loadLasagnaAtlasExport(
+        detachedAtlas,
+        {},
+        root / "fibers");
+    REQUIRE(exported.objects.size() == 1);
+    CHECK(exported.objects[0].fiberPath == root / "fibers" / "fiber.json");
+    CHECK(exported.objects[0].fiberRelativePath == fs::path("fibers/fiber.json"));
 }
 
 TEST_CASE("Lasagna atlas export rejects obsolete fiber mappings before compact export")
