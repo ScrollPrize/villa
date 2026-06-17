@@ -821,6 +821,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit slimFlattenRequested(segmentId);
     });
 
+    QAction* straightenAction = contextMenu.addAction(tr("Straighten (vc_straighten)"));
+    connect(straightenAction, &QAction::triggered, this, [this, segmentId]() {
+        emit straightenRequested(segmentId);
+    });
+
     QAction* abfFlattenAction = contextMenu.addAction(tr("ABF++ flatten"));
     connect(abfFlattenAction, &QAction::triggered, this, [this, segmentId]() {
         emit abfFlattenRequested(segmentId);

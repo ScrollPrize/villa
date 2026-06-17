@@ -225,6 +225,7 @@ TEST_CASE("ChunkCache: stats reflect decoded byte budget and activity")
     auto s = c->stats();
     CHECK(s.decodedByteCapacity > 0);
     CHECK(s.decodedBytes >= 64);
+    CHECK_FALSE(s.persistentCacheEnabled);
 }
 
 TEST_CASE("ChunkCache: invalidate clears decoded entries")

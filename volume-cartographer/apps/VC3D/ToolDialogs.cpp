@@ -1613,6 +1613,152 @@ QString SlimFlattenDialog::outputPath() const
     return defaultOutput_;
 }
 
+// ================= StraightenDialog =================
+bool StraightenDialog::s_haveSession = false;
+bool StraightenDialog::s_unbend = true;
+double StraightenDialog::s_unbendSmoothCols = 300.0;
+int StraightenDialog::s_overlapPasses = 2;
+bool StraightenDialog::s_orthogonalize = true;
+bool StraightenDialog::s_trim = true;
+double StraightenDialog::s_trimMaxEdge = 100.0;
+
+StraightenDialog::StraightenDialog(QWidget* parent, const QString& defaultOutputPath)
+    : QDialog(parent)
+    , defaultOutput_(defaultOutputPath)
+{
+    setWindowTitle(tr("Straighten"));
+    auto main = new QVBoxLayout(this);
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    cbUnbend_ = new QCheckBox(tr("Unbend (spine-based bend removal)"), this);
+    cbUnbend_->setChecked(s_haveSession ? s_unbend : true);
+    cbUnbend_->setToolTip(tr(
+        "Fit a smooth spine through the band and re-coordinate into "
+        "(arc-length, normal-offset). A local rotation that removes global "
+        "curvature without shearing. Run this before the other stages when "
+        "the flattened band curves in UV (e.g. a free-boundary SLIM result)."));
+    form->addRow(QString(), cbUnbend_);
+
+    spUnbendSmooth_ = new QDoubleSpinBox(this);
+    spUnbendSmooth_->setRange(10.0, 5000.0);
+    spUnbendSmooth_->setDecimals(0);
+    spUnbendSmooth_->setSingleStep(50.0);
+    spUnbendSmooth_->setValue(s_haveSession ? s_unbendSmoothCols : 300.0);
+    spUnbendSmooth_->setToolTip(tr("Spine Gaussian sigma (columns). Larger keeps the unbend gentle/global."));
+    form->addRow(tr("Unbend smoothing:"), spUnbendSmooth_);
+
+    spOverlap_ = new QSpinBox(this);
+    spOverlap_->setRange(0, 10);
+    spOverlap_->setValue(s_haveSession ? s_overlapPasses : 2);
+    spOverlap_->setToolTip(tr(
+        "Cross-wrap row-alignment passes. Each pass pairs grid points with the "
+        "nearest 3D point one winding over and warps v so they share a row; "
+        "each pass re-measures from the 3D geometry. 0 disables."));
+    form->addRow(tr("Overlap-pair passes:"), spOverlap_);
+
+    cbOrtho_ = new QCheckBox(tr("Orthogonalize columns"), this);
+    cbOrtho_->setChecked(s_haveSession ? s_orthogonalize : true);
+    cbOrtho_->setToolTip(tr("Remove residual column shear measured from the surface tangents."));
+    form->addRow(QString(), cbOrtho_);
+
+    cbTrim_ = new QCheckBox(tr("Trim bridge cells"), this);
+    cbTrim_->setChecked(s_haveSession ? s_trim : true);
+    cbTrim_->setToolTip(tr(
+        "Drop cells whose 3D step to a grid neighbor is absurdly long. They are "
+        "few but dominate area-weighted distortion metrics and render as "
+        "mid-air geometry."));
+    form->addRow(QString(), cbTrim_);
+
+    spTrimMaxEdge_ = new QDoubleSpinBox(this);
+    spTrimMaxEdge_->setRange(1.0, 10000.0);
+    spTrimMaxEdge_->setDecimals(0);
+    spTrimMaxEdge_->setSingleStep(10.0);
+    spTrimMaxEdge_->setValue(s_haveSession ? s_trimMaxEdge : 100.0);
+    spTrimMaxEdge_->setToolTip(tr("Max 3D neighbor-step (voxels) before a cell is trimmed. Nominal step is 1/scale (~20 at scale 0.05)."));
+    form->addRow(tr("Trim max edge:"), spTrimMaxEdge_);
+
+    auto outputRow = new QHBoxLayout();
+    edtOutput_ = new QLineEdit(this);
+    edtOutput_->setText(defaultOutput_);
+    edtOutput_->setToolTip(tr("Output tifxyz directory (must not exist). Defaults to <segment>_straightened next to the input."));
+    auto btnBrowse = new QPushButton(tr("Browse..."), this);
+    auto btnReset = new QPushButton(tr("Default"), this);
+    outputRow->addWidget(edtOutput_, /*stretch=*/1);
+    outputRow->addWidget(btnBrowse);
+    outputRow->addWidget(btnReset);
+    form->addRow(tr("Output:"), outputRow);
+
+    auto syncEnabled = [this]() {
+        if (spUnbendSmooth_) spUnbendSmooth_->setEnabled(cbUnbend_->isChecked());
+        if (spTrimMaxEdge_)  spTrimMaxEdge_->setEnabled(cbTrim_->isChecked());
+    };
+    connect(cbUnbend_, &QCheckBox::toggled, this, [syncEnabled]() { syncEnabled(); });
+    connect(cbTrim_,   &QCheckBox::toggled, this, [syncEnabled]() { syncEnabled(); });
+    syncEnabled();
+
+    connect(btnBrowse, &QPushButton::clicked, this, [this]() {
+        const QString start = edtOutput_->text().isEmpty()
+            ? QFileInfo(defaultOutput_).absolutePath()
+            : edtOutput_->text();
+        const QString chosen = QFileDialog::getSaveFileName(
+            this, tr("Choose output tifxyz directory"), start,
+            /*filter=*/QString(), /*selectedFilter=*/nullptr,
+            QFileDialog::DontConfirmOverwrite);
+        if (!chosen.isEmpty()) edtOutput_->setText(chosen);
+    });
+    connect(btnReset, &QPushButton::clicked, this, [this]() {
+        edtOutput_->setText(defaultOutput_);
+    });
+
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(btns);
+
+    connect(btns, &QDialogButtonBox::accepted, this, [this]() {
+        s_haveSession = true;
+        s_unbend = cbUnbend_->isChecked();
+        s_unbendSmoothCols = spUnbendSmooth_->value();
+        s_overlapPasses = spOverlap_->value();
+        s_orthogonalize = cbOrtho_->isChecked();
+        s_trim = cbTrim_->isChecked();
+        s_trimMaxEdge = spTrimMaxEdge_->value();
+    });
+}
+
+QString StraightenDialog::outputPath() const
+{
+    if (edtOutput_) {
+        const QString t = edtOutput_->text().trimmed();
+        if (!t.isEmpty()) return t;
+    }
+    return defaultOutput_;
+}
+
+QStringList StraightenDialog::toArgs() const
+{
+    QStringList a;
+    if (cbUnbend_ && cbUnbend_->isChecked()) {
+        a << QStringLiteral("--unbend");
+        if (spUnbendSmooth_)
+            a << QStringLiteral("--unbend-smooth-cols")
+              << QString::number(spUnbendSmooth_->value(), 'f', 0);
+    }
+    // Always explicit so vc_straighten never falls back to its implicit
+    // "no stage flags = full default pipeline" behavior.
+    a << QStringLiteral("--overlap-pairs")
+      << QString::number(spOverlap_ ? spOverlap_->value() : 2);
+    if (cbOrtho_ && cbOrtho_->isChecked()) a << QStringLiteral("--orthogonalize");
+    if (cbTrim_ && cbTrim_->isChecked()) {
+        a << QStringLiteral("--trim");
+        if (spTrimMaxEdge_)
+            a << QStringLiteral("--trim-max-edge")
+              << QString::number(spTrimMaxEdge_->value(), 'f', 0);
+    }
+    return a;
+}
+
 // ================= VisLasagnaObjDialog =================
 // static session members
 bool VisLasagnaObjDialog::s_haveSession = false;

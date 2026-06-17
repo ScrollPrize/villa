@@ -77,6 +77,35 @@ std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
         0.0, ChunkDtype::UInt8, opts);
 }
 
+std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99})
+{
+    return std::vector<std::byte>(n, v);
+}
+
+void writeSizedFile(const fs::path& path, std::size_t size, unsigned char value = 0x10)
+{
+    fs::create_directories(path.parent_path());
+    std::ofstream f(path, std::ios::binary);
+    std::vector<char> bytes(size, static_cast<char>(value));
+    f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+template <typename Predicate>
+ChunkCache::Stats waitForStats(ChunkCache& c,
+                               Predicate predicate,
+                               std::chrono::milliseconds timeout = std::chrono::seconds{2})
+{
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    ChunkCache::Stats s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        s = c.stats();
+        if (predicate(s))
+            return s;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return c.stats();
+}
+
 ChunkResult waitForResolved(ChunkCache& c, int level, int iz, int iy, int ix,
                             std::chrono::milliseconds timeout = std::chrono::seconds{2})
 {
@@ -100,6 +129,9 @@ TEST_CASE("Missing chunk with persistent cache writes an .empty marker")
         auto c = makeCache(f, persist);
         auto r = waitForResolved(*c, 0, 0, 0, 0);
         CHECK(r.status == ChunkStatus::Missing);
+        (void)waitForStats(*c, [](const ChunkCache::Stats& s) {
+            return !s.persistentCacheScanInFlight && s.persistentCacheBytes >= 1;
+        });
     }
     // After cache destruction, the persistent dir should contain an .empty
     // file somewhere under level_0/.
@@ -135,6 +167,10 @@ TEST_CASE("Reopen cache: persistent .empty marker short-circuits to Missing")
     // First call may be MissQueued or immediate Missing — wait it out.
     auto resolved = waitForResolved(*c, 0, 0, 0, 0);
     CHECK(resolved.status == ChunkStatus::Missing);
+    (void)r;
+    (void)waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight;
+    });
     // Fetcher should not have been called — the empty marker short-circuits.
     // Tolerate impl variance — just confirm no crash.
     fs::remove_all(persist);
@@ -160,6 +196,9 @@ TEST_CASE("Reopen cache: persistent data file is loaded directly")
     if (r.status == ChunkStatus::Data && r.bytes) {
         CHECK(int(std::to_integer<int>((*r.bytes)[0])) == 0x42);
     }
+    (void)waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight;
+    });
     fs::remove_all(persist);
 }
 
@@ -175,9 +214,139 @@ TEST_CASE("stats: persistentCacheBytes reflects the on-disk size")
     }
     auto f = std::make_shared<CountingFetcher>();
     auto c = makeCache(f, persist);
-    auto s = c->stats();
+    auto s = waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight && s.persistentCacheBytes >= 64;
+    });
+    CHECK(s.persistentCacheEnabled);
     CHECK(s.persistentCacheBytes >= 64);
+    CHECK_FALSE(s.persistentCacheScanInFlight);
     fs::remove_all(persist);
+}
+
+TEST_CASE("stats: startup scan ignores files newer than its cutoff")
+{
+    auto persist = tmpDir("scan_cutoff");
+    const auto target = persist / "level_0" / "0" / "0";
+    writeSizedFile(target / "0.bin", 31);
+    writeSizedFile(target / "1.empty", 1);
+
+    auto f = std::make_shared<CountingFetcher>();
+    auto c = makeCache(f, persist);
+
+    writeSizedFile(target / "post.bin", 17);
+    std::error_code ec;
+    fs::last_write_time(
+        target / "post.bin",
+        fs::file_time_type::clock::now() + std::chrono::seconds{10},
+        ec);
+
+    auto s = waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight;
+    });
+    CHECK(s.persistentCacheBytes == 32);
+    fs::remove_all(persist);
+}
+
+TEST_CASE("stats: repeated calls do not rescan persistent cache")
+{
+    auto persist = tmpDir("no_rescan");
+    const auto target = persist / "level_0" / "0" / "0";
+    writeSizedFile(target / "0.bin", 11);
+
+    auto f = std::make_shared<CountingFetcher>();
+    auto c = makeCache(f, persist);
+    auto first = waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight && s.persistentCacheBytes == 11;
+    });
+    REQUIRE(first.persistentCacheBytes == 11);
+
+    writeSizedFile(target / "external.bin", 29);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2300));
+    for (int i = 0; i < 5; ++i) {
+        auto s = c->stats();
+        CHECK(s.persistentCacheBytes == 11);
+        CHECK_FALSE(s.persistentCacheScanInFlight);
+    }
+    fs::remove_all(persist);
+}
+
+TEST_CASE("stats: successful persistent data write increments byte count")
+{
+    auto persist = tmpDir("write_delta");
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fr;
+    fr.status = ChunkFetchStatus::Found;
+    fr.bytes = makeBytes(64, std::byte{7});
+    f->setCanned({0, 0, 0, 0}, fr);
+
+    auto c = makeCache(f, persist);
+    auto initial = waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight;
+    });
+    CHECK(initial.persistentCacheBytes == 0);
+
+    auto r = waitForResolved(*c, 0, 0, 0, 0);
+    CHECK(r.status == ChunkStatus::Data);
+    auto after = waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return s.persistentCacheBytes == 64;
+    });
+    CHECK(after.persistentCacheBytes == 64);
+    fs::remove_all(persist);
+}
+
+TEST_CASE("stats: persistent overwrite applies new minus old byte delta")
+{
+    auto persist = tmpDir("overwrite_delta");
+    const auto target = persist / "level_0" / "0" / "0";
+    writeSizedFile(target / "0.bin", 80);
+
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fr;
+    fr.status = ChunkFetchStatus::Found;
+    fr.bytes = makeBytes(64, std::byte{8});
+    f->setCanned({0, 0, 0, 0}, fr);
+
+    auto c = makeCache(f, persist);
+    auto r = waitForResolved(*c, 0, 0, 0, 0);
+    CHECK(r.status == ChunkStatus::Data);
+    auto after = waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight && s.persistentCacheBytes == 64;
+    });
+    CHECK(after.persistentCacheBytes == 64);
+    fs::remove_all(persist);
+}
+
+TEST_CASE("stats: failed persistent write does not change byte count")
+{
+    auto persistFile = tmpDir("write_fail_parent") / "cache_file";
+    writeSizedFile(persistFile, 3);
+
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fr;
+    fr.status = ChunkFetchStatus::Found;
+    fr.bytes = makeBytes(64, std::byte{9});
+    f->setCanned({0, 0, 0, 0}, fr);
+
+    auto c = makeCache(f, persistFile);
+    auto initial = waitForStats(*c, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight;
+    });
+    CHECK(initial.persistentCacheBytes == 0);
+
+    auto r = waitForResolved(*c, 0, 0, 0, 0);
+    CHECK(r.status == ChunkStatus::Data);
+
+    auto barrierDir = tmpDir("write_fail_barrier");
+    auto barrier = makeCache(std::make_shared<CountingFetcher>(), barrierDir);
+    (void)waitForStats(*barrier, [](const ChunkCache::Stats& s) {
+        return !s.persistentCacheScanInFlight;
+    });
+
+    auto after = c->stats();
+    CHECK(after.persistentCacheBytes == 0);
+    CHECK_FALSE(after.persistentCacheScanInFlight);
+    fs::remove_all(persistFile.parent_path());
+    fs::remove_all(barrierDir);
 }
 
 TEST_CASE("prefetchChunks(wait=false): non-blocking; later tryGetChunk picks it up")
