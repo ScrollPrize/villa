@@ -162,6 +162,80 @@ def _link_points_to_patches_with_surface_index(
     return links
 
 
+_BETWEEN_PATCHES_PREFIX = 'between_patches__'
+
+
+def _resolve_between_patches_targets(
+    collection: Dict[str, Any],
+    patches: Dict[str, Patch],
+) -> Optional[Dict[str, Patch]]:
+    """Resolve a "between_patches__XXX__YYY" collection to its named patch pair.
+
+    These collections are written by connect_overlapping_patches.py to connect
+    a specific pair of patches; their points should attach only to that pair.
+    Returns ``{XXX: patch, YYY: patch}`` when the name encodes a pair and both
+    patches are present, otherwise ``None`` (so the collection falls back to the
+    general nearest-patch search). Patch ids may themselves contain the ``__``
+    separator, so the split is disambiguated by requiring both halves to name an
+    existing patch.
+    """
+    name = collection.get('name', '') or ''
+    if not name.startswith(_BETWEEN_PATCHES_PREFIX):
+        return None
+    rest = name[len(_BETWEEN_PATCHES_PREFIX):]
+    idx = rest.find('__')
+    while idx != -1:
+        a, b = rest[:idx], rest[idx + 2:]
+        if a in patches and b in patches:
+            return {a: patches[a], b: patches[b]}
+        idx = rest.find('__', idx + 1)
+    return None
+
+
+def _link_collection_to_patch_subset(
+    links: Dict[str, List[PointPatchLink]],
+    collection_id: int,
+    collection: Dict[str, Any],
+    candidate_patches: Dict[str, Patch],
+    tolerance: float,
+) -> None:
+    """Attach each point of one collection to the nearest of ``candidate_patches``.
+
+    Brute-force projection (``Patch.project``) restricted to the given patch
+    subset; the nearest patch within ``tolerance`` wins. Shared by the general
+    fallback (all patches) and the "between_patches" special case (the named
+    pair only).
+    """
+    device = torch.device('cpu')
+    tolerance_t = torch.tensor(tolerance, device=device, dtype=torch.float32)
+
+    for point_id, point in collection['points'].items():
+        point_zyx = torch.as_tensor(point.get('zyx', point['p'][::-1]), dtype=torch.float32, device=device)
+
+        nearest_patch_id = None
+        nearest_distance = torch.tensor(float('inf'), device=device)
+        nearest_ij = None
+
+        for patch_id, patch in candidate_patches.items():
+            ij_coord, distance = patch.project(point_zyx)
+            if distance < nearest_distance and distance <= tolerance_t:
+                nearest_distance = distance
+                nearest_patch_id = patch_id
+                nearest_ij = ij_coord
+
+        if nearest_patch_id:
+            _record_point_patch_link(
+                links,
+                collection,
+                collection_id,
+                point_id,
+                point,
+                nearest_patch_id,
+                float(nearest_distance.cpu().item()),
+                nearest_ij.tolist(),
+            )
+
+
 def link_points_to_patches(
     patches: Dict[str, Patch],
     point_collections: Dict[int, Dict[str, Any]],
@@ -169,44 +243,55 @@ def link_points_to_patches(
     surface_index_tolerance: Optional[float] = None,
     distance_scale: float = 1.0,
 ) -> Dict[str, List[PointPatchLink]]:
-    """Process point collections and link them to patches."""
+    """Process point collections and link them to patches.
+
+    Special case: a collection named "between_patches__XXX__YYY" (written by
+    connect_overlapping_patches.py) attaches its points only to patches XXX and
+    YYY, when both exist. Such collections are handled here by projecting onto
+    just that pair; all other collections go through the general nearest-patch
+    search (surface index when available, else brute force).
+
+    The between_patches subset match is always brute force, so it must use the
+    same effective cutoff (in brute-force/voxel units) as the regime the general
+    collections use: the surface index accepts points within
+    ``surface_index_tolerance`` of a patch and reports distances divided by
+    ``distance_scale``, which is the cutoff ``surface_index_tolerance /
+    distance_scale`` in brute-force units; the brute-force paths report distances
+    directly and use ``tolerance``.
+    """
+    links: Dict[str, List[PointPatchLink]] = {}
+
+    # The general collections take the surface-index path iff a surface-index
+    # tolerance is requested and the backend is available; everything else is
+    # brute force. Match that regime's cutoff for the between_patches subset.
+    use_surface_index = surface_index_tolerance is not None and can_use_surface_index_backend(patches)
+    subset_tolerance = surface_index_tolerance / distance_scale if use_surface_index else tolerance
+
+    # Pull out the "between_patches" collections whose named pair both exist and
+    # attach each only to its pair; the rest go through the general search.
+    general_collections: Dict[int, Dict[str, Any]] = {}
+    n_between = 0
+    for collection_id, collection in point_collections.items():
+        targets = _resolve_between_patches_targets(collection, patches)
+        if targets is None:
+            general_collections[collection_id] = collection
+        else:
+            n_between += 1
+            _link_collection_to_patch_subset(links, collection_id, collection, targets, subset_tolerance)
+    if n_between:
+        print(f'attached {n_between} between_patches collection(s) to their named patch pairs only')
+
     if surface_index_tolerance is not None:
-        links = _link_points_to_patches_with_surface_index(
-            patches, point_collections, surface_index_tolerance, distance_scale
+        index_links = _link_points_to_patches_with_surface_index(
+            patches, general_collections, surface_index_tolerance, distance_scale
         )
-        if links is not None:
+        if index_links is not None:
+            for patch_id, patch_links in index_links.items():
+                links.setdefault(patch_id, []).extend(patch_links)
             return links
 
-    links: Dict[str, List[PointPatchLink]] = {}
-    device = torch.device('cpu')
-    tolerance_t = torch.tensor(tolerance, device=device, dtype=torch.float32)
-
-    for collection_id, collection in tqdm(point_collections.items(), 'linking points to patches'):
-        for point_id, point in collection['points'].items():
-            point_zyx = torch.as_tensor(point.get('zyx', point['p'][::-1]), dtype=torch.float32, device=device)
-
-            nearest_patch_id = None
-            nearest_distance = torch.tensor(float('inf'), device=device)
-            nearest_ij = None
-
-            for patch_id, patch in patches.items():
-                ij_coord, distance = patch.project(point_zyx)
-                if distance < nearest_distance and distance <= tolerance_t:
-                    nearest_distance = distance
-                    nearest_patch_id = patch_id
-                    nearest_ij = ij_coord
-
-            if nearest_patch_id:
-                _record_point_patch_link(
-                    links,
-                    collection,
-                    collection_id,
-                    point_id,
-                    point,
-                    nearest_patch_id,
-                    float(nearest_distance.cpu().item()),
-                    nearest_ij.tolist(),
-                )
+    for collection_id, collection in tqdm(general_collections.items(), 'linking points to patches'):
+        _link_collection_to_patch_subset(links, collection_id, collection, patches, tolerance)
 
     return links
 

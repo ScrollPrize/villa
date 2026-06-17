@@ -1568,13 +1568,16 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # crossings along the whole strip (the corner only introduces a ~sqrt(2)-quad ij
     # jump). We then pool all 4 L-strips per annotated point into one set of sample
     # points and take a single all-pairs diff between p1's and p2's pooled sets,
-    # regressing it onto winding_diff * dr_per_winding.
+    # regressing it onto winding_diff * dr_per_winding. If the selected PCL
+    # points (adjacent mode) or the PCL chain between them (non-adjacent mode)
+    # crosses theta=0, adjust the expected delta by that branch-cut jump.
 
     num_points_per_strip = cfg['num_points_per_patch'] // 2
     num_strips_per_pcl = 4
     num_strips_per_pair = 2 * num_strips_per_pcl  # 8
 
-    # Each entry: (ls1, ls2, pid1, pid2, winding_diff) where ls* is a list of 4 L-shape ij strips
+    # Each entry: (ls1, ls2, pid1, pid2, winding_diff, pcl_chain_zyxs), where
+    # ls* is a list of 4 L-shape ij strips and pcl_chain_zyxs is ordered p1 -> p2.
     strip_pairs = []
 
     # Single-point pcls (possible only for winding_is_absolute pcls) can't form a
@@ -1587,6 +1590,14 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     selected_pcls = [candidate_pcls[i] for i in selected_idxs]
 
     for pcl in selected_pcls:
+        sorted_pcl_points = None
+        sorted_pcl_point_idx = None
+        if not cfg['rel_winding_adjacent_patches_only']:
+            sorted_pcl_points = [
+                point for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
+            ]
+            sorted_pcl_point_idx = {id(point): idx for idx, point in enumerate(sorted_pcl_points)}
+
         # Pair patches either only with their immediate neighbour in the pcl's
         # patch ordering (first-seen order; built in main()),
         # or with every other patch.
@@ -1616,7 +1627,17 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             ls2 = _sample_l_shapes_at_ij(patches_dict[pid2], i2, j2, num_points_per_strip)
             if ls1 is None or ls2 is None:
                 continue
-            strip_pairs.append((ls1, ls2, pid1, pid2, winding_diff))
+
+            if cfg['rel_winding_adjacent_patches_only']:
+                pcl_chain = [p1, p2]
+            else:
+                idx1, idx2 = sorted_pcl_point_idx[id(p1)], sorted_pcl_point_idx[id(p2)]
+                if idx1 <= idx2:
+                    pcl_chain = sorted_pcl_points[idx1:idx2 + 1]
+                else:
+                    pcl_chain = list(reversed(sorted_pcl_points[idx2:idx1 + 1]))
+            pcl_chain_zyxs = np.stack([point['zyx'] for point in pcl_chain], axis=0).astype(np.float32)
+            strip_pairs.append((ls1, ls2, pid1, pid2, winding_diff, pcl_chain_zyxs))
 
     if not strip_pairs:
         return torch.zeros([], device='cuda')
@@ -1625,7 +1646,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     total_strips = len(strip_pairs) * num_strips_per_pair
     flat_ijs = np.empty([total_strips, num_points_per_strip, 2], dtype=np.float32)
     flat_pids = []
-    for k, (ls1, ls2, pid1, pid2, _) in enumerate(strip_pairs):
+    for k, (ls1, ls2, pid1, pid2, _, _) in enumerate(strip_pairs):
         base = k * num_strips_per_pair
         for s, strip in enumerate(ls1):
             flat_ijs[base + s] = strip
@@ -1668,7 +1689,16 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         device='cuda',
         dtype=torch.float32,
     )
-    expected_diff = (winding_diffs * dr_per_winding)[:, None, None]
+    pcl_seam_adjustments = []
+    for _, _, _, _, _, pcl_chain_zyxs in strip_pairs:
+        chain_zyxs = torch.from_numpy(pcl_chain_zyxs).cuda(non_blocking=True)
+        chain_spiral = slice_to_spiral_transform(chain_zyxs)
+        chain_theta, _, _ = get_theta_and_radii(chain_spiral[..., 1:], dr_per_winding)
+        zero_shifted = torch.zeros_like(chain_theta)
+        chain_adjustments = _unwrap_track_shifted_radii(chain_theta, zero_shifted, dr_per_winding)
+        pcl_seam_adjustments.append(chain_adjustments[-1])
+    pcl_seam_adjustments = torch.stack(pcl_seam_adjustments)
+    expected_diff = ((winding_diffs * dr_per_winding) - pcl_seam_adjustments)[:, None, None]
 
     diff = p2_r[:, :, None] - p1_r[:, None, :]
     pair_mask = m2[:, :, None] & m1[:, None, :]
@@ -5262,30 +5292,37 @@ def prepare_point_collections(patches):
     # points_by_patch (which is built from all attached points, regardless of z).
     # Exception: pcls flagged metadata.winding_is_absolute carry absolute winding annotations
     # and are always consumed as cross-patch pcls (never unattached), retained even when they
-    # hold a single point; we assert that every one of their points attached to a patch and
-    # carries an explicit winding annotation (an absolute pcl must not fall back to winding 0),
-    # and (once grouped below) that no patch holds more than one of their points.
+    # hold a single point. We only *warn* on any of their points that failed to attach to a
+    # patch -- those points carry no winding target and are simply dropped (they never enter
+    # points_by_patch) -- and assert that every *attached* point carries an explicit, positive
+    # winding annotation (an absolute pcl must not fall back to winding 0), and (once grouped
+    # below) that no patch holds more than one of their points.
     cross_patch_point_collections = {}
     unattached_point_collections = {}
     for pid, pcl in point_collections.items():
         num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
         num_unattached = len(pcl['points']) - num_attached
         if pcl.get('metadata', {}).get('winding_is_absolute', False):
-            assert num_unattached == 0, (
-                f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_unattached} of '
-                f'{len(pcl["points"])} points not attached to any patch; expected all attached'
-            )
-            num_unannotated = sum(1 for point in pcl['points'].values() if not np.isfinite(point['winding_annotation']))
+            if num_unattached > 0:
+                print(
+                    f'WARNING: winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has '
+                    f'{num_unattached} of {len(pcl["points"])} points not attached to any patch; '
+                    f'dropping the unattached points'
+                )
+            # Validate only the attached points -- unattached ones are dropped above and never
+            # enter points_by_patch, so their annotations are irrelevant.
+            attached_points = [point for point in pcl['points'].values() if 'on_patch' in point]
+            num_unannotated = sum(1 for point in attached_points if not np.isfinite(point['winding_annotation']))
             assert num_unannotated == 0, (
                 f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_unannotated} of '
-                f'{len(pcl["points"])} points without a winding annotation; absolute pcls must '
-                f'give every winding number explicitly'
+                f'{len(attached_points)} attached points without a winding annotation; absolute pcls '
+                f'must give every winding number explicitly'
             )
-            num_non_positive = sum(1 for point in pcl['points'].values() if point['winding_annotation'] <= 0)
+            num_non_positive = sum(1 for point in attached_points if point['winding_annotation'] <= 0)
             assert num_non_positive == 0, (
                 f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_non_positive} of '
-                f'{len(pcl["points"])} points with a non-positive winding annotation; absolute '
-                f'winding numbers must be > 0'
+                f'{len(attached_points)} attached points with a non-positive winding annotation; '
+                f'absolute winding numbers must be > 0'
             )
             cross_patch_point_collections[pid] = pcl
             continue
@@ -5337,16 +5374,6 @@ def prepare_point_collections(patches):
                 continue
             points_by_patch.setdefault(pid, []).append(point)
         pcl['points_by_patch'] = points_by_patch
-        # An absolute-winding pcl carries one absolute winding per patch (one sheet ->
-        # one winding); two annotated points on the same patch would hand the abs-winding
-        # loss conflicting targets for the same sheet, so require at most one per patch.
-        if pcl.get('metadata', {}).get('winding_is_absolute', False):
-            multi_point_patches = {pid: len(pts) for pid, pts in points_by_patch.items() if len(pts) > 1}
-            assert not multi_point_patches, (
-                f'winding_is_absolute pcl ({pcl.get("name")!r}) attaches multiple points to '
-                f'patches {multi_point_patches}; each absolute pcl must attach at most one '
-                f'point per patch'
-            )
     unattached_pcl_strips = _prepare_unattached_pcl_strips(unattached_point_collections, cfg['unattached_pcl_min_point_spacing'])
     print(
         f'pcls: {len(cross_patch_point_collections)} cross-patch, '
