@@ -96,6 +96,7 @@
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "CPointCollectionWidget.hpp"
+#include "WrapAnnotationWidget.hpp"
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
@@ -334,6 +335,13 @@ VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
 bool isChunkedViewer(VolumeViewerBase* viewer)
 {
     return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
+}
+
+bool moveOnSurfaceChangeEnabled()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                          vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
 }
 
 void centerViewerOnVolumePointForNavigation(VolumeViewerBase* viewer, const cv::Vec3f& position)
@@ -1158,6 +1166,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
+                               static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                ui.dockWidgetVolumes,
                                ui.dockWidgetViewerControls,
                                _atlasOverviewDock,
@@ -1192,6 +1201,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                    _lasagnaDock,
                                    ui.dockWidgetDistanceTransform,
+                                   static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
                                    _atlasOverviewDock,
@@ -1386,6 +1396,24 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
+    fApplyApprovedTagShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ApplyApprovedTag), this);
+    fApplyApprovedTagShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fApplyApprovedTagShortcut, &QShortcut::activated, [this]() {
+        if (_surfacePanel &&
+            _surfacePanel->setTagChecked(SurfacePanelController::Tag::Approved, true)) {
+            statusBar()->showMessage(tr("Applied Approved tag"), 2000);
+        }
+    });
+
+    fApplyDefectiveTagShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ApplyDefectiveTag), this);
+    fApplyDefectiveTagShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fApplyDefectiveTagShortcut, &QShortcut::activated, [this]() {
+        if (_surfacePanel &&
+            _surfacePanel->setTagChecked(SurfacePanelController::Tag::Defective, true)) {
+            statusBar()->showMessage(tr("Applied Defective tag"), 2000);
+        }
+    });
+
     // Focused view toggle (Shift+Ctrl+F) - hides dock widgets, keeps all viewers
     fFocusedViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::FocusedView), this);
     fFocusedViewShortcut->setContext(Qt::ApplicationShortcut);
@@ -1475,6 +1503,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(_atlasSearchDock);
     addDock(_atlasControlDock);
     addDock(_point_collection_widget);
+    addDock(_wrapAnnotationWidget);
     addDock(_fiberWidget);
     addDock(_fiberSliceWidget);
 }
@@ -1742,27 +1771,47 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointClicked,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationToggled,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationSpacingChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationSpacing, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationMergeToggled,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationPathTypeChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationPathType, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationFilterTypeChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationFilterType, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationFilterKernelSizeChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize, Qt::UniqueConnection);
-        connect(_point_collection_widget, &CPointCollectionWidget::sameWrapAnnotationClearRequested,
-                viewer, &CChunkedVolumeViewer::clearSameWrapAnnotationPreview, Qt::UniqueConnection);
-        viewer->setSameWrapAnnotationSpacing(_point_collection_widget->sameWrapAnnotationSpacing());
-        viewer->setSameWrapAnnotationMergeExisting(_point_collection_widget->sameWrapAnnotationMergeEnabled());
-        viewer->setSameWrapAnnotationPathType(_point_collection_widget->sameWrapAnnotationPathType());
-        viewer->setSameWrapAnnotationFilterKernelSize(_point_collection_widget->sameWrapAnnotationFilterKernelSize());
-        viewer->setSameWrapAnnotationFilterType(_point_collection_widget->sameWrapAnnotationFilterType());
-        viewer->setSameWrapAnnotationMode(_point_collection_widget->sameWrapAnnotationEnabled());
         viewer->setProperty("vc_points_bound", true);
+    }
+
+    if (_wrapAnnotationWidget && !viewer->property("vc_wrap_annotation_bound").toBool()) {
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::collectionSelected,
+                viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectCollection, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointSelected,
+                viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::pointSelected,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectPoint, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::pointClicked,
+                _wrapAnnotationWidget, &WrapAnnotationWidget::selectPoint, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationToggled,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationSpacingChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationSpacing, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationMergeToleranceChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeTolerance, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationPolylineOpacityChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationPolylineOpacity, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationMergeToggled,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationPathTypeChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationPathType, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationFilterTypeChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationFilterType, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationFilterKernelSizeChanged,
+                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationClearRequested,
+                viewer, &CChunkedVolumeViewer::clearSameWrapAnnotationPreview, Qt::UniqueConnection);
+        viewer->setSameWrapAnnotationSpacing(_wrapAnnotationWidget->sameWrapAnnotationSpacing());
+        viewer->setSameWrapAnnotationMergeTolerance(_wrapAnnotationWidget->sameWrapAnnotationMergeTolerance());
+        viewer->setSameWrapAnnotationPolylineOpacity(_wrapAnnotationWidget->sameWrapAnnotationPolylineOpacity());
+        viewer->setSameWrapAnnotationMergeExisting(_wrapAnnotationWidget->sameWrapAnnotationMergeEnabled());
+        viewer->setSameWrapAnnotationPathType(_wrapAnnotationWidget->sameWrapAnnotationPathType());
+        viewer->setSameWrapAnnotationFilterKernelSize(_wrapAnnotationWidget->sameWrapAnnotationFilterKernelSize());
+        viewer->setSameWrapAnnotationFilterType(_wrapAnnotationWidget->sameWrapAnnotationFilterType());
+        viewer->setSameWrapAnnotationMode(_wrapAnnotationWidget->sameWrapAnnotationEnabled());
+        viewer->setProperty("vc_wrap_annotation_bound", true);
     }
 
     const std::string& surfName = viewer->surfName();
@@ -3891,6 +3940,7 @@ void CWindow::CreateWidgets(void)
 
     // Create Seeding widget
     _seedingWidget = new SeedingWidget(_state->pointCollection(), _state);
+    _seedingWidget->setViewerManager(_viewerManager.get());
     attachScrollAreaToDock(ui.dockWidgetDistanceTransform, _seedingWidget, QStringLiteral("dockWidgetDistanceTransformContent"));
 
     _seedingWidget->setState(_state);
@@ -3904,6 +3954,20 @@ void CWindow::CreateWidgets(void)
             });
     connect(_seedingWidget, &SeedingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(_state, &CState::surfacesLoaded, _seedingWidget, &SeedingWidget::onSurfacesLoaded);
+
+    _wrapAnnotationWidget = new WrapAnnotationWidget(_state->pointCollection(), this);
+    _wrapAnnotationWidget->setObjectName("wrapAnnotationDock");
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _wrapAnnotationWidget);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::relWindingAnnotationToggled,
+            _seedingWidget, &SeedingWidget::setRelWindingAnnotationMode);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::relWindingIntersectionSourceChanged,
+            _seedingWidget, &SeedingWidget::setRelWindingIntersectionSource);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::relWindingPatchToleranceChanged,
+            _seedingWidget, &SeedingWidget::setRelWindingPatchTolerance);
+    connect(_seedingWidget, &SeedingWidget::relWindingAnnotationModeChanged,
+            _wrapAnnotationWidget, &WrapAnnotationWidget::setRelWindingAnnotationChecked);
+    _seedingWidget->setRelWindingIntersectionSource(_wrapAnnotationWidget->relWindingIntersectionSource());
+    _seedingWidget->setRelWindingPatchTolerance(_wrapAnnotationWidget->relWindingPatchTolerance());
 
     // Create and add the point collection widget
     _point_collection_widget = new CPointCollectionWidget(_state->pointCollection(), this);
@@ -3960,6 +4024,13 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    if (_pointsOverlay) {
+        _pointsOverlay->setViewTolerance(_point_collection_widget->pointViewTolerance());
+        connect(_point_collection_widget, &CPointCollectionWidget::pointViewToleranceChanged,
+                _pointsOverlay.get(), &PointsOverlayController::setViewTolerance);
+    }
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, and Point Collections together
     // Wire annotate mode & annotation selection: dock widget <-> segmentation module
@@ -4365,6 +4436,8 @@ void CWindow::CreateWidgets(void)
     filterUi.pointSetMode = cmbPointSetFilterMode;
     filterUi.surfaceIdFilter = ui.lineEditSurfaceFilter;
     filterUi.focusPointDistance = ui.spinFocusPointFilterDistance;
+    filterUi.zLowerBound = ui.spinSurfaceZLowerBound;
+    filterUi.zUpperBound = ui.spinSurfaceZUpperBound;
     _surfacePanel->configureFilters(filterUi, _state->pointCollection());
 
     SurfacePanelController::TagUiRefs tagUi{
@@ -4492,16 +4565,18 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
-    if (_viewerManager && _point_collection_widget && _point_collection_widget->sameWrapAnnotationEnabled()) {
+    if (_viewerManager && _wrapAnnotationWidget && _wrapAnnotationWidget->sameWrapAnnotationEnabled()) {
         if (event->key() == Qt::Key_E && event->modifiers() == Qt::ShiftModifier) {
             bool committed = false;
             _viewerManager->forEachBaseViewer([&committed](VolumeViewerBase* baseViewer) {
                 if (committed || !baseViewer) {
                     return;
                 }
-                if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
-                    committed = viewer->commitSameWrapAnnotationPreview();
+                auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject());
+                if (!viewer) {
+                    return;
                 }
+                committed = viewer->commitSameWrapAnnotationPreview();
             });
             if (committed) {
                 event->accept();
@@ -4509,16 +4584,36 @@ void CWindow::keyPressEvent(QKeyEvent* event)
             }
         }
         if (event->key() == Qt::Key_Z && event->modifiers() == Qt::ControlModifier) {
-            _viewerManager->forEachBaseViewer([](VolumeViewerBase* baseViewer) {
+            bool clearedPreview = false;
+            _viewerManager->forEachBaseViewer([&clearedPreview](VolumeViewerBase* baseViewer) {
                 if (!baseViewer) {
                     return;
                 }
                 if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
-                    viewer->clearSameWrapAnnotationPreview();
+                    if (viewer->hasSameWrapAnnotationPreview()) {
+                        viewer->clearSameWrapAnnotationPreview();
+                        clearedPreview = true;
+                    }
                 }
             });
-            event->accept();
-            return;
+            if (clearedPreview) {
+                event->accept();
+                return;
+            }
+
+            bool undone = false;
+            _viewerManager->forEachBaseViewer([&undone](VolumeViewerBase* baseViewer) {
+                if (undone || !baseViewer) {
+                    return;
+                }
+                if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())) {
+                    undone = viewer->undoSameWrapAnnotation();
+                }
+            });
+            if (undone) {
+                event->accept();
+                return;
+            }
         }
     }
 
@@ -4548,8 +4643,8 @@ void CWindow::keyPressEvent(QKeyEvent* event)
 
 void CWindow::keyReleaseEvent(QKeyEvent* event)
 {
-    if (_viewerManager && _point_collection_widget &&
-        _point_collection_widget->sameWrapAnnotationEnabled() &&
+    if (_viewerManager && _wrapAnnotationWidget &&
+        _wrapAnnotationWidget->sameWrapAnnotationEnabled() &&
         event->key() == Qt::Key_Shift) {
         _viewerManager->forEachBaseViewer([event](VolumeViewerBase* baseViewer) {
             if (!baseViewer) {
@@ -5082,26 +5177,59 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         }
     }
 
+    const bool moveOnSurfaceChange = moveOnSurfaceChangeEnabled();
     const bool activatingAxisAlignedPlane =
         newSurfId == "xy plane" || newSurfId == "seg xz" || newSurfId == "seg yz";
-    if (_axisAlignedSliceController && !activatingAxisAlignedPlane) {
+    if (moveOnSurfaceChange && _axisAlignedSliceController && !activatingAxisAlignedPlane) {
         _axisAlignedSliceController->resetAll();
     }
 
-    try {
-        if (surf) {
-            _axisAlignedSliceController->applyOrientation(surf.get());
-        } else {
+    if (moveOnSurfaceChange) {
+        if (auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf)) {
+            try {
+                quadSurf->ensureLoaded();
+                const cv::Vec3f worldCenter = quadSurf->coord({0, 0, 0}, {0, 0, 0});
+                const bool centerValid = std::isfinite(worldCenter[0])
+                    && std::isfinite(worldCenter[1])
+                    && std::isfinite(worldCenter[2])
+                    && worldCenter[0] >= 0.0f;
+                if (centerValid) {
+                    if (auto vol = _state->currentVolume()) {
+                        auto [w, h, d] = vol->shapeXyz();
+                        cv::Vec3f clamped = worldCenter;
+                        clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
+                        clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
+                        clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
+                        POI* poi = new POI;
+                        poi->p = clamped;
+                        poi->n = cv::Vec3f(0, 0, 0);
+                        poi->surfaceId = newSurfId;
+                        _state->setPOI("focus", poi);
+                    }
+                }
+            } catch (const std::exception& e) {
+                qWarning() << "Could not compute world center for"
+                           << surfaceId << ":" << e.what();
+            }
+        }
+    }
+
+    if (moveOnSurfaceChange || activatingAxisAlignedPlane) {
+        try {
+            if (surf) {
+                _axisAlignedSliceController->applyOrientation(surf.get());
+            } else {
+                _axisAlignedSliceController->applyOrientation();
+            }
+        } catch (const std::exception& e) {
+            qWarning() << "Failed to apply surface orientation for"
+                       << surfaceId
+                       << "while it may still be writing:"
+                       << e.what();
+            _state->clearActiveSurface();
+            _state->setSurface("segmentation", nullptr, false, false);
             _axisAlignedSliceController->applyOrientation();
         }
-    } catch (const std::exception& e) {
-        qWarning() << "Failed to apply surface orientation for"
-                   << surfaceId
-                   << "while it may still be writing:"
-                   << e.what();
-        _state->clearActiveSurface();
-        _state->setSurface("segmentation", nullptr, false, false);
-        _axisAlignedSliceController->applyOrientation();
     }
 
     if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
@@ -5213,20 +5341,22 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
         }
     }
 
-    try {
-        if (surf) {
-            _axisAlignedSliceController->applyOrientation(surf.get());
-        } else {
+    if (moveOnSurfaceChangeEnabled()) {
+        try {
+            if (surf) {
+                _axisAlignedSliceController->applyOrientation(surf.get());
+            } else {
+                _axisAlignedSliceController->applyOrientation();
+            }
+        } catch (const std::exception& e) {
+            qWarning() << "Failed to apply surface orientation for"
+                       << surfaceId
+                       << "while it may still be writing:"
+                       << e.what();
+            _state->clearActiveSurface();
+            _state->setSurface("segmentation", nullptr, false, false);
             _axisAlignedSliceController->applyOrientation();
         }
-    } catch (const std::exception& e) {
-        qWarning() << "Failed to apply surface orientation for"
-                   << surfaceId
-                   << "while it may still be writing:"
-                   << e.what();
-        _state->clearActiveSurface();
-        _state->setSurface("segmentation", nullptr, false, false);
-        _axisAlignedSliceController->applyOrientation();
     }
 
     if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {

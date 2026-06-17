@@ -42,6 +42,8 @@ extern const ShortcutDef WorldOffsetZPos;
 extern const ShortcutDef WorldOffsetZNeg;
 extern const ShortcutDef CycleNextSegment;
 extern const ShortcutDef CyclePrevSegment;
+extern const ShortcutDef ApplyApprovedTag;
+extern const ShortcutDef ApplyDefectiveTag;
 extern const ShortcutDef FocusedView;
 extern const ShortcutDef CycleViewers;
 } // namespace shortcuts

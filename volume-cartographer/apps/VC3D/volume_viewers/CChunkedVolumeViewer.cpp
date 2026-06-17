@@ -15,6 +15,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/ui/VCCollection.hpp"
 
 #include <QApplication>
 #include <QCursor>
@@ -24,6 +25,7 @@
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPointer>
@@ -1082,6 +1084,7 @@ void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv
         return;
     }
 
+
     auto surf = _surfWeak.lock();
     auto* quad = dynamic_cast<QuadSurface*>(surf.get());
     if (!quad) {
@@ -1767,9 +1770,9 @@ bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
 
     _framebuffer = std::move(preview);
     syncCameraTransform();
-    if (_interactivePreview)
+    if (_interactivePreview) {
         updateIntersectionPreviewTransform();
-    else
+    } else
         renderIntersections("interactive axis-aligned preview rendered");
     emit overlaysUpdated();
     _view->viewport()->update();
@@ -1793,9 +1796,9 @@ void CChunkedVolumeViewer::updateInteractivePreviewFromStableFrame(float newSurf
         _stableFramebuffer.size() != _framebuffer.size() ||
         _stableScale <= 0.0f || newScale <= 0.0f) {
         syncCameraTransform();
-        if (_interactivePreview)
+        if (_interactivePreview) {
             updateIntersectionPreviewTransform();
-        else
+        } else
             renderIntersections("interactive preview fallback no stable frame");
         _view->viewport()->update();
         return;
@@ -1820,9 +1823,9 @@ void CChunkedVolumeViewer::updateInteractivePreviewFromStableFrame(float newSurf
 
     _framebuffer = std::move(preview);
     syncCameraTransform();
-    if (_interactivePreview)
+    if (_interactivePreview) {
         updateIntersectionPreviewTransform();
-    else
+    } else
         renderIntersections("interactive preview transformed stable frame");
     emit overlaysUpdated();
     _view->viewport()->update();
@@ -2725,9 +2728,9 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
 
     _framebuffer = std::move(result->framebuffer);
     syncCameraTransform();
-    if (_interactivePreview)
+    if (_interactivePreview) {
         updateIntersectionPreviewTransform();
-    else
+    } else
         scheduleIntersectionRender("stable render finished");
     if (!_interactivePreview) {
         if (auto surf = _surfWeak.lock()) {
@@ -3164,6 +3167,9 @@ void CChunkedVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
 void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton && modifiers.testFlag(Qt::ShiftModifier)) {
+        if (_sameWrapAnnotation.manualPathType()) {
+            return;
+        }
         const bool appendToPreview = _sameWrapAnnotation.hasPreview() &&
                                      !_sameWrapAnnotation.shiftReleasedSincePreview();
         if (_sameWrapAnnotation.generatePreview(
@@ -3182,6 +3188,16 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
         }
     }
 
+    if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+        if (const auto hit = pointAtScenePosition(scenePos)) {
+            _selectedCollectionId = hit->first;
+            _selectedPointId = hit->second;
+            emit pointClicked(_selectedPointId);
+            emit overlaysUpdated();
+            return;
+        }
+    }
+
     const auto sample = sampleSceneVolume(scenePos);
     if (!sample) {
         return;
@@ -3189,17 +3205,54 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
     emit sendVolumeClicked(sample->position, sample->normal, sample->surface, button, modifiers);
 }
 
+void CChunkedVolumeViewer::onCollectionSelected(uint64_t collectionId)
+{
+    _selectedCollectionId = collectionId;
+    if (_selectedPointId != 0) {
+        const auto point = _pointCollection ? _pointCollection->getPoint(_selectedPointId)
+                                            : std::optional<ColPoint>{};
+        if (!point || point->collectionId != collectionId) {
+            _selectedPointId = 0;
+        }
+    }
+    emit overlaysUpdated();
+}
+
+void CChunkedVolumeViewer::onPointSelected(uint64_t pointId)
+{
+    _selectedPointId = pointId;
+    if (_pointCollection && pointId != 0) {
+        if (const auto point = _pointCollection->getPoint(pointId)) {
+            _selectedCollectionId = point->collectionId;
+        }
+    }
+    emit overlaysUpdated();
+}
+
 void CChunkedVolumeViewer::setSameWrapAnnotationMode(bool enabled)
 {
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.setEnabled(enabled);
     if (!enabled) {
         clearSameWrapAnnotationPreview();
     }
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationSpacing(double spacingVx)
 {
     _sameWrapAnnotation.setSpacing(spacingVx);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationMergeTolerance(double toleranceVx)
+{
+    _sameWrapAnnotation.setMergeTolerance(toleranceVx);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationPolylineOpacity(double opacity)
+{
+    _sameWrapAnnotationPolylineOpacity = std::clamp(opacity, 0.0, 1.0);
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
@@ -3209,10 +3262,14 @@ void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
 
 void CChunkedVolumeViewer::setSameWrapAnnotationPathType(int pathType)
 {
-    _sameWrapAnnotation.setPathType(
-        pathType == static_cast<int>(SameWrapAnnotationTool::PathType::ShortestPath)
-            ? SameWrapAnnotationTool::PathType::ShortestPath
-            : SameWrapAnnotationTool::PathType::ConnectedComponents);
+    SameWrapAnnotationTool::PathType toolPathType = SameWrapAnnotationTool::PathType::ConnectedComponents;
+    if (pathType == static_cast<int>(SameWrapAnnotationTool::PathType::ShortestPath)) {
+        toolPathType = SameWrapAnnotationTool::PathType::ShortestPath;
+    } else if (pathType == static_cast<int>(SameWrapAnnotationTool::PathType::Manual)) {
+        toolPathType = SameWrapAnnotationTool::PathType::Manual;
+    }
+    _sameWrapManualPathDragActive = false;
+    _sameWrapAnnotation.setPathType(toolPathType);
     clearSameWrapAnnotationPreview();
 }
 
@@ -3234,8 +3291,14 @@ void CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize(int kernelSize)
     clearSameWrapAnnotationPreview();
 }
 
+bool CChunkedVolumeViewer::hasSameWrapAnnotationPreview() const
+{
+    return _sameWrapAnnotation.hasPreview();
+}
+
 void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()
 {
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.clear([this](const std::string& key) { clearOverlayGroup(key); });
 }
 
@@ -3243,7 +3306,18 @@ bool CChunkedVolumeViewer::commitSameWrapAnnotationPreview()
 {
     return _sameWrapAnnotation.commit(
         _pointCollection,
+        [this](const cv::Vec3f& point) { return volumeToScene(point); },
+        QRectF(0.0, 0.0, _framebuffer.width(), _framebuffer.height()),
         [this](const std::string& key) { clearOverlayGroup(key); });
+}
+
+bool CChunkedVolumeViewer::undoSameWrapAnnotation()
+{
+    if (_sameWrapAnnotation.hasPreview()) {
+        clearSameWrapAnnotationPreview();
+        return true;
+    }
+    return _sameWrapAnnotation.undoLastCommit(_pointCollection);
 }
 
 void CChunkedVolumeViewer::refreshSameWrapAnnotationOverlay()
@@ -3266,10 +3340,71 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    _sameWrapManualMergePressConsumed = false;
+
+    if (_sameWrapAnnotation.enabled() && button == Qt::RightButton &&
+        modifiers.testFlag(Qt::ShiftModifier)) {
+        if (const auto hit = pointAtScenePosition(scenePos)) {
+            if (_sameWrapAnnotation.manualMergePointClicked(
+                    _pointCollection,
+                    hit->first,
+                    hit->second,
+                    [this](const cv::Vec3f& point) { return volumeToScene(point); },
+                    QRectF(0.0, 0.0, _framebuffer.width(), _framebuffer.height()),
+                    [this](const SameWrapAnnotationTool::MixedDirectionMergeWarning& warning) {
+                        const auto directionText = [this](const std::string& key) {
+                            return key == "z" ? tr("mostly up/down in Z") : tr("mostly in XY");
+                        };
+                        const QMessageBox::StandardButton reply = QMessageBox::warning(
+                            this,
+                            tr("Same-wrap Merge"),
+                            tr("You are about to merge two same-wrap point collections with different dominant directions:\n\n"
+                               "%1: %2\n"
+                               "%3: %4\n\n"
+                               "Continue merging?")
+                                .arg(QString::fromStdString(warning.firstCollectionName),
+                                     directionText(warning.firstDirectionKey),
+                                     QString::fromStdString(warning.secondCollectionName),
+                                     directionText(warning.secondDirectionKey)),
+                            QMessageBox::Yes | QMessageBox::No,
+                            QMessageBox::No);
+                        return reply == QMessageBox::Yes;
+                    })) {
+                if (_pointCollection && _pointCollection->getPoint(hit->second)) {
+                    _selectedCollectionId = hit->first;
+                    _selectedPointId = hit->second;
+                } else {
+                    _selectedCollectionId = 0;
+                    _selectedPointId = 0;
+                }
+                _sameWrapManualMergePressConsumed = true;
+                if (_selectedPointId != 0) {
+                    emit pointClicked(_selectedPointId);
+                }
+                emit overlaysUpdated();
+                return;
+            }
+        }
+    }
+
     if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton &&
         modifiers.testFlag(Qt::ShiftModifier)) {
+        if (_sameWrapAnnotation.manualPathType()) {
+            const bool appendToPreview = _sameWrapAnnotation.hasPreview() &&
+                                         !_sameWrapAnnotation.shiftReleasedSincePreview();
+            _sameWrapManualPathDragActive = _sameWrapAnnotation.beginManualPreview(
+                scenePos,
+                appendToPreview,
+                [this](const QPointF& point) { return sceneToVolume(point); },
+                [this](const cv::Vec3f& point) { return volumeToScene(point); },
+                [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                    setOverlayGroup(key, items);
+                },
+                [this](const std::string& key) { clearOverlayGroup(key); });
+        }
         return;
     }
+
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _bboxStart = QPointF(sp[0], sp[1]);
@@ -3294,7 +3429,6 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
 
 void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
 {
-    Q_UNUSED(modifiers);
     const bool reusedCursorSample = (_lastScenePos == scenePos && _lastCursorVolumePos.has_value());
     if (!reusedCursorSample) {
         _lastCursorVolumePos = cursorVolumePosition(scenePos);
@@ -3302,6 +3436,30 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
     _lastScenePos = scenePos;
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+
+    const uint64_t previousHighlight = _highlightedPointId;
+    if (const auto hit = pointAtScenePosition(scenePos)) {
+        _highlightedPointId = hit->second;
+    } else {
+        _highlightedPointId = 0;
+    }
+    if (_highlightedPointId != previousHighlight) {
+        emit overlaysUpdated();
+    }
+
+    if (_sameWrapManualPathDragActive && (buttons & Qt::LeftButton)) {
+        _sameWrapAnnotation.appendManualPreview(
+            scenePos,
+            _scale,
+            _pointCollection,
+            [this](const QPointF& point) { return sceneToVolume(point); },
+            [this](const cv::Vec3f& point) { return volumeToScene(point); },
+            [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                setOverlayGroup(key, items);
+            },
+            [this](const std::string& key) { clearOverlayGroup(key); });
+        return;
+    }
     if (_bboxMode && _activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _activeBBoxSurfRect = QRectF(_bboxStart, QPointF(sp[0], sp[1])).normalized();
@@ -3330,6 +3488,24 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_sameWrapManualMergePressConsumed && button == Qt::RightButton) {
+        _sameWrapManualMergePressConsumed = false;
+        return;
+    }
+    if (_sameWrapManualPathDragActive && button == Qt::LeftButton) {
+        _sameWrapAnnotation.appendManualPreview(
+            scenePos,
+            _scale,
+            _pointCollection,
+            [this](const QPointF& point) { return sceneToVolume(point); },
+            [this](const cv::Vec3f& point) { return volumeToScene(point); },
+            [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                setOverlayGroup(key, items);
+            },
+            [this](const std::string& key) { clearOverlayGroup(key); });
+        _sameWrapManualPathDragActive = false;
+        return;
+    }
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton &&
         _activeBBoxSurfRect) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
@@ -3527,6 +3703,38 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
             p += n * _zOff;
     }
     return p;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtScenePosition(const QPointF& scenePos)
+{
+    if (!_pointCollection || !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        return std::nullopt;
+    }
+
+    constexpr qreal kPointHitRadius = 4.0;
+    constexpr qreal kPointHitRadiusSq = kPointHitRadius * kPointHitRadius;
+    qreal bestDistSq = kPointHitRadiusSq;
+    std::optional<std::pair<uint64_t, uint64_t>> bestHit;
+
+    const auto& collections = _pointCollection->getAllCollections();
+    for (const auto& [collectionId, collection] : collections) {
+        for (const auto& [pointId, point] : collection.points) {
+            const QPointF pointScenePos = volumeToScene(point.p);
+            if (!std::isfinite(pointScenePos.x()) || !std::isfinite(pointScenePos.y())) {
+                continue;
+            }
+
+            const qreal dx = pointScenePos.x() - scenePos.x();
+            const qreal dy = pointScenePos.y() - scenePos.y();
+            const qreal distSq = dx * dx + dy * dy;
+            if (distSq <= bestDistSq) {
+                bestDistSq = distSq;
+                bestHit = std::make_pair(collectionId, pointId);
+            }
+        }
+    }
+
+    return bestHit;
 }
 
 void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&)
@@ -4316,26 +4524,52 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         tilePaths.emplace(tileKey, std::vector<QPainterPath>(planes.size()));
     }
 
-    for (const auto& [cellKey, lines] : _flattenedIntersectionCache.cellLines) {
-        const int col = int(std::uint32_t(cellKey));
-        const int row = int(std::uint32_t(cellKey >> 32));
-        const std::uint64_t tileKey = surfaceCellTileKey(col, row);
+    auto appendLinesForCell = [&](std::uint64_t tileKey, std::uint64_t cellKey) {
         auto pathsIt = tilePaths.find(tileKey);
         if (pathsIt == tilePaths.end()) {
-            continue;
+            return;
         }
+        const auto linesIt = _flattenedIntersectionCache.cellLines.find(cellKey);
+        if (linesIt == _flattenedIntersectionCache.cellLines.end()) {
+            return;
+        }
+        const auto dirtyIt = dirtyTilePlanes.find(tileKey);
+        if (dirtyIt == dirtyTilePlanes.end()) {
+            return;
+        }
+
         auto& paths = pathsIt->second;
-        for (const auto& line : lines) {
+        for (const auto& line : linesIt->second) {
             if (line.planeIndex < 0 || static_cast<size_t>(line.planeIndex) >= paths.size()) {
                 continue;
             }
-            const auto dirtyIt = dirtyTilePlanes.find(tileKey);
-            if (dirtyIt == dirtyTilePlanes.end() ||
-                dirtyIt->second.count(line.planeIndex) == 0) {
+            if (dirtyIt->second.count(line.planeIndex) == 0) {
                 continue;
             }
             paths[line.planeIndex].moveTo(line.a);
             paths[line.planeIndex].lineTo(line.b);
+        }
+    };
+
+    if (rebuildAllTileItems) {
+        for (const auto& [cellKey, lines] : _flattenedIntersectionCache.cellLines) {
+            const int col = int(std::uint32_t(cellKey));
+            const int row = int(std::uint32_t(cellKey >> 32));
+            appendLinesForCell(surfaceCellTileKey(col, row), cellKey);
+        }
+    } else {
+        for (const auto& [tileKey, _] : dirtyTilePlanes) {
+            const int tileCol = int(std::uint32_t(tileKey));
+            const int tileRow = int(std::uint32_t(tileKey >> 32));
+            const int colStart = std::max(0, tileCol * kSurfaceCellTileSize);
+            const int rowStart = std::max(0, tileRow * kSurfaceCellTileSize);
+            const int colEnd = std::min(points->cols - 1, colStart + kSurfaceCellTileSize);
+            const int rowEnd = std::min(points->rows - 1, rowStart + kSurfaceCellTileSize);
+            for (int row = rowStart; row < rowEnd; ++row) {
+                for (int col = colStart; col < colEnd; ++col) {
+                    appendLinesForCell(tileKey, surfaceTileKey(col, row));
+                }
+            }
         }
     }
 
@@ -4439,16 +4673,17 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
     if (!plane) {
-        if (!_planeIntersectionLinesVisible) {
+        if (_planeIntersectionLinesVisible) {
+            renderFlattenedIntersections(surf, reason, caller);
+        } else {
             clearIntersectionItems();
             _lastIntersectFp = {};
-            profile.setDetails("action=skip flattened_disabled");
-            return;
         }
     }
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();
-    if (!patchIndex || patchIndex->empty()) {
+    auto* editPatchIndex = _viewerManager->activeSegmentationEditSurfacePatchIndex();
+    if ((!patchIndex || patchIndex->empty()) && (!editPatchIndex || editPatchIndex->empty())) {
         invalidateIntersect();
         _lastIntersectFp = {};
         profile.setDetails("action=skip empty_patch_index");
@@ -4467,6 +4702,11 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name))) {
             if (activeSeg && quad != activeSeg && !activeSeg->id.empty() &&
                 quad->id == activeSeg->id) {
+                // During editing, named/highlighted surface lookups may resolve
+                // to the saved surface object while the live geometry is in the
+                // active segmentation preview. Target the preview instead of
+                // dropping the surface for this frame.
+                targets.insert(activeSeg);
                 return;
             }
             targets.insert(std::move(quad));
@@ -4490,6 +4730,17 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         profile.setDetails("action=skip no_targets");
         return;
     }
+
+    const bool useEditIndexForActive = _segmentationEditActive && editPatchIndex && !editPatchIndex->empty() &&
+        activeSeg && targets.find(activeSeg) != targets.end();
+    auto globalTargets = targets;
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> editTargets;
+    if (useEditIndexForActive) {
+        editPatchIndex->flushPendingUpdates(activeSeg);
+        globalTargets.erase(activeSeg);
+        editTargets.insert(activeSeg);
+    }
+    auto* primaryPatchIndex = patchIndex ? patchIndex : editPatchIndex;
 
     QRectF sceneRect = _view->mapToScene(_view->viewport()->rect()).boundingRect();
     if (!sceneRect.isValid()) {
@@ -4536,15 +4787,19 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     fp.planeBasisYQ = quantizeVec(plane->basisY());
     fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
     fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
-    fp.indexSamplingStride = patchIndex->samplingStride();
-    fp.patchCount = patchIndex->patchCount();
-    fp.surfaceCount = patchIndex->surfaceCount();
+    fp.indexSamplingStride = primaryPatchIndex ? primaryPatchIndex->samplingStride() : 1;
+    fp.patchCount = (patchIndex ? patchIndex->patchCount() : 0) +
+                    (useEditIndexForActive ? editPatchIndex->patchCount() : 0);
+    fp.surfaceCount = (patchIndex ? patchIndex->surfaceCount() : 0) +
+                      (useEditIndexForActive ? editPatchIndex->surfaceCount() : 0);
     size_t th = 0;
     size_t gh = 0;
     for (const auto& t : targets) {
+        auto* generationIndex = (useEditIndexForActive && t == activeSeg) ? editPatchIndex : patchIndex;
+        const uint64_t generation = generationIndex ? generationIndex->generation(t) : 0;
         th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
         gh ^= std::hash<const void*>{}(t.get()) ^
-              (std::hash<uint64_t>{}(patchIndex->generation(t)) + 0x9e3779b9u);
+              (std::hash<uint64_t>{}(generation) + 0x9e3779b9u);
     }
     fp.targetHash = th;
     fp.targetGenerationHash = gh;
@@ -4639,8 +4894,17 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         _intersectionGeometryCache.surfaceCount = fp.surfaceCount;
         _intersectionGeometryCache.targetHash = fp.targetHash;
         _intersectionGeometryCache.targetGenerationHash = fp.targetGenerationHash;
-        _intersectionGeometryCache.intersections =
-            patchIndex->computePlaneIntersections(*plane, cacheRoi, targets);
+        if (patchIndex && !globalTargets.empty()) {
+            _intersectionGeometryCache.intersections =
+                patchIndex->computePlaneIntersections(*plane, cacheRoi, globalTargets);
+        }
+        if (useEditIndexForActive && !editTargets.empty()) {
+            auto editIntersections = editPatchIndex->computePlaneIntersections(*plane, cacheRoi, editTargets);
+            for (auto& [surface, segments] : editIntersections) {
+                auto& out = _intersectionGeometryCache.intersections[surface];
+                out.insert(out.end(), segments.begin(), segments.end());
+            }
+        }
         _intersectionGeometryCache.valid = true;
     }
 
