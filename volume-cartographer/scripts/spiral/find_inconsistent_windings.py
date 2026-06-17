@@ -112,6 +112,34 @@ import fit_spiral as fs
 import connect_overlapping_patches as cop
 
 
+def resolve_umbilicus_path(patches_dir, explicit_path=None):
+    """Resolve the umbilicus used to rebuild a checkpoint transform.
+
+    Checkpoints do not carry the source umbilicus samples, and fit_spiral's module
+    default may point at the machine where the checkpoint was trained. Prefer an
+    explicit path, then the dataset root inferred from --patches-dir, then the
+    fit_spiral default if it exists.
+    """
+    if explicit_path:
+        return os.path.abspath(os.path.expanduser(explicit_path))
+
+    patches_dir = os.path.abspath(os.path.expanduser(patches_dir))
+    inferred = os.path.join(os.path.dirname(patches_dir), 'umbilicus.json')
+    if os.path.exists(inferred):
+        return inferred
+
+    default_dataset_path = getattr(fs, 'dataset_path', None)
+    if default_dataset_path:
+        default_path = os.path.join(os.path.expanduser(default_dataset_path), 'umbilicus.json')
+        if os.path.exists(default_path):
+            return os.path.abspath(default_path)
+
+    raise SystemExit(
+        f'could not find umbilicus.json next to --patches-dir ({inferred}); '
+        'pass --umbilicus /path/to/umbilicus.json'
+    )
+
+
 def _to_py(x):
     """Convert numpy / torch scalars+arrays to plain python for json."""
     if isinstance(x, torch.Tensor):
@@ -123,7 +151,7 @@ def _to_py(x):
     return x
 
 
-def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin_ds, filter_z_end_ds):
+def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin_ds, filter_z_end_ds, umbilicus_path):
     """Point fit_spiral's module globals at the checkpoint's cfg and the
     user-supplied patches/pcls/filter-z-range so its loaders behave identically.
     Returns the checkpoint's (model) downsampled z-range, which shapes the
@@ -136,6 +164,9 @@ def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin_ds, filte
     fs.pcl_json_paths = list(pcl_paths)
     fs.z_begin = filter_z_begin_ds
     fs.z_end = filter_z_end_ds
+    fs.umbilicus_z_to_yx = (
+        lambda f, path=umbilicus_path: fs.json_umbilicus_z_to_yx(path, downsample_factor=f)
+    )
     # We don't compute shell losses; stop prepare_patches from loading the shell.
     fs.shell_losses_enabled = lambda: False
     return int(checkpoint['z_begin']), int(checkpoint['z_end'])
@@ -553,6 +584,8 @@ def parse_z_range(z_range):
               help='Path to a checkpoint_*.ckpt saved by fit_spiral.')
 @click.option('--patches-dir', required=True, type=click.Path(exists=True, file_okay=False),
               help='Directory of patch tifxyz folders (the full set, for attachment).')
+@click.option('--umbilicus', default=None, type=click.Path(exists=True, dir_okay=False),
+              help='Path to umbilicus.json. Defaults to umbilicus.json next to --patches-dir.')
 @click.option('--patch-id', required=True, help='Folder name (within --patches-dir) of the seed patch to debug.')
 @click.option('--pcl', 'pcl_paths', required=True, multiple=True, type=click.Path(exists=True, dir_okay=False),
               help='Point-collection json file(s). Repeat --pcl for several. Both absolute- and '
@@ -581,7 +614,7 @@ def parse_z_range(z_range):
                    'relative-edge graph itself. Recorded under "loops" in the output.')
 @click.option('--output', default=None, type=click.Path(dir_okay=False),
               help='Output json path (default: winding_votes_<patch>.json next to the checkpoint).')
-def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, medial_weight, max_hops,
+def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_size, medial_weight, max_hops,
          detect_loops, output):
     torch.set_grad_enabled(False)
     device = torch.device('cuda')
@@ -597,9 +630,14 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
     df = fs.downsample_factor
     filter_z_begin, filter_z_end = z_lo_raw // df, z_hi_raw // df
 
+    umbilicus_path = resolve_umbilicus_path(patches_dir, umbilicus)
+    print(f'using umbilicus {umbilicus_path}')
+
     print(f'loading checkpoint {checkpoint}')
     ckpt = torch.load(checkpoint, map_location='cpu')
-    model_z_begin, model_z_end = install_globals(ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end)
+    model_z_begin, model_z_end = install_globals(
+        ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path
+    )
     print(f'checkpoint (model) z-range: [{model_z_begin}, {model_z_end}); '
           f'filtering z-range: [{filter_z_begin}, {filter_z_end}) (downsampled, df={df})')
     if not (filter_z_begin >= model_z_begin and filter_z_end <= model_z_end):
@@ -878,6 +916,7 @@ def main(checkpoint, patches_dir, patch_id, pcl_paths, z_range, step_size, media
     out = {
         'checkpoint': os.path.abspath(checkpoint),
         'patches_dir': os.path.abspath(patches_dir),
+        'umbilicus': os.path.abspath(umbilicus_path),
         'patch_id': patch_id,
         'pcl_paths': [os.path.abspath(p) for p in pcl_paths],
         'downsample_factor': df,

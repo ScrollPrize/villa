@@ -269,10 +269,16 @@ void CPointCollectionWidget::setupUi()
     _reset_button = new QPushButton("Clear All Points");
     file_layout->addWidget(_reset_button);
     layout->addLayout(file_layout);
- 
+
+    _reset_winding_button = new QPushButton("Reset Winding Numbers");
+    _reset_winding_button->setToolTip("Clear winding assignments on all points in every "
+                                      "collection and uncheck Absolute Winding Number");
+    layout->addWidget(_reset_winding_button);
+
     connect(_load_button, &QPushButton::clicked, this, &CPointCollectionWidget::onLoadClicked);
     connect(_save_button, &QPushButton::clicked, this, &CPointCollectionWidget::onSaveClicked);
     connect(_reset_button, &QPushButton::clicked, this, &CPointCollectionWidget::onResetClicked);
+    connect(_reset_winding_button, &QPushButton::clicked, this, &CPointCollectionWidget::onResetWindingClicked);
  
     setWidget(main_widget);
 
@@ -391,6 +397,41 @@ void CPointCollectionWidget::onResetClicked()
         _tree_view->selectionModel()->clear();
         _point_collection->clearAll();
     }
+}
+
+void CPointCollectionWidget::onResetWindingClicked()
+{
+    if (!_point_collection) return;
+
+    // Snapshot IDs/points first to avoid mutating the maps while iterating them.
+    const auto& collections = _point_collection->getAllCollections();
+    std::vector<uint64_t> collectionIds;
+    std::vector<ColPoint> pointsToUpdate;
+    collectionIds.reserve(collections.size());
+    for (const auto& [cid, collection] : collections) {
+        collectionIds.push_back(cid);
+        for (const auto& [pid, point] : collection.points) {
+            ColPoint updated = point;
+            updated.winding_annotation = std::nan("");
+            pointsToUpdate.push_back(updated);
+        }
+    }
+
+    for (const auto& p : pointsToUpdate) {
+        _point_collection->updatePoint(p);          // emits pointChanged
+    }
+
+    for (uint64_t cid : collectionIds) {
+        CollectionMetadata metadata = collections.at(cid).metadata;
+        metadata.absolute_winding_number = false;    // uncheck absolute winding
+        _point_collection->setCollectionMetadata(cid, metadata);  // emits collectionChanged
+
+        // Also clear any active auto-fill mode so new points don't get re-filled
+        // and the Fill +/-/= buttons untoggle (keeps state consistent with the reset).
+        _point_collection->setAutoFillMode(cid, VCCollection::WindingFillMode::None);
+    }
+
+    updateMetadataWidgets();   // refresh checkbox + fill-button states in the UI
 }
 
 void CPointCollectionWidget::onCollectionsAdded(const std::vector<uint64_t>& collectionIds)

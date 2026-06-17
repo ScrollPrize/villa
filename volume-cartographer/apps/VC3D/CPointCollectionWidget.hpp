@@ -78,6 +78,7 @@ private slots:
     void onPointRemoved(uint64_t pointId);
 
     void onResetClicked();
+    void onResetWindingClicked();
     void onSelectionChanged(const QItemSelection &selected, const QItemSelection &deselected);
     void onNewNameClicked();
     void onNameEdited(const QString &name);
@@ -119,6 +120,7 @@ private slots:
     QPushButton *_load_button;
     QPushButton *_save_button;
     QPushButton *_reset_button;
+    QPushButton *_reset_winding_button;
  
     QGroupBox *_collection_metadata_group;
     QLineEdit *_collection_name_edit;
