@@ -264,13 +264,12 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
                     float u0, float v0, cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec3f>& normals)
 {
     surf->gen(&points, &normals, size, cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
-    if (g_flipNormals)
-        for (int y = 0; y < normals.rows; y++)
-            for (int x = 0; x < normals.cols; x++) {
-                cv::Vec3f& n = normals(y, x);
-                if (std::isnan(n[0])) continue;
-                n = -n;
-            }
+    // NOTE: do NOT mutate `normals` here. gen() returns a view into the
+    // surface's shared per-instance scratch buffer (_genNormalsScratch), and
+    // the tile loop calls genTile() concurrently on one `surf` under OpenMP.
+    // Writing into that aliased view races with other threads' gen() calls
+    // (which realloc/overwrite the scratch) -> SIGSEGV. --flip-normals is
+    // applied later in prepareBaseAndDirs() on the thread-private clone.
 }
 
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
@@ -280,6 +279,11 @@ static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv
 {
     base = pts.clone(); base *= scale_seg;
     dirs = nrm.clone();
+    // --flip-normals: negate on the private clone (safe under OpenMP), never on
+    // gen()'s shared scratch view. Negation commutes with the affine + the
+    // subsequent normalization, so applying it here is identical to flipping
+    // the raw geometric normal. (-NaN stays NaN, so invalid pixels are intact.)
+    if (g_flipNormals) dirs *= -1.0f;
     if (hasAffine) applyAffineTransform(base, dirs, aff);
     normalizeNormals(dirs);
     base *= ds_scale;
