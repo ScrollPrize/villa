@@ -23,7 +23,6 @@
 #include <QVBoxLayout>
 #include <QCursor>
 #include <QEvent>
-#include <QEventLoop>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QSettings>
@@ -37,7 +36,6 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QClipboard>
-#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -3844,45 +3842,167 @@ void CWindow::optimizeAtlasSnapCandidates()
         ? manifestPath.filename().generic_string()
         : manifestPath.string();
     if (statusBar()) {
-        statusBar()->showMessage(tr("Ranking atlas snap candidates..."), 3000);
+        statusBar()->showMessage(tr("Preparing atlas snap candidates..."), 3000);
     }
-    for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        if (auto* button = dock->widget()->findChild<QPushButton*>(
-                QStringLiteral("atlasRankSnapButton"))) {
-            button->setEnabled(false);
-        }
-    }
-
-    auto* watcher = new QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>(this);
-    connect(watcher,
-            &QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>::finished,
-            this,
-            [this, watcher, atlasDir]() {
-        watcher->deleteLater();
-        try {
-            const vc::atlas::AtlasSnapOptimizeReport report = watcher->result();
-            refreshAtlasOverviewDocks();
-            displayAtlasFromDirectory(atlasDir);
-            if (statusBar()) {
-                statusBar()->showMessage(
-                    tr("Ranked snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 queued, %7 cached.")
-                        .arg(report.controls)
-                        .arg(report.successfulPairTerms)
-                        .arg(report.zeroContributionTerms)
-                        .arg(report.skippedPairTerms)
-                        .arg(report.pairTerms)
-                        .arg(report.rankJobsRequested)
-                        .arg(report.cacheHits),
-                    6000);
+    auto setRankButtonsEnabled = [this](bool enabled) {
+        for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
+            if (!dock || !dock->widget()) {
+                continue;
             }
+            if (auto* button = dock->widget()->findChild<QPushButton*>(
+                    QStringLiteral("atlasRankSnapButton"))) {
+                button->setEnabled(enabled);
+            }
+        }
+    };
+    setRankButtonsEnabled(false);
+
+    QPointer<CWindow> self(this);
+    auto startFinish =
+        [this, self, atlasDir, setRankButtonsEnabled](
+            vc::atlas::AtlasSnapPreparedCandidates prepared,
+            nlohmann::json rankResponse) {
+        if (!self) {
+            return;
+        }
+        if (statusBar()) {
+            statusBar()->showMessage(tr("Applying atlas snap candidate ranking..."), 3000);
+        }
+        auto* finishWatcher = new QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>(this);
+        connect(finishWatcher,
+                &QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>::finished,
+                this,
+                [this, finishWatcher, atlasDir, setRankButtonsEnabled]() {
+            finishWatcher->deleteLater();
+            setRankButtonsEnabled(true);
+            try {
+                const vc::atlas::AtlasSnapOptimizeReport report = finishWatcher->result();
+                refreshAtlasOverviewDocks();
+                displayAtlasFromDirectory(atlasDir);
+                if (statusBar()) {
+                    statusBar()->showMessage(
+                        tr("Ranked snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 queued, %7 cached.")
+                            .arg(report.controls)
+                            .arg(report.successfulPairTerms)
+                            .arg(report.zeroContributionTerms)
+                            .arg(report.skippedPairTerms)
+                            .arg(report.pairTerms)
+                            .arg(report.rankJobsRequested)
+                            .arg(report.cacheHits),
+                        6000);
+                }
+                std::cerr << "[atlas-snap] rank finished"
+                          << " controls=" << report.controls
+                          << " variables=" << report.variableControls
+                          << " fixed=" << report.fixedControls
+                          << " manual=" << report.manualControls
+                          << " singleton_auto=" << report.singletonControls
+                          << " links=" << report.links
+                          << " pair_terms=" << report.pairTerms
+                          << " successful_terms=" << report.successfulPairTerms
+                          << " zero_contribution_terms=" << report.zeroContributionTerms
+                          << " skipped_terms=" << report.skippedPairTerms
+                          << " queued=" << report.rankJobsRequested
+                          << " cached=" << report.cacheHits
+                          << " objective=" << report.objective
+                          << std::endl;
+            } catch (const std::exception& ex) {
+                refreshAtlasOverviewDocks();
+                updateAtlasSearchDocks();
+                const QString message = extractFutureExceptionMessage(ex);
+                std::cerr << "[atlas-snap] finish failed: "
+                          << message.toStdString() << std::endl;
+                QMessageBox::warning(
+                    this,
+                    tr("Atlas Snap Candidates"),
+                    tr("Could not rank snap candidates: %1").arg(message));
+            }
+        });
+        finishWatcher->setFuture(QtConcurrent::run(
+            [prepared = std::move(prepared), rankResponse = std::move(rankResponse)]() mutable {
+                return vc::atlas::finishAtlasPredSnapCandidates(prepared, rankResponse);
+            }));
+    };
+
+    auto* prepareWatcher =
+        new QFutureWatcher<vc::atlas::AtlasSnapPreparedCandidates>(this);
+    connect(prepareWatcher,
+            &QFutureWatcher<vc::atlas::AtlasSnapPreparedCandidates>::finished,
+            this,
+            [this,
+             prepareWatcher,
+             startFinish,
+             self,
+             serviceManifestPath,
+             setRankButtonsEnabled]() mutable {
+        prepareWatcher->deleteLater();
+        try {
+            vc::atlas::AtlasSnapPreparedCandidates prepared = prepareWatcher->result();
+            const size_t jobCount =
+                prepared.rankRequest.value("jobs", nlohmann::json::array()).size();
+            if (jobCount == 0) {
+                std::cerr << "[atlas-snap] no laplace rank jobs required; finishing from cache"
+                          << std::endl;
+                startFinish(std::move(prepared), nlohmann::json::object());
+                return;
+            }
+
+            nlohmann::json serviceRequest = prepared.rankRequest;
+            serviceRequest["manifest"] = serviceManifestPath;
+            std::cerr << "[atlas-snap] requesting laplace rank jobs="
+                      << jobCount
+                      << " service_manifest=" << serviceManifestPath
+                      << std::endl;
+            QJsonObject qtRequest = toQtJsonObject(serviceRequest);
+            if (statusBar()) {
+                statusBar()->showMessage(tr("Ranking atlas snap candidates..."), 3000);
+            }
+            LasagnaServiceManager::instance().rankLaplaceSnapPairs(
+                qtRequest,
+                [startFinish, prepared](const QJsonObject& response) mutable {
+                    std::cerr << "[atlas-snap] laplace rank response received"
+                              << std::endl;
+                    startFinish(prepared, fromQtJsonObject(response));
+                },
+                [self, setRankButtonsEnabled](const QString& message) {
+                    if (!self) {
+                        return;
+                    }
+                    setRankButtonsEnabled(true);
+                    self->refreshAtlasOverviewDocks();
+                    self->updateAtlasSearchDocks();
+                    std::cerr << "[atlas-snap] laplace rank failed: "
+                              << message.toStdString() << std::endl;
+                    QMessageBox::warning(
+                        self.data(),
+                        self->tr("Atlas Snap Candidates"),
+                        self->tr("Could not rank snap candidates: %1").arg(message));
+                },
+                [self, prepared](int index, const QJsonObject& result) mutable {
+                    if (!self) {
+                        return;
+                    }
+                    try {
+                        vc::atlas::cacheAtlasPredSnapRankResult(
+                            prepared,
+                            static_cast<size_t>(index),
+                            fromQtJsonObject(result));
+                    } catch (const std::exception& ex) {
+                        std::cerr << "[atlas-snap] partial rank result callback failed: "
+                                  << ex.what()
+                                  << std::endl;
+                    } catch (...) {
+                        std::cerr << "[atlas-snap] partial rank result callback failed: "
+                                  << "unknown non-standard exception"
+                                  << std::endl;
+                    }
+                });
         } catch (const std::exception& ex) {
+            setRankButtonsEnabled(true);
             refreshAtlasOverviewDocks();
             updateAtlasSearchDocks();
             const QString message = extractFutureExceptionMessage(ex);
-            std::cerr << "[atlas-snap] rank failed: "
+            std::cerr << "[atlas-snap] prepare failed: "
                       << message.toStdString() << std::endl;
             QMessageBox::warning(
                 this,
@@ -3891,18 +4011,14 @@ void CWindow::optimizeAtlasSnapCandidates()
         }
     });
 
-    QPointer<CWindow> self(this);
-    watcher->setFuture(QtConcurrent::run([self,
-                                           atlasDir,
-                                           volpkgRoot,
-                                           manifestPath,
-                                           serviceManifestPath]() {
+    prepareWatcher->setFuture(QtConcurrent::run([atlasDir,
+                                                  volpkgRoot,
+                                                  manifestPath]() {
         try {
-            std::cerr << "[atlas-snap] rank start"
+            std::cerr << "[atlas-snap] prepare start"
                       << " atlas=" << atlasDir.string()
                       << " volpkg_root=" << volpkgRoot.string()
                       << " manifest=" << manifestPath.string()
-                      << " service_manifest=" << serviceManifestPath
                       << std::endl;
             vc::lasagna::LasagnaDataset dataset =
                 vc::lasagna::LasagnaDataset::open(manifestPath);
@@ -3920,98 +4036,26 @@ void CWindow::optimizeAtlasSnapCandidates()
                 {"source_depth", 0},
                 {"amgx_config", nullptr},
             };
-            const auto ranker =
-                [self, serviceManifestPath](
-                    const nlohmann::json& request,
-                    const vc::atlas::AtlasSnapPairRankProgress& onResult) -> nlohmann::json {
-                    if (!self) {
-                        throw std::runtime_error("window closed before rank request completed");
-                    }
-                    nlohmann::json serviceRequest = request;
-                    serviceRequest["manifest"] = serviceManifestPath;
-                    const size_t jobCount =
-                        serviceRequest.value("jobs", nlohmann::json::array()).size();
-                    std::cerr << "[atlas-snap] requesting laplace rank jobs="
-                              << jobCount
-                              << " service_manifest=" << serviceManifestPath
-                              << std::endl;
-                    QJsonObject qtRequest = toQtJsonObject(serviceRequest);
-                    QJsonObject qtResponse;
-                    QString error;
-                    QMetaObject::invokeMethod(
-                        self.data(),
-                        [&qtRequest, &qtResponse, &error, &onResult]() {
-                            QEventLoop loop;
-                            LasagnaServiceManager::instance().rankLaplaceSnapPairs(
-                                qtRequest,
-                                [&](const QJsonObject& response) {
-                                    qtResponse = response;
-                                    loop.quit();
-                                },
-                                [&](const QString& message) {
-                                    error = message;
-                                    loop.quit();
-                                },
-                                [&](int index, const QJsonObject& result) {
-                                    if (!onResult) {
-                                        return;
-                                    }
-                                    try {
-                                        onResult(static_cast<size_t>(index),
-                                                 fromQtJsonObject(result));
-                                    } catch (const std::exception& ex) {
-                                        std::cerr << "[atlas-snap] partial rank result callback failed: "
-                                                  << ex.what()
-                                                  << std::endl;
-                                    } catch (...) {
-                                        std::cerr << "[atlas-snap] partial rank result callback failed: "
-                                                  << "unknown non-standard exception"
-                                                  << std::endl;
-                                    }
-                                });
-                            loop.exec();
-                        },
-                        Qt::BlockingQueuedConnection);
-                    if (!error.isEmpty()) {
-                        std::cerr << "[atlas-snap] laplace rank failed: "
-                                  << error.toStdString() << std::endl;
-                        throw std::runtime_error(error.toStdString());
-                    }
-                    std::cerr << "[atlas-snap] laplace rank response received"
-                              << std::endl;
-                    return fromQtJsonObject(qtResponse);
-                };
 
-            vc::atlas::AtlasSnapOptimizeReport report =
-                vc::atlas::optimizeAtlasPredSnapCandidates(
+            vc::atlas::AtlasSnapPreparedCandidates prepared =
+                vc::atlas::prepareAtlasPredSnapCandidates(
                     atlasDir,
                     volpkgRoot,
                     manifestPath,
                     sampler,
-                    ranker,
                     options);
-            std::cerr << "[atlas-snap] rank finished"
-                      << " controls=" << report.controls
-                      << " variables=" << report.variableControls
-                      << " fixed=" << report.fixedControls
-                      << " manual=" << report.manualControls
-                      << " singleton_auto=" << report.singletonControls
-                      << " links=" << report.links
-                      << " pair_terms=" << report.pairTerms
-                      << " successful_terms=" << report.successfulPairTerms
-                      << " zero_contribution_terms=" << report.zeroContributionTerms
-                      << " skipped_terms=" << report.skippedPairTerms
-                      << " queued=" << report.rankJobsRequested
-                      << " cached=" << report.cacheHits
-                      << " objective=" << report.objective
+            const size_t jobCount =
+                prepared.rankRequest.value("jobs", nlohmann::json::array()).size();
+            std::cerr << "[atlas-snap] prepare finished"
+                      << " queued=" << jobCount
                       << std::endl;
-            return report;
+            return prepared;
         } catch (const std::exception& ex) {
-            std::cerr << "[atlas-snap] rank exception: "
+            std::cerr << "[atlas-snap] prepare exception: "
                       << ex.what() << std::endl;
             throw;
         } catch (...) {
-            std::cerr << "[atlas-snap] rank exception: unknown non-standard exception"
+            std::cerr << "[atlas-snap] prepare exception: unknown non-standard exception"
                       << std::endl;
             throw;
         }

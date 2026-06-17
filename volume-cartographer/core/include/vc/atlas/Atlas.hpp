@@ -289,11 +289,12 @@ struct AtlasSnapOptimizeReport {
     double objective = 0.0;
 };
 
-using AtlasSnapPairRankProgress =
-    std::function<void(size_t resultIndex, const nlohmann::json& result)>;
-using AtlasSnapPairRanker = std::function<nlohmann::json(
-    const nlohmann::json& request,
-    const AtlasSnapPairRankProgress& onResult)>;
+struct AtlasSnapPreparedCandidatesState;
+
+struct AtlasSnapPreparedCandidates {
+    std::shared_ptr<AtlasSnapPreparedCandidatesState> state;
+    nlohmann::json rankRequest = nlohmann::json::object();
+};
 
 struct LasagnaAtlasObject {
     std::string id;
@@ -461,13 +462,19 @@ AtlasSnapOptimizationResult optimizeAtlasSnapCandidates(
     const AtlasSnapOptimizationProblem& problem,
     const std::vector<AtlasSnapPairMatrix>& matrices,
     const AtlasSnapOptimizeOptions& options = {});
-AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
+AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
     const std::filesystem::path& atlasDir,
     const std::filesystem::path& volpkgRoot,
     const std::filesystem::path& manifestPath,
     const vc::lasagna::LasagnaNormalSampler& sampler,
-    const AtlasSnapPairRanker& ranker,
     const AtlasSnapOptimizeOptions& options = {});
+void cacheAtlasPredSnapRankResult(
+    const AtlasSnapPreparedCandidates& prepared,
+    size_t index,
+    const nlohmann::json& result);
+AtlasSnapOptimizeReport finishAtlasPredSnapCandidates(
+    const AtlasSnapPreparedCandidates& prepared,
+    const nlohmann::json& rankResponse = nlohmann::json::object());
 
 void validateFiberInputControlPoints(FiberInput& fiber);
 bool atlasLoadErrorRequiresRebuild(const std::exception& ex);

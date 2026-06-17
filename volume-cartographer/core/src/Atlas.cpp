@@ -2929,17 +2929,90 @@ AtlasSnapOptimizationResult optimizeAtlasSnapCandidates(
     return result;
 }
 
-AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
+struct AtlasSnapPreparedCandidatesState {
+    fs::path atlasDir;
+    fs::path manifestPath;
+    fs::path cachePath;
+    nlohmann::json rankOptions = nlohmann::json::object();
+    nlohmann::json cache = nlohmann::json::object();
+    Atlas atlas;
+    std::unordered_map<std::string, AtlasPredSnapSet> setsByFiber;
+    AtlasSnapOptimizationProblem problem;
+    AtlasSnapOptimizeOptions options;
+    AtlasSnapOptimizeReport report;
+    std::vector<AtlasSnapPairMatrix> matrices;
+    std::vector<size_t> missingTermIndices;
+    std::vector<std::string> missingKeys;
+    bool finished = false;
+};
+
+namespace {
+
+void cachePreparedAtlasPredSnapRankResult(
+    AtlasSnapPreparedCandidatesState& state,
+    size_t index,
+    const nlohmann::json& result)
+{
+    if (index >= state.missingTermIndices.size()) {
+        std::cerr << "[atlas-snap] ignoring out-of-range partial rank result"
+                  << " index=" << index
+                  << " expected=" << state.missingTermIndices.size()
+                  << std::endl;
+        return;
+    }
+    const AtlasSnapPairTerm& term =
+        state.problem.terms[state.missingTermIndices[index]];
+    const auto& first = state.problem.controls[term.firstControl];
+    const auto& second = state.problem.controls[term.secondControl];
+    AtlasSnapPairMatrix matrix;
+    try {
+        matrix = atlasSnapPairMatrixFromRankResult(
+            term, first.candidates.size(), second.candidates.size(), result);
+    } catch (const std::exception& ex) {
+        std::cerr << "[atlas-snap] not caching partial rank result "
+                  << termDebugString(term, state.problem)
+                  << " error=" << ex.what()
+                  << std::endl;
+        return;
+    }
+    state.cache["entries"][state.missingKeys[index]] = {
+        {"schema", 1},
+        {"source_job_id", term.id},
+        {"manifest", state.manifestPath.lexically_normal().generic_string()},
+        {"rank_options", state.rankOptions},
+        {"side_a", pointsJson(first.candidates)},
+        {"side_b", pointsJson(second.candidates)},
+        {"rank_result", matrix.metadata},
+    };
+    try {
+        writeJsonFile(state.cachePath, state.cache);
+        std::cerr << "[atlas-snap] cached partial rank result"
+                  << " index=" << index
+                  << " id=" << term.id
+                  << " entries=" << state.cache["entries"].size()
+                  << std::endl;
+    } catch (const std::exception& ex) {
+        std::cerr << "[atlas-snap] could not write partial rank cache: "
+                  << ex.what()
+                  << std::endl;
+    }
+}
+
+} // namespace
+
+AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
     const fs::path& atlasDir,
     const fs::path& volpkgRootIn,
     const fs::path& manifestPath,
     const vc::lasagna::LasagnaNormalSampler& sampler,
-    const AtlasSnapPairRanker& ranker,
     const AtlasSnapOptimizeOptions& options)
 {
-    if (!ranker) {
-        throw std::runtime_error("atlas snap optimizer requires a ranker callback");
-    }
+    AtlasSnapPreparedCandidates prepared;
+    prepared.state = std::make_shared<AtlasSnapPreparedCandidatesState>();
+    AtlasSnapPreparedCandidatesState& state = *prepared.state;
+    state.atlasDir = atlasDir;
+    state.manifestPath = manifestPath;
+    state.options = options;
     const fs::path volpkgRoot = volpkgRootIn.empty()
         ? inferVolpkgRootFromAtlasDir(atlasDir)
         : volpkgRootIn;
@@ -2956,6 +3029,7 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
               << std::endl;
     QuadSurface baseSurface(atlasDir / atlas.metadata.baseMeshPath);
     const nlohmann::json rankOptions = effectiveRankOptions(options);
+    state.rankOptions = rankOptions;
     const double predDtThreshold = rankOptions.value("threshold", options.predDtThreshold);
     std::cerr << "[atlas-snap] pred_dt threshold=" << predDtThreshold
               << " rank_options=" << rankOptions.dump()
@@ -2980,7 +3054,6 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
     }
     sampling.predDtStepVx = 0.5 * *predDtSpacing;
 
-    std::unordered_map<std::string, AtlasPredSnapSet> setsByFiber;
     for (const auto& mapping : atlas.fibers) {
         const fs::path fiberPath = resolveAtlasRelativePath(atlasDir, volpkgRoot, mapping.fiberPath);
         std::cerr << "[atlas-snap] generating candidates fiber="
@@ -2997,50 +3070,51 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
                   << mapping.fiberPath.generic_string()
                   << " points=" << set.points.size()
                   << std::endl;
-        setsByFiber[atlasFiberPathKey(mapping.fiberPath)] = std::move(set);
+        state.setsByFiber[atlasFiberPathKey(mapping.fiberPath)] = std::move(set);
     }
 
-    propagateAtlasPredSnapStatuses(atlas, setsByFiber);
+    propagateAtlasPredSnapStatuses(atlas, state.setsByFiber);
 
-    AtlasSnapOptimizationProblem problem =
-        buildAtlasSnapOptimizationProblem(atlas, setsByFiber);
+    state.atlas = std::move(atlas);
+    state.problem =
+        buildAtlasSnapOptimizationProblem(state.atlas, state.setsByFiber);
 
-    nlohmann::json cache = {
+    state.cache = {
         {"type", "vc3d_atlas_pred_snap_rank_cache"},
         {"version", 1},
         {"entries", nlohmann::json::object()},
     };
-    const fs::path cachePath = atlasPredSnapRankCachePath(atlasDir);
-    if (fs::is_regular_file(cachePath)) {
+    state.cachePath = atlasPredSnapRankCachePath(atlasDir);
+    if (fs::is_regular_file(state.cachePath)) {
         try {
             std::cerr << "[atlas-snap] reading rank cache="
-                      << cachePath.string()
+                      << state.cachePath.string()
                       << std::endl;
-            cache = readJsonFile(cachePath);
-            if (!cache.is_object() ||
-                cache.value("type", std::string{}) != "vc3d_atlas_pred_snap_rank_cache" ||
-                cache.value("version", 0) != 1 ||
-                !cache.contains("entries") ||
-                !cache["entries"].is_object()) {
+            state.cache = readJsonFile(state.cachePath);
+            if (!state.cache.is_object() ||
+                state.cache.value("type", std::string{}) != "vc3d_atlas_pred_snap_rank_cache" ||
+                state.cache.value("version", 0) != 1 ||
+                !state.cache.contains("entries") ||
+                !state.cache["entries"].is_object()) {
                 std::cerr << "[atlas-snap] rank cache has unexpected schema; ignoring entries"
                           << std::endl;
-                cache["entries"] = nlohmann::json::object();
+                state.cache["entries"] = nlohmann::json::object();
             }
         } catch (const std::exception& ex) {
             std::cerr << "[atlas-snap] could not read rank cache; ignoring: "
                       << ex.what() << std::endl;
-            cache["entries"] = nlohmann::json::object();
+            state.cache["entries"] = nlohmann::json::object();
         } catch (...) {
             std::cerr << "[atlas-snap] could not read rank cache; ignoring unknown error"
                       << std::endl;
-            cache["entries"] = nlohmann::json::object();
+            state.cache["entries"] = nlohmann::json::object();
         }
     }
 
-    AtlasSnapOptimizeReport report;
-    report.controls = problem.controls.size();
-    report.links = atlas.links.size();
-    for (const auto& control : problem.controls) {
+    AtlasSnapOptimizeReport& report = state.report;
+    report.controls = state.problem.controls.size();
+    report.links = state.atlas.links.size();
+    for (const auto& control : state.problem.controls) {
         if (!control.fixed && control.candidates.size() > 1) {
             ++report.variableControls;
         }
@@ -3054,7 +3128,7 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             ++report.singletonControls;
         }
     }
-    report.pairTerms = problem.terms.size();
+    report.pairTerms = state.problem.terms.size();
     std::cerr << "[atlas-snap] built optimization problem"
               << " controls=" << report.controls
               << " variables=" << report.variableControls
@@ -3065,21 +3139,19 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
               << " pair_terms=" << report.pairTerms
               << std::endl;
 
-    std::vector<AtlasSnapPairMatrix> matrices;
     nlohmann::json jobs = nlohmann::json::array();
-    std::vector<const AtlasSnapPairTerm*> missingTerms;
-    std::vector<std::string> missingKeys;
-    for (const auto& term : problem.terms) {
-        const auto& first = problem.controls[term.firstControl];
-        const auto& second = problem.controls[term.secondControl];
+    for (size_t termIndex = 0; termIndex < state.problem.terms.size(); ++termIndex) {
+        const auto& term = state.problem.terms[termIndex];
+        const auto& first = state.problem.controls[term.firstControl];
+        const auto& second = state.problem.controls[term.secondControl];
         if (first.candidates.empty() || second.candidates.empty()) {
             ++report.skippedPairTerms;
             continue;
         }
         const std::string key = atlasSnapRankTermCacheKey(
             manifestPath, rankOptions, first.candidates, second.candidates);
-        const auto cacheIt = cache["entries"].find(key);
-        if (cacheIt != cache["entries"].end() && cacheIt->is_object() &&
+        const auto cacheIt = state.cache["entries"].find(key);
+        if (cacheIt != state.cache["entries"].end() && cacheIt->is_object() &&
             cacheIt->contains("rank_result")) {
             try {
                 AtlasSnapPairMatrix matrix = atlasSnapPairMatrixFromRankResult(
@@ -3090,11 +3162,11 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
                 } else {
                     ++report.successfulPairTerms;
                 }
-                matrices.push_back(std::move(matrix));
+                state.matrices.push_back(std::move(matrix));
             } catch (const std::exception& ex) {
                 std::ostringstream message;
                 message << "cached " << ex.what() << "; "
-                        << termDebugString(term, problem);
+                        << termDebugString(term, state.problem);
                 throw std::runtime_error(message.str());
             }
             ++report.cacheHits;
@@ -3104,83 +3176,70 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             {"id", term.id},
             {"side_a", pointsJson(first.candidates)},
             {"side_b", pointsJson(second.candidates)},
-            {"debug", termDebugJson(term, problem)},
+            {"debug", termDebugJson(term, state.problem)},
         });
-        missingTerms.push_back(&term);
-        missingKeys.push_back(key);
+        state.missingTermIndices.push_back(termIndex);
+        state.missingKeys.push_back(key);
     }
+    report.rankJobsRequested = state.missingTermIndices.size();
 
     std::cerr << "[atlas-snap] rank cache summary"
               << " hits=" << report.cacheHits
-              << " misses=" << missingTerms.size()
+              << " misses=" << state.missingTermIndices.size()
               << " skipped=" << report.skippedPairTerms
               << std::endl;
 
-    if (!jobs.empty()) {
-        auto cacheRankResult = [&](size_t index, const nlohmann::json& result) {
-            if (index >= missingTerms.size()) {
-                std::cerr << "[atlas-snap] ignoring out-of-range partial rank result"
-                          << " index=" << index
-                          << " expected=" << missingTerms.size()
-                          << std::endl;
-                return;
-            }
-            const auto& term = *missingTerms[index];
-            const auto& first = problem.controls[term.firstControl];
-            const auto& second = problem.controls[term.secondControl];
-            AtlasSnapPairMatrix matrix;
-            try {
-                matrix = atlasSnapPairMatrixFromRankResult(
-                    term, first.candidates.size(), second.candidates.size(), result);
-            } catch (const std::exception& ex) {
-                std::cerr << "[atlas-snap] not caching partial rank result "
-                          << termDebugString(term, problem)
-                          << " error=" << ex.what()
-                          << std::endl;
-                return;
-            }
-            cache["entries"][missingKeys[index]] = {
-                {"schema", 1},
-                {"source_job_id", term.id},
-                {"manifest", manifestPath.lexically_normal().generic_string()},
-                {"rank_options", rankOptions},
-                {"side_a", pointsJson(first.candidates)},
-                {"side_b", pointsJson(second.candidates)},
-                {"rank_result", matrix.metadata},
-            };
-            try {
-                writeJsonFile(cachePath, cache);
-                std::cerr << "[atlas-snap] cached partial rank result"
-                          << " index=" << index
-                          << " id=" << term.id
-                          << " entries=" << cache["entries"].size()
-                          << std::endl;
-            } catch (const std::exception& ex) {
-                std::cerr << "[atlas-snap] could not write partial rank cache: "
-                          << ex.what()
-                          << std::endl;
-            }
-        };
-        nlohmann::json request = {
-            {"manifest", manifestPath.string()},
-            {"jobs", jobs},
-            {"options", rankOptions},
-        };
-        std::cerr << "[atlas-snap] sending rank request jobs="
-                  << missingTerms.size()
-                  << " manifest=" << manifestPath.string()
-                  << " options=" << request["options"].dump()
-                  << std::endl;
-        const nlohmann::json response = ranker(request, cacheRankResult);
-        const auto& results = response.at("results");
-        if (!results.is_array() || results.size() != missingTerms.size()) {
-            throw std::runtime_error("atlas snap ranker returned an unexpected result count");
+    prepared.rankRequest = {
+        {"manifest", manifestPath.string()},
+        {"jobs", jobs},
+        {"options", rankOptions},
+    };
+    std::cerr << "[atlas-snap] prepared rank request jobs="
+              << state.missingTermIndices.size()
+              << " manifest=" << manifestPath.string()
+              << " options=" << prepared.rankRequest["options"].dump()
+              << std::endl;
+    return prepared;
+}
+
+void cacheAtlasPredSnapRankResult(
+    const AtlasSnapPreparedCandidates& prepared,
+    size_t index,
+    const nlohmann::json& result)
+{
+    if (!prepared.state) {
+        throw std::runtime_error("atlas snap rank result cache received an empty prepared session");
+    }
+    cachePreparedAtlasPredSnapRankResult(*prepared.state, index, result);
+}
+
+AtlasSnapOptimizeReport finishAtlasPredSnapCandidates(
+    const AtlasSnapPreparedCandidates& prepared,
+    const nlohmann::json& rankResponse)
+{
+    if (!prepared.state) {
+        throw std::runtime_error("atlas snap optimizer received an empty prepared session");
+    }
+    AtlasSnapPreparedCandidatesState& state = *prepared.state;
+    if (state.finished) {
+        throw std::runtime_error("atlas snap prepared session was already finished");
+    }
+    state.finished = true;
+
+    AtlasSnapOptimizeReport& report = state.report;
+    AtlasSnapOptimizationProblem& problem = state.problem;
+    std::vector<AtlasSnapPairMatrix>& matrices = state.matrices;
+
+    if (!state.missingTermIndices.empty()) {
+        const auto& results = rankResponse.at("results");
+        if (!results.is_array() || results.size() != state.missingTermIndices.size()) {
+            throw std::runtime_error("atlas snap rank response has an unexpected result count");
         }
         std::cerr << "[atlas-snap] parsing rank response results="
                   << results.size()
                   << std::endl;
-        for (size_t i = 0; i < missingTerms.size(); ++i) {
-            const auto& term = *missingTerms[i];
+        for (size_t i = 0; i < state.missingTermIndices.size(); ++i) {
+            const auto& term = problem.terms[state.missingTermIndices[i]];
             const auto& first = problem.controls[term.firstControl];
             const auto& second = problem.controls[term.secondControl];
             const auto& result = results.at(i);
@@ -3202,23 +3261,22 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
             } else {
                 ++report.successfulPairTerms;
             }
-            cache["entries"][missingKeys[i]] = {
+            state.cache["entries"][state.missingKeys[i]] = {
                 {"schema", 1},
                 {"source_job_id", term.id},
-                {"manifest", manifestPath.lexically_normal().generic_string()},
-                {"rank_options", rankOptions},
+                {"manifest", state.manifestPath.lexically_normal().generic_string()},
+                {"rank_options", state.rankOptions},
                 {"side_a", pointsJson(first.candidates)},
                 {"side_b", pointsJson(second.candidates)},
                 {"rank_result", matrix.metadata},
             };
             matrices.push_back(std::move(matrix));
         }
-        report.rankJobsRequested = missingTerms.size();
         std::cerr << "[atlas-snap] writing rank cache="
-                  << cachePath.string()
-                  << " entries=" << cache["entries"].size()
+                  << state.cachePath.string()
+                  << " entries=" << state.cache["entries"].size()
                   << std::endl;
-        writeJsonFile(cachePath, cache);
+        writeJsonFile(state.cachePath, state.cache);
     }
 
     std::unordered_set<std::string> nonZeroMatrixIds;
@@ -3288,7 +3346,7 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
         }
     }
 
-    for (const auto& mapping : atlas.fibers) {
+    for (const auto& mapping : state.atlas.fibers) {
         std::vector<int> indices;
         indices.reserve(mapping.controlAnchors.size());
         for (const auto& anchor : mapping.controlAnchors) {
@@ -3370,14 +3428,14 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
               << " unscored_variables=" << report.unscoredVariableControls
               << std::endl;
     const AtlasSnapOptimizationResult optimized =
-        optimizeAtlasSnapCandidates(problem, matrices, options);
+        optimizeAtlasSnapCandidates(problem, matrices, state.options);
     report.objective = optimized.objective;
     std::cerr << "[atlas-snap] discrete optimizer finished"
               << " objective=" << report.objective
               << std::endl;
 
     std::unordered_map<std::string, AtlasPredSnapSet*> mutableSets;
-    for (auto& [key, set] : setsByFiber) {
+    for (auto& [key, set] : state.setsByFiber) {
         mutableSets[key] = &set;
     }
     for (size_t controlIndex = 0; controlIndex < problem.controls.size(); ++controlIndex) {
@@ -3440,12 +3498,12 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
                 pointIt->candidates[selected].windingDistance;
         }
     }
-    for (const auto& [key, set] : setsByFiber) {
+    for (const auto& [key, set] : state.setsByFiber) {
         (void)key;
         std::cerr << "[atlas-snap] saving pred snap attachment="
-                  << atlasPredSnapAttachmentPath(atlasDir, set.fiberPath).string()
+                  << atlasPredSnapAttachmentPath(state.atlasDir, set.fiberPath).string()
                   << std::endl;
-        saveAtlasPredSnapSet(atlasPredSnapAttachmentPath(atlasDir, set.fiberPath), set);
+        saveAtlasPredSnapSet(atlasPredSnapAttachmentPath(state.atlasDir, set.fiberPath), set);
     }
     return report;
 }

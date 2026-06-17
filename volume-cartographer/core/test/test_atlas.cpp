@@ -8,8 +8,12 @@
 #include "vc/atlas/FiberHvClassification.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/Manifest.hpp"
 #include "vc/lasagna/LineModel.hpp"
+
+#include "utils/zarr.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -156,6 +160,28 @@ void writeText(const fs::path& path, const std::string& text)
     out << text;
 }
 
+void createU8Zarr(
+    const fs::path& path,
+    std::vector<size_t> shape,
+    std::vector<size_t> chunks,
+    const std::vector<uint8_t>& payload)
+{
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v2;
+    meta.shape = std::move(shape);
+    meta.chunks = std::move(chunks);
+    meta.dtype = utils::ZarrDtype::uint8;
+    meta.compressor_id.clear();
+    meta.fill_value = 0.0;
+    auto array = utils::ZarrArray::create(path, meta);
+    std::vector<std::byte> bytes(payload.size());
+    for (size_t i = 0; i < payload.size(); ++i) {
+        bytes[i] = static_cast<std::byte>(payload[i]);
+    }
+    std::vector<size_t> zero(meta.shape.size(), 0);
+    array.write_chunk(zero, bytes);
+}
+
 void saveSurface(const fs::path& path, const std::shared_ptr<QuadSurface>& surface)
 {
     fs::create_directories(path.parent_path());
@@ -186,6 +212,101 @@ void writeValidLasagnaAtlasFixture(const fs::path& volpkgRoot,
     writeText(atlasDir / "metadata.json",
               R"({"type":"vc3d_atlas","version":5,"name":")" + atlasName +
               R"(","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})");
+}
+
+struct AtlasSnapPrepareFixture {
+    fs::path root;
+    fs::path volpkgRoot;
+    fs::path atlasDir;
+    fs::path manifestPath;
+};
+
+vc::atlas::AtlasSnapOptimizeOptions atlasSnapPrepareTestOptions()
+{
+    vc::atlas::AtlasSnapOptimizeOptions options;
+    options.predDtThreshold = 110;
+    options.rankOptions = {
+        {"threshold", options.predDtThreshold},
+        {"margin_base_voxels", 1000},
+        {"source_depth", 0},
+        {"amgx_config", nullptr},
+    };
+    return options;
+}
+
+nlohmann::json atlasSnapSinglePairSuccess(double value = 2.0)
+{
+    return {
+        {"id", "term:0:1"},
+        {"status", "success"},
+        {"values", nlohmann::json::array({
+            {
+                {"solve_side", "side_a"},
+                {"solve_index", 0},
+                {"target_index", 0},
+                {"value", value},
+            },
+        })},
+    };
+}
+
+AtlasSnapPrepareFixture writeAtlasSnapPrepareFixture(const std::string& name)
+{
+    AtlasSnapPrepareFixture fixture;
+    fixture.root = tempRoot(name);
+    fixture.volpkgRoot = fixture.root / "volpkg";
+    fixture.atlasDir = fixture.volpkgRoot / "atlases" / "snap";
+    fixture.manifestPath = fixture.root / "dataset.lasagna.json";
+
+    saveSurface(fixture.atlasDir / "base_mesh" / "base.tifxyz",
+                makeWrappedPlane(4, 4, 0.0));
+    writeText(fixture.volpkgRoot / "fibers" / "fiber.json",
+              R"({"type":"vc3d_fiber","version":1,"line_points":[[0,0,0],[1,0,0]],"control_points":[[0,0,0],[1,0,0]]})");
+    writeText(fixture.atlasDir / "mappings" / "fibers" / "fiber.json",
+              R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","line_anchors":[{"source_index":0,"world":[0,0,0],"atlas":[0,0],"distance":0},{"source_index":1,"world":[1,0,0],"atlas":[1,0],"distance":0}],"control_anchors":[{"source_index":0,"world":[0,0,0],"atlas":[0,0],"distance":0},{"source_index":1,"world":[1,0,0],"atlas":[1,0],"distance":0}]})");
+    writeText(fixture.atlasDir / "metadata.json",
+              R"({"type":"vc3d_atlas","version":5,"name":"snap","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})");
+
+    vc::atlas::AtlasPredSnapSet set;
+    set.fiberPath = fs::path("fibers") / "fiber.json";
+    for (int i = 0; i < 2; ++i) {
+        vc::atlas::AtlasPredSnapPoint point;
+        point.fiberPath = set.fiberPath;
+        point.sourceIndex = i;
+        point.controlPoint = cv::Vec3d{static_cast<double>(i), 0.0, 0.0};
+        point.predSnapPoint = cv::Vec3d{static_cast<double>(i), 0.0, 1.0};
+        point.source = vc::atlas::AtlasPredSnapSource::Manual;
+        point.status = "manual";
+        point.statusReason = "manual pred-snap point";
+        point.candidates.push_back({*point.predSnapPoint, std::nullopt, std::nullopt, std::nullopt});
+        set.points.push_back(std::move(point));
+    }
+    vc::atlas::saveAtlasPredSnapSet(
+        vc::atlas::atlasPredSnapAttachmentPath(fixture.atlasDir, set.fiberPath),
+        set);
+
+    const fs::path zarrPath = fixture.root / "pred.zarr";
+    std::vector<uint8_t> payload(4 * 3 * 3 * 3, 0);
+    for (size_t i = 0; i < 3 * 3 * 3; ++i) {
+        payload[i] = 255;
+        payload[1 * 3 * 3 * 3 + i] = 255;
+        payload[2 * 3 * 3 * 3 + i] = 128;
+        payload[3 * 3 * 3 * 3 + i] = 170;
+    }
+    createU8Zarr(zarrPath, {4, 3, 3, 3}, {4, 3, 3, 3}, payload);
+    writeText(fixture.manifestPath, R"({
+        "version": 2,
+        "grad_mag_encode_scale": 255.0,
+        "grad_mag_factor": 1.0,
+        "groups": {
+            "pred": {
+                "zarr": "pred.zarr",
+                "scaledown": 0,
+                "channels": ["grad_mag", "nx", "ny", "pred_dt"]
+            }
+        }
+    })");
+    return fixture;
 }
 
 fs::path atlas21FixtureRoot()
@@ -708,6 +829,85 @@ TEST_CASE("Atlas snap rank cache keys track candidates and options")
             a,
             b);
     CHECK(key1 != key4);
+}
+
+TEST_CASE("Atlas pred-snap prepare emits rank request for missing pair terms")
+{
+    const auto fixture = writeAtlasSnapPrepareFixture("vc_atlas_snap_prepare_request");
+    vc::lasagna::LasagnaDataset dataset =
+        vc::lasagna::LasagnaDataset::open(fixture.manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+    const auto prepared = vc::atlas::prepareAtlasPredSnapCandidates(
+        fixture.atlasDir,
+        fixture.volpkgRoot,
+        fixture.manifestPath,
+        sampler,
+        atlasSnapPrepareTestOptions());
+
+    REQUIRE(prepared.state != nullptr);
+    REQUIRE(prepared.rankRequest.is_object());
+    CHECK(prepared.rankRequest["manifest"] == fixture.manifestPath.string());
+    REQUIRE(prepared.rankRequest["jobs"].is_array());
+    REQUIRE(prepared.rankRequest["jobs"].size() == 1);
+    const auto& job = prepared.rankRequest["jobs"][0];
+    CHECK(job["id"] == "term:0:1");
+    REQUIRE(job["side_a"].size() == 1);
+    REQUIRE(job["side_b"].size() == 1);
+    CHECK(prepared.rankRequest["options"]["threshold"] == 110);
+}
+
+TEST_CASE("Atlas pred-snap finish rejects wrong-sized rank response")
+{
+    const auto fixture = writeAtlasSnapPrepareFixture("vc_atlas_snap_finish_bad_size");
+    vc::lasagna::LasagnaDataset dataset =
+        vc::lasagna::LasagnaDataset::open(fixture.manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    auto prepared = vc::atlas::prepareAtlasPredSnapCandidates(
+        fixture.atlasDir,
+        fixture.volpkgRoot,
+        fixture.manifestPath,
+        sampler,
+        atlasSnapPrepareTestOptions());
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::finishAtlasPredSnapCandidates(
+            prepared,
+            nlohmann::json{{"results", nlohmann::json::array()}}),
+        doctest::Contains("unexpected result count"),
+        std::runtime_error);
+}
+
+TEST_CASE("Atlas pred-snap partial cache is reused by later prepare and no-service finish")
+{
+    const auto fixture = writeAtlasSnapPrepareFixture("vc_atlas_snap_partial_cache");
+    vc::lasagna::LasagnaDataset dataset =
+        vc::lasagna::LasagnaDataset::open(fixture.manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+
+    auto prepared = vc::atlas::prepareAtlasPredSnapCandidates(
+        fixture.atlasDir,
+        fixture.volpkgRoot,
+        fixture.manifestPath,
+        sampler,
+        atlasSnapPrepareTestOptions());
+    REQUIRE(prepared.rankRequest["jobs"].size() == 1);
+    vc::atlas::cacheAtlasPredSnapRankResult(prepared, 0, atlasSnapSinglePairSuccess());
+
+    auto cachedPrepared = vc::atlas::prepareAtlasPredSnapCandidates(
+        fixture.atlasDir,
+        fixture.volpkgRoot,
+        fixture.manifestPath,
+        sampler,
+        atlasSnapPrepareTestOptions());
+    CHECK(cachedPrepared.rankRequest["jobs"].empty());
+
+    const auto report =
+        vc::atlas::finishAtlasPredSnapCandidates(cachedPrepared, nlohmann::json::object());
+    CHECK(report.cacheHits == 1);
+    CHECK(report.rankJobsRequested == 0);
+    CHECK(report.successfulPairTerms == 1);
+    CHECK(report.objective == doctest::Approx(1.0));
 }
 
 TEST_CASE("Atlas optimization adds adjacent control terms along fibers")
