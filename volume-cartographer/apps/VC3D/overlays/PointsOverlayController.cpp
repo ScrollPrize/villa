@@ -8,6 +8,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 
 #include <QtGlobal>
+#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
@@ -338,5 +339,16 @@ void PointsOverlayController::disconnectCollectionSignals()
 
 void PointsOverlayController::handleCollectionMutated()
 {
-    refreshAll();
+    // Several collection mutations (notably VCCollection::addPoints) emit both
+    // per-point and batch signals, and a batch add fires pointAdded N times plus
+    // pointsAdded once. Coalesce the resulting refreshes onto a single deferred
+    // call so a burst of signals in one event-loop turn triggers one refreshAll().
+    if (_refreshPending) {
+        return;
+    }
+    _refreshPending = true;
+    QTimer::singleShot(0, this, [this]() {
+        _refreshPending = false;
+        refreshAll();
+    });
 }
