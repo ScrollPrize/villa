@@ -717,7 +717,7 @@ bool SegmentationPushPullTool::applyStepInternal()
         return false;
     }
 
-    auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
+    auto* patchIndex = _editManager->preferredSurfacePatchIndex();
 
     // Get normal directly from grid position (avoids expensive pointTo lookup)
     cv::Vec3f normal = baseSurface->gridNormal(row, col);
@@ -860,7 +860,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
 
         centerNormal = baseSurface->gridNormal(row, col);
         if (!isValidNormal(centerNormal)) {
-            auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
+            auto* patchIndex = _editManager->preferredSurfacePatchIndex();
             cv::Vec3f ptr(0, 0, 0);
             baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
             if (const auto fallback = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
@@ -1007,9 +1007,7 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
     }
 
     if (auto* manager = _module.viewerManager()) {
-        if (auto* index = manager->surfacePatchIndex()) {
-            index->flushPendingUpdates(surface);
-        }
+        _editManager->flushEditSurfacePatchIndex();
         manager->forEachBaseViewer([viewer](VolumeViewerBase* candidate) {
             if (!candidate || candidate == viewer) {
                 return;
