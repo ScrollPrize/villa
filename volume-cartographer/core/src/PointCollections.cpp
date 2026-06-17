@@ -189,6 +189,7 @@ void PointCollections::addPoints(const std::string& collectionName, const std::v
         collection_points[new_point.id] = new_point;
         _points[new_point.id] = new_point;
         added_points.push_back(new_point);
+        onPointAdded(new_point);
     }
     if (!added_points.empty()) {
         onPointsAdded(added_points);
