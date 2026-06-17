@@ -3595,8 +3595,16 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
     if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
         cv::Vec3f ptr = quad->pointer();
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        if (quad->pointTo(ptr, volPoint, 4.0f, 100, patchIndex) < 0.0f)
-            return {};
+        // Match the points-overlay default view tolerance so points that are meant to
+        // render faded still project to their true location rather than collapsing.
+        constexpr float kQuadProjectTolerance = 10.0f;
+        // pointTo() with a patch index signals "no surface point within tolerance" by
+        // returning a positive value (~the tolerance) WITHOUT updating ptr, so a bare
+        // `< 0.0f` check would silently keep ptr at {0,0,0} and map the point to the
+        // segment center. Treat anything outside the tolerance as a failed projection.
+        const float dist = quad->pointTo(ptr, volPoint, kQuadProjectTolerance, 100, patchIndex);
+        if (dist < 0.0f || dist > kQuadProjectTolerance)
+            return {NAN, NAN};
         const cv::Vec3f loc = quad->loc(ptr);
         return surfaceToScene(loc[0], loc[1]);
     }
