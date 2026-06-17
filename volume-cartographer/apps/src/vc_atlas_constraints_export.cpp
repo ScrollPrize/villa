@@ -38,6 +38,7 @@ void printUsage(const char* argv0)
         << "  --lasagna-manifest PATH               Override selected Lasagna dataset\n"
         << "  --fiber-path PATH                     Base directory for atlas fiber JSON paths\n"
         << "  --debug-image PATH                    Write one debug image; extension selects format\n"
+        << "  --dbg-dir DIR                         Write aggregate and per-constraint LZW TIFFs\n"
         << "  --line-max-step W                     Max on-fiber point spacing in windings (default 0.25)\n"
         << "  --cross-target W                      Cross-winding target distance (default 1.0)\n"
         << "  --cross-tolerance W                   Cross-winding tolerance (default 0.1)\n"
@@ -133,8 +134,12 @@ Options parseArgs(int argc, char** argv)
             options.exportOptions.debugImagesDir = value;
             continue;
         }
+        if (auto value = optionValue(arg, "--dbg-dir", i, argc, argv); !value.empty()) {
+            options.exportOptions.debugDirectory = value;
+            continue;
+        }
         if (auto value = optionValue(arg, "--debug-images-dir", i, argc, argv); !value.empty()) {
-            options.exportOptions.debugImagesDir = value;
+            options.exportOptions.debugDirectory = value;
             continue;
         }
         if (readDoubleOption(arg, "--line-max-step", i, argc, argv, options.exportOptions.lineMaxWindingStep) ||

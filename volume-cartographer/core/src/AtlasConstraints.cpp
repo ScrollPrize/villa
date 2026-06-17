@@ -9,6 +9,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -165,6 +166,34 @@ double continuousWindingForAtlasU(double actualU, const AtlasMetadata& metadata,
            static_cast<double>(periodColumns);
 }
 
+const AtlasAnchor* nearestControlAnchor(const FiberMapping& mapping, double sourcePosition)
+{
+    if (mapping.controlAnchors.empty() || !std::isfinite(sourcePosition)) {
+        return nullptr;
+    }
+    const AtlasAnchor* best = nullptr;
+    double bestDelta = std::numeric_limits<double>::infinity();
+    for (const auto& anchor : mapping.controlAnchors) {
+        const double delta = std::abs(static_cast<double>(anchor.sourceIndex) - sourcePosition);
+        if (delta < bestDelta ||
+            (delta == bestDelta && best && anchor.sourceIndex < best->sourceIndex)) {
+            best = &anchor;
+            bestDelta = delta;
+        }
+    }
+    return best;
+}
+
+std::optional<double> nearestControlSourcePosition(const FiberMapping& mapping,
+                                                   double sourcePosition)
+{
+    const AtlasAnchor* anchor = nearestControlAnchor(mapping, sourcePosition);
+    if (!anchor) {
+        return std::nullopt;
+    }
+    return static_cast<double>(anchor->sourceIndex);
+}
+
 std::optional<ExportPoint> interpolateMappedPoint(size_t fiberIndex,
                                                   const FiberMapping& mapping,
                                                   double sourcePosition,
@@ -172,51 +201,20 @@ std::optional<ExportPoint> interpolateMappedPoint(size_t fiberIndex,
                                                   const AtlasMetadata& metadata,
                                                   int periodColumns)
 {
-    if (mapping.lineAnchors.empty()) {
+    const AtlasAnchor* anchor = nearestControlAnchor(mapping, sourcePosition);
+    if (!anchor) {
         return std::nullopt;
-    }
-    std::vector<const AtlasAnchor*> anchors;
-    anchors.reserve(mapping.lineAnchors.size());
-    for (const auto& anchor : mapping.lineAnchors) {
-        anchors.push_back(&anchor);
-    }
-    std::sort(anchors.begin(), anchors.end(), [](const AtlasAnchor* a, const AtlasAnchor* b) {
-        return a->sourceIndex < b->sourceIndex;
-    });
-
-    const AtlasAnchor* lo = anchors.front();
-    const AtlasAnchor* hi = anchors.back();
-    for (size_t i = 1; i < anchors.size(); ++i) {
-        if (sourcePosition <= static_cast<double>(anchors[i]->sourceIndex)) {
-            lo = anchors[i - 1];
-            hi = anchors[i];
-            break;
-        }
-    }
-    if (sourcePosition <= static_cast<double>(anchors.front()->sourceIndex)) {
-        lo = hi = anchors.front();
-    } else if (sourcePosition >= static_cast<double>(anchors.back()->sourceIndex)) {
-        lo = hi = anchors.back();
-    }
-
-    double t = 0.0;
-    if (lo != hi) {
-        const double span = static_cast<double>(hi->sourceIndex - lo->sourceIndex);
-        if (std::abs(span) > kEpsilon) {
-            t = std::clamp((sourcePosition - static_cast<double>(lo->sourceIndex)) / span, 0.0, 1.0);
-        }
     }
 
     ExportPoint p;
     p.fiber = fiberIndex;
-    p.sourcePosition = sourcePosition;
-    p.world = lo->world * (1.0 - t) + hi->world * t;
-    p.atlasU = actualAtlasU(*lo, mapping, periodColumns) * (1.0 - t) +
-               actualAtlasU(*hi, mapping, periodColumns) * t;
-    p.atlasV = lo->atlasV * (1.0 - t) + hi->atlasV * t;
+    p.sourcePosition = static_cast<double>(anchor->sourceIndex);
+    p.world = anchor->world;
+    p.atlasU = actualAtlasU(*anchor, mapping, periodColumns);
+    p.atlasV = anchor->atlasV;
     p.continuousWinding = continuousWindingForAtlasU(p.atlasU, metadata, periodColumns);
     p.fiberDir = fiberDir;
-    p.stableKey = pointKey(fiberIndex, sourcePosition);
+    p.stableKey = pointKey(fiberIndex, p.sourcePosition);
     if (!finitePoint(p.world) || !std::isfinite(p.continuousWinding)) {
         return std::nullopt;
     }
@@ -342,7 +340,7 @@ std::vector<TemporaryLink> temporaryCycleClosingLinks(
                 options.closeAtlasWindingThreshold) {
             continue;
         }
-        links.push_back({a, sourcePosition, b, targetPosition});
+        links.push_back({a, pa->sourcePosition, b, pb->sourcePosition});
     }
     std::sort(links.begin(), links.end(), [](const TemporaryLink& a, const TemporaryLink& b) {
         return std::tie(a.firstFiber, a.firstPosition, a.secondFiber, a.secondPosition) <
@@ -390,38 +388,13 @@ Graph buildGraph(const LasagnaAtlasExport& exportData,
                  const AtlasConstraintExportOptions& options,
                  AtlasConstraintExportReport& report)
 {
+    (void)options;
     const int period = atlasHorizontalPeriodColumns(baseSurface);
     std::vector<std::map<double, bool>> fiberPositions(fibers.size());
     for (size_t i = 0; i < exportData.atlas.fibers.size(); ++i) {
         const auto& mapping = exportData.atlas.fibers[i];
-        std::vector<const AtlasAnchor*> anchors;
-        for (const auto& anchor : mapping.lineAnchors) {
+        for (const auto& anchor : mapping.controlAnchors) {
             addUniquePosition(fiberPositions[i], static_cast<double>(anchor.sourceIndex));
-            anchors.push_back(&anchor);
-        }
-        std::sort(anchors.begin(), anchors.end(), [](const AtlasAnchor* a, const AtlasAnchor* b) {
-            return a->sourceIndex < b->sourceIndex;
-        });
-        for (size_t j = 1; j < anchors.size(); ++j) {
-            const double w0 = continuousWindingForAtlasU(
-                actualAtlasU(*anchors[j - 1], mapping, period),
-                exportData.atlas.metadata,
-                period);
-            const double w1 = continuousWindingForAtlasU(
-                actualAtlasU(*anchors[j], mapping, period),
-                exportData.atlas.metadata,
-                period);
-            const double span = std::abs(w1 - w0);
-            const int steps = options.lineMaxWindingStep > kEpsilon
-                ? std::max(1, static_cast<int>(std::ceil(span / options.lineMaxWindingStep)))
-                : 1;
-            for (int s = 1; s < steps; ++s) {
-                const double t = static_cast<double>(s) / static_cast<double>(steps);
-                addUniquePosition(
-                    fiberPositions[i],
-                    static_cast<double>(anchors[j - 1]->sourceIndex) * (1.0 - t) +
-                        static_cast<double>(anchors[j]->sourceIndex) * t);
-            }
         }
     }
 
@@ -436,7 +409,12 @@ Graph buildGraph(const LasagnaAtlasExport& exportData,
             return;
         }
         const size_t idx = static_cast<size_t>(std::distance(exportData.atlas.fibers.begin(), it));
-        addUniquePosition(fiberPositions[idx], static_cast<double>(endpoint.sourceIndex));
+        const auto snapped = nearestControlSourcePosition(
+            exportData.atlas.fibers[idx],
+            static_cast<double>(endpoint.sourceIndex));
+        if (snapped) {
+            addUniquePosition(fiberPositions[idx], *snapped);
+        }
     };
     for (const auto& link : exportData.atlas.links) {
         addLinkEndpoint(link.first);
@@ -486,7 +464,13 @@ Graph buildGraph(const LasagnaAtlasExport& exportData,
         for (size_t i = 0; i < exportData.atlas.fibers.size(); ++i) {
             if (atlasFiberPathKey(exportData.atlas.fibers[i].fiberPath) ==
                 atlasFiberPathKey(endpoint.fiberPath)) {
-                const auto key = pointKey(i, static_cast<double>(endpoint.sourceIndex));
+                const auto snapped = nearestControlSourcePosition(
+                    exportData.atlas.fibers[i],
+                    static_cast<double>(endpoint.sourceIndex));
+                if (!snapped) {
+                    return std::nullopt;
+                }
+                const auto key = pointKey(i, *snapped);
                 const auto it = idByKey.find(key);
                 if (it != idByKey.end()) {
                     return it->second;
@@ -898,15 +882,16 @@ void drawDebugMarker(cv::Mat& image,
     }
 }
 
-void drawDebugGroups(cv::Mat& image,
-                     const Graph& graph,
-                     const DebugCanvasTransform& transform,
-                     const std::vector<std::vector<size_t>>& groups,
-                     uint64_t colorSalt)
+void drawDebugGroup(cv::Mat& image,
+                    const Graph& graph,
+                    const DebugCanvasTransform& transform,
+                    const std::vector<size_t>& group,
+                    size_t groupIndex,
+                    uint64_t colorSalt,
+                    bool connectSegments)
 {
-    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
-        const auto& group = groups[groupIndex];
-        const cv::Scalar color = debugColor(groupIndex, colorSalt);
+    const cv::Scalar color = debugColor(groupIndex, colorSalt);
+    if (connectSegments) {
         for (size_t i = 1; i < group.size(); ++i) {
             const auto& a = graph.points[group[i - 1]];
             const auto& b = graph.points[group[i]];
@@ -917,12 +902,40 @@ void drawDebugGroups(cv::Mat& image,
                      2,
                      cv::LINE_AA);
         }
-        for (size_t node : group) {
-            drawDebugMarker(image,
-                            debugPoint(graph.points[node], transform),
-                            color,
-                            groupIndex);
-        }
+    }
+    for (size_t node : group) {
+        drawDebugMarker(image,
+                        debugPoint(graph.points[node], transform),
+                        color,
+                        groupIndex);
+    }
+}
+
+void drawDebugGroups(cv::Mat& image,
+                     const Graph& graph,
+                     const DebugCanvasTransform& transform,
+                     const std::vector<std::vector<size_t>>& groups,
+                     uint64_t colorSalt,
+                     bool connectSegments)
+{
+    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+        drawDebugGroup(
+            image, graph, transform, groups[groupIndex], groupIndex, colorSalt, connectSegments);
+    }
+}
+
+void writeDebugMat(const cv::Mat& image, const fs::path& path)
+{
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    std::vector<int> params;
+    if (ext == ".tif" || ext == ".tiff") {
+        params = {cv::IMWRITE_TIFF_COMPRESSION, cv::IMWRITE_TIFF_COMPRESSION_LZW};
+    }
+    if (!cv::imwrite(path.string(), image, params)) {
+        throw std::runtime_error("failed to write debug image: " + path.string());
     }
 }
 
@@ -954,16 +967,72 @@ size_t writeDebugImage(const Graph& graph,
         return 0;
     }
     cv::Mat image(transform->height, transform->width, CV_8UC3, cv::Scalar(0, 0, 0));
-    drawDebugGroups(image, graph, *transform, lineGroups, 0x11efeULL);
-    drawDebugGroups(image, graph, *transform, crossGroups, 0xc4055ULL);
+    drawDebugGroups(image, graph, *transform, lineGroups, 0x11efeULL, true);
+    drawDebugGroups(image, graph, *transform, crossGroups, 0xc4055ULL, false);
 
     const fs::path path = hasFormatExtension
         ? debugOutput
         : (debugDir / ("atlas_constraints_debug" + extension));
-    if (!cv::imwrite(path.string(), image)) {
-        throw std::runtime_error("failed to write debug image: " + path.string());
-    }
+    writeDebugMat(image, path);
     return 1;
+}
+
+cv::Mat blankDebugImage(const DebugCanvasTransform& transform)
+{
+    return cv::Mat(transform.height, transform.width, CV_8UC3, cv::Scalar(0, 0, 0));
+}
+
+size_t writeDebugDirectory(const Graph& graph,
+                           const std::vector<std::vector<size_t>>& lineGroups,
+                           const std::vector<std::vector<size_t>>& crossGroups,
+                           const fs::path& debugDir)
+{
+    if (debugDir.empty() || (lineGroups.empty() && crossGroups.empty())) {
+        return 0;
+    }
+    std::error_code ec;
+    fs::create_directories(debugDir, ec);
+    if (ec) {
+        throw std::runtime_error("failed to create debug image directory " +
+                                 debugDir.string() + ": " + ec.message());
+    }
+
+    const auto transform = debugCanvasTransformForGraph(graph);
+    if (!transform) {
+        return 0;
+    }
+
+    size_t written = 0;
+    if (!lineGroups.empty()) {
+        cv::Mat image = blankDebugImage(*transform);
+        drawDebugGroups(image, graph, *transform, lineGroups, 0x11efeULL, true);
+        writeDebugMat(image, debugDir / "lines.tif");
+        ++written;
+    }
+    if (!crossGroups.empty()) {
+        cv::Mat image = blankDebugImage(*transform);
+        drawDebugGroups(image, graph, *transform, crossGroups, 0xc4055ULL, false);
+        writeDebugMat(image, debugDir / "cross.tif");
+        ++written;
+    }
+
+    for (size_t i = 0; i < lineGroups.size(); ++i) {
+        cv::Mat image = blankDebugImage(*transform);
+        drawDebugGroup(image, graph, *transform, lineGroups[i], i, 0x11efeULL, true);
+        std::ostringstream name;
+        name << "line_" << std::setw(6) << std::setfill('0') << i << ".tif";
+        writeDebugMat(image, debugDir / name.str());
+        ++written;
+    }
+    for (size_t i = 0; i < crossGroups.size(); ++i) {
+        cv::Mat image = blankDebugImage(*transform);
+        drawDebugGroup(image, graph, *transform, crossGroups[i], i, 0xc4055ULL, false);
+        std::ostringstream name;
+        name << "cross_" << std::setw(6) << std::setfill('0') << i << ".tif";
+        writeDebugMat(image, debugDir / name.str());
+        ++written;
+    }
+    return written;
 }
 
 } // namespace
@@ -1037,6 +1106,13 @@ AtlasConstraintExportResult exportAtlasConstraints(
             linePaths,
             crossChains,
             options.debugImagesDir);
+    }
+    if (!options.debugDirectory.empty()) {
+        result.report.debugImagesWritten += writeDebugDirectory(
+            graph,
+            linePaths,
+            crossChains,
+            options.debugDirectory);
     }
     return result;
 }

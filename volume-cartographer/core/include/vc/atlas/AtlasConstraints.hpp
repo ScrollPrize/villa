@@ -33,6 +33,7 @@ struct AtlasConstraintExportOptions {
     double intersectionDeduplicateArclength = 4.0;
     size_t greedyBeamWidth = 32;
     std::filesystem::path debugImagesDir;
+    std::filesystem::path debugDirectory;
 };
 
 struct AtlasConstraintExportReport {
