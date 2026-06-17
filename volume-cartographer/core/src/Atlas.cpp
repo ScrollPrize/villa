@@ -1106,25 +1106,42 @@ bool atlasLoadErrorRequiresRebuild(const std::exception& ex)
            message.find("obsolete") != std::string::npos;
 }
 
+AtlasBaseMappingContext atlasBaseMappingContextFromSurface(
+    std::shared_ptr<QuadSurface> baseSurface)
+{
+    if (!baseSurface) {
+        throw std::runtime_error("atlas base mapping context has no base surface");
+    }
+    const auto* points = baseSurface->rawPointsPtr();
+    if (!points || points->empty() || points->cols <= 0) {
+        throw std::runtime_error("atlas base mesh has no valid grid");
+    }
+    AtlasBaseMappingContext context;
+    context.baseSurface = std::move(baseSurface);
+    context.baseIndex = std::make_shared<SurfacePatchIndex>();
+    context.baseIndex->rebuild({context.baseSurface});
+    return context;
+}
+
+AtlasBaseMappingContext loadAtlasBaseMappingContext(const fs::path& atlasDir,
+                                                    const Atlas& atlas)
+{
+    if (atlas.metadata.baseMeshPath.empty()) {
+        throw std::runtime_error("cannot load atlas base mapping context without base_mesh_path");
+    }
+    return atlasBaseMappingContextFromSurface(
+        std::make_shared<QuadSurface>(atlasDir / atlas.metadata.baseMeshPath));
+}
+
 Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
                                    const fs::path& volpkgRoot,
                                    const vc::lasagna::NormalSampler& normalSampler,
                                    const LineMappingOptions& options)
 {
     const Atlas legacy = loadAtlasContextForRebuild(atlasDir);
-    if (legacy.metadata.baseMeshPath.empty()) {
-        throw std::runtime_error("cannot rebuild atlas without base_mesh_path");
-    }
-    QuadSurface loadedBase(atlasDir / legacy.metadata.baseMeshPath);
-    const auto* points = loadedBase.rawPointsPtr();
-    if (!points || points->empty()) {
-        throw std::runtime_error("cannot rebuild atlas: base mesh has no valid grid");
-    }
-    auto baseSurface = std::make_shared<QuadSurface>(*points, loadedBase.scale());
-    SurfacePatchIndex baseIndex;
-    baseIndex.rebuild({baseSurface});
+    auto context = loadAtlasBaseMappingContext(atlasDir, legacy);
     return rebuildAtlasFromSourceFibers(
-        atlasDir, volpkgRoot, *baseSurface, baseIndex, normalSampler, options);
+        atlasDir, volpkgRoot, *context.baseSurface, *context.baseIndex, normalSampler, options);
 }
 
 Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
@@ -3975,6 +3992,73 @@ std::optional<cv::Vec3d> atlasAnchorBaseNormal(const AtlasAnchor& anchor,
                                atlasBaseNormalOutwardSign(baseSurface));
 }
 
+const AtlasAnchor* nearestLineAnchorForPosition(const FiberMapping& mapping,
+                                                double linePosition)
+{
+    if (!std::isfinite(linePosition)) {
+        return nullptr;
+    }
+    const AtlasAnchor* best = nullptr;
+    double bestDelta = std::numeric_limits<double>::infinity();
+    for (const auto& anchor : mapping.lineAnchors) {
+        const double delta = std::abs(static_cast<double>(anchor.sourceIndex) - linePosition);
+        if (delta < bestDelta) {
+            best = &anchor;
+            bestDelta = delta;
+        }
+    }
+    return best;
+}
+
+AtlasSignedWindingDisplay signedAtlasSearchWindingDisplay(
+    double windingDistance,
+    bool sourceFiberDisplaysAsH,
+    double sourceLinePosition,
+    double targetLinePosition,
+    const cv::Vec3d& sourcePoint,
+    const cv::Vec3d& targetPoint,
+    const FiberMapping& sourceMapping,
+    const FiberMapping& targetMapping,
+    const QuadSurface& baseSurface)
+{
+    if (!std::isfinite(windingDistance)) {
+        throw std::runtime_error("atlas search winding distance is not finite");
+    }
+    if (!std::isfinite(sourceLinePosition) || !std::isfinite(targetLinePosition)) {
+        throw std::runtime_error("atlas search line position is not finite");
+    }
+    if (!finitePoint(sourcePoint) || !finitePoint(targetPoint)) {
+        throw std::runtime_error("atlas search intersection point is not finite");
+    }
+
+    const FiberMapping& hMapping = sourceFiberDisplaysAsH ? sourceMapping : targetMapping;
+    const double hLinePosition = sourceFiberDisplaysAsH ? sourceLinePosition : targetLinePosition;
+    const cv::Vec3d hPoint = sourceFiberDisplaysAsH ? sourcePoint : targetPoint;
+    const cv::Vec3d vPoint = sourceFiberDisplaysAsH ? targetPoint : sourcePoint;
+
+    const AtlasAnchor* hAnchor = nearestLineAnchorForPosition(hMapping, hLinePosition);
+    if (!hAnchor) {
+        throw std::runtime_error("mapped H fiber has no line anchor for atlas search signing");
+    }
+    const auto hNormal = atlasAnchorBaseNormal(*hAnchor, hMapping, baseSurface);
+    if (!hNormal || !validNormal(*hNormal)) {
+        throw std::runtime_error("could not sample outward base normal for atlas search signing");
+    }
+
+    const double projection = (vPoint - hPoint).dot(*hNormal);
+    if (!std::isfinite(projection)) {
+        throw std::runtime_error("atlas search H/V normal projection is not finite");
+    }
+
+    AtlasSignedWindingDisplay display;
+    display.sourceFiberIsH = sourceFiberDisplaysAsH;
+    display.hAnchorSourceIndex = hAnchor->sourceIndex;
+    display.hToVOutwardProjection = projection;
+    display.signedWindingDistance =
+        projection > 0.0 ? -std::abs(windingDistance) : std::abs(windingDistance);
+    return display;
+}
+
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
 {
     AtlasDisplayRange range;
@@ -4025,41 +4109,60 @@ AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns)
     return range;
 }
 
-void layoutAtlasObjects(Atlas& atlas, int periodColumns)
+int atlasLinkWindingOffsetDelta(const AtlasLink& link,
+                                int periodColumns,
+                                int zeroWindingColumn)
+{
+    const int firstBaseWinding = atlasWindingForColumn(
+        link.first.atlasU, periodColumns, zeroWindingColumn);
+    const int secondBaseWinding = atlasWindingForColumn(
+        link.second.atlasU, periodColumns, zeroWindingColumn);
+    return link.desiredWindingDelta - (secondBaseWinding - firstBaseWinding);
+}
+
+std::vector<AtlasLayoutConflict> layoutAtlasObjects(Atlas& atlas, int periodColumns)
 {
     if (periodColumns <= 0 || atlas.fibers.empty()) {
-        return;
+        return {};
     }
 
     std::unordered_map<std::string, size_t> fiberIndexByPath;
     fiberIndexByPath.reserve(atlas.fibers.size());
     for (size_t i = 0; i < atlas.fibers.size(); ++i) {
-        fiberIndexByPath.emplace(atlas.fibers[i].fiberPath.generic_string(), i);
+        fiberIndexByPath.emplace(atlasFiberPathKey(atlas.fibers[i].fiberPath), i);
         atlas.fibers[i].windingOffset = 0;
     }
 
     struct Edge {
         size_t to = 0;
         int delta = 0;
+        std::string toKey;
     };
     std::vector<std::vector<Edge>> graph(atlas.fibers.size());
     for (const auto& link : atlas.links) {
-        const auto firstIt = fiberIndexByPath.find(link.first.fiberPath.generic_string());
-        const auto secondIt = fiberIndexByPath.find(link.second.fiberPath.generic_string());
+        const std::string firstKey = atlasFiberPathKey(link.first.fiberPath);
+        const std::string secondKey = atlasFiberPathKey(link.second.fiberPath);
+        const auto firstIt = fiberIndexByPath.find(firstKey);
+        const auto secondIt = fiberIndexByPath.find(secondKey);
         if (firstIt == fiberIndexByPath.end() || secondIt == fiberIndexByPath.end()) {
             continue;
         }
-        const int firstBaseWinding = atlasWindingForColumn(
-            link.first.atlasU, periodColumns, atlas.metadata.zeroWindingColumn);
-        const int secondBaseWinding = atlasWindingForColumn(
-            link.second.atlasU, periodColumns, atlas.metadata.zeroWindingColumn);
-        const int secondMinusFirst =
-            link.desiredWindingDelta - (secondBaseWinding - firstBaseWinding);
-        graph[firstIt->second].push_back({secondIt->second, secondMinusFirst});
-        graph[secondIt->second].push_back({firstIt->second, -secondMinusFirst});
+        const int secondMinusFirst = atlasLinkWindingOffsetDelta(
+            link, periodColumns, atlas.metadata.zeroWindingColumn);
+        graph[firstIt->second].push_back({secondIt->second, secondMinusFirst, secondKey});
+        graph[secondIt->second].push_back({firstIt->second, -secondMinusFirst, firstKey});
+    }
+
+    for (auto& edges : graph) {
+        std::sort(edges.begin(), edges.end(), [](const Edge& a, const Edge& b) {
+            if (a.toKey != b.toKey) return a.toKey < b.toKey;
+            if (a.delta != b.delta) return a.delta < b.delta;
+            return a.to < b.to;
+        });
     }
 
     std::vector<bool> visited(atlas.fibers.size(), false);
+    std::vector<AtlasLayoutConflict> conflicts;
     std::queue<size_t> pending;
     visited[0] = true;
     pending.push(0);
@@ -4069,6 +4172,19 @@ void layoutAtlasObjects(Atlas& atlas, int periodColumns)
         for (const auto& edge : graph[current]) {
             const int candidateOffset = atlas.fibers[current].windingOffset + edge.delta;
             if (visited[edge.to]) {
+                if (atlas.fibers[edge.to].windingOffset != candidateOffset) {
+                    conflicts.push_back({
+                        atlas.fibers[edge.to].fiberPath,
+                        atlas.fibers[edge.to].windingOffset,
+                        candidateOffset,
+                    });
+                    atlasDebug(
+                        "layout conflict for " +
+                        atlas.fibers[edge.to].fiberPath.generic_string() +
+                        ": existing offset " +
+                        std::to_string(atlas.fibers[edge.to].windingOffset) +
+                        ", candidate offset " + std::to_string(candidateOffset));
+                }
                 continue;
             }
             atlas.fibers[edge.to].windingOffset = candidateOffset;
@@ -4076,6 +4192,7 @@ void layoutAtlasObjects(Atlas& atlas, int periodColumns)
             pending.push(edge.to);
         }
     }
+    return conflicts;
 }
 
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,

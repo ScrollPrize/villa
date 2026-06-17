@@ -2352,8 +2352,23 @@ void LineAnnotationController::rebuildIntersectionInspection()
         vSide.style = FiberSliceOverlayController::targetFiberStyle();
 
         auto prepareSide = [this](SideBuild& side) {
-            side.lineViews = vc::lasagna::buildLineViewSurfaces(
-                syntheticLineModelFromPoints(side.fiber->linePoints));
+            if (!side.editSession) {
+                throw std::runtime_error("Intersection side has no editable line session");
+            }
+            if (!ensureDatasetForSession(*side.editSession)) {
+                throw std::runtime_error(
+                    "Intersection side strips require a selected Lasagna normal dataset; "
+                    "not showing a synthetic strip");
+            }
+            side.editSession->optimizedLine =
+                lineModelFromPoints(side.fiber->linePoints, side.editSession->normalSampler.get());
+            side.lineViews = vc::lasagna::buildLineViewSurfaces(side.editSession->optimizedLine);
+            Logger()->info("Intersection {} strip built from sampled normals: fiber={} points={} surface={} side_slice={}",
+                           side.displayPrefix,
+                           side.fiber ? side.fiber->id : 0,
+                           side.fiber ? side.fiber->linePoints.size() : 0,
+                           static_cast<const void*>(side.lineViews.lineSurface.get()),
+                           static_cast<const void*>(side.lineViews.lineSideSlice.get()));
             side.triplet = vc3d::fiber_slice::selectControlTriplet(
                 side.fiber->linePoints,
                 side.fiber->controlPoints,
@@ -3319,7 +3334,12 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
                 if (auto fiber = loadFiberFile(entry.path())) {
                     const fs::path path = relativeFiberPath(*fiber);
                     byPath[path] = FiberSnapshotWithPath{
-                        path, snapshotForFiber(*fiber), fiber->id, fiber->tags};
+                        path,
+                        snapshotForFiber(*fiber),
+                        fiber->id,
+                        fiber->hvClassification,
+                        fiber->manualHvTag,
+                        fiber->tags};
                 }
             } catch (const std::exception& ex) {
                 Logger()->warn("Skipping invalid VC3D fiber file {} during atlas search: {}",
@@ -3332,7 +3352,12 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
     for (const auto& fiber : _fibers) {
         const fs::path path = relativeFiberPath(fiber);
         byPath[path] = FiberSnapshotWithPath{
-            path, snapshotForFiber(fiber), fiber.id, fiber.tags};
+            path,
+            snapshotForFiber(fiber),
+            fiber.id,
+            fiber.hvClassification,
+            fiber.manualHvTag,
+            fiber.tags};
     }
 
     std::vector<fs::path> orderedPaths;

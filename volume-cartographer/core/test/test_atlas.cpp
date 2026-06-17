@@ -842,6 +842,112 @@ TEST_CASE("Atlas base normal orientation uses central ring perimeter")
     CHECK(normal->dot(radial) > 0.0);
 }
 
+TEST_CASE("Atlas search signed winding display uses H outward normal")
+{
+    auto surface = makeWrappedPlane(5, 4, 0.0);
+    vc::atlas::FiberMapping hMapping;
+    hMapping.fiberPath = fs::path("fibers") / "h.json";
+    vc::atlas::AtlasAnchor hAnchor;
+    hAnchor.sourceIndex = 1;
+    hAnchor.world = {2.0, 2.0, 0.0};
+    hAnchor.atlasU = 2.0;
+    hAnchor.atlasV = 2.0;
+    hMapping.lineAnchors.push_back(hAnchor);
+
+    vc::atlas::FiberMapping vMapping = hMapping;
+    vMapping.fiberPath = fs::path("fibers") / "v.json";
+
+    const auto normal = vc::atlas::atlasAnchorBaseNormal(hAnchor, hMapping, *surface);
+    REQUIRE(normal.has_value());
+    const cv::Vec3d hPoint = hAnchor.world;
+    const cv::Vec3d outsideV = hPoint + *normal * 0.5;
+    const cv::Vec3d insideV = hPoint - *normal * 0.5;
+
+    const auto outsideDisplay = vc::atlas::signedAtlasSearchWindingDisplay(
+        2.25,
+        true,
+        1.0,
+        1.0,
+        hPoint,
+        outsideV,
+        hMapping,
+        vMapping,
+        *surface);
+    CHECK(outsideDisplay.sourceFiberIsH);
+    CHECK(outsideDisplay.hAnchorSourceIndex == 1);
+    CHECK(outsideDisplay.hToVOutwardProjection > 0.0);
+    CHECK(outsideDisplay.signedWindingDistance == doctest::Approx(-2.25));
+
+    const auto insideDisplay = vc::atlas::signedAtlasSearchWindingDisplay(
+        2.25,
+        true,
+        1.0,
+        1.0,
+        hPoint,
+        insideV,
+        hMapping,
+        vMapping,
+        *surface);
+    CHECK(insideDisplay.hToVOutwardProjection < 0.0);
+    CHECK(insideDisplay.signedWindingDistance == doctest::Approx(2.25));
+
+    const auto swappedDisplay = vc::atlas::signedAtlasSearchWindingDisplay(
+        2.25,
+        false,
+        1.0,
+        1.0,
+        outsideV,
+        hPoint,
+        vMapping,
+        hMapping,
+        *surface);
+    CHECK_FALSE(swappedDisplay.sourceFiberIsH);
+    CHECK(swappedDisplay.hToVOutwardProjection > 0.0);
+    CHECK(swappedDisplay.signedWindingDistance == doctest::Approx(-2.25));
+}
+
+TEST_CASE("Atlas search signed winding display fails on missing signing data")
+{
+    auto surface = makeWrappedPlane(5, 4, 0.0);
+    vc::atlas::FiberMapping mapping;
+    mapping.fiberPath = fs::path("fibers") / "fiber.json";
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::signedAtlasSearchWindingDisplay(
+            1.0,
+            true,
+            0.0,
+            0.0,
+            {2.0, 2.0, 0.0},
+            {2.0, 2.0, 1.0},
+            mapping,
+            mapping,
+            *surface),
+        doctest::Contains("no line anchor"),
+        std::runtime_error);
+
+    vc::atlas::AtlasAnchor anchor;
+    anchor.sourceIndex = 0;
+    anchor.world = {0.0, 0.0, 0.0};
+    anchor.atlasU = 0.0;
+    anchor.atlasV = 99.0;
+    mapping.lineAnchors.push_back(anchor);
+
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::signedAtlasSearchWindingDisplay(
+            1.0,
+            true,
+            0.0,
+            0.0,
+            {0.0, 0.0, 0.0},
+            {0.0, 0.0, 1.0},
+            mapping,
+            mapping,
+            *surface),
+        doctest::Contains("outward base normal"),
+        std::runtime_error);
+}
+
 TEST_CASE("Atlas pred-snap attachments are coordinate keyed and ignore stale records")
 {
     const fs::path root = tempRoot("atlas_pred_snap_attachment");
@@ -1909,6 +2015,26 @@ TEST_CASE("Atlas layout flood fills same-winding link offsets from root")
     CHECK(atlas.fibers[1].windingOffset == -2);
 }
 
+TEST_CASE("Atlas link winding offset delta preserves layout equation")
+{
+    vc::atlas::AtlasLink link;
+    link.first.fiberPath = "fibers/root.json";
+    link.first.atlasU = 1.0;
+    link.second.fiberPath = "fibers/linked.json";
+    link.second.atlasU = 9.0;
+    link.desiredWindingDelta = 0;
+
+    CHECK(vc::atlas::atlasLinkWindingOffsetDelta(link, 4, 0) == -2);
+
+    link.desiredWindingDelta = 1;
+    CHECK(vc::atlas::atlasLinkWindingOffsetDelta(link, 4, 0) == -1);
+
+    link.first.atlasU = 3.0;
+    link.second.atlasU = 1.0;
+    link.desiredWindingDelta = 0;
+    CHECK(vc::atlas::atlasLinkWindingOffsetDelta(link, 4, 2) == 1);
+}
+
 TEST_CASE("Atlas layout propagates offsets through a link chain")
 {
     vc::atlas::Atlas atlas;
@@ -1944,6 +2070,156 @@ TEST_CASE("Atlas layout propagates offsets through a link chain")
     CHECK(atlas.fibers[0].windingOffset == 0);
     CHECK(atlas.fibers[1].windingOffset == -1);
     CHECK(atlas.fibers[2].windingOffset == -2);
+}
+
+TEST_CASE("Atlas layout offsets are stable for consistent redundant links")
+{
+    auto makeAtlas = [](bool reverseLinks) {
+        vc::atlas::Atlas atlas;
+        atlas.metadata.zeroWindingColumn = 0;
+        for (const char* name : {"root", "a", "b"}) {
+            vc::atlas::FiberMapping mapping;
+            mapping.fiberPath = fs::path("fibers") / (std::string(name) + ".json");
+            mapping.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
+            atlas.fibers.push_back(std::move(mapping));
+        }
+
+        vc::atlas::AtlasLink rootToA;
+        rootToA.first.fiberPath = "fibers/root.json";
+        rootToA.first.atlasU = 1.0;
+        rootToA.second.fiberPath = "fibers/a.json";
+        rootToA.second.atlasU = 5.0;
+        rootToA.desiredWindingDelta = 0;
+
+        vc::atlas::AtlasLink aToB;
+        aToB.first.fiberPath = "fibers/a.json";
+        aToB.first.atlasU = 5.0;
+        aToB.second.fiberPath = "fibers/b.json";
+        aToB.second.atlasU = 9.0;
+        aToB.desiredWindingDelta = 0;
+
+        vc::atlas::AtlasLink rootToB;
+        rootToB.first.fiberPath = "fibers/root.json";
+        rootToB.first.atlasU = 1.0;
+        rootToB.second.fiberPath = "fibers/b.json";
+        rootToB.second.atlasU = 9.0;
+        rootToB.desiredWindingDelta = 0;
+
+        atlas.links = reverseLinks
+            ? std::vector<vc::atlas::AtlasLink>{rootToB, aToB, rootToA}
+            : std::vector<vc::atlas::AtlasLink>{rootToA, aToB, rootToB};
+        return atlas;
+    };
+
+    auto forward = makeAtlas(false);
+    auto reverse = makeAtlas(true);
+
+    CHECK(vc::atlas::layoutAtlasObjects(forward, 4).empty());
+    CHECK(vc::atlas::layoutAtlasObjects(reverse, 4).empty());
+    REQUIRE(forward.fibers.size() == reverse.fibers.size());
+    for (size_t i = 0; i < forward.fibers.size(); ++i) {
+        CHECK(forward.fibers[i].windingOffset == reverse.fibers[i].windingOffset);
+    }
+    CHECK(forward.fibers[0].windingOffset == 0);
+    CHECK(forward.fibers[1].windingOffset == -1);
+    CHECK(forward.fibers[2].windingOffset == -2);
+}
+
+TEST_CASE("Atlas layout reports conflicting redundant links deterministically")
+{
+    auto makeAtlas = [](bool reverseLinks) {
+        vc::atlas::Atlas atlas;
+        atlas.metadata.zeroWindingColumn = 0;
+        vc::atlas::FiberMapping root;
+        root.fiberPath = "fibers/root.json";
+        root.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
+        atlas.fibers.push_back(std::move(root));
+
+        vc::atlas::FiberMapping linked;
+        linked.fiberPath = "fibers/linked.json";
+        linked.lineAnchors.push_back({0, {}, 5.0, 1.0, 0.0});
+        atlas.fibers.push_back(std::move(linked));
+
+        vc::atlas::AtlasLink sameWinding;
+        sameWinding.first.fiberPath = "fibers/root.json";
+        sameWinding.first.atlasU = 1.0;
+        sameWinding.second.fiberPath = "fibers/linked.json";
+        sameWinding.second.atlasU = 5.0;
+        sameWinding.desiredWindingDelta = 0;
+
+        vc::atlas::AtlasLink oneWindingApart = sameWinding;
+        oneWindingApart.desiredWindingDelta = 1;
+
+        atlas.links = reverseLinks
+            ? std::vector<vc::atlas::AtlasLink>{oneWindingApart, sameWinding}
+            : std::vector<vc::atlas::AtlasLink>{sameWinding, oneWindingApart};
+        return atlas;
+    };
+
+    auto forward = makeAtlas(false);
+    auto reverse = makeAtlas(true);
+    const auto forwardConflicts = vc::atlas::layoutAtlasObjects(forward, 4);
+    const auto reverseConflicts = vc::atlas::layoutAtlasObjects(reverse, 4);
+
+    CHECK(forward.fibers[1].windingOffset == reverse.fibers[1].windingOffset);
+    REQUIRE(forwardConflicts.size() == reverseConflicts.size());
+    REQUIRE_FALSE(forwardConflicts.empty());
+    for (size_t i = 0; i < forwardConflicts.size(); ++i) {
+        CHECK(forwardConflicts[i].fiberPath == reverseConflicts[i].fiberPath);
+        CHECK(forwardConflicts[i].existingOffset == reverseConflicts[i].existingOffset);
+        CHECK(forwardConflicts[i].candidateOffset == reverseConflicts[i].candidateOffset);
+    }
+}
+
+TEST_CASE("Atlas preview incremental target offset matches full temporary layout")
+{
+    vc::atlas::Atlas displayed;
+    displayed.metadata.zeroWindingColumn = 0;
+    vc::atlas::FiberMapping root;
+    root.fiberPath = "fibers/root.json";
+    root.lineAnchors.push_back({0, {}, 1.0, 1.0, 0.0});
+    displayed.fibers.push_back(std::move(root));
+
+    vc::atlas::FiberMapping source;
+    source.fiberPath = "fibers/source.json";
+    source.lineAnchors.push_back({0, {}, 5.0, 1.0, 0.0});
+    displayed.fibers.push_back(std::move(source));
+
+    vc::atlas::AtlasLink rootToSource;
+    rootToSource.first.fiberPath = "fibers/root.json";
+    rootToSource.first.atlasU = 1.0;
+    rootToSource.second.fiberPath = "fibers/source.json";
+    rootToSource.second.atlasU = 5.0;
+    rootToSource.desiredWindingDelta = 0;
+    displayed.links.push_back(rootToSource);
+
+    REQUIRE(vc::atlas::layoutAtlasObjects(displayed, 4).empty());
+    REQUIRE(displayed.fibers[1].windingOffset == -1);
+    const int sourceOffsetBeforePreview = displayed.fibers[1].windingOffset;
+
+    vc::atlas::FiberMapping previewTarget;
+    previewTarget.fiberPath = "fibers/target.json";
+    previewTarget.lineAnchors.push_back({0, {}, 9.0, 1.0, 0.0});
+
+    vc::atlas::AtlasLink previewLink;
+    previewLink.first.fiberPath = displayed.fibers[1].fiberPath;
+    previewLink.first.atlasU = displayed.fibers[1].lineAnchors[0].atlasU;
+    previewLink.second.fiberPath = previewTarget.fiberPath;
+    previewLink.second.atlasU = previewTarget.lineAnchors[0].atlasU;
+    previewLink.desiredWindingDelta = 0;
+
+    const int previewDelta =
+        vc::atlas::atlasLinkWindingOffsetDelta(previewLink, 4, displayed.metadata.zeroWindingColumn);
+    previewTarget.windingOffset = displayed.fibers[1].windingOffset + previewDelta;
+
+    vc::atlas::Atlas fullTemporary = displayed;
+    fullTemporary.fibers.push_back(previewTarget);
+    fullTemporary.links.push_back(previewLink);
+    REQUIRE(vc::atlas::layoutAtlasObjects(fullTemporary, 4).empty());
+
+    CHECK(previewTarget.windingOffset == fullTemporary.fibers[2].windingOffset);
+    CHECK(displayed.fibers.size() == 2);
+    CHECK(displayed.fibers[1].windingOffset == sourceOffsetBeforePreview);
 }
 
 TEST_CASE("Atlas zero winding column changes winding interpretation only")

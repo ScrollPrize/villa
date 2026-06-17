@@ -25,6 +25,7 @@
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
+#include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -64,6 +65,8 @@ struct AtlasSearchFiberSnapshot {
     std::filesystem::path fiberPath;
     vc::atlas::FiberPolyline fiber;
     uint64_t storedFiberId = 0;
+    vc3d::line_annotation::FiberHvClassification hvClassification;
+    std::string manualHvTag;
     std::vector<std::string> tags;
 };
 
@@ -148,7 +151,8 @@ private:
     void updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
                                    std::size_t completed,
                                    std::size_t total);
-    void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results);
+    void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results,
+                                    std::vector<double> signedWindings = {});
     void openAtlasSearchResult(int sortedResultIndex);
     void clearAtlasSearchPreviewState();
     void updateAtlasSearchPreviewCandidates();
@@ -186,6 +190,7 @@ private:
                                       const QString& preferredVolumeId = QString());
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
+    void syncVolumeSelectionControls(const QString& activeVolumeId = QString());
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
     bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId);
@@ -241,6 +246,7 @@ private:
     CState* _state;
 
     QComboBox* volSelect{nullptr};
+    QComboBox* _intersectionsVolumeSelect{nullptr};
     QComboBox* cmbSegmentationDir;
 
 
@@ -270,6 +276,7 @@ private:
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
+    QDockWidget* _intersectionsVolumeDock{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     AtlasControlPointsDock* _atlasControlDock{nullptr};
@@ -281,6 +288,7 @@ private:
     std::string _currentAtlasName;
     vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
     std::vector<vc::atlas::FiberIntersectionResult> _atlasSearchResults;
+    std::vector<double> _atlasSearchSignedWindings;
     std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _atlasSearchFiberSnapshotsByRuntimeId;
     std::optional<std::filesystem::path> _atlasSearchLasagnaManifestPath;
     int _atlasSearchPreviewGeneration{0};

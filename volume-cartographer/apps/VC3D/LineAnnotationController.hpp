@@ -74,6 +74,8 @@ public:
         std::filesystem::path fiberPath;
         vc::atlas::FiberPolyline fiber;
         uint64_t storedFiberId = 0;
+        vc3d::line_annotation::FiberHvClassification hvClassification;
+        std::string manualHvTag;
         std::vector<std::string> tags;
     };
 

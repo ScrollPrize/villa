@@ -271,7 +271,7 @@ TEST_CASE("Fiber intersection search matches legacy indexed candidate refinement
     }
 }
 
-TEST_CASE("Atlas search phase progress maps four equal phases")
+TEST_CASE("Atlas search phase progress maps five equal phases")
 {
     using vc::atlas::AtlasSearchProgressPhase;
 
@@ -282,15 +282,19 @@ TEST_CASE("Atlas search phase progress maps four equal phases")
     CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
               AtlasSearchProgressPhase::PrepareInputs,
               4,
-              4) == 25);
+              4) == 20);
     CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
               AtlasSearchProgressPhase::BuildSpatialIndex,
               4,
-              4) == 50);
+              4) == 40);
     CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
               AtlasSearchProgressPhase::SearchPairs,
               12,
-              12) == 75);
+              12) == 60);
+    CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
+              AtlasSearchProgressPhase::PrepareSigningSurface,
+              2,
+              2) == 80);
     CHECK(vc::atlas::atlasSearchPhaseProgressPercent(
               AtlasSearchProgressPhase::FinishResults,
               3,

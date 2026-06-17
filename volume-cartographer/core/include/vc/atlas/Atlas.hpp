@@ -94,6 +94,24 @@ struct AtlasDisplayRange {
     bool hasMappedObjects = false;
 };
 
+struct AtlasLayoutConflict {
+    std::filesystem::path fiberPath;
+    int existingOffset = 0;
+    int candidateOffset = 0;
+};
+
+struct AtlasBaseMappingContext {
+    std::shared_ptr<QuadSurface> baseSurface;
+    std::shared_ptr<SurfacePatchIndex> baseIndex;
+};
+
+struct AtlasSignedWindingDisplay {
+    double signedWindingDistance = 0.0;
+    bool sourceFiberIsH = true;
+    int hAnchorSourceIndex = -1;
+    double hToVOutwardProjection = 0.0;
+};
+
 struct FiberInput {
     std::filesystem::path fiberPath;
     std::vector<cv::Vec3d> controlPoints;
@@ -353,8 +371,21 @@ std::optional<cv::Vec3d> atlasAnchorBasePoint(const AtlasAnchor& anchor,
 std::optional<cv::Vec3d> atlasAnchorBaseNormal(const AtlasAnchor& anchor,
                                                const FiberMapping& fiber,
                                                const QuadSurface& baseSurface);
+AtlasSignedWindingDisplay signedAtlasSearchWindingDisplay(
+    double windingDistance,
+    bool sourceFiberDisplaysAsH,
+    double sourceLinePosition,
+    double targetLinePosition,
+    const cv::Vec3d& sourcePoint,
+    const cv::Vec3d& targetPoint,
+    const FiberMapping& sourceMapping,
+    const FiberMapping& targetMapping,
+    const QuadSurface& baseSurface);
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns);
-void layoutAtlasObjects(Atlas& atlas, int periodColumns);
+int atlasLinkWindingOffsetDelta(const AtlasLink& link,
+                                int periodColumns,
+                                int zeroWindingColumn);
+std::vector<AtlasLayoutConflict> layoutAtlasObjects(Atlas& atlas, int periodColumns);
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
                                    double atlasV,
                                    const QuadSurface& displaySurface,
@@ -436,6 +467,10 @@ AtlasSnapOptimizeReport optimizeAtlasPredSnapCandidates(
 
 void validateFiberInputControlPoints(FiberInput& fiber);
 bool atlasLoadErrorRequiresRebuild(const std::exception& ex);
+AtlasBaseMappingContext atlasBaseMappingContextFromSurface(
+    std::shared_ptr<QuadSurface> baseSurface);
+AtlasBaseMappingContext loadAtlasBaseMappingContext(const std::filesystem::path& atlasDir,
+                                                    const Atlas& atlas);
 Atlas rebuildAtlasFromSourceFibers(const std::filesystem::path& atlasDir,
                                    const std::filesystem::path& volpkgRoot,
                                    const vc::lasagna::NormalSampler& normalSampler,

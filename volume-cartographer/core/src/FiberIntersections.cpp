@@ -839,7 +839,7 @@ uint64_t FiberSpatialIndex::generation(uint64_t fiberId) const
 
 int atlasSearchPhaseProgressPercent(AtlasSearchProgressPhase phase, size_t completed, size_t total)
 {
-    constexpr int kPhaseCount = 4;
+    constexpr int kPhaseCount = 5;
     constexpr int kPercentMax = 100;
     const int phaseIndex = std::clamp(static_cast<int>(phase), 0, kPhaseCount - 1);
     const int phaseBase = (phaseIndex * kPercentMax) / kPhaseCount;

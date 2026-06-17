@@ -109,7 +109,8 @@ enum class AtlasSearchProgressPhase {
     PrepareInputs = 0,
     BuildSpatialIndex = 1,
     SearchPairs = 2,
-    FinishResults = 3,
+    PrepareSigningSurface = 3,
+    FinishResults = 4,
 };
 
 [[nodiscard]] int atlasSearchPhaseProgressPercent(AtlasSearchProgressPhase phase,

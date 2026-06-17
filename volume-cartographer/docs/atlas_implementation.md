@@ -28,7 +28,7 @@ The link field `desired_winding_delta` means:
 
 `actual_winding(second) - actual_winding(first) = desired_winding_delta`
 
-Atlas layout treats links as an undirected graph. `layoutAtlasObjects(atlas, periodColumns)` starts from the root mapped fiber, currently the first fiber in the atlas mapping list, gives it offset `0`, and flood-fills integer offsets through the link graph. Unreachable fibers keep offset `0`. Conflicting cycles are not resolved yet; the first flood-fill path assigns the offset.
+Atlas layout treats links as an undirected graph. `layoutAtlasObjects(atlas, periodColumns)` starts from the root mapped fiber, currently the first fiber in the atlas mapping list, gives it offset `0`, and flood-fills integer offsets through the link graph. Unreachable fibers keep offset `0`. Redundant links that imply the same offset are accepted; conflicting cycles are reported by the returned conflict list and debug log while the deterministic flood-fill assignment remains in place.
 
 New atlas objects are added either by creating a new atlas from a seed fiber or by accepting an intersection link from an atlas that already contains at least one of the inspected fibers. If neither inspected fiber is already mapped, the accept operation fails without mutating the atlas.
 
