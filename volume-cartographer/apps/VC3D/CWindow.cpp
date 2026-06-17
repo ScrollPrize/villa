@@ -1789,8 +1789,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMode, Qt::UniqueConnection);
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationSpacingChanged,
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationSpacing, Qt::UniqueConnection);
-        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationMergeToleranceChanged,
-                viewer, &CChunkedVolumeViewer::setSameWrapAnnotationMergeTolerance, Qt::UniqueConnection);
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationPolylineOpacityChanged,
                 viewer, &CChunkedVolumeViewer::setSameWrapAnnotationPolylineOpacity, Qt::UniqueConnection);
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationMergeToggled,
@@ -1804,7 +1802,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::sameWrapAnnotationClearRequested,
                 viewer, &CChunkedVolumeViewer::clearSameWrapAnnotationPreview, Qt::UniqueConnection);
         viewer->setSameWrapAnnotationSpacing(_wrapAnnotationWidget->sameWrapAnnotationSpacing());
-        viewer->setSameWrapAnnotationMergeTolerance(_wrapAnnotationWidget->sameWrapAnnotationMergeTolerance());
         viewer->setSameWrapAnnotationPolylineOpacity(_wrapAnnotationWidget->sameWrapAnnotationPolylineOpacity());
         viewer->setSameWrapAnnotationMergeExisting(_wrapAnnotationWidget->sameWrapAnnotationMergeEnabled());
         viewer->setSameWrapAnnotationPathType(_wrapAnnotationWidget->sameWrapAnnotationPathType());

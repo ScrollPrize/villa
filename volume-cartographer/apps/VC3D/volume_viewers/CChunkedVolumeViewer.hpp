@@ -224,7 +224,6 @@ public slots:
     void onPointSelected(uint64_t pointId);
     void setSameWrapAnnotationMode(bool enabled);
     void setSameWrapAnnotationSpacing(double spacingVx);
-    void setSameWrapAnnotationMergeTolerance(double toleranceVx);
     void setSameWrapAnnotationPolylineOpacity(double opacity);
     void setSameWrapAnnotationMergeExisting(bool enabled);
     void setSameWrapAnnotationPathType(int pathType);

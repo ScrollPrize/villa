@@ -14,13 +14,6 @@
 class QGraphicsItem;
 class VCCollection;
 
-struct SameWrapAnnotationMergeBucket {
-    std::string directionKey;
-    std::string collectionName;
-    std::vector<cv::Vec3f> points;
-    std::vector<uint64_t> collectionIds;
-};
-
 class SameWrapAnnotationTool {
 public:
     struct MixedDirectionMergeWarning {
@@ -56,7 +49,6 @@ public:
 
     void setEnabled(bool enabled);
     void setSpacing(double spacingVx);
-    void setMergeTolerance(double toleranceVx);
     void setMergeExistingAnnotations(bool enabled);
     void setPathType(PathType pathType);
     void setImageFilter(ImageFilterType filterType, int kernelSize);
@@ -111,7 +103,6 @@ private:
         ImageFilterType imageFilterType = ImageFilterType::None;
         int imageFilterKernelSize = 3;
         float spacingVx = 20.0f;
-        float mergeToleranceVx = 1.0f;
         bool shiftReleasedSincePreview = true;
         bool hasShortestPathSource = false;
         QPointF shortestPathSourceScenePos;
@@ -119,8 +110,6 @@ private:
         std::vector<QPointF> componentScenePath;
         std::vector<cv::Vec3f> componentVolumePath;
         std::vector<cv::Vec3f> sampledVolumePoints;
-        std::vector<cv::Vec3f> mergeQueryVolumePoints;
-        std::vector<SameWrapAnnotationMergeBucket> mergeBuckets;
         cv::Vec3f clickVolumePos{0.0f, 0.0f, 0.0f};
         uint64_t pendingMergeCollectionId = 0;
         uint64_t pendingMergePointId = 0;

@@ -28,7 +28,6 @@ public:
 
     bool sameWrapAnnotationEnabled() const;
     double sameWrapAnnotationSpacing() const;
-    double sameWrapAnnotationMergeTolerance() const;
     double sameWrapAnnotationPolylineOpacity() const;
     bool sameWrapAnnotationMergeEnabled() const;
     int sameWrapAnnotationPathType() const;
@@ -61,7 +60,6 @@ signals:
     void focusViewsRequested(uint64_t collectionId, uint64_t pointId);
     void sameWrapAnnotationToggled(bool enabled);
     void sameWrapAnnotationSpacingChanged(double spacing);
-    void sameWrapAnnotationMergeToleranceChanged(double tolerance);
     void sameWrapAnnotationPolylineOpacityChanged(double opacity);
     void sameWrapAnnotationMergeToggled(bool enabled);
     void sameWrapAnnotationPathTypeChanged(int pathType);
@@ -91,7 +89,6 @@ private:
     QComboBox* _sameWrapFilterTypeCombo{nullptr};
     QSpinBox* _sameWrapFilterKernelSpinbox{nullptr};
     QDoubleSpinBox* _sameWrapSpacingSpinbox{nullptr};
-    QDoubleSpinBox* _sameWrapMergeToleranceSpinbox{nullptr};
     QDoubleSpinBox* _sameWrapPolylineOpacitySpinbox{nullptr};
     QPushButton* _clearSameWrapAnnotationButton{nullptr};
     QComboBox* _relWindingIntersectionSourceCombo{nullptr};

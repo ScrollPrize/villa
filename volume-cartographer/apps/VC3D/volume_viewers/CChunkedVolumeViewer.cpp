@@ -3244,11 +3244,6 @@ void CChunkedVolumeViewer::setSameWrapAnnotationSpacing(double spacingVx)
     _sameWrapAnnotation.setSpacing(spacingVx);
 }
 
-void CChunkedVolumeViewer::setSameWrapAnnotationMergeTolerance(double toleranceVx)
-{
-    _sameWrapAnnotation.setMergeTolerance(toleranceVx);
-}
-
 void CChunkedVolumeViewer::setSameWrapAnnotationPolylineOpacity(double opacity)
 {
     _sameWrapAnnotationPolylineOpacity = std::clamp(opacity, 0.0, 1.0);
@@ -3711,14 +3706,39 @@ std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtSceneP
         return std::nullopt;
     }
 
+    const auto& collections = _pointCollection->getAllCollections();
+    if (collections.empty()) {
+        return std::nullopt;
+    }
+
     constexpr qreal kPointHitRadius = 4.0;
     constexpr qreal kPointHitRadiusSq = kPointHitRadius * kPointHitRadius;
+
+    // volumeToScene() is expensive on a QuadSurface (a per-point pointTo search) and
+    // this runs on every mouse-move for hover highlighting. Reject points that are
+    // obviously too far before paying for the projection: the cursor's volume position
+    // lies on the current surface, so a marker can only fall within kPointHitRadius
+    // scene px if it is within ~kPointHitRadius/_scale surface units laterally, plus a
+    // normal-direction margin covering the depth band that is actually drawn (markers
+    // fade out past the view tolerance, whose generous ceiling we bound below).
+    const std::optional<cv::Vec3f> cursorVol = cursorVolumePosition(scenePos);
+    constexpr float kHoverDepthMarginVx = 256.0f;
+    const float lateralBoundVx = static_cast<float>(kPointHitRadius) / std::max(_scale, 1e-3f);
+    const float prefilterRadiusVx = lateralBoundVx + kHoverDepthMarginVx;
+    const float prefilterRadiusSqVx = prefilterRadiusVx * prefilterRadiusVx;
+
     qreal bestDistSq = kPointHitRadiusSq;
     std::optional<std::pair<uint64_t, uint64_t>> bestHit;
 
-    const auto& collections = _pointCollection->getAllCollections();
     for (const auto& [collectionId, collection] : collections) {
         for (const auto& [pointId, point] : collection.points) {
+            if (cursorVol) {
+                const cv::Vec3f delta = point.p - *cursorVol;
+                if (delta.dot(delta) > prefilterRadiusSqVx) {
+                    continue;
+                }
+            }
+
             const QPointF pointScenePos = volumeToScene(point.p);
             if (!std::isfinite(pointScenePos.x()) || !std::isfinite(pointScenePos.y())) {
                 continue;
@@ -4672,13 +4692,11 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         profile.setDetails("action=skip missing_input");
         return;
     }
-    if (!plane) {
-        if (_planeIntersectionLinesVisible) {
-            renderFlattenedIntersections(surf, reason, caller);
-        } else {
-            clearIntersectionItems();
-            _lastIntersectFp = {};
-        }
+    if (!plane && !_planeIntersectionLinesVisible) {
+        clearIntersectionItems();
+        _lastIntersectFp = {};
+        profile.setDetails("action=skip flattened_disabled");
+        return;
     }
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();

@@ -140,16 +140,6 @@ void WrapAnnotationWidget::setupUi()
     _sameWrapSpacingSpinbox->setMaximumWidth(90);
     _sameWrapSpacingSpinbox->setToolTip("Distance between generated same-wrap annotation points in surface voxels.");
     sameWrapSpacingLayout->addWidget(_sameWrapSpacingSpinbox);
-    sameWrapSpacingLayout->addWidget(new QLabel("Merge tol.:"));
-    _sameWrapMergeToleranceSpinbox = new QDoubleSpinBox(sameWrapGroup);
-    _sameWrapMergeToleranceSpinbox->setRange(0.0, 1000.0);
-    _sameWrapMergeToleranceSpinbox->setDecimals(2);
-    _sameWrapMergeToleranceSpinbox->setSingleStep(0.25);
-    _sameWrapMergeToleranceSpinbox->setValue(1.0);
-    _sameWrapMergeToleranceSpinbox->setSuffix(" vx");
-    _sameWrapMergeToleranceSpinbox->setMaximumWidth(90);
-    _sameWrapMergeToleranceSpinbox->setToolTip("Reserved for same-wrap merge tools.");
-    sameWrapSpacingLayout->addWidget(_sameWrapMergeToleranceSpinbox);
     sameWrapSpacingLayout->addStretch();
     sameWrapLayout->addLayout(sameWrapSpacingLayout);
 
@@ -247,8 +237,6 @@ void WrapAnnotationWidget::setupUi()
     });
     connect(_sameWrapSpacingSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, &WrapAnnotationWidget::sameWrapAnnotationSpacingChanged);
-    connect(_sameWrapMergeToleranceSpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-            this, &WrapAnnotationWidget::sameWrapAnnotationMergeToleranceChanged);
     connect(_sameWrapPolylineOpacitySpinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, &WrapAnnotationWidget::sameWrapAnnotationPolylineOpacityChanged);
     connect(_clearSameWrapAnnotationButton, &QPushButton::clicked,
@@ -290,11 +278,6 @@ bool WrapAnnotationWidget::sameWrapAnnotationEnabled() const
 double WrapAnnotationWidget::sameWrapAnnotationSpacing() const
 {
     return _sameWrapSpacingSpinbox ? _sameWrapSpacingSpinbox->value() : 20.0;
-}
-
-double WrapAnnotationWidget::sameWrapAnnotationMergeTolerance() const
-{
-    return _sameWrapMergeToleranceSpinbox ? _sameWrapMergeToleranceSpinbox->value() : 1.0;
 }
 
 double WrapAnnotationWidget::sameWrapAnnotationPolylineOpacity() const
