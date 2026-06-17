@@ -321,6 +321,19 @@ bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
         }
     }
     pointCollection->addPoints(collectionName, _state.sampledVolumePoints);
+
+    // Same-wrap annotations use relative winding numbers; ensure the collection is
+    // not flagged as absolute (which would tick the "Absolute Winding Number" checkbox).
+    const uint64_t collectionId = pointCollection->getCollectionId(collectionName);
+    if (collectionId != 0) {
+        const auto& collections = pointCollection->getAllCollections();
+        if (collections.count(collectionId)) {
+            CollectionMetadata metadata = collections.at(collectionId).metadata;
+            metadata.absolute_winding_number = false;
+            pointCollection->setCollectionMetadata(collectionId, metadata);
+        }
+    }
+
     clear(clearOverlayGroup);
     return true;
 }

@@ -79,6 +79,7 @@ public:
     std::vector<ColPoint> getPoints(const std::string& collectionName) const;
     std::string generateNewCollectionName(const std::string& prefix = "col") const;
     void autoFillWindingNumbers(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
+    void resetWindingNumbers();
     void setAutoFillMode(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
     WindingFillMode getAutoFillMode(uint64_t collectionId) const;
     float getAutoFillConstant(uint64_t collectionId) const;

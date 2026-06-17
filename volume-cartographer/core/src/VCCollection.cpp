@@ -396,8 +396,26 @@ void VCCollection::autoFillWindingNumbers(uint64_t collectionId, WindingFillMode
                     point->winding_annotation = constantValue;
                     break;
             }
-            updatePoint(*point);
+            _points[point->id] = *point; // keep flat map in sync (value set above)
         }
+
+        emit collectionChanged(collectionId); // single signal for the whole batch
+    }
+}
+
+void VCCollection::resetWindingNumbers()
+{
+    for (auto& [cid, collection] : _collections) {
+        for (auto& [pid, point] : collection.points) {
+            point.winding_annotation = std::nan("");
+            if (_points.count(pid)) {
+                _points[pid].winding_annotation = std::nan("");
+            }
+        }
+        collection.metadata.absolute_winding_number = false;
+        collection.autoFillMode = WindingFillMode::None;
+        collection.autoFillConstant = 0.0f;
+        emit collectionChanged(cid);
     }
 }
 

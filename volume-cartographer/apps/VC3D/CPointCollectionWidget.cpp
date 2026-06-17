@@ -403,33 +403,10 @@ void CPointCollectionWidget::onResetWindingClicked()
 {
     if (!_point_collection) return;
 
-    // Snapshot IDs/points first to avoid mutating the maps while iterating them.
-    const auto& collections = _point_collection->getAllCollections();
-    std::vector<uint64_t> collectionIds;
-    std::vector<ColPoint> pointsToUpdate;
-    collectionIds.reserve(collections.size());
-    for (const auto& [cid, collection] : collections) {
-        collectionIds.push_back(cid);
-        for (const auto& [pid, point] : collection.points) {
-            ColPoint updated = point;
-            updated.winding_annotation = std::nan("");
-            pointsToUpdate.push_back(updated);
-        }
-    }
-
-    for (const auto& p : pointsToUpdate) {
-        _point_collection->updatePoint(p);          // emits pointChanged
-    }
-
-    for (uint64_t cid : collectionIds) {
-        CollectionMetadata metadata = collections.at(cid).metadata;
-        metadata.absolute_winding_number = false;    // uncheck absolute winding
-        _point_collection->setCollectionMetadata(cid, metadata);  // emits collectionChanged
-
-        // Also clear any active auto-fill mode so new points don't get re-filled
-        // and the Fill +/-/= buttons untoggle (keeps state consistent with the reset).
-        _point_collection->setAutoFillMode(cid, VCCollection::WindingFillMode::None);
-    }
+    // Clears winding annotations, unchecks Absolute Winding Number, and clears any active
+    // auto-fill mode on every collection in a single batch. This emits one collectionChanged
+    // per collection instead of a pointChanged per point, avoiding an overlay-rebuild storm.
+    _point_collection->resetWindingNumbers();
 
     updateMetadataWidgets();   // refresh checkbox + fill-button states in the UI
 }
