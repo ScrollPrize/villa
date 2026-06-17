@@ -287,6 +287,9 @@ std::filesystem::path outputSegmentsPathForState(CState* state)
         const auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
         path = vpkgRoot / "paths";
     }
+    if (path.empty()) {
+        return {};
+    }
     return std::filesystem::absolute(path).lexically_normal();
 }
 
@@ -312,8 +315,11 @@ std::filesystem::path volpkgRootForState(CState* state)
     if (!state || !state->vpkg()) {
         return {};
     }
-    return std::filesystem::absolute(
-        std::filesystem::path(state->vpkg()->getVolpkgDirectory())).lexically_normal();
+    const std::filesystem::path dir(state->vpkg()->getVolpkgDirectory());
+    if (dir.empty()) {
+        return {};
+    }
+    return std::filesystem::absolute(dir).lexically_normal();
 }
 
 QString versionedTifxyzOutputName(const QString& baseNameIn,
