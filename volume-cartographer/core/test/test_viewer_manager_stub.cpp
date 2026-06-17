@@ -14,3 +14,5 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished() {}
 void ViewerManager::handleSurfaceChanged(std::string, std::shared_ptr<Surface>, bool) {}
 
 void ViewerManager::handleSurfaceWillBeDeleted(std::string, std::shared_ptr<Surface>) {}
+
+void ViewerManager::onGlobalTick() {}
