@@ -170,8 +170,8 @@ TEST_CASE("LasagnaNormalSampler samples pred_dt channel with accepted threshold"
     REQUIRE(predDt.has_value());
     CHECK(*predDt == doctest::Approx(170.0));
     CHECK(vc::atlas::atlasPredDtIsInside(*predDt));
-    CHECK(vc::atlas::atlasPredDtIsInside(114.0));
-    CHECK_FALSE(vc::atlas::atlasPredDtIsInside(113.0));
+    CHECK(vc::atlas::atlasPredDtIsInside(110.0));
+    CHECK_FALSE(vc::atlas::atlasPredDtIsInside(109.0));
     fs::remove_all(dir);
 }
 
