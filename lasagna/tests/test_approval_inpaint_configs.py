@@ -33,6 +33,12 @@ class ApprovalInpaintConfigTest(unittest.TestCase):
 		self.assertEqual(args.get("init-mode"), "shell-dir-crop")
 		self.assertTrue(args.get("tifxyz-flow-gate-channels"))
 
+	def test_atlas_snap_flow_speculative_config_enables_tifxyz_flow_gate_channels(self) -> None:
+		cfg = json.loads((Path(ROOT) / "configs" / "atlas_reopt_snap_flow_speculative.json").read_text(encoding="utf-8"))
+		args = cfg.get("args", {})
+		self.assertEqual(args.get("model-init"), "model")
+		self.assertTrue(args.get("tifxyz-flow-gate-channels"))
+
 	def test_approval_inpaint_export_configs_enable_output_mask(self) -> None:
 		config_names = [
 			"init_corr_approval_inpaint.json",

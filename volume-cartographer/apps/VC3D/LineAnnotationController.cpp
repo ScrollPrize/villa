@@ -63,10 +63,12 @@
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <locale>
 #include <map>
 #include <sstream>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -108,9 +110,13 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string fiberFileName;
     std::string fiberManualHvTag;
     std::vector<std::string> fiberTags;
+    std::optional<fs::path> atlasDir;
+    fs::path atlasFiberPath;
+    vc::atlas::AtlasPredSnapSet predSnapSet;
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
     bool controlPointsDirtySinceOptimization = false;
+    bool disableInitialGeneratedHoverFollow = false;
     std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
 };
 
@@ -121,6 +127,7 @@ struct LineAnnotationController::IntersectionInspectionSession {
         bool sourceSide = true;
         std::string surfaceName;
         QPointer<CChunkedVolumeViewer> viewer;
+        QPointer<QLabel> controlPointInfoLabel;
         std::vector<cv::Vec3d> linePoints;
         std::vector<cv::Vec3f> lineUpVectors;
         std::vector<vc::lasagna::LineControlPoint> controlPoints;
@@ -156,6 +163,7 @@ namespace {
 
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
+constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 using Clock = std::chrono::steady_clock;
 
 bool atlasDebugEnabled()
@@ -221,6 +229,98 @@ cv::Vec3d toVec3d(const cv::Vec3f& v)
 bool approximatelyEqual(double a, double b)
 {
     return std::abs(a - b) <= 1.0e-9;
+}
+
+std::optional<size_t> controlPointIndexAtLinePosition(
+    const std::vector<vc::lasagna::LineControlPoint>& controls,
+    double linePosition)
+{
+    if (!std::isfinite(linePosition)) {
+        return std::nullopt;
+    }
+    std::optional<size_t> bestIndex;
+    double bestDistance = kControlPointLabelLinePositionTolerance;
+    for (size_t i = 0; i < controls.size(); ++i) {
+        const double controlPosition = controls[i].linePosition;
+        if (!std::isfinite(controlPosition)) {
+            continue;
+        }
+        const double distance = std::abs(controlPosition - linePosition);
+        if (distance <= bestDistance) {
+            bestDistance = distance;
+            bestIndex = i;
+        }
+    }
+    return bestIndex;
+}
+
+QString controlPointInfoText(const std::vector<vc::lasagna::LineControlPoint>& controls,
+                             double linePosition)
+{
+    const auto index = controlPointIndexAtLinePosition(controls, linePosition);
+    if (!index) {
+        return {};
+    }
+    const auto& point = controls[*index].volumePoint;
+    return QStringLiteral("CP %1  pos [%2, %3, %4]")
+        .arg(static_cast<qulonglong>(*index))
+        .arg(point[0], 0, 'f', 2)
+        .arg(point[1], 0, 'f', 2)
+        .arg(point[2], 0, 'f', 2);
+}
+
+void positionControlPointInfoLabel(QLabel* label)
+{
+    if (!label) {
+        return;
+    }
+    auto* parent = qobject_cast<QWidget*>(label->parentWidget());
+    if (!parent) {
+        return;
+    }
+    constexpr int margin = 8;
+    label->adjustSize();
+    label->move(margin, std::max(margin, parent->height() - label->height() - margin));
+    label->raise();
+}
+
+QLabel* createControlPointInfoLabel(
+    QWidget* parent,
+    const std::vector<vc::lasagna::LineControlPoint>& controls,
+    double linePosition)
+{
+    if (!parent) {
+        return nullptr;
+    }
+    auto* label = new QLabel(parent);
+    label->setObjectName(QStringLiteral("intersectionControlPointInfo"));
+    label->setAttribute(Qt::WA_TransparentForMouseEvents);
+    label->setStyleSheet(QStringLiteral(
+        "QLabel#intersectionControlPointInfo {"
+        " color: white;"
+        " background: rgba(0, 0, 0, 180);"
+        " padding: 3px 6px;"
+        " border-radius: 3px;"
+        " font-weight: 600;"
+        "}"));
+    const QString text = controlPointInfoText(controls, linePosition);
+    label->setText(text);
+    label->setVisible(!text.isEmpty());
+    positionControlPointInfoLabel(label);
+    return label;
+}
+
+void updateControlPointInfoLabel(QLabel* label,
+                                 const std::vector<vc::lasagna::LineControlPoint>& controls,
+                                 double linePosition)
+{
+    if (!label) {
+        return;
+    }
+    const QString text = controlPointInfoText(controls, linePosition);
+    label->setText(text);
+    label->setVisible(!text.isEmpty());
+    positionControlPointInfoLabel(label);
 }
 
 std::optional<std::string> normalizedFiberJsonFileNameInput(const QString& input, QString* error)
@@ -424,6 +524,40 @@ generatedControlMarkers(const std::vector<vc::lasagna::LineControlPoint>& contro
         marker.point = toVec3f(control.volumePoint);
         marker.linePosition = control.linePosition;
         marker.isSeed = control.isSeed;
+        markers.push_back(marker);
+    }
+    return markers;
+}
+
+std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker>
+generatedPredSnapMarkers(const std::vector<vc::lasagna::LineControlPoint>& controls,
+                         const vc::atlas::AtlasPredSnapSet& predSnapSet)
+{
+    std::unordered_map<std::string, const vc::atlas::AtlasPredSnapPoint*> snapsByControl;
+    snapsByControl.reserve(predSnapSet.points.size());
+    for (const auto& point : predSnapSet.points) {
+        if (point.predSnapPoint &&
+            (point.source == vc::atlas::AtlasPredSnapSource::Manual ||
+             point.source == vc::atlas::AtlasPredSnapSource::Optimized)) {
+            snapsByControl[vc::atlas::atlasPredSnapControlPointKey(point.controlPoint)] = &point;
+        }
+    }
+
+    std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker> markers;
+    markers.reserve(controls.size());
+    for (size_t i = 0; i < controls.size(); ++i) {
+        const auto& control = controls[i];
+        const auto it = snapsByControl.find(
+            vc::atlas::atlasPredSnapControlPointKey(control.volumePoint));
+        if (it == snapsByControl.end() || !it->second || !it->second->predSnapPoint) {
+            continue;
+        }
+        vc3d::line_annotation::GeneratedOverlay::PredSnapMarker marker;
+        marker.controlPoint = toVec3f(control.volumePoint);
+        marker.snapPoint = toVec3f(*it->second->predSnapPoint);
+        marker.linePosition = control.linePosition;
+        marker.controlIndex = i;
+        marker.manual = it->second->source == vc::atlas::AtlasPredSnapSource::Manual;
         markers.push_back(marker);
     }
     return markers;
@@ -780,9 +914,19 @@ void LineAnnotationController::setOptimizationTaskFactoryForTesting(Optimization
     _optimizationTaskFactory = std::move(factory);
 }
 
+void LineAnnotationController::setVolumeSelectorFactory(VolumeSelectorFactory factory)
+{
+    _volumeSelectorFactory = std::move(factory);
+}
+
 void LineAnnotationController::setSurfacePanel(SurfacePanelController* panel)
 {
     _surfacePanel = panel;
+}
+
+void LineAnnotationController::setCurrentAtlasDirectory(std::optional<fs::path> atlasDir)
+{
+    _currentAtlasDir = std::move(atlasDir);
 }
 
 bool LineAnnotationController::canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const
@@ -905,7 +1049,7 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
     session->deferShowUntilGenerated = deferShowUntilGenerated;
     _state->setSurface(surfaceName, std::move(sourceSurface));
-    auto* dialog = new LineAnnotationDialog(_viewerManager, nullptr);
+    auto* dialog = new LineAnnotationDialog(_viewerManager, _volumeSelectorFactory, nullptr);
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
         dialog->deleteLater();
         _state->setSurface(surfaceName, nullptr);
@@ -944,6 +1088,12 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             this,
             [this](const std::string& name, double linePosition, cv::Vec3f volumePoint) {
                 handleGeneratedControlPointDelete(name, linePosition, volumePoint);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::generatedPredSnapPointRequested,
+            this,
+            [this](const std::string& name, cv::Vec3f volumePoint) {
+                handleGeneratedPredSnapPoint(name, volumePoint);
             });
     connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
         handleShowAsMesh(surfaceName);
@@ -1010,6 +1160,23 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
 void LineAnnotationController::openFiber(uint64_t fiberId)
 {
+    openFiberWithControlPoint(fiberId, std::nullopt, std::nullopt);
+}
+
+void LineAnnotationController::openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex)
+{
+    openFiberWithControlPoint(fiberId, controlPointIndex, std::nullopt);
+}
+
+void LineAnnotationController::openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex)
+{
+    openFiberWithControlPoint(fiberId, std::nullopt, linePointIndex);
+}
+
+void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
+                                                         std::optional<int> controlPointIndex,
+                                                         std::optional<int> linePointIndex)
+{
     auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
     });
@@ -1030,6 +1197,8 @@ void LineAnnotationController::openFiber(uint64_t fiberId)
     session->fiberFileName = it->fileName;
     session->fiberManualHvTag = it->manualHvTag;
     session->fiberTags = it->tags;
+    session->disableInitialGeneratedHoverFollow =
+        controlPointIndex.has_value() || linePointIndex.has_value();
     session->focusedLinePosition = static_cast<double>(it->linePoints.size() / 2);
     session->focusedControlPoint = it->controlPoints.empty()
         ? std::optional<cv::Vec3d>{}
@@ -1078,7 +1247,27 @@ void LineAnnotationController::openFiber(uint64_t fiberId)
         }
     }
     if (!session->controlPoints.empty()) {
-        if (seedControl < 0) {
+        if (linePointIndex &&
+            *linePointIndex >= 0 &&
+            *linePointIndex < static_cast<int>(it->linePoints.size())) {
+            double bestLineDistance = std::numeric_limits<double>::infinity();
+            for (size_t i = 0; i < session->controlPoints.size(); ++i) {
+                const auto& control = session->controlPoints[i];
+                if (!std::isfinite(control.linePosition)) {
+                    continue;
+                }
+                const double distance = std::abs(
+                    control.linePosition - static_cast<double>(*linePointIndex));
+                if (distance < bestLineDistance) {
+                    bestLineDistance = distance;
+                    seedControl = static_cast<int>(i);
+                }
+            }
+        } else if (controlPointIndex &&
+            *controlPointIndex >= 0 &&
+            *controlPointIndex < static_cast<int>(session->controlPoints.size())) {
+            seedControl = *controlPointIndex;
+        } else if (seedControl < 0) {
             seedControl = 0;
         }
         session->controlPoints[static_cast<size_t>(seedControl)].isSeed = true;
@@ -1087,13 +1276,23 @@ void LineAnnotationController::openFiber(uint64_t fiberId)
             session->controlPoints[static_cast<size_t>(seedControl)].optimizedIndex;
         session->focusedLinePosition =
             session->controlPoints[static_cast<size_t>(seedControl)].linePosition;
+        session->focusedControlPoint =
+            session->controlPoints[static_cast<size_t>(seedControl)].volumePoint;
+    }
+    if (_currentAtlasDir) {
+        attachAtlasPredSnaps(*it, *session, *_currentAtlasDir);
     }
 
     CChunkedVolumeViewer::CameraState camera;
     camera.scale = 1.0f;
-    const cv::Vec3d origin = it->linePoints.empty()
-        ? cv::Vec3d{0.0, 0.0, 0.0}
-        : it->linePoints[it->linePoints.size() / 2];
+    const cv::Vec3d origin = session->focusedControlPoint.value_or(
+        it->linePoints.empty()
+            ? cv::Vec3d{0.0, 0.0, 0.0}
+            : it->linePoints[static_cast<size_t>(std::clamp(
+                  static_cast<int>(std::llround(session->focusedLinePosition)),
+                  0,
+                  static_cast<int>(it->linePoints.size() - 1)))]
+    );
     auto sourcePlane = std::make_shared<PlaneSurface>(
         cv::Vec3f{static_cast<float>(origin[0]),
                   static_cast<float>(origin[1]),
@@ -1470,6 +1669,13 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
                                          atlasDir / atlas.metadata.baseMeshPath);
         atlas.save(atlasDir);
+        if (sampler.hasPredDtChannel() && !atlas.fibers.empty()) {
+            (void)vc::atlas::ensureAtlasPredSnapSet(atlasDir,
+                                                    input,
+                                                    atlas.fibers.front(),
+                                                    *selected.surface,
+                                                    sampler);
+        }
         emit atlasCreated(atlasDir);
     } catch (const std::exception& ex) {
         showError(tr("Could not create atlas: %1").arg(QString::fromStdString(ex.what())));
@@ -1767,6 +1973,24 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
         link.desiredWindingDelta = 0;
         atlas.links.push_back(std::move(link));
         vc::atlas::layoutAtlasObjects(atlas, periodColumns);
+        if (sampler.hasPredDtChannel()) {
+            sourceMappingIt = findMapping(atlas, sourceInput.fiberPath);
+            targetMappingIt = findMapping(atlas, targetInput.fiberPath);
+            if (sourceMappingIt != atlas.fibers.end()) {
+                (void)vc::atlas::ensureAtlasPredSnapSet(*_intersectionInspection->atlasDir,
+                                                        sourceInput,
+                                                        *sourceMappingIt,
+                                                        *baseSurface,
+                                                        sampler);
+            }
+            if (targetMappingIt != atlas.fibers.end()) {
+                (void)vc::atlas::ensureAtlasPredSnapSet(*_intersectionInspection->atlasDir,
+                                                        targetInput,
+                                                        *targetMappingIt,
+                                                        *baseSurface,
+                                                        sampler);
+            }
+        }
         atlas.save(*_intersectionInspection->atlasDir);
 
         emit atlasCreated(*_intersectionInspection->atlasDir);
@@ -1860,6 +2084,9 @@ bool LineAnnotationController::updateIntersectionFollowSlice(bool sourceSideFlag
     surface->id = follow.surfaceName;
     _state->setSurface(follow.surfaceName, surface, false, true);
     follow.linePosition = linePosition;
+    updateControlPointInfoLabel(follow.controlPointInfoLabel,
+                                follow.controlPoints,
+                                follow.linePosition);
     if (auto* viewer = follow.viewer.data()) {
         viewer->centerOnVolumePoint(toVec3f(origin), false);
         viewer->renderVisible(true, reason);
@@ -1897,6 +2124,9 @@ void LineAnnotationController::toggleIntersectionFollowSlice(bool sourceSideFlag
         follow.followsMouse = false;
     } else {
         follow.followsMouse = true;
+        updateControlPointInfoLabel(follow.controlPointInfoLabel,
+                                    follow.controlPoints,
+                                    std::numeric_limits<double>::quiet_NaN());
     }
 }
 
@@ -1939,6 +2169,14 @@ bool LineAnnotationController::handleIntersectionFollowKeyPress(int key,
 
 bool LineAnnotationController::eventFilter(QObject* watched, QEvent* event)
 {
+    if (_intersectionInspection && event && event->type() == QEvent::Resize) {
+        if (auto* widget = qobject_cast<QWidget*>(watched)) {
+            if (auto* label = widget->findChild<QLabel*>(
+                    QStringLiteral("intersectionControlPointInfo"))) {
+                positionControlPointInfoLabel(label);
+            }
+        }
+    }
     if (_intersectionInspection && event && event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (watched) {
@@ -2093,6 +2331,16 @@ void LineAnnotationController::rebuildIntersectionInspection()
                                                              targetSide.editSessionName,
                                                              targetCallback);
 
+        auto attachAtlasPredSnapsForInspection = [this](const StoredFiber& fiber,
+                                                        const std::shared_ptr<LineAnnotationSession>& session) {
+            if (!_intersectionInspection || !_intersectionInspection->atlasDir || !session) {
+                return;
+            }
+            attachAtlasPredSnaps(fiber, *session, *_intersectionInspection->atlasDir);
+        };
+        attachAtlasPredSnapsForInspection(*sourceIt, sourceSide.editSession);
+        attachAtlasPredSnapsForInspection(*targetIt, targetSide.editSession);
+
         const bool sourceIsH = vc3d::line_annotation::firstFiberDisplaysAsH(
             sourceIt->hvClassification,
             sourceIt->manualHvTag,
@@ -2109,8 +2357,23 @@ void LineAnnotationController::rebuildIntersectionInspection()
         vSide.style = FiberSliceOverlayController::targetFiberStyle();
 
         auto prepareSide = [this](SideBuild& side) {
-            side.lineViews = vc::lasagna::buildLineViewSurfaces(
-                syntheticLineModelFromPoints(side.fiber->linePoints));
+            if (!side.editSession) {
+                throw std::runtime_error("Intersection side has no editable line session");
+            }
+            if (!ensureDatasetForSession(*side.editSession)) {
+                throw std::runtime_error(
+                    "Intersection side strips require a selected Lasagna normal dataset; "
+                    "not showing a synthetic strip");
+            }
+            side.editSession->optimizedLine =
+                lineModelFromPoints(side.fiber->linePoints, side.editSession->normalSampler.get());
+            side.lineViews = vc::lasagna::buildLineViewSurfaces(side.editSession->optimizedLine);
+            Logger()->info("Intersection {} strip built from sampled normals: fiber={} points={} surface={} side_slice={}",
+                           side.displayPrefix,
+                           side.fiber ? side.fiber->id : 0,
+                           side.fiber ? side.fiber->linePoints.size() : 0,
+                           static_cast<const void*>(side.lineViews.lineSurface.get()),
+                           static_cast<const void*>(side.lineViews.lineSideSlice.get()));
             side.triplet = vc3d::fiber_slice::selectControlTriplet(
                 side.fiber->linePoints,
                 side.fiber->controlPoints,
@@ -2293,8 +2556,15 @@ void LineAnnotationController::rebuildIntersectionInspection()
             if (!viewer) {
                 throw std::runtime_error("Could not create intersection slice viewer");
             }
+            QPointer<QLabel> controlPointInfoLabel;
             if (auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject())) {
                 viewerWidget->installEventFilter(this);
+                if (spec.editableCurrentCross && spec.editSession) {
+                    controlPointInfoLabel = createControlPointInfoLabel(
+                        viewerWidget,
+                        spec.editSession->controlPoints,
+                        spec.editLinePosition);
+                }
                 if (spec.hasFollowSide) {
                     viewerWidget->setProperty("vc_intersection_follow_source_side", spec.sourceFollow);
                 }
@@ -2342,6 +2612,10 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     follow.lineUpVectors = followSide.lineViews.lineUpVectors;
                     follow.controlPoints = followSide.editSession->controlPoints;
                     follow.linePosition = followSide.focusLinePosition;
+                    follow.controlPointInfoLabel = controlPointInfoLabel;
+                    updateControlPointInfoLabel(follow.controlPointInfoLabel,
+                                                follow.controlPoints,
+                                                std::numeric_limits<double>::quiet_NaN());
                 }
                 if (spec.shiftScroll) {
                     chunkedViewer->setProperty("vc_show_custom_normal_offset", true);
@@ -2409,7 +2683,9 @@ void LineAnnotationController::rebuildIntersectionInspection()
                                         effectiveLinePosition = follow.linePosition;
                                     }
                                 }
-                                if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                                if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+                                    handleGeneratedPredSnapPoint(surfaceName, volumePoint);
+                                } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                                     handleGeneratedControlPoint(surfaceName,
                                                                 volumePoint,
                                                                 effectiveLinePosition);
@@ -2450,6 +2726,9 @@ void LineAnnotationController::rebuildIntersectionInspection()
                             views.linePoints = generatedLinePoints(linePoints);
                             views.lineUpVectors = lineUpVectors;
                             views.controlPoints = generatedControlMarkers(session->controlPoints);
+                            views.predSnapPoints =
+                                generatedPredSnapMarkers(session->controlPoints,
+                                                         session->predSnapSet);
                             vc3d::line_annotation::applyGeneratedOverlay(
                                 chunkedViewer,
                                 surfaceName,
@@ -2567,6 +2846,9 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     views.linePoints = generatedLinePoints(linePoints);
                     views.lineUpVectors = lineUpVectors;
                     views.controlPoints = generatedControlMarkers(session->controlPoints);
+                    views.predSnapPoints =
+                        generatedPredSnapMarkers(session->controlPoints,
+                                                 session->predSnapSet);
                     auto overlay = vc3d::line_annotation::makeGeneratedStripOverlay(
                         views,
                         focus,
@@ -2617,7 +2899,7 @@ void LineAnnotationController::rebuildIntersectionInspection()
                         Qt::MouseButton button,
                         Qt::KeyboardModifiers modifiers,
                         QPointF scenePoint) {
-                        if (modifiers != Qt::NoModifier) {
+                        if (modifiers != Qt::NoModifier && modifiers != Qt::ShiftModifier) {
                             return;
                         }
                         const double linePosition =
@@ -2631,7 +2913,11 @@ void LineAnnotationController::rebuildIntersectionInspection()
                             _intersectionInspection->activeFollowSourceSide = sourceSideFlag;
                         }
                         if (button == Qt::LeftButton) {
-                            handleGeneratedControlPoint(surfaceName, volumePoint, linePosition);
+                            if (modifiers == Qt::ShiftModifier) {
+                                handleGeneratedPredSnapPoint(surfaceName, volumePoint);
+                            } else {
+                                handleGeneratedControlPoint(surfaceName, volumePoint, linePosition);
+                            }
                         }
                     });
         };
@@ -2664,6 +2950,13 @@ void LineAnnotationController::rebuildIntersectionInspection()
             auto* title = new QLabel(tr("Intersection decision"), pane);
             title->setObjectName(QStringLiteral("intersectionDecisionTitle"));
             layout->addWidget(title);
+
+            if (_volumeSelectorFactory) {
+                if (auto* volumeSelector = _volumeSelectorFactory(pane)) {
+                    volumeSelector->setObjectName(QStringLiteral("intersectionDecisionVolumeSelector"));
+                    layout->addWidget(volumeSelector);
+                }
+            }
 
             auto* hLabel = new QLabel(
                 tr("H: %1 - %2").arg(fiberDisplayName(*hSide.fiber), hvSummary(*hSide.fiber)),
@@ -2833,7 +3126,6 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
         if (fibers.size() != 2) {
             throw std::runtime_error("The edited intersection fibers are no longer both loaded");
         }
-        vc::atlas::FiberSpatialIndex index;
         vc::atlas::FiberIntersectionCache cache;
         vc::atlas::FiberIntersectionBroadPhaseOptions broad;
         vc::atlas::FiberIntersectionCeresOptions ceres;
@@ -2841,7 +3133,6 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
             fibers,
             {sourceId},
             {targetId},
-            index,
             &cache,
             broad,
             ceres);
@@ -3054,7 +3345,13 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
             try {
                 if (auto fiber = loadFiberFile(entry.path())) {
                     const fs::path path = relativeFiberPath(*fiber);
-                    byPath[path] = FiberSnapshotWithPath{path, snapshotForFiber(*fiber)};
+                    byPath[path] = FiberSnapshotWithPath{
+                        path,
+                        snapshotForFiber(*fiber),
+                        fiber->id,
+                        fiber->hvClassification,
+                        fiber->manualHvTag,
+                        fiber->tags};
                 }
             } catch (const std::exception& ex) {
                 Logger()->warn("Skipping invalid VC3D fiber file {} during atlas search: {}",
@@ -3066,7 +3363,13 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
 
     for (const auto& fiber : _fibers) {
         const fs::path path = relativeFiberPath(fiber);
-        byPath[path] = FiberSnapshotWithPath{path, snapshotForFiber(fiber)};
+        byPath[path] = FiberSnapshotWithPath{
+            path,
+            snapshotForFiber(fiber),
+            fiber.id,
+            fiber.hvClassification,
+            fiber.manualHvTag,
+            fiber.tags};
     }
 
     std::vector<fs::path> orderedPaths;
@@ -3084,6 +3387,19 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
         snapshots.push_back(std::move(snapshot));
     }
     return snapshots;
+}
+
+std::optional<uint64_t> LineAnnotationController::fiberIdForAtlasPath(
+    const fs::path& atlasFiberPath) const
+{
+    const std::string targetKey = vc::atlas::atlasFiberPathKey(atlasFiberPath);
+    for (const auto& fiber : _fibers) {
+        const auto keys = atlasPathKeysForFiber(fiber);
+        if (std::find(keys.begin(), keys.end(), targetKey) != keys.end()) {
+            return fiber.id;
+        }
+    }
+    return std::nullopt;
 }
 
 void LineAnnotationController::onSurfaceChanged(std::string name,
@@ -3205,6 +3521,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         session.controlPointsDirtySinceOptimization = true;
         if (pane->dialog) {
             pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
+            pane->dialog->setGeneratedPredSnapPoints(
+                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
         }
         return;
     }
@@ -3253,6 +3571,62 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                        session.controlPoints,
                        linePointsToJson(session.optimizedLine));
     startOptimization(session, false, update.activeStart, update.activeEnd);
+}
+
+void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& surfaceName,
+                                                           cv::Vec3f volumePoint)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+
+    auto& session = *pane->session;
+    if (!session.atlasDir || session.atlasDir->empty() || session.controlPoints.empty()) {
+        return;
+    }
+
+    const cv::Vec3d clicked(volumePoint[0], volumePoint[1], volumePoint[2]);
+    if (!finitePoint(clicked)) {
+        return;
+    }
+
+    size_t nearestIndex = 0;
+    double nearestDistanceSq = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < session.controlPoints.size(); ++i) {
+        const cv::Vec3d delta = session.controlPoints[i].volumePoint - clicked;
+        const double distanceSq = delta.dot(delta);
+        if (distanceSq < nearestDistanceSq) {
+            nearestIndex = i;
+            nearestDistanceSq = distanceSq;
+        }
+    }
+
+    fs::path atlasFiberPath = session.atlasFiberPath;
+    if (atlasFiberPath.empty()) {
+        return;
+    }
+
+    std::optional<double> predDtValue;
+    if (session.normalSampler) {
+        predDtValue = session.normalSampler->samplePredDt(clicked);
+    }
+
+    try {
+        session.predSnapSet = vc::atlas::setManualAtlasPredSnapPoint(
+            *session.atlasDir,
+            atlasFiberPath,
+            session.controlPoints[nearestIndex].volumePoint,
+            clicked,
+            predDtValue);
+        if (pane->dialog) {
+            pane->dialog->setGeneratedPredSnapPoints(
+                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
+        }
+    } catch (const std::exception& ex) {
+        showError(tr("Could not save pred-snap point: %1")
+                      .arg(QString::fromStdString(ex.what())));
+    }
 }
 
 void LineAnnotationController::handleGeneratedControlPointDelete(const std::string& surfaceName,
@@ -3643,6 +4017,11 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     const cv::Vec3f seedPoint{static_cast<float>(session.seedPoint[0]),
                               static_cast<float>(session.seedPoint[1]),
                               static_cast<float>(session.seedPoint[2])};
+    const cv::Vec3f focusPoint = session.focusedControlPoint
+        ? cv::Vec3f{static_cast<float>((*session.focusedControlPoint)[0]),
+                    static_cast<float>((*session.focusedControlPoint)[1]),
+                    static_cast<float>((*session.focusedControlPoint)[2])}
+        : seedPoint;
 
     LineAnnotationDialog::GeneratedViews generatedViews;
     generatedViews.lineSurfaceName = "line-surface";
@@ -3652,7 +4031,10 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
     generatedViews.seedPoint = seedPoint;
+    generatedViews.focusPoint = focusPoint;
     generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
+    generatedViews.initialCurrentCutFollowsStripMouse =
+        !session.disableInitialGeneratedHoverFollow;
     for (const auto& control : session.controlPoints) {
         LineAnnotationDialog::GeneratedOverlay::ControlPointMarker marker;
         marker.point = {static_cast<float>(control.volumePoint[0]),
@@ -3667,6 +4049,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             generatedViews.seedLineIndex = static_cast<int>(std::llround(marker.linePosition));
         }
     }
+    generatedViews.predSnapPoints =
+        generatedPredSnapMarkers(session.controlPoints, session.predSnapSet);
     generatedViews.initialCenterIndex = static_cast<int>(std::llround(std::clamp(
         session.focusedLinePosition,
         0.0,
@@ -4080,6 +4464,109 @@ fs::path LineAnnotationController::fiberPath(const StoredFiber& fiber) const
             fiber.username, fiber.startedAt, fiber.sequence);
     }
     return fibersDir() / (std::to_string(fiber.id) + ".json");
+}
+
+fs::path LineAnnotationController::currentVolpkgRoot() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    const auto vpkg = _state->vpkg();
+    const fs::path projectPath = vpkg->path();
+    if (!projectPath.empty()) {
+        return projectPath.parent_path();
+    }
+    return fs::path(vpkg->getVolpkgDirectory());
+}
+
+std::vector<std::string> LineAnnotationController::atlasPathKeysForFiber(
+    const StoredFiber& fiber) const
+{
+    std::vector<std::string> keys;
+    auto addKey = [&keys](const fs::path& path) {
+        if (path.empty()) {
+            return;
+        }
+        const std::string key = vc::atlas::atlasFiberPathKey(path);
+        if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+            keys.push_back(key);
+        }
+    };
+
+    if (!fiber.fileName.empty()) {
+        addKey(fs::path("fibers") / fiber.fileName);
+        addKey(fs::path(fiber.fileName));
+    }
+
+    const fs::path absoluteFiberPath = fiberPath(fiber);
+    addKey(absoluteFiberPath);
+
+    const fs::path volpkgRoot = currentVolpkgRoot();
+    if (!volpkgRoot.empty()) {
+        std::error_code ec;
+        const fs::path relativePath = fs::relative(absoluteFiberPath, volpkgRoot, ec);
+        if (!ec && !relativePath.empty()) {
+            addKey(relativePath);
+        }
+    }
+    return keys;
+}
+
+std::optional<fs::path> LineAnnotationController::resolveAtlasFiberPath(
+    const StoredFiber& fiber,
+    const fs::path& atlasDir) const
+{
+    if (atlasDir.empty()) {
+        return std::nullopt;
+    }
+
+    const fs::path volpkgRoot = currentVolpkgRoot();
+    vc::atlas::Atlas atlas = volpkgRoot.empty()
+        ? vc::atlas::Atlas::load(atlasDir)
+        : vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    const auto keys = atlasPathKeysForFiber(fiber);
+    for (const auto& mapping : atlas.fibers) {
+        const std::string mappingKey = vc::atlas::atlasFiberPathKey(mapping.fiberPath);
+        if (std::find(keys.begin(), keys.end(), mappingKey) != keys.end()) {
+            return mapping.fiberPath;
+        }
+    }
+    return std::nullopt;
+}
+
+void LineAnnotationController::attachAtlasPredSnaps(
+    const StoredFiber& fiber,
+    LineAnnotationSession& session,
+    const fs::path& atlasDir)
+{
+    session.atlasDir = atlasDir;
+    session.atlasFiberPath.clear();
+    session.predSnapSet = {};
+
+    std::optional<fs::path> atlasFiberPath;
+    try {
+        atlasFiberPath = resolveAtlasFiberPath(fiber, atlasDir);
+    } catch (const std::exception& ex) {
+        Logger()->warn("Could not resolve atlas fiber mapping for {}: {}",
+                       fiberPath(fiber).string(),
+                       ex.what());
+        return;
+    }
+
+    if (!atlasFiberPath) {
+        Logger()->warn("Could not find atlas mapping for fiber {}", fiberPath(fiber).string());
+        return;
+    }
+
+    session.atlasFiberPath = *atlasFiberPath;
+    try {
+        session.predSnapSet = vc::atlas::loadAtlasPredSnapSet(
+            vc::atlas::atlasPredSnapAttachmentPath(atlasDir, *atlasFiberPath));
+    } catch (const std::exception& ex) {
+        Logger()->warn("Could not load pred-snap attachment for {}: {}",
+                       atlasFiberPath->string(),
+                       ex.what());
+    }
 }
 
 uint64_t LineAnnotationController::nextFiberId() const

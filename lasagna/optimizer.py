@@ -350,6 +350,16 @@ def _parse_opt_settings(
 				)
 	scalar_terms = set(MAP_LOSS_NAMES) if kind == "map" else (set(base.keys()) - set(MAP_LOSS_NAMES))
 	eff, _mods = _stage_to_modifiers(base, default_mul, w_fac, scalar_terms=scalar_terms)
+	if float(eff.get("atlas_line_snap", 0.0)) > 0.0:
+		conflicting = [
+			name for name in ("atlas_line", "atlas_line_control", "atlas_line_other")
+			if float(eff.get(name, 0.0)) > 0.0
+		]
+		if conflicting:
+			raise ValueError(
+				f"stages_json: stage '{stage_name}' atlas_line_snap cannot be combined with "
+				+ ", ".join(conflicting)
+			)
 	if steps_auto and "cyl_params" in params:
 		raise ValueError(f"stages_json: stage '{stage_name}' opt.steps='auto' is not supported for cyl_params stages")
 	if "cyl_params" in params:
@@ -407,6 +417,7 @@ lambda_global: dict[str, float] = {
 	"atlas_line": 0.0,
 	"atlas_line_control": 0.0,
 	"atlas_line_other": 0.0,
+	"atlas_line_snap": 0.0,
 	"map_dist": 1.0,
 	"map_vec_normal": 1.0,
 	"map_surface_normal": 1.0,
@@ -1808,7 +1819,7 @@ def optimize(
 		},
 		"atlas_line": {
 			"loss": opt_loss_atlas_line.atlas_line_loss,
-			"sub": ["atlas_line", "atlas_line_control", "atlas_line_other"],
+			"sub": ["atlas_line", "atlas_line_control", "atlas_line_other", "atlas_line_snap"],
 			"needs": Needs(mesh_normals=True),
 		},
 		"cyl_normal": {
@@ -1914,6 +1925,8 @@ def optimize(
 						hr_prefetch_channels=frozenset({"pred_dt"}),
 						prefetch_pred_dt_flow=True,
 					))
+					if bool(pred_dt_flow_gate_cfg_.get("atlas_snap_seed_enabled", False)):
+						needs = needs.merged(Needs(mesh_normals=True))
 		return needs
 
 	def _prefetch_grad_summary(needs: fit_model.ModelForwardNeeds) -> str:
@@ -2519,6 +2532,7 @@ def optimize(
 				"atlas_line": "a_line",
 				"atlas_line_control": "a_ctl",
 				"atlas_line_other": "a_oth",
+				"atlas_line_snap": "a_snap",
 				"atlas_line_samples": "a_samp",
 				"atlas_line_valid": "a_val",
 				"atlas_line_rms": "a_rms",
@@ -2530,6 +2544,9 @@ def optimize(
 				"atlas_line_other_valid": "a_oval",
 				"atlas_line_other_rms": "a_orms",
 				"atlas_line_other_active_vertices": "a_ovtx",
+				"atlas_line_snap_valid": "a_sval",
+				"atlas_line_snap_rms": "a_srms",
+				"atlas_line_snap_active_vertices": "a_svtx",
 				"flatten_point_valid": "f_pt",
 				"flatten_quad_valid": "f_quad",
 				"flatten_tgt_step": "f_tgt",
@@ -2674,6 +2691,7 @@ def optimize(
 				"atlas_line": "atlas line loss",
 				"atlas_line_control": "atlas control-anchor loss",
 				"atlas_line_other": "atlas in-span line-anchor loss",
+				"atlas_line_snap": "atlas pred-snap loss",
 				"atlas_line_samples": "atlas line sample slots",
 				"atlas_line_valid": "atlas valid samples",
 				"atlas_line_rms": "atlas line RMS",
@@ -2685,6 +2703,9 @@ def optimize(
 				"atlas_line_other_valid": "atlas valid other samples",
 				"atlas_line_other_rms": "atlas other RMS",
 				"atlas_line_other_active_vertices": "atlas active other vertices",
+				"atlas_line_snap_valid": "atlas valid pred-snap samples",
+				"atlas_line_snap_rms": "atlas pred-snap RMS",
+				"atlas_line_snap_active_vertices": "atlas active pred-snap vertices",
 				"p:wcirc_avg_vx": "param circ avg",
 				"p:wcirc_tgt_vx": "param circ target",
 				"p:wstep_invalid_avg_vx": "param invalid avg",
@@ -2789,17 +2810,21 @@ def optimize(
 				"atlas_line": 182,
 				"atlas_line_control": 183,
 				"atlas_line_other": 184,
-				"atlas_line_samples": 185,
-				"atlas_line_valid": 186,
-				"atlas_line_rms": 187,
-				"atlas_line_active_vertices": 188,
-				"atlas_line_signed_delta_mean": 189,
-				"atlas_line_control_valid": 190,
-				"atlas_line_control_rms": 191,
-				"atlas_line_control_active_vertices": 192,
-				"atlas_line_other_valid": 193,
-				"atlas_line_other_rms": 194,
-				"atlas_line_other_active_vertices": 195,
+				"atlas_line_snap": 185,
+				"atlas_line_samples": 186,
+				"atlas_line_valid": 187,
+				"atlas_line_rms": 188,
+				"atlas_line_active_vertices": 189,
+				"atlas_line_signed_delta_mean": 190,
+				"atlas_line_control_valid": 191,
+				"atlas_line_control_rms": 192,
+				"atlas_line_control_active_vertices": 193,
+				"atlas_line_other_valid": 194,
+				"atlas_line_other_rms": 195,
+				"atlas_line_other_active_vertices": 196,
+				"atlas_line_snap_valid": 197,
+				"atlas_line_snap_rms": 198,
+				"atlas_line_snap_active_vertices": 199,
 				"cyl_outside_pen_frac": 200,
 				"cyl_outside_depth_max": 201,
 				"cyl_outside_depth_avg": 202,
@@ -2824,6 +2849,10 @@ def optimize(
 			def _fmt_val(k: str, v: float) -> str:
 				return format_progress_value(v)
 			verbose_map_status = bool((stage_args or {}).get("verbose_map_status", (stage_args or {}).get("debug_map_status", False)))
+			verbose_pred_dt_flow_status = bool((stage_args or {}).get(
+				"verbose_pred_dt_flow_status",
+				(stage_args or {}).get("debug_pred_dt_flow_status", False),
+			))
 			visible_map_status_keys = {
 				"snaps_map_snap",
 				"snaps_map_snap_abs",
@@ -2839,10 +2868,36 @@ def optimize(
 					"snaps_map_area_smooth",
 					"snaps_map_samples",
 				}
+			hidden_pred_dt_flow_status_prefixes = (
+				"pred_dt_atlas_snap_seed_",
+				"pred_dt_corr_seed_",
+				"pred_dt_flow_",
+				"pred_dt_layer_",
+			)
+			visible_pred_dt_status_keys = {
+				"pred_dt_gate_gt01",
+			}
+			verbose_atlas_line_status = bool((stage_args or {}).get(
+				"verbose_atlas_line_status",
+				(stage_args or {}).get("debug_atlas_line_status", False),
+			))
+			visible_atlas_line_status_keys = {
+				"atlas_line",
+				"atlas_line_control",
+				"atlas_line_other",
+				"atlas_line_snap",
+			}
 			def _show_status_key(k: str) -> bool:
-				if not str(k).startswith("snaps_map_"):
-					return True
-				return verbose_map_status or k in visible_map_status_keys
+				ks = str(k)
+				if ks.startswith("snaps_map_"):
+					return verbose_map_status or ks in visible_map_status_keys
+				if ks.startswith(hidden_pred_dt_flow_status_prefixes):
+					return verbose_pred_dt_flow_status
+				if ks.startswith("pred_dt_gate_") or ks.startswith("pred_dt_pull_"):
+					return verbose_pred_dt_flow_status or ks in visible_pred_dt_status_keys
+				if ks.startswith("atlas_line_"):
+					return verbose_atlas_line_status or ks in visible_atlas_line_status_keys
+				return True
 			tv_keys = sorted((k for k in tv.keys() if _show_status_key(k)), key=_sort_key)
 			pv_keys = sorted(pv.keys())
 			cols = tv_keys + [f"p:{k}" for k in pv_keys]

@@ -112,6 +112,8 @@ int main(int argc, char** argv)
     settings.setValue(QStringLiteral("lasagna_offset_value"), -1.25);
     const QString altConfigPath = tempDir.filePath(QStringLiteral("alt_config.json"));
     writeFile(altConfigPath, QByteArrayLiteral(R"({"args":{"alternate":1}})"));
+    const QString reoptModelConfigPath = tempDir.filePath(QStringLiteral("reopt_model.json"));
+    writeFile(reoptModelConfigPath, QByteArrayLiteral(R"({"args":{"model-init":"model"}})"));
 
     SegmentationLasagnaPanel panel(QStringLiteral("test-lasagna"));
     panel.restoreSettings(settings);
@@ -427,11 +429,103 @@ int main(int argc, char** argv)
     require(wrapJobArgs[QStringLiteral("model-w-unit")].toString() == QStringLiteral("wraps"),
             "New Model launch should send the wraps width unit");
 
+    const QString externalModelPath = tempDir.filePath(QStringLiteral("external_model.pt"));
+    writeFile(externalModelPath, QByteArrayLiteral("external-model"));
+    const QString segNoModelDir = tempDir.filePath(QStringLiteral("sheet_no_model.tifxyz"));
+    require(QDir().mkpath(segNoModelDir), "Failed to create no-model tifxyz segment");
+    writeFile(segNoModelDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
+    writeFile(segNoModelDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
+    writeFile(segNoModelDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
+    writeFile(segNoModelDir + QStringLiteral("/meta.json"),
+              QByteArray(R"({"model_source":")") +
+                  externalModelPath.toUtf8().replace("\\", "\\\\").replace("\"", "\\\"") +
+                  QByteArrayLiteral(R"("})"));
+    auto noModelSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+    noModelSurface->path = std::filesystem::path(segNoModelDir.toStdString());
+    state.setSurface("segmentation", noModelSurface, true);
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
+        reoptModelConfigPath,
+        4,
+        5,
+        6);
+    QJsonObject modelSourceJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    require(!g_lastLasagnaOptimizationRequest.contains(QStringLiteral("copy_model")),
+            "Re-optimize should not send deprecated copy_model request flag");
+    require(modelSourceJobSpec[QStringLiteral("model")].toObject()[QStringLiteral("type")].toString() ==
+                QStringLiteral("lasagna_model"),
+            "Re-optimize should derive job_spec.model from meta.json model_source when model.pt is absent");
+    bool uploadedModelSource = false;
+    for (const QJsonValue& value : g_lastLasagnaOptimizationRequest[QStringLiteral("_objects")].toArray()) {
+        uploadedModelSource = uploadedModelSource ||
+            value.toObject()[QStringLiteral("object")].toObject()[QStringLiteral("type")].toString() ==
+                QStringLiteral("lasagna_model");
+    }
+    require(uploadedModelSource,
+            "Re-optimize should upload the local model_source model when model.pt is absent");
+
+    const QString segModelRefDir = tempDir.filePath(QStringLiteral("sheet_model_ref.tifxyz"));
+    require(QDir().mkpath(segModelRefDir), "Failed to create model-ref tifxyz segment");
+    writeFile(segModelRefDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
+    writeFile(segModelRefDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
+    writeFile(segModelRefDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
+    writeFile(segModelRefDir + QStringLiteral("/meta.json"),
+              QByteArrayLiteral(R"({"object_refs":{"version":1,"objects":[{"type":"lasagna_model","name":"sheet_model_ref.tifxyz/model.pt","hash":"md5:22222222222222222222222222222222"}]}})"));
+    auto modelRefSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+    modelRefSurface->path = std::filesystem::path(segModelRefDir.toStdString());
+    state.setSurface("segmentation", modelRefSurface, true);
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
+        reoptModelConfigPath,
+        4,
+        5,
+        6);
+    QJsonObject modelRefJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    require(!g_lastLasagnaOptimizationRequest.contains(QStringLiteral("copy_model")),
+            "Re-optimize with model ref should not send deprecated copy_model request flag");
+    require(modelRefJobSpec[QStringLiteral("model")].toObject()[QStringLiteral("hash")].toString() ==
+                QStringLiteral("md5:22222222222222222222222222222222"),
+            "Re-optimize should derive job_spec.model from meta.json object_refs when no local model is present");
+
+    const QString segBrokenModelDir = tempDir.filePath(QStringLiteral("sheet_broken_model.tifxyz"));
+    require(QDir().mkpath(segBrokenModelDir), "Failed to create broken-model tifxyz segment");
+    writeFile(segBrokenModelDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
+    writeFile(segBrokenModelDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
+    writeFile(segBrokenModelDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
+    writeFile(segBrokenModelDir + QStringLiteral("/meta.json"), QByteArrayLiteral("{}"));
+    std::error_code symlinkErr;
+    std::filesystem::create_symlink(
+        std::filesystem::path(tempDir.filePath(QStringLiteral("missing_model.pt")).toStdString()),
+        std::filesystem::path((segBrokenModelDir + QStringLiteral("/model.pt")).toStdString()),
+        symlinkErr);
+    require(!symlinkErr, "Failed to create broken model symlink");
+    auto brokenModelSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+    brokenModelSurface->path = std::filesystem::path(segBrokenModelDir.toStdString());
+    state.setSurface("segmentation", brokenModelSurface, true);
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
+        reoptModelConfigPath,
+        4,
+        5,
+        6);
+    require(statusBar.currentMessage().contains(QStringLiteral("broken symlink")),
+            "Re-optimize should reject a broken local model.pt symlink");
+
+    state.setSurface("segmentation", surface, true);
+
     const QString volpkgRoot = tempDir.filePath(QStringLiteral("sample.volpkg"));
     require(QDir().mkpath(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/base_mesh/base.tifxyz")),
             "Failed to create atlas base directory");
     require(QDir().mkpath(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/mappings/fibers")),
             "Failed to create atlas mappings directory");
+    require(QDir().mkpath(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/attachments/pred_snap_points")),
+            "Failed to create atlas pred-snap attachments directory");
     require(QDir().mkpath(volpkgRoot + QStringLiteral("/fibers")),
             "Failed to create atlas fibers directory");
     writeWrappedTifxyz(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/base_mesh/base.tifxyz"));
@@ -439,8 +533,10 @@ int main(int argc, char** argv)
               QByteArrayLiteral(R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})"));
     writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/mappings/fibers/fiber.json"),
               QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}]})"));
+    writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/attachments/pred_snap_points/fiber.json"),
+              QByteArrayLiteral(R"({"type":"vc3d_atlas_pred_snap_points","version":1,"fiber_path":"fibers/fiber.json","entries":{}})"));
     writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/metadata.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":5,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})"));
 
     const QString projectPath = volpkgRoot + QStringLiteral("/project.volpkg");
     writeFile(projectPath, QByteArrayLiteral(R"({"name":"atlas-test","version":1})"));
@@ -488,11 +584,12 @@ int main(int argc, char** argv)
                 !atlasJobSpec.contains(QStringLiteral("linked_surfaces")),
             "Atlas launch should not send model or linked surface refs");
     QJsonArray atlasUploads = atlasRequest[QStringLiteral("_objects")].toArray();
-    require(atlasUploads.size() == 4,
-            "Atlas launch should upload base, line, line-map, and compact atlas objects");
+    require(atlasUploads.size() == 5,
+            "Atlas launch should upload base, line, line-map, pred-snap, and compact atlas objects");
     bool sawBase = false;
     bool sawLine = false;
     bool sawMap = false;
+    bool sawPredSnap = false;
     bool sawAtlas = false;
     QJsonObject compactAtlas;
     for (const QJsonValue& value : atlasUploads) {
@@ -502,6 +599,7 @@ int main(int argc, char** argv)
         sawBase = sawBase || type == QStringLiteral("atlas-base");
         sawLine = sawLine || type == QStringLiteral("line");
         sawMap = sawMap || type == QStringLiteral("line-map");
+        sawPredSnap = sawPredSnap || type == QStringLiteral("atlas-pred-snap");
         if (type == QStringLiteral("atlas")) {
             sawAtlas = true;
             QByteArray data = QByteArray::fromBase64(upload[QStringLiteral("data")].toString().toLatin1());
@@ -510,7 +608,7 @@ int main(int argc, char** argv)
         require(type != QStringLiteral("tifxyz_segment") && type != QStringLiteral("lasagna_model"),
                 "Atlas launch should not upload selected segmentation or model objects");
     }
-    require(sawBase && sawLine && sawMap && sawAtlas,
+    require(sawBase && sawLine && sawMap && sawPredSnap && sawAtlas,
             "Atlas launch should include the expected atlas object types");
     QJsonObject compactMetadata = compactAtlas[QStringLiteral("metadata")].toObject();
     require(compactMetadata[QStringLiteral("zero_winding_column")].toInt() == 1,
@@ -521,6 +619,10 @@ int main(int argc, char** argv)
     QJsonObject compactMap = compactAtlas[QStringLiteral("maps")].toArray()[0].toObject();
     require(compactMap[QStringLiteral("winding_offset")].toInt() == 0,
             "Compact atlas JSON should include each derived map winding_offset");
+    require(compactMap.contains(QStringLiteral("pred_snap_ref")),
+            "Compact atlas JSON should reference pred-snap attachments by object ref");
+    require(!compactMap.contains(QStringLiteral("pred_snap_path")),
+            "Compact atlas JSON should not inline local pred-snap paths");
 
     panel._outputNameEdit->clear();
     panel._submittedOutputNames.clear();
@@ -556,7 +658,7 @@ int main(int argc, char** argv)
     require(QDir().mkpath(missingBaseAtlas + QStringLiteral("/mappings/fibers")),
             "Failed to create missing-base atlas directory");
     writeFile(missingBaseAtlas + QStringLiteral("/metadata.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":5,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})"));
     writeFile(missingBaseAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
               QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})"));
     panel._atlasDirPath = missingBaseAtlas;
@@ -571,7 +673,7 @@ int main(int argc, char** argv)
             "Failed to create missing-fiber mappings directory");
     writeWrappedTifxyz(missingFiberAtlas + QStringLiteral("/base_mesh/base.tifxyz"));
     writeFile(missingFiberAtlas + QStringLiteral("/metadata.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":5,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
     writeFile(missingFiberAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
               QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})"));
     panel._atlasDirPath = missingFiberAtlas;
@@ -584,7 +686,7 @@ int main(int argc, char** argv)
             "Failed to create missing-map base directory");
     writeWrappedTifxyz(missingMapAtlas + QStringLiteral("/base_mesh/base.tifxyz"));
     writeFile(missingMapAtlas + QStringLiteral("/metadata.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":4,"name":"missing_map","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
+              QByteArrayLiteral(R"({"type":"vc3d_atlas","version":5,"name":"missing_map","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
     panel._atlasDirPath = missingMapAtlas;
     panel.startAtlasOptimization(&state, &statusBar);
     require(statusBar.currentMessage().contains(QStringLiteral("no fiber mappings directory")),

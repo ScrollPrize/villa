@@ -18,6 +18,8 @@ struct ColPoint
     cv::Vec3f p = {0,0,0};
     float winding_annotation = NAN;
     int64_t creation_time = 0;
+    std::vector<uint64_t> links;
+    std::string fiber_dir;
 };
 
 struct CollectionMetadata
@@ -48,6 +50,7 @@ public:
         WindingFillMode autoFillMode = WindingFillMode::None;
         float autoFillConstant = 0.0f;
         std::unordered_map<std::string, std::string> tags;
+        std::vector<uint64_t> windings_linked;
     };
 
     PointCollections() = default;
@@ -72,6 +75,7 @@ public:
     void setCollectionTag(uint64_t collectionId, const std::string& key, const std::string& value);
     void removeCollectionTag(uint64_t collectionId, const std::string& key);
     std::optional<std::string> getCollectionTag(uint64_t collectionId, const std::string& key) const;
+    void setCollectionWindingsLinked(uint64_t collectionId, const std::vector<uint64_t>& linkedCollectionIds);
     std::optional<ColPoint> getPoint(uint64_t pointId) const;
     std::vector<ColPoint> getPoints(const std::string& collectionName) const;
     std::string generateNewCollectionName(const std::string& prefix = "col") const;

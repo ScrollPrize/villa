@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 namespace vc::lasagna {
 
@@ -28,6 +29,9 @@ public:
 
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const;
+    [[nodiscard]] std::optional<double> samplePredDt(const cv::Vec3d& volumePoint) const;
+    [[nodiscard]] bool hasPredDtChannel() const;
+    [[nodiscard]] std::optional<double> predDtSpacing() const;
     [[nodiscard]] double windingDistance(const cv::Vec3d& a,
                                          const cv::Vec3d& b,
                                          double stepVx = 8.0) const;

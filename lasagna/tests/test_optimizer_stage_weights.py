@@ -119,6 +119,39 @@ class OptimizerStageWeightsTest(unittest.TestCase):
 		self.assertAlmostEqual(opt.eff["atlas_line_control"], 0.6, delta=1.0e-12)
 		self.assertAlmostEqual(opt.eff["atlas_line_other"], 0.125, delta=1.0e-12)
 
+	def test_atlas_line_snap_rejects_combined_atlas_line_terms(self) -> None:
+		with self.assertRaisesRegex(ValueError, "atlas_line_snap cannot be combined"):
+			optimizer.load_stages_cfg({
+				"base": {
+					"atlas_line_snap": 1.0,
+					"atlas_line_control": 0.5,
+				},
+				"stages": [
+					{"name": "stage0", "steps": 1, "params": ["mesh_ms"]},
+				],
+			})
+
+	def test_atlas_snap_flow_speculative_config_parses_snap_plus_pred_dt(self) -> None:
+		cfg_path = Path(ROOT) / "configs" / "atlas_reopt_snap_flow_speculative.json"
+		cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+		stages = optimizer.load_stages_cfg(cfg)
+
+		self.assertTrue(cfg["args"].get("tifxyz-flow-gate-channels"))
+		self.assertEqual(len(stages), 1)
+		opt = stages[0].global_opt
+		self.assertGreater(opt.eff["atlas_line_snap"], 0.0)
+		self.assertGreater(opt.eff["pred_dt"], 0.0)
+		self.assertEqual(opt.eff["atlas_line_control"], 0.0)
+		self.assertEqual(opt.eff["atlas_line_other"], 0.0)
+		gate = opt.args["pred_dt_flow_gate"]
+		self.assertTrue(gate["enabled"])
+		self.assertTrue(gate["debug"])
+		self.assertEqual(gate["debug_layer_interval"], 0)
+		self.assertEqual(gate["debug_vis_interval"], 10)
+		self.assertTrue(gate["atlas_snap_seed_enabled"])
+		self.assertFalse(gate["corr_seed_enabled"])
+		self.assertTrue(gate["anticipatory_pull"]["enabled"])
+
 	def test_step_regularizer_split_weights_parse_independently(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"base": {

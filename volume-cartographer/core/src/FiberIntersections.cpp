@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
-#include <future>
+#include <iterator>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -372,11 +375,15 @@ struct JointIntersectionResidual {
     const FiberPolyline& target;
     FiberIntersectionCeresOptions options;
     const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr;
+    FiberIntersectionCancelCallback cancelCallback;
 
     bool operator()(const double* const sourceS,
                     const double* const targetS,
                     double* residuals) const
     {
+        if (cancelCallback && cancelCallback()) {
+            return false;
+        }
         const FiberSample a = sampleFiber(source, sourceS[0]);
         const FiberSample b = sampleFiber(target, targetS[0]);
         if (windingSampler) {
@@ -448,6 +455,246 @@ FiberIntersectionResult normalizedResultForPair(FiberIntersectionResult result,
     }
     return result;
 }
+
+class FiberIntersectionCancelIterationCallback final : public ceres::IterationCallback {
+public:
+    explicit FiberIntersectionCancelIterationCallback(FiberIntersectionCancelCallback cancelCallback)
+        : cancelCallback_(std::move(cancelCallback))
+    {
+    }
+
+    ceres::CallbackReturnType operator()(const ceres::IterationSummary& /*summary*/) override
+    {
+        return cancelCallback_ && cancelCallback_()
+            ? ceres::SOLVER_ABORT
+            : ceres::SOLVER_CONTINUE;
+    }
+
+private:
+    FiberIntersectionCancelCallback cancelCallback_;
+};
+
+class SearchFiberPointIndex {
+public:
+    explicit SearchFiberPointIndex(double maxSampleSpacing)
+        : maxSampleSpacing_(sanitizedSampleSpacing(maxSampleSpacing))
+    {
+    }
+
+    void insertFiber(const FiberPolyline& fiber)
+    {
+        auto samples = denseSamplesForFiber(fiber, maxSampleSpacing_);
+        auto values = pointValuesForFiber(fiber, samples);
+        samplesByFiberId_[fiber.id] = std::move(samples);
+        values_.insert(values_.end(),
+                       std::make_move_iterator(values.begin()),
+                       std::make_move_iterator(values.end()));
+    }
+
+    void finalize()
+    {
+        tree_ = PointTree(values_.begin(), values_.end());
+    }
+
+    [[nodiscard]] std::vector<FiberIntersectionCandidate> candidatesForFiber(
+        const FiberPolyline& source,
+        const FiberIntersectionBroadPhaseOptions& options,
+        FiberIntersectionCancelCallback cancelCallback) const
+    {
+        const double maxDistance = std::isfinite(options.maxDistance) && options.maxDistance >= 0.0
+            ? options.maxDistance
+            : 0.0;
+        const auto sourceSamplesIt = samplesByFiberId_.find(source.id);
+        const auto fallbackSourceSamples = sourceSamplesIt == samplesByFiberId_.end()
+            ? denseSamplesForFiber(source, maxSampleSpacing_)
+            : std::vector<FiberDenseSample>{};
+        const auto& sourceSamples = sourceSamplesIt == samplesByFiberId_.end()
+            ? fallbackSourceSamples
+            : sourceSamplesIt->second;
+        if (sourceSamples.empty() || values_.empty()) {
+            return {};
+        }
+
+        std::vector<FiberIntersectionCandidate> candidates;
+        const double maxDistanceSq = maxDistance * maxDistance;
+        std::unordered_map<uint64_t, std::vector<int>> coverageByTarget;
+
+        struct OrderedHit {
+            FiberPointEntry entry;
+            double distanceSq = std::numeric_limits<double>::infinity();
+        };
+
+        auto directLocalSearch = [&](int sourceStartIndex,
+                                     const std::vector<FiberDenseSample>& targetSamples,
+                                     int targetStartIndex,
+                                     uint64_t targetFiberId,
+                                     uint64_t targetGeneration) {
+            struct DirectSearchResult {
+                FiberIntersectionCandidate candidate;
+                std::vector<int> visitedSourceIndices;
+            };
+
+            int sourceIndex = std::clamp(sourceStartIndex, 0, static_cast<int>(sourceSamples.size()) - 1);
+            int targetIndex = std::clamp(targetStartIndex, 0, static_cast<int>(targetSamples.size()) - 1);
+            std::vector<int> visitedSourceIndices;
+            visitedSourceIndices.push_back(sourceIndex);
+
+            double bestDistanceSq = squaredDistance(sourceSamples[sourceIndex].position,
+                                                    targetSamples[targetIndex].position);
+            for (;;) {
+                if (cancelCallback && cancelCallback()) {
+                    break;
+                }
+                int bestSourceIndex = sourceIndex;
+                int bestTargetIndex = targetIndex;
+                for (int ds = -1; ds <= 1; ++ds) {
+                    const int nextSourceIndex = sourceIndex + ds;
+                    if (nextSourceIndex < 0 ||
+                        nextSourceIndex >= static_cast<int>(sourceSamples.size())) {
+                        continue;
+                    }
+                    for (int dt = -1; dt <= 1; ++dt) {
+                        if (ds == 0 && dt == 0) {
+                            continue;
+                        }
+                        const int nextTargetIndex = targetIndex + dt;
+                        if (nextTargetIndex < 0 ||
+                            nextTargetIndex >= static_cast<int>(targetSamples.size())) {
+                            continue;
+                        }
+                        const double distanceSq = squaredDistance(
+                            sourceSamples[nextSourceIndex].position,
+                            targetSamples[nextTargetIndex].position);
+                        if (distanceSq < bestDistanceSq - kEpsilon) {
+                            bestDistanceSq = distanceSq;
+                            bestSourceIndex = nextSourceIndex;
+                            bestTargetIndex = nextTargetIndex;
+                        }
+                    }
+                }
+                if (bestSourceIndex == sourceIndex && bestTargetIndex == targetIndex) {
+                    break;
+                }
+                sourceIndex = bestSourceIndex;
+                targetIndex = bestTargetIndex;
+                visitedSourceIndices.push_back(sourceIndex);
+            }
+
+            const auto& sourceSample = sourceSamples[sourceIndex];
+            const auto& targetSample = targetSamples[targetIndex];
+            DirectSearchResult result;
+            result.candidate = FiberIntersectionCandidate{
+                source.id,
+                source.generation,
+                sourceSample.segmentIndex,
+                sourceSample.arclength,
+                targetFiberId,
+                targetGeneration,
+                targetSample.segmentIndex,
+                targetSample.arclength,
+                std::sqrt(std::max(0.0, bestDistanceSq)),
+            };
+            result.visitedSourceIndices = std::move(visitedSourceIndices);
+            return result;
+        };
+
+        std::vector<PointRTreeValue> pointHits;
+        std::vector<OrderedHit> hits;
+        std::vector<char> processed(sourceSamples.size(), 0);
+        const int stride = sanitizedSeedStride(options.seedStride);
+
+        auto processSourceIndex = [&](int sourceIndex) {
+            if (cancelCallback && cancelCallback()) {
+                return;
+            }
+            processed[static_cast<size_t>(sourceIndex)] = 1;
+            const auto& sourceSample = sourceSamples[static_cast<size_t>(sourceIndex)];
+            pointHits.clear();
+            hits.clear();
+            tree_.query(bgi::intersects(pointQueryBox(sourceSample.position, maxDistance)),
+                        std::back_inserter(pointHits));
+            for (const auto& pointHit : pointHits) {
+                const auto& target = pointHit.second;
+                if (target.fiberId == source.id) {
+                    continue;
+                }
+                const double distanceSq = squaredDistance(sourceSample.position, target.position);
+                if (distanceSq > maxDistanceSq) {
+                    continue;
+                }
+                hits.push_back(OrderedHit{target, distanceSq});
+            }
+            std::sort(hits.begin(), hits.end(), [](const auto& a, const auto& b) {
+                if (a.distanceSq != b.distanceSq) return a.distanceSq < b.distanceSq;
+                if (a.entry.fiberId != b.entry.fiberId) return a.entry.fiberId < b.entry.fiberId;
+                return a.entry.denseSampleIndex < b.entry.denseSampleIndex;
+            });
+
+            for (const auto& hit : hits) {
+                if (cancelCallback && cancelCallback()) {
+                    return;
+                }
+                auto& coverage = coverageByTarget[hit.entry.fiberId];
+                if (coverage.empty()) {
+                    coverage.assign(sourceSamples.size(), -1);
+                }
+                if (coverage[static_cast<size_t>(sourceIndex)] != -1) {
+                    continue;
+                }
+                const auto targetSamplesIt = samplesByFiberId_.find(hit.entry.fiberId);
+                if (targetSamplesIt == samplesByFiberId_.end() ||
+                    hit.entry.denseSampleIndex < 0 ||
+                    hit.entry.denseSampleIndex >= static_cast<int>(targetSamplesIt->second.size()) ||
+                    targetSamplesIt->second.empty()) {
+                    continue;
+                }
+
+                auto direct = directLocalSearch(sourceIndex,
+                                                targetSamplesIt->second,
+                                                hit.entry.denseSampleIndex,
+                                                hit.entry.fiberId,
+                                                hit.entry.generation);
+                if (cancelCallback && cancelCallback()) {
+                    return;
+                }
+                if (direct.candidate.straightDistance > maxDistance) {
+                    continue;
+                }
+                const int resultIndex = static_cast<int>(candidates.size());
+                candidates.push_back(std::move(direct.candidate));
+                for (const int visitedSourceIndex : direct.visitedSourceIndices) {
+                    if (visitedSourceIndex >= 0 &&
+                        visitedSourceIndex < static_cast<int>(coverage.size())) {
+                        coverage[static_cast<size_t>(visitedSourceIndex)] = resultIndex;
+                    }
+                }
+            }
+        };
+
+        for (size_t i = 0; i < sourceSamples.size(); i += static_cast<size_t>(stride)) {
+            if (cancelCallback && cancelCallback()) {
+                return {};
+            }
+            processSourceIndex(static_cast<int>(i));
+        }
+        for (size_t i = 0; i < sourceSamples.size(); ++i) {
+            if (cancelCallback && cancelCallback()) {
+                return {};
+            }
+            if (!processed[i]) {
+                processSourceIndex(static_cast<int>(i));
+            }
+        }
+
+        return clusterCandidates(std::move(candidates), options.clusterArclength);
+    }
+
+private:
+    double maxSampleSpacing_ = kDefaultMaxSampleSpacing;
+    std::unordered_map<uint64_t, std::vector<FiberDenseSample>> samplesByFiberId_;
+    std::vector<PointRTreeValue> values_;
+    PointTree tree_;
+};
 
 } // namespace
 
@@ -590,9 +837,26 @@ uint64_t FiberSpatialIndex::generation(uint64_t fiberId) const
     return it == impl_->generations.end() ? 0 : it->second;
 }
 
+int atlasSearchPhaseProgressPercent(AtlasSearchProgressPhase phase, size_t completed, size_t total)
+{
+    constexpr int kPhaseCount = 5;
+    constexpr int kPercentMax = 100;
+    const int phaseIndex = std::clamp(static_cast<int>(phase), 0, kPhaseCount - 1);
+    const int phaseBase = (phaseIndex * kPercentMax) / kPhaseCount;
+    const int phaseEnd = ((phaseIndex + 1) * kPercentMax) / kPhaseCount;
+    const int phaseSpan = phaseEnd - phaseBase;
+    if (total == 0) {
+        return phaseBase + (completed > 0 ? phaseSpan : 0);
+    }
+    const size_t clampedCompleted = std::min(completed, total);
+    const double fraction = static_cast<double>(clampedCompleted) / static_cast<double>(total);
+    return phaseBase + static_cast<int>(std::round(fraction * static_cast<double>(phaseSpan)));
+}
+
 std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
     const FiberPolyline& source,
-    const FiberIntersectionBroadPhaseOptions& options) const
+    const FiberIntersectionBroadPhaseOptions& options,
+    FiberIntersectionCancelCallback cancelCallback) const
 {
     if (!impl_) {
         return {};
@@ -647,6 +911,9 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
         double bestDistanceSq = squaredDistance(sourceSamples[sourceIndex].position,
                                                 targetSamples[targetIndex].position);
         for (;;) {
+            if (cancelCallback && cancelCallback()) {
+                break;
+            }
             int bestSourceIndex = sourceIndex;
             int bestTargetIndex = targetIndex;
             for (int ds = -1; ds <= 1; ++ds) {
@@ -707,6 +974,9 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
         const int stride = sanitizedSeedStride(options.seedStride);
 
         auto processSourceIndex = [&](int sourceIndex) {
+            if (cancelCallback && cancelCallback()) {
+                return;
+            }
             processed[static_cast<size_t>(sourceIndex)] = 1;
             const auto& sourceSample = sourceSamples[static_cast<size_t>(sourceIndex)];
             pointHits.clear();
@@ -738,6 +1008,9 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
             });
 
             for (const auto& hit : hits) {
+                if (cancelCallback && cancelCallback()) {
+                    return;
+                }
                 auto& coverage = coverageByTarget[hit.entry.fiberId];
                 if (coverage.empty()) {
                     coverage.assign(sourceSamples.size(), -1);
@@ -758,6 +1031,9 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
                                                 hit.entry.denseSampleIndex,
                                                 hit.entry.fiberId,
                                                 hit.entry.generation);
+                if (cancelCallback && cancelCallback()) {
+                    return;
+                }
                 if (direct.candidate.straightDistance > maxDistance) {
                     continue;
                 }
@@ -773,9 +1049,15 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
         };
 
         for (size_t i = 0; i < sourceSamples.size(); i += static_cast<size_t>(stride)) {
+            if (cancelCallback && cancelCallback()) {
+                return;
+            }
             processSourceIndex(static_cast<int>(i));
         }
         for (size_t i = 0; i < sourceSamples.size(); ++i) {
+            if (cancelCallback && cancelCallback()) {
+                return;
+            }
             if (!processed[i]) {
                 processSourceIndex(static_cast<int>(i));
             }
@@ -783,8 +1065,17 @@ std::vector<FiberIntersectionCandidate> FiberSpatialIndex::candidatesForFiber(
     };
 
     scanTree(impl_->committedTree, true, 0);
+    if (cancelCallback && cancelCallback()) {
+        return {};
+    }
     scanTree(impl_->recentTrees[0], false, 0);
+    if (cancelCallback && cancelCallback()) {
+        return {};
+    }
     scanTree(impl_->recentTrees[1], false, 1);
+    if (cancelCallback && cancelCallback()) {
+        return {};
+    }
     return clusterCandidates(std::move(candidates), options.clusterArclength);
 }
 
@@ -878,8 +1169,22 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
     const FiberPolyline& target,
     const FiberIntersectionCandidate& candidate,
     const FiberIntersectionCeresOptions& options,
-    const vc::lasagna::LasagnaNormalSampler* windingSampler)
+    const vc::lasagna::LasagnaNormalSampler* windingSampler,
+    FiberIntersectionCancelCallback cancelCallback)
 {
+    if (cancelCallback && cancelCallback()) {
+        FiberIntersectionResult result;
+        result.sourceFiberId = source.id;
+        result.sourceGeneration = source.generation;
+        result.targetFiberId = target.id;
+        result.targetGeneration = target.generation;
+        result.candidateDistance = candidate.straightDistance;
+        result.sourceArclength = candidate.sourceArclength;
+        result.targetArclength = candidate.targetArclength;
+        result.message = "canceled";
+        return result;
+    }
+
     const auto sourceLengths = cumulativeArclengths(source);
     const auto targetLengths = cumulativeArclengths(target);
     const ArclengthDomain sourceDomain = activeArclengthDomain(source, sourceLengths);
@@ -893,7 +1198,7 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
                                                         5,
                                                         1,
                                                         1>(
-        new JointIntersectionResidual{source, target, options, windingSampler});
+        new JointIntersectionResidual{source, target, options, windingSampler, cancelCallback});
     problem.AddResidualBlock(residual, nullptr, &sourceS, &targetS);
     problem.SetParameterLowerBound(&sourceS, 0, sourceDomain.start);
     problem.SetParameterUpperBound(&sourceS, 0, sourceDomain.end);
@@ -909,6 +1214,10 @@ FiberIntersectionResult refineFiberIntersectionCandidate(
     solverOptions.linear_solver_type = ceres::DENSE_QR;
     solverOptions.logging_type = ceres::SILENT;
     solverOptions.minimizer_progress_to_stdout = false;
+    FiberIntersectionCancelIterationCallback cancelIterationCallback(cancelCallback);
+    if (cancelCallback) {
+        solverOptions.callbacks.push_back(&cancelIterationCallback);
+    }
     ceres::Solver::Summary summary;
     ceres::Solve(solverOptions, &problem, &summary);
 
@@ -1008,122 +1317,295 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     const std::vector<FiberPolyline>& fibers,
     const std::vector<uint64_t>& sourceFiberIds,
     const std::vector<uint64_t>& targetFiberIds,
-    FiberSpatialIndex& index,
     FiberIntersectionCache* cache,
     const FiberIntersectionBroadPhaseOptions& broad,
     const FiberIntersectionCeresOptions& ceres,
-    const vc::lasagna::LasagnaNormalSampler* windingSampler)
+    const vc::lasagna::LasagnaNormalSampler* windingSampler,
+    FiberIntersectionProgressCallback progressCallback,
+    FiberIntersectionCancelCallback cancelCallback)
 {
     if (windingSampler) {
         cache = nullptr;
     }
 
     std::unordered_map<uint64_t, const FiberPolyline*> byId;
+    SearchFiberPointIndex index(broad.maxSampleSpacing);
+    if (progressCallback) {
+        progressCallback(AtlasSearchProgressPhase::BuildSpatialIndex, 0, fibers.size());
+    }
+    size_t indexedFibers = 0;
     for (const auto& fiber : fibers) {
+        if (cancelCallback && cancelCallback()) {
+            return {};
+        }
         byId[fiber.id] = &fiber;
-        index.upsertCommitted(fiber);
+        index.insertFiber(fiber);
+        ++indexedFibers;
+        if (progressCallback && indexedFibers < fibers.size()) {
+            progressCallback(AtlasSearchProgressPhase::BuildSpatialIndex,
+                             indexedFibers,
+                             fibers.size());
+        }
+    }
+    if (cancelCallback && cancelCallback()) {
+        return {};
+    }
+    index.finalize();
+    if (progressCallback) {
+        progressCallback(AtlasSearchProgressPhase::BuildSpatialIndex,
+                         fibers.size(),
+                         fibers.size());
     }
 
     std::unordered_set<uint64_t> sourceSet(sourceFiberIds.begin(), sourceFiberIds.end());
     std::unordered_set<uint64_t> targetSet(targetFiberIds.begin(), targetFiberIds.end());
-    std::set<std::pair<uint64_t, uint64_t>> searchedPairs;
-    std::vector<FiberIntersectionResult> allResults;
-    std::unordered_map<uint64_t, std::vector<FiberIntersectionCandidate>> candidateCache;
+    const size_t pairTotal = sourceFiberIds.size() * targetFiberIds.size();
 
-    auto candidatesFor = [&](const FiberPolyline& fiber) -> const std::vector<FiberIntersectionCandidate>& {
-        auto it = candidateCache.find(fiber.id);
-        if (it == candidateCache.end()) {
-            it = candidateCache.emplace(fiber.id, index.candidatesForFiber(fiber, broad)).first;
-        }
-        return it->second;
+    struct PairJob {
+        const FiberPolyline* source = nullptr;
+        const FiberPolyline* target = nullptr;
+        bool skip = true;
     };
-
+    std::vector<PairJob> pairJobs;
+    pairJobs.reserve(pairTotal);
+    std::set<std::pair<uint64_t, uint64_t>> scheduledPairs;
     for (uint64_t sourceId : sourceFiberIds) {
-        auto sourceIt = byId.find(sourceId);
-        if (sourceIt == byId.end()) {
+        const auto sourceIt = byId.find(sourceId);
+        for (uint64_t targetId : targetFiberIds) {
+            PairJob job;
+            if (sourceIt != byId.end() && targetId != sourceId) {
+                const auto targetIt = byId.find(targetId);
+                if (targetIt != byId.end()) {
+                    const FiberPolyline& source = *sourceIt->second;
+                    const FiberPolyline& target = *targetIt->second;
+                    const uint64_t a = std::min(source.id, target.id);
+                    const uint64_t b = std::max(source.id, target.id);
+                    if (!(sourceSet.count(target.id) &&
+                          targetSet.count(source.id) &&
+                          scheduledPairs.count({a, b}))) {
+                        job.source = &source;
+                        job.target = &target;
+                        job.skip = false;
+                        scheduledPairs.insert({a, b});
+                    }
+                }
+            }
+            pairJobs.push_back(job);
+        }
+    }
+
+    std::vector<uint64_t> candidateFiberIds;
+    candidateFiberIds.reserve(fibers.size());
+    std::unordered_map<uint64_t, size_t> candidateIndexByFiberId;
+    for (const auto& job : pairJobs) {
+        if (job.skip) {
             continue;
         }
-        const FiberPolyline& source = *sourceIt->second;
-        for (uint64_t targetId : targetFiberIds) {
-            if (targetId == sourceId) {
+        for (const FiberPolyline* fiber : {job.source, job.target}) {
+            if (!fiber || candidateIndexByFiberId.count(fiber->id)) {
                 continue;
             }
-            auto targetIt = byId.find(targetId);
-            if (targetIt == byId.end()) {
+            const size_t index = candidateFiberIds.size();
+            candidateIndexByFiberId.emplace(fiber->id, index);
+            candidateFiberIds.push_back(fiber->id);
+        }
+    }
+
+    const size_t searchWorkTotal = pairTotal + candidateFiberIds.size();
+    size_t completedSearchWork = 0;
+    std::mutex progressMutex;
+    auto reportSearchWorkFinished = [&]() {
+        std::lock_guard<std::mutex> lock(progressMutex);
+        if (completedSearchWork < searchWorkTotal) {
+            ++completedSearchWork;
+        }
+        if (progressCallback) {
+            progressCallback(AtlasSearchProgressPhase::SearchPairs,
+                             completedSearchWork,
+                             searchWorkTotal);
+        }
+    };
+    if (progressCallback) {
+        progressCallback(AtlasSearchProgressPhase::SearchPairs, 0, searchWorkTotal);
+    }
+
+    std::vector<std::vector<FiberIntersectionCandidate>> candidateResults(candidateFiberIds.size());
+    std::atomic_size_t nextCandidate{0};
+    std::atomic_bool canceled{false};
+    const unsigned hardwareThreads = std::thread::hardware_concurrency();
+    const size_t candidateWorkerCount = std::max<size_t>(
+        1,
+        std::min<size_t>(candidateFiberIds.empty() ? 1 : candidateFiberIds.size(),
+                         hardwareThreads == 0 ? 4 : hardwareThreads));
+
+    auto candidateWorker = [&]() {
+        for (;;) {
+            if (canceled.load(std::memory_order_relaxed)) {
+                return;
+            }
+            const size_t candidateIndex = nextCandidate.fetch_add(1, std::memory_order_relaxed);
+            if (candidateIndex >= candidateFiberIds.size()) {
+                return;
+            }
+            if (cancelCallback && cancelCallback()) {
+                canceled.store(true, std::memory_order_relaxed);
+                return;
+            }
+            const auto fiberIt = byId.find(candidateFiberIds[candidateIndex]);
+            if (fiberIt == byId.end()) {
                 continue;
             }
-            const FiberPolyline& target = *targetIt->second;
-            const uint64_t a = std::min(source.id, target.id);
-            const uint64_t b = std::max(source.id, target.id);
-            if (sourceSet.count(target.id) &&
-                targetSet.count(source.id) &&
-                searchedPairs.count({a, b})) {
+            candidateResults[candidateIndex] =
+                index.candidatesForFiber(*fiberIt->second, broad, cancelCallback);
+            reportSearchWorkFinished();
+            if (cancelCallback && cancelCallback()) {
+                canceled.store(true, std::memory_order_relaxed);
+                return;
+            }
+        }
+    };
+
+    std::vector<std::thread> candidateWorkers;
+    candidateWorkers.reserve(candidateWorkerCount);
+    for (size_t i = 0; i < candidateWorkerCount; ++i) {
+        candidateWorkers.emplace_back(candidateWorker);
+    }
+    for (auto& worker : candidateWorkers) {
+        worker.join();
+    }
+    if (canceled.load(std::memory_order_relaxed)) {
+        return {};
+    }
+
+    auto candidatesFor = [&](uint64_t fiberId) -> const std::vector<FiberIntersectionCandidate>& {
+        static const std::vector<FiberIntersectionCandidate> empty;
+        const auto it = candidateIndexByFiberId.find(fiberId);
+        return it == candidateIndexByFiberId.end() ? empty : candidateResults[it->second];
+    };
+
+    std::vector<std::vector<FiberIntersectionResult>> resultsByJob(pairJobs.size());
+    std::mutex cacheMutex;
+    std::atomic_size_t nextPair{0};
+    const size_t pairWorkerCount = std::max<size_t>(
+        1,
+        std::min<size_t>(pairJobs.empty() ? 1 : pairJobs.size(),
+                         hardwareThreads == 0 ? 4 : hardwareThreads));
+
+    auto pairWorker = [&]() {
+        for (;;) {
+            if (canceled.load(std::memory_order_relaxed)) {
+                return;
+            }
+            const size_t jobIndex = nextPair.fetch_add(1, std::memory_order_relaxed);
+            if (jobIndex >= pairJobs.size()) {
+                return;
+            }
+            const PairJob& job = pairJobs[jobIndex];
+            if (job.skip) {
+                reportSearchWorkFinished();
                 continue;
             }
+            if (cancelCallback && cancelCallback()) {
+                canceled.store(true, std::memory_order_relaxed);
+                return;
+            }
+            const FiberPolyline& source = *job.source;
+            const FiberPolyline& target = *job.target;
 
             std::vector<FiberIntersectionResult> pairResults;
-            if (cache && cache->lookup(source.id,
-                                       source.generation,
-                                       target.id,
-                                       target.generation,
-                                       broad,
-                                       ceres,
-                                       pairResults)) {
-                for (auto& result : pairResults) {
-                    result = normalizedResultForPair(std::move(result), source.id, target.id);
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                if (cache && cache->lookup(source.id,
+                                           source.generation,
+                                           target.id,
+                                           target.generation,
+                                           broad,
+                                           ceres,
+                                           pairResults)) {
+                    for (auto& result : pairResults) {
+                        result = normalizedResultForPair(std::move(result), source.id, target.id);
+                    }
+                    resultsByJob[jobIndex] = std::move(pairResults);
+                    reportSearchWorkFinished();
+                    continue;
                 }
-                allResults.insert(allResults.end(), pairResults.begin(), pairResults.end());
-                searchedPairs.insert({a, b});
-                continue;
             }
 
             std::vector<FiberIntersectionCandidate> pairCandidates;
-            for (const auto& c : candidatesFor(source)) {
+            for (const auto& c : candidatesFor(source.id)) {
+                if (cancelCallback && cancelCallback()) {
+                    canceled.store(true, std::memory_order_relaxed);
+                    return;
+                }
                 if (c.targetFiberId == target.id) {
                     pairCandidates.push_back(c);
                 }
             }
-            for (const auto& c : candidatesFor(target)) {
+            for (const auto& c : candidatesFor(target.id)) {
+                if (cancelCallback && cancelCallback()) {
+                    canceled.store(true, std::memory_order_relaxed);
+                    return;
+                }
                 if (c.targetFiberId == source.id) {
                     pairCandidates.push_back(normalizedCandidateForPair(c, source.id, target.id));
                 }
             }
             pairCandidates = clusterCandidates(std::move(pairCandidates), broad.clusterArclength);
             if (pairCandidates.empty()) {
-                searchedPairs.insert({a, b});
+                reportSearchWorkFinished();
                 continue;
             }
 
-            std::vector<std::future<FiberIntersectionResult>> futures;
-            futures.reserve(pairCandidates.size());
             for (const auto& c : pairCandidates) {
-                futures.push_back(std::async(std::launch::async,
-                                             [&source, &target, c, ceres, windingSampler]() {
-                                                 return refineFiberIntersectionCandidate(
-                                                     source,
-                                                     target,
-                                                     c,
-                                                     ceres,
-                                                     windingSampler);
-                                             }));
+                if (cancelCallback && cancelCallback()) {
+                    canceled.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                pairResults.push_back(refineFiberIntersectionCandidate(source,
+                                                                       target,
+                                                                       c,
+                                                                       ceres,
+                                                                       windingSampler,
+                                                                       cancelCallback));
             }
-            for (auto& future : futures) {
-                pairResults.push_back(future.get());
+            if (cancelCallback && cancelCallback()) {
+                canceled.store(true, std::memory_order_relaxed);
+                return;
             }
             pairResults = deduplicateFiberIntersectionResults(std::move(pairResults),
                                                               ceres.deduplicateArclength);
-            if (cache) {
-                cache->store(source.id,
-                             source.generation,
-                             target.id,
-                             target.generation,
-                             broad,
-                             ceres,
-                             pairResults);
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex);
+                if (cache) {
+                    cache->store(source.id,
+                                 source.generation,
+                                 target.id,
+                                 target.generation,
+                                 broad,
+                                 ceres,
+                                 pairResults);
+                }
             }
-            allResults.insert(allResults.end(), pairResults.begin(), pairResults.end());
-            searchedPairs.insert({a, b});
+            resultsByJob[jobIndex] = std::move(pairResults);
+            reportSearchWorkFinished();
         }
+    };
+
+    std::vector<std::thread> pairWorkers;
+    pairWorkers.reserve(pairWorkerCount);
+    for (size_t i = 0; i < pairWorkerCount; ++i) {
+        pairWorkers.emplace_back(pairWorker);
+    }
+    for (auto& worker : pairWorkers) {
+        worker.join();
+    }
+    if (canceled.load(std::memory_order_relaxed)) {
+        return {};
+    }
+
+    std::vector<FiberIntersectionResult> allResults;
+    for (const auto& pairResults : resultsByJob) {
+        allResults.insert(allResults.end(), pairResults.begin(), pairResults.end());
     }
 
     return allResults;

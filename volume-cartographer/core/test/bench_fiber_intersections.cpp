@@ -382,13 +382,11 @@ int main(int argc, char** argv)
         }
         std::cout << "\n";
 
-        vc::atlas::FiberSpatialIndex resultIndex;
         const auto finalStart = Clock::now();
         std::vector<vc::atlas::FiberIntersectionResult> allResults =
             vc::atlas::searchFiberIntersections(fiberPolylines,
                                                 sourceFiberIds,
                                                 targetFiberIds,
-                                                resultIndex,
                                                 nullptr,
                                                 options.broad,
                                                 options.ceres,

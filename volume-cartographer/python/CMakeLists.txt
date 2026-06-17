@@ -18,23 +18,34 @@ nanobind_add_module(vc_python
     volume_bindings.cpp
 )
 
+nanobind_add_module(vc_lasagna_amgx
+    NOMINSIZE
+    lasagna_amgx_bindings.cpp
+)
+
 set_target_properties(vc_python PROPERTIES
     OUTPUT_NAME vc
     INSTALL_RPATH "$ORIGIN"
 )
 
-target_link_libraries(vc_python PRIVATE vc_core)
-
-set_target_properties(vc_core utils utils_c3d_codec c3d PROPERTIES
+set_target_properties(vc_lasagna_amgx PROPERTIES
+    OUTPUT_NAME vc_lasagna_amgx
     INSTALL_RPATH "$ORIGIN"
 )
 
-install(TARGETS vc_python
+target_link_libraries(vc_python PRIVATE vc_core)
+target_link_libraries(vc_lasagna_amgx PRIVATE vc_lasagna)
+
+set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+)
+
+install(TARGETS vc_python vc_lasagna_amgx
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
 )
 
-install(TARGETS vc_core utils utils_c3d_codec c3d
+install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .

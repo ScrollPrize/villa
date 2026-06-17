@@ -73,6 +73,28 @@ CChunkedVolumeViewer::CameraState generatedPaneCamera(CChunkedVolumeViewer* view
     return camera;
 }
 
+std::optional<cv::Vec2f> generatedStripSurfaceCenter(CChunkedVolumeViewer* viewer,
+                                                     double linePosition)
+{
+    auto* quad = viewer ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
+    if (!quad || !std::isfinite(linePosition)) {
+        return std::nullopt;
+    }
+    const auto* points = quad->rawPointsPtr();
+    if (!points || points->empty()) {
+        return std::nullopt;
+    }
+    const cv::Vec2f scale = quad->scale();
+    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+        return std::nullopt;
+    }
+    const float surfaceX = (static_cast<float>(linePosition) -
+                            static_cast<float>(points->cols) / 2.0f) / scale[0];
+    const float centerRow = static_cast<float>(points->rows / 2);
+    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
+    return cv::Vec2f{surfaceX, surfaceY};
+}
+
 bool finitePoint(const cv::Vec3f& point)
 {
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
@@ -91,7 +113,9 @@ cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
 
 } // namespace
 
-LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget* parent)
+LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
+                                           VolumeSelectorFactory volumeSelectorFactory,
+                                           QWidget* parent)
     : QMainWindow(parent)
     , _viewerManager(viewerManager)
 {
@@ -140,6 +164,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager, QWidget
     _shiftScrollCombo->setCurrentIndex(0);
     _shiftScrollCombo->installEventFilter(this);
     buttonLayout->addWidget(_shiftScrollCombo);
+    if (volumeSelectorFactory) {
+        if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
+            volumeSelector->installEventFilter(this);
+            buttonLayout->addWidget(volumeSelector);
+        }
+    }
     _sliceStepLabel = new QLabel(this);
     _sliceStepLabel->setText(tr("Step: %1").arg(_viewerManager ? _viewerManager->sliceStepSize() : 1));
     _sliceStepLabel->setToolTip(tr("Shift+Scroll step size. Use Shift+G / Shift+H to adjust."));
@@ -222,6 +252,16 @@ void LineAnnotationDialog::setGeneratedControlPoints(
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
+    rebuildGeneratedOverlays();
+}
+
+void LineAnnotationDialog::setGeneratedPredSnapPoints(
+    std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints)
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+    _generatedViews.predSnapPoints = std::move(predSnapPoints);
     rebuildGeneratedOverlays();
 }
 
@@ -516,7 +556,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
     _hasGeneratedViews = true;
-    _currentCutFollowsStripMouse = true;
+    _currentCutFollowsStripMouse = views.initialCurrentCutFollowsStripMouse;
     _currentCutStraightOffsetActive = false;
     if (!replacingGeneratedViews) {
         _currentCutManualRotation = cv::Matx33f::eye();
@@ -557,6 +597,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                         ? currentCutCamera
                                         : generatedPaneCamera(currentViewer, camera),
                                     false);
+    if (!haveCurrentCutCamera && finitePoint(_generatedViews.focusPoint)) {
+        currentViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
+    }
     currentViewer->setShiftScrollOverride(
         [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
             if (modifiers.testFlag(Qt::ControlModifier)) {
@@ -576,7 +619,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                    Qt::MouseButton button,
                    Qt::KeyboardModifiers modifiers,
                    QPointF) {
-                if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+                    emit generatedPredSnapPointRequested(_generatedViews.currentCutName,
+                                                         volumePoint);
+                } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                     setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
@@ -610,10 +656,18 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             return false;
         }
         viewer->setObjectName(title);
-        viewer->applyCameraState(static_cast<size_t>(stripIndex) < stripCameras.size()
-                                     ? stripCameras[static_cast<size_t>(stripIndex)]
-                                     : generatedPaneCamera(viewer, camera),
-                                 false);
+        const bool haveStripCamera = static_cast<size_t>(stripIndex) < stripCameras.size();
+        auto stripCamera = haveStripCamera
+            ? stripCameras[static_cast<size_t>(stripIndex)]
+            : generatedPaneCamera(viewer, camera);
+        if (!haveStripCamera) {
+            if (const auto center =
+                    generatedStripSurfaceCenter(viewer, _currentLinePosition)) {
+                stripCamera.surfacePtrX = (*center)[0];
+                stripCamera.surfacePtrY = (*center)[1];
+            }
+        }
+        viewer->applyCameraState(stripCamera, false);
         bindPaneInteractions(surfaceName, viewer, false);
         connect(viewer,
                 &CChunkedVolumeViewer::sendMouseMoveVolume,
@@ -635,14 +689,19 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers modifiers,
                                             QPointF scenePoint) {
-                    if (button != Qt::LeftButton || modifiers != Qt::NoModifier) {
+                    if (button != Qt::LeftButton ||
+                        (modifiers != Qt::NoModifier && modifiers != Qt::ShiftModifier)) {
                         return;
                     }
                     const double position = linePositionFromStripScene(viewer, scenePoint);
                     if (std::isfinite(position)) {
                         setCurrentCutFollowsStripMouse(true);
                         setCurrentLinePosition(position);
-                        emit generatedControlPointRequested(surfaceName, volumePoint, position);
+                        if (modifiers == Qt::ShiftModifier) {
+                            emit generatedPredSnapPointRequested(surfaceName, volumePoint);
+                        } else {
+                            emit generatedControlPointRequested(surfaceName, volumePoint, position);
+                        }
                     }
                 });
         stripLayout->addWidget(viewer, 1);
@@ -697,7 +756,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                           Qt::MouseButton button,
                                           Qt::KeyboardModifiers modifiers,
                                           QPointF) {
-                    if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                    if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+                        emit generatedPredSnapPointRequested(surfaceName, volumePoint);
+                    } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                         const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
                         const double linePosition = bottomSliceLinePosition(slot, bottomCount);
                         setCurrentCutFollowsStripMouse(true);

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <cstdint>
@@ -12,19 +13,23 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 
+#include "vc/lasagna/LineModel.hpp"
+
 class QuadSurface;
 class SurfacePatchIndex;
 
 namespace vc::lasagna {
 struct LasagnaDatasetManifest;
+struct NormalSample;
 class NormalSampler;
+class LasagnaNormalSampler;
 }
 
 namespace vc::atlas {
 
 struct AtlasMetadata {
     std::string type = "vc3d_atlas";
-    int version = 4;
+    int version = 5;
     std::string name;
     std::filesystem::path baseMeshPath;
     std::filesystem::path sourceBaseMeshPath;
@@ -70,6 +75,11 @@ struct Atlas {
 
     void save(const std::filesystem::path& atlasDir) const;
     static Atlas load(const std::filesystem::path& atlasDir);
+    static Atlas load(const std::filesystem::path& atlasDir,
+                      const std::filesystem::path& volpkgRoot);
+    static Atlas load(const std::filesystem::path& atlasDir,
+                      const std::filesystem::path& volpkgRoot,
+                      const std::filesystem::path& fiberPathRoot);
 };
 
 struct AtlasCoveredSize {
@@ -85,6 +95,24 @@ struct AtlasDisplayRange {
     int unwrapCount = 1;
     double atlasUOffset = 0.0;
     bool hasMappedObjects = false;
+};
+
+struct AtlasLayoutConflict {
+    std::filesystem::path fiberPath;
+    int existingOffset = 0;
+    int candidateOffset = 0;
+};
+
+struct AtlasBaseMappingContext {
+    std::shared_ptr<QuadSurface> baseSurface;
+    std::shared_ptr<SurfacePatchIndex> baseIndex;
+};
+
+struct AtlasSignedWindingDisplay {
+    double signedWindingDistance = 0.0;
+    bool sourceFiberIsH = true;
+    int hAnchorSourceIndex = -1;
+    double hToVOutwardProjection = 0.0;
 };
 
 struct FiberInput {
@@ -147,12 +175,135 @@ struct AtlasDirectoryInfo {
     std::string name;
 };
 
+enum class AtlasPredSnapSource {
+    Auto,
+    Optimized,
+    Manual,
+};
+
+enum class AtlasPredSnapDirection {
+    Inside,
+    Outside,
+};
+
+struct AtlasPredSnapCandidate {
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    std::optional<double> predDtValue;
+    std::optional<AtlasPredSnapDirection> direction;
+    std::optional<double> windingDistance;
+};
+
+struct AtlasPredSnapPoint {
+    std::filesystem::path fiberPath;
+    std::optional<int> sourceIndex;
+    cv::Vec3d controlPoint{0.0, 0.0, 0.0};
+    std::optional<cv::Vec3d> predSnapPoint;
+    std::vector<AtlasPredSnapCandidate> candidates;
+    std::optional<int> selectedCandidateIndex;
+    AtlasPredSnapSource source = AtlasPredSnapSource::Auto;
+    std::string status;
+    std::string statusReason;
+    std::optional<double> predDtValue;
+    std::optional<AtlasPredSnapDirection> direction;
+    std::optional<double> weightedFirstHitWindingDistance;
+    std::optional<cv::Vec3d> searchNormal;
+    std::string generatedAtUtc;
+};
+
+struct AtlasPredSnapSet {
+    std::filesystem::path fiberPath;
+    std::vector<AtlasPredSnapPoint> points;
+};
+
+struct AtlasPredSnapSampling {
+    std::function<vc::lasagna::NormalSample(const cv::Vec3d&)> sampleNormal;
+    std::function<std::optional<double>(const cv::Vec3d&)> samplePredDt;
+    std::function<double(const cv::Vec3d&, const cv::Vec3d&, double)> windingDistance;
+    double predDtThreshold = 110.0;
+    double predDtStepVx = 0.05;
+    double outwardWindingLimit = 1.0;
+    double inwardWindingLimit = 1.0;
+};
+
+struct AtlasPredSnapAttachmentReport {
+    size_t fibersChecked = 0;
+    size_t attachmentsCreated = 0;
+};
+
+struct AtlasSnapCandidateSet {
+    std::string id;
+    std::filesystem::path fiberPath;
+    int sourceIndex = 0;
+    cv::Vec3d controlPoint{0.0, 0.0, 0.0};
+    std::vector<cv::Vec3d> candidates;
+    bool fixed = false;
+    bool manual = false;
+    bool eligible = true;
+    std::string status;
+    std::string statusReason;
+};
+
+struct AtlasSnapPairTerm {
+    std::string id;
+    size_t firstControl = 0;
+    size_t secondControl = 0;
+};
+
+struct AtlasSnapPairMatrix {
+    std::string id;
+    std::vector<std::vector<double>> rawValues;
+    std::vector<std::vector<double>> normalizedValues;
+    nlohmann::json metadata;
+};
+
+struct AtlasSnapOptimizationProblem {
+    std::vector<AtlasSnapCandidateSet> controls;
+    std::vector<AtlasSnapPairTerm> terms;
+};
+
+struct AtlasSnapOptimizationResult {
+    std::vector<size_t> selectedCandidateIndices;
+    double objective = 0.0;
+};
+
+struct AtlasSnapOptimizeOptions {
+    nlohmann::json rankOptions = nlohmann::json::object();
+    int predDtThreshold = 110;
+    size_t exhaustiveAssignmentLimit = 1000000;
+};
+
+struct AtlasSnapOptimizeReport {
+    size_t controls = 0;
+    size_t fixedControls = 0;
+    size_t manualControls = 0;
+    size_t singletonControls = 0;
+    size_t links = 0;
+    size_t variableControls = 0;
+    size_t unscoredVariableControls = 0;
+    size_t pairTerms = 0;
+    size_t skippedPairTerms = 0;
+    size_t cacheHits = 0;
+    size_t rankJobsRequested = 0;
+    size_t successfulPairTerms = 0;
+    size_t zeroContributionTerms = 0;
+    double objective = 0.0;
+};
+
+struct AtlasSnapPreparedCandidatesState;
+
+struct AtlasSnapPreparedCandidates {
+    std::shared_ptr<AtlasSnapPreparedCandidatesState> state;
+    nlohmann::json rankRequest = nlohmann::json::object();
+};
+
 struct LasagnaAtlasObject {
     std::string id;
     std::filesystem::path fiberPath;
     std::filesystem::path mappingPath;
+    std::filesystem::path predSnapAttachmentPath;
     std::filesystem::path fiberRelativePath;
     std::filesystem::path mappingRelativePath;
+    std::filesystem::path predSnapAttachmentRelativePath;
     int windingOffset = 0;
 };
 
@@ -168,6 +319,10 @@ struct LasagnaAtlasExport {
 
 std::string sanitizeAtlasName(std::string name);
 std::string atlasFiberPathKey(const std::filesystem::path& path);
+std::string atlasPredSnapControlPointKey(const cv::Vec3d& point);
+std::filesystem::path atlasPredSnapAttachmentPath(
+    const std::filesystem::path& atlasDir,
+    const std::filesystem::path& fiberPath);
 std::vector<std::string> atlasMappedFiberPathKeys(const Atlas& atlas);
 FiberRuntimeIdentityMap makeFiberRuntimeIdentityMap(
     const std::vector<std::filesystem::path>& orderedCanonicalFiberPaths);
@@ -178,7 +333,8 @@ std::vector<AtlasDirectoryInfo> discoverAtlasDirectories(
     const std::filesystem::path& volpkgRoot);
 LasagnaAtlasExport loadLasagnaAtlasExport(
     const std::filesystem::path& atlasDir,
-    const std::filesystem::path& volpkgRoot = {});
+    const std::filesystem::path& volpkgRoot = {},
+    const std::filesystem::path& fiberPathRoot = {});
 std::filesystem::path uniqueAtlasDirectory(const std::filesystem::path& volpkgRoot,
                                            const std::string& baseName);
 std::filesystem::path initShellDirectoryFromManifest(
@@ -217,8 +373,24 @@ std::optional<cv::Vec3d> atlasBasePointAt(double atlasU,
 std::optional<cv::Vec3d> atlasAnchorBasePoint(const AtlasAnchor& anchor,
                                               const FiberMapping& fiber,
                                               const QuadSurface& baseSurface);
+std::optional<cv::Vec3d> atlasAnchorBaseNormal(const AtlasAnchor& anchor,
+                                               const FiberMapping& fiber,
+                                               const QuadSurface& baseSurface);
+AtlasSignedWindingDisplay signedAtlasSearchWindingDisplay(
+    double windingDistance,
+    bool sourceFiberDisplaysAsH,
+    double sourceLinePosition,
+    double targetLinePosition,
+    const cv::Vec3d& sourcePoint,
+    const cv::Vec3d& targetPoint,
+    const FiberMapping& sourceMapping,
+    const FiberMapping& targetMapping,
+    const QuadSurface& baseSurface);
 AtlasDisplayRange atlasDisplayRange(const Atlas& atlas, int baseColumns);
-void layoutAtlasObjects(Atlas& atlas, int periodColumns);
+int atlasLinkWindingOffsetDelta(const AtlasLink& link,
+                                int periodColumns,
+                                int zeroWindingColumn);
+std::vector<AtlasLayoutConflict> layoutAtlasObjects(Atlas& atlas, int periodColumns);
 cv::Vec2f atlasGridToSurfaceCoords(double atlasU,
                                    double atlasV,
                                    const QuadSurface& displaySurface,
@@ -227,8 +399,89 @@ std::shared_ptr<QuadSurface> repeatedAtlasDisplaySurface(const QuadSurface& base
                                                         int unwrapCount,
                                                         int startColumn = 0);
 
+bool atlasPredDtIsInside(double predDtValue, double threshold = 110.0);
+std::vector<AtlasPredSnapCandidate> findAtlasPredSnapCandidates(
+    const cv::Vec3d& controlPoint,
+    const cv::Vec3d& alignedNormal,
+    const AtlasPredSnapSampling& sampling);
+AtlasPredSnapSet generateAtlasPredSnapSet(
+    const FiberInput& fiber,
+    const FiberMapping& mapping,
+    const QuadSurface& baseSurface,
+    const AtlasPredSnapSampling& sampling);
+AtlasPredSnapSet generateAtlasPredSnapSet(
+    const FiberInput& fiber,
+    const FiberMapping& mapping,
+    const QuadSurface& baseSurface,
+    const vc::lasagna::LasagnaNormalSampler& sampler);
+AtlasPredSnapSet loadAtlasPredSnapSet(
+    const std::filesystem::path& attachmentPath);
+void saveAtlasPredSnapSet(const std::filesystem::path& attachmentPath,
+                          const AtlasPredSnapSet& set);
+AtlasPredSnapSet mergeAtlasPredSnapSetByControlPoint(
+    AtlasPredSnapSet existing,
+    const AtlasPredSnapSet& generated);
+AtlasPredSnapSet ensureAtlasPredSnapSet(
+    const std::filesystem::path& atlasDir,
+    const FiberInput& fiber,
+    const FiberMapping& mapping,
+    const QuadSurface& baseSurface,
+    const AtlasPredSnapSampling& sampling);
+AtlasPredSnapSet ensureAtlasPredSnapSet(
+    const std::filesystem::path& atlasDir,
+    const FiberInput& fiber,
+    const FiberMapping& mapping,
+    const QuadSurface& baseSurface,
+    const vc::lasagna::LasagnaNormalSampler& sampler);
+AtlasPredSnapSet setManualAtlasPredSnapPoint(
+    const std::filesystem::path& atlasDir,
+    const std::filesystem::path& fiberPath,
+    const cv::Vec3d& controlPoint,
+    const cv::Vec3d& predSnapPoint,
+    std::optional<double> predDtValue = std::nullopt);
+AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
+    const std::filesystem::path& atlasDir,
+    const std::filesystem::path& volpkgRoot,
+    const vc::lasagna::LasagnaNormalSampler& sampler);
+std::filesystem::path atlasPredSnapRankCachePath(
+    const std::filesystem::path& atlasDir);
+std::string atlasSnapRankTermCacheKey(
+    const std::filesystem::path& manifestPath,
+    const nlohmann::json& rankOptions,
+    const std::vector<cv::Vec3d>& sideA,
+    const std::vector<cv::Vec3d>& sideB);
+AtlasSnapOptimizationProblem buildAtlasSnapOptimizationProblem(
+    const Atlas& atlas,
+    const std::unordered_map<std::string, AtlasPredSnapSet>& predSnapSets);
+AtlasSnapPairMatrix atlasSnapPairMatrixFromRankResult(
+    const AtlasSnapPairTerm& term,
+    size_t sideACount,
+    size_t sideBCount,
+    const nlohmann::json& result);
+AtlasSnapOptimizationResult optimizeAtlasSnapCandidates(
+    const AtlasSnapOptimizationProblem& problem,
+    const std::vector<AtlasSnapPairMatrix>& matrices,
+    const AtlasSnapOptimizeOptions& options = {});
+AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
+    const std::filesystem::path& atlasDir,
+    const std::filesystem::path& volpkgRoot,
+    const std::filesystem::path& manifestPath,
+    const vc::lasagna::LasagnaNormalSampler& sampler,
+    const AtlasSnapOptimizeOptions& options = {});
+void cacheAtlasPredSnapRankResult(
+    const AtlasSnapPreparedCandidates& prepared,
+    size_t index,
+    const nlohmann::json& result);
+AtlasSnapOptimizeReport finishAtlasPredSnapCandidates(
+    const AtlasSnapPreparedCandidates& prepared,
+    const nlohmann::json& rankResponse = nlohmann::json::object());
+
 void validateFiberInputControlPoints(FiberInput& fiber);
 bool atlasLoadErrorRequiresRebuild(const std::exception& ex);
+AtlasBaseMappingContext atlasBaseMappingContextFromSurface(
+    std::shared_ptr<QuadSurface> baseSurface);
+AtlasBaseMappingContext loadAtlasBaseMappingContext(const std::filesystem::path& atlasDir,
+                                                    const Atlas& atlas);
 Atlas rebuildAtlasFromSourceFibers(const std::filesystem::path& atlasDir,
                                    const std::filesystem::path& volpkgRoot,
                                    const vc::lasagna::NormalSampler& normalSampler,

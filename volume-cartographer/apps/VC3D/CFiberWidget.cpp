@@ -62,6 +62,21 @@ void CFiberWidget::setupUi()
     _autoLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(_autoLabel);
 
+    _model = new QStandardItemModel(this);
+    _listView = new QListView(mainWidget);
+    _listView->setModel(_model);
+    _listView->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _listView->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    _listView->setContextMenuPolicy(Qt::CustomContextMenu);
+    layout->addWidget(_listView, 1);
+
+    connect(_listView->selectionModel(), &QItemSelectionModel::selectionChanged,
+            this, &CFiberWidget::onSelectionChanged);
+    connect(_listView, &QListView::doubleClicked,
+            this, &CFiberWidget::onDoubleClicked);
+    connect(_listView, &QWidget::customContextMenuRequested,
+            this, &CFiberWidget::showContextMenu);
+
     layout->addWidget(new QLabel(tr("Tags:"), mainWidget));
     _tagListWidget = new QWidget(mainWidget);
     _tagListLayout = new QVBoxLayout(_tagListWidget);
@@ -81,21 +96,6 @@ void CFiberWidget::setupUi()
 
     connect(_newTagEdit, &QLineEdit::returnPressed, this, &CFiberWidget::onAddTagClicked);
     connect(_addTagButton, &QPushButton::clicked, this, &CFiberWidget::onAddTagClicked);
-
-    _model = new QStandardItemModel(this);
-    _listView = new QListView(mainWidget);
-    _listView->setModel(_model);
-    _listView->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    _listView->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    _listView->setContextMenuPolicy(Qt::CustomContextMenu);
-    layout->addWidget(_listView, 1);
-
-    connect(_listView->selectionModel(), &QItemSelectionModel::selectionChanged,
-            this, &CFiberWidget::onSelectionChanged);
-    connect(_listView, &QListView::doubleClicked,
-            this, &CFiberWidget::onDoubleClicked);
-    connect(_listView, &QWidget::customContextMenuRequested,
-            this, &CFiberWidget::showContextMenu);
 
     auto* manualLayout = new QHBoxLayout();
     manualLayout->addWidget(new QLabel(tr("Manual:"), mainWidget));

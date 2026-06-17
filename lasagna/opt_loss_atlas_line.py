@@ -26,6 +26,7 @@ class AtlasLineDebugPayload:
 	model_normal: torch.Tensor
 	signed_delta: torch.Tensor
 	is_control: torch.Tensor
+	is_snap: torch.Tensor
 	sample_model_h: torch.Tensor
 	sample_model_w: torch.Tensor
 	normal_proxy_target_xyz: torch.Tensor
@@ -79,6 +80,16 @@ def _xyz_list(values: torch.Tensor) -> list[float | None]:
 	return [_finite_float(v) for v in vals]
 
 
+def _snap_status(*, valid: bool | None, signed_delta: float | None) -> str:
+	if valid is None:
+		return "-"
+	if not valid:
+		return "invalid"
+	if signed_delta is None:
+		return "valid"
+	return "valid fw" if signed_delta >= 0.0 else "valid bw"
+
+
 def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None = None) -> dict | None:
 	"""Build JSON-safe final atlas-control feedback from an atlas-line debug payload."""
 	payload = _last_debug_payload if payload is None else payload
@@ -100,6 +111,11 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 		control_k = torch.zeros(K, dtype=torch.bool)
 	else:
 		control_k = is_control.detach().cpu().to(dtype=torch.bool).view(K)
+	is_snap = getattr(lines, "is_snap_point", None)
+	if is_snap is None:
+		snap_k = torch.zeros(K, dtype=torch.bool)
+	else:
+		snap_k = is_snap.detach().cpu().to(dtype=torch.bool).view(K)
 	object_ids = _atlas_object_ids(lines, K)
 	source_indices = _atlas_source_indices(lines, K)
 
@@ -110,6 +126,11 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 	model_h = payload.sample_model_h.detach().cpu().to(dtype=torch.float32)
 	model_w = payload.sample_model_w.detach().cpu().to(dtype=torch.float32)
 	D = int(valid.shape[0])
+
+	snap_by_key: dict[tuple[str, int], int] = {}
+	for k in range(K):
+		if bool(snap_k[k]):
+			snap_by_key.setdefault((object_ids[k], int(source_indices[k])), k)
 
 	records: list[dict] = []
 	for d in range(D):
@@ -122,6 +143,26 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 			distance = None
 			if ok:
 				distance = float(torch.linalg.vector_norm(target - mesh).item())
+			snap_idx = snap_by_key.get((object_ids[k], int(source_indices[k])))
+			snap_valid = None
+			snap_delta = None
+			snap_target_xyz = None
+			snap_mesh_xyz = None
+			snap_model_h = None
+			snap_model_w = None
+			if snap_idx is not None:
+				snap_target = target_xyz[d, snap_idx]
+				snap_mesh = hit_xyz[d, snap_idx]
+				snap_valid = (
+					bool(valid[d, snap_idx])
+					and bool(torch.isfinite(snap_target).all())
+					and bool(torch.isfinite(snap_mesh).all())
+				)
+				snap_delta = _finite_float(signed_delta[d, snap_idx].item())
+				snap_target_xyz = _xyz_list(snap_target)
+				snap_mesh_xyz = _xyz_list(snap_mesh)
+				snap_model_h = _finite_float(model_h[d, snap_idx].item())
+				snap_model_w = _finite_float(model_w[d, snap_idx].item())
 			record = {
 				"fiber_id": object_ids[k],
 				"object_id": object_ids[k],
@@ -134,6 +175,14 @@ def atlas_control_points_results(*, lines, payload: AtlasLineDebugPayload | None
 				"distance": _finite_float(distance),
 				"signed_delta": _finite_float(signed_delta[d, k].item()),
 				"valid": ok,
+				"snap_valid": snap_valid,
+				"snap_direction": None if snap_valid is None or snap_delta is None else ("fw" if snap_delta >= 0.0 else "bw"),
+				"snap_signed_delta": snap_delta,
+				"snap_target_xyz": snap_target_xyz,
+				"snap_mesh_xyz": snap_mesh_xyz,
+				"snap_model_h": snap_model_h,
+				"snap_model_w": snap_model_w,
+				"snap_status": _snap_status(valid=snap_valid, signed_delta=snap_delta),
 			}
 			if D != 1:
 				record["layer_index"] = int(d)
@@ -196,6 +245,7 @@ def _empty_debug_payload(*, res: fit_model.FitResult3D, lines) -> AtlasLineDebug
 		model_normal=torch.full((D, K, 3), float("nan"), dtype=torch.float32),
 		signed_delta=torch.full((D, K), float("nan"), dtype=torch.float32),
 		is_control=torch.zeros((D, K), dtype=torch.bool),
+		is_snap=torch.zeros((D, K), dtype=torch.bool),
 		sample_model_h=torch.full((D, K), float("nan"), dtype=torch.float32),
 		sample_model_w=torch.full((D, K), float("nan"), dtype=torch.float32),
 		normal_proxy_target_xyz=torch.full(tuple(res.xyz_lr.shape), float("nan"), dtype=torch.float32),
@@ -584,7 +634,7 @@ def atlas_line_loss(
 		item = _zero_item(res)
 		if debug_payload:
 			_last_debug_payload = _empty_debug_payload(res=res, lines=lines)
-		return {"atlas_line": item, "atlas_line_control": item, "atlas_line_other": item}
+		return {"atlas_line": item, "atlas_line_control": item, "atlas_line_other": item, "atlas_line_snap": item}
 
 	_ensure_state(res=res)
 	assert _rows is not None and _cols is not None and _frac_h is not None and _frac_w is not None
@@ -601,26 +651,36 @@ def atlas_line_loss(
 		control_k = torch.zeros(K, device=device, dtype=torch.bool)
 	else:
 		control_k = is_control.to(device=device, dtype=torch.bool).view(K)
-	other_k = ~control_k
+	is_snap = getattr(lines, "is_snap_point", None)
+	if is_snap is None:
+		snap_k = torch.zeros(K, device=device, dtype=torch.bool)
+	else:
+		snap_k = is_snap.to(device=device, dtype=torch.bool).view(K)
+	other_k = ~(control_k | snap_k)
 	if stage_eff is None:
 		process_control = True
 		process_other = True
+		process_snap = True
 	else:
 		legacy_weight = float(stage_eff.get("atlas_line", 0.0)) > 0.0
 		process_control = legacy_weight or float(stage_eff.get("atlas_line_control", 0.0)) > 0.0
 		process_other = legacy_weight or float(stage_eff.get("atlas_line_other", 0.0)) > 0.0
-	active_k = (control_k & process_control) | (other_k & process_other)
+		process_snap = float(stage_eff.get("atlas_line_snap", 0.0)) > 0.0
+	active_k = (control_k & process_control) | (other_k & process_other) | (snap_k & process_snap)
 	zero_item = _zero_item(res)
 
 	valid = torch.zeros((D, K), device=device, dtype=torch.bool)
 	valid_control = torch.zeros_like(valid)
 	valid_other = torch.zeros_like(valid)
+	valid_snap = torch.zeros_like(valid)
 	combined_item = zero_item
 	control_item = zero_item
 	other_item = zero_item
+	snap_item = zero_item
 	combined_active_verts = 0.0
 	control_active_verts = 0.0
 	other_active_verts = 0.0
+	snap_active_verts = 0.0
 	signed_delta_mean = 0.0
 	if debug_payload:
 		_last_debug_payload = _empty_debug_payload(res=res, lines=lines)
@@ -673,8 +733,10 @@ def atlas_line_loss(
 		valid = valid.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active)
 		active_control = control_k.index_select(0, active_idx).view(1, K_active).expand(D, K_active)
 		active_other = other_k.index_select(0, active_idx).view(1, K_active).expand(D, K_active)
+		active_snap = snap_k.index_select(0, active_idx).view(1, K_active).expand(D, K_active)
 		valid_control = valid_control.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active & active_control)
 		valid_other = valid_other.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active & active_other)
+		valid_snap = valid_snap.scatter(1, active_idx.view(1, K_active).expand(D, K_active), valid_active & active_snap)
 
 		signed_delta = ((target - hit_xyz) * model_n).sum(dim=-1)
 		h_cont = hit_rows.to(dtype=res.xyz_lr.dtype) + u
@@ -689,6 +751,7 @@ def atlas_line_loss(
 		mask_flat = valid_active.to(dtype=res.xyz_lr.dtype).reshape(-1)
 		control_flat = active_control.reshape(-1)
 		other_flat = active_other.reshape(-1)
+		snap_flat = active_snap.reshape(-1)
 		with torch.no_grad():
 			if bool(valid_active.any().detach().cpu()):
 				signed_delta_mean = float(signed_delta[valid_active].mean().detach().cpu())
@@ -716,6 +779,7 @@ def atlas_line_loss(
 				sample_w_full = torch.full((D, K), float("nan"), dtype=torch.float32)
 				valid_full = torch.zeros((D, K), dtype=torch.bool)
 				control_full = control_k.view(1, K).expand(D, K).detach().cpu().to(dtype=torch.bool)
+				snap_full = snap_k.view(1, K).expand(D, K).detach().cpu().to(dtype=torch.bool)
 				target_full[:, idx_cpu] = target.detach().cpu().to(dtype=torch.float32)
 				hit_full[:, idx_cpu] = hit_xyz.detach().cpu().to(dtype=torch.float32)
 				normal_full[:, idx_cpu] = model_n.detach().cpu().to(dtype=torch.float32)
@@ -731,6 +795,7 @@ def atlas_line_loss(
 					model_normal=normal_full,
 					signed_delta=signed_full,
 					is_control=control_full,
+					is_snap=snap_full,
 					sample_model_h=sample_h_full,
 					sample_model_w=sample_w_full,
 					normal_proxy_target_xyz=proxy_target_map.detach().cpu().to(dtype=torch.float32),
@@ -762,6 +827,18 @@ def atlas_line_loss(
 			mask_p=mask_flat * other_flat.to(dtype=res.xyz_lr.dtype),
 		)
 		other_item = (other_loss, other_maps, other_masks)
+		snap_loss, snap_maps, snap_masks, snap_active_verts, _snap_proxy_target_map, _snap_proxy_valid_map = _loss_from_splats(
+			res=res,
+			d_p=d_flat,
+			h_floor_p=h_floor_flat,
+			w_floor_p=w_floor_flat,
+			h_cont_p=h_cont_flat,
+			w_cont_p=w_cont_flat,
+			signed_delta_p=signed_flat,
+			normal_p=normal_flat,
+			mask_p=mask_flat * snap_flat.to(dtype=res.xyz_lr.dtype),
+		)
+		snap_item = (snap_loss, snap_maps, snap_masks)
 
 		with torch.no_grad():
 			next_rows = _rows.clone()
@@ -782,6 +859,7 @@ def atlas_line_loss(
 		valid_count = float(valid.to(dtype=torch.float32).sum().detach().cpu())
 		control_count = float(valid_control.to(dtype=torch.float32).sum().detach().cpu())
 		other_count = float(valid_other.to(dtype=torch.float32).sum().detach().cpu())
+		snap_count = float(valid_snap.to(dtype=torch.float32).sum().detach().cpu())
 		_last_stats = {
 			"atlas_line_samples": float(D * K),
 			"atlas_line_valid": valid_count,
@@ -794,10 +872,14 @@ def atlas_line_loss(
 			"atlas_line_other_valid": other_count,
 			"atlas_line_other_rms": float(torch.sqrt(other_item[0]).detach().cpu()),
 			"atlas_line_other_active_vertices": other_active_verts,
+			"atlas_line_snap_valid": snap_count,
+			"atlas_line_snap_rms": float(torch.sqrt(snap_item[0]).detach().cpu()),
+			"atlas_line_snap_active_vertices": snap_active_verts,
 		}
 
 	return {
 		"atlas_line": combined_item,
 		"atlas_line_control": control_item,
 		"atlas_line_other": other_item,
+		"atlas_line_snap": snap_item,
 	}

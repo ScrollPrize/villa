@@ -39,6 +39,18 @@ struct GeneratedOverlay {
         bool isSeed = false;
     };
 
+    struct PredSnapMarker {
+        cv::Vec3f controlPoint{std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f snapPoint{std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN()};
+        double linePosition = std::numeric_limits<double>::quiet_NaN();
+        size_t controlIndex = std::numeric_limits<size_t>::max();
+        bool manual = false;
+    };
+
     std::vector<cv::Vec3f> linePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
@@ -49,6 +61,7 @@ struct GeneratedOverlay {
     int seedLineIndex = -1;
     std::vector<double> markerLinePositions;
     std::vector<ControlPointMarker> controlPoints;
+    std::vector<PredSnapMarker> predSnapPoints;
     double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
@@ -68,9 +81,14 @@ struct GeneratedViews {
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
+    cv::Vec3f focusPoint{std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::quiet_NaN()};
     int seedLineIndex = -1;
     int initialCenterIndex = 0;
+    bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
+    std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
 };
 
 struct GeneratedControlPointLinePositionIndex {
@@ -442,6 +460,29 @@ inline std::optional<double> closestGeneratedControlPointLinePosition(
     return closest;
 }
 
+inline std::optional<size_t> nearestGeneratedControlPointIndex(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    const cv::Vec3f& point)
+{
+    if (!finiteGeneratedPoint(point)) {
+        return std::nullopt;
+    }
+    std::optional<size_t> best;
+    double bestDistanceSq = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < controlPoints.size(); ++i) {
+        if (!finiteGeneratedPoint(controlPoints[i].point)) {
+            continue;
+        }
+        const cv::Vec3f delta = controlPoints[i].point - point;
+        const double distanceSq = static_cast<double>(delta.dot(delta));
+        if (distanceSq < bestDistanceSq) {
+            best = i;
+            bestDistanceSq = distanceSq;
+        }
+    }
+    return best;
+}
+
 inline bool generatedLineSegmentIsTail(
     double startPosition,
     double endPosition,
@@ -466,6 +507,7 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     overlay.useSurfaceCenterLine = true;
     overlay.currentLinePosition = currentLinePosition;
     overlay.controlPoints = views.controlPoints;
+    overlay.predSnapPoints = views.predSnapPoints;
     overlay.markerLinePositions = markerLinePositions;
     return overlay;
 }
@@ -478,6 +520,7 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
     overlay.seedLineIndex = views.controlPoints.empty() ? views.seedLineIndex : -1;
     overlay.useSurfaceCenterLine = true;
     overlay.controlPoints = views.controlPoints;
+    overlay.predSnapPoints = views.predSnapPoints;
     return overlay;
 }
 
@@ -503,7 +546,9 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
     std::optional<double> controlLinePositionRadius = std::nullopt)
 {
     GeneratedOverlay overlay;
-    overlay.pointMarker = interpolatedGeneratedLinePoint(views.linePoints, linePosition);
+    overlay.pointMarker = emphasized && finiteGeneratedPoint(views.focusPoint)
+        ? views.focusPoint
+        : interpolatedGeneratedLinePoint(views.linePoints, linePosition);
     overlay.emphasizedPointMarker = emphasized;
     if (!controlDistanceThreshold || !pointDistance) {
         return overlay;
@@ -534,6 +579,12 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
         const float distance = pointDistance(control.point);
         if (std::isfinite(distance) && std::abs(distance) <= *controlDistanceThreshold) {
             overlay.controlPoints.push_back(control);
+            for (const auto& predSnap : views.predSnapPoints) {
+                if (predSnap.controlIndex == controlIndexValue &&
+                    finiteGeneratedPoint(predSnap.snapPoint)) {
+                    overlay.predSnapPoints.push_back(predSnap);
+                }
+            }
         }
     }
     return overlay;

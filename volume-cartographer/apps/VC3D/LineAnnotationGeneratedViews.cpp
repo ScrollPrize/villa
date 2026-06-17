@@ -175,7 +175,7 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
 
     const auto key = "line_annotation_overlay_" + surfaceName;
     std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
-    primitives.reserve(3);
+    primitives.reserve(3 + overlay.controlPoints.size() + overlay.predSnapPoints.size() * 2);
 
     ViewerOverlayControllerBase::OverlayStyle lineStyle;
     lineStyle.penColor = QColor(0, 220, 255, 190);
@@ -206,6 +206,17 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     currentMarkerStyle.brushColor = QColor(0, 245, 255, 210);
     currentMarkerStyle.penWidth = 1.5;
     currentMarkerStyle.z = 153.0;
+
+    ViewerOverlayControllerBase::OverlayStyle predSnapLineStyle;
+    predSnapLineStyle.penColor = QColor(255, 120, 40, 185);
+    predSnapLineStyle.penWidth = 1.0;
+    predSnapLineStyle.z = 158.0;
+
+    ViewerOverlayControllerBase::OverlayStyle predSnapPointStyle;
+    predSnapPointStyle.penColor = QColor(255, 120, 40, 225);
+    predSnapPointStyle.brushColor = QColor(255, 120, 40, 165);
+    predSnapPointStyle.penWidth = 1.0;
+    predSnapPointStyle.z = 159.0;
 
     auto addVolumePointMarker = [&](const cv::Vec3f& point,
                                     qreal radius,
@@ -277,6 +288,26 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                         control.isSeed ? seedStyle : controlPointStyle});
                 }
             }
+            for (const auto& predSnap : overlay.predSnapPoints) {
+                if (!finiteGeneratedPoint(predSnap.snapPoint)) {
+                    continue;
+                }
+                const QPointF controlScene = finiteGeneratedPoint(predSnap.controlPoint)
+                    ? viewer->volumeToScene(predSnap.controlPoint)
+                    : generatedStripLinePositionToScene(viewer, quad, predSnap.linePosition);
+                const QPointF snapScene = viewer->volumeToScene(predSnap.snapPoint);
+                if (finiteScenePoint(controlScene) && finiteScenePoint(snapScene)) {
+                    primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                        {controlScene, snapScene},
+                        false,
+                        predSnapLineStyle});
+                    primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                        snapScene,
+                        3.0,
+                        true,
+                        predSnapPointStyle});
+                }
+            }
             if (std::isfinite(overlay.currentLinePosition)) {
                 const QPointF markerScene =
                     generatedStripLinePositionToScene(viewer, quad, overlay.currentLinePosition);
@@ -324,6 +355,25 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     if (!overlay.useSurfaceCenterLine) {
+        for (const auto& predSnap : overlay.predSnapPoints) {
+            if (!finiteGeneratedPoint(predSnap.controlPoint) ||
+                !finiteGeneratedPoint(predSnap.snapPoint)) {
+                continue;
+            }
+            const QPointF controlScene = viewer->volumeToScene(predSnap.controlPoint);
+            const QPointF snapScene = viewer->volumeToScene(predSnap.snapPoint);
+            if (finiteScenePoint(controlScene) && finiteScenePoint(snapScene)) {
+                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                    {controlScene, snapScene},
+                    false,
+                    predSnapLineStyle});
+                primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                    snapScene,
+                    4.0,
+                    true,
+                    predSnapPointStyle});
+            }
+        }
         for (const auto& control : overlay.controlPoints) {
             addVolumePointMarker(control.point,
                                  control.isSeed ? 11.0 : 10.0,
