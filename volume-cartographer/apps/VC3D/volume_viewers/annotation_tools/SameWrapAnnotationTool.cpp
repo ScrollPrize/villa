@@ -10,12 +10,15 @@
 #include <QGraphicsPathItem>
 #include <QPainterPath>
 #include <QPen>
+#include <QRectF>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <iterator>
+#include <optional>
 #include <queue>
 #include <string_view>
 #include <unordered_map>
@@ -26,11 +29,26 @@
 
 namespace {
 constexpr const char* kSameWrapAnnotationOverlayKey = "same_wrap_annotation_preview";
-constexpr float kSameWrapMergeContactToleranceVx = 1.0f;
+constexpr qreal kNearbyCollectionColorRadiusPx = 160.0;
 
 bool isSameWrapCollectionName(const std::string& name)
 {
     return std::string_view(name).rfind("same_wrap", 0) == 0;
+}
+
+std::string stripSameWrapDirectionSuffix(const std::string& name)
+{
+    constexpr std::string_view xySuffix = "_xy";
+    constexpr std::string_view zSuffix = "_z";
+    if (name.size() > xySuffix.size() &&
+        std::string_view(name).substr(name.size() - xySuffix.size()) == xySuffix) {
+        return name.substr(0, name.size() - xySuffix.size());
+    }
+    if (name.size() > zSuffix.size() &&
+        std::string_view(name).substr(name.size() - zSuffix.size()) == zSuffix) {
+        return name.substr(0, name.size() - zSuffix.size());
+    }
+    return name;
 }
 
 std::vector<ColPoint> orderedCollectionPoints(const VCCollection::Collection& collection)
@@ -49,7 +67,80 @@ std::vector<ColPoint> orderedCollectionPoints(const VCCollection::Collection& co
     return points;
 }
 
+std::vector<cv::Vec3f> orderedCollectionPositions(const VCCollection::Collection& collection)
+{
+    std::vector<ColPoint> points = orderedCollectionPoints(collection);
+    std::vector<cv::Vec3f> positions;
+    positions.reserve(points.size());
+    for (const ColPoint& point : points) {
+        positions.push_back(point.p);
+    }
+    return positions;
+}
+
+float endpointGap(const std::vector<cv::Vec3f>& first, const std::vector<cv::Vec3f>& second)
+{
+    if (first.empty() || second.empty()) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return cv::norm(first.back() - second.front());
+}
+
+std::vector<cv::Vec3f> reversedCopy(std::vector<cv::Vec3f> points)
+{
+    std::reverse(points.begin(), points.end());
+    return points;
+}
+
+std::vector<cv::Vec3f> bestEndpointMergeOrder(const VCCollection::Collection& firstCollection,
+                                              const VCCollection::Collection& secondCollection)
+{
+    const std::vector<cv::Vec3f> firstOrdered = orderedCollectionPositions(firstCollection);
+    const std::vector<cv::Vec3f> secondOrdered = orderedCollectionPositions(secondCollection);
+    if (firstOrdered.empty() || secondOrdered.empty()) {
+        return {};
+    }
+
+    std::vector<cv::Vec3f> bestFirst;
+    std::vector<cv::Vec3f> bestSecond;
+    float bestGap = std::numeric_limits<float>::infinity();
+
+    const std::array<std::vector<cv::Vec3f>, 2> firstVariants = {
+        firstOrdered,
+        reversedCopy(firstOrdered)
+    };
+    const std::array<std::vector<cv::Vec3f>, 2> secondVariants = {
+        secondOrdered,
+        reversedCopy(secondOrdered)
+    };
+
+    for (const std::vector<cv::Vec3f>& first : firstVariants) {
+        for (const std::vector<cv::Vec3f>& second : secondVariants) {
+            const float gap = endpointGap(first, second);
+            if (gap < bestGap) {
+                bestGap = gap;
+                bestFirst = first;
+                bestSecond = second;
+            }
+        }
+    }
+
+    if (bestFirst.empty() || bestSecond.empty()) {
+        return {};
+    }
+    if (bestGap <= 0.5f) {
+        bestSecond.erase(bestSecond.begin());
+    }
+    bestFirst.insert(bestFirst.end(), bestSecond.begin(), bestSecond.end());
+    return bestFirst;
+}
+
 struct PathProjection {
+    float distance = std::numeric_limits<float>::infinity();
+    float arclength = 0.0f;
+};
+
+struct PathComponentProjection {
     float distance = std::numeric_limits<float>::infinity();
     float arclength = 0.0f;
 };
@@ -82,6 +173,44 @@ PathProjection projectPointToPath(const cv::Vec3f& point,
     return best;
 }
 
+std::vector<float> cumulativePathLength(const std::vector<cv::Vec3f>& path);
+
+PathComponentProjection projectPointToPathComponents(
+    const cv::Vec3f& point,
+    const std::vector<std::vector<cv::Vec3f>>& paths,
+    const std::vector<std::vector<float>>& cumulativeLengths,
+    const std::vector<float>& componentOffsets)
+{
+    PathComponentProjection best;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        const PathProjection projection = projectPointToPath(point, paths[i], cumulativeLengths[i]);
+        if (projection.distance < best.distance) {
+            best.distance = projection.distance;
+            best.arclength = componentOffsets[i] + projection.arclength;
+        }
+    }
+    return best;
+}
+
+bool pointsTouchWithinTolerance(const std::vector<cv::Vec3f>& a,
+                                const std::vector<cv::Vec3f>& b,
+                                float tolerance)
+{
+    if (a.empty() || b.empty()) {
+        return false;
+    }
+    const float tolerance2 = tolerance * tolerance;
+    for (const cv::Vec3f& pa : a) {
+        for (const cv::Vec3f& pb : b) {
+            const cv::Vec3f delta = pa - pb;
+            if (delta.dot(delta) <= tolerance2) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 std::vector<float> cumulativePathLength(const std::vector<cv::Vec3f>& path)
 {
     std::vector<float> cumulative(path.size(), 0.0f);
@@ -91,63 +220,482 @@ std::vector<float> cumulativePathLength(const std::vector<cv::Vec3f>& path)
     return cumulative;
 }
 
-void appendIfDistinct(std::vector<cv::Vec3f>& points, const cv::Vec3f& point, float tolerance)
+void appendIfSeparated(std::vector<cv::Vec3f>& points, const cv::Vec3f& point, float minSpacing)
 {
-    if (!points.empty() && cv::norm(points.back() - point) <= tolerance) {
+    if (!points.empty() && cv::norm(points.back() - point) < minSpacing) {
         return;
     }
     points.push_back(point);
+}
+
+std::vector<cv::Vec3f> removeClosePoints(const std::vector<cv::Vec3f>& points, float minSpacing)
+{
+    if (points.size() < 2) {
+        return points;
+    }
+
+    minSpacing = std::max(0.0f, minSpacing);
+    const float minSpacing2 = minSpacing * minSpacing;
+    std::vector<cv::Vec3f> filtered;
+    filtered.reserve(points.size());
+    for (const cv::Vec3f& point : points) {
+        if (filtered.empty()) {
+            filtered.push_back(point);
+            continue;
+        }
+        const cv::Vec3f delta = point - filtered.back();
+        if (delta.dot(delta) >= minSpacing2) {
+            filtered.push_back(point);
+        }
+    }
+    return filtered;
+}
+
+std::string dominantDirectionKey(const std::vector<cv::Vec3f>& path)
+{
+    float xyMotion = 0.0f;
+    float zMotion = 0.0f;
+    for (size_t i = 1; i < path.size(); ++i) {
+        const cv::Vec3f delta = path[i] - path[i - 1];
+        xyMotion += std::hypot(delta[0], delta[1]);
+        zMotion += std::abs(delta[2]);
+    }
+    return zMotion > xyMotion ? "z" : "xy";
+}
+
+float rgbDistance2(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    const cv::Vec3f delta = a - b;
+    return delta.dot(delta);
+}
+
+cv::Vec3f qColorToVec3f(const QColor& color)
+{
+    return {
+        static_cast<float>(color.redF()),
+        static_cast<float>(color.greenF()),
+        static_cast<float>(color.blueF())
+    };
+}
+
+struct WeightedColor {
+    cv::Vec3f color;
+    float weight = 1.0f;
+};
+
+std::vector<cv::Vec3f> sameWrapCandidateColors()
+{
+    static constexpr std::array<QRgb, 16> palette = {
+        qRgb(0, 255, 255),    // cyan
+        qRgb(255, 230, 0),    // yellow
+        qRgb(0, 255, 70),     // green
+        qRgb(0, 120, 255),    // blue
+        qRgb(255, 128, 0),    // orange
+        qRgb(180, 0, 255),    // violet
+        qRgb(255, 0, 180),    // magenta
+        qRgb(255, 40, 40),    // red
+        qRgb(64, 255, 160),   // mint
+        qRgb(120, 180, 255),  // sky
+        qRgb(255, 160, 220),  // pink
+        qRgb(180, 255, 80),   // lime
+        qRgb(0, 190, 160),    // teal
+        qRgb(255, 180, 80),   // amber
+        qRgb(120, 80, 255),   // indigo
+        qRgb(255, 80, 120)    // coral
+    };
+
+    std::vector<cv::Vec3f> colors;
+    colors.reserve(palette.size());
+    for (const QRgb rgb : palette) {
+        colors.push_back(qColorToVec3f(QColor::fromRgb(rgb)));
+    }
+    return colors;
+}
+
+float circularHueDistance(float a, float b)
+{
+    if (a < 0.0f || b < 0.0f) {
+        return 0.0f;
+    }
+    const float delta = std::abs(a - b);
+    return std::min(delta, 1.0f - delta);
+}
+
+float visualColorDistance(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    const QColor qa = QColor::fromRgbF(
+        std::clamp(a[0], 0.0f, 1.0f),
+        std::clamp(a[1], 0.0f, 1.0f),
+        std::clamp(a[2], 0.0f, 1.0f));
+    const QColor qb = QColor::fromRgbF(
+        std::clamp(b[0], 0.0f, 1.0f),
+        std::clamp(b[1], 0.0f, 1.0f),
+        std::clamp(b[2], 0.0f, 1.0f));
+
+    const float hueDistance = circularHueDistance(qa.hsvHueF(), qb.hsvHueF());
+    const float saturationDistance = static_cast<float>(qa.hsvSaturationF() - qb.hsvSaturationF());
+    const float valueDistance = static_cast<float>(qa.valueF() - qb.valueF());
+    return 4.0f * hueDistance * hueDistance +
+           0.75f * saturationDistance * saturationDistance +
+           0.5f * valueDistance * valueDistance +
+           1.25f * rgbDistance2(a, b);
+}
+
+std::vector<int> sameWrapPaletteUsage(const VCCollection* pointCollection,
+                                      const std::unordered_set<uint64_t>& excludedCollectionIds,
+                                      const std::vector<cv::Vec3f>& candidates)
+{
+    std::vector<int> usage(candidates.size(), 0);
+    if (!pointCollection) {
+        return usage;
+    }
+
+    constexpr float kSameColorDistance = 0.03f;
+    for (const auto& [collectionId, collection] : pointCollection->getAllCollections()) {
+        if (excludedCollectionIds.count(collectionId) != 0 || !isSameWrapCollectionName(collection.name)) {
+            continue;
+        }
+
+        auto bestIt = candidates.end();
+        float bestDistance = std::numeric_limits<float>::infinity();
+        for (auto it = candidates.begin(); it != candidates.end(); ++it) {
+            const float distance = visualColorDistance(collection.color, *it);
+            if (distance < bestDistance) {
+                bestIt = it;
+                bestDistance = distance;
+            }
+        }
+        if (bestIt != candidates.end() && bestDistance <= kSameColorDistance) {
+            const auto idx = static_cast<std::size_t>(std::distance(candidates.begin(), bestIt));
+            ++usage[idx];
+        }
+    }
+    return usage;
+}
+
+std::optional<cv::Vec3f> mostRecentSameWrapColor(
+    const VCCollection* pointCollection,
+    const std::unordered_set<uint64_t>& excludedCollectionIds)
+{
+    if (!pointCollection) {
+        return std::nullopt;
+    }
+
+    std::optional<cv::Vec3f> color;
+    int64_t latestCreationTime = std::numeric_limits<int64_t>::min();
+    uint64_t latestCollectionId = 0;
+    for (const auto& [collectionId, collection] : pointCollection->getAllCollections()) {
+        if (excludedCollectionIds.count(collectionId) != 0 || !isSameWrapCollectionName(collection.name)) {
+            continue;
+        }
+
+        int64_t collectionCreationTime = std::numeric_limits<int64_t>::min();
+        for (const auto& [pointId, point] : collection.points) {
+            (void)pointId;
+            collectionCreationTime = std::max(collectionCreationTime, point.creation_time);
+        }
+        if (collectionCreationTime > latestCreationTime ||
+            (collectionCreationTime == latestCreationTime && collectionId > latestCollectionId)) {
+            color = collection.color;
+            latestCreationTime = collectionCreationTime;
+            latestCollectionId = collectionId;
+        }
+    }
+    return color;
+}
+
+cv::Vec3f mostDistinctColor(const std::vector<WeightedColor>& avoidedColors,
+                            const std::vector<int>& paletteUsage)
+{
+    const std::vector<cv::Vec3f> candidates = sameWrapCandidateColors();
+    cv::Vec3f best = candidates.front();
+    float bestMinDistance = -1.0f;
+    float bestTotalDistance = -1.0f;
+    int bestUsage = std::numeric_limits<int>::max();
+
+    int minUsage = 0;
+    if (paletteUsage.size() == candidates.size()) {
+        minUsage = *std::min_element(paletteUsage.begin(), paletteUsage.end());
+    }
+
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const int usage = paletteUsage.size() == candidates.size() ? paletteUsage[i] : 0;
+        if (usage != minUsage) {
+            continue;
+        }
+
+        const cv::Vec3f& candidate = candidates[i];
+        float minDistance = std::numeric_limits<float>::infinity();
+        float totalDistance = 0.0f;
+        for (const WeightedColor& avoidedColor : avoidedColors) {
+            const float distance = visualColorDistance(candidate, avoidedColor.color);
+            minDistance = std::min(minDistance, distance);
+            totalDistance += distance * avoidedColor.weight;
+        }
+        if (usage < bestUsage ||
+            (usage == bestUsage && minDistance > bestMinDistance) ||
+            (minDistance == bestMinDistance && totalDistance > bestTotalDistance)) {
+            best = candidate;
+            bestUsage = usage;
+            bestMinDistance = minDistance;
+            bestTotalDistance = totalDistance;
+        }
+    }
+    return best;
+}
+
+std::optional<cv::Vec3f> colorDistinctFromVisibleCollections(
+    const VCCollection* pointCollection,
+    const std::vector<cv::Vec3f>& points,
+    const std::unordered_set<uint64_t>& excludedCollectionIds,
+    const std::vector<cv::Vec3f>& extraAvoidedColors,
+    const SameWrapAnnotationTool::VolumeToSceneFn& volumeToScene,
+    const QRectF& visibleSceneRect)
+{
+    if (!pointCollection || points.empty()) {
+        return std::nullopt;
+    }
+
+    const std::vector<cv::Vec3f> candidates = sameWrapCandidateColors();
+    const std::vector<int> paletteUsage =
+        sameWrapPaletteUsage(pointCollection, excludedCollectionIds, candidates);
+
+    std::vector<WeightedColor> avoidedColors;
+    avoidedColors.reserve(extraAvoidedColors.size() + 1);
+    for (const cv::Vec3f& color : extraAvoidedColors) {
+        avoidedColors.push_back({color, 24.0f});
+    }
+    if (const auto previousColor = mostRecentSameWrapColor(pointCollection, excludedCollectionIds)) {
+        avoidedColors.push_back({*previousColor, 32.0f});
+    }
+
+    if (!volumeToScene || visibleSceneRect.isEmpty()) {
+        return mostDistinctColor(avoidedColors, paletteUsage);
+    }
+
+    std::vector<QPointF> visibleNewPoints;
+    visibleNewPoints.reserve(points.size());
+    for (const cv::Vec3f& point : points) {
+        const QPointF scenePoint = volumeToScene(point);
+        if (std::isfinite(scenePoint.x()) &&
+            std::isfinite(scenePoint.y()) &&
+            visibleSceneRect.contains(scenePoint)) {
+            visibleNewPoints.push_back(scenePoint);
+        }
+    }
+    if (visibleNewPoints.empty()) {
+        return mostDistinctColor(avoidedColors, paletteUsage);
+    }
+
+    constexpr qreal radius2 = kNearbyCollectionColorRadiusPx * kNearbyCollectionColorRadiusPx;
+    constexpr qreal cellSize = kNearbyCollectionColorRadiusPx;
+    struct CellKey {
+        int x = 0;
+        int y = 0;
+        bool operator==(const CellKey& other) const
+        {
+            return x == other.x && y == other.y;
+        }
+    };
+    struct CellKeyHash {
+        std::size_t operator()(const CellKey& key) const
+        {
+            const std::uint64_t ux = static_cast<std::uint64_t>(static_cast<std::uint32_t>(key.x));
+            const std::uint64_t uy = static_cast<std::uint64_t>(static_cast<std::uint32_t>(key.y));
+            return static_cast<std::size_t>((ux << 32) ^ uy);
+        }
+    };
+    const auto cellForPoint = [&](const QPointF& point) {
+        return CellKey{
+            static_cast<int>(std::floor(point.x() / cellSize)),
+            static_cast<int>(std::floor(point.y() / cellSize))
+        };
+    };
+
+    std::unordered_map<CellKey, std::vector<QPointF>, CellKeyHash> newPointGrid;
+    newPointGrid.reserve(visibleNewPoints.size());
+    for (const QPointF& newScenePoint : visibleNewPoints) {
+        newPointGrid[cellForPoint(newScenePoint)].push_back(newScenePoint);
+    }
+
+    const auto isNearNewPoint = [&](const QPointF& scenePoint) {
+        const CellKey base = cellForPoint(scenePoint);
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const auto it = newPointGrid.find(CellKey{base.x + dx, base.y + dy});
+                if (it == newPointGrid.end()) {
+                    continue;
+                }
+                for (const QPointF& newScenePoint : it->second) {
+                    const qreal xDelta = scenePoint.x() - newScenePoint.x();
+                    const qreal yDelta = scenePoint.y() - newScenePoint.y();
+                    if (xDelta * xDelta + yDelta * yDelta <= radius2) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    std::unordered_set<uint64_t> avoidedCollectionIds;
+    const auto& collections = pointCollection->getAllCollections();
+    for (const auto& [collectionId, collection] : collections) {
+        if (excludedCollectionIds.count(collectionId) != 0) {
+            continue;
+        }
+        bool isVisible = false;
+        bool isNearby = false;
+        for (const auto& [pointId, point] : collection.points) {
+            (void)pointId;
+            const QPointF scenePoint = volumeToScene(point.p);
+            if (!std::isfinite(scenePoint.x()) ||
+                !std::isfinite(scenePoint.y()) ||
+                !visibleSceneRect.contains(scenePoint)) {
+                continue;
+            }
+            isVisible = true;
+            isNearby = isNearNewPoint(scenePoint);
+            if (isNearby) {
+                break;
+            }
+        }
+        if (isVisible && avoidedCollectionIds.insert(collectionId).second) {
+            avoidedColors.push_back({collection.color, isNearby ? 8.0f : 1.0f});
+        }
+    }
+
+    if (avoidedColors.empty()) {
+        return mostDistinctColor(avoidedColors, paletteUsage);
+    }
+    return mostDistinctColor(avoidedColors, paletteUsage);
+}
+
+SameWrapAnnotationMergeBucket& findOrCreateMergeBucket(
+    std::vector<SameWrapAnnotationMergeBucket>& buckets,
+    const std::string& baseCollectionName,
+    const std::string& directionKey)
+{
+    for (SameWrapAnnotationMergeBucket& bucket : buckets) {
+        if (bucket.directionKey == directionKey) {
+            return bucket;
+        }
+    }
+
+    SameWrapAnnotationMergeBucket bucket;
+    bucket.directionKey = directionKey;
+    bucket.collectionName = baseCollectionName + "_" + directionKey;
+    buckets.push_back(std::move(bucket));
+    return buckets.back();
+}
+
+std::unordered_set<uint64_t> bucketCollectionIds(
+    const std::vector<SameWrapAnnotationMergeBucket>& buckets)
+{
+    std::unordered_set<uint64_t> ids;
+    for (const SameWrapAnnotationMergeBucket& bucket : buckets) {
+        ids.insert(bucket.collectionIds.begin(), bucket.collectionIds.end());
+    }
+    return ids;
 }
 
 struct ProjectedPoint {
     float arclength = 0.0f;
     uint64_t collectionId = 0;
     uint64_t pointId = 0;
+    std::string directionKey;
     cv::Vec3f point;
 };
 
 bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
-                                      const std::vector<cv::Vec3f>& volumePath,
+                                      const std::vector<std::vector<cv::Vec3f>>& volumePaths,
                                       float spacingVx,
+                                      float mergeTolerance,
                                       std::vector<cv::Vec3f>& sampled,
-                                      std::vector<uint64_t>& mergeCollectionIds,
-                                      std::string& mergeCollectionName)
+                                      const std::vector<cv::Vec3f>& mergeQueryPoints,
+                                      std::vector<SameWrapAnnotationMergeBucket>& mergeBuckets,
+                                      bool includeKnownMergeCollections = false)
 {
-    if (!pointCollection || volumePath.size() < 2) {
+    if (!pointCollection) {
+        return true;
+    }
+
+    std::vector<std::vector<cv::Vec3f>> mergePaths;
+    mergePaths.reserve(volumePaths.size());
+    for (const std::vector<cv::Vec3f>& path : volumePaths) {
+        if (path.size() >= 2) {
+            mergePaths.push_back(path);
+        }
+    }
+    if (mergePaths.empty()) {
         return true;
     }
 
     std::vector<ProjectedPoint> projectedPoints;
-    const std::vector<float> cumulativeLength = cumulativePathLength(volumePath);
-    const float mergeTolerance = kSameWrapMergeContactToleranceVx;
-    std::unordered_set<uint64_t> seenCollections(mergeCollectionIds.begin(), mergeCollectionIds.end());
+    std::vector<std::vector<float>> cumulativeLengths;
+    cumulativeLengths.reserve(mergePaths.size());
+    std::vector<float> componentOffsets;
+    componentOffsets.reserve(mergePaths.size());
+    float nextOffset = 0.0f;
+    for (const std::vector<cv::Vec3f>& path : mergePaths) {
+        componentOffsets.push_back(nextOffset);
+        cumulativeLengths.push_back(cumulativePathLength(path));
+        if (!cumulativeLengths.back().empty()) {
+            nextOffset += cumulativeLengths.back().back();
+        }
+    }
+    std::unordered_set<uint64_t> seenCollections = bucketCollectionIds(mergeBuckets);
+    std::string baseCollectionName;
+    if (!mergeBuckets.empty()) {
+        baseCollectionName = stripSameWrapDirectionSuffix(mergeBuckets.front().collectionName);
+    }
+    for (SameWrapAnnotationMergeBucket& bucket : mergeBuckets) {
+        bucket.points.clear();
+    }
 
     for (const auto& [collectionId, collection] : pointCollection->getAllCollections()) {
-        if (!isSameWrapCollectionName(collection.name) || collection.points.empty() ||
-            seenCollections.count(collectionId) > 0) {
+        if (!isSameWrapCollectionName(collection.name) || collection.points.empty()) {
+            continue;
+        }
+
+        const bool alreadyMerged = seenCollections.count(collectionId) > 0;
+        if (alreadyMerged && !includeKnownMergeCollections) {
             continue;
         }
 
         const std::vector<ColPoint> orderedPoints = orderedCollectionPoints(collection);
-        std::vector<ProjectedPoint> collectionProjectedPoints;
-        collectionProjectedPoints.reserve(orderedPoints.size());
-        bool collectionMatchesPath = false;
+        std::vector<cv::Vec3f> collectionPath;
+        collectionPath.reserve(orderedPoints.size());
         for (const ColPoint& point : orderedPoints) {
-            const PathProjection projection = projectPointToPath(point.p, volumePath, cumulativeLength);
-            if (projection.distance <= mergeTolerance) {
-                collectionMatchesPath = true;
-            }
-            collectionProjectedPoints.push_back({projection.arclength, collectionId, point.id, point.p});
+            collectionPath.push_back(point.p);
         }
 
-        if (!collectionMatchesPath) {
+        std::vector<ProjectedPoint> collectionProjectedPoints;
+        collectionProjectedPoints.reserve(orderedPoints.size());
+        bool collectionMatchesPath =
+            pointsTouchWithinTolerance(collectionPath, mergeQueryPoints, mergeTolerance);
+        for (const ColPoint& point : orderedPoints) {
+            const PathComponentProjection projection =
+                projectPointToPathComponents(point.p, mergePaths, cumulativeLengths, componentOffsets);
+            collectionProjectedPoints.push_back({projection.arclength, collectionId, point.id, "", point.p});
+        }
+
+        if (!collectionMatchesPath && !alreadyMerged) {
             continue;
         }
-        if (mergeCollectionName.empty()) {
-            mergeCollectionName = collection.name;
+        if (baseCollectionName.empty()) {
+            baseCollectionName = stripSameWrapDirectionSuffix(collection.name);
         }
-        mergeCollectionIds.push_back(collectionId);
-        seenCollections.insert(collectionId);
+        const std::string directionKey = dominantDirectionKey(collectionPath);
+        SameWrapAnnotationMergeBucket& bucket =
+            findOrCreateMergeBucket(mergeBuckets, baseCollectionName, directionKey);
+        if (!alreadyMerged) {
+            bucket.collectionIds.push_back(collectionId);
+            seenCollections.insert(collectionId);
+        }
+        for (ProjectedPoint& projectedPoint : collectionProjectedPoints) {
+            projectedPoint.directionKey = directionKey;
+        }
         projectedPoints.insert(projectedPoints.end(),
                                collectionProjectedPoints.begin(),
                                collectionProjectedPoints.end());
@@ -157,10 +705,18 @@ bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
         return true;
     }
 
+    const std::string sampledDirectionKey = dominantDirectionKey(sampled);
     for (const cv::Vec3f& point : sampled) {
-        const PathProjection projection = projectPointToPath(point, volumePath, cumulativeLength);
-        projectedPoints.push_back({projection.arclength, 0, 0, point});
+        const PathComponentProjection projection =
+            projectPointToPathComponents(point, mergePaths, cumulativeLengths, componentOffsets);
+        projectedPoints.push_back({projection.arclength, 0, 0, sampledDirectionKey, point});
     }
+    if (baseCollectionName.empty()) {
+        baseCollectionName = "same_wrap";
+    }
+    SameWrapAnnotationMergeBucket& sampledBucket =
+        findOrCreateMergeBucket(mergeBuckets, baseCollectionName, sampledDirectionKey);
+    (void)sampledBucket;
 
     std::sort(projectedPoints.begin(), projectedPoints.end(),
               [](const ProjectedPoint& a, const ProjectedPoint& b) {
@@ -174,10 +730,32 @@ bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
               });
 
     sampled.clear();
+    const float minMergedSpacing = std::max(0.5f, spacingVx);
     for (const ProjectedPoint& projected : projectedPoints) {
-        appendIfDistinct(sampled, projected.point, std::max(0.5f, spacingVx * 0.5f));
+        appendIfSeparated(sampled, projected.point, minMergedSpacing);
+        SameWrapAnnotationMergeBucket& bucket =
+            findOrCreateMergeBucket(mergeBuckets, baseCollectionName, projected.directionKey);
+        appendIfSeparated(bucket.points, projected.point, minMergedSpacing);
     }
     return sampled.size() >= 2;
+}
+
+bool mergeExistingSameWrapAnnotations(const VCCollection* pointCollection,
+                                      const std::vector<cv::Vec3f>& volumePath,
+                                      float spacingVx,
+                                      float mergeTolerance,
+                                      std::vector<cv::Vec3f>& sampled,
+                                      std::vector<SameWrapAnnotationMergeBucket>& mergeBuckets,
+                                      bool includeKnownMergeCollections = false)
+{
+    return mergeExistingSameWrapAnnotations(pointCollection,
+                                            std::vector<std::vector<cv::Vec3f>>{volumePath},
+                                            spacingVx,
+                                            mergeTolerance,
+                                            sampled,
+                                            sampled,
+                                            mergeBuckets,
+                                            includeKnownMergeCollections);
 }
 
 int nearestSkeletonPixel(const cv::Mat& skeleton, int x, int y, int searchRadius)
@@ -203,6 +781,19 @@ int nearestSkeletonPixel(const cv::Mat& skeleton, int x, int y, int searchRadius
         }
     }
     return bestKey;
+}
+
+// Same-wrap collections mark points on a single wrap, not winding annotations.
+// They must not carry an absolute winding number (the metadata default), or
+// downstream winding consumers misinterpret them.
+void markSameWrapCollectionMetadata(VCCollection* pointCollection, uint64_t collectionId)
+{
+    if (!pointCollection || collectionId == 0) {
+        return;
+    }
+    CollectionMetadata metadata;
+    metadata.absolute_winding_number = false;
+    pointCollection->setCollectionMetadata(collectionId, metadata);
 }
 
 std::vector<cv::Vec3f> sampleScenePath(const std::vector<QPointF>& scenePath,
@@ -249,6 +840,11 @@ void SameWrapAnnotationTool::setSpacing(double spacingVx)
     _state.spacingVx = std::max(1.0f, static_cast<float>(spacingVx));
 }
 
+void SameWrapAnnotationTool::setMergeTolerance(double toleranceVx)
+{
+    _state.mergeToleranceVx = std::max(0.0f, static_cast<float>(toleranceVx));
+}
+
 void SameWrapAnnotationTool::setMergeExistingAnnotations(bool enabled)
 {
     _state.mergeExistingAnnotations = enabled;
@@ -292,9 +888,11 @@ void SameWrapAnnotationTool::clear(const ClearOverlayGroupFn& clearOverlayGroup)
     _state.componentScenePath.clear();
     _state.componentVolumePath.clear();
     _state.sampledVolumePoints.clear();
-    _state.mergeCollectionIds.clear();
-    _state.mergeCollectionName.clear();
+    _state.mergeQueryVolumePoints.clear();
+    _state.mergeBuckets.clear();
     _state.clickVolumePos = {0.0f, 0.0f, 0.0f};
+    _state.pendingMergeCollectionId = 0;
+    _state.pendingMergePointId = 0;
     _state.hasShortestPathSource = false;
     _state.shortestPathSourceScenePos = QPointF();
     _state.shortestPathSourceVolumePos = {0.0f, 0.0f, 0.0f};
@@ -304,6 +902,8 @@ void SameWrapAnnotationTool::clear(const ClearOverlayGroupFn& clearOverlayGroup)
 }
 
 bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
+                                    const VolumeToSceneFn& volumeToScene,
+                                    const QRectF& visibleSceneRect,
                                     const ClearOverlayGroupFn& clearOverlayGroup)
 {
     if (!_state.enabled || !_state.hasPreview ||
@@ -311,17 +911,194 @@ bool SameWrapAnnotationTool::commit(VCCollection* pointCollection,
         return false;
     }
 
-    std::string collectionName = pointCollection->generateNewCollectionName("same_wrap");
-    if (_state.mergeExistingAnnotations && !_state.mergeCollectionIds.empty() &&
-        !_state.mergeCollectionName.empty()) {
-        collectionName = _state.mergeCollectionName;
-        const std::vector<uint64_t> mergeCollectionIds = _state.mergeCollectionIds;
-        for (uint64_t collectionId : mergeCollectionIds) {
+    std::vector<uint64_t> committedCollectionIds;
+    if (_state.mergeExistingAnnotations && !_state.mergeBuckets.empty()) {
+        std::unordered_set<uint64_t> collectionIdsToClear;
+        for (const SameWrapAnnotationMergeBucket& bucket : _state.mergeBuckets) {
+            collectionIdsToClear.insert(bucket.collectionIds.begin(), bucket.collectionIds.end());
+        }
+
+        std::unordered_map<uint64_t, cv::Vec3f> sourceCollectionColors;
+        const auto& collections = pointCollection->getAllCollections();
+        for (uint64_t collectionId : collectionIdsToClear) {
+            const auto it = collections.find(collectionId);
+            if (it != collections.end()) {
+                sourceCollectionColors.emplace(collectionId, it->second.color);
+            }
+        }
+
+        for (uint64_t collectionId : collectionIdsToClear) {
             pointCollection->clearCollection(collectionId);
         }
+        for (const SameWrapAnnotationMergeBucket& bucket : _state.mergeBuckets) {
+            if (bucket.points.empty()) {
+                continue;
+            }
+            pointCollection->addPoints(bucket.collectionName, bucket.points);
+            const uint64_t collectionId = pointCollection->getCollectionId(bucket.collectionName);
+            if (collectionId != 0) {
+                markSameWrapCollectionMetadata(pointCollection, collectionId);
+                pointCollection->setCollectionTag(collectionId, "same_wrap_direction", bucket.directionKey);
+                std::vector<cv::Vec3f> sourceColorsToAvoid;
+                sourceColorsToAvoid.reserve(bucket.collectionIds.size());
+                for (uint64_t sourceCollectionId : bucket.collectionIds) {
+                    const auto colorIt = sourceCollectionColors.find(sourceCollectionId);
+                    if (colorIt != sourceCollectionColors.end()) {
+                        sourceColorsToAvoid.push_back(colorIt->second);
+                    }
+                }
+                if (const auto color = colorDistinctFromVisibleCollections(
+                        pointCollection,
+                        bucket.points,
+                        std::unordered_set<uint64_t>{collectionId},
+                        sourceColorsToAvoid,
+                        volumeToScene,
+                        visibleSceneRect)) {
+                    pointCollection->setCollectionColor(collectionId, *color);
+                }
+                committedCollectionIds.push_back(collectionId);
+            }
+        }
+    } else {
+        const std::string collectionName = pointCollection->generateNewCollectionName("same_wrap");
+        pointCollection->addPoints(collectionName, _state.sampledVolumePoints);
+        const uint64_t collectionId = pointCollection->getCollectionId(collectionName);
+        if (collectionId != 0) {
+            markSameWrapCollectionMetadata(pointCollection, collectionId);
+            if (const auto color = colorDistinctFromVisibleCollections(
+                    pointCollection,
+                    _state.sampledVolumePoints,
+                    std::unordered_set<uint64_t>{collectionId},
+                    {},
+                    volumeToScene,
+                    visibleSceneRect)) {
+                pointCollection->setCollectionColor(collectionId, *color);
+            }
+            committedCollectionIds.push_back(collectionId);
+        }
     }
-    pointCollection->addPoints(collectionName, _state.sampledVolumePoints);
+    if (!committedCollectionIds.empty()) {
+        _committedCollectionHistory.push_back(std::move(committedCollectionIds));
+    }
     clear(clearOverlayGroup);
+    return true;
+}
+
+bool SameWrapAnnotationTool::undoLastCommit(VCCollection* pointCollection)
+{
+    if (!pointCollection) {
+        return false;
+    }
+
+    while (!_committedCollectionHistory.empty()) {
+        std::vector<uint64_t> collectionIds = std::move(_committedCollectionHistory.back());
+        _committedCollectionHistory.pop_back();
+
+        bool removedAny = false;
+        for (uint64_t collectionId : collectionIds) {
+            if (pointCollection->getAllCollections().count(collectionId) == 0) {
+                continue;
+            }
+            pointCollection->clearCollection(collectionId);
+            removedAny = true;
+        }
+        if (removedAny) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SameWrapAnnotationTool::manualMergePointClicked(VCCollection* pointCollection,
+                                                     uint64_t collectionId,
+                                                     uint64_t pointId,
+                                                     const VolumeToSceneFn& volumeToScene,
+                                                     const QRectF& visibleSceneRect,
+                                                     const ConfirmMixedDirectionMergeFn& confirmMixedDirectionMerge)
+{
+    if (!_state.enabled || !_state.mergeExistingAnnotations || !pointCollection ||
+        collectionId == 0 || pointId == 0) {
+        return false;
+    }
+
+    const auto& collections = pointCollection->getAllCollections();
+    const auto collectionIt = collections.find(collectionId);
+    if (collectionIt == collections.end() ||
+        !isSameWrapCollectionName(collectionIt->second.name) ||
+        collectionIt->second.points.count(pointId) == 0) {
+        _state.pendingMergeCollectionId = 0;
+        _state.pendingMergePointId = 0;
+        return false;
+    }
+
+    if (_state.pendingMergeCollectionId == 0 ||
+        _state.pendingMergePointId == 0 ||
+        _state.pendingMergeCollectionId == collectionId) {
+        _state.pendingMergeCollectionId = collectionId;
+        _state.pendingMergePointId = pointId;
+        return true;
+    }
+
+    const uint64_t firstCollectionId = _state.pendingMergeCollectionId;
+    const uint64_t firstPointId = _state.pendingMergePointId;
+    _state.pendingMergeCollectionId = 0;
+    _state.pendingMergePointId = 0;
+
+    const auto firstIt = collections.find(firstCollectionId);
+    if (firstIt == collections.end() ||
+        !isSameWrapCollectionName(firstIt->second.name) ||
+        firstIt->second.points.count(firstPointId) == 0) {
+        _state.pendingMergeCollectionId = collectionId;
+        _state.pendingMergePointId = pointId;
+        return true;
+    }
+
+    const std::string firstDirectionKey = dominantDirectionKey(orderedCollectionPositions(firstIt->second));
+    const std::string secondDirectionKey = dominantDirectionKey(orderedCollectionPositions(collectionIt->second));
+    if (firstDirectionKey != secondDirectionKey && confirmMixedDirectionMerge) {
+        const MixedDirectionMergeWarning warning{
+            firstIt->second.name,
+            firstDirectionKey,
+            collectionIt->second.name,
+            secondDirectionKey
+        };
+        if (!confirmMixedDirectionMerge(warning)) {
+            _state.pendingMergeCollectionId = firstCollectionId;
+            _state.pendingMergePointId = firstPointId;
+            return true;
+        }
+    }
+
+    std::vector<cv::Vec3f> mergedPoints =
+        bestEndpointMergeOrder(firstIt->second, collectionIt->second);
+    mergedPoints = removeClosePoints(mergedPoints, _state.spacingVx);
+    if (mergedPoints.size() < 2) {
+        return false;
+    }
+
+    const std::string mergedCollectionName = firstIt->second.name;
+    const std::string directionKey = dominantDirectionKey(mergedPoints);
+    const std::vector<cv::Vec3f> sourceColorsToAvoid{
+        firstIt->second.color,
+        collectionIt->second.color
+    };
+    pointCollection->clearCollection(firstCollectionId);
+    pointCollection->clearCollection(collectionId);
+    pointCollection->addPoints(mergedCollectionName, mergedPoints);
+    const uint64_t mergedCollectionId = pointCollection->getCollectionId(mergedCollectionName);
+    if (mergedCollectionId != 0) {
+        markSameWrapCollectionMetadata(pointCollection, mergedCollectionId);
+        pointCollection->setCollectionTag(mergedCollectionId, "same_wrap_direction", directionKey);
+        if (const auto color = colorDistinctFromVisibleCollections(
+                pointCollection,
+                mergedPoints,
+                std::unordered_set<uint64_t>{mergedCollectionId},
+                sourceColorsToAvoid,
+                volumeToScene,
+                visibleSceneRect)) {
+            pointCollection->setCollectionColor(mergedCollectionId, *color);
+        }
+    }
     return true;
 }
 
@@ -335,17 +1112,21 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
                                              const SetOverlayGroupFn& setOverlayGroup,
                                              const ClearOverlayGroupFn& clearOverlayGroup)
 {
+    if (_state.pathType == PathType::Manual) {
+        return false;
+    }
+
     std::vector<QPointF> previousScenePath;
     std::vector<cv::Vec3f> previousVolumePath;
     std::vector<cv::Vec3f> previousSampledPoints;
-    std::vector<uint64_t> previousMergeCollectionIds;
-    std::string previousMergeCollectionName;
+    std::vector<cv::Vec3f> previousMergeQueryPoints;
+    std::vector<SameWrapAnnotationMergeBucket> previousMergeBuckets;
     if (appendToPreview && _state.hasPreview) {
         previousScenePath = _state.componentScenePath;
         previousVolumePath = _state.componentVolumePath;
         previousSampledPoints = _state.sampledVolumePoints;
-        previousMergeCollectionIds = _state.mergeCollectionIds;
-        previousMergeCollectionName = _state.mergeCollectionName;
+        previousMergeQueryPoints = _state.mergeQueryVolumePoints;
+        previousMergeBuckets = _state.mergeBuckets;
     } else {
         if (!(_state.pathType == PathType::ShortestPath && _state.hasShortestPathSource)) {
             clear(clearOverlayGroup);
@@ -359,8 +1140,8 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
             _state.componentScenePath = std::move(previousScenePath);
             _state.componentVolumePath = std::move(previousVolumePath);
             _state.sampledVolumePoints = std::move(previousSampledPoints);
-            _state.mergeCollectionIds = std::move(previousMergeCollectionIds);
-            _state.mergeCollectionName = std::move(previousMergeCollectionName);
+            _state.mergeQueryVolumePoints = std::move(previousMergeQueryPoints);
+            _state.mergeBuckets = std::move(previousMergeBuckets);
             _state.hasPreview = !_state.sampledVolumePoints.empty();
         }
         return false;
@@ -458,24 +1239,14 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
         if (sampled.size() < 2) {
             return false;
         }
+        const std::vector<cv::Vec3f> mergeQueryPoints = sampled;
 
-        std::vector<uint64_t> mergeCollectionIds;
-        std::string mergeCollectionName;
-        if (_state.mergeExistingAnnotations &&
-            !mergeExistingSameWrapAnnotations(pointCollection,
-                                              volumePath,
-                                              _state.spacingVx,
-                                              sampled,
-                                              mergeCollectionIds,
-                                              mergeCollectionName)) {
-            return false;
-        }
-
+        std::vector<SameWrapAnnotationMergeBucket> mergeBuckets;
         _state.componentScenePath = std::move(scenePath);
         _state.componentVolumePath = std::move(volumePath);
         _state.sampledVolumePoints = std::move(sampled);
-        _state.mergeCollectionIds = std::move(mergeCollectionIds);
-        _state.mergeCollectionName = std::move(mergeCollectionName);
+        _state.mergeQueryVolumePoints = mergeQueryPoints;
+        _state.mergeBuckets = std::move(mergeBuckets);
         _state.clickVolumePos = sceneToVolume(snappedScenePos);
         _state.hasPreview = true;
         _state.hasShortestPathSource = false;
@@ -693,22 +1464,11 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
     if (sampled.size() < 2) {
         return false;
     }
+    const std::vector<cv::Vec3f> mergeQueryPoints = sampled;
 
-    std::vector<uint64_t> mergeCollectionIds;
-    std::string mergeCollectionName;
+    std::vector<SameWrapAnnotationMergeBucket> mergeBuckets;
     if (appendToPreview) {
-        mergeCollectionIds = std::move(previousMergeCollectionIds);
-        mergeCollectionName = std::move(previousMergeCollectionName);
-    }
-
-    if (_state.mergeExistingAnnotations &&
-        !mergeExistingSameWrapAnnotations(pointCollection,
-                                          volumePath,
-                                          _state.spacingVx,
-                                          sampled,
-                                          mergeCollectionIds,
-                                          mergeCollectionName)) {
-        return false;
+        mergeBuckets = std::move(previousMergeBuckets);
     }
 
     if (appendToPreview && !previousSampledPoints.empty() && !sampled.empty()) {
@@ -734,20 +1494,96 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
         }
 
         previousSampledPoints.insert(previousSampledPoints.end(), sampled.begin(), sampled.end());
+        previousMergeQueryPoints.insert(previousMergeQueryPoints.end(),
+                                        mergeQueryPoints.begin(),
+                                        mergeQueryPoints.end());
         _state.componentScenePath = std::move(previousScenePath);
         _state.componentVolumePath = std::move(previousVolumePath);
         _state.sampledVolumePoints = std::move(previousSampledPoints);
-        _state.mergeCollectionIds = std::move(mergeCollectionIds);
-        _state.mergeCollectionName = std::move(mergeCollectionName);
+        _state.mergeQueryVolumePoints = std::move(previousMergeQueryPoints);
+        _state.mergeBuckets = std::move(mergeBuckets);
     } else {
         _state.componentScenePath = std::move(scenePath);
         _state.componentVolumePath = std::move(volumePath);
         _state.sampledVolumePoints = std::move(sampled);
-        _state.mergeCollectionIds = std::move(mergeCollectionIds);
-        _state.mergeCollectionName = std::move(mergeCollectionName);
+        _state.mergeQueryVolumePoints = mergeQueryPoints;
+        _state.mergeBuckets = std::move(mergeBuckets);
     }
     _state.clickVolumePos = sceneToVolume(QPointF(clickX, clickY));
     _state.hasPreview = true;
+    _state.shiftReleasedSincePreview = false;
+    updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
+    return true;
+}
+
+bool SameWrapAnnotationTool::beginManualPreview(const QPointF& scenePos,
+                                                bool appendToPreview,
+                                                const SceneToVolumeFn& sceneToVolume,
+                                                const VolumeToSceneFn& volumeToScene,
+                                                const SetOverlayGroupFn& setOverlayGroup,
+                                                const ClearOverlayGroupFn& clearOverlayGroup)
+{
+    if (!_state.enabled || _state.pathType != PathType::Manual) {
+        return false;
+    }
+
+    if (!appendToPreview || !_state.hasPreview) {
+        clear(clearOverlayGroup);
+    }
+
+    if (!_state.componentScenePath.empty()) {
+        const QPointF& previous = _state.componentScenePath.back();
+        if (std::hypot(scenePos.x() - previous.x(), scenePos.y() - previous.y()) <= 0.5) {
+            return true;
+        }
+    }
+
+    _state.componentScenePath.push_back(scenePos);
+    _state.componentVolumePath.push_back(sceneToVolume(scenePos));
+    _state.clickVolumePos = _state.componentVolumePath.back();
+    _state.hasPreview = true;
+    _state.shiftReleasedSincePreview = false;
+    updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
+    return true;
+}
+
+bool SameWrapAnnotationTool::appendManualPreview(const QPointF& scenePos,
+                                                 float viewScale,
+                                                 const VCCollection* pointCollection,
+                                                 const SceneToVolumeFn& sceneToVolume,
+                                                 const VolumeToSceneFn& volumeToScene,
+                                                 const SetOverlayGroupFn& setOverlayGroup,
+                                                 const ClearOverlayGroupFn& clearOverlayGroup)
+{
+    if (!_state.enabled || _state.pathType != PathType::Manual || !_state.hasPreview) {
+        return false;
+    }
+
+    if (!_state.componentScenePath.empty()) {
+        const QPointF& previous = _state.componentScenePath.back();
+        if (std::hypot(scenePos.x() - previous.x(), scenePos.y() - previous.y()) <= 0.5) {
+            return true;
+        }
+    }
+
+    _state.componentScenePath.push_back(scenePos);
+    _state.componentVolumePath.push_back(sceneToVolume(scenePos));
+    _state.clickVolumePos = _state.componentVolumePath.back();
+
+    const float spacingPx = std::max(1.0f, _state.spacingVx * viewScale);
+    std::vector<cv::Vec3f> sampled = sampleScenePath(_state.componentScenePath, spacingPx, sceneToVolume);
+    if (sampled.size() < 2) {
+        _state.sampledVolumePoints.clear();
+        _state.mergeQueryVolumePoints.clear();
+        updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
+        return true;
+    }
+    const std::vector<cv::Vec3f> mergeQueryPoints = sampled;
+
+    std::vector<SameWrapAnnotationMergeBucket> mergeBuckets = _state.mergeBuckets;
+    _state.sampledVolumePoints = std::move(sampled);
+    _state.mergeQueryVolumePoints = mergeQueryPoints;
+    _state.mergeBuckets = std::move(mergeBuckets);
     _state.shiftReleasedSincePreview = false;
     updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
     return true;
