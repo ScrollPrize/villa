@@ -1688,6 +1688,12 @@ struct SpanRolloutResult {
     double closestTargetDistance = std::numeric_limits<double>::infinity();
 };
 
+struct OptimizedControlSpan {
+    std::vector<std::array<double, 3>> points;
+    LineReinitializationSpanReport report;
+    double candidateFinalCostDiff = 0.0;
+};
+
 [[nodiscard]] cv::Vec3d projectedChordTangentAtStart(
     const cv::Vec3d& start,
     const cv::Vec3d& target,
@@ -2531,6 +2537,89 @@ struct LineDifference {
     return out.str();
 }
 
+[[nodiscard]] OptimizedControlSpan optimizedControlSpan(
+    const cv::Vec3d& leftPoint,
+    const cv::Vec3d& rightPoint,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config,
+    int segmentIndex,
+    int leftControlIndex,
+    int rightControlIndex,
+    std::string candidatePrefix)
+{
+    if (length(rightPoint - leftPoint) <= kEpsilon) {
+        throw std::invalid_argument("Adjacent reinitialization control points are coincident");
+    }
+
+    const SpanRolloutResult leftRollout =
+        spanRolloutCandidate(leftPoint, rightPoint, sampler, config);
+
+    SpanRolloutResult rightRollout =
+        spanRolloutCandidate(rightPoint, leftPoint, sampler, config);
+    std::reverse(rightRollout.points.begin(), rightRollout.points.end());
+    if (!rightRollout.points.empty()) {
+        rightRollout.points.front() = leftPoint;
+        rightRollout.points.back() = rightPoint;
+    }
+
+    LineOptimizationConfig spanConfig = config;
+    spanConfig.printSolverProgress = false;
+    const cv::Vec3d seedTangent = projectedChordTangentAtStart(leftPoint, rightPoint, sampler);
+    const auto spanStart = Clock::now();
+    GlobalSolveResult leftSolved =
+        solveGlobalCandidate(candidatePrefix + "-left-" + std::to_string(segmentIndex),
+                             toArrayPoints(leftRollout.points),
+                             evenStepSpanConstraints(leftRollout.points.size() - 1,
+                                                     segmentIndex),
+                             {0, static_cast<int>(leftRollout.points.size()) - 1},
+                             sampler,
+                             spanConfig,
+                             seedTangent,
+                             false,
+                             spanStart);
+    GlobalSolveResult rightSolved =
+        solveGlobalCandidate(candidatePrefix + "-right-" + std::to_string(segmentIndex),
+                             toArrayPoints(rightRollout.points),
+                             evenStepSpanConstraints(rightRollout.points.size() - 1,
+                                                     segmentIndex),
+                             {0, static_cast<int>(rightRollout.points.size()) - 1},
+                             sampler,
+                             spanConfig,
+                             seedTangent,
+                             false,
+                             spanStart);
+
+    const bool chooseLeft = leftSolved.finalCost <= rightSolved.finalCost;
+    const GlobalSolveResult& chosen = chooseLeft ? leftSolved : rightSolved;
+
+    OptimizedControlSpan result;
+    result.points = chosen.points;
+    result.candidateFinalCostDiff = std::abs(leftSolved.finalCost - rightSolved.finalCost);
+    result.report.segmentIndex = segmentIndex;
+    result.report.leftControlIndex = leftControlIndex;
+    result.report.rightControlIndex = rightControlIndex;
+    result.report.points = static_cast<int>(chosen.points.size());
+    result.report.candLeftRolloutSteps = leftRollout.rolloutSteps;
+    result.report.candLeftTruncatedPoints = leftRollout.truncatedPoints;
+    result.report.candRightRolloutSteps = rightRollout.rolloutSteps;
+    result.report.candRightTruncatedPoints = rightRollout.truncatedPoints;
+    result.report.candLeftSelectedSign = leftRollout.selectedSign;
+    result.report.candRightSelectedSign = rightRollout.selectedSign;
+    result.report.candLeftClosestTargetDistance = leftRollout.closestTargetDistance;
+    result.report.candRightClosestTargetDistance = rightRollout.closestTargetDistance;
+    result.report.candLeftInitialCost = leftSolved.initialCost;
+    result.report.candLeftFinalCost = leftSolved.finalCost;
+    result.report.candRightInitialCost = rightSolved.initialCost;
+    result.report.candRightFinalCost = rightSolved.finalCost;
+    const SpanDeviationMetrics deviations = spanDeviationMetrics(chosen.points, sampler, config);
+    result.report.chosenMaxEvenStepDeviation = deviations.maxEvenStepDeviation;
+    result.report.chosenMaxTangentSmoothDeviation = deviations.maxTangentSmoothDeviation;
+    result.report.chosenMaxNormalSmoothDeviation = deviations.maxNormalSmoothDeviation;
+    result.report.chosenMaxNormalAlignmentAbs = deviations.maxNormalAlignmentAbs;
+    result.report.chosen = chooseLeft ? "left" : "right";
+    return result;
+}
+
 [[nodiscard]] LineModel buildLineModel(
     const std::vector<std::array<double, 3>>& points,
     const NormalSampler& sampler,
@@ -2847,81 +2936,202 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
     const LineOptimizationConfig& rawConfig)
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
-    LineControlPointUpdateResult result =
-        updateExistingLineControlPoint(std::move(linePoints),
-                                       std::move(controlPoints),
-                                       changedControlIndex,
-                                       config.segmentLength);
-    if (result.linePoints.size() < 2 ||
-        result.controlPoints.empty() ||
-        result.changedControlIndex < 0 ||
-        result.changedControlIndex >= static_cast<int>(result.controlPoints.size())) {
-        return result;
+    if (linePoints.size() < 2) {
+        throw std::invalid_argument("Existing line update requires at least two samples");
     }
+    if (changedControlIndex >= controlPoints.size()) {
+        throw std::invalid_argument("Changed control index is out of range");
+    }
+
+    std::vector<std::pair<LineControlPoint, bool>> taggedControls;
+    taggedControls.reserve(controlPoints.size());
+    for (size_t i = 0; i < controlPoints.size(); ++i) {
+        taggedControls.push_back({controlPoints[i], i == changedControlIndex});
+    }
+    std::stable_sort(taggedControls.begin(),
+                     taggedControls.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.first.linePosition < b.first.linePosition;
+                     });
+
+    int changedSortedIndex = -1;
+    controlPoints.clear();
+    controlPoints.reserve(taggedControls.size());
+    const int inputMaxIndex = static_cast<int>(linePoints.size()) - 1;
+    for (size_t i = 0; i < taggedControls.size(); ++i) {
+        taggedControls[i].first.linePosition = std::clamp(
+            taggedControls[i].first.linePosition,
+            0.0,
+            static_cast<double>(inputMaxIndex));
+        if (taggedControls[i].second) {
+            changedSortedIndex = static_cast<int>(i);
+        }
+        controlPoints.push_back(taggedControls[i].first);
+    }
+    if (changedSortedIndex < 0) {
+        throw std::invalid_argument("Changed control point was not found after sorting");
+    }
+
+    const bool hasLeft = changedSortedIndex > 0;
+    const bool hasRight = changedSortedIndex + 1 < static_cast<int>(controlPoints.size());
+    if (!hasLeft && !hasRight) {
+        LineControlPointUpdateResult unchanged;
+        unchanged.linePoints = std::move(linePoints);
+        unchanged.controlPoints = std::move(controlPoints);
+        unchanged.changedControlIndex = changedSortedIndex;
+        unchanged.activeStart = 0;
+        unchanged.activeEnd = static_cast<int>(unchanged.linePoints.size()) - 1;
+        return unchanged;
+    }
+
+    const double replaceStartPosition = hasLeft
+        ? controlPoints[static_cast<size_t>(changedSortedIndex - 1)].linePosition
+        : controlPoints[static_cast<size_t>(changedSortedIndex)].linePosition;
+    const double replaceEndPosition = hasRight
+        ? controlPoints[static_cast<size_t>(changedSortedIndex + 1)].linePosition
+        : controlPoints[static_cast<size_t>(changedSortedIndex)].linePosition;
+
+    std::vector<cv::Vec3d> replacement;
+    std::vector<LineReinitializationSpanReport> initializedSpans;
+    if (hasLeft) {
+        const int leftIndex = changedSortedIndex - 1;
+        OptimizedControlSpan leftSpan =
+            optimizedControlSpan(controlPoints[static_cast<size_t>(leftIndex)].volumePoint,
+                                 controlPoints[static_cast<size_t>(changedSortedIndex)].volumePoint,
+                                 sampler,
+                                 config,
+                                 leftIndex,
+                                 leftIndex,
+                                 changedSortedIndex,
+                                 "control-update-span");
+        initializedSpans.push_back(leftSpan.report);
+        replacement.reserve(leftSpan.points.size());
+        for (const auto& point : leftSpan.points) {
+            replacement.push_back(toVec3d(point));
+        }
+    }
+    if (hasRight) {
+        const int rightIndex = changedSortedIndex + 1;
+        OptimizedControlSpan rightSpan =
+            optimizedControlSpan(controlPoints[static_cast<size_t>(changedSortedIndex)].volumePoint,
+                                 controlPoints[static_cast<size_t>(rightIndex)].volumePoint,
+                                 sampler,
+                                 config,
+                                 changedSortedIndex,
+                                 changedSortedIndex,
+                                 rightIndex,
+                                 "control-update-span");
+        initializedSpans.push_back(rightSpan.report);
+        if (!replacement.empty()) {
+            for (size_t i = 1; i < rightSpan.points.size(); ++i) {
+                replacement.push_back(toVec3d(rightSpan.points[i]));
+            }
+        } else {
+            replacement.reserve(rightSpan.points.size());
+            for (const auto& point : rightSpan.points) {
+                replacement.push_back(toVec3d(point));
+            }
+        }
+    }
+
+    const int eraseStart = std::clamp(static_cast<int>(std::ceil(replaceStartPosition)),
+                                      0,
+                                      inputMaxIndex);
+    const int eraseEnd = std::clamp(static_cast<int>(std::floor(replaceEndPosition)),
+                                    eraseStart,
+                                    inputMaxIndex);
+
+    std::vector<cv::Vec3d> updatedLine;
+    updatedLine.reserve(linePoints.size() + replacement.size());
+    updatedLine.insert(updatedLine.end(), linePoints.begin(), linePoints.begin() + eraseStart);
+    updatedLine.insert(updatedLine.end(), replacement.begin(), replacement.end());
+    updatedLine.insert(updatedLine.end(),
+                       linePoints.begin() + static_cast<std::ptrdiff_t>(eraseEnd + 1),
+                       linePoints.end());
+
+    for (auto& control : controlPoints) {
+        int bestIndex = 0;
+        double bestDistance = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < updatedLine.size(); ++i) {
+            const double distance = length(updatedLine[i] - control.volumePoint);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = static_cast<int>(i);
+            }
+        }
+        control.optimizedIndex = bestIndex;
+        control.linePosition = static_cast<double>(bestIndex);
+        control.volumePoint = updatedLine[static_cast<size_t>(bestIndex)];
+    }
+
+    LineControlPointUpdateResult result;
+    result.linePoints = std::move(updatedLine);
+    result.controlPoints = std::move(controlPoints);
+    result.initializedSpans = std::move(initializedSpans);
+    result.changedControlIndex = changedSortedIndex;
 
     const int changed = result.changedControlIndex;
     const int lastControl = static_cast<int>(result.controlPoints.size()) - 1;
-    if (changed != 0 && changed != lastControl) {
-        const auto activeRange = activeRangeAroundControlSpans(result.controlPoints,
-                                                              result.changedControlIndex,
-                                                              static_cast<int>(result.linePoints.size()),
-                                                              3);
-        result.activeStart = activeRange.first;
-        result.activeEnd = activeRange.second;
-        return result;
-    }
-
     if (changed == 0 && result.controlPoints.size() >= 2) {
         const LineControlPoint& first = result.controlPoints.front();
-        const LineControlPoint& second = result.controlPoints[1];
-        std::vector<std::array<double, 3>> grown;
-        growNormalConstructedExtension(first.volumePoint,
-                                       first.volumePoint - second.volumePoint,
-                                       sampler,
-                                       config,
-                                       grown);
-
         const int firstIndex = std::clamp(first.optimizedIndex,
                                           0,
                                           static_cast<int>(result.linePoints.size()) - 1);
-        std::vector<cv::Vec3d> expanded;
-        expanded.reserve(grown.size() + result.linePoints.size() - static_cast<size_t>(firstIndex));
-        for (auto it = grown.rbegin(); it != grown.rend(); ++it) {
-            expanded.push_back(toVec3d(*it));
-        }
-        expanded.insert(expanded.end(),
-                        result.linePoints.begin() + static_cast<std::ptrdiff_t>(firstIndex),
-                        result.linePoints.end());
+        if (firstIndex + 1 < static_cast<int>(result.linePoints.size())) {
+            const cv::Vec3d outward = first.volumePoint -
+                                      result.linePoints[static_cast<size_t>(firstIndex + 1)];
+            std::vector<std::array<double, 3>> grown;
+            growNormalConstructedExtension(first.volumePoint,
+                                           projectedDirectionAtStart(first.volumePoint,
+                                                                     outward,
+                                                                     sampler),
+                                           sampler,
+                                           config,
+                                           grown);
 
-        const int shift = static_cast<int>(grown.size()) - firstIndex;
-        for (auto& control : result.controlPoints) {
-            control.optimizedIndex += shift;
-            control.linePosition = static_cast<double>(control.optimizedIndex);
+            std::vector<cv::Vec3d> expanded;
+            expanded.reserve(grown.size() + result.linePoints.size() - static_cast<size_t>(firstIndex));
+            for (auto it = grown.rbegin(); it != grown.rend(); ++it) {
+                expanded.push_back(toVec3d(*it));
+            }
+            expanded.insert(expanded.end(),
+                            result.linePoints.begin() + static_cast<std::ptrdiff_t>(firstIndex),
+                            result.linePoints.end());
+
+            const int shift = static_cast<int>(grown.size()) - firstIndex;
+            for (auto& control : result.controlPoints) {
+                control.optimizedIndex += shift;
+                control.linePosition = static_cast<double>(control.optimizedIndex);
+            }
+            result.linePoints = std::move(expanded);
         }
-        result.linePoints = std::move(expanded);
     } else if (changed == lastControl && result.controlPoints.size() >= 2) {
         const LineControlPoint& last = result.controlPoints.back();
-        const LineControlPoint& beforeLast =
-            result.controlPoints[static_cast<size_t>(lastControl - 1)];
-        std::vector<std::array<double, 3>> grown;
-        growNormalConstructedExtension(last.volumePoint,
-                                       last.volumePoint - beforeLast.volumePoint,
-                                       sampler,
-                                       config,
-                                       grown);
-
         const int lastIndex = std::clamp(last.optimizedIndex,
                                          0,
                                          static_cast<int>(result.linePoints.size()) - 1);
-        std::vector<cv::Vec3d> expanded;
-        expanded.reserve(static_cast<size_t>(lastIndex + 1) + grown.size());
-        expanded.insert(expanded.end(),
-                        result.linePoints.begin(),
-                        result.linePoints.begin() + static_cast<std::ptrdiff_t>(lastIndex + 1));
-        for (const auto& point : grown) {
-            expanded.push_back(toVec3d(point));
+        if (lastIndex > 0) {
+            const cv::Vec3d outward = last.volumePoint -
+                                      result.linePoints[static_cast<size_t>(lastIndex - 1)];
+            std::vector<std::array<double, 3>> grown;
+            growNormalConstructedExtension(last.volumePoint,
+                                           projectedDirectionAtStart(last.volumePoint,
+                                                                     outward,
+                                                                     sampler),
+                                           sampler,
+                                           config,
+                                           grown);
+
+            std::vector<cv::Vec3d> expanded;
+            expanded.reserve(static_cast<size_t>(lastIndex + 1) + grown.size());
+            expanded.insert(expanded.end(),
+                            result.linePoints.begin(),
+                            result.linePoints.begin() + static_cast<std::ptrdiff_t>(lastIndex + 1));
+            for (const auto& point : grown) {
+                expanded.push_back(toVec3d(point));
+            }
+            result.linePoints = std::move(expanded);
         }
-        result.linePoints = std::move(expanded);
     }
 
     const auto activeRange = activeRangeAroundControlSpans(result.controlPoints,
@@ -3344,87 +3554,19 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     for (size_t controlIndex = 0; controlIndex + 1 < controlPoints.size(); ++controlIndex) {
         const LineControlPoint& left = controlPoints[controlIndex];
         const LineControlPoint& right = controlPoints[controlIndex + 1];
-        if (length(right.volumePoint - left.volumePoint) <= kEpsilon) {
-            throw std::invalid_argument("Adjacent reinitialization control points are coincident");
-        }
-
-        const SpanRolloutResult leftRollout =
-            spanRolloutCandidate(left.volumePoint,
+        OptimizedControlSpan span =
+            optimizedControlSpan(left.volumePoint,
                                  right.volumePoint,
                                  normalSampler_,
-                                 config);
-
-        SpanRolloutResult rightRollout =
-            spanRolloutCandidate(right.volumePoint,
-                                 left.volumePoint,
-                                 normalSampler_,
-                                 config);
-        std::reverse(rightRollout.points.begin(), rightRollout.points.end());
-        if (!rightRollout.points.empty()) {
-            rightRollout.points.front() = left.volumePoint;
-            rightRollout.points.back() = right.volumePoint;
-        }
-
-        LineOptimizationConfig spanConfig = config;
-        spanConfig.printSolverProgress = false;
-        const cv::Vec3d seedTangent = projectedChordTangentAtStart(left.volumePoint,
-                                                                   right.volumePoint,
-                                                                   normalSampler_);
-        const auto spanStart = Clock::now();
-        GlobalSolveResult leftSolved =
-            solveGlobalCandidate("reinit-span-left-" + std::to_string(controlIndex),
-                                 toArrayPoints(leftRollout.points),
-                                 evenStepSpanConstraints(leftRollout.points.size() - 1,
-                                                         static_cast<int>(controlIndex)),
-                                 {0, static_cast<int>(leftRollout.points.size()) - 1},
-                                 normalSampler_,
-                                 spanConfig,
-                                 seedTangent,
-                                 false,
-                                 spanStart);
-        GlobalSolveResult rightSolved =
-            solveGlobalCandidate("reinit-span-right-" + std::to_string(controlIndex),
-                                 toArrayPoints(rightRollout.points),
-                                 evenStepSpanConstraints(rightRollout.points.size() - 1,
-                                                         static_cast<int>(controlIndex)),
-                                 {0, static_cast<int>(rightRollout.points.size()) - 1},
-                                 normalSampler_,
-                                 spanConfig,
-                                 seedTangent,
-                                 false,
-                                 spanStart);
-
-        const bool chooseLeft = leftSolved.finalCost <= rightSolved.finalCost;
-        const GlobalSolveResult& chosen = chooseLeft ? leftSolved : rightSolved;
+                                 config,
+                                 static_cast<int>(controlIndex),
+                                 originalControlIndices[controlIndex],
+                                 originalControlIndices[controlIndex + 1],
+                                 "reinit-span");
         maxCandidateFinalDiff = std::max(maxCandidateFinalDiff,
-                                         std::abs(leftSolved.finalCost - rightSolved.finalCost));
-
-        LineReinitializationSpanReport report;
-        report.segmentIndex = static_cast<int>(controlIndex);
-        report.leftControlIndex = originalControlIndices[controlIndex];
-        report.rightControlIndex = originalControlIndices[controlIndex + 1];
-        report.points = static_cast<int>(chosen.points.size());
-        report.candLeftRolloutSteps = leftRollout.rolloutSteps;
-        report.candLeftTruncatedPoints = leftRollout.truncatedPoints;
-        report.candRightRolloutSteps = rightRollout.rolloutSteps;
-        report.candRightTruncatedPoints = rightRollout.truncatedPoints;
-        report.candLeftSelectedSign = leftRollout.selectedSign;
-        report.candRightSelectedSign = rightRollout.selectedSign;
-        report.candLeftClosestTargetDistance = leftRollout.closestTargetDistance;
-        report.candRightClosestTargetDistance = rightRollout.closestTargetDistance;
-        report.candLeftInitialCost = leftSolved.initialCost;
-        report.candLeftFinalCost = leftSolved.finalCost;
-        report.candRightInitialCost = rightSolved.initialCost;
-        report.candRightFinalCost = rightSolved.finalCost;
-        const SpanDeviationMetrics deviations =
-            spanDeviationMetrics(chosen.points, normalSampler_, config);
-        report.chosenMaxEvenStepDeviation = deviations.maxEvenStepDeviation;
-        report.chosenMaxTangentSmoothDeviation = deviations.maxTangentSmoothDeviation;
-        report.chosenMaxNormalSmoothDeviation = deviations.maxNormalSmoothDeviation;
-        report.chosenMaxNormalAlignmentAbs = deviations.maxNormalAlignmentAbs;
-        report.chosen = chooseLeft ? "left" : "right";
-        spanReports.push_back(report);
-        optimizedSpans.push_back(chosen.points);
+                                         span.candidateFinalCostDiff);
+        spanReports.push_back(span.report);
+        optimizedSpans.push_back(std::move(span.points));
     }
 
     std::vector<cv::Vec3d> stitchedInternal;

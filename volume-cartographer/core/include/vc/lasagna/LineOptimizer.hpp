@@ -92,6 +92,7 @@ struct LineControlPoint {
 struct LineControlPointUpdateResult {
     std::vector<cv::Vec3d> linePoints;
     std::vector<LineControlPoint> controlPoints;
+    std::vector<LineReinitializationSpanReport> initializedSpans;
     int changedControlIndex = -1;
     int activeStart = -1;
     int activeEnd = -1;

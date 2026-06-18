@@ -477,6 +477,62 @@ TEST_CASE("LineOptimizer local update range covers three neighboring control spa
     CHECK(update.activeEnd == update.controlPoints[7].optimizedIndex);
 }
 
+TEST_CASE("LineOptimizer normal-aware control update uses two-sided span trials")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 40; ++i) {
+        linePoints.push_back({static_cast<double>(i), 0.0, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls;
+    for (int i = 0; i <= 40; i += 5) {
+        controls.push_back({static_cast<double>(i),
+                            linePoints[static_cast<size_t>(i)],
+                            i == 20,
+                            i});
+    }
+    controls[4].volumePoint = {20.0, 1.0, 0.0};
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 1.0;
+    config.segmentsPerSide = 3;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    const auto update = vc::lasagna::updateExistingLineControlPoint(linePoints,
+                                                                    std::move(controls),
+                                                                    4,
+                                                                    sampler,
+                                                                    config);
+
+    REQUIRE(update.controlPoints.size() == 9);
+    REQUIRE(update.initializedSpans.size() == 2);
+    CHECK(update.changedControlIndex == 4);
+    CHECK(update.initializedSpans[0].leftControlIndex == 3);
+    CHECK(update.initializedSpans[0].rightControlIndex == 4);
+    CHECK(update.initializedSpans[1].leftControlIndex == 4);
+    CHECK(update.initializedSpans[1].rightControlIndex == 5);
+    for (const auto& span : update.initializedSpans) {
+        CHECK(span.candLeftSelectedSign != 0);
+        CHECK(span.candRightSelectedSign != 0);
+        CHECK(std::isfinite(span.candLeftClosestTargetDistance));
+        CHECK(std::isfinite(span.candRightClosestTargetDistance));
+        CHECK(span.points >= 2);
+    }
+    CHECK(update.activeStart == update.controlPoints[1].optimizedIndex);
+    CHECK(update.activeEnd == update.controlPoints[7].optimizedIndex);
+    CHECK(norm(update.linePoints[static_cast<size_t>(update.controlPoints[4].optimizedIndex)] -
+               cv::Vec3d{20.0, 1.0, 0.0}) == doctest::Approx(0.0).epsilon(1.0e-12));
+}
+
 TEST_CASE("LineOptimizer open-end control update grows a new extension")
 {
     ConstantNormalSampler sampler({0.0, 0.0, 1.0});
