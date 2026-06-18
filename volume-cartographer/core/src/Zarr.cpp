@@ -296,8 +296,8 @@ void buildPyramidLevel(const std::filesystem::path& outDir, int level,
             }
         }
 
-        dst->writeChunk(0, dcy, dcx,
-                        dstBuf.data(), dstBuf.size() * sizeof(T));
+        dst->writeChunkSkipEmpty(0, dcy, dcx,
+                                 dstBuf.data(), dstBuf.size() * sizeof(T));
 
         size_t d = ++done;
         #pragma omp critical(pp)
@@ -316,7 +316,10 @@ template void buildPyramidLevel<uint16_t>(const std::filesystem::path&, int, siz
 
 void createPyramidDatasets(const std::filesystem::path& outDir,
                            const std::vector<size_t>& shape0,
-                           size_t CH, size_t CW, bool isU16)
+                           size_t CH, size_t CW, bool isU16,
+                           const std::string& compressor,
+                           int compressionLevel,
+                           const std::string& dimensionSeparator)
 {
     auto dtype = isU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
 
@@ -326,7 +329,8 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
         std::vector<size_t> shape = {prevShape[0], (prevShape[1]+1)/2, (prevShape[2]+1)/2};
         size_t chZ = std::min(shape[0], shape0[0]);
         std::vector<size_t> chunks = {chZ, std::min(CH, shape[1]), std::min(CW, shape[2])};
-        vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype, "blosc");
+        vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype,
+                              compressor, dimensionSeparator, 0, compressionLevel);
         prevShape = shape;
     }
 }
