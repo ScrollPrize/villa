@@ -189,6 +189,7 @@ public:
     void setLineAnnotationPlacementPreviewEnabled(bool enabled);
     bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
     bool lineAnnotationPlacementMarkerVisible() const;
+    void markSurfaceGeometryChanged();
     void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
@@ -316,6 +317,7 @@ private:
         float overlayWindowLow = 0.0f;
         float overlayWindowHigh = 255.0f;
         std::uint64_t chunkContentEpoch = 0;
+        std::uint64_t surfaceGeometryEpoch = 0;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
         bool genCacheDirty = false;
         std::string profileReason;
@@ -393,6 +395,7 @@ private:
     bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
     std::uint64_t _chunkContentEpoch = 0;
+    std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _renderSerial = 0;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;

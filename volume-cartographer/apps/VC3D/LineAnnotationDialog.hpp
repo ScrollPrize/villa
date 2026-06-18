@@ -121,7 +121,7 @@ private:
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
-    void setCurrentLinePosition(double position);
+    void setCurrentLinePosition(double position, bool updateBottomCuts = true);
     void cancelControlPointPreviewAnimation();
     void jumpToPreviousControlPoint();
     void jumpToNextControlPoint();
@@ -131,14 +131,15 @@ private:
     bool shiftBottomSlicesByScrollSteps(int steps);
     bool scaleBottomSliceLineStepByScrollSteps(int steps);
     bool handleBottomSliceStepWheel(QWheelEvent* event);
+    void handleShiftScrollModeChanged();
     void setCurrentCutFollowsStripMouse(bool follows);
-    void recenterBottomSlicesOnCurrentPosition();
     double snappedControlPointPosition(double position) const;
     void rebuildGeneratedStaticStripOverlays();
-    void rebuildGeneratedDynamicOverlays();
+    void rebuildGeneratedDynamicOverlays(bool includeBottomCuts = true);
     void rebuildGeneratedOverlays();
     void installGeneratedViewShortcuts();
     void resetGeneratedViews();
+    bool toggleCurrentCutFollowFromKeyboard();
     bool rotateCurrentCut(vc3d::line_annotation::GeneratedCutRotationAxis axis, float radians);
     cv::Vec3f currentCutViewerCenterVolumePoint() const;
     void captureInitialGeneratedViewState();
@@ -165,7 +166,6 @@ private:
                                      QuadSurface* surface,
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
-    void renderBottomSlicePlanes(const char* reason);
     void updateOptimizationOverlayGeometry();
 
     ViewerManager* _viewerManager = nullptr;
@@ -188,7 +188,6 @@ private:
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
-    std::vector<QPointer<CChunkedVolumeViewer>> _bottomSliceViewers;
     GeneratedViews _generatedViews;
     bool _hasGeneratedViews = false;
     double _currentLinePosition = 0.0;
@@ -207,5 +206,4 @@ private:
     bool _haveInitialCurrentCutCamera = false;
     CChunkedVolumeViewer::CameraState _initialCurrentCutCamera;
     std::vector<CChunkedVolumeViewer::CameraState> _initialStripCameras;
-    std::vector<CChunkedVolumeViewer::CameraState> _initialBottomSliceCameras;
 };

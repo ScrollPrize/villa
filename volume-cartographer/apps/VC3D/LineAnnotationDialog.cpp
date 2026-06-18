@@ -7,6 +7,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <QAbstractItemView>
 #include <QBrush>
 #include <QComboBox>
 #include <QEvent>
@@ -100,6 +101,17 @@ bool finitePoint(const cv::Vec3f& point)
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
 }
 
+void installComboEventFilter(QComboBox* combo, QObject* filter)
+{
+    if (!combo || !filter) {
+        return;
+    }
+    combo->installEventFilter(filter);
+    if (auto* popupView = combo->view()) {
+        popupView->installEventFilter(filter);
+    }
+}
+
 cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
 {
     const float n = cv::norm(vector);
@@ -140,7 +152,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _initialDirectionCombo->addItem(tr("sideways"), static_cast<int>(InitialDirectionMode::Sideways));
     _initialDirectionCombo->addItem(tr("z (in/out)"), static_cast<int>(InitialDirectionMode::ZInOut));
     _initialDirectionCombo->setCurrentIndex(1);
-    _initialDirectionCombo->installEventFilter(this);
+    installComboEventFilter(_initialDirectionCombo, this);
     buttonLayout->addWidget(_initialDirectionCombo);
     _reoptimizationCombo = new QComboBox(buttonRow);
     _reoptimizationCombo->addItem(tr("auto-reopt"),
@@ -148,7 +160,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _reoptimizationCombo->addItem(tr("no optimization"),
                                   static_cast<int>(ReoptimizationMode::NoOptimization));
     _reoptimizationCombo->setCurrentIndex(0);
-    _reoptimizationCombo->installEventFilter(this);
+    installComboEventFilter(_reoptimizationCombo, this);
     buttonLayout->addWidget(_reoptimizationCombo);
     connect(_reoptimizationCombo,
             qOverload<int>(&QComboBox::currentIndexChanged),
@@ -162,8 +174,14 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _shiftScrollCombo->addItem(tr("straight"),
                                static_cast<int>(ShiftScrollMode::StraightNormal));
     _shiftScrollCombo->setCurrentIndex(0);
-    _shiftScrollCombo->installEventFilter(this);
+    installComboEventFilter(_shiftScrollCombo, this);
     buttonLayout->addWidget(_shiftScrollCombo);
+    connect(_shiftScrollCombo,
+            qOverload<int>(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                handleShiftScrollModeChanged();
+            });
     if (volumeSelectorFactory) {
         if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
             volumeSelector->installEventFilter(this);
@@ -362,7 +380,6 @@ bool LineAnnotationDialog::setGeneratedRows(
     _suppressPaneClosed = false;
     _panes.clear();
     _stripViewers.clear();
-    _bottomSliceViewers.clear();
     _currentCutViewer = nullptr;
     _hasGeneratedViews = false;
     _currentCutManualRotation = cv::Matx33f::eye();
@@ -371,7 +388,6 @@ bool LineAnnotationDialog::setGeneratedRows(
     _generatedControlIndex = {};
     _haveInitialCurrentCutCamera = false;
     _initialStripCameras.clear();
-    _initialBottomSliceCameras.clear();
 
     for (const auto& row : rows) {
         if (row.empty()) {
@@ -489,7 +505,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 {
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
         views.lineUpVectors.size() != views.linePoints.size() ||
-        !views.currentCutSurface || views.bottomCutSurfaces.empty()) {
+        !views.currentCutSurface) {
         return false;
     }
 
@@ -522,14 +538,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         }
     }
 
-    std::vector<CChunkedVolumeViewer::CameraState> bottomSliceCameras;
-    bottomSliceCameras.reserve(_bottomSliceViewers.size());
-    for (const auto& viewer : _bottomSliceViewers) {
-        if (viewer) {
-            bottomSliceCameras.push_back(viewer->cameraState());
-        }
-    }
-
     clearGeneratedOverlayRefreshConnections();
     _suppressPaneClosed = true;
     if (_mdiArea) {
@@ -548,7 +556,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedTopWidget = nullptr;
     _panes.clear();
     _stripViewers.clear();
-    _bottomSliceViewers.clear();
     _currentCutViewer = nullptr;
 
     _generatedViews = views;
@@ -602,9 +609,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
     currentViewer->setShiftScrollOverride(
         [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
-            if (modifiers.testFlag(Qt::ControlModifier)) {
-                return scaleBottomSliceLineStepByScrollSteps(steps);
-            }
+            (void)modifiers;
             if (shiftScrollMode() == ShiftScrollMode::StraightNormal) {
                 return shiftCurrentCutPlaneStraightByScrollSteps(steps);
             }
@@ -711,67 +716,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         ++stripIndex;
     }
 
-    auto* bottomWidget = new QWidget(this);
-    bottomWidget->installEventFilter(this);
-    auto* bottomLayout = new QHBoxLayout(bottomWidget);
-    bottomLayout->setContentsMargins(0, 0, 0, 0);
-    bottomLayout->setSpacing(0);
-    _generatedContainers.push_back(bottomWidget);
-    _layout->addWidget(bottomWidget, 1);
-
-    const int bottomCount = std::min<int>(kBottomCrossSliceCount,
-                                          static_cast<int>(views.bottomCutSurfaces.size()));
-    for (int slot = 0; slot < bottomCount; ++slot) {
-        const double position = bottomSliceLinePosition(slot, bottomCount);
-        const auto& [surfaceName, plane] = views.bottomCutSurfaces[static_cast<size_t>(slot)];
-        if (!updatePlaneSurface(plane.get(), position)) {
-            return false;
-        }
-        auto* base = _viewerManager->createViewerInWidget(
-            surfaceName,
-            bottomWidget,
-            ViewerManager::ViewerRole::Annotation);
-        auto* viewer = base ? qobject_cast<CChunkedVolumeViewer*>(base->asQObject()) : nullptr;
-        if (!viewer) {
-            return false;
-        }
-        viewer->setObjectName(tr("Line Z Slice %1").arg(slot));
-        viewer->applyCameraState(static_cast<size_t>(slot) < bottomSliceCameras.size()
-                                     ? bottomSliceCameras[static_cast<size_t>(slot)]
-                                     : generatedPaneCamera(viewer, camera),
-                                 false);
-        viewer->setShiftScrollOverride(
-            [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
-                if (modifiers.testFlag(Qt::ControlModifier)) {
-                    return scaleBottomSliceLineStepByScrollSteps(steps);
-                }
-                return shiftBottomSlicesByScrollSteps(steps);
-            });
-        bindPaneInteractions(surfaceName, viewer, false);
-        connect(viewer,
-                &CChunkedVolumeViewer::sendMousePressVolume,
-                this,
-                [this, surfaceName, slot](cv::Vec3f volumePoint,
-                                          cv::Vec3f,
-                                          Qt::MouseButton button,
-                                          Qt::KeyboardModifiers modifiers,
-                                          QPointF) {
-                    if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
-                        emit generatedPredSnapPointRequested(surfaceName, volumePoint);
-                    } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
-                        const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
-                        const double linePosition = bottomSliceLinePosition(slot, bottomCount);
-                        setCurrentCutFollowsStripMouse(true);
-                        setCurrentLinePosition(linePosition);
-                        emit generatedControlPointRequested(surfaceName, volumePoint, linePosition);
-                    }
-                });
-        bottomLayout->addWidget(viewer, 1);
-        _bottomSliceViewers.push_back(viewer);
-        _panes.push_back(Pane{surfaceName, viewer, {}});
-        connectGeneratedOverlayRefresh(viewer);
-    }
-
     if (_generatedTopWidget && _currentCutViewer) {
         _currentCutViewer->setFixedWidth(std::max(1, _generatedTopWidget->height()));
     }
@@ -809,15 +753,6 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(const std::string& su
             if (viewer == _stripViewers[i]) {
                 linePosition = linePositionFromStripScene(viewer, scenePoint);
                 break;
-            }
-        }
-        if (!std::isfinite(linePosition)) {
-            const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
-            for (int slot = 0; slot < bottomCount; ++slot) {
-                if (viewer == _bottomSliceViewers[static_cast<size_t>(slot)]) {
-                    linePosition = bottomSliceLinePosition(slot, bottomCount);
-                    break;
-                }
             }
         }
     }
@@ -882,20 +817,25 @@ double LineAnnotationDialog::linePositionFromStripScene(CChunkedVolumeViewer* vi
     return vc3d::line_annotation::generatedLinePositionFromStripScene(viewer, scenePoint);
 }
 
-void LineAnnotationDialog::setCurrentLinePosition(double position)
+void LineAnnotationDialog::setCurrentLinePosition(double position, bool updateBottomCuts)
 {
     if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
         return;
     }
     position = std::clamp(position, 0.0, static_cast<double>(_generatedViews.linePoints.size() - 1));
     const bool currentChanged = std::abs(position - _currentLinePosition) >= 1.0e-3;
-    const bool bottomChanged = std::abs(position - _bottomCenterPosition) >= 1.0e-3;
+    const bool bottomChanged =
+        updateBottomCuts && std::abs(position - _bottomCenterPosition) >= 1.0e-3;
     if (!currentChanged && !bottomChanged) {
         return;
     }
-    if (currentChanged && _generatedViews.currentCutSurface && !_currentCutStraightOffsetActive) {
+    if (currentChanged && _generatedViews.currentCutSurface) {
+        _currentCutStraightOffsetActive = false;
         _currentLinePosition = position;
         (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
+        if (_currentCutViewer) {
+            _currentCutViewer->markSurfaceGeometryChanged();
+        }
     } else {
         _currentLinePosition = position;
     }
@@ -904,9 +844,8 @@ void LineAnnotationDialog::setCurrentLinePosition(double position)
     }
     if (bottomChanged) {
         _bottomCenterPosition = position;
-        renderBottomSlicePlanes("line annotation bottom cuts follow current");
     }
-    rebuildGeneratedDynamicOverlays();
+    rebuildGeneratedDynamicOverlays(updateBottomCuts);
 }
 
 void LineAnnotationDialog::cancelControlPointPreviewAnimation()
@@ -1030,7 +969,10 @@ bool LineAnnotationDialog::shiftCurrentCutPlaneStraightByScrollSteps(int steps)
     if (!finitePoint(shiftedOrigin)) {
         return true;
     }
-    plane->setOrigin(shiftedOrigin);
+    plane->setFromNormalAndUp(shiftedOrigin, normal, plane->basisY());
+    if (_currentCutViewer) {
+        _currentCutViewer->markSurfaceGeometryChanged();
+    }
     _currentCutStraightOffsetActive = true;
     if (_currentCutViewer) {
         _currentCutViewer->renderVisible(true, "line annotation current cut straight shift");
@@ -1042,10 +984,6 @@ bool LineAnnotationDialog::shiftCurrentCutPlaneStraightByScrollSteps(int steps)
 bool LineAnnotationDialog::shiftBottomSlicesByScrollSteps(int steps)
 {
     if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
-        return true;
-    }
-    const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
-    if (bottomCount <= 0) {
         return true;
     }
     const int sliceStepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
@@ -1072,7 +1010,6 @@ bool LineAnnotationDialog::scaleBottomSliceLineStepByScrollSteps(int steps)
     }
     _bottomSliceLineStep = lineStep;
     updateBottomSliceStepLabel();
-    renderBottomSlicePlanes("line annotation bottom cut spacing");
     rebuildGeneratedDynamicOverlays();
     return true;
 }
@@ -1101,17 +1038,32 @@ bool LineAnnotationDialog::handleBottomSliceStepWheel(QWheelEvent* event)
     return true;
 }
 
+void LineAnnotationDialog::handleShiftScrollModeChanged()
+{
+    if (shiftScrollMode() != ShiftScrollMode::AlongLine) {
+        return;
+    }
+    setCurrentCutFollowsStripMouse(true);
+    if (!_hasGeneratedViews || !_generatedViews.currentCutSurface) {
+        return;
+    }
+    if (!_currentCutStraightOffsetActive) {
+        return;
+    }
+    _currentCutStraightOffsetActive = false;
+    if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition)) {
+        return;
+    }
+    if (_currentCutViewer) {
+        _currentCutViewer->markSurfaceGeometryChanged();
+        _currentCutViewer->renderVisible(true, "line annotation current cut along-line mode");
+    }
+    rebuildGeneratedDynamicOverlays();
+}
+
 void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 {
     _currentCutFollowsStripMouse = follows;
-}
-
-void LineAnnotationDialog::recenterBottomSlicesOnCurrentPosition()
-{
-    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
-        return;
-    }
-    setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
 }
 
 void LineAnnotationDialog::installGeneratedViewShortcuts()
@@ -1139,6 +1091,12 @@ void LineAnnotationDialog::installGeneratedViewShortcuts()
     bindNavigationShortcut(Qt::Key_E, &LineAnnotationDialog::jumpToPreviousControlPoint);
     bindNavigationShortcut(Qt::Key_R, &LineAnnotationDialog::previewClosestControlPoint);
     bindNavigationShortcut(Qt::Key_T, &LineAnnotationDialog::jumpToNextControlPoint);
+
+    auto* spaceShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
+    spaceShortcut->setContext(Qt::WindowShortcut);
+    connect(spaceShortcut, &QShortcut::activated, this, [this]() {
+        (void)toggleCurrentCutFollowFromKeyboard();
+    });
 }
 
 cv::Vec3f LineAnnotationDialog::currentCutViewerCenterVolumePoint() const
@@ -1171,6 +1129,7 @@ bool LineAnnotationDialog::rotateCurrentCut(vc3d::line_annotation::GeneratedCutR
     if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition)) {
         return false;
     }
+    _currentCutViewer->markSurfaceGeometryChanged();
     if (finitePoint(centerVolumePoint)) {
         _currentCutViewer->centerOnVolumePoint(centerVolumePoint, false);
     }
@@ -1197,13 +1156,6 @@ void LineAnnotationDialog::captureInitialGeneratedViewState()
             _initialStripCameras.push_back(viewer->cameraState());
         }
     }
-    _initialBottomSliceCameras.clear();
-    _initialBottomSliceCameras.reserve(_bottomSliceViewers.size());
-    for (const auto& viewer : _bottomSliceViewers) {
-        if (viewer) {
-            _initialBottomSliceCameras.push_back(viewer->cameraState());
-        }
-    }
 }
 
 void LineAnnotationDialog::restoreInitialGeneratedViewerCameras()
@@ -1214,11 +1166,6 @@ void LineAnnotationDialog::restoreInitialGeneratedViewerCameras()
     for (size_t i = 0; i < _stripViewers.size() && i < _initialStripCameras.size(); ++i) {
         if (_stripViewers[i]) {
             _stripViewers[i]->applyCameraState(_initialStripCameras[i], false);
-        }
-    }
-    for (size_t i = 0; i < _bottomSliceViewers.size() && i < _initialBottomSliceCameras.size(); ++i) {
-        if (_bottomSliceViewers[i]) {
-            _bottomSliceViewers[i]->applyCameraState(_initialBottomSliceCameras[i], false);
         }
     }
 }
@@ -1249,8 +1196,10 @@ void LineAnnotationDialog::resetGeneratedViews()
 
     if (_generatedViews.currentCutSurface) {
         (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
+        if (_currentCutViewer) {
+            _currentCutViewer->markSurfaceGeometryChanged();
+        }
     }
-    renderBottomSlicePlanes("line annotation reset bottom cuts");
     restoreInitialGeneratedViewerCameras();
     if (_currentCutViewer) {
         _currentCutViewer->renderVisible(true, "line annotation reset current cut");
@@ -1260,30 +1209,7 @@ void LineAnnotationDialog::resetGeneratedViews()
             viewer->renderVisible(true, "line annotation reset strip view");
         }
     }
-    for (const auto& viewer : _bottomSliceViewers) {
-        if (viewer) {
-            viewer->renderVisible(true, "line annotation reset bottom view");
-        }
-    }
     rebuildGeneratedOverlays();
-}
-
-void LineAnnotationDialog::renderBottomSlicePlanes(const char* reason)
-{
-    const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
-    if (bottomCount <= 0) {
-        return;
-    }
-    for (int slot = 0; slot < bottomCount; ++slot) {
-        auto* viewer = _bottomSliceViewers[static_cast<size_t>(slot)].data();
-        if (!viewer) {
-            continue;
-        }
-        const double position = bottomSliceLinePosition(slot, bottomCount);
-        const auto& plane = _generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].second;
-        (void)updatePlaneSurface(plane.get(), position);
-        viewer->renderVisible(true, reason);
-    }
 }
 
 double LineAnnotationDialog::snappedControlPointPosition(double position) const
@@ -1363,11 +1289,12 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
     }
 }
 
-void LineAnnotationDialog::rebuildGeneratedDynamicOverlays()
+void LineAnnotationDialog::rebuildGeneratedDynamicOverlays(bool includeBottomCuts)
 {
     if (!_hasGeneratedViews) {
         return;
     }
+    (void)includeBottomCuts;
 
     const GeneratedOverlay strip = dynamicStripOverlay();
     for (size_t i = 0; i < _stripViewers.size(); ++i) {
@@ -1387,22 +1314,6 @@ void LineAnnotationDialog::rebuildGeneratedDynamicOverlays()
                                             true,
                                             _currentCutViewer,
                                             _generatedViews.currentCutSurface.get()));
-    }
-
-    const int bottomCount = static_cast<int>(_bottomSliceViewers.size());
-    if (bottomCount <= 0 || _generatedViews.linePoints.empty()) {
-        return;
-    }
-    for (int slot = 0; slot < bottomCount; ++slot) {
-        auto* viewer = _bottomSliceViewers[static_cast<size_t>(slot)].data();
-        if (!viewer) {
-            continue;
-        }
-        const double position = bottomSliceLinePosition(slot, bottomCount);
-        const auto& plane = _generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].second;
-        applyOverlayForViewer(_generatedViews.bottomCutSurfaces[static_cast<size_t>(slot)].first,
-                              viewer,
-                              zSliceOverlay(position, false, viewer, plane.get()));
     }
 }
 
@@ -1568,29 +1479,36 @@ void LineAnnotationDialog::resizeEvent(QResizeEvent* event)
     updateOptimizationOverlayGeometry();
 }
 
+bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
+{
+    if (shiftScrollMode() == ShiftScrollMode::StraightNormal &&
+        _currentCutStraightOffsetActive) {
+        _currentCutStraightOffsetActive = false;
+        _currentCutManualRotation = cv::Matx33f::eye();
+        _currentCutManualRotationActive = false;
+        (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
+        if (_currentCutViewer) {
+            _currentCutViewer->markSurfaceGeometryChanged();
+            _currentCutViewer->renderVisible(true, "line annotation current cut snap to line");
+        }
+        rebuildGeneratedDynamicOverlays();
+    }
+    if (_currentCutFollowsStripMouse) {
+        setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
+        setCurrentCutFollowsStripMouse(false);
+    } else {
+        setCurrentCutFollowsStripMouse(true);
+    }
+    return true;
+}
+
 bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 {
     if (!event) {
         return false;
     }
     if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
-        if (shiftScrollMode() == ShiftScrollMode::StraightNormal &&
-            _currentCutStraightOffsetActive) {
-            _currentCutStraightOffsetActive = false;
-            _currentCutManualRotation = cv::Matx33f::eye();
-            _currentCutManualRotationActive = false;
-            (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
-            if (_currentCutViewer) {
-                _currentCutViewer->renderVisible(true, "line annotation current cut snap to line");
-            }
-            rebuildGeneratedDynamicOverlays();
-        }
-        if (_currentCutFollowsStripMouse) {
-            setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
-            setCurrentCutFollowsStripMouse(false);
-        } else {
-            setCurrentCutFollowsStripMouse(true);
-        }
+        (void)toggleCurrentCutFollowFromKeyboard();
         event->accept();
         return true;
     }

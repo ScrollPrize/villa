@@ -2222,6 +2222,7 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.overlayWindowLow = _overlayWindowLow;
     job.overlayWindowHigh = _overlayWindowHigh;
     job.chunkContentEpoch = _chunkContentEpoch;
+    job.surfaceGeometryEpoch = _surfaceGeometryEpoch;
     job.genCache = _genSurfaceCache;
     job.genCacheDirty = _genCacheDirty;
     job.profileReason = reason ? reason : "";
@@ -2261,6 +2262,7 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
            a.overlayWindowLow == b.overlayWindowLow &&
            a.overlayWindowHigh == b.overlayWindowHigh &&
            a.chunkContentEpoch == b.chunkContentEpoch &&
+           a.surfaceGeometryEpoch == b.surfaceGeometryEpoch &&
            a.genCacheDirty == b.genCacheDirty;
 }
 
@@ -3212,6 +3214,16 @@ void CChunkedVolumeViewer::setLineAnnotationPlacementPreviewEnabled(bool enabled
 bool CChunkedVolumeViewer::lineAnnotationPlacementMarkerVisible() const
 {
     return _lineAnnotationPlacementMarker && _lineAnnotationPlacementMarker->isVisible();
+}
+
+void CChunkedVolumeViewer::markSurfaceGeometryChanged()
+{
+    if (_closing) {
+        return;
+    }
+    ++_surfaceGeometryEpoch;
+    _genCacheDirty = true;
+    _surfaceChunkPrefetchCache = {};
 }
 
 void CChunkedVolumeViewer::updateLineAnnotationPlacementMarker(const QPointF& scenePos)
