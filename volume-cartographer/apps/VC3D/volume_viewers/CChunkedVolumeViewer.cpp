@@ -1886,12 +1886,13 @@ struct CChunkedVolumeViewer::RenderResult {
     float surfacePtrX = 0.0f;
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
-    qint64 renderFrameElapsedMs = 0;
+    double renderFrameElapsedMs = 0.0;
 };
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
 {
     QElapsedTimer renderTimer;
+    renderTimer.start();
     // Sub-phase timing (only meaningful under --profile). gen = surface coords,
     // sample = chunk sample/decode, blit = colormap LUT + framebuffer write.
     const bool profilePhases = ProfileLoggingEnabled();
@@ -1899,7 +1900,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     bool phaseGenCached = false;
     QElapsedTimer phaseTimer;
     if (ProfileLoggingEnabled()) {
-        renderTimer.start();
         Logger()->info("[vc3d-profile] renderFrame begin reason='{}' caller='{}' serial={} surf='{}' size={}x{} level={} overlay={} composite={} planeComposite={}",
                        ctx.profileReason, ctx.profileCaller, ctx.serial,
                        ctx.surf ? ctx.surf->id : std::string(""),
@@ -1916,9 +1916,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.framebuffer.fill(QColor(64, 64, 64));
 
     auto finishRenderFrameProfile = [&]() {
-        if (!ProfileLoggingEnabled() || !renderTimer.isValid())
+        result.renderFrameElapsedMs = static_cast<double>(renderTimer.nsecsElapsed()) / 1000000.0;
+        if (!ProfileLoggingEnabled())
             return;
-        result.renderFrameElapsedMs = renderTimer.elapsed();
         Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} gen_ms={} genCached={} sample_ms={} blit_ms={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
                        result.renderFrameElapsedMs, phaseGenMs, phaseGenCached,
                        phaseSampleMs, phaseBlitMs, ctx.profileReason, ctx.profileCaller,

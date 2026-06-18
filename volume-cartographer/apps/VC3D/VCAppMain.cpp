@@ -24,6 +24,7 @@
 #include <omp.h>
 #include <blosc.h>
 #include <cstdlib>
+#include <cstring>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -56,6 +57,15 @@ static void setThreadPoliciesEarly()
 __attribute__((section(".preinit_array"), used))
 static auto preinitFn = &setThreadPoliciesEarly;
 #endif
+
+static bool hasCliFlag(int argc, char* argv[], const char* flag)
+{
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && std::strcmp(argv[i], flag) == 0)
+            return true;
+    }
+    return false;
+}
 
 __attribute__((visibility("default")))
 auto main(int argc, char* argv[]) -> int
@@ -121,6 +131,14 @@ auto main(int argc, char* argv[]) -> int
     // compare or debug the dedup path.
     if (qEnvironmentVariableIsEmpty("VC_DISABLE_FETCHINTERACTIVE_DEDUP")) {
         qputenv("VC_DISABLE_FETCHINTERACTIVE_DEDUP", "1");
+    }
+
+    // Qt selects its platform plugin while QApplication is constructed, before
+    // QCommandLineParser runs. Pre-scan this replay flag so the flag alone is
+    // enough for headless offscreen benchmarking.
+    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM") &&
+        hasCliFlag(argc, argv, "--replay-offscreen-4k")) {
+        qputenv("QT_QPA_PLATFORM", "offscreen");
     }
 
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
@@ -230,7 +248,7 @@ auto main(int argc, char* argv[]) -> int
     benchOptions.replaySkipChunkComplete = parser.isSet(replaySkipChunkCompleteOption);
     benchOptions.replaySkipFastRender = parser.isSet(replaySkipFastRenderOption);
 
-    if (parser.isSet(profileOption) || !benchOptions.replayPath.isEmpty()) {
+    if (parser.isSet(profileOption)) {
         SetProfileLoggingEnabled(true);
         Logger()->info("[vc3d-profile] enabled");
     }
