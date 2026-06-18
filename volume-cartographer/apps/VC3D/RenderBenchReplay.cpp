@@ -151,6 +151,10 @@ bool RenderBenchReplay::load(const QString& path)
 
     _keyframes.clear();
     for (const auto v : root["keyframes"].toArray()) {
+        if (_replayLimit > 0 &&
+            static_cast<int>(_keyframes.size()) >= _replayLimit) {
+            break;
+        }
         const auto o = v.toObject();
         Keyframe kf;
         kf.surface = o["surface"].toString();

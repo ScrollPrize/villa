@@ -223,6 +223,13 @@ auto main(int argc, char* argv[]) -> int
         "With --replay, force the replay viewport to 3840x2160.");
     parser.addOption(replayOffscreen4kOption);
 
+    QCommandLineOption replayLimitOption(
+        "replay-limit",
+        "With --replay, replay only the first N recorded keyframes (0 = all).",
+        "frames",
+        "0");
+    parser.addOption(replayLimitOption);
+
     QCommandLineOption replaySkipChunkCompleteOption(
         "replay-skip-chunk-complete",
         "With --replay, advance after the first full render instead of waiting for chunk-complete quiet settle.");
@@ -260,6 +267,9 @@ auto main(int argc, char* argv[]) -> int
     benchOptions.replaySkipChunkComplete = parser.isSet(replaySkipChunkCompleteOption);
     benchOptions.replaySkipFastRender = parser.isSet(replaySkipFastRenderOption);
     benchOptions.replayTimedProfile = parser.isSet(replayTimedProfileOption);
+    bool limitOk = false;
+    const int replayLimit = parser.value(replayLimitOption).toInt(&limitOk);
+    benchOptions.replayLimit = (limitOk && replayLimit > 0) ? replayLimit : 0;
     bool periodOk = false;
     const int timedPeriod = parser.value(replayTimedProfilePeriodOption).toInt(&periodOk);
     benchOptions.replayTimedProfilePeriodMs = (periodOk && timedPeriod > 0) ? timedPeriod : 200;

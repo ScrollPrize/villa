@@ -203,8 +203,9 @@ void CVolumeViewerView::drawTiltHandle(QPainter* p) const
 
 void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/)
 {
+    painter->resetTransform();
+    painter->fillRect(viewport()->rect(), Qt::black);
     if (_directFb && !_directFb->isNull()) {
-        painter->resetTransform();
         const QRectF target(
             _directFbOffset,
             QSizeF(_directFb->width() * _directFbScale,

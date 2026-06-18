@@ -65,6 +65,7 @@ struct RenderBenchOptions {
     bool replaySkipFastRender = false;
     bool replayTimedProfile = false;
     int replayTimedProfilePeriodMs = 200;
+    int replayLimit = 0;
 };
 
 struct AtlasSearchFiberSnapshot {

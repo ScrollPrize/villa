@@ -3,6 +3,7 @@
 #include <QPointer>
 #include <QString>
 
+#include <algorithm>
 #include <functional>
 #include <vector>
 
@@ -42,6 +43,7 @@ public:
     void setSkipFastRender(bool enabled) { _skipFastRender = enabled; }
     void setTimedProfile(bool enabled) { _timedProfile = enabled; }
     void setTimedProfilePeriodMs(int periodMs) { _timedProfilePeriodMs = periodMs; }
+    void setReplayLimit(int limit) { _replayLimit = std::max(0, limit); }
 
     // Opens the recorded volume+segment in the window, then replays every
     // keyframe. Calls QApplication::quit() on completion. Blocking (pumps the
@@ -55,6 +57,7 @@ private:
     bool _skipFastRender = false;
     bool _timedProfile = false;
     int _timedProfilePeriodMs = 200;
+    int _replayLimit = 0;
     Header _header;
     std::vector<Keyframe> _keyframes;
 
