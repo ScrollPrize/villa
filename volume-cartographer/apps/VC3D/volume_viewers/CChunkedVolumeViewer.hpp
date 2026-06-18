@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -98,6 +99,7 @@ public:
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
     void applyCameraState(const CameraState& state, bool forceRender = true);
+    void applyCameraStateForReplayRepaint(const CameraState& state);
     // Render-bench helpers: true when no render is running/queued/pending; count of
     // remote chunk fetches still outstanding. Used by replay to settle each frame.
     bool isRenderQuiescent() const;
@@ -107,14 +109,14 @@ public:
     Surface* currentSurface() const override;
     VCCollection* pointCollection() const override { return _pointCollection; }
 
-    void setCompositeRenderSettings(const CompositeRenderSettings& s) override { if (_closing) return; _compositeSettings = s; scheduleRender("setCompositeRenderSettings"); }
+    void setCompositeRenderSettings(const CompositeRenderSettings& s) override { if (_closing) return; _compositeSettings = s; submitRender("setCompositeRenderSettings"); }
     const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
     bool isCompositeEnabled() const override { return _compositeSettings.enabled && !streamingCompositeUnsupported(); }
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
 
     void setVolumeWindow(float low, float high) override;
-    void setBaseColormap(const std::string& id) override { if (_closing) return; _baseColormapId = id; scheduleRender("setBaseColormap"); }
-    void setStretchValues(bool) { if (_closing) return; scheduleRender("setStretchValues"); }
+    void setBaseColormap(const std::string& id) override { if (_closing) return; _baseColormapId = id; submitRender("setBaseColormap"); }
+    void setStretchValues(bool) { if (_closing) return; submitRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
     void setPlaneIntersectionLinesVisible(bool visible) override;
 
@@ -189,6 +191,7 @@ public:
     void setLineAnnotationPlacementPreviewEnabled(bool enabled);
     bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
     bool lineAnnotationPlacementMarkerVisible() const;
+    void markSurfaceGeometryChanged();
     void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
@@ -257,12 +260,11 @@ signals:
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
     void overlaysUpdated();
+    void renderFrameSubmitted(std::uint64_t serial);
+    void renderFrameCompleted(std::uint64_t serial, double workerElapsedMs);
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
 
 private:
-    void scheduleRender(
-        const char* reason = "internal caller",
-        std::source_location caller = std::source_location::current());
     void quiesceForClose();
     void submitRender(
         const char* reason = "internal caller",
@@ -270,6 +272,7 @@ private:
     void updateStatusLabel();
     void rebuildChunkArray();
     void syncCameraTransform();
+    void requestDirectPaint();
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
@@ -294,9 +297,53 @@ private:
                              int fbW,
                              int fbH);
     void prefetchVisibleSurfaceChunks(int priorityOffset = 0);
+    struct GeneratedSurfaceCache;
+    struct PendingRenderJob {
+        std::uint64_t requestId = 0;
+        int fbW = 0;
+        int fbH = 0;
+        float surfacePtrX = 0.0f;
+        float surfacePtrY = 0.0f;
+        float scale = 1.0f;
+        float zOff = 0.0f;
+        cv::Vec3f zOffWorldDir{0, 0, 0};
+        int startLevel = 0;
+        vc::Sampling samplingMethod = vc::Sampling::Trilinear;
+        CompositeRenderSettings compositeSettings;
+        float windowLow = 0.0f;
+        float windowHigh = 255.0f;
+        std::string baseColormapId;
+        std::shared_ptr<Surface> surf;
+        std::string surfaceName;
+        std::shared_ptr<vc::render::ChunkCache> chunkArray;
+        std::shared_ptr<Volume> overlayVolume;
+        std::shared_ptr<vc::render::ChunkCache> overlayChunkArray;
+        float overlayOpacity = 0.0f;
+        std::string overlayColormapId;
+        float overlayWindowLow = 0.0f;
+        float overlayWindowHigh = 255.0f;
+        std::uint64_t chunkContentEpoch = 0;
+        std::uint64_t surfaceGeometryEpoch = 0;
+        std::shared_ptr<GeneratedSurfaceCache> genCache;
+        bool genCacheDirty = false;
+        std::string profileReason;
+        std::string profileCaller;
+        std::chrono::steady_clock::time_point submittedAt;
+    };
+    std::optional<PendingRenderJob> captureRenderJob(
+        const char* reason,
+        std::source_location caller,
+        const std::shared_ptr<Surface>& surf,
+        int fbW,
+        int fbH,
+        std::chrono::steady_clock::time_point submittedAt);
+    void startRenderJob(PendingRenderJob job);
+    void submitPendingRenderJobIfNeeded();
+    void updateDisplayedFramebufferMapping();
+    static bool renderJobsEquivalentForDisplay(const PendingRenderJob& a,
+                                               const PendingRenderJob& b);
     struct RenderContext;
     struct RenderResult;
-    struct GeneratedSurfaceCache;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
@@ -322,10 +369,9 @@ private:
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
-    // No per-viewer timers: ViewerManager's single global clock drives rendering via
-    // serviceRenderTick(), which drains these flags/countdowns (counts are in ticks).
+    // No per-viewer timers. ViewerManager's global clock only services
+    // intersection/status maintenance; render requests submit immediately.
     bool _closing = false;
-    bool _renderPending = false;
     bool _intersectionPending = false;
     int  _statusRefreshTicks = 0;  // counts down to the periodic status refresh
     // A render was requested while this viewer was hidden (minimized MDI subwindow /
@@ -350,14 +396,14 @@ private:
 
     QImage _framebuffer;
     std::atomic<bool> _renderWorkerBusy{false};
-    bool _renderPendingAfterWorker = false;
+    std::optional<PendingRenderJob> _activeRenderJob;
+    std::optional<PendingRenderJob> _pendingRenderJob;
+    std::optional<PendingRenderJob> _displayedRenderJob;
+    bool _pendingRenderDirty = false;
+    std::uint64_t _renderRequestSerial = 0;
+    std::uint64_t _chunkContentEpoch = 0;
+    std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _renderSerial = 0;
-    // Output-affecting view params of the render currently in flight. A submit that
-    // arrives while the worker is busy only DISCARDS that frame (bumps _renderSerial)
-    // when these change; a data-only refresh lets the in-flight frame finish and
-    // display instead of being thrown away (cuts discarded renders ~19%->5%).
-    std::size_t _inFlightParamsKey = 0;
-    std::size_t viewParamsKey() const;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;

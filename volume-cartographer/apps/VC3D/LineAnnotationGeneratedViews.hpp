@@ -615,6 +615,11 @@ GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& vi
                                                         CChunkedVolumeViewer* viewer,
                                                         PlaneSurface* plane,
                                                         const GeneratedControlPointLinePositionIndex* controlIndex = nullptr);
+GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(const GeneratedViews& views,
+                                                               double linePosition,
+                                                               CChunkedVolumeViewer* viewer,
+                                                               PlaneSurface* plane,
+                                                               const GeneratedControlPointLinePositionIndex* controlIndex = nullptr);
 void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                            const std::string& surfaceName,
                            const GeneratedOverlay& overlay);

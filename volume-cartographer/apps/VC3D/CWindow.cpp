@@ -2144,8 +2144,14 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     // recorder to attach when a volume+segment becomes active.
     if (!_benchOptions.replayPath.isEmpty()) {
         _benchReplay = std::make_unique<RenderBenchReplay>();
+        _benchReplay->setReplayLimit(_benchOptions.replayLimit);
         if (_benchReplay->load(_benchOptions.replayPath)) {
             _benchReplay->setWarmPass(_benchOptions.replayWarm);
+            _benchReplay->setOffscreen4k(_benchOptions.replayOffscreen4k);
+            _benchReplay->setSkipChunkComplete(_benchOptions.replaySkipChunkComplete);
+            _benchReplay->setSkipFastRender(_benchOptions.replaySkipFastRender);
+            _benchReplay->setTimedProfile(_benchOptions.replayTimedProfile);
+            _benchReplay->setTimedProfilePeriodMs(_benchOptions.replayTimedProfilePeriodMs);
             QTimer::singleShot(0, this, [this] { _benchReplay->run(*this); });
         } else {
             _benchReplay.reset();

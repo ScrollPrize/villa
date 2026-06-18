@@ -165,6 +165,27 @@ GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& vi
         linePositionRadius);
 }
 
+GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(
+    const GeneratedViews& views,
+    double linePosition,
+    CChunkedVolumeViewer* viewer,
+    PlaneSurface* plane,
+    const GeneratedControlPointLinePositionIndex* controlIndex)
+{
+    GeneratedOverlay overlay =
+        makeGeneratedCrossSliceOverlayForPlane(views,
+                                               linePosition,
+                                               false,
+                                               viewer,
+                                               plane,
+                                               controlIndex);
+    overlay.pointMarker = {std::numeric_limits<float>::quiet_NaN(),
+                           std::numeric_limits<float>::quiet_NaN(),
+                           std::numeric_limits<float>::quiet_NaN()};
+    overlay.emphasizedPointMarker = false;
+    return overlay;
+}
+
 void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                            const std::string& surfaceName,
                            const GeneratedOverlay& overlay)
