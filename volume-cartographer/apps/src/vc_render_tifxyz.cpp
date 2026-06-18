@@ -268,12 +268,14 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
                                 float scale_seg, float ds_scale,
                                 bool hasAffine, const AffineTransform& aff,
+                                bool flipNormals,
                                 cv::Mat_<cv::Vec3f>& base, cv::Mat_<cv::Vec3f>& dirs)
 {
     base = pts.clone(); base *= scale_seg;
     dirs = nrm.clone();
     if (hasAffine) applyAffineTransform(base, dirs, aff);
     normalizeNormals(dirs);
+    if (flipNormals) dirs *= -1.0f;
     base *= ds_scale;
 }
 
@@ -463,6 +465,7 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     float dsScale,
     bool hasAffine,
     const AffineTransform& aff,
+    bool flipNormals,
     uint32_t rowStart,
     uint32_t rowEnd,
     uint32_t bandH,
@@ -495,7 +498,7 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
         genTile(surf, cv::Size(tgtSize.width, int(dy)), renderScale, u0, v0, bandPts, bandNrm);
 
         cv::Mat_<cv::Vec3f> base, dirs;
-        prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+        prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, flipNormals, base, dirs);
 
         auto region = computeChunkRegionForSamples(base, dirs, offsets, ds, level);
         if (region.valid()) {
@@ -579,6 +582,7 @@ static void renderBands(
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
     bool hasAffine, const AffineTransform& aff,
+    bool flipNormals,
     int numSlices, double sliceStep,
     const std::vector<float>& accumOffsets, AccumType accumType,
     bool isComposite, int compositeStart, int compositeEnd,
@@ -614,7 +618,7 @@ static void renderBands(
         genTile(surf, cv::Size(tgtSize.width, int(dy)), renderScale, u0, v0, bandPts, bandNrm);
 
         cv::Mat_<cv::Vec3f> base, dirs;
-        prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+        prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, flipNormals, base, dirs);
 
         std::vector<cv::Mat> slices;
 
@@ -695,6 +699,7 @@ static void renderTiles(
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
     bool hasAffine, const AffineTransform& aff,
+    bool flipNormals,
     int numSlices, double sliceStep,
     const std::vector<float>& accumOffsets, AccumType accumType,
     bool isComposite, int compositeStart, int compositeEnd,
@@ -822,7 +827,7 @@ static void renderTiles(
 
             // 2. Prepare base coords and step directions
             cv::Mat_<cv::Vec3f> base, dirs;
-            prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+            prepareBaseAndDirs(tilePts, tileNrm, scaleSeg, dsScale, hasAffine, aff, flipNormals, base, dirs);
 
             // 3. Sample all slices for this tile (single-threaded)
             std::vector<cv::Mat_<T>> raw;
@@ -1063,6 +1068,7 @@ int main(int argc, char *argv[])
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
         ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
         ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
+        ("flip-normals", po::bool_switch()->default_value(false), "Flip generated surface normals before sampling")
         ("zarr-output", po::value<std::string>(), "Output path for .zarr (optional)")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
@@ -1228,6 +1234,7 @@ int main(int argc, char *argv[])
     float scale_seg = parsed["scale-segmentation"].as<float>();
     double rotate_angle = parsed["rotate"].as<double>();
     int flip_axis = parsed["flip"].as<int>();
+    const bool flip_normals = parsed["flip-normals"].as<bool>();
     const bool quickTif = parsed["quick-tif"].as<bool>();
 
     // --- Load affines ---
@@ -1372,6 +1379,7 @@ int main(int argc, char *argv[])
         logPrintf(stdout, "Rotation: %.0f degrees\n", rotate_angle);
     }
     if (flip_axis >= 0) logPrintf(stdout, "Flip: %s\n", flip_axis == 0 ? "V" : flip_axis == 1 ? "H" : "Both");
+    if (flip_normals) logPrintf(stdout, "Normal direction: flipped before sampling\n");
 
     if (wantZarr) {
         if (auto p = std::filesystem::path(zarrOutputArg).parent_path(); !p.empty())
@@ -1621,6 +1629,7 @@ int main(int argc, char *argv[])
                 full_size, crop, tgt_size,
                 float(render_scale), scale_seg, ds_scale,
                 hasAffine, affineTransform,
+                flip_normals,
                 rowStart, rowEnd, kPrefetchBandH,
                 num_slices, slice_step, accumOffsets,
                 isCompositeMode, compositeStart, compositeEnd);
@@ -1641,7 +1650,7 @@ int main(int argc, char *argv[])
                 if (useU16)
                     renderTiles<uint16_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
-                        hasAffine, affineTransform, num_slices, slice_step,
+                        hasAffine, affineTransform, flip_normals, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType,
                         dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
@@ -1651,7 +1660,7 @@ int main(int argc, char *argv[])
                 else
                     renderTiles<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
-                        hasAffine, affineTransform, num_slices, slice_step,
+                        hasAffine, affineTransform, flip_normals, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType,
                         dsOut.get(), chunks0, tilesXSrc, tilesYSrc,
@@ -1683,13 +1692,13 @@ int main(int argc, char *argv[])
                 if (useU16)
                     renderBands<uint16_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
-                        hasAffine, affineTransform, num_slices, slice_step,
+                        hasAffine, affineTransform, flip_normals, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
                 else
                     renderBands<uint8_t>(surf.get(), chunk_cache, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
-                        hasAffine, affineTransform, num_slices, slice_step,
+                        hasAffine, affineTransform, flip_normals, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
             }
