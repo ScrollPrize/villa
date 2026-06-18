@@ -69,7 +69,7 @@ Contestants can also contribute to our two primary subproblems:
 </Admonition>
 
 <Admonition type="info" icon="🖋️" title="Ink Detection">
-* Prizes: 7 x \$60,000 [First Letters and First Title Prizes](prizes#first-letters-and-title-prizes)
+* Prizes: \$60,000 each [First Letters and First Title Prizes](prizes#first-letters-and-title-prizes)
 * Starting point: [Ink detection tutorial](tutorial5)
 </Admonition>
 
