@@ -1280,7 +1280,8 @@ std::string serialize_zarray(const ZarrMetadata& meta) {
 
     // dtype
     s += "  \"dtype\": \"";
-    s += meta.byte_order;
+    // Byte order is not applicable to single-byte dtypes; zarr v2 uses '|'.
+    s += (dtype_size(meta.dtype) == 1) ? '|' : meta.byte_order;
     s += dtype_string_v2(meta.dtype);
     s += "\",\n";
 
