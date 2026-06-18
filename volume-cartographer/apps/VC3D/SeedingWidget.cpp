@@ -43,6 +43,100 @@ using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
 
+namespace {
+enum class RayPlane {
+    XY,
+    XZ,
+    YZ,
+};
+
+RayPlane rayPlaneFromNormal(const cv::Vec3f& normal)
+{
+    const float ax = std::abs(normal[0]);
+    const float ay = std::abs(normal[1]);
+    const float az = std::abs(normal[2]);
+    const float strongest = std::max(ax, std::max(ay, az));
+    if (strongest <= 1e-6f) {
+        return RayPlane::XY;
+    }
+
+    if (ax >= ay && ax >= az) {
+        return RayPlane::YZ;
+    }
+    if (ay >= ax && ay >= az) {
+        return RayPlane::XZ;
+    }
+    return RayPlane::XY;
+}
+
+QString rayPlaneLabel(RayPlane plane)
+{
+    switch (plane) {
+    case RayPlane::XZ:
+        return QStringLiteral("XZ");
+    case RayPlane::YZ:
+        return QStringLiteral("YZ");
+    case RayPlane::XY:
+    default:
+        return QStringLiteral("XY");
+    }
+}
+
+cv::Vec3f pointOnRayPlane(const cv::Vec3f& startPoint,
+                          const cv::Vec2f& rayDir,
+                          float distance,
+                          RayPlane plane)
+{
+    switch (plane) {
+    case RayPlane::XZ:
+        return {startPoint[0] + distance * rayDir[0],
+                startPoint[1],
+                startPoint[2] + distance * rayDir[1]};
+    case RayPlane::YZ:
+        return {startPoint[0],
+                startPoint[1] + distance * rayDir[0],
+                startPoint[2] + distance * rayDir[1]};
+    case RayPlane::XY:
+    default:
+        return {startPoint[0] + distance * rayDir[0],
+                startPoint[1] + distance * rayDir[1],
+                startPoint[2]};
+    }
+}
+
+cv::Vec3f pointOnSampledPlane(int col,
+                              int row,
+                              const cv::Vec3f& anchor,
+                              RayPlane plane)
+{
+    switch (plane) {
+    case RayPlane::XZ:
+        return {static_cast<float>(col), anchor[1], static_cast<float>(row)};
+    case RayPlane::YZ:
+        return {anchor[0], static_cast<float>(col), static_cast<float>(row)};
+    case RayPlane::XY:
+    default:
+        return {static_cast<float>(col), static_cast<float>(row), anchor[2]};
+    }
+}
+
+cv::Vec2i distanceTransformPixel(const cv::Vec3f& point, RayPlane plane)
+{
+    switch (plane) {
+    case RayPlane::XZ:
+        return {static_cast<int>(std::round(point[0])),
+                static_cast<int>(std::round(point[2]))};
+    case RayPlane::YZ:
+        return {static_cast<int>(std::round(point[1])),
+                static_cast<int>(std::round(point[2]))};
+    case RayPlane::XY:
+    default:
+        return {static_cast<int>(std::round(point[0])),
+                static_cast<int>(std::round(point[1]))};
+    }
+}
+} // namespace
+
 
 namespace {
 struct SegmentTriangleHit {
@@ -644,6 +738,7 @@ void SeedingWidget::onPreviewRaysClicked()
     const int numSteps = static_cast<int>(360.0 / angleStep);
     const int maxRadius = maxRadiusSpinBox->value();
     const cv::Vec3f& startPoint = focus_poi->p;
+    const RayPlane rayPlane = rayPlaneFromNormal(focus_poi->n);
 
     std::vector<cv::Vec3f> preview_points;
 
@@ -654,11 +749,7 @@ void SeedingWidget::onPreviewRaysClicked()
 
         for (int j = 1; j <= pointsPerRay; ++j) {
             const float dist = (static_cast<float>(j) / pointsPerRay) * maxRadius;
-            cv::Vec3f pointOnRay;
-            pointOnRay[0] = startPoint[0] + dist * rayDir[0];
-            pointOnRay[1] = startPoint[1] + dist * rayDir[1];
-            pointOnRay[2] = startPoint[2];
-            preview_points.push_back(pointOnRay);
+            preview_points.push_back(pointOnRayPlane(startPoint, rayDir, dist, rayPlane));
         }
     }
 
@@ -666,7 +757,9 @@ void SeedingWidget::onPreviewRaysClicked()
         _point_collection->addPoints("ray_preview", preview_points);
     }
 
-    infoLabel->setText(QString("Previewing %1 rays.").arg(numSteps));
+    infoLabel->setText(QString("Previewing %1 %2-plane rays.")
+                           .arg(numSteps)
+                           .arg(rayPlaneLabel(rayPlane)));
 }
 
 void SeedingWidget::onCastRaysClicked()
@@ -698,14 +791,18 @@ void SeedingWidget::onCastRaysClicked()
     const int maxRadius = maxRadiusSpinBox->value();
     const int threshold = thresholdSpinBox->value();
     const int zSlice = currentZSlice;
-    const cv::Vec3f startPoint = _castRaysWasPointMode
-        ? _state->poi("focus")->p : cv::Vec3f(0, 0, 0);
+    const POI* focusPoi = _castRaysWasPointMode ? _state->poi("focus") : nullptr;
+    const cv::Vec3f startPoint = focusPoi ? focusPoi->p : cv::Vec3f(0, 0, 0);
+    const cv::Vec3f distanceTransformAnchor = focusPoi
+        ? startPoint : cv::Vec3f(0, 0, static_cast<float>(zSlice));
+    const RayPlane rayPlane = focusPoi ? rayPlaneFromNormal(focusPoi->n) : RayPlane::XY;
     const QList<PathPrimitive> pathsCopy = paths;  // snapshot for draw mode
 
     // Disable button, show status
     castRaysButton->setEnabled(false);
-    infoLabel->setText("Computing rays...");
-    emit sendStatusMessageAvailable("Computing rays...", 0);
+    const QString planeStatus = QString("Computing %1-plane rays...").arg(rayPlaneLabel(rayPlane));
+    infoLabel->setText(planeStatus);
+    emit sendStatusMessageAvailable(planeStatus, 0);
 
     // Clear previous results
     _castRaysPeaks.clear();
@@ -713,17 +810,25 @@ void SeedingWidget::onCastRaysClicked()
     // Launch background computation
     auto future = QtConcurrent::run(
         [this, currentVolume, angleStep, maxRadius, threshold,
-         zSlice, startPoint, pathsCopy]() {
+         distanceTransformAnchor, rayPlane, startPoint, pathsCopy]() {
 
         // --- Compute distance transform ---
-        const int width = currentVolume->sliceWidth();
-        const int height = currentVolume->sliceHeight();
+        auto [volumeWidth, volumeHeight, volumeDepth] = currentVolume->shapeXyz();
+        int width = currentVolume->sliceWidth();
+        int height = currentVolume->sliceHeight();
+        if (rayPlane == RayPlane::XZ) {
+            width = volumeWidth;
+            height = volumeDepth;
+        } else if (rayPlane == RayPlane::YZ) {
+            width = volumeHeight;
+            height = volumeDepth;
+        }
 
         cv::Mat_<uint8_t> sliceData(height, width);
         cv::Mat_<cv::Vec3f> coords(height, width);
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                coords(y, x) = cv::Vec3f(x, y, zSlice);
+                coords(y, x) = pointOnSampledPlane(x, y, distanceTransformAnchor, rayPlane);
             }
         }
         currentVolume->sample(sliceData, coords, vc::SampleParams{});
@@ -737,8 +842,9 @@ void SeedingWidget::onCastRaysClicked()
         // --- Helper lambdas ---
         auto sampleDistAt = [&](const cv::Vec3f& p) -> float {
             if (dt.empty()) return 0.0f;
-            int px = std::max(0, std::min(dt.cols - 1, int(std::round(p[0]))));
-            int py = std::max(0, std::min(dt.rows - 1, int(std::round(p[1]))));
+            const cv::Vec2i pixel = distanceTransformPixel(p, rayPlane);
+            int px = std::max(0, std::min(dt.cols - 1, pixel[0]));
+            int py = std::max(0, std::min(dt.rows - 1, pixel[1]));
             return dt.at<float>(py, px);
         };
 
@@ -822,10 +928,8 @@ void SeedingWidget::onCastRaysClicked()
                 std::vector<cv::Vec3f> positions;
 
                 for (int dist = 1; dist < maxRadius; dist++) {
-                    cv::Vec3f point;
-                    point[0] = startPoint[0] + dist * rayDir[0];
-                    point[1] = startPoint[1] + dist * rayDir[1];
-                    point[2] = startPoint[2];
+                    cv::Vec3f point = pointOnRayPlane(
+                        startPoint, rayDir, static_cast<float>(dist), rayPlane);
 
                     if (point[0] < bx0 || point[0] >= bx1 ||
                         point[1] < by0 || point[1] >= by1 ||
@@ -1354,6 +1458,8 @@ void SeedingWidget::updateParameterPreview()
     const double angleStep = angleStepSpinBox->value();
     const int numRays = static_cast<int>(360.0 / angleStep);
     const int maxRadius = maxRadiusSpinBox->value();
+    const POI* focusPoi = _state ? _state->poi("focus") : nullptr;
+    const RayPlane rayPlane = focusPoi ? rayPlaneFromNormal(focusPoi->n) : RayPlane::XY;
     
     // Add points along the radius circle
     for (int i = 0; i < numRays; ++i) {
@@ -1361,26 +1467,23 @@ void SeedingWidget::updateParameterPreview()
         const cv::Vec2f rayDir(cos(angle), sin(angle));
         
         // Add points along the radius circle
-        float x = center_point[0] + maxRadius * rayDir[0];
-        float y = center_point[1] + maxRadius * rayDir[1];
-        
-        _point_collection->addPoint("seeding_preview", {x, y, center_point[2]});
+        cv::Vec3f point = pointOnRayPlane(center_point, rayDir, static_cast<float>(maxRadius), rayPlane);
+        _point_collection->addPoint("seeding_preview", point);
         
         // Add intermediate points for better visualization
         for (int r = maxRadius / 4; r < maxRadius; r += maxRadius / 4) {
-            x = center_point[0] + r * rayDir[0];
-            y = center_point[1] + r * rayDir[1];
-            
-            _point_collection->addPoint("seeding_preview", {x, y, center_point[2]});
+            point = pointOnRayPlane(center_point, rayDir, static_cast<float>(r), rayPlane);
+            _point_collection->addPoint("seeding_preview", point);
         }
     }
     
     // Update info label
-    infoLabel->setText(QString("Seed at (%1, %2, %3) | Preview: %4 rays, radius %5px")
+    infoLabel->setText(QString("Seed at (%1, %2, %3) | Preview: %4 %5-plane rays, radius %6px")
                            .arg(center_point[0])
                            .arg(center_point[1])
                            .arg(center_point[2])
                            .arg(numRays)
+                           .arg(rayPlaneLabel(rayPlane))
                            .arg(maxRadius));
 }
 
