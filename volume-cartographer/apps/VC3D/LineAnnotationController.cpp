@@ -3199,7 +3199,7 @@ void LineAnnotationController::saveOpenFibers()
             session.controlPoints.empty()) {
             continue;
         }
-        if (!runFinalReinitReoptSynchronously(session)) {
+        if (!runFinalReinitReoptSynchronously(session, false)) {
             continue;
         }
         saveSessionAsFiber(session);
@@ -3837,7 +3837,8 @@ bool LineAnnotationController::needsFinalReinitReopt(const LineAnnotationSession
 bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession& session,
                                                            OptimizationTaskResult task,
                                                            bool updateGeneratedViews,
-                                                           const std::string& eventOverride)
+                                                           const std::string& eventOverride,
+                                                           bool fireSuccessCallback)
 {
     if (!task.ok) {
         session.taskState = LineAnnotationSession::TaskState::Failed;
@@ -3918,14 +3919,15 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                    session.optimizationReport.ceresSolveMs,
                    session.optimizationReport.totalMs,
                    session.optimizedLine.points.size());
-    auto callback = session.optimizationSucceededCallback;
+    auto callback = fireSuccessCallback ? session.optimizationSucceededCallback : nullptr;
     if (callback) {
         callback(session);
     }
     return true;
 }
 
-bool LineAnnotationController::runFinalReinitReoptSynchronously(LineAnnotationSession& session)
+bool LineAnnotationController::runFinalReinitReoptSynchronously(LineAnnotationSession& session,
+                                                                bool fireSuccessCallback)
 {
     if (!needsFinalReinitReopt(session)) {
         return true;
@@ -3955,7 +3957,8 @@ bool LineAnnotationController::runFinalReinitReoptSynchronously(LineAnnotationSe
     return applyOptimizationTaskResult(session,
                                        std::move(task),
                                        false,
-                                       "final_reinit_reopt");
+                                       "final_reinit_reopt",
+                                       fireSuccessCallback);
 }
 
 void LineAnnotationController::requestFinalizedClose(const std::string& surfaceName)
@@ -4095,7 +4098,13 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     OptimizationTaskResult task = watcher->result();
     session.watcher = nullptr;
     const bool closePending = session.finalReinitClosePending;
-    const bool ok = applyOptimizationTaskResult(session, std::move(task), true);
+    // Save/close finalization continues using session after applying the result;
+    // callbacks may rebuild intersection panes and invalidate this reference.
+    const bool ok = applyOptimizationTaskResult(session,
+                                               std::move(task),
+                                               true,
+                                               {},
+                                               !closePending);
     if (pane->dialog) {
         pane->dialog->setOptimizationBusy(false);
     }
@@ -4246,7 +4255,7 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
         showError(tr("Run line optimization before exporting generated meshes."));
         return;
     }
-    if (!runFinalReinitReoptSynchronously(session)) {
+    if (!runFinalReinitReoptSynchronously(session, false)) {
         return;
     }
     if (!session.suppressGeneratedViews && !materializeGeneratedViews(session)) {
@@ -4932,7 +4941,7 @@ LineAnnotationController::makeIntersectionLineSession(
 void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session)
 {
     try {
-        if (!runFinalReinitReoptSynchronously(session)) {
+        if (!runFinalReinitReoptSynchronously(session, false)) {
             return;
         }
         ensureSessionFiberIdentity(session);
