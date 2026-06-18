@@ -54,6 +54,13 @@ public:
     bool writeChunk(size_t iz, size_t iy, size_t ix,
                     const void* input, size_t nbytes);
 
+    // Write a chunk unless it is entirely the fill value. An all-fill chunk is
+    // not written (zarr readers reconstruct it from fill_value); any existing
+    // on-disk chunk at that index is removed so stale data is not left behind.
+    // Returns true if the chunk was written, false if it was skipped/removed.
+    bool writeChunkSkipEmpty(size_t iz, size_t iy, size_t ix,
+                             const void* input, size_t nbytes);
+
     // Remove a chunk file if it exists.
     bool removeChunk(size_t iz, size_t iy, size_t ix);
 
@@ -95,7 +102,8 @@ std::unique_ptr<VcDataset> createZarrDataset(
     VcDtype dtype,
     const std::string& compressor = "blosc",
     const std::string& dimensionSeparator = ".",
-    std::int64_t fillValue = 0);
+    std::int64_t fillValue = 0,
+    int compressionLevel = -1);  // <=0 uses the compressor's built-in default
 
 // buildZarrCodecRegistry() is declared in utils/zarr.hpp so its CodecRegistry
 // return type doesn't pull zarr.hpp into every VcDataset.hpp includer.
