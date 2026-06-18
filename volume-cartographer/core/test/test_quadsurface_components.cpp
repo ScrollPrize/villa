@@ -11,6 +11,9 @@
 
 #include <filesystem>
 #include <random>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -69,6 +72,38 @@ TEST_CASE("QuadSurface(path,json) with components: gen() uses multi-component wa
     CHECK(coords.rows == 8);
     CHECK(coords.cols == 8);
     fs::remove_all(root);
+}
+
+TEST_CASE("QuadSurface::gen with normals is safe across concurrent tile workers")
+{
+    QuadSurface qs(grid(64, 64), cv::Vec2f(1.f, 1.f));
+    std::atomic<bool> ok{true};
+    std::vector<std::thread> workers;
+
+    for (int t = 0; t < 8; ++t) {
+        workers.emplace_back([&qs, &ok, t]() {
+            try {
+                for (int i = 0; i < 24; ++i) {
+                    cv::Mat_<cv::Vec3f> coords, normals;
+                    qs.gen(&coords, &normals, cv::Size(32, 24),
+                           cv::Vec3f(static_cast<float>(t + i), static_cast<float>(i), 1.0f),
+                           1.0f, cv::Vec3f(0, 0, 0));
+                    if (coords.rows != 24 || coords.cols != 32 ||
+                        normals.rows != 24 || normals.cols != 32) {
+                        ok = false;
+                    }
+                }
+            } catch (...) {
+                ok = false;
+            }
+        });
+    }
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    CHECK(ok.load());
 }
 
 TEST_CASE("components-meta with degenerate ranges is filtered out")

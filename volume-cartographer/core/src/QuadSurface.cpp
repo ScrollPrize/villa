@@ -264,6 +264,10 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
                         uint8_t border)
 {
     const int sc = src.cols, sr = src.rows;
+    if (sc <= 0 || sr <= 0) {
+        dst.setTo(border);
+        return;
+    }
     const int dw = dst.cols, dh = dst.rows;
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
@@ -290,6 +294,10 @@ void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
                            const cv::Vec3f& border)
 {
     const int sc = src.cols, sr = src.rows;
+    if (sc <= 0 || sr <= 0) {
+        dst.setTo(border);
+        return;
+    }
     const int dw = dst.cols, dh = dst.rows;
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
@@ -644,7 +652,10 @@ void QuadSurface::unloadPoints()
     _channels.clear();
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    {
+        std::lock_guard<std::mutex> normalLock(_normalCacheMutex);
+        _normalCache = cv::Mat_<cv::Vec3f>();
+    }
     _needsLoad = true;
     if (DebugLoggingEnabled()) {
         std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
@@ -655,7 +666,10 @@ void QuadSurface::unloadCaches()
 {
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    {
+        std::lock_guard<std::mutex> normalLock(_normalCacheMutex);
+        _normalCache = cv::Mat_<cv::Vec3f>();
+    }
     // Release loaded channel pixel data but keep the keys so channel(name)
     // still knows which channels exist on disk and can lazy-reload them.
     for (auto& [_, mat] : _channels) {
@@ -741,7 +755,10 @@ void QuadSurface::invalidateCache()
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    {
+        std::lock_guard<std::mutex> normalLock(_normalCacheMutex);
+        _normalCache = cv::Mat_<cv::Vec3f>();
+    }
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -777,8 +794,10 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     bool skipValidity = _validMaskAllValid;
 
     // --- warp coords and validity ----------------------------------------
-    cv::Mat_<cv::Vec3f>& coords_big = _genCoordsScratch;
-    cv::Mat_<uint8_t>& valid_big = _genValidScratch;
+    thread_local cv::Mat_<cv::Vec3f> coordsScratch;
+    thread_local cv::Mat_<uint8_t> validScratch;
+    cv::Mat_<cv::Vec3f>& coords_big = coordsScratch;
+    cv::Mat_<uint8_t>& valid_big = validScratch;
 
     if (!_components.empty()) {
         // Multi-component surface: warp each component separately with
@@ -832,44 +851,52 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     }
 
     // --- normals: warp cached source-grid normals -------------------
-    cv::Mat_<cv::Vec3f>& normals_big = _genNormalsScratch;
+    thread_local cv::Mat_<cv::Vec3f> normalsScratch;
+    cv::Mat_<cv::Vec3f>& normals_big = normalsScratch;
     if (need_normals) {
         // Build source-grid normal cache once per surface. Subsequent gen()
         // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
         // a different surface becomes active.
-        if (_normalCache.empty() || _normalCache.size() != _points->size()) {
-            _normalCache.create(_points->rows, _points->cols);
-            const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN());
-            const int rows = _points->rows;
-            const int cols = _points->cols;
-            // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
-            if (rows > 0) {
-                cv::Vec3f* top = _normalCache[0];
-                cv::Vec3f* bot = _normalCache[rows - 1];
-                for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
-            }
-            #pragma omp parallel for schedule(dynamic, 16)
-            for (int r = 1; r < rows - 1; r++) {
-                cv::Vec3f* dst = _normalCache[r];
-                const cv::Vec3f* row = (*_points)[r];
-                dst[0] = qn;
-                dst[cols - 1] = qn;
-                for (int c = 1; c < cols - 1; c++) {
-                    if (row[c][0] == -1.f) {
-                        dst[c] = qn;
-                    } else {
-                        dst[c] = grid_normal_int(*_points, r, c);
+        cv::Mat_<cv::Vec3f> normalCache;
+        {
+            std::lock_guard<std::mutex> normalLock(_normalCacheMutex);
+            if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+                _normalCache.create(_points->rows, _points->cols);
+                const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN());
+                const int rows = _points->rows;
+                const int cols = _points->cols;
+                // Border rows/cols: no +/-1 neighbors, fill with NaN sentinel.
+                if (rows > 0) {
+                    cv::Vec3f* top = _normalCache[0];
+                    cv::Vec3f* bot = _normalCache[rows - 1];
+                    for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
+                }
+                #pragma omp parallel for schedule(dynamic, 16)
+                for (int r = 1; r < rows - 1; r++) {
+                    cv::Vec3f* dst = _normalCache[r];
+                    const cv::Vec3f* row = (*_points)[r];
+                    if (cols > 0) {
+                        dst[0] = qn;
+                        dst[cols - 1] = qn;
+                    }
+                    for (int c = 1; c < cols - 1; c++) {
+                        if (row[c][0] == -1.f) {
+                            dst[c] = qn;
+                        } else {
+                            dst[c] = grid_normal_int(*_points, r, c);
+                        }
                     }
                 }
             }
+            normalCache = _normalCache;
         }
         const cv::Vec3f qnVec(std::numeric_limits<float>::quiet_NaN(),
                               std::numeric_limits<float>::quiet_NaN(),
                               std::numeric_limits<float>::quiet_NaN());
         normals_big.create(h + 8, w + 8);
-        warpNearestConstVec3f(_normalCache, normals_big,
+        warpNearestConstVec3f(normalCache, normals_big,
                               ox, oy, sx, sy, qnVec);
     }
 
