@@ -56,6 +56,32 @@ public:
     mutable std::vector<cv::Vec3d> sampledPoints;
 };
 
+class BatchOnlyZNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& /*volumePoint*/) const override
+    {
+        return {{1.0, 0.0, 0.0}, true, {}};
+    }
+
+    vc::lasagna::NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool /*withDerivative*/,
+        std::vector<vc::lasagna::NormalSampleWithDerivative>& samples) const override
+    {
+        ++batchCalls;
+        batchSampledPoints.insert(batchSampledPoints.end(), volumePoints.begin(), volumePoints.end());
+        samples.assign(volumePoints.size(),
+                       vc::lasagna::NormalSampleWithDerivative{
+                           {{0.0, 0.0, 1.0}, true, {}},
+                           cv::Matx33d::zeros(),
+                           false});
+        return {};
+    }
+
+    mutable int batchCalls = 0;
+    mutable std::vector<cv::Vec3d> batchSampledPoints;
+};
+
 class SeedThenTiltedNormalSampler final : public vc::lasagna::NormalSampler {
 public:
     vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override
@@ -938,6 +964,40 @@ TEST_CASE("LineOptimizer split straightness samples the normal sampler at stenci
         }
     }
     CHECK(centerSamples > static_cast<int>(result.line.points.size() - 2));
+}
+
+TEST_CASE("LineOptimizer straightness reuses prefetched point normals")
+{
+    BatchOnlyZNormalSampler sampler;
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 10.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.straightnessWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 1.0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 3.0},
+        {20.0, 0.0, 0.0},
+    };
+    const auto result = optimizer.optimizeExistingLine(linePoints,
+                                                       {0, 2},
+                                                       1,
+                                                       config,
+                                                       -1,
+                                                       -1,
+                                                       "prefetched-straightness");
+
+    CHECK(sampler.batchCalls > 0);
+    CHECK(result.report.initialCost == doctest::Approx(18.0));
 }
 
 TEST_CASE("LineOptimizer supports zero iterations and single-seed optimizeFromSeeds")

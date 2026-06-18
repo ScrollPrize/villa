@@ -233,6 +233,52 @@ struct PositionPriorResidual {
     double weight = 1.0;
 };
 
+void evaluateSurfaceStraightnessResidual(const cv::Vec3d& normal,
+                                         double tangentWeight,
+                                         double normalWeight,
+                                         double const* const* parameters,
+                                         double* residuals,
+                                         double** jacobians)
+{
+    cv::Vec3d curvature;
+    for (int axis = 0; axis < 3; ++axis) {
+        curvature[axis] = parameters[0][axis] -
+                          2.0 * parameters[1][axis] +
+                          parameters[2][axis];
+    }
+
+    const double normalComponent = curvature.dot(normal);
+    const cv::Vec3d tangentComponent = curvature - normal * normalComponent;
+    for (int axis = 0; axis < 3; ++axis) {
+        residuals[axis] = tangentWeight * tangentComponent[axis];
+    }
+    residuals[3] = normalWeight * normalComponent;
+
+    if (jacobians) {
+        double tangentProjection[3][3];
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                tangentProjection[r][c] = (r == c ? 1.0 : 0.0) - normal[r] * normal[c];
+            }
+        }
+        for (int block = 0; block < 3; ++block) {
+            if (!jacobians[block]) {
+                continue;
+            }
+            const double coefficient = block == 1 ? -2.0 : 1.0;
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    jacobians[block][r * 3 + c] =
+                        coefficient * tangentWeight * tangentProjection[r][c];
+                }
+            }
+            for (int c = 0; c < 3; ++c) {
+                jacobians[block][3 * 3 + c] = coefficient * normalWeight * normal[c];
+            }
+        }
+    }
+}
+
 struct LiveSurfaceStraightnessResidual final : public ceres::SizedCostFunction<4, 3, 3, 3> {
     LiveSurfaceStraightnessResidual(const NormalSampler& sampler,
                                     double tangentWeight,
@@ -252,43 +298,12 @@ struct LiveSurfaceStraightnessResidual final : public ceres::SizedCostFunction<4
             normal = {0.0, 0.0, 1.0};
         }
 
-        cv::Vec3d curvature;
-        for (int axis = 0; axis < 3; ++axis) {
-            curvature[axis] = parameters[0][axis] -
-                              2.0 * parameters[1][axis] +
-                              parameters[2][axis];
-        }
-
-        const double normalComponent = curvature.dot(normal);
-        const cv::Vec3d tangentComponent = curvature - normal * normalComponent;
-        for (int axis = 0; axis < 3; ++axis) {
-            residuals[axis] = tangentWeight * tangentComponent[axis];
-        }
-        residuals[3] = normalWeight * normalComponent;
-
-        if (jacobians) {
-            double tangentProjection[3][3];
-            for (int r = 0; r < 3; ++r) {
-                for (int c = 0; c < 3; ++c) {
-                    tangentProjection[r][c] = (r == c ? 1.0 : 0.0) - normal[r] * normal[c];
-                }
-            }
-            for (int block = 0; block < 3; ++block) {
-                if (!jacobians[block]) {
-                    continue;
-                }
-                const double coefficient = block == 1 ? -2.0 : 1.0;
-                for (int r = 0; r < 3; ++r) {
-                    for (int c = 0; c < 3; ++c) {
-                        jacobians[block][r * 3 + c] =
-                            coefficient * tangentWeight * tangentProjection[r][c];
-                    }
-                }
-                for (int c = 0; c < 3; ++c) {
-                    jacobians[block][3 * 3 + c] = coefficient * normalWeight * normal[c];
-                }
-            }
-        }
+        evaluateSurfaceStraightnessResidual(normal,
+                                            tangentWeight,
+                                            normalWeight,
+                                            parameters,
+                                            residuals,
+                                            jacobians);
         return true;
     }
 
@@ -459,6 +474,44 @@ struct PrefetchTiming {
     double materializeMs = 0.0;
     uint64_t requestedChunks = 0;
     uint64_t chunksRead = 0;
+};
+
+struct PrefetchedSurfaceStraightnessResidual final : public ceres::SizedCostFunction<4, 3, 3, 3> {
+    PrefetchedSurfaceStraightnessResidual(const PrefetchedNormalSamples& prefetched,
+                                          size_t sampleIndex,
+                                          double tangentWeight,
+                                          double normalWeight)
+        : prefetched(prefetched)
+        , sampleIndex(sampleIndex)
+        , tangentWeight(tangentWeight)
+        , normalWeight(normalWeight)
+    {
+    }
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        cv::Vec3d normal{0.0, 0.0, 1.0};
+        if (sampleIndex < prefetched.samples.size()) {
+            const NormalSampleWithDerivative& sampled = prefetched.samples[sampleIndex];
+            const cv::Vec3d sampledNormal = normalizedOrZero(sampled.sample.normal);
+            if (sampled.sample.valid && length(sampledNormal) > kEpsilon) {
+                normal = sampledNormal;
+            }
+        }
+
+        evaluateSurfaceStraightnessResidual(normal,
+                                            tangentWeight,
+                                            normalWeight,
+                                            parameters,
+                                            residuals,
+                                            jacobians);
+        return true;
+    }
+
+    const PrefetchedNormalSamples& prefetched;
+    size_t sampleIndex = 0;
+    double tangentWeight = 1.0;
+    double normalWeight = 1.0;
 };
 
 struct PrefetchedNormalAlignmentResidual final : public ceres::SizedCostFunction<1, 3, 3> {
@@ -1025,9 +1078,19 @@ void addResiduals(
         if (config.tangentStraightnessWeight <= 0.0 && config.normalStraightnessWeight <= 0.0) {
             continue;
         }
-        auto* cost = new LiveSurfaceStraightnessResidual(sampler,
-                                                         config.tangentStraightnessWeight,
-                                                         config.normalStraightnessWeight);
+        const size_t sampleIndex = static_cast<size_t>(i - 1) *
+                                       static_cast<size_t>(config.samplesPerSegment + 1) +
+                                   static_cast<size_t>(config.samplesPerSegment);
+        ceres::CostFunction* cost = prefetchedSamples
+            ? static_cast<ceres::CostFunction*>(
+                  new PrefetchedSurfaceStraightnessResidual(*prefetchedSamples,
+                                                            sampleIndex,
+                                                            config.tangentStraightnessWeight,
+                                                            config.normalStraightnessWeight))
+            : static_cast<ceres::CostFunction*>(
+                  new LiveSurfaceStraightnessResidual(sampler,
+                                                      config.tangentStraightnessWeight,
+                                                      config.normalStraightnessWeight));
         problem.AddResidualBlock(cost, nullptr,
                                  points[static_cast<size_t>(i - 1)].data(),
                                  points[static_cast<size_t>(i)].data(),
