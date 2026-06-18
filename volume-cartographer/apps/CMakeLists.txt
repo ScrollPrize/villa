@@ -133,7 +133,7 @@ add_executable(vc_calc_surface_metrics src/vc_calc_surface_metrics.cpp)
 target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
 
 add_executable(vc_lasagna_line_probe src/vc_lasagna_line_probe.cpp)
-target_link_libraries(vc_lasagna_line_probe vc_lasagna)
+target_link_libraries(vc_lasagna_line_probe vc_lasagna opencv_imgcodecs opencv_imgproc)
 
 add_executable(vc_lasagna_maxflow_graph src/vc_lasagna_maxflow_graph.cpp)
 target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)

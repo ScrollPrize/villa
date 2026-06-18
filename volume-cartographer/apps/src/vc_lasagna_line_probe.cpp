@@ -2,9 +2,13 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -18,6 +22,7 @@
 #include <locale>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -45,9 +50,9 @@ bool finiteDirection(const cv::Vec3d& v)
 void printUsage(const char* argv0)
 {
     std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z]\n"
-              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> --reopt [--constant-normal-jacobian]\n"
+              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--constant-normal-jacobian]\n"
               << "Runs line annotation optimization at seed "
-              << "[17955,15141,37891] with initial z-axis mode, or reoptimizes a saved VC3D fiber without saving it.\n";
+              << "[17955,15141,37891] with initial z-axis mode, or loads/reoptimizes a saved VC3D fiber.\n";
 }
 
 cv::Vec3d parseSeed(const std::string& value)
@@ -77,7 +82,23 @@ int parsePositiveInt(const std::string& value, const char* name)
     return parsed;
 }
 
+int parseNonNegativeInt(const std::string& value, const char* name)
+{
+    size_t consumed = 0;
+    int parsed = 0;
+    try {
+        parsed = std::stoi(value, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string(name) + " must be a non-negative integer");
+    }
+    if (consumed != value.size() || parsed < 0) {
+        throw std::invalid_argument(std::string(name) + " must be a non-negative integer");
+    }
+    return parsed;
+}
+
 struct FiberInput {
+    nlohmann::json root;
     std::vector<cv::Vec3d> controlPoints;
     std::vector<cv::Vec3d> linePoints;
 };
@@ -117,17 +138,17 @@ FiberInput loadFiberInput(const std::filesystem::path& fiberPath)
     if (!input.good()) {
         throw std::runtime_error("could not open fiber JSON: " + fiberPath.string());
     }
-    const nlohmann::json root = nlohmann::json::parse(input);
-    if (root.value("type", std::string{}) != "vc3d_fiber") {
+    FiberInput fiber;
+    fiber.root = nlohmann::json::parse(input);
+    if (fiber.root.value("type", std::string{}) != "vc3d_fiber") {
         throw std::runtime_error("fiber JSON type is not vc3d_fiber");
     }
-    if (root.value("version", 0) != 1) {
+    if (fiber.root.value("version", 0) != 1) {
         throw std::runtime_error("unsupported vc3d_fiber version");
     }
 
-    FiberInput fiber;
-    fiber.controlPoints = readPointArray(root, "control_points");
-    fiber.linePoints = readPointArray(root, "line_points");
+    fiber.controlPoints = readPointArray(fiber.root, "control_points");
+    fiber.linePoints = readPointArray(fiber.root, "line_points");
     if (fiber.controlPoints.empty()) {
         throw std::runtime_error("fiber JSON has no control_points");
     }
@@ -135,6 +156,54 @@ FiberInput loadFiberInput(const std::filesystem::path& fiberPath)
         throw std::runtime_error("fiber JSON needs at least two line_points for reoptimization");
     }
     return fiber;
+}
+
+nlohmann::json pointToJson(const cv::Vec3d& point)
+{
+    return nlohmann::json::array({point[0], point[1], point[2]});
+}
+
+void saveReoptimizedFiber(const FiberInput& fiber,
+                          const std::vector<cv::Vec3d>& optimizedLinePoints,
+                          const std::filesystem::path& outputPath)
+{
+    if (outputPath.empty()) {
+        throw std::runtime_error("output path is empty");
+    }
+    nlohmann::json root = fiber.root;
+    root["line_points"] = nlohmann::json::array();
+    for (const auto& point : optimizedLinePoints) {
+        root["line_points"].push_back(pointToJson(point));
+    }
+    root["generation"] = std::max<uint64_t>(uint64_t{1},
+                                            root.value("generation", uint64_t{1})) +
+                         uint64_t{1};
+
+    const std::filesystem::path parent = outputPath.parent_path();
+    std::error_code ec;
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            throw std::runtime_error("failed to create output directory " +
+                                     parent.string() + ": " + ec.message());
+        }
+    }
+
+    const std::filesystem::path tempPath = outputPath.string() + ".tmp";
+    {
+        std::ofstream output(tempPath);
+        if (!output.good()) {
+            throw std::runtime_error("could not open output temp file: " + tempPath.string());
+        }
+        output << root.dump(2) << '\n';
+    }
+
+    std::filesystem::rename(tempPath, outputPath, ec);
+    if (ec) {
+        std::filesystem::remove(tempPath);
+        throw std::runtime_error("failed to replace output file " +
+                                 outputPath.string() + ": " + ec.message());
+    }
 }
 
 double distance(const cv::Vec3d& a, const cv::Vec3d& b)
@@ -210,25 +279,156 @@ std::vector<cv::Vec3d> linePointsFromModel(const vc::lasagna::LineModel& line)
     return points;
 }
 
-void printControlDiagnostics(const char* label,
-                             const std::vector<cv::Vec3d>& linePoints,
-                             const std::vector<cv::Vec3d>& controlPoints)
+vc::lasagna::LineModel makeLineModelFromPoints(
+    const std::vector<cv::Vec3d>& points,
+    const vc::lasagna::NormalSampler& sampler,
+    int displayFrameAnchorIndex)
+{
+    vc::lasagna::LineModel model;
+    model.displayFrameAnchorIndex = displayFrameAnchorIndex;
+    model.points.reserve(points.size());
+    for (const auto& point : points) {
+        vc::lasagna::LinePoint linePoint;
+        linePoint.position = point;
+        linePoint.sampledNormal = sampler.sampleNormal(point);
+        linePoint.sampledNormal.normal = normalizedOrZero(linePoint.sampledNormal.normal);
+        linePoint.sampledNormal.valid =
+            linePoint.sampledNormal.valid && finiteDirection(linePoint.sampledNormal.normal);
+        linePoint.valid = linePoint.sampledNormal.valid;
+        model.points.push_back(std::move(linePoint));
+    }
+    return model;
+}
+
+struct PointMotionStats {
+    size_t compared = 0;
+    size_t inputPoints = 0;
+    size_t outputPoints = 0;
+    double min = 0.0;
+    double avg = 0.0;
+    double max = 0.0;
+};
+
+PointMotionStats pointMotionStats(const std::vector<cv::Vec3d>& inputPoints,
+                                  const std::vector<cv::Vec3d>& outputPoints)
+{
+    PointMotionStats stats;
+    stats.inputPoints = inputPoints.size();
+    stats.outputPoints = outputPoints.size();
+    stats.compared = std::min(inputPoints.size(), outputPoints.size());
+    if (stats.compared == 0) {
+        return stats;
+    }
+
+    stats.min = std::numeric_limits<double>::infinity();
+    double sum = 0.0;
+    for (size_t i = 0; i < stats.compared; ++i) {
+        const double motion = distance(inputPoints[i], outputPoints[i]);
+        stats.min = std::min(stats.min, motion);
+        stats.max = std::max(stats.max, motion);
+        sum += motion;
+    }
+    stats.avg = sum / static_cast<double>(stats.compared);
+    return stats;
+}
+
+PointMotionStats pointMotionStatsForRange(const std::vector<cv::Vec3d>& inputPoints,
+                                          const std::vector<cv::Vec3d>& outputPoints,
+                                          size_t start,
+                                          size_t endInclusive)
+{
+    PointMotionStats stats;
+    stats.inputPoints = inputPoints.size();
+    stats.outputPoints = outputPoints.size();
+    const size_t compared = std::min(inputPoints.size(), outputPoints.size());
+    if (compared == 0 || start >= compared) {
+        return stats;
+    }
+    endInclusive = std::min(endInclusive, compared - 1);
+    if (endInclusive < start) {
+        return stats;
+    }
+
+    stats.compared = endInclusive - start + 1;
+    stats.min = std::numeric_limits<double>::infinity();
+    double sum = 0.0;
+    for (size_t i = start; i <= endInclusive; ++i) {
+        const double motion = distance(inputPoints[i], outputPoints[i]);
+        stats.min = std::min(stats.min, motion);
+        stats.max = std::max(stats.max, motion);
+        sum += motion;
+    }
+    stats.avg = sum / static_cast<double>(stats.compared);
+    return stats;
+}
+
+void printPointMotionStats(const PointMotionStats& stats)
 {
     std::cout.imbue(std::locale::classic());
     std::cout << std::scientific << std::setprecision(3);
-    std::cout << label << " control diagnostics:\n"
-              << "idx line_index distance point[x,y,z]\n";
-    for (size_t i = 0; i < controlPoints.size(); ++i) {
-        const int lineIndex = nearestLinePointIndex(linePoints, controlPoints[i]);
-        const double controlDistance = lineIndex >= 0
-            ? distance(linePoints[static_cast<size_t>(lineIndex)], controlPoints[i])
-            : std::numeric_limits<double>::quiet_NaN();
-        std::cout << std::setw(3) << i
-                  << std::setw(11) << lineIndex
-                  << std::setw(13) << controlDistance
-                  << " [" << controlPoints[i][0]
-                  << ", " << controlPoints[i][1]
-                  << ", " << controlPoints[i][2] << "]\n";
+    std::cout << "Point motion: compared=" << stats.compared
+              << " input_points=" << stats.inputPoints
+              << " output_points=" << stats.outputPoints
+              << " avg=" << stats.avg
+              << " min=" << stats.min
+              << " max=" << stats.max << '\n';
+}
+
+void printSegmentMotionTable(const std::vector<cv::Vec3d>& inputPoints,
+                             const std::vector<cv::Vec3d>& outputPoints,
+                             std::vector<int> fixedIndices)
+{
+    const size_t compared = std::min(inputPoints.size(), outputPoints.size());
+    std::cout.imbue(std::locale::classic());
+    std::cout << std::scientific << std::setprecision(3);
+    std::cout << "Segment motion:\n"
+              << "segment              start      end   points          avg          min          max\n";
+    if (compared == 0) {
+        return;
+    }
+
+    fixedIndices.erase(std::remove_if(fixedIndices.begin(),
+                                      fixedIndices.end(),
+                                      [compared](int index) {
+                                          return index < 0 ||
+                                                 static_cast<size_t>(index) >= compared;
+                                      }),
+                       fixedIndices.end());
+    std::sort(fixedIndices.begin(), fixedIndices.end());
+    fixedIndices.erase(std::unique(fixedIndices.begin(), fixedIndices.end()),
+                       fixedIndices.end());
+
+    auto printRow = [&](const std::string& label, size_t start, size_t endInclusive) {
+        const PointMotionStats stats =
+            pointMotionStatsForRange(inputPoints, outputPoints, start, endInclusive);
+        std::cout << std::left << std::setw(18) << label
+                  << std::right << std::setw(8) << start
+                  << std::setw(9) << endInclusive
+                  << std::setw(9) << stats.compared
+                  << std::setw(13) << stats.avg
+                  << std::setw(13) << stats.min
+                  << std::setw(13) << stats.max << '\n';
+    };
+
+    if (fixedIndices.empty()) {
+        printRow("whole_line", 0, compared - 1);
+        return;
+    }
+
+    const size_t first = static_cast<size_t>(fixedIndices.front());
+    if (first > 0) {
+        printRow("open_left", 0, first);
+    }
+    for (size_t i = 0; i + 1 < fixedIndices.size(); ++i) {
+        const size_t start = static_cast<size_t>(fixedIndices[i]);
+        const size_t end = static_cast<size_t>(fixedIndices[i + 1]);
+        printRow("control_" + std::to_string(i) + "_" + std::to_string(i + 1),
+                 start,
+                 end);
+    }
+    const size_t last = static_cast<size_t>(fixedIndices.back());
+    if (last + 1 < compared) {
+        printRow("open_right", last, compared - 1);
     }
 }
 
@@ -323,6 +523,287 @@ void printLineViewDiagnostics(const vc::lasagna::LineModel& line)
                       << ' ' << issue.reason << '\n';
         }
     }
+}
+
+void ensureDirectory(const std::filesystem::path& dir)
+{
+    if (dir.empty()) {
+        throw std::runtime_error("output directory is empty");
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        throw std::runtime_error("failed to create output directory " +
+                                 dir.string() + ": " + ec.message());
+    }
+}
+
+bool validSurfacePoint(const cv::Vec3f& point)
+{
+    return point[0] != -1.0f &&
+           std::isfinite(point[0]) &&
+           std::isfinite(point[1]) &&
+           std::isfinite(point[2]);
+}
+
+void writeLineObj(const std::vector<cv::Vec3d>& points,
+                  const std::filesystem::path& outputPath)
+{
+    std::ofstream output(outputPath);
+    if (!output.good()) {
+        throw std::runtime_error("could not open OBJ output: " + outputPath.string());
+    }
+    output.imbue(std::locale::classic());
+    output << "# VC3D fiber line\n";
+    for (const auto& point : points) {
+        output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+    }
+    if (!points.empty()) {
+        output << "l";
+        for (size_t i = 0; i < points.size(); ++i) {
+            output << ' ' << (i + 1);
+        }
+        output << '\n';
+    }
+}
+
+void writeSurfaceMtl(const std::filesystem::path& path,
+                     const std::string& materialName,
+                     const std::string& textureName)
+{
+    std::ofstream output(path);
+    if (!output.good()) {
+        throw std::runtime_error("could not open MTL output: " + path.string());
+    }
+    output << "newmtl " << materialName << '\n'
+           << "Ka 1 1 1\n"
+           << "Kd 1 1 1\n"
+           << "Ks 0 0 0\n"
+           << "d 1\n"
+           << "illum 1\n"
+           << "map_Kd " << textureName << '\n';
+}
+
+void writeSurfaceObj(const QuadSurface& surface,
+                     const std::filesystem::path& objPath,
+                     const std::string& materialName,
+                     const std::string& mtlName)
+{
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (!points || points->empty()) {
+        throw std::runtime_error("surface has no points for OBJ export");
+    }
+
+    std::ofstream output(objPath);
+    if (!output.good()) {
+        throw std::runtime_error("could not open OBJ output: " + objPath.string());
+    }
+    output.imbue(std::locale::classic());
+    output << "# VC3D line-view strip\n"
+           << "mtllib " << mtlName << '\n'
+           << "usemtl " << materialName << '\n';
+
+    std::vector<int> vertexIndex(static_cast<size_t>(points->rows * points->cols), 0);
+    int nextVertex = 1;
+    for (int row = 0; row < points->rows; ++row) {
+        for (int col = 0; col < points->cols; ++col) {
+            const cv::Vec3f& point = (*points)(row, col);
+            if (!validSurfacePoint(point)) {
+                continue;
+            }
+            vertexIndex[static_cast<size_t>(row * points->cols + col)] = nextVertex++;
+            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+        }
+    }
+
+    std::vector<int> uvIndex(static_cast<size_t>(points->rows * points->cols), 0);
+    int nextUv = 1;
+    const double colDenom = std::max(1, points->cols - 1);
+    const double rowDenom = std::max(1, points->rows - 1);
+    for (int row = 0; row < points->rows; ++row) {
+        for (int col = 0; col < points->cols; ++col) {
+            const cv::Vec3f& point = (*points)(row, col);
+            if (!validSurfacePoint(point)) {
+                continue;
+            }
+            uvIndex[static_cast<size_t>(row * points->cols + col)] = nextUv++;
+            output << "vt "
+                   << (static_cast<double>(col) / colDenom) << ' '
+                   << (1.0 - static_cast<double>(row) / rowDenom) << '\n';
+        }
+    }
+
+    for (int row = 0; row + 1 < points->rows; ++row) {
+        for (int col = 0; col + 1 < points->cols; ++col) {
+            const auto idx = [&](int r, int c) {
+                return static_cast<size_t>(r * points->cols + c);
+            };
+            const int v00 = vertexIndex[idx(row, col)];
+            const int v01 = vertexIndex[idx(row, col + 1)];
+            const int v10 = vertexIndex[idx(row + 1, col)];
+            const int v11 = vertexIndex[idx(row + 1, col + 1)];
+            if (v00 == 0 || v01 == 0 || v10 == 0 || v11 == 0) {
+                continue;
+            }
+            const int t00 = uvIndex[idx(row, col)];
+            const int t01 = uvIndex[idx(row, col + 1)];
+            const int t10 = uvIndex[idx(row + 1, col)];
+            const int t11 = uvIndex[idx(row + 1, col + 1)];
+            output << "f "
+                   << v00 << '/' << t00 << ' '
+                   << v01 << '/' << t01 << ' '
+                   << v11 << '/' << t11 << ' '
+                   << v10 << '/' << t10 << '\n';
+        }
+    }
+}
+
+cv::Mat renderSurfaceTexture(const QuadSurface& surface,
+                             Volume& textureVolume,
+                             int textureLevel)
+{
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (!points || points->empty()) {
+        throw std::runtime_error("surface has no points for texture rendering");
+    }
+
+    vc::SampleParams params;
+    params.level = textureLevel;
+    params.method = vc::Sampling::Trilinear;
+
+    if (textureVolume.dtype() == vc::render::ChunkDtype::UInt16) {
+        cv::Mat_<uint16_t> sampled;
+        textureVolume.sample(sampled, *points, params);
+        cv::Mat texture8;
+        sampled.convertTo(texture8, CV_8U, 1.0 / 256.0);
+        return texture8;
+    }
+
+    cv::Mat_<uint8_t> sampled;
+    textureVolume.sample(sampled, *points, params);
+    return sampled;
+}
+
+void writePng(const std::filesystem::path& path, const cv::Mat& image)
+{
+    if (image.empty()) {
+        throw std::runtime_error("cannot write empty image: " + path.string());
+    }
+    if (!cv::imwrite(path.string(), image)) {
+        throw std::runtime_error("failed to write image: " + path.string());
+    }
+}
+
+cv::Mat makeStripOverlay(const cv::Mat& grayscale,
+                         const std::vector<int>& fixedIndices)
+{
+    cv::Mat image8;
+    if (grayscale.depth() == CV_8U) {
+        image8 = grayscale;
+    } else {
+        grayscale.convertTo(image8, CV_8U);
+    }
+    cv::Mat overlay;
+    cv::cvtColor(image8, overlay, cv::COLOR_GRAY2BGR);
+
+    const int centerRow = overlay.rows / 2;
+    cv::line(overlay,
+             cv::Point(0, centerRow),
+             cv::Point(std::max(0, overlay.cols - 1), centerRow),
+             cv::Scalar(0, 255, 255),
+             1,
+             cv::LINE_AA);
+
+    for (const int index : fixedIndices) {
+        if (index < 0 || index >= overlay.cols) {
+            continue;
+        }
+        cv::line(overlay,
+                 cv::Point(index, 0),
+                 cv::Point(index, std::max(0, overlay.rows - 1)),
+                 cv::Scalar(0, 0, 255),
+                 1,
+                 cv::LINE_AA);
+        cv::circle(overlay,
+                   cv::Point(index, centerRow),
+                   3,
+                   cv::Scalar(0, 255, 0),
+                   cv::FILLED,
+                   cv::LINE_AA);
+    }
+    return overlay;
+}
+
+struct RenderedStrips {
+    cv::Mat lineSurface;
+    cv::Mat lineSideSlice;
+};
+
+RenderedStrips renderLineViewStrips(const vc::lasagna::LineModel& line,
+                                    Volume& textureVolume,
+                                    int textureLevel)
+{
+    const auto surfaces = vc::lasagna::buildLineViewSurfaces(line);
+    if (!surfaces.lineSurface || !surfaces.lineSideSlice) {
+        throw std::runtime_error("line view builder did not produce both strips");
+    }
+    return {
+        renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel),
+        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel),
+    };
+}
+
+void writeStripImages(const vc::lasagna::LineModel& line,
+                      const std::vector<int>& fixedIndices,
+                      Volume& textureVolume,
+                      int textureLevel,
+                      const std::filesystem::path& outputDir)
+{
+    ensureDirectory(outputDir);
+    const RenderedStrips strips = renderLineViewStrips(line, textureVolume, textureLevel);
+    writePng(outputDir / "line_surface.png", strips.lineSurface);
+    writePng(outputDir / "line_surface_overlay.png",
+             makeStripOverlay(strips.lineSurface, fixedIndices));
+    writePng(outputDir / "side_slice.png", strips.lineSideSlice);
+    writePng(outputDir / "side_slice_overlay.png",
+             makeStripOverlay(strips.lineSideSlice, fixedIndices));
+}
+
+void writeLineViewObjOutput(const vc::lasagna::LineModel& line,
+                            const std::vector<cv::Vec3d>& linePoints,
+                            Volume& textureVolume,
+                            int textureLevel,
+                            const std::filesystem::path& outputDir)
+{
+    ensureDirectory(outputDir);
+    const auto surfaces = vc::lasagna::buildLineViewSurfaces(line);
+    if (!surfaces.lineSurface || !surfaces.lineSideSlice) {
+        throw std::runtime_error("line view builder did not produce both strips");
+    }
+
+    writeLineObj(linePoints, outputDir / "line.obj");
+
+    const cv::Mat lineSurfaceTexture =
+        renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel);
+    const cv::Mat sideSliceTexture =
+        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel);
+    writePng(outputDir / "line_surface.png", lineSurfaceTexture);
+    writePng(outputDir / "side_slice.png", sideSliceTexture);
+
+    writeSurfaceMtl(outputDir / "line_surface.mtl",
+                    "line_surface_texture",
+                    "line_surface.png");
+    writeSurfaceMtl(outputDir / "side_slice.mtl",
+                    "side_slice_texture",
+                    "side_slice.png");
+    writeSurfaceObj(*surfaces.lineSurface,
+                    outputDir / "line_surface.obj",
+                    "line_surface_texture",
+                    "line_surface.mtl");
+    writeSurfaceObj(*surfaces.lineSideSlice,
+                    outputDir / "side_slice.obj",
+                    "side_slice_texture",
+                    "side_slice.mtl");
 }
 
 bool isSchurSolver(vc::lasagna::LineOptimizationConfig::LinearSolver solver)
@@ -470,6 +951,11 @@ int main(int argc, char** argv)
     bool traceInit = false;
     bool reopt = false;
     std::filesystem::path fiberPath;
+    std::filesystem::path outputPath;
+    std::filesystem::path objOutputDir;
+    std::filesystem::path stripOutputDir;
+    std::filesystem::path textureZarrPath;
+    int textureLevel = 0;
     int segmentsPerSide = 200;
     cv::Vec3d seedPoint{17955.0, 15141.0, 37891.0};
     for (int i = 2; i < argc; ++i) {
@@ -489,6 +975,31 @@ int main(int argc, char** argv)
                 throw std::invalid_argument("--fiber requires a path");
             }
             fiberPath = argv[++i];
+        } else if (arg == "--output") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("--output requires a path");
+            }
+            outputPath = argv[++i];
+        } else if (arg == "--obj-output-dir") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("--obj-output-dir requires a directory");
+            }
+            objOutputDir = argv[++i];
+        } else if (arg == "--strip-output-dir") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("--strip-output-dir requires a directory");
+            }
+            stripOutputDir = argv[++i];
+        } else if (arg == "--texture-zarr") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("--texture-zarr requires a zarr path");
+            }
+            textureZarrPath = argv[++i];
+        } else if (arg == "--texture-level") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("--texture-level requires an integer");
+            }
+            textureLevel = parseNonNegativeInt(argv[++i], "texture-level");
         } else if (arg.rfind("--segments-per-side=", 0) == 0) {
             segmentsPerSide = parsePositiveInt(arg.substr(20), "segments-per-side");
         } else if (arg.rfind("--seed=", 0) == 0) {
@@ -500,20 +1011,43 @@ int main(int argc, char** argv)
     }
 
     try {
-        if (!fiberPath.empty() && !reopt) {
-            throw std::invalid_argument("--fiber requires --reopt");
+        const bool wantsObjOutput = !objOutputDir.empty();
+        const bool wantsStripOutput = !stripOutputDir.empty();
+        const bool wantsTextureOutput = wantsObjOutput || wantsStripOutput;
+        if (!outputPath.empty() && !reopt) {
+            throw std::invalid_argument("--output requires --reopt");
         }
         if (reopt && fiberPath.empty()) {
             throw std::invalid_argument("--reopt requires --fiber <fiber.json>");
         }
+        if (wantsTextureOutput && fiberPath.empty()) {
+            throw std::invalid_argument("--obj-output-dir/--strip-output-dir require --fiber <fiber.json>");
+        }
+        if (wantsTextureOutput && textureZarrPath.empty()) {
+            throw std::invalid_argument("--obj-output-dir/--strip-output-dir require --texture-zarr <zarr>");
+        }
+        if (!textureZarrPath.empty() && !wantsTextureOutput) {
+            throw std::invalid_argument("--texture-zarr requires --obj-output-dir or --strip-output-dir");
+        }
         if (reopt && (benchmarkSolvers || benchmarkThreads || traceInit)) {
             throw std::invalid_argument("--reopt cannot be combined with benchmark or seed trace modes");
+        }
+        if (!fiberPath.empty() && (benchmarkSolvers || benchmarkThreads || traceInit)) {
+            throw std::invalid_argument("--fiber cannot be combined with benchmark or seed trace modes");
         }
 
         const std::filesystem::path manifestPath = argv[1];
         vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         vc::lasagna::LineOptimizer optimizer(sampler);
+        std::shared_ptr<Volume> textureVolume;
+        if (wantsTextureOutput) {
+            textureVolume = Volume::New(textureZarrPath);
+            if (!textureVolume->hasScaleLevel(textureLevel)) {
+                throw std::runtime_error("texture zarr has no scale level " +
+                                         std::to_string(textureLevel));
+            }
+        }
 
         const cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         const auto seedNormal = sampler.sampleNormal(seedPoint);
@@ -534,7 +1068,7 @@ int main(int argc, char** argv)
         config.tangentGuideMode =
             vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane;
 
-        if (reopt) {
+        if (!fiberPath.empty()) {
             const FiberInput fiber = loadFiberInput(fiberPath);
             const int seedControlIndex = middleControlIndex(fiber.controlPoints, fiber.linePoints);
             const int displayFrameAnchorIndex = nearestLinePointIndex(
@@ -552,9 +1086,10 @@ int main(int argc, char** argv)
                 throw std::runtime_error("fiber has no usable fixed control indices");
             }
 
-            std::cout << "Fiber reoptimization input:\n"
+            std::cout << "Fiber input:\n"
                       << "fiber=" << fiberPath.string() << '\n'
                       << "manifest=" << manifestPath.string() << '\n'
+                      << "output=" << (outputPath.empty() ? std::string{"<none>"} : outputPath.string()) << '\n'
                       << "line_points=" << fiber.linePoints.size()
                       << " control_points=" << fiber.controlPoints.size()
                       << " fixed_points=" << fixedIndices.size()
@@ -571,31 +1106,65 @@ int main(int argc, char** argv)
                       << ", " << config.initialTangent[1]
                       << ", " << config.initialTangent[2] << "]\n";
             std::cout << "Differentiable normal sampling=" << config.differentiableNormalSampling << "\n";
-            printControlDiagnostics("Input", fiber.linePoints, fiber.controlPoints);
 
-            const auto result = optimizer.optimizeExistingLine(fiber.linePoints,
-                                                               fixedIndices,
-                                                               displayFrameAnchorIndex,
-                                                               config,
-                                                               -1,
-                                                               -1,
-                                                               "fiber-reopt+global");
-            const auto outputLinePoints = linePointsFromModel(result.line);
-            std::cout << "Fiber reoptimization complete: points=" << result.line.points.size()
-                      << " iterations=" << result.report.iterations
-                      << " initial_cost=" << result.report.initialCost
-                      << " final_cost=" << result.report.finalCost
-                      << " valid_normals=" << result.report.validNormalSamples
-                      << " invalid_normals=" << result.report.invalidNormalSamples
-                      << " converged=" << result.report.converged
-                      << " line_length=" << lineLength(outputLinePoints)
-                      << "\n";
-            if (!result.report.message.empty()) {
-                std::cout << result.report.message << '\n';
+            std::vector<cv::Vec3d> outputLinePoints = fiber.linePoints;
+            vc::lasagna::LineModel outputLine =
+                makeLineModelFromPoints(fiber.linePoints, sampler, displayFrameAnchorIndex);
+
+            if (reopt) {
+                const auto result = optimizer.optimizeExistingLine(fiber.linePoints,
+                                                                   fixedIndices,
+                                                                   displayFrameAnchorIndex,
+                                                                   config,
+                                                                   -1,
+                                                                   -1,
+                                                                   "fiber-reopt+global");
+                outputLine = result.line;
+                outputLinePoints = linePointsFromModel(result.line);
+                const PointMotionStats motionStats = pointMotionStats(fiber.linePoints, outputLinePoints);
+                printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
+                std::cout << "Fiber reoptimization complete: points=" << result.line.points.size()
+                          << " iterations=" << result.report.iterations
+                          << " initial_cost=" << result.report.initialCost
+                          << " final_cost=" << result.report.finalCost
+                          << " valid_normals=" << result.report.validNormalSamples
+                          << " invalid_normals=" << result.report.invalidNormalSamples
+                          << " converged=" << result.report.converged
+                          << " line_length=" << lineLength(outputLinePoints)
+                          << "\n";
+                std::cout << "Fit: initial=" << result.report.initialCost
+                          << " final=" << result.report.finalCost
+                          << " change=" << (result.report.initialCost - result.report.finalCost)
+                          << '\n';
+                printPointMotionStats(motionStats);
+                printLosses(result.report);
+            } else {
+                std::cout << "Loaded fiber without reoptimization: points="
+                          << outputLine.points.size()
+                          << " line_length=" << lineLength(outputLinePoints)
+                          << '\n';
             }
-            printLosses(result.report);
-            printControlDiagnostics("Output", outputLinePoints, fiber.controlPoints);
-            printLineViewDiagnostics(result.line);
+            printLineViewDiagnostics(outputLine);
+            if (!outputPath.empty()) {
+                saveReoptimizedFiber(fiber, outputLinePoints, outputPath);
+                std::cout << "Saved reoptimized fiber to " << outputPath.string() << '\n';
+            }
+            if (wantsObjOutput) {
+                writeLineViewObjOutput(outputLine,
+                                       outputLinePoints,
+                                       *textureVolume,
+                                       textureLevel,
+                                       objOutputDir);
+                std::cout << "Saved OBJ line-view output to " << objOutputDir.string() << '\n';
+            }
+            if (wantsStripOutput) {
+                writeStripImages(outputLine,
+                                 fixedIndices,
+                                 *textureVolume,
+                                 textureLevel,
+                                 stripOutputDir);
+                std::cout << "Saved strip render output to " << stripOutputDir.string() << '\n';
+            }
             return 0;
         }
 

@@ -2784,6 +2784,20 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
                 spacing[static_cast<size_t>(segment)] = {SegmentSpacingMode::FixedStep, -1};
             }
         }
+        for (size_t spanIndex = 0; spanIndex + 1 < controlAnchorIndices.size(); ++spanIndex) {
+            const int spanStart = controlAnchorIndices[spanIndex];
+            const int spanEnd = controlAnchorIndices[spanIndex + 1];
+            if (spanEnd <= spanStart) {
+                continue;
+            }
+            const int spanId = static_cast<int>(spanIndex);
+            for (int segment = spanStart; segment < spanEnd; ++segment) {
+                spacing[static_cast<size_t>(segment)] = {
+                    SegmentSpacingMode::EvenStep,
+                    spanId,
+                };
+            }
+        }
     }
 
     const int tangentLeft = std::max(0, displayFrameAnchorIndex - 1);

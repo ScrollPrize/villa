@@ -555,7 +555,7 @@ TEST_CASE("LineOptimizer full existing-line solve uses current samples directly"
     CHECK(result.report.message.find("control-points+global") == std::string::npos);
     CHECK(result.report.message.find("normal-construct") == std::string::npos);
     CHECK(lossByName(result.report, "step_distance").residuals == 2);
-    CHECK(lossByName(result.report, "even_step").residuals == 0);
+    CHECK(lossByName(result.report, "even_step").residuals == 1);
     for (size_t i = 0; i < linePoints.size(); ++i) {
         CHECK(norm(result.line.points[i].position - linePoints[i]) == doctest::Approx(0.0));
     }
