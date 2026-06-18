@@ -3,12 +3,15 @@
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 
+#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -42,8 +45,9 @@ bool finiteDirection(const cv::Vec3d& v)
 void printUsage(const char* argv0)
 {
     std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z]\n"
+              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> --reopt [--constant-normal-jacobian]\n"
               << "Runs line annotation optimization at seed "
-              << "[17955,15141,37891] with initial z-axis mode.\n";
+              << "[17955,15141,37891] with initial z-axis mode, or reoptimizes a saved VC3D fiber without saving it.\n";
 }
 
 cv::Vec3d parseSeed(const std::string& value)
@@ -71,6 +75,161 @@ int parsePositiveInt(const std::string& value, const char* name)
         throw std::invalid_argument(std::string(name) + " must be a positive integer");
     }
     return parsed;
+}
+
+struct FiberInput {
+    std::vector<cv::Vec3d> controlPoints;
+    std::vector<cv::Vec3d> linePoints;
+};
+
+cv::Vec3d pointFromJson(const nlohmann::json& value)
+{
+    if (!value.is_array() || value.size() != 3) {
+        throw std::runtime_error("point must be [x, y, z]");
+    }
+    cv::Vec3d point{
+        value.at(0).get<double>(),
+        value.at(1).get<double>(),
+        value.at(2).get<double>(),
+    };
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+        throw std::runtime_error("point contains non-finite coordinates");
+    }
+    return point;
+}
+
+std::vector<cv::Vec3d> readPointArray(const nlohmann::json& root, const char* key)
+{
+    if (!root.contains(key) || !root.at(key).is_array()) {
+        throw std::runtime_error(std::string("fiber JSON is missing array ") + key);
+    }
+    std::vector<cv::Vec3d> points;
+    points.reserve(root.at(key).size());
+    for (const auto& value : root.at(key)) {
+        points.push_back(pointFromJson(value));
+    }
+    return points;
+}
+
+FiberInput loadFiberInput(const std::filesystem::path& fiberPath)
+{
+    std::ifstream input(fiberPath);
+    if (!input.good()) {
+        throw std::runtime_error("could not open fiber JSON: " + fiberPath.string());
+    }
+    const nlohmann::json root = nlohmann::json::parse(input);
+    if (root.value("type", std::string{}) != "vc3d_fiber") {
+        throw std::runtime_error("fiber JSON type is not vc3d_fiber");
+    }
+    if (root.value("version", 0) != 1) {
+        throw std::runtime_error("unsupported vc3d_fiber version");
+    }
+
+    FiberInput fiber;
+    fiber.controlPoints = readPointArray(root, "control_points");
+    fiber.linePoints = readPointArray(root, "line_points");
+    if (fiber.controlPoints.empty()) {
+        throw std::runtime_error("fiber JSON has no control_points");
+    }
+    if (fiber.linePoints.size() < 2) {
+        throw std::runtime_error("fiber JSON needs at least two line_points for reoptimization");
+    }
+    return fiber;
+}
+
+double distance(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    const cv::Vec3d delta = a - b;
+    return std::sqrt(delta.dot(delta));
+}
+
+int nearestLinePointIndex(const std::vector<cv::Vec3d>& linePoints,
+                          const cv::Vec3d& point)
+{
+    if (linePoints.empty()) {
+        return -1;
+    }
+    int bestIndex = 0;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < linePoints.size(); ++i) {
+        const double candidate = distance(linePoints[i], point);
+        if (candidate < bestDistance) {
+            bestDistance = candidate;
+            bestIndex = static_cast<int>(i);
+        }
+    }
+    return bestIndex;
+}
+
+int middleControlIndex(const std::vector<cv::Vec3d>& controlPoints,
+                       const std::vector<cv::Vec3d>& linePoints)
+{
+    const double center = static_cast<double>(linePoints.size() - 1) * 0.5;
+    int bestIndex = 0;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < controlPoints.size(); ++i) {
+        const int lineIndex = nearestLinePointIndex(linePoints, controlPoints[i]);
+        const double candidate = std::abs(static_cast<double>(lineIndex) - center);
+        if (candidate < bestDistance) {
+            bestDistance = candidate;
+            bestIndex = static_cast<int>(i);
+        }
+    }
+    return bestIndex;
+}
+
+std::vector<int> fixedIndicesForControls(const FiberInput& fiber)
+{
+    std::vector<int> fixedIndices;
+    fixedIndices.reserve(fiber.controlPoints.size());
+    for (const auto& control : fiber.controlPoints) {
+        fixedIndices.push_back(nearestLinePointIndex(fiber.linePoints, control));
+    }
+    std::sort(fixedIndices.begin(), fixedIndices.end());
+    fixedIndices.erase(std::unique(fixedIndices.begin(), fixedIndices.end()),
+                       fixedIndices.end());
+    return fixedIndices;
+}
+
+double lineLength(const std::vector<cv::Vec3d>& points)
+{
+    double length = 0.0;
+    for (size_t i = 1; i < points.size(); ++i) {
+        length += distance(points[i - 1], points[i]);
+    }
+    return length;
+}
+
+std::vector<cv::Vec3d> linePointsFromModel(const vc::lasagna::LineModel& line)
+{
+    std::vector<cv::Vec3d> points;
+    points.reserve(line.points.size());
+    for (const auto& point : line.points) {
+        points.push_back(point.position);
+    }
+    return points;
+}
+
+void printControlDiagnostics(const char* label,
+                             const std::vector<cv::Vec3d>& linePoints,
+                             const std::vector<cv::Vec3d>& controlPoints)
+{
+    std::cout.imbue(std::locale::classic());
+    std::cout << std::scientific << std::setprecision(3);
+    std::cout << label << " control diagnostics:\n"
+              << "idx line_index distance point[x,y,z]\n";
+    for (size_t i = 0; i < controlPoints.size(); ++i) {
+        const int lineIndex = nearestLinePointIndex(linePoints, controlPoints[i]);
+        const double controlDistance = lineIndex >= 0
+            ? distance(linePoints[static_cast<size_t>(lineIndex)], controlPoints[i])
+            : std::numeric_limits<double>::quiet_NaN();
+        std::cout << std::setw(3) << i
+                  << std::setw(11) << lineIndex
+                  << std::setw(13) << controlDistance
+                  << " [" << controlPoints[i][0]
+                  << ", " << controlPoints[i][1]
+                  << ", " << controlPoints[i][2] << "]\n";
+    }
 }
 
 cv::Vec3d initialZInOutTangent(const cv::Vec3d& sourceSliceNormal,
@@ -309,6 +468,8 @@ int main(int argc, char** argv)
     bool benchmarkSolvers = false;
     bool benchmarkThreads = false;
     bool traceInit = false;
+    bool reopt = false;
+    std::filesystem::path fiberPath;
     int segmentsPerSide = 200;
     cv::Vec3d seedPoint{17955.0, 15141.0, 37891.0};
     for (int i = 2; i < argc; ++i) {
@@ -321,6 +482,13 @@ int main(int argc, char** argv)
             benchmarkThreads = true;
         } else if (arg == "--trace-init") {
             traceInit = true;
+        } else if (arg == "--reopt") {
+            reopt = true;
+        } else if (arg == "--fiber") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("--fiber requires a path");
+            }
+            fiberPath = argv[++i];
         } else if (arg.rfind("--segments-per-side=", 0) == 0) {
             segmentsPerSide = parsePositiveInt(arg.substr(20), "segments-per-side");
         } else if (arg.rfind("--seed=", 0) == 0) {
@@ -332,6 +500,16 @@ int main(int argc, char** argv)
     }
 
     try {
+        if (!fiberPath.empty() && !reopt) {
+            throw std::invalid_argument("--fiber requires --reopt");
+        }
+        if (reopt && fiberPath.empty()) {
+            throw std::invalid_argument("--reopt requires --fiber <fiber.json>");
+        }
+        if (reopt && (benchmarkSolvers || benchmarkThreads || traceInit)) {
+            throw std::invalid_argument("--reopt cannot be combined with benchmark or seed trace modes");
+        }
+
         const std::filesystem::path manifestPath = argv[1];
         vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
@@ -355,6 +533,71 @@ int main(int argc, char** argv)
         config.tangentGuideWeight = 1.0;
         config.tangentGuideMode =
             vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane;
+
+        if (reopt) {
+            const FiberInput fiber = loadFiberInput(fiberPath);
+            const int seedControlIndex = middleControlIndex(fiber.controlPoints, fiber.linePoints);
+            const int displayFrameAnchorIndex = nearestLinePointIndex(
+                fiber.linePoints,
+                fiber.controlPoints[static_cast<size_t>(seedControlIndex)]);
+            const auto fiberSeedNormal =
+                sampler.sampleNormal(fiber.controlPoints[static_cast<size_t>(seedControlIndex)]);
+            config.initialTangent = initialZInOutTangent(sourceSliceNormal, fiberSeedNormal);
+            config.useInitialTangent = finiteDirection(config.initialTangent);
+            config.initialLinePoints = fiber.linePoints;
+            config.printSolverProgress = false;
+
+            const auto fixedIndices = fixedIndicesForControls(fiber);
+            if (fixedIndices.empty()) {
+                throw std::runtime_error("fiber has no usable fixed control indices");
+            }
+
+            std::cout << "Fiber reoptimization input:\n"
+                      << "fiber=" << fiberPath.string() << '\n'
+                      << "manifest=" << manifestPath.string() << '\n'
+                      << "line_points=" << fiber.linePoints.size()
+                      << " control_points=" << fiber.controlPoints.size()
+                      << " fixed_points=" << fixedIndices.size()
+                      << " seed_control_index=" << seedControlIndex
+                      << " display_frame_anchor_index=" << displayFrameAnchorIndex
+                      << " line_length=" << lineLength(fiber.linePoints)
+                      << '\n';
+            std::cout << "Seed normal valid=" << fiberSeedNormal.valid
+                      << " normal=[" << fiberSeedNormal.normal[0]
+                      << ", " << fiberSeedNormal.normal[1]
+                      << ", " << fiberSeedNormal.normal[2] << "]\n";
+            std::cout << "Initial tangent valid=" << config.useInitialTangent
+                      << " tangent=[" << config.initialTangent[0]
+                      << ", " << config.initialTangent[1]
+                      << ", " << config.initialTangent[2] << "]\n";
+            std::cout << "Differentiable normal sampling=" << config.differentiableNormalSampling << "\n";
+            printControlDiagnostics("Input", fiber.linePoints, fiber.controlPoints);
+
+            const auto result = optimizer.optimizeExistingLine(fiber.linePoints,
+                                                               fixedIndices,
+                                                               displayFrameAnchorIndex,
+                                                               config,
+                                                               -1,
+                                                               -1,
+                                                               "fiber-reopt+global");
+            const auto outputLinePoints = linePointsFromModel(result.line);
+            std::cout << "Fiber reoptimization complete: points=" << result.line.points.size()
+                      << " iterations=" << result.report.iterations
+                      << " initial_cost=" << result.report.initialCost
+                      << " final_cost=" << result.report.finalCost
+                      << " valid_normals=" << result.report.validNormalSamples
+                      << " invalid_normals=" << result.report.invalidNormalSamples
+                      << " converged=" << result.report.converged
+                      << " line_length=" << lineLength(outputLinePoints)
+                      << "\n";
+            if (!result.report.message.empty()) {
+                std::cout << result.report.message << '\n';
+            }
+            printLosses(result.report);
+            printControlDiagnostics("Output", outputLinePoints, fiber.controlPoints);
+            printLineViewDiagnostics(result.line);
+            return 0;
+        }
 
         std::cout << "Seed: [" << seedPoint[0] << ", " << seedPoint[1] << ", " << seedPoint[2] << "]\n";
         std::cout << "Source direction: [0, 0, 1]\n";
