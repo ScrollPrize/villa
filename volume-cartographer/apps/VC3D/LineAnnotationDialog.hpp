@@ -19,6 +19,8 @@
 
 class CState;
 class QComboBox;
+class QGraphicsEllipseItem;
+class QGraphicsPathItem;
 class QLabel;
 class QMdiArea;
 class QMdiSubWindow;
@@ -56,6 +58,19 @@ public:
         std::string surfaceName;
         QPointer<CChunkedVolumeViewer> viewer;
         QPointer<QMdiSubWindow> subWindow;
+    };
+
+    struct FastStripOverlayItems {
+        QPointer<CChunkedVolumeViewer> viewer;
+        std::string surfaceName;
+        std::vector<QGraphicsEllipseItem*> crossMarkers;
+        QGraphicsEllipseItem* currentMarker = nullptr;
+    };
+
+    struct FastCurrentCutOverlayItems {
+        QPointer<CChunkedVolumeViewer> viewer;
+        QGraphicsPathItem* controlPoints = nullptr;
+        QGraphicsPathItem* seedPoints = nullptr;
     };
 
     using GeneratedOverlay = vc3d::line_annotation::GeneratedOverlay;
@@ -121,7 +136,9 @@ private:
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
-    void setCurrentLinePosition(double position, bool updateBottomCuts = true);
+    void setCurrentLinePosition(double position,
+                                bool updateBottomCuts = true,
+                                bool updateCurrentCutOverlay = true);
     void cancelControlPointPreviewAnimation();
     void jumpToPreviousControlPoint();
     void jumpToNextControlPoint();
@@ -135,7 +152,9 @@ private:
     void setCurrentCutFollowsStripMouse(bool follows);
     double snappedControlPointPosition(double position) const;
     void rebuildGeneratedStaticStripOverlays();
-    void rebuildGeneratedDynamicOverlays(bool includeBottomCuts = true);
+    void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true);
+    void updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay);
+    void clearFastGeneratedOverlayItemRefs();
     void rebuildGeneratedOverlays();
     void installGeneratedViewShortcuts();
     void resetGeneratedViews();
@@ -186,6 +205,8 @@ private:
     QWidget* _generatedTopWidget = nullptr;
     std::vector<QPointer<QWidget>> _generatedContainers;
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
+    std::vector<FastStripOverlayItems> _fastStripOverlayItems;
+    FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     GeneratedViews _generatedViews;
@@ -201,6 +222,7 @@ private:
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
     bool _currentCutStraightOffsetActive = false;
+    bool _generatedOverlayRefreshQueued = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     bool _haveInitialCurrentCutCamera = false;

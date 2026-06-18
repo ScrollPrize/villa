@@ -165,6 +165,36 @@ GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& vi
         linePositionRadius);
 }
 
+GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(
+    const GeneratedViews& views,
+    double linePosition,
+    CChunkedVolumeViewer* viewer,
+    PlaneSurface* plane,
+    const GeneratedControlPointLinePositionIndex* controlIndex)
+{
+    GeneratedOverlay overlay =
+        makeGeneratedCrossSliceOverlayForPlane(views,
+                                               linePosition,
+                                               false,
+                                               viewer,
+                                               plane,
+                                               controlIndex);
+    overlay.pointMarker = {std::numeric_limits<float>::quiet_NaN(),
+                           std::numeric_limits<float>::quiet_NaN(),
+                           std::numeric_limits<float>::quiet_NaN()};
+    overlay.emphasizedPointMarker = false;
+    return overlay;
+}
+
+GeneratedOverlay makeGeneratedSurfaceCenterPointOverlay(bool emphasized)
+{
+    GeneratedOverlay overlay;
+    overlay.pointMarker = {0.0f, 0.0f, 0.0f};
+    overlay.pointMarkerInSurfaceCoords = true;
+    overlay.emphasizedPointMarker = emphasized;
+    return overlay;
+}
+
 void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                            const std::string& surfaceName,
                            const GeneratedOverlay& overlay)
@@ -399,9 +429,16 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     if (finiteGeneratedPoint(overlay.pointMarker)) {
-        addVolumePointMarker(overlay.pointMarker,
-                             overlay.emphasizedPointMarker ? 2.5 : 2.0,
-                             overlay.emphasizedPointMarker ? currentMarkerStyle : markerStyle);
+        const qreal radius = overlay.emphasizedPointMarker ? 2.5 : 2.0;
+        const auto& style = overlay.emphasizedPointMarker ? currentMarkerStyle : markerStyle;
+        if (overlay.pointMarkerInSurfaceCoords) {
+            primitives.push_back(ViewerOverlayControllerBase::SurfacePointPrimitive{
+                {overlay.pointMarker[0], overlay.pointMarker[1]},
+                radius,
+                style});
+        } else {
+            addVolumePointMarker(overlay.pointMarker, radius, style);
+        }
     }
 
     if (!hasSeedScene && finiteGeneratedPoint(overlay.seedPoint)) {
