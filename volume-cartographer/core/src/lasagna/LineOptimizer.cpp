@@ -3537,26 +3537,43 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
 
     std::ostringstream message;
     message.imbue(std::locale::classic());
-    message << std::scientific << std::setprecision(2)
+    message << std::scientific << std::setprecision(1)
             << "Reinitialized control spans:\n"
-            << "seg lcp rcp pts lsgn lnear rsgn rnear linit lfinal rinit rfinal mxstep mxtan mxnorm mxalign pick\n";
+            << std::right
+            << std::setw(3) << "seg"
+            << std::setw(4) << "lcp"
+            << std::setw(4) << "rcp"
+            << std::setw(4) << "pts"
+            << std::setw(5) << "lsgn"
+            << std::setw(8) << "lnear"
+            << std::setw(5) << "rsgn"
+            << std::setw(8) << "rnear"
+            << std::setw(8) << "linit"
+            << std::setw(8) << "lfinal"
+            << std::setw(8) << "rinit"
+            << std::setw(8) << "rfinal"
+            << std::setw(8) << "mxstep"
+            << std::setw(8) << "mxtan"
+            << std::setw(8) << "mxnorm"
+            << std::setw(8) << "mxalign"
+            << ' ' << "pick" << '\n';
     for (const auto& report : spanReports) {
         message << std::right << std::setw(3) << report.segmentIndex
-                << std::setw(8) << report.leftControlIndex
-                << std::setw(9) << report.rightControlIndex
-                << std::setw(7) << report.points
-                << std::setw(10) << report.candLeftSelectedSign
-                << std::setw(13) << report.candLeftClosestTargetDistance
-                << std::setw(11) << report.candRightSelectedSign
-                << std::setw(14) << report.candRightClosestTargetDistance
-                << std::setw(15) << report.candLeftInitialCost
-                << std::setw(16) << report.candLeftFinalCost
-                << std::setw(16) << report.candRightInitialCost
-                << std::setw(17) << report.candRightFinalCost
-                << std::setw(14) << report.chosenMaxEvenStepDeviation
-                << std::setw(15) << report.chosenMaxTangentSmoothDeviation
-                << std::setw(16) << report.chosenMaxNormalSmoothDeviation
-                << std::setw(15) << report.chosenMaxNormalAlignmentAbs
+                << std::setw(4) << report.leftControlIndex
+                << std::setw(4) << report.rightControlIndex
+                << std::setw(4) << report.points
+                << std::setw(5) << report.candLeftSelectedSign
+                << std::setw(8) << report.candLeftClosestTargetDistance
+                << std::setw(5) << report.candRightSelectedSign
+                << std::setw(8) << report.candRightClosestTargetDistance
+                << std::setw(8) << report.candLeftInitialCost
+                << std::setw(8) << report.candLeftFinalCost
+                << std::setw(8) << report.candRightInitialCost
+                << std::setw(8) << report.candRightFinalCost
+                << std::setw(8) << report.chosenMaxEvenStepDeviation
+                << std::setw(8) << report.chosenMaxTangentSmoothDeviation
+                << std::setw(8) << report.chosenMaxNormalSmoothDeviation
+                << std::setw(8) << report.chosenMaxNormalAlignmentAbs
                 << ' ' << report.chosen << '\n';
     }
     message << "max_segment_candidate_final_cost_diff=" << maxCandidateFinalDiff << "\n\n"

@@ -51,8 +51,8 @@ bool finiteDirection(const cv::Vec3d& v)
 
 void printUsage(const char* argv0)
 {
-    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z]\n"
-              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt|--reinit-reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian]\n"
+    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z] [--verbose]\n"
+              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt|--reinit-reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian] [--verbose]\n"
               << "Runs line annotation optimization at seed "
               << "[17955,15141,37891] with initial z-axis mode, or loads/reoptimizes a saved VC3D fiber.\n";
 }
@@ -437,26 +437,43 @@ void printSegmentMotionTable(const std::vector<cv::Vec3d>& inputPoints,
 void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpanReport>& spans)
 {
     std::cout.imbue(std::locale::classic());
-    std::cout << std::scientific << std::setprecision(2);
+    std::cout << std::scientific << std::setprecision(1);
     std::cout << "Reinit segment candidates:\n"
-              << "seg lcp rcp pts lsgn lnear rsgn rnear linit lfinal rinit rfinal mxstep mxtan mxnorm mxalign pick\n";
+              << std::right
+              << std::setw(3) << "seg"
+              << std::setw(4) << "lcp"
+              << std::setw(4) << "rcp"
+              << std::setw(4) << "pts"
+              << std::setw(5) << "lsgn"
+              << std::setw(8) << "lnear"
+              << std::setw(5) << "rsgn"
+              << std::setw(8) << "rnear"
+              << std::setw(8) << "linit"
+              << std::setw(8) << "lfinal"
+              << std::setw(8) << "rinit"
+              << std::setw(8) << "rfinal"
+              << std::setw(8) << "mxstep"
+              << std::setw(8) << "mxtan"
+              << std::setw(8) << "mxnorm"
+              << std::setw(8) << "mxalign"
+              << ' ' << "pick" << '\n';
     for (const auto& span : spans) {
         std::cout << std::right << std::setw(3) << span.segmentIndex
-                  << std::setw(8) << span.leftControlIndex
-                  << std::setw(9) << span.rightControlIndex
-                  << std::setw(7) << span.points
-                  << std::setw(10) << span.candLeftSelectedSign
-                  << std::setw(13) << span.candLeftClosestTargetDistance
-                  << std::setw(11) << span.candRightSelectedSign
-                  << std::setw(14) << span.candRightClosestTargetDistance
-                  << std::setw(15) << span.candLeftInitialCost
-                  << std::setw(16) << span.candLeftFinalCost
-                  << std::setw(16) << span.candRightInitialCost
-                  << std::setw(17) << span.candRightFinalCost
-                  << std::setw(14) << span.chosenMaxEvenStepDeviation
-                  << std::setw(15) << span.chosenMaxTangentSmoothDeviation
-                  << std::setw(16) << span.chosenMaxNormalSmoothDeviation
-                  << std::setw(15) << span.chosenMaxNormalAlignmentAbs
+                  << std::setw(4) << span.leftControlIndex
+                  << std::setw(4) << span.rightControlIndex
+                  << std::setw(4) << span.points
+                  << std::setw(5) << span.candLeftSelectedSign
+                  << std::setw(8) << span.candLeftClosestTargetDistance
+                  << std::setw(5) << span.candRightSelectedSign
+                  << std::setw(8) << span.candRightClosestTargetDistance
+                  << std::setw(8) << span.candLeftInitialCost
+                  << std::setw(8) << span.candLeftFinalCost
+                  << std::setw(8) << span.candRightInitialCost
+                  << std::setw(8) << span.candRightFinalCost
+                  << std::setw(8) << span.chosenMaxEvenStepDeviation
+                  << std::setw(8) << span.chosenMaxTangentSmoothDeviation
+                  << std::setw(8) << span.chosenMaxNormalSmoothDeviation
+                  << std::setw(8) << span.chosenMaxNormalAlignmentAbs
                   << ' ' << span.chosen << '\n';
     }
 }
@@ -488,6 +505,15 @@ void printLosses(const vc::lasagna::LineOptimizationReport& report)
                   << std::setw(14) << loss.weightedCost
                   << '\n';
     }
+}
+
+void printResidualSummary(const vc::lasagna::LineOptimizationReport& report)
+{
+    std::cout.imbue(std::locale::classic());
+    std::cout << std::scientific << std::setprecision(3)
+              << "Residual: initial=" << report.initialCost
+              << " optimized=" << report.finalCost
+              << '\n';
 }
 
 const char* solverName(vc::lasagna::LineOptimizationConfig::LinearSolver solver)
@@ -1030,6 +1056,7 @@ int main(int argc, char** argv)
     bool traceInit = false;
     bool reopt = false;
     bool reinitReopt = false;
+    bool verbose = false;
     std::filesystem::path fiberPath;
     std::filesystem::path outputPath;
     std::filesystem::path objOutputDir;
@@ -1053,6 +1080,8 @@ int main(int argc, char** argv)
             reopt = true;
         } else if (arg == "--reinit-reopt") {
             reinitReopt = true;
+        } else if (arg == "--verbose") {
+            verbose = true;
         } else if (arg == "--fiber") {
             if (i + 1 >= argc) {
                 throw std::invalid_argument("--fiber requires a path");
@@ -1161,6 +1190,9 @@ int main(int argc, char** argv)
         config.tangentGuideWeight = 1.0;
         config.tangentGuideMode =
             vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane;
+        if (reopt || reinitReopt) {
+            config.normalStraightnessWeight *= 10.0;
+        }
 
         if (!fiberPath.empty()) {
             const FiberInput fiber = loadFiberInput(fiberPath);
@@ -1180,26 +1212,28 @@ int main(int argc, char** argv)
                 throw std::runtime_error("fiber has no usable fixed control indices");
             }
 
-            std::cout << "Fiber input:\n"
-                      << "fiber=" << fiberPath.string() << '\n'
-                      << "manifest=" << manifestPath.string() << '\n'
-                      << "output=" << (outputPath.empty() ? std::string{"<none>"} : outputPath.string()) << '\n'
-                      << "line_points=" << fiber.linePoints.size()
-                      << " control_points=" << fiber.controlPoints.size()
-                      << " fixed_points=" << fixedIndices.size()
-                      << " seed_control_index=" << seedControlIndex
-                      << " display_frame_anchor_index=" << displayFrameAnchorIndex
-                      << " line_length=" << lineLength(fiber.linePoints)
-                      << '\n';
-            std::cout << "Seed normal valid=" << fiberSeedNormal.valid
-                      << " normal=[" << fiberSeedNormal.normal[0]
-                      << ", " << fiberSeedNormal.normal[1]
-                      << ", " << fiberSeedNormal.normal[2] << "]\n";
-            std::cout << "Initial tangent valid=" << config.useInitialTangent
-                      << " tangent=[" << config.initialTangent[0]
-                      << ", " << config.initialTangent[1]
-                      << ", " << config.initialTangent[2] << "]\n";
-            std::cout << "Differentiable normal sampling=" << config.differentiableNormalSampling << "\n";
+            if (verbose) {
+                std::cout << "Fiber input:\n"
+                          << "fiber=" << fiberPath.string() << '\n'
+                          << "manifest=" << manifestPath.string() << '\n'
+                          << "output=" << (outputPath.empty() ? std::string{"<none>"} : outputPath.string()) << '\n'
+                          << "line_points=" << fiber.linePoints.size()
+                          << " control_points=" << fiber.controlPoints.size()
+                          << " fixed_points=" << fixedIndices.size()
+                          << " seed_control_index=" << seedControlIndex
+                          << " display_frame_anchor_index=" << displayFrameAnchorIndex
+                          << " line_length=" << lineLength(fiber.linePoints)
+                          << '\n';
+                std::cout << "Seed normal valid=" << fiberSeedNormal.valid
+                          << " normal=[" << fiberSeedNormal.normal[0]
+                          << ", " << fiberSeedNormal.normal[1]
+                          << ", " << fiberSeedNormal.normal[2] << "]\n";
+                std::cout << "Initial tangent valid=" << config.useInitialTangent
+                          << " tangent=[" << config.initialTangent[0]
+                          << ", " << config.initialTangent[1]
+                          << ", " << config.initialTangent[2] << "]\n";
+                std::cout << "Differentiable normal sampling=" << config.differentiableNormalSampling << "\n";
+            }
 
             std::vector<cv::Vec3d> outputLinePoints = fiber.linePoints;
             vc::lasagna::LineModel outputLine =
@@ -1228,28 +1262,26 @@ int main(int argc, char** argv)
                 outputLine = result.optimization.line;
                 outputLinePoints = linePointsFromModel(result.optimization.line);
                 outputFixedIndices = result.fixedPointIndices;
-                const PointMotionStats motionStats = pointMotionStats(fiber.linePoints, outputLinePoints);
-                printReinitSpanTable(result.spans);
-                std::cout << "max_segment_candidate_final_cost_diff="
-                          << result.maxSegmentCandidateFinalCostDiff << '\n';
-                printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
-                std::cout << "Fiber reinit reoptimization complete: points="
-                          << result.optimization.line.points.size()
-                          << " iterations=" << result.optimization.report.iterations
-                          << " initial_cost=" << result.optimization.report.initialCost
-                          << " final_cost=" << result.optimization.report.finalCost
-                          << " valid_normals=" << result.optimization.report.validNormalSamples
-                          << " invalid_normals=" << result.optimization.report.invalidNormalSamples
-                          << " converged=" << result.optimization.report.converged
-                          << " line_length=" << lineLength(outputLinePoints)
-                          << "\n";
-                std::cout << "Fit: initial=" << result.optimization.report.initialCost
-                          << " final=" << result.optimization.report.finalCost
-                          << " change=" << (result.optimization.report.initialCost -
-                                            result.optimization.report.finalCost)
-                          << '\n';
-                printPointMotionStats(motionStats);
-                printLosses(result.optimization.report);
+                printResidualSummary(result.optimization.report);
+                if (verbose) {
+                    const PointMotionStats motionStats = pointMotionStats(fiber.linePoints, outputLinePoints);
+                    printReinitSpanTable(result.spans);
+                    std::cout << "max_segment_candidate_final_cost_diff="
+                              << result.maxSegmentCandidateFinalCostDiff << '\n';
+                    printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
+                    std::cout << "Fiber reinit reoptimization complete: points="
+                              << result.optimization.line.points.size()
+                              << " iterations=" << result.optimization.report.iterations
+                              << " initial_cost=" << result.optimization.report.initialCost
+                              << " final_cost=" << result.optimization.report.finalCost
+                              << " valid_normals=" << result.optimization.report.validNormalSamples
+                              << " invalid_normals=" << result.optimization.report.invalidNormalSamples
+                              << " converged=" << result.optimization.report.converged
+                              << " line_length=" << lineLength(outputLinePoints)
+                              << "\n";
+                    printPointMotionStats(motionStats);
+                    printLosses(result.optimization.report);
+                }
             } else if (reopt) {
                 const auto result = optimizer.optimizeExistingLine(fiber.linePoints,
                                                                    fixedIndices,
@@ -1260,35 +1292,40 @@ int main(int argc, char** argv)
                                                                    "fiber-reopt+global");
                 outputLine = result.line;
                 outputLinePoints = linePointsFromModel(result.line);
-                const PointMotionStats motionStats = pointMotionStats(fiber.linePoints, outputLinePoints);
-                printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
-                std::cout << "Fiber reoptimization complete: points=" << result.line.points.size()
-                          << " iterations=" << result.report.iterations
-                          << " initial_cost=" << result.report.initialCost
-                          << " final_cost=" << result.report.finalCost
-                          << " valid_normals=" << result.report.validNormalSamples
-                          << " invalid_normals=" << result.report.invalidNormalSamples
-                          << " converged=" << result.report.converged
-                          << " line_length=" << lineLength(outputLinePoints)
-                          << "\n";
-                std::cout << "Fit: initial=" << result.report.initialCost
-                          << " final=" << result.report.finalCost
-                          << " change=" << (result.report.initialCost - result.report.finalCost)
-                          << '\n';
-                printPointMotionStats(motionStats);
-                printLosses(result.report);
+                printResidualSummary(result.report);
+                if (verbose) {
+                    const PointMotionStats motionStats = pointMotionStats(fiber.linePoints, outputLinePoints);
+                    printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
+                    std::cout << "Fiber reoptimization complete: points=" << result.line.points.size()
+                              << " iterations=" << result.report.iterations
+                              << " initial_cost=" << result.report.initialCost
+                              << " final_cost=" << result.report.finalCost
+                              << " valid_normals=" << result.report.validNormalSamples
+                              << " invalid_normals=" << result.report.invalidNormalSamples
+                              << " converged=" << result.report.converged
+                              << " line_length=" << lineLength(outputLinePoints)
+                              << "\n";
+                    printPointMotionStats(motionStats);
+                    printLosses(result.report);
+                }
             } else {
-                std::cout << "Loaded fiber without reoptimization: points="
-                          << outputLine.points.size()
-                          << " line_length=" << lineLength(outputLinePoints)
-                          << '\n';
+                if (verbose) {
+                    std::cout << "Loaded fiber without reoptimization: points="
+                              << outputLine.points.size()
+                              << " line_length=" << lineLength(outputLinePoints)
+                              << '\n';
+                }
             }
-            printLineViewDiagnostics(outputLine);
+            if (verbose) {
+                printLineViewDiagnostics(outputLine);
+            }
             if (!outputPath.empty()) {
                 saveReoptimizedFiber(fiber, outputLinePoints, outputPath);
-                std::cout << "Saved " << (reinitReopt ? "reinitialized/reoptimized" :
-                                          (reopt ? "reoptimized" : "original"))
-                          << " fiber to " << outputPath.string() << '\n';
+                if (verbose) {
+                    std::cout << "Saved " << (reinitReopt ? "reinitialized/reoptimized" :
+                                              (reopt ? "reoptimized" : "original"))
+                              << " fiber to " << outputPath.string() << '\n';
+                }
             }
             if (wantsObjOutput) {
                 writeLineViewObjOutput(outputLine,
@@ -1297,7 +1334,9 @@ int main(int argc, char** argv)
                                        textureLevel,
                                        stripRenderScale,
                                        objOutputDir);
-                std::cout << "Saved OBJ line-view output to " << objOutputDir.string() << '\n';
+                if (verbose) {
+                    std::cout << "Saved OBJ line-view output to " << objOutputDir.string() << '\n';
+                }
             }
             if (wantsStripOutput) {
                 writeStripImages(outputLine,
@@ -1306,22 +1345,26 @@ int main(int argc, char** argv)
                                  textureLevel,
                                  stripRenderScale,
                                  stripOutputDir);
-                std::cout << "Saved strip render output to " << stripOutputDir.string() << '\n';
+                if (verbose) {
+                    std::cout << "Saved strip render output to " << stripOutputDir.string() << '\n';
+                }
             }
             return 0;
         }
 
-        std::cout << "Seed: [" << seedPoint[0] << ", " << seedPoint[1] << ", " << seedPoint[2] << "]\n";
-        std::cout << "Source direction: [0, 0, 1]\n";
-        std::cout << "Seed normal valid=" << seedNormal.valid
-                  << " normal=[" << seedNormal.normal[0]
-                  << ", " << seedNormal.normal[1]
-                  << ", " << seedNormal.normal[2] << "]\n";
-        std::cout << "Initial tangent valid=" << config.useInitialTangent
-                  << " tangent=[" << config.initialTangent[0]
-                  << ", " << config.initialTangent[1]
-                  << ", " << config.initialTangent[2] << "]\n";
-        std::cout << "Differentiable normal sampling=" << config.differentiableNormalSampling << "\n";
+        if (verbose) {
+            std::cout << "Seed: [" << seedPoint[0] << ", " << seedPoint[1] << ", " << seedPoint[2] << "]\n";
+            std::cout << "Source direction: [0, 0, 1]\n";
+            std::cout << "Seed normal valid=" << seedNormal.valid
+                      << " normal=[" << seedNormal.normal[0]
+                      << ", " << seedNormal.normal[1]
+                      << ", " << seedNormal.normal[2] << "]\n";
+            std::cout << "Initial tangent valid=" << config.useInitialTangent
+                      << " tangent=[" << config.initialTangent[0]
+                      << ", " << config.initialTangent[1]
+                      << ", " << config.initialTangent[2] << "]\n";
+            std::cout << "Differentiable normal sampling=" << config.differentiableNormalSampling << "\n";
+        }
         if (traceInit) {
             printInitTrace(seedPoint, config.initialTangent, sampler, config);
         }
@@ -1415,18 +1458,21 @@ int main(int argc, char** argv)
 
         const auto result = optimizer.optimizeFromSeed(seedPoint, config);
 
-        std::cout << "Optimization complete: points=" << result.line.points.size()
-                  << " iterations=" << result.report.iterations
-                  << " initial_cost=" << result.report.initialCost
-                  << " final_cost=" << result.report.finalCost
-                  << " valid_normals=" << result.report.validNormalSamples
-                  << " invalid_normals=" << result.report.invalidNormalSamples
-                  << " converged=" << result.report.converged << "\n";
-        if (!result.report.message.empty()) {
-            std::cout << result.report.message << '\n';
+        printResidualSummary(result.report);
+        if (verbose) {
+            std::cout << "Optimization complete: points=" << result.line.points.size()
+                      << " iterations=" << result.report.iterations
+                      << " initial_cost=" << result.report.initialCost
+                      << " final_cost=" << result.report.finalCost
+                      << " valid_normals=" << result.report.validNormalSamples
+                      << " invalid_normals=" << result.report.invalidNormalSamples
+                      << " converged=" << result.report.converged << "\n";
+            if (!result.report.message.empty()) {
+                std::cout << result.report.message << '\n';
+            }
+            printLosses(result.report);
+            printLineViewDiagnostics(result.line);
         }
-        printLosses(result.report);
-        printLineViewDiagnostics(result.line);
     } catch (const std::exception& ex) {
         std::cerr << "vc_lasagna_line_probe failed: " << ex.what() << '\n';
         return 1;
