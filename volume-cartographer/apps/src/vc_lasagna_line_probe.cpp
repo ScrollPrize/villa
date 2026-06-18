@@ -2,6 +2,7 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -28,6 +29,7 @@
 namespace {
 
 constexpr double kEpsilon = 1.0e-12;
+constexpr int kTiffCompressionNone = 1;
 
 cv::Vec3d normalizedOrZero(const cv::Vec3d& v)
 {
@@ -50,7 +52,7 @@ bool finiteDirection(const cv::Vec3d& v)
 void printUsage(const char* argv0)
 {
     std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z]\n"
-              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--constant-normal-jacobian]\n"
+              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian]\n"
               << "Runs line annotation optimization at seed "
               << "[17955,15141,37891] with initial z-axis mode, or loads/reoptimizes a saved VC3D fiber.\n";
 }
@@ -660,42 +662,88 @@ void writeSurfaceObj(const QuadSurface& surface,
 
 cv::Mat renderSurfaceTexture(const QuadSurface& surface,
                              Volume& textureVolume,
-                             int textureLevel)
+                             int textureLevel,
+                             int renderScale)
 {
     const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
     if (!points || points->empty()) {
         throw std::runtime_error("surface has no points for texture rendering");
     }
-
-    vc::SampleParams params;
-    params.level = textureLevel;
-    params.method = vc::Sampling::Trilinear;
-
-    if (textureVolume.dtype() == vc::render::ChunkDtype::UInt16) {
-        cv::Mat_<uint16_t> sampled;
-        textureVolume.sample(sampled, *points, params);
-        cv::Mat texture8;
-        sampled.convertTo(texture8, CV_8U, 1.0 / 256.0);
-        return texture8;
+    renderScale = std::max(1, renderScale);
+    cv::Mat_<cv::Vec3f> coords;
+    if (renderScale == 1) {
+        coords = points->clone();
+    } else {
+        cv::resize(*points,
+                   coords,
+                   cv::Size(points->cols * renderScale, points->rows * renderScale),
+                   0.0,
+                   0.0,
+                   cv::INTER_LINEAR);
     }
 
-    cv::Mat_<uint8_t> sampled;
-    textureVolume.sample(sampled, *points, params);
+    vc::render::IChunkedArray* cache = textureVolume.chunkedCache();
+    if (!cache) {
+        throw std::runtime_error("texture volume has no chunk cache");
+    }
+    if (cache->dtype() != vc::render::ChunkDtype::UInt8) {
+        throw std::runtime_error(
+            "line probe strip rendering uses the VC3D uint8 chunk sampler; "
+            "choose a uint8 texture zarr");
+    }
+
+    cv::Mat_<uint8_t> sampled(coords.rows, coords.cols, uint8_t(0));
+    cv::Mat_<uint8_t> coverage(coords.rows, coords.cols, uint8_t(0));
+    const vc::render::ChunkedPlaneSampler::Options options(vc::Sampling::Trilinear, 32);
+    const int startLevel = std::clamp(textureLevel, 0, cache->numLevels() - 1);
+
+    for (int level = startLevel; level < cache->numLevels(); ++level) {
+        std::vector<vc::render::ChunkKey> keys =
+            vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+                *cache, level, coords, coverage, options);
+        if (!keys.empty()) {
+            cache->prefetchChunks(keys, true);
+        }
+    }
+
+    const auto stats = vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+        *cache, startLevel, coords, sampled, coverage, options);
+    const int covered = cv::countNonZero(coverage);
+    const int total = coverage.rows * coverage.cols;
+    std::cout << "Strip texture sampling: start_level=" << startLevel
+              << " render_scale=" << renderScale
+              << " size=" << sampled.cols << "x" << sampled.rows
+              << " covered=" << covered << "/" << total
+              << " requested_chunks=" << stats.requestedChunks
+              << " error_chunks=" << stats.errorChunks << '\n';
     return sampled;
 }
 
-void writePng(const std::filesystem::path& path, const cv::Mat& image)
+void writeTif(const std::filesystem::path& path, const cv::Mat& image)
 {
     if (image.empty()) {
         throw std::runtime_error("cannot write empty image: " + path.string());
     }
-    if (!cv::imwrite(path.string(), image)) {
+    const std::vector<int> params{
+        cv::IMWRITE_TIFF_COMPRESSION,
+        kTiffCompressionNone,
+    };
+    if (!cv::imwrite(path.string(), image, params)) {
         throw std::runtime_error("failed to write image: " + path.string());
     }
 }
 
+int scaledControlColumn(int sourceIndex, int renderScale, int cols)
+{
+    const double scaled = (static_cast<double>(sourceIndex) + 0.5) *
+                          static_cast<double>(std::max(1, renderScale)) -
+                          0.5;
+    return std::clamp(static_cast<int>(std::lround(scaled)), 0, std::max(0, cols - 1));
+}
+
 cv::Mat makeStripOverlay(const cv::Mat& grayscale,
-                         const std::vector<int>& fixedIndices)
+                         const std::vector<int>& fixedIndices,
+                         int renderScale)
 {
     cv::Mat image8;
     if (grayscale.depth() == CV_8U) {
@@ -715,17 +763,18 @@ cv::Mat makeStripOverlay(const cv::Mat& grayscale,
              cv::LINE_AA);
 
     for (const int index : fixedIndices) {
-        if (index < 0 || index >= overlay.cols) {
+        if (index < 0) {
             continue;
         }
+        const int col = scaledControlColumn(index, renderScale, overlay.cols);
         cv::line(overlay,
-                 cv::Point(index, 0),
-                 cv::Point(index, std::max(0, overlay.rows - 1)),
+                 cv::Point(col, 0),
+                 cv::Point(col, std::max(0, overlay.rows - 1)),
                  cv::Scalar(0, 0, 255),
                  1,
                  cv::LINE_AA);
         cv::circle(overlay,
-                   cv::Point(index, centerRow),
+                   cv::Point(col, centerRow),
                    3,
                    cv::Scalar(0, 255, 0),
                    cv::FILLED,
@@ -741,15 +790,16 @@ struct RenderedStrips {
 
 RenderedStrips renderLineViewStrips(const vc::lasagna::LineModel& line,
                                     Volume& textureVolume,
-                                    int textureLevel)
+                                    int textureLevel,
+                                    int renderScale)
 {
     const auto surfaces = vc::lasagna::buildLineViewSurfaces(line);
     if (!surfaces.lineSurface || !surfaces.lineSideSlice) {
         throw std::runtime_error("line view builder did not produce both strips");
     }
     return {
-        renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel),
-        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel),
+        renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel, renderScale),
+        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale),
     };
 }
 
@@ -757,22 +807,24 @@ void writeStripImages(const vc::lasagna::LineModel& line,
                       const std::vector<int>& fixedIndices,
                       Volume& textureVolume,
                       int textureLevel,
+                      int renderScale,
                       const std::filesystem::path& outputDir)
 {
     ensureDirectory(outputDir);
-    const RenderedStrips strips = renderLineViewStrips(line, textureVolume, textureLevel);
-    writePng(outputDir / "line_surface.png", strips.lineSurface);
-    writePng(outputDir / "line_surface_overlay.png",
-             makeStripOverlay(strips.lineSurface, fixedIndices));
-    writePng(outputDir / "side_slice.png", strips.lineSideSlice);
-    writePng(outputDir / "side_slice_overlay.png",
-             makeStripOverlay(strips.lineSideSlice, fixedIndices));
+    const RenderedStrips strips = renderLineViewStrips(line, textureVolume, textureLevel, renderScale);
+    writeTif(outputDir / "line_surface.tif", strips.lineSurface);
+    writeTif(outputDir / "line_surface_overlay.tif",
+             makeStripOverlay(strips.lineSurface, fixedIndices, renderScale));
+    writeTif(outputDir / "side_slice.tif", strips.lineSideSlice);
+    writeTif(outputDir / "side_slice_overlay.tif",
+             makeStripOverlay(strips.lineSideSlice, fixedIndices, renderScale));
 }
 
 void writeLineViewObjOutput(const vc::lasagna::LineModel& line,
                             const std::vector<cv::Vec3d>& linePoints,
                             Volume& textureVolume,
                             int textureLevel,
+                            int renderScale,
                             const std::filesystem::path& outputDir)
 {
     ensureDirectory(outputDir);
@@ -784,18 +836,18 @@ void writeLineViewObjOutput(const vc::lasagna::LineModel& line,
     writeLineObj(linePoints, outputDir / "line.obj");
 
     const cv::Mat lineSurfaceTexture =
-        renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel);
+        renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel, renderScale);
     const cv::Mat sideSliceTexture =
-        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel);
-    writePng(outputDir / "line_surface.png", lineSurfaceTexture);
-    writePng(outputDir / "side_slice.png", sideSliceTexture);
+        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale);
+    writeTif(outputDir / "line_surface.tif", lineSurfaceTexture);
+    writeTif(outputDir / "side_slice.tif", sideSliceTexture);
 
     writeSurfaceMtl(outputDir / "line_surface.mtl",
                     "line_surface_texture",
-                    "line_surface.png");
+                    "line_surface.tif");
     writeSurfaceMtl(outputDir / "side_slice.mtl",
                     "side_slice_texture",
-                    "side_slice.png");
+                    "side_slice.tif");
     writeSurfaceObj(*surfaces.lineSurface,
                     outputDir / "line_surface.obj",
                     "line_surface_texture",
@@ -956,6 +1008,7 @@ int main(int argc, char** argv)
     std::filesystem::path stripOutputDir;
     std::filesystem::path textureZarrPath;
     int textureLevel = 0;
+    int stripRenderScale = 4;
     int segmentsPerSide = 200;
     cv::Vec3d seedPoint{17955.0, 15141.0, 37891.0};
     for (int i = 2; i < argc; ++i) {
@@ -1000,6 +1053,11 @@ int main(int argc, char** argv)
                 throw std::invalid_argument("--texture-level requires an integer");
             }
             textureLevel = parseNonNegativeInt(argv[++i], "texture-level");
+        } else if (arg == "--strip-render-scale") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("--strip-render-scale requires a positive integer");
+            }
+            stripRenderScale = parsePositiveInt(argv[++i], "strip-render-scale");
         } else if (arg.rfind("--segments-per-side=", 0) == 0) {
             segmentsPerSide = parsePositiveInt(arg.substr(20), "segments-per-side");
         } else if (arg.rfind("--seed=", 0) == 0) {
@@ -1014,8 +1072,8 @@ int main(int argc, char** argv)
         const bool wantsObjOutput = !objOutputDir.empty();
         const bool wantsStripOutput = !stripOutputDir.empty();
         const bool wantsTextureOutput = wantsObjOutput || wantsStripOutput;
-        if (!outputPath.empty() && !reopt) {
-            throw std::invalid_argument("--output requires --reopt");
+        if (!outputPath.empty() && fiberPath.empty()) {
+            throw std::invalid_argument("--output requires --fiber <fiber.json>");
         }
         if (reopt && fiberPath.empty()) {
             throw std::invalid_argument("--reopt requires --fiber <fiber.json>");
@@ -1147,13 +1205,15 @@ int main(int argc, char** argv)
             printLineViewDiagnostics(outputLine);
             if (!outputPath.empty()) {
                 saveReoptimizedFiber(fiber, outputLinePoints, outputPath);
-                std::cout << "Saved reoptimized fiber to " << outputPath.string() << '\n';
+                std::cout << "Saved " << (reopt ? "reoptimized" : "original")
+                          << " fiber to " << outputPath.string() << '\n';
             }
             if (wantsObjOutput) {
                 writeLineViewObjOutput(outputLine,
                                        outputLinePoints,
                                        *textureVolume,
                                        textureLevel,
+                                       stripRenderScale,
                                        objOutputDir);
                 std::cout << "Saved OBJ line-view output to " << objOutputDir.string() << '\n';
             }
@@ -1162,6 +1222,7 @@ int main(int argc, char** argv)
                                  fixedIndices,
                                  *textureVolume,
                                  textureLevel,
+                                 stripRenderScale,
                                  stripOutputDir);
                 std::cout << "Saved strip render output to " << stripOutputDir.string() << '\n';
             }
