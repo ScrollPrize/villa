@@ -51,6 +51,37 @@ struct LineOptimizationResult {
     LineOptimizationReport report;
 };
 
+struct LineReinitializationSpanReport {
+    int segmentIndex = -1;
+    int leftControlIndex = -1;
+    int rightControlIndex = -1;
+    int points = 0;
+    int candLeftRolloutSteps = 0;
+    int candLeftTruncatedPoints = 0;
+    int candRightRolloutSteps = 0;
+    int candRightTruncatedPoints = 0;
+    int candLeftSelectedSign = 0;
+    int candRightSelectedSign = 0;
+    double candLeftClosestTargetDistance = 0.0;
+    double candRightClosestTargetDistance = 0.0;
+    double candLeftInitialCost = 0.0;
+    double candLeftFinalCost = 0.0;
+    double candRightInitialCost = 0.0;
+    double candRightFinalCost = 0.0;
+    double chosenMaxEvenStepDeviation = 0.0;
+    double chosenMaxTangentSmoothDeviation = 0.0;
+    double chosenMaxNormalSmoothDeviation = 0.0;
+    double chosenMaxNormalAlignmentAbs = 0.0;
+    std::string chosen;
+};
+
+struct LineReinitializationOptimizationResult {
+    LineOptimizationResult optimization;
+    std::vector<LineReinitializationSpanReport> spans;
+    double maxSegmentCandidateFinalCostDiff = 0.0;
+    std::vector<int> fixedPointIndices;
+};
+
 struct LineControlPoint {
     double linePosition = 0.0;
     cv::Vec3d volumePoint{0.0, 0.0, 0.0};
@@ -61,6 +92,7 @@ struct LineControlPoint {
 struct LineControlPointUpdateResult {
     std::vector<cv::Vec3d> linePoints;
     std::vector<LineControlPoint> controlPoints;
+    std::vector<LineReinitializationSpanReport> initializedSpans;
     int changedControlIndex = -1;
     int activeStart = -1;
     int activeEnd = -1;
@@ -103,6 +135,13 @@ public:
         int activeStart = -1,
         int activeEnd = -1,
         std::string candidateName = "existing-line+global") const;
+
+    [[nodiscard]] LineReinitializationOptimizationResult reinitializeAndOptimizeExistingLine(
+        std::vector<cv::Vec3d> linePoints,
+        std::vector<LineControlPoint> controlPoints,
+        std::vector<int> fixedControlAnchorIndices,
+        int displayFrameAnchorIndex,
+        const LineOptimizationConfig& config = {}) const;
 
 private:
     const NormalSampler& normalSampler_;

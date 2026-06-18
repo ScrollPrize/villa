@@ -202,6 +202,15 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
+    bool needsFinalReinitReopt(const LineAnnotationSession& session) const;
+    bool runFinalReinitReoptSynchronously(LineAnnotationSession& session,
+                                          bool fireSuccessCallback);
+    bool applyOptimizationTaskResult(LineAnnotationSession& session,
+                                     OptimizationTaskResult task,
+                                     bool updateGeneratedViews,
+                                     const std::string& eventOverride = {},
+                                     bool fireSuccessCallback = true);
+    void requestFinalizedClose(const std::string& surfaceName);
     void startOptimization(LineAnnotationSession& session,
                            bool fullOptimization = false,
                            int activeStart = -1,

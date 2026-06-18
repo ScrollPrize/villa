@@ -8,6 +8,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QBrush>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QEvent>
 #include <QKeyEvent>
@@ -192,7 +193,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _showAsMeshButton->setEnabled(false);
     _showAsMeshButton->installEventFilter(this);
     buttonLayout->addWidget(_showAsMeshButton);
-    _fullOptimizationButton = new QPushButton(tr("full optimization"), buttonRow);
+    _fullOptimizationButton = new QPushButton(tr("reinit reopt"), buttonRow);
     _fullOptimizationButton->setEnabled(false);
     _fullOptimizationButton->installEventFilter(this);
     buttonLayout->addWidget(_fullOptimizationButton);
@@ -293,6 +294,21 @@ void LineAnnotationDialog::setOptimizationBusy(bool busy)
     if (busy) {
         _optimizationOverlay->raise();
     }
+}
+
+void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
+{
+    _closeAfterFinalizationAllowed = allowed;
+}
+
+void LineAnnotationDialog::closeEvent(QCloseEvent* event)
+{
+    if (_closeAfterFinalizationAllowed) {
+        QMainWindow::closeEvent(event);
+        return;
+    }
+    event->ignore();
+    emit closeFinalizationRequested(event);
 }
 
 CChunkedVolumeViewer* LineAnnotationDialog::addPane(

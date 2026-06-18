@@ -116,6 +116,8 @@ struct LineAnnotationController::LineAnnotationSession {
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
     bool controlPointsDirtySinceOptimization = false;
+    bool finalReinitClean = false;
+    bool finalReinitClosePending = false;
     bool disableInitialGeneratedHoverFollow = false;
     std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
 };
@@ -789,7 +791,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     task.initialDirectionMode = directionMode;
     task.eventName = initialLinePoints.empty()
         ? "seed"
-        : (forceFullOptimization ? "full_optimization" : "control_optimization");
+        : (forceFullOptimization ? "full_reinit_reopt" : "control_optimization");
     try {
         vc::lasagna::LineOptimizer optimizer(sampler);
         vc::lasagna::LineOptimizationConfig config;
@@ -812,7 +814,30 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.tangentGuideMode = directionMode == LineAnnotationController::InitialDirectionMode::ZInOut
             ? vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane
             : vc::lasagna::LineOptimizationConfig::TangentGuideMode::CrossVectorWithNormal;
-        if (!forceFullOptimization && initialLinePoints.size() >= 2) {
+        if (forceFullOptimization && initialLinePoints.size() >= 2 && task.controlPoints.size() >= 2) {
+            std::vector<int> fixedIndices;
+            fixedIndices.reserve(task.controlPoints.size());
+            int displayFrameAnchorIndex = static_cast<int>(initialLinePoints.size() / 2);
+            for (const auto& control : task.controlPoints) {
+                if (!std::isfinite(control.linePosition)) {
+                    continue;
+                }
+                const int index = std::clamp(static_cast<int>(std::llround(control.linePosition)),
+                                             0,
+                                             static_cast<int>(initialLinePoints.size()) - 1);
+                fixedIndices.push_back(index);
+                if (control.isSeed) {
+                    displayFrameAnchorIndex = index;
+                }
+            }
+            auto reinitialized =
+                optimizer.reinitializeAndOptimizeExistingLine(std::move(initialLinePoints),
+                                                              task.controlPoints,
+                                                              std::move(fixedIndices),
+                                                              displayFrameAnchorIndex,
+                                                              config);
+            task.result = std::move(reinitialized.optimization);
+        } else if (!forceFullOptimization && initialLinePoints.size() >= 2) {
             std::vector<int> fixedIndices;
             fixedIndices.reserve(task.controlPoints.size());
             int displayFrameAnchorIndex = static_cast<int>(initialLinePoints.size() / 2);
@@ -829,15 +854,15 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
                 }
             }
             const bool hasLocalRange = activeStart >= 0 && activeEnd >= activeStart;
-            const std::string candidateName = forceFullOptimization || !hasLocalRange
+            const std::string candidateName = !hasLocalRange
                 ? "existing-line+global"
                 : "existing-line+local";
             task.result = optimizer.optimizeExistingLine(std::move(initialLinePoints),
                                                          std::move(fixedIndices),
                                                          displayFrameAnchorIndex,
                                                          config,
-                                                         forceFullOptimization ? -1 : activeStart,
-                                                         forceFullOptimization ? -1 : activeEnd,
+                                                         activeStart,
+                                                         activeEnd,
                                                          candidateName);
         } else {
             task.result = optimizer.optimizeFromControlPoints(task.controlPoints, config);
@@ -1065,6 +1090,12 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     connect(dialog, &LineAnnotationDialog::paneClosed, this, [this](const std::string& name) {
         cleanupSurfaceName(name);
     });
+    connect(dialog,
+            &LineAnnotationDialog::closeFinalizationRequested,
+            this,
+            [this, surfaceName](QCloseEvent*) {
+                requestFinalizedClose(surfaceName);
+            });
     connect(dialog,
             &LineAnnotationDialog::lineSeedRequested,
             this,
@@ -3168,7 +3199,11 @@ void LineAnnotationController::saveOpenFibers()
             session.controlPoints.empty()) {
             continue;
         }
+        if (!runFinalReinitReoptSynchronously(session, false)) {
+            continue;
+        }
         saveSessionAsFiber(session);
+        session.suppressFiberSave = true;
     }
 }
 
@@ -3507,6 +3542,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     session.focusedLinePosition = linePosition;
     session.focusedControlPoint = clicked;
+    session.finalReinitClean = false;
     const bool autoReoptimize =
         !pane->dialog ||
         pane->dialog->reoptimizationMode() ==
@@ -3553,6 +3589,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
     session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
     session.controlPoints = update.controlPoints;
+    session.finalReinitClean = false;
     if (update.changedControlIndex >= 0 &&
         update.changedControlIndex < static_cast<int>(session.controlPoints.size())) {
         const auto& changed = session.controlPoints[static_cast<size_t>(update.changedControlIndex)];
@@ -3675,6 +3712,7 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
     const bool deletedSeed = selected->isSeed;
     session.controlPoints.erase(selected);
+    session.finalReinitClean = false;
     if (session.controlPoints.empty()) {
         return;
     }
@@ -3789,6 +3827,170 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     return true;
 }
 
+bool LineAnnotationController::needsFinalReinitReopt(const LineAnnotationSession& session) const
+{
+    return !session.finalReinitClean &&
+           !session.optimizedLine.points.empty() &&
+           session.controlPoints.size() >= 2;
+}
+
+bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession& session,
+                                                           OptimizationTaskResult task,
+                                                           bool updateGeneratedViews,
+                                                           const std::string& eventOverride,
+                                                           bool fireSuccessCallback)
+{
+    if (!task.ok) {
+        session.taskState = LineAnnotationSession::TaskState::Failed;
+        session.error = task.error;
+        showError(tr("Lasagna line optimization failed: %1")
+                      .arg(QString::fromStdString(task.error)));
+        return false;
+    }
+
+    auto* pane = paneForSurface(session.surfaceName);
+    session.taskState = LineAnnotationSession::TaskState::Succeeded;
+    session.seedPoint = task.seedPoint;
+    session.selectedManifestPath = task.manifestPath;
+    session.optimizationReport = task.result.report;
+    session.optimizedLine = std::move(task.result.line);
+    session.controlPoints = std::move(task.controlPoints);
+    session.controlPointsDirtySinceOptimization = false;
+    for (auto& control : session.controlPoints) {
+        double bestDistance = std::numeric_limits<double>::infinity();
+        int bestIndex = -1;
+        for (size_t i = 0; i < session.optimizedLine.points.size(); ++i) {
+            const cv::Vec3d delta = session.optimizedLine.points[i].position - control.volumePoint;
+            const double distance = std::sqrt(delta.dot(delta));
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = static_cast<int>(i);
+            }
+        }
+        if (bestIndex >= 0) {
+            const cv::Vec3d controlVolumePoint = control.volumePoint;
+            control.optimizedIndex = bestIndex;
+            control.linePosition = static_cast<double>(bestIndex);
+            const bool matchesFocusedControl = session.focusedControlPoint.has_value() &&
+                std::sqrt((controlVolumePoint - *session.focusedControlPoint).dot(
+                    controlVolumePoint - *session.focusedControlPoint)) <= 1.0e-6;
+            if (std::abs(session.focusedLinePosition - control.linePosition) <= 0.5 ||
+                matchesFocusedControl) {
+                session.focusedLinePosition = control.linePosition;
+            }
+        }
+        if (control.isSeed) {
+            session.seedPoint = control.volumePoint;
+        }
+    }
+
+    const std::string eventName = eventOverride.empty() ? task.eventName : eventOverride;
+    if (eventName.find("reinit_reopt") != std::string::npos ||
+        !needsFinalReinitReopt(session)) {
+        session.finalReinitClean = true;
+    } else {
+        session.finalReinitClean = false;
+    }
+
+    const std::string resultEvent = eventName.empty()
+        ? "optimization_result"
+        : eventName + "_result";
+    writeLineDebugJson(resultEvent,
+                       session.controlPoints,
+                       linePointsToJson(session.optimizedLine),
+                       &session.optimizationReport);
+    if (updateGeneratedViews && !session.suppressGeneratedViews) {
+        if (!materializeGeneratedViews(session)) {
+            session.taskState = LineAnnotationSession::TaskState::Failed;
+            return false;
+        }
+    }
+    if (session.deferShowUntilGenerated && pane && pane->dialog && !pane->dialog->isVisible()) {
+        pane->dialog->showMaximized();
+        pane->dialog->raise();
+        pane->dialog->activateWindow();
+    }
+
+    const double prefetchPrepMs = session.optimizationReport.normalChunkPrefetchMs +
+                                  session.optimizationReport.normalMaterializeMs;
+    Logger()->info("Line annotation Lasagna stage timing: event={} prefetch_prep_ms={:.3f} ceres_solve_ms={:.3f} overall_ms={:.3f} points={}",
+                   resultEvent,
+                   prefetchPrepMs,
+                   session.optimizationReport.ceresSolveMs,
+                   session.optimizationReport.totalMs,
+                   session.optimizedLine.points.size());
+    auto callback = fireSuccessCallback ? session.optimizationSucceededCallback : nullptr;
+    if (callback) {
+        callback(session);
+    }
+    return true;
+}
+
+bool LineAnnotationController::runFinalReinitReoptSynchronously(LineAnnotationSession& session,
+                                                                bool fireSuccessCallback)
+{
+    if (!needsFinalReinitReopt(session)) {
+        return true;
+    }
+    if (!ensureDatasetForSession(session)) {
+        return false;
+    }
+    if (!session.normalSampler) {
+        showError(tr("Could not run final line reinitialization: no Lasagna dataset is loaded."));
+        return false;
+    }
+
+    std::vector<cv::Vec3d> initialLinePoints;
+    initialLinePoints.reserve(session.optimizedLine.points.size());
+    for (const auto& point : session.optimizedLine.points) {
+        initialLinePoints.push_back(point.position);
+    }
+    OptimizationTaskResult task = optimizeLineWithSampler(session.selectedManifestPath,
+                                                          session.controlPoints,
+                                                          std::move(initialLinePoints),
+                                                          session.sourceSliceNormal,
+                                                          session.initialDirectionMode,
+                                                          true,
+                                                          -1,
+                                                          -1,
+                                                          *session.normalSampler);
+    return applyOptimizationTaskResult(session,
+                                       std::move(task),
+                                       false,
+                                       "final_reinit_reopt",
+                                       fireSuccessCallback);
+}
+
+void LineAnnotationController::requestFinalizedClose(const std::string& surfaceName)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->dialog) {
+        cleanupSurfaceName(surfaceName);
+        return;
+    }
+    if (!pane->session) {
+        pane->dialog->setCloseAfterFinalizationAllowed(true);
+        pane->dialog->close();
+        return;
+    }
+
+    auto& session = *pane->session;
+    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+        showError(tr("Line optimization is already running."));
+        return;
+    }
+    if (!needsFinalReinitReopt(session)) {
+        pane->dialog->setCloseAfterFinalizationAllowed(true);
+        pane->dialog->close();
+        return;
+    }
+    if (!ensureDatasetForSession(session)) {
+        return;
+    }
+    session.finalReinitClosePending = true;
+    startOptimization(session, true);
+}
+
 void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                                  bool forceFullOptimization,
                                                  int activeStart,
@@ -3895,87 +4097,31 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
 
     OptimizationTaskResult task = watcher->result();
     session.watcher = nullptr;
-    if (task.ok) {
-        session.taskState = LineAnnotationSession::TaskState::Succeeded;
-        session.seedPoint = task.seedPoint;
-        session.selectedManifestPath = task.manifestPath;
-        session.optimizationReport = task.result.report;
-        session.optimizedLine = std::move(task.result.line);
-        session.controlPoints = std::move(task.controlPoints);
-        session.controlPointsDirtySinceOptimization = false;
-        for (auto& control : session.controlPoints) {
-            double bestDistance = std::numeric_limits<double>::infinity();
-            int bestIndex = -1;
-            for (size_t i = 0; i < session.optimizedLine.points.size(); ++i) {
-                const cv::Vec3d delta = session.optimizedLine.points[i].position - control.volumePoint;
-                const double distance = std::sqrt(delta.dot(delta));
-                if (distance < bestDistance) {
-                    bestDistance = distance;
-                    bestIndex = static_cast<int>(i);
-                }
+    const bool closePending = session.finalReinitClosePending;
+    // Save/close finalization continues using session after applying the result;
+    // callbacks may rebuild intersection panes and invalidate this reference.
+    const bool ok = applyOptimizationTaskResult(session,
+                                               std::move(task),
+                                               true,
+                                               {},
+                                               !closePending);
+    if (pane->dialog) {
+        pane->dialog->setOptimizationBusy(false);
+    }
+    if (ok) {
+        if (closePending) {
+            session.finalReinitClosePending = false;
+            saveSessionAsFiber(session);
+            session.suppressFiberSave = true;
+            if (pane->dialog) {
+                pane->dialog->setCloseAfterFinalizationAllowed(true);
+                pane->dialog->close();
             }
-            if (bestIndex >= 0) {
-                const cv::Vec3d controlVolumePoint = control.volumePoint;
-                control.optimizedIndex = bestIndex;
-                control.linePosition = static_cast<double>(bestIndex);
-                const bool matchesFocusedControl = session.focusedControlPoint.has_value() &&
-                    std::sqrt((controlVolumePoint - *session.focusedControlPoint).dot(
-                        controlVolumePoint - *session.focusedControlPoint)) <= 1.0e-6;
-                if (std::abs(session.focusedLinePosition - control.linePosition) <= 0.5 ||
-                    matchesFocusedControl) {
-                    session.focusedLinePosition = control.linePosition;
-                }
-            }
-            if (control.isSeed) {
-                session.seedPoint = control.volumePoint;
-            }
-        }
-        const std::string resultEvent = task.eventName.empty()
-            ? "optimization_result"
-            : task.eventName + "_result";
-        writeLineDebugJson(resultEvent,
-                           session.controlPoints,
-                           linePointsToJson(session.optimizedLine),
-                           &session.optimizationReport);
-        if (!session.suppressGeneratedViews) {
-            if (!materializeGeneratedViews(session)) {
-                session.taskState = LineAnnotationSession::TaskState::Failed;
-                if (pane->dialog) {
-                    pane->dialog->setOptimizationBusy(false);
-                }
-                return;
-            }
-        }
-        if (session.deferShowUntilGenerated && pane->dialog && !pane->dialog->isVisible()) {
-            pane->dialog->showMaximized();
-            pane->dialog->raise();
-            pane->dialog->activateWindow();
-        }
-        const double prefetchPrepMs = session.optimizationReport.normalChunkPrefetchMs +
-                                      session.optimizationReport.normalMaterializeMs;
-        Logger()->info("Line annotation Lasagna stage timing: event={} prefetch_prep_ms={:.3f} ceres_solve_ms={:.3f} overall_ms={:.3f} points={}",
-                       resultEvent,
-                       prefetchPrepMs,
-                       session.optimizationReport.ceresSolveMs,
-                       session.optimizationReport.totalMs,
-                       session.optimizedLine.points.size());
-        auto callback = session.optimizationSucceededCallback;
-        if (callback) {
-            callback(session);
-        }
-        if (pane->dialog) {
-            pane->dialog->setOptimizationBusy(false);
         }
         return;
     }
 
-    session.taskState = LineAnnotationSession::TaskState::Failed;
-    session.error = task.error;
-    if (pane->dialog) {
-        pane->dialog->setOptimizationBusy(false);
-    }
-    showError(tr("Lasagna line optimization failed: %1")
-                  .arg(QString::fromStdString(task.error)));
+    session.finalReinitClosePending = false;
 }
 
 bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)
@@ -4107,6 +4253,12 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
     auto& session = *pane->session;
     if (session.taskState != LineAnnotationSession::TaskState::Succeeded) {
         showError(tr("Run line optimization before exporting generated meshes."));
+        return;
+    }
+    if (!runFinalReinitReoptSynchronously(session, false)) {
+        return;
+    }
+    if (!session.suppressGeneratedViews && !materializeGeneratedViews(session)) {
         return;
     }
 
@@ -4789,6 +4941,9 @@ LineAnnotationController::makeIntersectionLineSession(
 void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session)
 {
     try {
+        if (!runFinalReinitReoptSynchronously(session, false)) {
+            return;
+        }
         ensureSessionFiberIdentity(session);
         StoredFiber fiber;
         fiber.username = session.fiberUsername;
