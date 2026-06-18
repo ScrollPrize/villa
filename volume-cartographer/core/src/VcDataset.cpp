@@ -720,6 +720,32 @@ bool VcDataset::writeChunk(size_t iz, size_t iy, size_t ix,
     return true;
 }
 
+bool VcDataset::writeChunkSkipEmpty(size_t iz, size_t iy, size_t ix,
+                                     const void* input, size_t nbytes)
+{
+    // A chunk made up entirely of the fill value need not exist on disk: zarr
+    // readers reconstruct it from fill_value. Skip writing it (and drop any
+    // stale chunk left from a previous render).
+    const auto& fill = impl_->fillValueBytes_;
+    const size_t elemSize = fill.empty() ? 1 : fill.size();
+    const auto* bytes = static_cast<const std::byte*>(input);
+    bool allFill = (nbytes % elemSize == 0);
+    if (allFill && elemSize == 1) {
+        const std::byte f = fill.empty() ? std::byte{0} : std::byte{fill[0]};
+        for (size_t i = 0; i < nbytes; ++i)
+            if (bytes[i] != f) { allFill = false; break; }
+    } else if (allFill) {
+        for (size_t i = 0; i < nbytes; i += elemSize)
+            if (std::memcmp(bytes + i, fill.data(), elemSize) != 0) { allFill = false; break; }
+    }
+
+    if (allFill) {
+        if (chunkExists(iz, iy, ix)) removeChunk(iz, iy, ix);
+        return false;
+    }
+    return writeChunk(iz, iy, ix, input, nbytes);
+}
+
 bool VcDataset::removeChunk(size_t iz, size_t iy, size_t ix)
 {
     auto p = impl_->fsPath /
@@ -1029,7 +1055,8 @@ std::unique_ptr<VcDataset> createZarrDataset(
     VcDtype dtype,
     const std::string& compressor,
     const std::string& dimensionSeparator,
-    std::int64_t fillValue)
+    std::int64_t fillValue,
+    int compressionLevel)
 {
     namespace fs = std::filesystem;
     fs::path dsPath = parentPath / name;
@@ -1042,16 +1069,13 @@ std::unique_ptr<VcDataset> createZarrDataset(
                                            : utils::ZarrDtype::uint16;
     meta.fill_value = static_cast<double>(fillValue);
     meta.dimension_separator = dimensionSeparator;
-    if (compressor == "blosc") {
-        meta.compressor_id = "blosc";
-        meta.compression_level = 3;
-    } else if (compressor == "zstd") {
-        meta.compressor_id = "zstd";
-        meta.compression_level = 3;
-    } else if (compressor.empty() || compressor == "none") {
+    if (compressor.empty() || compressor == "none") {
         meta.compressor_id.clear();
     } else {
         meta.compressor_id = compressor;
+        // Default level 3 (blosc/zstd) preserves prior behaviour; an explicit
+        // compressionLevel > 0 overrides it.
+        meta.compression_level = compressionLevel > 0 ? compressionLevel : 3;
     }
 
     // ZarrArray::create writes the .zarray file for us.
