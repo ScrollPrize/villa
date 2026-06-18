@@ -205,7 +205,11 @@ void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/
 {
     if (_directFb && !_directFb->isNull()) {
         painter->resetTransform();
-        painter->drawImage(0, 0, *_directFb);
+        const QRectF target(
+            _directFbOffset,
+            QSizeF(_directFb->width() * _directFbScale,
+                   _directFb->height() * _directFbScale));
+        painter->drawImage(target, *_directFb);
     }
 }
 

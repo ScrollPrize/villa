@@ -774,9 +774,8 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setScene(_scene);
     _view->setDirectFramebuffer(&_framebuffer);
 
-    // No per-viewer timers: ViewerManager's single global clock calls
-    // serviceRenderTick() ~60Hz, which drains _renderPending / _intersectionPending /
-    // the resize-settle + status-refresh countdowns. Start the periodic status poll.
+    // No per-viewer timers: render requests submit immediately. ViewerManager's
+    // global clock still drains intersection requests and status refreshes.
     _statusRefreshTicks = kStatusRefreshTicks;
 
     reloadPerfSettings();
@@ -810,7 +809,7 @@ void CChunkedVolumeViewer::showEvent(QShowEvent* event)
     // renders + prefetch for invisible viewers).
     if (_renderStaleWhileHidden && !_closing) {
         _renderStaleWhileHidden = false;
-        scheduleRender("shown after hidden");
+        submitRender("shown after hidden");
     }
 }
 
@@ -833,11 +832,13 @@ void CChunkedVolumeViewer::quiesceForClose()
         _viewerManager->unregisterViewer(this);
     }
 
-    // Clear all pending tick work (the global clock will see nothing to do).
+    // Clear all pending maintenance work (the global clock will see nothing to do).
     _intersectionPending = false;
 
-    _renderPending = false;
-    _renderPendingAfterWorker = false;
+    _activeRenderJob.reset();
+    _pendingRenderJob.reset();
+    _displayedRenderJob.reset();
+    _pendingRenderDirty = false;
     ++_renderSerial;
 
     if (_chunkCbId != 0 && _chunkArray) {
@@ -912,7 +913,7 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     if (forceRender) {
         renderVisible(true, "annotation camera state applied");
     } else {
-        scheduleRender("annotation camera state applied");
+        submitRender("annotation camera state applied");
     }
     emit overlaysUpdated();
 }
@@ -936,8 +937,8 @@ void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& s
 bool CChunkedVolumeViewer::isRenderQuiescent() const
 {
     return !_renderWorkerBusy.load(std::memory_order_acquire)
-        && !_renderPendingAfterWorker
-        && !_renderPending;
+        && !_pendingRenderJob.has_value()
+        && !_pendingRenderDirty;
 }
 
 std::size_t CChunkedVolumeViewer::chunkFetchesInFlight() const
@@ -975,11 +976,8 @@ void CChunkedVolumeViewer::rebuildChunkArray()
             auto volume = volumeWeak.lock();
             if (!volume || guard->_volume != volume || guard->_closing)
                 return;
-            // Coalesce on the 16ms render debounce. Mark pending and arm the timer
-            // Mark pending; the global clock coalesces a burst of arriving chunks into
-            // one render (it doesn't restart anything), so repaints aren't starved for
-            // as long as chunks keep streaming.
-            guard->_renderPending = true;
+            ++guard->_chunkContentEpoch;
+            guard->submitRender("chunk ready");
         }, Qt::QueuedConnection);
     });
 }
@@ -1021,7 +1019,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     recalcPyramidLevel();   // also pushes the scalebar µm/px (updateScalebarScale)
     updateContentBounds();
     resizeFramebuffer();
-    scheduleRender("volume changed");
+    submitRender("volume changed");
     renderIntersections("volume changed");
     updateStatusLabel();
 }
@@ -1118,7 +1116,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         if (_suppressNextSurfaceEditRender) {
             _suppressNextSurfaceEditRender = false;
         } else {
-            scheduleRender("current surface edit update");
+            submitRender("current surface edit update");
         }
         scheduleIntersectionRender("current surface edit update");
         return;
@@ -1214,7 +1212,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         }
     }
     updateFocusMarker();
-    scheduleRender("current surface changed");
+    submitRender("current surface changed");
     renderIntersections("current surface changed");
 }
 
@@ -1270,7 +1268,7 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     updateFocusMarker(poi);
     updateStatusLabel();
     emit overlaysUpdated();
-    scheduleRender("focus POI changed");
+    submitRender("focus POI changed");
     if (!isPlaneSurface || !poi->suppressTransientPlaneIntersections)
         renderIntersections("focus POI changed");
 }
@@ -1378,32 +1376,12 @@ void CChunkedVolumeViewer::resizeFramebuffer()
     _scene->setSceneRect(0, 0, w, h);
 }
 
-void CChunkedVolumeViewer::scheduleRender(const char* reason, std::source_location caller)
-{
-    if (_closing) {
-        return;
-    }
-    if (ProfileLoggingEnabled()) {
-        _pendingRenderReason = reason ? reason : "";
-        _pendingRenderCaller = profileCaller(caller);
-    }
-    ProfileScope profile("scheduleRender", reason, caller);
-    if (profile.enabled()) {
-        profile.setDetails(std::format(
-            "surf='{}' force=false pending={} scale={:.4f} zOff={:.3f}",
-            _surfName, _renderPending, _scale, _zOff));
-    }
-    syncCameraTransform();
-    _renderPending = true;   // serviceRenderTick() (global clock) submits it next tick
-    profile.setDetails("action=render_pending");
-}
-
 void CChunkedVolumeViewer::requestRender(const char* reason, std::source_location caller)
 {
     if (reason && std::string_view(reason) == "push/pull active viewer refresh") {
         _suppressNextSurfaceEditRender = true;
     }
-    scheduleRender(reason, caller);
+    submitRender(reason, caller);
 }
 
 void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::source_location caller)
@@ -1428,19 +1406,13 @@ void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::s
     profile.setDetails("action=intersection_pending");
 }
 
-// Driven by ViewerManager's single global clock (~60Hz). Drains the pending flags:
-// submit a render and/or an intersection render, run the resize-settle countdown, and
-// poll the status bar periodically. The only place these flags are consumed.
+// Driven by ViewerManager's single global clock (~60Hz). Rendering is submitted
+// immediately by view/data updates; this tick only drains non-render maintenance.
 void CChunkedVolumeViewer::serviceRenderTick()
 {
     if (_closing)
         return;
 
-    if (_renderPending) {
-        _renderPending = false;
-        submitRender("global tick render");
-        updateStatusLabel();
-    }
     if (_intersectionPending) {
         _intersectionPending = false;
         renderIntersections("global tick intersection");
@@ -1472,6 +1444,7 @@ void CChunkedVolumeViewer::syncCameraTransform()
     _camSurfX = _surfacePtrX;
     _camSurfY = _surfacePtrY;
     _camScale = _scale;
+    updateDisplayedFramebufferMapping();
     updateFocusMarker();
 }
 
@@ -1852,6 +1825,7 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
 }
 
 struct CChunkedVolumeViewer::RenderContext {
+    PendingRenderJob renderJob;
     std::uint64_t serial = 0;
     int fbW = 0;
     int fbH = 0;
@@ -1882,11 +1856,15 @@ struct CChunkedVolumeViewer::RenderContext {
 
 struct CChunkedVolumeViewer::RenderResult {
     std::uint64_t serial = 0;
+    PendingRenderJob renderJob;
     QImage framebuffer;
     float surfacePtrX = 0.0f;
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
     double renderFrameElapsedMs = 0.0;
+    std::chrono::steady_clock::time_point submittedAt;
+    std::chrono::steady_clock::time_point workerStartedAt;
+    std::chrono::steady_clock::time_point workerFinishedAt;
 };
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
@@ -1909,14 +1887,18 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     }
     RenderResult result;
     result.serial = ctx.serial;
+    result.renderJob = ctx.renderJob;
     result.surfacePtrX = ctx.surfacePtrX;
     result.surfacePtrY = ctx.surfacePtrY;
     result.scale = ctx.scale;
+    result.submittedAt = ctx.renderJob.submittedAt;
+    result.workerStartedAt = std::chrono::steady_clock::now();
     result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
     result.framebuffer.fill(QColor(64, 64, 64));
 
     auto finishRenderFrameProfile = [&]() {
         result.renderFrameElapsedMs = static_cast<double>(renderTimer.nsecsElapsed()) / 1000000.0;
+        result.workerFinishedAt = std::chrono::steady_clock::now();
         if (!ProfileLoggingEnabled())
             return;
         Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} gen_ms={} genCached={} sample_ms={} blit_ms={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
@@ -2203,33 +2185,189 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     return result;
 }
 
-// Hash of every output-affecting VIEW parameter (camera, sampling, window/level,
-// colormaps, overlay, composite settings) -- NOT chunk data. Two submits with the
-// same key produce the same pixels for the same resident data, so a submit that
-// lands while a worker is busy need not discard the in-flight frame unless this key
-// changed. FNV-1a over the raw bytes of the relevant scalars + string ids.
-std::size_t CChunkedVolumeViewer::viewParamsKey() const
+std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::captureRenderJob(
+    const char* reason,
+    std::source_location caller,
+    const std::shared_ptr<Surface>& surf,
+    int fbW,
+    int fbH,
+    std::chrono::steady_clock::time_point submittedAt)
 {
-    std::size_t h = 1469598103934665603ULL;
-    auto mix = [&h](const void* p, std::size_t n) {
-        const unsigned char* b = static_cast<const unsigned char*>(p);
-        for (std::size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+    if (!surf || !_volume || !_chunkArray || fbW <= 0 || fbH <= 0) {
+        return std::nullopt;
+    }
+
+    PendingRenderJob job;
+    job.requestId = ++_renderRequestSerial;
+    job.fbW = fbW;
+    job.fbH = fbH;
+    job.surfacePtrX = _surfacePtrX;
+    job.surfacePtrY = _surfacePtrY;
+    job.scale = _scale;
+    job.zOff = _zOff;
+    job.zOffWorldDir = _zOffWorldDir;
+    job.startLevel = renderStartLevel(dynamic_cast<PlaneSurface*>(surf.get()) == nullptr);
+    job.samplingMethod = _samplingMethod;
+    job.compositeSettings = _compositeSettings;
+    job.windowLow = _windowLow;
+    job.windowHigh = _windowHigh;
+    job.baseColormapId = _baseColormapId;
+    job.surf = surf;
+    job.surfaceName = _surfName;
+    job.chunkArray = _chunkArray;
+    job.overlayVolume = _overlayVolume;
+    job.overlayChunkArray = _overlayChunkArray;
+    job.overlayOpacity = _overlayOpacity;
+    job.overlayColormapId = _overlayColormapId;
+    job.overlayWindowLow = _overlayWindowLow;
+    job.overlayWindowHigh = _overlayWindowHigh;
+    job.chunkContentEpoch = _chunkContentEpoch;
+    job.genCache = _genSurfaceCache;
+    job.genCacheDirty = _genCacheDirty;
+    job.profileReason = reason ? reason : "";
+    if (ProfileLoggingEnabled()) {
+        job.profileCaller = profileCaller(caller);
+    }
+    job.submittedAt = submittedAt;
+    return job;
+}
+
+bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob& a,
+                                                          const PendingRenderJob& b)
+{
+    auto vecEqual = [](const cv::Vec3f& lhs, const cv::Vec3f& rhs) {
+        return lhs[0] == rhs[0] && lhs[1] == rhs[1] && lhs[2] == rhs[2];
     };
-    auto mixF = [&](float v) { mix(&v, sizeof v); };
-    auto mixS = [&](const std::string& s) { mix(s.data(), s.size()); h ^= s.size(); h *= 1099511628211ULL; };
-    mixF(_surfacePtrX); mixF(_surfacePtrY); mixF(_scale); mixF(_zOff);
-    mix(&_zOffWorldDir, sizeof _zOffWorldDir);
-    mix(&_samplingMethod, sizeof _samplingMethod);
-    mixF(_windowLow); mixF(_windowHigh);
-    mixS(_baseColormapId);
-    mix(&_compositeSettings, sizeof _compositeSettings);
-    // overlay state (its presence/opacity/window/colormap changes pixels)
-    const void* ov = _overlayVolume.get(); mix(&ov, sizeof ov);
-    mixF(_overlayOpacity); mixF(_overlayWindowLow); mixF(_overlayWindowHigh);
-    mixS(_overlayColormapId);
-    int w = _framebuffer.width(), hh = _framebuffer.height();
-    mix(&w, sizeof w); mix(&hh, sizeof hh);
-    return h;
+    return a.fbW == b.fbW &&
+           a.fbH == b.fbH &&
+           a.surfacePtrX == b.surfacePtrX &&
+           a.surfacePtrY == b.surfacePtrY &&
+           a.scale == b.scale &&
+           a.zOff == b.zOff &&
+           vecEqual(a.zOffWorldDir, b.zOffWorldDir) &&
+           a.startLevel == b.startLevel &&
+           a.samplingMethod == b.samplingMethod &&
+           a.compositeSettings == b.compositeSettings &&
+           a.windowLow == b.windowLow &&
+           a.windowHigh == b.windowHigh &&
+           a.baseColormapId == b.baseColormapId &&
+           a.surf.get() == b.surf.get() &&
+           a.surfaceName == b.surfaceName &&
+           a.chunkArray.get() == b.chunkArray.get() &&
+           a.overlayVolume.get() == b.overlayVolume.get() &&
+           a.overlayChunkArray.get() == b.overlayChunkArray.get() &&
+           a.overlayOpacity == b.overlayOpacity &&
+           a.overlayColormapId == b.overlayColormapId &&
+           a.overlayWindowLow == b.overlayWindowLow &&
+           a.overlayWindowHigh == b.overlayWindowHigh &&
+           a.chunkContentEpoch == b.chunkContentEpoch &&
+           a.genCacheDirty == b.genCacheDirty;
+}
+
+void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
+{
+    if (!_view || !_displayedRenderJob || _displayedRenderJob->scale <= 0.0f) {
+        if (_view) {
+            _view->setDirectFramebufferMapping(1.0, QPointF(0.0, 0.0));
+        }
+        return;
+    }
+
+    const auto& job = *_displayedRenderJob;
+    const qreal ratio = static_cast<qreal>(_scale) / static_cast<qreal>(job.scale);
+    const qreal currentHalfW = static_cast<qreal>(_framebuffer.width()) * 0.5;
+    const qreal currentHalfH = static_cast<qreal>(_framebuffer.height()) * 0.5;
+    const qreal renderedHalfW = static_cast<qreal>(job.fbW) * 0.5;
+    const qreal renderedHalfH = static_cast<qreal>(job.fbH) * 0.5;
+    const QPointF offset(
+        currentHalfW +
+            (static_cast<qreal>(job.surfacePtrX) - static_cast<qreal>(_surfacePtrX)) *
+                static_cast<qreal>(_scale) -
+            renderedHalfW * ratio,
+        currentHalfH +
+            (static_cast<qreal>(job.surfacePtrY) - static_cast<qreal>(_surfacePtrY)) *
+                static_cast<qreal>(_scale) -
+            renderedHalfH * ratio);
+    _view->setDirectFramebufferMapping(ratio, offset);
+}
+
+void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
+{
+    if (_closing || !job.chunkArray) {
+        return;
+    }
+
+    _renderWorkerBusy.store(true, std::memory_order_release);
+    _activeRenderJob = job;
+    _pendingRenderDirty = false;
+
+    job.chunkArray->beginViewRequest();
+    if (job.overlayChunkArray) {
+        job.overlayChunkArray->beginViewRequest();
+    }
+
+    prefetchVisibleSurfaceChunks();
+
+    RenderContext ctx;
+    ctx.renderJob = job;
+    ctx.serial = ++_renderSerial;
+    emit renderFrameSubmitted(ctx.serial);
+    ctx.fbW = job.fbW;
+    ctx.fbH = job.fbH;
+    ctx.surfacePtrX = job.surfacePtrX;
+    ctx.surfacePtrY = job.surfacePtrY;
+    ctx.scale = job.scale;
+    ctx.zOff = job.zOff;
+    ctx.zOffWorldDir = job.zOffWorldDir;
+    ctx.startLevel = job.startLevel;
+    ctx.samplingMethod = job.samplingMethod;
+    ctx.compositeSettings = job.compositeSettings;
+    ctx.windowLow = job.windowLow;
+    ctx.windowHigh = job.windowHigh;
+    ctx.baseColormapId = job.baseColormapId;
+    ctx.surf = job.surf;
+    ctx.chunkArray = job.chunkArray;
+    ctx.overlayVolume = job.overlayVolume;
+    ctx.overlayChunkArray = job.overlayChunkArray;
+    ctx.overlayOpacity = job.overlayOpacity;
+    ctx.overlayColormapId = job.overlayColormapId;
+    ctx.overlayWindowLow = job.overlayWindowLow;
+    ctx.overlayWindowHigh = job.overlayWindowHigh;
+    ctx.genCache = job.genCache;
+    ctx.genCacheDirty = job.genCacheDirty;
+    ctx.profileReason = job.profileReason;
+    ctx.profileCaller = job.profileCaller;
+    _genCacheDirty = false;
+
+    QPointer<CChunkedVolumeViewer> guard(this);
+    (void)QtConcurrent::run([guard, ctx = std::move(ctx)]() mutable {
+        auto result = std::make_shared<RenderResult>(renderFrame(std::move(ctx)));
+        QMetaObject::invokeMethod(qApp, [guard, result = std::move(result)]() mutable {
+            if (guard) {
+                guard->finishRenderOnMainThread(std::move(result));
+            }
+        }, Qt::QueuedConnection);
+    });
+}
+
+void CChunkedVolumeViewer::submitPendingRenderJobIfNeeded()
+{
+    if (_closing || _renderWorkerBusy.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!_pendingRenderJob) {
+        _pendingRenderDirty = false;
+        return;
+    }
+
+    auto job = std::move(*_pendingRenderJob);
+    _pendingRenderJob.reset();
+    if (_displayedRenderJob &&
+        renderJobsEquivalentForDisplay(job, *_displayedRenderJob)) {
+        _pendingRenderDirty = false;
+        return;
+    }
+    startRenderJob(std::move(job));
 }
 
 void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location caller)
@@ -2237,19 +2375,24 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     ProfileScope profile("submitRender", reason, caller);
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "surf='{}' volume={} chunkArray={} busy={}",
+            "surf='{}' volume={} chunkArray={} busy={} pending={}",
             _surfName, bool(_volume), bool(_chunkArray),
-            _renderWorkerBusy.load(std::memory_order_acquire)));
+            _renderWorkerBusy.load(std::memory_order_acquire),
+            _pendingRenderJob.has_value()));
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
         return;
     }
+    syncCameraTransform();
+    if (ProfileLoggingEnabled()) {
+        _pendingRenderReason = reason ? reason : "";
+        _pendingRenderCaller = profileCaller(caller);
+    }
     // Hidden viewer (minimized subwindow / background tab): skip the render AND its
     // prefetch entirely. Mark stale so showEvent renders it when it becomes visible.
     if (!isVisible()) {
         _renderStaleWhileHidden = true;
-        _renderPending = false;
         profile.setDetails("action=skip hidden");
         return;
     }
@@ -2260,83 +2403,55 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
 
-    resizeFramebuffer();
-    const int fbW = _framebuffer.width();
-    const int fbH = _framebuffer.height();
-    if (fbW <= 0 || fbH <= 0) {
-        if (profile.enabled()) {
-            profile.setDetails(std::format("action=skip invalid_framebuffer size={}x{}", fbW, fbH));
+    const bool busy = _renderWorkerBusy.load(std::memory_order_acquire);
+    if (!busy) {
+        resizeFramebuffer();
+    }
+    const int fbW = !_framebuffer.isNull()
+        ? _framebuffer.width()
+        : (_view && _view->viewport() ? std::max(1, _view->viewport()->width()) : 1);
+    const int fbH = !_framebuffer.isNull()
+        ? _framebuffer.height()
+        : (_view && _view->viewport() ? std::max(1, _view->viewport()->height()) : 1);
+    auto job = captureRenderJob(reason, caller, surf, fbW, fbH, std::chrono::steady_clock::now());
+    if (!job) {
+        profile.setDetails("action=skip invalid_job");
+        return;
+    }
+
+    if (busy) {
+        if (_activeRenderJob &&
+            renderJobsEquivalentForDisplay(*job, *_activeRenderJob)) {
+            profile.setDetails("action=skip_duplicate_active");
+            return;
         }
+        if (_pendingRenderJob &&
+            renderJobsEquivalentForDisplay(*job, *_pendingRenderJob)) {
+            _pendingRenderDirty = true;
+            profile.setDetails("action=skip_duplicate_pending");
+            return;
+        }
+        _pendingRenderJob = std::move(*job);
+        _pendingRenderDirty = true;
+        updateStatusLabel();
+        profile.setDetails("action=queued_latest_after_worker");
         return;
     }
 
-    const std::size_t paramsKey = viewParamsKey();
-    if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
-        // A render is already in flight. Only DISCARD it (bump the serial so its
-        // result is dropped) when the view params changed -- a data-only refresh
-        // (chunks landed) lets the in-flight frame finish and display, and we just
-        // re-render once it does. Stops slow frames from being thrown away mid-stream.
-        if (paramsKey != _inFlightParamsKey)
-            ++_renderSerial;
-        _renderPendingAfterWorker = true;
-        profile.setDetails(paramsKey != _inFlightParamsKey
-                               ? "action=queued_after_worker view_changed"
-                               : "action=queued_after_worker data_only");
+    if (_displayedRenderJob &&
+        renderJobsEquivalentForDisplay(*job, *_displayedRenderJob)) {
+        _pendingRenderDirty = false;
+        profile.setDetails("action=skip_duplicate_displayed");
         return;
     }
-    _inFlightParamsKey = paramsKey;
 
-    _chunkArray->beginViewRequest();
-    if (_overlayChunkArray)
-        _overlayChunkArray->beginViewRequest();
-
-    prefetchVisibleSurfaceChunks();
-
-    RenderContext ctx;
-    ctx.serial = ++_renderSerial;
-    emit renderFrameSubmitted(ctx.serial);
-    ctx.fbW = fbW;
-    ctx.fbH = fbH;
-    ctx.surfacePtrX = _surfacePtrX;
-    ctx.surfacePtrY = _surfacePtrY;
-    ctx.scale = _scale;
-    ctx.zOff = _zOff;
-    ctx.zOffWorldDir = _zOffWorldDir;
-    ctx.startLevel = renderStartLevel(dynamic_cast<PlaneSurface*>(surf.get()) == nullptr);
-    ctx.samplingMethod = _samplingMethod;
-    ctx.compositeSettings = _compositeSettings;
-    ctx.windowLow = _windowLow;
-    ctx.windowHigh = _windowHigh;
-    ctx.baseColormapId = _baseColormapId;
-    ctx.surf = std::move(surf);
-    ctx.chunkArray = _chunkArray;
-    ctx.overlayVolume = _overlayVolume;
-    ctx.overlayChunkArray = _overlayChunkArray;
-    ctx.overlayOpacity = _overlayOpacity;
-    ctx.overlayColormapId = _overlayColormapId;
-    ctx.overlayWindowLow = _overlayWindowLow;
-    ctx.overlayWindowHigh = _overlayWindowHigh;
-    ctx.genCache = _genSurfaceCache;
-    ctx.genCacheDirty = _genCacheDirty;
-    if (ProfileLoggingEnabled()) {
-        ctx.profileReason = reason ? reason : "";
-        ctx.profileCaller = profileCaller(caller);
-    }
-    _genCacheDirty = false;
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "action=worker_start serial={} size={}x{} level={}",
-            ctx.serial, ctx.fbW, ctx.fbH, ctx.startLevel));
+            "action=worker_start serial={} request={} size={}x{} level={}",
+            _renderSerial + 1, job->requestId, job->fbW, job->fbH, job->startLevel));
     }
-
-    QPointer<CChunkedVolumeViewer> guard(this);
-    (void)QtConcurrent::run([guard, ctx = std::move(ctx)]() mutable {
-        auto result = std::make_shared<RenderResult>(renderFrame(std::move(ctx)));
-        QMetaObject::invokeMethod(qApp, [guard, result = std::move(result)]() mutable {
-            if (guard)
-                guard->finishRenderOnMainThread(std::move(result));
-        }, Qt::QueuedConnection);
-    });
+    startRenderJob(std::move(*job));
+    updateStatusLabel();
 }
 
 void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult> result)
@@ -2345,25 +2460,24 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
                          std::source_location::current());
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "result={} serial={} currentSerial={} pendingAfterWorker={}",
+            "result={} serial={} currentSerial={} pending={}",
             bool(result), result ? result->serial : 0, _renderSerial,
-            _renderPendingAfterWorker));
+            _pendingRenderJob.has_value()));
     }
     _renderWorkerBusy.store(false, std::memory_order_release);
+    _activeRenderJob.reset();
     if (_closing) {
         profile.setDetails("action=drop_closing");
         return;
     }
-    if (!result || result->serial != _renderSerial) {
-        if (_renderPendingAfterWorker) {
-            _renderPendingAfterWorker = false;
-            scheduleRender("stale render result had pending worker");
-        }
-        profile.setDetails("action=drop_stale_result");
+    if (!result) {
+        submitPendingRenderJobIfNeeded();
+        profile.setDetails("action=drop_empty_result");
         return;
     }
 
     _framebuffer = std::move(result->framebuffer);
+    _displayedRenderJob = result->renderJob;
     syncCameraTransform();
     scheduleIntersectionRender("stable render finished");
     if (auto surf = _surfWeak.lock()) {
@@ -2391,15 +2505,40 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     emit renderFrameCompleted(result->serial, result->renderFrameElapsedMs);
     updateStatusLabel();
 
-    if (_renderPendingAfterWorker) {
-        _renderPendingAfterWorker = false;
-        scheduleRender("worker finished with pending render");
+    if (_pendingRenderJob &&
+        renderJobsEquivalentForDisplay(*_pendingRenderJob, result->renderJob)) {
+        _pendingRenderJob.reset();
+        _pendingRenderDirty = false;
     }
+    if (!_pendingRenderJob) {
+        auto surf = _surfWeak.lock();
+        if (surf && _volume && _chunkArray) {
+            const int fbW = !_framebuffer.isNull()
+                ? _framebuffer.width()
+                : (_view && _view->viewport() ? std::max(1, _view->viewport()->width()) : 1);
+            const int fbH = !_framebuffer.isNull()
+                ? _framebuffer.height()
+                : (_view && _view->viewport() ? std::max(1, _view->viewport()->height()) : 1);
+            auto latest = captureRenderJob("catch up after stale presentation",
+                                           std::source_location::current(),
+                                           surf,
+                                           fbW,
+                                           fbH,
+                                           std::chrono::steady_clock::now());
+            if (latest &&
+                !renderJobsEquivalentForDisplay(*latest, result->renderJob)) {
+                _pendingRenderJob = std::move(*latest);
+                _pendingRenderDirty = true;
+            }
+        }
+    }
+    submitPendingRenderJobIfNeeded();
+
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "action=display serial={} worker_elapsed_ms={} framebuffer={}x{}",
-            result->serial, result->renderFrameElapsedMs,
-            _framebuffer.width(), _framebuffer.height()));
+            "action=display serial={} request={} worker_elapsed_ms={} framebuffer={}x{} pending={}",
+            result->serial, result->renderJob.requestId, result->renderFrameElapsedMs,
+            _framebuffer.width(), _framebuffer.height(), _pendingRenderJob.has_value()));
     }
 }
 
@@ -2408,21 +2547,14 @@ void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::so
     ProfileScope profile("renderVisible", reason, caller);
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "surf='{}' force={} pending={} scale={:.4f} zOff={:.3f}",
-            _surfName, force, _renderPending, _scale, _zOff));
+            "surf='{}' force={} scale={:.4f} zOff={:.3f}",
+            _surfName, force, _scale, _zOff));
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
         return;
     }
-    if (!force) {
-        scheduleRender("renderVisible non-force", caller);
-        profile.setDetails("action=schedule");
-        return;
-    }
-    _renderPending = false;
-    submitRender("renderVisible force", caller);
-    updateStatusLabel();
+    submitRender(reason ? reason : (force ? "renderVisible force" : "renderVisible non-force"), caller);
     profile.setDetails("action=submit");
 }
 
@@ -2440,7 +2572,7 @@ void CChunkedVolumeViewer::setVolumeWindow(float low, float high)
         return;
     _windowLow = clampedLow;
     _windowHigh = clampedHigh;
-    scheduleRender("volume window changed");
+    submitRender("volume window changed");
 }
 
 void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
@@ -2470,12 +2602,13 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
                     auto volume = overlayVolumeWeak.lock();
                     if (!volume || guard->_overlayVolume != volume || guard->_closing)
                         return;
-                    guard->scheduleRender("overlay chunk ready");
+                    ++guard->_chunkContentEpoch;
+                    guard->submitRender("overlay chunk ready");
                 }, Qt::QueuedConnection);
             });
         }
     }
-    scheduleRender("overlay volume changed");
+    submitRender("overlay volume changed");
 }
 
 void CChunkedVolumeViewer::setOverlayOpacity(float opacity)
@@ -2484,7 +2617,7 @@ void CChunkedVolumeViewer::setOverlayOpacity(float opacity)
         return;
     }
     _overlayOpacity = std::clamp(opacity, 0.0f, 1.0f);
-    scheduleRender("overlay opacity changed");
+    submitRender("overlay opacity changed");
 }
 
 void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
@@ -2493,7 +2626,7 @@ void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
         return;
     }
     _overlayColormapId = colormapId;
-    scheduleRender("overlay colormap changed");
+    submitRender("overlay colormap changed");
 }
 
 void CChunkedVolumeViewer::setOverlayThreshold(float threshold)
@@ -2511,7 +2644,7 @@ void CChunkedVolumeViewer::setOverlayWindow(float low, float high)
     }
     _overlayWindowLow = std::clamp(low, 0.0f, 255.0f);
     _overlayWindowHigh = std::clamp(high, _overlayWindowLow + 1.0f, 255.0f);
-    scheduleRender("overlay window changed");
+    submitRender("overlay window changed");
 }
 
 void CChunkedVolumeViewer::panByF(float dx, float dy)
@@ -2525,7 +2658,7 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
         _surfacePtrY = std::clamp(_surfacePtrY, _contentMinV, _contentMaxV);
     }
     prefetchVisibleSurfaceChunks();
-    scheduleRender("pan");
+    submitRender("pan");
     refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
@@ -2557,7 +2690,7 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _genCacheDirty = true;
     resizeFramebuffer();
     prefetchVisibleSurfaceChunks();
-    scheduleRender("zoom");
+    submitRender("zoom");
     refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
@@ -2576,7 +2709,7 @@ void CChunkedVolumeViewer::notifyInteractiveViewChange(double motionPx)
     markInteractiveMotion(motionPx);
     _genCacheDirty = true;
     prefetchVisibleSurfaceChunks();
-    scheduleRender("interactive view change");
+    submitRender("interactive view change");
     emit overlaysUpdated();
 }
 
@@ -2589,7 +2722,7 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
     }
     _zOff = std::clamp(_zOff + delta, -maxZ, maxZ);
     _genCacheDirty = true;
-    scheduleRender("surface offset changed");
+    submitRender("surface offset changed");
     updateStatusLabel();
 }
 
@@ -2600,7 +2733,7 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
     _zOff = 0.0f;
     _zOffWorldDir = {0, 0, 0};
     _genCacheDirty = true;
-    scheduleRender("surface offsets reset");
+    submitRender("surface offsets reset");
 }
 
 void CChunkedVolumeViewer::fitSurfaceInView()
@@ -2610,7 +2743,7 @@ void CChunkedVolumeViewer::fitSurfaceInView()
     _scale = 0.5f;
     recalcPyramidLevel();
     _genCacheDirty = true;
-    scheduleRender("fit surface in view");
+    submitRender("fit surface in view");
 }
 
 void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forceRender)
@@ -2660,7 +2793,7 @@ void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool for
                                           double(_surfacePtrY - oldSurfacePtrY)) *
                                 double(std::max(_scale, kMinScale));
         markInteractiveMotion(motionPx);
-        scheduleRender("center on surface point");
+        submitRender("center on surface point");
     }
     emit overlaysUpdated();
 }
@@ -2690,13 +2823,13 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                     _surfWeak = _defaultSurface;
                     updateContentBounds();
                     _genCacheDirty = true;
-                    scheduleRender("plane slice mouse wheel");
+                    submitRender("plane slice mouse wheel");
                 }
             }
         } else {
             _zOff += static_cast<float>(steps) * _zScrollSensitivity;
             _genCacheDirty = true;
-            scheduleRender("z offset mouse wheel");
+            submitRender("z offset mouse wheel");
         }
     } else if (modifiers & Qt::ControlModifier) {
         emit sendSegmentationRadiusWheel(steps, scenePoint, sceneToVolume(scenePoint));
@@ -2712,10 +2845,7 @@ void CChunkedVolumeViewer::onResized()
     }
     resizeFramebuffer();
     _genCacheDirty = true;
-    // Just mark pending: the global clock coalesces the resize-event burst into one
-    // render per tick, and the worker-busy + view-param fingerprint discard supersede
-    // any mid-drag render with the latest size -- no special resize-settle handling.
-    scheduleRender("resized");
+    submitRender("resized");
     _view->viewport()->update();
 }
 
@@ -2762,7 +2892,7 @@ void CChunkedVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
     _panSmoothingInitialized = false;
     _smoothedPanDx = 0.0f;
     _smoothedPanDy = 0.0f;
-    scheduleRender("pan released");
+    submitRender("pan released");
 }
 
 void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)

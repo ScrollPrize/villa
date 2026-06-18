@@ -186,9 +186,8 @@ private:
     bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<VolumeViewerBase*> _baseViewers;
-    // The ONE render clock for the whole app. Ticks ~60Hz; each tick services every
-    // viewer's pending render/intersection flags (coalescing: N events between ticks
-    // collapse to one render). Replaces the per-viewer debounce/settle/status timers.
+    // The one maintenance clock for the whole app. Ticks ~60Hz; render requests
+    // submit immediately, while deferred intersections/status are serviced here.
     QTimer* _globalClock{nullptr};
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};

@@ -69,10 +69,9 @@ public:
     virtual void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
-    // Called by ViewerManager's single global render clock (the only timer in the
-    // render system). Consumes this viewer's pending flags -- submit a render and/or
-    // an intersection render if requested and the viewer is visible. Viewers do NOT
-    // own timers; scheduleRender() just sets a flag this drains.
+    // Called by ViewerManager's global maintenance clock. Render requests submit
+    // immediately; this hook is for non-render maintenance such as deferred
+    // intersections and status refreshes.
     virtual void serviceRenderTick() {}
     virtual void invalidateVis() = 0;
     virtual void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)

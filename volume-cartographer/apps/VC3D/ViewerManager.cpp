@@ -88,9 +88,8 @@ ViewerManager::ViewerManager(CState* state,
                 &ViewerManager::handleSurfaceWillBeDeleted);
     }
 
-    // The single render clock for the whole app: ~60Hz, free-running. Each tick
-    // services every viewer's pending render/intersection flags. This is the only
-    // timer in the render-scheduling system (viewers own none).
+    // The single maintenance clock for the whole app: ~60Hz, free-running. Render
+    // requests submit immediately; this services deferred intersections and status.
     _globalClock = new QTimer(this);
     _globalClock->setInterval(16);
     connect(_globalClock, &QTimer::timeout, this, &ViewerManager::onGlobalTick);

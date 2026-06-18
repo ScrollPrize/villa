@@ -66,8 +66,15 @@ protected:
 
 public:
     void setDirectFramebuffer(const QImage* fb) { _directFb = fb; }
+    void setDirectFramebufferMapping(qreal scale, QPointF offset)
+    {
+        _directFbScale = scale;
+        _directFbOffset = offset;
+    }
 private:
     const QImage* _directFb = nullptr;
+    qreal _directFbScale = 1.0;
+    QPointF _directFbOffset{0.0, 0.0};
 
  private:
     /// Round “ideal” length to 1,2 or 5 × 10^n
