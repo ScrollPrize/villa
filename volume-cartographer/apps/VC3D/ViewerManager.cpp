@@ -17,6 +17,7 @@
 #include "vc/core/util/Logging.hpp"
 
 #include <QMdiArea>
+#include <QTimer>
 #include <QThread>
 #include <QMdiSubWindow>
 #include <QSettings>
@@ -85,6 +86,22 @@ ViewerManager::ViewerManager(CState* state,
                 &CState::surfaceWillBeDeleted,
                 this,
                 &ViewerManager::handleSurfaceWillBeDeleted);
+    }
+
+    // The single render clock for the whole app: ~60Hz, free-running. Each tick
+    // services every viewer's pending render/intersection flags. This is the only
+    // timer in the render-scheduling system (viewers own none).
+    _globalClock = new QTimer(this);
+    _globalClock->setInterval(16);
+    connect(_globalClock, &QTimer::timeout, this, &ViewerManager::onGlobalTick);
+    _globalClock->start();
+}
+
+void ViewerManager::onGlobalTick()
+{
+    for (auto* v : _baseViewers) {
+        if (v)
+            v->serviceRenderTick();
     }
 }
 
@@ -473,6 +490,9 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (!surface) {
         return;
     }
+    // An intersection worker is reading the index now: defer the in-place mutation
+    // (mark dirty -> rebuilt on the next query) instead of tearing the read.
+    if (_indexReadsInFlight > 0) { _surfacePatchIndexNeedsRebuild = true; return; }
     const std::string surfId = surface->id;
     if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex.empty()) {
         _surfacePatchIndexNeedsRebuild = true;
@@ -499,6 +519,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (!surface) {
         return;
     }
+    if (_indexReadsInFlight > 0) { _surfacePatchIndexNeedsRebuild = true; return; }  // defer: worker reading
 
     // Empty rect means no changes
     if (changedRegion.empty()) {
@@ -567,6 +588,9 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     }
     _pendingSurfacePatchIndexSurfaceIds = surfaceIds;
     if (quadSurfaces.empty()) {
+        if (_indexReadsInFlight > 0) {                 // worker reading: defer the clear
+            _surfacePatchIndexNeedsRebuild = true; return;
+        }
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
@@ -611,6 +635,24 @@ void ViewerManager::rebuildSurfacePatchIndexIfNeeded()
     primeSurfacePatchIndicesAsync();
 }
 
+void ViewerManager::endIndexRead()
+{
+    if (_indexReadsInFlight > 0) --_indexReadsInFlight;
+    if (_indexReadsInFlight > 0) return;               // other reads still in flight
+    // Reads drained: apply a swap that was deferred while a worker was reading.
+    if (_deferredIndexSwap) {
+        _surfacePatchIndex = std::move(*_deferredIndexSwap);
+        _deferredIndexSwap.reset();
+        _surfacePatchIndexNeedsRebuild = false;
+        _indexedSurfaceIds.clear();
+        _indexedSurfaceIds.insert(_deferredIndexSwapIds.begin(), _deferredIndexSwapIds.end());
+        _deferredIndexSwapIds.clear();
+        forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections("deferred index swap"); });
+    }
+    // Run any single-surface mutation task that was held while reads were in flight.
+    startNextSurfacePatchIndexTask();
+}
+
 void ViewerManager::handleSurfacePatchIndexPrimeFinished()
 {
     if (!_surfacePatchIndexWatcher) {
@@ -619,6 +661,14 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     auto result = _surfacePatchIndexWatcher->future().result();
     if (!result) {
         _pendingSurfacePatchIndexSurfaceIds.clear();
+        return;
+    }
+    // An intersection worker may be reading the live index. Swapping it now would
+    // tear that read -> stash the rebuilt index; endIndexRead() applies it once reads
+    // drain.
+    if (_indexReadsInFlight > 0) {
+        _deferredIndexSwap = std::move(result);
+        _deferredIndexSwapIds = _pendingSurfacePatchIndexSurfaceIds;
         return;
     }
     _surfacePatchIndex = std::move(*result);
@@ -684,6 +734,12 @@ void ViewerManager::startNextSurfacePatchIndexTask()
     if (!_surfacePatchIndexTaskWatcher ||
         _surfacePatchIndexTaskWatcher->isRunning() ||
         _pendingSurfacePatchIndexTasks.empty()) {
+        return;
+    }
+    // This task MUTATES the live index on a worker. A plane-intersection read worker
+    // may be reading it concurrently -> hold the task until reads drain (endIndexRead
+    // re-runs us). Single-writer + single-reader exclusion, no lock on the index.
+    if (_indexReadsInFlight > 0) {
         return;
     }
 

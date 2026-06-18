@@ -81,6 +81,7 @@ public:
     void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) override;
+    void serviceRenderTick() override;
     void invalidateVis() override;
     void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells) override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
@@ -201,6 +202,7 @@ public:
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
@@ -268,9 +270,6 @@ private:
     void updateStatusLabel();
     void rebuildChunkArray();
     void syncCameraTransform();
-    bool renderInteractiveAxisAlignedSlicePreview();
-    void updateInteractivePreviewFromStableFrame(float newSurfX, float newSurfY, float newScale);
-    bool shouldRefreshInteractivePreview();
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
@@ -323,14 +322,16 @@ private:
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
-    QTimer* _renderTimer = nullptr;
-    QTimer* _settleRenderTimer = nullptr;
-    QTimer* _intersectionRenderTimer = nullptr;
-    QTimer* _resizeRenderTimer = nullptr;
-    QTimer* _statusTimer = nullptr;
+    // No per-viewer timers: ViewerManager's single global clock drives rendering via
+    // serviceRenderTick(), which drains these flags/countdowns (counts are in ticks).
     bool _closing = false;
     bool _renderPending = false;
-    bool _interactivePreview = false;
+    bool _intersectionPending = false;
+    int  _statusRefreshTicks = 0;  // counts down to the periodic status refresh
+    // A render was requested while this viewer was hidden (minimized MDI subwindow /
+    // background tab). We skip the work and set this; showEvent re-renders so the
+    // viewer catches up on whatever went stale while invisible.
+    bool _renderStaleWhileHidden = false;
     bool _segmentationEditActive = false;
     bool _deferSegmentationIntersections = false;
     bool _deferredSegmentationIntersectionsDirty = false;
@@ -339,9 +340,6 @@ private:
     std::string _pendingRenderCaller;
     std::string _pendingIntersectionReason;
     std::string _pendingIntersectionCaller;
-    QElapsedTimer _interactionClock;
-    qint64 _lastInteractionMs = -1;
-    qint64 _lastInteractivePreviewMs = -1;
 
     std::shared_ptr<Volume> _volume;
     std::weak_ptr<Surface> _surfWeak;
@@ -351,14 +349,15 @@ private:
     vc::render::IChunkedArray::ChunkReadyCallbackId _chunkCbId = 0;
 
     QImage _framebuffer;
-    QImage _stableFramebuffer;
-    float _stableSurfX = 0.0f;
-    float _stableSurfY = 0.0f;
-    float _stableScale = 1.0f;
-    bool _stableFramebufferValid = false;
     std::atomic<bool> _renderWorkerBusy{false};
     bool _renderPendingAfterWorker = false;
     std::uint64_t _renderSerial = 0;
+    // Output-affecting view params of the render currently in flight. A submit that
+    // arrives while the worker is busy only DISCARDS that frame (bumps _renderSerial)
+    // when these change; a data-only refresh lets the in-flight frame finish and
+    // display instead of being thrown away (cuts discarded renders ~19%->5%).
+    std::size_t _inFlightParamsKey = 0;
+    std::size_t viewParamsKey() const;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
@@ -464,6 +463,18 @@ private:
                            std::vector<SurfacePatchIndex::TriangleSegment>> intersections;
     };
     IntersectionGeometryCache _intersectionGeometryCache;
+
+    // Async plane-intersection compute. The r-tree query + triangle clip is heavy
+    // (~12% of the GUI tick); on a geometry-cache miss it runs on a worker and the
+    // QGraphicsItems are built on the main thread when the result lands. _intersectGen
+    // rises on every input change; a result whose gen no longer matches is dropped.
+    // One compute at a time; the current scene items stand as the preview meanwhile.
+    std::uint64_t _intersectGen = 0;
+    bool _intersectComputeInFlight = false;
+    void finishPlaneIntersectionCompute(
+        std::uint64_t gen, cv::Rect cacheRoi, IntersectFingerprint fp,
+        std::shared_ptr<std::unordered_map<SurfacePatchIndex::SurfacePtr,
+            std::vector<SurfacePatchIndex::TriangleSegment>>> result);
 
     struct FlattenedIntersectionLine {
         int planeIndex = 0;

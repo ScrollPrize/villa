@@ -16,6 +16,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
+class QTimer;
 class CChunkedVolumeViewer;
 class CState;
 class QWidget;
@@ -138,6 +139,7 @@ signals:
     void sliceStepSizeChanged(int size);
 
 private slots:
+    void onGlobalTick();
     void handleSurfacePatchIndexPrimeFinished();
     void handleSurfacePatchIndexTaskFinished();
     void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -185,6 +187,10 @@ private:
     bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<VolumeViewerBase*> _baseViewers;
+    // The ONE render clock for the whole app. Ticks ~60Hz; each tick services every
+    // viewer's pending render/intersection flags (coalescing: N events between ticks
+    // collapse to one render). Replaces the per-viewer debounce/settle/status timers.
+    QTimer* _globalClock{nullptr};
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
@@ -218,4 +224,19 @@ private:
     std::vector<std::shared_ptr<QuadSurface>> _pinnedHighlightSurfaces;
 
     void rebuildSurfacePatchIndexIfNeeded();
+
+public:
+    // Async-intersection mutual exclusion. A viewer's plane-intersection query reads
+    // _surfacePatchIndex on a worker thread; while any such read is in flight the
+    // index must not be mutated (rebuild swap / updateSurface / clear / single-surface
+    // task) or the worker tears. Mutation sites consult _indexReadsInFlight and defer
+    // (mark dirty / stash result / hold task); endIndexRead() applies the deferred
+    // work once reads drain. Begin/end bracket each worker read on the main thread.
+    void beginIndexRead() { ++_indexReadsInFlight; }
+    void endIndexRead();
+    bool indexReadInFlight() const { return _indexReadsInFlight > 0; }
+private:
+    int _indexReadsInFlight{0};
+    std::shared_ptr<SurfacePatchIndex> _deferredIndexSwap;
+    std::vector<std::string> _deferredIndexSwapIds;
 };
