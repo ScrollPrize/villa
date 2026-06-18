@@ -5,6 +5,7 @@
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QPainter>
+#include <QPaintEvent>
 #include <QScrollBar>
 #include <cmath>
 #include <algorithm>
@@ -206,6 +207,12 @@ void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/
         painter->resetTransform();
         painter->drawImage(0, 0, *_directFb);
     }
+}
+
+void CVolumeViewerView::paintEvent(QPaintEvent* event)
+{
+    QGraphicsView::paintEvent(event);
+    emit paintCompleted();
 }
 
 void CVolumeViewerView::scrollContentsBy(int dx, int dy)

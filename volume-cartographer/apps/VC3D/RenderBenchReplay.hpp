@@ -37,6 +37,9 @@ public:
     bool load(const QString& path);
 
     void setWarmPass(bool warm) { _warm = warm; }
+    void setOffscreen4k(bool enabled) { _offscreen4k = enabled; }
+    void setSkipChunkComplete(bool enabled) { _skipChunkComplete = enabled; }
+    void setSkipFastRender(bool enabled) { _skipFastRender = enabled; }
 
     // Opens the recorded volume+segment in the window, then replays every
     // keyframe. Calls QApplication::quit() on completion. Blocking (pumps the
@@ -45,6 +48,9 @@ public:
 
 private:
     bool _warm = false;
+    bool _offscreen4k = false;
+    bool _skipChunkComplete = false;
+    bool _skipFastRender = false;
     Header _header;
     std::vector<Keyframe> _keyframes;
 

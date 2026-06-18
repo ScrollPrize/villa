@@ -17,6 +17,7 @@ public:
     bool viewportEvent(QEvent* event) override;
     void wheelEvent(QWheelEvent *event) override;
     void scrollContentsBy(int dx, int dy) override;
+    void paintEvent(QPaintEvent* event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
@@ -50,6 +51,7 @@ signals:
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void sendTiltHandleChanged(QPointF tilt);
     void sendTiltHandleReset();
+    void paintCompleted();
     
 protected:
     bool _regular_pan = false;

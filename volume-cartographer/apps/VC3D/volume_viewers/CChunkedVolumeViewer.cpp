@@ -917,6 +917,22 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     emit overlaysUpdated();
 }
 
+void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& state)
+{
+    if (_closing) {
+        return;
+    }
+    _surfacePtrX = state.surfacePtrX;
+    _surfacePtrY = state.surfacePtrY;
+    _scale = state.scale;
+    _zOff = state.zOffset;
+    _zOffWorldDir = state.zOffsetWorldDir;
+    recalcPyramidLevel();
+    _genCacheDirty = true;
+    syncCameraTransform();
+    emit overlaysUpdated();
+}
+
 bool CChunkedVolumeViewer::isRenderQuiescent() const
 {
     return !_renderWorkerBusy.load(std::memory_order_acquire)
@@ -2371,6 +2387,7 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     }
     emit overlaysUpdated();
     _view->viewport()->update();
+    emit renderFrameCompleted(result->serial, result->renderFrameElapsedMs);
     updateStatusLabel();
 
     if (_renderPendingAfterWorker) {

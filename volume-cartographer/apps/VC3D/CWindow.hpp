@@ -60,6 +60,9 @@ struct RenderBenchOptions {
     QString recordPath;   // non-empty: record camera-state timeline to this file
     QString replayPath;   // non-empty: replay a recorded timeline then quit
     bool replayWarm = false;
+    bool replayOffscreen4k = false;
+    bool replaySkipChunkComplete = false;
+    bool replaySkipFastRender = false;
 };
 
 struct AtlasSearchFiberSnapshot {

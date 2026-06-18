@@ -98,6 +98,7 @@ public:
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
     void applyCameraState(const CameraState& state, bool forceRender = true);
+    void applyCameraStateForReplayRepaint(const CameraState& state);
     // Render-bench helpers: true when no render is running/queued/pending; count of
     // remote chunk fetches still outstanding. Used by replay to settle each frame.
     bool isRenderQuiescent() const;
@@ -252,6 +253,7 @@ signals:
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
     void overlaysUpdated();
+    void renderFrameCompleted(std::uint64_t serial, qint64 workerElapsedMs);
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
 
 private:

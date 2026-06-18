@@ -7,10 +7,16 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QObject>
+#include <QWidget>
+
+#include <algorithm>
+#include <cstdint>
 
 #include "CState.hpp"
 #include "CWindow.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -25,6 +31,43 @@ constexpr int kMaxFrameMsLocal = 30000;    // per-keyframe settle ceiling, local
 constexpr int kMaxFrameMsRemote = 180000;  // per-keyframe ceiling for S3 (slow/flaky net)
 constexpr int kQuietWindowMs = 150;        // continuous quiescence before "settled"
 constexpr int kPumpSliceMs = 5;            // event-loop poll granularity
+constexpr int kOffscreen4kW = 3840;
+constexpr int kOffscreen4kH = 2160;
+
+struct FrameTiming {
+    qint64 repaintMs = -1;
+    qint64 fullRenderMs = -1;
+    qint64 settledMs = -1;
+    qint64 workerMs = -1;
+    bool settled = false;
+};
+
+struct PhaseSummary {
+    qint64 minMs = 0;
+    qint64 maxMs = 0;
+    qint64 totalMs = 0;
+    int count = 0;
+
+    void add(qint64 value)
+    {
+        if (value < 0)
+            return;
+        if (count == 0) {
+            minMs = value;
+            maxMs = value;
+        } else {
+            minMs = std::min(minMs, value);
+            maxMs = std::max(maxMs, value);
+        }
+        totalMs += value;
+        ++count;
+    }
+
+    double avg() const
+    {
+        return count > 0 ? static_cast<double>(totalMs) / static_cast<double>(count) : 0.0;
+    }
+};
 }  // namespace
 
 bool RenderBenchReplay::load(const QString& path)
@@ -189,15 +232,28 @@ void RenderBenchReplay::run(CWindow& window)
     // gets overridden on the next layout pass. setFixedSize on the view itself
     // forces the viewport to match and survives relayout; we leave it fixed for
     // the whole replay since we never need it resizable here.
-    if (viewer && _header.viewportW > 0 && _header.viewportH > 0) {
+    const int targetViewportW = _offscreen4k ? kOffscreen4kW : _header.viewportW;
+    const int targetViewportH = _offscreen4k ? kOffscreen4kH : _header.viewportH;
+    if (viewer && targetViewportW > 0 && targetViewportH > 0) {
         if (auto* gv = viewer->graphicsView()) {
-            gv->setFixedSize(_header.viewportW, _header.viewportH);
+            auto pinViewport = [&](int targetW, int targetH) {
+                gv->setFixedSize(targetW, targetH);
+                QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
+                QSize got = gv->viewport()->size();
+                if (got.width() != targetW || got.height() != targetH) {
+                    const QSize viewSize = gv->size();
+                    gv->setFixedSize(std::max(1, viewSize.width() + targetW - got.width()),
+                                     std::max(1, viewSize.height() + targetH - got.height()));
+                    QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
+                }
+            };
+            pinViewport(targetViewportW, targetViewportH);
             QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
             const QSize got = gv->viewport()->size();
-            if (got.width() != _header.viewportW || got.height() != _header.viewportH) {
+            if (got.width() != targetViewportW || got.height() != targetViewportH) {
                 Logger()->warn("[vc3d-replay] viewport pinned to {}x{} but got {}x{} "
                                "(framebuffer follows the actual viewport size)",
-                               _header.viewportW, _header.viewportH,
+                               targetViewportW, targetViewportH,
                                got.width(), got.height());
             }
         }
@@ -206,12 +262,22 @@ void RenderBenchReplay::run(CWindow& window)
     // Remote (S3) data streams chunks in over the network and can stall on a
     // flaky connection; give it a much longer settle ceiling than local data.
     const int maxFrameMs = _header.volpkgIsRemote ? kMaxFrameMsRemote : kMaxFrameMsLocal;
-    Logger()->info("[vc3d-replay] remote={} per-frame settle ceiling={}ms",
-                   _header.volpkgIsRemote, maxFrameMs);
+    Logger()->info("[vc3d-replay] remote={} per-frame ceiling={}ms quiet_window={}ms "
+                   "offscreen4k={} skip_chunk_complete={} skip_fast_render={}",
+                   _header.volpkgIsRemote, maxFrameMs, kQuietWindowMs,
+                   _offscreen4k, _skipChunkComplete, _skipFastRender);
+    Logger()->info("[vc3d-replay] current phases: repaint=current framebuffer paint, "
+                   "full_render=first accepted worker render, settled=render quiet plus zero chunk fetches");
+    Logger()->info("[vc3d-replay] current fast_render phase: absent on this branch "
+                   "(camera changes submit the normal worker render directly)");
 
-    auto driveFrame = [&](int i, const Keyframe& kf, bool timed) {
+    std::vector<FrameTiming> timedFrames;
+    timedFrames.reserve(_keyframes.size());
+
+    auto driveFrame = [&](int i, const Keyframe& kf, bool timed, bool forceSettle) -> FrameTiming {
+        FrameTiming timing;
         if (!viewer)
-            return;
+            return timing;
         CChunkedVolumeViewer::CameraState cs;
         cs.surfacePtrX = kf.surfacePtrX;
         cs.surfacePtrY = kf.surfacePtrY;
@@ -222,31 +288,126 @@ void RenderBenchReplay::run(CWindow& window)
             Logger()->info("[vc3d-replay] frame={} begin scale={:.4f} zOff={:.3f}",
                            i, kf.scale, kf.zOffset);
         }
+        (void)waitForCondition([&] {
+            return !viewer || viewer->isRenderQuiescent();
+        }, maxFrameMs);
+
         QElapsedTimer frameTimer;
         frameTimer.start();
-        viewer->applyCameraState(cs, /*forceRender=*/true);
-        const bool settled = settleFrame(viewer, maxFrameMs, kQuietWindowMs);
+
+        bool repainted = false;
+        QMetaObject::Connection paintConn;
+        if (auto* gv = viewer->graphicsView()) {
+            paintConn = QObject::connect(gv, &CVolumeViewerView::paintCompleted,
+                                         gv, [&] { repainted = true; });
+        }
+
+        viewer->applyCameraStateForReplayRepaint(cs);
+        if (auto* gv = viewer->graphicsView()) {
+            if (auto* viewport = gv->viewport())
+                viewport->repaint();
+        }
+        if (!repainted) {
+            (void)waitForCondition([&] { return repainted || !viewer; }, maxFrameMs);
+        }
+        if (paintConn)
+            QObject::disconnect(paintConn);
+        if (repainted)
+            timing.repaintMs = frameTimer.elapsed();
+
+        bool fullRenderDone = false;
+        qint64 fullRenderWorkerMs = -1;
+        auto renderConn = QObject::connect(
+            viewer, &CChunkedVolumeViewer::renderFrameCompleted,
+            viewer, [&](std::uint64_t, qint64 workerElapsedMs) {
+                if (!fullRenderDone) {
+                    fullRenderDone = true;
+                    fullRenderWorkerMs = workerElapsedMs;
+                }
+            });
+
+        viewer->renderVisible(true, "replay full render");
+        const bool fullRenderSeen = waitForCondition([&] {
+            return fullRenderDone || !viewer;
+        }, maxFrameMs);
+        QObject::disconnect(renderConn);
+        if (fullRenderSeen && fullRenderDone) {
+            timing.fullRenderMs = frameTimer.elapsed();
+            timing.workerMs = fullRenderWorkerMs;
+        }
+
+        if (forceSettle || !_skipChunkComplete) {
+            timing.settled = settleFrame(viewer, maxFrameMs, kQuietWindowMs);
+            timing.settledMs = frameTimer.elapsed();
+        }
+
         if (timed) {
             const QSize fb = viewer->graphicsView()
                 ? viewer->graphicsView()->viewport()->size() : QSize(0, 0);
-            Logger()->info("[vc3d-replay] frame={} end wall_ms={} dsLevel={} "
-                           "recordedDs={} fb={}x{} settled={}",
-                           i, frameTimer.elapsed(), viewer->datasetScaleIndex(),
-                           kf.dsScaleIdx, fb.width(), fb.height(), settled);
+            Logger()->info("[vc3d-replay] frame={} phases repaint_ms={} full_render_ms={} "
+                           "settled_ms={} full_worker_ms={} dsLevel={} recordedDs={} fb={}x{} settled={}",
+                           i, timing.repaintMs, timing.fullRenderMs,
+                           timing.settledMs, timing.workerMs,
+                           viewer->datasetScaleIndex(), kf.dsScaleIdx,
+                           fb.width(), fb.height(), timing.settled);
         }
+        return timing;
     };
 
     // 7. Optional warm pass (discard timings).
     if (_warm) {
         Logger()->info("[vc3d-replay] warm pass over {} keyframes", _keyframes.size());
         for (std::size_t i = 0; i < _keyframes.size(); ++i)
-            driveFrame(static_cast<int>(i), _keyframes[i], /*timed=*/false);
+            (void)driveFrame(static_cast<int>(i), _keyframes[i], /*timed=*/false, /*forceSettle=*/false);
     }
 
-    // 8. Timed pass.
-    Logger()->info("[vc3d-replay] timed pass over {} keyframes", _keyframes.size());
-    for (std::size_t i = 0; i < _keyframes.size(); ++i)
-        driveFrame(static_cast<int>(i), _keyframes[i], /*timed=*/true);
+    // 8. Prime the first recorded view to a fully settled state, but do not count
+    // it. This removes first-frame setup/cache effects from the timed summaries.
+    std::size_t timedStart = 0;
+    if (!_keyframes.empty()) {
+        Logger()->info("[vc3d-replay] priming frame=0 until settled (not timed)");
+        (void)driveFrame(0, _keyframes[0], /*timed=*/false, /*forceSettle=*/true);
+        timedStart = 1;
+    }
+
+    // 9. Timed pass.
+    Logger()->info("[vc3d-replay] timed pass over {} keyframes (start_frame={})",
+                   _keyframes.size() - timedStart, timedStart);
+    for (std::size_t i = timedStart; i < _keyframes.size(); ++i) {
+        timedFrames.push_back(driveFrame(static_cast<int>(i), _keyframes[i],
+                                         /*timed=*/true, /*forceSettle=*/false));
+    }
+
+    PhaseSummary repaintSummary;
+    PhaseSummary fullRenderSummary;
+    PhaseSummary settledSummary;
+    PhaseSummary workerSummary;
+    for (const auto& frame : timedFrames) {
+        repaintSummary.add(frame.repaintMs);
+        fullRenderSummary.add(frame.fullRenderMs);
+        settledSummary.add(frame.settledMs);
+        workerSummary.add(frame.workerMs);
+    }
+    Logger()->info("[vc3d-replay] summary_table |phase|count|min_ms|mean_ms|max_ms|status|");
+    Logger()->info("[vc3d-replay] summary_table |---|---:|---:|---:|---:|---|");
+    auto logSummary = [](const char* name, const PhaseSummary& s) {
+        if (s.count == 0) {
+            Logger()->info("[vc3d-replay] summary_table |{}|0|-|-|-|no samples|", name);
+            return;
+        }
+        Logger()->info("[vc3d-replay] summary_table |{}|{}|{}|{:.2f}|{}|ok|",
+                       name, s.count, s.minMs, s.avg(), s.maxMs);
+    };
+    logSummary("repaint", repaintSummary);
+    logSummary("full_render", fullRenderSummary);
+    logSummary("full_worker", workerSummary);
+    if (_skipChunkComplete) {
+        Logger()->info("[vc3d-replay] summary_table |settled|0|-|-|-|skipped by option|");
+    } else {
+        logSummary("settled", settledSummary);
+    }
+    Logger()->info("[vc3d-replay] summary_table |fast_render|0|-|-|-|present=false skipped_by_option={}|",
+                   _skipFastRender);
 
     Logger()->info("[vc3d-replay] done");
     QApplication::quit();

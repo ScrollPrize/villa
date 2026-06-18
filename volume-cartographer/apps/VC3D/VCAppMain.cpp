@@ -200,6 +200,21 @@ auto main(int argc, char* argv[]) -> int
         "With --replay, run a discarded warm-up pass before the timed pass.");
     parser.addOption(replayWarmOption);
 
+    QCommandLineOption replayOffscreen4kOption(
+        "replay-offscreen-4k",
+        "With --replay, force the replay viewport to 3840x2160.");
+    parser.addOption(replayOffscreen4kOption);
+
+    QCommandLineOption replaySkipChunkCompleteOption(
+        "replay-skip-chunk-complete",
+        "With --replay, advance after the first full render instead of waiting for chunk-complete quiet settle.");
+    parser.addOption(replaySkipChunkCompleteOption);
+
+    QCommandLineOption replaySkipFastRenderOption(
+        "replay-skip-fast-render",
+        "With --replay, skip any fast-render phase and submit the full render directly.");
+    parser.addOption(replaySkipFastRenderOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
@@ -211,6 +226,9 @@ auto main(int argc, char* argv[]) -> int
     benchOptions.recordPath = parser.value(recordOption).trimmed();
     benchOptions.replayPath = parser.value(replayOption).trimmed();
     benchOptions.replayWarm = parser.isSet(replayWarmOption);
+    benchOptions.replayOffscreen4k = parser.isSet(replayOffscreen4kOption);
+    benchOptions.replaySkipChunkComplete = parser.isSet(replaySkipChunkCompleteOption);
+    benchOptions.replaySkipFastRender = parser.isSet(replaySkipFastRenderOption);
 
     if (parser.isSet(profileOption) || !benchOptions.replayPath.isEmpty()) {
         SetProfileLoggingEnabled(true);
