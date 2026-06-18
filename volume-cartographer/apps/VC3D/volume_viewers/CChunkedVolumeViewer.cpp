@@ -79,6 +79,49 @@ constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(140, 255, 220), qRgb(200, 255, 140), qRgb(255, 180, 120),
     qRgb(180, 200, 255), qRgb(255, 140, 180), qRgb(160, 255, 180),
 };
+
+template <typename T>
+void applySurfaceViewOrientation(cv::Mat_<T>& mat, bool flipHorizontally, int quarterTurns)
+{
+    if (mat.empty())
+        return;
+
+    quarterTurns = ((quarterTurns % 4) + 4) % 4;
+    if (!flipHorizontally && quarterTurns == 0)
+        return;
+
+    if (flipHorizontally) {
+        cv::Mat_<T> flipped;
+        cv::flip(mat, flipped, 1);
+        mat = flipped;
+    }
+
+    switch (quarterTurns) {
+        case 1:
+        {
+            cv::Mat_<T> rotated;
+            cv::rotate(mat, rotated, cv::ROTATE_90_CLOCKWISE);
+            mat = rotated;
+            break;
+        }
+        case 2:
+        {
+            cv::Mat_<T> rotated;
+            cv::rotate(mat, rotated, cv::ROTATE_180);
+            mat = rotated;
+            break;
+        }
+        case 3:
+        {
+            cv::Mat_<T> rotated;
+            cv::rotate(mat, rotated, cv::ROTATE_90_COUNTERCLOCKWISE);
+            mat = rotated;
+            break;
+        }
+        default:
+            break;
+    }
+}
 constexpr int kIntersectionZ = 100;
 
 constexpr int kHighlightedIntersectionZ = 110;
@@ -897,6 +940,8 @@ CChunkedVolumeViewer::CameraState CChunkedVolumeViewer::cameraState() const
     state.scale = _scale;
     state.zOffset = _zOff;
     state.zOffsetWorldDir = _zOffWorldDir;
+    state.surfaceViewRotationQuarterTurns = _surfaceViewRotationQuarterTurns;
+    state.surfaceViewFlippedHorizontally = _surfaceViewFlippedHorizontally;
     return state;
 }
 
@@ -905,13 +950,24 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     if (_closing) {
         return;
     }
+    const int nextRotationQuarterTurns =
+        ((state.surfaceViewRotationQuarterTurns % 4) + 4) % 4;
+    const bool orientationChanged =
+        _surfaceViewRotationQuarterTurns != nextRotationQuarterTurns ||
+        _surfaceViewFlippedHorizontally != state.surfaceViewFlippedHorizontally;
+
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
     _zOff = state.zOffset;
     _zOffWorldDir = state.zOffsetWorldDir;
+    _surfaceViewRotationQuarterTurns = nextRotationQuarterTurns;
+    _surfaceViewFlippedHorizontally = state.surfaceViewFlippedHorizontally;
     recalcPyramidLevel();
     _genCacheDirty = true;
+    if (orientationChanged) {
+        invalidateSurfaceViewOrientation();
+    }
     if (forceRender) {
         renderVisible(true, "annotation camera state applied");
     } else {
@@ -925,13 +981,24 @@ void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& s
     if (_closing) {
         return;
     }
+    const int nextRotationQuarterTurns =
+        ((state.surfaceViewRotationQuarterTurns % 4) + 4) % 4;
+    const bool orientationChanged =
+        _surfaceViewRotationQuarterTurns != nextRotationQuarterTurns ||
+        _surfaceViewFlippedHorizontally != state.surfaceViewFlippedHorizontally;
+
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
     _zOff = state.zOffset;
     _zOffWorldDir = state.zOffsetWorldDir;
+    _surfaceViewRotationQuarterTurns = nextRotationQuarterTurns;
+    _surfaceViewFlippedHorizontally = state.surfaceViewFlippedHorizontally;
     recalcPyramidLevel();
     _genCacheDirty = true;
+    if (orientationChanged) {
+        invalidateSurfaceViewOrientation();
+    }
     syncCameraTransform();
     emit overlaysUpdated();
 }
@@ -1505,8 +1572,9 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
         (!prefetchBase && !prefetchOverlay))
         return;
 
-    const int fbW = _framebuffer.width();
-    const int fbH = _framebuffer.height();
+    const bool rotatedSideways = _surfaceViewRotationQuarterTurns % 2 != 0;
+    const int fbW = rotatedSideways ? _framebuffer.height() : _framebuffer.width();
+    const int fbH = rotatedSideways ? _framebuffer.width() : _framebuffer.height();
     if (fbW <= 0 || fbH <= 0)
         return;
 
@@ -1566,8 +1634,9 @@ void CChunkedVolumeViewer::prefetchPlaneNormalNeighbors(
     if (_framebuffer.isNull() || (!prefetchBase && !prefetchOverlay))
         return;
 
-    const int fbW = _framebuffer.width();
-    const int fbH = _framebuffer.height();
+    const bool rotatedSideways = _surfaceViewRotationQuarterTurns % 2 != 0;
+    const int fbW = rotatedSideways ? _framebuffer.height() : _framebuffer.width();
+    const int fbH = rotatedSideways ? _framebuffer.width() : _framebuffer.height();
     if (fbW <= 0 || fbH <= 0)
         return;
 
@@ -1740,8 +1809,11 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
     if (level < 0 || level >= _chunkArray->numLevels())
         return;
 
-    const float halfW = static_cast<float>(_framebuffer.width()) * 0.5f / std::max(_scale, kMinScale);
-    const float halfH = static_cast<float>(_framebuffer.height()) * 0.5f / std::max(_scale, kMinScale);
+    const bool rotatedSideways = _surfaceViewRotationQuarterTurns % 2 != 0;
+    const int fbW = rotatedSideways ? _framebuffer.height() : _framebuffer.width();
+    const int fbH = rotatedSideways ? _framebuffer.width() : _framebuffer.height();
+    const float halfW = static_cast<float>(fbW) * 0.5f / std::max(_scale, kMinScale);
+    const float halfH = static_cast<float>(fbH) * 0.5f / std::max(_scale, kMinScale);
     const cv::Vec2f g0 = quad->ptrToGrid({_surfacePtrX - halfW, _surfacePtrY - halfH, 0.0f});
     const cv::Vec2f g1 = quad->ptrToGrid({_surfacePtrX + halfW, _surfacePtrY + halfH, 0.0f});
     const float minX = std::min(g0[0], g1[0]);
@@ -1760,9 +1832,9 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
         return;
 
     const float cellsPerPixelX =
-        float(visibleCells.width) / float(std::max(1, _framebuffer.width()));
+        float(visibleCells.width) / float(std::max(1, fbW));
     const float cellsPerPixelY =
-        float(visibleCells.height) / float(std::max(1, _framebuffer.height()));
+        float(visibleCells.height) / float(std::max(1, fbH));
     const int padX = std::max(1, int(std::ceil(float(kChunkPrefetchHaloPx) * cellsPerPixelX)) + 2);
     const int padY = std::max(1, int(std::ceil(float(kChunkPrefetchHaloPx) * cellsPerPixelY)) + 2);
     cv::Rect paddedCells(
@@ -1846,6 +1918,8 @@ struct CChunkedVolumeViewer::RenderContext {
     float scale = 1.0f;
     float zOff = 0.0f;
     cv::Vec3f zOffWorldDir{0, 0, 0};
+    int surfaceViewRotationQuarterTurns = 0;
+    bool surfaceViewFlippedHorizontally = false;
     int startLevel = 0;
     vc::Sampling samplingMethod = vc::Sampling::Trilinear;
     CompositeRenderSettings compositeSettings;
@@ -1897,6 +1971,12 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                        bool(ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f),
                        ctx.compositeSettings.enabled, ctx.compositeSettings.planeEnabled);
     }
+    const int surfaceViewTurns =
+        ((ctx.surfaceViewRotationQuarterTurns % 4) + 4) % 4;
+    const bool surfaceViewRotatedSideways = surfaceViewTurns % 2 != 0;
+    const int renderW = surfaceViewRotatedSideways ? ctx.fbH : ctx.fbW;
+    const int renderH = surfaceViewRotatedSideways ? ctx.fbW : ctx.fbH;
+
     RenderResult result;
     result.serial = ctx.serial;
     result.renderJob = ctx.renderJob;
@@ -1924,8 +2004,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         return result;
     }
 
-    cv::Mat_<uint8_t> values(ctx.fbH, ctx.fbW, uint8_t(0));
-    cv::Mat_<uint8_t> coverage(ctx.fbH, ctx.fbW, uint8_t(0));
+    cv::Mat_<uint8_t> values(renderH, renderW, uint8_t(0));
+    cv::Mat_<uint8_t> coverage(renderH, renderW, uint8_t(0));
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
     const vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
@@ -2069,8 +2149,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const cv::Vec3f vx = plane->basisX();
         const cv::Vec3f vy = plane->basisY();
         const cv::Vec3f n = plane->normal({0, 0, 0});
-        const float halfW = static_cast<float>(ctx.fbW) * 0.5f / ctx.scale;
-        const float halfH = static_cast<float>(ctx.fbH) * 0.5f / ctx.scale;
+        const float halfW = static_cast<float>(renderW) * 0.5f / ctx.scale;
+        const float halfH = static_cast<float>(renderH) * 0.5f / ctx.scale;
         const cv::Vec3f origin = vx * (ctx.surfacePtrX - halfW)
                                + vy * (ctx.surfacePtrY - halfH)
                                + plane->origin()
@@ -2081,8 +2161,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         samplePlane(origin, vxStep, vyStep, n, values, coverage, *ctx.chunkArray);
         if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
         if (ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
-            overlayValues.create(ctx.fbH, ctx.fbW);
-            overlayCoverage.create(ctx.fbH, ctx.fbW);
+            overlayValues.create(renderH, renderW);
+            overlayCoverage.create(renderH, renderW);
             overlayValues.setTo(0);
             overlayCoverage.setTo(0);
             const int level = std::clamp(ctx.startLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
@@ -2093,8 +2173,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     } else {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
-        const cv::Vec3f offset(ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f,
-                               ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f,
+        const cv::Vec3f offset(ctx.surfacePtrX * ctx.scale - float(renderW) * 0.5f,
+                               ctx.surfacePtrY * ctx.scale - float(renderH) * 0.5f,
                                0.0f);
         const bool needSurfaceNormals =
             ctx.zOff != 0.0f ||
@@ -2111,8 +2191,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             genCacheHit =
                 ctx.genCache->valid &&
                 ctx.genCache->surface == ctx.surf.get() &&
-                ctx.genCache->fbW == ctx.fbW &&
-                ctx.genCache->fbH == ctx.fbH &&
+                ctx.genCache->fbW == renderW &&
+                ctx.genCache->fbH == renderH &&
                 ctx.genCache->scale == ctx.scale &&
                 ctx.genCache->offset == offset &&
                 ctx.genCache->zOff == ctx.zOff &&
@@ -2130,7 +2210,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         if (!genCacheHit) {
             if (profilePhases) phaseTimer.restart();
             ctx.surf->gen(&coords, needSurfaceNormals ? &normals : nullptr,
-                          cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0}, ctx.scale, offset);
+                          cv::Size(renderW, renderH), {0, 0, 0}, ctx.scale, offset);
             applyPerPixelNormalOffset(coords, normals, ctx.zOff);
             if (profilePhases) phaseGenMs = phaseTimer.elapsed();
 
@@ -2138,8 +2218,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 std::lock_guard lock(ctx.genCache->mutex);
                 ctx.genCache->valid = true;
                 ctx.genCache->surface = ctx.surf.get();
-                ctx.genCache->fbW = ctx.fbW;
-                ctx.genCache->fbH = ctx.fbH;
+                ctx.genCache->fbW = renderW;
+                ctx.genCache->fbH = renderH;
                 ctx.genCache->scale = ctx.scale;
                 ctx.genCache->offset = offset;
                 ctx.genCache->zOff = ctx.zOff;
@@ -2153,8 +2233,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             sampleCoords(coords, normals, values, coverage, *ctx.chunkArray);
             if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
             if (ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
-                overlayValues.create(ctx.fbH, ctx.fbW);
-                overlayCoverage.create(ctx.fbH, ctx.fbW);
+                overlayValues.create(renderH, renderW);
+                overlayCoverage.create(renderH, renderW);
                 overlayValues.setTo(0);
                 overlayCoverage.setTo(0);
                 const int level = std::clamp(ctx.startLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
@@ -2163,6 +2243,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             }
         }
     }
+
+    applySurfaceViewOrientation(values, ctx.surfaceViewFlippedHorizontally, surfaceViewTurns);
+    applySurfaceViewOrientation(coverage, ctx.surfaceViewFlippedHorizontally, surfaceViewTurns);
+    applySurfaceViewOrientation(overlayValues, ctx.surfaceViewFlippedHorizontally, surfaceViewTurns);
+    applySurfaceViewOrientation(overlayCoverage, ctx.surfaceViewFlippedHorizontally, surfaceViewTurns);
 
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
@@ -2218,6 +2303,9 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.scale = _scale;
     job.zOff = _zOff;
     job.zOffWorldDir = _zOffWorldDir;
+    job.surfaceViewRotationQuarterTurns =
+        ((_surfaceViewRotationQuarterTurns % 4) + 4) % 4;
+    job.surfaceViewFlippedHorizontally = _surfaceViewFlippedHorizontally;
     job.startLevel = renderStartLevel(dynamic_cast<PlaneSurface*>(surf.get()) == nullptr);
     job.samplingMethod = _samplingMethod;
     job.compositeSettings = _compositeSettings;
@@ -2258,6 +2346,8 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
            a.scale == b.scale &&
            a.zOff == b.zOff &&
            vecEqual(a.zOffWorldDir, b.zOffWorldDir) &&
+           a.surfaceViewRotationQuarterTurns == b.surfaceViewRotationQuarterTurns &&
+           a.surfaceViewFlippedHorizontally == b.surfaceViewFlippedHorizontally &&
            a.startLevel == b.startLevel &&
            a.samplingMethod == b.samplingMethod &&
            a.compositeSettings == b.compositeSettings &&
@@ -2293,15 +2383,12 @@ void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
     const qreal currentHalfH = static_cast<qreal>(_framebuffer.height()) * 0.5;
     const qreal renderedHalfW = static_cast<qreal>(job.fbW) * 0.5;
     const qreal renderedHalfH = static_cast<qreal>(job.fbH) * 0.5;
+    const QPointF orientedDelta = surfaceDeltaToSceneDelta(
+        static_cast<qreal>(job.surfacePtrX) - static_cast<qreal>(_surfacePtrX),
+        static_cast<qreal>(job.surfacePtrY) - static_cast<qreal>(_surfacePtrY));
     const QPointF offset(
-        currentHalfW +
-            (static_cast<qreal>(job.surfacePtrX) - static_cast<qreal>(_surfacePtrX)) *
-                static_cast<qreal>(_scale) -
-            renderedHalfW * ratio,
-        currentHalfH +
-            (static_cast<qreal>(job.surfacePtrY) - static_cast<qreal>(_surfacePtrY)) *
-                static_cast<qreal>(_scale) -
-            renderedHalfH * ratio);
+        currentHalfW + orientedDelta.x() * static_cast<qreal>(_scale) - renderedHalfW * ratio,
+        currentHalfH + orientedDelta.y() * static_cast<qreal>(_scale) - renderedHalfH * ratio);
     _view->setDirectFramebufferMapping(ratio, offset);
 }
 
@@ -2333,6 +2420,8 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.scale = job.scale;
     ctx.zOff = job.zOff;
     ctx.zOffWorldDir = job.zOffWorldDir;
+    ctx.surfaceViewRotationQuarterTurns = job.surfaceViewRotationQuarterTurns;
+    ctx.surfaceViewFlippedHorizontally = job.surfaceViewFlippedHorizontally;
     ctx.startLevel = job.startLevel;
     ctx.samplingMethod = job.samplingMethod;
     ctx.compositeSettings = job.compositeSettings;
@@ -2501,8 +2590,11 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             const cv::Vec3f vx = plane->basisX();
             const cv::Vec3f vy = plane->basisY();
             const cv::Vec3f n = plane->normal({0, 0, 0});
-            const float halfW = static_cast<float>(_framebuffer.width()) * 0.5f / _scale;
-            const float halfH = static_cast<float>(_framebuffer.height()) * 0.5f / _scale;
+            const bool rotatedSideways = _surfaceViewRotationQuarterTurns % 2 != 0;
+            const int renderW = rotatedSideways ? _framebuffer.height() : _framebuffer.width();
+            const int renderH = rotatedSideways ? _framebuffer.width() : _framebuffer.height();
+            const float halfW = static_cast<float>(renderW) * 0.5f / _scale;
+            const float halfH = static_cast<float>(renderH) * 0.5f / _scale;
             const cv::Vec3f origin = vx * (_surfacePtrX - halfW)
                                    + vy * (_surfacePtrY - halfH)
                                    + plane->origin()
@@ -2510,8 +2602,11 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             prefetchPlaneHalo(origin, vx / _scale, vy / _scale, startLevel, options);
             prefetchPlaneNormalNeighbors(*plane, startLevel, options);
         } else {
+            const bool rotatedSideways = _surfaceViewRotationQuarterTurns % 2 != 0;
+            const int renderW = rotatedSideways ? _framebuffer.height() : _framebuffer.width();
+            const int renderH = rotatedSideways ? _framebuffer.width() : _framebuffer.height();
             prefetchSurfaceHalo(*surf, renderStartLevel(true), options,
-                                _framebuffer.width(), _framebuffer.height());
+                                renderW, renderH);
         }
     }
     emit overlaysUpdated();
@@ -2665,8 +2760,9 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
 {
     markInteractiveMotion(std::hypot(double(dx), double(dy)));
     const float invScale = _panSensitivity / _scale;
-    _surfacePtrX -= dx * invScale;
-    _surfacePtrY -= dy * invScale;
+    const cv::Vec2f surfaceDelta = sceneDeltaToSurfaceDelta(dx * invScale, dy * invScale);
+    _surfacePtrX -= surfaceDelta[0];
+    _surfacePtrY -= surfaceDelta[1];
     if (_contentMaxU > _contentMinU) {
         _surfacePtrX = std::clamp(_surfacePtrX, _contentMinU, _contentMaxU);
         _surfacePtrY = std::clamp(_surfacePtrY, _contentMinV, _contentMaxV);
@@ -2696,8 +2792,10 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     if (mx >= 0 && mx < vpW && my >= 0 && my < vpH) {
         const float dx = mx - vpW * 0.5f;
         const float dy = my - vpH * 0.5f;
-        _surfacePtrX += dx * (1.0f / _scale - 1.0f / newScale);
-        _surfacePtrY += dy * (1.0f / _scale - 1.0f / newScale);
+        const float scaleDelta = 1.0f / _scale - 1.0f / newScale;
+        const cv::Vec2f surfaceDelta = sceneDeltaToSurfaceDelta(dx * scaleDelta, dy * scaleDelta);
+        _surfacePtrX += surfaceDelta[0];
+        _surfacePtrY += surfaceDelta[1];
     }
     _scale = newScale;
     recalcPyramidLevel();
@@ -2748,6 +2846,7 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
     _zOffWorldDir = {0, 0, 0};
     _genCacheDirty = true;
     submitRender("surface offsets reset");
+    refreshSameWrapAnnotationOverlay();
 }
 
 void CChunkedVolumeViewer::fitSurfaceInView()
@@ -2758,6 +2857,52 @@ void CChunkedVolumeViewer::fitSurfaceInView()
     recalcPyramidLevel();
     _genCacheDirty = true;
     submitRender("fit surface in view");
+    refreshSameWrapAnnotationOverlay();
+}
+
+bool CChunkedVolumeViewer::rotateSurfaceViewClockwise()
+{
+    if (_closing)
+        return false;
+
+    _surfaceViewRotationQuarterTurns = (_surfaceViewRotationQuarterTurns + 1) % 4;
+    invalidateSurfaceViewOrientation();
+    submitRender("surface view rotated clockwise");
+    refreshSameWrapAnnotationOverlay();
+    emit overlaysUpdated();
+    return true;
+}
+
+bool CChunkedVolumeViewer::flipSurfaceViewHorizontally()
+{
+    if (_closing)
+        return false;
+
+    const int normalizedRotation =
+        ((_surfaceViewRotationQuarterTurns % 4) + 4) % 4;
+    _surfaceViewFlippedHorizontally = !_surfaceViewFlippedHorizontally;
+    _surfaceViewRotationQuarterTurns = (4 - normalizedRotation) % 4;
+    invalidateSurfaceViewOrientation();
+    submitRender("surface view flipped horizontally");
+    refreshSameWrapAnnotationOverlay();
+    emit overlaysUpdated();
+    return true;
+}
+
+bool CChunkedVolumeViewer::resetSurfaceViewOrientation()
+{
+    if (_closing)
+        return false;
+    if (_surfaceViewRotationQuarterTurns == 0 && !_surfaceViewFlippedHorizontally)
+        return false;
+
+    _surfaceViewRotationQuarterTurns = 0;
+    _surfaceViewFlippedHorizontally = false;
+    invalidateSurfaceViewOrientation();
+    submitRender("surface view orientation reset");
+    refreshSameWrapAnnotationOverlay();
+    emit overlaysUpdated();
+    return true;
 }
 
 void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forceRender)
@@ -3299,9 +3444,11 @@ QPointF CChunkedVolumeViewer::surfaceToScene(float surfX, float surfY) const
 {
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    const qreal vx = (surfX - _surfacePtrX) * _scale + vpCx;
-    const qreal vy = (surfY - _surfacePtrY) * _scale + vpCy;
-    return QPointF(vx, vy);
+    const QPointF oriented = surfaceDeltaToSceneDelta(
+        static_cast<qreal>(surfX) - static_cast<qreal>(_surfacePtrX),
+        static_cast<qreal>(surfY) - static_cast<qreal>(_surfacePtrY));
+    return QPointF(oriented.x() * _scale + vpCx,
+                   oriented.y() * _scale + vpCy);
 }
 
 cv::Vec2f CChunkedVolumeViewer::sceneToSurface(const QPointF& scenePos) const
@@ -3310,8 +3457,10 @@ cv::Vec2f CChunkedVolumeViewer::sceneToSurface(const QPointF& scenePos) const
         return {0, 0};
     const float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    return {(static_cast<float>(scenePos.x()) - vpCx) / _scale + _surfacePtrX,
-            (static_cast<float>(scenePos.y()) - vpCy) / _scale + _surfacePtrY};
+    const cv::Vec2f surfaceDelta = sceneDeltaToSurfaceDelta(
+        (scenePos.x() - static_cast<qreal>(vpCx)) / static_cast<qreal>(_scale),
+        (scenePos.y() - static_cast<qreal>(vpCy)) / static_cast<qreal>(_scale));
+    return {surfaceDelta[0] + _surfacePtrX, surfaceDelta[1] + _surfacePtrY};
 }
 
 QRectF CChunkedVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) const
@@ -3326,6 +3475,75 @@ QRectF CChunkedVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) cons
 cv::Vec2f CChunkedVolumeViewer::sceneToSurfaceCoords(const QPointF& scenePos) const
 {
     return sceneToSurface(scenePos);
+}
+
+QPointF CChunkedVolumeViewer::surfaceDeltaToSceneDelta(qreal surfaceDx, qreal surfaceDy) const
+{
+    qreal x = surfaceDx;
+    qreal y = surfaceDy;
+    if (_surfaceViewFlippedHorizontally) {
+        x = -x;
+    }
+
+    switch (((_surfaceViewRotationQuarterTurns % 4) + 4) % 4) {
+        case 1:
+            return QPointF(-y, x);
+        case 2:
+            return QPointF(-x, -y);
+        case 3:
+            return QPointF(y, -x);
+        default:
+            return QPointF(x, y);
+    }
+}
+
+cv::Vec2f CChunkedVolumeViewer::sceneDeltaToSurfaceDelta(qreal sceneDx, qreal sceneDy) const
+{
+    qreal surfaceX = sceneDx;
+    qreal surfaceY = sceneDy;
+    switch (((_surfaceViewRotationQuarterTurns % 4) + 4) % 4) {
+        case 1:
+            surfaceX = sceneDy;
+            surfaceY = -sceneDx;
+            break;
+        case 2:
+            surfaceX = -sceneDx;
+            surfaceY = -sceneDy;
+            break;
+        case 3:
+            surfaceX = -sceneDy;
+            surfaceY = sceneDx;
+            break;
+        default:
+            break;
+    }
+
+    if (_surfaceViewFlippedHorizontally) {
+        surfaceX = -surfaceX;
+    }
+    return {static_cast<float>(surfaceX), static_cast<float>(surfaceY)};
+}
+
+void CChunkedVolumeViewer::invalidateSurfaceViewOrientation()
+{
+    _genCacheDirty = true;
+    _surfaceChunkPrefetchCache = {};
+    _lastIntersectFp = {};
+    _intersectionGeometryCache.valid = false;
+    _flattenedIntersectionCache.valid = false;
+    _flattenedIntersectionDirtyCells.reset();
+    clearIntersectionItems();
+    _displayedRenderJob.reset();
+    if (_genSurfaceCache) {
+        std::lock_guard lock(_genSurfaceCache->mutex);
+        _genSurfaceCache->valid = false;
+        _genSurfaceCache->coords.release();
+        _genSurfaceCache->normals.release();
+    }
+    if (_view) {
+        _view->setDirectFramebufferMapping(1.0, QPointF(0.0, 0.0));
+    }
+    scheduleIntersectionRender("surface view orientation changed");
 }
 
 QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
@@ -3926,10 +4144,11 @@ void CChunkedVolumeViewer::updateIntersectionPreviewTransform()
     const qreal vpCx = qreal(_framebuffer.width()) * 0.5;
     const qreal vpCy = qreal(_framebuffer.height()) * 0.5;
     const qreal scale = qreal(_camScale / _intersectionItemsCamScale);
-    const qreal tx = (qreal(_intersectionItemsCamSurfX) - qreal(_camSurfX)) * qreal(_camScale)
-                   + vpCx - vpCx * scale;
-    const qreal ty = (qreal(_intersectionItemsCamSurfY) - qreal(_camSurfY)) * qreal(_camScale)
-                   + vpCy - vpCy * scale;
+    const QPointF orientedDelta = surfaceDeltaToSceneDelta(
+        qreal(_intersectionItemsCamSurfX) - qreal(_camSurfX),
+        qreal(_intersectionItemsCamSurfY) - qreal(_camSurfY));
+    const qreal tx = orientedDelta.x() * qreal(_camScale) + vpCx - vpCx * scale;
+    const qreal ty = orientedDelta.y() * qreal(_camScale) + vpCy - vpCy * scale;
     const QTransform transform(scale, 0.0, 0.0,
                                0.0, scale, 0.0,
                                tx, ty, 1.0);
@@ -4018,8 +4237,10 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     fp.targetGenerationHash = 0;
 
     // Flattened intersections are built in surface-view scene coordinates.
-    // Pan/zoom can reuse the same paths by transforming the existing items.
-    fp.cameraHash = 0;
+    // Pan/zoom can reuse the same paths by transforming the existing items,
+    // but rotation/flip changes the scene orientation.
+    fp.cameraHash = (std::hash<int>{}(_surfaceViewRotationQuarterTurns) + 0x9e3779b9u) ^
+                    (std::hash<bool>{}(_surfaceViewFlippedHorizontally) << 1);
     fp.valid = true;
     if (_lastIntersectFp == fp && !_intersectionItems.empty() &&
         !_flattenedIntersectionDirtyCells) {
@@ -4590,7 +4811,9 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
     fp.highlightedSurfaceHash = hh;
     fp.cameraHash = (std::hash<int>{}(_framebuffer.width()) + 0x9e3779b9u) ^
-                    (std::hash<int>{}(_framebuffer.height()) << 1);
+                    (std::hash<int>{}(_framebuffer.height()) << 1) ^
+                    (std::hash<int>{}(_surfaceViewRotationQuarterTurns) << 2) ^
+                    (std::hash<bool>{}(_surfaceViewFlippedHorizontally) << 3);
     fp.valid = true;
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         updateIntersectionPreviewTransform();

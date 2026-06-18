@@ -61,6 +61,8 @@ public:
         float scale = 1.0f;
         float zOffset = 0.0f;
         cv::Vec3f zOffsetWorldDir{0, 0, 0};
+        int surfaceViewRotationQuarterTurns = 0;
+        bool surfaceViewFlippedHorizontally = false;
     };
     struct SceneVolumeSample {
         cv::Vec3f position{0, 0, 0};
@@ -90,6 +92,9 @@ public:
     void adjustSurfaceOffset(float delta) override;
     void resetSurfaceOffsets() override;
     void fitSurfaceInView() override;
+    bool rotateSurfaceViewClockwise() override;
+    bool flipSurfaceViewHorizontally() override;
+    bool resetSurfaceViewOrientation() override;
     void notifyInteractiveViewChange(double motionPx);
 
     std::string surfName() const override { return _surfName; }
@@ -307,6 +312,8 @@ private:
         float scale = 1.0f;
         float zOff = 0.0f;
         cv::Vec3f zOffWorldDir{0, 0, 0};
+        int surfaceViewRotationQuarterTurns = 0;
+        bool surfaceViewFlippedHorizontally = false;
         int startLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
         CompositeRenderSettings compositeSettings;
@@ -350,6 +357,9 @@ private:
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
+    QPointF surfaceDeltaToSceneDelta(qreal surfaceDx, qreal surfaceDy) const;
+    cv::Vec2f sceneDeltaToSurfaceDelta(qreal sceneDx, qreal sceneDy) const;
+    void invalidateSurfaceViewOrientation();
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
     void clearLineAnnotationPlacementMarker();
@@ -429,6 +439,8 @@ private:
     float _camSurfY = 0.0f;
     float _camScale = 1.0f;
     cv::Vec3f _zOffWorldDir{0, 0, 0};
+    int _surfaceViewRotationQuarterTurns = 0;
+    bool _surfaceViewFlippedHorizontally = false;
 
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;

@@ -31,6 +31,8 @@ public:
         float surfacePtrX = 0.0f, surfacePtrY = 0.0f;
         float scale = 1.0f, zOffset = 0.0f;
         float zDirX = 0.0f, zDirY = 0.0f, zDirZ = 0.0f;
+        int surfaceViewRotationQuarterTurns = 0;
+        bool surfaceViewFlippedHorizontally = false;
         int dsScaleIdx = 0;
     };
 
