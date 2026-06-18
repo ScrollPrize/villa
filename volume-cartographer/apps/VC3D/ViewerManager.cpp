@@ -17,6 +17,7 @@
 #include "vc/core/util/Logging.hpp"
 
 #include <QMdiArea>
+#include <QTimer>
 #include <QThread>
 #include <QMdiSubWindow>
 #include <QSettings>
@@ -86,21 +87,35 @@ ViewerManager::ViewerManager(CState* state,
                 this,
                 &ViewerManager::handleSurfaceWillBeDeleted);
     }
+
+    // The single render clock for the whole app: ~60Hz, free-running. Each tick
+    // services every viewer's pending render/intersection flags. This is the only
+    // timer in the render-scheduling system (viewers own none).
+    _globalClock = new QTimer(this);
+    _globalClock->setInterval(16);
+    connect(_globalClock, &QTimer::timeout, this, &ViewerManager::onGlobalTick);
+    _globalClock->start();
+}
+
+void ViewerManager::onGlobalTick()
+{
+    for (auto* v : _baseViewers) {
+        if (v)
+            v->serviceRenderTick();
+    }
 }
 
 VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
                                               const QString& title,
-                                              QMdiArea* mdiArea)
+                                              QMdiArea* mdiArea,
+                                              ViewerRole role)
 {
     if (!mdiArea || !_state) {
         return nullptr;
     }
 
-    QWidget* widget = nullptr;
-    VolumeViewerBase* baseViewer = nullptr;
     auto* chunkedViewer = new CChunkedVolumeViewer(_state, this, mdiArea);
-    widget = chunkedViewer;
-    baseViewer = chunkedViewer;
+    QWidget* widget = chunkedViewer;
 
     auto* win = mdiArea->addSubWindow(widget);
     win->setWindowTitle(title);
@@ -112,6 +127,35 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     win->setAttribute(Qt::WA_DeleteOnClose);
     win->installEventFilter(widget);
 
+    return initializeChunkedViewer(chunkedViewer, surfaceName, role);
+}
+
+VolumeViewerBase* ViewerManager::createViewerInWidget(const std::string& surfaceName,
+                                                      QWidget* parent,
+                                                      ViewerRole role)
+{
+    if (!parent || !_state) {
+        return nullptr;
+    }
+
+    auto* chunkedViewer = new CChunkedVolumeViewer(_state, this, parent);
+    return initializeChunkedViewer(chunkedViewer, surfaceName, role);
+}
+
+VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* chunkedViewer,
+                                                         const std::string& surfaceName,
+                                                         ViewerRole role)
+{
+    if (!chunkedViewer || !_state) {
+        return nullptr;
+    }
+
+    auto* widget = chunkedViewer;
+    VolumeViewerBase* baseViewer = chunkedViewer;
+    chunkedViewer->setProperty("vc_viewer_role",
+                               role == ViewerRole::Annotation
+                                   ? QStringLiteral("annotation")
+                                   : QStringLiteral("standard"));
     chunkedViewer->setPointCollection(_points);
 
     if (_state) {
@@ -144,6 +188,9 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     }
 
     baseViewer->setSurface(surfaceName);
+    if (_state->currentVolume()) {
+        chunkedViewer->OnVolumeChanged(_state->currentVolume());
+    }
     baseViewer->setSegmentationEditActive(_segmentationEditActive);
     baseViewer->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
 
@@ -167,7 +214,7 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     baseViewer->setOverlayColormap(_overlayColormapId);
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
 
-    if (_segmentationModule) {
+    if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);
     }
     emit baseViewerCreated(baseViewer);
@@ -433,11 +480,19 @@ SurfacePatchIndex* ViewerManager::surfacePatchIndexIfReady()
     return &_surfacePatchIndex;
 }
 
+SurfacePatchIndex* ViewerManager::activeSegmentationEditSurfacePatchIndex() const
+{
+    return _segmentationModule ? _segmentationModule->activeEditSurfacePatchIndex() : nullptr;
+}
+
 void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface)
 {
     if (!surface) {
         return;
     }
+    // An intersection worker is reading the index now: defer the in-place mutation
+    // (mark dirty -> rebuilt on the next query) instead of tearing the read.
+    if (_indexReadsInFlight > 0) { _surfacePatchIndexNeedsRebuild = true; return; }
     const std::string surfId = surface->id;
     if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex.empty()) {
         _surfacePatchIndexNeedsRebuild = true;
@@ -464,6 +519,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (!surface) {
         return;
     }
+    if (_indexReadsInFlight > 0) { _surfacePatchIndexNeedsRebuild = true; return; }  // defer: worker reading
 
     // Empty rect means no changes
     if (changedRegion.empty()) {
@@ -532,6 +588,9 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     }
     _pendingSurfacePatchIndexSurfaceIds = surfaceIds;
     if (quadSurfaces.empty()) {
+        if (_indexReadsInFlight > 0) {                 // worker reading: defer the clear
+            _surfacePatchIndexNeedsRebuild = true; return;
+        }
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
@@ -576,6 +635,24 @@ void ViewerManager::rebuildSurfacePatchIndexIfNeeded()
     primeSurfacePatchIndicesAsync();
 }
 
+void ViewerManager::endIndexRead()
+{
+    if (_indexReadsInFlight > 0) --_indexReadsInFlight;
+    if (_indexReadsInFlight > 0) return;               // other reads still in flight
+    // Reads drained: apply a swap that was deferred while a worker was reading.
+    if (_deferredIndexSwap) {
+        _surfacePatchIndex = std::move(*_deferredIndexSwap);
+        _deferredIndexSwap.reset();
+        _surfacePatchIndexNeedsRebuild = false;
+        _indexedSurfaceIds.clear();
+        _indexedSurfaceIds.insert(_deferredIndexSwapIds.begin(), _deferredIndexSwapIds.end());
+        _deferredIndexSwapIds.clear();
+        forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections("deferred index swap"); });
+    }
+    // Run any single-surface mutation task that was held while reads were in flight.
+    startNextSurfacePatchIndexTask();
+}
+
 void ViewerManager::handleSurfacePatchIndexPrimeFinished()
 {
     if (!_surfacePatchIndexWatcher) {
@@ -584,6 +661,14 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     auto result = _surfacePatchIndexWatcher->future().result();
     if (!result) {
         _pendingSurfacePatchIndexSurfaceIds.clear();
+        return;
+    }
+    // An intersection worker may be reading the live index. Swapping it now would
+    // tear that read -> stash the rebuilt index; endIndexRead() applies it once reads
+    // drain.
+    if (_indexReadsInFlight > 0) {
+        _deferredIndexSwap = std::move(result);
+        _deferredIndexSwapIds = _pendingSurfacePatchIndexSurfaceIds;
         return;
     }
     _surfacePatchIndex = std::move(*result);
@@ -649,6 +734,12 @@ void ViewerManager::startNextSurfacePatchIndexTask()
     if (!_surfacePatchIndexTaskWatcher ||
         _surfacePatchIndexTaskWatcher->isRunning() ||
         _pendingSurfacePatchIndexTasks.empty()) {
+        return;
+    }
+    // This task MUTATES the live index on a worker. A plane-intersection read worker
+    // may be reading it concurrently -> hold the task until reads drain (endIndexRead
+    // re-runs us). Single-writer + single-reader exclusion, no lock on the index.
+    if (_indexReadsInFlight > 0) {
         return;
     }
 
@@ -725,16 +816,24 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
                                         _surfacePatchIndexWatcher->isRunning();
 
-    // Editing tools queue the exact touched cells as vertices move. Flush those
-    // cells into the current index immediately so plane intersections update
-    // without turning every brush/push-pull tick into a global async rebuild.
+    // During an active edit session, the mutable preview surface is tracked by
+    // SegmentationEditManager's single-surface index. Do not churn the global
+    // all-surfaces index for every preview update; it is refreshed when the
+    // edit session is committed or closed.
+    if (isEditUpdate) {
+        if (alreadyIndexed) {
+            _indexedSurfaceIds.insert(surfId);
+        }
+        return true;
+    }
+
     if (_surfacePatchIndex.hasPendingUpdates(quad)) {
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
         }
         _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
-        return flushed || isEditUpdate;
+        return flushed;
     }
 
     // Non-edit surfaceChanged signals are also used for UI alias/selection
@@ -744,28 +843,6 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     if (!isEditUpdate && alreadyIndexed) {
         _indexedSurfaceIds.insert(surfId);
         return true;
-    }
-
-    if (isEditUpdate && alreadyIndexed) {
-        return true;
-    }
-
-    if (isEditUpdate && !_surfacePatchIndex.empty()) {
-        if (_surfacePatchIndex.updateSurface(quad)) {
-            _indexedSurfaceIds.insert(surfId);
-            if (asyncRebuildInProgress) {
-                _surfacesQueuedDuringRebuild.push_back(
-                    {SurfacePatchIndexTaskType::Update, surfId, quad});
-            }
-            VC3D_DEBUG_QCINFO(lcViewerManager) << "Inserted active edit surface into SurfacePatchIndex"
-                                    << surfId.c_str();
-            return true;
-        }
-        _indexedSurfaceIds.erase(surfId);
-        _surfacePatchIndexNeedsRebuild = true;
-        VC3D_DEBUG_QCINFO(lcViewerManager) << "Failed to insert active edit surface into SurfacePatchIndex"
-                                << surfId.c_str() << "- marking index for rebuild";
-        return false;
     }
 
     if (asyncRebuildInProgress) {
@@ -907,7 +984,12 @@ void ViewerManager::broadcastLinkedCursor(VolumeViewerBase* source,
 
 void ViewerManager::setSliceStepSize(int size)
 {
-    _sliceStepSize = std::max(1, size);
+    const int clampedSize = std::max(1, size);
+    if (_sliceStepSize == clampedSize) {
+        return;
+    }
+    _sliceStepSize = clampedSize;
+    emit sliceStepSizeChanged(_sliceStepSize);
 }
 
 void ViewerManager::forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const

@@ -60,6 +60,10 @@ signals:
     // wires this to SegmentationCommandHandler::onMergeTifxyz with an
     // empty seed list so the dialog opens with an empty grid.
     void mergeTifxyzFromMenuRequested();
+    // Emitted when the user picks Actions -> Patch tifxyz... CWindow
+    // wires this to SegmentationCommandHandler::onMergePatch with an
+    // empty seed list so the dialog opens with empty combo boxes.
+    void mergePatchFromMenuRequested();
 
 private:
     QStringList loadRecentPaths() const;
@@ -123,6 +127,8 @@ private:
     QAction* _importObjAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
     QAction* _mergeTifxyzAct{nullptr};
+    QAction* _mergePatchAct{nullptr};
+    QAction* _recalculateFiberScoresAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
 };

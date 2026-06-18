@@ -57,6 +57,7 @@
 
 #include "CommandLineToolRunner.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -915,8 +916,11 @@ private:
         QStringList args;
         args << srcObj
              << outTemp_
-             // Downsample UV grid by 20x per axis to reduce compute/memory.
-             << QStringLiteral("--uv-downsample=20");
+             // The original tifxyz: its meta scale sizes the output grid to the
+             // input sampling density (so the flattened tifxyz keeps the input
+             // scale, no 1/scale blowup), and its approval.tif is resampled onto
+             // the new grid via the grid-UV sidecar carried alongside srcObj.
+             << QStringLiteral("--tifxyz-source=%1").arg(segDir_);
         ioLog_ += QStringLiteral("Running: %1 %2\n").arg(obj2tifxyzExe_, args.join(' '));
         proc_->start(obj2tifxyzExe_, args);
     }
@@ -1407,6 +1411,108 @@ private:
     QPointer<QProgressDialog> progress_;
 };
 
+// vc_straighten runs directly on tifxyz dirs (no OBJ round-trip), so this is a
+// single subprocess: stream its stdout into the progress label, then reload
+// the surface list so the new surface appears.
+class StraightenJob : public QObject {
+    Q_OBJECT
+public:
+    StraightenJob(QWidget* parentWidget, SurfacePanelController* surfacePanel,
+                  SegmentationCommandHandler* handler, const QString& straightenExe,
+                  const QString& segDir, const QString& segmentStem,
+                  const QString& outputDir, const QStringList& extraArgs)
+        : QObject(handler)
+        , parentWidget_(parentWidget)
+        , handler_(handler)
+        , surfacePanel_(surfacePanel)
+        , stem_(segmentStem)
+        , outDir_(outputDir)
+        , proc_(new QProcess(this))
+        , progress_(new QProgressDialog(QObject::tr("Straightening..."), QObject::tr("Cancel"), 0, 0, parentWidget))
+    {
+        progress_->setWindowModality(Qt::NonModal);
+        progress_->setMinimumDuration(0);
+        progress_->setRange(0, 0); // indeterminate; vc_straighten emits no PROGRESS
+        progress_->setAttribute(Qt::WA_DeleteOnClose);
+        connect(progress_, &QProgressDialog::canceled, this, &StraightenJob::onCanceled_);
+
+        proc_->setProcessChannelMode(QProcess::MergedChannels);
+        connect(proc_, &QProcess::readyReadStandardOutput, this, &StraightenJob::onStdout_);
+        connect(proc_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                this, &StraightenJob::onFinished_);
+        connect(proc_, &QProcess::errorOccurred, this, &StraightenJob::onProcError_);
+
+        QStringList args;
+        args << segDir << outputDir << extraArgs;
+        std::cout << "[straighten] launching: " << straightenExe.toStdString()
+                  << " " << args.join(' ').toStdString() << std::endl;
+        if (handler_) emit handler_->statusMessage(QObject::tr("Running vc_straighten..."), 0);
+        proc_->start(straightenExe, args);
+    }
+
+private slots:
+    void onStdout_() {
+        const QString chunk = QString::fromLocal8Bit(proc_->readAllStandardOutput());
+        const QStringList lines = chunk.split('\n', Qt::SkipEmptyParts);
+        for (const QString& raw : lines) {
+            const QString line = raw.trimmed();
+            if (line.isEmpty()) continue;
+            std::cout << "[straighten] " << line.toStdString() << std::endl;
+            if (progress_) progress_->setLabelText(line);
+            if (handler_) emit handler_->statusMessage(line, 0);
+        }
+    }
+
+    void onCanceled_() {
+        if (proc_ && proc_->state() != QProcess::NotRunning) proc_->kill();
+    }
+
+    void onProcError_(QProcess::ProcessError e) {
+        // A crash is reported through finished(); only the hard start failure
+        // needs handling here.
+        if (e != QProcess::FailedToStart || done_) return;
+        done_ = true;
+        if (handler_) emit handler_->statusMessage(QObject::tr("Straighten failed"), 5000);
+        if (progress_) progress_->close();
+        QMessageBox::critical(parentWidget_, QObject::tr("Straighten Failed"),
+            QObject::tr("Could not launch vc_straighten."));
+        deleteLater();
+    }
+
+    void onFinished_(int code, QProcess::ExitStatus status) {
+        if (done_) return;
+        done_ = true;
+        if (progress_) progress_->close();
+        if (status != QProcess::NormalExit || code != 0) {
+            if (handler_) emit handler_->statusMessage(QObject::tr("Straighten failed"), 5000);
+            QMessageBox::critical(parentWidget_, QObject::tr("Straighten Failed"),
+                QObject::tr("vc_straighten exited with code %1.\nSee the console for details.").arg(code));
+            deleteLater();
+            return;
+        }
+        const QString label = !stem_.isEmpty() ? stem_ : outDir_;
+        if (handler_) emit handler_->statusMessage(QObject::tr("Straighten complete: %1").arg(label), 5000);
+        QMessageBox::information(parentWidget_, QObject::tr("Straighten Complete"),
+            QObject::tr("Straightened surface saved to:\n%1").arg(outDir_));
+        if (surfacePanel_) {
+            QMetaObject::invokeMethod(surfacePanel_.data(),
+                                      &SurfacePanelController::reloadSurfacesFromDisk,
+                                      Qt::QueuedConnection);
+        }
+        deleteLater();
+    }
+
+private:
+    QWidget* parentWidget_ = nullptr;
+    QPointer<SegmentationCommandHandler> handler_;
+    QPointer<SurfacePanelController> surfacePanel_;
+    QString stem_;
+    QString outDir_;
+    QProcess* proc_ = nullptr;
+    QPointer<QProgressDialog> progress_;
+    bool done_ = false;
+};
+
 } // -------------------- end anonymous namespace ------------------------------
 
 // ====================== SegmentationCommandHandler ============================
@@ -1677,6 +1783,54 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
     if (!std::isfinite(voxelSize) || voxelSize <= 0.0) voxelSize = 0.0;
 
     new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters, tol, energy, keepPercent, inpaintHoles, outputDir, voxelSize);
+}
+
+void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
+{
+    auto* surface = requireSurfaceAndRunner(segmentId, false);
+    if (!surface) return;
+    if (_cmdRunner && _cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    const std::filesystem::path segDirFs = surface->path; // tifxyz folder
+    const QString segDir = QString::fromStdString(segDirFs.string());
+    const QString segmentStem = QString::fromStdString(segmentId);
+
+    const QString exe = findVcTool("vc_straighten");
+    if (exe.isEmpty()) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+            tr("Could not find the 'vc_straighten' executable.\n"
+               "Looked in known locations and PATH.\n\n"
+               "Tip: set an override via VC.ini [tools] vc_straighten, or put "
+               "the binary on PATH."));
+        emit statusMessage(tr("Straighten failed"), 5000);
+        return;
+    }
+
+    const QString defaultOutput = segDir.endsWith("_straightened")
+        ? (segDir + "_v2") : (segDir + "_straightened");
+    StraightenDialog dlg(_parentWidget, defaultOutput);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    const QString outputDir = dlg.outputPath();
+    if (QFileInfo::exists(outputDir)) {
+        QMessageBox::warning(_parentWidget, tr("Straighten"),
+            tr("Output directory already exists:\n%1\n\nvc_straighten will not "
+               "overwrite it; choose a different name.").arg(outputDir));
+        return;
+    }
+    const QStringList args = dlg.toArgs();
+    std::cout << "[straighten] segment=" << segmentId
+              << " dir=" << segDirFs.string()
+              << " out=" << outputDir.toStdString()
+              << " exe=" << exe.toStdString()
+              << " args=" << args.join(' ').toStdString()
+              << std::endl;
+
+    new StraightenJob(_parentWidget, _surfacePanel, this, exe, segDir, segmentStem, outputDir, args);
 }
 
 void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
@@ -2902,6 +3056,119 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
     emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
 }
 
+void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
+{
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("Open a volpkg first."));
+        return;
+    }
+    if (!_cmdRunner) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("Command runner is not initialized."));
+        return;
+    }
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("A command-line tool is already running."));
+        return;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("No active segmentation directory; pick one "
+                                "before running patch."));
+        return;
+    }
+    const QString pathsDir  = QString::fromStdString(resolvedSeg.string());
+    const QString volpkgDir = QString::fromStdString(
+        resolvedSeg.parent_path().string());
+
+    QStringList availableSegments;
+    {
+        const auto ids = vpkg->segmentationIDs();
+        availableSegments.reserve(static_cast<int>(ids.size()));
+        for (const auto& s : ids) availableSegments << QString::fromStdString(s);
+    }
+    if (availableSegments.size() < 2) {
+        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+                             tr("This volpkg has fewer than 2 segments; "
+                                "patch needs a parent + child."));
+        return;
+    }
+
+    MergePatchDialog dlg(_parentWidget, segmentIds, availableSegments,
+                         vpkg, volpkgDir, pathsDir);
+    if (dlg.exec() != QDialog::Accepted) {
+        emit statusMessage(tr("Patch cancelled"), 3000);
+        return;
+    }
+
+    _cmdRunner->setMergePatchParams(dlg.parentPath(),
+                                    dlg.childPath(),
+                                    dlg.explicitRoles(),
+                                    dlg.borderCells(),
+                                    dlg.blendCells(),
+                                    dlg.idwK(),
+                                    dlg.ransacIters(),
+                                    dlg.ransacMinThresh(),
+                                    dlg.ransacMaxThresh(),
+                                    dlg.ransacMadK(),
+                                    dlg.ransacSeed(),
+                                    dlg.anchorCap());
+    if (dlg.ompThreads() > 0) _cmdRunner->setOmpThreads(dlg.ompThreads());
+
+    // One-shot handler: on success, force-refresh the parent (and any
+    // other modified) surface from disk. The mask.tif mtime drives the
+    // per-surface reload inside detectSurfaceChanges, so the in-memory
+    // QuadSurface picks up the patched x/y/z without per-surface
+    // bookkeeping here.
+    QPointer<SegmentationCommandHandler> guard(this);
+    auto connection = std::make_shared<QMetaObject::Connection>();
+    *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
+                          this,
+                          [this, guard, connection]
+                          (CommandLineToolRunner::Tool tool,
+                           bool success,
+                           const QString& message,
+                           const QString& outputPath,
+                           bool) {
+        if (!guard) {
+            disconnect(*connection);
+            return;
+        }
+        if (tool != CommandLineToolRunner::Tool::MergePatch) {
+            return;
+        }
+        disconnect(*connection);
+        if (success) {
+            if (_surfacePanel) _surfacePanel->reloadSurfacesFromDisk();
+            emit statusMessage(
+                tr("Patch applied to %1")
+                    .arg(QDir::toNativeSeparators(outputPath)), 5000);
+        } else {
+            QMessageBox::critical(_parentWidget, tr("Patch tifxyz"),
+                                  tr("vc_merge_patch failed.\n%1").arg(message));
+            emit statusMessage(tr("Patch failed"), 5000);
+        }
+    });
+
+    _cmdRunner->showConsoleOutput();
+    // If execute() rejects the launch (preflight failure, missing binary),
+    // it never emits toolFinished -- so the one-shot lambda above would
+    // stay attached and fire on the NEXT tool's toolFinished. Disconnect
+    // immediately on launch failure to keep the runner's signal table
+    // clean across subsequent runs.
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch)) {
+        QObject::disconnect(*connection);
+        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
+        return;
+    }
+    emit statusMessage(tr("Patching tifxyz..."), 0);
+}
+
 void SegmentationCommandHandler::onAddIgnoreLabel()
 {
     if (!_state || !_state->vpkg()) {
@@ -3535,11 +3802,12 @@ void SegmentationCommandHandler::onReloadFromBackup(const QString& segmentId, in
         return;
     }
 
-    // Build paths
+    // Backups live under <backupRoot>/backups/<id>/<index> (backupRoot is the
+    // volpkg.json's directory), matching QuadSurface::saveSnapshot().
     namespace fs = std::filesystem;
-    fs::path volpkgRoot = _state->vpkg()->getVolpkgDirectory();
-    fs::path backupDir = volpkgRoot / "backups" / segIdStd / std::to_string(backupIndex);
     fs::path segmentDir = surf->path;
+    fs::path backupRoot = surf->backupRoot.empty() ? segmentDir.parent_path() : surf->backupRoot;
+    fs::path backupDir = backupRoot / "backups" / segmentDir.filename() / std::to_string(backupIndex);
 
     if (!fs::exists(backupDir)) {
         QMessageBox::warning(_parentWidget, tr("Error"),

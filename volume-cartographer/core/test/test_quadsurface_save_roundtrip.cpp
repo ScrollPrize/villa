@@ -33,7 +33,7 @@ struct TmpVolpkg {
     fs::path root;        // <root>
     fs::path pathsDir;    // <root>/paths
     fs::path segDir;      // <root>/paths/<segName>
-    fs::path backupsDir;  // <root>/backups/<segName>
+    fs::path backupsDir;  // <root>/paths/backups/<segName> (sibling of segDir)
     std::string segName;
 
     explicit TmpVolpkg(const std::string& tag)
@@ -45,7 +45,7 @@ struct TmpVolpkg {
         pathsDir = root / "paths";
         segName = "seg_" + std::to_string(rng());
         segDir = pathsDir / segName;
-        backupsDir = root / "backups" / segName;
+        backupsDir = pathsDir / "backups" / segName;
         fs::create_directories(pathsDir);
     }
 

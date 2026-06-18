@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -309,27 +310,26 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
     const int maxArrowsPerAxis = viewer->normalMaxArrows();
 
     const float kArrowLen = 50.0f * arrowLengthScale;
-    // Normal sign colors: +N (green), -N (red)
-    const QColor kNormalPositiveColor(0, 200, 0);
-    const QColor kNormalNegativeColor(255, 50, 50);
+    // 3-axis frame colors (standard convention): U-tangent = red, V-tangent = green,
+    // Normal = blue. Drawn as a local frame at each sampled surface point.
+    const QColor kAxisUColor(235, 60, 60);    // red
+    const QColor kAxisVColor(60, 200, 60);    // green
+    const QColor kAxisNColor(70, 120, 255);   // blue
 
     auto addNormalLegend = [&]() {
         const QRectF sceneRect = visibleSceneRect(viewer);
-        const QPointF anchor = sceneRect.bottomRight() + QPointF(-42.0, -28.0);
-
-        OverlayStyle plusStyle;
-        plusStyle.penColor = kNormalPositiveColor;
-        plusStyle.z = kLabelZ;
-
-        OverlayStyle minusStyle;
-        minusStyle.penColor = kNormalNegativeColor;
-        minusStyle.z = kLabelZ;
+        const QPointF anchor = sceneRect.bottomRight() + QPointF(-42.0, -42.0);
 
         QFont font;
         font.setPointSizeF(9.0);
-
-        builder.addText(anchor, QStringLiteral("+N"), font, plusStyle, true);
-        builder.addText(anchor + QPointF(0.0, 14.0), QStringLiteral("-N"), font, minusStyle, true);
+        auto legendLine = [&](const QPointF& pos, const QString& text, const QColor& color) {
+            OverlayStyle style; style.penColor = color; style.z = kLabelZ;
+            builder.addText(pos, text, font, style, true);
+        };
+        // 3-axis frame legend: U (red), V (green), N (blue).
+        legendLine(anchor,                        QStringLiteral("U"), kAxisUColor);
+        legendLine(anchor + QPointF(0.0, 14.0),   QStringLiteral("V"), kAxisVColor);
+        legendLine(anchor + QPointF(0.0, 28.0),   QStringLiteral("N"), kAxisNColor);
     };
 
     auto addPlaneNormalsInstruction = [&]() {
@@ -338,22 +338,42 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
             return;
         }
 
-        const QString instruction = QStringLiteral("Negative (Red) should point toward scroll center");
-
-        OverlayStyle textStyle;
-        textStyle.penColor = Qt::white;
-        textStyle.z = kLabelZ;
-
+        // 3-axis flip-check hint, using the empirically-verified directions of the
+        // local frame: U (red) winds within the slice, V (green) points toward +Z
+        // (up the scroll), N (blue) points INWARD toward the scroll center. Blue is
+        // the reliable flip check -- if it points outward, the normals are reversed.
+        // Each color word is drawn in its arrow's color, on two lines.
         QFont font;
         font.setPointSizeF(9.0);
         font.setBold(true);
-
         QFontMetricsF metrics(font);
-        const qreal textWidth = metrics.horizontalAdvance(instruction);
-        const qreal yOffset = std::clamp(sceneRect.height() * 0.22, 56.0, 120.0);
-        const QPointF position(sceneRect.center().x() - textWidth * 0.5, sceneRect.top() + yOffset);
 
-        builder.addText(position, instruction, font, textStyle, true);
+        struct Seg { QString text; QColor color; };
+        // Line 1: each axis' expected direction, drawn in its arrow's color.
+        const std::vector<Seg> line1 = {
+            {QStringLiteral("Blue (N) should point toward the center of the scroll.   "), kAxisNColor},
+            {QStringLiteral("Red (U) should point along the winding.   "),               kAxisUColor},
+            {QStringLiteral("Green (V) should point down the segment toward +Z."),       kAxisVColor},
+        };
+        // Line 2: the actionable check.
+        const std::vector<Seg> line2 = {
+            {QStringLiteral("If they don't, the surface normals are reversed — flip them."),
+                            Qt::white},
+        };
+        auto drawCentered = [&](const std::vector<Seg>& segs, qreal y) {
+            qreal totalW = 0.0;
+            for (const auto& s : segs) totalW += metrics.horizontalAdvance(s.text);
+            qreal x = sceneRect.center().x() - totalW * 0.5;
+            for (const auto& s : segs) {
+                OverlayStyle style; style.penColor = s.color; style.z = kLabelZ;
+                builder.addText(QPointF(x, y), s.text, font, style, true);
+                x += metrics.horizontalAdvance(s.text);
+            }
+        };
+        const qreal yOffset = std::clamp(sceneRect.height() * 0.22, 56.0, 120.0);
+        const qreal y0 = sceneRect.top() + yOffset;
+        drawCentered(line1, y0);
+        drawCentered(line2, y0 + metrics.height() + 2.0);
     };
 
     // Handle segmentation view (flattened UV space)
@@ -372,13 +392,27 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
         const int cols = points->cols;
         const cv::Vec2f surfScale = quad->scale();
 
-        const float gridToSceneX = viewerScale / surfScale[0];
-        const float gridToSceneY = viewerScale / surfScale[1];
-        const float centerOffsetX = (cols / 2.0f) * gridToSceneX;
-        const float centerOffsetY = (rows / 2.0f) * gridToSceneY;
-
-        const int strideR = std::max(1, rows / maxArrowsPerAxis);
-        const int strideC = std::max(1, cols / maxArrowsPerAxis);
+        // Arrow spacing: enforce a MINIMUM on-screen gap between arrows AND a hard cap
+        // on the total count, so we don't draw thousands of cramped arrows when zoomed
+        // out. scene px per grid cell = viewerScale / surfScale; the stride to hit the
+        // min pixel gap is minGap / scenePxPerCell. The per-axis sampling cap
+        // (maxArrowsPerAxis) is still respected as a floor on stride. Then, if the
+        // resulting grid would still exceed the total cap, grow the stride to fit.
+        constexpr double kMinArrowSpacingPx = 36.0;   // on-screen gap between arrows
+        constexpr int    kMaxArrowsTotal    = 1000;   // hard cap (each is a +N/-N pair)
+        const double scenePxPerCellX = double(viewerScale) / std::max(1e-6f, surfScale[0]);
+        const double scenePxPerCellY = double(viewerScale) / std::max(1e-6f, surfScale[1]);
+        int strideR = std::max({1,
+            int(std::ceil(kMinArrowSpacingPx / std::max(1e-6, scenePxPerCellY))),
+            rows / std::max(1, maxArrowsPerAxis)});
+        int strideC = std::max({1,
+            int(std::ceil(kMinArrowSpacingPx / std::max(1e-6, scenePxPerCellX))),
+            cols / std::max(1, maxArrowsPerAxis)});
+        // Grow strides uniformly until the sampled grid fits under the total cap.
+        while ((std::size_t(rows / strideR + 1) * std::size_t(cols / strideC + 1))
+                   > std::size_t(kMaxArrowsTotal)) {
+            ++strideR; ++strideC;
+        }
 
         auto drawAxisArrow = [&](const QPointF& origin, const cv::Vec3f& dir3d, const QColor& color) {
             OverlayStyle style;
@@ -386,10 +420,14 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
             style.penWidth = 3.0;
             style.z = kArrowZ;
 
-            QPointF dir2d(dir3d[0], dir3d[1]);
-            const float len2d2 = dir2d.x() * dir2d.x() + dir2d.y() * dir2d.y();
-
-            if (len2d2 < 0.01f) {
+            // dir3d is a UNIT vector. Its (x,y) is its projection onto the view plane,
+            // so |(x,y)| in [0,1] is the FORESHORTENING: 1 = fully in-plane, 0 = points
+            // straight in/out of the screen. Draw the arrow at length proportional to
+            // that, so an axis tilted out of plane reads as a shorter arrow (and a
+            // perpendicular one as a dot) -- otherwise every axis drew the same fixed
+            // length and you couldn't tell which way U/V actually pointed.
+            const float inPlane = std::sqrt(dir3d[0] * dir3d[0] + dir3d[1] * dir3d[1]);
+            if (inPlane < 0.1f) {
                 OverlayStyle dotStyle;
                 dotStyle.penColor = color;
                 dotStyle.brushColor = color;
@@ -397,15 +435,20 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
                 dotStyle.z = kArrowZ;
                 builder.addCircle(origin, 3.0f, true, dotStyle);
             } else {
-                dir2d /= std::sqrt(len2d2);
-                QPointF end = origin + dir2d * kArrowLen;
+                QPointF dir2d(dir3d[0] / inPlane, dir3d[1] / inPlane);
+                QPointF end = origin + dir2d * (kArrowLen * inPlane);
                 builder.addArrow(origin, end, 5.0, 3.0, style);
             }
         };
 
-        auto drawNormalPair = [&](const QPointF& origin, const cv::Vec3f& normal) {
-            drawAxisArrow(origin, normal, kNormalPositiveColor);
-            drawAxisArrow(origin, -normal, kNormalNegativeColor);
+        // Draw the local 3-axis frame at a surface point: U-tangent (red),
+        // V-tangent (green), Normal (blue). Each is projected to screen by
+        // drawAxisArrow (a near-perpendicular axis collapses to a dot).
+        auto drawAxisFrame = [&](const QPointF& origin, const cv::Vec3f& tangentU,
+                                 const cv::Vec3f& tangentV, const cv::Vec3f& normal) {
+            drawAxisArrow(origin, tangentU, kAxisUColor);
+            drawAxisArrow(origin, tangentV, kAxisVColor);
+            drawAxisArrow(origin, normal,   kAxisNColor);
         };
 
         addNormalLegend();
@@ -433,7 +476,14 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
                 bool hasV = (pDown[0] != -1.0f && pUp[0] != -1.0f);
                 if (!hasU && !hasV) continue;
 
-                QPointF origin(c * gridToSceneX - centerOffsetX, r * gridToSceneY - centerOffsetY);
+                // Map the grid cell to scene via the viewer's real transform, which
+                // includes the PAN offset (_surfacePtrX) + viewport-center term. The
+                // old hand-rolled `c*gridToScene - centerOffset` applied only zoom, so
+                // arrows didn't move with pan and spread from a fixed anchor on zoom.
+                // grid cell (r,c) -> surface UV coords = ((c-cols/2)/surfScaleX, ...).
+                const float surfX = (static_cast<float>(c) - cols / 2.0f) / surfScale[0];
+                const float surfY = (static_cast<float>(r) - rows / 2.0f) / surfScale[1];
+                QPointF origin = viewer->surfaceCoordsToScene(surfX, surfY);
 
                 cv::Vec3f tangentU(0, 0, 0), tangentV(0, 0, 0);
 
@@ -460,7 +510,8 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
                     const float len2 = normal.dot(normal);
                     if (len2 > 1e-12f) {
                         normal /= std::sqrt(len2);
-                        drawNormalPair(origin, normal);
+                        // U (red), V (green), N (blue) local frame.
+                        drawAxisFrame(origin, tangentU, tangentV, normal);
                     }
                 }
             }
@@ -500,22 +551,29 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
         return;
     }
 
-    // Helper to draw an arrow projected onto the plane
+    // Helper to draw an arrow projected onto the plane. Anchor + tip go through the
+    // viewer's volumeToScene() (plane projection + PAN offset + viewport-center term)
+    // -- the old raw plane->project() applied only zoom, so arrows stuck to the
+    // top-left and ignored pan. Direction is computed in SCENE space from the two
+    // projected world points so it stays correct under the full transform.
     auto drawPlaneArrow = [&](const cv::Vec3f& worldPos, const cv::Vec3f& dir3d, const QColor& color) {
-        cv::Vec3f p0 = plane->project(worldPos, 1.0f, viewerScale);
-        cv::Vec3f p1 = plane->project(worldPos + dir3d * (kArrowLen / viewerScale), 1.0f, viewerScale);
+        const QPointF origin = viewer->volumeToScene(worldPos);
+        const QPointF tip = viewer->volumeToScene(worldPos + dir3d * (kArrowLen / viewerScale));
 
-        QPointF origin(p0[0], p0[1]);
-        QPointF dir2d(p1[0] - p0[0], p1[1] - p0[1]);
-        const float len2d2 = dir2d.x() * dir2d.x() + dir2d.y() * dir2d.y();
+        // tip-origin IS the honest foreshortened scene vector (projecting a fixed
+        // world-space length): full kArrowLen when the axis lies in the plane, shorter
+        // as it tilts out, ~0 when perpendicular. Draw it AS-IS (don't re-normalize to
+        // a fixed length) so the in-plane direction + foreshortening are both readable.
+        const QPointF dir2d(tip.x() - origin.x(), tip.y() - origin.y());
+        const float len2d = static_cast<float>(std::hypot(dir2d.x(), dir2d.y()));
 
         OverlayStyle style;
         style.penColor = color;
         style.penWidth = 3.0;
         style.z = kArrowZ;
 
-        if (len2d2 < 4.0f) {
-            // Vector is mostly perpendicular to view plane
+        if (len2d < 2.0f) {
+            // Mostly perpendicular to the view plane -> dot.
             OverlayStyle dotStyle;
             dotStyle.penColor = color;
             dotStyle.brushColor = color;
@@ -523,15 +581,17 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
             dotStyle.z = kArrowZ;
             builder.addCircle(origin, 3.0f, true, dotStyle);
         } else {
-            dir2d /= std::sqrt(len2d2);
-            QPointF end = origin + dir2d * kArrowLen;
-            builder.addArrow(origin, end, 5.0, 3.0, style);
+            builder.addArrow(origin, tip, 5.0, 3.0, style);
         }
     };
 
-    auto drawPlaneNormalPair = [&](const cv::Vec3f& worldPos, const cv::Vec3f& normal) {
-        drawPlaneArrow(worldPos, normal, kNormalPositiveColor);
-        drawPlaneArrow(worldPos, -normal, kNormalNegativeColor);
+    // 3-axis frame at a world point projected onto the plane: U (red), V (green),
+    // N (blue). An axis pointing into/out of the plane collapses to a dot.
+    auto drawPlaneAxisFrame = [&](const cv::Vec3f& worldPos, const cv::Vec3f& tangentU,
+                                  const cv::Vec3f& tangentV, const cv::Vec3f& normal) {
+        drawPlaneArrow(worldPos, tangentU, kAxisUColor);
+        drawPlaneArrow(worldPos, tangentV, kAxisVColor);
+        drawPlaneArrow(worldPos, normal,   kAxisNColor);
     };
 
     addNormalLegend();
@@ -608,7 +668,7 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
                 const float len2 = normal.dot(normal);
                 if (len2 > 1e-12f) {
                     normal /= std::sqrt(len2);
-                    drawPlaneNormalPair(worldPos, normal);
+                    drawPlaneAxisFrame(worldPos, tangentU, tangentV, normal);
                 }
             }
 

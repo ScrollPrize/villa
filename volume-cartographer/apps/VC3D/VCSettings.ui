@@ -325,6 +325,38 @@
             </property>
            </widget>
           </item>
+          <item row="10" column="0">
+           <widget class="QLabel" name="labelVoxelSize">
+            <property name="text">
+             <string>Voxel size (µm)</string>
+            </property>
+            <property name="toolTip">
+             <string>Physical size of one volume voxel in micrometres, used by the scalebar. Falls back to the volume metadata; set here for volumes (e.g. .vca) that don't carry it. 0 = use metadata only.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="10" column="1">
+           <widget class="QDoubleSpinBox" name="spinVoxelSize">
+            <property name="decimals">
+             <number>4</number>
+            </property>
+            <property name="minimum">
+             <double>0.000000000000000</double>
+            </property>
+            <property name="maximum">
+             <double>100000.000000000000000</double>
+            </property>
+            <property name="singleStep">
+             <double>0.100000000000000</double>
+            </property>
+            <property name="value">
+             <double>0.000000000000000</double>
+            </property>
+            <property name="suffix">
+             <string> µm</string>
+            </property>
+           </widget>
+          </item>
          </layout>
         </widget>
        </item>
@@ -689,6 +721,32 @@
             </property>
             <property name="toolTip">
              <string>Number of background threads for downloading remote chunks (1-100). Requires restart.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="7" column="0">
+           <widget class="QLabel" name="labelSegmentBackupCount">
+            <property name="text">
+             <string>Segment backups to keep</string>
+            </property>
+            <property name="toolTip">
+             <string>Number of rotating snapshots kept per segment in a backups/ folder beside the volpkg file. 0 disables backups. Snapshots are throttled to at most one every 2 minutes per segment.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="7" column="1">
+           <widget class="QSpinBox" name="spinSegmentBackupCount">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>100</number>
+            </property>
+            <property name="value">
+             <number>10</number>
+            </property>
+            <property name="toolTip">
+             <string>Number of rotating snapshots kept per segment (0 disables). Throttled to at most one snapshot per segment every 2 minutes.</string>
             </property>
            </widget>
           </item>

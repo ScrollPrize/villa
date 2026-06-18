@@ -49,13 +49,21 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
         double barUm = chooseNiceLength(wUm / 4.0);
         _cachedBarPx = barUm * pxPerUm;
 
+        // Pick the natural unit by magnitude: nm < 1 µm, µm < 1 mm (1e3), mm < 1 cm
+        // (1e4), cm < 1 m (1e6), then m. barUm is already a "nice" 1/2/5 value, so the
+        // displayed number stays clean. Trim trailing zeros (0.5 not 0.500000).
         double displayLength = barUm;
         QString unit = QStringLiteral(" µm");
-        if (barUm >= 1000.0) {
-            displayLength = barUm / 1000.0;
-            unit = QStringLiteral(" mm");
+        if (barUm < 1.0) {
+            displayLength = barUm * 1000.0;   unit = QStringLiteral(" nm");
+        } else if (barUm >= 1.0e6) {
+            displayLength = barUm / 1.0e6;    unit = QStringLiteral(" m");
+        } else if (barUm >= 1.0e4) {
+            displayLength = barUm / 1.0e4;    unit = QStringLiteral(" cm");
+        } else if (barUm >= 1.0e3) {
+            displayLength = barUm / 1.0e3;    unit = QStringLiteral(" mm");
         }
-        _cachedBarLabel = QString::number(displayLength) + unit;
+        _cachedBarLabel = QString::number(displayLength, 'g', 4) + unit;
     }
 
     p->save();
@@ -375,6 +383,16 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
             return;
         }
 
+        if (event->modifiers().testFlag(Qt::ControlModifier)) {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            emit sendAnnotationContextMenuRequested(scene_loc,
+                                                    event->globalPosition().toPoint(),
+                                                    event->modifiers());
+            event->accept();
+            return;
+        }
+
         _regular_pan = true;
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         sendPanStart(event->button(), event->modifiers());
@@ -461,4 +479,18 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
     // rely on hover state (e.g. segmentation editing) receive continuous
     // volume coordinates.
     sendMouseMove(scene_loc, event->buttons(), event->modifiers());
+}
+
+void CVolumeViewerView::leaveEvent(QEvent *event)
+{
+    emit sendMouseLeftView();
+    QGraphicsView::leaveEvent(event);
+}
+
+bool CVolumeViewerView::viewportEvent(QEvent* event)
+{
+    if (event && event->type() == QEvent::Leave) {
+        emit sendMouseLeftView();
+    }
+    return QGraphicsView::viewportEvent(event);
 }

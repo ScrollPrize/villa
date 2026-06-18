@@ -18,7 +18,7 @@ import torch
 from torch.utils.data import Dataset
 
 import vesuvius.tifxyz as tifxyz
-from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
+from vesuvius.neural_tracing.datasets.chunk_finding import find_training_chunks
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
     OfflineCacheMiss,
@@ -32,7 +32,7 @@ from vesuvius.neural_tracing.datasets.common import (
     _segment_overlaps_z_range,
     _trim_to_world_bbox,
     _triplet_wraps_compatible,
-    _upsample_world_triplet,
+    _upsample_world_surface,
     voxelize_surface_grid_masked,
 )
 
@@ -444,24 +444,18 @@ def build_patch_chains(patch, max_wraps: int) -> dict:
 def _find_patches_world_chunks(config, patch_size_zyx):
     """Find training patches using the world-chunk tiling method.
 
-    Follows the pattern from dataset_rowcol_cond.py, using find_world_chunk_patches
+    Follows the pattern from dataset_rowcol_cond.py, using find_training_chunks
     from the neural tracing pipeline.
     """
-    # Defaults from dataset_defaults.py:50-62
+    # Defaults from rowcol_cond_config.py.
     overlap_fraction = float(config.get("overlap_fraction", 0.0))
-    min_span_ratio = float(config.get("min_span_ratio", 1.0))
-    edge_touch_frac = float(config.get("edge_touch_frac", 0.1))
-    edge_touch_min_count_base = int(config.get("edge_touch_min_count", 10))
-    edge_touch_pad = int(config.get("edge_touch_pad", 0))
     min_points_per_wrap_base = int(config.get("min_points_per_wrap", 100))
     scale_normalize = bool(config.get("scale_normalize_patch_counts", True))
     ref_scale = int(config.get("patch_count_reference_scale", 0))
     bbox_pad_2d = int(config.get("bbox_pad_2d", 0))
-    require_all_valid = bool(config.get("require_all_valid_in_bbox", True))
-    skip_invalid = bool(config.get("skip_chunk_if_any_invalid", False))
-    inner_bbox_fraction = float(config.get("inner_bbox_fraction", 0.7))
     force_recompute = bool(config.get("force_recompute_patches", False))
     chunk_pad = float(config.get("chunk_pad", 0.0))
+    terminal_chunk_guard_voxels = config.get("terminal_chunk_guard_voxels", None)
     verbose = bool(config.get("verbose", False))
 
     target_size = tuple(int(v) for v in patch_size_zyx)
@@ -567,29 +561,22 @@ def _find_patches_world_chunks(config, patch_size_zyx):
         min_points_per_wrap = max(
             1, int(round(min_points_per_wrap_base * count_scale_sq))
         )
-        edge_touch_min_count = max(
-            1, int(round(edge_touch_min_count_base * count_scale_sq))
-        )
-
         # Find world-chunk patches
         cache_dir = Path(segments_path) / ".patch_cache"
-        chunk_results = find_world_chunk_patches(
+        chunk_results = find_training_chunks(
             segments=scaled_segments,
+            volume=volume,
+            scale=volume_scale,
             target_size=target_size,
             overlap_fraction=overlap_fraction,
-            min_span_ratio=min_span_ratio,
-            edge_touch_frac=edge_touch_frac,
-            edge_touch_min_count=edge_touch_min_count,
-            edge_touch_pad=edge_touch_pad,
             min_points_per_wrap=min_points_per_wrap,
             bbox_pad_2d=bbox_pad_2d,
-            require_all_valid_in_bbox=require_all_valid,
-            skip_chunk_if_any_invalid=skip_invalid,
-            inner_bbox_fraction=inner_bbox_fraction,
             cache_dir=cache_dir,
             force_recompute=force_recompute,
             verbose=verbose,
             chunk_pad=chunk_pad,
+            terminal_chunk_guard_voxels=terminal_chunk_guard_voxels,
+            training_mode=config.get("training_mode", "rowcol_hidden"),
         )
 
         # Convert chunk dicts to ChunkPatch objects (dataset_rowcol_cond.py:332-349)
@@ -858,7 +845,7 @@ class TifxyzLasagnaDataset(Dataset):
 
         # Upsample to full resolution
         try:
-            x_full, y_full, z_full = _upsample_world_triplet(
+            x_full, y_full, z_full = _upsample_world_surface(
                 x_s, y_s, z_s, scale_y, scale_x,
             )
         except ValueError:

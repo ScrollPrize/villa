@@ -1,5 +1,7 @@
 #include "PlaneSlicingOverlayController.hpp"
 
+#include <opencv2/core.hpp>  // cv::normalize
+
 #include "../volume_viewers/CChunkedVolumeViewer.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../CState.hpp"

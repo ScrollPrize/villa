@@ -4,7 +4,7 @@
 #include <memory>
 #include <string>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include "utils/Json.hpp"
 
 //base surface class
@@ -35,4 +35,10 @@ public:
     utils::Json meta;
     std::filesystem::path path;
     std::string id;
+    // Directory under which rotating backups are written, as
+    // <backupRoot>/backups/<id>/{0..N-1}/. VolumePkg sets this to the directory
+    // holding the volpkg.json so backups stay a sibling of the project file no
+    // matter where the segment itself lives (a segments dir, an explicit path,
+    // etc.). When empty, saveSnapshot() falls back to the segment's parent dir.
+    std::filesystem::path backupRoot;
 };

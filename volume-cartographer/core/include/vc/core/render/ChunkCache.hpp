@@ -2,8 +2,7 @@
 
 #include "vc/core/render/IChunkedArray.hpp"
 
-#include <utils/thread_pool.hpp>
-
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +44,8 @@ public:
         std::size_t decodedBytes = 0;
         std::size_t decodedByteCapacity = 0;
         std::size_t persistentCacheBytes = 0;
+        bool persistentCacheEnabled = false;
+        bool persistentCacheScanInFlight = false;
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
     };
@@ -95,7 +96,7 @@ private:
         bool persisted = false;
         bool inLru = false;
         int basePriority = 0;
-        utils::PriorityThreadPool::Priority priority = 0;
+        std::int64_t priority = 0;
         std::uint64_t fetchSerial = 0;
         std::list<ChunkKey>::iterator lruIt;
     };
@@ -125,14 +126,14 @@ private:
         std::list<ChunkKey> lru_;
         std::size_t decodedBytes_ = 0;
         std::uint64_t generation_ = 0;
-        utils::PriorityThreadPool::Priority viewEpoch_ = 1;
+        std::int64_t viewEpoch_ = 1;
         std::uint64_t nextFetchSerial_ = 1;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
         std::size_t remoteFetchesInFlight_ = 0;
         std::deque<std::pair<std::chrono::steady_clock::time_point, std::size_t>> remoteDownloadHistory_;
-        std::chrono::steady_clock::time_point lastPersistentCacheSizeScan_{};
-        std::size_t cachedPersistentCacheBytes_ = 0;
+        std::atomic<std::int64_t> persistentCacheBytes_{0};
+        std::atomic_bool persistentCacheScanInFlight_{false};
     };
 
     static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);
@@ -155,11 +156,16 @@ private:
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
     static bool queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
                                           const ChunkKey& key);
-    static void writePersistent(const State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
-    static void writePersistentEmpty(const State& state, const ChunkKey& key);
+    static void writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
+    static void writePersistentEmpty(State& state, const ChunkKey& key);
     static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
-    static std::size_t persistentCacheBytes(const std::optional<std::filesystem::path>& path);
+    static void startPersistentCacheSizeScan(const std::shared_ptr<State>& state);
+    static std::size_t persistentCacheBytes(
+        const std::filesystem::path& path,
+        std::filesystem::file_time_type cutoff);
+    static std::optional<std::size_t> regularFileSize(const std::filesystem::path& path);
+    static void addPersistentCacheBytesDelta(State& state, std::int64_t delta);
     static void pruneDownloadHistoryLocked(State& state, std::chrono::steady_clock::time_point now);
     static void touchLocked(State& state, const ChunkKey& key, Entry& entry);
     static void enforceCapacityLocked(const std::shared_ptr<State>& state);

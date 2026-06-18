@@ -13,7 +13,7 @@
 #include <QString>
 #include <QTransform>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <cstddef>
 #include <functional>
@@ -52,6 +52,18 @@ public:
         OverlayStyle style{};
     };
 
+    struct VolumePointPrimitive {
+        cv::Vec3f position{0.0f, 0.0f, 0.0f};
+        qreal radius{3.0};
+        OverlayStyle style{};
+    };
+
+    struct SurfacePointPrimitive {
+        cv::Vec2f position{0.0f, 0.0f};
+        qreal radius{3.0};
+        OverlayStyle style{};
+    };
+
     struct CirclePrimitive {
         QPointF center;
         qreal radius{3.0};
@@ -59,8 +71,23 @@ public:
         OverlayStyle style{};
     };
 
+    struct RotatedEllipsePrimitive {
+        QPointF center;
+        qreal radiusX{3.0};
+        qreal radiusY{2.0};
+        qreal rotationRadians{0.0};
+        bool filled{true};
+        OverlayStyle style{};
+    };
+
     struct LineStripPrimitive {
         std::vector<QPointF> points;
+        bool closed{false};
+        OverlayStyle style{};
+    };
+
+    struct SurfaceLineStripPrimitive {
+        std::vector<cv::Vec2f> points;
         bool closed{false};
         OverlayStyle style{};
     };
@@ -125,8 +152,12 @@ public:
     };
 
     using OverlayPrimitive = std::variant<PointPrimitive,
+                                          VolumePointPrimitive,
+                                          SurfacePointPrimitive,
                                           CirclePrimitive,
+                                          RotatedEllipsePrimitive,
                                           LineStripPrimitive,
+                                          SurfaceLineStripPrimitive,
                                           RectPrimitive,
                                           TextPrimitive,
                                           PathPrimitive,
@@ -175,14 +206,29 @@ protected:
                       qreal radius,
                       OverlayStyle style);
 
+        void addSurfacePoint(const cv::Vec2f& position,
+                             qreal radius,
+                             OverlayStyle style);
+
         void addCircle(const QPointF& center,
                        qreal radius,
                        bool filled,
                        OverlayStyle style);
 
+        void addRotatedEllipse(const QPointF& center,
+                               qreal radiusX,
+                               qreal radiusY,
+                               qreal rotationRadians,
+                               bool filled,
+                               OverlayStyle style);
+
         void addLineStrip(const std::vector<QPointF>& points,
                           bool closed,
                           OverlayStyle style);
+
+        void addSurfaceLineStrip(const std::vector<cv::Vec2f>& points,
+                                 bool closed,
+                                 OverlayStyle style);
 
         void addRect(const QRectF& rect,
                      bool filled,

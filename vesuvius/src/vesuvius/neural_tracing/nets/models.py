@@ -294,20 +294,76 @@ def resolve_checkpoint_path(checkpoint_path):
     return path
 
 
-def load_checkpoint(checkpoint_path):
+def load_checkpoint(
+    checkpoint_path,
+    model=None,
+    checkpoint=None,
+    allow_partial_weight_load=False,
+    map_location='cpu',
+    weights_only=False,
+    print_fn=print,
+    return_checkpoint=False,
+):
     checkpoint_path = resolve_checkpoint_path(checkpoint_path)
-    print(f'loading checkpoint {checkpoint_path}... ')
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    print_fn(f'loading checkpoint {checkpoint_path}... ')
+    if checkpoint is None:
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=weights_only)
 
     state = checkpoint['model']
     config = checkpoint['config']
 
-    model = make_model(config)
+    if model is None:
+        model = make_model(config)
 
-    state = strip_state(state)
+    state = normalize_state_for_model(state, model)
+    if allow_partial_weight_load:
+        load_result = load_partial_state_dict(model, state, print_fn=print_fn)
+    else:
+        load_result = model.load_state_dict(state)
 
-    model.load_state_dict(state)
+    if return_checkpoint:
+        return model, config, checkpoint, load_result
     return model, config
+
+
+def load_checkpoint_payload(checkpoint_path, map_location='cpu', weights_only=False):
+    checkpoint_path = resolve_checkpoint_path(checkpoint_path)
+    return torch.load(checkpoint_path, map_location=map_location, weights_only=weights_only)
+
+
+def checkpoint_wandb_run_id(checkpoint):
+    wandb_run_id = checkpoint.get('wandb_run_id')
+    if wandb_run_id is None:
+        ckpt_config = checkpoint.get('config', {})
+        if isinstance(ckpt_config, dict):
+            wandb_run_id = ckpt_config.get('wandb_run_id')
+    return wandb_run_id
+
+
+def normalize_state_for_model(state, model):
+    # Checkpoints saved by torch.compile prepend _orig_mod.; regular inference
+    # models usually need that stripped, while compiled training models need it.
+    model_keys = set(model.state_dict().keys())
+    model_has_compile_prefix = any(k.startswith('_orig_mod.') for k in model_keys)
+    stripped = strip_state(state)
+    if model_has_compile_prefix:
+        return {f'_orig_mod.{k}': v for k, v in stripped.items()}
+    return stripped
+
+
+def load_partial_state_dict(model, state, print_fn=print):
+    current_state = model.state_dict()
+    compatible_state = {
+        k: v for k, v in state.items()
+        if k in current_state and tuple(v.shape) == tuple(current_state[k].shape)
+    }
+    skipped = sorted(set(state.keys()) - set(compatible_state.keys()))
+    missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+    print_fn(
+        f"Loaded {len(compatible_state)}/{len(current_state)} compatible checkpoint tensors "
+        f"(missing={len(missing)}, unexpected={len(unexpected)}, skipped={len(skipped)})"
+    )
+    return missing, unexpected
 
 
 def strip_state(state):

@@ -14,7 +14,8 @@
 		"pred_dt": 0.001,
 		"corr": 0.001,
 		"bend": 100.0,
-		"ext_offset": 0.0
+		"ext_offset": 0.0,
+		"tifxyz-flow-gate-channels": true
 	},
 	"stages": [
 		{

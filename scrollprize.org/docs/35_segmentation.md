@@ -9,7 +9,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
 
   <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
   <meta
     property="og:image"
@@ -29,7 +29,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
   <meta
     property="twitter:image"
@@ -61,7 +61,7 @@ Due to a complex set of dependencies, it is *highly* recommended to use the dock
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
 
-If you want to install vc3d from source, the easiest path is to look at the [dockerfile](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/ubuntu-24.04-noble.Dockerfile) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
+If you want to install vc3d from source, the easiest path is to look at the [Dockerfile](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/Dockerfile) (and the shared [install_build_deps.sh](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/install_build_deps.sh) it uses) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
 
 [installation instructions for docker](https://docs.docker.com/engine/install/)
 

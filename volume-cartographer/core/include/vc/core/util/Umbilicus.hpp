@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 namespace vc::core::util {
 

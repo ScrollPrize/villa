@@ -27,7 +27,14 @@ Example
 >>> write_tifxyz("/path/to/output", surface, overwrite=True)
 """
 
-from .reader import TifxyzInfo, TifxyzReader, list_tifxyz, load_folder, read_tifxyz
+from .reader import (
+    TifxyzInfo,
+    TifxyzReader,
+    discover_labels,
+    list_tifxyz,
+    load_folder,
+    read_tifxyz,
+)
 from .types import Tifxyz
 from .upsampling import (
     catmull_rom_smooth_1d,
@@ -44,6 +51,7 @@ __all__ = [
     "read_tifxyz",
     "TifxyzReader",
     # Discovery
+    "discover_labels",
     "list_tifxyz",
     "load_folder",
     "TifxyzInfo",

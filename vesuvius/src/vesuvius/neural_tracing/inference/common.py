@@ -13,10 +13,11 @@ import zarr
 
 import vesuvius.tifxyz as tifxyz
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
-from vesuvius.neural_tracing.datasets.extrapolation import _EXTRAPOLATION_METHODS, apply_degradation
 from vesuvius.neural_tracing.inference.extrap_lookup import ExtrapLookupArrays
 
 from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz
+
+_EXTRAPOLATION_METHODS = {}
 
 
 def _resolve_extrapolation_settings(args, runtime_config):
@@ -894,15 +895,7 @@ def compute_extrapolation_infer(
     zyx_extrap_local_full = zyx_extrapolated - min_corner_arr[None, :]
 
     if degrade_prob > 0.0 and cond_direction is not None:
-        uv_shape = uv_query.shape[:2]
-        zyx_extrap_local_full, _ = apply_degradation(
-            zyx_extrap_local_full,
-            uv_shape,
-            cond_direction,
-            degrade_prob=degrade_prob,
-            curvature_range=degrade_curvature_range,
-            gradient_range=degrade_gradient_range,
-        )
+        raise ValueError("extrap_degrade_prob is no longer supported")
     extrap_coords_local = zyx_extrap_local_full
     extrap_surface = None
     if not skip_bounds_check:

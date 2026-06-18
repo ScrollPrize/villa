@@ -6,7 +6,7 @@
 #include <tuple>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 class PointIndex
 {

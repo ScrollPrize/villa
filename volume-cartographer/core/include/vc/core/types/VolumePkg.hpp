@@ -12,8 +12,10 @@
 #include <vector>
 
 #include "utils/Json.hpp"
-#include "vc/core/types/Segmentation.hpp"
-#include "vc/core/types/Volume.hpp"
+
+class Volume;
+class Segmentation;
+class QuadSurface;
 
 namespace vc::project {
 
@@ -75,6 +77,11 @@ public:
     void clearOutputSegments();
     [[nodiscard]] bool hasOutputSegments() const;
     [[nodiscard]] std::filesystem::path outputSegmentsPath() const;
+
+    [[nodiscard]] std::string selectedLasagnaDataset() const;
+    void setSelectedLasagnaDataset(std::string location);
+    void clearSelectedLasagnaDataset();
+    [[nodiscard]] std::filesystem::path selectedLasagnaDatasetPath() const;
 
     [[nodiscard]] bool hasVolumes() const;
     [[nodiscard]] bool hasVolume(const std::string& id) const;
@@ -138,6 +145,7 @@ private:
     std::vector<vc::project::Entry> segments_;
     std::vector<vc::project::Entry> normalGrids_;
     std::optional<std::string> outputSegments_;
+    std::optional<std::string> selectedLasagnaDataset_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;

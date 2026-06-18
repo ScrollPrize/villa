@@ -20,7 +20,7 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     serialize_split_conditioning_example,
 )
 from vesuvius.neural_tracing.datasets.common import _read_volume_crop_from_patch, _trim_to_world_bbox
-from vesuvius.neural_tracing.datasets.dataset_defaults import (
+from vesuvius.neural_tracing.datasets.rowcol_cond_config import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
 )
@@ -493,7 +493,7 @@ class AutoregMeshDataset(Dataset):
                 wrap,
                 require_all_valid=True,
             )
-        return self._base_dataset._extract_wrap_world_surface(patch, wrap, require_all_valid=True)
+        return self._base_dataset._extract_wrap_world_surface(patch, wrap)
 
     def _serialize_candidate_plan(
         self,

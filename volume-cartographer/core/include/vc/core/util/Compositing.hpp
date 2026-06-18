@@ -1,6 +1,6 @@
 #pragma once
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <string>
 #include <vector>
 #include <cstdint>

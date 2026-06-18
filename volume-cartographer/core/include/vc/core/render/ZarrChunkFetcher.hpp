@@ -17,6 +17,7 @@ struct OpenedChunkedZarr {
     std::vector<IChunkedArray::LevelTransform> transforms;
     std::vector<std::array<int, 3>> shapes;
     std::vector<std::array<int, 3>> chunkShapes;
+    std::vector<std::array<int, 3>> storageChunkShapes;
     std::vector<std::shared_ptr<IChunkFetcher>> fetchers;
     double fillValue = 0.0;
     ChunkDtype dtype = ChunkDtype::UInt8;

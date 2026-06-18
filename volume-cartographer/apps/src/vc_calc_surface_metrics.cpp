@@ -1,5 +1,5 @@
 #include "vc/ui/surface_metrics.hpp"
-#include "vc/ui/VCCollection.hpp"
+#include "vc/core/PointCollections.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <opencv2/imgcodecs.hpp>
@@ -42,7 +42,7 @@ int main(int argc, char** argv)
     int z_min = vm["z_min"].as<int>();
     int z_max = vm["z_max"].as<int>();
 
-    VCCollection collection;
+    PointCollections collection;
     if (!collection.loadFromJSON(collection_path)) {
         std::cerr << "Error: Failed to load point collection from " << collection_path << std::endl;
         return 1;

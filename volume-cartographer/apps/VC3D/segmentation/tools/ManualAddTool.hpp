@@ -2,7 +2,7 @@
 
 #include "SegmentationEditManager.hpp"
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <optional>
 #include <string>

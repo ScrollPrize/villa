@@ -13,7 +13,7 @@
 #include <QPointer>
 #include <QToolButton>
 #include <QFutureWatcher>
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <memory>
 
 #include "elements/ProgressUtil.hpp"
@@ -23,7 +23,11 @@ using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+class CChunkedVolumeViewer;
 class CState;
+class ViewerManager;
+class SurfacePatchIndex;
+class QuadSurface;
 
 class SeedingWidget : public QWidget {
     Q_OBJECT
@@ -32,11 +36,18 @@ public:
     explicit SeedingWidget(VCCollection* point_collection, CState* state, QWidget* parent = nullptr);
     ~SeedingWidget();
     
+    enum class RelWindingIntersectionSource {
+        CurrentVolume = 0,
+        Patches = 1
+    };
+
     void setState(CState* state);
+    void setViewerManager(ViewerManager* viewerManager);
     
 signals:
     void sendPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void sendStatusMessageAvailable(QString text, int timeout);
+    void relWindingAnnotationModeChanged(bool active);
     
 public slots:
     void onSurfacesLoaded();  // Called when surfaces have been loaded/reloaded
@@ -50,6 +61,9 @@ public slots:
     void onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(cv::Vec3f vol_point, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void setRelWindingAnnotationMode(bool active);
+    void setRelWindingIntersectionSource(int source);
+    void setRelWindingPatchTolerance(double tolerance);
     
 private slots:
     void onPreviewRaysClicked();
@@ -86,10 +100,11 @@ private:
     void startDrawing(cv::Vec3f startPoint);
     void addPointToPath(cv::Vec3f point);
     void finalizePath();
-    // Label Wraps helpers
+    // Relative winding annotation helpers
     void finalizePathLabelWraps(bool shiftHeld);
     void findPeaksAlongPathToCollection(const ViewerOverlayControllerBase::PathPrimitive& path, const std::string& collectionName);
-    void setLabelWrapsMode(bool active);
+    int findPatchIntersectionsAlongPathToCollection(const ViewerOverlayControllerBase::PathPrimitive& path, const std::string& collectionName);
+    std::vector<std::shared_ptr<QuadSurface>> relWindingPatchSurfaces() const;
     QColor generatePathColor();
     void displayPaths();
     void updatePointsDisplay();
@@ -125,12 +140,13 @@ private:
     QPushButton* expandSeedsButton;
     QPushButton* resetPointsButton;
     QPushButton* cancelButton;
-    QPushButton* labelWrapsButton;
     QProgressBar* progressBar;
     ProgressUtil* progressUtil;
     
     // Data
     CState* _state{nullptr};
+    ViewerManager* _viewerManager{nullptr};
+    QPointer<CChunkedVolumeViewer> _relWindingDrawViewer;
     int currentZSlice;
     VCCollection* _point_collection;
     cv::Mat distanceTransform;
@@ -142,6 +158,8 @@ private:
     ViewerOverlayControllerBase::PathPrimitive currentPath;
     int colorIndex;
     bool labelWrapsMode = false; // special mode built on DrawMode
+    RelWindingIntersectionSource _relWindingIntersectionSource{RelWindingIntersectionSource::CurrentVolume};
+    double _relWindingPatchTolerance{1.0};
     
     // Process management
     QList<QPointer<QProcess>> runningProcesses;

@@ -1,12 +1,13 @@
 #pragma once
 
-#include <opencv2/opencv.hpp>
+#include <opencv2/core/mat.hpp>
 #include <vc/core/types/VcDataset.hpp>
-#include <boost/program_options.hpp>
 #include <vc/core/util/Slicing.hpp>
 
 #include <filesystem>
+#include <optional>
 
+namespace boost::program_options { class variables_map; }
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
 

@@ -11,7 +11,6 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--device` (default `cuda`)
   - `--seed cx cy cz` seed point in fullres voxels
   - `--model-w`, `--model-h` model extent in fullres voxels
-  - `--windings` number of depth layers
   - `--winding-volume` optional winding volume zarr path
   - `--cuda-gridsample` enable custom CUDA uint8 sampling kernel
   - `--erode-valid-mask` erode valid mask by N pixels
@@ -21,7 +20,7 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--mesh-step` (default 100) height step in fullres voxels
   - `--winding-step` (default 25) radial step per winding
   - `--mesh-h`, `--mesh-w` mesh grid dimensions
-  - `--depth` number of windings
+  - `--depth` number of windings / model depth layers
   - `--subsample-mesh`, `--subsample-winding` HR subsampling factors (default 4)
   - `--model-input`, `--model-output` checkpoint paths
   - `--init-mode` (`arc` or `straight`)
@@ -35,10 +34,9 @@ Each part provides `add_args(parser)` + `from_args(args)`:
 ## fit.py-specific arguments
 
 - `--out-dir` output directory for snapshots and debug
-- `--model-init` (`seed`, `ext`, or `model`; default `seed`)
+- `--model-init` (`seed`, `ext`, `model`, or `flatten`; default `seed`)
+- `--flatten-solver` (`torch`, `inverse`, or `forward`; default `torch`) selects the flattening variant when `--model-init flatten`
 - `--tifxyz-init` tifxyz directory used when `--model-init ext`
-- `--window-size` window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)
-- `--window-overlap` overlap between windows in fullres voxels (default 0)
 - `--progress` print machine-readable `PROGRESS` lines to stdout
 
 ## JSON config
@@ -49,9 +47,7 @@ All arguments can be set via JSON config files (merged left-to-right). The `args
 {
   "args": {
     "input": "path/to/vol.lasagna.json",
-    "mesh-step": 100,
-    "window-size": 5000,
-    "window-overlap": 500
+    "mesh-step": 100
   },
   "stage_1": { "steps": 200, "global_opt": { ... } },
   "stage_2": { "steps": 100, "global_opt": { ... } }
@@ -61,14 +57,14 @@ All arguments can be set via JSON config files (merged left-to-right). The `args
 Top-level keys (other than `args`) are parsed as optimizer stages by `optimizer.load_stages_cfg()`.
 
 Special config keys consumed by fit.py/fit_service.py before stage parsing:
-- `external_surfaces`: list of `{"path": "...", "offset": 1.0}` for offset mode
+- `external_surfaces`: list of `{"path": "...", "offset": 1.0}` for offset mode, or one `{"path": "..."}` tifxyz source for flatten mode
 - `corr_points`: correction point collections from VC3D
 - `voxel_size_um`: voxel size for area calculations
-- `offset_value`: target offset (injected by VC3D offset mode)
 
 `args.model-init` selects the initial mesh source:
-- `seed` creates a fresh model from `args.seed`, `args.model-w`, `args.model-h`, and `args.windings`.
+- `seed` creates a fresh model from `args.seed`, `args.model-w`, `args.model-h`, and `args.depth`.
 - `ext` initializes from the selected tifxyz mesh sent by VC3D.
 - `model` initializes from the selected segment's `model.pt`.
+- `flatten` optimizes a 2D flattening over one external tifxyz source. The default [`configs/flatten.json`](../configs/flatten.json) keeps the existing inverse-map Adam path. [`configs/flatten_forward.json`](../configs/flatten_forward.json) sets `flatten_solver: "forward"` to optimize source-vertex UVs with the same pyramid/Adam stages, then invert that UV map at export. Use exactly one `external_surfaces` entry supplied by VC3D or the calling config.
 
 For VC3D integration, VC3D is transport only: it sends the selected tifxyz/model data and UI state it has available. `fit_service.py` / `fit.py` decide whether those fields are consumed as `tifxyz-init`, `external_surfaces`, approval-inpaint input, model checkpoint input, or ignored as surplus transport data.

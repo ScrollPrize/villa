@@ -167,55 +167,17 @@ lasagna → VC3D:  optimized tifxyz (with updated d.tif channel)
 Generates a new surface at a configurable grad_mag integral offset from an existing tifxyz reference. Used to trace adjacent papyrus windings from a known surface.
 
 **Data flow:**
-1. VC3D sends the existing tifxyz as base64 (`tifxyz` in request body) — no model.pt needed
-2. `fit_service.py` decodes files to temp dir, creates config with:
-   - `tifxyz-init`: initialize model from the tifxyz (via `Model3D.from_tifxyz()`)
-   - `external_surfaces`: same tifxyz registered as frozen reference with target offset
-3. `fit.py` creates model (depth=1) initialized from the tifxyz vertices, then adds the frozen reference surface
+1. VC3D sends the selected model/object refs and a complete `job_spec.config.external_surfaces` list.
+2. `fit_service.py` resolves `external_surfaces` object refs to local `path` values and preserves each entry's `offset`.
+3. `fit.py` creates the model, then adds the resolved frozen reference surface.
 4. Optimization: `ext_offset` loss (in `opt_loss_winding_density.py`) drives the model surface toward the target offset from the reference, using grad_mag integration along ray-bilinear-patch intersections (`model.py:_intersect_ext_surfaces()`)
 5. Result exported as tifxyz back to VC3D
 
 **Config keys** (injected by VC3D in offset mode):
-- `offset_value` (float): target offset in winding-integral space (0 = reoptimize in place, ±1 = adjacent winding)
-- `args.windings`: forced to 1
+- `external_surfaces[].offset` (float): target offset in winding-integral space (0 = reoptimize in place, ±1 = adjacent winding)
+- `args.depth`: forced to 1
 
 **Invalid vertices**: tifxyz surfaces use `(-1,-1,-1)` as invalid sentinel. `tifxyz_io.load_tifxyz()` returns a validity mask. Invalid vertices are inpainted via masked scale-space pyramid reconstruction in `Model3D.from_tifxyz_crop()`. The external surface validity mask is checked during ray intersection so `ext_offset` loss skips rays hitting invalid regions.
-
-### Windowed optimization (offset mode)
-
-Large tifxyz surfaces are too big to optimize as a single model. Windowed mode splits the surface into overlapping rectangular tiles, optimizes each independently, and returns multiple output tifxyz directories.
-
-**Config** (set in VC3D Offset Settings panel, injected into `args`):
-- `window-size` (int): window size in fullres voxels. 0 or omitted = no windowing (process whole surface).
-- `window-overlap` (int): overlap between windows in fullres voxels. Default 500.
-
-**Implementation** (`fit.py`):
-1. Load full tifxyz to CPU (keeps GPU memory free)
-2. Derive mesh_step from meta.json scale: `mesh_step = round(1/scale[0])`
-3. Compute window grid via `_compute_window_grid()`:
-   - `win_verts = window_size // mesh_step + 1`
-   - `overlap_verts = overlap // mesh_step`
-   - `stride = win_verts - overlap_verts`
-   - Tiles H and W dimensions; last windows clamp to grid edges
-4. Per window:
-   - Crop `xyz[h0:h1, w0:w1]` and validity to GPU
-   - `Model3D.from_tifxyz_crop()` creates model from cropped tensors
-   - External surface cropped with margin (`max(4, 2*|offset|/mesh_step + 2)` extra verts each side) for correct ray intersection at boundaries
-   - Auto-crop volume data for this window's spatial extent
-   - Run all optimization stages
-   - Export to `window_NNNN.tifxyz` with window metadata in meta.json
-   - Free GPU memory (`del mdl, data; torch.cuda.empty_cache()`)
-
-**Output**: each window is an independent tifxyz directory. `meta.json` includes:
-- `window_index`: 0-based window number
-- `window_origin_verts`: `[h0, w0]` position in the original grid
-- `window_size_verts`: `[h, w]` of this window
-- `source_grid_size_verts`: `[H, W]` of the original full surface
-- `overlap_verts`: overlap in vertex units
-
-**Service integration**: `fit_service.py` detects windowed output (`.tifxyz` dirs already present) and skips the standalone `fit2tifxyz` export step. The existing tar.gz packaging naturally includes all window directories.
-
----
 
 ## Recent Fix: wind_a Lookup via 2D Click Position
 

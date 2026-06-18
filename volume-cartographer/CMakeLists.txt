@@ -11,6 +11,19 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Shared libs to shrink binaries and CI disk usage. (flatboi forces this
+# OFF locally for PaStiX.)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "Build vc_* and FetchContent deps as .so")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# Exes default to -fPIE; force -fPIC to match the shared libs' PCH. -no-pie
+# only on exe links (mold/lld reject it on a .so).
+add_compile_options(-fPIC)
+add_link_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-no-pie>)
+# Find the .so via $ORIGIN without LD_LIBRARY_PATH.
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+set(CMAKE_BUILD_WITH_INSTALL_RPATH OFF)
+
 option(VC_MARCH_NATIVE     "Tune for the host CPU (-march=native)"        OFF)
 option(VC_WARNINGS        "Enable curated warning set"                   OFF)
 option(VC_WERROR          "Treat compiler warnings as errors"            OFF)
@@ -27,6 +40,56 @@ option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on c
 option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
 option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
+option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
+option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
+option(VC_ENABLE_ECL_MAXFLOW "Build CUDA ECL-MaxFlow integration for Lasagna maxflow" OFF)
+option(VC_ENABLE_AMGX "Build external AMGX-backed Lasagna screened-Laplace solver" OFF)
+set(AMGX_ROOT "" CACHE PATH "External AMGX installation prefix")
+set(VC_CCACHE_PCH_SLOPPINESS "pch_defines,time_macros" CACHE STRING
+    "ccache sloppiness required when VC_USE_PCH and VC_USE_CCACHE are both ON")
+
+if(VC_ENABLE_ECL_MAXFLOW)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(NOT CMAKE_CUDA_COMPILER)
+        message(FATAL_ERROR "VC_ENABLE_ECL_MAXFLOW=ON requires a CUDA compiler")
+    endif()
+    enable_language(CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
+        set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures for ECL-MaxFlow" FORCE)
+    endif()
+endif()
+
+set(_vc_build_types Debug Release RelWithDebInfo MinSizeRel QuickBuild)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the build type." FORCE)
+endif()
+if(DEFINED CMAKE_BUILD_TYPE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS ${_vc_build_types})
+endif()
+
+# Fast local iteration: keep some optimization so optimized code paths still
+# compile, but skip LTO and force the shared vc_core PCH back on.
+if(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
+    set(VC_USE_PCH ON CACHE BOOL "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" FORCE)
+    message(STATUS "QuickBuild: -O1, PCH enabled, LTO disabled")
+endif()
+
+if(VC_USE_CCACHE)
+    find_program(CCACHE_PROGRAM ccache)
+    if(NOT CCACHE_PROGRAM)
+        message(FATAL_ERROR "VC_USE_CCACHE=ON but ccache was not found on PATH.")
+    endif()
+    if(VC_USE_PCH)
+        set(_vc_ccache_launcher
+            "${CMAKE_COMMAND};-E;env;CCACHE_SLOPPINESS=${VC_CCACHE_PCH_SLOPPINESS};${CCACHE_PROGRAM}")
+        message(STATUS "ccache with PCH: CCACHE_SLOPPINESS=${VC_CCACHE_PCH_SLOPPINESS}")
+    else()
+        set(_vc_ccache_launcher "${CCACHE_PROGRAM}")
+    endif()
+    set(CMAKE_C_COMPILER_LAUNCHER "${_vc_ccache_launcher}" CACHE STRING "Compiler launcher for C" FORCE)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${_vc_ccache_launcher}" CACHE STRING "Compiler launcher for CXX" FORCE)
+endif()
 
 # Skip building app executables (vc_*, VC3D) when generating coverage:
 # the apps add ~3 GB of debug+coverage-instrumented binaries to the
@@ -70,11 +133,11 @@ set(VC_VERSION_STRING "${GIT_SHA1_SHORT}-${GIT_COMMIT_DATE}")
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-endif()
 if(VC_DEAD_CODE_REPORT)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+endif()
+if(VC_BUILD_PYTHON)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
 # Portable shippable defaults; VC_MARCH_NATIVE=ON (set by dev-* presets) opts
@@ -95,6 +158,26 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(_lto -flto=thin)
     if(APPLE)
         set(_link "")
+        # ld64.lld (the LLVM Mach-O linker the macOS preset selects via
+        # -fuse-ld=lld) mishandles C++ exception unwind info for our large
+        # ThinLTO shared libraries: a `throw` inside e.g. libvc_core that should
+        # be caught in an executable instead unwinds past every handler into
+        # std::terminate (SIGABRT) once it crosses the dylib boundary. The
+        # failure is in how lld lays out the dylib's unwind tables — relinking
+        # the *same* objects with Apple's ld makes cross-dylib exceptions
+        # propagate correctly, and no ld64.lld flag (-keep_dwarf_unwind,
+        # -no_compact_unwind, -dead_strip) reliably fixes it for a library this
+        # size. So on macOS we link shared libraries with Apple's system ld
+        # (always available via the SDK) while keeping lld for executables.
+        # -fuse-ld= with an empty value selects the driver default (Apple ld).
+        # A later -fuse-ld= (empty) on the link line overrides the preset's
+        # earlier -fuse-ld=lld for shared-library targets only; clang honors the
+        # last one. Applied per-target via a genex so it's idempotent across
+        # reconfigures and leaves executables on lld.
+        if(CMAKE_EXE_LINKER_FLAGS MATCHES "lld" OR CMAKE_SHARED_LINKER_FLAGS MATCHES "lld")
+            add_link_options(
+                "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,SHARED_LIBRARY>:-fuse-ld=>")
+        endif()
     else()
         set(_link -fuse-ld=lld -Wl,--gc-sections -Wl,--as-needed)
     endif()
@@ -162,24 +245,22 @@ if(VC_ENABLE_ASAN OR VC_ENABLE_UBSAN OR VC_ENABLE_TSAN
     list(APPEND _san -fno-sanitize-recover=all)
 endif()
 if(VC_ENABLE_COVERAGE)
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        list(APPEND _san -fprofile-instr-generate -fcoverage-mapping)
-    else()
-        list(APPEND _san --coverage)
+    # clang source-based coverage only: accurate at any -O level, reads
+    # .profraw + the binary's coverage-mapping section. gcc/gcov was retired
+    # (only accurate at -O0). -g1 keeps line tables for useful backtraces.
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "VC_ENABLE_COVERAGE requires clang — gcc/gcov was retired (only accurate at -O0). Use the ci-coverage-clang preset.")
     endif()
-    # Coverage doesn't need DWARF: gcov/llvm-cov read .gcno/.gcda (gcc) or
-    # .profraw + the binary's coverage-mapping section (clang), neither of
-    # which depends on debug info. Drop to -g1 (line tables only — keeps
-    # backtraces useful when an assertion fires) and split DWARF into .dwo
-    # files so the executables stay small. On a full build this trims the
-    # coverage build dir from ~12 GB to ~5 GB and avoids ENOSPC on CI.
-    list(APPEND _san -g1 -gsplit-dwarf)
+    list(APPEND _san -fprofile-instr-generate -fcoverage-mapping)
+    list(APPEND _san -g1)
 endif()
 # Sanitizer/coverage flags applied below, after libs/ — see that block.
 
 # ---- Optimization + LTO -----------------------------------------------------
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_options(-O0)
+elseif(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
+    add_compile_options(-O1)
 elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O3)
 elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
@@ -187,7 +268,7 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
 elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
     add_compile_options(-Os)
 endif()
-if(NOT _san AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+if(NOT _san AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     add_compile_options(${_lto})
     add_link_options(${_lto})
 endif()
@@ -316,6 +397,35 @@ if(NOT TARGET Blosc::blosc)
         IMPORTED_LOCATION "${BLOSC_LIBRARY}"
         INTERFACE_INCLUDE_DIRECTORIES "${BLOSC_INCLUDE_DIR}")
 endif()
+
+if(VC_ENABLE_AMGX)
+    if(DEFINED AMGX_INCLUDE_DIR AND "${AMGX_INCLUDE_DIR}" STREQUAL "")
+        unset(AMGX_INCLUDE_DIR CACHE)
+    endif()
+    if(DEFINED AMGX_LIBRARY AND "${AMGX_LIBRARY}" STREQUAL "")
+        unset(AMGX_LIBRARY CACHE)
+    endif()
+    find_path(AMGX_INCLUDE_DIR
+        NAMES amgx_c.h
+        HINTS "${AMGX_ROOT}" "$ENV{AMGX_ROOT}"
+        PATH_SUFFIXES include)
+    find_library(AMGX_LIBRARY
+        NAMES amgxsh amgx
+        HINTS "${AMGX_ROOT}" "$ENV{AMGX_ROOT}"
+        PATH_SUFFIXES lib lib64)
+    if(NOT AMGX_INCLUDE_DIR OR NOT AMGX_LIBRARY)
+        message(FATAL_ERROR
+            "VC_ENABLE_AMGX=ON requires external AMGX. Set AMGX_ROOT or "
+            "AMGX_INCLUDE_DIR and AMGX_LIBRARY.")
+    endif()
+    if(NOT TARGET AMGX::amgx)
+        add_library(AMGX::amgx UNKNOWN IMPORTED)
+        set_target_properties(AMGX::amgx PROPERTIES
+            IMPORTED_LOCATION "${AMGX_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${AMGX_INCLUDE_DIR}")
+    endif()
+    message(STATUS "Using AMGX include=${AMGX_INCLUDE_DIR} library=${AMGX_LIBRARY}")
+endif()
 pkg_check_modules(zstd REQUIRED IMPORTED_TARGET libzstd)
 pkg_check_modules(lz4 REQUIRED IMPORTED_TARGET liblz4)
 if(NOT TARGET zstd::libzstd)
@@ -415,4 +525,22 @@ if(VC_TESTING)
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
         USES_TERMINAL)
+
+    if(VC_ENABLE_COVERAGE)
+        find_program(LLVM_PROFDATA NAMES llvm-profdata REQUIRED)
+        find_program(LLVM_COV NAMES llvm-cov REQUIRED)
+        get_property(_vc_test_targets GLOBAL PROPERTY VC_TEST_TARGETS)
+        string(REPLACE ";" "," _vc_test_targets_csv "${_vc_test_targets}")
+        add_custom_target(coverage-report
+            COMMAND ${CMAKE_COMMAND}
+                    -D "BUILD_DIR=${CMAKE_BINARY_DIR}"
+                    -D "CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+                    -D "LLVM_PROFDATA=${LLVM_PROFDATA}"
+                    -D "LLVM_COV=${LLVM_COV}"
+                    -D "TEST_TARGETS=${_vc_test_targets_csv}"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/run_coverage_report.cmake"
+            DEPENDS ${_vc_test_targets}
+            USES_TERMINAL
+            COMMENT "Running clang source-based coverage")
+    endif()
 endif()

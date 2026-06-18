@@ -10,7 +10,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
 
   <meta property="og:type" content="website" />
@@ -18,7 +18,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
   <meta
     property="og:image"
@@ -30,7 +30,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
   <meta
     property="twitter:image"
@@ -116,7 +116,7 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 [Improvements to VC3D](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) can be also considered for progress prizes!
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, May 31st, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, June 30th, 2026!
 
 <details>
 <summary>Submission criteria and requirements</summary>
@@ -135,7 +135,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Designed for modular integration
 </details>
 
-[Submission Form](https://forms.gle/LrpQmSAqdwGpTczLA)
+[Submission Form](https://forms.gle/Sy6mW5cfJS2U7E9F7)
 
 ***
 

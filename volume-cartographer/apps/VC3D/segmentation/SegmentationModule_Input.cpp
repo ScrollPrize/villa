@@ -65,6 +65,15 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return false;
     }
 
+    const Qt::KeyboardModifiers keyPressMods = event->modifiers() & ~Qt::KeypadModifier;
+    if (event->key() == Qt::Key_G && keyPressMods == Qt::NoModifier && !event->isAutoRepeat()) {
+        if (_editingEnabled && !_growthInProgress && _editManager && _editManager->hasSession()) {
+            _correctionDragKeyActive = true;
+            event->accept();
+            return true;
+        }
+    }
+
     if (event->key() == vc3d::keybinds::keypress::ManualAddToggle.key &&
         event->modifiers() == vc3d::keybinds::keypress::ManualAddToggle.modifiers &&
         (!vc3d::keybinds::keypress::ManualAddToggle.requireNoAutoRepeat || !event->isAutoRepeat())) {
@@ -367,6 +376,15 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
         return false;
     }
 
+    if (event->key() == Qt::Key_G && !event->isAutoRepeat()) {
+        const bool wasCorrectionDragKeyActive = _correctionDragKeyActive;
+        _correctionDragKeyActive = false;
+        if (wasCorrectionDragKeyActive) {
+            event->accept();
+            return true;
+        }
+    }
+
     if (event->key() == vc3d::keybinds::keypress::LineDrawHold.key && !event->isAutoRepeat()) {
         _lineDrawKeyActive = false;
         if (_lineTool && _lineTool->strokeActive()) {
@@ -418,6 +436,10 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
         return;
     }
 
+    if (_growthInProgress) {
+        return;
+    }
+
     const bool drawMaskAllowed = _editingEnabled && _editManager && _editManager->hasSession();
     const bool drawMaskRequested = drawMaskAllowed &&
                                    (_drawMaskEnabled || modifiers.testFlag(Qt::ShiftModifier));
@@ -461,6 +483,25 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
                 _approvalTool->startStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), gridIdx);
             }
         }
+        return;
+    }
+
+    if (_correctionDragKeyActive && isLeftButton && !modifiers.testFlag(Qt::ControlModifier) &&
+        !modifiers.testFlag(Qt::AltModifier) && !modifiers.testFlag(Qt::ShiftModifier)) {
+        if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+            return;
+        }
+        stopAllPushPull();
+        if (_drag.active) {
+            cancelDrag();
+        }
+        auto gridIndex = _editManager->worldToGridIndex(worldPos);
+        if (!gridIndex) {
+            emit statusMessageRequested(tr("Move the cursor over the segmentation surface before correction drag."),
+                                        kStatusMedium);
+            return;
+        }
+        beginCorrectionDrag(gridIndex->first, gridIndex->second, viewer, worldPos);
         return;
     }
 
@@ -551,6 +592,10 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
                                          const QPointF& scenePos)
 {
     if (_manualAddMode && handleManualAddMouseMove(viewer, buttons, scenePos)) {
+        return;
+    }
+
+    if (_growthInProgress) {
         return;
     }
 
@@ -687,6 +732,10 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
         return;
     }
 
+    if (_growthInProgress) {
+        return;
+    }
+
     const bool maskStrokeActive = _surfaceMaskTool && _surfaceMaskTool->strokeActive();
     if (maskStrokeActive && button == Qt::RightButton) {
         if (_surfaceMaskTool && viewer) {
@@ -791,7 +840,7 @@ void SegmentationModule::handleWheel(VolumeViewerBase* viewer,
                                      const QPointF& scenePos,
                                      const cv::Vec3f& worldPos)
 {
-    if (!_editingEnabled) {
+    if (!_editingEnabled || _growthInProgress) {
         return;
     }
     const float step = deltaSteps * 0.25f;

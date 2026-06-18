@@ -1,6 +1,7 @@
 #include "SettingsDialog.hpp"
 
 #include "VCSettings.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <thread>
@@ -28,6 +29,9 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     edtScanRange->setText(settings.value(viewer::SCAN_RANGE_STEPS, viewer::SCAN_RANGE_STEPS_DEFAULT).toString());
     spinScrollSpeed->setValue(settings.value(viewer::SCROLL_SPEED, viewer::SCROLL_SPEED_DEFAULT).toInt());
     spinZoomSensitivity->setValue(settings.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toDouble());
+    if (auto* spin = findChild<QDoubleSpinBox*>("spinVoxelSize")) {
+        spin->setValue(settings.value(viewer::VOXEL_SIZE_UM, viewer::VOXEL_SIZE_UM_DEFAULT).toDouble());
+    }
     spinDisplayOpacity->setValue(settings.value(viewer::DISPLAY_SEGMENT_OPACITY, viewer::DISPLAY_SEGMENT_OPACITY_DEFAULT).toInt());
     chkPlaySoundAfterSegRun->setChecked(settings.value(viewer::PLAY_SOUND_AFTER_SEG_RUN, viewer::PLAY_SOUND_AFTER_SEG_RUN_DEFAULT).toInt() != 0);
     edtUsername->setText(settings.value(viewer::USERNAME, viewer::USERNAME_DEFAULT).toString());
@@ -61,6 +65,12 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
         const QString stored =
             settings.value(viewer::REMOTE_CACHE_DIR).toString();
         edtRemoteCachePath->setText(vc3d::remoteCachePath(stored));
+    }
+
+    // Per-segment rotating-backup count.
+    if (spinSegmentBackupCount) {
+        spinSegmentBackupCount->setValue(
+            settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
 
     // IO threads is no longer user-configurable (tracks hardware_concurrency).
@@ -113,6 +123,9 @@ void SettingsDialog::accept()
     settings.setValue(viewer::SCAN_RANGE_STEPS, edtScanRange->text());
     settings.setValue(viewer::SCROLL_SPEED, spinScrollSpeed->value());
     settings.setValue(viewer::ZOOM_SENSITIVITY, spinZoomSensitivity->value());
+    if (auto* spin = findChild<QDoubleSpinBox*>("spinVoxelSize")) {
+        settings.setValue(viewer::VOXEL_SIZE_UM, spin->value());
+    }
     settings.setValue(viewer::DISPLAY_SEGMENT_OPACITY, spinDisplayOpacity->value());
     settings.setValue(viewer::PLAY_SOUND_AFTER_SEG_RUN, chkPlaySoundAfterSegRun->isChecked() ? "1" : "0");
     settings.setValue(viewer::USERNAME, edtUsername->text());
@@ -140,6 +153,13 @@ void SettingsDialog::accept()
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
     settings.setValue(perf::DISK_CACHE_COMPRESSED, chkVideoRecompress->isChecked());
+
+    // Per-segment backup count: persist and apply live (no restart needed).
+    if (spinSegmentBackupCount) {
+        const int backupCount = spinSegmentBackupCount->value();
+        settings.setValue(backup::SEGMENT_COUNT, backupCount);
+        QuadSurface::setBackupCount(backupCount);
+    }
 
     // IO_THREADS setting removed — see CState::applyCacheBudget.
 

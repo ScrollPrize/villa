@@ -4,7 +4,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <ceres/ceres.h>
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include <cstddef>
 #include <set>

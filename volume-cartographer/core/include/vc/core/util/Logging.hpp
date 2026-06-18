@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <format>
 
 // Forward declaration
@@ -60,13 +61,16 @@ public:
     void add_file(const std::filesystem::path& path);
 
 private:
+    // The template stays trivial — make_format_args is cheap. The heavy
+    // std::vformat instantiation (the bulk of <format>'s compile cost) lives
+    // once in vlog() in Logging.cpp instead of in every TU that logs.
     template<typename... Args>
     void log(LogLevel level, std::format_string<Args...> fmt, Args&&... args) {
         if (level < current_level_) return;
-        std::string msg = std::format(fmt, std::forward<Args>(args)...);
-        write_log(level, msg);
+        vlog(level, fmt.get(), std::make_format_args(args...));
     }
 
+    void vlog(LogLevel level, std::string_view fmt, std::format_args args);
     void write_log(LogLevel level, const std::string& msg);
     const char* level_string(LogLevel level);
 

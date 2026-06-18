@@ -594,6 +594,18 @@ struct Flatboi {
         throw std::runtime_error("Failed to write OBJ with UVs");
     }
     std::cout << "Wrote: " << out << "\n";
+
+    // Flattening preserves vertex order (V/F written unchanged), so a grid-UV
+    // sidecar next to the input applies to the output too. Copy it through.
+    const fs::path in_griduv = fs::path(input_obj + ".griduv");
+    if (fs::exists(in_griduv)) {
+      std::error_code ec;
+      fs::copy_file(in_griduv, fs::path(out.string() + ".griduv"),
+                    fs::copy_options::overwrite_existing, ec);
+      if (ec) {
+        std::cerr << "warning: failed to copy grid-UV sidecar: " << ec.message() << "\n";
+      }
+    }
   }
 
   // === UV heatmaps (OpenCV PNG write; no clipping; V increases downward) ===
@@ -996,8 +1008,14 @@ int main(int argc, char** argv) {
 
     WBLogger wblog(obj_path, iters); // optional; becomes no-op if unavailable
 
-    // Run SLIM from original UVs (matches Python default), with W&B logging
-    auto [uv_out, energies] = fb.slim_run("original", wblog.enabled()? &wblog : nullptr);
+    // Use the input's UVs as the initial condition when present (matches the
+    // Python/VC3D default); otherwise fall back to a harmonic parametrization
+    // so flatboi can flatten a raw mesh that has no UVs (e.g. a scrollfiesta
+    // surface mesh streamed straight from the mesher).
+    const std::string ic = fb.have_per_corner_uv ? "original" : "harmonic";
+    if (!fb.have_per_corner_uv)
+      std::cout << "No per-corner UVs in input; using harmonic initial condition.\n";
+    auto [uv_out, energies] = fb.slim_run(ic, wblog.enabled()? &wblog : nullptr);
 
     // Persist
     save_energies(obj_path, energies);

@@ -230,8 +230,11 @@ bool CommandLineToolRunner::execute(Tool tool)
         return false;
     }
 
-    // vc_merge_tifxyz operates on segment paths only; no volume required.
-    const bool needsVolume = !isCustom && tool != Tool::MergeTifxyz;
+    // vc_merge_tifxyz and vc_merge_patch are path-only tools (segment dirs);
+    // no volume required.
+    const bool needsVolume = !isCustom
+                             && tool != Tool::MergeTifxyz
+                             && tool != Tool::MergePatch;
     if (needsVolume) {
         if (_explicitVolumePath) {
             if (_volumePath.isEmpty()) {
@@ -672,6 +675,26 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << "--anchor-cap"        << QString::number(_mergeAnchorCap)
                  << "--strip-cols"        << QString::number(_mergeStripCols);
             break;
+        case Tool::MergePatch:
+            // Either positional (auto-detect roles by valid-cell count) or
+            // explicit --parent / --child when the user swapped via the
+            // dialog. The binary requires exactly one of these forms.
+            if (_patchExplicitRoles) {
+                args << "--parent" << _patchParentPath
+                     << "--child"  << _patchChildPath;
+            } else {
+                args << _patchParentPath << _patchChildPath;
+            }
+            args << "--border-cells"      << QString::number(_patchBorderCells)
+                 << "--blend-cells"       << QString::number(_patchBlendCells)
+                 << "--idw-k"             << QString::number(_patchIdwK)
+                 << "--ransac-iters"      << QString::number(_patchRansacIters)
+                 << "--ransac-min-thresh" << QString::number(_patchRansacMinThresh, 'g', 10)
+                 << "--ransac-max-thresh" << QString::number(_patchRansacMaxThresh, 'g', 10)
+                 << "--ransac-mad-k"      << QString::number(_patchRansacMadK,      'g', 10)
+                 << "--ransac-seed"       << QString::number(_patchRansacSeed)
+                 << "--anchor-cap"        << QString::number(_patchAnchorCap);
+            break;
         case Tool::CustomCommand:
             args = _customArgs;
             break;
@@ -705,6 +728,9 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::MergeTifxyz:
             return basePath + "vc_merge_tifxyz";
 
+        case Tool::MergePatch:
+            return basePath + "vc_merge_patch";
+
         case Tool::CustomCommand:
             return _customCommand.isEmpty() ? "custom_command" : _customCommand;
 
@@ -725,6 +751,11 @@ QString CommandLineToolRunner::getOutputPath() const
         // The tool auto-names the output dir under <volpkg>/paths/; we
         // surface the merge.json instead so the user can find the run.
         return _mergeJsonPath;
+    }
+    if (_currentTool == Tool::MergePatch) {
+        // The binary overwrites the parent in place; surface that path so
+        // the post-run notification can point users at what changed.
+        return _patchParentPath;
     }
     if (_currentTool == Tool::CustomCommand) {
         return QString();
@@ -755,6 +786,33 @@ void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
     _mergeRansacSeed      = ransacSeed;
     _mergeAnchorCap       = anchorCap;
     _mergeStripCols       = stripCols;
+}
+
+void CommandLineToolRunner::setMergePatchParams(const QString& parentPath,
+                                                const QString& childPath,
+                                                bool explicitRoles,
+                                                int borderCells,
+                                                int blendCells,
+                                                int idwK,
+                                                int ransacIters,
+                                                double ransacMinThresh,
+                                                double ransacMaxThresh,
+                                                double ransacMadK,
+                                                int ransacSeed,
+                                                int anchorCap)
+{
+    _patchParentPath      = parentPath;
+    _patchChildPath       = childPath;
+    _patchExplicitRoles   = explicitRoles;
+    _patchBorderCells     = borderCells;
+    _patchBlendCells      = blendCells;
+    _patchIdwK            = idwK;
+    _patchRansacIters     = ransacIters;
+    _patchRansacMinThresh = ransacMinThresh;
+    _patchRansacMaxThresh = ransacMaxThresh;
+    _patchRansacMadK      = ransacMadK;
+    _patchRansacSeed      = ransacSeed;
+    _patchAnchorCap       = anchorCap;
 }
 
 void CommandLineToolRunner::setObj2TifxyzParams(const QString& objPath, const QString& outputDir,

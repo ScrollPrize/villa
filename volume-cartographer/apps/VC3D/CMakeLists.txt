@@ -3,7 +3,12 @@ set(CMAKE_AUTORCC ON)
 set(CHUNK_CACHE_SIZE_GB "10" CACHE STRING "size of the chunk cache in gigabytes")
 add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
 
+# Qt shim + Qt image helpers formerly in vc_ui; wrap the shim header for MOC.
+qt6_wrap_cpp(vccollection_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+
 set(srcs
+    ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
+    ${vccollection_moc}
     VCAppMain.cpp
     CState.cpp
     CState.hpp
@@ -11,14 +16,30 @@ set(srcs
     Keybinds.hpp
     CWindow.cpp
     CWindowContextMenu.cpp
+    RenderBenchRecorder.cpp
+    RenderBenchRecorder.hpp
+    RenderBenchReplay.cpp
+    RenderBenchReplay.hpp
     FileWatcherService.cpp
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
+    LineAnnotationFiberClassification.hpp
+    FiberSliceGeometry.cpp
+    FiberSliceGeometry.hpp
+    LineAnnotationController.cpp
+    LineAnnotationController.hpp
+    LineAnnotationDialog.cpp
+    LineAnnotationDialog.hpp
+    LineAnnotationGeneratedViews.cpp
+    LineAnnotationGeneratedViews.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
     SurfaceAreaCalculator.hpp
+    AtlasControlPointsDock.cpp
+    AtlasControlPointsDock.hpp
+    AtlasControlPointsTypes.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
@@ -28,6 +49,8 @@ set(srcs
     VolumeViewerCmaps.hpp
     WindowRangeWidget.cpp
     WindowRangeWidget.hpp
+    WrapAnnotationWidget.cpp
+    WrapAnnotationWidget.hpp
     elements/CollapsibleSettingsGroup.cpp
     elements/CollapsibleSettingsGroup.hpp
     elements/DropdownChecklistButton.cpp
@@ -107,6 +130,12 @@ set(srcs
     overlays/PlaneSlicingOverlayController.hpp
     overlays/SurfaceRotationOverlayController.cpp
     overlays/SurfaceRotationOverlayController.hpp
+    overlays/AtlasOverlayController.cpp
+    overlays/AtlasOverlayController.hpp
+    overlays/AtlasControlPointsOverlayController.cpp
+    overlays/AtlasControlPointsOverlayController.hpp
+    overlays/FiberSliceOverlayController.cpp
+    overlays/FiberSliceOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
@@ -126,6 +155,8 @@ set(srcs
     NeuralTraceServiceManager.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
+    LasagnaBatchWindow.cpp
+    LasagnaBatchWindow.hpp
     segmentation/panels/SegmentationLasagnaPanel.cpp
     segmentation/panels/SegmentationLasagnaPanel.hpp
     ViewerManager.cpp
@@ -168,7 +199,7 @@ set(srcs
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
-    list(APPEND srcs "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.c")
+    list(APPEND srcs "${CMAKE_SOURCE_DIR}/misc/sanitizer_config.cpp")
 endif()
 
 
@@ -206,7 +237,8 @@ target_link_libraries(VC3D
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
-    vc_ui
+    vc_atlas
+    vc_lasagna
     vc_tracer
     vc_flattening
     Ceres::ceres
@@ -220,3 +252,15 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     Blosc::blosc
 )
+
+if(VC_USE_PCH)
+    # VC3D gets its own PCH = vc_core's common headers + the heavy Qt umbrella
+    # headers. Qt stays out of vc_core's shared PCH so the Qt-free CLI apps that
+    # REUSE_FROM it don't pay to parse Qt. (Can't REUSE_FROM vc_core and add Qt
+    # — a target has one PCH — so build VC3D's directly from the same list.)
+    target_precompile_headers(VC3D PRIVATE
+        ${VC_PCH_HEADERS}
+        "$<$<COMPILE_LANGUAGE:CXX>:<QtCore/QtCore>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<QtWidgets/QtWidgets>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<QtConcurrent/QtConcurrent>>")
+endif()

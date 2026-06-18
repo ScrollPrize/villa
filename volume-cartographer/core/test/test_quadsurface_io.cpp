@@ -182,12 +182,12 @@ TEST_CASE("saveSnapshot: copies prior on-disk state into backups/<id>/0")
         qs.path = t.segDir;
         qs.save(t.segDir);
     }
-    // saveSnapshot stores into <root>/backups/<id>/0
+    // saveSnapshot stores into <segDir-parent>/backups/<id>/0
     QuadSurface qs2(t.segDir);
     qs2.id = t.segId;
     qs2.path = t.segDir;
     qs2.saveSnapshot(/*maxBackups=*/3);
 
-    auto backupsRoot = t.root / "backups" / t.segId;
+    auto backupsRoot = t.segDir.parent_path() / "backups" / t.segId;
     CHECK(fs::exists(backupsRoot / "0"));
 }

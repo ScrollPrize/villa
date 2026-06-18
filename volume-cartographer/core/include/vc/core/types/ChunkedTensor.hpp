@@ -1,13 +1,12 @@
 #pragma once
 
-#include <iostream>
 #include "vc/core/util/HashFunctions.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Volume.hpp"
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 

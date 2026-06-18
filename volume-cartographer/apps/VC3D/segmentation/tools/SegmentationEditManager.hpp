@@ -9,7 +9,9 @@
 #include <utility>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
+
+#include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QuadSurface;
 class ViewerManager;
@@ -85,6 +87,9 @@ public:
     [[nodiscard]] bool hasSession() const { return static_cast<bool>(_baseSurface); }
     [[nodiscard]] std::shared_ptr<QuadSurface> baseSurface() const { return _baseSurface; }
     [[nodiscard]] std::shared_ptr<QuadSurface> previewSurface() const { return _baseSurface; }
+    [[nodiscard]] SurfacePatchIndex* editSurfacePatchIndex() const { return _editSurfacePatchIndex.get(); }
+    [[nodiscard]] SurfacePatchIndex* preferredSurfacePatchIndex() const;
+    bool flushEditSurfacePatchIndex();
 
     // Synchronize a rectangular region with the latest base-surface data without rebuilding the session.
     bool applyExternalSurfaceUpdate(const cv::Rect& vertexRect);
@@ -107,6 +112,11 @@ public:
                               const std::vector<GridKey>& editedVertices,
                               bool markAsPendingEdit,
                               std::optional<cv::Rect>* outDiffBounds = nullptr);
+    bool setResizedPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
+                                 const cv::Mat_<cv::Vec3f>& originalPoints,
+                                 const std::vector<GridKey>& editedVertices,
+                                 bool markAsPendingEdit,
+                                 std::optional<cv::Rect>* outDiffBounds = nullptr);
     bool restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& points);
 
     void resetPreview();
@@ -153,10 +163,15 @@ private:
     float stepNormalization() const;
     cv::Mat_<cv::Vec3f>* previewPointsPtr();
     const cv::Mat_<cv::Vec3f>* previewPointsPtr() const;
+    void rebuildEditSurfacePatchIndex();
+    void queueEditSurfacePatchIndexVertex(int row, int col);
+    void queueEditSurfacePatchIndexRange(int minRow, int maxRow, int minCol, int maxCol);
 
     std::shared_ptr<QuadSurface> _baseSurface;
     ViewerManager* _viewerManager{nullptr};
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _originalPoints;
+    std::unique_ptr<cv::Mat_<cv::Vec3f>> _preResizeOriginalPoints;
+    std::unique_ptr<SurfacePatchIndex> _editSurfacePatchIndex;
 
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};

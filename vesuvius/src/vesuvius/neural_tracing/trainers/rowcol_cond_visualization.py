@@ -67,7 +67,8 @@ def make_visualization(inputs, disp_pred, extrap_coords, gt_displacement, valid_
                        sdt_pred=None, sdt_target=None,
                        heatmap_pred=None, heatmap_target=None,
                        seg_pred=None, seg_target=None,
-                       save_path=None):
+                       save_path=None,
+                       **unused_trace_kwargs):
     """Create and save PNG visualization of Z, Y, and X slices."""
     import matplotlib.pyplot as plt
 
@@ -713,6 +714,240 @@ def _make_dense_triplet_visualization(
     plt.close(fig)
 
 
+def make_trace_visualization(vis_data, save_path):
+    """Create a dense trace-only visualization from a trainer payload."""
+    make_dense_visualization(
+        vis_data['inputs'], None, None, None,
+        velocity_dir_pred=vis_data.get('velocity_dir_pred'),
+        velocity_dir_target=vis_data.get('velocity_dir_target'),
+        velocity_loss_weight=vis_data.get('velocity_loss_weight'),
+        trace_loss_weight=vis_data.get('trace_loss_weight'),
+        trace_validity_pred=vis_data.get('trace_validity_pred'),
+        trace_validity_target=vis_data.get('trace_validity_target'),
+        trace_validity_weight=vis_data.get('trace_validity_weight'),
+        surface_attract_pred=vis_data.get('surface_attract_pred'),
+        surface_attract_target=vis_data.get('surface_attract_target'),
+        surface_attract_weight=vis_data.get('surface_attract_weight'),
+        save_path=save_path,
+    )
+
+
+def make_copy_neighbor_visualization(vis_data, save_path):
+    """Create a copy-neighbor trace/ODE visualization from a trainer payload."""
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    inputs = vis_data["inputs"]
+    b = 0
+    _, _, D, H, W = inputs.shape
+
+    vol = _tensor_to_numpy(inputs[b, 0])
+    cond = _tensor_to_numpy(inputs[b, 1])
+    side_hint = _tensor_to_numpy(inputs[b, 2:5])
+    target_seg = _tensor_to_numpy(vis_data["target_seg"][b]) if vis_data.get("target_seg") is not None else None
+    domain = _tensor_to_numpy(vis_data["domain"][b]) if vis_data.get("domain") is not None else None
+    if domain is None and vis_data.get("progress_phi_weight") is not None:
+        domain = _tensor_to_numpy(vis_data["progress_phi_weight"][b, 0])
+
+    progress_target = (
+        _tensor_to_numpy(vis_data["progress_phi_target"][b, 0])
+        if vis_data.get("progress_phi_target") is not None else None
+    )
+    progress_pred = (
+        _tensor_to_numpy(vis_data["progress_phi_pred"][b, 0].float())
+        if vis_data.get("progress_phi_pred") is not None else None
+    )
+    stop_target = _tensor_to_numpy(vis_data["stop_target"][b, 0]) if vis_data.get("stop_target") is not None else None
+    stop_pred = (
+        _tensor_to_numpy(torch.sigmoid(vis_data["stop_pred"][b, 0].float()))
+        if vis_data.get("stop_pred") is not None else None
+    )
+    target_edt = _tensor_to_numpy(vis_data["target_edt"][b, 0]) if vis_data.get("target_edt") is not None else None
+
+    velocity_align = None
+    if vis_data.get("velocity_dir_pred") is not None and vis_data.get("velocity_dir_target") is not None:
+        pred_vel = F.normalize(vis_data["velocity_dir_pred"][b:b + 1].float(), dim=1, eps=1e-6)
+        target_vel = F.normalize(vis_data["velocity_dir_target"][b:b + 1].float(), dim=1, eps=1e-6)
+        velocity_align = _tensor_to_numpy((pred_vel * target_vel).sum(dim=1)[0].clamp(-1.0, 1.0))
+        if vis_data.get("velocity_loss_weight") is not None:
+            vel_mask = _tensor_to_numpy(vis_data["velocity_loss_weight"][b, 0]) > 0.0
+            velocity_align = np.where(vel_mask, velocity_align, np.nan)
+
+    attract_err = None
+    if vis_data.get("surface_attract_pred") is not None and vis_data.get("surface_attract_target") is not None:
+        pred = _tensor_to_numpy(vis_data["surface_attract_pred"][b])
+        target = _tensor_to_numpy(vis_data["surface_attract_target"][b])
+        attract_err = np.linalg.norm(pred - target, axis=0)
+        if vis_data.get("surface_attract_weight") is not None:
+            attract_mask = _tensor_to_numpy(vis_data["surface_attract_weight"][b, 0]) > 0.0
+            attract_err = np.where(attract_mask, attract_err, np.nan)
+
+    seeds = _tensor_to_numpy(vis_data["endpoint_seed_points"][b]) if vis_data.get("endpoint_seed_points") is not None else None
+    seed_mask = _tensor_to_numpy(vis_data["endpoint_seed_mask"][b]) > 0.0 if vis_data.get("endpoint_seed_mask") is not None else None
+
+    focus_mask = domain > 0.0 if domain is not None else cond > 0.0
+    if np.any(focus_mask):
+        z0, y0, x0 = np.median(np.argwhere(focus_mask), axis=0).astype(int).tolist()
+    else:
+        z0, y0, x0 = D // 2, H // 2, W // 2
+    slices = [("z", z0), ("y", y0), ("x", x0)]
+
+    def _slice(arr, axis, idx):
+        if arr is None:
+            return None
+        if axis == "z":
+            return arr[idx]
+        if axis == "y":
+            return arr[:, idx, :]
+        return arr[:, :, idx]
+
+    def _finite_vmax(arr, fallback=1.0, percentile=99):
+        if arr is None:
+            return fallback
+        vals = arr[np.isfinite(arr)]
+        if vals.size == 0:
+            return fallback
+        value = float(np.percentile(np.abs(vals), percentile))
+        return value if np.isfinite(value) and value > 1e-8 else fallback
+
+    progress_error = None
+    if progress_pred is not None and progress_target is not None:
+        progress_error = np.abs(progress_pred - progress_target)
+        if domain is not None:
+            progress_error = np.where(domain > 0.0, progress_error, np.nan)
+    progress_pred_vmin = 0.0
+    progress_pred_vmax = 1.0
+    if progress_pred is not None:
+        vals = progress_pred[np.isfinite(progress_pred)]
+        if vals.size > 0:
+            progress_pred_vmin = min(0.0, float(np.percentile(vals, 1)))
+            progress_pred_vmax = max(1.0, float(np.percentile(vals, 99)))
+
+    cols = [
+        "Source/Target",
+        "Domain",
+        "Velocity Cos",
+        "Phi Target",
+        "Phi Pred",
+        "Phi |Err|",
+        "Stop Target",
+        "Stop Pred",
+        "Target EDT + Seeds",
+        "Attract |Err|",
+    ]
+    fig = plt.figure(figsize=(3.4 * len(cols), 11))
+    gs = GridSpec(3, len(cols) + 1, figure=fig, width_ratios=[1] * len(cols) + [1.25], wspace=0.28)
+    axes = np.empty((3, len(cols)), dtype=object)
+    for r in range(3):
+        for c in range(len(cols)):
+            axes[r, c] = fig.add_subplot(gs[r, c])
+    ax_text = fig.add_subplot(gs[:, len(cols)])
+    ax_text.axis("off")
+
+    edt_vmax = _finite_vmax(target_edt, fallback=8.0)
+    attract_vmax = _finite_vmax(attract_err, fallback=1.0)
+    phi_err_vmax = _finite_vmax(progress_error, fallback=0.25)
+
+    for row, (axis, idx) in enumerate(slices):
+        vol_slice = _slice(vol, axis, idx)
+        cond_slice = _slice(cond, axis, idx) > 0.5
+        target_slice = _slice(target_seg, axis, idx) > 0.5 if target_seg is not None else np.zeros_like(cond_slice)
+        overlay = np.stack([vol_slice, vol_slice, vol_slice], axis=-1)
+        overlay = (overlay - np.nanmin(overlay)) / max(float(np.nanmax(overlay) - np.nanmin(overlay)), 1e-6)
+        overlay[..., 1] = np.maximum(overlay[..., 1], cond_slice.astype(np.float32))
+        overlay[..., 0] = np.maximum(overlay[..., 0], target_slice.astype(np.float32))
+
+        panels = [
+            (overlay, None, None, None),
+            (_slice(domain, axis, idx), "gray", 0, 1),
+            (_slice(velocity_align, axis, idx), "coolwarm", -1, 1),
+            (_slice(progress_target, axis, idx), "viridis", 0, 1),
+            (_slice(progress_pred, axis, idx), "viridis", progress_pred_vmin, progress_pred_vmax),
+            (_slice(progress_error, axis, idx), "magma", 0, phi_err_vmax),
+            (_slice(stop_target, axis, idx), "viridis", 0, 1),
+            (_slice(stop_pred, axis, idx), "viridis", 0, 1),
+            (_slice(target_edt, axis, idx), "magma", 0, edt_vmax),
+            (_slice(attract_err, axis, idx), "magma", 0, attract_vmax),
+        ]
+        for col, (panel, cmap, vmin, vmax) in enumerate(panels):
+            ax = axes[row, col]
+            if panel is None:
+                panel = np.zeros_like(vol_slice)
+            ax.imshow(panel, cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_title(f"{cols[col]} ({axis}={idx})")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        if seeds is not None and seed_mask is not None:
+            active = seeds[seed_mask]
+            if active.size > 0:
+                if axis == "z":
+                    near = np.abs(active[:, 0] - idx) <= 1.5
+                    xy = active[near][:, [2, 1]]
+                elif axis == "y":
+                    near = np.abs(active[:, 1] - idx) <= 1.5
+                    xy = active[near][:, [2, 0]]
+                else:
+                    near = np.abs(active[:, 2] - idx) <= 1.5
+                    xy = active[near][:, [1, 0]]
+                if xy.size > 0:
+                    axes[row, 8].scatter(xy[:, 0], xy[:, 1], s=8, c="cyan", edgecolors="black", linewidths=0.2)
+
+    def _finite_mean(arr, mask=None):
+        if arr is None:
+            return 0.0
+        vals = arr[mask] if mask is not None and np.any(mask) else arr.reshape(-1)
+        vals = vals[np.isfinite(vals)]
+        return float(vals.mean()) if vals.size else 0.0
+
+    domain_mask = domain > 0.0 if domain is not None else None
+    side = np.nanmean(side_hint.reshape(3, -1), axis=1)
+    stats_lines = [
+        "=" * 40,
+        "COPY NEIGHBOR TRACE SUMMARY",
+        "=" * 40,
+        f"Input shape: {D}x{H}x{W}",
+        f"Conditioning voxels: {int((cond > 0.5).sum())}",
+        f"Target voxels: {int((target_seg > 0.5).sum()) if target_seg is not None else 0}",
+        f"Domain voxels: {int(domain_mask.sum()) if domain_mask is not None else 0}",
+        f"Side hint mean ZYX: {side[0]:.3f}, {side[1]:.3f}, {side[2]:.3f}",
+        "",
+        "--- Velocity ---",
+        f"Cosine mean: {_finite_mean(velocity_align, domain_mask):.4f}",
+        "",
+        "--- Progress ---",
+        f"Phi target mean: {_finite_mean(progress_target, domain_mask):.4f}",
+        f"Phi pred mean:   {_finite_mean(progress_pred, domain_mask):.4f}",
+        f"Phi abs err:     {_finite_mean(progress_error, domain_mask):.4f}",
+        "",
+        "--- Stop / Attract ---",
+        f"Stop target voxels: {int((stop_target > 0.5).sum()) if stop_target is not None else 0}",
+        f"Stop pred mean:     {_finite_mean(stop_pred, domain_mask):.4f}",
+        f"Attract err mean:   {_finite_mean(attract_err):.4f}",
+    ]
+    if vis_data.get("endpoint_step_count") is not None:
+        steps = _tensor_to_numpy(vis_data["endpoint_step_count"])
+        stats_lines.append(f"Endpoint steps:     {int(steps[b])}")
+    if seed_mask is not None:
+        stats_lines.append(f"Endpoint seeds:     {int(seed_mask.sum())}")
+    stats_lines.append("=" * 40)
+    ax_text.text(
+        0.04,
+        0.96,
+        "\n".join(stats_lines),
+        transform=ax_text.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, edgecolor="gray"),
+    )
+
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
 def make_dense_visualization(
     inputs,
     disp_pred,
@@ -725,6 +960,16 @@ def make_dense_visualization(
     heatmap_target=None,
     seg_pred=None,
     seg_target=None,
+    velocity_dir_pred=None,
+    velocity_dir_target=None,
+    velocity_loss_weight=None,
+    trace_loss_weight=None,
+    trace_validity_pred=None,
+    trace_validity_target=None,
+    trace_validity_weight=None,
+    surface_attract_pred=None,
+    surface_attract_target=None,
+    surface_attract_weight=None,
     save_path=None,
 ):
     """Create and save PNG visualization for dense displacement supervision."""
@@ -738,9 +983,15 @@ def make_dense_visualization(
     cond_3d = _tensor_to_numpy(inputs[b, 1])
     aux_3d = _tensor_to_numpy(inputs[b, 2]) if inputs.shape[1] > 2 else None
 
-    pred_3d = _tensor_to_numpy(disp_pred[b])
-    gt_3d = _tensor_to_numpy(dense_gt_displacement[b])
-    triplet_mode = pred_3d.shape[0] == 6 and gt_3d.shape[0] == 6
+    gt_3d = _tensor_to_numpy(dense_gt_displacement[b]) if dense_gt_displacement is not None else None
+    if disp_pred is None:
+        if gt_3d is not None:
+            raise ValueError("dense displacement visualization requires disp_pred when dense GT is provided")
+        pred_3d = np.zeros((3, D, H, W), dtype=np.float32)
+    else:
+        pred_3d = _tensor_to_numpy(disp_pred[b])
+    trace_only_mode = gt_3d is None
+    triplet_mode = gt_3d is not None and pred_3d.shape[0] == 6 and gt_3d.shape[0] == 6
     if triplet_mode:
         _make_dense_triplet_visualization(
             inputs=inputs,
@@ -774,9 +1025,14 @@ def make_dense_visualization(
         resid_mag_3d = 0.5 * (resid_back_mag_3d + resid_front_mag_3d)
     else:
         pred_mag_3d = np.linalg.norm(pred_3d, axis=0)
-        gt_mag_3d = np.linalg.norm(gt_3d, axis=0)
-        gt_surface_3d = (gt_mag_3d < 0.5).astype(np.float32)
-        resid_mag_3d = np.linalg.norm(pred_3d - gt_3d, axis=0)
+        if gt_3d is not None:
+            gt_mag_3d = np.linalg.norm(gt_3d, axis=0)
+            gt_surface_3d = (gt_mag_3d < 0.5).astype(np.float32)
+            resid_mag_3d = np.linalg.norm(pred_3d - gt_3d, axis=0)
+        else:
+            gt_mag_3d = np.zeros_like(pred_mag_3d)
+            gt_surface_3d = np.zeros_like(pred_mag_3d)
+            resid_mag_3d = np.zeros_like(pred_mag_3d)
 
     if dense_loss_weight is None:
         weight_3d = np.ones((D, H, W), dtype=np.float32)
@@ -797,6 +1053,18 @@ def make_dense_visualization(
         if den <= 1e-8:
             return float(arr.mean())
         return float((arr * wts).sum() / den)
+
+    def _finite_mean(arr, mask=None):
+        if arr is None:
+            return 0.0
+        if mask is not None:
+            if not np.any(mask):
+                return 0.0
+            vals = arr[mask]
+        else:
+            vals = arr.reshape(-1)
+        vals = vals[np.isfinite(vals)]
+        return float(vals.mean()) if vals.size > 0 else 0.0
 
     pred_for_scale = pred_mag_3d[supervised_mask] if np.any(supervised_mask) else pred_mag_3d.reshape(-1)
     gt_for_scale = gt_mag_3d[supervised_mask] if np.any(supervised_mask) else gt_mag_3d.reshape(-1)
@@ -824,12 +1092,85 @@ def make_dense_visualization(
     seg_pred_3d = _tensor_to_numpy(seg_pred[b].argmax(dim=0)) if seg_pred is not None else None
     seg_gt_3d = _tensor_to_numpy(seg_target[b, 0]) if seg_target is not None else None
 
-    use_aux = aux_3d is not None
+    has_trace = (
+        velocity_dir_pred is not None
+        or trace_validity_pred is not None
+        or surface_attract_pred is not None
+    )
+    trace_weight_3d = _tensor_to_numpy(trace_loss_weight[b, 0]) if trace_loss_weight is not None else None
+    velocity_weight_3d = _tensor_to_numpy(velocity_loss_weight[b, 0]) if velocity_loss_weight is not None else trace_weight_3d
+    attract_weight_3d = (
+        _tensor_to_numpy(surface_attract_weight[b, 0])
+        if surface_attract_weight is not None else None
+    )
+    trace_mask_3d = trace_weight_3d > 0.0 if trace_weight_3d is not None else None
+    velocity_mask_3d = velocity_weight_3d > 0.0 if velocity_weight_3d is not None else trace_mask_3d
+    attract_mask_3d = attract_weight_3d > 0.0 if attract_weight_3d is not None else None
+    vel_align_3d = None
+    if velocity_dir_pred is not None and velocity_dir_target is not None:
+        pred_vel = F.normalize(velocity_dir_pred[b:b + 1].float(), dim=1, eps=1e-6)
+        target_vel = F.normalize(velocity_dir_target[b:b + 1].float(), dim=1, eps=1e-6)
+        vel_align_3d = _tensor_to_numpy((pred_vel * target_vel).sum(dim=1)[0].clamp(-1.0, 1.0))
+        if velocity_mask_3d is not None:
+            vel_align_3d = np.where(velocity_mask_3d, vel_align_3d, np.nan)
+    trace_validity_pred_3d = (
+        _tensor_to_numpy(torch.sigmoid(trace_validity_pred[b, 0].float()))
+        if trace_validity_pred is not None else None
+    )
+    trace_validity_gt_3d = _tensor_to_numpy(trace_validity_target[b, 0]) if trace_validity_target is not None else None
+    trace_validity_weight_3d = (
+        _tensor_to_numpy(trace_validity_weight[b, 0])
+        if trace_validity_weight is not None else None
+    )
+    trace_validity_mask_3d = trace_validity_weight_3d > 0.0 if trace_validity_weight_3d is not None else None
+    attract_pred_mag_3d = (
+        np.linalg.norm(_tensor_to_numpy(surface_attract_pred[b]), axis=0)
+        if surface_attract_pred is not None else None
+    )
+    attract_pred_vec_3d = _tensor_to_numpy(surface_attract_pred[b]) if surface_attract_pred is not None else None
+    attract_gt_vec_3d = _tensor_to_numpy(surface_attract_target[b]) if surface_attract_target is not None else None
+    attract_gt_mag_3d = (
+        np.linalg.norm(attract_gt_vec_3d, axis=0)
+        if surface_attract_target is not None else None
+    )
+    attract_err_mag_3d = (
+        np.linalg.norm(attract_pred_vec_3d - attract_gt_vec_3d, axis=0)
+        if attract_pred_vec_3d is not None and attract_gt_vec_3d is not None else None
+    )
+    if attract_mask_3d is not None:
+        if attract_pred_mag_3d is not None:
+            attract_pred_mag_3d = np.where(attract_mask_3d, attract_pred_mag_3d, np.nan)
+        if attract_gt_mag_3d is not None:
+            attract_gt_mag_3d = np.where(attract_mask_3d, attract_gt_mag_3d, np.nan)
+        if attract_err_mag_3d is not None:
+            attract_err_mag_3d = np.where(attract_mask_3d, attract_err_mag_3d, np.nan)
+    attract_vmax = 1.0
+    if attract_pred_mag_3d is not None or attract_gt_mag_3d is not None:
+        attract_vals = [
+            arr[np.isfinite(arr)]
+            for arr in (attract_pred_mag_3d, attract_gt_mag_3d, attract_err_mag_3d)
+            if arr is not None
+        ]
+        attract_vals = [vals for vals in attract_vals if vals.size > 0]
+        attract_vmax = _safe_percentile(np.concatenate(attract_vals), 99, fallback=1.0) if attract_vals else 1.0
+
+    use_aux = aux_3d is not None and not trace_only_mode
     use_sdt = sdt_pred_3d is not None
     use_hm = hm_pred_3d is not None
-    n_cols = 6 + int(use_aux) + int(triplet_mode) * 3 + int(use_sdt) + int(use_hm) + int(has_seg)
+    n_trace_cols = 0
+    n_trace_cols += int(vel_align_3d is not None)
+    n_trace_cols += int(trace_validity_pred_3d is not None)
+    n_trace_cols += int(trace_validity_gt_3d is not None)
+    n_trace_cols += int(trace_validity_weight_3d is not None)
+    n_trace_cols += int(trace_mask_3d is not None)
+    n_trace_cols += int(attract_pred_mag_3d is not None)
+    n_trace_cols += int(attract_gt_mag_3d is not None)
+    n_trace_cols += int(attract_mask_3d is not None)
+    n_trace_cols += int(attract_err_mag_3d is not None)
+    base_cols = 2 if trace_only_mode else 6
+    n_cols = base_cols + int(use_aux) + int(triplet_mode) * 3 + int(use_sdt) + int(use_hm) + int(has_seg) + n_trace_cols
 
-    fig = plt.figure(figsize=(4 * n_cols + 4, 14))
+    fig = plt.figure(figsize=(3.6 * n_cols + 4, 14))
     gs = GridSpec(3, n_cols + 1, figure=fig, width_ratios=[1] * n_cols + [1.2], wspace=0.3)
     axes = np.empty((3, n_cols), dtype=object)
     for r in range(3):
@@ -904,25 +1245,26 @@ def make_dense_visualization(
             axes[row, col].set_yticks([])
             col += 1
 
-        axes[row, col].imshow(pred_slice, cmap="hot", vmin=0, vmax=disp_vmax, extent=extent)
-        axes[row, col].set_title("Pred Disp Mag")
-        axes[row, col].set_yticks([])
-        col += 1
+        if not trace_only_mode:
+            axes[row, col].imshow(pred_slice, cmap="hot", vmin=0, vmax=disp_vmax, extent=extent)
+            axes[row, col].set_title("Pred Disp Mag")
+            axes[row, col].set_yticks([])
+            col += 1
 
-        axes[row, col].imshow(gt_surface_slice, cmap="gray", vmin=0, vmax=1, extent=extent)
-        axes[row, col].set_title("GT Surface (full)")
-        axes[row, col].set_yticks([])
-        col += 1
+            axes[row, col].imshow(gt_surface_slice, cmap="gray", vmin=0, vmax=1, extent=extent)
+            axes[row, col].set_title("GT Surface (full)")
+            axes[row, col].set_yticks([])
+            col += 1
 
-        axes[row, col].imshow(gt_slice, cmap="hot", vmin=0, vmax=disp_vmax, extent=extent)
-        axes[row, col].set_title("GT Disp Mag")
-        axes[row, col].set_yticks([])
-        col += 1
+            axes[row, col].imshow(gt_slice, cmap="hot", vmin=0, vmax=disp_vmax, extent=extent)
+            axes[row, col].set_title("GT Disp Mag")
+            axes[row, col].set_yticks([])
+            col += 1
 
-        axes[row, col].imshow(resid_slice, cmap="hot", vmin=0, vmax=resid_vmax, extent=extent)
-        axes[row, col].set_title("|Pred-GT|")
-        axes[row, col].set_yticks([])
-        col += 1
+            axes[row, col].imshow(resid_slice, cmap="hot", vmin=0, vmax=resid_vmax, extent=extent)
+            axes[row, col].set_title("|Pred-GT|")
+            axes[row, col].set_yticks([])
+            col += 1
 
         if use_sdt:
             sdt_pred_slice = _slice(sdt_pred_3d, axis, idx)
@@ -946,6 +1288,60 @@ def make_dense_visualization(
             overlay[..., 1] = seg_gt_slice.astype(np.float32)
             axes[row, col].imshow(overlay, extent=extent)
             axes[row, col].set_title("Seg Pred(R) GT(G)")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if vel_align_3d is not None:
+            axes[row, col].imshow(_slice(vel_align_3d, axis, idx), cmap="coolwarm", vmin=-1, vmax=1, extent=extent)
+            axes[row, col].set_title("Vel Cos(Pred,GT)")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if trace_validity_pred_3d is not None:
+            axes[row, col].imshow(_slice(trace_validity_pred_3d, axis, idx), cmap="viridis", vmin=0, vmax=1, extent=extent)
+            axes[row, col].set_title("Validity Pred")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if trace_validity_gt_3d is not None:
+            axes[row, col].imshow(_slice(trace_validity_gt_3d, axis, idx), cmap="viridis", vmin=0, vmax=1, extent=extent)
+            axes[row, col].set_title("Validity GT")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if trace_validity_weight_3d is not None:
+            axes[row, col].imshow(_slice(trace_validity_weight_3d, axis, idx), cmap="gray", vmin=0, vmax=1, extent=extent)
+            axes[row, col].set_title("Validity Weight")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if trace_mask_3d is not None:
+            axes[row, col].imshow(_slice(trace_mask_3d.astype(np.float32), axis, idx), cmap="gray", vmin=0, vmax=1, extent=extent)
+            axes[row, col].set_title("Trace Sup Mask")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if attract_pred_mag_3d is not None:
+            axes[row, col].imshow(_slice(attract_pred_mag_3d, axis, idx), cmap="hot", vmin=0, vmax=attract_vmax, extent=extent)
+            axes[row, col].set_title("Attract Pred Mag")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if attract_gt_mag_3d is not None:
+            axes[row, col].imshow(_slice(attract_gt_mag_3d, axis, idx), cmap="hot", vmin=0, vmax=attract_vmax, extent=extent)
+            axes[row, col].set_title("Attract GT Mag")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if attract_mask_3d is not None:
+            axes[row, col].imshow(_slice(attract_mask_3d.astype(np.float32), axis, idx), cmap="gray", vmin=0, vmax=1, extent=extent)
+            axes[row, col].set_title("Attract Band")
+            axes[row, col].set_yticks([])
+            col += 1
+
+        if attract_err_mag_3d is not None:
+            axes[row, col].imshow(_slice(attract_err_mag_3d, axis, idx), cmap="hot", vmin=0, vmax=attract_vmax, extent=extent)
+            axes[row, col].set_title("Attract |Pred-GT|")
             axes[row, col].set_yticks([])
 
         for c in range(n_cols):
@@ -972,28 +1368,85 @@ def make_dense_visualization(
         n_imp = 0
 
     w = weight_3d
-    stats_lines = [
-        "=" * 40,
-        "DENSE DISPLACEMENT STATS",
-        "=" * 40,
-        f"Triplet mode: {'yes' if triplet_mode else 'no'}",
-        f"Supervised voxels: {int(supervised_mask.sum())}",
-        f"Total voxels:      {int(weight_3d.size)}",
-        "",
-        "--- Weighted means ---",
-        f"Pred |disp|: {_weighted_mean(pred_mag_3d, w):.4f}",
-        f"GT   |disp|: {_weighted_mean(gt_mag_3d, w):.4f}",
-        f"Resid|disp|: {_weighted_mean(resid_mag_3d, w):.4f}",
-        "",
-        "--- Improvement ---",
-        f"Median % improvement: {improvement:.1f}%",
-        f"  gt_mag > {gt_floor:.2f}, clipped to +/-{improvement_clip:.0f}% (n={n_imp})",
-        "",
-        "--- Conditioning voxels ---",
-        f"N cond voxels: {int(cond_mask.sum())}",
-        f"Pred |disp| @ cond mean: {float(cond_pred.mean()) if cond_pred.size > 0 else 0.0:.4f}",
-        f"GT   |disp| @ cond mean: {float(cond_gt.mean()) if cond_gt.size > 0 else 0.0:.4f}",
-    ]
+    if trace_only_mode:
+        stats_lines = [
+            "=" * 40,
+            "TRACE FIELD SUMMARY",
+            "=" * 40,
+            f"Input shape: {D}x{H}x{W}",
+            f"Conditioning voxels: {int(cond_mask.sum())}",
+            "",
+            "--- Velocity ---",
+            f"Supervised voxels: {int(velocity_mask_3d.sum()) if velocity_mask_3d is not None else 0}",
+            f"Cosine mean:       {_finite_mean(vel_align_3d, velocity_mask_3d):.4f}",
+        ]
+        if vel_align_3d is not None and velocity_mask_3d is not None and np.any(velocity_mask_3d):
+            vals = vel_align_3d[velocity_mask_3d]
+            vals = vals[np.isfinite(vals)]
+            if vals.size > 0:
+                stats_lines.extend([
+                    f"Cosine p10/p50:    {np.percentile(vals, 10):.4f} / {np.percentile(vals, 50):.4f}",
+                    f"Cosine below 0.5:  {100.0 * np.mean(vals < 0.5):.1f}%",
+                ])
+        stats_lines.extend([
+            "",
+            "--- Validity ---",
+            f"Weighted voxels:   {int(trace_validity_mask_3d.sum()) if trace_validity_mask_3d is not None else 0}",
+        ])
+        if trace_validity_gt_3d is not None and trace_validity_mask_3d is not None:
+            valid_pos = trace_validity_mask_3d & (trace_validity_gt_3d > 0.5)
+            valid_neg = trace_validity_mask_3d & (trace_validity_gt_3d <= 0.5)
+            stats_lines.extend([
+                f"Positive voxels:   {int(valid_pos.sum())}",
+                f"Negative voxels:   {int(valid_neg.sum())}",
+                f"Pred on positives: {_finite_mean(trace_validity_pred_3d, valid_pos):.4f}",
+                f"Pred on negatives: {_finite_mean(trace_validity_pred_3d, valid_neg):.4f}",
+            ])
+        stats_lines.extend([
+            "",
+            "--- Surface attraction ---",
+            f"Band voxels:       {int(attract_mask_3d.sum()) if attract_mask_3d is not None else 0}",
+            f"Pred magnitude:    {_finite_mean(attract_pred_mag_3d, attract_mask_3d):.4f}",
+            f"GT magnitude:      {_finite_mean(attract_gt_mag_3d, attract_mask_3d):.4f}",
+            f"Error magnitude:   {_finite_mean(attract_err_mag_3d, attract_mask_3d):.4f}",
+        ])
+    else:
+        stats_lines = [
+            "=" * 40,
+            "DENSE DISPLACEMENT STATS",
+            "=" * 40,
+            f"Triplet mode: {'yes' if triplet_mode else 'no'}",
+            f"Supervised voxels: {int(supervised_mask.sum())}",
+            f"Total voxels:      {int(weight_3d.size)}",
+            "",
+            "--- Weighted means ---",
+            f"Pred |disp|: {_weighted_mean(pred_mag_3d, w):.4f}",
+            f"GT   |disp|: {_weighted_mean(gt_mag_3d, w):.4f}",
+            f"Resid|disp|: {_weighted_mean(resid_mag_3d, w):.4f}",
+            "",
+            "--- Improvement ---",
+            f"Median % improvement: {improvement:.1f}%",
+            f"  gt_mag > {gt_floor:.2f}, clipped to +/-{improvement_clip:.0f}% (n={n_imp})",
+            "",
+            "--- Conditioning voxels ---",
+            f"N cond voxels: {int(cond_mask.sum())}",
+            f"Pred |disp| @ cond mean: {float(cond_pred.mean()) if cond_pred.size > 0 else 0.0:.4f}",
+            f"GT   |disp| @ cond mean: {float(cond_gt.mean()) if cond_gt.size > 0 else 0.0:.4f}",
+        ]
+    if has_trace and not trace_only_mode:
+        stats_lines.extend([
+            "",
+            "--- Trace heads ---",
+            f"Velocity supervised voxels: {int(velocity_mask_3d.sum()) if velocity_mask_3d is not None else 0}",
+            f"Trace supervised voxels:    {int(trace_mask_3d.sum()) if trace_mask_3d is not None else 0}",
+            f"Validity weighted voxels:   {int(trace_validity_mask_3d.sum()) if trace_validity_mask_3d is not None else 0}",
+            f"Attract band voxels:        {int(attract_mask_3d.sum()) if attract_mask_3d is not None else 0}",
+            f"Velocity cosine mean: {_finite_mean(vel_align_3d, velocity_mask_3d):.4f}",
+            f"Validity pred mean:   {_finite_mean(trace_validity_pred_3d, trace_validity_mask_3d):.4f}",
+            f"Attract pred mean:    {_finite_mean(attract_pred_mag_3d, attract_mask_3d):.4f}",
+            f"Attract GT mean:      {_finite_mean(attract_gt_mag_3d, attract_mask_3d):.4f}",
+            f"Attract error mean:   {_finite_mean(attract_err_mag_3d, attract_mask_3d):.4f}",
+        ])
     if triplet_mode:
         stats_lines.extend([
             "",

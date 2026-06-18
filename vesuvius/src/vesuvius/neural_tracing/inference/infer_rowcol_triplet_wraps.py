@@ -3,13 +3,15 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
 from scipy import ndimage
 import torch
-import zarr
+import torch.nn.functional as F
 from tqdm import tqdm
+import vc
 
 try:
     import trimesh
@@ -21,14 +23,9 @@ try:
 except Exception:  # pragma: no cover - optional dependency at runtime
     njit = None
 
-from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid_masked
-from vesuvius.image_proc.intensity.normalization import normalize_zscore
-from vesuvius.neural_tracing.inference.common import (
-    _bbox_to_min_corner_and_bounds_array,
-    _crop_volume_from_min_corner,
-    _resolve_segment_volume,
-    _scale_to_subsample_stride,
-    resolve_tifxyz_params,
+from vesuvius.neural_tracing.datasets.common import (
+    _read_volume_crop,
+    voxelize_surface_grid_masked,
 )
 from vesuvius.neural_tracing.inference.displacement_tta import (
     TTA_MERGE_METHODS,
@@ -39,13 +36,8 @@ from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
     _generate_segment_cover_records,
     _serialize_bbox_record,
 )
-from vesuvius.neural_tracing.inference.infer_global_extrap import (
-    _sample_trilinear_displacement_stack,
-    _surface_to_stored_uv_samples_lattice,
-)
 from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz
 from vesuvius.tifxyz import read_tifxyz
-from vesuvius.tifxyz.upsampling import interpolate_at_points
 
 _TTA_TRANSFORM_ALIASES = {
     "mirror+rot90": "rotate3",
@@ -58,12 +50,6 @@ _COPY_ARG_ALIASES = {
     "dense_checkpoint_path": "checkpoint_path",
     "volume_zarr": "volume_path",
     "tifxyz_out_dir": "out_dir",
-    "_DENSE_PROJECTION_NEIGHBORHOOD_RADIUS": "dp_radius",
-    "_DENSE_PROJECTION_REJECT_OUTLIER_FRACTION": "dp_reject_frac",
-    "_DENSE_PROJECTION_REJECT_MIN_KEEP": "dp_reject_min_keep",
-    "dense_projection_neighborhood_radius": "dp_radius",
-    "dense_projection_reject_outlier_fraction": "dp_reject_frac",
-    "dense_projection_reject_min_keep": "dp_reject_min_keep",
 }
 _COPY_ARG_TO_CLI = {
     "tifxyz_path": "--tifxyz-path",
@@ -71,6 +57,10 @@ _COPY_ARG_TO_CLI = {
     "checkpoint_path": "--checkpoint-path",
     "device": "--device",
     "volume_scale": "--volume-scale",
+    "volume_cache_dir": "--volume-cache-dir",
+    "volume_cache_retry_seconds": "--volume-cache-retry-seconds",
+    "volume_chunk_cache_gb": "--volume-chunk-cache-gb",
+    "compile_mode": "--compile-mode",
     "crop_size": "--crop-size",
     "batch_size": "--batch-size",
     "crop_input_workers": "--crop-input-workers",
@@ -82,20 +72,655 @@ _COPY_ARG_TO_CLI = {
     "tta_outlier_drop_thresh": "--tta-outlier-drop-thresh",
     "tta_outlier_drop_min_keep": "--tta-outlier-drop-min-keep",
     "tta_batch_size": "--tta-batch-size",
+    "disp_sample_radius": "--disp-sample-radius",
+    "disp_sample_spacing": "--disp-sample-spacing",
+    "disp_sample_min_count": "--disp-sample-min-count",
+    "disp_sample_reduce": "--disp-sample-reduce",
+    "merge_temp_dir": "--merge-temp-dir",
     "out_dir": "--out-dir",
     "output_prefix": "--output-prefix",
     "iterations": "--iterations",
     "iter_direction": "--iter-direction",
     "tifxyz_step_size": "--tifxyz-step-size",
     "tifxyz_voxel_size_um": "--tifxyz-voxel-size-um",
-    "dp_radius": "--dp-radius",
-    "dp_reject_frac": "--dp-reject-frac",
-    "dp_reject_min_keep": "--dp-reject-min-keep",
 }
-_DENSE_PROJECTION_INTERP_METHOD = "catmull_rom"
-_DENSE_PROJECTION_NEIGHBORHOOD_RADIUS = 5
-_DENSE_PROJECTION_REJECT_OUTLIER_FRACTION = 0.25
-_DENSE_PROJECTION_REJECT_MIN_KEEP = 4
+_DEFAULT_VOLUME_CHUNK_CACHE_GB = 20.0
+
+
+class _VcVolumeLevel:
+    """Small array adapter over vc.Volume for the crop reader used here."""
+
+    def __init__(self, volume, level):
+        self._volume = volume
+        self._level = int(level)
+        self.shape = tuple(int(v) for v in volume.shape_at(self._level))
+        self.dtype = np.dtype(volume.dtype)
+        self.chunks = tuple(int(v) for v in volume.chunk_shape(self._level))
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple) or len(key) != 3:
+            raise TypeError(f"vc volume reads require 3 ZYX slices, got {key!r}")
+        starts = []
+        stops = []
+        for axis, item in enumerate(key):
+            if not isinstance(item, slice):
+                raise TypeError(f"vc volume reads require slices, got axis {axis}: {item!r}")
+            step = 1 if item.step is None else int(item.step)
+            if step != 1:
+                raise ValueError(f"vc volume reads only support unit-step slices, got axis {axis} step={step}")
+            start = 0 if item.start is None else int(item.start)
+            stop = self.shape[axis] if item.stop is None else int(item.stop)
+            starts.append(start)
+            stops.append(stop)
+        read_shape = [stop - start for start, stop in zip(starts, stops)]
+        if any(v < 0 for v in read_shape):
+            raise ValueError(f"Invalid vc volume slice {key!r} for shape {self.shape}")
+        if any(v == 0 for v in read_shape):
+            return np.empty(tuple(read_shape), dtype=self.dtype)
+        return np.asarray(
+            self._volume.read_zyx(starts, read_shape, level=self._level, missing_policy="all_fill")
+        )
+
+
+def _open_vc_volume_level(volume_path, volume_scale, cache_dir, chunk_cache_gb):
+    path = str(volume_path)
+    cache_bytes = int(round(float(chunk_cache_gb) * (1024 ** 3)))
+
+    def _set_cache_budget(volume):
+        volume.set_cache_budget(cache_bytes)
+        return volume
+
+    target_level = int(volume_scale)
+    if path.startswith(("http://", "https://", "s3://")):
+        volume = _set_cache_budget(vc.Volume.open_url(path, cache_root=str(cache_dir)))
+    else:
+        try:
+            volume = _set_cache_budget(vc.Volume.open(path))
+        except RuntimeError as exc:
+            scale_path = Path(path) / str(target_level)
+            if not scale_path.exists():
+                raise
+            try:
+                volume = _set_cache_budget(vc.Volume.open(str(scale_path)))
+            except RuntimeError:
+                raise exc
+            return _VcVolumeLevel(volume, 0), target_level
+
+    if volume.has_scale_level(target_level):
+        level = target_level
+    else:
+        present_levels = [int(v) for v in volume.present_scale_levels()]
+        if not present_levels:
+            raise RuntimeError(f"vc volume {path!r} does not report any scale levels")
+        level = min(present_levels, key=lambda v: abs(v - target_level))
+
+    return _VcVolumeLevel(volume, level), level
+
+
+def _empty_uv(dtype=np.int64):
+    return np.zeros((0, 2), dtype=dtype)
+
+
+def _empty_world(dtype=np.float32):
+    return np.zeros((0, 3), dtype=dtype)
+
+
+def _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32):
+    return _empty_uv(dtype=uv_dtype), _empty_world(dtype=world_dtype)
+
+
+def _normalize_scale_rc(scale_rc, source_label):
+    if scale_rc is None:
+        return None
+    if not isinstance(scale_rc, (list, tuple)) or len(scale_rc) != 2:
+        raise RuntimeError(f"Expected {source_label} scale as [scale_y, scale_x], got {scale_rc!r}")
+    scale_y = float(scale_rc[0])
+    scale_x = float(scale_rc[1])
+    if (not np.isfinite(scale_y)) or (not np.isfinite(scale_x)) or scale_y <= 0.0 or scale_x <= 0.0:
+        raise RuntimeError(f"Invalid {source_label} scale: {scale_rc!r}")
+    return (scale_y, scale_x)
+
+
+def _read_tifxyz_scale_from_meta(tifxyz_path):
+    if tifxyz_path is None:
+        return None
+    meta_path = Path(tifxyz_path) / "meta.json"
+    if not meta_path.exists():
+        raise RuntimeError(
+            f"Unable to resolve stored tifxyz density scale: missing meta.json at {meta_path}"
+        )
+    with open(meta_path, "rt") as meta_fp:
+        meta = json.load(meta_fp)
+    return _normalize_scale_rc(meta.get("scale"), source_label=str(meta_path))
+
+
+def _scale_to_subsample_stride(scale):
+    scale = float(scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"Invalid tifxyz scale: {scale}")
+    return max(1, int(round(1.0 / scale)))
+
+
+def resolve_tifxyz_params(args, model_config, volume_scale, input_scale=None):
+    tifxyz_step_size = args.tifxyz_step_size
+    tifxyz_voxel_size_um = args.tifxyz_voxel_size_um
+    stored_scale_rc = _read_tifxyz_scale_from_meta(getattr(args, "tifxyz_path", None))
+    if stored_scale_rc is None and input_scale is not None:
+        stored_scale_rc = _normalize_scale_rc(input_scale, source_label="input_scale")
+
+    stored_step_size = None
+    if stored_scale_rc is not None:
+        step_y = _scale_to_subsample_stride(stored_scale_rc[0])
+        step_x = _scale_to_subsample_stride(stored_scale_rc[1])
+        if step_y != step_x:
+            raise RuntimeError(
+                "infer_rowcol_triplet_wraps requires isotropic stored tifxyz scale for output, "
+                f"but got stored scale={stored_scale_rc!r} -> steps ({step_y}, {step_x})."
+            )
+        stored_step_size = int(step_y)
+
+    if tifxyz_step_size is None:
+        if stored_step_size is not None:
+            tifxyz_step_size = stored_step_size
+        elif model_config is not None:
+            tifxyz_step_size = model_config.get(
+                "step_size",
+                model_config.get("heatmap_step_size", 10),
+            )
+        else:
+            tifxyz_step_size = 10
+
+    if tifxyz_voxel_size_um is None:
+        meta_path = os.path.join(args.volume_path, "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "rt") as meta_fp:
+                tifxyz_voxel_size_um = json.load(meta_fp).get("voxelsize", None)
+    if tifxyz_voxel_size_um is None:
+        tifxyz_voxel_size_um = 8.24
+
+    tifxyz_step_size = int(round(float(tifxyz_step_size)))
+    if stored_step_size is not None and tifxyz_step_size != stored_step_size:
+        raise RuntimeError(
+            "--tifxyz-step-size cannot override the stored input tifxyz scale for infer_rowcol_triplet_wraps. "
+            f"Expected step_size={stored_step_size} for scale={stored_scale_rc}, got {tifxyz_step_size}."
+        )
+
+    return tifxyz_step_size, tifxyz_voxel_size_um, stored_scale_rc
+
+
+def _resolve_segment_volume(segment, volume_scale=None):
+    volume = segment.volume
+    if hasattr(volume, "read_zyx") and hasattr(volume, "shape_at"):
+        target_level = 0 if volume_scale is None else int(volume_scale)
+        return _VcVolumeLevel(volume, target_level)
+    if hasattr(volume, "keys") and not hasattr(volume, "shape"):
+        target_level = None
+        if volume_scale is not None:
+            target_level = int(volume_scale)
+        else:
+            extra = getattr(segment, "extra", None)
+            if isinstance(extra, dict):
+                for key in ("volume_scale", "vol_scale", "zarr_level", "volume_level", "level"):
+                    if key in extra:
+                        try:
+                            target_level = int(extra[key])
+                            break
+                        except (TypeError, ValueError):
+                            continue
+        if target_level is None:
+            target_level = 0
+        level_key = str(target_level)
+        if level_key in volume:
+            return volume[level_key]
+        numeric_levels = sorted([k for k in volume.keys() if k.isdigit()], key=int)
+        if numeric_levels:
+            level_ints = [int(k) for k in numeric_levels]
+            nearest = min(level_ints, key=lambda v: abs(v - target_level))
+            return volume[str(nearest)]
+    return volume
+
+
+def _bbox_to_min_corner_and_bounds_array(bbox):
+    z_min, z_max, y_min, y_max, x_min, x_max = bbox
+    min_corner = np.floor([z_min, y_min, x_min]).astype(np.int64)
+    bounds_array = np.asarray(
+        [
+            [z_min, y_min, x_min],
+            [z_max, y_max, x_max],
+        ],
+        dtype=np.int32,
+    )
+    return min_corner, bounds_array
+
+
+def _as_displacement_tensor(disp):
+    if torch.is_tensor(disp):
+        disp_t = disp.detach()
+        if disp_t.ndim == 4:
+            disp_t = disp_t.unsqueeze(0)
+        if disp_t.ndim != 5 or disp_t.shape[0] != 1 or disp_t.shape[1] < 3:
+            raise RuntimeError(f"Expected displacement tensor with shape [1, 3+, D, H, W], got {tuple(disp_t.shape)}")
+        return disp_t[:, :3].to(dtype=torch.float32, device="cpu").contiguous()
+
+    disp_np = np.asarray(disp, dtype=np.float32)
+    if disp_np.ndim != 4 or disp_np.shape[0] < 3:
+        raise RuntimeError(f"Expected displacement array with shape [3+, D, H, W], got {tuple(disp_np.shape)}")
+    return torch.from_numpy(disp_np[:3]).unsqueeze(0).contiguous()
+
+
+def _coords_local_to_grid(coords_t, d, h, w):
+    d_denom = max(int(d) - 1, 1)
+    h_denom = max(int(h) - 1, 1)
+    w_denom = max(int(w) - 1, 1)
+    coords_norm = coords_t.clone()
+    coords_norm[:, 0] = 2.0 * coords_norm[:, 0] / float(d_denom) - 1.0
+    coords_norm[:, 1] = 2.0 * coords_norm[:, 1] / float(h_denom) - 1.0
+    coords_norm[:, 2] = 2.0 * coords_norm[:, 2] / float(w_denom) - 1.0
+    return coords_norm[:, [2, 1, 0]].view(1, -1, 1, 1, 3)
+
+
+def _displacement_sample_offsets_rc(radius, spacing):
+    radius = float(radius)
+    spacing = float(spacing)
+    if radius <= 0.0:
+        return torch.zeros((1, 2), dtype=torch.float32)
+    if spacing <= 0.0:
+        raise ValueError(f"disp_sample_spacing must be > 0, got {spacing}")
+
+    axis = np.arange(-radius, radius + (0.5 * spacing), spacing, dtype=np.float32)
+    rr, cc = np.meshgrid(axis, axis, indexing="ij")
+    offsets = np.stack([rr, cc], axis=-1).reshape(-1, 2)
+    center = np.zeros((1, 2), dtype=np.float32)
+    non_center = np.linalg.norm(offsets, axis=1) > 1e-6
+    offsets = np.concatenate([center, offsets[non_center]], axis=0)
+    return torch.from_numpy(offsets.astype(np.float32, copy=False))
+
+
+def _reduce_sampled_displacements(sampled_t, valid_t, reduce, min_count):
+    reduce = str(reduce).lower()
+    min_count = max(1, int(min_count))
+    n_points = int(sampled_t.shape[0])
+    out_t = torch.zeros((n_points, 3), dtype=sampled_t.dtype, device=sampled_t.device)
+    counts_t = valid_t.sum(dim=1)
+    enough_t = counts_t >= int(min_count)
+    if not bool(enough_t.any()):
+        return out_t, enough_t
+
+    if reduce == "mean":
+        weighted_t = sampled_t * valid_t.unsqueeze(-1).to(dtype=sampled_t.dtype)
+        denom_t = counts_t.clamp(min=1).to(dtype=sampled_t.dtype).unsqueeze(-1)
+        out_t[enough_t] = weighted_t.sum(dim=1)[enough_t] / denom_t[enough_t]
+        return out_t, enough_t
+
+    if reduce == "median":
+        enough_idx = torch.nonzero(enough_t, as_tuple=False).flatten()
+        for idx_t in enough_idx:
+            idx = int(idx_t.item())
+            vals_t = sampled_t[idx, valid_t[idx]]
+            out_t[idx] = torch.median(vals_t, dim=0).values
+        return out_t, enough_t
+
+    raise ValueError(f"Unknown displacement sample reducer: {reduce!r}")
+
+
+def _coords_local_tensor(coords_local):
+    if coords_local is None:
+        return None
+    if torch.is_tensor(coords_local):
+        return coords_local.to(dtype=torch.float32, device="cpu")
+    coords_np = np.asarray(coords_local, dtype=np.float32)
+    if coords_np.ndim != 2 or coords_np.shape[1] != 3:
+        return None
+    return torch.from_numpy(coords_np)
+
+
+def _sample_displacement_at_local_coords_tensor(disp_t, coords_t):
+    if coords_t is None or coords_t.ndim != 2 or coords_t.shape[1] != 3 or coords_t.shape[0] == 0:
+        return (
+            torch.zeros((0, 3), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.bool),
+        )
+
+    _, _, d, h, w = disp_t.shape
+    valid_mask_t = (
+        (coords_t[:, 0] >= 0.0) & (coords_t[:, 0] <= float(d - 1)) &
+        (coords_t[:, 1] >= 0.0) & (coords_t[:, 1] <= float(h - 1)) &
+        (coords_t[:, 2] >= 0.0) & (coords_t[:, 2] <= float(w - 1))
+    )
+
+    sampled_disp_t = torch.zeros((coords_t.shape[0], 3), dtype=disp_t.dtype, device=disp_t.device)
+    if bool(valid_mask_t.any()):
+        valid_coords_t = coords_t[valid_mask_t]
+        grid = _coords_local_to_grid(valid_coords_t, d=d, h=h, w=w)
+        sampled_valid_t = F.grid_sample(
+            disp_t,
+            grid,
+            mode="bilinear",
+            align_corners=True,
+        ).view(3, -1).permute(1, 0)
+        sampled_disp_t[valid_mask_t] = sampled_valid_t
+    return sampled_disp_t, valid_mask_t
+
+
+def _sample_local_surface_coords_from_uv_tensor(uv_rc, local_zyx, query_uv_t):
+    uv_arr = np.asarray(uv_rc, dtype=np.int64)
+    local_arr = np.asarray(local_zyx, dtype=np.float32)
+    if (
+        uv_arr.ndim != 2 or uv_arr.shape[1] != 2 or
+        local_arr.ndim != 2 or local_arr.shape[1] != 3 or
+        uv_arr.shape[0] == 0 or uv_arr.shape[0] != local_arr.shape[0]
+    ):
+        return (
+            torch.zeros((0, 3), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.bool),
+        )
+
+    finite = np.isfinite(local_arr).all(axis=1)
+    if not bool(finite.any()):
+        return (
+            torch.zeros((query_uv_t.shape[0], 3), dtype=torch.float32),
+            torch.zeros((query_uv_t.shape[0],), dtype=torch.bool),
+        )
+    uv_arr = uv_arr[finite]
+    local_arr = local_arr[finite]
+
+    r_min = int(uv_arr[:, 0].min())
+    c_min = int(uv_arr[:, 1].min())
+    r_max = int(uv_arr[:, 0].max())
+    c_max = int(uv_arr[:, 1].max())
+    h = int(r_max - r_min + 1)
+    w = int(c_max - c_min + 1)
+    if h <= 0 or w <= 0:
+        return (
+            torch.zeros((query_uv_t.shape[0], 3), dtype=torch.float32),
+            torch.zeros((query_uv_t.shape[0],), dtype=torch.bool),
+        )
+
+    grid_np = np.zeros((h, w, 3), dtype=np.float32)
+    mask_np = np.zeros((h, w), dtype=np.float32)
+    rr = (uv_arr[:, 0] - r_min).astype(np.int64, copy=False)
+    cc = (uv_arr[:, 1] - c_min).astype(np.int64, copy=False)
+    grid_np[rr, cc] = local_arr
+    mask_np[rr, cc] = 1.0
+
+    value_t = torch.from_numpy(grid_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
+    mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).contiguous()
+    q_t = query_uv_t.to(dtype=torch.float32, device="cpu")
+    q_r = q_t[:, 0] - float(r_min)
+    q_c = q_t[:, 1] - float(c_min)
+    y_norm = (2.0 * q_r / float(max(h - 1, 1))) - 1.0
+    x_norm = (2.0 * q_c / float(max(w - 1, 1))) - 1.0
+    query_grid_t = torch.stack([x_norm, y_norm], dim=1).view(1, -1, 1, 2)
+    with torch.no_grad():
+        sampled_num_t = F.grid_sample(
+            value_t,
+            query_grid_t,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        sampled_den_t = F.grid_sample(
+            mask_t,
+            query_grid_t,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+    sampled_num_t = sampled_num_t.view(3, -1).permute(1, 0).contiguous()
+    sampled_den_t = sampled_den_t.view(-1)
+    can_sample_t = sampled_den_t > 1e-6
+    sampled_coords_t = torch.zeros_like(sampled_num_t)
+    if bool(can_sample_t.any()):
+        sampled_coords_t[can_sample_t] = sampled_num_t[can_sample_t] / sampled_den_t[can_sample_t, None]
+    return sampled_coords_t, can_sample_t
+
+
+def _sample_trilinear_displacement_stack_tensor(
+    disp_t,
+    coords_local,
+    uv_rc=None,
+    sample_radius=0.0,
+    sample_spacing=1.0,
+    sample_min_count=1,
+    sample_reduce="mean",
+):
+    coords_t = _coords_local_tensor(coords_local)
+    if coords_t is None or coords_t.ndim != 2 or coords_t.shape[1] != 3 or coords_t.shape[0] == 0:
+        return (
+            torch.zeros((0, 3), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.bool),
+        )
+
+    if float(sample_radius) <= 0.0:
+        return _sample_displacement_at_local_coords_tensor(disp_t, coords_t)
+
+    if uv_rc is None:
+        offsets_t = _displacement_sample_offsets_rc(
+            radius=float(sample_radius),
+            spacing=float(sample_spacing),
+        ).to(dtype=torch.float32, device="cpu")
+        query_coords_t = coords_t[:, None, :].repeat(1, offsets_t.shape[0], 1)
+        query_coords_t[:, :, 1] += offsets_t[None, :, 0]
+        query_coords_t[:, :, 2] += offsets_t[None, :, 1]
+        sampled_flat_t, valid_flat_t = _sample_displacement_at_local_coords_tensor(
+            disp_t,
+            query_coords_t.reshape(-1, 3),
+        )
+        sampled_stack_t = sampled_flat_t.view(coords_t.shape[0], offsets_t.shape[0], 3)
+        valid_stack_t = valid_flat_t.view(coords_t.shape[0], offsets_t.shape[0])
+        return _reduce_sampled_displacements(
+            sampled_stack_t,
+            valid_stack_t,
+            reduce=sample_reduce,
+            min_count=int(sample_min_count),
+        )
+
+    uv_t = torch.from_numpy(np.asarray(uv_rc, dtype=np.float32))
+    if uv_t.ndim != 2 or uv_t.shape[1] != 2 or uv_t.shape[0] != coords_t.shape[0]:
+        return _sample_displacement_at_local_coords_tensor(disp_t, coords_t)
+
+    offsets_t = _displacement_sample_offsets_rc(
+        radius=float(sample_radius),
+        spacing=float(sample_spacing),
+    ).to(dtype=torch.float32, device="cpu")
+    query_uv_t = (uv_t[:, None, :] + offsets_t[None, :, :]).reshape(-1, 2)
+    sample_coords_t, surface_valid_t = _sample_local_surface_coords_from_uv_tensor(
+        uv_rc=uv_rc,
+        local_zyx=coords_local,
+        query_uv_t=query_uv_t,
+    )
+    sampled_flat_t, disp_valid_t = _sample_displacement_at_local_coords_tensor(disp_t, sample_coords_t)
+    valid_flat_t = surface_valid_t & disp_valid_t
+
+    sampled_stack_t = sampled_flat_t.view(coords_t.shape[0], offsets_t.shape[0], 3)
+    valid_stack_t = valid_flat_t.view(coords_t.shape[0], offsets_t.shape[0])
+    sampled_disp_t, valid_mask_t = _reduce_sampled_displacements(
+        sampled_stack_t,
+        valid_stack_t,
+        reduce=sample_reduce,
+        min_count=int(sample_min_count),
+    )
+    return sampled_disp_t, valid_mask_t
+
+
+def _sample_trilinear_displacement_stack(
+    disp,
+    coords_local,
+    uv_rc=None,
+    sample_radius=0.0,
+    sample_spacing=1.0,
+    sample_min_count=1,
+    sample_reduce="mean",
+):
+    if coords_local is None or len(coords_local) == 0:
+        return (
+            _empty_world(dtype=np.float32),
+            np.zeros((0,), dtype=bool),
+        )
+
+    disp_t = _as_displacement_tensor(disp)
+    sampled_disp_t, valid_mask_t = _sample_trilinear_displacement_stack_tensor(
+        disp_t,
+        coords_local,
+        uv_rc=uv_rc,
+        sample_radius=sample_radius,
+        sample_spacing=sample_spacing,
+        sample_min_count=sample_min_count,
+        sample_reduce=sample_reduce,
+    )
+    return (
+        sampled_disp_t.numpy().astype(np.float32, copy=False),
+        valid_mask_t.numpy().astype(bool, copy=False),
+    )
+
+
+def _surface_to_stored_uv_samples_lattice(
+    grid,
+    valid,
+    uv_offset,
+    sub_r,
+    sub_c,
+    phase_rc=(0, 0),
+):
+    grid = np.asarray(grid, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
+    sub_r = max(1, int(sub_r))
+    sub_c = max(1, int(sub_c))
+    phase_r = int(phase_rc[0])
+    phase_c = int(phase_rc[1])
+
+    empty_meta = {
+        "mode": "lattice_bilinear_torch",
+        "stride_rc": [sub_r, sub_c],
+        "phase_rc": [phase_r, phase_c],
+        "n_full_valid": 0,
+        "n_stored_valid": 0,
+    }
+    if grid.ndim != 3 or grid.shape[-1] != 3:
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + (empty_meta,)
+
+    h, w = grid.shape[:2]
+    support = valid & np.isfinite(grid).all(axis=2)
+    n_full_valid = int(support.sum())
+    if n_full_valid < 1:
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + (empty_meta,)
+
+    r_abs0 = int(uv_offset[0])
+    c_abs0 = int(uv_offset[1])
+    r_abs1 = r_abs0 + h - 1
+    c_abs1 = c_abs0 + w - 1
+    s_r_min = int(np.ceil((r_abs0 - phase_r) / float(sub_r)))
+    s_r_max = int(np.floor((r_abs1 - phase_r) / float(sub_r)))
+    s_c_min = int(np.ceil((c_abs0 - phase_c) / float(sub_c)))
+    s_c_max = int(np.floor((c_abs1 - phase_c) / float(sub_c)))
+    if s_r_max < s_r_min or s_c_max < s_c_min:
+        meta = dict(empty_meta)
+        meta["n_full_valid"] = n_full_valid
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + (meta,)
+
+    stored_rows = np.arange(s_r_min, s_r_max + 1, dtype=np.int64)
+    stored_cols = np.arange(s_c_min, s_c_max + 1, dtype=np.int64)
+    sr, sc = np.meshgrid(stored_rows, stored_cols, indexing="ij")
+    uv_q = np.stack([sr.reshape(-1), sc.reshape(-1)], axis=-1).astype(np.int64, copy=False)
+
+    q_r_abs = uv_q[:, 0].astype(np.int64, copy=False) * int(sub_r) + int(phase_r)
+    q_c_abs = uv_q[:, 1].astype(np.int64, copy=False) * int(sub_c) + int(phase_c)
+    q_r = (q_r_abs - int(uv_offset[0])).astype(np.float32, copy=False)
+    q_c = (q_c_abs - int(uv_offset[1])).astype(np.float32, copy=False)
+
+    in_grid = (
+        (q_r >= 0.0) &
+        (q_r <= float(max(h - 1, 0))) &
+        (q_c >= 0.0) &
+        (q_c <= float(max(w - 1, 0)))
+    )
+    if not bool(in_grid.any()):
+        meta = dict(empty_meta)
+        meta["n_full_valid"] = n_full_valid
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + (meta,)
+
+    uv_q = uv_q[in_grid].astype(np.int64, copy=False)
+    q_r = q_r[in_grid].astype(np.float32, copy=False)
+    q_c = q_c[in_grid].astype(np.float32, copy=False)
+
+    denom_r = float(max(h - 1, 1))
+    denom_c = float(max(w - 1, 1))
+    value_np = np.where(support[..., None], grid, 0.0).astype(np.float32, copy=False)
+    value_t = torch.from_numpy(value_np.transpose(2, 0, 1)).unsqueeze(0).contiguous()
+    mask_t = torch.from_numpy(support.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).contiguous()
+
+    def _sample_world_and_mask(qr, qc):
+        y_norm = (2.0 * qr / denom_r) - 1.0
+        x_norm = (2.0 * qc / denom_c) - 1.0
+        query_grid = np.stack([x_norm, y_norm], axis=-1).astype(np.float32, copy=False)
+        query_t = torch.from_numpy(query_grid.reshape(1, -1, 1, 2)).contiguous()
+        with torch.no_grad():
+            sampled_num_t = F.grid_sample(
+                value_t,
+                query_t,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            sampled_den_t = F.grid_sample(
+                mask_t,
+                query_t,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+        sampled_num = (
+            sampled_num_t[0, :, :, 0]
+            .permute(1, 0)
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        sampled_den = sampled_den_t[0, 0, :, 0].cpu().numpy().astype(np.float32, copy=False)
+        return sampled_num, sampled_den
+
+    sampled_num, sampled_den = _sample_world_and_mask(q_r, q_c)
+    can_sample = sampled_den > 1e-6
+    n_anchor_sampled = int(can_sample.sum())
+    n_fallback_tried = 0
+    n_fallback_recovered = 0
+
+    if not bool(can_sample.all()):
+        fallback_idx = np.nonzero(~can_sample)[0]
+        n_fallback_tried = int(fallback_idx.shape[0])
+        if n_fallback_tried > 0:
+            q_r_fallback = (q_r[fallback_idx] + (0.5 * float(sub_r - 1))).astype(np.float32, copy=False)
+            q_c_fallback = (q_c[fallback_idx] + (0.5 * float(sub_c - 1))).astype(np.float32, copy=False)
+            sampled_num_fb, sampled_den_fb = _sample_world_and_mask(q_r_fallback, q_c_fallback)
+            can_fb = sampled_den_fb > 1e-6
+            if bool(can_fb.any()):
+                recovered_idx = fallback_idx[can_fb]
+                sampled_num[recovered_idx] = sampled_num_fb[can_fb]
+                sampled_den[recovered_idx] = sampled_den_fb[can_fb]
+                can_sample[recovered_idx] = True
+                n_fallback_recovered = int(can_fb.sum())
+
+    if not bool(can_sample.any()):
+        meta = dict(empty_meta)
+        meta["n_full_valid"] = n_full_valid
+        return _empty_uv_world(uv_dtype=np.int64, world_dtype=np.float32) + (meta,)
+
+    uv_keep = uv_q[can_sample].astype(np.int64, copy=False)
+    pts_bilinear = (
+        sampled_num[can_sample] / sampled_den[can_sample, None]
+    ).astype(np.float32, copy=False)
+
+    projection_meta = {
+        "mode": "lattice_bilinear_torch",
+        "stride_rc": [sub_r, sub_c],
+        "phase_rc": [phase_r, phase_c],
+        "n_full_valid": n_full_valid,
+        "n_anchor_sampled": n_anchor_sampled,
+        "n_fallback_tried": n_fallback_tried,
+        "n_fallback_recovered": n_fallback_recovered,
+        "n_stored_valid": int(uv_keep.shape[0]),
+    }
+    return uv_keep, pts_bilinear, projection_meta
 
 
 def parse_args(argv=None):
@@ -109,6 +734,12 @@ def parse_args(argv=None):
     parser.add_argument("--checkpoint-path", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--volume-scale", type=int, default=0)
+    parser.add_argument("--volume-cache-dir", type=str, default="/tmp/vesuvius-volume-cache")
+    parser.add_argument("--volume-cache-retry-seconds", type=float, default=60.0)
+    parser.add_argument("--volume-chunk-cache-gb", type=float, default=_DEFAULT_VOLUME_CHUNK_CACHE_GB)
+    parser.add_argument("--compile", dest="compile_model", action="store_true", default=True)
+    parser.add_argument("--no-compile", dest="compile_model", action="store_false")
+    parser.add_argument("--compile-mode", type=str, default="default")
 
     parser.add_argument(
         "--crop-size",
@@ -150,6 +781,40 @@ def parse_args(argv=None):
     parser.add_argument("--tta-outlier-drop-thresh", type=float, default=1.25)
     parser.add_argument("--tta-outlier-drop-min-keep", type=int, default=4)
     parser.add_argument("--tta-batch-size", type=int, default=2)
+    parser.add_argument(
+        "--disp-sample-radius",
+        type=float,
+        default=1.0,
+        help=(
+            "Dense parameterized row/col radius around each surface point used when "
+            "sampling predicted displacements. Use 0 for the legacy single trilinear sample."
+        ),
+    )
+    parser.add_argument(
+        "--disp-sample-spacing",
+        type=float,
+        default=1.0,
+        help="Parameterized row/col spacing for the dense displacement sampling kernel.",
+    )
+    parser.add_argument(
+        "--disp-sample-min-count",
+        type=int,
+        default=1,
+        help="Minimum in-bounds samples required for a displacement estimate.",
+    )
+    parser.add_argument(
+        "--disp-sample-reduce",
+        type=str,
+        default="mean",
+        choices=("mean", "median"),
+        help="Reducer used across the dense displacement sampling kernel.",
+    )
+    parser.add_argument(
+        "--merge-temp-dir",
+        type=str,
+        default=None,
+        help="Parent directory for temporary dense overlap-merge memmaps. Defaults to the system temp directory.",
+    )
 
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--output-prefix", type=str, default=None)
@@ -175,24 +840,6 @@ def parse_args(argv=None):
 
     parser.add_argument("--tifxyz-step-size", type=int, default=None)
     parser.add_argument("--tifxyz-voxel-size-um", type=float, default=None)
-    parser.add_argument(
-        "--dp-radius",
-        type=int,
-        default=_DENSE_PROJECTION_NEIGHBORHOOD_RADIUS,
-        help="Dense-projection neighborhood radius in UV cells.",
-    )
-    parser.add_argument(
-        "--dp-reject-frac",
-        type=float,
-        default=_DENSE_PROJECTION_REJECT_OUTLIER_FRACTION,
-        help="Dense-projection max outlier rejection fraction in [0, 1].",
-    )
-    parser.add_argument(
-        "--dp-reject-min-keep",
-        type=int,
-        default=_DENSE_PROJECTION_REJECT_MIN_KEEP,
-        help="Dense-projection minimum kept samples after rejection.",
-    )
 
     parser.add_argument("--verbose", action="store_true")
 
@@ -212,18 +859,26 @@ def parse_args(argv=None):
         parser.error("--bbox-overlap must satisfy 0.0 <= overlap < 1.0")
     if args.crop_size is not None and any(v < 1 for v in args.crop_size):
         parser.error("--crop-size values must be >= 1")
+    if args.volume_cache_retry_seconds < 0.0:
+        parser.error("--volume-cache-retry-seconds must be >= 0")
+    if args.volume_chunk_cache_gb < 0.0:
+        parser.error("--volume-chunk-cache-gb must be >= 0")
+    if args.disp_sample_radius < 0.0:
+        parser.error("--disp-sample-radius must be >= 0")
+    if args.disp_sample_spacing <= 0.0:
+        parser.error("--disp-sample-spacing must be > 0")
+    if args.disp_sample_min_count < 1:
+        parser.error("--disp-sample-min-count must be >= 1")
+    if args.merge_temp_dir is not None:
+        merge_temp_dir = Path(args.merge_temp_dir)
+        if merge_temp_dir.exists() and not merge_temp_dir.is_dir():
+            parser.error("--merge-temp-dir must be a directory when it already exists")
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be >= 1 when provided.")
     if args.iterations is not None and args.iter_direction is None:
         parser.error("--iter-direction is required when --iterations is provided.")
     if args.iterations is None and args.iter_direction is not None:
         parser.error("--iter-direction requires --iterations.")
-    if args.dp_radius < 0:
-        parser.error("--dp-radius must be >= 0")
-    if args.dp_reject_frac < 0.0 or args.dp_reject_frac > 1.0:
-        parser.error("--dp-reject-frac must satisfy 0.0 <= value <= 1.0")
-    if args.dp_reject_min_keep < 1:
-        parser.error("--dp-reject-min-keep must be >= 1")
     return args
 
 
@@ -261,6 +916,8 @@ def _copy_args_to_argv(copy_args):
 
     if "tta" in copy_args and bool(copy_args.get("tta")) is False:
         argv.append("--no-tta")
+    if "compile_model" in copy_args and bool(copy_args.get("compile_model")) is False:
+        argv.append("--no-compile")
     if "bbox_prune" in copy_args and bool(copy_args.get("bbox_prune")) is False:
         argv.append("--no-bbox-prune")
     if "save_original_copy" in copy_args and bool(copy_args.get("save_original_copy")):
@@ -320,6 +977,7 @@ def _generate_cover_bboxes_from_points(
     prune_bboxes=False,
     prune_max_remove_per_band=None,
     band_workers=1,
+    show_progress=False,
 ):
     result = _generate_segment_cover_records(
         np.asarray(points_zyx, dtype=np.float64),
@@ -328,6 +986,8 @@ def _generate_cover_bboxes_from_points(
         prune_bboxes=prune_bboxes,
         prune_max_remove_per_band=prune_max_remove_per_band,
         band_workers=band_workers,
+        show_progress=show_progress,
+        progress_desc="triplet_bbox_bands",
     )
     return [
         {
@@ -362,6 +1022,234 @@ def _split_triplet_displacement_channels(disp_batch):
     branch_a = disp_batch[:, 0:3]
     branch_b = disp_batch[:, 3:6]
     return branch_a, branch_b
+
+
+def _crop_center_distance_weights(crop_size, eps=1e-3):
+    crop_size = tuple(int(v) for v in crop_size)
+    if len(crop_size) != 3:
+        raise RuntimeError(f"crop_size must be length 3, got {crop_size}")
+
+    axes = []
+    for n in crop_size:
+        n = int(n)
+        center = 0.5 * float(n - 1)
+        radius = max(center, float(n) - 1.0 - center, 1.0)
+        axis = 1.0 - (np.abs(np.arange(n, dtype=np.float32) - np.float32(center)) / np.float32(radius))
+        axes.append(np.maximum(axis, np.float32(eps)))
+    weights = axes[0][:, None, None] * axes[1][None, :, None] * axes[2][None, None, :]
+    return weights.astype(np.float32, copy=False)
+
+
+def _records_window(records, crop_size):
+    crop_arr = np.asarray(crop_size, dtype=np.int64)
+    if len(records) == 0:
+        raise RuntimeError("Cannot build merged displacement window without bbox records.")
+    starts = []
+    ends = []
+    for rec in records:
+        min_corner, _ = _bbox_to_min_corner_and_bounds_array(tuple(rec["bbox"]))
+        start = min_corner.astype(np.int64, copy=False)
+        starts.append(start)
+        ends.append(start + crop_arr)
+    window_min = np.min(np.stack(starts, axis=0), axis=0).astype(np.int64, copy=False)
+    window_max = np.max(np.stack(ends, axis=0), axis=0).astype(np.int64, copy=False)
+    window_shape = (window_max - window_min).astype(np.int64, copy=False)
+    return window_min, tuple(int(v) for v in window_shape.tolist())
+
+
+def _slice_len(s):
+    return int(s.stop) - int(s.start)
+
+
+def _chunk_slices_for_region(start, end, chunks):
+    start = np.asarray(start, dtype=np.int64)
+    end = np.asarray(end, dtype=np.int64)
+    chunks = np.asarray(chunks, dtype=np.int64)
+    chunk_start = start // chunks
+    chunk_end = (end - 1) // chunks
+    for zz in range(int(chunk_start[0]), int(chunk_end[0]) + 1):
+        z0 = max(int(start[0]), zz * int(chunks[0]))
+        z1 = min(int(end[0]), (zz + 1) * int(chunks[0]))
+        for yy in range(int(chunk_start[1]), int(chunk_end[1]) + 1):
+            y0 = max(int(start[1]), yy * int(chunks[1]))
+            y1 = min(int(end[1]), (yy + 1) * int(chunks[1]))
+            for xx in range(int(chunk_start[2]), int(chunk_end[2]) + 1):
+                x0 = max(int(start[2]), xx * int(chunks[2]))
+                x1 = min(int(end[2]), (xx + 1) * int(chunks[2]))
+                yield (zz, yy, xx), (slice(z0, z1), slice(y0, y1), slice(x0, x1))
+
+
+class _WeightedDenseDisplacementMerger:
+    def __init__(self, window_min, window_shape, crop_size, channels=6, temp_dir=None, chunk_size=128):
+        self.window_min = np.asarray(window_min, dtype=np.int64)
+        self.window_shape = tuple(int(v) for v in window_shape)
+        self.crop_size = tuple(int(v) for v in crop_size)
+        self.channels = int(channels)
+        chunk_size = max(1, int(chunk_size))
+        self.chunks_3d = tuple(min(chunk_size, int(v)) for v in self.crop_size)
+        parent_dir = None if temp_dir is None else str(temp_dir)
+        if parent_dir is not None:
+            Path(parent_dir).mkdir(parents=True, exist_ok=True)
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="infer_rowcol_triplet_merge_", dir=parent_dir)
+        self.path = Path(self._tmpdir.name)
+        self.weighted_sum_chunks = {}
+        self.weight_sum_chunks = {}
+        self.crop_weights = _crop_center_distance_weights(self.crop_size)
+        self.crop_count = 0
+        self.current_bytes = 0
+
+    def _chunk_path(self, kind, chunk_key):
+        zz, yy, xx = (int(v) for v in chunk_key)
+        return self.path / f"{kind}_{zz}_{yy}_{xx}.npy"
+
+    def _chunk_region(self, chunk_key):
+        zz, yy, xx = (int(v) for v in chunk_key)
+        z0 = zz * self.chunks_3d[0]
+        y0 = yy * self.chunks_3d[1]
+        x0 = xx * self.chunks_3d[2]
+        return (
+            slice(z0, min(z0 + self.chunks_3d[0], self.window_shape[0])),
+            slice(y0, min(y0 + self.chunks_3d[1], self.window_shape[1])),
+            slice(x0, min(x0 + self.chunks_3d[2], self.window_shape[2])),
+        )
+
+    def _close_memmap(self, arr):
+        if arr is None:
+            return
+        if hasattr(arr, "flush"):
+            arr.flush()
+        mmap_obj = getattr(arr, "_mmap", None)
+        if mmap_obj is not None:
+            mmap_obj.close()
+
+    def _create_chunk(self, kind, chunk_key, shape):
+        path = self._chunk_path(kind, chunk_key)
+        arr = np.lib.format.open_memmap(
+            path,
+            mode="w+",
+            dtype=np.float32,
+            shape=shape,
+        )
+        arr[...] = 0.0
+        self._close_memmap(arr)
+        self.current_bytes += int(np.prod(shape, dtype=np.int64)) * np.dtype(np.float32).itemsize
+        return path
+
+    def _open_chunk(self, path, mode):
+        return np.lib.format.open_memmap(path, mode=mode, dtype=np.float32)
+
+    def _ensure_chunk(self, chunk_key):
+        chunk_key = tuple(int(v) for v in chunk_key)
+        sum_path = self.weighted_sum_chunks.get(chunk_key)
+        if sum_path is not None:
+            return sum_path, self.weight_sum_chunks[chunk_key]
+
+        region = self._chunk_region(chunk_key)
+        chunk_shape = tuple(_slice_len(s) for s in region)
+        sum_path = self._create_chunk("weighted_sum", chunk_key, (self.channels, *chunk_shape))
+        weight_path = self._create_chunk("weight_sum", chunk_key, chunk_shape)
+        self.weighted_sum_chunks[chunk_key] = sum_path
+        self.weight_sum_chunks[chunk_key] = weight_path
+        return sum_path, weight_path
+
+    def close(self):
+        self.weighted_sum_chunks.clear()
+        self.weight_sum_chunks.clear()
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+            self._tmpdir = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def _relative_crop_bounds(self, min_corner):
+        start = np.asarray(min_corner, dtype=np.int64) - self.window_min
+        end = start + np.asarray(self.crop_size, dtype=np.int64)
+        if np.any(start < 0) or np.any(end > np.asarray(self.window_shape, dtype=np.int64)):
+            raise RuntimeError(
+                "BBox crop lies outside merged displacement window: "
+                f"start={start.tolist()} end={end.tolist()} window_shape={self.window_shape}"
+            )
+        return start, end
+
+    def accumulate_batch(self, disp_batch, items):
+        disp_arr = np.asarray(disp_batch, dtype=np.float32)
+        if disp_arr.ndim != 5:
+            raise RuntimeError(f"Expected dense displacement batch [B,C,D,H,W], got {tuple(disp_arr.shape)}")
+        if disp_arr.shape[1] != self.channels:
+            raise RuntimeError(f"Expected {self.channels} displacement channels, got {int(disp_arr.shape[1])}")
+        if tuple(int(v) for v in disp_arr.shape[2:]) != self.crop_size:
+            raise RuntimeError(
+                f"Dense displacement spatial shape {tuple(disp_arr.shape[2:])} does not match crop_size {self.crop_size}"
+            )
+        if int(disp_arr.shape[0]) != len(items):
+            raise RuntimeError(f"Displacement batch size {int(disp_arr.shape[0])} does not match item count {len(items)}")
+
+        weights = self.crop_weights
+        for i, item in enumerate(items):
+            start, end = self._relative_crop_bounds(item["min_corner"])
+            for chunk_key, region in _chunk_slices_for_region(start, end, self.chunks_3d):
+                crop_region = tuple(
+                    slice(int(region_axis.start) - int(start_axis), int(region_axis.stop) - int(start_axis))
+                    for region_axis, start_axis in zip(region, start)
+                )
+                chunk_region = self._chunk_region(chunk_key)
+                local_region = tuple(
+                    slice(int(region_axis.start) - int(chunk_axis.start), int(region_axis.stop) - int(chunk_axis.start))
+                    for region_axis, chunk_axis in zip(region, chunk_region)
+                )
+                sum_path, weight_path = self._ensure_chunk(chunk_key)
+                weight_region = weights[crop_region]
+                sum_chunk = self._open_chunk(sum_path, mode="r+")
+                weight_chunk = self._open_chunk(weight_path, mode="r+")
+                try:
+                    sum_chunk[(slice(None), *local_region)] += (
+                        disp_arr[i][(slice(None), *crop_region)] * weight_region[None, ...]
+                    )
+                    weight_chunk[local_region] += weight_region
+                finally:
+                    self._close_memmap(sum_chunk)
+                    self._close_memmap(weight_chunk)
+            self.crop_count += 1
+
+    def read_crop(self, min_corner):
+        start, end = self._relative_crop_bounds(min_corner)
+        out = np.zeros((self.channels, *self.crop_size), dtype=np.float32)
+        for chunk_key, region in _chunk_slices_for_region(start, end, self.chunks_3d):
+            chunk_key = tuple(int(v) for v in chunk_key)
+            sum_path = self.weighted_sum_chunks.get(chunk_key)
+            if sum_path is None:
+                continue
+            weight_path = self.weight_sum_chunks[chunk_key]
+            crop_region = tuple(
+                slice(int(region_axis.start) - int(start_axis), int(region_axis.stop) - int(start_axis))
+                for region_axis, start_axis in zip(region, start)
+            )
+            chunk_region = self._chunk_region(chunk_key)
+            local_region = tuple(
+                slice(int(region_axis.start) - int(chunk_axis.start), int(region_axis.stop) - int(chunk_axis.start))
+                for region_axis, chunk_axis in zip(region, chunk_region)
+            )
+            sum_chunk = self._open_chunk(sum_path, mode="r")
+            weight_chunk = self._open_chunk(weight_path, mode="r")
+            try:
+                sums = np.asarray(sum_chunk[(slice(None), *local_region)], dtype=np.float32)
+                weights = np.asarray(weight_chunk[local_region], dtype=np.float32)
+                valid = weights > 0.0
+                if bool(valid.any()):
+                    np.divide(
+                        sums,
+                        weights[None, ...],
+                        out=out[(slice(None), *crop_region)],
+                        where=valid[None, ...],
+                    )
+            finally:
+                self._close_memmap(sum_chunk)
+                self._close_memmap(weight_chunk)
+        return out
 
 
 def _estimate_global_unit_normal(input_normals, input_normals_valid):
@@ -403,7 +1291,15 @@ def _estimate_global_unit_normal(input_normals, input_normals_valid):
     return (mean_vec / mean_norm).astype(np.float32, copy=False)
 
 
-def _build_triplet_direction_priors_for_crop(crop_size, cond_vox, global_unit_normal, mask_mode="cond"):
+def _build_triplet_direction_priors_for_crop(
+    crop_size,
+    cond_vox,
+    local_zyx,
+    local_normals,
+    local_normals_valid,
+    fallback_unit_normal,
+    mask_mode="cond",
+):
     crop_size = tuple(int(v) for v in crop_size)
     if len(crop_size) != 3:
         raise RuntimeError(f"crop_size must be length 3, got {crop_size}")
@@ -412,18 +1308,106 @@ def _build_triplet_direction_priors_for_crop(crop_size, cond_vox, global_unit_no
     if cond.shape != crop_size:
         raise RuntimeError(f"cond_vox shape must match crop_size {crop_size}, got {tuple(cond.shape)}")
 
-    n = np.asarray(global_unit_normal, dtype=np.float32).reshape(3)
+    priors_zyx = np.zeros(crop_size + (3,), dtype=np.float32)
+    counts = np.zeros(crop_size, dtype=np.uint32)
+
+    local_arr = np.asarray(local_zyx, dtype=np.float32)
+    normals_arr = np.asarray(local_normals, dtype=np.float32)
+    normals_valid = np.asarray(local_normals_valid, dtype=bool)
+    if local_arr.ndim == 2 and local_arr.shape[1] == 3 and normals_arr.shape == local_arr.shape:
+        finite = (
+            normals_valid
+            & np.isfinite(local_arr).all(axis=1)
+            & np.isfinite(normals_arr).all(axis=1)
+        )
+        if bool(finite.any()):
+            ijk = np.rint(local_arr[finite]).astype(np.int64, copy=False)
+            in_bounds = (
+                (ijk[:, 0] >= 0)
+                & (ijk[:, 0] < crop_size[0])
+                & (ijk[:, 1] >= 0)
+                & (ijk[:, 1] < crop_size[1])
+                & (ijk[:, 2] >= 0)
+                & (ijk[:, 2] < crop_size[2])
+            )
+            if bool(in_bounds.any()):
+                ijk = ijk[in_bounds]
+                n = normals_arr[finite][in_bounds]
+                np.add.at(priors_zyx[..., 0], (ijk[:, 0], ijk[:, 1], ijk[:, 2]), n[:, 0])
+                np.add.at(priors_zyx[..., 1], (ijk[:, 0], ijk[:, 1], ijk[:, 2]), n[:, 1])
+                np.add.at(priors_zyx[..., 2], (ijk[:, 0], ijk[:, 1], ijk[:, 2]), n[:, 2])
+                np.add.at(counts, (ijk[:, 0], ijk[:, 1], ijk[:, 2]), 1)
+
+    have_prior = counts > 0
+    if bool(have_prior.any()):
+        priors_zyx[have_prior] /= counts[have_prior, None].astype(np.float32, copy=False)
+        norms = np.linalg.norm(priors_zyx, axis=3)
+        finite = np.isfinite(priors_zyx).all(axis=3) & np.isfinite(norms) & (norms > 1e-6)
+        have_prior &= finite
+        priors_zyx[have_prior] /= norms[have_prior, None].astype(np.float32, copy=False)
+
+    fallback = np.asarray(fallback_unit_normal, dtype=np.float32).reshape(3)
+    fill_mask = (cond > 0.5) & (~have_prior)
+    if bool(fill_mask.any()):
+        priors_zyx[fill_mask] = fallback
+        have_prior[fill_mask] = True
+
+    if str(mask_mode).lower() == "full":
+        if bool(have_prior.any()):
+            n = np.mean(priors_zyx[have_prior], axis=0, dtype=np.float64).astype(np.float32, copy=False)
+            norm = float(np.linalg.norm(n))
+            if np.isfinite(norm) and norm > 1e-6:
+                n /= norm
+            else:
+                n = fallback
+        else:
+            n = fallback
+        priors_zyx[:, :, :] = n
+    elif str(mask_mode).lower() == "cond":
+        priors_zyx[cond <= 0.5] = 0.0
+    else:
+        raise RuntimeError(f"Unknown triplet direction prior mask mode: {mask_mode!r}")
+
     priors = np.zeros((6, *crop_size), dtype=np.float32)
     for axis in range(3):
-        priors[axis, ...] = n[axis]
-        priors[axis + 3, ...] = -n[axis]
-
-    mode = str(mask_mode).lower()
-    if mode == "cond":
-        priors *= (cond > 0.5).astype(np.float32, copy=False)[None, ...]
-    elif mode != "full":
-        raise RuntimeError(f"Unknown triplet direction prior mask mode: {mask_mode!r}")
+        priors[axis, ...] = priors_zyx[..., axis]
+        priors[axis + 3, ...] = -priors_zyx[..., axis]
     return priors
+
+
+def _assign_triplet_slots_to_chart_sides(
+    world,
+    uv_rc,
+    slot_a_disp,
+    slot_a_valid,
+    slot_b_disp,
+    slot_b_valid,
+    normals,
+    normals_valid,
+):
+    uv = np.asarray(uv_rc, dtype=np.int64)
+    side_normals = normals[uv[:, 0], uv[:, 1]]
+    side_normals_valid = normals_valid[uv[:, 0], uv[:, 1]] & np.isfinite(side_normals).all(axis=1)
+    score_a = np.sum(np.asarray(slot_a_disp, dtype=np.float32) * side_normals, axis=1)
+    score_b = np.sum(np.asarray(slot_b_disp, dtype=np.float32) * side_normals, axis=1)
+    score_ok = side_normals_valid & np.isfinite(score_a) & np.isfinite(score_b)
+
+    a_is_front = score_a >= score_b
+    world_a = world + slot_a_disp
+    world_b = world + slot_b_disp
+    world_front = np.where(a_is_front[:, None], world_a, world_b)
+    world_back = np.where(a_is_front[:, None], world_b, world_a)
+    front_valid = np.where(a_is_front, slot_a_valid, slot_b_valid)
+    back_valid = np.where(a_is_front, slot_b_valid, slot_a_valid)
+
+    fallback = ~score_ok
+    if bool(fallback.any()):
+        world_front[fallback] = world_a[fallback]
+        world_back[fallback] = world_b[fallback]
+        front_valid[fallback] = slot_a_valid[fallback]
+        back_valid[fallback] = slot_b_valid[fallback]
+
+    return world_front, front_valid, world_back, back_valid, int(np.count_nonzero(score_ok))
 
 
 def _compute_surface_tangent_axis(surface_grid, surface_valid, axis):
@@ -485,6 +1469,9 @@ def _compute_surface_normals_from_input_grid(input_grid, input_valid):
     valid = np.asarray(input_valid, dtype=bool)
     row_tangent, row_tangent_valid = _compute_surface_tangent_axis(grid, valid, axis=0)
     col_tangent, col_tangent_valid = _compute_surface_tangent_axis(grid, valid, axis=1)
+    # This is the signed chart normal. Flipping exactly one UV axis flips it;
+    # flipping both axes preserves it. Direction priors intentionally follow
+    # this handedness rather than trying to infer an absolute inside/outside.
     normals = np.cross(col_tangent, row_tangent)
     norms = np.linalg.norm(normals, axis=2)
     finite = np.isfinite(normals).all(axis=2) & np.isfinite(norms)
@@ -493,6 +1480,7 @@ def _compute_surface_normals_from_input_grid(input_grid, input_valid):
     if bool(normals_valid.any()):
         out[normals_valid] = normals[normals_valid] / norms[normals_valid, None]
     return out, normals_valid
+
 
 def _accumulate_displaced(sum_grid, count_grid, uv_rc, world_zyx):
     if uv_rc.size == 0 or world_zyx.size == 0:
@@ -503,245 +1491,6 @@ def _accumulate_displaced(sum_grid, count_grid, uv_rc, world_zyx):
     np.add.at(sum_grid[..., 1], (rr, cc), world_zyx[:, 1].astype(np.float32, copy=False))
     np.add.at(sum_grid[..., 2], (rr, cc), world_zyx[:, 2].astype(np.float32, copy=False))
     np.add.at(count_grid, (rr, cc), 1)
-
-
-def _build_local_sparse_uv_grid(uv_rc, world_zyx):
-    uv_arr = np.asarray(uv_rc, dtype=np.int64)
-    world_arr = np.asarray(world_zyx, dtype=np.float32)
-    if uv_arr.ndim != 2 or uv_arr.shape[1] != 2:
-        raise RuntimeError(f"Expected uv_rc shape [N,2], got {tuple(uv_arr.shape)}")
-    if world_arr.ndim != 2 or world_arr.shape[1] != 3:
-        raise RuntimeError(f"Expected world_zyx shape [N,3], got {tuple(world_arr.shape)}")
-    if uv_arr.shape[0] != world_arr.shape[0]:
-        raise RuntimeError(
-            f"uv/world size mismatch: uv N={int(uv_arr.shape[0])}, world N={int(world_arr.shape[0])}"
-        )
-    if uv_arr.shape[0] == 0:
-        return np.zeros((0, 0, 3), dtype=np.float32), np.zeros((0, 0), dtype=bool), (0, 0)
-
-    r_min = int(uv_arr[:, 0].min())
-    c_min = int(uv_arr[:, 1].min())
-    rr = (uv_arr[:, 0] - r_min).astype(np.int64, copy=False)
-    cc = (uv_arr[:, 1] - c_min).astype(np.int64, copy=False)
-    h = int(rr.max()) + 1
-    w = int(cc.max()) + 1
-
-    sum_grid = np.zeros((h, w, 3), dtype=np.float64)
-    count_grid = np.zeros((h, w), dtype=np.uint32)
-    _accumulate_displaced(sum_grid, count_grid, np.stack([rr, cc], axis=-1), world_arr)
-
-    sparse_grid = np.full((h, w, 3), -1.0, dtype=np.float32)
-    sparse_valid = count_grid > 0
-    if bool(sparse_valid.any()):
-        sr, sc = np.where(sparse_valid)
-        denom = count_grid[sr, sc].astype(np.float32, copy=False)[:, None]
-        vals = (sum_grid[sr, sc] / denom).astype(np.float32, copy=False)
-        finite = np.isfinite(vals).all(axis=1)
-        if bool(finite.any()):
-            sr = sr[finite]
-            sc = sc[finite]
-            vals = vals[finite]
-            sparse_grid[sr, sc] = vals
-            sparse_valid = np.zeros_like(sparse_valid, dtype=bool)
-            sparse_valid[sr, sc] = True
-        else:
-            sparse_valid = np.zeros_like(sparse_valid, dtype=bool)
-    return sparse_grid, sparse_valid, (r_min, c_min)
-
-
-def _densify_local_sparse_uv_grid(
-    sparse_grid,
-    sparse_valid,
-    subsample_stride,
-    interpolation_method=_DENSE_PROJECTION_INTERP_METHOD,
-):
-    grid = np.asarray(sparse_grid, dtype=np.float32)
-    valid = np.asarray(sparse_valid, dtype=bool)
-    if grid.ndim != 3 or grid.shape[-1] != 3:
-        raise RuntimeError(f"Expected sparse_grid shape [H,W,3], got {tuple(grid.shape)}")
-    if valid.shape != grid.shape[:2]:
-        raise RuntimeError(f"sparse_valid shape {tuple(valid.shape)} does not match grid shape {tuple(grid.shape[:2])}")
-
-    h, w = grid.shape[:2]
-    if h == 0 or w == 0:
-        return np.zeros((0, 0, 3), dtype=np.float32), np.zeros((0, 0), dtype=bool)
-
-    stride = max(1, int(subsample_stride))
-    if stride == 1:
-        out = np.asarray(grid, dtype=np.float32).copy()
-        out_valid = np.asarray(valid, dtype=bool).copy()
-        out[~out_valid] = -1.0
-        return out, out_valid
-
-    dense_h = int((h - 1) * stride + 1)
-    dense_w = int((w - 1) * stride + 1)
-    if dense_h <= 0 or dense_w <= 0:
-        return np.zeros((0, 0, 3), dtype=np.float32), np.zeros((0, 0), dtype=bool)
-
-    if not bool(valid.any()):
-        return (
-            np.full((dense_h, dense_w, 3), -1.0, dtype=np.float32),
-            np.zeros((dense_h, dense_w), dtype=bool),
-        )
-
-    query_r = np.arange(dense_h, dtype=np.float32)
-    query_c = np.arange(dense_w, dtype=np.float32)
-    query_rr, query_cc = np.meshgrid(query_r, query_c, indexing="ij")
-    x_src = grid[..., 2]
-    y_src = grid[..., 1]
-    z_src = grid[..., 0]
-    x_int, y_int, z_int, int_valid = interpolate_at_points(
-        x_src,
-        y_src,
-        z_src,
-        valid,
-        query_rr,
-        query_cc,
-        scale=(float(stride), float(stride)),
-        method=str(interpolation_method),
-        invalid_value=-1.0,
-    )
-    dense_grid = np.stack([z_int, y_int, x_int], axis=-1).astype(np.float32, copy=False)
-    dense_valid = np.asarray(int_valid, dtype=bool) & np.isfinite(dense_grid).all(axis=2)
-    dense_grid = dense_grid.copy()
-    dense_grid[~dense_valid] = -1.0
-    return dense_grid, dense_valid
-
-
-def _sample_dense_neighborhood_for_uv_points(
-    dense_grid,
-    dense_valid,
-    uv_rc,
-    uv_offset_rc,
-    fallback_world_zyx,
-    subsample_stride,
-    neighborhood_radius=_DENSE_PROJECTION_NEIGHBORHOOD_RADIUS,
-    reject_outlier_fraction=_DENSE_PROJECTION_REJECT_OUTLIER_FRACTION,
-    reject_min_keep=_DENSE_PROJECTION_REJECT_MIN_KEEP,
-):
-    dense_arr = np.asarray(dense_grid, dtype=np.float32)
-    dense_mask = np.asarray(dense_valid, dtype=bool)
-    uv_arr = np.asarray(uv_rc, dtype=np.int64)
-    fallback = np.asarray(fallback_world_zyx, dtype=np.float32)
-
-    if uv_arr.ndim != 2 or uv_arr.shape[1] != 2:
-        raise RuntimeError(f"Expected uv_rc shape [N,2], got {tuple(uv_arr.shape)}")
-    if fallback.ndim != 2 or fallback.shape[1] != 3:
-        raise RuntimeError(f"Expected fallback_world_zyx shape [N,3], got {tuple(fallback.shape)}")
-    if uv_arr.shape[0] != fallback.shape[0]:
-        raise RuntimeError(
-            f"uv/fallback size mismatch: uv N={int(uv_arr.shape[0])}, fallback N={int(fallback.shape[0])}"
-        )
-    if uv_arr.shape[0] == 0:
-        return fallback.astype(np.float32, copy=True)
-    if dense_arr.ndim != 3 or dense_arr.shape[-1] != 3:
-        return fallback.astype(np.float32, copy=True)
-    if dense_mask.shape != dense_arr.shape[:2]:
-        return fallback.astype(np.float32, copy=True)
-    if not bool(dense_mask.any()):
-        return fallback.astype(np.float32, copy=True)
-
-    h, w = dense_mask.shape
-    stride = max(1, int(subsample_stride))
-    radius = max(0, int(neighborhood_radius))
-    reject_fraction = float(reject_outlier_fraction)
-    if not np.isfinite(reject_fraction):
-        reject_fraction = 0.0
-    reject_fraction = min(max(0.0, reject_fraction), 1.0)
-    min_keep = max(1, int(reject_min_keep))
-    out = fallback.astype(np.float32, copy=True)
-
-    local_r = uv_arr[:, 0] - int(uv_offset_rc[0])
-    local_c = uv_arr[:, 1] - int(uv_offset_rc[1])
-    anchor_r = local_r * int(stride)
-    anchor_c = local_c * int(stride)
-    in_bounds = (
-        (anchor_r >= 0)
-        & (anchor_r < int(h))
-        & (anchor_c >= 0)
-        & (anchor_c < int(w))
-    )
-    if not bool(in_bounds.any()):
-        return out
-
-    idx = np.nonzero(in_bounds)[0]
-    ar = anchor_r[idx].astype(np.int64, copy=False)
-    ac = anchor_c[idx].astype(np.int64, copy=False)
-    for j, out_i in enumerate(idx):
-        r = int(ar[j])
-        c = int(ac[j])
-        r0 = max(0, r - radius)
-        r1 = min(h - 1, r + radius)
-        c0 = max(0, c - radius)
-        c1 = min(w - 1, c + radius)
-        win_valid = dense_mask[r0:r1 + 1, c0:c1 + 1]
-        if not bool(win_valid.any()):
-            continue
-        pts = dense_arr[r0:r1 + 1, c0:c1 + 1][win_valid]
-        if pts.shape[0] == 0:
-            continue
-        pts = pts.astype(np.float32, copy=False)
-        n_pts = int(pts.shape[0])
-        max_reject = min(
-            int(np.floor(reject_fraction * float(n_pts))),
-            max(0, n_pts - min_keep),
-        )
-        if max_reject > 0 and n_pts >= 4:
-            center = np.median(pts, axis=0).astype(np.float32, copy=False)
-            d = np.linalg.norm(pts - center[None, :], axis=1).astype(np.float32, copy=False)
-            if d.shape[0] > 0:
-                med_d = float(np.median(d))
-                mad = float(np.median(np.abs(d - med_d)))
-                if mad <= 1e-6:
-                    cand = np.where(d > (med_d + 1e-6))[0]
-                else:
-                    robust_z = np.abs(d - med_d) / float(1.4826 * mad)
-                    cand = np.where(robust_z > 3.5)[0]
-                if cand.size > 0:
-                    take = min(int(max_reject), int(cand.size), int(pts.shape[0] - 1))
-                    if take > 0:
-                        order = np.argsort(d[cand])[::-1]
-                        drop = cand[order[:take]]
-                        keep = np.ones(pts.shape[0], dtype=bool)
-                        keep[drop] = False
-                        if bool(keep.any()):
-                            pts = pts[keep]
-        out[out_i] = np.mean(pts, axis=0).astype(np.float32, copy=False)
-    return out
-
-
-def _robustify_samples_with_dense_projection(
-    uv_rc,
-    world_zyx,
-    subsample_stride,
-    neighborhood_radius=_DENSE_PROJECTION_NEIGHBORHOOD_RADIUS,
-    interpolation_method=_DENSE_PROJECTION_INTERP_METHOD,
-    reject_outlier_fraction=_DENSE_PROJECTION_REJECT_OUTLIER_FRACTION,
-    reject_min_keep=_DENSE_PROJECTION_REJECT_MIN_KEEP,
-):
-    uv_arr = np.asarray(uv_rc, dtype=np.int64)
-    world_arr = np.asarray(world_zyx, dtype=np.float32)
-    if uv_arr.shape[0] == 0:
-        return world_arr.astype(np.float32, copy=True)
-
-    sparse_grid, sparse_valid, uv_offset = _build_local_sparse_uv_grid(uv_arr, world_arr)
-    dense_grid, dense_valid = _densify_local_sparse_uv_grid(
-        sparse_grid,
-        sparse_valid,
-        subsample_stride=subsample_stride,
-        interpolation_method=interpolation_method,
-    )
-    return _sample_dense_neighborhood_for_uv_points(
-        dense_grid,
-        dense_valid,
-        uv_arr,
-        uv_offset_rc=uv_offset,
-        fallback_world_zyx=world_arr,
-        subsample_stride=subsample_stride,
-        neighborhood_radius=neighborhood_radius,
-        reject_outlier_fraction=reject_outlier_fraction,
-        reject_min_keep=reject_min_keep,
-    )
 
 
 def _finalize_sparse_prediction(sum_grid, count_grid, shape_hw):
@@ -886,8 +1635,8 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
     local_sel = (world_sel - min_corner[None, :].astype(np.float32, copy=False)).astype(np.float32, copy=False)
 
     cond_vox = _voxelize_local_surface_from_uv_points(local_sel, uv_sel, crop_size).astype(np.float32, copy=False)
-    vol_crop = _crop_volume_from_min_corner(volume_arr, min_corner, crop_size)
-    vol_crop = normalize_zscore(vol_crop).astype(np.float32, copy=False)
+    vol_crop = _read_volume_crop(volume_arr, crop_size, min_corner, max_corner)
+    vol_crop = vol_crop.astype(np.float32, copy=False)
 
     return {
         "bbox_id": int(record.get("bbox_id", -1)),
@@ -897,6 +1646,36 @@ def _prepare_bbox_item(record, crop_size, world_points, uv_points, volume_arr):
         "local": local_sel,
         "cond_vox": cond_vox,
         "volume": vol_crop,
+    }
+
+
+def _prepare_bbox_sample_item(record, crop_size, world_points, uv_points):
+    bbox = tuple(record["bbox"])
+    min_corner, _ = _bbox_to_min_corner_and_bounds_array(bbox)
+    crop_arr = np.asarray(crop_size, dtype=np.int32)
+    max_corner = min_corner + crop_arr
+
+    in_bounds = (
+        (world_points[:, 0] >= float(min_corner[0]))
+        & (world_points[:, 0] < float(max_corner[0]))
+        & (world_points[:, 1] >= float(min_corner[1]))
+        & (world_points[:, 1] < float(max_corner[1]))
+        & (world_points[:, 2] >= float(min_corner[2]))
+        & (world_points[:, 2] < float(max_corner[2]))
+    )
+    if not bool(in_bounds.any()):
+        return None
+
+    uv_sel = uv_points[in_bounds].astype(np.int32, copy=False)
+    world_sel = world_points[in_bounds].astype(np.float32, copy=False)
+    local_sel = (world_sel - min_corner[None, :].astype(np.float32, copy=False)).astype(np.float32, copy=False)
+
+    return {
+        "bbox_id": int(record.get("bbox_id", -1)),
+        "min_corner": min_corner.astype(np.int32, copy=False),
+        "uv": uv_sel,
+        "world": world_sel,
+        "local": local_sel,
     }
 
 
@@ -931,6 +1710,35 @@ def _gather_batch_items(
         return [item for item in prepared if item is not None]
 
 
+def _gather_sample_items(
+    batch_records,
+    crop_size,
+    world_points,
+    uv_points,
+    num_workers,
+):
+    if len(batch_records) == 0:
+        return []
+    if int(num_workers) <= 1 or len(batch_records) == 1:
+        items = []
+        for rec in batch_records:
+            item = _prepare_bbox_sample_item(rec, crop_size, world_points, uv_points)
+            if item is not None:
+                items.append(item)
+        return items
+
+    max_workers = min(int(num_workers), len(batch_records))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        prepared = executor.map(
+            _prepare_bbox_sample_item,
+            batch_records,
+            [crop_size] * len(batch_records),
+            [world_points] * len(batch_records),
+            [uv_points] * len(batch_records),
+        )
+        return [item for item in prepared if item is not None]
+
+
 def _run_triplet_inference(
     args,
     model_state,
@@ -940,7 +1748,6 @@ def _run_triplet_inference(
     uv_points,
     volume_arr,
     shape_hw,
-    dense_subsample_stride,
     input_normals,
     input_normals_valid,
 ):
@@ -984,96 +1791,150 @@ def _run_triplet_inference(
     n_total = len(records)
     n_batches = (n_total + int(args.batch_size) - 1) // int(args.batch_size)
     kept_bboxes = 0
-    dp_radius = int(getattr(args, "dp_radius", _DENSE_PROJECTION_NEIGHBORHOOD_RADIUS))
-    dp_reject_frac = float(getattr(args, "dp_reject_frac", _DENSE_PROJECTION_REJECT_OUTLIER_FRACTION))
-    dp_reject_min_keep = int(getattr(args, "dp_reject_min_keep", _DENSE_PROJECTION_REJECT_MIN_KEEP))
+    side_assignment_points = 0
+    window_min, window_shape = _records_window(records, crop_size)
 
-    batch_iter = _iter_bbox_batches(records, int(args.batch_size))
-    batch_iter = tqdm(batch_iter, total=n_batches, desc="triplet_batches", unit="batch")
-    for batch_idx, (_, batch_records) in enumerate(batch_iter, start=1):
-        items = _gather_batch_items(
-            batch_records=batch_records,
-            crop_size=crop_size,
-            world_points=world_points,
-            uv_points=uv_points,
-            volume_arr=volume_arr,
-            num_workers=int(args.crop_input_workers),
+    with _WeightedDenseDisplacementMerger(
+        window_min=window_min,
+        window_shape=window_shape,
+        crop_size=crop_size,
+        channels=6,
+        temp_dir=getattr(args, "merge_temp_dir", None),
+    ) as merger:
+        _log(
+            args.verbose,
+            "temporary dense merge path: "
+            f"{merger.path} window_min={window_min.tolist()} window_shape={list(window_shape)}",
         )
-
-        if len(items) == 0:
-            _log(args.verbose, f"batch {batch_idx}/{n_batches}: skipped (no points in batch bboxes)")
-            continue
-
-        kept_bboxes += len(items)
-        d, h_c, w_c = crop_size
-        batch_np = np.empty((len(items), 8, d, h_c, w_c), dtype=np.float32)
-        for i, item in enumerate(items):
-            batch_np[i, 0] = item["volume"]
-            batch_np[i, 1] = item["cond_vox"]
-            batch_np[i, 2:8] = _build_triplet_direction_priors_for_crop(
+        batch_iter = _iter_bbox_batches(records, int(args.batch_size))
+        batch_iter = tqdm(batch_iter, total=n_batches, desc="triplet_infer_merge", unit="batch")
+        for batch_idx, (_, batch_records) in enumerate(batch_iter, start=1):
+            items = _gather_batch_items(
+                batch_records=batch_records,
                 crop_size=crop_size,
-                cond_vox=item["cond_vox"],
-                global_unit_normal=global_unit_normal,
-                mask_mode=triplet_direction_prior_mask,
+                world_points=world_points,
+                uv_points=uv_points,
+                volume_arr=volume_arr,
+                num_workers=int(args.crop_input_workers),
             )
 
-        model_inputs = torch.from_numpy(batch_np).to(args.device, non_blocking=True)
-        disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=bool(args.tta), profiler=None)
-        if disp_pred is None:
-            raise RuntimeError("Model output did not contain 'displacement'.")
-        disp_pred_np = (
-            disp_pred.detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
-        )
-        slot_a_batch, slot_b_batch = _split_triplet_displacement_channels(disp_pred_np)
+            if len(items) == 0:
+                _log(args.verbose, f"batch {batch_idx}/{n_batches}: skipped (no points in batch bboxes)")
+                continue
 
-        for i, item in enumerate(items):
-            local = item["local"]
-            uv = item["uv"]
-            world = item["world"]
-
-            slot_a_disp, slot_a_valid = _sample_trilinear_displacement_stack(slot_a_batch[i], local)
-            slot_b_disp, slot_b_valid = _sample_trilinear_displacement_stack(slot_b_batch[i], local)
-
-            # Deterministic branch mapping with direction priors:
-            # slot A (+normal prior) -> front, slot B (-normal prior) -> back.
-            world_front_all = world + slot_a_disp
-            world_back_all = world + slot_b_disp
-            front_ok = np.asarray(slot_a_valid, dtype=bool) & np.isfinite(world_front_all).all(axis=1)
-            back_ok = np.asarray(slot_b_valid, dtype=bool) & np.isfinite(world_back_all).all(axis=1)
-
-            if bool(back_ok.any()):
-                uv_b = uv[back_ok].astype(np.int32, copy=False)
-                world_b = world_back_all[back_ok].astype(np.float32, copy=False)
-                world_b_robust = _robustify_samples_with_dense_projection(
-                    uv_b,
-                    world_b,
-                    subsample_stride=int(dense_subsample_stride),
-                    neighborhood_radius=dp_radius,
-                    reject_outlier_fraction=dp_reject_frac,
-                    reject_min_keep=dp_reject_min_keep,
+            kept_bboxes += len(items)
+            d, h_c, w_c = crop_size
+            real_batch_size = len(items)
+            infer_batch_size = real_batch_size
+            if bool(model_state.get("compiled", False)):
+                infer_batch_size = int(args.batch_size)
+            use_pinned_input = bool(str(args.device).startswith("cuda") and torch.cuda.is_available())
+            batch_cpu = torch.empty(
+                (infer_batch_size, 8, d, h_c, w_c),
+                dtype=torch.float32,
+                pin_memory=use_pinned_input,
+            )
+            batch_np = batch_cpu.numpy()
+            for i, item in enumerate(items):
+                uv = item["uv"].astype(np.int64, copy=False)
+                batch_np[i, 0] = item["volume"]
+                batch_np[i, 1] = item["cond_vox"]
+                batch_np[i, 2:8] = _build_triplet_direction_priors_for_crop(
+                    crop_size=crop_size,
+                    cond_vox=item["cond_vox"],
+                    local_zyx=item["local"],
+                    local_normals=normals_arr[uv[:, 0], uv[:, 1]],
+                    local_normals_valid=normals_valid_arr[uv[:, 0], uv[:, 1]],
+                    fallback_unit_normal=global_unit_normal,
+                    mask_mode=triplet_direction_prior_mask,
                 )
-                _accumulate_displaced(sum_back, count_back, uv_b, world_b_robust)
+            if infer_batch_size > real_batch_size:
+                batch_np[real_batch_size:] = 0.0
 
-            if bool(front_ok.any()):
-                uv_f = uv[front_ok].astype(np.int32, copy=False)
-                world_f = world_front_all[front_ok].astype(np.float32, copy=False)
-                world_f_robust = _robustify_samples_with_dense_projection(
-                    uv_f,
-                    world_f,
-                    subsample_stride=int(dense_subsample_stride),
-                    neighborhood_radius=dp_radius,
-                    reject_outlier_fraction=dp_reject_frac,
-                    reject_min_keep=dp_reject_min_keep,
+            model_inputs = batch_cpu.to(args.device, non_blocking=use_pinned_input)
+            disp_pred = predict_displacement(args, model_state, model_inputs, use_tta=bool(args.tta), profiler=None)
+            if disp_pred is None:
+                raise RuntimeError("Model output did not contain 'displacement'.")
+            disp_pred_np = (
+                disp_pred[:real_batch_size].detach().to(dtype=torch.float32).cpu().numpy().astype(np.float32, copy=False)
+            )
+            _split_triplet_displacement_channels(disp_pred_np)
+            merger.accumulate_batch(disp_pred_np[:, :6], items)
+
+            del batch_cpu
+            del model_inputs
+            del disp_pred
+            del disp_pred_np
+
+            _log(args.verbose, f"batch {batch_idx}/{n_batches}: merged {len(items)} bbox dense outputs")
+
+        _log(args.verbose, f"merged bbox crops with points: {kept_bboxes}/{len(records)}")
+
+        sample_kwargs = {
+            "sample_radius": float(args.disp_sample_radius),
+            "sample_spacing": float(args.disp_sample_spacing),
+            "sample_min_count": int(args.disp_sample_min_count),
+            "sample_reduce": str(args.disp_sample_reduce),
+        }
+        batch_iter = _iter_bbox_batches(records, int(args.batch_size))
+        batch_iter = tqdm(batch_iter, total=n_batches, desc="triplet_sample_merged", unit="batch")
+        for batch_idx, (_, batch_records) in enumerate(batch_iter, start=1):
+            items = _gather_sample_items(
+                batch_records=batch_records,
+                crop_size=crop_size,
+                world_points=world_points,
+                uv_points=uv_points,
+                num_workers=int(args.crop_input_workers),
+            )
+            if len(items) == 0:
+                continue
+
+            for item in items:
+                local = item["local"]
+                uv = item["uv"]
+                world = item["world"]
+                merged_disp = merger.read_crop(item["min_corner"])
+                slot_a, slot_b = _split_triplet_displacement_channels(merged_disp[None, ...])
+                slot_a_disp, slot_a_valid = _sample_trilinear_displacement_stack(
+                    slot_a[0],
+                    local,
+                    uv_rc=uv,
+                    **sample_kwargs,
                 )
-                _accumulate_displaced(sum_front, count_front, uv_f, world_f_robust)
+                slot_b_disp, slot_b_valid = _sample_trilinear_displacement_stack(
+                    slot_b[0],
+                    local,
+                    uv_rc=uv,
+                    **sample_kwargs,
+                )
 
-        del model_inputs
-        del disp_pred
-        del disp_pred_np
+                world_front_all, front_valid, world_back_all, back_valid, n_side_assigned = (
+                    _assign_triplet_slots_to_chart_sides(
+                        world=world,
+                        uv_rc=uv,
+                        slot_a_disp=slot_a_disp,
+                        slot_a_valid=np.asarray(slot_a_valid, dtype=bool),
+                        slot_b_disp=slot_b_disp,
+                        slot_b_valid=np.asarray(slot_b_valid, dtype=bool),
+                        normals=normals_arr,
+                        normals_valid=normals_valid_arr,
+                    )
+                )
+                side_assignment_points += int(n_side_assigned)
+                front_ok = np.asarray(front_valid, dtype=bool) & np.isfinite(world_front_all).all(axis=1)
+                back_ok = np.asarray(back_valid, dtype=bool) & np.isfinite(world_back_all).all(axis=1)
 
-        _log(args.verbose, f"batch {batch_idx}/{n_batches}: processed {len(items)} bbox crops")
+                if bool(back_ok.any()):
+                    uv_b = uv[back_ok].astype(np.int32, copy=False)
+                    world_b = world_back_all[back_ok].astype(np.float32, copy=False)
+                    _accumulate_displaced(sum_back, count_back, uv_b, world_b)
 
-    _log(args.verbose, f"processed bbox crops with points: {kept_bboxes}/{len(records)}")
+                if bool(front_ok.any()):
+                    uv_f = uv[front_ok].astype(np.int32, copy=False)
+                    world_f = world_front_all[front_ok].astype(np.float32, copy=False)
+                    _accumulate_displaced(sum_front, count_front, uv_f, world_f)
+
+            _log(args.verbose, f"batch {batch_idx}/{n_batches}: sampled merged outputs for {len(items)} bbox crops")
 
     back_sparse_grid, back_sparse_valid = _finalize_sparse_prediction(sum_back, count_back, shape_hw=(h, w))
     front_sparse_grid, front_sparse_valid = _finalize_sparse_prediction(sum_front, count_front, shape_hw=(h, w))
@@ -1096,11 +1957,28 @@ def _run_triplet_inference(
         "front_projection_meta": front_proj_meta,
         "n_back_cells": int(back_projected_valid.sum()),
         "n_front_cells": int(front_projected_valid.sum()),
-        "orientation_mode": "global_direction_prior_fixed",
+        "orientation_mode": "uv_handedness_chart_normal",
         "orientation_global_normals_points": int(orientation_global_normals_points),
         "orientation_global_normal_zyx": [float(global_unit_normal[0]), float(global_unit_normal[1]), float(global_unit_normal[2])],
+        "orientation_side_assignment_points": int(side_assignment_points),
+        "orientation_convention": "front/back are assigned by signed displacement along normal = cross(col_tangent, row_tangent); names are arbitrary but chart-side consistent",
         "triplet_direction_prior_mask": str(triplet_direction_prior_mask),
-        "triplet_slot_to_output": {"A": "front", "B": "back"},
+        "triplet_slot_to_output": {"A": "dynamic", "B": "dynamic"},
+        "triplet_slot_assignment": "per-point chart-side signed displacement",
+        "triplet_output_direction_prior_sign": {"front": 1, "back": -1},
+        "dense_overlap_merge": "center_distance_weighted_sparse_chunked_temporary_memmap",
+        "dense_overlap_merge_window_min_zyx": [int(v) for v in window_min.tolist()],
+        "dense_overlap_merge_window_shape_zyx": [int(v) for v in window_shape],
+        "dense_overlap_merge_crop_count": int(kept_bboxes),
+        "dense_overlap_merge_chunk_shape_zyx": [int(v) for v in merger.chunks_3d],
+        "dense_overlap_merge_chunks": int(len(merger.weight_sum_chunks)),
+        "dense_overlap_merge_sparse_bytes": int(merger.current_bytes),
+        "dense_overlap_merge_temp_parent": None if getattr(args, "merge_temp_dir", None) is None else str(args.merge_temp_dir),
+        "disp_sample_space": "parameterized_row_col",
+        "disp_sample_radius": float(args.disp_sample_radius),
+        "disp_sample_spacing": float(args.disp_sample_spacing),
+        "disp_sample_min_count": int(args.disp_sample_min_count),
+        "disp_sample_reduce": str(args.disp_sample_reduce),
     }
 
 
@@ -1520,7 +2398,6 @@ def _run_single_iteration(
     tifxyz_step_size,
     tifxyz_voxel_size_um,
     stored_scale_rc,
-    dense_subsample_stride,
     save_scale_factor,
     iteration_index,
     iterations_requested,
@@ -1551,6 +2428,7 @@ def _run_single_iteration(
         prune_bboxes=bool(args.bbox_prune),
         prune_max_remove_per_band=args.bbox_prune_max_remove_per_band,
         band_workers=int(args.bbox_band_workers),
+        show_progress=bool(args.verbose),
     )
     _log(args.verbose, f"generated bboxes (retargeted coords): {len(records)}")
 
@@ -1563,7 +2441,6 @@ def _run_single_iteration(
         uv_points=uv_points,
         volume_arr=volume_arr,
         shape_hw=input_valid.shape,
-        dense_subsample_stride=dense_subsample_stride,
         input_normals=input_normals,
         input_normals_valid=input_normals_valid,
     )
@@ -1583,6 +2460,9 @@ def _run_single_iteration(
 
     run_meta = {
         "checkpoint_path": str(args.checkpoint_path),
+        "compile_model": bool(model_state.get("compiled", False)),
+        "compile_requested": bool(model_state.get("compile_requested", False)),
+        "compile_mode": str(model_state.get("compile_mode", "")),
         "crop_size": [int(v) for v in crop_size],
         "bbox_count": int(len(records)),
         "bbox_overlap": float(args.bbox_overlap),
@@ -1598,17 +2478,28 @@ def _run_single_iteration(
         "orientation_mode": str(infer_out.get("orientation_mode", "legacy")),
         "orientation_global_normals_points": int(infer_out.get("orientation_global_normals_points", 0)),
         "orientation_global_normal_zyx": list(infer_out.get("orientation_global_normal_zyx", [])),
+        "orientation_side_assignment_points": int(infer_out.get("orientation_side_assignment_points", 0)),
+        "orientation_convention": str(infer_out.get("orientation_convention", "")),
         "triplet_direction_prior_mask_effective": str(infer_out.get("triplet_direction_prior_mask", "cond")),
         "triplet_slot_to_output": dict(infer_out.get("triplet_slot_to_output", {"A": "front", "B": "back"})),
+        "triplet_slot_assignment": str(infer_out.get("triplet_slot_assignment", "")),
+        "triplet_output_direction_prior_sign": dict(infer_out.get("triplet_output_direction_prior_sign", {"front": 1, "back": -1})),
+        "dense_overlap_merge": str(infer_out.get("dense_overlap_merge", "")),
+        "dense_overlap_merge_window_min_zyx": list(infer_out.get("dense_overlap_merge_window_min_zyx", [])),
+        "dense_overlap_merge_window_shape_zyx": list(infer_out.get("dense_overlap_merge_window_shape_zyx", [])),
+        "dense_overlap_merge_crop_count": int(infer_out.get("dense_overlap_merge_crop_count", 0)),
+        "dense_overlap_merge_chunk_shape_zyx": list(infer_out.get("dense_overlap_merge_chunk_shape_zyx", [])),
+        "dense_overlap_merge_chunks": int(infer_out.get("dense_overlap_merge_chunks", 0)),
+        "dense_overlap_merge_sparse_bytes": int(infer_out.get("dense_overlap_merge_sparse_bytes", 0)),
+        "dense_overlap_merge_temp_parent": infer_out.get("dense_overlap_merge_temp_parent", None),
+        "disp_sample_space": str(infer_out.get("disp_sample_space", "parameterized_row_col")),
+        "disp_sample_radius": float(infer_out.get("disp_sample_radius", args.disp_sample_radius)),
+        "disp_sample_spacing": float(infer_out.get("disp_sample_spacing", args.disp_sample_spacing)),
+        "disp_sample_min_count": int(infer_out.get("disp_sample_min_count", args.disp_sample_min_count)),
+        "disp_sample_reduce": str(infer_out.get("disp_sample_reduce", args.disp_sample_reduce)),
         "save_coordinate_scale_factor": int(save_scale_factor),
         "stored_scale_rc": None if stored_scale_rc is None else [float(stored_scale_rc[0]), float(stored_scale_rc[1])],
         "effective_step_size_used": int(tifxyz_step_size),
-        "projection_dense_interp_method": str(_DENSE_PROJECTION_INTERP_METHOD),
-        "projection_dense_uv_mode": "per_bbox",
-        "projection_dense_neighborhood": int(2 * int(args.dp_radius) + 1),
-        "projection_dense_reject_outlier_fraction": float(args.dp_reject_frac),
-        "projection_dense_reject_min_keep": int(args.dp_reject_min_keep),
-        "projection_dense_scale_factor": int(dense_subsample_stride),
         "front_projection": infer_out["front_projection_meta"],
         "back_projection": infer_out["back_projection_meta"],
         "iteration_index": int(iteration_index),
@@ -1717,20 +2608,19 @@ def run(args):
                 "Triplet wrap inference currently requires isotropic stored scale; "
                 f"got scale={stored_scale_rc!r} -> steps ({step_y}, {step_x})."
             )
-    dense_subsample_stride = int(max(1, tifxyz_step_size))
-
-    volume_root = zarr.open(args.volume_path, mode="r")
-
-    class _Holder:
-        pass
-
-    holder = _Holder()
-    holder.volume = volume_root
-    holder.extra = {}
-    volume_arr = _resolve_segment_volume(holder, volume_scale=args.volume_scale)
+    volume_arr, resolved_volume_level = _open_vc_volume_level(
+        args.volume_path,
+        volume_scale=args.volume_scale,
+        cache_dir=args.volume_cache_dir,
+        chunk_cache_gb=args.volume_chunk_cache_gb,
+    )
     _log(
         args.verbose,
-        f"resolved volume level shape={tuple(int(v) for v in volume_arr.shape)} volume_scale={int(args.volume_scale)}",
+        "resolved vc volume level "
+        f"shape={tuple(int(v) for v in volume_arr.shape)} "
+        f"volume_scale={int(args.volume_scale)} "
+        f"resolved_level={int(resolved_volume_level)} "
+        f"chunk_cache_gb={float(args.volume_chunk_cache_gb):.3g}",
     )
 
     out_dir = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.tifxyz_path).resolve().parent)
@@ -1761,7 +2651,6 @@ def run(args):
             tifxyz_step_size=tifxyz_step_size,
             tifxyz_voxel_size_um=tifxyz_voxel_size_um,
             stored_scale_rc=stored_scale_rc,
-            dense_subsample_stride=dense_subsample_stride,
             save_scale_factor=save_scale_factor,
             iteration_index=iteration_index,
             iterations_requested=iterations_requested,

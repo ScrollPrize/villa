@@ -1,11 +1,16 @@
 """Station-keeping loss: anchor the mesh to the seed point.
 
-For each winding, finds the closest point on the current detached mesh surface.
+For each winding, initializes a seed ray anchor by minimizing station_t over
+valid ray/surface intersections, then updates the tracked fractional quad
+position locally on later calls. If the local quad loses the ray intersection,
+the update walks direct neighbor quads before falling back to the same
+brute-force ray search used for initialization.
 
 Two loss components:
-  - Normal-offset: central winding's signed offset from the seed along the
+  - Normal-offset: winding-number 0's signed offset from the seed along the
     closest point's detached model normal, applied jointly to all windings
-    along that same base point normal.
+    along that same base point normal. Falls back to the center depth when
+    winding metadata is unavailable.
   - XY-centering: per-winding, how far the closest point is from the model
     center in grid-index space, pushing each winding along model tangents.
 """
@@ -20,10 +25,17 @@ import model as fit_model
 _seed: torch.Tensor | None = None   # (3,) base coords
 _h_frac: list[float] = []           # tracked h position per winding
 _w_frac: list[float] = []           # tracked w position per winding
+_anchor_initialized: list[bool] = []
+_ray_dir: list[torch.Tensor | None] = []
 _printed_initial: bool = False
+_printed_recovery_events: int = 0
 
-_STATION_N_LOCAL_RADIUS_IDX = 8.0
+_STATION_N_LOCAL_SIGMA_IDX = 20.0
 _STATION_N_OUTSIDE_WEIGHT = 0.1
+_STATION_LOCAL_UPDATE_MAX_ITERS = 20
+_STATION_RECOVERY_PRINT_LIMIT = 20
+_STATION_INTERSECTION_EPS = 1.0e-2
+_STATION_RECOVERY_PRINT_MOVE = 0.25
 
 
 def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D",
@@ -37,25 +49,31 @@ def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D",
     """
     del data
 
-    global _seed, _h_frac, _w_frac, _printed_initial
+    global _seed, _h_frac, _w_frac, _anchor_initialized, _ray_dir, _printed_initial, _printed_recovery_events
     _seed = seed_xyz.detach().clone()
 
     # Initialize tracked position at grid center for each winding
     _h_frac = [(Hm - 1) / 2.0] * D
     _w_frac = [(Wm - 1) / 2.0] * D
+    _anchor_initialized = [False] * D
+    _ray_dir = [None] * D
     _printed_initial = False
+    _printed_recovery_events = 0
 
     print(f"[station] seed=({seed_xyz[0]:.0f},{seed_xyz[1]:.0f},{seed_xyz[2]:.0f}) "
-          f"normal_source=model_closest "
+          f"anchor_source=station_ray "
           f"grid={Hm}x{Wm} D={D}", flush=True)
 
 
 def reset() -> None:
-    global _seed, _h_frac, _w_frac, _printed_initial
+    global _seed, _h_frac, _w_frac, _anchor_initialized, _ray_dir, _printed_initial, _printed_recovery_events
     _seed = None
     _h_frac = []
     _w_frac = []
+    _anchor_initialized = []
+    _ray_dir = []
     _printed_initial = False
+    _printed_recovery_events = 0
 
 
 def _station_mesh_scale(res: fit_model.FitResult3D) -> float:
@@ -88,9 +106,8 @@ def _station_normal_weights(
     h = torch.arange(Hm, device=device, dtype=dtype).view(Hm, 1)
     w = torch.arange(Wm, device=device, dtype=dtype).view(1, Wm)
     dist_idx = torch.sqrt((h - float(h_center)).square() + (w - float(w_center)).square())
-    radius = max(1.0e-6, float(_STATION_N_LOCAL_RADIUS_IDX))
-    t = (1.0 - dist_idx / radius).clamp(min=0.0, max=1.0)
-    falloff = t * t * (3.0 - 2.0 * t)
+    sigma = max(1.0e-6, float(_STATION_N_LOCAL_SIGMA_IDX))
+    falloff = torch.exp(-0.5 * (dist_idx / sigma).square())
     weights = float(_STATION_N_OUTSIDE_WEIGHT) + (1.0 - float(_STATION_N_OUTSIDE_WEIGHT)) * falloff
     return weights.view(1, Hm, Wm).expand(D, Hm, Wm)
 
@@ -126,6 +143,23 @@ def _print_initial_station_diagnostic(
         f"w={float(w_frac) if w_frac is not None else float('nan'):.3f}",
         flush=True,
     )
+
+
+def _print_station_recovery_event(message: str) -> None:
+    global _printed_recovery_events
+    if _printed_recovery_events >= _STATION_RECOVERY_PRINT_LIMIT:
+        return
+    print(message, flush=True)
+    _printed_recovery_events += 1
+
+
+def _station_anchor_depth_index(*, D: int, depth_windings: tuple[int, ...] | list[int] | None) -> int:
+    if depth_windings is not None and len(depth_windings) == int(D):
+        try:
+            return list(int(v) for v in depth_windings).index(0)
+        except ValueError:
+            pass
+    return max(0, (int(D) - 1) // 2)
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +243,7 @@ def _intersect_single_quad(
 
 
 # ---------------------------------------------------------------------------
-# Closest point on mesh surface
+# Triangle closest-point helper retained for legacy callers
 # ---------------------------------------------------------------------------
 
 def _closest_points_on_triangles(
@@ -318,70 +352,228 @@ def _quad_model_normal(
     return n / n_norm.clamp(min=1.0e-8)
 
 
-def _closest_point_on_mesh_surface(
+def _bilinear_point(
+    P00: torch.Tensor,
+    P10: torch.Tensor,
+    P01: torch.Tensor,
+    P11: torch.Tensor,
+    frac_h: float,
+    frac_w: float,
+) -> torch.Tensor:
+    u = torch.tensor(frac_h, device=P00.device, dtype=P00.dtype)
+    v = torch.tensor(frac_w, device=P00.device, dtype=P00.dtype)
+    return P00 + u * (P10 - P00) + v * (P01 - P00) + (u * v) * (P11 - P10 - P01 + P00)
+
+
+def _station_seed_ray_direction(
+    *,
+    seed: torch.Tensor,
+    ref_point: torch.Tensor,
+    fallback_normal: torch.Tensor,
+) -> torch.Tensor:
+    ray = ref_point - seed
+    ray_norm = ray.norm()
+    fallback = fallback_normal / fallback_normal.norm().clamp(min=1.0e-8)
+    if float(ray_norm.detach().cpu()) <= 1.0e-6:
+        return fallback
+    ray_unit = ray / ray_norm.clamp(min=1.0e-8)
+    if float((ray_unit * fallback).sum().abs().detach().cpu()) <= 1.0e-3:
+        return fallback
+    return ray_unit
+
+
+def _station_seed_ray_direction_at_grid_position(
+    *,
     seed: torch.Tensor,
     surf: torch.Tensor,
-) -> tuple[torch.Tensor, float, float, torch.Tensor] | None:
+    h_ref: float,
+    w_ref: float,
+) -> torch.Tensor | None:
     Hm, Wm, _ = surf.shape
     if Hm < 2 or Wm < 2:
+        return None
+    row = max(0, min(int(h_ref), Hm - 2))
+    col = max(0, min(int(w_ref), Wm - 2))
+    frac_h = max(0.0, min(1.0, float(h_ref) - float(row)))
+    frac_w = max(0.0, min(1.0, float(w_ref) - float(col)))
+    n_fallback = _quad_model_normal(
+        surf[row, col],
+        surf[row + 1, col],
+        surf[row, col + 1],
+        surf[row + 1, col + 1],
+        frac_h,
+        frac_w,
+    )
+    ref_point = _bilinear_point(
+        surf[row, col],
+        surf[row + 1, col],
+        surf[row, col + 1],
+        surf[row + 1, col + 1],
+        frac_h,
+        frac_w,
+    )
+    return _station_seed_ray_direction(seed=seed, ref_point=ref_point, fallback_normal=n_fallback)
+
+
+def _station_anchor_from_local_ray_update(
+    seed: torch.Tensor,
+    surf: torch.Tensor,
+    h_ref: float,
+    w_ref: float,
+    n_ray: torch.Tensor,
+    *,
+    max_iters: int = _STATION_LOCAL_UPDATE_MAX_ITERS,
+) -> tuple[tuple[torch.Tensor, float, float, torch.Tensor] | None, int]:
+    Hm, Wm, _ = surf.shape
+    if Hm < 2 or Wm < 2:
+        return None, 0
+    if not (torch.isfinite(seed).all().item()):
+        return None, 0
+    if not (torch.isfinite(n_ray).all().item()):
+        return None, 0
+    n_ray = n_ray.to(device=surf.device, dtype=surf.dtype)
+    n_ray = n_ray / n_ray.norm().clamp(min=1.0e-8)
+
+    row = max(0, min(int(h_ref), Hm - 2))
+    col = max(0, min(int(w_ref), Wm - 2))
+    frac_h = max(0.0, min(1.0, float(h_ref) - float(row)))
+    frac_w = max(0.0, min(1.0, float(w_ref) - float(col)))
+
+    max_iters = max(1, int(max_iters))
+    for it in range(1, max_iters + 1):
+        try:
+            u, v, point = _intersect_single_quad(
+                seed,
+                n_ray,
+                surf[row, col],
+                surf[row + 1, col],
+                surf[row, col + 1],
+                surf[row + 1, col + 1],
+                frac_h,
+                frac_w,
+            )
+        except Exception:
+            return None, it
+        if not (torch.isfinite(torch.tensor([u, v], device=surf.device, dtype=surf.dtype)).all().item()):
+            return None, it
+        eps = float(_STATION_INTERSECTION_EPS)
+        if -eps <= u <= 1.0 + eps and -eps <= v <= 1.0 + eps:
+            u_c = max(0.0, min(1.0, float(u)))
+            v_c = max(0.0, min(1.0, float(v)))
+            h_frac = max(0.0, min(float(Hm - 1), float(row) + u_c))
+            w_frac = max(0.0, min(float(Wm - 1), float(col) + v_c))
+            point = _bilinear_point(
+                surf[row, col],
+                surf[row + 1, col],
+                surf[row, col + 1],
+                surf[row + 1, col + 1],
+                u_c,
+                v_c,
+            )
+            normal = _quad_model_normal(
+                surf[row, col],
+                surf[row + 1, col],
+                surf[row, col + 1],
+                surf[row + 1, col + 1],
+                u_c,
+                v_c,
+            )
+            return (point, h_frac, w_frac, normal), it
+
+        step_h = -1 if u < 0.0 else (1 if u > 1.0 else 0)
+        step_w = -1 if v < 0.0 else (1 if v > 1.0 else 0)
+        new_row = max(0, min(Hm - 2, row + step_h))
+        new_col = max(0, min(Wm - 2, col + step_w))
+        if new_row == row and new_col == col:
+            return None, it
+        target_h = row + float(u)
+        target_w = col + float(v)
+        row = new_row
+        col = new_col
+        frac_h = max(0.0, min(1.0, target_h - float(row)))
+        frac_w = max(0.0, min(1.0, target_w - float(col)))
+
+    return None, max_iters
+
+
+def _station_anchor_from_ray_min_station_t(
+    seed: torch.Tensor,
+    surf: torch.Tensor,
+    h_ref: float,
+    w_ref: float,
+) -> tuple[tuple[torch.Tensor, float, float, torch.Tensor], torch.Tensor] | None:
+    Hm, Wm, _ = surf.shape
+    if Hm < 2 or Wm < 2:
+        return None
+    n_ray = _station_seed_ray_direction_at_grid_position(
+        seed=seed,
+        surf=surf,
+        h_ref=h_ref,
+        w_ref=w_ref,
+    )
+    if n_ray is None:
         return None
 
     p00 = surf[:-1, :-1].reshape(-1, 3)
     p10 = surf[1:, :-1].reshape(-1, 3)
     p01 = surf[:-1, 1:].reshape(-1, 3)
     p11 = surf[1:, 1:].reshape(-1, 3)
-
     row_ids = (
-        torch.arange(Hm - 1, device=surf.device)
+        torch.arange(Hm - 1, device=surf.device, dtype=surf.dtype)
         .view(Hm - 1, 1)
         .expand(Hm - 1, Wm - 1)
         .reshape(-1)
     )
     col_ids = (
-        torch.arange(Wm - 1, device=surf.device)
+        torch.arange(Wm - 1, device=surf.device, dtype=surf.dtype)
         .view(1, Wm - 1)
         .expand(Hm - 1, Wm - 1)
         .reshape(-1)
     )
-
-    cp0, bary0 = _closest_points_on_triangles(seed, p00, p10, p11)
-    dist0 = (cp0 - seed.view(1, 3)).square().sum(dim=-1)
-    idx0 = int(torch.argmin(dist0).detach().cpu())
-
-    cp1, bary1 = _closest_points_on_triangles(seed, p00, p11, p01)
-    dist1 = (cp1 - seed.view(1, 3)).square().sum(dim=-1)
-    idx1 = int(torch.argmin(dist1).detach().cpu())
-
-    if float(dist0[idx0].detach().cpu()) <= float(dist1[idx1].detach().cpu()):
-        idx = idx0
-        point = cp0[idx]
-        bary = bary0[idx]
-        row = int(row_ids[idx].detach().cpu())
-        col = int(col_ids[idx].detach().cpu())
-        h_frac = float(row) + float((bary[1] + bary[2]).detach().cpu())
-        w_frac = float(col) + float(bary[2].detach().cpu())
-    else:
-        idx = idx1
-        point = cp1[idx]
-        bary = bary1[idx]
-        row = int(row_ids[idx].detach().cpu())
-        col = int(col_ids[idx].detach().cpu())
-        h_frac = float(row) + float(bary[1].detach().cpu())
-        w_frac = float(col) + float((bary[1] + bary[2]).detach().cpu())
-
-    h_frac = max(0.0, min(float(Hm - 1), h_frac))
-    w_frac = max(0.0, min(float(Wm - 1), w_frac))
-    normal_frac_h = max(0.0, min(1.0, h_frac - float(row)))
-    normal_frac_w = max(0.0, min(1.0, w_frac - float(col)))
+    frac_h0 = (torch.full_like(row_ids, float(h_ref)) - row_ids).clamp(0.0, 1.0)
+    frac_w0 = (torch.full_like(col_ids, float(w_ref)) - col_ids).clamp(0.0, 1.0)
+    n = n_ray.view(1, 3).expand_as(p00)
+    u, v = fit_model.Model3D._ray_bilinear_intersect(
+        seed.view(1, 3).expand_as(p00),
+        n,
+        p00,
+        p10,
+        p01,
+        p11,
+        frac_h0,
+        frac_w0,
+    )
+    valid = torch.isfinite(u) & torch.isfinite(v) & (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
+    if not bool(valid.any().detach().cpu()):
+        return None
+    h_all = row_ids + u
+    w_all = col_ids + v
+    station_t = (h_all - float(h_ref)).square() + (w_all - float(w_ref)).square()
+    score = torch.where(valid, station_t, torch.full_like(station_t, float("inf")))
+    idx = int(torch.argmin(score).detach().cpu())
+    row = int(row_ids[idx].detach().cpu())
+    col = int(col_ids[idx].detach().cpu())
+    h_frac = float(h_all[idx].detach().cpu())
+    w_frac = float(w_all[idx].detach().cpu())
+    frac_h = float(u[idx].detach().cpu())
+    frac_w = float(v[idx].detach().cpu())
+    point = _bilinear_point(
+        surf[row, col],
+        surf[row + 1, col],
+        surf[row, col + 1],
+        surf[row + 1, col + 1],
+        frac_h,
+        frac_w,
+    )
     normal = _quad_model_normal(
         surf[row, col],
         surf[row + 1, col],
         surf[row, col + 1],
         surf[row + 1, col + 1],
-        normal_frac_h,
-        normal_frac_w,
+        frac_h,
+        frac_w,
     )
-    return point, h_frac, w_frac, normal
+    return (point, h_frac, w_frac, normal), n_ray.detach()
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +584,7 @@ def station_loss(
     *, res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """Station-keeping loss anchored to seed point."""
-    global _h_frac, _w_frac, _printed_initial
+    global _h_frac, _w_frac, _anchor_initialized, _ray_dir, _printed_initial
 
     dev = res.xyz_lr.device
     D, Hm, Wm, _ = res.xyz_lr.shape
@@ -407,25 +599,91 @@ def station_loss(
         }
 
     seed = _seed.to(device=dev, dtype=res.xyz_lr.dtype)
-    d_center = (D - 1) // 2
+    d_anchor = _station_anchor_depth_index(
+        D=D,
+        depth_windings=getattr(res.params, "depth_windings", None),
+    )
     xyz_det = res.xyz_lr.detach()
 
     # Ensure tracked state matches current D
     while len(_h_frac) < D:
         _h_frac.append((Hm - 1) / 2.0)
         _w_frac.append((Wm - 1) / 2.0)
+    while len(_anchor_initialized) < D:
+        _anchor_initialized.append(False)
+    while len(_ray_dir) < D:
+        _ray_dir.append(None)
 
     h_mid = (Hm - 1) / 2.0
     w_mid = (Wm - 1) / 2.0
     mesh_scale = _station_mesh_scale(res)
     huber_delta = 1.0
 
-    # --- Closest point per winding (non-differentiable anchor update) ---
+    # --- Station ray anchor per winding (non-differentiable anchor update) ---
     anchors: list[tuple[int, torch.Tensor, float, float, torch.Tensor]] = []
     with torch.no_grad():
         for d in range(D):
             surf = xyz_det[d]  # (Hm, Wm, 3)
-            anchor = _closest_point_on_mesh_surface(seed, surf)
+            if _anchor_initialized[d]:
+                ray = _ray_dir[d]
+                if ray is None:
+                    ray = _station_seed_ray_direction_at_grid_position(
+                        seed=seed,
+                        surf=surf,
+                        h_ref=_h_frac[d],
+                        w_ref=_w_frac[d],
+                    )
+                    _ray_dir[d] = None if ray is None else ray.detach()
+                if ray is None:
+                    anchor = None
+                    update_iters = 0
+                else:
+                    anchor, update_iters = _station_anchor_from_local_ray_update(
+                        seed,
+                        surf,
+                        h_ref=_h_frac[d],
+                        w_ref=_w_frac[d],
+                        n_ray=ray,
+                    )
+                local_move = float("inf")
+                if anchor is not None:
+                    local_move = max(abs(float(anchor[1]) - float(_h_frac[d])), abs(float(anchor[2]) - float(_w_frac[d])))
+                if anchor is not None and update_iters > 1 and local_move >= float(_STATION_RECOVERY_PRINT_MOVE):
+                    _print_station_recovery_event(
+                        f"[station] local ray recovery d={d} iters={update_iters} "
+                        f"from=({_h_frac[d]:.3f},{_w_frac[d]:.3f}) "
+                        f"to=({anchor[1]:.3f},{anchor[2]:.3f})"
+                    )
+                if anchor is None:
+                    _print_station_recovery_event(
+                        f"[station] local ray recovery failed d={d} "
+                        f"iters={update_iters}; running brute-force ray search"
+                    )
+                    anchor = _station_anchor_from_ray_min_station_t(
+                        seed,
+                        surf,
+                        h_ref=_h_frac[d],
+                        w_ref=_w_frac[d],
+                    )
+                    if anchor is not None:
+                        anchor, ray = anchor
+                        _ray_dir[d] = ray.detach()
+                        _print_station_recovery_event(
+                            f"[station] brute-force ray recovery d={d} "
+                            f"from=({_h_frac[d]:.3f},{_w_frac[d]:.3f}) "
+                            f"to=({anchor[1]:.3f},{anchor[2]:.3f})"
+                        )
+            else:
+                anchor = _station_anchor_from_ray_min_station_t(
+                    seed,
+                    surf,
+                    h_ref=_h_frac[d],
+                    w_ref=_w_frac[d],
+                )
+                if anchor is not None:
+                    anchor, ray = anchor
+                    _ray_dir[d] = ray.detach()
+                    _anchor_initialized[d] = True
             if anchor is None:
                 continue
 
@@ -434,45 +692,45 @@ def station_loss(
             _w_frac[d] = w_frac
             anchors.append((d, conn_pt, h_frac, w_frac, normal))
 
-    # --- Normal-offset loss (from central winding, applied jointly) ---
+    # --- Normal-offset loss (from winding number 0, applied jointly) ---
     loss_normal = zero
     with torch.no_grad():
-        center_hits = [x for x in anchors if x[0] == d_center]
-        if center_hits:
-            _, p_int_c, h_int_c, w_int_c, n_model_c = center_hits[0]
-            offset = ((p_int_c - seed) * n_model_c).sum()  # signed scalar
-            target_n = xyz_det - offset * n_model_c
+        anchor_hits = [x for x in anchors if x[0] == d_anchor]
+        if anchor_hits:
+            _, p_int_a, h_int_a, w_int_a, n_model_a = anchor_hits[0]
+            offset = ((p_int_a - seed) * n_model_a).sum()  # signed scalar
+            target_n = xyz_det - offset * n_model_a
             normal_weights = _station_normal_weights(
                 D=D,
                 Hm=Hm,
                 Wm=Wm,
-                h_center=h_int_c,
-                w_center=w_int_c,
+                h_center=h_int_a,
+                w_center=w_int_a,
                 device=dev,
                 dtype=res.xyz_lr.dtype,
             )
         else:
-            p_int_c = None
-            h_int_c = None
-            w_int_c = None
-            n_model_c = None
+            p_int_a = None
+            h_int_a = None
+            w_int_a = None
+            n_model_a = None
             offset = None
             target_n = None
             normal_weights = None
         if not _printed_initial:
             _print_initial_station_diagnostic(
                 seed=seed,
-                p_int=p_int_c,
-                h_frac=h_int_c,
-                w_frac=w_int_c,
-                normal=n_model_c,
+                p_int=p_int_a,
+                h_frac=h_int_a,
+                w_frac=w_int_a,
+                normal=n_model_a,
                 normal_offset=offset,
                 mesh_step=float(res.params.mesh_step),
             )
             _printed_initial = True
 
     if target_n is not None:
-        normal_distance_vx = ((res.xyz_lr - target_n) * n_model_c.view(1, 1, 1, 3)).sum(dim=-1)
+        normal_distance_vx = ((res.xyz_lr - target_n) * n_model_a.view(1, 1, 1, 3)).sum(dim=-1)
         normal_lm = _huberized_loss_map(normal_distance_vx / mesh_scale, delta=huber_delta)
         loss_normal = (normal_lm * normal_weights).mean()
 

@@ -1083,6 +1083,12 @@ static int ceilDivPow2(int v, int level)
     return static_cast<int>((static_cast<int64_t>(v) + denom - 1) / denom);
 }
 
+static bool paddedShapeOK(long long actual, long long expected, int padMultiple)
+{
+    const long long maxPad = std::max(1, padMultiple);
+    return actual >= expected && actual - expected < maxPad;
+}
+
 void Volume::zarrOpen()
 {
     if (!metadata_.contains("format") || metadata_["format"].get_string() != "zarr")
@@ -1094,6 +1100,7 @@ void Volume::zarrOpen()
     }
     zarrLevelShapes_ = opened.shapes;
     zarrLevelChunkShapes_ = opened.chunkShapes;
+    zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
     zarrDtype_ = opened.dtype;
     zarrFillValue_ = opened.fillValue;
 
@@ -1139,13 +1146,12 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(baseHeight, levelInt);
             const int expectedWidth = ceilDivPow2(baseWidth, levelInt);
 
-            constexpr int kMaxPerLevelPad = 128;
-            auto padOK = [](long long actual, long long expected) {
-                return actual >= expected && actual - expected < kMaxPerLevelPad;
-            };
-            if (!padOK(shape[0], expectedSlices) ||
-                !padOK(shape[1], expectedHeight) ||
-                !padOK(shape[2], expectedWidth)) {
+            const auto storageChunkShape = level < zarrLevelStorageChunkShapes_.size()
+                ? zarrLevelStorageChunkShapes_[level]
+                : std::array<int, 3>{128, 128, 128};
+            if (!paddedShapeOK(shape[0], expectedSlices, storageChunkShape[0]) ||
+                !paddedShapeOK(shape[1], expectedHeight, storageChunkShape[1]) ||
+                !paddedShapeOK(shape[2], expectedWidth, storageChunkShape[2])) {
                 throw std::runtime_error(
                     "zarr level " + std::to_string(levelInt) + " shape [z,y,x]=("
                     + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
@@ -1178,13 +1184,12 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(_height, static_cast<int>(level));
             const int expectedWidth = ceilDivPow2(_width, static_cast<int>(level));
 
-            constexpr int kMaxPerLevelPad = 128;
-            auto padOK = [](long long actual, long long expected) {
-                return actual >= expected && actual - expected < kMaxPerLevelPad;
-            };
-            if (!padOK(shape[0], expectedSlices) ||
-                !padOK(shape[1], expectedHeight) ||
-                !padOK(shape[2], expectedWidth)) {
+            const auto storageChunkShape = level < zarrLevelStorageChunkShapes_.size()
+                ? zarrLevelStorageChunkShapes_[level]
+                : std::array<int, 3>{128, 128, 128};
+            if (!paddedShapeOK(shape[0], expectedSlices, storageChunkShape[0]) ||
+                !paddedShapeOK(shape[1], expectedHeight, storageChunkShape[1]) ||
+                !paddedShapeOK(shape[2], expectedWidth, storageChunkShape[2])) {
                 throw std::runtime_error(
                     "zarr level " + std::to_string(level) + " shape [z,y,x]=("
                     + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
@@ -1219,8 +1224,6 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::filesystem::path& cacheRoot,
     const vc::HttpAuth& authIn)
 {
-    (void)cacheRoot;
-
     // Resolve s3:// URLs to https:// and detect AWS credentials
     auto resolved = vc::resolveRemoteUrl(url);
     vc::HttpAuth auth = authIn;
@@ -1275,9 +1278,11 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->isRemote_ = true;
     vol->remoteUrl_ = remoteUrl;
     vol->remoteAuth_ = auth;
+    vol->remoteCacheRoot_ = cacheRoot;
     vol->remoteNumScales_ = opened.shapes.size();
     vol->zarrLevelShapes_ = opened.shapes;
     vol->zarrLevelChunkShapes_ = opened.chunkShapes;
+    vol->zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
     vol->zarrDtype_ = opened.dtype;
     vol->zarrFillValue_ = opened.fillValue;
     const auto& firstShape = opened.shapes[static_cast<std::size_t>(firstPresentLevel)];
@@ -1310,6 +1315,13 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     }
 
     return vol;
+}
+
+std::filesystem::path Volume::remotePersistentCachePath() const
+{
+    if (!isRemote_ || remoteCacheRoot_.empty())
+        return {};
+    return remoteCacheRoot_ / id();
 }
 
 int Volume::sliceWidth() const noexcept { return _width; }
@@ -1461,6 +1473,9 @@ vc::render::IChunkedArray* Volume::chunkedCache()
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
     vc::render::ChunkCache::Options options) const
 {
+    if (isRemote_ && !remoteCacheRoot_.empty())
+        options.persistentCachePath = remotePersistentCachePath();
+
     vc::render::OpenedChunkedZarr opened = isRemote_
         ? vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_)
         : vc::render::openLocalZarrPyramid(path_);

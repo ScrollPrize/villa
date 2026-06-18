@@ -249,6 +249,7 @@ void addLevel(OpenedChunkedZarr& opened, utils::ZarrArray array)
 
     opened.shapes.push_back(toArray3(meta.shape, "shape"));
     opened.chunkShapes.push_back(toArray3(chunkShape, "chunk shape"));
+    opened.storageChunkShapes.push_back(toArray3(meta.chunks, "storage chunk shape"));
     const int logicalLevel = static_cast<int>(opened.transforms.size());
     const double invScale = 1.0 / static_cast<double>(std::uint64_t{1} << logicalLevel);
     IChunkedArray::LevelTransform transform;
@@ -270,6 +271,7 @@ void addPhysicalLevel(OpenedChunkedZarr& opened, int physicalLevel, utils::ZarrA
         opened.transforms.resize(index + 1);
         opened.shapes.resize(index + 1, {0, 0, 0});
         opened.chunkShapes.resize(index + 1, {1, 1, 1});
+        opened.storageChunkShapes.resize(index + 1, {1, 1, 1});
         opened.fetchers.resize(index + 1);
     }
     if (opened.fetchers[index])
@@ -287,6 +289,7 @@ void addPhysicalLevel(OpenedChunkedZarr& opened, int physicalLevel, utils::ZarrA
     opened.levelNumbers[index] = physicalLevel;
     opened.shapes[index] = single.shapes[0];
     opened.chunkShapes[index] = single.chunkShapes[0];
+    opened.storageChunkShapes[index] = single.storageChunkShapes[0];
     IChunkedArray::LevelTransform transform;
     const double invScale = 1.0 / static_cast<double>(std::uint64_t{1} << physicalLevel);
     transform.scaleFromLevel0 = {invScale, invScale, invScale};

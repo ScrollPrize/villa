@@ -307,13 +307,9 @@ void SegmentationOverlayController::detachViewer(VolumeViewerBase* viewer)
 
 void SegmentationOverlayController::loadApprovalMaskImage(QuadSurface* surface)
 {
-    // If there are unsaved pending changes and a debounced save is active,
-    // save immediately before loading new data to avoid losing auto-approvals
-    if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
-        _approvalSaveTimer->stop();
-        saveApprovalMaskToSurface(_approvalSaveSurface);
-        _approvalSaveSurface = nullptr;
-    }
+    // Segment switch: flush pending approval edits to the OLD surface now,
+    // before its pointer changes, so they aren't lost.
+    flushPendingApprovalMaskSave();
 
     // Clear undo stack - old entries are for a different surface
     clearApprovalMaskUndoHistory();
@@ -462,44 +458,53 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
         }
     }
 
-    // Paint directly into the images
+    // Paint directly into the images. Both masks are Format_ARGB32_Premultiplied,
+    // so we write packed QRgb straight into scanLine() rows -- far cheaper than
+    // setPixel() (no per-pixel detach/format dispatch). alpha is 255 (or 0), so
+    // the value equals its premultiplied form; no conversion needed.
+    const int imgH = _pendingApprovalMaskImage.height();
+    const int imgW = _pendingApprovalMaskImage.width();
+    const QRgb approveRgb = qRgba(brushColor.red(), brushColor.green(), brushColor.blue(), kApprovalMaskAlpha);
+    const QRgb clearRgb = qRgba(0, 0, 0, 0);
+    const float radiusSq = radiusSteps * radiusSteps;  // circle span uses the exact (float) radius
+
+    const bool clearSaved = (paintValue == 0) && !_savedApprovalMaskImage.isNull();
+    const int savedH = clearSaved ? _savedApprovalMaskImage.height() : 0;
+    const int savedW = clearSaved ? _savedApprovalMaskImage.width() : 0;
+
+    const QRgb writeRgb = (paintValue > 0) ? approveRgb : clearRgb;
+
     for (const auto& [centerRow, centerCol] : gridPositions) {
-        // For rectangle: iterate over explicit width/height
-        // For circle: iterate over full radius in both dimensions
         const int colRange = useRectangle ? rectHalfWidth : radius;
         const int rowRange = useRectangle ? rectHalfHeight : radius;
 
-        for (int dr = -rowRange; dr <= rowRange; ++dr) {
-            for (int dc = -colRange; dc <= colRange; ++dc) {
-                const int row = centerRow + dr;
-                const int col = centerCol + dc;
+        const int r0 = std::max(0, centerRow - rowRange);
+        const int r1 = std::min(imgH - 1, centerRow + rowRange);
 
-                if (row < 0 || row >= _pendingApprovalMaskImage.height() ||
-                    col < 0 || col >= _pendingApprovalMaskImage.width()) {
-                    continue;
-                }
+        for (int row = r0; row <= r1; ++row) {
+            // Per-row horizontal span. For a circle, solve the column extent once
+            // (dc^2 <= r^2 - dr^2) instead of testing every pixel; for a rectangle
+            // the span is the full colRange. Then fill the run contiguously.
+            int dcMax = colRange;
+            if (!useRectangle) {
+                const int dr = row - centerRow;
+                const float rem = radiusSq - static_cast<float>(dr * dr);
+                if (rem < 0.f) continue;  // row entirely outside the circle
+                dcMax = static_cast<int>(std::sqrt(rem));
+            }
+            const int c0 = std::max(0, centerCol - dcMax);
+            const int c1 = std::min(imgW - 1, centerCol + dcMax);
+            if (c1 < c0) continue;
 
-                // For circle mode, skip pixels outside the radius
-                if (!useRectangle) {
-                    const float distanceSq = static_cast<float>(dr * dr + dc * dc);
-                    if (distanceSq > static_cast<float>(radiusSteps * radiusSteps)) {
-                        continue;
-                    }
-                }
+            QRgb* pendRow = reinterpret_cast<QRgb*>(_pendingApprovalMaskImage.scanLine(row));
+            std::fill(pendRow + c0, pendRow + c1 + 1, writeRgb);
 
-                // Update pixel color based on paint mode:
-                // - Approval (paintValue > 0): paint with selected RGB color in pending
-                // - Unapproval (paintValue = 0): clear both saved and pending immediately
-                if (paintValue > 0) {
-                    _pendingApprovalMaskImage.setPixel(col, row, qRgba(brushColor.red(), brushColor.green(), brushColor.blue(), kApprovalMaskAlpha));
-                } else {
-                    // Unapproving: Clear both saved and pending images immediately (no red preview)
-                    _pendingApprovalMaskImage.setPixel(col, row, qRgba(0, 0, 0, 0));
-                    if (!_savedApprovalMaskImage.isNull() &&
-                        row < _savedApprovalMaskImage.height() &&
-                        col < _savedApprovalMaskImage.width()) {
-                        _savedApprovalMaskImage.setPixel(col, row, qRgba(0, 0, 0, 0));
-                    }
+            // Unapproving also clears the saved image directly (no red preview).
+            if (clearSaved && row < savedH) {
+                QRgb* savedRow = reinterpret_cast<QRgb*>(_savedApprovalMaskImage.scanLine(row));
+                const int sc1 = std::min(c1, savedW - 1);
+                if (sc1 >= c0) {
+                    std::fill(savedRow + c0, savedRow + sc1 + 1, clearRgb);
                 }
             }
         }
@@ -521,9 +526,9 @@ void SegmentationOverlayController::paintApprovalMaskDirect(
     }
 }
 
-void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surface)
+void SegmentationOverlayController::composeApprovalMaskToSurface(QuadSurface* surface)
 {
-    OverlayProfileScope profile("saveApprovalMaskToSurface");
+    OverlayProfileScope profile("composeApprovalMaskToSurface");
     if (!surface || (_savedApprovalMaskImage.isNull() && _pendingApprovalMaskImage.isNull())) {
         return;
     }
@@ -569,9 +574,10 @@ void SegmentationOverlayController::saveApprovalMaskToSurface(QuadSurface* surfa
         }
     }
 
-    // Save to surface
+    // Stash the composited mask onto the surface's approval channel. Disk
+    // persistence is the single SegmentationModule autosave's job (saveOverwrite
+    // writes x/y/z + meta + all channels incl. approval every 10s).
     surface->setChannel("approval", approvalMask);
-    surface->saveOverwrite();
 
     // Update saved image to match what we just wrote and clear pending
     for (int row = 0; row < height; ++row) {
@@ -694,46 +700,32 @@ void SegmentationOverlayController::clearApprovalMaskUndoHistory()
 
 void SegmentationOverlayController::scheduleDebouncedSave(QuadSurface* surface)
 {
-    scheduleApprovalMaskSave(surface);
+    // Compose the edited mask onto the surface's approval channel and remember
+    // the surface for the boundary flush. The caller (which owns the module)
+    // triggers the single autosave; there is no separate approval timer.
+    if (!surface) {
+        return;
+    }
+    composeApprovalMaskToSurface(surface);
+    _approvalSaveSurface = surface;
 }
 
 void SegmentationOverlayController::flushPendingApprovalMaskSave()
 {
-    // If there's a pending debounced save, execute it immediately
-    // This ensures changes are saved to the correct surface before segment switching
-    if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
-        _approvalSaveTimer->stop();
-        saveApprovalMaskToSurface(_approvalSaveSurface);
-        _approvalSaveSurface = nullptr;
-    }
-}
-
-void SegmentationOverlayController::scheduleApprovalMaskSave(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-
-    _approvalSaveSurface = surface;
-
-    if (!_approvalSaveTimer) {
-        _approvalSaveTimer = new QTimer(this);
-        _approvalSaveTimer->setSingleShot(true);
-        connect(_approvalSaveTimer, &QTimer::timeout, this, &SegmentationOverlayController::performDebouncedApprovalSave);
-    }
-
-    // Restart the timer (debounce)
-    _approvalSaveTimer->start(kApprovalSaveDelayMs);
-}
-
-void SegmentationOverlayController::performDebouncedApprovalSave()
-{
+    // Boundary flush (segment switch / app close): write the pending approval
+    // edits to disk synchronously before the surface pointer changes. Uses the
+    // full saveOverwrite so it shares the per-dir lock with the autosave.
     if (!_approvalSaveSurface) {
         return;
     }
-
-    saveApprovalMaskToSurface(_approvalSaveSurface);
+    QuadSurface* surface = _approvalSaveSurface;
     _approvalSaveSurface = nullptr;
+    composeApprovalMaskToSurface(surface);
+    try {
+        surface->saveOverwrite();
+    } catch (const std::exception& e) {
+        qWarning() << "flushPendingApprovalMaskSave: save failed:" << e.what();
+    }
 }
 
 bool SegmentationOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
@@ -1103,13 +1095,8 @@ void SegmentationOverlayController::onSurfaceChanged(std::string name, std::shar
 {
     Q_UNUSED(surface);
 
-    // If there are unsaved pending changes and a debounced save is active,
-    // save immediately before the surface pointer becomes dangling
-    if (_approvalSaveTimer && _approvalSaveTimer->isActive() && _approvalSaveSurface) {
-        _approvalSaveTimer->stop();
-        saveApprovalMaskToSurface(_approvalSaveSurface);
-        _approvalSaveSurface = nullptr;
-    }
+    // Surface changing: flush pending approval edits before the pointer dangles.
+    flushPendingApprovalMaskSave();
 
     if (name == "segmentation") {
         refreshAll();

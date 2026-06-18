@@ -541,6 +541,15 @@ void SegmentationModule::updateViewerCursors()
     }
 }
 
+SurfacePatchIndex* SegmentationModule::activeEditSurfacePatchIndex() const
+{
+    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        return nullptr;
+    }
+    auto* index = _editManager->editSurfacePatchIndex();
+    return (index && !index->empty()) ? index : nullptr;
+}
+
 void SegmentationModule::setIgnoreSegSurfaceChange(bool ignore)
 {
     _ignoreSegSurfaceChange = ignore;
@@ -964,12 +973,10 @@ void SegmentationModule::saveApprovalMaskToDisk()
     }
 
     if (_overlay && surface) {
-        _overlay->saveApprovalMaskToSurface(surface);
-        emit statusMessageRequested(tr("Saved approval mask."), kStatusShort);
-        qCInfo(lcSegModule) << "  Approval mask saved to disk";
-
-        // Emit signal so CWindow can mark this segment as recently edited
-        // (to prevent inotify from triggering unwanted removals/reloads)
+        // Compose the mask onto the surface channel and let the single autosave
+        // persist it (x/y/z + meta + all channels) on its next tick.
+        _overlay->composeApprovalMaskToSurface(surface);
+        markAutosaveNeeded();
         if (!surface->id.empty()) {
             emit approvalMaskSaved(surface->id);
         }
@@ -2695,14 +2702,10 @@ bool SegmentationModule::applyPushPullStep()
 
 void SegmentationModule::markAutosaveNeeded(bool immediate)
 {
-    if (!_editManager || !_editManager->hasSession()) {
-        return;
-    }
-
     _autosaveState.markPending();
 
     ensureAutosaveTimer();
-    if (_editingEnabled && _autosaveTimer && !_autosaveTimer->isActive()) {
+    if (_autosaveTimer && !_autosaveTimer->isActive()) {
         _autosaveTimer->start();
     }
 
@@ -2733,31 +2736,25 @@ void SegmentationModule::performAutosave()
     if (!_autosaveState.pending()) {
         return;
     }
-    if (!_editManager) {
-        _autosaveState.clearDeferred();
-        _pendingAutosaveVertexUpdates.clear();
-        return;
-    }
 
     // If a save is already running, mark dirty so we re-save when it finishes
     if (_autosaveState.markDirtyIfSaving()) {
         return;
     }
 
-    if (!_editManager->hasSession()) {
-        if (!_editingEnabled) {
-            _autosaveState.clearDeferred();
-            _pendingAutosaveVertexUpdates.clear();
-        }
-        return;
+    // The single autosave persists the whole segment (x/y/z + meta + all
+    // channels incl. approval). Resolve the live surface from the edit session
+    // if there is one, else from the active "segmentation" surface — approval
+    // edits happen with editing disabled / no session and must still save.
+    std::shared_ptr<QuadSurface> surfacePtr;
+    if (_editManager && _editManager->hasSession()) {
+        surfacePtr = _editManager->baseSurface();
+    } else if (_state) {
+        surfacePtr = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
     }
-
-    auto surfacePtr = _editManager->baseSurface();
     if (!surfacePtr) {
-        if (!_editingEnabled) {
-            _autosaveState.clearDeferred();
-            _pendingAutosaveVertexUpdates.clear();
-        }
+        _autosaveState.clearDeferred();
+        _pendingAutosaveVertexUpdates.clear();
         return;
     }
     if (surfacePtr->path.empty() || surfacePtr->id.empty()) {
@@ -2772,7 +2769,8 @@ void SegmentationModule::performAutosave()
 
     ensureSurfaceMetaObject(surfacePtr.get());
 
-    if (_pendingAutosaveVertexUpdates.empty() && _editManager->hasPendingChanges()) {
+    if (_pendingAutosaveVertexUpdates.empty() && _editManager && _editManager->hasSession()
+        && _editManager->hasPendingChanges()) {
         queueAutosaveVertexUpdates(_editManager->editedVertices());
     }
 
@@ -2922,7 +2920,10 @@ void SegmentationModule::updateAutosaveState()
         return;
     }
 
-    const bool shouldRun = _editingEnabled && _editManager && _editManager->hasSession();
+    // Keep the single autosave timer running while editing a segment OR while
+    // any save is still pending (approval edits happen with editing disabled).
+    const bool shouldRun = (_editingEnabled && _editManager && _editManager->hasSession())
+                        || _autosaveState.pending();
     if (shouldRun) {
         if (!_autosaveTimer->isActive()) {
             _autosaveTimer->start();

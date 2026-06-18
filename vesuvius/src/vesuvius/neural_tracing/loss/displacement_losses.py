@@ -221,8 +221,10 @@ def dense_displacement_loss(pred_field, gt_displacement, sample_weights=None,
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
-    effective_mask = _resolve_dense_sample_weights(sample_weights, diff)
+    if sample_weights is None:
+        return diff.mean()
 
+    effective_mask = _resolve_dense_sample_weights(sample_weights, diff)
     masked_diff = diff * effective_mask
     return masked_diff.sum() / effective_mask.sum().clamp(min=1)
 
@@ -306,3 +308,294 @@ def smoothness_loss(pred_field):
 
     loss = (dz ** 2).mean() + (dy ** 2).mean() + (dx ** 2).mean()
     return loss
+
+
+def weighted_vector_smoothness_loss(pred_field, sample_weights=None, normalize_vectors=True):
+    """Weighted smoothness loss for dense vector fields.
+
+    Args:
+        pred_field: (B, C, D, H, W) dense vector field. C is normally 3.
+        sample_weights: optional (B, 1, D, H, W) or (B, D, H, W) weights.
+        normalize_vectors: if true, penalize angular variation instead of speed
+            variation. This is usually what we want for velocity direction heads.
+    """
+    if pred_field.ndim != 5:
+        raise ValueError(f"pred_field must have shape (B, C, D, H, W), got {tuple(pred_field.shape)}")
+
+    field = pred_field.float()
+    if normalize_vectors:
+        field = F.normalize(field, dim=1, eps=1e-6)
+
+    if sample_weights is None:
+        dz = field[:, :, 1:, :, :] - field[:, :, :-1, :, :]
+        dy = field[:, :, :, 1:, :] - field[:, :, :, :-1, :]
+        dx = field[:, :, :, :, 1:] - field[:, :, :, :, :-1]
+        return (dz ** 2).sum(dim=1).mean() + (dy ** 2).sum(dim=1).mean() + (dx ** 2).sum(dim=1).mean()
+
+    weights = _resolve_dense_sample_weights(sample_weights, field[:, 0]).float()
+    dz = field[:, :, 1:, :, :] - field[:, :, :-1, :, :]
+    dy = field[:, :, :, 1:, :] - field[:, :, :, :-1, :]
+    dx = field[:, :, :, :, 1:] - field[:, :, :, :, :-1]
+
+    wz = torch.minimum(weights[:, 1:, :, :], weights[:, :-1, :, :])
+    wy = torch.minimum(weights[:, :, 1:, :], weights[:, :, :-1, :])
+    wx = torch.minimum(weights[:, :, :, 1:], weights[:, :, :, :-1])
+
+    loss_z = ((dz ** 2).sum(dim=1) * wz).sum()
+    loss_y = ((dy ** 2).sum(dim=1) * wy).sum()
+    loss_x = ((dx ** 2).sum(dim=1) * wx).sum()
+    denom = (wz.sum() + wy.sum() + wx.sum()).clamp(min=1.0)
+    return (loss_z + loss_y + loss_x) / denom
+
+
+def _coords_to_grid(coords_zyx, spatial_shape):
+    d, h, w = (int(v) for v in spatial_shape)
+    coords = coords_zyx.clone()
+    coords[..., 0] = 2.0 * coords[..., 0] / max(d - 1, 1) - 1.0
+    coords[..., 1] = 2.0 * coords[..., 1] / max(h - 1, 1) - 1.0
+    coords[..., 2] = 2.0 * coords[..., 2] / max(w - 1, 1) - 1.0
+    return coords[..., [2, 1, 0]]
+
+
+def _sample_field_at_zyx(field, coords_zyx, *, padding_mode='zeros'):
+    """Sample a dense field at per-batch z/y/x coordinates.
+
+    Args:
+        field: (B, C, D, H, W)
+        coords_zyx: (B, N, 3)
+    Returns:
+        (B, N, C)
+    """
+    if field.ndim != 5:
+        raise ValueError(f"field must have shape (B, C, D, H, W), got {tuple(field.shape)}")
+    if coords_zyx.ndim != 3 or coords_zyx.shape[-1] != 3:
+        raise ValueError(f"coords_zyx must have shape (B, N, 3), got {tuple(coords_zyx.shape)}")
+    if coords_zyx.shape[0] != field.shape[0]:
+        raise ValueError(
+            f"batch size mismatch between field and coords: {field.shape[0]} vs {coords_zyx.shape[0]}"
+        )
+
+    grid = _coords_to_grid(coords_zyx, field.shape[2:]).view(field.shape[0], -1, 1, 1, 3)
+    sampled = F.grid_sample(field.float(), grid, mode='bilinear', padding_mode=padding_mode, align_corners=True)
+    return sampled.view(field.shape[0], field.shape[1], -1).permute(0, 2, 1)
+
+
+def displaced_source_edt_loss(
+    pred_field,
+    source_mask,
+    branch_target_edt,
+    *,
+    loss_type='huber',
+    beta=1.0,
+    max_points=4096,
+    random_sample=True,
+    oob_weight=1.0,
+):
+    """Penalize source-surface points that do not land on branch target surfaces.
+
+    The predicted 6-channel copy-neighbor field is interpreted as two 3-vector
+    displacement branches. For source surface voxels, each branch is sampled,
+    added to the source coordinate, then scored by sampling the matching target
+    EDT at the landed coordinate. This avoids requiring source/target
+    vertex-to-vertex correspondences.
+    """
+    if pred_field.ndim != 5 or pred_field.shape[1] < 6 or pred_field.shape[1] % 3 != 0:
+        raise ValueError(
+            "pred_field must have shape [B, 6+, D, H, W] with dz/dy/dx branches, "
+            f"got {tuple(pred_field.shape)}"
+        )
+    if branch_target_edt.ndim != 5 or branch_target_edt.shape[1] < 2:
+        raise ValueError(
+            "branch_target_edt must have shape [B, 2+, D, H, W], "
+            f"got {tuple(branch_target_edt.shape)}"
+        )
+    if pred_field.shape[0] != branch_target_edt.shape[0] or pred_field.shape[2:] != branch_target_edt.shape[2:]:
+        raise ValueError(
+            "pred_field and branch_target_edt must share batch/spatial shape, got "
+            f"{tuple(pred_field.shape)} vs {tuple(branch_target_edt.shape)}"
+        )
+    if source_mask.ndim == 5:
+        if source_mask.shape[1] != 1:
+            raise ValueError(
+                "source_mask with 5 dims must have shape [B, 1, D, H, W], "
+                f"got {tuple(source_mask.shape)}"
+            )
+        mask = source_mask[:, 0]
+    elif source_mask.ndim == 4:
+        mask = source_mask
+    else:
+        raise ValueError(f"source_mask must have shape [B, 1, D, H, W] or [B, D, H, W], got {tuple(source_mask.shape)}")
+
+    if mask.shape[0] != pred_field.shape[0] or mask.shape[1:] != pred_field.shape[2:]:
+        raise ValueError(
+            "source_mask must share batch/spatial shape with pred_field, got "
+            f"{tuple(mask.shape)} vs {(pred_field.shape[0], *pred_field.shape[2:])}"
+        )
+
+    max_points = int(max_points)
+    if max_points <= 0:
+        return pred_field.new_zeros(())
+
+    _, _, depth, height, width = pred_field.shape
+    num_branches = min(pred_field.shape[1] // 3, branch_target_edt.shape[1])
+    losses = []
+    weights = []
+    mask = mask.to(device=pred_field.device)
+    branch_target_edt = branch_target_edt.to(device=pred_field.device, dtype=torch.float32)
+
+    for b in range(pred_field.shape[0]):
+        coords = torch.nonzero(mask[b] > 0.5, as_tuple=False)
+        if coords.numel() == 0:
+            continue
+        if coords.shape[0] > max_points:
+            if random_sample:
+                selected = torch.randperm(coords.shape[0], device=coords.device)[:max_points]
+            else:
+                selected = torch.linspace(
+                    0,
+                    coords.shape[0] - 1,
+                    steps=max_points,
+                    device=coords.device,
+                    dtype=torch.float32,
+                ).round().long()
+            coords = coords[selected]
+
+        coords = coords.to(dtype=torch.float32).unsqueeze(0)
+        pred_b = pred_field[b:b + 1]
+        edt_b = branch_target_edt[b:b + 1]
+
+        for branch_idx in range(num_branches):
+            disp = _sample_field_at_zyx(
+                pred_b[:, branch_idx * 3 : branch_idx * 3 + 3],
+                coords,
+                padding_mode='border',
+            )
+            landed = coords + disp
+            sampled_edt = _sample_field_at_zyx(
+                edt_b[:, branch_idx : branch_idx + 1],
+                landed,
+                padding_mode='border',
+            ).squeeze(-1)
+
+            z, y, x = landed[..., 0], landed[..., 1], landed[..., 2]
+            below = F.relu(-z) + F.relu(-y) + F.relu(-x)
+            above = F.relu(z - (depth - 1)) + F.relu(y - (height - 1)) + F.relu(x - (width - 1))
+            distance = sampled_edt + float(oob_weight) * (below + above)
+
+            if loss_type == 'l1':
+                diff = distance.abs()
+            elif loss_type == 'l2':
+                diff = distance ** 2
+            elif loss_type == 'huber':
+                diff = F.smooth_l1_loss(
+                    distance,
+                    torch.zeros_like(distance),
+                    beta=float(beta),
+                    reduction='none',
+                )
+            else:
+                raise ValueError(f"Unknown displaced source EDT loss_type: {loss_type}")
+            losses.append(diff.sum())
+            weights.append(torch.as_tensor(diff.numel(), device=pred_field.device, dtype=torch.float32))
+
+    if not losses:
+        return pred_field.new_zeros(())
+    return torch.stack(losses).sum() / torch.stack(weights).sum().clamp(min=1.0)
+
+
+def velocity_streamline_integration_loss(
+    velocity_dir_pred,
+    velocity_dir_target,
+    velocity_loss_weight,
+    *,
+    steps=2,
+    step_size=1.0,
+    max_points=2048,
+    min_weight=0.5,
+    detach_steps=False,
+    random_sample=True,
+):
+    """Short-horizon streamline consistency loss for velocity direction fields.
+
+    This samples supervised voxels, advances them through the predicted velocity
+    field for a few Euler steps, and compares the predicted direction along that
+    path against the target direction sampled at the same continuous locations.
+    It is intended as a cheap local rollout regularizer, not a full tracing
+    objective.
+    """
+    if velocity_dir_pred.ndim != 5 or velocity_dir_pred.shape[1] != 3:
+        raise ValueError(
+            "velocity_dir_pred must have shape (B, 3, D, H, W), "
+            f"got {tuple(velocity_dir_pred.shape)}"
+        )
+    if velocity_dir_target.shape != velocity_dir_pred.shape:
+        raise ValueError(
+            "velocity_dir_target must match velocity_dir_pred shape, got "
+            f"{tuple(velocity_dir_target.shape)} vs {tuple(velocity_dir_pred.shape)}"
+        )
+    if velocity_loss_weight.ndim != 5 or velocity_loss_weight.shape[1] != 1:
+        raise ValueError(
+            "velocity_loss_weight must have shape (B, 1, D, H, W), "
+            f"got {tuple(velocity_loss_weight.shape)}"
+        )
+
+    steps = int(steps)
+    max_points = int(max_points)
+    if steps <= 0 or max_points <= 0 or float(step_size) <= 0.0:
+        return velocity_dir_pred.new_zeros(())
+
+    bsz, _, depth, height, width = velocity_dir_pred.shape
+    losses = []
+    weights_out = []
+    weight = velocity_loss_weight.float()
+
+    for b in range(bsz):
+        valid = weight[b, 0] > float(min_weight)
+        coords = torch.nonzero(valid, as_tuple=False)
+        if coords.numel() == 0:
+            continue
+        if coords.shape[0] > max_points:
+            if random_sample:
+                selected = torch.randperm(coords.shape[0], device=coords.device)[:max_points]
+            else:
+                selected = torch.linspace(
+                    0,
+                    coords.shape[0] - 1,
+                    steps=max_points,
+                    device=coords.device,
+                    dtype=torch.float32,
+                ).round().long()
+            coords = coords[selected]
+        coords = coords.to(dtype=torch.float32).unsqueeze(0)
+
+        pred_b = velocity_dir_pred[b:b + 1]
+        target_b = velocity_dir_target[b:b + 1]
+        weight_b = weight[b:b + 1]
+
+        for _ in range(steps):
+            pred_vec = F.normalize(_sample_field_at_zyx(pred_b, coords), dim=-1, eps=1e-6)
+            step_vec = pred_vec.detach() if detach_steps else pred_vec
+            coords = coords + float(step_size) * step_vec
+
+            in_bounds = (
+                (coords[..., 0] >= 0.0)
+                & (coords[..., 0] <= depth - 1)
+                & (coords[..., 1] >= 0.0)
+                & (coords[..., 1] <= height - 1)
+                & (coords[..., 2] >= 0.0)
+                & (coords[..., 2] <= width - 1)
+            )
+            target_w = _sample_field_at_zyx(weight_b, coords).squeeze(-1).clamp(min=0.0, max=1.0)
+            target_w = target_w * in_bounds.to(dtype=target_w.dtype)
+            if not bool((target_w > 1e-6).any().item()):
+                continue
+
+            pred_next = F.normalize(_sample_field_at_zyx(pred_b, coords), dim=-1, eps=1e-6)
+            target_next = F.normalize(_sample_field_at_zyx(target_b, coords), dim=-1, eps=1e-6)
+            dir_diff = 1.0 - (pred_next * target_next).sum(dim=-1).clamp(min=-1.0, max=1.0)
+            losses.append((dir_diff * target_w).sum())
+            weights_out.append(target_w.sum())
+
+    if not losses:
+        return velocity_dir_pred.new_zeros(())
+    return torch.stack(losses).sum() / torch.stack(weights_out).sum().clamp(min=1.0)

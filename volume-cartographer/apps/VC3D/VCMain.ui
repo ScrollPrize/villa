@@ -382,6 +382,55 @@
                </property>
               </widget>
              </item>
+             <item row="0" column="2">
+              <widget class="QLabel" name="lblSurfaceZRangeFilter">
+               <property name="text">
+                <string>Z range</string>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="3">
+              <layout class="QHBoxLayout" name="surfaceZRangeFilterLayout">
+               <property name="spacing">
+                <number>4</number>
+               </property>
+               <item>
+                <widget class="QDoubleSpinBox" name="spinSurfaceZLowerBound">
+                 <property name="toolTip">
+                  <string>Lower Z bound for visible surfaces.</string>
+                 </property>
+                 <property name="decimals">
+                  <number>2</number>
+                 </property>
+                 <property name="maximum">
+                  <double>1000000.000000000000000</double>
+                 </property>
+                 <property name="singleStep">
+                  <double>1.000000000000000</double>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QDoubleSpinBox" name="spinSurfaceZUpperBound">
+                 <property name="toolTip">
+                  <string>Upper Z bound for visible surfaces.</string>
+                 </property>
+                 <property name="decimals">
+                  <number>2</number>
+                 </property>
+                 <property name="maximum">
+                  <double>1000000.000000000000000</double>
+                 </property>
+                 <property name="singleStep">
+                  <double>1.000000000000000</double>
+                 </property>
+                 <property name="value">
+                  <double>1000000.000000000000000</double>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
              <item row="1" column="0">
               <widget class="QCheckBox" name="chkApproved">
                <property name="text">

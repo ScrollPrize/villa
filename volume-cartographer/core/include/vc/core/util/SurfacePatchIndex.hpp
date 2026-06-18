@@ -12,9 +12,9 @@
 #include <unordered_set>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
-#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Rect3D.hpp"
 
 class QuadSurface;
 class PlaneSurface;
@@ -53,6 +53,8 @@ public:
         SurfacePtr only;
         const std::unordered_set<SurfacePtr>* include = nullptr;
         const std::unordered_set<SurfacePtr>* exclude = nullptr;
+        const std::unordered_set<QuadSurface*>* includeRaw = nullptr;
+        const std::unordered_set<QuadSurface*>* excludeRaw = nullptr;
     };
 
     struct TriangleQuery {
@@ -84,7 +86,9 @@ public:
     SurfacePatchIndex(const SurfacePatchIndex&) = delete;
     SurfacePatchIndex& operator=(const SurfacePatchIndex&) = delete;
 
-    void rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding = 0.0f);
+    void rebuild(const std::vector<SurfacePtr>& surfaces,
+                 float bboxPadding = 0.0f,
+                 bool useMappedSurfaces = true);
     static std::string cacheKeyForSurfaces(const std::vector<SurfacePtr>& surfaces,
                                            int samplingStride,
                                            float bboxPadding);

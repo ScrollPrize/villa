@@ -28,6 +28,8 @@ add_library(vc_core
         src/HttpFetch.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
+        src/PointCollections.cpp
+        src/surface_metrics.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
         src/render/ChunkCache.cpp
@@ -35,8 +37,13 @@ add_library(vc_core
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
         src/render/ZarrChunkFetcher.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src/vc_merge_tifxyz_grid.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
+
+# Grid-resolution helpers (vc_merge_tifxyz_grid) live in apps/src but are
+# compiled into vc_core so the unit tests link them without the binary.
+target_include_directories(vc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src)
 
 target_link_libraries(vc_core
         PUBLIC
@@ -62,35 +69,125 @@ target_link_libraries(vc_core PRIVATE
     ${VC_LIBBACKTRACE}
 )
 
+# Neutral PCH carrier shared by vc_core, downstream vc_* libs, and CLI apps.
+# Keep this separate from vc_core: shared-library targets add export macros
+# such as vc_core_EXPORTS while compiling themselves, and GCC rejects a PCH
+# built with those target-local definitions when consumers try to REUSE_FROM it.
+if(VC_USE_PCH)
+    set(VC_PCH_HEADERS
+        "$<$<COMPILE_LANGUAGE:CXX>:<algorithm>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<array>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<atomic>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<chrono>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<cmath>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<cstdint>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<cstring>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<filesystem>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<fstream>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<iomanip>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<iostream>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<limits>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<memory>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<mutex>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<optional>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<sstream>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<stdexcept>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<string>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<unordered_map>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<unordered_set>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<random>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<utility>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<vector>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<functional>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<set>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<map>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<thread>>"
+        # <format> is the heaviest std header in the build (~1.3k s of
+        # instantiation across TUs; libstdc++ 15 + Qt pull it in widely).
+        "$<$<COMPILE_LANGUAGE:CXX>:<format>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<string_view>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/core.hpp>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgproc.hpp>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgcodecs.hpp>>"
+        "$<$<COMPILE_LANGUAGE:CXX>:<nlohmann/json.hpp>>"
+        CACHE INTERNAL "PCH header list shared by vc_* and downstream targets")
 
+    set(_vc_common_pch_source "${CMAKE_CURRENT_BINARY_DIR}/vc_common_pch.cpp")
+    file(WRITE "${_vc_common_pch_source}" "void vc_common_pch_anchor() {}\n")
+    add_library(vc_common_pch STATIC "${_vc_common_pch_source}")
+    set_target_properties(vc_common_pch PROPERTIES
+        AUTOMOC OFF AUTOUIC OFF AUTORCC OFF
+        POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(vc_common_pch PRIVATE
+        opencv_core
+        opencv_imgproc
+        opencv_imgcodecs
+        nlohmann_json::nlohmann_json
+        OpenMP::OpenMP_CXX
+        TIFF::TIFF)
+    target_precompile_headers(vc_common_pch PRIVATE ${VC_PCH_HEADERS})
+    target_precompile_headers(vc_core REUSE_FROM vc_common_pch)
+endif()
 
-# Slicing.cpp is the hot sampling loop (87% of render time).
-# Force O3 + fast-math for maximum vectorization regardless of build type.
-set_source_files_properties(src/Slicing.cpp PROPERTIES
-    COMPILE_OPTIONS "-O3;-ffast-math"
+add_library(vc_flattening src/ABFFlattening.cpp)
+target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
+
+add_library(vc_inpaint src/InpaintSurface.cpp)
+target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
+
+add_library(vc_lasagna
+    src/lasagna/Dataset.cpp
+    src/lasagna/EclMaxflow.cpp
+    src/lasagna/EclMaxflowCut.cpp
+    src/lasagna/LaplaceAmgx.cpp
+    src/lasagna/LaplaceRank.cpp
+    src/lasagna/LasagnaNormalSampler.cpp
+    src/lasagna/LineViewBuilder.cpp
+    src/lasagna/LineOptimizer.cpp
+    src/lasagna/Manifest.cpp
+    src/lasagna/MaxflowGraph.cpp
 )
+if(VC_ENABLE_ECL_MAXFLOW)
+    target_sources(vc_lasagna PRIVATE src/lasagna/EclMaxflow.cu)
+    set_source_files_properties(src/lasagna/EclMaxflow.cpp PROPERTIES HEADER_FILE_ONLY ON)
+    target_compile_definitions(vc_lasagna PUBLIC VC_ENABLE_ECL_MAXFLOW=1)
+    target_include_directories(vc_lasagna PRIVATE
+        ${CMAKE_SOURCE_DIR}/libs/ECL-MaxFlow/src
+        ${CMAKE_SOURCE_DIR}/libs/ECL-MaxFlow/lib)
+    set_source_files_properties(src/lasagna/EclMaxflow.cu PROPERTIES
+        LANGUAGE CUDA
+        CUDA_SEPARABLE_COMPILATION OFF)
+    set_property(TARGET vc_lasagna PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET vc_lasagna PROPERTY CUDA_STANDARD_REQUIRED ON)
+endif()
+if(VC_ENABLE_AMGX)
+    target_compile_definitions(vc_lasagna PUBLIC VC_ENABLE_AMGX=1)
+    target_link_libraries(vc_lasagna PRIVATE AMGX::amgx)
+endif()
+target_link_libraries(vc_lasagna PUBLIC vc_core PRIVATE Ceres::ceres)
 
-if(VC_BUILD_UI_TRACER)
-    qt6_wrap_cpp(metrics_moc include/vc/ui/VCCollection.hpp)
-    add_library(vc_ui src/VCCollection.cpp src/UDataManipulateUtils.cpp src/surface_metrics.cpp ${metrics_moc})
-    target_link_libraries(vc_ui PUBLIC vc_core Qt6::Core Qt6::Gui Qt6::Widgets)
+add_library(vc_atlas
+    src/Atlas.cpp
+    src/AtlasConstraints.cpp
+    src/FiberIntersections.cpp
+)
+target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
-    add_library(vc_flattening src/ABFFlattening.cpp)
-    target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
+add_library(vc_tracer
+    src/GrowPatch.cpp
+    src/GrowSurface.cpp
+    src/SurfTrackerData.cpp
+    src/NeuralTracerConnection.cpp
+    src/ChunkedTensor.cpp
+    src/growth_strategies/CandidateOrdering.cpp
+    src/growth_strategies/ComponentPruning.cpp
+    src/growth_strategies/GrowthConfig.cpp
+)
+target_link_libraries(vc_tracer PUBLIC vc_core vc_flattening Ceres::ceres)
+target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
-    add_library(vc_inpaint src/InpaintSurface.cpp)
-    target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
-
-    add_library(vc_tracer
-        src/GrowPatch.cpp
-        src/GrowSurface.cpp
-        src/SurfTrackerData.cpp
-        src/NeuralTracerConnection.cpp
-        src/ChunkedTensor.cpp
-        src/growth_strategies/CandidateOrdering.cpp
-        src/growth_strategies/ComponentPruning.cpp
-        src/growth_strategies/GrowthConfig.cpp
-    )
-    target_link_libraries(vc_tracer PUBLIC vc_core vc_ui vc_flattening Ceres::ceres Qt6::Core)
-    target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
+if(VC_USE_PCH)
+    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_atlas vc_tracer)
+        target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
+    endforeach()
 endif()

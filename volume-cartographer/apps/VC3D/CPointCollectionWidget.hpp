@@ -11,9 +11,7 @@
 #include <QCheckBox>
 #include <QItemSelection>
 #include <QDoubleSpinBox>
-#include <QSpinBox>
 #include <QLabel>
-#include <QComboBox>
 
 #include <cmath>
 #include <filesystem>
@@ -42,22 +40,11 @@ public:
     void clearCorrPointsResults();
 
     void setAnnotateChecked(bool checked);
-    bool sameWrapAnnotationEnabled() const;
-    double sameWrapAnnotationSpacing() const;
-    bool sameWrapAnnotationMergeEnabled() const;
-    int sameWrapAnnotationPathType() const;
-    int sameWrapAnnotationFilterType() const;
-    int sameWrapAnnotationFilterKernelSize() const;
+    double pointViewTolerance() const;
 
 signals:
     void annotateToggled(bool enabled);
-    void sameWrapAnnotationToggled(bool enabled);
-    void sameWrapAnnotationSpacingChanged(double spacing);
-    void sameWrapAnnotationMergeToggled(bool enabled);
-    void sameWrapAnnotationPathTypeChanged(int pathType);
-    void sameWrapAnnotationFilterTypeChanged(int filterType);
-    void sameWrapAnnotationFilterKernelSizeChanged(int kernelSize);
-    void sameWrapAnnotationClearRequested();
+    void pointViewToleranceChanged(double tolerance);
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
@@ -74,6 +61,7 @@ private slots:
     void onCollectionChanged(uint64_t collectionId);
     void onCollectionRemoved(uint64_t collectionId);
     void onPointAdded(const ColPoint& point);
+    void onPointsAdded(const std::vector<ColPoint>& points);
     void onPointChanged(const ColPoint& point);
     void onPointRemoved(uint64_t pointId);
 
@@ -106,13 +94,7 @@ private slots:
     uint64_t _selected_point_id = 0;
 
     QCheckBox *_chkAnnotate{nullptr};
-    QCheckBox *_chkSameWrapAnnotation{nullptr};
-    QCheckBox *_chkSameWrapMerge{nullptr};
-    QComboBox *_sameWrapPathTypeCombo{nullptr};
-    QComboBox *_sameWrapFilterTypeCombo{nullptr};
-    QSpinBox *_sameWrapFilterKernelSpinbox{nullptr};
-    QDoubleSpinBox *_sameWrapSpacingSpinbox{nullptr};
-    QPushButton *_clearSameWrapAnnotationButton{nullptr};
+    QDoubleSpinBox *_pointViewToleranceSpinbox{nullptr};
 
     QTreeView *_tree_view;
     QStandardItemModel *_model;
@@ -121,7 +103,7 @@ private slots:
     QPushButton *_save_button;
     QPushButton *_reset_button;
     QPushButton *_reset_winding_button;
- 
+
     QGroupBox *_collection_metadata_group;
     QLineEdit *_collection_name_edit;
     QPushButton *_new_name_button;

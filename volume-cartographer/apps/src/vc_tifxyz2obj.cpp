@@ -1,4 +1,6 @@
 // vc_tifxyz2obj.cpp
+#include <opencv2/core.hpp>  // operator<<(ostream, cv::Size) for the debug prints below
+
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/InpaintSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
@@ -93,6 +95,7 @@ static cv::Mat_<cv::Vec3f> decimate_grid_ratio(const cv::Mat_<cv::Vec3f>& points
 // Adds vertex/texcoord/normal for grid location (y,x) if not already added.
 // Returns the (1-based) OBJ index for this vertex (and matching vt/vn).
 static int get_add_vertex(std::ofstream& out,
+                          std::ofstream* griduv,
                           const cv::Mat_<cv::Vec3f>& points,
                           const cv::Mat_<cv::Vec3f>& normals,
                           cv::Mat_<int>& idxs,
@@ -107,6 +110,13 @@ static int get_add_vertex(std::ofstream& out,
         idxs(loc) = v_idx++;
         const cv::Vec3f p = points(loc);
         out << "v " << p[0] << " " << p[1] << " " << p[2] << '\n';
+
+        // Grid-UV sidecar: raw (col,row) of this vertex in source-grid space,
+        // one line per OBJ vertex in emit order. Carries the original grid
+        // cell through flatten so approval can be resampled. See vc_obj2tifxyz.
+        if (griduv) {
+            (*griduv) << loc[1] << ' ' << loc[0] << '\n';
+        }
 
         // UVs: scaled by SCALE = 20
         const float u = normalize_uv ? float(loc[1]) / float(points.cols - 1) : float(loc[1]) * uv_fac_x;
@@ -241,6 +251,20 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
     }
     out << std::fixed << std::setprecision(6);
 
+    // Emit a grid-UV sidecar only when the source carries an approval mask;
+    // it lets the flatten pipeline resample approval onto the new grid.
+    std::ofstream griduv;
+    std::ofstream* griduv_ptr = nullptr;
+    if (!surf->channel("approval", SURF_CHANNEL_NORESIZE).empty()) {
+        const std::filesystem::path griduv_fn = out_fn.string() + ".griduv";
+        griduv.open(griduv_fn);
+        if (griduv) {
+            griduv_ptr = &griduv;
+        } else {
+            std::cerr << "warning: could not write grid-UV sidecar: " << griduv_fn << "\n";
+        }
+    }
+
     cv::Mat_<cv::Vec3f> normals = build_vertex_normals_from_faces(points);
 
     std::cout << "Point dims: " << points.size()
@@ -269,10 +293,10 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
         for (int i = 0; i < points.cols - 1; ++i)
             if (loc_valid(points, cv::Vec2d(j, i)))
             {
-                const int c00 = get_add_vertex(out, points, normals, idxs, v_idx, {j,   i  }, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c01 = get_add_vertex(out, points, normals, idxs, v_idx, {j,   i+1}, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c10 = get_add_vertex(out, points, normals, idxs, v_idx, {j+1, i  }, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c11 = get_add_vertex(out, points, normals, idxs, v_idx, {j+1, i+1}, normalize_uv, uv_fac_x, uv_fac_y);
+                const int c00 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j,   i  }, normalize_uv, uv_fac_x, uv_fac_y);
+                const int c01 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j,   i+1}, normalize_uv, uv_fac_x, uv_fac_y);
+                const int c10 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j+1, i  }, normalize_uv, uv_fac_x, uv_fac_y);
+                const int c11 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j+1, i+1}, normalize_uv, uv_fac_x, uv_fac_y);
                 // faces unchanged: use same index for v/vt/vn
                 out << "f " << c10 << "/" << c10 << "/" << c10 << " "
                            << c00 << "/" << c00 << "/" << c00 << " "

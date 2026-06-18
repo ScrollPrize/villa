@@ -26,7 +26,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--winding-step", type=int, default=25)
 	g.add_argument("--subsample-mesh", type=int, default=4)
 	g.add_argument("--subsample-winding", type=int, default=4)
-	g.add_argument("--depth", type=int, default=3)
+	g.add_argument("--depth", type=int, default=None,
+		help="Number of windings / model depth layers")
 	g.add_argument("--mesh-h", type=int, default=32)
 	g.add_argument("--mesh-w", type=int, default=32)
 	g.add_argument("--init-mode", default="cylinder_seed", choices=["cylinder_seed", "shell-dir-crop"])
@@ -36,13 +37,25 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--model-output", default=None)
 
 
+def _resolved_depth(args: argparse.Namespace) -> int:
+	depth_raw = getattr(args, "depth", None)
+	depth = None if depth_raw is None else int(depth_raw)
+	resolved = depth
+	if resolved is None:
+		resolved = 3
+	resolved = max(1, int(resolved))
+	setattr(args, "depth", resolved)
+	return resolved
+
+
 def from_args(args: argparse.Namespace) -> ModelConfig:
+	depth = _resolved_depth(args)
 	return ModelConfig(
 		mesh_step=int(args.mesh_step),
 		winding_step=int(args.winding_step),
 		subsample_mesh=int(args.subsample_mesh),
 		subsample_winding=int(args.subsample_winding),
-		depth=max(1, int(args.depth)),
+		depth=depth,
 		mesh_h=max(2, int(args.mesh_h)),
 		mesh_w=max(2, int(args.mesh_w)),
 		init_mode=str(args.init_mode),

@@ -96,6 +96,8 @@ public:
     uint64_t selectedPointId() const override { return 0; }
     uint64_t selectedCollectionId() const override { return 0; }
     bool isPointDragActive() const override { return false; }
+    bool isSameWrapAnnotationModeEnabled() const override { return false; }
+    double sameWrapAnnotationPolylineOpacity() const override { return 1.0; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override { return paths_; }
 
     void setOverlayGroup(const std::string&, const std::vector<QGraphicsItem*>&) override {}

@@ -46,6 +46,18 @@
 namespace {
 
 constexpr double kFocusPointFilterRadius = 10.0;
+constexpr double kZRangeFilterLowerDefault = 0.0;
+constexpr double kZRangeFilterUpperDefault = 1000000.0;
+
+bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
+{
+    if (!lower || !upper) {
+        return false;
+    }
+
+    return lower->value() != kZRangeFilterLowerDefault ||
+           upper->value() != kZRangeFilterUpperDefault;
+}
 
 void sync_tag(utils::Json& dict, bool checked, const std::string& name, const std::string& username = {})
 {
@@ -452,9 +464,7 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
 
     std::cout << "Adding segmentation: " << segId << std::endl;
     try {
-        if (!_volumePkg->addSingleSegmentation(segId)) {
-            _volumePkg->refreshSegmentations();
-        }
+        (void)_volumePkg->addSingleSegmentation(segId);
         auto surf = _volumePkg->loadSurface(segId);
         if (!surf) {
             return;
@@ -463,7 +473,18 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
             _state->setSurface(segId, surf, true, false);
         }
         if (_ui.treeWidget) {
-            auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
+            SurfaceTreeWidgetItem* item = nullptr;
+            QTreeWidgetItemIterator it(_ui.treeWidget);
+            while (*it) {
+                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == segId) {
+                    item = static_cast<SurfaceTreeWidgetItem*>(*it);
+                    break;
+                }
+                ++it;
+            }
+            if (!item) {
+                item = new SurfaceTreeWidgetItem(_ui.treeWidget);
+            }
             item->setText(SURFACE_ID_COLUMN, QString::fromStdString(segId));
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
             const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
@@ -605,7 +626,6 @@ void SurfacePanelController::handleTreeSelectionChanged()
         if (surfaceJustLoaded || !_state->surface(id)) {
             _state->setSurface(id, surface, true, false);
         }
-        _state->setSurface("segmentation", surface, false, false);
     }
 
     syncSelectionUi(id, surface.get());
@@ -710,10 +730,17 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
             emit resumeLocalGrowPatchRequested(segmentId);
         });
 
-        // Reload from Backup submenu
-        std::filesystem::path backupsDir =
-            std::filesystem::path(_volumePkg->getVolpkgDirectory()) / "backups" / segmentId.toStdString();
-        if (std::filesystem::exists(backupsDir) && std::filesystem::is_directory(backupsDir)) {
+        // Reload from Backup submenu. Backups live under
+        // <backupRoot>/backups/<id> (backupRoot is the volpkg.json's directory),
+        // matching QuadSurface::saveSnapshot().
+        auto backupSurf = getSurfaceById(segmentId.toStdString());
+        std::filesystem::path backupsDir;
+        if (backupSurf && !backupSurf->path.empty()) {
+            std::filesystem::path root = backupSurf->backupRoot.empty()
+                ? backupSurf->path.parent_path() : backupSurf->backupRoot;
+            backupsDir = root / "backups" / backupSurf->path.filename();
+        }
+        if (!backupsDir.empty() && std::filesystem::exists(backupsDir) && std::filesystem::is_directory(backupsDir)) {
             std::vector<int> availableBackups;
             for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
                 if (entry.is_directory()) {
@@ -806,6 +833,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit slimFlattenRequested(segmentId);
     });
 
+    QAction* straightenAction = contextMenu.addAction(tr("Straighten (vc_straighten)"));
+    connect(straightenAction, &QAction::triggered, this, [this, segmentId]() {
+        emit straightenRequested(segmentId);
+    });
+
     QAction* abfFlattenAction = contextMenu.addAction(tr("ABF++ flatten"));
     connect(abfFlattenAction, &QAction::triggered, this, [this, segmentId]() {
         emit abfFlattenRequested(segmentId);
@@ -833,6 +865,15 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         QAction* mergeAction = contextMenu.addAction(tr("Merge tifxyz..."));
         connect(mergeAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
             emit mergeTifxyzRequested(selectedSegmentIds);
+        });
+    }
+    // Patch tifxyz is exactly-2-input; gate to exactly 2 selected segments
+    // so the dialog opens with both pickers pre-filled and the user can
+    // dial in border / blend without picking inputs.
+    if (selectedSegmentIds.size() == 2) {
+        QAction* patchAction = contextMenu.addAction(tr("Patch tifxyz..."));
+        connect(patchAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
+            emit mergePatchRequested(selectedSegmentIds);
         });
     }
 
@@ -998,6 +1039,26 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
         _filters.focusPointDistance->setToolTip(tr("Maximum distance from the focus point for the Focus Point filter."));
     }
 
+    if (_filters.zLowerBound) {
+        _filters.zLowerBound->setRange(kZRangeFilterLowerDefault, kZRangeFilterUpperDefault);
+        _filters.zLowerBound->setDecimals(2);
+        _filters.zLowerBound->setSingleStep(1.0);
+        _filters.zLowerBound->setPrefix(tr("Lower "));
+        _filters.zLowerBound->setSuffix(tr(" z"));
+        _filters.zLowerBound->setValue(kZRangeFilterLowerDefault);
+        _filters.zLowerBound->setToolTip(tr("Lower Z bound for visible surfaces."));
+    }
+
+    if (_filters.zUpperBound) {
+        _filters.zUpperBound->setRange(kZRangeFilterLowerDefault, kZRangeFilterUpperDefault);
+        _filters.zUpperBound->setDecimals(2);
+        _filters.zUpperBound->setSingleStep(1.0);
+        _filters.zUpperBound->setPrefix(tr("Upper "));
+        _filters.zUpperBound->setSuffix(tr(" z"));
+        _filters.zUpperBound->setValue(kZRangeFilterUpperDefault);
+        _filters.zUpperBound->setToolTip(tr("Upper Z bound for visible surfaces."));
+    }
+
     _filters.focusPoints = nullptr;
     _filters.unreviewed = nullptr;
     _filters.hideUnapproved = nullptr;
@@ -1127,6 +1188,29 @@ bool SurfacePanelController::toggleTag(Tag tag)
     return true;
 }
 
+bool SurfacePanelController::setTagChecked(Tag tag, bool checked)
+{
+    QCheckBox* target = nullptr;
+    switch (tag) {
+        case Tag::Approved: target = _tags.approved; break;
+        case Tag::Defective: target = _tags.defective; break;
+        case Tag::Reviewed: target = _tags.reviewed; break;
+        case Tag::Inspect: target = _tags.inspect; break;
+    }
+
+    if (!target || !target->isEnabled()) {
+        return false;
+    }
+
+    const Qt::CheckState desiredState = checked ? Qt::Checked : Qt::Unchecked;
+    if (target->checkState() == desiredState) {
+        onTagCheckboxToggled();
+    } else {
+        target->setCheckState(desiredState);
+    }
+    return true;
+}
+
 void SurfacePanelController::reloadSurfacesFromDisk()
 {
     loadSurfacesIncremental();
@@ -1209,6 +1293,32 @@ void SurfacePanelController::connectFilterSignals()
                 QOverload<double>::of(&QDoubleSpinBox::valueChanged),
                 this,
                 [this](double) { applyFilters(); });
+    }
+
+    if (_filters.zLowerBound) {
+        connect(_filters.zLowerBound,
+                QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this,
+                [this](double value) {
+                    if (_filters.zUpperBound && value > _filters.zUpperBound->value()) {
+                        const QSignalBlocker blocker(_filters.zUpperBound);
+                        _filters.zUpperBound->setValue(value);
+                    }
+                    applyFilters();
+                });
+    }
+
+    if (_filters.zUpperBound) {
+        connect(_filters.zUpperBound,
+                QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this,
+                [this](double value) {
+                    if (_filters.zLowerBound && value < _filters.zLowerBound->value()) {
+                        const QSignalBlocker blocker(_filters.zLowerBound);
+                        _filters.zLowerBound->setValue(value);
+                    }
+                    applyFilters();
+                });
     }
 
     if (_filters.showPartialReview) {
@@ -1362,6 +1472,9 @@ void SurfacePanelController::updateFilterSummary()
     countIfChecked(_filters.showPartialReview);
     countIfChecked(_filters.inspectOnly);
     countIfChecked(_filters.currentOnly);
+    if (z_range_filter_active(_filters.zLowerBound, _filters.zUpperBound)) {
+        ++activeFilters;
+    }
 
     QString label = tr("Filters");
     if (activeFilters > 0) {
@@ -1455,6 +1568,7 @@ void SurfacePanelController::applyFiltersInternal()
 
     const QString surfaceIdFilterText = _filters.surfaceIdFilter ? _filters.surfaceIdFilter->text().trimmed() : QString{};
     const bool hasSurfaceIdFilter = !surfaceIdFilterText.isEmpty();
+    const bool hasZRangeFilter = z_range_filter_active(_filters.zLowerBound, _filters.zUpperBound);
 
     bool hasActiveFilters = isChecked(_filters.focusPoints) ||
                             isChecked(_filters.unreviewed) ||
@@ -1465,7 +1579,8 @@ void SurfacePanelController::applyFiltersInternal()
                             isChecked(_filters.currentOnly) ||
                             isChecked(_filters.hideUnapproved) ||
                             isChecked(_filters.inspectOnly) ||
-                            hasSurfaceIdFilter;
+                            hasSurfaceIdFilter ||
+                            hasZRangeFilter;
 
     auto* model = qobject_cast<QStandardItemModel*>(_filters.pointSet ? _filters.pointSet->model() : nullptr);
     if (!hasActiveFilters && model) {
@@ -1530,6 +1645,12 @@ void SurfacePanelController::applyFiltersInternal()
     const double focusPointFilterRadius = _filters.focusPointDistance
         ? _filters.focusPointDistance->value()
         : kFocusPointFilterRadius;
+    const double zLowerBound = _filters.zLowerBound
+        ? _filters.zLowerBound->value()
+        : kZRangeFilterLowerDefault;
+    const double zUpperBound = _filters.zUpperBound
+        ? _filters.zUpperBound->value()
+        : kZRangeFilterUpperDefault;
     std::unordered_set<QuadSurface*> focusPointSurfaces;
     if (focusPointFilter) {
         if (auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr) {
@@ -1561,7 +1682,18 @@ void SurfacePanelController::applyFiltersInternal()
             show = show && surf && focusPointSurfaces.find(surf.get()) != focusPointSurfaces.end();
         }
 
+        if (hasZRangeFilter && !surf) {
+            show = false;
+        }
+
         if (surf) {
+            if (hasZRangeFilter) {
+                const auto bbox = surf->bbox();
+                show = show && bbox.low[0] != -1.0f &&
+                       bbox.low[2] <= zUpperBound &&
+                       bbox.high[2] >= zLowerBound;
+            }
+
             if (model) {
                 bool anyChecked = false;
                 bool anyMatches = false;
@@ -1913,7 +2045,6 @@ bool SurfacePanelController::cycleVisibleSegment(int direction)
         if (!_state->surface(id)) {
             _state->setSurface(id, surface, true, false);
         }
-        _state->setSurface("segmentation", surface, false, false);
     }
 
     _currentSurfaceId = id;

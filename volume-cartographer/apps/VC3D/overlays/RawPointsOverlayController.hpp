@@ -4,7 +4,7 @@
 #include <memory>
 #include <optional>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 struct POI;
 class CState;

@@ -3,20 +3,31 @@ import copy
 import dataclasses
 import math
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 import cli_data
 import cli_json
 import cli_model
 import cli_opt
 import fit_data
+import atlas as atlas_mod
 import model
 import opt_loss_corr
 import opt_loss_dir
+import opt_loss_pred_dt
+import opt_loss_step
 import optimizer
+import volume_scale
+
+
+_SHELL_STEP_ANALYSIS_ENABLED = False
+_ATLAS_LINE_ATTACHMENT_STATE_KEY = "_atlas_line_attachment_state_"
+_ATLAS_LINE_ATTACHMENT_STATE_FORMAT = "lasagna_atlas_line_attachment_state"
+_ATLAS_LINE_TERMS = ("atlas_line", "atlas_line_control", "atlas_line_other", "atlas_line_snap")
 
 
 def _stage_start(label: str) -> float:
@@ -35,6 +46,319 @@ def _truthy_config_bool(value: object) -> bool:
 	if isinstance(value, str):
 		return value.strip().lower() in {"1", "true", "yes", "on"}
 	return False
+
+
+def _cpu_float_tensor_1d(value: torch.Tensor, *, name: str, count: int | None = None) -> torch.Tensor:
+	t = value.detach().cpu().to(dtype=torch.float32).reshape(-1).contiguous()
+	if count is not None and int(t.numel()) != int(count):
+		raise ValueError(f"{name} expected {count} values, got {int(t.numel())}")
+	if not bool(torch.isfinite(t).all()):
+		raise ValueError(f"{name} contains non-finite values")
+	return t
+
+
+def _cpu_float_tensor_2d(value: torch.Tensor, *, name: str, shape: tuple[int, int] | None = None) -> torch.Tensor:
+	t = value.detach().cpu().to(dtype=torch.float32)
+	if t.ndim != 2:
+		raise ValueError(f"{name} expected a 2D tensor, got shape {tuple(t.shape)}")
+	if shape is not None and tuple(int(v) for v in t.shape) != tuple(shape):
+		raise ValueError(f"{name} expected shape {shape}, got {tuple(t.shape)}")
+	if not bool(torch.isfinite(t).all()):
+		raise ValueError(f"{name} contains non-finite values")
+	return t.contiguous()
+
+
+def _cpu_bool_tensor_1d(value: torch.Tensor | None, *, name: str, count: int) -> torch.Tensor:
+	if value is None:
+		return torch.zeros(int(count), dtype=torch.bool)
+	t = value.detach().cpu().to(dtype=torch.bool).reshape(-1).contiguous()
+	if int(t.numel()) != int(count):
+		raise ValueError(f"{name} expected {count} values, got {int(t.numel())}")
+	return t
+
+
+def _atlas_line_attachment_state_from_debug_payload(
+	*,
+	lines: fit_data.AtlasLines3D,
+	payload: object,
+) -> dict:
+	K = int(lines.target_xyz.shape[0])
+	sample_h = getattr(payload, "sample_model_h", None)
+	sample_w = getattr(payload, "sample_model_w", None)
+	if not isinstance(sample_h, torch.Tensor) or not isinstance(sample_w, torch.Tensor):
+		raise ValueError("atlas attachment persistence requires sample_model_h/sample_model_w debug tensors")
+	sample_h = sample_h.detach().cpu().to(dtype=torch.float32)
+	sample_w = sample_w.detach().cpu().to(dtype=torch.float32)
+	if sample_h.ndim != 2 or sample_w.ndim != 2:
+		raise ValueError(
+			"atlas attachment persistence requires sample_model_h/sample_model_w with shape (D,K)"
+		)
+	if int(sample_h.shape[0]) != 1 or int(sample_w.shape[0]) != 1:
+		raise ValueError(
+			f"atlas attachment persistence requires depth-1 debug payload, got "
+			f"sample_model_h={tuple(sample_h.shape)} sample_model_w={tuple(sample_w.shape)}"
+		)
+	if int(sample_h.shape[1]) != K or int(sample_w.shape[1]) != K:
+		raise ValueError(
+			f"atlas attachment persistence sample count mismatch: lines={K} "
+			f"sample_model_h={tuple(sample_h.shape)} sample_model_w={tuple(sample_w.shape)}"
+		)
+	object_ids = [str(v) for v in (getattr(lines, "object_ids", ()) or ())]
+	if len(object_ids) != K:
+		object_ids = ["unknown" for _ in range(K)]
+	source_indices = [int(v) for v in (getattr(lines, "source_indices", ()) or ())]
+	if len(source_indices) != K:
+		source_indices = [int(i) for i in range(K)]
+	return {
+		"format": _ATLAS_LINE_ATTACHMENT_STATE_FORMAT,
+		"version": 1,
+		"target_xyz": _cpu_float_tensor_2d(lines.target_xyz, name="target_xyz", shape=(K, 3)),
+		"normal_xyz": _cpu_float_tensor_2d(lines.normal_xyz, name="normal_xyz", shape=(K, 3)),
+		"model_h": _cpu_float_tensor_1d(sample_h[0], name="model_h", count=K),
+		"model_w": _cpu_float_tensor_1d(sample_w[0], name="model_w", count=K),
+		"object_ids": object_ids,
+		"source_indices": source_indices,
+		"is_control_point": _cpu_bool_tensor_1d(getattr(lines, "is_control_point", None), name="is_control_point", count=K),
+		"is_snap_point": _cpu_bool_tensor_1d(getattr(lines, "is_snap_point", None), name="is_snap_point", count=K),
+		"atlas_winding_model_ranges": [
+			[int(winding), float(start_w), float(end_w)]
+			for winding, start_w, end_w in (getattr(lines, "atlas_winding_model_ranges", ()) or ())
+		],
+	}
+
+
+def _atlas_lines_from_attachment_state(state: object, *, device: torch.device) -> fit_data.AtlasLines3D:
+	if not isinstance(state, dict):
+		raise ValueError("atlas reopt requires _atlas_line_attachment_state_ checkpoint state")
+	if state.get("format") != _ATLAS_LINE_ATTACHMENT_STATE_FORMAT or int(state.get("version", -1)) != 1:
+		raise ValueError("atlas reopt requires valid _atlas_line_attachment_state_ checkpoint state")
+	try:
+		target_xyz = torch.as_tensor(state["target_xyz"], device=device, dtype=torch.float32)
+		normal_xyz = torch.as_tensor(state["normal_xyz"], device=device, dtype=torch.float32)
+		model_h = torch.as_tensor(state["model_h"], device=device, dtype=torch.float32).reshape(-1)
+		model_w = torch.as_tensor(state["model_w"], device=device, dtype=torch.float32).reshape(-1)
+	except KeyError as exc:
+		raise ValueError("atlas reopt requires valid _atlas_line_attachment_state_ checkpoint state") from exc
+	K = int(model_h.numel())
+	if target_xyz.shape != (K, 3) or normal_xyz.shape != (K, 3) or int(model_w.numel()) != K:
+		raise ValueError("atlas reopt requires valid _atlas_line_attachment_state_ checkpoint state")
+	if not bool(torch.isfinite(target_xyz).all() and torch.isfinite(normal_xyz).all()
+				and torch.isfinite(model_h).all() and torch.isfinite(model_w).all()):
+		raise ValueError("atlas reopt requires finite _atlas_line_attachment_state_ coordinates")
+	object_ids = tuple(str(v) for v in state.get("object_ids", ()))
+	source_indices = tuple(int(v) for v in state.get("source_indices", ()))
+	if len(object_ids) != K:
+		raise ValueError("atlas reopt requires _atlas_line_attachment_state_.object_ids to match attachments")
+	if len(source_indices) != K:
+		raise ValueError("atlas reopt requires _atlas_line_attachment_state_.source_indices to match attachments")
+	is_control = torch.as_tensor(state.get("is_control_point", torch.zeros(K, dtype=torch.bool)), device=device, dtype=torch.bool).reshape(-1)
+	is_snap = torch.as_tensor(state.get("is_snap_point", torch.zeros(K, dtype=torch.bool)), device=device, dtype=torch.bool).reshape(-1)
+	if int(is_control.numel()) != K or int(is_snap.numel()) != K:
+		raise ValueError("atlas reopt requires _atlas_line_attachment_state_ flags to match attachments")
+	ranges_raw = state.get("atlas_winding_model_ranges", ())
+	ranges: list[tuple[int, float, float]] = []
+	for item in ranges_raw or ():
+		if not isinstance(item, (list, tuple)) or len(item) != 3:
+			raise ValueError("atlas reopt requires valid _atlas_line_attachment_state_.atlas_winding_model_ranges")
+		ranges.append((int(item[0]), float(item[1]), float(item[2])))
+	return fit_data.AtlasLines3D(
+		target_xyz=target_xyz,
+		normal_xyz=normal_xyz,
+		model_h=model_h,
+		model_w=model_w,
+		object_ids=object_ids,
+		source_indices=source_indices,
+		is_control_point=is_control,
+		is_snap_point=is_snap,
+		atlas_winding_model_ranges=tuple(ranges),
+	)
+
+
+def _stages_use_atlas_line_terms(stages: list[optimizer.Stage] | tuple[optimizer.Stage, ...]) -> bool:
+	for stage in stages:
+		if stage.children and _stages_use_atlas_line_terms(stage.children):
+			return True
+		if stage.global_opt is None:
+			continue
+		if int(stage.global_opt.steps) <= 0:
+			continue
+		if any(float(stage.global_opt.eff.get(name, 0.0)) > 0.0 for name in _ATLAS_LINE_TERMS):
+			return True
+	return False
+
+
+def _checkpoint_atlas_lines_for_reopt(
+	*,
+	checkpoint_state: object,
+	stages: list[optimizer.Stage],
+	device: torch.device,
+) -> fit_data.AtlasLines3D | None:
+	if not _stages_use_atlas_line_terms(stages):
+		return None
+	if not isinstance(checkpoint_state, dict) or _ATLAS_LINE_ATTACHMENT_STATE_KEY not in checkpoint_state:
+		raise ValueError(
+			"atlas reopt with active atlas-line terms requires checkpoint "
+			"_atlas_line_attachment_state_; rerun model-init=atlas to create a model-owned attachment state"
+		)
+	return _atlas_lines_from_attachment_state(
+		checkpoint_state[_ATLAS_LINE_ATTACHMENT_STATE_KEY],
+		device=device,
+	)
+
+
+def _populate_atlas_checkpoint_state(st: dict, *, mdl: object, data: fit_data.FitData3D) -> dict | None:
+	if data.atlas_lines is None:
+		return None
+	import opt_loss_atlas_line
+
+	with torch.no_grad():
+		atlas_res = mdl(data, needs=model.ModelForwardNeeds(mesh_normals=True))
+		opt_loss_atlas_line.atlas_line_loss(
+			res=atlas_res,
+			stage_eff={
+				"atlas_line_control": 1.0,
+				"atlas_line_other": 1.0,
+				"atlas_line_snap": 1.0,
+			},
+			debug_payload=True,
+		)
+		atlas_debug_payload = opt_loss_atlas_line.last_debug_payload()
+		st[_ATLAS_LINE_ATTACHMENT_STATE_KEY] = _atlas_line_attachment_state_from_debug_payload(
+			lines=data.atlas_lines,
+			payload=atlas_debug_payload,
+		)
+		atlas_control_results = opt_loss_atlas_line.atlas_control_points_results(
+			lines=data.atlas_lines,
+			payload=atlas_debug_payload,
+		)
+	if atlas_control_results is not None:
+		st["_atlas_control_points_results_"] = atlas_control_results
+	return atlas_control_results
+
+
+@dataclass(frozen=True)
+class InitGrowConfig:
+	enabled: bool = False
+	axis: str = "z"
+	initial_depth: int = 1
+	target_depth_from: str = "depth"
+	order: tuple[str, ...] = ("up",)
+	step: int = 1
+
+
+def _raw_init_grow_initial_depth(args_cfg: dict | None) -> int:
+	if not isinstance(args_cfg, dict):
+		return 1
+	raw = args_cfg.get("init-grow", args_cfg.get("init_grow"))
+	if not isinstance(raw, dict):
+		return 1
+	return max(1, int(raw.get("initial_depth", raw.get("initial-depth", 1))))
+
+
+def _raw_init_grow_enabled(args_cfg: dict | None) -> bool:
+	if not isinstance(args_cfg, dict):
+		return False
+	raw = args_cfg.get("init-grow", args_cfg.get("init_grow"))
+	if raw is None:
+		return False
+	if not isinstance(raw, dict):
+		return True
+	return _truthy_config_bool(raw.get("enabled", True))
+
+
+def _init_grow_stage_depth_delta(cfg: dict) -> int:
+	def _grow_value(grow: object, keys: tuple[str, ...]) -> int:
+		if not isinstance(grow, dict):
+			return 0
+		total = 0
+		for key in keys:
+			if key in grow:
+				total += max(0, int(grow[key]))
+		return total
+
+	def _walk(stages: object) -> int:
+		if not isinstance(stages, list):
+			return 0
+		total = 0
+		for stage in stages:
+			if not isinstance(stage, dict):
+				continue
+			name = str(stage.get("name", ""))
+			if name == "expand-z":
+				total += _grow_value(
+					stage.get("grow"),
+					("d_pos", "d-pos", "z_pos", "z-pos", "depth_pos", "depth-pos", "up"),
+				)
+				total += _grow_value(
+					stage.get("grow"),
+					("d_neg", "d-neg", "z_neg", "z-neg", "depth_neg", "depth-neg", "down"),
+				)
+			total += _walk(stage.get("stages"))
+		return total
+
+	return _walk(cfg.get("stages"))
+
+
+def _parse_init_grow_config(args_cfg: dict | None, *, target_depth: int) -> InitGrowConfig:
+	if not isinstance(args_cfg, dict):
+		return InitGrowConfig(enabled=False)
+	raw = args_cfg.get("init-grow", args_cfg.get("init_grow"))
+	if raw is None:
+		return InitGrowConfig(enabled=False)
+	if not isinstance(raw, dict):
+		raise ValueError("args.init-grow must be an object")
+	enabled = _truthy_config_bool(raw.get("enabled", True))
+	axis = str(raw.get("axis", "z")).strip().lower()
+	if axis not in {"z", "d", "depth"}:
+		raise ValueError("args.init-grow.axis must be 'z'")
+	initial_depth = int(raw.get("initial_depth", raw.get("initial-depth", 1)))
+	if initial_depth < 1:
+		raise ValueError("args.init-grow.initial_depth must be >= 1")
+	if initial_depth > int(target_depth):
+		raise ValueError("args.init-grow.initial_depth must be <= args.depth")
+	target_depth_from = str(raw.get("target_depth_from", raw.get("target-depth-from", "depth"))).strip().lower()
+	if target_depth_from != "depth":
+		raise ValueError("args.init-grow.target_depth_from currently only supports 'depth'")
+	order_raw = raw.get("order", ["up"])
+	if isinstance(order_raw, str):
+		order = (order_raw.strip().lower(),)
+	elif isinstance(order_raw, list):
+		order = tuple(str(v).strip().lower() for v in order_raw)
+	else:
+		raise ValueError("args.init-grow.order must be a string or list")
+	for item in order:
+		if item not in {"up", "down"}:
+			raise ValueError("args.init-grow.order entries must be 'up' or 'down'")
+	step = int(raw.get("step", 1))
+	if step < 1:
+		raise ValueError("args.init-grow.step must be >= 1")
+	return InitGrowConfig(
+		enabled=enabled,
+		axis="z",
+		initial_depth=initial_depth,
+		target_depth_from=target_depth_from,
+		order=order,
+		step=step,
+	)
+
+
+def _require_torch_device_available(device: torch.device) -> None:
+	if device.type != "cuda":
+		return
+	if not torch.cuda.is_available():
+		raise RuntimeError(
+			"CUDA device was requested, but PyTorch cannot access an NVIDIA GPU. "
+			"Expose the NVIDIA driver/device nodes to this process (for example "
+			"/dev/nvidia*, Docker --gpus all, or the equivalent sandbox GPU "
+			"passthrough). Refusing to continue because falling back to CPU would "
+			"make fit smoke/perf runs misleading."
+		)
+	count = int(torch.cuda.device_count())
+	if device.index is not None and int(device.index) >= count:
+		raise RuntimeError(
+			f"CUDA device {device} was requested, but PyTorch reports only "
+			f"{count} visible CUDA device(s)."
+		)
 
 
 def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
@@ -64,8 +388,419 @@ def _optimization_seed_xyz(
 	return config_seed
 
 
+@dataclasses.dataclass(frozen=True)
+class _CorrPointRoiProjection:
+	row_index: int
+	point_id: int
+	collection_id: int
+	xyz: tuple[float, float, float]
+	h: float
+	w: float
+	distance: float
+	direction_sign: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class _CorrPointRoiInit:
+	surface: object
+	closest: object
+	effective_seed: tuple[float, float, float]
+	model_w: float
+	model_h: float
+	projections: list[_CorrPointRoiProjection]
+	skipped: list[dict]
+	payload: dict
+
+
+def _unwrap_w_near(w: float, anchor_w: float, width: int) -> float:
+	width_f = float(max(1, int(width)))
+	dw = math.fmod(float(w) - float(anchor_w) + 0.5 * width_f, width_f)
+	if dw < 0.0:
+		dw += width_f
+	dw -= 0.5 * width_f
+	return float(anchor_w) + dw
+
+
+def _trim_shell_for_anchor(surface, closest, *, source_step: float):
+	from init_shell_index import trim_shell_surface_rows_by_quality
+
+	trimmed_surface, trim_top, trim_bottom = trim_shell_surface_rows_by_quality(
+		surface,
+		target_step=source_step,
+		lo_ratio=0.5,
+		hi_ratio=2.0,
+	)
+	if trim_top or trim_bottom:
+		if not (float(trim_top) <= float(closest.h) <= float(trim_top + trimmed_surface.xyz_wrapped.shape[0] - 1)):
+			raise ValueError(
+				f"corr-point-roi source row trim removed closest seed row: "
+				f"h={closest.h:.3f} trim_top={trim_top} kept_h={int(trimmed_surface.xyz_wrapped.shape[0])}"
+			)
+		closest = dataclasses.replace(
+			closest,
+			h=float(closest.h) - float(trim_top),
+			quad_row=max(0, int(closest.quad_row) - int(trim_top)),
+		)
+		surface = trimmed_surface
+	return surface, closest, int(trim_top), int(trim_bottom)
+
+
+def _projection_skip_reasons(skipped: list[dict]) -> dict[str, int]:
+	reasons: dict[str, int] = {}
+	for item in skipped:
+		reason = str(item.get("reason", "unknown"))
+		reasons[reason] = reasons.get(reason, 0) + 1
+	return dict(sorted(reasons.items()))
+
+
+def _sample_corr_point_roi_normals(
+	*,
+	data: fit_data.FitData3D,
+	corr_points: fit_data.CorrPoints3D,
+	device: torch.device,
+) -> torch.Tensor:
+	points = corr_points.points_xyz_winda[:, :3].to(device=device, dtype=torch.float32)
+	if points.numel() <= 0:
+		return points.reshape(0, 3)
+	sample_xyz = points.reshape(1, 1, int(points.shape[0]), 3)
+	if data.sparse_caches:
+		for cache in data.sparse_caches.values():
+			if not ({"nx", "ny"} & set(cache.channels)):
+				continue
+			cache.prefetch(sample_xyz, data.origin_fullres, data._spacing_for(cache.channels[0]))
+		for cache in data.sparse_caches.values():
+			if {"nx", "ny"} & set(cache.channels):
+				cache.sync()
+	sampled = data.grid_sample_fullres(sample_xyz, channels={"nx", "ny"})
+	normals = sampled.normal_3d
+	if normals is None:
+		raise ValueError("corr-point-roi requires nx and ny channels to sample corr point normals")
+	normals = normals.reshape(int(points.shape[0]), 3)
+	return normals / (normals.norm(dim=-1, keepdim=True) + 1.0e-8)
+
+
+def _line_project_points_to_selected_shell(
+	surface,
+	points_xyz: torch.Tensor,
+	normals_xyz: torch.Tensor,
+	*,
+	anchor_hw: tuple[float, float],
+	device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	points = points_xyz.to(device=device, dtype=torch.float32)
+	normals = normals_xyz.to(device=device, dtype=torch.float32)
+	K = int(points.shape[0])
+	if K <= 0:
+		empty_f = torch.empty(0, device=device, dtype=torch.float32)
+		empty_b = torch.empty(0, device=device, dtype=torch.bool)
+		empty_i = torch.empty(0, device=device, dtype=torch.int64)
+		return empty_b, empty_f, empty_f, empty_i
+	if points.shape != normals.shape or points.shape[-1] != 3:
+		raise ValueError(
+			f"corr-point-roi line projection expects points/normals shape (K,3), "
+			f"got points={tuple(points.shape)} normals={tuple(normals.shape)}"
+		)
+	shell = surface.xyz_wrapped.to(device=device, dtype=torch.float32)
+	H = int(shell.shape[0])
+	W = int(surface.unique_w)
+	if H < 2 or W < 1:
+		raise ValueError(f"corr-point-roi selected shell is too small: shape={tuple(shell.shape[:2])} unique_w={W}")
+	p00 = shell[:-1, :W].reshape(-1, 3).contiguous()
+	p10 = shell[1:, :W].reshape(-1, 3).contiguous()
+	p01 = shell[:-1, 1:W + 1].reshape(-1, 3).contiguous()
+	p11 = shell[1:, 1:W + 1].reshape(-1, 3).contiguous()
+	Q = int(p00.shape[0])
+	row_ids = torch.arange(H - 1, device=device, dtype=torch.float32).view(H - 1, 1).expand(H - 1, W).reshape(-1)
+	col_ids = torch.arange(W, device=device, dtype=torch.float32).view(1, W).expand(H - 1, W).reshape(-1)
+	best_score = torch.full((K,), float("inf"), device=device, dtype=torch.float32)
+	best_h = torch.full((K,), float("nan"), device=device, dtype=torch.float32)
+	best_w = torch.full((K,), float("nan"), device=device, dtype=torch.float32)
+	best_sign = torch.zeros((K,), device=device, dtype=torch.int64)
+	anchor_h, anchor_w = (float(anchor_hw[0]), float(anchor_hw[1]))
+	width_f = float(max(1, W))
+	batch_quads = max(1, min(32768, 2_000_000 // max(1, K)))
+	for q0 in range(0, Q, batch_quads):
+		q1 = min(q0 + batch_quads, Q)
+		B = int(q1 - q0)
+		M00 = p00[q0:q1].view(1, B, 3).expand(K, B, 3)
+		M10 = p10[q0:q1].view(1, B, 3).expand(K, B, 3)
+		M01 = p01[q0:q1].view(1, B, 3).expand(K, B, 3)
+		M11 = p11[q0:q1].view(1, B, 3).expand(K, B, 3)
+		O = points.view(K, 1, 3).expand(K, B, 3)
+		frac_h = torch.full((K, B), 0.5, device=device, dtype=torch.float32)
+		frac_w = torch.full((K, B), 0.5, device=device, dtype=torch.float32)
+		rows = row_ids[q0:q1].view(1, B)
+		cols = col_ids[q0:q1].view(1, B)
+		for sign in (1, -1):
+			direction = normals.view(K, 1, 3).expand(K, B, 3) * float(sign)
+			u, v = model.Model3D._ray_bilinear_intersect(O, direction, M00, M10, M01, M11, frac_h, frac_w)
+			hit = M00 * (1.0 - u.unsqueeze(-1)) * (1.0 - v.unsqueeze(-1))
+			hit = hit + M10 * u.unsqueeze(-1) * (1.0 - v.unsqueeze(-1))
+			hit = hit + M01 * (1.0 - u.unsqueeze(-1)) * v.unsqueeze(-1)
+			hit = hit + M11 * u.unsqueeze(-1) * v.unsqueeze(-1)
+			ray_t = ((hit - O) * direction).sum(dim=-1)
+			h = rows + u
+			w = torch.remainder(cols + v, width_f)
+			dw = torch.remainder(w - anchor_w + 0.5 * width_f, width_f) - 0.5 * width_f
+			score = (h - anchor_h) ** 2 + dw ** 2
+			valid = (
+				torch.isfinite(u) & torch.isfinite(v) &
+				torch.isfinite(score) & torch.isfinite(ray_t) &
+				(u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0) &
+				(ray_t >= -1.0e-4)
+			)
+			score = torch.where(valid, score, torch.full_like(score, float("inf")))
+			chunk_score, chunk_idx = score.min(dim=1)
+			better = chunk_score < best_score
+			if bool(better.any().detach().cpu()):
+				best_score = torch.where(better, chunk_score, best_score)
+				best_h = torch.where(better, h.gather(1, chunk_idx.view(K, 1)).squeeze(1), best_h)
+				best_w = torch.where(better, w.gather(1, chunk_idx.view(K, 1)).squeeze(1), best_w)
+				best_sign = torch.where(
+					better,
+					torch.full_like(best_sign, int(sign)),
+					best_sign,
+				)
+	valid = torch.isfinite(best_score)
+	return valid, best_h, best_w, best_sign
+
+
+def _project_corr_points_to_shell(
+	surface,
+	corr_points: fit_data.CorrPoints3D,
+	normals_xyz: torch.Tensor,
+	*,
+	anchor_hw: tuple[float, float],
+	device: torch.device,
+) -> tuple[list[_CorrPointRoiProjection], list[dict]]:
+	points = corr_points.points_xyz_winda[:, :3].detach().cpu()
+	cols = corr_points.collection_idx.detach().cpu()
+	pids = corr_points.point_ids.detach().cpu()
+	valid, h_t, w_t, sign_t = _line_project_points_to_selected_shell(
+		surface,
+		corr_points.points_xyz_winda[:, :3],
+		normals_xyz,
+		anchor_hw=anchor_hw,
+		device=device,
+	)
+	valid_cpu = valid.detach().cpu()
+	h_cpu = h_t.detach().cpu()
+	w_cpu = w_t.detach().cpu()
+	sign_cpu = sign_t.detach().cpu()
+	projections: list[_CorrPointRoiProjection] = []
+	skipped: list[dict] = []
+	for i in range(int(points.shape[0])):
+		xyz = tuple(float(v) for v in points[i].tolist())
+		if not bool(valid_cpu[i].item()):
+			skipped.append({
+				"row_index": int(i),
+				"point_id": int(pids[i].item()),
+				"collection_id": int(cols[i].item()),
+				"reason": "no_line_shell_intersection",
+			})
+			continue
+		dh = float(h_cpu[i].item()) - float(anchor_hw[0])
+		dw = _unwrap_w_near(float(w_cpu[i].item()), float(anchor_hw[1]), int(surface.unique_w)) - float(anchor_hw[1])
+		projections.append(_CorrPointRoiProjection(
+			row_index=int(i),
+			point_id=int(pids[i].item()),
+			collection_id=int(cols[i].item()),
+			xyz=xyz,
+			h=float(h_cpu[i].item()),
+			w=float(w_cpu[i].item()),
+			distance=float(math.sqrt(dh * dh + dw * dw)),
+			direction_sign=int(sign_cpu[i].item()),
+		))
+	return projections, skipped
+
+
+def _derive_corr_point_roi_init(
+	*,
+	shell_index,
+	corr_points: fit_data.CorrPoints3D,
+	normals_xyz: torch.Tensor,
+	mesh_step: float,
+	init_margin_grid_points: int,
+	device: torch.device,
+):
+	if corr_points.points_xyz_winda.shape[0] <= 0:
+		raise ValueError("corr-point-roi requires nonempty corr_points")
+	points = corr_points.points_xyz_winda[:, :3].to(device=device, dtype=torch.float32)
+	mean_xyz = points.mean(dim=0)
+	initial_idx = int(torch.argmin(((points - mean_xyz.view(1, 3)) ** 2).sum(dim=-1)).detach().cpu())
+	initial_seed = tuple(float(v) for v in points[initial_idx].detach().cpu().tolist())
+
+	def _select_from_seed(seed_xyz: tuple[float, float, float]):
+		closest = shell_index.closest_point(seed_xyz, device=device)
+		surface = shell_index.surfaces[closest.shell_index]
+		source_step = float(surface.source_step) if surface.source_step is not None else float(mesh_step)
+		surface, closest, trim_top, trim_bottom = _trim_shell_for_anchor(
+			surface,
+			closest,
+			source_step=source_step,
+		)
+		projections, skipped = _project_corr_points_to_shell(
+			surface,
+			corr_points,
+			normals_xyz,
+			anchor_hw=(float(closest.h), float(closest.w)),
+			device=device,
+		)
+		return closest, surface, projections, skipped, trim_top, trim_bottom
+
+	closest0, surface0, projections0, skipped0, trim_top0, trim_bottom0 = _select_from_seed(initial_seed)
+	if not projections0:
+		raise ValueError("corr-point-roi could not project any corr_points onto the initial shell")
+	width0 = int(surface0.unique_w)
+	h_avg = sum(float(p.h) for p in projections0) / float(len(projections0))
+	w_unwrapped0 = [_unwrap_w_near(float(p.w), float(closest0.w), width0) for p in projections0]
+	w_avg = sum(w_unwrapped0) / float(len(w_unwrapped0))
+	recenter_projection = min(
+		zip(projections0, w_unwrapped0),
+		key=lambda item: (float(item[0].h) - h_avg) ** 2 + (float(item[1]) - w_avg) ** 2,
+	)[0]
+
+	closest, surface, projections, skipped, trim_top, trim_bottom = _select_from_seed(recenter_projection.xyz)
+	if not projections:
+		raise ValueError("corr-point-roi could not project any corr_points onto the final shell")
+	width = int(surface.unique_w)
+	w_unwrapped = [_unwrap_w_near(float(p.w), float(closest.w), width) for p in projections]
+	h_vals = [float(p.h) for p in projections]
+	h_span = max(h_vals) - min(h_vals)
+	w_span = max(w_unwrapped) - min(w_unwrapped)
+	margin_vx = float(max(0, int(init_margin_grid_points))) * float(mesh_step)
+	model_h = max(float(mesh_step), h_span * float(mesh_step) + 2.0 * margin_vx)
+	model_w = max(float(mesh_step), w_span * float(mesh_step) + 2.0 * margin_vx)
+	payload = {
+		"mode": "corr-point-roi",
+		"projection_mode": "normal-line",
+		"init_margin_grid_points": int(init_margin_grid_points),
+		"effective_seed": [float(v) for v in recenter_projection.xyz],
+		"initial_seed": [float(v) for v in initial_seed],
+		"initial_shell_id": str(closest0.shell_id),
+		"final_shell_id": str(closest.shell_id),
+		"initial_trim_top": int(trim_top0),
+		"initial_trim_bottom": int(trim_bottom0),
+		"final_trim_top": int(trim_top),
+		"final_trim_bottom": int(trim_bottom),
+		"model_w": float(model_w),
+		"model_h": float(model_h),
+		"model_w_unit": "voxels",
+		"depth": 1,
+		"parsed_point_count": int(corr_points.points_xyz_winda.shape[0]),
+		"initial_usable_point_count": int(len(projections0)),
+		"initial_skipped_point_count": int(len(skipped0)),
+		"initial_skipped_reasons": _projection_skip_reasons(skipped0),
+		"usable_point_count": int(len(projections)),
+		"skipped_point_count": int(len(skipped)),
+		"skipped_reasons": _projection_skip_reasons(skipped),
+		"skipped_points": skipped,
+		"projected_points": [
+			{
+				"row_index": int(p.row_index),
+				"point_id": int(p.point_id),
+				"collection_id": int(p.collection_id),
+				"h": float(p.h),
+				"w": float(p.w),
+				"direction_sign": int(p.direction_sign),
+				"grid_distance_to_anchor": float(p.distance),
+			}
+			for p in projections
+		],
+		"final_anchor_h": float(closest.h),
+		"final_anchor_w": float(closest.w),
+		"projected_h_span_grid": float(h_span),
+		"projected_w_span_grid": float(w_span),
+		"projected_h_span_vx": float(h_span * float(mesh_step)),
+		"projected_w_span_vx": float(w_span * float(mesh_step)),
+	}
+	return _CorrPointRoiInit(
+		surface=surface,
+		closest=closest,
+		effective_seed=recenter_projection.xyz,
+		model_w=float(model_w),
+		model_h=float(model_h),
+		projections=projections,
+		skipped=skipped,
+		payload=payload,
+	)
+
+
+def _corr_point_roi_mask_from_results(
+	corr_results: dict | None,
+	*,
+	shape: tuple[int, int],
+	radius: int,
+	device: torch.device,
+) -> tuple[torch.Tensor, dict]:
+	if not isinstance(corr_results, dict):
+		raise ValueError("corr-point-roi output mask requires _corr_points_results_ in the checkpoint")
+	points = corr_results.get("points_list", None)
+	if not isinstance(points, list):
+		raw_points = corr_results.get("points", {})
+		points = list(raw_points.values()) if isinstance(raw_points, dict) else []
+	H, W = int(shape[0]), int(shape[1])
+	seed = torch.zeros((1, 1, H, W), device=device, dtype=torch.float32)
+	usable = 0
+	skipped: dict[str, int] = {}
+	for point in points:
+		if not isinstance(point, dict):
+			continue
+		if not bool(point.get("valid", False)):
+			skipped["point_invalid"] = skipped.get("point_invalid", 0) + 1
+			continue
+		locations = point.get("model_locations", [])
+		if not isinstance(locations, list) or not locations:
+			skipped["missing_model_locations"] = skipped.get("missing_model_locations", 0) + 1
+			continue
+		point_used = False
+		for loc in locations:
+			if not isinstance(loc, dict):
+				continue
+			try:
+				d = int(loc.get("d"))
+				h = float(loc.get("h"))
+				w = float(loc.get("w"))
+			except (TypeError, ValueError):
+				skipped["bad_location_value"] = skipped.get("bad_location_value", 0) + 1
+				continue
+			if d != 0:
+				skipped["nonzero_depth_location"] = skipped.get("nonzero_depth_location", 0) + 1
+				continue
+			if not (math.isfinite(h) and math.isfinite(w)):
+				skipped["nonfinite_location"] = skipped.get("nonfinite_location", 0) + 1
+				continue
+			h0 = math.floor(h)
+			h1 = math.ceil(h)
+			w0 = math.floor(w)
+			w1 = math.ceil(w)
+			for hh in {h0, h1}:
+				for ww in {w0, w1}:
+					if 0 <= hh < H and 0 <= ww < W:
+						seed[0, 0, int(hh), int(ww)] = 1.0
+						point_used = True
+		if point_used:
+			usable += 1
+	if usable <= 0:
+		raise ValueError(f"corr-point-roi output mask has no usable final corr projections; skipped={skipped}")
+	r = max(0, int(radius))
+	if r > 0:
+		mask = F.max_pool2d(seed, kernel_size=2 * r + 1, stride=1, padding=r) > 0.0
+	else:
+		mask = seed > 0.0
+	debug = {
+		"usable_point_count": int(usable),
+		"seed_vertex_count": int(seed.sum().detach().cpu().item()),
+		"dilated_vertex_count": int(mask.sum().detach().cpu().item()),
+		"skipped_reasons": dict(sorted(skipped.items())),
+	}
+	return mask[0, 0], debug
+
+
 def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | None:
 	for stage in stages:
+		if stage.global_opt is None:
+			continue
 		if "cyl_params" not in stage.global_opt.params:
 			continue
 		args = stage.global_opt.args or {}
@@ -75,6 +810,103 @@ def _first_cylinder_stage_model_step(stages: list[optimizer.Stage]) -> float | N
 		value_f = float(value)
 		return value_f if value_f > 0.0 else None
 	return None
+
+
+def _stage_opt_cfgs(raw_stages: object):
+	if not isinstance(raw_stages, list):
+		return
+	for stage in raw_stages:
+		if not isinstance(stage, dict):
+			continue
+		children = stage.get("stages")
+		if isinstance(children, list):
+			yield from _stage_opt_cfgs(children)
+			continue
+		opt_cfg = stage.get("global_opt")
+		if not isinstance(opt_cfg, dict):
+			opt_cfg = stage.get("opt")
+		yield opt_cfg if isinstance(opt_cfg, dict) else stage
+
+
+def _stage_params_list(opt_cfg: dict) -> list[str]:
+	params = opt_cfg.get("params", [])
+	if isinstance(params, str):
+		return [params]
+	if isinstance(params, list):
+		return [str(p) for p in params]
+	return []
+
+
+def _stage_runs(opt_cfg: dict) -> bool:
+	steps = opt_cfg.get("steps", 0)
+	if isinstance(steps, str) and steps.strip().lower() == "auto":
+		return True
+	try:
+		return int(steps) > 0
+	except (TypeError, ValueError):
+		return False
+
+
+def _config_effective_loss_enabled(cfg: dict, term_name: str) -> bool:
+	base = dict(optimizer.lambda_global)
+	base_cfg = cfg.get("base")
+	if isinstance(base_cfg, dict):
+		for k, v in base_cfg.items():
+			try:
+				base[str(k)] = float(v)
+			except (TypeError, ValueError):
+				base[str(k)] = 0.0
+	base_term = float(base.get(term_name, 0.0))
+	map_loss_names = set(optimizer.MAP_LOSS_NAMES)
+	for opt_cfg in _stage_opt_cfgs(cfg.get("stages")):
+		if not isinstance(opt_cfg, dict) or not _stage_runs(opt_cfg):
+			continue
+		eff = base_term
+		params = set(_stage_params_list(opt_cfg))
+		kind = "map" if (params & optimizer.MAP_OPT_PARAMS) and not (params & optimizer.MODEL_OPT_PARAMS) else "model"
+		default_mul = opt_cfg.get("default_mul")
+		if default_mul is not None:
+			try:
+				eff = base_term * float(default_mul)
+			except (TypeError, ValueError):
+				eff = 0.0
+		w_fac = opt_cfg.get("w_fac")
+		if isinstance(w_fac, (int, float)):
+			scalar_applies = (kind == "map" and term_name in map_loss_names) or (
+				kind == "model" and term_name not in map_loss_names
+			)
+			if scalar_applies:
+				eff = base_term * float(w_fac)
+		elif isinstance(w_fac, dict) and term_name in w_fac and w_fac.get(term_name) is not None:
+			try:
+				eff = base_term * float(w_fac.get(term_name))
+			except (TypeError, ValueError):
+				eff = 0.0
+		if abs(float(eff)) > 0.0:
+			return True
+	return False
+
+
+def _config_requests_external_surface_maps(cfg: dict, *, self_map_init: str) -> bool:
+	if _config_effective_loss_enabled(cfg, "ext_offset"):
+		return True
+	if str(self_map_init).strip().lower().replace("-", "_") != "off":
+		return False
+	if _config_effective_loss_enabled(cfg, "snap_surf_map"):
+		return True
+	for opt_cfg in _stage_opt_cfgs(cfg.get("stages")):
+		if not isinstance(opt_cfg, dict) or not _stage_runs(opt_cfg):
+			continue
+		params = set(_stage_params_list(opt_cfg))
+		if params & optimizer.MAP_OPT_PARAMS:
+			return True
+		args = opt_cfg.get("args")
+		if not isinstance(args, dict):
+			continue
+		snap_map = args.get("snap_surf_map")
+		if isinstance(snap_map, dict) and snap_map.get("map_opt") is not None:
+			return True
+	return False
 
 
 def _apply_cylinder_prepare_model_step(mdl: "model.Model3D", model_step: float | None) -> None:
@@ -172,52 +1004,412 @@ def _build_parser() -> argparse.ArgumentParser:
 	cli_opt.add_args(p)
 	p.add_argument("--out-dir", default=None, help="Output directory for snapshots and debug")
 	p.add_argument("--tifxyz-init", default=None, help="Initialize model from tifxyz directory instead of model.pt or new model")
-	p.add_argument("--model-init", choices=("seed", "ext", "model"), default="seed",
-		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input")
-	p.add_argument("--window-size", type=int, default=None,
-		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
-	p.add_argument("--window-overlap", type=int, default=0,
-		help="Overlap between windows in fullres voxels")
+	p.add_argument("--model-init", choices=("seed", "ext", "model", "flatten", "atlas"), default="seed",
+		help="Initial model source: seed creates a new model, ext uses --tifxyz-init, model uses --model-input, flatten optimizes one external tifxyz inverse map, atlas uses config atlas data")
+	p.add_argument("--self-map-init", choices=("off", "multi_wrap_full", "multi_wrap_d"), default="off",
+		help="Initialize snap_surf_map from the model itself instead of external_surfaces")
+	p.add_argument("--flatten-solver", choices=("torch", "inverse", "forward"), default="torch",
+		help="Flatten solver variant for model-init=flatten: torch/inverse keeps the existing inverse-map Adam path; forward optimizes source-vertex UVs and inverts at export")
 	p.add_argument("--approval-inpaint", action=argparse.BooleanOptionalAction, default=False,
 		help="Use selected approval mask/tifxyz data to inpaint the seed-region setup")
 	p.add_argument("--approval-inpaint-corr-spacing", type=float, default=None,
 		help="Correction point spacing for approval inpaint (default: --mesh-step)")
 	p.add_argument("--approval-inpaint-padding-frac", type=float, default=0.25,
 		help="Per-side model extent padding for approval inpaint")
+	p.add_argument("--approval-inpaint-output-mask", action=argparse.BooleanOptionalAction, default=False,
+		help="Store selected approval-inpaint cell as an export mask")
+	p.add_argument("--approval-inpaint-output-mask-dilate", type=int, default=3,
+		help="Output-mask dilation radius in exported mesh vertices")
 	p.add_argument("--approval-inpaint-tifxyz", default=None, help=argparse.SUPPRESS)
+	p.add_argument("--tifxyz-flow-gate-channels", action=argparse.BooleanOptionalAction, default=False,
+		help="Store flow-gate component maps in the final checkpoint for tifxyz export")
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
 	return p
 
 
-def _compute_window_grid(
-	H: int, W: int, mesh_step: int, window_size: int, overlap: int,
-) -> list[tuple[int, int, int, int]]:
-	"""Compute window tiles over a (H, W) vertex grid.
+def _fit_config_args_from_namespace(args: argparse.Namespace) -> dict[str, object]:
+	out: dict[str, object] = {}
+	for k, v in vars(args).items():
+		out[k.replace("_", "-")] = v
+	return out
 
-	window_size and overlap are in fullres voxels.
-	Returns list of (h0, h1, w0, w1) in vertex indices.
-	"""
-	if overlap >= window_size:
-		raise ValueError(f"overlap ({overlap}) must be less than window_size ({window_size})")
-	win_verts = window_size // mesh_step + 1
-	overlap_verts = overlap // mesh_step
-	stride = max(1, win_verts - overlap_verts)
-	windows = []
-	h = 0
-	while h < H:
-		h1 = min(h + win_verts, H)
-		w = 0
-		while w < W:
-			w1 = min(w + win_verts, W)
-			windows.append((h, h1, w, w1))
-			if w1 == W:
-				break
-			w += stride
-		if h1 == H:
-			break
-		h += stride
-	return windows
+
+def _reject_removed_windings_arg(args_cfg: dict | None) -> None:
+	if isinstance(args_cfg, dict) and "windings" in args_cfg:
+		raise ValueError("args.windings has been removed; use args.depth")
+
+
+def _validate_self_map_init_args(
+	*,
+	self_map_init: str,
+	model_init: str,
+	init_mode: str,
+	model_depth: int | None,
+	model_w: float | None,
+	model_w_unit: str,
+	validate_shape_contract: bool = True,
+) -> str:
+	mode = str(self_map_init if self_map_init is not None else "off").strip().lower().replace("-", "_")
+	if mode not in {"off", "multi_wrap_full", "multi_wrap_d"}:
+		raise ValueError(f"invalid self-map-init '{self_map_init}' (expected off, multi_wrap_full, or multi_wrap_d)")
+	if mode == "off":
+		return mode
+	model_init_i = str(model_init).strip().lower()
+	if model_init_i not in {"seed", "model"}:
+		raise ValueError("self-map-init requires args.model-init=seed or args.model-init=model")
+	if model_init_i == "seed" and str(init_mode).strip().lower() != "shell-dir-crop":
+		raise ValueError("self-map-init requires args.init-mode=shell-dir-crop")
+	if not validate_shape_contract:
+		return mode
+	if mode == "multi_wrap_full":
+		if model_depth is None:
+			raise ValueError("self-map-init=multi_wrap_full requires known args.depth")
+		if int(model_depth) != 1:
+			raise ValueError("self-map-init=multi_wrap_full requires args.depth=1")
+	if mode == "multi_wrap_d":
+		if model_depth is None:
+			raise ValueError("self-map-init=multi_wrap_d requires known args.depth")
+		if int(model_depth) <= 1:
+			raise ValueError("self-map-init=multi_wrap_d requires args.depth > 1")
+	unit = str(model_w_unit).strip().lower()
+	if unit == "wraps":
+		_validate_self_map_width_contract(mode=mode, model_w_wraps=None if model_w is None else float(model_w))
+	return mode
+
+
+def _validate_self_map_width_contract(*, mode: str, model_w_wraps: float | None) -> None:
+	mode_i = str(mode if mode is not None else "off").strip().lower().replace("-", "_")
+	if mode_i == "off":
+		return
+	wraps = 0.0 if model_w_wraps is None else float(model_w_wraps)
+	if mode_i == "multi_wrap_full":
+		if wraps <= 1.0:
+			raise ValueError("self-map-init=multi_wrap_full requires args.model-w > 1.0 wraps")
+	elif mode_i == "multi_wrap_d":
+		if not (0.0 < wraps < 1.0):
+			raise ValueError("self-map-init=multi_wrap_d requires 0 < args.model-w < 1.0 wraps")
+
+
+def _dummy_flatten_data() -> fit_data.FitData3D:
+	return fit_data.FitData3D(
+		cos=None,
+		grad_mag=None,
+		nx=None,
+		ny=None,
+		pred_dt=None,
+		corr_points=None,
+		winding_volume=None,
+		origin_fullres=(0.0, 0.0, 0.0),
+		spacing=(1.0, 1.0, 1.0),
+		channel_spacing=None,
+		_vol_size=(1, 1, 1),
+		sparse_caches=None,
+	)
+
+
+def _mesh_step_from_tifxyz_meta(meta: dict, fallback: int) -> int:
+	scale = meta.get("scale") if isinstance(meta, dict) else None
+	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
+		return max(1, int(round(1.0 / float(scale[0]))))
+	return max(1, int(fallback))
+
+
+def _scale_from_tifxyz_meta(meta: dict, mesh_step: int) -> float:
+	scale = meta.get("scale") if isinstance(meta, dict) else None
+	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
+		return float(scale[0])
+	return 1.0 / float(max(1, int(mesh_step)))
+
+
+def _shape_list(shape: tuple[int, int, int] | None) -> list[int] | None:
+	return None if shape is None else [int(v) for v in shape]
+
+
+def _source_shape_from_tifxyz_meta(meta: dict, fallback_shape_zyx: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
+	return volume_scale.tifxyz_source_shape(meta, fallback_shape_zyx)
+
+
+def _tifxyz_scale_to_base(
+	meta: dict,
+	*,
+	base_shape_zyx: tuple[int, int, int] | None,
+	request_shape_zyx: tuple[int, int, int] | None,
+	path_label: str,
+) -> volume_scale.CoordinateScale:
+	source_shape = _source_shape_from_tifxyz_meta(meta, request_shape_zyx)
+	return volume_scale.coordinate_scale_to_base(
+		base_shape_zyx=base_shape_zyx,
+		source_shape_zyx=source_shape,
+		source_name=f"{path_label}.base_shape_zyx",
+	)
+
+
+def _load_scaled_tifxyz(
+	path: str,
+	*,
+	device: torch.device,
+	base_shape_zyx: tuple[int, int, int] | None,
+	request_shape_zyx: tuple[int, int, int] | None,
+	path_label: str,
+):
+	from tifxyz_io import load_tifxyz
+	xyz, valid, meta = load_tifxyz(path, device=device)
+	scale = _tifxyz_scale_to_base(
+		meta,
+		base_shape_zyx=base_shape_zyx,
+		request_shape_zyx=request_shape_zyx,
+		path_label=path_label,
+	)
+	xyz = volume_scale.scale_tifxyz_tensor(xyz, valid, scale.factor)
+	if not scale.is_identity:
+		print(
+			f"[fit] scaled {path_label} coordinates by {scale.factor:.9g} "
+			f"from source_shape={_shape_list(scale.source_shape_zyx)} "
+			f"to base_shape={_shape_list(scale.base_shape_zyx)}",
+			flush=True,
+		)
+	return xyz, valid, meta, scale
+
+
+def _scaled_approval_tifxyz_path(
+	path: str,
+	*,
+	tmp_parent: Path | None,
+	base_shape_zyx: tuple[int, int, int] | None,
+	request_shape_zyx: tuple[int, int, int] | None,
+) -> str:
+	meta = volume_scale.read_tifxyz_meta(path)
+	scale = _tifxyz_scale_to_base(
+		meta,
+		base_shape_zyx=base_shape_zyx,
+		request_shape_zyx=request_shape_zyx,
+		path_label="approval-inpaint tifxyz",
+	)
+	if scale.is_identity:
+		return path
+	parent = tmp_parent if tmp_parent is not None else Path(path).parent
+	parent.mkdir(parents=True, exist_ok=True)
+	dst = parent / "approval_inpaint_base_scale.tifxyz"
+	volume_scale.copy_scaled_tifxyz_dir(
+		path,
+		dst,
+		factor=scale.factor,
+		base_shape_zyx=base_shape_zyx,
+	)
+	print(
+		f"[fit] approval-inpaint tifxyz scaled by {scale.factor:.9g} "
+		f"from source_shape={_shape_list(scale.source_shape_zyx)} "
+		f"to base_shape={_shape_list(scale.base_shape_zyx)}",
+		flush=True,
+	)
+	return str(dst)
+
+
+def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData3D, fit_config: dict) -> None:
+	st = dict(mdl.state_dict())
+	for k in [k for k in st if k.startswith("mesh_ms.")]:
+		del st[k]
+	with torch.no_grad():
+		map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+		sentinel = torch.full_like(xyz, -1.0)
+		xyz = torch.where(point_mask.unsqueeze(0).unsqueeze(-1), xyz, sentinel)
+		st["mesh_flat"] = xyz.permute(3, 0, 1, 2).detach().cpu()
+		st["flatten_map_flat"] = map_yx.detach().cpu()
+		st["flatten_point_mask"] = point_mask.detach().cpu()
+	params = asdict(mdl.params)
+	params["depth_windings"] = [int(v) for v in mdl.params.depth_windings]
+	if fit_config.get("lasagna_base_shape_zyx") is not None:
+		params["lasagna_base_shape_zyx"] = list(fit_config["lasagna_base_shape_zyx"])
+	st["_model_params_"] = params
+	st["_fit_config_"] = fit_config
+	torch.save(st, path)
+
+
+def _export_flatten_result(
+	*,
+	mdl: model.Model3D,
+	data: fit_data.FitData3D,
+	out_dir: Path,
+	scale: float,
+	voxel_size_um: float | None,
+	fit_config: dict,
+	model_source: Path | None,
+) -> None:
+	import numpy as np
+	import fit2tifxyz
+
+	out_dir.mkdir(parents=True, exist_ok=True)
+	with torch.no_grad():
+		_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+	xyz_np = xyz[0].detach().cpu().numpy().astype(np.float32, copy=False)
+	mask_np = point_mask.detach().cpu().numpy().astype(bool, copy=False)
+	x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
+	y = np.where(mask_np, xyz_np[..., 1], -1.0).astype(np.float32, copy=False)
+	z = np.where(mask_np, xyz_np[..., 2], -1.0).astype(np.float32, copy=False)
+	mesh_step = 1.0 / float(scale) if float(scale) > 0.0 else float(mdl.params.mesh_step)
+	area = fit2tifxyz._get_area(x, y, z, mesh_step, voxel_size_um)
+	fit2tifxyz._write_tifxyz(
+		out_dir=out_dir / "flatten.tifxyz",
+		x=x,
+		y=y,
+		z=z,
+		scale=scale,
+		model_source=model_source,
+		fit_config=fit_config,
+		area=area,
+		base_shape_zyx=volume_scale.parse_shape_zyx(
+			fit_config.get("lasagna_base_shape_zyx"), name="lasagna_base_shape_zyx"),
+		lasagna_base_shape_zyx=volume_scale.parse_shape_zyx(
+			fit_config.get("lasagna_base_shape_zyx"), name="lasagna_base_shape_zyx"),
+	)
+	fit2tifxyz._print_area(area)
+
+
+def _run_flatten_mode(
+	*,
+	cfg: dict,
+	fit_config: dict,
+	args: argparse.Namespace,
+	model_cfg: cli_model.ModelConfig,
+	opt_cfg: cli_opt.OptConfig,
+	progress_enabled: bool,
+	out_dir: str | None,
+) -> int:
+	ext_surfaces_cfg = cfg.get("external_surfaces", None)
+	if not isinstance(ext_surfaces_cfg, list) or len(ext_surfaces_cfg) != 1:
+		raise ValueError("model-init=flatten requires exactly one external_surfaces entry")
+	ext0 = ext_surfaces_cfg[0]
+	if not isinstance(ext0, dict) or not ext0.get("path"):
+		raise ValueError("model-init=flatten external_surfaces[0] requires path")
+	if getattr(args, "tifxyz_init", None):
+		raise ValueError("model-init=flatten uses external_surfaces[0], not --tifxyz-init")
+	if model_cfg.model_input is not None:
+		raise ValueError("model-init=flatten must not set --model-input")
+
+	device = torch.device(str(getattr(args, "device", "cuda")))
+	from tifxyz_io import load_tifxyz
+	xyz, valid, meta = load_tifxyz(str(ext0["path"]), device=device)
+	mesh_step = _mesh_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
+	scale = _scale_from_tifxyz_meta(meta, mesh_step)
+
+	stage_cfg = copy.deepcopy(cfg)
+	for key in ("external_surfaces", "tifxyz", "voxel_size_um", "corr_points"):
+		stage_cfg.pop(key, None)
+	stages = optimizer.load_stages_cfg(stage_cfg, init_mode=None)
+	flatten_args: dict[str, object] = {}
+	if isinstance(cfg.get("args"), dict):
+		flatten_args.update(cfg["args"])
+	if stages:
+		flatten_args.update(stages[0].global_opt.args or {})
+	flatten_solver_raw = flatten_args.get(
+		"flatten_solver",
+		flatten_args.get("flatten-solver", getattr(args, "flatten_solver", "torch")),
+	)
+	flatten_direction = model.Model3D._normalize_flatten_direction(str(flatten_solver_raw))
+	flatten_output_margin = float(flatten_args.get(
+		"flatten_output_margin",
+		flatten_args.get("flatten_forward_output_margin", 0.10),
+	))
+	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
+	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
+	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
+	mdl = model.Model3D.from_flatten_tifxyz_crop(
+		xyz,
+		valid,
+		device=device,
+		mesh_step=mesh_step,
+		winding_step=model_cfg.winding_step,
+		subsample_mesh=model_cfg.subsample_mesh,
+		subsample_winding=model_cfg.subsample_winding,
+		flatten_filter_source_angles=filter_source_angles,
+		flatten_filter_angle_deg=filter_angle_deg,
+		flatten_filter_radius=filter_radius,
+		flatten_direction=flatten_direction,
+		flatten_output_margin=flatten_output_margin,
+	)
+	data = _dummy_flatten_data()
+
+	print("data: flatten-only (no volume input)")
+	print("model:", model_cfg)
+	print("opt:", opt_cfg)
+	print(
+		f"[fit] model-init=flatten solver={flatten_direction} source={ext0['path']} "
+		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
+		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
+		f"mesh_step={mesh_step} target_step={float(mdl.flatten_target_step.detach().cpu()):.6g}",
+		flush=True,
+	)
+	filter_stats = getattr(mdl, "flatten_source_filter_stats", {})
+	if filter_source_angles:
+		print(
+			f"[fit] flatten source angle filter: angle>{filter_angle_deg:.4g} radius={max(0, filter_radius)} "
+			f"bad_pairs={int(filter_stats.get('bad_pairs', 0.0))} "
+			f"bad_cells={int(filter_stats.get('bad_cells', 0.0))} "
+			f"dilated={int(filter_stats.get('bad_cells_dilated', 0.0))} "
+			f"cell_valid={int(filter_stats.get('cell_valid_after', 0.0))}/"
+			f"{int(filter_stats.get('cell_valid_before', 0.0))}",
+			flush=True,
+		)
+
+	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:
+		if out_dir is None:
+			return
+		out = Path(out_dir)
+		out.mkdir(parents=True, exist_ok=True)
+		snaps = out / "model_snapshots"
+		snaps.mkdir(parents=True, exist_ok=True)
+		_save_flatten_model(str(snaps / f"model_{stage}_{step:06d}.pt"), mdl=mdl, data=data, fit_config=fit_config)
+
+	def _progress(*, step: int, total: int, loss: float, **_kw: object) -> None:
+		if progress_enabled:
+			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
+
+	with torch.no_grad():
+		map_yx, xyz0, point_mask, quad_mask = mdl._flatten_sample_current()
+		print(
+			f"initial flatten: map_shape={tuple(map_yx.shape)} "
+			f"point_valid={int(point_mask.sum())}/{point_mask.numel()} "
+			f"quad_valid={int(quad_mask.sum())}/{quad_mask.numel()}",
+			flush=True,
+		)
+
+	optimizer.optimize(
+		model=mdl,
+		data=data,
+		stages=stages,
+		snapshot_interval=opt_cfg.snapshot_interval,
+		snapshot_fn=_snapshot,
+		progress_fn=_progress,
+		ensure_data_fn=None,
+		seed_xyz=None,
+		out_dir=out_dir,
+	)
+
+	if device.type == "cuda":
+		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30
+		print(f"[fit] peak GPU memory: {peak_gb:.2f} GiB", flush=True)
+
+	model_out: str | None = model_cfg.model_output
+	if model_out is not None:
+		_save_flatten_model(str(model_out), mdl=mdl, data=data, fit_config=fit_config)
+		print(f"[fit] saved model to {model_out}")
+	if out_dir is not None:
+		out = Path(out_dir)
+		out.mkdir(parents=True, exist_ok=True)
+		final_path = out / "model_final.pt"
+		_save_flatten_model(str(final_path), mdl=mdl, data=data, fit_config=fit_config)
+		model_source = Path(model_out) if model_out is not None else final_path
+		_export_flatten_result(
+			mdl=mdl,
+			data=data,
+			out_dir=out / "tifxyz",
+			scale=scale,
+			voxel_size_um=(None if cfg.get("voxel_size_um") is None else float(cfg.get("voxel_size_um"))),
+			fit_config=fit_config,
+			model_source=model_source,
+		)
+	return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -233,26 +1425,74 @@ def main(argv: list[str] | None = None) -> int:
 	fit_config = copy.deepcopy(cfg)
 	cli_json.apply_defaults_from_cfg_args(parser, cfg)
 	args = parser.parse_args(argv_rest or [])
-	# Merge final parsed args into fit_config so checkpoint has all values
-	fit_config.setdefault("args", {}).update(
-		{k.replace("_", "-"): v for k, v in vars(args).items()})
 
-	data_cfg = cli_data.from_args(args)
 	model_cfg = cli_model.from_args(args)
+	requested_model_depth = int(model_cfg.depth)
+	args_cfg = cfg.get("args") if isinstance(cfg.get("args"), dict) else None
+	_reject_removed_windings_arg(args_cfg)
+	grow_enabled = _raw_init_grow_enabled(args_cfg)
+	grow_initial_depth = _raw_init_grow_initial_depth(args_cfg) if grow_enabled else requested_model_depth
+	grow_stage_depth_delta = _init_grow_stage_depth_delta(cfg) if grow_enabled else 0
+	final_model_depth = max(requested_model_depth, grow_initial_depth + grow_stage_depth_delta)
+	if final_model_depth != requested_model_depth:
+		setattr(args, "depth", final_model_depth)
+		model_cfg = dataclasses.replace(model_cfg, depth=final_model_depth)
+	init_grow_cfg = _parse_init_grow_config(
+		args_cfg,
+		target_depth=final_model_depth,
+	)
+	# Merge final parsed args into fit_config so checkpoint has all values.
+	fit_config.setdefault("args", {}).update(_fit_config_args_from_namespace(args))
 	opt_cfg = cli_opt.from_args(args)
 	progress_enabled = bool(args.progress)
 	_out_dir = args.out_dir
 	_stage_done("parse_config", _t)
 
+	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
+	self_map_init = str(getattr(args, "self_map_init", "off")).strip().lower().replace("-", "_")
+	if model_init not in {"seed", "ext", "model", "flatten", "atlas"}:
+		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, model, flatten, or atlas)")
+	if model_init == "flatten":
+		return _run_flatten_mode(
+			cfg=cfg,
+			fit_config=fit_config,
+			args=args,
+			model_cfg=model_cfg,
+			opt_cfg=opt_cfg,
+			progress_enabled=progress_enabled,
+			out_dir=_out_dir,
+		)
+
+	data_cfg = cli_data.from_args(args)
+	if init_grow_cfg.enabled:
+		if model_init != "seed" or str(model_cfg.init_mode).strip().lower() != "shell-dir-crop":
+			raise ValueError("args.init-grow requires args.model-init=seed and args.init-mode=shell-dir-crop")
+		if self_map_init != "multi_wrap_d":
+			raise ValueError("args.init-grow currently requires args.self-map-init=multi_wrap_d")
+		print(
+			f"[fit] init-grow enabled: initial_depth={init_grow_cfg.initial_depth} "
+			f"target_depth={final_model_depth} order={list(init_grow_cfg.order)} step={init_grow_cfg.step}",
+			flush=True,
+		)
 	print("data:", data_cfg)
 	print("model:", model_cfg)
 	print("opt:", opt_cfg)
 
 	device = torch.device(data_cfg.device)
-	model_init = str(getattr(args, "model_init", "seed")).strip().lower()
-	if model_init not in {"seed", "ext", "model"}:
-		raise ValueError(f"invalid model-init '{model_init}' (expected seed, ext, or model)")
+	_require_torch_device_available(device)
 	init_mode = str(model_cfg.init_mode).strip().lower()
+	self_map_init = _validate_self_map_init_args(
+		self_map_init=self_map_init,
+		model_init=model_init,
+		init_mode=init_mode,
+		model_depth=int(model_cfg.depth),
+		model_w=data_cfg.model_w,
+		model_w_unit=data_cfg.model_w_unit,
+		validate_shape_contract=(model_init != "model"),
+	)
+	self_map_model_w_wraps: float | None = (
+		None if data_cfg.model_w is None else float(data_cfg.model_w)
+	) if data_cfg.model_w_unit == "wraps" else None
 	if init_mode == "shell-dir-crop" and model_init != "seed":
 		raise ValueError("init-mode=shell-dir-crop requires args.model-init=seed")
 	if init_mode == "shell-dir-crop" and "init_shell_dir" in cfg:
@@ -262,6 +1502,33 @@ def main(argv: list[str] | None = None) -> int:
 	_t = _stage_start("probe_preprocessed_data")
 	prep_params = fit_data.get_preprocessed_params(str(data_cfg.input))
 	source_to_base = float(prep_params.get("source_to_base", 1.0))
+	lasagna_base_shape_zyx = volume_scale.parse_shape_zyx(
+		prep_params.get("base_shape_zyx"), name="lasagna_base_shape_zyx")
+	vc3d_volume_shape_zyx = volume_scale.parse_shape_zyx(
+		cfg.get("vc3d_volume_shape_zyx"), name="vc3d_volume_shape_zyx")
+	request_scale = volume_scale.coordinate_scale_to_base(
+		base_shape_zyx=lasagna_base_shape_zyx,
+		source_shape_zyx=vc3d_volume_shape_zyx,
+		source_name="vc3d_volume_shape_zyx",
+	)
+	fit_config["lasagna_base_shape_zyx"] = _shape_list(lasagna_base_shape_zyx)
+	if vc3d_volume_shape_zyx is not None:
+		fit_config["vc3d_volume_shape_zyx"] = _shape_list(vc3d_volume_shape_zyx)
+	if not request_scale.is_identity:
+		print(
+			f"[fit] VC3D coordinate import scale={request_scale.factor:.9g} "
+			f"vc3d_shape={_shape_list(vc3d_volume_shape_zyx)} "
+			f"lasagna_base_shape={_shape_list(lasagna_base_shape_zyx)}",
+			flush=True,
+		)
+	if data_cfg.seed is not None:
+		scaled_seed = tuple(float(v) for v in volume_scale.scale_xyz_point(data_cfg.seed, request_scale.factor)[:3])
+		data_cfg = dataclasses.replace(data_cfg, seed=scaled_seed)
+		fit_config.setdefault("args", {})["seed"] = [float(v) for v in scaled_seed]
+	if isinstance(cfg.get("corr_points"), dict):
+		scaled_corr = volume_scale.scale_corr_points_json(cfg["corr_points"], request_scale.factor)
+		cfg["corr_points"] = scaled_corr
+		fit_config["corr_points"] = copy.deepcopy(scaled_corr)
 	# Model scaledown in base coords = channel_scaledown * source_to_base
 	scaledown = float(prep_params["scaledown"]) * source_to_base
 	volume_extent_fullres = prep_params.get("volume_extent_fullres")
@@ -274,6 +1541,10 @@ def main(argv: list[str] | None = None) -> int:
 	# a centered effective seed, and extents before the configured init runs.
 	_t = _stage_start("approval_inpaint")
 	approval_inpaint_enabled = _truthy_config_bool(getattr(args, "approval_inpaint", False))
+	approval_inpaint_output_mask_enabled = _truthy_config_bool(getattr(args, "approval_inpaint_output_mask", False))
+	if approval_inpaint_output_mask_enabled and not approval_inpaint_enabled:
+		raise ValueError("approval-inpaint-output-mask requires approval-inpaint=true")
+	approval_inpaint_output_mask: dict | None = None
 	if approval_inpaint_enabled:
 		if model_init != "seed":
 			raise ValueError("approval-inpaint requires args.model-init=seed")
@@ -283,6 +1554,12 @@ def main(argv: list[str] | None = None) -> int:
 		if not approval_tifxyz:
 			raise ValueError("approval-inpaint requires service arg approval-inpaint-tifxyz")
 		from approval_inpaint import build_approval_inpaint
+		approval_tifxyz = _scaled_approval_tifxyz_path(
+			str(approval_tifxyz),
+			tmp_parent=None,
+			base_shape_zyx=lasagna_base_shape_zyx,
+			request_shape_zyx=vc3d_volume_shape_zyx,
+		)
 
 		result = build_approval_inpaint(
 			tifxyz_path=str(approval_tifxyz),
@@ -291,11 +1568,15 @@ def main(argv: list[str] | None = None) -> int:
 			corr_spacing=getattr(args, "approval_inpaint_corr_spacing", None),
 			padding_frac=getattr(args, "approval_inpaint_padding_frac", 0.25),
 			existing_corr_points=cfg.get("corr_points") if isinstance(cfg.get("corr_points"), dict) else None,
+			output_mask=approval_inpaint_output_mask_enabled,
+			output_mask_dilate=int(getattr(args, "approval_inpaint_output_mask_dilate", 3)),
 		)
+		approval_inpaint_output_mask = result.output_mask
 		data_cfg = dataclasses.replace(
 			data_cfg,
 			seed=result.seed,
 			model_w=result.model_w,
+			model_w_unit="voxels",
 			model_h=result.model_h,
 		)
 		cfg["corr_points"] = result.corr_points
@@ -303,9 +1584,19 @@ def main(argv: list[str] | None = None) -> int:
 		fit_config.setdefault("args", {}).update({
 			"seed": [float(v) for v in result.seed],
 			"model-w": int(result.model_w),
+			"model-w-unit": "voxels",
 			"model-h": int(result.model_h),
 			"approval-inpaint": True,
+			"approval-inpaint-output-mask": bool(approval_inpaint_output_mask_enabled),
+			"approval-inpaint-output-mask-dilate": int(getattr(args, "approval_inpaint_output_mask_dilate", 3)),
 		})
+		if approval_inpaint_output_mask is not None:
+			fit_config["args"]["approval-inpaint-output-mask-source"] = str(
+				approval_inpaint_output_mask.get("source", "corr_points")
+			)
+			fit_config["args"]["approval-inpaint-output-mask-corr-collections"] = [
+				int(v) for v in approval_inpaint_output_mask.get("corr_collection_ids", [])
+			]
 		print(
 			f"[fit] approval-inpaint: points={result.point_count} "
 			f"component={result.component_size} skeleton={result.skeleton_size} "
@@ -315,6 +1606,85 @@ def main(argv: list[str] | None = None) -> int:
 			flush=True,
 		)
 	_stage_done("approval_inpaint", _t)
+
+	_t = _stage_start("corr_point_roi_init")
+	corr_point_roi_enabled = _truthy_config_bool(getattr(args, "corr_point_roi", False))
+	corr_point_roi_init: _CorrPointRoiInit | None = None
+	corr_point_roi_shell_index = None
+	if corr_point_roi_enabled:
+		if model_init != "seed":
+			raise ValueError("corr-point-roi requires args.model-init=seed")
+		if init_mode != "shell-dir-crop":
+			raise ValueError("corr-point-roi requires args.init-mode=shell-dir-crop")
+		corr_points_obj_for_roi = cfg.get("corr_points")
+		if not isinstance(corr_points_obj_for_roi, dict):
+			raise ValueError("corr-point-roi requires nonempty corr_points")
+		corr_points_3d_for_roi = _parse_corr_points(corr_points_obj_for_roi, device)
+		if corr_points_3d_for_roi is None or corr_points_3d_for_roi.points_xyz_winda.shape[0] <= 0:
+			raise ValueError("corr-point-roi requires nonempty corr_points")
+		from init_shell_index import InitShellIndex
+		init_shell_dir = _require_manifest_init_shell_dir(prep_params)
+		corr_point_roi_shell_index = InitShellIndex.from_directory(init_shell_dir)
+		if device.type == "cuda":
+			corr_point_roi_normal_data = fit_data.load_3d_streaming(
+				path=str(data_cfg.input),
+				device=device,
+				sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
+				skip_channels={"cos", "pred_dt"},
+			)
+		else:
+			corr_point_roi_normal_data = fit_data.load_3d(
+				path=str(data_cfg.input),
+				device=device,
+				cuda_gridsample=(device.type == "cuda" and bool(data_cfg.cuda_gridsample)),
+				skip_channels={"cos", "pred_dt"},
+			)
+		corr_point_roi_normals = _sample_corr_point_roi_normals(
+			data=corr_point_roi_normal_data,
+			corr_points=corr_points_3d_for_roi,
+			device=device,
+		)
+		corr_point_roi_init = _derive_corr_point_roi_init(
+			shell_index=corr_point_roi_shell_index,
+			corr_points=corr_points_3d_for_roi,
+			normals_xyz=corr_point_roi_normals,
+			mesh_step=float(model_cfg.mesh_step),
+			init_margin_grid_points=int(data_cfg.corr_point_roi_init_margin),
+			device=device,
+		)
+		corr_point_roi_init.payload["output_radius_grid_points"] = int(data_cfg.corr_point_roi_output_radius)
+		data_cfg = dataclasses.replace(
+			data_cfg,
+			seed=corr_point_roi_init.effective_seed,
+			model_w=corr_point_roi_init.model_w,
+			model_w_unit="voxels",
+			model_h=corr_point_roi_init.model_h,
+		)
+		model_cfg = dataclasses.replace(model_cfg, depth=1, pyramid_d=False)
+		fit_config.setdefault("args", {}).update({
+			"corr-point-roi": True,
+			"corr-point-roi-init-margin": int(data_cfg.corr_point_roi_init_margin),
+			"corr-point-roi-output-radius": int(data_cfg.corr_point_roi_output_radius),
+			"seed": [float(v) for v in corr_point_roi_init.effective_seed],
+			"model-w": float(corr_point_roi_init.model_w),
+			"model-w-unit": "voxels",
+			"model-h": float(corr_point_roi_init.model_h),
+			"depth": 1,
+			"pyramid-d": False,
+		})
+		fit_config["_corr_point_roi_init_"] = copy.deepcopy(corr_point_roi_init.payload)
+		print(
+			f"[fit] corr-point-roi: shell={corr_point_roi_init.payload['final_shell_id']} "
+			f"line_hits={corr_point_roi_init.payload['usable_point_count']}/"
+			f"{corr_point_roi_init.payload['parsed_point_count']} "
+			f"skipped={corr_point_roi_init.payload['skipped_reasons']} "
+			f"seed=({corr_point_roi_init.effective_seed[0]:.1f},"
+			f"{corr_point_roi_init.effective_seed[1]:.1f},"
+			f"{corr_point_roi_init.effective_seed[2]:.1f}) "
+			f"model_w={corr_point_roi_init.model_w:.1f} model_h={corr_point_roi_init.model_h:.1f}",
+			flush=True,
+		)
+	_stage_done("corr_point_roi_init", _t)
 
 	# --- Init from seed (new model only) ---
 	_t = _stage_start("derive_initial_model_params")
@@ -340,6 +1710,25 @@ def main(argv: list[str] | None = None) -> int:
 			raise ValueError("model-init=model requires --model-input")
 		if getattr(args, "tifxyz_init", None):
 			raise ValueError("model-init=model must not set --tifxyz-init; tifxyz can only be used as external_surfaces")
+	elif model_init == "atlas":
+		if model_cfg.model_input is not None:
+			raise ValueError("model-init=atlas must not set --model-input")
+		if getattr(args, "tifxyz_init", None):
+			raise ValueError("model-init=atlas must not set --tifxyz-init")
+		if not isinstance(cfg.get("atlas"), dict):
+			raise ValueError("model-init=atlas requires top-level config atlas object")
+		if isinstance(args_cfg, dict):
+			bad_atlas_args = [
+				name for name in ("depth", "subsample-mesh", "subsample_mesh", "subsample-winding", "subsample_winding")
+				if name in args_cfg
+			]
+			if bad_atlas_args:
+				raise ValueError(
+					"model-init=atlas does not support args "
+					+ ", ".join(sorted(bad_atlas_args))
+					+ "; atlas models are always depth=1 with fixed atlas sampling"
+				)
+		model_cfg = dataclasses.replace(model_cfg, depth=1, subsample_mesh=1, subsample_winding=1, pyramid_d=False)
 
 	if model_init == "seed" and data_cfg.seed is not None:
 		model_cfg = dataclasses.replace(model_cfg, z_center=float(data_cfg.seed[2]))
@@ -362,213 +1751,48 @@ def main(argv: list[str] | None = None) -> int:
 			  f"(umbilicus tube search grid; final mesh bake uses model-w/model-h/mesh-step)", flush=True)
 	_stage_done("derive_initial_model_params", _t)
 
-	# --- Windowed tifxyz mode ---
 	tifxyz_init = getattr(args, "tifxyz_init", None)
-	window_size = getattr(args, "window_size", None) or 0
-	window_overlap = getattr(args, "window_overlap", 0)
-	if model_init != "ext" and window_size > 0:
-		raise ValueError("windowed optimization currently requires model-init=ext")
-
-	if model_init == "ext" and tifxyz_init and window_size > 0:
-		from tifxyz_io import load_tifxyz
-		import fit2tifxyz as _f2t
-		import json as _json
-
-		# Load full tifxyz to CPU (save GPU mem)
-		full_xyz, full_valid, full_meta = load_tifxyz(tifxyz_init, device="cpu")
-		H_full, W_full, _ = full_xyz.shape
-		mesh_step = model_cfg.mesh_step
-		scale = full_meta.get("scale")
-		if scale is not None and isinstance(scale, list) and len(scale) >= 1 and float(scale[0]) > 0:
-			mesh_step = max(1, int(round(1.0 / float(scale[0]))))
-
-		# Get offset from external_surfaces config
-		ext_surfaces_cfg = cfg.pop("external_surfaces", None)
-		offset_val = 1.0
-		if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
-			offset_val = float(ext_surfaces_cfg[0].get("offset", 1.0))
-		ext_margin = max(4, int(2 * abs(offset_val) / mesh_step) + 2)
-
-		# Parse stages and channel skipping (shared across windows)
-		cfg.pop("corr_points", None)
-		cfg.pop("args", None)
-		cfg.pop("voxel_size_um", None)
-		cfg.pop("external_surfaces", None)
-		cfg.pop("tifxyz", None)
-		cfg.pop("offset_value", None)
-		stages = optimizer.load_stages_cfg(
-			cfg,
-			init_mode=model_cfg.init_mode if model_init == "seed" else None,
-		)
-
-		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
-		n_windows = len(windows)
-		overlap_verts = window_overlap // mesh_step
-		print(f"[fit] windowed mode: {n_windows} windows, window_size={window_size} "
-			  f"overlap={window_overlap} mesh_step={mesh_step} grid={H_full}x{W_full}",
-			  flush=True)
-
-		# Output directory for window tifxyz exports
-		output_dir = model_cfg.model_output
-		if output_dir is not None:
-			output_dir = str(Path(output_dir).parent)
-		elif _out_dir is not None:
-			output_dir = _out_dir
-		else:
-			raise ValueError("windowed mode requires --model-output or --out-dir")
-		Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-		voxel_size_um = fit_config.get("voxel_size_um")
-
-		for wi, (h0, h1, w0, w1) in enumerate(windows):
-			print(f"\n[fit] === window {wi+1}/{n_windows}: rows [{h0}:{h1}], cols [{w0}:{w1}] "
-				  f"({h1-h0}x{w1-w0} verts) ===", flush=True)
-
-			# Crop tifxyz to window
-			crop_xyz = full_xyz[h0:h1, w0:w1].to(device)
-			crop_valid = full_valid[h0:h1, w0:w1].to(device)
-
-			# Create model from crop
-			mdl = model.Model3D.from_tifxyz_crop(
-				crop_xyz, crop_valid, device=device, mesh_step=mesh_step,
-				winding_step=model_cfg.winding_step,
-				subsample_mesh=model_cfg.subsample_mesh,
-				subsample_winding=model_cfg.subsample_winding,
-			)
-
-			# Crop external surface with margin for ray intersection at boundaries
-			eh0 = max(0, h0 - ext_margin)
-			eh1 = min(H_full, h1 + ext_margin)
-			ew0 = max(0, w0 - ext_margin)
-			ew1 = min(W_full, w1 + ext_margin)
-			ext_xyz = full_xyz[eh0:eh1, ew0:ew1].to(device)
-			ext_valid = full_valid[eh0:eh1, ew0:ew1].to(device)
-			ext_idx = mdl.add_external_surface(ext_xyz, valid=ext_valid, offset=offset_val)
-			# ext→model mapping: ext corner r → model grid r + h_off
-			# ext grid 0 = fullres eh0, model grid 0 = fullres h0
-			# so model_h = r + (eh0 - h0)
-			mdl._ext_conn_offsets[ext_idx][0] = float(eh0 - h0)
-			mdl._ext_conn_offsets[ext_idx][1] = float(ew0 - w0)
-
-			# Streaming data loader for this window
-			def _streaming_skip_channels(needed_channels: set[str]) -> set[str]:
-				optional = {"cos", "pred_dt"}
-				return optional - set(needed_channels)
-
-			def _streaming_loaded_channels(d: fit_data.FitData3D) -> set[str]:
-				if not d.sparse_caches:
-					return set()
-				return {
-					ch
-					for cache in d.sparse_caches.values()
-					for ch in cache.channels
-				}
-
-			def _load_streaming_win(needed_channels: set[str]) -> fit_data.FitData3D:
-				d = fit_data.load_3d_streaming(
-					path=str(data_cfg.input),
-					device=device,
-					sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
-					skip_channels=_streaming_skip_channels(needed_channels),
-				)
-				Z, Y, X = d.size
-				sx, sy, sz = d.spacing
-				volume_extent = (
-					d.origin_fullres[0], d.origin_fullres[1], d.origin_fullres[2],
-					d.origin_fullres[0] + (X - 1) * sx,
-					d.origin_fullres[1] + (Y - 1) * sy,
-					d.origin_fullres[2] + (Z - 1) * sz,
-				)
-				mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
-				return d
-
-			def _ensure_data_win(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
-				if data is None:
-					return _load_streaming_win(needed_channels)
-				loaded = _streaming_loaded_channels(data)
-				required = {"grad_mag", "nx", "ny"} | set(needed_channels)
-				if not required.issubset(loaded) or (loaded & {"cos", "pred_dt"}) != (required & {"cos", "pred_dt"}):
-					return _load_streaming_win(needed_channels)
-				return data
-
-			data = _ensure_data_win(None, set())
-
-			# Progress wrapper: prefix window index, scale overall progress
-			def _make_progress(wi_=wi, n_=n_windows):
-				def _progress_win(*, step: int, total: int, loss: float, **kw: object) -> None:
-					if progress_enabled:
-						inner = float(kw.get("overall_progress", 0.0))
-						overall = (wi_ + inner) / n_
-						stage_name = kw.get("stage_name", "")
-						print(f"PROGRESS {step} {total} {loss:.6f} win={wi_+1}/{n_} "
-							  f"overall={overall:.3f} {stage_name}", flush=True)
-				return _progress_win
-
-			opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
-
-			# Seed from center of model grid (matches h_mid/w_mid in station loss)
-			center_pt = _grid_center(mdl)
-			win_seed = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
-			print(f"[fit] window seed: ({win_seed[0]:.0f}, {win_seed[1]:.0f}, {win_seed[2]:.0f})",
-				  flush=True)
-
-			optimizer.optimize(
-				model=mdl,
-				data=data,
-				stages=stages,
-				snapshot_interval=0,
-				snapshot_fn=lambda **kw: None,
-				progress_fn=_make_progress(),
-				ensure_data_fn=_ensure_data_win,
-				seed_xyz=win_seed,
-				out_dir=str(Path(output_dir) / f"window_{wi:04d}"),
-			)
-
-			# Export this window's tifxyz
-			mesh = mdl.mesh_coarse()  # (3, 1, Hm, Wm)
-			mesh_np = mesh.detach().cpu().numpy()
-			Hm, Wm = mesh_np.shape[2], mesh_np.shape[3]
-			x_out = mesh_np[0, 0]  # (Hm, Wm)
-			y_out = mesh_np[1, 0]
-			z_out = mesh_np[2, 0]
-			meta_scale = 1.0 / float(mesh_step)
-
-			win_name = f"window_{wi:04d}.tifxyz"
-			win_dir = Path(output_dir) / win_name
-			area = _f2t._get_area(x_out, y_out, z_out, float(mesh_step),
-								  float(voxel_size_um) if voxel_size_um else None)
-			_f2t._write_tifxyz(
-				out_dir=win_dir, x=x_out, y=y_out, z=z_out,
-				scale=meta_scale, area=area,
-			)
-			# Add window metadata to meta.json
-			meta_path = win_dir / "meta.json"
-			meta = _json.loads(meta_path.read_text(encoding="utf-8"))
-			meta["window_index"] = wi
-			meta["window_origin_verts"] = [h0, w0]
-			meta["window_size_verts"] = [h1 - h0, w1 - w0]
-			meta["source_grid_size_verts"] = [H_full, W_full]
-			meta["overlap_verts"] = overlap_verts
-			meta_path.write_text(_json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-
-			_f2t._print_area(area)
-			print(f"[fit] exported {win_name}", flush=True)
-
-			# Free GPU memory before next window
-			del mdl, data, crop_xyz, crop_valid, ext_xyz, ext_valid, mesh, mesh_np
-			if device.type == "cuda":
-				torch.cuda.empty_cache()
-
-		print(f"\n[fit] windowed mode complete: {n_windows} windows exported to {output_dir}",
-			  flush=True)
-		return 0
+	loaded_snap_surf_map_state: dict | None = None
+	loaded_model_checkpoint: dict | None = None
+	atlas_lines_3d: fit_data.AtlasLines3D | None = None
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
 	_t = _stage_start("construct_model")
-	if model_init == "ext":
-		mdl = model.Model3D.from_tifxyz(
-			tifxyz_init, device=device,
+	if model_init == "atlas":
+		atlas_init = atlas_mod.build_atlas_init(
+			cfg["atlas"],
+			device=device,
 			mesh_step=model_cfg.mesh_step,
+			winding_step=model_cfg.winding_step,
+		)
+		mdl = atlas_init.model
+		atlas_lines_3d = atlas_init.atlas_lines
+		fit_config["_atlas_init_"] = copy.deepcopy(atlas_init.metadata)
+		print(
+			f"[fit] model-init=atlas: base_shape={tuple(mdl._grid_xyz().shape[1:3])} "
+			f"samples={atlas_init.metadata['line_sample_count']} "
+			f"period_columns={atlas_init.metadata['period_columns']} "
+			f"windings={atlas_init.metadata['leftmost_winding']}..{atlas_init.metadata['rightmost_winding']}",
+			flush=True,
+		)
+	elif model_init == "ext":
+		from tifxyz_io import surface_step_stats
+		xyz_init, valid_init, _meta_init, _scale_init = _load_scaled_tifxyz(
+			str(tifxyz_init),
+			device=device,
+			base_shape_zyx=lasagna_base_shape_zyx,
+			request_shape_zyx=vc3d_volume_shape_zyx,
+			path_label="tifxyz-init",
+		)
+		_step_h, _step_w, _step_diag, step_avg = surface_step_stats(xyz_init, valid_init)
+		mesh_step_init = model_cfg.mesh_step
+		if math.isfinite(step_avg) and step_avg > 0.0:
+			mesh_step_init = max(1, int(round(step_avg)))
+		mdl = model.Model3D.from_tifxyz_crop(
+			xyz_init,
+			valid_init,
+			device=device,
+			mesh_step=mesh_step_init,
 			winding_step=model_cfg.winding_step,
 			subsample_mesh=model_cfg.subsample_mesh,
 			subsample_winding=model_cfg.subsample_winding,
@@ -577,20 +1801,123 @@ def main(argv: list[str] | None = None) -> int:
 	elif model_init == "seed":
 		if init_mode == "shell-dir-crop":
 			print("[fit] model-init=seed/init-mode=shell-dir-crop: constructing model from init shells", flush=True)
-			from init_shell_index import InitShellIndex, crop_shell_surface
+			from init_shell_index import (
+				InitShellIndex,
+				crop_shell_surface,
+				shell_quality_analysis,
+				trim_shell_surface_rows_by_quality,
+			)
 			init_shell_dir = _require_manifest_init_shell_dir(prep_params)
-			shell_index = InitShellIndex.from_directory(init_shell_dir)
-			closest = shell_index.closest_point(tuple(float(v) for v in data_cfg.seed), device=device)
-			surface = shell_index.surfaces[closest.shell_index]
+			if corr_point_roi_init is not None:
+				shell_index = corr_point_roi_shell_index if corr_point_roi_shell_index is not None else InitShellIndex.from_directory(init_shell_dir)
+				closest = corr_point_roi_init.closest
+				surface = corr_point_roi_init.surface
+			else:
+				shell_index = InitShellIndex.from_directory(init_shell_dir)
+				closest = shell_index.closest_point(tuple(float(v) for v in data_cfg.seed), device=device)
+				surface = shell_index.surfaces[closest.shell_index]
+			source_step = float(surface.source_step) if surface.source_step is not None else float(model_cfg.mesh_step)
+			selected_shell = surface.xyz_wrapped[:, :surface.unique_w].to(device=device, dtype=torch.float32)
+			print(
+				f"[fit] shell-dir-crop closest shell before crop: "
+				f"id={closest.shell_id} path={surface.path} "
+				f"source_step={source_step:.3f} "
+				f"source_shape={int(surface.xyz_wrapped.shape[0])}x{int(surface.xyz_wrapped.shape[1])} "
+				f"unique_shape={int(selected_shell.shape[0])}x{int(selected_shell.shape[1])} "
+				f"quad=({closest.quad_row},{closest.quad_col}) tri={closest.triangle_id} "
+				f"h={closest.h:.3f} w={closest.w:.3f} dist={closest.distance:.3f}",
+				flush=True,
+			)
+			source_quality = shell_quality_analysis(selected_shell, target_step=source_step)
+			print(
+				f"[fit] shell-dir-crop source-shell quality before row trim: "
+				f"target_step={source_quality['target_step']:.3f} target_area={source_quality['target_area']:.3f} "
+				f"h=({source_quality['h_min']:.3f},{source_quality['h_med']:.3f},{source_quality['h_max']:.3f}) "
+				f"w_top=({source_quality['w_top_min']:.3f},{source_quality['w_top_med']:.3f},{source_quality['w_top_max']:.3f}) "
+				f"w_bottom=({source_quality['w_bottom_min']:.3f},{source_quality['w_bottom_med']:.3f},{source_quality['w_bottom_max']:.3f}) "
+				f"diag_main=({source_quality['diag_main_min']:.3f},{source_quality['diag_main_med']:.3f},{source_quality['diag_main_max']:.3f}) "
+				f"diag_anti=({source_quality['diag_anti_min']:.3f},{source_quality['diag_anti_med']:.3f},{source_quality['diag_anti_max']:.3f}) "
+				f"area=({source_quality['area_min']:.3f},{source_quality['area_med']:.3f},{source_quality['area_max']:.3f}) "
+				f"area_sqrt=({source_quality['area_sqrt_min']:.3f},{source_quality['area_sqrt_med']:.3f},{source_quality['area_sqrt_max']:.3f})",
+				flush=True,
+			)
+			if corr_point_roi_init is None:
+				trimmed_surface, trim_top, trim_bottom = trim_shell_surface_rows_by_quality(
+					surface,
+					target_step=source_step,
+					lo_ratio=0.5,
+					hi_ratio=2.0,
+				)
+				if trim_top or trim_bottom:
+					if not (float(trim_top) <= float(closest.h) <= float(trim_top + trimmed_surface.xyz_wrapped.shape[0] - 1)):
+						raise ValueError(
+							f"shell-dir-crop source row trim removed closest seed row: "
+							f"h={closest.h:.3f} trim_top={trim_top} kept_h={int(trimmed_surface.xyz_wrapped.shape[0])}"
+						)
+					closest = dataclasses.replace(
+						closest,
+						h=float(closest.h) - float(trim_top),
+						quad_row=max(0, int(closest.quad_row) - int(trim_top)),
+					)
+					surface = trimmed_surface
+					selected_shell = surface.xyz_wrapped[:, :surface.unique_w].to(device=device, dtype=torch.float32)
+					trim_quality = shell_quality_analysis(selected_shell, target_step=source_step)
+					print(
+						f"[fit] shell-dir-crop source-shell row trim: "
+						f"trim_top={trim_top} trim_bottom={trim_bottom} "
+						f"kept_shape={int(surface.xyz_wrapped.shape[0])}x{int(surface.xyz_wrapped.shape[1])} "
+						f"adjusted_h={closest.h:.3f} "
+						f"h=({trim_quality['h_min']:.3f},{trim_quality['h_med']:.3f},{trim_quality['h_max']:.3f}) "
+						f"w_top=({trim_quality['w_top_min']:.3f},{trim_quality['w_top_med']:.3f},{trim_quality['w_top_max']:.3f}) "
+						f"w_bottom=({trim_quality['w_bottom_min']:.3f},{trim_quality['w_bottom_med']:.3f},{trim_quality['w_bottom_max']:.3f}) "
+						f"diag_main=({trim_quality['diag_main_min']:.3f},{trim_quality['diag_main_med']:.3f},{trim_quality['diag_main_max']:.3f}) "
+						f"diag_anti=({trim_quality['diag_anti_min']:.3f},{trim_quality['diag_anti_med']:.3f},{trim_quality['diag_anti_max']:.3f}) "
+						f"area=({trim_quality['area_min']:.3f},{trim_quality['area_med']:.3f},{trim_quality['area_max']:.3f}) "
+						f"area_sqrt=({trim_quality['area_sqrt_min']:.3f},{trim_quality['area_sqrt_med']:.3f},{trim_quality['area_sqrt_max']:.3f})",
+						flush=True,
+					)
+			if _SHELL_STEP_ANALYSIS_ENABLED:
+				step_stats = opt_loss_step.step_loss_analysis(selected_shell, mesh_step=source_step)
+				print(
+					f"[fit] shell-dir-crop selected-shell step analysis before crop: "
+					f"loss={step_stats['loss']:.6g} target={step_stats['target']:.3f} "
+					f"step_min={step_stats['step_min']:.3f} step_avg={step_stats['step_avg']:.3f} "
+					f"step_med={step_stats['step_med']:.3f} step_max={step_stats['step_max']:.3f} "
+					f"h_avg={step_stats['h_avg']:.3f} w_avg={step_stats['w_avg']:.3f} "
+					f"diag_avg={step_stats['diag_avg']:.3f} "
+					f"h_max={step_stats['h_max']:.3f} w_max={step_stats['w_max']:.3f} "
+					f"diag_max={step_stats['diag_max']:.3f} max_kind={step_stats['max_kind']}",
+					flush=True,
+				)
 			crop_xyz, crop_valid, crop_info = crop_shell_surface(
 				surface,
 				closest,
 				seed=tuple(float(v) for v in data_cfg.seed),
 				model_w=float(data_cfg.model_w) if data_cfg.model_w is not None else 0.0,
 				model_h=float(data_cfg.model_h),
+				model_w_unit=data_cfg.model_w_unit,
 				mesh_step=float(model_cfg.mesh_step),
 				device=device,
 			)
+			if self_map_init != "off":
+				self_map_model_w_wraps = float(crop_info.requested_width_wraps)
+				_validate_self_map_width_contract(
+					mode=self_map_init,
+					model_w_wraps=self_map_model_w_wraps,
+				)
+			if _SHELL_STEP_ANALYSIS_ENABLED:
+				crop_step_stats = opt_loss_step.step_loss_analysis(crop_xyz, mesh_step=float(model_cfg.mesh_step))
+				print(
+					f"[fit] shell-dir-crop resampled-crop step analysis: "
+					f"loss={crop_step_stats['loss']:.6g} target={crop_step_stats['target']:.3f} "
+					f"step_min={crop_step_stats['step_min']:.3f} step_avg={crop_step_stats['step_avg']:.3f} "
+					f"step_med={crop_step_stats['step_med']:.3f} step_max={crop_step_stats['step_max']:.3f} "
+					f"h_avg={crop_step_stats['h_avg']:.3f} w_avg={crop_step_stats['w_avg']:.3f} "
+					f"diag_avg={crop_step_stats['diag_avg']:.3f} "
+					f"h_max={crop_step_stats['h_max']:.3f} w_max={crop_step_stats['w_max']:.3f} "
+					f"diag_max={crop_step_stats['diag_max']:.3f} max_kind={crop_step_stats['max_kind']}",
+					flush=True,
+				)
 			mdl = model.Model3D.from_tifxyz_crop(
 				crop_xyz,
 				crop_valid,
@@ -599,6 +1926,11 @@ def main(argv: list[str] | None = None) -> int:
 				winding_step=model_cfg.winding_step,
 				subsample_mesh=model_cfg.subsample_mesh,
 				subsample_winding=model_cfg.subsample_winding,
+				depth=(
+					init_grow_cfg.initial_depth
+					if init_grow_cfg.enabled
+					else (model_cfg.depth if self_map_init == "multi_wrap_d" else 1)
+				),
 			)
 			mdl.params = dataclasses.replace(
 				mdl.params,
@@ -608,12 +1940,32 @@ def main(argv: list[str] | None = None) -> int:
 				model_w=(None if data_cfg.model_w is None else float(data_cfg.model_w)),
 				model_h=float(data_cfg.model_h),
 			)
+			if _SHELL_STEP_ANALYSIS_ENABLED:
+				model_step_stats = opt_loss_step.step_loss_analysis(mdl._grid_xyz().detach(), mesh_step=float(model_cfg.mesh_step))
+				print(
+					f"[fit] shell-dir-crop model-init step analysis: "
+					f"loss={model_step_stats['loss']:.6g} target={model_step_stats['target']:.3f} "
+					f"step_min={model_step_stats['step_min']:.3f} step_avg={model_step_stats['step_avg']:.3f} "
+					f"step_med={model_step_stats['step_med']:.3f} step_max={model_step_stats['step_max']:.3f} "
+					f"h_avg={model_step_stats['h_avg']:.3f} w_avg={model_step_stats['w_avg']:.3f} "
+					f"diag_avg={model_step_stats['diag_avg']:.3f} "
+					f"h_max={model_step_stats['h_max']:.3f} w_max={model_step_stats['w_max']:.3f} "
+					f"diag_max={model_step_stats['diag_max']:.3f} max_kind={model_step_stats['max_kind']}",
+					flush=True,
+				)
 			print(
 				f"[fit] shell-dir-crop selected {closest.shell_id}: "
 				f"quad=({closest.quad_row},{closest.quad_col}) tri={closest.triangle_id} "
 				f"h={closest.h:.3f} w={closest.w:.3f} "
 				f"dist={closest.distance:.3f} "
-				f"crop={crop_info.mesh_h}x{crop_info.mesh_w} full_width={crop_info.full_width}",
+				f"crop={crop_info.mesh_h}x{crop_info.mesh_w} "
+				f"requested_h={crop_info.requested_mesh_h} "
+				f"dropped_h={crop_info.requested_mesh_h - crop_info.mesh_h} "
+				f"dropped_h_low={crop_info.height_dropped_low} "
+				f"dropped_h_high={crop_info.height_dropped_high} "
+				f"source={crop_info.source_h}x{crop_info.source_w} "
+				f"full_width={crop_info.full_width} "
+				f"requested_width_wraps={crop_info.requested_width_wraps:.6g}",
 				flush=True,
 			)
 		elif init_mode == "cylinder_seed":
@@ -645,7 +1997,26 @@ def main(argv: list[str] | None = None) -> int:
 	else:
 		print(f"[fit] model-init=model: loading checkpoint {model_cfg.model_input}", flush=True)
 		st = torch.load(model_cfg.model_input, map_location=device, weights_only=False)
+		loaded_model_checkpoint = st if isinstance(st, dict) else None
+		loaded_snap_surf_map_state = st.get("_snap_surf_map_state_") if isinstance(st, dict) else None
 		mdl = model.Model3D.from_checkpoint(st, device=device)
+		if self_map_init != "off":
+			checkpoint_model_w = getattr(mdl.params, "model_w", None)
+			model_w_wraps = (
+				float(data_cfg.model_w)
+				if data_cfg.model_w is not None
+				else (None if checkpoint_model_w is None else float(checkpoint_model_w))
+			)
+			_validate_self_map_init_args(
+				self_map_init=self_map_init,
+				model_init=model_init,
+				init_mode=init_mode,
+				model_depth=int(mdl.depth),
+				model_w=model_w_wraps,
+				model_w_unit=data_cfg.model_w_unit,
+			)
+			if data_cfg.model_w_unit == "wraps":
+				self_map_model_w_wraps = model_w_wraps
 
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"cylinder_enabled={getattr(mdl, 'cylinder_enabled', False)}")
@@ -654,15 +2025,49 @@ def main(argv: list[str] | None = None) -> int:
 	# Load external reference surfaces
 	_t = _stage_start("load_external_surfaces")
 	ext_surfaces_cfg = cfg.pop("external_surfaces", None)
-	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
-		from tifxyz_io import load_tifxyz
+	external_surface_maps_requested = (
+		_config_requests_external_surface_maps(fit_config, self_map_init=self_map_init)
+		or bool(getattr(mdl, "_ext_surfaces", None))
+	)
+	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg and not external_surface_maps_requested:
+		print(
+			"[fit] external_surfaces present but no external-surface map consumer is active; "
+			"skipping model external-surface registration",
+			flush=True,
+		)
+	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg and external_surface_maps_requested:
+		if len(ext_surfaces_cfg) != 1:
+			raise ValueError(
+				f"external_surfaces currently requires exactly one entry, got {len(ext_surfaces_cfg)}")
+		from tifxyz_io import surface_step_stats
 		for es in ext_surfaces_cfg:
 			es_path = str(es["path"])
 			es_offset = float(es.get("offset", 1.0))
-			xyz_ext, valid_ext, meta_ext = load_tifxyz(es_path, device=device)
+			xyz_ext, valid_ext, meta_ext, es_scale = _load_scaled_tifxyz(
+				es_path,
+				device=device,
+				base_shape_zyx=lasagna_base_shape_zyx,
+				request_shape_zyx=vc3d_volume_shape_zyx,
+				path_label=f"external surface {es_path}",
+			)
 			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
+			meta_ext_base = volume_scale.scale_tifxyz_meta(
+				meta_ext,
+				es_scale.factor,
+				base_shape_zyx=lasagna_base_shape_zyx,
+				lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+			)
+			scale = meta_ext_base.get("scale") if isinstance(meta_ext_base, dict) else None
+			meta_step = float("nan")
+			if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
+				meta_step = 1.0 / float(scale[0])
+			step_h, step_w, step_diag, step_avg = surface_step_stats(xyz_ext, valid_ext)
+			ratio = step_avg / max(1.0e-8, float(mdl.params.mesh_step))
 			print(f"[fit] external surface {idx}: path={es_path} offset={es_offset} "
-				  f"shape={tuple(xyz_ext.shape)} valid={int(valid_ext.sum())}/{valid_ext.numel()}", flush=True)
+				  f"shape={tuple(xyz_ext.shape)} valid={int(valid_ext.sum())}/{valid_ext.numel()} "
+				  f"meta_step={meta_step:.3f} step_h={step_h:.3f} step_w={step_w:.3f} step_diag={step_diag:.3f} "
+				  f"step_avg={step_avg:.3f} model_step={float(mdl.params.mesh_step):.3f} "
+				  f"step_ratio={ratio:.3f}", flush=True)
 	_stage_done("load_external_surfaces", _t)
 
 	# Parse correction points from config (injected by VC3D)
@@ -681,11 +2086,52 @@ def main(argv: list[str] | None = None) -> int:
 	cfg.pop("voxel_size_um", None)
 	cfg.pop("external_surfaces", None)
 	cfg.pop("tifxyz", None)
-	cfg.pop("offset_value", None)
+	cfg.pop("atlas", None)
 	stages = optimizer.load_stages_cfg(
 		cfg,
 		init_mode=model_cfg.init_mode if model_init == "seed" else None,
 	)
+	print("[fit] optimizer stages:", flush=True)
+	for i, st in enumerate(stages):
+		if st.children:
+			print(
+				f"[fit]   stage{i} name={st.name!r} expand wrapper children={len(st.children)} grow={st.grow}",
+				flush=True,
+			)
+			for j, child in enumerate(st.children):
+				if child.global_opt is None:
+					print(f"[fit]     child{j} name={child.name!r} wrapper", flush=True)
+					continue
+				args_snap_map = child.global_opt.args.get("snap_surf_map") if isinstance(child.global_opt.args, dict) else None
+				print(
+					f"[fit]     child{j} name={child.name!r} steps={child.global_opt.steps} "
+					f"snap_surf_map_eff={child.global_opt.eff.get('snap_surf_map', 0.0):.6g} "
+					f"snap_surf_map_args={args_snap_map}",
+					flush=True,
+				)
+			continue
+		if st.global_opt is None:
+			print(f"[fit]   stage{i} name={st.name!r} empty wrapper", flush=True)
+			continue
+		args_snap_map = st.global_opt.args.get("snap_surf_map") if isinstance(st.global_opt.args, dict) else None
+		print(
+			f"[fit]   stage{i} name={st.name!r} steps={st.global_opt.steps} "
+			f"snap_surf_map_eff={st.global_opt.eff.get('snap_surf_map', 0.0):.6g} "
+			f"snap_surf_map_args={args_snap_map}",
+			flush=True,
+		)
+	if model_init == "model":
+		atlas_lines_3d = _checkpoint_atlas_lines_for_reopt(
+			checkpoint_state=loaded_model_checkpoint,
+			stages=stages,
+			device=device,
+		)
+		if atlas_lines_3d is not None:
+			print(
+				"[fit] model-init=model: restored atlas lines from checkpoint "
+				f"{_ATLAS_LINE_ATTACHMENT_STATE_KEY} samples={int(atlas_lines_3d.target_xyz.shape[0])}",
+				flush=True,
+			)
 	_stage_done("load_optimizer_stages", _t)
 
 	# --- Streaming data loader ---
@@ -723,6 +2169,8 @@ def main(argv: list[str] | None = None) -> int:
 		mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
 		if corr_points_3d is not None:
 			d = dataclasses.replace(d, corr_points=corr_points_3d)
+		if atlas_lines_3d is not None:
+			d = dataclasses.replace(d, atlas_lines=atlas_lines_3d)
 		if data_cfg.winding_volume is not None:
 			wv_t, wv_min, wv_max = fit_data.load_winding_volume(
 				path=data_cfg.winding_volume, device=device,
@@ -740,6 +2188,8 @@ def main(argv: list[str] | None = None) -> int:
 			d = _load_streaming(needed_channels)
 			if data.corr_points is not None:
 				d = dataclasses.replace(d, corr_points=data.corr_points)
+			if data.atlas_lines is not None:
+				d = dataclasses.replace(d, atlas_lines=data.atlas_lines)
 			if data.winding_volume is not None:
 				d = dataclasses.replace(
 					d,
@@ -790,7 +2240,15 @@ def main(argv: list[str] | None = None) -> int:
 			  f"min={[round(v, 1) for v in mn]} max={[round(v, 1) for v in mx]}")
 	_stage_done("initial_mesh_stats", _t)
 
-	def _save_model(path: str) -> None:
+	tifxyz_flow_gate_channels = bool(getattr(args, "tifxyz_flow_gate_channels", False))
+	last_flow_gate_channels_payload: dict | None = None
+
+	def _save_model(
+		path: str,
+		*,
+		apply_corr_point_roi_mask: bool = True,
+		flow_gate_channels_payload: dict | None = None,
+	) -> None:
 		st = dict(mdl.state_dict())
 		# Store flat mesh instead of pyramid levels
 		ms_keys = [k for k in st if k.startswith("mesh_ms.")]
@@ -804,12 +2262,71 @@ def main(argv: list[str] | None = None) -> int:
 		elif getattr(mdl, "cylinder_enabled", False) and "conn_offsets" in st:
 			st["conn_offsets"] = torch.zeros_like(st["conn_offsets"])
 		with torch.no_grad():
-			st["mesh_flat"] = mdl.mesh_flat_for_save(data=data)
-		st["_model_params_"] = asdict(mdl.params)
+			mesh_flat = mdl.mesh_flat_for_save(data=data)
+		params = asdict(mdl.params)
+		params["depth_windings"] = [int(v) for v in mdl.params.depth_windings]
+		if lasagna_base_shape_zyx is not None:
+			params["lasagna_base_shape_zyx"] = [int(v) for v in lasagna_base_shape_zyx]
+		st["_model_params_"] = params
 		st["_fit_config_"] = fit_config
 		corr_results = opt_loss_corr.get_last_results()
 		if corr_results is not None:
 			st["_corr_points_results_"] = corr_results
+		if data.atlas_lines is not None:
+			atlas_control_results = _populate_atlas_checkpoint_state(st, mdl=mdl, data=data)
+			if atlas_control_results is not None:
+				summary = atlas_control_results.get("summary", {})
+				print(
+					"[fit] saving atlas control point results "
+					f"total={summary.get('total_count', 0)} "
+					f"valid={summary.get('valid_count', 0)} "
+					f"rms={float(summary.get('rms_distance', 0.0)):.6g}",
+					flush=True,
+				)
+		if corr_point_roi_init is not None:
+			payload = copy.deepcopy(corr_point_roi_init.payload)
+			payload["output_radius_grid_points"] = int(data_cfg.corr_point_roi_output_radius)
+			if apply_corr_point_roi_mask:
+				if int(mesh_flat.shape[1]) != 1:
+					raise ValueError(f"corr-point-roi requires final mesh depth 1, got {int(mesh_flat.shape[1])}")
+				mask, mask_debug = _corr_point_roi_mask_from_results(
+					corr_results,
+					shape=(int(mesh_flat.shape[2]), int(mesh_flat.shape[3])),
+					radius=int(data_cfg.corr_point_roi_output_radius),
+					device=mesh_flat.device,
+				)
+				sentinel = torch.full_like(mesh_flat, -1.0)
+				mesh_flat = torch.where(mask.view(1, 1, int(mesh_flat.shape[2]), int(mesh_flat.shape[3])), mesh_flat, sentinel)
+				payload["output_mask"] = mask_debug
+				print(
+					f"[fit] corr-point-roi output mask: usable={mask_debug['usable_point_count']} "
+					f"seed_vertices={mask_debug['seed_vertex_count']} "
+					f"dilated_vertices={mask_debug['dilated_vertex_count']} "
+					f"radius={payload['output_radius_grid_points']}",
+					flush=True,
+				)
+			st["_corr_point_roi_"] = payload
+		st["mesh_flat"] = mesh_flat
+		snap_surf_map_state = getattr(mdl, "_snap_surf_map_state_for_save", None)
+		if snap_surf_map_state is not None:
+			st["_snap_surf_map_state_"] = snap_surf_map_state
+		if approval_inpaint_output_mask is not None:
+			st["_approval_inpaint_output_mask_"] = copy.deepcopy(approval_inpaint_output_mask)
+			print(
+				"[fit] saving approval-inpaint output mask "
+				f"collections={approval_inpaint_output_mask.get('corr_collection_ids', [])} "
+				f"dilate={approval_inpaint_output_mask.get('dilation_radius')} "
+				f"corr_results_saved={corr_results is not None}",
+				flush=True,
+			)
+			if corr_results is None:
+				print(
+					"[fit] WARNING: approval-inpaint output mask was requested, but no "
+					"corr point results were produced; fit2tifxyz cannot project the mask",
+					flush=True,
+				)
+		if flow_gate_channels_payload is not None:
+			st["_flow_gate_channels_"] = copy.deepcopy(flow_gate_channels_payload)
 		# Store winding volume auto-offset if computed
 		from opt_loss_winding_volume import _winding_offset, _winding_direction
 		if _winding_offset is not None:
@@ -818,12 +2335,17 @@ def main(argv: list[str] | None = None) -> int:
 		torch.save(st, path)
 
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:
+		nonlocal last_flow_gate_channels_payload
+		if tifxyz_flow_gate_channels and res is not None:
+			payload = opt_loss_pred_dt.flow_gate_last_channels()
+			if payload is not None:
+				last_flow_gate_channels_payload = payload
 		if _out_dir is not None:
 			out = Path(_out_dir)
 			out.mkdir(parents=True, exist_ok=True)
 			snaps = out / "model_snapshots"
 			snaps.mkdir(parents=True, exist_ok=True)
-			_save_model(str(snaps / f"model_{stage}_{step:06d}.pt"))
+			_save_model(str(snaps / f"model_{stage}_{step:06d}.pt"), apply_corr_point_roi_mask=False)
 
 	def _progress(*, step: int, total: int, loss: float, **_kw: object) -> None:
 		if progress_enabled:
@@ -843,6 +2365,9 @@ def main(argv: list[str] | None = None) -> int:
 			  flush=True)
 	_stage_done("prepare_optimization", _t)
 	_t = _stage_start("optimizer")
+	init_grow_runtime = asdict(init_grow_cfg) if init_grow_cfg.enabled else None
+	if init_grow_runtime is not None:
+		init_grow_runtime["target_depth"] = final_model_depth
 	optimizer.optimize(
 		model=mdl,
 		data=data,
@@ -853,6 +2378,12 @@ def main(argv: list[str] | None = None) -> int:
 		ensure_data_fn=_ensure_data,
 		seed_xyz=seed_xyz,
 		out_dir=_out_dir,
+		capture_flow_gate_channels=tifxyz_flow_gate_channels,
+		self_map_init=self_map_init,
+		self_map_model_w_wraps=self_map_model_w_wraps,
+		init_grow=init_grow_runtime,
+		snap_surf_map_state=loaded_snap_surf_map_state,
+		require_snap_surf_map_state=(model_init == "model" and self_map_init != "off"),
 	)
 	_stage_done("optimizer", _t)
 
@@ -863,7 +2394,7 @@ def main(argv: list[str] | None = None) -> int:
 	# Save final model
 	if model_cfg.model_output is not None:
 		_t = _stage_start("save_model_output")
-		_save_model(str(model_cfg.model_output))
+		_save_model(str(model_cfg.model_output), flow_gate_channels_payload=last_flow_gate_channels_payload)
 		print(f"[fit] saved model to {model_cfg.model_output}")
 		_stage_done("save_model_output", _t)
 
@@ -872,7 +2403,7 @@ def main(argv: list[str] | None = None) -> int:
 		_t = _stage_start("save_final_snapshot")
 		out = Path(_out_dir)
 		out.mkdir(parents=True, exist_ok=True)
-		_save_model(str(out / "model_final.pt"))
+		_save_model(str(out / "model_final.pt"), flow_gate_channels_payload=last_flow_gate_channels_payload)
 		_stage_done("save_final_snapshot", _t)
 
 	# Export tifxyz

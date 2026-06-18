@@ -307,11 +307,13 @@ void ApprovalMaskBrushTool::finishStroke()
     }
     _module.refreshOverlay();
 
-    // Schedule debounced save to disk so brush strokes auto-persist
+    // Compose the painted mask onto the surface channel; the single autosave
+    // persists it on its next 10s tick.
     if (_surface) {
         if (auto overlay = _module.overlay()) {
             overlay->scheduleDebouncedSave(_surface);
         }
+        _module.markAutosaveNeeded();
     }
 }
 
@@ -329,17 +331,17 @@ bool ApprovalMaskBrushTool::applyPending(float /*dragRadiusSteps*/)
         finishStroke();
     }
 
-    // Since we're painting in real-time, just save the QImage to disk
     auto overlay = _module.overlay();
     if (!overlay) {
         qCWarning(lcApprovalMask) << "Cannot apply: no overlay controller";
         return false;
     }
 
-    // Save the approval mask QImage to disk
-    overlay->saveApprovalMaskToSurface(_surface);
+    // Compose the mask onto the surface channel; the single autosave persists it.
+    overlay->composeApprovalMaskToSurface(_surface);
+    _module.markAutosaveNeeded();
 
-    qCDebug(lcApprovalMask) << "Saved approval mask to disk in" << totalTimer.elapsed() << "ms";
+    qCDebug(lcApprovalMask) << "Applied approval mask in" << totalTimer.elapsed() << "ms";
 
     // Clear pending strokes and overlay segments (but keep the painted QImage)
     _strokeActive = false;
@@ -835,11 +837,13 @@ void ApprovalMaskBrushTool::finishStrokeFromWorld()
     }
     _module.refreshOverlay();
 
-    // Schedule debounced save to disk so brush strokes auto-persist
+    // Compose the painted mask onto the surface channel; the single autosave
+    // persists it on its next 10s tick.
     if (_surface) {
         if (auto overlay = _module.overlay()) {
             overlay->scheduleDebouncedSave(_surface);
         }
+        _module.markAutosaveNeeded();
     }
 }
 

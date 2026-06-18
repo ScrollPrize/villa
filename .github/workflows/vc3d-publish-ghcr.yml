@@ -1,21 +1,21 @@
 name: Publish builder images (ghcr.io)
 
-# Publishes the volume-cartographer CI builder images (Ubuntu base +
-# all apt deps) to ghcr.io so PR CI can `docker pull` them instead of
+# Publishes the volume-cartographer CI builder image (Ubuntu base +
+# all apt deps) to ghcr.io so PR CI can `docker pull` it instead of
 # rebuilding from scratch each time. Triggered only when the relevant
-# Dockerfile / ci.sh changes land on main.
+# Dockerfile / ci.sh / install_build_deps.sh changes land on main.
 #
 # Image:  ghcr.io/<owner>/villa/volume-cartographer
-# Tags:   builder-ubuntu-24.04, builder-ubuntu-26.04
-#         (plus a sha suffix for traceability)
+# Tags:   builder-ubuntu-26.04 (plus a sha suffix for traceability)
 
 on:
   push:
     branches: [main]
     paths:
-      - 'volume-cartographer/*.Dockerfile'
+      - 'volume-cartographer/Dockerfile'
       - 'volume-cartographer/.dockerignore'
       - 'volume-cartographer/scripts/ci.sh'
+      - 'volume-cartographer/scripts/install_build_deps.sh'
       - '.github/workflows/vc3d-publish-ghcr.yml'
   workflow_dispatch:
 
@@ -34,9 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { image: ubuntu-24.04, dockerfile: ubuntu-24.04-noble.Dockerfile }
-          - { image: ubuntu-26.04, dockerfile: ubuntu-26.04.Dockerfile }
+        image: [ubuntu-26.04]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

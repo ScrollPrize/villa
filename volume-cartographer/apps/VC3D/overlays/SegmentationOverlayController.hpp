@@ -12,7 +12,7 @@
 #include <optional>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 class CState;
 class SegmentationEditManager;
@@ -137,14 +137,16 @@ public:
                                   float heightSteps = 0.0f,
                                   bool isAutoApproval = false);
 
-    // Save the approval mask QImage back to the surface
-    void saveApprovalMaskToSurface(QuadSurface* surface);
+    // Composite the pending+saved approval QImages into the surface's "approval"
+    // channel (in memory only). Disk persistence is the SegmentationModule
+    // autosave's job (saveOverwrite writes all channels).
+    void composeApprovalMaskToSurface(QuadSurface* surface);
 
-    // Schedule a debounced save of the approval mask (saves after kApprovalSaveDelayMs of inactivity)
+    // Compose the edited mask onto the surface channel and record it for the
+    // boundary flush. The caller triggers the autosave.
     void scheduleDebouncedSave(QuadSurface* surface);
 
-    // Flush any pending approval mask saves immediately (uses the surface from scheduleDebouncedSave)
-    // Call this before segment switching to ensure changes are saved to the correct surface
+    // Synchronously persist pending approval edits before a segment switch/close.
     void flushPendingApprovalMaskSave();
 
     // Undo support for approval mask painting
@@ -259,12 +261,9 @@ private:
     // Match segmentation undo history size to keep auto-approval undo in sync.
     static constexpr size_t kMaxUndoEntries = 10;
 
-    // Debounce timer for auto-saving approval mask after painting
-    QTimer* _approvalSaveTimer{nullptr};
-    QuadSurface* _approvalSaveSurface{nullptr};  // Surface to save to when timer fires
-    static constexpr int kApprovalSaveDelayMs = 500;
-    void scheduleApprovalMaskSave(QuadSurface* surface);
-    void performDebouncedApprovalSave();
+    // Surface holding pending (composed-but-unsaved) approval edits, for the
+    // boundary flush before a segment switch / close.
+    QuadSurface* _approvalSaveSurface{nullptr};
 
     // Approval mask overlay opacity (0-100, where 50 is default)
     int _approvalMaskOpacity{50};

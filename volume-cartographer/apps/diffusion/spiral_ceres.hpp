@@ -1,7 +1,7 @@
 #pragma once
 
 #include <ceres/ceres.h>
-#include <opencv2/opencv.hpp>
+#include <opencv2/core/mat.hpp>
 #include <vector>
 #include <string>
 #include <memory>

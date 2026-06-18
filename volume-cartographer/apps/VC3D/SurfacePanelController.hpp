@@ -56,6 +56,8 @@ public:
         QCheckBox* inspectOnly{nullptr};
         QCheckBox* currentOnly{nullptr};
         QLineEdit* surfaceIdFilter{nullptr};
+        QDoubleSpinBox* zLowerBound{nullptr};
+        QDoubleSpinBox* zUpperBound{nullptr};
     };
 
     struct TagUiRefs {
@@ -100,6 +102,7 @@ public:
 
     bool isCurrentOnlyFilterEnabled() const;
     bool toggleTag(Tag tag);
+    bool setTagChecked(Tag tag, bool checked);
     void reloadSurfacesFromDisk();
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
@@ -120,12 +123,17 @@ signals:
     void visLasagnaObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
+    void straightenRequested(const QString& segmentId);
     void abfFlattenRequested(const QString& segmentId);
     void recalcAreaRequested(const QStringList& segmentIds);
     void exportTifxyzChunksRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
     void mergeTifxyzRequested(const QStringList& segmentIds);
+    // Emitted when the user right-clicks two selected segments and picks
+    // "Patch tifxyz...". CWindow wires this to
+    // SegmentationCommandHandler::onMergePatch.
+    void mergePatchRequested(const QStringList& segmentIds);
     void addIgnoreLabelRequested();
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);

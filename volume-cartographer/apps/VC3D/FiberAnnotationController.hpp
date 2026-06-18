@@ -1,7 +1,7 @@
 #pragma once
 
 #include <QObject>
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <memory>
 #include <string>
 #include <vector>

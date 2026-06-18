@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/Compositing.hpp"
 
@@ -69,6 +69,11 @@ public:
     virtual void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
+    // Called by ViewerManager's single global render clock (the only timer in the
+    // render system). Consumes this viewer's pending flags -- submit a render and/or
+    // an intersection render if requested and the viewer is visible. Viewers do NOT
+    // own timers; scheduleRender() just sets a flag this drains.
+    virtual void serviceRenderTick() {}
     virtual void invalidateVis() = 0;
     virtual void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
     {
@@ -130,6 +135,8 @@ public:
     virtual uint64_t selectedPointId() const = 0;
     virtual uint64_t selectedCollectionId() const = 0;
     virtual bool isPointDragActive() const = 0;
+    virtual bool isSameWrapAnnotationModeEnabled() const = 0;
+    virtual double sameWrapAnnotationPolylineOpacity() const = 0;
     virtual const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const = 0;
 
     // --- Overlay management ---

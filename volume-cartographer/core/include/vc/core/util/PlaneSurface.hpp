@@ -2,7 +2,7 @@
 
 #include "Surface.hpp"
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 class PlaneSurface : public Surface
 {

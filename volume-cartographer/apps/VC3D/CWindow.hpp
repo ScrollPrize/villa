@@ -2,10 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QPointer>
 #include <QString>
 #include <memory>
 #include <optional>
@@ -13,14 +15,18 @@
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
+#include "vc/atlas/FiberIntersections.hpp"
 
+#include <filesystem>
 #include <QShortcut>
+#include <set>
 #include <unordered_map>
 #include <map>
 
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
+#include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -30,6 +36,8 @@
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/SurfaceRotationOverlayController.hpp"
+#include "overlays/AtlasOverlayController.hpp"
+#include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 #include "SurfaceAffineTransformController.hpp"
 
@@ -38,10 +46,30 @@ class CChunkedVolumeViewer;
 #include "segmentation/SegmentationWidget.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "SeedingWidget.hpp"
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/Surface.hpp"
-#include "vc/core/util/QuadSurface.hpp"
+
+class Volume;
+class VolumePkg;
+class Surface;
+class QuadSurface;
+class RenderBenchRecorder;
+class RenderBenchReplay;
+class QTreeWidget;
+
+// Render-bench profiling modes (see RenderBenchRecorder/RenderBenchReplay).
+struct RenderBenchOptions {
+    QString recordPath;   // non-empty: record camera-state timeline to this file
+    QString replayPath;   // non-empty: replay a recorded timeline then quit
+    bool replayWarm = false;
+};
+
+struct AtlasSearchFiberSnapshot {
+    std::filesystem::path fiberPath;
+    vc::atlas::FiberPolyline fiber;
+    uint64_t storedFiberId = 0;
+    vc3d::line_annotation::FiberHvClassification hvClassification;
+    std::string manualHvTag;
+    std::vector<std::string> tags;
+};
 
 #define MAX_RECENT_VOLPKG 10
 
@@ -58,12 +86,18 @@ class MenuActionController;
 class SegmentationGrower;
 class ViewerControlsPanel;
 class QLabel;
+class QMainWindow;
+class QMenu;
 class QSpinBox;
 class QStandardItemModel;
+class QTabWidget;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
+class LineAnnotationController;
+class WrapAnnotationWidget;
+class AtlasControlPointsDock;
 
 class CWindow : public QMainWindow
 {
@@ -71,6 +105,7 @@ class CWindow : public QMainWindow
     Q_OBJECT
 
     friend class MenuActionController;
+    friend class RenderBenchReplay;
 
 public:
 signals:
@@ -89,7 +124,8 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 public:
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB);
+    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
+                     RenderBenchOptions benchOptions = {});
     ~CWindow(void);
 
     // Helper method to get the current volume path
@@ -103,6 +139,35 @@ protected:
 
 private:
     void CreateWidgets(void);
+    QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
+    void populateDockToggleMenu(QMenu* menu) const;
+    void createAtlasWorkspace();
+    void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
+    void refreshAtlasOverviewDocks();
+    void updateAtlasFiberDocks();
+    void updateAtlasSearchDocks();
+    void remapCurrentAtlas();
+    void optimizeAtlasSnapCandidates();
+    void startAtlasFiberIntersectionSearch();
+    void cancelAtlasFiberIntersectionSearch();
+    void updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
+                                   std::size_t completed,
+                                   std::size_t total);
+    void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results,
+                                    std::vector<double> signedWindings = {});
+    void openAtlasSearchResult(int sortedResultIndex);
+    void clearAtlasSearchPreviewState();
+    void updateAtlasSearchPreviewCandidates();
+    void setAtlasSearchHoverResult(std::optional<int> sortedResultIndex);
+    void updateAtlasSearchSelectionFromTree(QTreeWidget* sourceTree);
+    void syncAtlasSearchTreeSelection(QTreeWidget* sourceTree);
+    void updateAtlasSearchPreviewRequests();
+    void requestAtlasSearchPreviewLine(int sortedResultIndex);
+    void switchToLasagnaWorkspace();
+    void switchToMainWorkspace();
+    void switchToFiberSliceWorkspace();
+    void repeatLastLasagnaAction();
+    void selectLasagnaOutputSegment(const QString& outputName);
 
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);
@@ -127,6 +192,8 @@ private:
                                       const QString& preferredVolumeId = QString());
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
+    void syncVolumeSelectionControls(const QString& activeVolumeId = QString());
+    QWidget* createAnnotationVolumeSelector(QWidget* parent);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
     bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId);
@@ -162,9 +229,14 @@ private slots:
     CChunkedVolumeViewer* segmentationViewer() const;
     VolumeViewerBase* segmentationBaseViewer() const;
     VolumeViewerBase* activeBaseViewer() const;
+    std::vector<QComboBox*> volumeSelectionControls() const;
+    void connectVolumeSelector(QComboBox* selector);
     void clearSurfaceSelection();
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
+    // Attaches the render-bench recorder once a volume+segment are active (no-op
+    // unless --record was passed and the recorder isn't already attached).
+    void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
     void onSliceStepSizeChanged(int newSize);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
@@ -179,6 +251,7 @@ private:
     CState* _state;
 
     QComboBox* volSelect{nullptr};
+    std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
     QComboBox* cmbSegmentationDir;
 
 
@@ -186,7 +259,9 @@ private:
     SegmentationWidget* _segmentationWidget{nullptr};
     QDockWidget* _lasagnaDock{nullptr};
     CPointCollectionWidget* _point_collection_widget;
+    WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
+    CFiberWidget* _fiberSliceWidget{nullptr};
     std::unique_ptr<FiberAnnotationController> _fiberController;
 
     SurfaceTreeWidget *treeWidgetSurfaces;
@@ -201,7 +276,39 @@ private:
 
 
     Ui_VCMainWindow ui;
+    QTabWidget* _workspaceTabs{nullptr};
+    QMainWindow* _segmentWorkspaceWindow{nullptr};
+    QMainWindow* _lasagnaWorkspaceWindow{nullptr};
+    QMainWindow* _atlasWorkspaceWindow{nullptr};
+    QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
+    QMainWindow* _intersectionsWorkspaceWindow{nullptr};
+    QDockWidget* _atlasOverviewDock{nullptr};
+    QDockWidget* _atlasSearchDock{nullptr};
+    AtlasControlPointsDock* _atlasControlDock{nullptr};
+    QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
+    QDockWidget* _atlasWorkspaceFiberDock{nullptr};
+    QDockWidget* _atlasWorkspaceSearchDock{nullptr};
+    VolumeViewerBase* _atlasViewer{nullptr};
+    std::optional<std::filesystem::path> _currentAtlasDir;
+    std::string _currentAtlasName;
+    vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
+    std::vector<vc::atlas::FiberIntersectionResult> _atlasSearchResults;
+    std::vector<double> _atlasSearchSignedWindings;
+    std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _atlasSearchFiberSnapshotsByRuntimeId;
+    std::optional<std::filesystem::path> _atlasSearchLasagnaManifestPath;
+    int _atlasSearchPreviewGeneration{0};
+    std::optional<int> _atlasSearchHoveredResult;
+    std::set<int> _atlasSearchSelectedResults;
+    std::set<int> _atlasSearchPreviewRequestedResults;
+    bool _atlasSearchCancelRequested{false};
+    std::shared_ptr<std::atomic_bool> _atlasSearchCancelFlag;
+    vc::atlas::AtlasSearchProgressPhase _atlasSearchProgressPhase{
+        vc::atlas::AtlasSearchProgressPhase::PrepareInputs};
+    std::size_t _atlasSearchPhaseCompleted{0};
+    std::size_t _atlasSearchPhaseTotal{0};
     QMdiArea *mdiArea;
+    QMdiArea* _fiberSliceMdiArea{nullptr};
+    QMdiArea* _intersectionsMdiArea{nullptr};
 
     bool can_change_volume_();
 
@@ -227,12 +334,18 @@ private:
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
+    std::unique_ptr<AtlasOverlayController> _atlasOverlay;
+    std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;
     std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
+    // Render-bench profiling harness (record/replay navigation timelines).
+    RenderBenchOptions _benchOptions;
+    std::unique_ptr<RenderBenchRecorder> _benchRecorder;
+    std::unique_ptr<RenderBenchReplay> _benchReplay;
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
@@ -240,6 +353,7 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
+    std::unique_ptr<LineAnnotationController> _lineAnnotationController;
     // Keyboard shortcuts
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
@@ -248,6 +362,8 @@ private:
     QShortcut* fZoomInShortcut;
     QShortcut* fZoomOutShortcut;
     QShortcut* fResetViewShortcut;
+    QShortcut* fOpenLasagnaWorkspaceShortcut{nullptr};
+    QShortcut* fRepeatLasagnaActionShortcut{nullptr};
 
     // Z offset shortcuts (Ctrl+,/. for normal direction)
     QShortcut* fWorldOffsetZPosShortcut;  // Ctrl+. (further/deeper)
@@ -256,6 +372,8 @@ private:
     // Segment cycling shortcuts
     QShortcut* fCycleNextSegmentShortcut;
     QShortcut* fCyclePrevSegmentShortcut;
+    QShortcut* fApplyApprovedTagShortcut{nullptr};
+    QShortcut* fApplyDefectiveTagShortcut{nullptr};
 
     QShortcut* fFocusedViewShortcut;
     bool _focusedViewActive{false};

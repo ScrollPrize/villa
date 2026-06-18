@@ -113,6 +113,17 @@ void ViewerOverlayControllerBase::OverlayBuilder::addPoint(const QPointF& positi
     _primitives.emplace_back(std::move(prim));
 }
 
+void ViewerOverlayControllerBase::OverlayBuilder::addSurfacePoint(const cv::Vec2f& position,
+                                                                  qreal radius,
+                                                                  OverlayStyle style)
+{
+    SurfacePointPrimitive prim;
+    prim.position = position;
+    prim.radius = radius;
+    prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
 void ViewerOverlayControllerBase::OverlayBuilder::addCircle(const QPointF& center,
                                                             qreal radius,
                                                             bool filled,
@@ -126,6 +137,26 @@ void ViewerOverlayControllerBase::OverlayBuilder::addCircle(const QPointF& cente
     _primitives.emplace_back(std::move(prim));
 }
 
+void ViewerOverlayControllerBase::OverlayBuilder::addRotatedEllipse(const QPointF& center,
+                                                                    qreal radiusX,
+                                                                    qreal radiusY,
+                                                                    qreal rotationRadians,
+                                                                    bool filled,
+                                                                    OverlayStyle style)
+{
+    if (radiusX <= 0.0 || radiusY <= 0.0) {
+        return;
+    }
+    RotatedEllipsePrimitive prim;
+    prim.center = center;
+    prim.radiusX = radiusX;
+    prim.radiusY = radiusY;
+    prim.rotationRadians = rotationRadians;
+    prim.filled = filled;
+    prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
 void ViewerOverlayControllerBase::OverlayBuilder::addLineStrip(const std::vector<QPointF>& points,
                                                                bool closed,
                                                                OverlayStyle style)
@@ -134,6 +165,20 @@ void ViewerOverlayControllerBase::OverlayBuilder::addLineStrip(const std::vector
         return;
     }
     LineStripPrimitive prim;
+    prim.points = points;
+    prim.closed = closed;
+    prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
+void ViewerOverlayControllerBase::OverlayBuilder::addSurfaceLineStrip(const std::vector<cv::Vec2f>& points,
+                                                                      bool closed,
+                                                                      OverlayStyle style)
+{
+    if (points.empty()) {
+        return;
+    }
+    SurfaceLineStripPrimitive prim;
     prim.points = points;
     prim.closed = closed;
     prim.style = style;
@@ -662,6 +707,28 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                 if constexpr (std::is_same_v<T, PointPrimitive>) {
                     PointGroup& group = groupForPoint(prim);
                     group.path.addEllipse(prim.position, prim.radius, prim.radius);
+                } else if constexpr (std::is_same_v<T, VolumePointPrimitive>) {
+                    PointPrimitive scenePoint;
+                    scenePoint.position = viewer->volumeToScene(prim.position);
+                    scenePoint.radius = prim.radius;
+                    scenePoint.style = prim.style;
+                    if (!std::isfinite(scenePoint.position.x()) ||
+                        !std::isfinite(scenePoint.position.y())) {
+                        return;
+                    }
+                    PointGroup& group = groupForPoint(scenePoint);
+                    group.path.addEllipse(scenePoint.position, scenePoint.radius, scenePoint.radius);
+                } else if constexpr (std::is_same_v<T, SurfacePointPrimitive>) {
+                    PointPrimitive scenePoint;
+                    scenePoint.position = viewer->surfaceCoordsToScene(prim.position[0], prim.position[1]);
+                    scenePoint.radius = prim.radius;
+                    scenePoint.style = prim.style;
+                    if (!std::isfinite(scenePoint.position.x()) ||
+                        !std::isfinite(scenePoint.position.y())) {
+                        return;
+                    }
+                    PointGroup& group = groupForPoint(scenePoint);
+                    group.path.addEllipse(scenePoint.position, scenePoint.radius, scenePoint.radius);
                 } else if constexpr (std::is_same_v<T, CirclePrimitive>) {
                     flushPointGroups();
                     auto* item = new QGraphicsEllipseItem(
@@ -669,6 +736,22 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                         prim.center.y() - prim.radius,
                         prim.radius * 2.0,
                         prim.radius * 2.0);
+                    auto style = prim.style;
+                    if (!prim.filled) {
+                        style.brushColor = Qt::transparent;
+                    }
+                    addItem(item, style);
+                } else if constexpr (std::is_same_v<T, RotatedEllipsePrimitive>) {
+                    flushPointGroups();
+                    if (prim.radiusX <= 0.0 || prim.radiusY <= 0.0) {
+                        return;
+                    }
+                    QPainterPath path;
+                    path.addEllipse(QPointF(0.0, 0.0), prim.radiusX, prim.radiusY);
+                    QTransform transform;
+                    transform.translate(prim.center.x(), prim.center.y());
+                    transform.rotateRadians(prim.rotationRadians);
+                    auto* item = new QGraphicsPathItem(transform.map(path));
                     auto style = prim.style;
                     if (!prim.filled) {
                         style.brushColor = Qt::transparent;
@@ -682,6 +765,29 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                     QPainterPath path(prim.points.front());
                     for (size_t i = 1; i < prim.points.size(); ++i) {
                         path.lineTo(prim.points[i]);
+                    }
+                    if (prim.closed) {
+                        path.closeSubpath();
+                    }
+                    auto* item = new QGraphicsPathItem(path);
+                    addItem(item, prim.style);
+                } else if constexpr (std::is_same_v<T, SurfaceLineStripPrimitive>) {
+                    flushPointGroups();
+                    if (prim.points.size() < 2) {
+                        return;
+                    }
+                    std::vector<QPointF> scenePoints;
+                    scenePoints.reserve(prim.points.size());
+                    for (const auto& p : prim.points) {
+                        QPointF scenePoint = viewer->surfaceCoordsToScene(p[0], p[1]);
+                        if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
+                            return;
+                        }
+                        scenePoints.push_back(scenePoint);
+                    }
+                    QPainterPath path(scenePoints.front());
+                    for (size_t i = 1; i < scenePoints.size(); ++i) {
+                        path.lineTo(scenePoints[i]);
                     }
                     if (prim.closed) {
                         path.closeSubpath();

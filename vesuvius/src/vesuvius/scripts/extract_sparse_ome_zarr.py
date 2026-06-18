@@ -39,7 +39,12 @@ def open_zarr_read(store_path: str):
     if "://" in store_path and not store_path.startswith("file://"):
         import fsspec
 
-        return zarr.open(fsspec.get_mapper(store_path), mode="r")
+        storage_options = {}
+        if store_path.startswith("s3://"):
+            from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
+
+            storage_options = s3_storage_options_for_path(store_path)
+        return zarr.open(fsspec.get_mapper(store_path, **storage_options), mode="r")
     return zarr.open(store_path, mode="r")
 
 

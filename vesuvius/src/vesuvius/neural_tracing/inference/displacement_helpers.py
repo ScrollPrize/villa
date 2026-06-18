@@ -15,7 +15,7 @@ def predict_displacement(args, model_state, model_inputs, use_tta=None, profiler
         use_tta = bool(getattr(args, "tta", True))
 
     def run_single_model_pass(model_obj, model_inputs_batch, amp_enabled_flag, amp_dtype_flag):
-        with torch.no_grad():
+        with torch.inference_mode():
             if amp_enabled_flag:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype_flag):
                     output = model_obj(model_inputs_batch)
@@ -49,6 +49,12 @@ def load_model(args):
     model, model_config = load_checkpoint(checkpoint_path)
     model.to(args.device)
     model.eval()
+    compile_requested = bool(getattr(args, "compile_model", False))
+    compile_mode = str(getattr(args, "compile_mode", "default"))
+    compiled = False
+    if compile_requested:
+        model = torch.compile(model, mode=compile_mode)
+        compiled = True
 
     expected_in_channels = int(model_config.get("in_channels", 3))
     mixed_precision = str(model_config.get("mixed_precision", "no")).lower()
@@ -69,6 +75,9 @@ def load_model(args):
         "expected_in_channels": expected_in_channels,
         "amp_enabled": amp_enabled,
         "amp_dtype": amp_dtype,
+        "compile_requested": compile_requested,
+        "compile_mode": compile_mode,
+        "compiled": compiled,
         "tifxyz_uuid": tifxyz_uuid,
     }
 

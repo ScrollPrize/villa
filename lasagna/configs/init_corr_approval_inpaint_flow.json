@@ -5,7 +5,10 @@
 		"mesh-step": 50.0,
 		"approval-inpaint": true,
 		"approval-inpaint-corr-spacing": 50.0,
-		"approval-inpaint-padding-frac": 0.25
+		"approval-inpaint-padding-frac": 0.25,
+		"approval-inpaint-output-mask": true,
+		"approval-inpaint-output-mask-dilate": 3,
+		"tifxyz-flow-gate-channels": true
 	},
 	"base": {
 		"normal": 1.0,

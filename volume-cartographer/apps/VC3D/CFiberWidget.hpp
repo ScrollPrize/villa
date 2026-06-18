@@ -4,54 +4,109 @@
 #include <QListView>
 #include <QStandardItemModel>
 #include <QPushButton>
-#include <QButtonGroup>
-#include "vc/ui/VCCollection.hpp"
+#include <QString>
+
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
+
+class QLabel;
+class QButtonGroup;
+class QAction;
+class QLineEdit;
+class QVBoxLayout;
 
 class CFiberWidget : public QDockWidget
 {
     Q_OBJECT
 
 public:
-    explicit CFiberWidget(VCCollection* collection, QWidget* parent = nullptr);
+    struct FiberEntry {
+        uint64_t id = 0;
+        std::string fileName;
+        int controlPointCount = 0;
+        int linePointCount = 0;
+        double lengthVx = 0.0;
+        double hvZDistance = 0.0;
+        double hvFiberLength = 0.0;
+        double horizontalScore = 0.0;
+        double verticalScore = 0.0;
+        double automaticCertainty = 0.0;
+        std::string automaticHvTag;
+        std::string manualHvTag;
+        std::vector<std::string> tags;
+    };
+
+    explicit CFiberWidget(QWidget* parent = nullptr);
     ~CFiberWidget();
 
     uint64_t selectedFiberId() const { return _selectedFiberId; }
-    int currentStep() const { return _currentStep; }
+    std::vector<uint64_t> selectedFiberIds() const;
+    bool canDeleteSelection() const;
+    bool canCreateAtlasFromSelection() const;
+    bool canShowFiberSlice() const;
+    bool canRenameFiberFile() const;
+    QAction* createShowFiberSliceAction(QObject* parent);
+    QAction* createRenameFiberFileAction(QObject* parent);
+    void setFibers(const std::vector<FiberEntry>& fibers);
+    void setKnownTags(const std::vector<std::string>& tags);
+    void selectFiber(uint64_t fiberId);
+    void selectFibers(const std::vector<uint64_t>& fiberIds);
+    void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
 
 signals:
-    void newFiberRequested();
-    void fiberSelected(uint64_t fiberId);
-    void stepChanged(int step);
-    void invertDirectionRequested();
-
-public slots:
-    void selectFiber(uint64_t fiberId);
+    void fiberOpenRequested(uint64_t fiberId);
+    void deleteFibersRequested(std::vector<uint64_t> fiberIds);
+    void manualHvTagChanged(uint64_t fiberId, QString tag);
+    void fiberTagChanged(uint64_t fiberId, QString tag, bool enabled);
+    void hvScoreRecalculationRequested(uint64_t fiberId);
+    void newAtlasFromFiberRequested(uint64_t fiberId);
+    void fiberSliceRequested(uint64_t fiberId);
+    void renameFiberFileRequested(uint64_t fiberId);
 
 private slots:
-    void onNewFiberClicked();
-    void onInvertDirClicked();
-    void onStepButtonClicked(int id);
     void onSelectionChanged();
-
-    void onCollectionsAdded(const std::vector<uint64_t>& collectionIds);
-    void onCollectionChanged(uint64_t collectionId);
-    void onCollectionRemoved(uint64_t collectionId);
-    void onPointAdded(const ColPoint& point);
-    void onPointRemoved(uint64_t pointId);
+    void onDoubleClicked(const QModelIndex& index);
+    void onDeleteClicked();
+    void onManualHvButtonClicked(int id);
+    void onManualHvResetClicked();
+    void onRecalculateHvScoreClicked();
+    void onAddTagClicked();
+    void showContextMenu(const QPoint& pos);
 
 private:
     void setupUi();
-    void refreshList();
-    bool isFiber(uint64_t collectionId) const;
     QStandardItem* findFiberItem(uint64_t fiberId);
+    const FiberEntry* selectedFiber() const;
+    void updateClassificationUi();
+    void rebuildTagList();
+    void applyTagLocally(uint64_t fiberId, const std::string& tag, bool enabled);
+    void requestFiberTagChange(const QString& tag, bool enabled);
+    void requestDeleteSelectedFibers();
+    void requestShowFiberSlice();
+    void requestRenameFiberFile();
+    bool confirmDeleteFibers(const std::vector<uint64_t>& fiberIds);
+    static QString labelForFiber(const FiberEntry& fiber);
 
-    VCCollection* _collection;
     uint64_t _selectedFiberId = 0;
-    int _currentStep = 50;
+    std::vector<FiberEntry> _fibers;
+    std::vector<std::string> _knownTags;
+    std::function<bool(const std::vector<uint64_t>&)> _deleteConfirmationForTesting;
 
     QListView* _listView;
     QStandardItemModel* _model;
-    QPushButton* _newFiberButton;
-    QPushButton* _invertDirButton;
-    QButtonGroup* _stepGroup;
+    QLabel* _nameLabel;
+    QLabel* _scoreLabel;
+    QLabel* _autoLabel;
+    QWidget* _tagListWidget;
+    QVBoxLayout* _tagListLayout;
+    QLineEdit* _newTagEdit;
+    QPushButton* _addTagButton;
+    QButtonGroup* _manualHvGroup;
+    QPushButton* _manualHButton;
+    QPushButton* _manualVButton;
+    QPushButton* _manualResetButton;
+    QPushButton* _recalculateScoreButton;
+    QPushButton* _deleteButton;
 };

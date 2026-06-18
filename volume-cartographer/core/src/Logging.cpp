@@ -58,6 +58,10 @@ const char* MinimalLogger::level_string(LogLevel level) {
     }
 }
 
+void MinimalLogger::vlog(LogLevel level, std::string_view fmt, std::format_args args) {
+    write_log(level, std::vformat(fmt, args));
+}
+
 void MinimalLogger::write_log(LogLevel level, const std::string& msg) {
     if (level < current_level_) return;
 

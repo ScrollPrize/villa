@@ -10,6 +10,7 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -36,6 +37,26 @@ fs::path tmpDir(const std::string& tag)
     fs::create_directories(p);
     return p;
 }
+
+struct TestAutosaveRoot {
+    TestAutosaveRoot()
+        : previous(VolumePkg::autosaveRoot())
+        , root(tmpDir("autosave_root"))
+    {
+        VolumePkg::setAutosaveRoot(root);
+    }
+
+    ~TestAutosaveRoot()
+    {
+        VolumePkg::setAutosaveRoot(previous);
+        fs::remove_all(root);
+    }
+
+    fs::path previous;
+    fs::path root;
+};
+
+TestAutosaveRoot testAutosaveRoot;
 
 void stageSegments(const fs::path& root, const std::string& dirName = "paths")
 {
@@ -84,6 +105,41 @@ TEST_CASE("save + load: getVolpkgDirectory returns the parent")
     auto loaded = VolumePkg::load(jsonPath);
     REQUIRE(loaded);
     CHECK(loaded->getVolpkgDirectory() == d.string());
+    fs::remove_all(d);
+}
+
+TEST_CASE("getSurface/loadSurface set backupRoot to the volpkg.json directory")
+{
+    // The autosave/backup system anchors backups at <backupRoot>/backups/<id>.
+    // VolumePkg must stamp backupRoot with the directory holding the volpkg.json
+    // so backups land beside the project file even though the segments live in a
+    // paths/ subdir. See QuadSurface::saveSnapshot.
+    auto d = tmpDir("backuproot");
+    stageSegments(d);                       // segments under <d>/paths/<id>
+    auto jsonPath = d / "project.json";
+    {
+        auto p = VolumePkg::newEmpty();
+        p->addSegmentsEntry((d / "paths").string());
+        p->save(jsonPath);
+    }
+    auto p = VolumePkg::load(jsonPath);
+    REQUIRE(p);
+    auto ids = p->segmentationIDs();
+    if (ids.empty()) { fs::remove_all(d); return; }
+    const auto& id = ids[0];
+
+    SUBCASE("loadSurface") {
+        auto surf = p->loadSurface(id);
+        REQUIRE(surf);
+        CHECK(surf->backupRoot == d);                 // == volpkg.json's dir
+        CHECK(surf->backupRoot != surf->path.parent_path());  // not the paths/ dir
+    }
+    SUBCASE("getSurface") {
+        REQUIRE(p->loadSurface(id));
+        auto surf = p->getSurface(id);
+        REQUIRE(surf);
+        CHECK(surf->backupRoot == d);
+    }
     fs::remove_all(d);
 }
 

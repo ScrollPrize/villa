@@ -8,12 +8,14 @@
 #include "VCSettings.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 #include <QTimer>
 #include <QCheckBox>
 #include <QSpinBox>
 #include <QSettings>
 #include <QLoggingCategory>
 #include <cmath>
+#include <optional>
 #include <opencv2/core.hpp>
 
 Q_LOGGING_CATEGORY(lcAxisSlices2, "vc.axis_aligned");
@@ -62,6 +64,87 @@ cv::Vec3f normalizeOrZero(const cv::Vec3f& v)
         return cv::Vec3f(0.0f, 0.0f, 0.0f);
     }
     return v * (1.0f / magnitude);
+}
+
+bool isFiniteVec3(const cv::Vec3f& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+bool isValidSurfacePoint(const cv::Vec3f& v)
+{
+    return isFiniteVec3(v) && v[0] != -1.0f && v[1] != -1.0f && v[2] != -1.0f;
+}
+
+struct SegmentSliceFrame {
+    cv::Vec3f origin{0, 0, 0};
+    cv::Vec3f xNormal{0, 0, 0};
+    cv::Vec3f yNormal{0, 0, 0};
+    cv::Vec3f ptr{0, 0, 0};
+    int row = -1;
+    int col = -1;
+    float dist = -1.0f;
+};
+
+std::optional<SegmentSliceFrame> segmentSliceFrameAtFocus(
+    QuadSurface& segment,
+    const cv::Vec3f& focus,
+    SurfacePatchIndex* patchIndex)
+{
+    if (!isFiniteVec3(focus)) {
+        return std::nullopt;
+    }
+
+    cv::Vec3f ptr(0, 0, 0);
+    constexpr float kProjectionThreshold = 1.0f;
+    const float dist = segment.pointTo(ptr, focus, kProjectionThreshold, 1000, patchIndex);
+    if (!std::isfinite(dist) || dist < 0.0f || dist >= kProjectionThreshold || !isFiniteVec3(ptr)) {
+        return std::nullopt;
+    }
+
+    const cv::Vec2f grid = segment.ptrToGrid(ptr);
+    if (!std::isfinite(grid[0]) || !std::isfinite(grid[1])) {
+        return std::nullopt;
+    }
+    const cv::Mat_<cv::Vec3f>* points = segment.rawPointsPtr();
+    if (!points || points->cols < 2 || points->rows < 2) {
+        return std::nullopt;
+    }
+    if (grid[0] <= 0.0f || grid[1] <= 0.0f ||
+        grid[0] >= static_cast<float>(points->cols - 1) ||
+        grid[1] >= static_cast<float>(points->rows - 1)) {
+        return std::nullopt;
+    }
+
+    const int col = static_cast<int>(std::floor(grid[0]));
+    const int row = static_cast<int>(std::floor(grid[1]));
+    if (!segment.isQuadValid(row, col)) {
+        return std::nullopt;
+    }
+    const int nearestCol = static_cast<int>(std::lround(grid[0]));
+    const int nearestRow = static_cast<int>(std::lround(grid[1]));
+    if (!segment.isPointValid(nearestRow, nearestCol) ||
+        !isFiniteVec3(segment.gridNormal(nearestRow, nearestCol))) {
+        return std::nullopt;
+    }
+
+    const cv::Vec3f surfOrigin = segment.coord(ptr, {0, 0, 0});
+    const cv::Vec3f xDir = segment.coord(ptr, {1, 0, 0});
+    const cv::Vec3f yDir = segment.coord(ptr, {0, 1, 0});
+    if (!isValidSurfacePoint(surfOrigin) ||
+        !isValidSurfacePoint(xDir) ||
+        !isValidSurfacePoint(yDir)) {
+        return std::nullopt;
+    }
+
+    const cv::Vec3f xNormal = xDir - surfOrigin;
+    const cv::Vec3f yNormal = yDir - surfOrigin;
+    if (!isFiniteVec3(xNormal) || !isFiniteVec3(yNormal) ||
+        cv::norm(xNormal) <= kEpsilon || cv::norm(yNormal) <= kEpsilon) {
+        return std::nullopt;
+    }
+
+    return SegmentSliceFrame{surfOrigin, xNormal, yNormal, ptr, row, col, dist};
 }
 
 float signedAngleBetween(const cv::Vec3f& from, const cv::Vec3f& to, const cv::Vec3f& axis)
@@ -340,6 +423,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
     } else {
         auto segXZShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface("seg xz"));
         auto segYZShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface("seg yz"));
+        const bool hadSegmentPlanes = static_cast<bool>(segXZShared) && static_cast<bool>(segYZShared);
 
         if (!segXZShared) {
             segXZShared = std::make_shared<PlaneSurface>();
@@ -348,25 +432,27 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             segYZShared = std::make_shared<PlaneSurface>();
         }
 
-        cv::Vec3f ptr(0, 0, 0);
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndexIfReady() : nullptr;
-        segment->pointTo(ptr, origin, 1.0f, 1000, patchIndex);
+        const auto frame = segmentSliceFrameAtFocus(*segment, origin, patchIndex);
+        if (!frame) {
+            if (!hadSegmentPlanes) {
+                configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
+                configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt);
+            }
+        } else {
+            // Use the closest safe surface point as origin for the slicing planes,
+            // not the raw focus point; this keeps normals on valid surface tangents.
+            segXZShared->setOrigin(frame->origin);
+            segYZShared->setOrigin(frame->origin);
 
-        // Use the closest surface point as origin for the slicing planes,
-        // not the raw focus point — ensures normals are true surface tangents
-        cv::Vec3f surfOrigin = segment->coord(ptr, {0, 0, 0});
-        segXZShared->setOrigin(surfOrigin);
-        segYZShared->setOrigin(surfOrigin);
+            segXZShared->setNormal(frame->xNormal);
+            segYZShared->setNormal(frame->yNormal);
+            segXZShared->setInPlaneRotation(0.0f);
+            segYZShared->setInPlaneRotation(0.0f);
 
-        cv::Vec3f xDir = segment->coord(ptr, {1, 0, 0});
-        cv::Vec3f yDir = segment->coord(ptr, {0, 1, 0});
-        segXZShared->setNormal(xDir - surfOrigin);
-        segYZShared->setNormal(yDir - surfOrigin);
-        segXZShared->setInPlaneRotation(0.0f);
-        segYZShared->setInPlaneRotation(0.0f);
-
-        _state->setSurface("seg xz", segXZShared, false, true);
-        _state->setSurface("seg yz", segYZShared, false, true);
+            _state->setSurface("seg xz", segXZShared, false, true);
+            _state->setSurface("seg yz", segYZShared, false, true);
+        }
     }
 
     if (_planeSlicingOverlay) {

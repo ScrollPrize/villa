@@ -1,0 +1,123 @@
+{
+	"args": {
+		"model-init": "seed",
+		"init-mode": "shell-dir-crop",
+		"mesh-step": 50.0
+	},
+	"base": {
+		"normal": 1.0,
+		"step": 10.0,
+		"smooth": 10.0,
+		"station_n": 0.1,
+		"station_t": 0.1,
+		"winding_density": 0.01,
+		"data": 0.0,
+		"data_plain": 0.0,
+		"pred_dt": 0.001,
+		"corr": 0.0,
+		"bend": 100.0,
+		"ext_offset": 0.0,
+		"snap_surf_map": 0.0001,
+		"map_dist": 0.0001,
+		"map_vec_normal": 1.0,
+		"map_surface_normal": 1.0,
+		"map_smooth": 0.1,
+		"map_bend": 0.01,
+		"map_turn": 0.1,
+		"map_jac": 1.0,
+		"map_metric_smooth": 0.1,
+		"map_area_smooth": 0.1,
+		"map_dense_prior": 0.001,
+		"map_station_t": 0.001
+	},
+	"stages": [
+		{
+			"name": "affine_seed_quad_init",
+			"steps": 100,
+			"lr": 0.1,
+			"params": ["map_surf_affine"],
+			"w_fac" : { "map_turn" : 100.0 },
+			"args": {
+				"status_interval": 10,
+				"subdiv": 1,
+				"map_global": {
+					"distance_scale": 1.0,
+					"huber_delta": 5.0,
+					"map_station_t": 1.0,
+					"map_init": {
+						"subdiv": 1,
+						"scale_levels": 4,
+						"w_dist": 0.0001,
+						"w_vec_normal": 1.0,
+						"w_surface_normal": 1.0,
+						"w_smooth": 0.05,
+						"w_bend": 0.01,
+						"w_jac": 1.0,
+						"w_metric_smooth": 0.05,
+						"w_area_smooth": 0.02,
+						"w_dense_prior": 0.001,
+						"max_sample_distance": 1000.0,
+						"max_sample_angle_deg": 180.0,
+						"max_step_neighbor_ratio": 0.0
+					}
+				},
+				"affine_seed_quad_init": {
+					"enabled": true,
+					"expansion_reopt": false,
+					"quads": 1
+				}
+			}
+		},
+		{
+			"name": "map_surf_affine_refine5",
+			"steps": 500,
+			"lr": 0.01,
+			"params": ["map_surf_affine"],
+			"args": {
+				"status_interval": 100,
+				"subdiv": 1
+			},
+			"w_fac" : { "map_turn" : 100.0 }
+		},
+		{
+			"name": "map_uv_coarse5",
+			"steps": 500,
+			"lr": 0.1,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 5,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20
+			}
+		},
+		{
+			"name": "map_uv_refine_noturn",
+			"steps": 200,
+			"lr": 0.1,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 0,
+			"w_fac" : { "map_turn" : 0.0 },
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20
+			}
+		},
+		{
+			"name": "map_uv_fine2",
+			"steps": 200,
+			"lr": 0.01,
+			"params": ["map_surf_ms"],
+			"min_scaledown": 0,
+			"args": {
+				"subdiv": 1,
+				"status_interval": 20,
+				"debug_obj_dir": "snap_surf_objs",
+				"export_fixture": {
+					"dir": "bench_fixtures_dbg/init",
+					"once": true,
+					"objs": true
+				}
+			}
+		}
+	]
+}

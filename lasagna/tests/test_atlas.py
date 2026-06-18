@@ -1,0 +1,794 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+
+import numpy as np
+import tifffile
+import torch
+
+
+ROOT = os.path.dirname(os.path.dirname(__file__))
+if ROOT not in sys.path:
+	sys.path.insert(0, ROOT)
+
+import atlas
+
+
+def _sample_model_xyz(xyz: torch.Tensor, h: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+	return atlas._bilinear_sample_grid(xyz[0], h, w)
+
+
+def _write_tifxyz(
+	path: Path,
+	*,
+	rows: int = 3,
+	cols: int = 4,
+	row_step: float = 1.0,
+	col_step: float = 1.0,
+) -> None:
+	path.mkdir(parents=True, exist_ok=True)
+	x = np.zeros((rows, cols), dtype=np.float32)
+	y = np.zeros((rows, cols), dtype=np.float32)
+	z = np.zeros((rows, cols), dtype=np.float32)
+	for r in range(rows):
+		for c in range(cols):
+			src_c = 0 if c == cols - 1 else c
+			x[r, c] = float(src_c) * col_step
+			y[r, c] = float(r) * row_step
+	tifffile.imwrite(path / "x.tif", x)
+	tifffile.imwrite(path / "y.tif", y)
+	tifffile.imwrite(path / "z.tif", z)
+	(path / "meta.json").write_text(json.dumps({"scale": [1.0, 1.0, 1.0]}) + "\n", encoding="utf-8")
+
+
+def _atlas21_fixture_root() -> Path:
+	if os.environ.get("VC_ATLAS21_FIXTURE_ROOT"):
+		return Path(os.environ["VC_ATLAS21_FIXTURE_ROOT"])
+	return Path(__file__).resolve().parents[2].parent / "data" / "test_data" / "atlas_export" / "fiber_21"
+
+
+def _atlas21_config_from_fixture(
+	fixture_root: Path,
+	expected_records: list[dict[str, object]],
+) -> dict[str, object]:
+	atlas_dir = fixture_root / "atlases" / "fiber_21"
+	metadata = json.loads((atlas_dir / "metadata.json").read_text(encoding="utf-8"))
+	winding_offsets: dict[str, int] = {}
+	for record in expected_records:
+		object_id = str(record["object_id"])
+		offset = int(record["winding_offset"])
+		if object_id in winding_offsets and winding_offsets[object_id] != offset:
+			raise AssertionError(f"inconsistent winding offset for {object_id}")
+		winding_offsets[object_id] = offset
+
+	line_objects = []
+	maps = []
+	for map_path in sorted((atlas_dir / "mappings" / "fibers").glob("*.json")):
+		mapping = json.loads(map_path.read_text(encoding="utf-8"))
+		object_id = str(mapping["fiber_path"])
+		fiber_path = fixture_root / object_id
+		line_objects.append({
+			"id": object_id,
+			"fiber_path": object_id,
+			"path": str(fiber_path),
+		})
+		maps.append({
+			"object_type": "line",
+			"object_id": object_id,
+			"fiber_path": object_id,
+			"object_path": str(fiber_path),
+			"mapping_path": str(map_path.relative_to(atlas_dir)),
+			"map_path": str(map_path),
+			"winding_offset": winding_offsets.get(object_id, 0),
+		})
+
+	return {
+		"type": "lasagna_atlas",
+		"version": 1,
+		"name": metadata.get("name", "fiber_21"),
+		"base": {"path": str(atlas_dir / metadata["base_mesh_path"])},
+		"metadata": {"zero_winding_column": int(metadata["zero_winding_column"])},
+		"objects": {"line": line_objects},
+		"maps": maps,
+	}
+
+
+class AtlasParserTest(unittest.TestCase):
+	def test_atlas_init_crops_from_anchor_extents_with_margin(self) -> None:
+		with self.subTest("synthetic atlas"):
+			import tempfile
+			with tempfile.TemporaryDirectory() as td:
+				root = Path(td)
+				base = root / "base_mesh.tifxyz"
+				_write_tifxyz(base, row_step=8.0, col_step=4.0)
+				fiber = root / "fiber.json"
+				fiber.write_text(json.dumps({
+					"type": "vc3d_fiber",
+					"version": 1,
+					"line_points": [[10.0, 20.0, 30.0], [11.0, 21.0, 31.0], [12.0, 22.0, 32.0]],
+					"control_points": [[10.0, 20.0, 30.0], [11.0, 21.0, 31.0]],
+				}) + "\n", encoding="utf-8")
+				mapping = root / "mapping.json"
+				mapping.write_text(json.dumps({
+					"type": "vc3d_atlas_fiber_mapping",
+					"version": 4,
+					"fiber_path": "fibers/fiber.json",
+					"winding_offset": 99,
+					"line_anchors": [{
+						"source_index": 0,
+						"world": [1.0, 1.0, 0.0],
+						"atlas": [2.0, 1.0],
+						"distance": 0.0,
+					}, {
+						"source_index": 1,
+						"world": [2.0, 1.0, 0.0],
+						"atlas": [8.0, 1.0],
+						"distance": 0.0,
+					}, {
+						"source_index": 2,
+						"world": [3.0, 1.0, 0.0],
+						"atlas": [100.0, 1.0],
+						"distance": 0.0,
+					}],
+					"control_anchors": [{
+						"source_index": 0,
+						"world": [10.0, 20.0, 30.0],
+						"atlas": [2.0, 1.0],
+						"distance": 0.0,
+					}, {
+						"source_index": 1,
+						"world": [11.0, 21.0, 31.0],
+						"atlas": [8.0, 1.0],
+						"distance": 0.0,
+					}],
+				}) + "\n", encoding="utf-8")
+				atlas_obj = {
+					"type": "lasagna_atlas",
+					"version": 1,
+					"name": "a",
+					"base": {"path": str(base), "ref": {"type": "atlas-base", "name": "a/base", "hash": "md5:" + "0" * 32}},
+					"metadata": {"zero_winding_column": 0},
+					"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+					"maps": [{
+						"object_type": "line",
+						"object_id": "fibers/fiber.json",
+						"map_path": str(mapping),
+						"winding_offset": 0,
+					}],
+				}
+
+				init = atlas.build_atlas_init(
+					atlas_obj,
+					device=torch.device("cpu"),
+					mesh_step=1,
+					winding_step=1,
+				)
+
+				self.assertEqual(init.metadata["period_columns"], 3)
+				self.assertEqual(init.metadata["leftmost_winding"], 0)
+				self.assertEqual(init.metadata["rightmost_winding"], 2)
+				self.assertEqual(init.metadata["init_margin_vx"], 4000)
+				self.assertEqual(init.metadata["init_margin_rows"], 500)
+				self.assertEqual(init.metadata["init_margin_columns"], 750)
+				self.assertLess(init.metadata["init_margin_rows"], init.metadata["init_margin_vx"])
+				self.assertLess(init.metadata["init_margin_columns"], init.metadata["init_margin_vx"])
+				self.assertEqual(init.metadata["crop_row_start"], 0)
+				self.assertEqual(init.metadata["crop_row_end"], 3)
+				self.assertEqual(init.metadata["crop_column_start"], -748)
+				self.assertEqual(init.metadata["crop_column_end"], 758)
+				self.assertEqual(init.metadata["atlas_u_offset"], -748.0)
+				self.assertEqual(init.metadata["control_point_sample_count"], 2)
+				self.assertEqual(init.metadata["other_line_point_sample_count"], 0)
+				self.assertEqual(init.metadata["requested_mesh_step"], 1)
+				self.assertEqual(init.metadata["resampled_source_rows"], 3)
+				self.assertEqual(init.metadata["resampled_source_columns"], 1506)
+				self.assertEqual(tuple(init.model._grid_xyz().shape), (
+					1,
+					init.metadata["resampled_rows"],
+					init.metadata["resampled_columns"],
+					3,
+				))
+				self.assertEqual(int(init.model.params.mesh_step), 1)
+				self.assertTrue(torch.allclose(init.atlas_lines.target_xyz[0], torch.tensor([10.0, 20.0, 30.0])))
+				self.assertEqual(init.atlas_lines.source_indices, (0, 1))
+				self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True])
+				row_scale = float(init.metadata["resampled_row_index_scale"])
+				col_scale = float(init.metadata["resampled_column_index_scale"])
+				self.assertAlmostEqual(float(init.atlas_lines.model_h[0]), 1.0 * row_scale, delta=1.0e-6)
+				self.assertAlmostEqual(float(init.atlas_lines.model_w[0]), 750.0 * col_scale, delta=1.0e-4)
+				self.assertAlmostEqual(float(init.atlas_lines.model_h[1]), 1.0 * row_scale, delta=1.0e-6)
+				self.assertAlmostEqual(float(init.atlas_lines.model_w[1]), 756.0 * col_scale, delta=1.0e-4)
+
+	def test_atlas_init_keeps_in_span_line_anchors_and_ignores_tails(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=4, cols=5, row_step=10.0, col_step=5.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[float(i), float(i + 1), float(i + 2)] for i in range(5)],
+				"control_points": [[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [
+					{"source_index": 0, "world": [0.0, 1.0, 2.0], "atlas": [-50.0, 1.0], "distance": 0.0},
+					{"source_index": 2, "world": [2.0, 3.0, 4.0], "atlas": [2.0, 1.5], "distance": 0.0},
+					{"source_index": 3, "world": [3.0, 4.0, 5.0], "atlas": [3.0, 2.0], "distance": 0.0},
+					{"source_index": 4, "world": [4.0, 5.0, 6.0], "atlas": [80.0, 2.0], "distance": 0.0},
+				],
+				"control_anchors": [
+					{"source_index": 1, "world": [1.0, 2.0, 3.0], "atlas": [1.0, 1.0], "distance": 0.0},
+					{"source_index": 3, "world": [3.0, 4.0, 5.0], "atlas": [3.0, 2.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 1,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=1,
+				winding_step=1,
+			)
+
+			self.assertEqual(init.metadata["period_columns"], 4)
+			self.assertEqual(init.metadata["crop_column_start"], -529)
+			self.assertEqual(init.metadata["crop_column_end"], 541)
+			self.assertEqual(init.atlas_lines.source_indices, (1, 3, 2))
+			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True, False])
+			self.assertEqual(init.metadata["control_point_sample_count"], 2)
+			self.assertEqual(init.metadata["other_line_point_sample_count"], 1)
+			self.assertEqual(tuple(init.model._grid_xyz().shape), (
+				1,
+				init.metadata["resampled_rows"],
+				init.metadata["resampled_columns"],
+				3,
+			))
+
+	def test_atlas_init_appends_pred_snap_samples_at_control_mapping(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=4, cols=5, row_step=10.0, col_step=5.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+				"control_points": [[1.0, 2.0, 3.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [],
+				"control_anchors": [{
+					"source_index": 0,
+					"world": [1.0, 2.0, 3.0],
+					"atlas": [2.0, 1.0],
+					"distance": 0.0,
+				}],
+			}) + "\n", encoding="utf-8")
+			pred_snap = root / "pred_snap.json"
+			pred_snap.write_text(json.dumps({
+				"type": "vc3d_atlas_pred_snap_points",
+				"version": 1,
+				"fiber_path": "fibers/fiber.json",
+				"entries": {
+					"1_2_3": {
+						"control_point": [1.0, 2.0, 3.0],
+						"pred_snap_point": [7.0, 8.0, 9.0],
+					}
+				},
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"pred_snap_path": str(pred_snap),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=1,
+				winding_step=1,
+			)
+
+			self.assertEqual(init.metadata["control_point_sample_count"], 1)
+			self.assertEqual(init.metadata["pred_snap_sample_count"], 1)
+			self.assertEqual(init.metadata["other_line_point_sample_count"], 0)
+			self.assertEqual(init.atlas_lines.source_indices, (0, 0))
+			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, False])
+			self.assertEqual(init.atlas_lines.is_snap_point.tolist(), [False, True])
+			self.assertTrue(torch.allclose(init.atlas_lines.target_xyz[1], torch.tensor([7.0, 8.0, 9.0])))
+			self.assertAlmostEqual(float(init.atlas_lines.model_h[0]), float(init.atlas_lines.model_h[1]), delta=1.0e-6)
+			self.assertAlmostEqual(float(init.atlas_lines.model_w[0]), float(init.atlas_lines.model_w[1]), delta=1.0e-6)
+
+	def test_atlas_init_mesh_step_coarsens_base_and_remaps_anchor_coords(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=5, cols=5, row_step=10.0, col_step=10.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+				"control_points": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [],
+				"control_anchors": [
+					{"source_index": 0, "world": [1.0, 2.0, 3.0], "atlas": [1.0, 1.0], "distance": 0.0},
+					{"source_index": 1, "world": [4.0, 5.0, 6.0], "atlas": [3.0, 3.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=20,
+				winding_step=1,
+			)
+
+			self.assertEqual(int(init.model.params.mesh_step), 20)
+			self.assertLess(init.metadata["resampled_rows"], init.metadata["resampled_source_rows"])
+			self.assertLess(init.metadata["resampled_columns"], init.metadata["resampled_source_columns"])
+			row_scale = float(init.metadata["resampled_row_index_scale"])
+			col_scale = float(init.metadata["resampled_column_index_scale"])
+			expected_h0 = (1.0 - float(init.metadata["crop_row_start"])) * row_scale
+			expected_w0 = (1.0 - float(init.metadata["atlas_u_offset"])) * col_scale
+			self.assertAlmostEqual(float(init.atlas_lines.model_h[0]), expected_h0, delta=1.0e-6)
+			self.assertAlmostEqual(float(init.atlas_lines.model_w[0]), expected_w0, delta=1.0e-5)
+
+	def test_atlas_init_resampled_anchor_hits_target_with_nonunit_base_step(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=9, cols=9, row_step=1000.0, col_step=1000.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[2000.0, 2000.0, 0.0], [4000.0, 4000.0, 0.0]],
+				"control_points": [[2000.0, 2000.0, 0.0], [4000.0, 4000.0, 0.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [],
+				"control_anchors": [
+					{"source_index": 0, "world": [2000.0, 2000.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 1, "world": [4000.0, 4000.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=2000,
+				winding_step=1,
+			)
+
+			model_xyz = init.model._grid_xyz().detach()
+			h = init.atlas_lines.model_h
+			w = init.atlas_lines.model_w
+			hit = _sample_model_xyz(model_xyz, h, w)
+			self.assertTrue(torch.allclose(hit, init.atlas_lines.target_xyz, atol=1.0e-4))
+
+	def test_atlas_init_source_index_is_line_point_index_not_control_row(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=9, cols=9, row_step=1000.0, col_step=1000.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [
+					[9999.0, 9999.0, 9999.0],
+					[2000.0, 2000.0, 0.0],
+					[3000.0, 3000.0, 0.0],
+					[4000.0, 4000.0, 0.0],
+				],
+				"control_points": [[2000.0, 2000.0, 0.0], [4000.0, 4000.0, 0.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [],
+				"control_anchors": [
+					{"source_index": 1, "world": [2000.0, 2000.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 3, "world": [4000.0, 4000.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=2000,
+				winding_step=1,
+			)
+
+			self.assertEqual(init.atlas_lines.source_indices, (1, 3))
+			self.assertTrue(torch.allclose(
+				init.atlas_lines.target_xyz,
+				torch.tensor([
+					[2000.0, 2000.0, 0.0],
+					[4000.0, 4000.0, 0.0],
+				]),
+				atol=1.0e-6,
+			))
+
+	def test_atlas_init_control_anchor_world_mismatch_fails(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=7, cols=8, row_step=10.0, col_step=5.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[float(i), 0.0, 0.0] for i in range(8)],
+				"control_points": [[2.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [
+					{"source_index": 2, "world": [92.0, 0.0, 0.0], "atlas": [2.0, 1.5], "distance": 0.0},
+					{"source_index": 5, "world": [95.0, 0.0, 0.0], "atlas": [5.0, 3.0], "distance": 0.0},
+				],
+				"control_anchors": [
+					{"source_index": 2, "world": [222.0, 0.0, 0.0], "atlas": [2.0, 1.0], "distance": 0.0},
+					{"source_index": 5, "world": [5.0, 0.0, 0.0], "atlas": [5.0, 3.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 0,
+				}],
+			}
+
+			with self.assertRaisesRegex(ValueError, "world does not match"):
+				atlas.build_atlas_init(
+					atlas_obj,
+					device=torch.device("cpu"),
+					mesh_step=1,
+					winding_step=1,
+				)
+
+	def test_atlas_init_v3_control_anchor_uses_line_index_and_anchor_world(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=6, cols=6, row_step=10.0, col_step=10.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[float(i), 0.0, 0.0] for i in range(6)],
+				"control_points": [[2.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [
+					{"source_index": 1, "world": [1.0, 0.0, 0.0], "atlas": [1.0, 1.0], "distance": 0.0},
+					{"source_index": 2, "world": [2.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 3, "world": [3.0, 0.0, 0.0], "atlas": [3.0, 3.0], "distance": 0.0},
+					{"source_index": 4, "world": [4.0, 0.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
+				],
+				"control_anchors": [
+					{"source_index": 2, "world": [2.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+					{"source_index": 4, "world": [4.0, 0.0, 0.0], "atlas": [4.0, 4.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=1,
+				winding_step=1,
+			)
+
+			self.assertEqual(init.atlas_lines.source_indices, (2, 4, 3))
+			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True, False])
+			self.assertTrue(torch.allclose(
+				init.atlas_lines.target_xyz,
+				torch.tensor([
+					[2.0, 0.0, 0.0],
+					[4.0, 0.0, 0.0],
+					[3.0, 0.0, 0.0],
+				]),
+				atol=1.0e-6,
+			))
+
+	def test_atlas_init_line_anchor_target_uses_line_points_before_world(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			base = root / "base_mesh.tifxyz"
+			_write_tifxyz(base, rows=5, cols=5, row_step=10.0, col_step=10.0)
+			fiber = root / "fiber.json"
+			fiber.write_text(json.dumps({
+				"type": "vc3d_fiber",
+				"version": 1,
+				"line_points": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+				"control_points": [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+			}) + "\n", encoding="utf-8")
+			mapping = root / "mapping.json"
+			mapping.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"fiber_path": "fibers/fiber.json",
+				"line_anchors": [
+					{"source_index": 1, "world": [99.0, 99.0, 99.0], "atlas": [1.0, 1.5], "distance": 0.0},
+				],
+				"control_anchors": [
+					{"source_index": 0, "world": [0.0, 0.0, 0.0], "atlas": [0.0, 1.0], "distance": 0.0},
+					{"source_index": 2, "world": [2.0, 0.0, 0.0], "atlas": [2.0, 2.0], "distance": 0.0},
+				],
+			}) + "\n", encoding="utf-8")
+			atlas_obj = {
+				"type": "lasagna_atlas",
+				"version": 1,
+				"name": "a",
+				"base": {"path": str(base)},
+				"metadata": {"zero_winding_column": 0},
+				"objects": {"line": [{"id": "fibers/fiber.json", "path": str(fiber)}]},
+				"maps": [{
+					"object_type": "line",
+					"object_id": "fibers/fiber.json",
+					"map_path": str(mapping),
+					"winding_offset": 0,
+				}],
+			}
+
+			init = atlas.build_atlas_init(
+				atlas_obj,
+				device=torch.device("cpu"),
+				mesh_step=1,
+				winding_step=1,
+			)
+
+			self.assertEqual(init.atlas_lines.source_indices, (0, 2, 1))
+			self.assertEqual(init.atlas_lines.is_control_point.tolist(), [True, True, False])
+			self.assertTrue(torch.allclose(
+				init.atlas_lines.target_xyz[2],
+				torch.tensor([1.0, 0.0, 0.0]),
+				atol=1.0e-6,
+			))
+
+	def test_wrapped_base_crop_allows_negative_start_and_multiple_wraps(self) -> None:
+		xyz = torch.tensor([[
+			[0.0, 0.0, 0.0],
+			[1.0, 0.0, 0.0],
+			[2.0, 0.0, 0.0],
+			[0.0, 0.0, 0.0],
+		]], dtype=torch.float32)
+		valid = torch.ones((1, 4), dtype=torch.bool)
+
+		crop_xyz, crop_valid = atlas._crop_wrapped_base_shell(
+			xyz,
+			valid,
+			row_start=0,
+			row_end=1,
+			column_start=-5,
+			column_end=4,
+		)
+
+		self.assertEqual(tuple(crop_xyz.shape), (1, 9, 3))
+		self.assertTrue(bool(crop_valid.all()))
+		self.assertTrue(torch.allclose(crop_xyz[0, :, 0], torch.tensor([1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0])))
+
+	def test_mapping_loader_accepts_vc3d_mapping_schema(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			path = Path(td) / "mapping.json"
+			path.write_text(json.dumps({
+				"type": "vc3d_atlas_fiber_mapping",
+				"version": 4,
+				"line_anchors": [{"source_index": 0, "atlas": [1.0, 2.0], "world": [0.0, 0.0, 0.0]}],
+			}), encoding="utf-8")
+			obj = atlas.load_vc3d_atlas_fiber_mapping(path)
+			self.assertEqual(obj["line_anchors"][0]["source_index"], 0)
+
+	def test_mapping_loader_rejects_obsolete_or_missing_versions(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			for name, payload in {
+				"missing.json": {
+					"type": "vc3d_atlas_fiber_mapping",
+					"line_anchors": [],
+				},
+				"v1.json": {
+					"type": "vc3d_atlas_fiber_mapping",
+					"version": 1,
+					"line_anchors": [],
+				},
+				"v2.json": {
+					"type": "vc3d_atlas_fiber_mapping",
+					"version": 2,
+					"line_anchors": [],
+				},
+				"v3.json": {
+					"type": "vc3d_atlas_fiber_mapping",
+					"version": 3,
+					"line_anchors": [],
+				},
+			}.items():
+				path = root / name
+				path.write_text(json.dumps(payload), encoding="utf-8")
+				with self.subTest(name=name):
+					with self.assertRaisesRegex(ValueError, "rebuild required"):
+						atlas.load_vc3d_atlas_fiber_mapping(path)
+
+	def test_atlas21_fixture_matches_cpp_base_samples(self) -> None:
+		fixture_root = _atlas21_fixture_root()
+		atlas_dir = fixture_root / "atlases" / "fiber_21"
+		expected_path = fixture_root / "expected_cpp_base_samples.json"
+		if not atlas_dir.is_dir():
+			self.skipTest(f"Atlas 21 fixture root is absent: {fixture_root}")
+		if not expected_path.is_file():
+			self.skipTest(f"Atlas 21 expected samples are absent: {expected_path}")
+
+		expected_records = json.loads(expected_path.read_text(encoding="utf-8"))
+		self.assertIsInstance(expected_records, list)
+		self.assertGreater(len(expected_records), 8)
+		atlas_obj = _atlas21_config_from_fixture(fixture_root, expected_records)
+		init = atlas.build_atlas_init(
+			atlas_obj,
+			device=torch.device("cpu"),
+			mesh_step=50,
+			winding_step=1,
+		)
+
+		line_lookup: dict[tuple[str, int, bool], int] = {}
+		for i, (object_id, source_index, is_control_point) in enumerate(zip(
+			init.atlas_lines.object_ids,
+			init.atlas_lines.source_indices,
+			init.atlas_lines.is_control_point.detach().cpu().tolist(),
+		)):
+			line_lookup[(object_id, int(source_index), bool(is_control_point))] = i
+
+		model_xyz = init.model._grid_xyz().detach()
+		max_error = 0.0
+		for record in expected_records:
+			key = (
+				str(record["object_id"]),
+				int(record["source_index"]),
+				bool(record["is_control_point"]),
+			)
+			self.assertIn(key, line_lookup)
+			i = line_lookup[key]
+			h = init.atlas_lines.model_h[i:i + 1]
+			w = init.atlas_lines.model_w[i:i + 1]
+			actual = _sample_model_xyz(model_xyz, h, w)[0].detach().cpu()
+			expected = torch.tensor(record["base_xyz"], dtype=torch.float32)
+			max_error = max(max_error, float(torch.linalg.vector_norm(actual - expected)))
+			self.assertTrue(torch.allclose(actual, expected, atol=6.0, rtol=1.0e-4),
+			                f"{key} actual={actual.tolist()} expected={expected.tolist()}")
+		self.assertLess(max_error, 6.0)
+
+
+if __name__ == "__main__":
+	unittest.main()

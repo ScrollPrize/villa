@@ -9,20 +9,24 @@
 #include "vc/core/render/PostProcess.hpp"
 #include "render/ChunkCache.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/ui/VCCollection.hpp"
 
 #include <QApplication>
 #include <QCursor>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QShowEvent>
 #include <QGraphicsEllipseItem>
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPointer>
@@ -40,6 +44,7 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <source_location>
 #include <sstream>
@@ -51,14 +56,17 @@ namespace {
 
 constexpr float kMinScale = 0.002f;
 constexpr float kMaxScale = 128.0f;
-constexpr int kInteractionSettleMs = 140;
-constexpr int kResizeSettleMs = 140;
-constexpr int kChunkReadyActiveDelayMs = 500;
+// Global clock is ~16ms/tick. Durations expressed in ticks for serviceRenderTick.
+constexpr int kGlobalTickMs = 16;
+constexpr int kStatusRefreshTicks = 5000 / kGlobalTickMs;           // ~313 ticks (5s)
+// Non-interactive chunk-ready coalescing. Chunks for one viewpoint trickle in
+// over many milliseconds; the default 16ms render debounce re-renders the whole
+// frame per chunk (~9-11x per viewpoint). Debounce chunk-ready re-renders on a
+// longer window so a burst collapses into ~1 render once chunks stop arriving.
 constexpr float kResolutionLodZoomBias = 0.5f;
 constexpr float kSegmentationResolutionLodZoomBias = 1.0f;
 constexpr int kSurfaceResolutionLevelBias = 1;
 constexpr int kInitialSegmentationSurfaceLevel = 5;
-constexpr qint64 kInteractivePreviewMinIntervalMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
 constexpr bool kEnableRemoteVolumePrefetchHalo = false;
 constexpr int kChunkPrefetchHaloPx = 128;
@@ -72,12 +80,14 @@ constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(180, 200, 255), qRgb(255, 140, 180), qRgb(160, 255, 180),
 };
 constexpr int kIntersectionZ = 100;
+
 constexpr int kHighlightedIntersectionZ = 110;
 constexpr int kActiveIntersectionZ = 120;
 constexpr float kActiveIntersectionOpacityScale = 1.2f;
 constexpr float kActiveIntersectionWidthScale = 1.3f;
 constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
 constexpr float kApprovalPlaneIntersectionScale = 1.5f;
+constexpr float kFocusProjectionThreshold = 4.0f;
 
 struct IntersectionStyle {
     QRgb color = 0;
@@ -159,7 +169,12 @@ std::string normalizedVolumeCacheIdentity(const std::shared_ptr<Volume>& volume)
 
 bool shouldSpeculativelyPrefetchVolume(const std::shared_ptr<Volume>& volume)
 {
-    return volume && volume->isRemote();
+    // Demand-driven: render workers' tryGetChunk misses queue exactly what the
+    // requested frames need. Speculative visible-set/halo/neighbor warming wasted
+    // bandwidth on chunks that may never be sampled. (Disabled, not deleted, so the
+    // enumeration code path stays compiling.)
+    (void)volume;
+    return false;
 }
 
 bool shouldPrefetchRemoteVolumeHalo(const std::shared_ptr<Volume>& volume)
@@ -203,6 +218,124 @@ bool validSurfacePoint(const cv::Vec3f& p)
 {
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
            p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
+}
+
+bool finiteVec2(const cv::Vec2f& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]);
+}
+
+bool finiteVec3(const cv::Vec3f& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+float distance3(const cv::Vec3f& a, const cv::Vec3f& b)
+{
+    const cv::Vec3f d = a - b;
+    return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+}
+
+struct SafeFocusProjection {
+    bool valid = false;
+    const char* reason = "unchecked";
+    float dist = -1.0f;
+    cv::Vec3f ptr{NAN, NAN, NAN};
+    cv::Vec3f loc{NAN, NAN, NAN};
+    cv::Vec3f coord{NAN, NAN, NAN};
+    cv::Vec2f grid{NAN, NAN};
+    int row = -1;
+    int col = -1;
+    int nearestRow = -1;
+    int nearestCol = -1;
+};
+
+SafeFocusProjection validateSafeFocusProjection(
+    QuadSurface& surface,
+    const cv::Vec3f& ptr,
+    const cv::Vec3f* focusWorld,
+    std::optional<float> pointToDistance = std::nullopt)
+{
+    SafeFocusProjection result;
+    result.ptr = ptr;
+
+    if (!finiteVec3(result.ptr)) {
+        result.reason = "non_finite_ptr";
+        return result;
+    }
+
+    result.loc = surface.loc(result.ptr);
+    if (!finiteVec3(result.loc)) {
+        result.reason = "non_finite_loc";
+        return result;
+    }
+
+    if (pointToDistance) {
+        result.dist = *pointToDistance;
+        if (!std::isfinite(result.dist) ||
+            result.dist < 0.0f ||
+            result.dist >= kFocusProjectionThreshold) {
+            result.reason = "distance_out_of_range";
+            return result;
+        }
+    }
+
+    result.coord = surface.coord(result.ptr);
+    if (!validSurfacePoint(result.coord)) {
+        result.reason = "invalid_coord";
+        return result;
+    }
+
+    if (!pointToDistance) {
+        result.dist = focusWorld ? distance3(result.coord, *focusWorld) : 0.0f;
+        if (!std::isfinite(result.dist) ||
+            result.dist < 0.0f ||
+            result.dist >= kFocusProjectionThreshold) {
+            result.reason = "distance_out_of_range";
+            return result;
+        }
+    }
+
+    result.grid = surface.ptrToGrid(result.ptr);
+    if (!finiteVec2(result.grid)) {
+        result.reason = "non_finite_grid";
+        return result;
+    }
+
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (!points || points->cols < 2 || points->rows < 2) {
+        result.reason = "missing_surface_points";
+        return result;
+    }
+    if (result.grid[0] <= 0.0f || result.grid[1] <= 0.0f ||
+        result.grid[0] >= static_cast<float>(points->cols - 1) ||
+        result.grid[1] >= static_cast<float>(points->rows - 1)) {
+        result.reason = "grid_on_or_outside_border";
+        return result;
+    }
+
+    result.col = static_cast<int>(std::floor(result.grid[0]));
+    result.row = static_cast<int>(std::floor(result.grid[1]));
+    if (!surface.isQuadValid(result.row, result.col)) {
+        result.reason = "invalid_interpolation_quad";
+        return result;
+    }
+
+    result.nearestCol = static_cast<int>(std::lround(result.grid[0]));
+    result.nearestRow = static_cast<int>(std::lround(result.grid[1]));
+    if (!surface.isPointValid(result.nearestRow, result.nearestCol)) {
+        result.reason = "invalid_nearest_point";
+        return result;
+    }
+    const cv::Vec3f normal = surface.gridNormal(result.nearestRow, result.nearestCol);
+    if (!finiteVec3(normal)) {
+        result.reason = "non_finite_grid_normal";
+        return result;
+    }
+
+    result.valid = true;
+    result.reason = "valid";
+    return result;
 }
 
 std::string profileCaller(const std::source_location& caller)
@@ -433,7 +566,9 @@ QString formatVec3(const cv::Vec3f& v)
 
 QString formatWholeVolumePosition(const cv::Vec3f& v)
 {
-    return QString("[%1, %2, %3]")
+    // v is in coordinate/UI order [x, y, z] = [width, height, slices]. Label each
+    // component so the scroll Z (slice/depth) axis is unambiguous in the status bar.
+    return QString("[X=%1, Y=%2, Z=%3]")
         .arg(v[0], 0, 'f', 0)
         .arg(v[1], 0, 'f', 0)
         .arg(v[2], 0, 'f', 0);
@@ -619,6 +754,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendMousePress, this, &CChunkedVolumeViewer::onMousePress);
     connect(_view, &CVolumeViewerView::sendMouseMove, this, &CChunkedVolumeViewer::onMouseMove);
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CChunkedVolumeViewer::onMouseRelease);
+    connect(_view, &CVolumeViewerView::sendMouseLeftView, this, [this]() {
+        clearLineAnnotationPlacementMarker();
+    });
     connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
             [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
                 const auto cursorPos = cursorVolumePosition(scenePos);
@@ -638,62 +776,10 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setScene(_scene);
     _view->setDirectFramebuffer(&_framebuffer);
 
-    _renderTimer = new QTimer(this);
-    _renderTimer->setSingleShot(true);
-    _renderTimer->setInterval(16);
-    connect(_renderTimer, &QTimer::timeout, this, [this]() {
-        if (!_renderPending)
-            return;
-        if (_interactivePreview) {
-            if (_settleRenderTimer)
-                _settleRenderTimer->start();
-            return;
-        }
-        _renderPending = false;
-        const std::string reason = ProfileLoggingEnabled()
-            ? std::format("render timer fired; scheduledReason='{}'; scheduledCaller='{}'",
-                          _pendingRenderReason, _pendingRenderCaller)
-            : std::string("render timer fired");
-        submitRender(reason.c_str());
-        updateStatusLabel();
-    });
-
-    _settleRenderTimer = new QTimer(this);
-    _settleRenderTimer->setSingleShot(true);
-    _settleRenderTimer->setInterval(kInteractionSettleMs);
-    connect(_settleRenderTimer, &QTimer::timeout, this, [this]() {
-        if (!_isPanning) {
-            _interactivePreview = false;
-            scheduleRender("interaction settled");
-        }
-    });
-
-    _intersectionRenderTimer = new QTimer(this);
-    _intersectionRenderTimer->setSingleShot(true);
-    _intersectionRenderTimer->setInterval(50);
-    connect(_intersectionRenderTimer, &QTimer::timeout, this, [this]() {
-        const std::string reason = ProfileLoggingEnabled()
-            ? std::format("intersection timer fired; scheduledReason='{}'; scheduledCaller='{}'",
-                          _pendingIntersectionReason, _pendingIntersectionCaller)
-            : std::string("intersection timer fired");
-        renderIntersections(reason.c_str());
-        emit overlaysUpdated();
-    });
-
-    _resizeRenderTimer = new QTimer(this);
-    _resizeRenderTimer->setSingleShot(true);
-    _resizeRenderTimer->setInterval(kResizeSettleMs);
-    connect(_resizeRenderTimer, &QTimer::timeout, this, [this]() {
-        scheduleRender("resize settled");
-        emit overlaysUpdated();
-    });
-
-    _statusTimer = new QTimer(this);
-    _statusTimer->setInterval(500);
-    connect(_statusTimer, &QTimer::timeout, this, [this]() {
-        updateStatusLabel();
-    });
-    _statusTimer->start();
+    // No per-viewer timers: ViewerManager's single global clock calls
+    // serviceRenderTick() ~60Hz, which drains _renderPending / _intersectionPending /
+    // the resize-settle + status-refresh countdowns. Start the periodic status poll.
+    _statusRefreshTicks = kStatusRefreshTicks;
 
     reloadPerfSettings();
 
@@ -719,6 +805,17 @@ CChunkedVolumeViewer::~CChunkedVolumeViewer()
     clearIntersectionItems();
 }
 
+void CChunkedVolumeViewer::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    // Render whatever went stale while this viewer was hidden (submitRender skipped
+    // renders + prefetch for invisible viewers).
+    if (_renderStaleWhileHidden && !_closing) {
+        _renderStaleWhileHidden = false;
+        scheduleRender("shown after hidden");
+    }
+}
+
 bool CChunkedVolumeViewer::eventFilter(QObject* watched, QEvent* event)
 {
     if (event && event->type() == QEvent::Close && watched == parentWidget()) {
@@ -738,16 +835,8 @@ void CChunkedVolumeViewer::quiesceForClose()
         _viewerManager->unregisterViewer(this);
     }
 
-    if (_renderTimer)
-        _renderTimer->stop();
-    if (_settleRenderTimer)
-        _settleRenderTimer->stop();
-    if (_intersectionRenderTimer)
-        _intersectionRenderTimer->stop();
-    if (_resizeRenderTimer)
-        _resizeRenderTimer->stop();
-    if (_statusTimer)
-        _statusTimer->stop();
+    // Clear all pending tick work (the global clock will see nothing to do).
+    _intersectionPending = false;
 
     _renderPending = false;
     _renderPendingAfterWorker = false;
@@ -770,6 +859,8 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
     _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
+    _voxelSizeOverrideUm = std::max(0.0, s.value(viewer::VOXEL_SIZE_UM, viewer::VOXEL_SIZE_UM_DEFAULT).toDouble());
+    updateScalebarScale();   // override may have changed -> refresh the scalebar
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
     _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
     _maxDisplayedResolution = std::clamp(
@@ -795,6 +886,49 @@ Surface* CChunkedVolumeViewer::currentSurface() const
         return shared ? shared.get() : nullptr;
     }
     return _state->surfaceRaw(_surfName);
+}
+
+CChunkedVolumeViewer::CameraState CChunkedVolumeViewer::cameraState() const
+{
+    CameraState state;
+    state.surfacePtrX = _surfacePtrX;
+    state.surfacePtrY = _surfacePtrY;
+    state.scale = _scale;
+    state.zOffset = _zOff;
+    state.zOffsetWorldDir = _zOffWorldDir;
+    return state;
+}
+
+void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool forceRender)
+{
+    if (_closing) {
+        return;
+    }
+    _surfacePtrX = state.surfacePtrX;
+    _surfacePtrY = state.surfacePtrY;
+    _scale = state.scale;
+    _zOff = state.zOffset;
+    _zOffWorldDir = state.zOffsetWorldDir;
+    recalcPyramidLevel();
+    _genCacheDirty = true;
+    if (forceRender) {
+        renderVisible(true, "annotation camera state applied");
+    } else {
+        scheduleRender("annotation camera state applied");
+    }
+    emit overlaysUpdated();
+}
+
+bool CChunkedVolumeViewer::isRenderQuiescent() const
+{
+    return !_renderWorkerBusy.load(std::memory_order_acquire)
+        && !_renderPendingAfterWorker
+        && !_renderPending;
+}
+
+std::size_t CChunkedVolumeViewer::chunkFetchesInFlight() const
+{
+    return _chunkArray ? _chunkArray->stats().remoteFetchesInFlight : 0;
 }
 
 void CChunkedVolumeViewer::rebuildChunkArray()
@@ -827,12 +961,11 @@ void CChunkedVolumeViewer::rebuildChunkArray()
             auto volume = volumeWeak.lock();
             if (!volume || guard->_volume != volume || guard->_closing)
                 return;
-            if (guard->_interactivePreview) {
-                if (guard->_settleRenderTimer)
-                    guard->_settleRenderTimer->start(kChunkReadyActiveDelayMs);
-                return;
-            }
-            guard->scheduleRender("chunk ready");
+            // Coalesce on the 16ms render debounce. Mark pending and arm the timer
+            // Mark pending; the global clock coalesces a burst of arriving chunks into
+            // one render (it doesn't restart anything), so repaints aren't starved for
+            // as long as chunks keep streaming.
+            guard->_renderPending = true;
         }, Qt::QueuedConnection);
     });
 }
@@ -857,9 +990,9 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     }
     _zOffWorldDir = {0, 0, 0};
     _surfaceChunkPrefetchCache = {};
-    _stableFramebufferValid = false;
     if (_cursorCrosshair)
         _cursorCrosshair->hide();
+    clearLineAnnotationPlacementMarker();
     if (_focusMarker)
         _focusMarker->hide();
 
@@ -871,11 +1004,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
                                   : static_cast<int>(_volume->numScales());
         _scale = scaleForCoarsestPlaneRenderLevel(n);
     }
-    recalcPyramidLevel();
-    if (_volume) {
-        const double vs = _volume->voxelSize() / static_cast<double>(_dsScale);
-        _view->setVoxelSize(vs, vs);
-    }
+    recalcPyramidLevel();   // also pushes the scalebar µm/px (updateScalebarScale)
     updateContentBounds();
     resizeFramebuffer();
     scheduleRender("volume changed");
@@ -889,7 +1018,6 @@ void CChunkedVolumeViewer::invalidateVis()
         return;
     }
     _genCacheDirty = true;
-    _stableFramebufferValid = false;
     _surfaceChunkPrefetchCache = {};
 }
 
@@ -900,6 +1028,7 @@ void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv
         return;
     }
 
+
     auto surf = _surfWeak.lock();
     auto* quad = dynamic_cast<QuadSurface*>(surf.get());
     if (!quad) {
@@ -908,7 +1037,6 @@ void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv
     }
 
     _genCacheDirty = true;
-    _stableFramebufferValid = false;
 
     auto& cache = _surfaceChunkPrefetchCache;
     if (!cache.valid || cache.surface != quad) {
@@ -972,7 +1100,6 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     if (isSameCurrentSurface && isEditUpdate) {
         _genCacheDirty = true;
         _zOffWorldDir = {0, 0, 0};
-        _stableFramebufferValid = false;
         updateContentBounds();
         updateFocusMarker();
         if (_suppressNextSurfaceEditRender) {
@@ -987,31 +1114,68 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     _genCacheDirty = true;
     _surfaceChunkPrefetchCache = {};
     _zOffWorldDir = {0, 0, 0};
-    _stableFramebufferValid = false;
     invalidateIntersect(name);
     if (!surf) {
         clearIntersectionItems();
         _scene->clear();
         _overlayGroups.clear();
         _cursorCrosshair = nullptr;
+        _lineAnnotationPlacementMarker = nullptr;
         _focusMarker = nullptr;
         return;
     }
     updateContentBounds();
     const bool isSegmentationQuadSurface =
         _surfName == "segmentation" && dynamic_cast<QuadSurface*>(surf.get());
+
+    auto setSegmentationPointerFromFocus = [&]() {
+        auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+        auto* poi = _state ? _state->poi("focus") : nullptr;
+        if (!quad || !poi) {
+            return false;
+        }
+        if (!poi->surfaceId.empty() && !quad->id.empty() &&
+            poi->surfaceId != quad->id && poi->surfaceId != _surfName) {
+            return false;
+        }
+
+        if (poi->surfacePtr) {
+            const SafeFocusProjection projected =
+                validateSafeFocusProjection(*quad, *poi->surfacePtr, &poi->p);
+            if (projected.valid) {
+                _surfacePtrX = projected.loc[0];
+                _surfacePtrY = projected.loc[1];
+                return true;
+            }
+        }
+
+        cv::Vec3f ptr = quad->pointer();
+        const float dist = quad->pointTo(ptr, poi->p, kFocusProjectionThreshold, 100, nullptr);
+        const SafeFocusProjection projected =
+            validateSafeFocusProjection(*quad, ptr, &poi->p, dist);
+        if (!projected.valid) {
+            return false;
+        }
+
+        _surfacePtrX = projected.loc[0];
+        _surfacePtrY = projected.loc[1];
+        return true;
+    };
+
     if (!isEditUpdate && isSegmentationQuadSurface && !_initializedFirstSegmentationSurface) {
-        _surfacePtrX = 0.0f;
-        _surfacePtrY = 0.0f;
+        if (_resetViewOnSurfaceChange) {
+            (void)setSegmentationPointerFromFocus();
+        }
         _zOff = 0.0f;
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
-        _scale = scaleForCoarsestSegmentationRenderLevel(n);
-        recalcPyramidLevel();
+        if (_resetViewOnSurfaceChange) {
+            _scale = scaleForCoarsestSegmentationRenderLevel(n);
+            recalcPyramidLevel();
+        }
         _initializedFirstSegmentationSurface = true;
     } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
-        _surfacePtrX = 0.0f;
-        _surfacePtrY = 0.0f;
+        (void)setSegmentationPointerFromFocus();
         _zOff = 0.0f;
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
@@ -1073,6 +1237,12 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     }
     if (name != "focus" || !poi)
         return;
+    if (property("vc_viewer_role").toString() == QStringLiteral("annotation")) {
+        if (_focusMarker) {
+            _focusMarker->hide();
+        }
+        return;
+    }
 
     auto surf = _surfWeak.lock();
     const bool isPlaneSurface = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
@@ -1151,6 +1321,36 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
         static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
         0, std::max(0, n - 1));
     _dsScale = static_cast<float>(std::uint64_t{1} << _dsScaleIdx);
+    updateScalebarScale();
+}
+
+void CChunkedVolumeViewer::updateScalebarScale()
+{
+    // The scalebar overlay (CVolumeViewerView::drawForeground) needs µm per scene
+    // pixel, where one scene pixel == one rendered framebuffer pixel (the framebuffer
+    // is blitted 1:1, so the view transform m11 ~= 1 and does NOT carry the zoom).
+    // The zoom + LOD live in the FRAMEBUFFER render, not the view transform:
+    //   - 1 framebuffer px = 1/_scale render-LOD voxels (gen steps gridScale/_scale).
+    //   - 1 render-LOD voxel = _dsScale level-0 voxels = _dsScale * voxelSize µm.
+    // => µm/px = voxelSize * _dsScale / _scale. Must be recomputed on every zoom AND
+    // LOD change (both happen here) -- the old code set it once at volume-load with
+    // the wrong formula (voxelSize/_dsScale, zoom ignored), so the bar was wrong at
+    // every zoom level.
+    if (!_view || !_volume)
+        return;
+    // Voxel size (µm per level-0 voxel): prefer the volume's own metadata, but many
+    // .vca archives don't carry one (voxelSize()==0). Fall back to the user-set
+    // override (viewer/voxel_size_um in settings) so the scalebar still shows real
+    // units. If neither is available the bar can't be physical -> leave the view's
+    // default and the overlay shows nothing meaningful.
+    double voxel = _volume->voxelSize();
+    if (!(voxel > 0.0))
+        voxel = _voxelSizeOverrideUm;                 // 0 if unset
+    if (!(voxel > 0.0) || !(_scale > 0.0f))
+        return;
+    const double umPerScenePx =
+        voxel * static_cast<double>(_dsScale) / static_cast<double>(_scale);
+    _view->setVoxelSize(umPerScenePx, umPerScenePx);
 }
 
 void CChunkedVolumeViewer::resizeFramebuffer()
@@ -1161,7 +1361,6 @@ void CChunkedVolumeViewer::resizeFramebuffer()
     if (_framebuffer.isNull() || _framebuffer.width() != w || _framebuffer.height() != h) {
         _framebuffer = QImage(w, h, QImage::Format_RGB32);
         _framebuffer.fill(QColor(64, 64, 64));
-        _stableFramebufferValid = false;
     }
     _scene->setSceneRect(0, 0, w, h);
 }
@@ -1178,23 +1377,12 @@ void CChunkedVolumeViewer::scheduleRender(const char* reason, std::source_locati
     ProfileScope profile("scheduleRender", reason, caller);
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "surf='{}' force=false pending={} interactive={} scale={:.4f} zOff={:.3f}",
-            _surfName, _renderPending, _interactivePreview, _scale, _zOff));
+            "surf='{}' force=false pending={} scale={:.4f} zOff={:.3f}",
+            _surfName, _renderPending, _scale, _zOff));
     }
     syncCameraTransform();
-    _renderPending = true;
-    if (_interactivePreview) {
-        if (_settleRenderTimer)
-            _settleRenderTimer->start();
-        profile.setDetails("action=settle_timer");
-        return;
-    }
-    if (_renderTimer && !_renderTimer->isActive()) {
-        _renderTimer->start();
-        profile.setDetails("action=render_timer_start");
-    } else {
-        profile.setDetails("action=already_scheduled");
-    }
+    _renderPending = true;   // serviceRenderTick() (global clock) submits it next tick
+    profile.setDetails("action=render_pending");
 }
 
 void CChunkedVolumeViewer::requestRender(const char* reason, std::source_location caller)
@@ -1223,11 +1411,33 @@ void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::s
         profile.setDetails("action=deferred_segmentation_edit");
         return;
     }
-    if (_intersectionRenderTimer && !_intersectionRenderTimer->isActive()) {
-        _intersectionRenderTimer->start();
-        profile.setDetails("action=intersection_timer_start");
-    } else {
-        profile.setDetails("action=already_scheduled");
+    _intersectionPending = true;   // serviceRenderTick() renders it next tick
+    profile.setDetails("action=intersection_pending");
+}
+
+// Driven by ViewerManager's single global clock (~60Hz). Drains the pending flags:
+// submit a render and/or an intersection render, run the resize-settle countdown, and
+// poll the status bar periodically. The only place these flags are consumed.
+void CChunkedVolumeViewer::serviceRenderTick()
+{
+    if (_closing)
+        return;
+
+    if (_renderPending) {
+        _renderPending = false;
+        submitRender("global tick render");
+        updateStatusLabel();
+    }
+    if (_intersectionPending) {
+        _intersectionPending = false;
+        renderIntersections("global tick intersection");
+        emit overlaysUpdated();
+    }
+
+    // Periodic status refresh (background prefetch/download progress).
+    if (--_statusRefreshTicks <= 0) {
+        _statusRefreshTicks = kStatusRefreshTicks;
+        updateStatusLabel();
     }
 }
 
@@ -1252,339 +1462,6 @@ void CChunkedVolumeViewer::syncCameraTransform()
     updateFocusMarker();
 }
 
-bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
-{
-    ProfileScope profile("renderInteractiveAxisAlignedSlicePreview",
-                         "interactive preview requested",
-                         std::source_location::current());
-    if (profile.enabled()) {
-        profile.setDetails(std::format(
-            "surf='{}' framebuffer={}x{} scale={:.4f} zOff={:.3f}",
-            _surfName, _framebuffer.width(), _framebuffer.height(), _scale, _zOff));
-    }
-    if (!_chunkArray || !_volume || _framebuffer.isNull()) {
-        profile.setDetails("action=skip missing_input");
-        return false;
-    }
-    if (_overlayVolume || _compositeSettings.enabled || _compositeSettings.planeEnabled) {
-        profile.setDetails("action=skip overlay_or_composite");
-        return false;
-    }
-
-    auto surf = _surfWeak.lock();
-    auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    if (!plane) {
-        profile.setDetails("action=skip non_plane");
-        return false;
-    }
-
-    const cv::Vec3f vx = plane->basisX();
-    const cv::Vec3f vy = plane->basisY();
-    const cv::Vec3f n = plane->normal({0, 0, 0});
-    const int uAxis = dominantAxis(vx);
-    const int vAxis = dominantAxis(vy);
-    const int fixedAxis = dominantAxis(n);
-    if (uAxis < 0 || vAxis < 0 || fixedAxis < 0 ||
-        uAxis == vAxis || uAxis == fixedAxis || vAxis == fixedAxis) {
-        profile.setDetails("action=skip non_axis_aligned");
-        return false;
-    }
-
-    const int fbW = _framebuffer.width();
-    const int fbH = _framebuffer.height();
-    if (fbW <= 0 || fbH <= 0) {
-        profile.setDetails("action=skip invalid_framebuffer");
-        return false;
-    }
-
-    const int level = renderStartLevel();
-    if (level < 0 || level >= _chunkArray->numLevels()) {
-        if (profile.enabled()) {
-            profile.setDetails(std::format("action=skip invalid_level level={}", level));
-        }
-        return false;
-    }
-
-    const float halfW = static_cast<float>(fbW) * 0.5f / _scale;
-    const float halfH = static_cast<float>(fbH) * 0.5f / _scale;
-    const cv::Vec3f origin0 = vx * (_surfacePtrX - halfW)
-                            + vy * (_surfacePtrY - halfH)
-                            + plane->origin()
-                            + n * _zOff;
-    const cv::Vec3f vxStep0 = vx / _scale;
-    const cv::Vec3f vyStep0 = vy / _scale;
-    constexpr int kMaxPreviewSourcePixels = 4096 * 4096;
-
-    const uint8_t fillByte = static_cast<uint8_t>(
-        std::clamp(std::lround(_chunkArray->fillValue()), 0L, 255L));
-    cv::Mat_<uint8_t> displayValues;
-    cv::Mat_<uint8_t> displayCoverage(fbH, fbW, uint8_t(0));
-    displayValues.create(fbH, fbW);
-    displayValues.setTo(fillByte);
-
-    int coveredChunks = 0;
-    int renderedLevels = 0;
-    bool emptyVisibleRegion = false;
-    auto renderLevel = [&](int sampleLevel) -> bool {
-        const auto shapeZyx = _chunkArray->shape(sampleLevel);
-        const auto chunkZyx = _chunkArray->chunkShape(sampleLevel);
-        std::array<int, 3> shapeXyz{shapeZyx[2], shapeZyx[1], shapeZyx[0]};
-        std::array<int, 3> chunkXyz{chunkZyx[2], chunkZyx[1], chunkZyx[0]};
-        if (shapeXyz[0] <= 0 || shapeXyz[1] <= 0 || shapeXyz[2] <= 0 ||
-            chunkXyz[0] <= 0 || chunkXyz[1] <= 0 || chunkXyz[2] <= 0) {
-            return false;
-        }
-
-        const auto transform = _chunkArray->levelTransform(sampleLevel);
-        auto toLevel = [&transform](const cv::Vec3f& p) {
-            return cv::Vec3f(
-                float(double(p[0]) * transform.scaleFromLevel0[0] + transform.offsetFromLevel0[0]),
-                float(double(p[1]) * transform.scaleFromLevel0[1] + transform.offsetFromLevel0[1]),
-                float(double(p[2]) * transform.scaleFromLevel0[2] + transform.offsetFromLevel0[2]));
-        };
-        auto stepToLevel = [&transform](const cv::Vec3f& p) {
-            return cv::Vec3f(
-                float(double(p[0]) * transform.scaleFromLevel0[0]),
-                float(double(p[1]) * transform.scaleFromLevel0[1]),
-                float(double(p[2]) * transform.scaleFromLevel0[2]));
-        };
-
-        const cv::Vec3f origin = toLevel(origin0);
-        const cv::Vec3f uStep = stepToLevel(vxStep0);
-        const cv::Vec3f vStep = stepToLevel(vyStep0);
-        if (std::abs(uStep[fixedAxis]) > 1e-5f || std::abs(vStep[fixedAxis]) > 1e-5f)
-            return false;
-        if (origin[fixedAxis] < 0.0f || origin[fixedAxis] >= float(shapeXyz[fixedAxis]))
-            return false;
-
-        const int fixed = std::clamp(int(std::lround(origin[fixedAxis])), 0, shapeXyz[fixedAxis] - 1);
-        const float u0 = origin[uAxis];
-        const float u1 = origin[uAxis] + uStep[uAxis] * float(std::max(0, fbW - 1));
-        const float v0 = origin[vAxis];
-        const float v1 = origin[vAxis] + vStep[vAxis] * float(std::max(0, fbH - 1));
-
-        const int uBegin = std::clamp(int(std::floor(std::min(u0, u1))) - 1, 0, shapeXyz[uAxis]);
-        const int uEnd = std::clamp(int(std::ceil(std::max(u0, u1))) + 2, 0, shapeXyz[uAxis]);
-        const int vBegin = std::clamp(int(std::floor(std::min(v0, v1))) - 1, 0, shapeXyz[vAxis]);
-        const int vEnd = std::clamp(int(std::ceil(std::max(v0, v1))) + 2, 0, shapeXyz[vAxis]);
-        if (uEnd <= uBegin || vEnd <= vBegin) {
-            emptyVisibleRegion = true;
-            return false;
-        }
-
-        const int srcW = uEnd - uBegin;
-        const int srcH = vEnd - vBegin;
-        if (srcW <= 0 || srcH <= 0 || srcW * srcH > kMaxPreviewSourcePixels)
-            return false;
-
-        cv::Mat_<uint8_t> src(srcH, srcW, fillByte);
-        cv::Mat_<uint8_t> srcCoverage(srcH, srcW, uint8_t(0));
-        const int uChunkBegin = uBegin / chunkXyz[uAxis];
-        const int uChunkEnd = (uEnd - 1) / chunkXyz[uAxis];
-        const int vChunkBegin = vBegin / chunkXyz[vAxis];
-        const int vChunkEnd = (vEnd - 1) / chunkXyz[vAxis];
-        const int fixedChunk = fixed / chunkXyz[fixedAxis];
-        int levelCoveredChunks = 0;
-
-        for (int vc = vChunkBegin; vc <= vChunkEnd; ++vc) {
-            for (int uc = uChunkBegin; uc <= uChunkEnd; ++uc) {
-                std::array<int, 3> chunkXyzCoord{};
-                chunkXyzCoord[uAxis] = uc;
-                chunkXyzCoord[vAxis] = vc;
-                chunkXyzCoord[fixedAxis] = fixedChunk;
-
-                vc::render::ChunkResult chunk = _chunkArray->tryGetChunk(
-                    sampleLevel,
-                    chunkXyzCoord[2],
-                    chunkXyzCoord[1],
-                    chunkXyzCoord[0]);
-                if (chunk.status == vc::render::ChunkStatus::MissQueued ||
-                    chunk.status == vc::render::ChunkStatus::Missing ||
-                    chunk.status == vc::render::ChunkStatus::Error)
-                    continue;
-
-                const int cu0 = chunkXyzCoord[uAxis] * chunkXyz[uAxis];
-                const int cv0 = chunkXyzCoord[vAxis] * chunkXyz[vAxis];
-                const int uA = std::max(uBegin, cu0);
-                const int uB = std::min(uEnd, cu0 + chunkXyz[uAxis]);
-                const int vA = std::max(vBegin, cv0);
-                const int vB = std::min(vEnd, cv0 + chunkXyz[vAxis]);
-                if (uA >= uB || vA >= vB)
-                    continue;
-
-                ++levelCoveredChunks;
-                if (chunk.status == vc::render::ChunkStatus::AllFill) {
-                    src(cv::Range(vA - vBegin, vB - vBegin),
-                        cv::Range(uA - uBegin, uB - uBegin)).setTo(fillByte);
-                    srcCoverage(cv::Range(vA - vBegin, vB - vBegin),
-                                cv::Range(uA - uBegin, uB - uBegin)).setTo(uint8_t(1));
-                    continue;
-                }
-                if (chunk.status != vc::render::ChunkStatus::Data || !chunk.bytes)
-                    continue;
-
-                const auto& bytes = *chunk.bytes;
-                for (int vv = vA; vv < vB; ++vv) {
-                    uint8_t* dst = src.ptr<uint8_t>(vv - vBegin);
-                    uint8_t* cov = srcCoverage.ptr<uint8_t>(vv - vBegin);
-                    for (int uu = uA; uu < uB; ++uu) {
-                        std::array<int, 3> xyz{};
-                        xyz[uAxis] = uu;
-                        xyz[vAxis] = vv;
-                        xyz[fixedAxis] = fixed;
-                        const int lx = xyz[0] - chunkXyzCoord[0] * chunkXyz[0];
-                        const int ly = xyz[1] - chunkXyzCoord[1] * chunkXyz[1];
-                        const int lz = xyz[2] - chunkXyzCoord[2] * chunkXyz[2];
-                        const std::size_t offset = (std::size_t(lz) * std::size_t(chunkZyx[1])
-                                                  + std::size_t(ly)) * std::size_t(chunkZyx[2])
-                                                  + std::size_t(lx);
-                        if (offset >= bytes.size())
-                            continue;
-                        dst[uu - uBegin] = std::to_integer<uint8_t>(bytes[offset]);
-                        cov[uu - uBegin] = 1;
-                    }
-                }
-            }
-        }
-        if (levelCoveredChunks == 0)
-            return false;
-
-        cv::Mat_<uint8_t> levelValues;
-        cv::Mat_<uint8_t> levelCoverage;
-        const cv::Matx23f dstToSrc(
-            uStep[uAxis], 0.0f, u0 - float(uBegin),
-            0.0f, vStep[vAxis], v0 - float(vBegin));
-        cv::warpAffine(src, levelValues, dstToSrc, cv::Size(fbW, fbH),
-                       cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
-                       cv::BORDER_CONSTANT, cv::Scalar(fillByte));
-        cv::warpAffine(srcCoverage, levelCoverage, dstToSrc, cv::Size(fbW, fbH),
-                       cv::INTER_NEAREST | cv::WARP_INVERSE_MAP,
-                       cv::BORDER_CONSTANT, cv::Scalar(0));
-        int filledPixels = 0;
-        for (int y = 0; y < fbH; ++y) {
-            const auto* levelValueRow = levelValues.ptr<uint8_t>(y);
-            const auto* levelCoverageRow = levelCoverage.ptr<uint8_t>(y);
-            auto* valueRow = displayValues.ptr<uint8_t>(y);
-            auto* coverageRow = displayCoverage.ptr<uint8_t>(y);
-            for (int x = 0; x < fbW; ++x) {
-                if (coverageRow[x] || !levelCoverageRow[x])
-                    continue;
-                valueRow[x] = levelValueRow[x];
-                coverageRow[x] = 1;
-                ++filledPixels;
-            }
-        }
-        if (filledPixels == 0)
-            return false;
-        coveredChunks += levelCoveredChunks;
-        ++renderedLevels;
-        return true;
-    };
-
-    for (int sampleLevel = level; sampleLevel < _chunkArray->numLevels(); ++sampleLevel)
-        (void)renderLevel(sampleLevel);
-
-    if (renderedLevels == 0) {
-        if (emptyVisibleRegion) {
-            _framebuffer.fill(QColor(64, 64, 64));
-            syncCameraTransform();
-            _view->viewport()->update();
-            profile.setDetails("action=empty_visible_region");
-            return true;
-        }
-        profile.setDetails("action=skip no_chunks_ready");
-        return false;
-    }
-
-    std::array<uint32_t, 256> lut{};
-    vc::buildWindowLevelColormapLut(lut, _windowLow, _windowHigh, _baseColormapId);
-    QImage preview(fbW, fbH, QImage::Format_RGB32);
-    auto* bits = reinterpret_cast<uint32_t*>(preview.bits());
-    const int stride = preview.bytesPerLine() / 4;
-    for (int y = 0; y < fbH; ++y) {
-        auto* row = bits + size_t(y) * size_t(stride);
-        const auto* values = displayValues.ptr<uint8_t>(y);
-        const auto* coverage = displayCoverage.ptr<uint8_t>(y);
-        for (int x = 0; x < fbW; ++x)
-            row[x] = coverage[x] ? lut[values[x]] : 0xFF404040u;
-    }
-
-    _framebuffer = std::move(preview);
-    syncCameraTransform();
-    if (_interactivePreview)
-        updateIntersectionPreviewTransform();
-    else
-        renderIntersections("interactive axis-aligned preview rendered");
-    emit overlaysUpdated();
-    _view->viewport()->update();
-    if (profile.enabled()) {
-        profile.setDetails(std::format(
-            "action=rendered startLevel={} renderedLevels={} coveredChunks={} fixedAxis={}",
-            level, renderedLevels, coveredChunks, fixedAxis));
-    }
-    return true;
-}
-
-void CChunkedVolumeViewer::updateInteractivePreviewFromStableFrame(float newSurfX,
-                                                                   float newSurfY,
-                                                                   float newScale)
-{
-    resizeFramebuffer();
-    if (renderInteractiveAxisAlignedSlicePreview())
-        return;
-
-    if (!_stableFramebufferValid || _stableFramebuffer.isNull() ||
-        _stableFramebuffer.size() != _framebuffer.size() ||
-        _stableScale <= 0.0f || newScale <= 0.0f) {
-        syncCameraTransform();
-        if (_interactivePreview)
-            updateIntersectionPreviewTransform();
-        else
-            renderIntersections("interactive preview fallback no stable frame");
-        _view->viewport()->update();
-        return;
-    }
-
-    const int w = _framebuffer.width();
-    const int h = _framebuffer.height();
-    const float cx = float(w) * 0.5f;
-    const float cy = float(h) * 0.5f;
-    const float r = newScale / _stableScale;
-    const float tx = (_stableSurfX - newSurfX) * newScale + cx - cx * r;
-    const float ty = (_stableSurfY - newSurfY) * newScale + cy - cy * r;
-
-    QImage preview(w, h, QImage::Format_RGB32);
-    preview.fill(QColor(64, 64, 64));
-    QPainter painter(&preview);
-    painter.setRenderHint(QPainter::SmoothPixmapTransform, std::abs(r - 1.0f) > 0.02f);
-    painter.translate(tx, ty);
-    painter.scale(r, r);
-    painter.drawImage(0, 0, _stableFramebuffer);
-    painter.end();
-
-    _framebuffer = std::move(preview);
-    syncCameraTransform();
-    if (_interactivePreview)
-        updateIntersectionPreviewTransform();
-    else
-        renderIntersections("interactive preview transformed stable frame");
-    emit overlaysUpdated();
-    _view->viewport()->update();
-}
-
-bool CChunkedVolumeViewer::shouldRefreshInteractivePreview()
-{
-    if (!_interactionClock.isValid())
-        _interactionClock.start();
-    const qint64 now = _interactionClock.elapsed();
-    if (_lastInteractivePreviewMs < 0 ||
-        now - _lastInteractivePreviewMs >= kInteractivePreviewMinIntervalMs) {
-        _lastInteractivePreviewMs = now;
-        return true;
-    }
-    return false;
-}
-
 int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
 {
     if (!_chunkArray)
@@ -1602,14 +1479,8 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
 
 void CChunkedVolumeViewer::markInteractiveMotion(double)
 {
-    if (!_interactionClock.isValid())
-        _interactionClock.start();
-
-    const qint64 now = _interactionClock.elapsed();
-    _lastInteractionMs = now;
-    _interactivePreview = true;
-    if (_settleRenderTimer)
-        _settleRenderTimer->start();
+    // Interactions schedule a normal full-quality render directly (scheduleRender in
+    // the handler). The old interactive-preview + settle-timer fast path is gone.
 }
 
 bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
@@ -1632,7 +1503,7 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
 {
     const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
     const bool prefetchOverlay = shouldPrefetchRemoteVolumeHalo(_overlayVolume);
-    if (_interactivePreview || _framebuffer.isNull() ||
+    if (_framebuffer.isNull() ||
         (!prefetchBase && !prefetchOverlay))
         return;
 
@@ -1789,7 +1660,7 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
 {
     const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
     const bool prefetchOverlay = shouldPrefetchRemoteVolumeHalo(_overlayVolume);
-    if (_interactivePreview || fbW <= 0 || fbH <= 0 ||
+    if (fbW <= 0 || fbH <= 0 ||
         (!prefetchBase && !prefetchOverlay))
         return;
 
@@ -1990,7 +1861,6 @@ struct CChunkedVolumeViewer::RenderContext {
     std::string overlayColormapId;
     float overlayWindowLow = 0.0f;
     float overlayWindowHigh = 255.0f;
-    bool interactivePreview = false;
     std::shared_ptr<GeneratedSurfaceCache> genCache;
     bool genCacheDirty = false;
     std::string profileReason;
@@ -2009,12 +1879,18 @@ struct CChunkedVolumeViewer::RenderResult {
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
 {
     QElapsedTimer renderTimer;
+    // Sub-phase timing (only meaningful under --profile). gen = surface coords,
+    // sample = chunk sample/decode, blit = colormap LUT + framebuffer write.
+    const bool profilePhases = ProfileLoggingEnabled();
+    qint64 phaseGenMs = -1, phaseSampleMs = 0, phaseBlitMs = 0;
+    bool phaseGenCached = false;
+    QElapsedTimer phaseTimer;
     if (ProfileLoggingEnabled()) {
         renderTimer.start();
-        Logger()->info("[vc3d-profile] renderFrame begin reason='{}' caller='{}' serial={} surf='{}' size={}x{} level={} interactive={} overlay={} composite={} planeComposite={}",
+        Logger()->info("[vc3d-profile] renderFrame begin reason='{}' caller='{}' serial={} surf='{}' size={}x{} level={} overlay={} composite={} planeComposite={}",
                        ctx.profileReason, ctx.profileCaller, ctx.serial,
                        ctx.surf ? ctx.surf->id : std::string(""),
-                       ctx.fbW, ctx.fbH, ctx.startLevel, ctx.interactivePreview,
+                       ctx.fbW, ctx.fbH, ctx.startLevel,
                        bool(ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f),
                        ctx.compositeSettings.enabled, ctx.compositeSettings.planeEnabled);
     }
@@ -2030,8 +1906,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         if (!ProfileLoggingEnabled() || !renderTimer.isValid())
             return;
         result.renderFrameElapsedMs = renderTimer.elapsed();
-        Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
-                       result.renderFrameElapsedMs, ctx.profileReason, ctx.profileCaller,
+        Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} gen_ms={} genCached={} sample_ms={} blit_ms={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
+                       result.renderFrameElapsedMs, phaseGenMs, phaseGenCached,
+                       phaseSampleMs, phaseBlitMs, ctx.profileReason, ctx.profileCaller,
                        result.serial, result.framebuffer.width(), result.framebuffer.height());
     };
 
@@ -2065,13 +1942,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                            vc::render::ChunkCache& array) {
         const bool wantComposite = ctx.compositeSettings.planeEnabled && !streamingCompositeUnsupported();
         if (!wantComposite) {
-            if (ctx.interactivePreview) {
-                vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
-                    array, ctx.startLevel, origin, vxStep, vyStep, dst, cov, options);
-            } else {
-                vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-                    array, ctx.startLevel, origin, vxStep, vyStep, dst, cov, options);
-            }
+            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
+                array, ctx.startLevel, origin, vxStep, vyStep, dst, cov, options);
             return;
         }
 
@@ -2089,15 +1961,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             layerValues.emplace_back(dst.rows, dst.cols, uint8_t(0));
             layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
             const cv::Vec3f layerOrigin = origin + normal * (float(zStart + i) * zStep);
-            if (ctx.interactivePreview) {
-                vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
-                    array, ctx.startLevel, layerOrigin, vxStep, vyStep,
-                    layerValues.back(), layerCoverage.back(), compositeOptions);
-            } else {
-                vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-                    array, ctx.startLevel, layerOrigin, vxStep, vyStep,
-                    layerValues.back(), layerCoverage.back(), compositeOptions);
-            }
+            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
+                array, ctx.startLevel, layerOrigin, vxStep, vyStep,
+                layerValues.back(), layerCoverage.back(), compositeOptions);
         }
         LayerStack stack;
         stack.values.resize(numLayers);
@@ -2132,13 +1998,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                    !streamingCompositeUnsupported() &&
                                    !normals.empty();
         if (!wantComposite) {
-            if (ctx.interactivePreview) {
-                vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-                    array, ctx.startLevel, coords, dst, cov, options);
-            } else {
-                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                    array, ctx.startLevel, coords, dst, cov, options);
-            }
+            vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                array, ctx.startLevel, coords, dst, cov, options);
             return;
         }
 
@@ -2168,15 +2029,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             }
             layerValues.emplace_back(dst.rows, dst.cols, uint8_t(0));
             layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
-            if (ctx.interactivePreview) {
-                vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-                    array, ctx.startLevel, layerCoords,
-                    layerValues.back(), layerCoverage.back(), compositeOptions);
-            } else {
-                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                    array, ctx.startLevel, layerCoords,
-                    layerValues.back(), layerCoverage.back(), compositeOptions);
-            }
+            vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                array, ctx.startLevel, layerCoords,
+                layerValues.back(), layerCoverage.back(), compositeOptions);
         }
         LayerStack stack;
         stack.values.resize(numLayers);
@@ -2215,22 +2070,18 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                + n * ctx.zOff;
         const cv::Vec3f vxStep = vx / ctx.scale;
         const cv::Vec3f vyStep = vy / ctx.scale;
+        if (profilePhases) phaseTimer.restart();
         samplePlane(origin, vxStep, vyStep, n, values, coverage, *ctx.chunkArray);
+        if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
         if (ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
             overlayValues.create(ctx.fbH, ctx.fbW);
             overlayCoverage.create(ctx.fbH, ctx.fbW);
             overlayValues.setTo(0);
             overlayCoverage.setTo(0);
             const int level = std::clamp(ctx.startLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
-            if (ctx.interactivePreview) {
-                vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
-                    *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
-                    overlayValues, overlayCoverage, options);
-            } else {
-                vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-                    *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
-                    overlayValues, overlayCoverage, options);
-            }
+            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
+                *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
+                overlayValues, overlayCoverage, options);
         }
     } else {
         cv::Mat_<cv::Vec3f> coords;
@@ -2268,10 +2119,13 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             }
         }
 
+        phaseGenCached = genCacheHit;
         if (!genCacheHit) {
+            if (profilePhases) phaseTimer.restart();
             ctx.surf->gen(&coords, needSurfaceNormals ? &normals : nullptr,
                           cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0}, ctx.scale, offset);
             applyPerPixelNormalOffset(coords, normals, ctx.zOff);
+            if (profilePhases) phaseGenMs = phaseTimer.elapsed();
 
             if (ctx.genCache && !coords.empty()) {
                 std::lock_guard lock(ctx.genCache->mutex);
@@ -2288,24 +2142,22 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             }
         }
         if (!coords.empty()) {
+            if (profilePhases) phaseTimer.restart();
             sampleCoords(coords, normals, values, coverage, *ctx.chunkArray);
+            if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
             if (ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
                 overlayValues.create(ctx.fbH, ctx.fbW);
                 overlayCoverage.create(ctx.fbH, ctx.fbW);
                 overlayValues.setTo(0);
                 overlayCoverage.setTo(0);
                 const int level = std::clamp(ctx.startLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
-                if (ctx.interactivePreview) {
-                    vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
-                } else {
-                    vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
-                }
+                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                    *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
             }
         }
     }
 
+    if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
     vc::buildWindowLevelColormapLut(lut, ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
     std::array<uint32_t, 256> overlayLut{};
@@ -2333,8 +2185,38 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             row[x] = pixel;
         }
     }
+    if (profilePhases) phaseBlitMs = phaseTimer.elapsed();
     finishRenderFrameProfile();
     return result;
+}
+
+// Hash of every output-affecting VIEW parameter (camera, sampling, window/level,
+// colormaps, overlay, composite settings) -- NOT chunk data. Two submits with the
+// same key produce the same pixels for the same resident data, so a submit that
+// lands while a worker is busy need not discard the in-flight frame unless this key
+// changed. FNV-1a over the raw bytes of the relevant scalars + string ids.
+std::size_t CChunkedVolumeViewer::viewParamsKey() const
+{
+    std::size_t h = 1469598103934665603ULL;
+    auto mix = [&h](const void* p, std::size_t n) {
+        const unsigned char* b = static_cast<const unsigned char*>(p);
+        for (std::size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+    };
+    auto mixF = [&](float v) { mix(&v, sizeof v); };
+    auto mixS = [&](const std::string& s) { mix(s.data(), s.size()); h ^= s.size(); h *= 1099511628211ULL; };
+    mixF(_surfacePtrX); mixF(_surfacePtrY); mixF(_scale); mixF(_zOff);
+    mix(&_zOffWorldDir, sizeof _zOffWorldDir);
+    mix(&_samplingMethod, sizeof _samplingMethod);
+    mixF(_windowLow); mixF(_windowHigh);
+    mixS(_baseColormapId);
+    mix(&_compositeSettings, sizeof _compositeSettings);
+    // overlay state (its presence/opacity/window/colormap changes pixels)
+    const void* ov = _overlayVolume.get(); mix(&ov, sizeof ov);
+    mixF(_overlayOpacity); mixF(_overlayWindowLow); mixF(_overlayWindowHigh);
+    mixS(_overlayColormapId);
+    int w = _framebuffer.width(), hh = _framebuffer.height();
+    mix(&w, sizeof w); mix(&hh, sizeof hh);
+    return h;
 }
 
 void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location caller)
@@ -2348,6 +2230,14 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
+        return;
+    }
+    // Hidden viewer (minimized subwindow / background tab): skip the render AND its
+    // prefetch entirely. Mark stale so showEvent renders it when it becomes visible.
+    if (!isVisible()) {
+        _renderStaleWhileHidden = true;
+        _renderPending = false;
+        profile.setDetails("action=skip hidden");
         return;
     }
 
@@ -2367,12 +2257,21 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
 
+    const std::size_t paramsKey = viewParamsKey();
     if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
-        ++_renderSerial;
+        // A render is already in flight. Only DISCARD it (bump the serial so its
+        // result is dropped) when the view params changed -- a data-only refresh
+        // (chunks landed) lets the in-flight frame finish and display, and we just
+        // re-render once it does. Stops slow frames from being thrown away mid-stream.
+        if (paramsKey != _inFlightParamsKey)
+            ++_renderSerial;
         _renderPendingAfterWorker = true;
-        profile.setDetails("action=queued_after_worker");
+        profile.setDetails(paramsKey != _inFlightParamsKey
+                               ? "action=queued_after_worker view_changed"
+                               : "action=queued_after_worker data_only");
         return;
     }
+    _inFlightParamsKey = paramsKey;
 
     _chunkArray->beginViewRequest();
     if (_overlayChunkArray)
@@ -2403,7 +2302,6 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     ctx.overlayColormapId = _overlayColormapId;
     ctx.overlayWindowLow = _overlayWindowLow;
     ctx.overlayWindowHigh = _overlayWindowHigh;
-    ctx.interactivePreview = _interactivePreview;
     ctx.genCache = _genSurfaceCache;
     ctx.genCacheDirty = _genCacheDirty;
     if (ProfileLoggingEnabled()) {
@@ -2413,8 +2311,8 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     _genCacheDirty = false;
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "action=worker_start serial={} size={}x{} level={} interactive={}",
-            ctx.serial, ctx.fbW, ctx.fbH, ctx.startLevel, ctx.interactivePreview));
+            "action=worker_start serial={} size={}x{} level={}",
+            ctx.serial, ctx.fbW, ctx.fbH, ctx.startLevel));
     }
 
     QPointer<CChunkedVolumeViewer> guard(this);
@@ -2453,37 +2351,27 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
 
     _framebuffer = std::move(result->framebuffer);
     syncCameraTransform();
-    if (_interactivePreview)
-        updateIntersectionPreviewTransform();
-    else
-        scheduleIntersectionRender("stable render finished");
-    if (!_interactivePreview) {
-        if (auto surf = _surfWeak.lock()) {
-            const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
-            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-                const int startLevel = renderStartLevel(false);
-                const cv::Vec3f vx = plane->basisX();
-                const cv::Vec3f vy = plane->basisY();
-                const cv::Vec3f n = plane->normal({0, 0, 0});
-                const float halfW = static_cast<float>(_framebuffer.width()) * 0.5f / _scale;
-                const float halfH = static_cast<float>(_framebuffer.height()) * 0.5f / _scale;
-                const cv::Vec3f origin = vx * (_surfacePtrX - halfW)
-                                       + vy * (_surfacePtrY - halfH)
-                                       + plane->origin()
-                                       + n * _zOff;
-                prefetchPlaneHalo(origin, vx / _scale, vy / _scale, startLevel, options);
-                prefetchPlaneNormalNeighbors(*plane, startLevel, options);
-            } else {
-                prefetchSurfaceHalo(*surf, renderStartLevel(true), options,
-                                    _framebuffer.width(), _framebuffer.height());
-            }
+    scheduleIntersectionRender("stable render finished");
+    if (auto surf = _surfWeak.lock()) {
+        const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
+        if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+            const int startLevel = renderStartLevel(false);
+            const cv::Vec3f vx = plane->basisX();
+            const cv::Vec3f vy = plane->basisY();
+            const cv::Vec3f n = plane->normal({0, 0, 0});
+            const float halfW = static_cast<float>(_framebuffer.width()) * 0.5f / _scale;
+            const float halfH = static_cast<float>(_framebuffer.height()) * 0.5f / _scale;
+            const cv::Vec3f origin = vx * (_surfacePtrX - halfW)
+                                   + vy * (_surfacePtrY - halfH)
+                                   + plane->origin()
+                                   + n * _zOff;
+            prefetchPlaneHalo(origin, vx / _scale, vy / _scale, startLevel, options);
+            prefetchPlaneNormalNeighbors(*plane, startLevel, options);
+        } else {
+            prefetchSurfaceHalo(*surf, renderStartLevel(true), options,
+                                _framebuffer.width(), _framebuffer.height());
         }
     }
-    _stableFramebuffer = _framebuffer.copy();
-    _stableSurfX = result->surfacePtrX;
-    _stableSurfY = result->surfacePtrY;
-    _stableScale = result->scale;
-    _stableFramebufferValid = !_stableFramebuffer.isNull();
     emit overlaysUpdated();
     _view->viewport()->update();
     updateStatusLabel();
@@ -2505,8 +2393,8 @@ void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::so
     ProfileScope profile("renderVisible", reason, caller);
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "surf='{}' force={} pending={} interactive={} scale={:.4f} zOff={:.3f}",
-            _surfName, force, _renderPending, _interactivePreview, _scale, _zOff));
+            "surf='{}' force={} pending={} scale={:.4f} zOff={:.3f}",
+            _surfName, force, _renderPending, _scale, _zOff));
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
@@ -2517,8 +2405,6 @@ void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::so
         profile.setDetails("action=schedule");
         return;
     }
-    if (_renderTimer && _renderTimer->isActive())
-        _renderTimer->stop();
     _renderPending = false;
     submitRender("renderVisible force", caller);
     updateStatusLabel();
@@ -2569,11 +2455,6 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
                     auto volume = overlayVolumeWeak.lock();
                     if (!volume || guard->_overlayVolume != volume || guard->_closing)
                         return;
-                    if (guard->_interactivePreview) {
-                        if (guard->_settleRenderTimer)
-                            guard->_settleRenderTimer->start(kChunkReadyActiveDelayMs);
-                        return;
-                    }
                     guard->scheduleRender("overlay chunk ready");
                 }, Qt::QueuedConnection);
             });
@@ -2629,8 +2510,6 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
         _surfacePtrY = std::clamp(_surfacePtrY, _contentMinV, _contentMaxV);
     }
     prefetchVisibleSurfaceChunks();
-    if (shouldRefreshInteractivePreview())
-        updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
     scheduleRender("pan");
     refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
@@ -2663,8 +2542,6 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _genCacheDirty = true;
     resizeFramebuffer();
     prefetchVisibleSurfaceChunks();
-    if (shouldRefreshInteractivePreview())
-        updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
     scheduleRender("zoom");
     refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
@@ -2684,11 +2561,7 @@ void CChunkedVolumeViewer::notifyInteractiveViewChange(double motionPx)
     markInteractiveMotion(motionPx);
     _genCacheDirty = true;
     prefetchVisibleSurfaceChunks();
-    if (shouldRefreshInteractivePreview()) {
-        _renderPending = false;
-        submitRender("interactive view change preview");
-    }
-    scheduleRender("interactive view change final render");
+    scheduleRender("interactive view change");
     emit overlaysUpdated();
 }
 
@@ -2712,7 +2585,6 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
     _zOff = 0.0f;
     _zOffWorldDir = {0, 0, 0};
     _genCacheDirty = true;
-    _stableFramebufferValid = false;
     scheduleRender("surface offsets reset");
 }
 
@@ -2723,7 +2595,6 @@ void CChunkedVolumeViewer::fitSurfaceInView()
     _scale = 0.5f;
     recalcPyramidLevel();
     _genCacheDirty = true;
-    _stableFramebufferValid = false;
     scheduleRender("fit surface in view");
 }
 
@@ -2768,15 +2639,12 @@ void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool for
     _surfacePtrY = point[1];
     _genCacheDirty = true;
     if (forceRender) {
-        _stableFramebufferValid = false;
         renderVisible(true, "center on surface point");
     } else {
         const double motionPx = std::hypot(double(_surfacePtrX - oldSurfacePtrX),
                                           double(_surfacePtrY - oldSurfacePtrY)) *
                                 double(std::max(_scale, kMinScale));
         markInteractiveMotion(motionPx);
-        if (shouldRefreshInteractivePreview())
-            updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
         scheduleRender("center on surface point");
     }
     emit overlaysUpdated();
@@ -2788,6 +2656,9 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
     if (!surf)
         return;
     if (modifiers & Qt::ShiftModifier) {
+        if (_shiftScrollOverride && _shiftScrollOverride(steps, scenePoint, modifiers)) {
+            return;
+        }
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
             const cv::Vec3f normal = plane->normal({0, 0, 0});
             if (std::isfinite(normal[0]) && std::isfinite(normal[1]) &&
@@ -2804,7 +2675,6 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                     _surfWeak = _defaultSurface;
                     updateContentBounds();
                     _genCacheDirty = true;
-                    _stableFramebufferValid = false;
                     scheduleRender("plane slice mouse wheel");
                 }
             }
@@ -2827,11 +2697,10 @@ void CChunkedVolumeViewer::onResized()
     }
     resizeFramebuffer();
     _genCacheDirty = true;
-    if (_renderTimer && _renderTimer->isActive())
-        _renderTimer->stop();
-    _renderPending = false;
-    if (_resizeRenderTimer)
-        _resizeRenderTimer->start();
+    // Just mark pending: the global clock coalesces the resize-event burst into one
+    // render per tick, and the worker-busy + view-param fingerprint discard supersede
+    // any mid-drag render with the latest size -- no special resize-settle handling.
+    scheduleRender("resized");
     _view->viewport()->update();
 }
 
@@ -2868,7 +2737,6 @@ void CChunkedVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
     _panSmoothingInitialized = false;
     _smoothedPanDx = 0.0f;
     _smoothedPanDy = 0.0f;
-    _lastInteractivePreviewMs = -1;
     markInteractiveMotion(0.0);
     _lastPanSceneF = _view->mapToScene(_view->mapFromGlobal(QCursor::pos()));
 }
@@ -2876,19 +2744,18 @@ void CChunkedVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
 void CChunkedVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
 {
     _isPanning = false;
-    _interactivePreview = false;
     _panSmoothingInitialized = false;
     _smoothedPanDx = 0.0f;
     _smoothedPanDy = 0.0f;
-    _lastInteractivePreviewMs = -1;
-    if (_settleRenderTimer)
-        _settleRenderTimer->stop();
     scheduleRender("pan released");
 }
 
 void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton && modifiers.testFlag(Qt::ShiftModifier)) {
+        if (_sameWrapAnnotation.manualPathType()) {
+            return;
+        }
         const bool appendToPreview = _sameWrapAnnotation.hasPreview() &&
                                      !_sameWrapAnnotation.shiftReleasedSincePreview();
         if (_sameWrapAnnotation.generatePreview(
@@ -2907,40 +2774,66 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
         }
     }
 
-    auto surf = _surfWeak.lock();
-    const auto cursorPos = cursorVolumePosition(scenePos);
-    cv::Vec3f volumePos;
-    if (cursorPos) {
-        volumePos = *cursorPos;
-    } else {
-        volumePos = sceneToVolume(scenePos);
-    }
-    cv::Vec3f n(0, 0, 1);
-    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-        n = plane->normal({0, 0, 0});
-    } else if (surf) {
-        const cv::Vec2f sp = sceneToSurface(scenePos);
-        const cv::Vec3f surfaceNormal = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
-        if (std::isfinite(surfaceNormal[0]) &&
-            std::isfinite(surfaceNormal[1]) &&
-            std::isfinite(surfaceNormal[2])) {
-            n = surfaceNormal;
+    if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+        if (const auto hit = pointAtScenePosition(scenePos)) {
+            _selectedCollectionId = hit->first;
+            _selectedPointId = hit->second;
+            emit pointClicked(_selectedPointId);
+            emit overlaysUpdated();
+            return;
         }
     }
-    emit sendVolumeClicked(volumePos, n, surf.get(), button, modifiers);
+
+    const auto sample = sampleSceneVolume(scenePos);
+    if (!sample) {
+        return;
+    }
+    emit sendVolumeClicked(sample->position, sample->normal, sample->surface, button, modifiers);
+}
+
+void CChunkedVolumeViewer::onCollectionSelected(uint64_t collectionId)
+{
+    _selectedCollectionId = collectionId;
+    if (_selectedPointId != 0) {
+        const auto point = _pointCollection ? _pointCollection->getPoint(_selectedPointId)
+                                            : std::optional<ColPoint>{};
+        if (!point || point->collectionId != collectionId) {
+            _selectedPointId = 0;
+        }
+    }
+    emit overlaysUpdated();
+}
+
+void CChunkedVolumeViewer::onPointSelected(uint64_t pointId)
+{
+    _selectedPointId = pointId;
+    if (_pointCollection && pointId != 0) {
+        if (const auto point = _pointCollection->getPoint(pointId)) {
+            _selectedCollectionId = point->collectionId;
+        }
+    }
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationMode(bool enabled)
 {
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.setEnabled(enabled);
     if (!enabled) {
         clearSameWrapAnnotationPreview();
     }
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationSpacing(double spacingVx)
 {
     _sameWrapAnnotation.setSpacing(spacingVx);
+}
+
+void CChunkedVolumeViewer::setSameWrapAnnotationPolylineOpacity(double opacity)
+{
+    _sameWrapAnnotationPolylineOpacity = std::clamp(opacity, 0.0, 1.0);
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
@@ -2950,10 +2843,14 @@ void CChunkedVolumeViewer::setSameWrapAnnotationMergeExisting(bool enabled)
 
 void CChunkedVolumeViewer::setSameWrapAnnotationPathType(int pathType)
 {
-    _sameWrapAnnotation.setPathType(
-        pathType == static_cast<int>(SameWrapAnnotationTool::PathType::ShortestPath)
-            ? SameWrapAnnotationTool::PathType::ShortestPath
-            : SameWrapAnnotationTool::PathType::ConnectedComponents);
+    SameWrapAnnotationTool::PathType toolPathType = SameWrapAnnotationTool::PathType::ConnectedComponents;
+    if (pathType == static_cast<int>(SameWrapAnnotationTool::PathType::ShortestPath)) {
+        toolPathType = SameWrapAnnotationTool::PathType::ShortestPath;
+    } else if (pathType == static_cast<int>(SameWrapAnnotationTool::PathType::Manual)) {
+        toolPathType = SameWrapAnnotationTool::PathType::Manual;
+    }
+    _sameWrapManualPathDragActive = false;
+    _sameWrapAnnotation.setPathType(toolPathType);
     clearSameWrapAnnotationPreview();
 }
 
@@ -2975,8 +2872,14 @@ void CChunkedVolumeViewer::setSameWrapAnnotationFilterKernelSize(int kernelSize)
     clearSameWrapAnnotationPreview();
 }
 
+bool CChunkedVolumeViewer::hasSameWrapAnnotationPreview() const
+{
+    return _sameWrapAnnotation.hasPreview();
+}
+
 void CChunkedVolumeViewer::clearSameWrapAnnotationPreview()
 {
+    _sameWrapManualPathDragActive = false;
     _sameWrapAnnotation.clear([this](const std::string& key) { clearOverlayGroup(key); });
 }
 
@@ -2984,7 +2887,18 @@ bool CChunkedVolumeViewer::commitSameWrapAnnotationPreview()
 {
     return _sameWrapAnnotation.commit(
         _pointCollection,
+        [this](const cv::Vec3f& point) { return volumeToScene(point); },
+        QRectF(0.0, 0.0, _framebuffer.width(), _framebuffer.height()),
         [this](const std::string& key) { clearOverlayGroup(key); });
+}
+
+bool CChunkedVolumeViewer::undoSameWrapAnnotation()
+{
+    if (_sameWrapAnnotation.hasPreview()) {
+        clearSameWrapAnnotationPreview();
+        return true;
+    }
+    return _sameWrapAnnotation.undoLastCommit(_pointCollection);
 }
 
 void CChunkedVolumeViewer::refreshSameWrapAnnotationOverlay()
@@ -3007,10 +2921,71 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    _sameWrapManualMergePressConsumed = false;
+
+    if (_sameWrapAnnotation.enabled() && button == Qt::RightButton &&
+        modifiers.testFlag(Qt::ShiftModifier)) {
+        if (const auto hit = pointAtScenePosition(scenePos)) {
+            if (_sameWrapAnnotation.manualMergePointClicked(
+                    _pointCollection,
+                    hit->first,
+                    hit->second,
+                    [this](const cv::Vec3f& point) { return volumeToScene(point); },
+                    QRectF(0.0, 0.0, _framebuffer.width(), _framebuffer.height()),
+                    [this](const SameWrapAnnotationTool::MixedDirectionMergeWarning& warning) {
+                        const auto directionText = [this](const std::string& key) {
+                            return key == "z" ? tr("mostly up/down in Z") : tr("mostly in XY");
+                        };
+                        const QMessageBox::StandardButton reply = QMessageBox::warning(
+                            this,
+                            tr("Same-wrap Merge"),
+                            tr("You are about to merge two same-wrap point collections with different dominant directions:\n\n"
+                               "%1: %2\n"
+                               "%3: %4\n\n"
+                               "Continue merging?")
+                                .arg(QString::fromStdString(warning.firstCollectionName),
+                                     directionText(warning.firstDirectionKey),
+                                     QString::fromStdString(warning.secondCollectionName),
+                                     directionText(warning.secondDirectionKey)),
+                            QMessageBox::Yes | QMessageBox::No,
+                            QMessageBox::No);
+                        return reply == QMessageBox::Yes;
+                    })) {
+                if (_pointCollection && _pointCollection->getPoint(hit->second)) {
+                    _selectedCollectionId = hit->first;
+                    _selectedPointId = hit->second;
+                } else {
+                    _selectedCollectionId = 0;
+                    _selectedPointId = 0;
+                }
+                _sameWrapManualMergePressConsumed = true;
+                if (_selectedPointId != 0) {
+                    emit pointClicked(_selectedPointId);
+                }
+                emit overlaysUpdated();
+                return;
+            }
+        }
+    }
+
     if (_sameWrapAnnotation.enabled() && button == Qt::LeftButton &&
         modifiers.testFlag(Qt::ShiftModifier)) {
+        if (_sameWrapAnnotation.manualPathType()) {
+            const bool appendToPreview = _sameWrapAnnotation.hasPreview() &&
+                                         !_sameWrapAnnotation.shiftReleasedSincePreview();
+            _sameWrapManualPathDragActive = _sameWrapAnnotation.beginManualPreview(
+                scenePos,
+                appendToPreview,
+                [this](const QPointF& point) { return sceneToVolume(point); },
+                [this](const cv::Vec3f& point) { return volumeToScene(point); },
+                [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                    setOverlayGroup(key, items);
+                },
+                [this](const std::string& key) { clearOverlayGroup(key); });
+        }
         return;
     }
+
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _bboxStart = QPointF(sp[0], sp[1]);
@@ -3025,11 +3000,16 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
         volumePos = sceneToVolume(scenePos);
     }
     emit sendMousePressVolume(volumePos, {0, 0, 1}, button, modifiers, scenePos);
+    if (_lineAnnotationPlacementPreviewEnabled && button == Qt::LeftButton &&
+        modifiers == Qt::NoModifier &&
+        std::isfinite(volumePos[0]) && std::isfinite(volumePos[1]) &&
+        std::isfinite(volumePos[2])) {
+        emit sendLineAnnotationSeedRequested(volumePos, scenePos);
+    }
 }
 
 void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
 {
-    Q_UNUSED(modifiers);
     const bool reusedCursorSample = (_lastScenePos == scenePos && _lastCursorVolumePos.has_value());
     if (!reusedCursorSample) {
         _lastCursorVolumePos = cursorVolumePosition(scenePos);
@@ -3037,6 +3017,30 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
     _lastScenePos = scenePos;
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+
+    const uint64_t previousHighlight = _highlightedPointId;
+    if (const auto hit = pointAtScenePosition(scenePos)) {
+        _highlightedPointId = hit->second;
+    } else {
+        _highlightedPointId = 0;
+    }
+    if (_highlightedPointId != previousHighlight) {
+        emit overlaysUpdated();
+    }
+
+    if (_sameWrapManualPathDragActive && (buttons & Qt::LeftButton)) {
+        _sameWrapAnnotation.appendManualPreview(
+            scenePos,
+            _scale,
+            _pointCollection,
+            [this](const QPointF& point) { return sceneToVolume(point); },
+            [this](const cv::Vec3f& point) { return volumeToScene(point); },
+            [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                setOverlayGroup(key, items);
+            },
+            [this](const std::string& key) { clearOverlayGroup(key); });
+        return;
+    }
     if (_bboxMode && _activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _activeBBoxSurfRect = QRectF(_bboxStart, QPointF(sp[0], sp[1])).normalized();
@@ -3049,6 +3053,13 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
     } else {
         volumePos = sceneToVolume(scenePos);
     }
+    if (_lineAnnotationPlacementPreviewEnabled &&
+        std::isfinite(volumePos[0]) && std::isfinite(volumePos[1]) &&
+        std::isfinite(volumePos[2])) {
+        updateLineAnnotationPlacementMarker(scenePos);
+    } else {
+        clearLineAnnotationPlacementMarker();
+    }
     emit sendMouseMoveVolume(volumePos, buttons, modifiers, scenePos);
 }
 
@@ -3058,6 +3069,24 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_sameWrapManualMergePressConsumed && button == Qt::RightButton) {
+        _sameWrapManualMergePressConsumed = false;
+        return;
+    }
+    if (_sameWrapManualPathDragActive && button == Qt::LeftButton) {
+        _sameWrapAnnotation.appendManualPreview(
+            scenePos,
+            _scale,
+            _pointCollection,
+            [this](const QPointF& point) { return sceneToVolume(point); },
+            [this](const cv::Vec3f& point) { return volumeToScene(point); },
+            [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
+                setOverlayGroup(key, items);
+            },
+            [this](const std::string& key) { clearOverlayGroup(key); });
+        _sameWrapManualPathDragActive = false;
+        return;
+    }
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton &&
         _activeBBoxSurfRect) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
@@ -3152,8 +3181,16 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
     if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
         cv::Vec3f ptr = quad->pointer();
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        if (quad->pointTo(ptr, volPoint, 4.0f, 100, patchIndex) < 0.0f)
-            return {};
+        // Match the points-overlay default view tolerance so points that are meant to
+        // render faded still project to their true location rather than collapsing.
+        constexpr float kQuadProjectTolerance = 10.0f;
+        // pointTo() with a patch index signals "no surface point within tolerance" by
+        // returning a positive value (~the tolerance) WITHOUT updating ptr, so a bare
+        // `< 0.0f` check would silently keep ptr at {0,0,0} and map the point to the
+        // segment center. Treat anything outside the tolerance as a failed projection.
+        const float dist = quad->pointTo(ptr, volPoint, kQuadProjectTolerance, 100, patchIndex);
+        if (dist < 0.0f || dist > kQuadProjectTolerance)
+            return {NAN, NAN};
         const cv::Vec3f loc = quad->loc(ptr);
         return surfaceToScene(loc[0], loc[1]);
     }
@@ -3195,6 +3232,50 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
     _cursorCrosshair->show();
 }
 
+void CChunkedVolumeViewer::setLineAnnotationPlacementPreviewEnabled(bool enabled)
+{
+    _lineAnnotationPlacementPreviewEnabled = enabled;
+    if (!enabled) {
+        clearLineAnnotationPlacementMarker();
+    }
+}
+
+bool CChunkedVolumeViewer::lineAnnotationPlacementMarkerVisible() const
+{
+    return _lineAnnotationPlacementMarker && _lineAnnotationPlacementMarker->isVisible();
+}
+
+void CChunkedVolumeViewer::updateLineAnnotationPlacementMarker(const QPointF& scenePos)
+{
+    if (!_lineAnnotationPlacementPreviewEnabled || !_scene ||
+        !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        clearLineAnnotationPlacementMarker();
+        return;
+    }
+
+    if (!_lineAnnotationPlacementMarker || !_lineAnnotationPlacementMarker->scene()) {
+        auto* marker = new QGraphicsEllipseItem(-6.0, -6.0, 12.0, 12.0);
+        QPen pen(QColor(Qt::yellow), 2.0);
+        pen.setCosmetic(true);
+        marker->setPen(pen);
+        marker->setBrush(QBrush(QColor(255, 255, 0, 70)));
+        marker->setZValue(135.0);
+        marker->setAcceptedMouseButtons(Qt::NoButton);
+        _scene->addItem(marker);
+        _lineAnnotationPlacementMarker = marker;
+    }
+
+    _lineAnnotationPlacementMarker->setPos(scenePos);
+    _lineAnnotationPlacementMarker->show();
+}
+
+void CChunkedVolumeViewer::clearLineAnnotationPlacementMarker()
+{
+    if (_lineAnnotationPlacementMarker) {
+        _lineAnnotationPlacementMarker->hide();
+    }
+}
+
 std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPointF& scenePos) const
 {
     auto surf = _surfWeak.lock();
@@ -3211,6 +3292,63 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
             p += n * _zOff;
     }
     return p;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtScenePosition(const QPointF& scenePos)
+{
+    if (!_pointCollection || !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        return std::nullopt;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    if (collections.empty()) {
+        return std::nullopt;
+    }
+
+    constexpr qreal kPointHitRadius = 4.0;
+    constexpr qreal kPointHitRadiusSq = kPointHitRadius * kPointHitRadius;
+
+    // volumeToScene() is expensive on a QuadSurface (a per-point pointTo search) and
+    // this runs on every mouse-move for hover highlighting. Reject points that are
+    // obviously too far before paying for the projection: the cursor's volume position
+    // lies on the current surface, so a marker can only fall within kPointHitRadius
+    // scene px if it is within ~kPointHitRadius/_scale surface units laterally, plus a
+    // normal-direction margin covering the depth band that is actually drawn (markers
+    // fade out past the view tolerance, whose generous ceiling we bound below).
+    const std::optional<cv::Vec3f> cursorVol = cursorVolumePosition(scenePos);
+    constexpr float kHoverDepthMarginVx = 256.0f;
+    const float lateralBoundVx = static_cast<float>(kPointHitRadius) / std::max(_scale, 1e-3f);
+    const float prefilterRadiusVx = lateralBoundVx + kHoverDepthMarginVx;
+    const float prefilterRadiusSqVx = prefilterRadiusVx * prefilterRadiusVx;
+
+    qreal bestDistSq = kPointHitRadiusSq;
+    std::optional<std::pair<uint64_t, uint64_t>> bestHit;
+
+    for (const auto& [collectionId, collection] : collections) {
+        for (const auto& [pointId, point] : collection.points) {
+            if (cursorVol) {
+                const cv::Vec3f delta = point.p - *cursorVol;
+                if (delta.dot(delta) > prefilterRadiusSqVx) {
+                    continue;
+                }
+            }
+
+            const QPointF pointScenePos = volumeToScene(point.p);
+            if (!std::isfinite(pointScenePos.x()) || !std::isfinite(pointScenePos.y())) {
+                continue;
+            }
+
+            const qreal dx = pointScenePos.x() - scenePos.x();
+            const qreal dy = pointScenePos.y() - scenePos.y();
+            const qreal distSq = dx * dx + dy * dy;
+            if (distSq <= bestDistSq) {
+                bestDistSq = distSq;
+                bestHit = std::make_pair(collectionId, pointId);
+            }
+        }
+    }
+
+    return bestHit;
 }
 
 void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&)
@@ -3261,6 +3399,45 @@ cv::Vec3f CChunkedVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
         return {0, 0, 0};
     const cv::Vec2f sp = sceneToSurface(scenePoint);
     return surf->coord({0, 0, 0}, {sp[0], sp[1], 0});
+}
+
+std::optional<CChunkedVolumeViewer::SceneVolumeSample> CChunkedVolumeViewer::sampleSceneVolume(
+    const QPointF& scenePoint) const
+{
+    auto surf = _surfWeak.lock();
+    if (!surf) {
+        return std::nullopt;
+    }
+
+    const auto cursorPos = cursorVolumePosition(scenePoint);
+    SceneVolumeSample sample;
+    sample.position = cursorPos ? *cursorPos : sceneToVolume(scenePoint);
+    sample.surface = surf.get();
+    if (!std::isfinite(sample.position[0]) ||
+        !std::isfinite(sample.position[1]) ||
+        !std::isfinite(sample.position[2])) {
+        return std::nullopt;
+    }
+
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        sample.normal = plane->normal({0, 0, 0});
+    } else {
+        const cv::Vec2f sp = sceneToSurface(scenePoint);
+        const cv::Vec3f surfaceNormal = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
+        if (std::isfinite(surfaceNormal[0]) &&
+            std::isfinite(surfaceNormal[1]) &&
+            std::isfinite(surfaceNormal[2]) &&
+            cv::norm(surfaceNormal) > 0.0f) {
+            sample.normal = surfaceNormal;
+        }
+    }
+    if (!std::isfinite(sample.normal[0]) ||
+        !std::isfinite(sample.normal[1]) ||
+        !std::isfinite(sample.normal[2]) ||
+        cv::norm(sample.normal) <= 0.0f) {
+        sample.normal = {0, 0, 1};
+    }
+    return sample;
 }
 
 void CChunkedVolumeViewer::setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items)
@@ -3961,26 +4138,52 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         tilePaths.emplace(tileKey, std::vector<QPainterPath>(planes.size()));
     }
 
-    for (const auto& [cellKey, lines] : _flattenedIntersectionCache.cellLines) {
-        const int col = int(std::uint32_t(cellKey));
-        const int row = int(std::uint32_t(cellKey >> 32));
-        const std::uint64_t tileKey = surfaceCellTileKey(col, row);
+    auto appendLinesForCell = [&](std::uint64_t tileKey, std::uint64_t cellKey) {
         auto pathsIt = tilePaths.find(tileKey);
         if (pathsIt == tilePaths.end()) {
-            continue;
+            return;
         }
+        const auto linesIt = _flattenedIntersectionCache.cellLines.find(cellKey);
+        if (linesIt == _flattenedIntersectionCache.cellLines.end()) {
+            return;
+        }
+        const auto dirtyIt = dirtyTilePlanes.find(tileKey);
+        if (dirtyIt == dirtyTilePlanes.end()) {
+            return;
+        }
+
         auto& paths = pathsIt->second;
-        for (const auto& line : lines) {
+        for (const auto& line : linesIt->second) {
             if (line.planeIndex < 0 || static_cast<size_t>(line.planeIndex) >= paths.size()) {
                 continue;
             }
-            const auto dirtyIt = dirtyTilePlanes.find(tileKey);
-            if (dirtyIt == dirtyTilePlanes.end() ||
-                dirtyIt->second.count(line.planeIndex) == 0) {
+            if (dirtyIt->second.count(line.planeIndex) == 0) {
                 continue;
             }
             paths[line.planeIndex].moveTo(line.a);
             paths[line.planeIndex].lineTo(line.b);
+        }
+    };
+
+    if (rebuildAllTileItems) {
+        for (const auto& [cellKey, lines] : _flattenedIntersectionCache.cellLines) {
+            const int col = int(std::uint32_t(cellKey));
+            const int row = int(std::uint32_t(cellKey >> 32));
+            appendLinesForCell(surfaceCellTileKey(col, row), cellKey);
+        }
+    } else {
+        for (const auto& [tileKey, _] : dirtyTilePlanes) {
+            const int tileCol = int(std::uint32_t(tileKey));
+            const int tileRow = int(std::uint32_t(tileKey >> 32));
+            const int colStart = std::max(0, tileCol * kSurfaceCellTileSize);
+            const int rowStart = std::max(0, tileRow * kSurfaceCellTileSize);
+            const int colEnd = std::min(points->cols - 1, colStart + kSurfaceCellTileSize);
+            const int rowEnd = std::min(points->rows - 1, rowStart + kSurfaceCellTileSize);
+            for (int row = rowStart; row < rowEnd; ++row) {
+                for (int col = colStart; col < colEnd; ++col) {
+                    appendLinesForCell(tileKey, surfaceTileKey(col, row));
+                }
+            }
         }
     }
 
@@ -4068,6 +4271,12 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         profile.setDetails("action=skip closing");
         return;
     }
+    if (property("vc_viewer_role").toString() == QStringLiteral("annotation")) {
+        clearIntersectionItems();
+        _lastIntersectFp = {};
+        profile.setDetails("action=skip annotation_viewer");
+        return;
+    }
 
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
@@ -4077,20 +4286,16 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         profile.setDetails("action=skip missing_input");
         return;
     }
-    if (!plane) {
-        if (!_planeIntersectionLinesVisible) {
-            clearIntersectionItems();
-            _lastIntersectFp = {};
-            profile.setDetails("action=skip flattened_disabled");
-            return;
-        }
-        renderFlattenedIntersections(surf, reason, caller);
-        profile.setDetails("action=delegated_flattened");
+    if (!plane && !_planeIntersectionLinesVisible) {
+        clearIntersectionItems();
+        _lastIntersectFp = {};
+        profile.setDetails("action=skip flattened_disabled");
         return;
     }
 
     auto* patchIndex = _viewerManager->surfacePatchIndex();
-    if (!patchIndex || patchIndex->empty()) {
+    auto* editPatchIndex = _viewerManager->activeSegmentationEditSurfacePatchIndex();
+    if ((!patchIndex || patchIndex->empty()) && (!editPatchIndex || editPatchIndex->empty())) {
         invalidateIntersect();
         _lastIntersectFp = {};
         profile.setDetails("action=skip empty_patch_index");
@@ -4098,11 +4303,22 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     }
 
     auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    if (!plane) {
+        renderFlattenedIntersections(surf, reason, caller);
+        profile.setDetails("action=delegated_flattened");
+        return;
+    }
+
     std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
     auto addTarget = [&](const std::string& name) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name))) {
             if (activeSeg && quad != activeSeg && !activeSeg->id.empty() &&
                 quad->id == activeSeg->id) {
+                // During editing, named/highlighted surface lookups may resolve
+                // to the saved surface object while the live geometry is in the
+                // active segmentation preview. Target the preview instead of
+                // dropping the surface for this frame.
+                targets.insert(activeSeg);
                 return;
             }
             targets.insert(std::move(quad));
@@ -4126,6 +4342,17 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         profile.setDetails("action=skip no_targets");
         return;
     }
+
+    const bool useEditIndexForActive = _segmentationEditActive && editPatchIndex && !editPatchIndex->empty() &&
+        activeSeg && targets.find(activeSeg) != targets.end();
+    auto globalTargets = targets;
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> editTargets;
+    if (useEditIndexForActive) {
+        editPatchIndex->flushPendingUpdates(activeSeg);
+        globalTargets.erase(activeSeg);
+        editTargets.insert(activeSeg);
+    }
+    auto* primaryPatchIndex = patchIndex ? patchIndex : editPatchIndex;
 
     QRectF sceneRect = _view->mapToScene(_view->viewport()->rect()).boundingRect();
     if (!sceneRect.isValid()) {
@@ -4172,15 +4399,19 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     fp.planeBasisYQ = quantizeVec(plane->basisY());
     fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
     fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
-    fp.indexSamplingStride = patchIndex->samplingStride();
-    fp.patchCount = patchIndex->patchCount();
-    fp.surfaceCount = patchIndex->surfaceCount();
+    fp.indexSamplingStride = primaryPatchIndex ? primaryPatchIndex->samplingStride() : 1;
+    fp.patchCount = (patchIndex ? patchIndex->patchCount() : 0) +
+                    (useEditIndexForActive ? editPatchIndex->patchCount() : 0);
+    fp.surfaceCount = (patchIndex ? patchIndex->surfaceCount() : 0) +
+                      (useEditIndexForActive ? editPatchIndex->surfaceCount() : 0);
     size_t th = 0;
     size_t gh = 0;
     for (const auto& t : targets) {
+        auto* generationIndex = (useEditIndexForActive && t == activeSeg) ? editPatchIndex : patchIndex;
+        const uint64_t generation = generationIndex ? generationIndex->generation(t) : 0;
         th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
         gh ^= std::hash<const void*>{}(t.get()) ^
-              (std::hash<uint64_t>{}(patchIndex->generation(t)) + 0x9e3779b9u);
+              (std::hash<uint64_t>{}(generation) + 0x9e3779b9u);
     }
     fp.targetHash = th;
     fp.targetGenerationHash = gh;
@@ -4264,20 +4495,69 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         cacheRoi.width += padX * 2;
         cacheRoi.height += padY * 2;
 
-        _intersectionGeometryCache = {};
-        _intersectionGeometryCache.roi = cacheRoi;
-        _intersectionGeometryCache.planeOriginQ = fp.planeOriginQ;
-        _intersectionGeometryCache.planeNormalQ = fp.planeNormalQ;
-        _intersectionGeometryCache.planeBasisXQ = fp.planeBasisXQ;
-        _intersectionGeometryCache.planeBasisYQ = fp.planeBasisYQ;
-        _intersectionGeometryCache.indexSamplingStride = fp.indexSamplingStride;
-        _intersectionGeometryCache.patchCount = fp.patchCount;
-        _intersectionGeometryCache.surfaceCount = fp.surfaceCount;
-        _intersectionGeometryCache.targetHash = fp.targetHash;
-        _intersectionGeometryCache.targetGenerationHash = fp.targetGenerationHash;
-        _intersectionGeometryCache.intersections =
-            patchIndex->computePlaneIntersections(*plane, cacheRoi, targets);
-        _intersectionGeometryCache.valid = true;
+        if (useEditIndexForActive) {
+            // The edit index lives in SegmentationEditManager and is mutated on the
+            // main thread during correction-drag; it is not covered by the index-read
+            // gate, so reading it off-thread would race. Compute synchronously here
+            // (global targets on the global index, the active surface on the edit
+            // index) and fall through to the scene-item build below.
+            _intersectionGeometryCache = {};
+            _intersectionGeometryCache.roi = cacheRoi;
+            _intersectionGeometryCache.planeOriginQ = fp.planeOriginQ;
+            _intersectionGeometryCache.planeNormalQ = fp.planeNormalQ;
+            _intersectionGeometryCache.planeBasisXQ = fp.planeBasisXQ;
+            _intersectionGeometryCache.planeBasisYQ = fp.planeBasisYQ;
+            _intersectionGeometryCache.indexSamplingStride = fp.indexSamplingStride;
+            _intersectionGeometryCache.patchCount = fp.patchCount;
+            _intersectionGeometryCache.surfaceCount = fp.surfaceCount;
+            _intersectionGeometryCache.targetHash = fp.targetHash;
+            _intersectionGeometryCache.targetGenerationHash = fp.targetGenerationHash;
+            if (patchIndex && !globalTargets.empty()) {
+                _intersectionGeometryCache.intersections =
+                    patchIndex->computePlaneIntersections(*plane, cacheRoi, globalTargets);
+            }
+            if (!editTargets.empty()) {
+                auto editIntersections = editPatchIndex->computePlaneIntersections(*plane, cacheRoi, editTargets);
+                for (auto& [surface, segments] : editIntersections) {
+                    auto& out = _intersectionGeometryCache.intersections[surface];
+                    out.insert(out.end(), segments.begin(), segments.end());
+                }
+            }
+            _intersectionGeometryCache.valid = true;
+        } else {
+            // Only one compute in flight at a time; while it runs the current scene items
+            // stand as the preview. A later render with changed inputs waits for the
+            // in-flight result (dropped if stale via the gen token) and re-kicks.
+            if (_intersectComputeInFlight) {
+                if (profile.enabled()) profile.setDetails("action=compute_already_in_flight");
+                return;
+            }
+            // Heavy r-tree query + triangle clip -> worker. The QGraphicsItem build (Qt,
+            // main-thread-only) happens in finishPlaneIntersectionCompute when it lands.
+            const std::uint64_t gen = ++_intersectGen;
+            auto planeCopy = std::make_shared<PlaneSurface>(*plane);
+            auto targetsCopy = std::make_shared<std::unordered_set<SurfacePatchIndex::SurfacePtr>>(targets);
+            _intersectComputeInFlight = true;
+            _viewerManager->beginIndexRead();
+            QPointer<CChunkedVolumeViewer> guard(this);
+            ViewerManager* vm = _viewerManager;            // outlives viewers; always end the read
+            SurfacePatchIndex* idx = patchIndex;
+            (void)QtConcurrent::run([guard, vm, gen, cacheRoi, fp, planeCopy, targetsCopy, idx]() mutable {
+                auto out = std::make_shared<std::unordered_map<SurfacePatchIndex::SurfacePtr,
+                    std::vector<SurfacePatchIndex::TriangleSegment>>>(
+                        idx->computePlaneIntersections(*planeCopy, cacheRoi, *targetsCopy));
+                QMetaObject::invokeMethod(qApp, [guard, vm, gen, cacheRoi, fp, out = std::move(out)]() mutable {
+                    if (guard)
+                        guard->finishPlaneIntersectionCompute(gen, cacheRoi, fp, std::move(out));
+                    else if (vm)
+                        vm->endIndexRead();                // viewer gone: still release the gate
+                }, Qt::QueuedConnection);
+            });
+            if (profile.enabled())
+                profile.setDetails(std::format("action=async_compute_kick gen={} roi={}",
+                                               gen, profileRect(cacheRoi)));
+            return;   // scene items rebuilt by finishPlaneIntersectionCompute -> re-entry
+        }
     }
 
     const auto& intersections = _intersectionGeometryCache.intersections;
@@ -4496,6 +4776,40 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     }
 }
 
+// Worker finished computePlaneIntersections (main thread, via invokeMethod). Release
+// the index read-gate; then -- unless superseded -- publish the geometry into the
+// cache and re-run renderIntersections, which now hits the geometry cache and builds
+// the QGraphicsItems synchronously (cheap). A stale result (gen advanced because the
+// camera/surface/targets changed) is dropped; the next render re-kicks.
+void CChunkedVolumeViewer::finishPlaneIntersectionCompute(
+    std::uint64_t gen, cv::Rect cacheRoi, IntersectFingerprint fp,
+    std::shared_ptr<std::unordered_map<SurfacePatchIndex::SurfacePtr,
+        std::vector<SurfacePatchIndex::TriangleSegment>>> result)
+{
+    _intersectComputeInFlight = false;
+    if (_viewerManager)
+        _viewerManager->endIndexRead();              // release the gate (may apply a deferred swap)
+    if (_closing || gen != _intersectGen || !result)
+        return;                                      // superseded or shutting down
+
+    _intersectionGeometryCache = {};
+    _intersectionGeometryCache.roi = cacheRoi;
+    _intersectionGeometryCache.planeOriginQ = fp.planeOriginQ;
+    _intersectionGeometryCache.planeNormalQ = fp.planeNormalQ;
+    _intersectionGeometryCache.planeBasisXQ = fp.planeBasisXQ;
+    _intersectionGeometryCache.planeBasisYQ = fp.planeBasisYQ;
+    _intersectionGeometryCache.indexSamplingStride = fp.indexSamplingStride;
+    _intersectionGeometryCache.patchCount = fp.patchCount;
+    _intersectionGeometryCache.surfaceCount = fp.surfaceCount;
+    _intersectionGeometryCache.targetHash = fp.targetHash;
+    _intersectionGeometryCache.targetGenerationHash = fp.targetGenerationHash;
+    _intersectionGeometryCache.intersections = std::move(*result);
+    _intersectionGeometryCache.valid = true;
+    // Clear the fp memo so the cache-hit early-out doesn't skip the scene-item build.
+    _lastIntersectFp = {};
+    renderIntersections("async intersection ready");
+}
+
 void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
 {
     if (_closing) {
@@ -4551,7 +4865,11 @@ void CChunkedVolumeViewer::updateStatusLabel()
         items << QString("RAM %1/%2 GB")
             .arg(formatGigabytes(stats.decodedBytes))
             .arg(formatGigabytes(stats.decodedByteCapacity));
-        items << QString("disk %1").arg(formatByteSize(stats.persistentCacheBytes));
+        if (stats.persistentCacheEnabled) {
+            items << QString("disk %1%2")
+                .arg(formatByteSize(stats.persistentCacheBytes))
+                .arg(stats.persistentCacheScanInFlight ? "+" : "");
+        }
         if (stats.remoteFetchesInFlight > 0) {
             items << QString("downloading %1 @ %2")
                 .arg(stats.remoteFetchesInFlight)
@@ -4568,6 +4886,9 @@ void CChunkedVolumeViewer::updateStatusLabel()
             if (auto* poi = _state->poi("focus"))
                 items << QString("POI %1").arg(formatVec3(poi->p));
         }
+    } else if (property("vc_show_custom_normal_offset").toBool()) {
+        items << QString("normal offset %1")
+                     .arg(property("vc_custom_normal_offset_vx").toDouble(), 0, 'f', 1);
     }
 
     _statsBar->setItems(items);

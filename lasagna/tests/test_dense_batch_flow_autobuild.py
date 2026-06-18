@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import unittest
+import ctypes
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -18,6 +21,23 @@ if ROOT not in sys.path:
 import dense_batch_flow
 import fit_data
 import opt_loss_pred_dt
+
+
+def _plane_xyz(*, depth: int, height: int, width: int, step: float = 2.0) -> torch.Tensor:
+	y, x = torch.meshgrid(
+		torch.arange(height, dtype=torch.float32) * float(step),
+		torch.arange(width, dtype=torch.float32) * float(step),
+		indexing="ij",
+	)
+	z = torch.zeros_like(x)
+	plane = torch.stack([x, y, z], dim=-1)
+	return plane.view(1, height, width, 3).expand(depth, height, width, 3).clone()
+
+
+def _normal_grid(*, depth: int, height: int, width: int) -> torch.Tensor:
+	n = torch.zeros((depth, height, width, 3), dtype=torch.float32)
+	n[..., 2] = 1.0
+	return n
 
 
 class DenseBatchFlowAutobuildTest(unittest.TestCase):
@@ -119,6 +139,38 @@ class DenseBatchFlowAutobuildTest(unittest.TestCase):
 		self.assertEqual(captured["grid_step"], 4)
 		self.assertEqual(captured["backtrack_distance"], 12.0)
 		self.assertEqual(captured["local_boost"], 0.5)
+
+	def test_compute_flow_grid_optionally_returns_gate_components(self) -> None:
+		def fake_dense_batch_flow_grid_u8(*args):
+			query_count = int(args[8])
+			final = np.ctypeslib.as_array(args[9], shape=(query_count,))
+			local = np.ctypeslib.as_array(
+				ctypes.cast(args[35], ctypes.POINTER(ctypes.c_float)),
+				shape=(query_count,),
+			)
+			normalized = np.ctypeslib.as_array(
+				ctypes.cast(args[36], ctypes.POINTER(ctypes.c_float)),
+				shape=(query_count,),
+			)
+			final[:] = [0.25, 0.75]
+			local[:] = [0.1, 0.9]
+			normalized[:] = [0.2, 0.8]
+			return 0
+
+		fake_lib = SimpleNamespace(
+			dense_batch_flow_grid_u8=fake_dense_batch_flow_grid_u8
+		)
+		with mock.patch.object(dense_batch_flow, "_load_library", return_value=fake_lib):
+			query_flow, _dense_flow, components = dense_batch_flow.compute_flow_grid(
+				np.zeros((4, 4), dtype=np.uint8),
+				source_xy=(1, 1),
+				query_xy=np.array([[1.0, 1.0], [2.0, 2.0]], dtype=np.float32),
+				return_components=True,
+			)
+
+		np.testing.assert_allclose(query_flow, [0.25, 0.75])
+		np.testing.assert_allclose(components["flow_gate_local_contrast"], [0.1, 0.9])
+		np.testing.assert_allclose(components["flow_gate_component_normalized"], [0.2, 0.8])
 
 	def test_flow_gate_debug_intervals_default_to_disabled(self) -> None:
 		self.assertEqual(
@@ -242,11 +294,28 @@ class DenseBatchFlowAutobuildTest(unittest.TestCase):
 		body = source[start:end]
 
 		self.assertIn("normalize_flow_by_regions(flow, normalization_labels", body)
+		self.assertIn("out_component_normalized", body)
+		self.assertIn("local_contrast", body)
 		self.assertIn("normalized_flow.setTo(1.0f, source_reach_mask)", body)
 		self.assertIn("cv::dilate(normalized_flow, local_max, kernel)", body)
 		self.assertIn("local_max_scope: global_after_region_normalization", body)
 		self.assertNotIn("label_local_max", body)
 		self.assertNotIn("normalized_flow.copyTo(label_flow", body)
+
+	def test_flow_bridge_samples_component_channels_separately(self) -> None:
+		source_path = Path(ROOT) / "dense_batch_min_cut/src/dense_batch_preprocess.cpp"
+		source = source_path.read_text()
+		start = source.index('extern "C" int dense_batch_flow_grid_u8')
+		end = source.index("return 0;", start)
+		body = source[start:end]
+
+		self.assertIn("query_flow_local_contrast", body)
+		self.assertIn("query_flow_component_normalized", body)
+		self.assertIn("sample_flow(flow_gate_weight", body)
+		self.assertIn("query_flow_local_contrast[i] = sample_flow", body)
+		self.assertIn("flow_gate_local_contrast", body)
+		self.assertIn("query_flow_component_normalized[i] = sample_flow", body)
+		self.assertIn("flow_gate_component_normalized", body)
 
 	def test_gate_normalization_uses_pre_merge_component_regions(self) -> None:
 		source_path = Path(ROOT) / "dense_batch_min_cut/src/dense_batch_preprocess.cpp"
@@ -297,6 +366,20 @@ class DenseBatchFlowAutobuildTest(unittest.TestCase):
 		np.testing.assert_array_equal(
 			outputs[-1], np.array([[0.0, 255.0], [255.0, 0.0]], dtype=np.float32)
 		)
+
+	def test_flow_seed_overlay_marks_primary_and_extra_sources(self) -> None:
+		panel = opt_loss_pred_dt._flow_seed_overlay_panel(
+			np.zeros((24, 24), dtype=np.uint8),
+			source_xy=(6, 6),
+			extra_source_xy=np.array([[12, 6], [18, 12]], dtype=np.int32),
+			corr_seed_debug=None,
+			source_edge_mask=None,
+			flow_metadata=None,
+		)
+
+		self.assertGreater(int(panel[6, 6].sum()), 0)
+		self.assertGreater(int(panel[6, 12].sum()), 0)
+		self.assertGreater(int(panel[12, 18].sum()), 0)
 
 	def test_multi_source_disconnected_components_get_gate_values(self) -> None:
 		height, width = 180, 260
@@ -409,6 +492,387 @@ class DenseBatchFlowAutobuildTest(unittest.TestCase):
 		np.testing.assert_array_equal(debug["xy"], np.array([[0, 0], [1, 1]], dtype=np.int32))
 		np.testing.assert_allclose(debug["distance"], np.array([0.70710677, 5.0], dtype=np.float32))
 		np.testing.assert_array_equal(debug["valid"], np.array([True, False]))
+
+	def test_corr_point_source_xy_filters_by_exact_winding(self) -> None:
+		xyz_img = torch.tensor(
+			[
+				[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+				[[0.0, 10.0, 0.0], [10.0, 10.0, 0.0]],
+			],
+			dtype=torch.float32,
+		)
+		points = torch.tensor(
+			[
+				[0.5, 0.5, 0.0, -1.0],
+				[10.0, 10.0, 0.0, 1.0],
+				[0.0, 10.0, 0.0, 1.00000001],
+				[10.0, 0.0, 0.0, 2.0],
+			],
+			dtype=torch.float32,
+		)
+		corr = fit_data.CorrPoints3D(
+			points_xyz_winda=points,
+			collection_idx=torch.zeros((4,), dtype=torch.int64),
+			point_ids=torch.arange(4, dtype=torch.int64),
+			is_absolute=torch.ones((4,), dtype=torch.bool),
+		)
+		res = SimpleNamespace(data=SimpleNamespace(corr_points=corr))
+
+		xy, stats, _debug = opt_loss_pred_dt._corr_point_source_xy(
+			res=res,
+			xyz_img=xyz_img,
+			cfg={"corr_seed_surface_distance": 2.0},
+			sub_h=1,
+			sub_w=1,
+			layer_index=2,
+			winding_value=1,
+		)
+
+		np.testing.assert_array_equal(xy, np.array([[0, 1], [1, 1]], dtype=np.int32))
+		self.assertEqual(stats["pred_dt_corr_seed_winding_candidates"], 2.0)
+		self.assertEqual(stats["pred_dt_corr_seed_candidates"], 2.0)
+		self.assertEqual(stats["pred_dt_corr_seed_valid"], 2.0)
+
+	def test_flow_gate_weight_runs_per_winding_and_captures_d_aware_channels(self) -> None:
+		D, He, We = 3, 4, 4
+		Hm, Wm = 2, 2
+		yy, xx = torch.meshgrid(
+			torch.arange(He, dtype=torch.float32),
+			torch.arange(We, dtype=torch.float32),
+			indexing="ij",
+		)
+		xyz_layer = torch.stack([xx, yy, torch.zeros_like(xx)], dim=-1)
+		xyz_hr = torch.stack([xyz_layer, xyz_layer + torch.tensor([0.0, 0.0, 1.0]), xyz_layer + torch.tensor([0.0, 0.0, 2.0])], dim=0)
+		yy_lr, xx_lr = torch.meshgrid(
+			torch.arange(Hm, dtype=torch.float32) * 2.0,
+			torch.arange(Wm, dtype=torch.float32) * 2.0,
+			indexing="ij",
+		)
+		xyz_lr_layer = torch.stack([xx_lr, yy_lr, torch.zeros_like(xx_lr)], dim=-1)
+		xyz_lr = torch.stack([xyz_lr_layer, xyz_lr_layer + torch.tensor([0.0, 0.0, 1.0]), xyz_lr_layer + torch.tensor([0.0, 0.0, 2.0])], dim=0)
+		points = torch.tensor(
+			[
+				[2.0, 2.0, 2.0, 1.0],
+				[3.0, 3.0, 2.0, 1.0],
+				[0.0, 0.0, 2.0, 2.0],
+			],
+			dtype=torch.float32,
+		)
+		corr = fit_data.CorrPoints3D(
+			points_xyz_winda=points,
+			collection_idx=torch.zeros((3,), dtype=torch.int64),
+			point_ids=torch.arange(3, dtype=torch.int64),
+			is_absolute=torch.ones((3,), dtype=torch.bool),
+		)
+
+		class FakeData:
+			corr_points = corr
+
+			def _spacing_for(self, channel: str) -> tuple[float, float, float]:
+				return (1.0, 1.0, 1.0)
+
+			def grid_sample_fullres(self, query, channels, diff: bool = False):
+				if "nx" in channels or "ny" in channels:
+					return SimpleNamespace(
+						nx=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
+						ny=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
+					)
+				raise AssertionError(f"unexpected sampled channels {channels}")
+
+		res = SimpleNamespace(
+			xyz_hr=xyz_hr,
+			xyz_lr=xyz_lr,
+			mask_lr=torch.ones((D, 1, Hm, Wm), dtype=torch.float32),
+			params=SimpleNamespace(
+				subsample_mesh=2,
+				subsample_winding=2,
+				depth_windings=(-1, 0, 1),
+			),
+			data=FakeData(),
+			data_s=SimpleNamespace(pred_dt=torch.full((1, 1, D, He, We), 160.0, dtype=torch.float32)),
+		)
+		calls: list[dict] = []
+
+		def fake_compute_flow_grid(image_u8, *, source_xy, extra_source_xy, query_xy, **kwargs):
+			calls.append({
+				"source_xy": tuple(source_xy),
+				"extra_source_xy": np.asarray(extra_source_xy, dtype=np.int32).copy(),
+				"return_components": bool(kwargs.get("return_components", False)),
+			})
+			value = 0.2 if len(calls) == 1 else 0.8
+			query_flow = np.full((query_xy.shape[0],), value, dtype=np.float32)
+			dense_flow = np.full(image_u8.shape, value, dtype=np.float32)
+			components = {
+				"flow_gate_local_contrast": np.full((query_xy.shape[0],), 0.4 if len(calls) == 1 else 0.6, dtype=np.float32),
+				"flow_gate_component_normalized": np.full((query_xy.shape[0],), 0.5 if len(calls) == 1 else 0.7, dtype=np.float32),
+			}
+			metadata = {
+				"accepted_source_count": 1 + int(extra_source_xy.shape[0]),
+				"source_edge_count": 10 * len(calls),
+				"seeded_node_count": 20 * len(calls),
+			}
+			return query_flow, dense_flow, components, metadata
+
+		opt_loss_pred_dt.configure_flow_gate(
+			cfg={
+				"enabled": True,
+				"gate_factor": 0.25,
+				"debug": False,
+				"corr_seed_surface_distance": 2.0,
+			},
+			stage_name="test",
+			seed_xyz=(1.0, 1.0, 1.0),
+			out_dir=None,
+			capture_channels=True,
+		)
+		try:
+			with mock.patch.object(dense_batch_flow, "compute_flow_grid", side_effect=fake_compute_flow_grid):
+				weight, pull = opt_loss_pred_dt._flow_gate_weight(res)
+				channels = opt_loss_pred_dt.flow_gate_last_channels()
+				stats = opt_loss_pred_dt.flow_gate_last_stats()
+		finally:
+			opt_loss_pred_dt.configure_flow_gate(cfg=None, stage_name="test", seed_xyz=None, out_dir=None)
+
+		self.assertIsNone(pull)
+		self.assertEqual(len(calls), 2)
+		self.assertEqual(calls[0]["source_xy"], (1, 1))
+		self.assertEqual(calls[0]["extra_source_xy"].shape, (0, 2))
+		self.assertEqual(calls[1]["source_xy"], (2, 2))
+		np.testing.assert_array_equal(calls[1]["extra_source_xy"], np.array([[3, 3]], dtype=np.int32))
+		self.assertTrue(all(call["return_components"] for call in calls))
+		self.assertEqual(tuple(weight.shape), (D, 1, Hm, Wm))
+		np.testing.assert_allclose(weight[0, 0].detach().cpu().numpy(), np.full((Hm, Wm), 0.75, dtype=np.float32))
+		np.testing.assert_allclose(weight[1, 0].detach().cpu().numpy(), np.full((Hm, Wm), 0.8, dtype=np.float32))
+		np.testing.assert_allclose(weight[2, 0].detach().cpu().numpy(), np.full((Hm, Wm), 0.95, dtype=np.float32))
+		self.assertIsNotNone(channels)
+		self.assertEqual(channels["mesh_shape_dhw"], [D, Hm, Wm])
+		self.assertEqual(tuple(channels["flow_gate_local_contrast"].shape), (D, Hm, Wm))
+		np.testing.assert_allclose(channels["flow_gate_local_contrast"][0].numpy(), 0.0)
+		np.testing.assert_allclose(channels["flow_gate_component_normalized"][0].numpy(), 0.0)
+		np.testing.assert_allclose(channels["flow_gate_local_contrast"][1].numpy(), 0.4)
+		np.testing.assert_allclose(channels["flow_gate_component_normalized"][2].numpy(), 0.7)
+		self.assertEqual(stats["pred_dt_flow_layers_no_sources"], 1.0)
+		self.assertEqual(stats["pred_dt_flow_layers_with_flow"], 2.0)
+		self.assertEqual(stats["pred_dt_layer_2_corr_sources"], 2.0)
+
+	def test_atlas_snap_seed_extraction_filters_and_uniques_sources(self) -> None:
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor(
+				[
+					[0.0, 0.0, 1.0],
+					[0.0, 2.0, 10.0],
+					[4.0, 2.0, 1.0],
+					[2.0, 2.0, 1.0],
+					[2.0, 2.0, 1.5],
+				],
+				dtype=torch.float32,
+			),
+			normal_xyz=torch.zeros((5, 3), dtype=torch.float32),
+			model_h=torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([0.0, 0.0, 2.0, 1.0, 1.0], dtype=torch.float32),
+			is_snap_point=torch.tensor([False, True, True, True, True], dtype=torch.bool),
+		)
+		res = SimpleNamespace(
+			xyz_lr=_plane_xyz(depth=1, height=3, width=3),
+			normals=_normal_grid(depth=1, height=3, width=3),
+			data=SimpleNamespace(atlas_lines=lines),
+		)
+		xyz_hr = _plane_xyz(depth=1, height=5, width=5, step=1.0)[0]
+		pred_img = np.full((5, 5), 160, dtype=np.uint8)
+		pred_img[2, 4] = 90
+
+		xy, stats, debug = opt_loss_pred_dt._atlas_snap_source_xy(
+			res=res,
+			xyz_img=xyz_hr,
+			pred_img=pred_img,
+			cfg={
+				"atlas_snap_seed_enabled": True,
+				"atlas_snap_seed_target_distance": 2.0,
+				"anticipatory_pull": {
+					"inlier_zero": 80.0,
+					"inlier_one": 120.0,
+				},
+			},
+			sub_h=2,
+			sub_w=2,
+			layer_index=0,
+		)
+
+		np.testing.assert_array_equal(xy, np.array([[2, 2]], dtype=np.int32))
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_candidates"], 4.0)
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_target_accepted"], 3.0)
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_pred_dt_accepted"], 2.0)
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_unique"], 1.0)
+		self.assertEqual(debug["valid"].tolist(), [False, False, True, True])
+
+	def test_flow_gate_uses_atlas_snap_sources_when_corr_seeding_disabled(self) -> None:
+		D, Hm, Wm = 1, 3, 3
+		He, We = 5, 5
+		lines = fit_data.AtlasLines3D(
+			target_xyz=torch.tensor(
+				[
+					[2.0, 2.0, 1.0],
+					[4.0, 2.0, 1.0],
+				],
+				dtype=torch.float32,
+			),
+			normal_xyz=torch.zeros((2, 3), dtype=torch.float32),
+			model_h=torch.tensor([1.0, 1.0], dtype=torch.float32),
+			model_w=torch.tensor([1.0, 2.0], dtype=torch.float32),
+			is_snap_point=torch.tensor([True, True], dtype=torch.bool),
+		)
+		corr = fit_data.CorrPoints3D(
+			points_xyz_winda=torch.tensor([[0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+			collection_idx=torch.zeros((1,), dtype=torch.int64),
+			point_ids=torch.zeros((1,), dtype=torch.int64),
+			is_absolute=torch.ones((1,), dtype=torch.bool),
+		)
+		class FakeData:
+			atlas_lines = lines
+			corr_points = corr
+
+			def grid_sample_fullres(self, query, channels, diff: bool = False):
+				return SimpleNamespace(
+					nx=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
+					ny=torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32),
+				)
+
+		res = SimpleNamespace(
+			xyz_hr=_plane_xyz(depth=D, height=He, width=We, step=1.0),
+			xyz_lr=_plane_xyz(depth=D, height=Hm, width=Wm),
+			normals=_normal_grid(depth=D, height=Hm, width=Wm),
+			mask_lr=torch.ones((D, 1, Hm, Wm), dtype=torch.float32),
+			params=SimpleNamespace(
+				subsample_mesh=2,
+				subsample_winding=2,
+				depth_windings=(0,),
+			),
+			data=FakeData(),
+			data_s=SimpleNamespace(pred_dt=torch.full((1, 1, D, He, We), 160.0, dtype=torch.float32)),
+		)
+		calls: list[dict] = []
+
+		def fake_compute_flow_grid(image_u8, *, source_xy, extra_source_xy, query_xy, **kwargs):
+			calls.append({
+				"source_xy": tuple(source_xy),
+				"extra_source_xy": np.asarray(extra_source_xy, dtype=np.int32).copy(),
+			})
+			query_flow = np.ones((query_xy.shape[0],), dtype=np.float32)
+			dense_flow = np.ones(image_u8.shape, dtype=np.float32)
+			metadata = {
+				"accepted_source_count": 1 + int(extra_source_xy.shape[0]),
+				"source_edge_count": 0,
+				"seeded_node_count": 0,
+			}
+			return query_flow, dense_flow, metadata
+
+		opt_loss_pred_dt.configure_flow_gate(
+			cfg={
+				"enabled": True,
+				"debug": False,
+				"atlas_snap_seed_enabled": True,
+				"corr_seed_enabled": False,
+				"atlas_snap_seed_target_distance": 2.0,
+			},
+			stage_name="test",
+			seed_xyz=(0.0, 0.0, 0.0),
+			out_dir=None,
+		)
+		try:
+			with mock.patch.object(dense_batch_flow, "compute_flow_grid", side_effect=fake_compute_flow_grid):
+				_weight, _pull = opt_loss_pred_dt._flow_gate_weight(res)
+				stats = opt_loss_pred_dt.flow_gate_last_stats()
+		finally:
+			opt_loss_pred_dt.configure_flow_gate(cfg=None, stage_name="test", seed_xyz=None, out_dir=None)
+
+		self.assertEqual(len(calls), 1)
+		self.assertEqual(calls[0]["source_xy"], (2, 2))
+		np.testing.assert_array_equal(calls[0]["extra_source_xy"], np.array([[4, 2], [0, 0]], dtype=np.int32))
+		self.assertEqual(stats["pred_dt_layer_0_corr_sources"], 0.0)
+		self.assertEqual(stats["pred_dt_layer_0_atlas_snap_sources"], 2.0)
+		self.assertEqual(stats["pred_dt_atlas_snap_seed_unique"], 2.0)
+
+	def test_atlas_snap_seed_report_prints_compact_table(self) -> None:
+		debug = {
+			"records": [
+				{
+					"object_id": "fibers/kb_20260605T205046741_000007.json",
+					"source_index": 567,
+					"sample_index": 40,
+					"source_xy": [256, 83],
+					"accepted": True,
+					"reason": "accepted",
+					"surface_distance": 0.02798154018819332,
+					"pred_dt_value": 128.0,
+					"inlier": 1.0,
+				},
+				{
+					"object_id": "fibers/kb_20260605T205046741_000007.json",
+					"source_index": 644,
+					"sample_index": 41,
+					"source_xy": [259, 133],
+					"accepted": True,
+					"reason": "accepted",
+					"surface_distance": 0.004026470240205526,
+					"pred_dt_value": 129.0,
+					"inlier": 1.0,
+				},
+			],
+		}
+		components = np.zeros((160, 300), dtype=np.float32)
+		components[80:86, 252:262] = 3.0
+		components[130:134, 258:264] = 4.0
+		buf = io.StringIO()
+		with contextlib.redirect_stdout(buf):
+			opt_loss_pred_dt._write_atlas_snap_seed_report(
+				stage_name="atlas_reopt_snap_flow_speculative",
+				debug_index=3,
+				layer_index=0,
+				winding=0,
+				atlas_seed_debug=debug,
+				primary_xy=(256, 83),
+				extra_source_xy=np.array([[259, 133]], dtype=np.int32),
+				flow_status="flow_ok",
+				source_component_mask_hr=components,
+				out_dir=Path("/tmp/unused-atlas-snap-report"),
+			)
+
+		text = buf.getvalue()
+		self.assertIn("atlas snap seeds layer=0 winding=0 samples=2 accepted=2 used=2", text)
+		self.assertIn("progress columns", text)
+		self.assertIn("idx", text)
+		self.assertIn("src", text)
+		self.assertIn("use", text)
+		self.assertIn("area", text)
+		self.assertIn("obj", text)
+		self.assertIn(" pri ", text)
+		self.assertIn(" ext ", text)
+		self.assertIn("60.000", text)
+		self.assertIn("24.000", text)
+		self.assertIn("kb_20260605T205046741_000007.json", text)
+		self.assertNotIn("atlas snap sample layer=", text)
+		self.assertNotIn("object=fibers/", text)
+		self.assertNotIn("jsonl=", text)
+
+	def test_anticipatory_pull_loss_map_writes_correct_layer(self) -> None:
+		xyz_lr = torch.zeros((2, 2, 2, 3), dtype=torch.float32)
+		xyz_lr[1, 1, 1] = torch.tensor([1.0, 0.0, 0.0])
+		res = SimpleNamespace(
+			xyz_lr=xyz_lr,
+			mask_lr=torch.ones((2, 1, 2, 2), dtype=torch.float32),
+		)
+		pull = {
+			"layer": torch.tensor([1], dtype=torch.long),
+			"tip_h": torch.tensor([1], dtype=torch.long),
+			"tip_w": torch.tensor([1], dtype=torch.long),
+			"target_xyz": torch.tensor([[3.0, 0.0, 0.0]], dtype=torch.float32),
+			"candidate_weight": torch.tensor([2.0], dtype=torch.float32),
+		}
+
+		loss_map = opt_loss_pred_dt._anticipatory_pull_loss_map(res=res, pull=pull)
+
+		self.assertEqual(float(loss_map[0].sum()), 0.0)
+		self.assertGreater(float(loss_map[1, 0, 1, 1]), 0.0)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
+#include "WrapAnnotationWidget.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
@@ -12,6 +13,7 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
+#include "LineAnnotationController.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -46,6 +48,7 @@
 #include <QMessageBox>
 #include <QProcess>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QStringList>
 #include <QSettings>
 #include <QStyle>
@@ -164,6 +167,17 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergeTifxyzAct, &QAction::triggered,
             this, &MenuActionController::mergeTifxyzFromMenuRequested);
 
+    _mergePatchAct = new QAction(QObject::tr("Patch tifxyz..."), this);
+    connect(_mergePatchAct, &QAction::triggered,
+            this, &MenuActionController::mergePatchFromMenuRequested);
+
+    _recalculateFiberScoresAct = new QAction(QObject::tr("Recalc fiber H/V scores"), this);
+    connect(_recalculateFiberScoresAct, &QAction::triggered, this, [qWindow]() {
+        if (qWindow->_lineAnnotationController) {
+            qWindow->_lineAnnotationController->recalculateAllFiberHvClassifications();
+        }
+    });
+
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
@@ -196,15 +210,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _editMenu = new QMenu(QObject::tr("&Edit"), qWindow);
 
     _viewMenu = new QMenu(QObject::tr("&View"), qWindow);
-    _viewMenu->addAction(qWindow->ui.dockWidgetVolumes->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetSegmentation->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetDistanceTransform->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetViewerControls->toggleViewAction());
-
-    if (qWindow->_point_collection_widget) {
-        _viewMenu->addAction(qWindow->_point_collection_widget->toggleViewAction());
-    }
-
+    qWindow->populateDockToggleMenu(_viewMenu);
     _viewMenu->addAction(_mirrorCursorAct);
     _viewMenu->addSeparator();
     _viewMenu->addAction(_resetViewsAct);
@@ -215,6 +221,8 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
+    _actionsMenu->addAction(_mergePatchAct);
+    _actionsMenu->addAction(_recalculateFiberScoresAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);
@@ -737,13 +745,24 @@ void MenuActionController::showSettingsDialog()
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
                                        vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
+    const bool resetViewOnSurfaceChange =
+        settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
+                       vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
     if (_window->_viewerManager) {
         _window->_viewerManager->forEachBaseViewer([showDirHints](VolumeViewerBase* viewer) {
             if (viewer) {
                 viewer->setShowDirectionHints(showDirHints);
+                // Re-read viewer settings (sensitivities, scalebar voxel size, ...)
+                // so changes made in the dialog take effect immediately.
+                viewer->reloadPerfSettings();
             }
         });
     }
+    if (_window->ui.chkMoveOnSurfaceChanged) {
+        QSignalBlocker blocker(_window->ui.chkMoveOnSurfaceChanged);
+        _window->ui.chkMoveOnSurfaceChanged->setChecked(resetViewOnSurfaceChange);
+    }
+    _window->onMoveOnSurfaceChangedToggled(resetViewOnSurfaceChange);
 
     dialog->deleteLater();
 }

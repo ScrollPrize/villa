@@ -12,7 +12,7 @@
 #include <string>
 
 #include "Surface.hpp"
-#include "Tiff.hpp"
+#include "Rect3D.hpp"
 
 // Surface loading and channel flags
 #define SURF_LOAD_IGNORE_MASK 1
@@ -20,14 +20,6 @@
 
 // Debug prefix for auto-generated surfaces
 #define Z_DBG_GEN_PREFIX "auto_grown_"
-
-struct Rect3D {
-    cv::Vec3f low = {0,0,0};
-    cv::Vec3f high = {0,0,0};
-};
-
-bool intersect(const Rect3D &a, const Rect3D &b);
-Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p);
 
 // Forward declarations
 class QuadSurface;
@@ -386,7 +378,20 @@ public:
     cv::Mat channel(const std::string& name, int flags = 0);
     void invalidateCache();
     void saveOverwrite();
-    void saveSnapshot(int maxBackups = 10);
+    // Write a single ancillary channel to path/<name>.tif in place, without
+    // snapshotting or rewriting x/y/z. No-op if the channel is absent/empty.
+    void saveChannel(const std::string& name);
+    // Rotating backup under <backupRoot>/backups/<seg>/ (backupRoot defaults to
+    // the segment's parent dir; VolumePkg sets it to the volpkg.json's dir).
+    // Throttled to at most one snapshot per segment every couple minutes; pass
+    // force=true to bypass. maxBackups < 0 means "use the configured default".
+    void saveSnapshot(int maxBackups = -1, bool force = false);
+
+    // App-configurable number of rotating snapshots kept per segment. VC3D
+    // wires this to a user setting; defaults to 10 so non-GUI tools behave as
+    // before. Used by saveOverwrite() and saveSnapshot()'s default.
+    static void setBackupCount(int count);
+    static int backupCount();
     void invalidateMask();
     std::vector<std::string> channelNames() const;
 
@@ -444,10 +449,22 @@ protected:
 private:
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
+    // Write a single ancillary channel as dir/<name>.tif.
+    void writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat);
     // Flag for lazy loading - true if points need to be loaded from path
     bool _needsLoad = false;
     // Mutex to protect lazy loading from concurrent access
     mutable std::mutex _loadMutex;
+
+    // Serializes all on-disk writes targeting a given segment directory, keyed by
+    // the directory path so it works across separate QuadSurface objects pointing
+    // at the same dir (e.g. the autosave worker's snapshot vs. the live surface).
+    // Without it, a worker-thread saveOverwrite() directory swap can delete a tmp
+    // file out from under a main-thread saveChannel() rename -> uncaught
+    // filesystem_error -> std::terminate. Recursive so a public entry point
+    // (saveOverwrite) can hold it across nested saveSnapshot()/save() calls on
+    // the same thread without self-deadlock.
+    static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags = 0);

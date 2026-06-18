@@ -16,6 +16,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/CrashHandler.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
 #include <iostream>
@@ -182,13 +183,36 @@ auto main(int argc, char* argv[]) -> int
         "Enable VC3D render profiling logs.");
     parser.addOption(profileOption);
 
+    QCommandLineOption recordOption(
+        "record",
+        "Record a navigation camera-state timeline to the given JSON file.",
+        "file");
+    parser.addOption(recordOption);
+
+    QCommandLineOption replayOption(
+        "replay",
+        "Replay a recorded navigation timeline (implies --profile), then exit.",
+        "file");
+    parser.addOption(replayOption);
+
+    QCommandLineOption replayWarmOption(
+        "replay-warm",
+        "With --replay, run a discarded warm-up pass before the timed pass.");
+    parser.addOption(replayWarmOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
         SetDebugLoggingEnabled(true);
         SetLogLevel("debug");
     }
-    if (parser.isSet(profileOption)) {
+
+    RenderBenchOptions benchOptions;
+    benchOptions.recordPath = parser.value(recordOption).trimmed();
+    benchOptions.replayPath = parser.value(replayOption).trimmed();
+    benchOptions.replayWarm = parser.isSet(replayWarmOption);
+
+    if (parser.isSet(profileOption) || !benchOptions.replayPath.isEmpty()) {
         SetProfileLoggingEnabled(true);
         Logger()->info("[vc3d-profile] enabled");
     }
@@ -203,6 +227,10 @@ auto main(int argc, char* argv[]) -> int
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         cacheSizeGB = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
+
+        // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
+        QuadSurface::setBackupCount(
+            settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
     if (parser.isSet(cacheSizeOption)) {
         bool ok = false;
@@ -225,7 +253,16 @@ auto main(int argc, char* argv[]) -> int
         }
     }
 
-    CWindow aWin(cacheSizeGB);
-    aWin.show();
-    return QApplication::exec();
+    int rc = 0;
+    {
+        CWindow aWin(cacheSizeGB, benchOptions);
+        aWin.show();
+        rc = QApplication::exec();
+    }
+    // Skip DSO finalizers: gnutls/libtasn1 destructors free through mimalloc after
+    // its own teardown, segfaulting in _dl_fini on every otherwise-clean exit.
+    // CWindow (above scope) has already run its real cleanup.
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(rc);
 }

@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <QFutureWatcher>
 #include <QString>
 

@@ -9,7 +9,7 @@ hide_title: true
 
   <meta
     name="description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
 
   <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@ hide_title: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
   <meta
     property="og:image"
@@ -29,7 +29,7 @@ hide_title: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,700,000+ machine learning and computer vision competition"
+    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
   />
   <meta
     property="twitter:image"
@@ -78,6 +78,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Khartes](https://github.com/KhartesViewer/khartes) by Chuck is a tool to manually create and visualize segment meshes, while also visualizing a preview of the rendered segment.
 
 ### 🛠️ Tools
+
+- [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/999) by pscamillo. Three GPU-native augmentations for the segmentation training pipeline, addressing #201: Squeeze (compression, [#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion (beam-scatter blur) and Warp (coherent warping). Each models a real scroll distortion rather than generic elastic noise, and is validated with a controlled ablation and a real-data demo to improve segmentation in compressed/warped/scattered regions.
 
 - [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
   
@@ -159,8 +161,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Affinity Prediction with Unet](https://discordapp.com/channels/1079907749569237093/1407379961417039953) by Ayush Mishra
     - Unet trained on affinity labels using pytorch_connectomics and experiments with watershed
 - [Gabor Filter for surface prediction](https://www.kaggle.com/code/bluetriad/scroll4-gaborfilters/notebook?scriptVersionId=265957590) by Ayush Mishra
-
-
+  
+- [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
 
 ### 📦 Materials
 
@@ -266,6 +268,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [ScrollMAE](https://github.com/jgcarrasco/ScrollMAE) by Jorge García. Contains the necessary code to pretrain a 3D ResNet on unlabeled data and then finetune it to perform ink detection.
 
 - [Unsupervised Ink Detection with DINO](https://github.com/jgcarrasco/dino-ink-detection) by Jorge García. Contains experiments related to detecting ink without labels, including a Colab notebook.
+
+- [Vesuvius AutoResearch](https://github.com/mojomast/vesuvius-autoresearch) by mojomast. Autonomous, evidence-gated experiment search for Vesuvius ink-detection research, with reproducible configs, metric contracts, synthetic demo data, and promotion checks.
 
 - [Vesuvius GP+](https://github.com/jaredlandau/Vesuvius-Grandprize-Winner-Plus) by Jared Landau. Updated version of the Grand Prize Ink Detection script with extra features.
   

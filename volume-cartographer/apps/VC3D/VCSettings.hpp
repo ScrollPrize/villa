@@ -105,6 +105,9 @@ namespace viewer {
     constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
     constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
     constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
+    // Fallback voxel size (µm per level-0 voxel) for the scalebar when the loaded
+    // volume's metadata has none (e.g. .vca archives). 0 = unset (no fallback).
+    constexpr auto VOXEL_SIZE_UM = "viewer/voxel_size_um";
 
     constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
     constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
@@ -112,6 +115,7 @@ namespace viewer {
     constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr double VOXEL_SIZE_UM_DEFAULT = 0.0;   // unset; scalebar falls back to volume metadata only
     constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
     constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 
@@ -128,6 +132,7 @@ namespace viewer {
     constexpr auto SHOW_PLANE_INTERSECTION_LINES = "viewer/show_plane_intersection_lines";
     constexpr auto MIRROR_CURSOR_TO_SEGMENTATION = "viewer/mirror_cursor_to_segmentation";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "viewer/max_displayed_resolution";
+    constexpr auto POINT_COLLECTION_VIEW_TOLERANCE = "viewer/point_collection_view_tolerance";
 
     constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
     constexpr bool SHOW_DIRECTION_HINTS_DEFAULT = true;
@@ -141,6 +146,7 @@ namespace viewer {
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr double POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT = 10.0;
 
     // Volume Window (Base Grayscale Window)
     constexpr auto BASE_WINDOW_LOW = "viewer/base_window_low";
@@ -205,6 +211,13 @@ namespace viewer {
     constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_POSTPROCESSING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_TRANSFORMS_EXPANDED_DEFAULT = true;
+}
+
+// -----------------------------------------------------------------------------
+// Atlas Workspace Settings
+// -----------------------------------------------------------------------------
+namespace atlas {
+    constexpr auto SEARCH_MAX_DISTANCE = "atlas/search_max_distance";
 }
 
 // -----------------------------------------------------------------------------
@@ -307,6 +320,15 @@ namespace aws {
 namespace tools {
     constexpr auto FLATBOI_PATH = "tools/flatboi_path";
     constexpr auto FLATBOI = "tools/flatboi";  // Legacy key
+}
+
+// -----------------------------------------------------------------------------
+// Backup Settings
+// -----------------------------------------------------------------------------
+namespace backup {
+    // How many rotating snapshots to keep per segment under <volpkg_dir>/backups/.
+    constexpr auto SEGMENT_COUNT = "backup/segment_count";
+    constexpr int  SEGMENT_COUNT_DEFAULT = 10;
 }
 
 // -----------------------------------------------------------------------------

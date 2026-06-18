@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "utils/Json.hpp"
-#include "utils/zarr.hpp"
 
 namespace vc {
 
@@ -98,6 +97,7 @@ std::unique_ptr<VcDataset> createZarrDataset(
     const std::string& dimensionSeparator = ".",
     std::int64_t fillValue = 0);
 
-utils::ZarrArray::CodecRegistry buildZarrCodecRegistry(int dtypeSize);
+// buildZarrCodecRegistry() is declared in utils/zarr.hpp so its CodecRegistry
+// return type doesn't pull zarr.hpp into every VcDataset.hpp includer.
 
 }  // namespace vc

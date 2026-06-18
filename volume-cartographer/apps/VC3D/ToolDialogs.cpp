@@ -1613,6 +1613,152 @@ QString SlimFlattenDialog::outputPath() const
     return defaultOutput_;
 }
 
+// ================= StraightenDialog =================
+bool StraightenDialog::s_haveSession = false;
+bool StraightenDialog::s_unbend = true;
+double StraightenDialog::s_unbendSmoothCols = 300.0;
+int StraightenDialog::s_overlapPasses = 2;
+bool StraightenDialog::s_orthogonalize = true;
+bool StraightenDialog::s_trim = true;
+double StraightenDialog::s_trimMaxEdge = 100.0;
+
+StraightenDialog::StraightenDialog(QWidget* parent, const QString& defaultOutputPath)
+    : QDialog(parent)
+    , defaultOutput_(defaultOutputPath)
+{
+    setWindowTitle(tr("Straighten"));
+    auto main = new QVBoxLayout(this);
+    auto form = new QFormLayout();
+    main->addLayout(form);
+
+    cbUnbend_ = new QCheckBox(tr("Unbend (spine-based bend removal)"), this);
+    cbUnbend_->setChecked(s_haveSession ? s_unbend : true);
+    cbUnbend_->setToolTip(tr(
+        "Fit a smooth spine through the band and re-coordinate into "
+        "(arc-length, normal-offset). A local rotation that removes global "
+        "curvature without shearing. Run this before the other stages when "
+        "the flattened band curves in UV (e.g. a free-boundary SLIM result)."));
+    form->addRow(QString(), cbUnbend_);
+
+    spUnbendSmooth_ = new QDoubleSpinBox(this);
+    spUnbendSmooth_->setRange(10.0, 5000.0);
+    spUnbendSmooth_->setDecimals(0);
+    spUnbendSmooth_->setSingleStep(50.0);
+    spUnbendSmooth_->setValue(s_haveSession ? s_unbendSmoothCols : 300.0);
+    spUnbendSmooth_->setToolTip(tr("Spine Gaussian sigma (columns). Larger keeps the unbend gentle/global."));
+    form->addRow(tr("Unbend smoothing:"), spUnbendSmooth_);
+
+    spOverlap_ = new QSpinBox(this);
+    spOverlap_->setRange(0, 10);
+    spOverlap_->setValue(s_haveSession ? s_overlapPasses : 2);
+    spOverlap_->setToolTip(tr(
+        "Cross-wrap row-alignment passes. Each pass pairs grid points with the "
+        "nearest 3D point one winding over and warps v so they share a row; "
+        "each pass re-measures from the 3D geometry. 0 disables."));
+    form->addRow(tr("Overlap-pair passes:"), spOverlap_);
+
+    cbOrtho_ = new QCheckBox(tr("Orthogonalize columns"), this);
+    cbOrtho_->setChecked(s_haveSession ? s_orthogonalize : true);
+    cbOrtho_->setToolTip(tr("Remove residual column shear measured from the surface tangents."));
+    form->addRow(QString(), cbOrtho_);
+
+    cbTrim_ = new QCheckBox(tr("Trim bridge cells"), this);
+    cbTrim_->setChecked(s_haveSession ? s_trim : true);
+    cbTrim_->setToolTip(tr(
+        "Drop cells whose 3D step to a grid neighbor is absurdly long. They are "
+        "few but dominate area-weighted distortion metrics and render as "
+        "mid-air geometry."));
+    form->addRow(QString(), cbTrim_);
+
+    spTrimMaxEdge_ = new QDoubleSpinBox(this);
+    spTrimMaxEdge_->setRange(1.0, 10000.0);
+    spTrimMaxEdge_->setDecimals(0);
+    spTrimMaxEdge_->setSingleStep(10.0);
+    spTrimMaxEdge_->setValue(s_haveSession ? s_trimMaxEdge : 100.0);
+    spTrimMaxEdge_->setToolTip(tr("Max 3D neighbor-step (voxels) before a cell is trimmed. Nominal step is 1/scale (~20 at scale 0.05)."));
+    form->addRow(tr("Trim max edge:"), spTrimMaxEdge_);
+
+    auto outputRow = new QHBoxLayout();
+    edtOutput_ = new QLineEdit(this);
+    edtOutput_->setText(defaultOutput_);
+    edtOutput_->setToolTip(tr("Output tifxyz directory (must not exist). Defaults to <segment>_straightened next to the input."));
+    auto btnBrowse = new QPushButton(tr("Browse..."), this);
+    auto btnReset = new QPushButton(tr("Default"), this);
+    outputRow->addWidget(edtOutput_, /*stretch=*/1);
+    outputRow->addWidget(btnBrowse);
+    outputRow->addWidget(btnReset);
+    form->addRow(tr("Output:"), outputRow);
+
+    auto syncEnabled = [this]() {
+        if (spUnbendSmooth_) spUnbendSmooth_->setEnabled(cbUnbend_->isChecked());
+        if (spTrimMaxEdge_)  spTrimMaxEdge_->setEnabled(cbTrim_->isChecked());
+    };
+    connect(cbUnbend_, &QCheckBox::toggled, this, [syncEnabled]() { syncEnabled(); });
+    connect(cbTrim_,   &QCheckBox::toggled, this, [syncEnabled]() { syncEnabled(); });
+    syncEnabled();
+
+    connect(btnBrowse, &QPushButton::clicked, this, [this]() {
+        const QString start = edtOutput_->text().isEmpty()
+            ? QFileInfo(defaultOutput_).absolutePath()
+            : edtOutput_->text();
+        const QString chosen = QFileDialog::getSaveFileName(
+            this, tr("Choose output tifxyz directory"), start,
+            /*filter=*/QString(), /*selectedFilter=*/nullptr,
+            QFileDialog::DontConfirmOverwrite);
+        if (!chosen.isEmpty()) edtOutput_->setText(chosen);
+    });
+    connect(btnReset, &QPushButton::clicked, this, [this]() {
+        edtOutput_->setText(defaultOutput_);
+    });
+
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(btns);
+
+    connect(btns, &QDialogButtonBox::accepted, this, [this]() {
+        s_haveSession = true;
+        s_unbend = cbUnbend_->isChecked();
+        s_unbendSmoothCols = spUnbendSmooth_->value();
+        s_overlapPasses = spOverlap_->value();
+        s_orthogonalize = cbOrtho_->isChecked();
+        s_trim = cbTrim_->isChecked();
+        s_trimMaxEdge = spTrimMaxEdge_->value();
+    });
+}
+
+QString StraightenDialog::outputPath() const
+{
+    if (edtOutput_) {
+        const QString t = edtOutput_->text().trimmed();
+        if (!t.isEmpty()) return t;
+    }
+    return defaultOutput_;
+}
+
+QStringList StraightenDialog::toArgs() const
+{
+    QStringList a;
+    if (cbUnbend_ && cbUnbend_->isChecked()) {
+        a << QStringLiteral("--unbend");
+        if (spUnbendSmooth_)
+            a << QStringLiteral("--unbend-smooth-cols")
+              << QString::number(spUnbendSmooth_->value(), 'f', 0);
+    }
+    // Always explicit so vc_straighten never falls back to its implicit
+    // "no stage flags = full default pipeline" behavior.
+    a << QStringLiteral("--overlap-pairs")
+      << QString::number(spOverlap_ ? spOverlap_->value() : 2);
+    if (cbOrtho_ && cbOrtho_->isChecked()) a << QStringLiteral("--orthogonalize");
+    if (cbTrim_ && cbTrim_->isChecked()) {
+        a << QStringLiteral("--trim");
+        if (spTrimMaxEdge_)
+            a << QStringLiteral("--trim-max-edge")
+              << QString::number(spTrimMaxEdge_->value(), 'f', 0);
+    }
+    return a;
+}
+
 // ================= VisLasagnaObjDialog =================
 // static session members
 bool VisLasagnaObjDialog::s_haveSession = false;
@@ -2344,6 +2490,401 @@ void MergeTifxyzDialog::accept()
         return;
     }
     _mergeJsonPath = QString::fromStdString(mj.string());
+
+    updateSessionFromUI();
+    QDialog::accept();
+}
+
+// ============================================================================
+// MergePatchDialog
+//
+// Two-input front-end for vc_merge_patch. Picks a parent + child tifxyz from
+// the volpkg, exposes the binary's tunables, and previews the auto-detected
+// parent/child role assignment (cheap: countValidPoints() against the
+// already-loaded VolumePkg surface cache).
+// ============================================================================
+
+#include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+
+#include <QComboBox>
+
+bool   MergePatchDialog::ms_haveSession  = false;
+int    MergePatchDialog::ms_borderCells  = 16;
+int    MergePatchDialog::ms_blendCells   = 6;
+int    MergePatchDialog::ms_idwK         = 4;
+int    MergePatchDialog::ms_iters        = 3000;
+double MergePatchDialog::ms_min          = 5.0;
+double MergePatchDialog::ms_max          = 10.0;
+double MergePatchDialog::ms_madK         = 3.0;
+int    MergePatchDialog::ms_seed         = 0;
+int    MergePatchDialog::ms_anchorCap    = 0;
+int    MergePatchDialog::ms_ompThreads   = -1;
+
+MergePatchDialog::MergePatchDialog(QWidget* parent,
+                                   const QStringList& seedSegmentIds,
+                                   const QStringList& availableSegments,
+                                   std::shared_ptr<VolumePkg> volpkg,
+                                   const QString& volpkgDir,
+                                   const QString& pathsDir)
+    : QDialog(parent),
+      _availableSegments(availableSegments),
+      _volpkg(std::move(volpkg)),
+      _volpkgDir(volpkgDir),
+      _pathsDir(pathsDir)
+{
+    setWindowTitle(tr("Patch tifxyz"));
+    auto main = new QVBoxLayout(this);
+
+    // --- Surface pickers -------------------------------------------------
+    auto grpInputs = new QGroupBox(tr("Inputs"), this);
+    auto inputsLay = new QFormLayout(grpInputs);
+
+    auto fillCombo = [&](QComboBox* cmb) {
+        cmb->setEditable(false);
+        for (const auto& id : _availableSegments) cmb->addItem(id);
+    };
+    cmbA_ = new QComboBox(grpInputs);
+    cmbB_ = new QComboBox(grpInputs);
+    fillCombo(cmbA_);
+    fillCombo(cmbB_);
+
+    // Seed selection: prefer the two segments the user right-clicked from
+    // the SurfacePanel. If the menu launched with no seeds, leave the
+    // combos at index 0/0 (user picks both).
+    auto pickSeed = [&](QComboBox* cmb, int index) {
+        if (index < 0 || index >= seedSegmentIds.size()) return;
+        const QString id = seedSegmentIds.at(index);
+        const int idx = cmb->findText(id);
+        if (idx >= 0) cmb->setCurrentIndex(idx);
+    };
+    pickSeed(cmbA_, 0);
+    pickSeed(cmbB_, 1);
+    // If only one seed was passed, leave B at index 0 (different from A
+    // by happenstance — user has to pick the other side).
+    if (seedSegmentIds.size() < 2 && _availableSegments.size() >= 2 &&
+        cmbA_->currentIndex() == cmbB_->currentIndex())
+    {
+        cmbB_->setCurrentIndex(cmbA_->currentIndex() == 0 ? 1 : 0);
+    }
+
+    inputsLay->addRow(tr("Surface A:"), cmbA_);
+    inputsLay->addRow(tr("Surface B:"), cmbB_);
+
+    lblRoleHint_ = new QLabel(grpInputs);
+    lblRoleHint_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    lblRoleHint_->setWordWrap(true);
+    inputsLay->addRow(tr("Roles:"), lblRoleHint_);
+
+    btnSwap_ = new QPushButton(tr("Swap parent/child"), grpInputs);
+    inputsLay->addRow(QString(), btnSwap_);
+
+    main->addWidget(grpInputs);
+
+    // --- Tunables ---------------------------------------------------------
+    auto grpTunables = new QGroupBox(tr("Patch"), this);
+    auto tForm = new QFormLayout(grpTunables);
+
+    spBorderCells_ = new QSpinBox(grpTunables);
+    spBorderCells_->setRange(1, 256);
+    spBorderCells_->setValue(ms_borderCells);
+    spBorderCells_->setToolTip(tr("Width of the child rim used for anchor seeding "
+                                  "(child grid cells)."));
+
+    spBlendCells_ = new QSpinBox(grpTunables);
+    spBlendCells_->setRange(1, 256);
+    spBlendCells_->setValue(ms_blendCells);
+    spBlendCells_->setToolTip(tr("Smoothstep blend ramp width at the seam "
+                                 "(parent grid cells)."));
+
+    spIdwK_ = new QSpinBox(grpTunables);
+    spIdwK_->setRange(1, 16);
+    spIdwK_->setValue(ms_idwK);
+    spIdwK_->setToolTip(tr("Base K for KDTree-IDW resampling of child XYZ "
+                           "(clamped to >= 8 internally)."));
+
+    tForm->addRow(tr("Border cells (anchor scope):"), spBorderCells_);
+    tForm->addRow(tr("Blend cells (seam ramp):"),     spBlendCells_);
+    tForm->addRow(tr("IDW K:"),                       spIdwK_);
+    main->addWidget(grpTunables);
+
+    // --- Advanced ---------------------------------------------------------
+    auto grpAdv = new QGroupBox(tr("Advanced"), this);
+    grpAdv->setCheckable(true);
+    grpAdv->setChecked(false);
+    auto advForm = new QFormLayout(grpAdv);
+
+    spIters_ = new QSpinBox(grpAdv);
+    spIters_->setRange(1, 1'000'000);
+    spIters_->setValue(ms_iters);
+    spIters_->setSingleStep(100);
+
+    spMin_ = new QDoubleSpinBox(grpAdv);
+    spMin_->setRange(0.1, 1000.0); spMin_->setDecimals(2); spMin_->setSingleStep(0.5);
+    spMin_->setValue(ms_min);
+
+    spMax_ = new QDoubleSpinBox(grpAdv);
+    spMax_->setRange(0.1, 1000.0); spMax_->setDecimals(2); spMax_->setSingleStep(0.5);
+    spMax_->setValue(ms_max);
+
+    spMadK_ = new QDoubleSpinBox(grpAdv);
+    spMadK_->setRange(0.1, 20.0); spMadK_->setDecimals(2); spMadK_->setSingleStep(0.1);
+    spMadK_->setValue(ms_madK);
+
+    spSeed_ = new QSpinBox(grpAdv);
+    spSeed_->setRange(0, std::numeric_limits<int>::max());
+    spSeed_->setValue(ms_seed);
+
+    spAnchorCap_ = new QSpinBox(grpAdv);
+    spAnchorCap_->setRange(0, 1'000'000);
+    spAnchorCap_->setValue(ms_anchorCap);
+    spAnchorCap_->setToolTip(tr("0 = no cap"));
+
+    edtThreads_ = new QLineEdit(grpAdv);
+    edtThreads_->setPlaceholderText(tr("optional"));
+    edtThreads_->setValidator(new QRegularExpressionValidator(
+        QRegularExpression("^\\s*\\d*\\s*$"), edtThreads_));
+    if (ms_ompThreads > 0) edtThreads_->setText(QString::number(ms_ompThreads));
+
+    advForm->addRow(tr("RANSAC iterations:"),         spIters_);
+    advForm->addRow(tr("RANSAC min threshold (vox):"), spMin_);
+    advForm->addRow(tr("RANSAC max threshold (vox):"), spMax_);
+    advForm->addRow(tr("RANSAC MAD k:"),               spMadK_);
+    advForm->addRow(tr("RANSAC seed (0 = random):"),   spSeed_);
+    advForm->addRow(tr("Anchor cap:"),                 spAnchorCap_);
+    advForm->addRow(tr("OMP threads:"),                edtThreads_);
+    main->addWidget(grpAdv);
+
+    // --- Destructive-action banner ---------------------------------------
+    lblBanner_ = new QLabel(this);
+    lblBanner_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    lblBanner_->setWordWrap(true);
+    lblBanner_->setStyleSheet(
+        "QLabel { background-color: #5a1a1a; color: #ffd0d0; "
+        "padding: 8px; border: 1px solid #a04040; border-radius: 4px; }");
+    main->addWidget(lblBanner_);
+
+    // --- Buttons ----------------------------------------------------------
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    auto btnReset = btns->addButton(tr("Reset to Defaults"), QDialogButtonBox::ResetRole);
+    connect(btns,     &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns,     &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(btnReset, &QPushButton::clicked,       this, [this]() { applyCodeDefaults(); });
+    main->addWidget(btns);
+
+    // --- Wiring -----------------------------------------------------------
+    connect(cmbA_, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int) { _userSwapped = false; recomputeRoleHint(); });
+    connect(cmbB_, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int) { _userSwapped = false; recomputeRoleHint(); });
+    connect(btnSwap_, &QPushButton::clicked, this, [this]() {
+        _aIsParent = !_aIsParent;
+        _userSwapped = true;
+        recomputeRoleHint();
+    });
+
+    applySessionDefaults();
+    recomputeRoleHint();
+
+    setSizeGripEnabled(true);
+    resize(560, 720);
+}
+
+void MergePatchDialog::applyCodeDefaults()
+{
+    spBorderCells_->setValue(16);
+    spBlendCells_->setValue(6);
+    spIdwK_->setValue(4);
+    spIters_->setValue(3000);
+    spMin_->setValue(5.0);
+    spMax_->setValue(10.0);
+    spMadK_->setValue(3.0);
+    spSeed_->setValue(0);
+    spAnchorCap_->setValue(0);
+    edtThreads_->clear();
+}
+
+void MergePatchDialog::applySessionDefaults()
+{
+    if (!ms_haveSession) return;
+    spBorderCells_->setValue(ms_borderCells);
+    spBlendCells_->setValue(ms_blendCells);
+    spIdwK_->setValue(ms_idwK);
+    spIters_->setValue(ms_iters);
+    spMin_->setValue(ms_min);
+    spMax_->setValue(ms_max);
+    spMadK_->setValue(ms_madK);
+    spSeed_->setValue(ms_seed);
+    spAnchorCap_->setValue(ms_anchorCap);
+    if (ms_ompThreads > 0) edtThreads_->setText(QString::number(ms_ompThreads));
+}
+
+void MergePatchDialog::updateSessionFromUI()
+{
+    ms_haveSession = true;
+    ms_borderCells = spBorderCells_->value();
+    ms_blendCells  = spBlendCells_->value();
+    ms_idwK        = spIdwK_->value();
+    ms_iters       = spIters_->value();
+    ms_min         = spMin_->value();
+    ms_max         = spMax_->value();
+    ms_madK        = spMadK_->value();
+    ms_seed        = spSeed_->value();
+    ms_anchorCap   = spAnchorCap_->value();
+    ms_ompThreads  = ompThreads();
+}
+
+int MergePatchDialog::validCellCountFor(const QString& segId) const
+{
+    if (!_volpkg) return -1;
+    auto surf = _volpkg->getSurface(segId.toStdString());
+    if (!surf || !surf->isLoaded()) return -1;
+    return surf->countValidPoints();
+}
+
+void MergePatchDialog::recomputeRoleHint()
+{
+    const QString idA = cmbA_->currentText();
+    const QString idB = cmbB_->currentText();
+
+    if (idA.isEmpty() || idB.isEmpty()) {
+        lblRoleHint_->setText(tr("(pick two surfaces)"));
+        refreshOverwriteBanner();
+        return;
+    }
+    if (idA == idB) {
+        lblRoleHint_->setText(QString::fromLatin1(
+            "<span style='color:#d04040;'>%1</span>")
+            .arg(tr("Surface A and B must be different")));
+        refreshOverwriteBanner();
+        return;
+    }
+
+    const int vA = validCellCountFor(idA);
+    const int vB = validCellCountFor(idB);
+
+    // Auto-detect parent if the user hasn't swapped; otherwise keep
+    // whichever side the user pinned.
+    if (!_userSwapped) {
+        if (vA >= 0 && vB >= 0) {
+            _aIsParent = (vA >= vB);
+        } else {
+            // No valid-count signal -> default to A as parent. The user
+            // can swap if that's wrong.
+            _aIsParent = true;
+        }
+    }
+
+    const QString parentId = _aIsParent ? idA : idB;
+    const QString childId  = _aIsParent ? idB : idA;
+    const int     vParent  = _aIsParent ? vA  : vB;
+    const int     vChild   = _aIsParent ? vB  : vA;
+
+    auto fmt = [](int v) {
+        return v < 0 ? QString("?") : QString::number(v);
+    };
+    QString tag = _userSwapped ? tr(" (swapped — explicit)") :
+                                 tr(" (auto-detect)");
+    lblRoleHint_->setText(
+        tr("Parent: %1 (valid=%2)<br/>Child: %3 (valid=%4)%5")
+            .arg(parentId, fmt(vParent), childId, fmt(vChild), tag));
+
+    if (vParent >= 0 && vChild > 0 && vParent < 2 * vChild) {
+        lblRoleHint_->setText(lblRoleHint_->text() +
+            QString::fromLatin1("<br/><span style='color:#c08040;'>%1</span>")
+                .arg(tr("warning: parent only %1× larger than child — "
+                        "verify roles")
+                         .arg((double)vParent / std::max(1, vChild), 0, 'f', 1)));
+    }
+
+    refreshOverwriteBanner();
+}
+
+void MergePatchDialog::refreshOverwriteBanner()
+{
+    const QString idA = cmbA_->currentText();
+    const QString idB = cmbB_->currentText();
+    QString parentId;
+    if (!idA.isEmpty() && !idB.isEmpty() && idA != idB) {
+        parentId = _aIsParent ? idA : idB;
+    }
+    if (parentId.isEmpty()) {
+        lblBanner_->setText(tr("Pick two distinct surfaces before continuing."));
+        return;
+    }
+    lblBanner_->setText(
+        tr("Parent <b>%1</b> will be overwritten in place. "
+           "x/y/z/mask/meta are replaced atomically; aux files "
+           "(approval.tif, generations.tif, ...) are preserved. "
+           "The pre-patch state is snapshotted to a "
+           "<code>backups/%1/{0..7}/</code> folder beside the volpkg "
+           "file.").arg(parentId));
+}
+
+QString MergePatchDialog::parentPath() const { return _parentPath; }
+QString MergePatchDialog::childPath()  const { return _childPath;  }
+bool    MergePatchDialog::explicitRoles() const { return _explicitRoles; }
+int     MergePatchDialog::borderCells() const { return spBorderCells_->value(); }
+int     MergePatchDialog::blendCells()  const { return spBlendCells_->value();  }
+int     MergePatchDialog::idwK()        const { return spIdwK_->value();        }
+int     MergePatchDialog::ransacIters() const { return spIters_->value();       }
+double  MergePatchDialog::ransacMinThresh() const { return spMin_->value();     }
+double  MergePatchDialog::ransacMaxThresh() const { return spMax_->value();     }
+double  MergePatchDialog::ransacMadK()  const { return spMadK_->value();        }
+int     MergePatchDialog::ransacSeed()  const { return spSeed_->value();        }
+int     MergePatchDialog::anchorCap()   const { return spAnchorCap_->value();   }
+int     MergePatchDialog::ompThreads()  const {
+    const QString t = edtThreads_->text().trimmed();
+    if (t.isEmpty()) return -1;
+    bool ok = false;
+    const int v = t.toInt(&ok);
+    return (ok && v > 0) ? v : -1;
+}
+
+void MergePatchDialog::accept()
+{
+    const QString idA = cmbA_->currentText();
+    const QString idB = cmbB_->currentText();
+    if (idA.isEmpty() || idB.isEmpty()) {
+        QMessageBox::warning(this, tr("Patch tifxyz"),
+            tr("Pick two surfaces before proceeding."));
+        return;
+    }
+    if (idA == idB) {
+        QMessageBox::warning(this, tr("Patch tifxyz"),
+            tr("Parent and child must be different surfaces."));
+        return;
+    }
+    if (spMin_->value() >= spMax_->value()) {
+        QMessageBox::warning(this, tr("Patch tifxyz"),
+            tr("RANSAC min threshold must be strictly less than max."));
+        return;
+    }
+
+    QSet<QString> avail(_availableSegments.begin(), _availableSegments.end());
+    if (!avail.contains(idA) || !avail.contains(idB)) {
+        QMessageBox::warning(this, tr("Patch tifxyz"),
+            tr("One of the picked surfaces is not present under %1.")
+                .arg(_pathsDir));
+        return;
+    }
+
+    const QString parentId = _aIsParent ? idA : idB;
+    const QString childId  = _aIsParent ? idB : idA;
+
+    namespace fs = std::filesystem;
+    const fs::path pathsRoot = fs::path(_pathsDir.toStdString());
+    const fs::path parentDir = pathsRoot / parentId.toStdString();
+    const fs::path childDir  = pathsRoot / childId.toStdString();
+    if (!fs::is_directory(parentDir) || !fs::is_directory(childDir)) {
+        QMessageBox::critical(this, tr("Patch tifxyz"),
+            tr("Surface directories not found under %1.").arg(_pathsDir));
+        return;
+    }
+
+    _parentPath     = QString::fromStdString(parentDir.string());
+    _childPath      = QString::fromStdString(childDir.string());
+    _explicitRoles  = _userSwapped;
 
     updateSessionFromUI();
     QDialog::accept();

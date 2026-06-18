@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -17,9 +18,10 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
-#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerBase.hpp"
@@ -32,6 +34,7 @@
 
 class CState;
 class QEvent;
+class QGraphicsEllipseItem;
 class QGraphicsItem;
 class QGraphicsPathItem;
 class QGraphicsScene;
@@ -51,6 +54,20 @@ class CChunkedVolumeViewer : public QWidget, public VolumeViewerBase
     Q_OBJECT
 
 public:
+    struct CameraState {
+        float surfacePtrX = 0.0f;
+        float surfacePtrY = 0.0f;
+        float scale = 1.0f;
+        float zOffset = 0.0f;
+        cv::Vec3f zOffsetWorldDir{0, 0, 0};
+    };
+    struct SceneVolumeSample {
+        cv::Vec3f position{0, 0, 0};
+        cv::Vec3f normal{0, 0, 1};
+        Surface* surface = nullptr;
+    };
+    using ShiftScrollOverride = std::function<bool(int, QPointF, Qt::KeyboardModifiers)>;
+
     CChunkedVolumeViewer(CState* state, ViewerManager* manager, QWidget* parent = nullptr);
     ~CChunkedVolumeViewer() override;
 
@@ -64,6 +81,7 @@ public:
     void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) override;
+    void serviceRenderTick() override;
     void invalidateVis() override;
     void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells) override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
@@ -78,6 +96,12 @@ public:
     float getCurrentScale() const override { return _scale; }
     float dsScale() const override { return _dsScale; }
     float normalOffset() const override { return _zOff; }
+    CameraState cameraState() const;
+    void applyCameraState(const CameraState& state, bool forceRender = true);
+    // Render-bench helpers: true when no render is running/queued/pending; count of
+    // remote chunk fetches still outstanding. Used by replay to settle each frame.
+    bool isRenderQuiescent() const;
+    std::size_t chunkFetchesInFlight() const;
     int datasetScaleIndex() const override { return _dsScaleIdx; }
     float datasetScaleFactor() const override { return _dsScale; }
     Surface* currentSurface() const override;
@@ -114,10 +138,12 @@ public:
     void setSegmentationCursorMirroring(bool) override {}
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
-    uint64_t highlightedPointId() const override { return 0; }
-    uint64_t selectedPointId() const override { return 0; }
-    uint64_t selectedCollectionId() const override { return 0; }
+    uint64_t highlightedPointId() const override { return _highlightedPointId; }
+    uint64_t selectedPointId() const override { return _selectedPointId; }
+    uint64_t selectedCollectionId() const override { return _selectedCollectionId; }
     bool isPointDragActive() const override { return false; }
+    bool isSameWrapAnnotationModeEnabled() const override { return _sameWrapAnnotation.enabled(); }
+    double sameWrapAnnotationPolylineOpacity() const override { return _sameWrapAnnotationPolylineOpacity; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
 
     void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items) override;
@@ -155,10 +181,15 @@ public:
 
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
+    [[nodiscard]] std::optional<SceneVolumeSample> sampleSceneVolume(const QPointF& scenePoint) const;
     cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const override;
     QPointF surfaceCoordsToScene(float surfX, float surfY) const override { return surfaceToScene(surfX, surfY); }
     void setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point) override;
     QPointF lastScenePosition() const override { return _lastScenePos; }
+    void setLineAnnotationPlacementPreviewEnabled(bool enabled);
+    bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
+    bool lineAnnotationPlacementMarkerVisible() const;
+    void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
     QObject* asQObject() override { return this; }
@@ -171,6 +202,7 @@ public:
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
@@ -190,16 +222,19 @@ public slots:
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
-    void onCollectionSelected(uint64_t) {}
-    void onPointSelected(uint64_t) {}
+    void onCollectionSelected(uint64_t collectionId);
+    void onPointSelected(uint64_t pointId);
     void setSameWrapAnnotationMode(bool enabled);
     void setSameWrapAnnotationSpacing(double spacingVx);
+    void setSameWrapAnnotationPolylineOpacity(double opacity);
     void setSameWrapAnnotationMergeExisting(bool enabled);
     void setSameWrapAnnotationPathType(int pathType);
     void setSameWrapAnnotationFilterType(int filterType);
     void setSameWrapAnnotationFilterKernelSize(int kernelSize);
+    bool hasSameWrapAnnotationPreview() const;
     void clearSameWrapAnnotationPreview();
     bool commitSameWrapAnnotationPreview();
+    bool undoSameWrapAnnotation();
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
@@ -217,6 +252,7 @@ signals:
                                 Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseDoubleClickVolume(cv::Vec3f volLoc, Qt::MouseButton button,
                                     Qt::KeyboardModifiers modifiers);
+    void sendLineAnnotationSeedRequested(cv::Vec3f volLoc, QPointF scenePos);
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
@@ -234,11 +270,9 @@ private:
     void updateStatusLabel();
     void rebuildChunkArray();
     void syncCameraTransform();
-    bool renderInteractiveAxisAlignedSlicePreview();
-    void updateInteractivePreviewFromStableFrame(float newSurfX, float newSurfY, float newScale);
-    bool shouldRefreshInteractivePreview();
     void resizeFramebuffer();
     void recalcPyramidLevel();
+    void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
     bool isAxisAlignedView() const;
@@ -270,8 +304,11 @@ private:
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
+    void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
+    void clearLineAnnotationPlacementMarker();
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
+    std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
@@ -285,14 +322,16 @@ private:
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
-    QTimer* _renderTimer = nullptr;
-    QTimer* _settleRenderTimer = nullptr;
-    QTimer* _intersectionRenderTimer = nullptr;
-    QTimer* _resizeRenderTimer = nullptr;
-    QTimer* _statusTimer = nullptr;
+    // No per-viewer timers: ViewerManager's single global clock drives rendering via
+    // serviceRenderTick(), which drains these flags/countdowns (counts are in ticks).
     bool _closing = false;
     bool _renderPending = false;
-    bool _interactivePreview = false;
+    bool _intersectionPending = false;
+    int  _statusRefreshTicks = 0;  // counts down to the periodic status refresh
+    // A render was requested while this viewer was hidden (minimized MDI subwindow /
+    // background tab). We skip the work and set this; showEvent re-renders so the
+    // viewer catches up on whatever went stale while invisible.
+    bool _renderStaleWhileHidden = false;
     bool _segmentationEditActive = false;
     bool _deferSegmentationIntersections = false;
     bool _deferredSegmentationIntersectionsDirty = false;
@@ -301,9 +340,6 @@ private:
     std::string _pendingRenderCaller;
     std::string _pendingIntersectionReason;
     std::string _pendingIntersectionCaller;
-    QElapsedTimer _interactionClock;
-    qint64 _lastInteractionMs = -1;
-    qint64 _lastInteractivePreviewMs = -1;
 
     std::shared_ptr<Volume> _volume;
     std::weak_ptr<Surface> _surfWeak;
@@ -313,14 +349,15 @@ private:
     vc::render::IChunkedArray::ChunkReadyCallbackId _chunkCbId = 0;
 
     QImage _framebuffer;
-    QImage _stableFramebuffer;
-    float _stableSurfX = 0.0f;
-    float _stableSurfY = 0.0f;
-    float _stableScale = 1.0f;
-    bool _stableFramebufferValid = false;
     std::atomic<bool> _renderWorkerBusy{false};
     bool _renderPendingAfterWorker = false;
     std::uint64_t _renderSerial = 0;
+    // Output-affecting view params of the render currently in flight. A submit that
+    // arrives while the worker is busy only DISCARDS that frame (bumps _renderSerial)
+    // when these change; a data-only refresh lets the in-flight frame finish and
+    // display instead of being thrown away (cuts discarded renders ~19%->5%).
+    std::size_t _inFlightParamsKey = 0;
+    std::size_t viewParamsKey() const;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
@@ -364,6 +401,7 @@ private:
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
+    double _voxelSizeOverrideUm = 0.0;   // scalebar fallback when volume metadata lacks voxelsize
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     int _maxDisplayedResolution = 0;
     bool _showDirectionHints = true;
@@ -426,6 +464,18 @@ private:
     };
     IntersectionGeometryCache _intersectionGeometryCache;
 
+    // Async plane-intersection compute. The r-tree query + triangle clip is heavy
+    // (~12% of the GUI tick); on a geometry-cache miss it runs on a worker and the
+    // QGraphicsItems are built on the main thread when the result lands. _intersectGen
+    // rises on every input change; a result whose gen no longer matches is dropped.
+    // One compute at a time; the current scene items stand as the preview meanwhile.
+    std::uint64_t _intersectGen = 0;
+    bool _intersectComputeInFlight = false;
+    void finishPlaneIntersectionCompute(
+        std::uint64_t gen, cv::Rect cacheRoi, IntersectFingerprint fp,
+        std::shared_ptr<std::unordered_map<SurfacePatchIndex::SurfacePtr,
+            std::vector<SurfacePatchIndex::TriangleSegment>>> result);
+
     struct FlattenedIntersectionLine {
         int planeIndex = 0;
         QPointF a;
@@ -455,13 +505,23 @@ private:
     QPointF _lastPanSceneF;
     QPointF _lastScenePos;
     std::optional<cv::Vec3f> _lastCursorVolumePos;
+    ShiftScrollOverride _shiftScrollOverride;
 
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
+    QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
+    bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
 
+    uint64_t _highlightedPointId = 0;
+    uint64_t _selectedCollectionId = 0;
+    uint64_t _selectedPointId = 0;
+
     SameWrapAnnotationTool _sameWrapAnnotation;
+    double _sameWrapAnnotationPolylineOpacity = 0.75;
+    bool _sameWrapManualMergePressConsumed = false;
+    bool _sameWrapManualPathDragActive = false;
 
     bool _bboxMode = false;
     QPointF _bboxStart;
