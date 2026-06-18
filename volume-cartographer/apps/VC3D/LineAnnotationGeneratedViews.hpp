@@ -66,7 +66,6 @@ struct GeneratedOverlay {
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
     bool currentLineMarkerAsCross = false;
-    bool pointMarkerInSurfaceCoords = false;
 };
 
 struct GeneratedViews {
@@ -621,7 +620,6 @@ GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(const GeneratedVi
                                                                CChunkedVolumeViewer* viewer,
                                                                PlaneSurface* plane,
                                                                const GeneratedControlPointLinePositionIndex* controlIndex = nullptr);
-GeneratedOverlay makeGeneratedSurfaceCenterPointOverlay(bool emphasized);
 void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                            const std::string& surfaceName,
                            const GeneratedOverlay& overlay);

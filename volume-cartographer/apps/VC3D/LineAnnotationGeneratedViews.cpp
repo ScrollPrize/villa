@@ -186,15 +186,6 @@ GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(
     return overlay;
 }
 
-GeneratedOverlay makeGeneratedSurfaceCenterPointOverlay(bool emphasized)
-{
-    GeneratedOverlay overlay;
-    overlay.pointMarker = {0.0f, 0.0f, 0.0f};
-    overlay.pointMarkerInSurfaceCoords = true;
-    overlay.emphasizedPointMarker = emphasized;
-    return overlay;
-}
-
 void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                            const std::string& surfaceName,
                            const GeneratedOverlay& overlay)
@@ -429,16 +420,9 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     if (finiteGeneratedPoint(overlay.pointMarker)) {
-        const qreal radius = overlay.emphasizedPointMarker ? 2.5 : 2.0;
-        const auto& style = overlay.emphasizedPointMarker ? currentMarkerStyle : markerStyle;
-        if (overlay.pointMarkerInSurfaceCoords) {
-            primitives.push_back(ViewerOverlayControllerBase::SurfacePointPrimitive{
-                {overlay.pointMarker[0], overlay.pointMarker[1]},
-                radius,
-                style});
-        } else {
-            addVolumePointMarker(overlay.pointMarker, radius, style);
-        }
+        addVolumePointMarker(overlay.pointMarker,
+                             overlay.emphasizedPointMarker ? 2.5 : 2.0,
+                             overlay.emphasizedPointMarker ? currentMarkerStyle : markerStyle);
     }
 
     if (!hasSeedScene && finiteGeneratedPoint(overlay.seedPoint)) {

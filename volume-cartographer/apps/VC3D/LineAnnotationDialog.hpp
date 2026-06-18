@@ -19,7 +19,6 @@
 
 class CState;
 class QComboBox;
-class QGraphicsEllipseItem;
 class QGraphicsPathItem;
 class QLabel;
 class QMdiArea;
@@ -63,12 +62,12 @@ public:
     struct FastStripOverlayItems {
         QPointer<CChunkedVolumeViewer> viewer;
         std::string surfaceName;
-        std::vector<QGraphicsEllipseItem*> crossMarkers;
-        QGraphicsEllipseItem* currentMarker = nullptr;
+        QGraphicsPathItem* currentLine = nullptr;
     };
 
     struct FastCurrentCutOverlayItems {
         QPointer<CChunkedVolumeViewer> viewer;
+        QGraphicsPathItem* centerPoint = nullptr;
         QGraphicsPathItem* controlPoints = nullptr;
         QGraphicsPathItem* seedPoints = nullptr;
     };
@@ -168,9 +167,7 @@ private:
                                const GeneratedOverlay& overlay);
     void clearControlPointContextPreview(const std::string& surfaceName,
                                          CChunkedVolumeViewer* viewer);
-    GeneratedOverlay stripOverlay() const;
     GeneratedOverlay staticStripOverlay() const;
-    GeneratedOverlay dynamicStripOverlay() const;
     GeneratedOverlay zSliceOverlay(double linePosition,
                                    bool emphasized,
                                    CChunkedVolumeViewer* viewer,
@@ -179,7 +176,6 @@ private:
     cv::Vec3f interpolatedLineTangent(double linePosition) const;
     cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
     bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
-    double bottomSliceLinePosition(int slot, int bottomCount) const;
     void updateBottomSliceStepLabel();
     QPointF stripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                      QuadSurface* surface,

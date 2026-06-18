@@ -11,7 +11,6 @@
 #include <QBrush>
 #include <QComboBox>
 #include <QEvent>
-#include <QGraphicsEllipseItem>
 #include <QGraphicsPathItem>
 #include <QKeyEvent>
 #include <QHBoxLayout>
@@ -37,11 +36,9 @@
 
 namespace {
 
-constexpr int kBottomCrossSliceCount = 7;
 constexpr float kCurrentCutRotationStepRadians = 3.14159265358979323846f / 36.0f;
 constexpr bool kGeneratedLineAnnotationOverlaysEnabled = true;
 constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
-constexpr char kGeneratedStaticCurrentCutCenterOverlayKey[] = "line-z-slice-center";
 
 std::string staticStripOverlayKey(const std::string& surfaceName)
 {
@@ -128,17 +125,6 @@ cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
                 std::numeric_limits<float>::quiet_NaN()};
     }
     return vector * (1.0f / n);
-}
-
-void setEllipseCenter(QGraphicsEllipseItem* item, const QPointF& center, qreal radius)
-{
-    if (!item) {
-        return;
-    }
-    item->setRect(center.x() - radius,
-                  center.y() - radius,
-                  radius * 2.0,
-                  radius * 2.0);
 }
 
 } // namespace
@@ -1267,37 +1253,9 @@ double LineAnnotationDialog::snappedControlPointPosition(double position) const
     return vc3d::line_annotation::snappedControlPointLinePosition(position, controlLinePositions);
 }
 
-LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::stripOverlay() const
-{
-    const int count = static_cast<int>(_generatedViews.linePoints.size());
-    const int visibleCount = std::min(kBottomCrossSliceCount, count);
-    std::vector<double> markerLinePositions;
-    markerLinePositions.reserve(static_cast<size_t>(visibleCount + 1));
-    for (int i = 0; i < visibleCount; ++i) {
-        markerLinePositions.push_back(bottomSliceLinePosition(i, visibleCount));
-    }
-    return vc3d::line_annotation::makeGeneratedStripOverlay(_generatedViews,
-                                                            _currentLinePosition,
-                                                            markerLinePositions);
-}
-
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::staticStripOverlay() const
 {
     return vc3d::line_annotation::makeGeneratedStaticStripOverlay(_generatedViews);
-}
-
-LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::dynamicStripOverlay() const
-{
-    const int count = static_cast<int>(_generatedViews.linePoints.size());
-    const int visibleCount = std::min(kBottomCrossSliceCount, count);
-    std::vector<double> markerLinePositions;
-    markerLinePositions.reserve(static_cast<size_t>(visibleCount + 1));
-    for (int i = 0; i < visibleCount; ++i) {
-        markerLinePositions.push_back(bottomSliceLinePosition(i, visibleCount));
-    }
-    return vc3d::line_annotation::makeGeneratedDynamicStripOverlay(_generatedViews,
-                                                                   _currentLinePosition,
-                                                                   markerLinePositions);
 }
 
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(double linePosition,
@@ -1334,11 +1292,6 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
     }
 
-    if (_currentCutViewer) {
-        applyOverlayForViewer(kGeneratedStaticCurrentCutCenterOverlayKey,
-                              _currentCutViewer,
-                              vc3d::line_annotation::makeGeneratedSurfaceCenterPointOverlay(true));
-    }
 }
 
 void LineAnnotationDialog::clearFastGeneratedOverlayItemRefs()
@@ -1356,13 +1309,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         return;
     }
 
-    const int linePointCount = static_cast<int>(_generatedViews.linePoints.size());
-    const int visibleCount = std::min(kBottomCrossSliceCount, linePointCount);
     const auto ensureStripItems =
-        [this, visibleCount](size_t index,
-                             CChunkedVolumeViewer* viewer,
-                             const std::string& surfaceName) -> FastStripOverlayItems* {
-        if (!viewer || visibleCount <= 0) {
+        [this](size_t index,
+               CChunkedVolumeViewer* viewer,
+               const std::string& surfaceName) -> FastStripOverlayItems* {
+        if (!viewer) {
             return nullptr;
         }
         if (index >= _fastStripOverlayItems.size()) {
@@ -1371,8 +1322,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         auto& entry = _fastStripOverlayItems[index];
         const bool recreate = entry.viewer != viewer ||
                               entry.surfaceName != surfaceName ||
-                              static_cast<int>(entry.crossMarkers.size()) != visibleCount ||
-                              !entry.currentMarker;
+                              !entry.currentLine;
         if (!recreate) {
             return &entry;
         }
@@ -1383,31 +1333,18 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         entry.viewer = viewer;
         entry.surfaceName = surfaceName;
 
-        QPen markerPen(QColor(0, 220, 255, 210));
-        markerPen.setWidthF(1.0);
-        QBrush markerBrush(QColor(0, 220, 255, 150));
         QPen currentPen(QColor(0, 245, 255, 245));
-        currentPen.setWidthF(1.5);
-        QBrush currentBrush(QColor(0, 245, 255, 210));
+        currentPen.setWidthF(2.0);
+        currentPen.setCapStyle(Qt::RoundCap);
 
         std::vector<QGraphicsItem*> items;
-        items.reserve(static_cast<size_t>(visibleCount + 1));
-        entry.crossMarkers.reserve(static_cast<size_t>(visibleCount));
-        for (int i = 0; i < visibleCount; ++i) {
-            auto* marker = new QGraphicsEllipseItem();
-            marker->setPen(markerPen);
-            marker->setBrush(markerBrush);
-            marker->setZValue(151.0);
-            marker->setVisible(false);
-            entry.crossMarkers.push_back(marker);
-            items.push_back(marker);
-        }
-        entry.currentMarker = new QGraphicsEllipseItem();
-        entry.currentMarker->setPen(currentPen);
-        entry.currentMarker->setBrush(currentBrush);
-        entry.currentMarker->setZValue(153.0);
-        entry.currentMarker->setVisible(false);
-        items.push_back(entry.currentMarker);
+        items.reserve(1);
+        entry.currentLine = new QGraphicsPathItem();
+        entry.currentLine->setPen(currentPen);
+        entry.currentLine->setBrush(Qt::NoBrush);
+        entry.currentLine->setZValue(153.0);
+        entry.currentLine->setVisible(false);
+        items.push_back(entry.currentLine);
         viewer->setOverlayGroup(overlayKey, items);
         return &entry;
     };
@@ -1424,36 +1361,31 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!entry || !quad) {
             continue;
         }
-        for (int markerIndex = 0; markerIndex < visibleCount; ++markerIndex) {
-            auto* marker = entry->crossMarkers[static_cast<size_t>(markerIndex)];
-            const double position = bottomSliceLinePosition(markerIndex, visibleCount);
-            if (!std::isfinite(position) ||
-                std::abs(position - _currentLinePosition) < 1.0e-6) {
-                marker->setVisible(false);
-                continue;
-            }
-            const QPointF scenePoint =
-                vc3d::line_annotation::generatedStripLinePositionToScene(viewer,
-                                                                          quad,
-                                                                          position);
-            if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
-                marker->setVisible(false);
-                continue;
-            }
-            setEllipseCenter(marker, scenePoint, 2.5);
-            marker->setVisible(true);
-        }
 
         const QPointF currentScenePoint =
             vc3d::line_annotation::generatedStripLinePositionToScene(viewer,
                                                                       quad,
                                                                       _currentLinePosition);
+        auto* view = viewer->graphicsView();
+        auto* viewport = view ? view->viewport() : nullptr;
         if (std::isfinite(currentScenePoint.x()) &&
-            std::isfinite(currentScenePoint.y())) {
-            setEllipseCenter(entry->currentMarker, currentScenePoint, 4.0);
-            entry->currentMarker->setVisible(true);
+            std::isfinite(currentScenePoint.y()) &&
+            view &&
+            viewport &&
+            viewport->width() > 0 &&
+            viewport->height() > 0) {
+            const QRect viewportRect = viewport->rect();
+            const QPointF topScene =
+                view->mapToScene(QPoint(viewportRect.center().x(), viewportRect.top()));
+            const QPointF bottomScene =
+                view->mapToScene(QPoint(viewportRect.center().x(), viewportRect.bottom()));
+            QPainterPath path;
+            path.moveTo(currentScenePoint.x(), topScene.y());
+            path.lineTo(currentScenePoint.x(), bottomScene.y());
+            entry->currentLine->setPath(path);
+            entry->currentLine->setVisible(true);
         } else {
-            entry->currentMarker->setVisible(false);
+            entry->currentLine->setVisible(false);
         }
     }
 
@@ -1463,15 +1395,24 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
 
     auto* viewer = _currentCutViewer.data();
     if (_fastCurrentCutOverlayItems.viewer != viewer ||
+        !_fastCurrentCutOverlayItems.centerPoint ||
         !_fastCurrentCutOverlayItems.controlPoints ||
         !_fastCurrentCutOverlayItems.seedPoints) {
         viewer->clearOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey);
         _fastCurrentCutOverlayItems = {};
         _fastCurrentCutOverlayItems.viewer = viewer;
 
+        QPen centerPen(QColor(0, 245, 255, 245));
+        centerPen.setWidthF(1.5);
+        QBrush centerBrush(QColor(0, 245, 255, 210));
         QPen controlPen(QColor(255, 230, 0, 220));
         controlPen.setWidthF(1.5);
         QBrush controlBrush(QColor(255, 230, 0, 170));
+
+        _fastCurrentCutOverlayItems.centerPoint = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.centerPoint->setPen(centerPen);
+        _fastCurrentCutOverlayItems.centerPoint->setBrush(centerBrush);
+        _fastCurrentCutOverlayItems.centerPoint->setZValue(153.0);
 
         _fastCurrentCutOverlayItems.controlPoints = new QGraphicsPathItem();
         _fastCurrentCutOverlayItems.controlPoints->setPen(controlPen);
@@ -1484,9 +1425,22 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.seedPoints->setZValue(161.0);
 
         viewer->setOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey,
-                                {_fastCurrentCutOverlayItems.controlPoints,
+                                {_fastCurrentCutOverlayItems.centerPoint,
+                                 _fastCurrentCutOverlayItems.controlPoints,
                                  _fastCurrentCutOverlayItems.seedPoints});
     }
+
+    QPointF centerScenePoint;
+    if (_currentCutStraightOffsetActive) {
+        centerScenePoint = viewer->volumeToScene(interpolatedLinePoint(_currentLinePosition));
+    } else {
+        centerScenePoint = viewer->surfaceCoordsToScene(0.0f, 0.0f);
+    }
+    QPainterPath centerPath;
+    if (std::isfinite(centerScenePoint.x()) && std::isfinite(centerScenePoint.y())) {
+        centerPath.addEllipse(centerScenePoint, 2.5, 2.5);
+    }
+    _fastCurrentCutOverlayItems.centerPoint->setPath(centerPath);
 
     QPainterPath controlPath;
     QPainterPath seedPath;
@@ -1641,19 +1595,6 @@ bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePo
         plane->setFromNormalAndUp(origin, tangent, upHint);
     }
     return true;
-}
-
-double LineAnnotationDialog::bottomSliceLinePosition(int slot, int bottomCount) const
-{
-    if (!_hasGeneratedViews || _generatedViews.linePoints.empty() || bottomCount <= 0) {
-        return 0.0;
-    }
-    return vc3d::line_annotation::bottomCrossSliceLinePosition(
-        _bottomCenterPosition,
-        slot,
-        bottomCount,
-        static_cast<int>(_generatedViews.linePoints.size()),
-        _bottomSliceLineStep);
 }
 
 void LineAnnotationDialog::updateBottomSliceStepLabel()
