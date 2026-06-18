@@ -135,6 +135,8 @@ public:
     virtual uint64_t selectedPointId() const = 0;
     virtual uint64_t selectedCollectionId() const = 0;
     virtual bool isPointDragActive() const = 0;
+    virtual bool isSameWrapAnnotationModeEnabled() const = 0;
+    virtual double sameWrapAnnotationPolylineOpacity() const = 0;
     virtual const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const = 0;
 
     // --- Overlay management ---

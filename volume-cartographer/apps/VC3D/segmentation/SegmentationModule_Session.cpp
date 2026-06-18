@@ -75,6 +75,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
     emitPendingChanges();
     _pendingAutosaveVertexUpdates.clear();
+    _pendingAutosaveVertexUpdateIndex.clear();
     _saveSnapshot.reset();
     updateAutosaveState();
     return true;
@@ -82,6 +83,9 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
 void SegmentationModule::endEditingSession()
 {
+    _forceFullSurfaceAutosave = false;
+    _pendingGridOffsetColDelta = 0;
+    _pendingGridOffsetRowDelta = 0;
     stopAllPushPull();
     clearUndoStack();
     cancelDrag();
@@ -122,12 +126,17 @@ void SegmentationModule::endEditingSession()
         performAutosave();
     }
 
+    if (_viewerManager && previewSurface) {
+        _viewerManager->refreshSurfacePatchIndex(previewSurface);
+    }
+
     if (_editManager) {
         _editManager->endSession();
     }
     _autosaveState.endSession();
     _saveSnapshot.reset();
     _pendingAutosaveVertexUpdates.clear();
+    _pendingAutosaveVertexUpdateIndex.clear();
     updateAutosaveState();
 }
 
@@ -284,16 +293,6 @@ bool SegmentationModule::restoreUndoSnapshot()
         if (_state) {
             auto preview = _editManager->previewSurface();
 
-            // Queue affected cells for incremental R-tree update
-            if (preview && undoBounds && undoBounds->width > 0 && undoBounds->height > 0 && _viewerManager) {
-                if (auto* index = _viewerManager->surfacePatchIndex()) {
-                    index->queueCellRangeUpdate(preview,
-                                              undoBounds->y,
-                                              undoBounds->y + undoBounds->height,
-                                              undoBounds->x,
-                                              undoBounds->x + undoBounds->width);
-                }
-            }
 
             _state->setSurface("segmentation", preview, false, true);
         }

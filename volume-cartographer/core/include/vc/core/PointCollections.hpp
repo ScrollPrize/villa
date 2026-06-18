@@ -80,6 +80,7 @@ public:
     std::vector<ColPoint> getPoints(const std::string& collectionName) const;
     std::string generateNewCollectionName(const std::string& prefix = "col") const;
     void autoFillWindingNumbers(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
+    void resetWindingNumbers();
     void setAutoFillMode(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
     WindingFillMode getAutoFillMode(uint64_t collectionId) const;
     float getAutoFillConstant(uint64_t collectionId) const;
@@ -102,8 +103,10 @@ protected:
     virtual void onCollectionsAdded(const std::vector<uint64_t>&) {}
     virtual void onCollectionRemoved(uint64_t) {}
     virtual void onPointAdded(const ColPoint&) {}
+    virtual void onPointsAdded(const std::vector<ColPoint>&) {}
     virtual void onPointChanged(const ColPoint&) {}
     virtual void onPointRemoved(uint64_t) {}
+    virtual void onPointsRemoved(const std::vector<uint64_t>&) {}
 
 private:
     uint64_t getNextPointId();

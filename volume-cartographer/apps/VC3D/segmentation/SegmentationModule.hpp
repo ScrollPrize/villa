@@ -8,6 +8,8 @@
 #include <QSet>
 #include <QLoggingCategory>
 
+#include <array>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -16,6 +18,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -70,6 +73,7 @@ public:
     ~SegmentationModule();
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
+    [[nodiscard]] SurfacePatchIndex* activeEditSurfacePatchIndex() const;
     [[nodiscard]] bool annotateMode() const { return _annotateMode; }
     void setEditingEnabled(bool enabled);
     void setAnnotateMode(bool enabled);
@@ -399,6 +403,7 @@ private:
     VCCollection* _pointCollection{nullptr};
 
     bool _annotateMode{false};
+    bool _correctionDragKeyActive{false};
     bool _editingEnabled{false};
     float _dragRadiusSteps{5.0f};
     float _dragSigmaSteps{2.0f};
@@ -419,6 +424,9 @@ private:
 
     DragState _drag;
     HoverState _hover;
+    bool _forceFullSurfaceAutosave{false};
+    int _pendingGridOffsetColDelta{0};
+    int _pendingGridOffsetRowDelta{0};
     CorrectionDragState _correctionDrag;
     PointMoveDragState _pointMoveDrag;
     uint64_t _selectedAnnotationCollectionId{0};
@@ -471,6 +479,7 @@ private:
     QFuture<std::shared_ptr<QuadSurface>> _saveFuture;
     std::shared_ptr<QuadSurface> _saveSnapshot;
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
+    std::unordered_map<std::uint64_t, std::size_t> _pendingAutosaveVertexUpdateIndex;
 
     // Correction points auto-save
     static constexpr int kCorrectionsSaveDelayMs = 2000;

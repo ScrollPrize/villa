@@ -541,6 +541,15 @@ void SegmentationModule::updateViewerCursors()
     }
 }
 
+SurfacePatchIndex* SegmentationModule::activeEditSurfacePatchIndex() const
+{
+    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
+        return nullptr;
+    }
+    auto* index = _editManager->editSurfacePatchIndex();
+    return (index && !index->empty()) ? index : nullptr;
+}
+
 void SegmentationModule::setIgnoreSegSurfaceChange(bool ignore)
 {
     _ignoreSegSurfaceChange = ignore;

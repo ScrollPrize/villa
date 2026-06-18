@@ -224,16 +224,23 @@ void PointCollections::addPoints(const std::string& collectionName, const std::v
     uint64_t collection_id = findOrCreateCollectionByName(collectionName);
     auto& collection_points = _collections[collection_id].points;
 
+    std::vector<ColPoint> added_points;
+    added_points.reserve(points.size());
+    const int64_t creation_time = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
     for (const auto& p : points) {
         ColPoint new_point;
         new_point.id = getNextPointId();
         new_point.collectionId = collection_id;
         new_point.p = p;
-        new_point.creation_time = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
+        new_point.creation_time = creation_time;
         collection_points[new_point.id] = new_point;
         _points[new_point.id] = new_point;
+        added_points.push_back(new_point);
         onPointAdded(new_point);
+    }
+    if (!added_points.empty()) {
+        onPointsAdded(added_points);
     }
 }
 
@@ -264,9 +271,14 @@ void PointCollections::clearCollection(uint64_t collectionId)
 {
     if (_collections.count(collectionId)) {
         auto& collection = _collections.at(collectionId);
+        std::vector<uint64_t> removed_point_ids;
+        removed_point_ids.reserve(collection.points.size());
         for (const auto& pair : collection.points) {
             _points.erase(pair.first);
-            onPointRemoved(pair.first);
+            removed_point_ids.push_back(pair.first);
+        }
+        if (!removed_point_ids.empty()) {
+            onPointsRemoved(removed_point_ids);
         }
         _collections.erase(collectionId);
         onCollectionRemoved(collectionId);
@@ -275,8 +287,13 @@ void PointCollections::clearCollection(uint64_t collectionId)
 
 void PointCollections::clearAll()
 {
+    std::vector<uint64_t> removed_point_ids;
+    removed_point_ids.reserve(_points.size());
     for (auto& point_pair : _points) {
-        onPointRemoved(point_pair.first);
+        removed_point_ids.push_back(point_pair.first);
+    }
+    if (!removed_point_ids.empty()) {
+        onPointsRemoved(removed_point_ids);
     }
     _collections.clear();
     _points.clear();
@@ -445,8 +462,26 @@ void PointCollections::autoFillWindingNumbers(uint64_t collectionId, WindingFill
                     point->winding_annotation = constantValue;
                     break;
             }
-            updatePoint(*point);
+            _points[point->id] = *point; // keep flat map in sync (value set above)
         }
+
+        onCollectionChanged(collectionId); // single signal for the whole batch
+    }
+}
+
+void PointCollections::resetWindingNumbers()
+{
+    for (auto& [cid, collection] : _collections) {
+        for (auto& [pid, point] : collection.points) {
+            point.winding_annotation = std::nan("");
+            if (_points.count(pid)) {
+                _points[pid].winding_annotation = std::nan("");
+            }
+        }
+        collection.metadata.absolute_winding_number = false;
+        collection.autoFillMode = WindingFillMode::None;
+        collection.autoFillConstant = 0.0f;
+        onCollectionChanged(cid);
     }
 }
 

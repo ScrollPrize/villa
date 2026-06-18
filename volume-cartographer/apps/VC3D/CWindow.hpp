@@ -96,6 +96,7 @@ class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
+class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 
 class CWindow : public QMainWindow
@@ -258,6 +259,7 @@ private:
     SegmentationWidget* _segmentationWidget{nullptr};
     QDockWidget* _lasagnaDock{nullptr};
     CPointCollectionWidget* _point_collection_widget;
+    WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
     CFiberWidget* _fiberSliceWidget{nullptr};
     std::unique_ptr<FiberAnnotationController> _fiberController;
@@ -370,6 +372,8 @@ private:
     // Segment cycling shortcuts
     QShortcut* fCycleNextSegmentShortcut;
     QShortcut* fCyclePrevSegmentShortcut;
+    QShortcut* fApplyApprovedTagShortcut{nullptr};
+    QShortcut* fApplyDefectiveTagShortcut{nullptr};
 
     QShortcut* fFocusedViewShortcut;
     bool _focusedViewActive{false};

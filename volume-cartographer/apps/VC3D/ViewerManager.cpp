@@ -480,6 +480,11 @@ SurfacePatchIndex* ViewerManager::surfacePatchIndexIfReady()
     return &_surfacePatchIndex;
 }
 
+SurfacePatchIndex* ViewerManager::activeSegmentationEditSurfacePatchIndex() const
+{
+    return _segmentationModule ? _segmentationModule->activeEditSurfacePatchIndex() : nullptr;
+}
+
 void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface)
 {
     if (!surface) {
@@ -811,16 +816,24 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
                                         _surfacePatchIndexWatcher->isRunning();
 
-    // Editing tools queue the exact touched cells as vertices move. Flush those
-    // cells into the current index immediately so plane intersections update
-    // without turning every brush/push-pull tick into a global async rebuild.
+    // During an active edit session, the mutable preview surface is tracked by
+    // SegmentationEditManager's single-surface index. Do not churn the global
+    // all-surfaces index for every preview update; it is refreshed when the
+    // edit session is committed or closed.
+    if (isEditUpdate) {
+        if (alreadyIndexed) {
+            _indexedSurfaceIds.insert(surfId);
+        }
+        return true;
+    }
+
     if (_surfacePatchIndex.hasPendingUpdates(quad)) {
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
         }
         _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
-        return flushed || isEditUpdate;
+        return flushed;
     }
 
     // Non-edit surfaceChanged signals are also used for UI alias/selection
@@ -830,28 +843,6 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     if (!isEditUpdate && alreadyIndexed) {
         _indexedSurfaceIds.insert(surfId);
         return true;
-    }
-
-    if (isEditUpdate && alreadyIndexed) {
-        return true;
-    }
-
-    if (isEditUpdate && !_surfacePatchIndex.empty()) {
-        if (_surfacePatchIndex.updateSurface(quad)) {
-            _indexedSurfaceIds.insert(surfId);
-            if (asyncRebuildInProgress) {
-                _surfacesQueuedDuringRebuild.push_back(
-                    {SurfacePatchIndexTaskType::Update, surfId, quad});
-            }
-            VC3D_DEBUG_QCINFO(lcViewerManager) << "Inserted active edit surface into SurfacePatchIndex"
-                                    << surfId.c_str();
-            return true;
-        }
-        _indexedSurfaceIds.erase(surfId);
-        _surfacePatchIndexNeedsRebuild = true;
-        VC3D_DEBUG_QCINFO(lcViewerManager) << "Failed to insert active edit surface into SurfacePatchIndex"
-                                << surfId.c_str() << "- marking index for rebuild";
-        return false;
     }
 
     if (asyncRebuildInProgress) {

@@ -119,6 +119,7 @@ public:
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
     SurfacePatchIndex* surfacePatchIndexIfReady();
+    SurfacePatchIndex* activeSegmentationEditSurfacePatchIndex() const;
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface);
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
 

@@ -56,6 +56,8 @@ public:
         QCheckBox* inspectOnly{nullptr};
         QCheckBox* currentOnly{nullptr};
         QLineEdit* surfaceIdFilter{nullptr};
+        QDoubleSpinBox* zLowerBound{nullptr};
+        QDoubleSpinBox* zUpperBound{nullptr};
     };
 
     struct TagUiRefs {
@@ -100,6 +102,7 @@ public:
 
     bool isCurrentOnlyFilterEnabled() const;
     bool toggleTag(Tag tag);
+    bool setTagChecked(Tag tag, bool checked);
     void reloadSurfacesFromDisk();
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);

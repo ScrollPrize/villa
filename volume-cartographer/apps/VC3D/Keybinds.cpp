@@ -10,6 +10,7 @@ constexpr const char* kSectionViewMenu = "View Menu";
 constexpr const char* kSectionViewerControls = "Viewer Controls";
 constexpr const char* kSectionNavigation = "Navigation";
 constexpr const char* kSectionSegments = "Segments";
+constexpr const char* kSectionSurfaceTags = "Surface Tags";
 constexpr const char* kSectionSegEditing = "Segmentation Editing";
 constexpr const char* kSectionApprovalMask = "Approval Mask";
 constexpr const char* kSectionSegGrowth = "Segmentation Growth";
@@ -143,6 +144,22 @@ const ShortcutDef CyclePrevSegment{
     "Cycle to previous visible segment",
     ShortcutKind::Text,
     "[",
+    QKeySequence::Open
+};
+const ShortcutDef ApplyApprovedTag{
+    "apply_approved_tag",
+    kSectionSurfaceTags,
+    "Apply Approved tag to selected segment",
+    ShortcutKind::Text,
+    "Shift+C",
+    QKeySequence::Open
+};
+const ShortcutDef ApplyDefectiveTag{
+    "apply_defective_tag",
+    kSectionSurfaceTags,
+    "Apply Defective tag to selected segment",
+    ShortcutKind::Text,
+    "Shift+V",
     QKeySequence::Open
 };
 const ShortcutDef FocusedView{
@@ -490,10 +507,14 @@ QString buildKeybindsHelpText()
         { kSectionSegments, shortcuts::CycleNextSegment.description, HelpKeyType::Shortcut, &shortcuts::CycleNextSegment, nullptr, nullptr },
         { kSectionSegments, shortcuts::CyclePrevSegment.description, HelpKeyType::Shortcut, &shortcuts::CyclePrevSegment, nullptr, nullptr },
 
+        { kSectionSurfaceTags, shortcuts::ApplyApprovedTag.description, HelpKeyType::Shortcut, &shortcuts::ApplyApprovedTag, nullptr, nullptr },
+        { kSectionSurfaceTags, shortcuts::ApplyDefectiveTag.description, HelpKeyType::Shortcut, &shortcuts::ApplyDefectiveTag, nullptr, nullptr },
+
         { kSectionSegEditing, keypress::SegmentationUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationUndo, nullptr },
         { kSectionSegEditing, keypress::ManualAddToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ManualAddToggle, nullptr },
         { kSectionSegEditing, keypress::LineDrawHold.description, HelpKeyType::KeyPress, nullptr, &keypress::LineDrawHold, nullptr },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
+        { kSectionSegEditing, "Anchor correction drag", HelpKeyType::Literal, nullptr, nullptr, "Hold G + Drag" },
         { kSectionSegEditing, "Add correction point", HelpKeyType::Literal, nullptr, nullptr, "  Click" },
         { kSectionSegEditing, "Move existing correction point", HelpKeyType::Literal, nullptr, nullptr, "  Shift+Drag" },
         { kSectionSegEditing, "Remove correction point", HelpKeyType::Literal, nullptr, nullptr, "  Right-click" },
