@@ -24,6 +24,7 @@ class QMdiArea;
 class QMdiSubWindow;
 class QPoint;
 class QPushButton;
+class QCloseEvent;
 class QResizeEvent;
 class QVariantAnimation;
 class QVBoxLayout;
@@ -87,6 +88,7 @@ public:
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setOptimizationBusy(bool busy);
+    void setCloseAfterFinalizationAllowed(bool allowed);
 
 signals:
     void paneClosed(const std::string& surfaceName);
@@ -101,9 +103,11 @@ signals:
                                          cv::Vec3f volumePoint);
     void showAsMeshRequested();
     void fullOptimizationRequested();
+    void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
 
 protected:
+    void closeEvent(QCloseEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -182,6 +186,7 @@ private:
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
+    bool _closeAfterFinalizationAllowed = false;
 
     QWidget* _generatedTopWidget = nullptr;
     std::vector<QPointer<QWidget>> _generatedContainers;
