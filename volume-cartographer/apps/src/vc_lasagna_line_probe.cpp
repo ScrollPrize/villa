@@ -52,7 +52,7 @@ bool finiteDirection(const cv::Vec3d& v)
 void printUsage(const char* argv0)
 {
     std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z]\n"
-              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian]\n"
+              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt|--reinit-reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian]\n"
               << "Runs line annotation optimization at seed "
               << "[17955,15141,37891] with initial z-axis mode, or loads/reoptimizes a saved VC3D fiber.\n";
 }
@@ -431,6 +431,33 @@ void printSegmentMotionTable(const std::vector<cv::Vec3d>& inputPoints,
     const size_t last = static_cast<size_t>(fixedIndices.back());
     if (last + 1 < compared) {
         printRow("open_right", last, compared - 1);
+    }
+}
+
+void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpanReport>& spans)
+{
+    std::cout.imbue(std::locale::classic());
+    std::cout << std::scientific << std::setprecision(2);
+    std::cout << "Reinit segment candidates:\n"
+              << "seg lcp rcp pts lsgn lnear rsgn rnear linit lfinal rinit rfinal mxstep mxtan mxnorm mxalign pick\n";
+    for (const auto& span : spans) {
+        std::cout << std::right << std::setw(3) << span.segmentIndex
+                  << std::setw(8) << span.leftControlIndex
+                  << std::setw(9) << span.rightControlIndex
+                  << std::setw(7) << span.points
+                  << std::setw(10) << span.candLeftSelectedSign
+                  << std::setw(13) << span.candLeftClosestTargetDistance
+                  << std::setw(11) << span.candRightSelectedSign
+                  << std::setw(14) << span.candRightClosestTargetDistance
+                  << std::setw(15) << span.candLeftInitialCost
+                  << std::setw(16) << span.candLeftFinalCost
+                  << std::setw(16) << span.candRightInitialCost
+                  << std::setw(17) << span.candRightFinalCost
+                  << std::setw(14) << span.chosenMaxEvenStepDeviation
+                  << std::setw(15) << span.chosenMaxTangentSmoothDeviation
+                  << std::setw(16) << span.chosenMaxNormalSmoothDeviation
+                  << std::setw(15) << span.chosenMaxNormalAlignmentAbs
+                  << ' ' << span.chosen << '\n';
     }
 }
 
@@ -1002,6 +1029,7 @@ int main(int argc, char** argv)
     bool benchmarkThreads = false;
     bool traceInit = false;
     bool reopt = false;
+    bool reinitReopt = false;
     std::filesystem::path fiberPath;
     std::filesystem::path outputPath;
     std::filesystem::path objOutputDir;
@@ -1023,6 +1051,8 @@ int main(int argc, char** argv)
             traceInit = true;
         } else if (arg == "--reopt") {
             reopt = true;
+        } else if (arg == "--reinit-reopt") {
+            reinitReopt = true;
         } else if (arg == "--fiber") {
             if (i + 1 >= argc) {
                 throw std::invalid_argument("--fiber requires a path");
@@ -1078,6 +1108,12 @@ int main(int argc, char** argv)
         if (reopt && fiberPath.empty()) {
             throw std::invalid_argument("--reopt requires --fiber <fiber.json>");
         }
+        if (reinitReopt && fiberPath.empty()) {
+            throw std::invalid_argument("--reinit-reopt requires --fiber <fiber.json>");
+        }
+        if (reopt && reinitReopt) {
+            throw std::invalid_argument("--reopt and --reinit-reopt are mutually exclusive");
+        }
         if (wantsTextureOutput && fiberPath.empty()) {
             throw std::invalid_argument("--obj-output-dir/--strip-output-dir require --fiber <fiber.json>");
         }
@@ -1087,8 +1123,8 @@ int main(int argc, char** argv)
         if (!textureZarrPath.empty() && !wantsTextureOutput) {
             throw std::invalid_argument("--texture-zarr requires --obj-output-dir or --strip-output-dir");
         }
-        if (reopt && (benchmarkSolvers || benchmarkThreads || traceInit)) {
-            throw std::invalid_argument("--reopt cannot be combined with benchmark or seed trace modes");
+        if ((reopt || reinitReopt) && (benchmarkSolvers || benchmarkThreads || traceInit)) {
+            throw std::invalid_argument("--reopt/--reinit-reopt cannot be combined with benchmark or seed trace modes");
         }
         if (!fiberPath.empty() && (benchmarkSolvers || benchmarkThreads || traceInit)) {
             throw std::invalid_argument("--fiber cannot be combined with benchmark or seed trace modes");
@@ -1168,8 +1204,53 @@ int main(int argc, char** argv)
             std::vector<cv::Vec3d> outputLinePoints = fiber.linePoints;
             vc::lasagna::LineModel outputLine =
                 makeLineModelFromPoints(fiber.linePoints, sampler, displayFrameAnchorIndex);
+            std::vector<int> outputFixedIndices = fixedIndices;
 
-            if (reopt) {
+            if (reinitReopt) {
+                std::vector<vc::lasagna::LineControlPoint> controls;
+                controls.reserve(fiber.controlPoints.size());
+                for (size_t controlIndex = 0; controlIndex < fiber.controlPoints.size(); ++controlIndex) {
+                    const int lineIndex = nearestLinePointIndex(fiber.linePoints,
+                                                                fiber.controlPoints[controlIndex]);
+                    controls.push_back({
+                        static_cast<double>(lineIndex),
+                        fiber.controlPoints[controlIndex],
+                        static_cast<int>(controlIndex) == seedControlIndex,
+                        lineIndex,
+                    });
+                }
+                const auto result =
+                    optimizer.reinitializeAndOptimizeExistingLine(fiber.linePoints,
+                                                                  std::move(controls),
+                                                                  fixedIndices,
+                                                                  displayFrameAnchorIndex,
+                                                                  config);
+                outputLine = result.optimization.line;
+                outputLinePoints = linePointsFromModel(result.optimization.line);
+                outputFixedIndices = result.fixedPointIndices;
+                const PointMotionStats motionStats = pointMotionStats(fiber.linePoints, outputLinePoints);
+                printReinitSpanTable(result.spans);
+                std::cout << "max_segment_candidate_final_cost_diff="
+                          << result.maxSegmentCandidateFinalCostDiff << '\n';
+                printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
+                std::cout << "Fiber reinit reoptimization complete: points="
+                          << result.optimization.line.points.size()
+                          << " iterations=" << result.optimization.report.iterations
+                          << " initial_cost=" << result.optimization.report.initialCost
+                          << " final_cost=" << result.optimization.report.finalCost
+                          << " valid_normals=" << result.optimization.report.validNormalSamples
+                          << " invalid_normals=" << result.optimization.report.invalidNormalSamples
+                          << " converged=" << result.optimization.report.converged
+                          << " line_length=" << lineLength(outputLinePoints)
+                          << "\n";
+                std::cout << "Fit: initial=" << result.optimization.report.initialCost
+                          << " final=" << result.optimization.report.finalCost
+                          << " change=" << (result.optimization.report.initialCost -
+                                            result.optimization.report.finalCost)
+                          << '\n';
+                printPointMotionStats(motionStats);
+                printLosses(result.optimization.report);
+            } else if (reopt) {
                 const auto result = optimizer.optimizeExistingLine(fiber.linePoints,
                                                                    fixedIndices,
                                                                    displayFrameAnchorIndex,
@@ -1205,7 +1286,8 @@ int main(int argc, char** argv)
             printLineViewDiagnostics(outputLine);
             if (!outputPath.empty()) {
                 saveReoptimizedFiber(fiber, outputLinePoints, outputPath);
-                std::cout << "Saved " << (reopt ? "reoptimized" : "original")
+                std::cout << "Saved " << (reinitReopt ? "reinitialized/reoptimized" :
+                                          (reopt ? "reoptimized" : "original"))
                           << " fiber to " << outputPath.string() << '\n';
             }
             if (wantsObjOutput) {
@@ -1219,7 +1301,7 @@ int main(int argc, char** argv)
             }
             if (wantsStripOutput) {
                 writeStripImages(outputLine,
-                                 fixedIndices,
+                                 outputFixedIndices,
                                  *textureVolume,
                                  textureLevel,
                                  stripRenderScale,

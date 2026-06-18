@@ -587,6 +587,136 @@ TEST_CASE("LineOptimizer full existing-line solve uses current samples directly"
     }
 }
 
+TEST_CASE("LineOptimizer reinit reopt reports rollout candidates and preserves fixed controls")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 100.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 10; ++i) {
+        linePoints.push_back({static_cast<double>(i) * 50.0, 0.0, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {5.0, {250.0, 0.0, 0.0}, true, 5},
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {10.0, {500.0, 0.0, 0.0}, false, 10},
+    };
+
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(linePoints,
+                                                                      controls,
+                                                                      {0, 5, 10},
+                                                                      5,
+                                                                      config);
+
+    REQUIRE(result.spans.size() == 2);
+    CHECK(result.spans[0].candLeftRolloutSteps == 10);
+    CHECK(result.spans[0].candRightRolloutSteps == 10);
+    CHECK(result.spans[0].candLeftTruncatedPoints == 3);
+    CHECK(result.spans[0].candRightTruncatedPoints == 3);
+    CHECK(result.spans[0].candLeftSelectedSign == 1);
+    CHECK(result.spans[0].candRightSelectedSign == 1);
+    CHECK(result.spans[0].candLeftClosestTargetDistance == doctest::Approx(50.0));
+    CHECK(result.spans[0].candRightClosestTargetDistance == doctest::Approx(50.0));
+    CHECK(result.spans[0].points == 4);
+    CHECK(result.spans[0].leftControlIndex == 1);
+    CHECK(result.spans[0].rightControlIndex == 0);
+    CHECK(result.spans[0].chosen == "left");
+    CHECK(result.maxSegmentCandidateFinalCostDiff >= 0.0);
+
+    REQUIRE(result.fixedPointIndices.size() == 3);
+    CHECK(result.fixedPointIndices[0] == 2);
+    CHECK(result.fixedPointIndices[1] == 5);
+    CHECK(result.fixedPointIndices[2] == 8);
+
+    REQUIRE(result.optimization.line.points.size() == 11);
+    CHECK(result.optimization.line.displayFrameAnchorIndex == 5);
+    CHECK(norm(result.optimization.line.points[2].position - controls[1].volumePoint) ==
+          doctest::Approx(0.0).epsilon(1.0e-12));
+    CHECK(norm(result.optimization.line.points[5].position - controls[0].volumePoint) ==
+          doctest::Approx(0.0).epsilon(1.0e-12));
+    CHECK(norm(result.optimization.line.points[8].position - controls[2].volumePoint) ==
+          doctest::Approx(0.0).epsilon(1.0e-12));
+    CHECK(result.optimization.line.points.front().position[0] < controls[1].volumePoint[0]);
+    CHECK(result.optimization.line.points.back().position[0] > controls[2].volumePoint[0]);
+    for (size_t i = 1; i < result.optimization.line.points.size(); ++i) {
+        CHECK(norm(result.optimization.line.points[i].position -
+                   result.optimization.line.points[i - 1].position) > 1.0e-9);
+    }
+    CHECK(result.optimization.report.message.find("Reinitialized control spans") != std::string::npos);
+    CHECK(result.optimization.report.message.find("lsgn") != std::string::npos);
+    CHECK(result.optimization.report.message.find("reinit-reopt+global") != std::string::npos);
+}
+
+TEST_CASE("LineOptimizer reinit reopt handles degenerate projected rollout tangents")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 100.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 10; ++i) {
+        linePoints.push_back({0.0, 0.0, static_cast<double>(i) * 50.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {5.0, {0.0, 0.0, 250.0}, true, 5},
+        {10.0, {0.0, 0.0, 500.0}, false, 10},
+    };
+
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(linePoints,
+                                                                      controls,
+                                                                      {0, 5, 10},
+                                                                      5,
+                                                                      config);
+
+    REQUIRE(result.spans.size() == 2);
+    for (const auto& span : result.spans) {
+        CHECK(span.candLeftSelectedSign == 1);
+        CHECK(span.candRightSelectedSign == 1);
+        CHECK(std::isfinite(span.candLeftClosestTargetDistance));
+        CHECK(std::isfinite(span.candRightClosestTargetDistance));
+    }
+    REQUIRE(result.fixedPointIndices.size() == 3);
+    for (size_t controlIndex = 0; controlIndex < controls.size(); ++controlIndex) {
+        const int fixedIndex = result.fixedPointIndices[controlIndex];
+        REQUIRE(fixedIndex >= 0);
+        REQUIRE(fixedIndex < static_cast<int>(result.optimization.line.points.size()));
+        CHECK(norm(result.optimization.line.points[static_cast<size_t>(fixedIndex)].position -
+                   controls[controlIndex].volumePoint) ==
+              doctest::Approx(0.0).epsilon(1.0e-12));
+    }
+    for (const auto& point : result.optimization.line.points) {
+        CHECK(std::isfinite(point.position[0]));
+        CHECK(std::isfinite(point.position[1]));
+        CHECK(std::isfinite(point.position[2]));
+    }
+}
+
 TEST_CASE("LineOptimizer reproduces las008 seed then added-control edit without local jump")
 {
     const fs::path manifestPath =
