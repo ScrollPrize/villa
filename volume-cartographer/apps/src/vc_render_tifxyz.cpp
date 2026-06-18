@@ -886,8 +886,8 @@ static void renderTiles(
                         std::memcpy(&chunkBuf[sliceOff + yy * chunkX], row, dx_actual * sizeof(T));
                     }
                 }
-                dsOut->writeChunk(0, size_t(dstTy), size_t(dstTx),
-                                  chunkBuf.data(), chunkBuf.size() * sizeof(T));
+                dsOut->writeChunkSkipEmpty(0, size_t(dstTy), size_t(dstTx),
+                                           chunkBuf.data(), chunkBuf.size() * sizeof(T));
 
                 // Scatter L0 tile into L1 pyramid accumulation buffer
                 // No rotation when inline pyramid is active, so tx/ty == dstTx/dstTy.
@@ -962,8 +962,8 @@ static void renderTiles(
 
                 // Write each column's accumulation buffer as a zarr chunk
                 for (size_t cx = 0; cx < pa.bufs.size(); cx++) {
-                    pyramidDs[li]->writeChunk(0, pyrChunkRow, cx,
-                                              pa.bufs[cx].data(), pa.bufs[cx].size() * sizeof(T));
+                    pyramidDs[li]->writeChunkSkipEmpty(0, pyrChunkRow, cx,
+                                                       pa.bufs[cx].data(), pa.bufs[cx].size() * sizeof(T));
                 }
 
                 // Cascade: scatter this level's buffers into the next level's accum
@@ -1083,6 +1083,9 @@ int main(int argc, char *argv[])
         // slice stack grows in front of the sheet rather than behind it.
         ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals (reverses slice ordering along the normal)")
         ("zarr-output", po::value<std::string>(), "Output path for .zarr (optional)")
+        ("zarr-compressor", po::value<std::string>()->default_value("blosc"), "Zarr compressor: blosc, zstd, gzip, lz4, none")
+        ("zarr-compression-level", po::value<int>()->default_value(-1), "Zarr compression level (<=0 = compressor default)")
+        ("zarr-separator", po::value<std::string>()->default_value("/"), "Zarr chunk dimension separator: / or .")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
         ("flatten", po::bool_switch()->default_value(false), "ABF++ flattening")
@@ -1156,6 +1159,22 @@ int main(int argc, char *argv[])
     if (!wantZarr && !wantTif) { logPrintf(stderr, "Error: at least one of --zarr-output or --tif-output required\n"); return EXIT_FAILURE; }
     const std::string zarrOutputArg = wantZarr ? parsed["zarr-output"].as<std::string>() : "";
     const std::string tifOutputArg = wantTif ? parsed["tif-output"].as<std::string>() : "";
+
+    // Zarr output codec / layout
+    std::string zarrCompressor = parsed["zarr-compressor"].as<std::string>();
+    const int zarrCompressionLevel = parsed["zarr-compression-level"].as<int>();
+    const std::string zarrSeparator = parsed["zarr-separator"].as<std::string>();
+    {
+        static const std::set<std::string> kComp{"blosc", "zstd", "gzip", "lz4", "none"};
+        if (kComp.find(zarrCompressor) == kComp.end()) {
+            logPrintf(stderr, "Error: --zarr-compressor must be one of blosc, zstd, gzip, lz4, none\n");
+            return EXIT_FAILURE;
+        }
+        if (zarrSeparator != "/" && zarrSeparator != ".") {
+            logPrintf(stderr, "Error: --zarr-separator must be \"/\" or \".\"\n");
+            return EXIT_FAILURE;
+        }
+    }
 
     const bool mergeTiffFlag = parsed["merge-tiff-parts"].as<bool>();
     if (mergeTiffFlag) {
@@ -1526,10 +1545,12 @@ int main(int argc, char *argv[])
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
                 std::filesystem::create_directories(outFilePath);
-                vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype, "blosc");
+                vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
+                                      zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
-                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16);
+                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                                          zarrCompressor, zarrCompressionLevel, zarrSeparator);
 
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
@@ -1547,7 +1568,8 @@ int main(int argc, char *argv[])
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {
                 std::filesystem::create_directories(outFilePath);
-                dsOut = vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype, "blosc");
+                dsOut = vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype,
+                                              zarrCompressor, zarrSeparator, 0, zarrCompressionLevel);
             }
 
             tilesYSrc = (tgt_size.height + CH - 1) / CH;
@@ -1607,7 +1629,8 @@ int main(int argc, char *argv[])
                 cv::Size zarrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
                 std::vector<size_t> shape0 = {baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
-                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16);
+                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16,
+                                      zarrCompressor, zarrCompressionLevel, zarrSeparator);
             }
             if (inlinePyramid) {
                 for (int level = 1; level <= 5; level++) {
