@@ -1446,6 +1446,15 @@ void CChunkedVolumeViewer::syncCameraTransform()
     _camScale = _scale;
     updateDisplayedFramebufferMapping();
     updateFocusMarker();
+    requestDirectPaint();
+}
+
+void CChunkedVolumeViewer::requestDirectPaint()
+{
+    if (_closing || !_view || !_view->viewport() || !_view->isVisible()) {
+        return;
+    }
+    _view->viewport()->update();
 }
 
 int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const

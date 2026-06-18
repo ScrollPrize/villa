@@ -267,6 +267,7 @@ private:
     void updateStatusLabel();
     void rebuildChunkArray();
     void syncCameraTransform();
+    void requestDirectPaint();
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
