@@ -233,6 +233,18 @@ auto main(int argc, char* argv[]) -> int
         "With --replay, skip any fast-render phase and submit the full render directly.");
     parser.addOption(replaySkipFastRenderOption);
 
+    QCommandLineOption replayTimedProfileOption(
+        "replay-timed-profile",
+        "With --replay, switch frames on a fixed timer and print one row per paint.");
+    parser.addOption(replayTimedProfileOption);
+
+    QCommandLineOption replayTimedProfilePeriodOption(
+        "replay-timed-profile-period-ms",
+        "With --replay-timed-profile, milliseconds between frame switches.",
+        "ms",
+        "200");
+    parser.addOption(replayTimedProfilePeriodOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
@@ -247,6 +259,10 @@ auto main(int argc, char* argv[]) -> int
     benchOptions.replayOffscreen4k = parser.isSet(replayOffscreen4kOption);
     benchOptions.replaySkipChunkComplete = parser.isSet(replaySkipChunkCompleteOption);
     benchOptions.replaySkipFastRender = parser.isSet(replaySkipFastRenderOption);
+    benchOptions.replayTimedProfile = parser.isSet(replayTimedProfileOption);
+    bool periodOk = false;
+    const int timedPeriod = parser.value(replayTimedProfilePeriodOption).toInt(&periodOk);
+    benchOptions.replayTimedProfilePeriodMs = (periodOk && timedPeriod > 0) ? timedPeriod : 200;
 
     if (parser.isSet(profileOption)) {
         SetProfileLoggingEnabled(true);

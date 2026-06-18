@@ -2294,6 +2294,7 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
 
     RenderContext ctx;
     ctx.serial = ++_renderSerial;
+    emit renderFrameSubmitted(ctx.serial);
     ctx.fbW = fbW;
     ctx.fbH = fbH;
     ctx.surfacePtrX = _surfacePtrX;

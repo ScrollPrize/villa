@@ -253,6 +253,7 @@ signals:
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
     void overlaysUpdated();
+    void renderFrameSubmitted(std::uint64_t serial);
     void renderFrameCompleted(std::uint64_t serial, double workerElapsedMs);
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
 

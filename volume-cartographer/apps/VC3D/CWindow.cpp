@@ -2121,6 +2121,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             _benchReplay->setOffscreen4k(_benchOptions.replayOffscreen4k);
             _benchReplay->setSkipChunkComplete(_benchOptions.replaySkipChunkComplete);
             _benchReplay->setSkipFastRender(_benchOptions.replaySkipFastRender);
+            _benchReplay->setTimedProfile(_benchOptions.replayTimedProfile);
+            _benchReplay->setTimedProfilePeriodMs(_benchOptions.replayTimedProfilePeriodMs);
             QTimer::singleShot(0, this, [this] { _benchReplay->run(*this); });
         } else {
             _benchReplay.reset();

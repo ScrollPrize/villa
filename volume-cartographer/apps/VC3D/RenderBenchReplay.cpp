@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QPainter>
+#include <QThread>
 #include <QWidget>
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 #include "CState.hpp"
 #include "CWindow.hpp"
@@ -82,9 +84,23 @@ struct PhaseSummary {
     }
 };
 
+struct TimedPaintSample {
+    int paint = 0;
+    int view = -1;
+    int renderedView = -1;
+    double viewAgeMs = -1.0;
+    double staleFrameMs = -1.0;
+    double paintCostMs = -1.0;
+};
+
 double elapsedMs(const QElapsedTimer& timer)
 {
     return static_cast<double>(timer.nsecsElapsed()) / 1000000.0;
+}
+
+double nsToMs(qint64 ns)
+{
+    return static_cast<double>(ns) / 1000000.0;
 }
 
 std::string msString(double value)
@@ -94,6 +110,17 @@ std::string msString(double value)
     std::ostringstream out;
     out << std::fixed << std::setprecision(3) << value;
     return out.str();
+}
+
+CChunkedVolumeViewer::CameraState cameraStateFromKeyframe(const RenderBenchReplay::Keyframe& kf)
+{
+    CChunkedVolumeViewer::CameraState cs;
+    cs.surfacePtrX = kf.surfacePtrX;
+    cs.surfacePtrY = kf.surfacePtrY;
+    cs.scale = kf.scale;
+    cs.zOffset = kf.zOffset;
+    cs.zOffsetWorldDir = {kf.zDirX, kf.zDirY, kf.zDirZ};
+    return cs;
 }
 }  // namespace
 
@@ -290,16 +317,201 @@ void RenderBenchReplay::run(CWindow& window)
     timedFrames.reserve(_keyframes.size());
     QImage offscreenPaintTarget;
 
+    auto paintViewToTarget = [&](double* paintCostMs = nullptr) {
+        auto* gv = viewer ? viewer->graphicsView() : nullptr;
+        if (!gv)
+            return false;
+        if (_offscreen4k) {
+            const QSize viewportSize = gv->viewport() ? gv->viewport()->size() : QSize();
+            if (!viewportSize.isValid() || viewportSize.isEmpty())
+                return false;
+            if (offscreenPaintTarget.size() != viewportSize ||
+                offscreenPaintTarget.format() != QImage::Format_RGB32) {
+                offscreenPaintTarget = QImage(viewportSize, QImage::Format_RGB32);
+            }
+            QElapsedTimer paintTimer;
+            paintTimer.start();
+            QPainter painter(&offscreenPaintTarget);
+            gv->render(&painter,
+                       QRectF(QPointF(0.0, 0.0), QSizeF(viewportSize)),
+                       QRect(QPoint(0, 0), viewportSize),
+                       Qt::IgnoreAspectRatio);
+            painter.end();
+            if (paintCostMs)
+                *paintCostMs = elapsedMs(paintTimer);
+        } else if (paintCostMs) {
+            *paintCostMs = 0.0;
+        }
+        return true;
+    };
+
+    if (_timedProfile) {
+        if (_keyframes.empty()) {
+            QApplication::quit();
+            return;
+        }
+
+        viewer->applyCameraStateForReplayRepaint(cameraStateFromKeyframe(_keyframes[0]));
+        viewer->renderVisible(true, "replay timed profile prime");
+        (void)settleFrame(viewer, maxFrameMs, kQuietWindowMs);
+
+        QElapsedTimer profileTimer;
+        profileTimer.start();
+        const qint64 periodNs = static_cast<qint64>(std::max(1, _timedProfilePeriodMs)) * 1000000LL;
+        const std::size_t firstTimedFrame = _keyframes.size() > 1 ? 1 : 0;
+        const qint64 runUntilNs =
+            static_cast<qint64>(_keyframes.size() - firstTimedFrame + 1) * periodNs;
+
+        int currentView = 0;
+        int displayedView = 0;
+        int paintCount = 0;
+        std::vector<qint64> viewChangeNs(_keyframes.size(), 0);
+        std::unordered_map<std::uint64_t, int> serialToView;
+        std::vector<TimedPaintSample> paintSamples;
+        paintSamples.reserve(_keyframes.size() * 2);
+
+        std::cout << std::setw(6) << "paint"
+                  << " " << std::setw(6) << "view"
+                  << " " << std::setw(8) << "rendered"
+                  << " " << std::setw(10) << "view_age"
+                  << " " << std::setw(12) << "stale_frame"
+                  << " " << std::setw(10) << "paint_cost"
+                  << '\n';
+        std::cout << std::setw(6) << "------"
+                  << " " << std::setw(6) << "------"
+                  << " " << std::setw(8) << "--------"
+                  << " " << std::setw(10) << "----------"
+                  << " " << std::setw(12) << "------------"
+                  << " " << std::setw(10) << "----------"
+                  << '\n';
+
+        auto samplePaint = [&]() {
+            double paintCostMs = 0.0;
+            if (!paintViewToTarget(&paintCostMs))
+                return;
+            const qint64 nowNs = profileTimer.nsecsElapsed();
+            TimedPaintSample sample;
+            sample.paint = ++paintCount;
+            sample.view = currentView;
+            sample.renderedView = displayedView;
+            if (currentView >= 0 && static_cast<std::size_t>(currentView) < viewChangeNs.size())
+                sample.viewAgeMs = nsToMs(nowNs - viewChangeNs[static_cast<std::size_t>(currentView)]);
+            if (displayedView >= 0) {
+                if (displayedView < currentView &&
+                    static_cast<std::size_t>(displayedView + 1) < viewChangeNs.size()) {
+                    sample.staleFrameMs =
+                        nsToMs(nowNs - viewChangeNs[static_cast<std::size_t>(displayedView + 1)]);
+                } else {
+                    sample.staleFrameMs = 0.0;
+                }
+            }
+            sample.paintCostMs = paintCostMs;
+            paintSamples.push_back(sample);
+            std::cout << std::setw(6) << sample.paint
+                      << " " << std::setw(6) << sample.view
+                      << " " << std::setw(8) << sample.renderedView
+                      << " " << std::setw(10) << msString(sample.viewAgeMs)
+                      << " " << std::setw(12) << msString(sample.staleFrameMs)
+                      << " " << std::setw(10) << msString(sample.paintCostMs)
+                      << '\n';
+        };
+
+        const auto submittedConn = QObject::connect(
+            viewer, &CChunkedVolumeViewer::renderFrameSubmitted,
+            viewer, [&](std::uint64_t serial) {
+                serialToView[serial] = currentView;
+            });
+        const auto completedConn = QObject::connect(
+            viewer, &CChunkedVolumeViewer::renderFrameCompleted,
+            viewer, [&](std::uint64_t serial, double) {
+                if (auto it = serialToView.find(serial); it != serialToView.end())
+                    displayedView = it->second;
+            });
+        const auto paintConn = QObject::connect(
+            viewer->graphicsView(), &CVolumeViewerView::paintCompleted,
+            viewer->graphicsView(), [&] { samplePaint(); });
+
+        std::size_t nextFrame = firstTimedFrame;
+        qint64 nextSwitchNs = 0;
+        while (profileTimer.nsecsElapsed() < runUntilNs) {
+            const qint64 nowNs = profileTimer.nsecsElapsed();
+            if (nextFrame < _keyframes.size() && nowNs >= nextSwitchNs) {
+                currentView = static_cast<int>(nextFrame);
+                viewChangeNs[nextFrame] = nowNs;
+                viewer->applyCameraStateForReplayRepaint(cameraStateFromKeyframe(_keyframes[nextFrame]));
+                if (auto* gv = viewer->graphicsView()) {
+                    if (auto* viewport = gv->viewport())
+                        viewport->update();
+                }
+                viewer->renderVisible(true, "replay timed profile");
+                ++nextFrame;
+                nextSwitchNs += periodNs;
+            }
+            QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+            QThread::msleep(1);
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, kPumpSliceMs);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+
+        QObject::disconnect(paintConn);
+        QObject::disconnect(completedConn);
+        QObject::disconnect(submittedConn);
+
+        PhaseSummary viewAgeSummary;
+        PhaseSummary staleFrameSummary;
+        PhaseSummary paintCostSummary;
+        for (const auto& sample : paintSamples) {
+            viewAgeSummary.add(sample.viewAgeMs);
+            staleFrameSummary.add(sample.staleFrameMs);
+            paintCostSummary.add(sample.paintCostMs);
+        }
+        std::cout << '\n'
+                  << std::left << std::setw(14) << "phase"
+                  << " " << std::right << std::setw(8) << "count"
+                  << " " << std::setw(10) << "min"
+                  << " " << std::setw(10) << "mean"
+                  << " " << std::setw(10) << "max"
+                  << " " << std::left << std::setw(28) << "status"
+                  << '\n';
+        std::cout << std::left << std::setw(14) << "--------------"
+                  << " " << std::right << std::setw(8) << "--------"
+                  << " " << std::setw(10) << "----------"
+                  << " " << std::setw(10) << "----------"
+                  << " " << std::setw(10) << "----------"
+                  << " " << std::left << std::setw(28) << "----------------------------"
+                  << '\n';
+        auto logSummary = [](const char* name, const PhaseSummary& s) {
+            if (s.count == 0) {
+                std::cout << std::left << std::setw(14) << name
+                          << " " << std::right << std::setw(8) << 0
+                          << " " << std::setw(10) << "-"
+                          << " " << std::setw(10) << "-"
+                          << " " << std::setw(10) << "-"
+                          << " " << std::left << std::setw(28) << "no samples"
+                          << '\n';
+                return;
+            }
+            std::cout << std::left << std::setw(14) << name
+                      << " " << std::right << std::setw(8) << s.count
+                      << " " << std::setw(10) << msString(s.minMs)
+                      << " " << std::setw(10) << msString(s.avg())
+                      << " " << std::setw(10) << msString(s.maxMs)
+                      << " " << std::left << std::setw(28) << "ok"
+                      << '\n';
+        };
+        logSummary("view_age", viewAgeSummary);
+        logSummary("stale_frame", staleFrameSummary);
+        logSummary("paint_cost", paintCostSummary);
+        QApplication::quit();
+        return;
+    }
+
     auto driveFrame = [&](int i, const Keyframe& kf, bool timed, bool forceSettle) -> FrameTiming {
         FrameTiming timing;
         if (!viewer)
             return timing;
-        CChunkedVolumeViewer::CameraState cs;
-        cs.surfacePtrX = kf.surfacePtrX;
-        cs.surfacePtrY = kf.surfacePtrY;
-        cs.scale = kf.scale;
-        cs.zOffset = kf.zOffset;
-        cs.zOffsetWorldDir = {kf.zDirX, kf.zDirY, kf.zDirZ};
+        CChunkedVolumeViewer::CameraState cs = cameraStateFromKeyframe(kf);
         (void)waitForCondition([&] {
             return !viewer || viewer->isRenderQuiescent();
         }, maxFrameMs);
@@ -312,22 +524,8 @@ void RenderBenchReplay::run(CWindow& window)
             if (!gv)
                 return false;
 
-            if (_offscreen4k) {
-                const QSize viewportSize = gv->viewport() ? gv->viewport()->size() : QSize();
-                if (!viewportSize.isValid() || viewportSize.isEmpty())
-                    return false;
-                if (offscreenPaintTarget.size() != viewportSize ||
-                    offscreenPaintTarget.format() != QImage::Format_RGB32) {
-                    offscreenPaintTarget = QImage(viewportSize, QImage::Format_RGB32);
-                }
-                QPainter painter(&offscreenPaintTarget);
-                gv->render(&painter,
-                           QRectF(QPointF(0.0, 0.0), QSizeF(viewportSize)),
-                           QRect(QPoint(0, 0), viewportSize),
-                           Qt::IgnoreAspectRatio);
-                painter.end();
-                return true;
-            }
+            if (_offscreen4k)
+                return paintViewToTarget();
 
             bool painted = false;
             QMetaObject::Connection paintConn;

@@ -40,6 +40,8 @@ public:
     void setOffscreen4k(bool enabled) { _offscreen4k = enabled; }
     void setSkipChunkComplete(bool enabled) { _skipChunkComplete = enabled; }
     void setSkipFastRender(bool enabled) { _skipFastRender = enabled; }
+    void setTimedProfile(bool enabled) { _timedProfile = enabled; }
+    void setTimedProfilePeriodMs(int periodMs) { _timedProfilePeriodMs = periodMs; }
 
     // Opens the recorded volume+segment in the window, then replays every
     // keyframe. Calls QApplication::quit() on completion. Blocking (pumps the
@@ -51,6 +53,8 @@ private:
     bool _offscreen4k = false;
     bool _skipChunkComplete = false;
     bool _skipFastRender = false;
+    bool _timedProfile = false;
+    int _timedProfilePeriodMs = 200;
     Header _header;
     std::vector<Keyframe> _keyframes;
 
