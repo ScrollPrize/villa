@@ -12,6 +12,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -52,7 +53,7 @@ bool finiteDirection(const cv::Vec3d& v)
 void printUsage(const char* argv0)
 {
     std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z] [--verbose]\n"
-              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt|--reinit-reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian] [--verbose]\n"
+              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt|--reinit-reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--reinit-debug-obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian] [--verbose]\n"
               << "Runs line annotation optimization at seed "
               << "[17955,15141,37891] with initial z-axis mode, or loads/reoptimizes a saved VC3D fiber.\n";
 }
@@ -434,6 +435,32 @@ void printSegmentMotionTable(const std::vector<cv::Vec3d>& inputPoints,
     }
 }
 
+const vc::lasagna::LineReinitializationCandidateReport* spanCandidateReport(
+    const vc::lasagna::LineReinitializationSpanReport& span,
+    const char* name)
+{
+    for (const auto& candidate : span.candidates) {
+        if (candidate.name == name) {
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+double initialRmsForCandidate(const vc::lasagna::LineReinitializationSpanReport& span,
+                              const char* name)
+{
+    const auto* candidate = spanCandidateReport(span, name);
+    return candidate ? candidate->initialRms : 0.0;
+}
+
+double finalRmsForCandidate(const vc::lasagna::LineReinitializationSpanReport& span,
+                            const char* name)
+{
+    const auto* candidate = spanCandidateReport(span, name);
+    return candidate ? candidate->finalRms : 0.0;
+}
+
 void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpanReport>& spans)
 {
     std::cout.imbue(std::locale::classic());
@@ -448,10 +475,14 @@ void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpa
               << std::setw(8) << "lnear"
               << std::setw(5) << "rsgn"
               << std::setw(8) << "rnear"
-              << std::setw(8) << "linit"
-              << std::setw(8) << "lfinal"
-              << std::setw(8) << "rinit"
-              << std::setw(8) << "rfinal"
+              << std::setw(8) << "clnear"
+              << std::setw(8) << "crnear"
+              << std::setw(9) << "lirms"
+              << std::setw(9) << "lfrms"
+              << std::setw(9) << "rirms"
+              << std::setw(9) << "rfrms"
+              << std::setw(9) << "clfrms"
+              << std::setw(9) << "crfrms"
               << std::setw(8) << "mxstep"
               << std::setw(8) << "mxtan"
               << std::setw(8) << "mxnorm"
@@ -466,15 +497,75 @@ void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpa
                   << std::setw(8) << span.candLeftClosestTargetDistance
                   << std::setw(5) << span.candRightSelectedSign
                   << std::setw(8) << span.candRightClosestTargetDistance
-                  << std::setw(8) << span.candLeftInitialCost
-                  << std::setw(8) << span.candLeftFinalCost
-                  << std::setw(8) << span.candRightInitialCost
-                  << std::setw(8) << span.candRightFinalCost
+                  << std::setw(8) << span.candContinueLeftClosestTargetDistance
+                  << std::setw(8) << span.candContinueRightClosestTargetDistance
+                  << std::setw(9) << initialRmsForCandidate(span, "left")
+                  << std::setw(9) << finalRmsForCandidate(span, "left")
+                  << std::setw(9) << initialRmsForCandidate(span, "right")
+                  << std::setw(9) << finalRmsForCandidate(span, "right")
+                  << std::setw(9) << finalRmsForCandidate(span, "continue-left")
+                  << std::setw(9) << finalRmsForCandidate(span, "continue-right")
                   << std::setw(8) << span.chosenMaxEvenStepDeviation
                   << std::setw(8) << span.chosenMaxTangentSmoothDeviation
                   << std::setw(8) << span.chosenMaxNormalSmoothDeviation
                   << std::setw(8) << span.chosenMaxNormalAlignmentAbs
                   << ' ' << span.chosen << '\n';
+    }
+}
+
+void printReinitCandidateTable(const std::vector<vc::lasagna::LineReinitializationSpanReport>& spans)
+{
+    std::cout.imbue(std::locale::classic());
+    std::cout << std::scientific << std::setprecision(2);
+    std::cout << "Reinit candidate details (pick=min avg(mean,p95,max) alignment):\n"
+              << std::right
+              << std::setw(3) << "seg"
+              << std::setw(4) << "lcp"
+              << std::setw(4) << "rcp"
+              << ' ' << std::left << std::setw(15) << "cand"
+              << std::right
+              << std::setw(5) << "sgn"
+              << std::setw(7) << "steps"
+              << std::setw(7) << "trunc"
+              << std::setw(6) << "pts"
+              << std::setw(7) << "iters"
+              << std::setw(7) << "res"
+              << std::setw(4) << "ok"
+              << ' '
+              << std::setw(12) << "near"
+              << std::setw(11) << "meanaln"
+              << std::setw(11) << "p95aln"
+              << std::setw(11) << "maxaln"
+              << std::setw(11) << "alnscore"
+              << std::setw(12) << "init_rms"
+              << std::setw(12) << "final_rms"
+              << std::setw(11) << "dscore"
+              << std::setw(6) << "pick" << '\n';
+    for (const auto& span : spans) {
+        for (const auto& cand : span.candidates) {
+            std::cout << std::right << std::setw(3) << span.segmentIndex
+                      << std::setw(4) << span.leftControlIndex
+                      << std::setw(4) << span.rightControlIndex
+                      << ' ' << std::left << std::setw(15) << cand.name
+                      << std::right
+                      << std::setw(5) << cand.selectedSign
+                      << std::setw(7) << cand.rolloutSteps
+                      << std::setw(7) << cand.truncatedPoints
+                      << std::setw(6) << cand.points
+                      << std::setw(7) << cand.iterations
+                      << std::setw(7) << cand.residuals
+                      << std::setw(4) << (cand.usable ? "yes" : "no")
+                      << ' '
+                      << std::setw(12) << cand.closestTargetDistance
+                      << std::setw(11) << cand.avgNormalAlignmentAbs
+                      << std::setw(11) << cand.p95NormalAlignmentAbs
+                      << std::setw(11) << cand.maxNormalAlignmentAbs
+                      << std::setw(11) << cand.alignmentChoiceScore
+                      << std::setw(12) << cand.initialRms
+                      << std::setw(12) << cand.finalRms
+                      << std::setw(11) << cand.alignmentChoiceScoreDelta
+                      << std::setw(6) << (cand.chosen ? "*" : "") << '\n';
+        }
     }
 }
 
@@ -496,13 +587,21 @@ void printLosses(const vc::lasagna::LineOptimizationReport& report)
     std::cout.imbue(std::locale::classic());
     std::cout << std::scientific << std::setprecision(3);
     std::cout << "Final loss breakdown:\n"
-              << "term                 n      weight    raw_cost weighted_cost\n";
+              << "term                 n      weight     raw_rms  weighted_rms\n";
     for (const auto& loss : report.finalLosses) {
+        const double rawRms = loss.residuals > 0
+            ? std::sqrt(std::max(0.0, 2.0 * loss.rawCost) /
+                        static_cast<double>(loss.residuals))
+            : 0.0;
+        const double weightedRms = loss.residuals > 0
+            ? std::sqrt(std::max(0.0, 2.0 * loss.weightedCost) /
+                        static_cast<double>(loss.residuals))
+            : 0.0;
         std::cout << std::left << std::setw(18) << loss.name
                   << std::right << std::setw(6) << loss.residuals
                   << std::setw(12) << loss.weight
-                  << std::setw(12) << loss.rawCost
-                  << std::setw(14) << loss.weightedCost
+                  << std::setw(12) << rawRms
+                  << std::setw(14) << weightedRms
                   << '\n';
     }
 }
@@ -511,8 +610,9 @@ void printResidualSummary(const vc::lasagna::LineOptimizationReport& report)
 {
     std::cout.imbue(std::locale::classic());
     std::cout << std::scientific << std::setprecision(3)
-              << "Residual: initial=" << report.initialCost
-              << " optimized=" << report.finalCost
+              << "Residual RMS: initial=" << report.initialRms
+              << " optimized=" << report.finalRms
+              << " residuals=" << report.residuals
               << '\n';
 }
 
@@ -538,11 +638,15 @@ const char* solverName(vc::lasagna::LineOptimizationConfig::LinearSolver solver)
     return "unknown";
 }
 
-double normalAlignmentCost(const vc::lasagna::LineOptimizationReport& report)
+double normalAlignmentRms(const vc::lasagna::LineOptimizationReport& report)
 {
     for (const auto& loss : report.finalLosses) {
         if (loss.name == "normal_alignment") {
-            return loss.weightedCost;
+            if (loss.residuals <= 0) {
+                return 0.0;
+            }
+            return std::sqrt(std::max(0.0, 2.0 * loss.weightedCost) /
+                             static_cast<double>(loss.residuals));
         }
     }
     return std::numeric_limits<double>::quiet_NaN();
@@ -619,6 +723,310 @@ void writeLineObj(const std::vector<cv::Vec3d>& points,
             output << ' ' << (i + 1);
         }
         output << '\n';
+    }
+}
+
+std::string objElementName(std::string name)
+{
+    if (name.empty()) {
+        return "polyline";
+    }
+    for (char& ch : name) {
+        const unsigned char value = static_cast<unsigned char>(ch);
+        if (!std::isalnum(value) && ch != '_' && ch != '-') {
+            ch = '_';
+        }
+    }
+    return name;
+}
+
+cv::Vec3d perpendicularUnitVector(const cv::Vec3d& direction)
+{
+    const cv::Vec3d unit = normalizedOrZero(direction);
+    if (!finiteDirection(unit)) {
+        return {0.0, 1.0, 0.0};
+    }
+    const cv::Vec3d reference = std::abs(unit[0]) < 0.9
+        ? cv::Vec3d{1.0, 0.0, 0.0}
+        : cv::Vec3d{0.0, 1.0, 0.0};
+    const cv::Vec3d perpendicular = normalizedOrZero(unit.cross(reference));
+    return finiteDirection(perpendicular) ? perpendicular : cv::Vec3d{0.0, 1.0, 0.0};
+}
+
+struct PlaneSliceBasis {
+    cv::Vec3d origin{0.0, 0.0, 0.0};
+    cv::Vec3d u{1.0, 0.0, 0.0};
+    cv::Vec3d v{0.0, 1.0, 0.0};
+    cv::Vec3d normal{0.0, 0.0, 1.0};
+    double minU = -1.0;
+    double maxU = 1.0;
+    double minV = -1.0;
+    double maxV = 1.0;
+};
+
+PlaneSliceBasis fitControlPointPlaneSlice(const std::vector<cv::Vec3d>& points)
+{
+    if (points.empty()) {
+        throw std::runtime_error("cannot write control plane slice without control points");
+    }
+
+    PlaneSliceBasis basis;
+    for (const auto& point : points) {
+        basis.origin += point;
+    }
+    basis.origin *= 1.0 / static_cast<double>(points.size());
+
+    cv::Matx33d covariance = cv::Matx33d::zeros();
+    for (const auto& point : points) {
+        const cv::Vec3d centered = point - basis.origin;
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+                covariance(row, col) += centered[row] * centered[col];
+            }
+        }
+    }
+    covariance *= 1.0 / static_cast<double>(points.size());
+
+    cv::Mat eigenvalues;
+    cv::Mat eigenvectors;
+    if (cv::eigen(cv::Mat(covariance), eigenvalues, eigenvectors) &&
+        eigenvectors.rows == 3 && eigenvectors.cols == 3) {
+        basis.u = normalizedOrZero({eigenvectors.at<double>(0, 0),
+                                    eigenvectors.at<double>(0, 1),
+                                    eigenvectors.at<double>(0, 2)});
+        basis.v = normalizedOrZero({eigenvectors.at<double>(1, 0),
+                                    eigenvectors.at<double>(1, 1),
+                                    eigenvectors.at<double>(1, 2)});
+        basis.normal = normalizedOrZero({eigenvectors.at<double>(2, 0),
+                                         eigenvectors.at<double>(2, 1),
+                                         eigenvectors.at<double>(2, 2)});
+    }
+
+    if (!finiteDirection(basis.u) && points.size() >= 2) {
+        basis.u = normalizedOrZero(points.back() - points.front());
+    }
+    if (!finiteDirection(basis.u)) {
+        basis.u = {1.0, 0.0, 0.0};
+    }
+    if (!finiteDirection(basis.normal)) {
+        basis.normal = normalizedOrZero(basis.u.cross({0.0, 0.0, 1.0}));
+        if (!finiteDirection(basis.normal)) {
+            basis.normal = perpendicularUnitVector(basis.u);
+        }
+    }
+    basis.v = normalizedOrZero(basis.normal.cross(basis.u));
+    if (!finiteDirection(basis.v)) {
+        basis.v = perpendicularUnitVector(basis.u);
+    }
+    basis.normal = normalizedOrZero(basis.u.cross(basis.v));
+    basis.v = normalizedOrZero(basis.normal.cross(basis.u));
+
+    basis.minU = basis.minV = std::numeric_limits<double>::infinity();
+    basis.maxU = basis.maxV = -std::numeric_limits<double>::infinity();
+    for (const auto& point : points) {
+        const cv::Vec3d delta = point - basis.origin;
+        const double du = delta.dot(basis.u);
+        const double dv = delta.dot(basis.v);
+        basis.minU = std::min(basis.minU, du);
+        basis.maxU = std::max(basis.maxU, du);
+        basis.minV = std::min(basis.minV, dv);
+        basis.maxV = std::max(basis.maxV, dv);
+    }
+
+    const double rangeU = std::max(0.0, basis.maxU - basis.minU);
+    const double rangeV = std::max(0.0, basis.maxV - basis.minV);
+    const double margin = std::max(64.0, 0.05 * std::max(rangeU, rangeV));
+    basis.minU -= margin;
+    basis.maxU += margin;
+    basis.minV -= margin;
+    basis.maxV += margin;
+    if (basis.maxU - basis.minU <= kEpsilon) {
+        basis.minU -= margin;
+        basis.maxU += margin;
+    }
+    if (basis.maxV - basis.minV <= kEpsilon) {
+        basis.minV -= margin;
+        basis.maxV += margin;
+    }
+    return basis;
+}
+
+void writePlaneSliceObj(const std::vector<cv::Vec3d>& points,
+                        const std::filesystem::path& outputPath)
+{
+    const PlaneSliceBasis basis = fitControlPointPlaneSlice(points);
+    const auto corner = [&](double u, double v) {
+        return basis.origin + basis.u * u + basis.v * v;
+    };
+    const std::vector<cv::Vec3d> corners{
+        corner(basis.minU, basis.minV),
+        corner(basis.maxU, basis.minV),
+        corner(basis.maxU, basis.maxV),
+        corner(basis.minU, basis.maxV),
+    };
+
+    std::ofstream output(outputPath);
+    if (!output.good()) {
+        throw std::runtime_error("could not open OBJ output: " + outputPath.string());
+    }
+    output.imbue(std::locale::classic());
+    output << "# Reinit control-point fitted plane slice\n";
+    output << "# origin " << basis.origin[0] << ' ' << basis.origin[1] << ' ' << basis.origin[2] << '\n';
+    output << "# normal " << basis.normal[0] << ' ' << basis.normal[1] << ' ' << basis.normal[2] << '\n';
+    for (const auto& point : corners) {
+        output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+    }
+    output << "f 1 2 3 4\n"
+           << "l 1 2 3 4 1\n";
+}
+
+cv::Mat_<cv::Vec3f> makePlaneSliceGrid(const PlaneSliceBasis& basis,
+                                       double targetSpacing,
+                                       int renderScale)
+{
+    const double width = std::max(kEpsilon, basis.maxU - basis.minU);
+    const double height = std::max(kEpsilon, basis.maxV - basis.minV);
+    targetSpacing = std::max(1.0, targetSpacing);
+    renderScale = std::max(1, renderScale);
+
+    const int maxRenderedDim = 4096;
+    const int maxBaseDim = std::max(2, maxRenderedDim / renderScale);
+    const int cols = std::clamp(static_cast<int>(std::ceil(width / targetSpacing)) + 1,
+                                2,
+                                maxBaseDim);
+    const int rows = std::clamp(static_cast<int>(std::ceil(height / targetSpacing)) + 1,
+                                2,
+                                maxBaseDim);
+
+    cv::Mat_<cv::Vec3f> coords(rows, cols);
+    for (int row = 0; row < rows; ++row) {
+        const double tv = rows == 1
+            ? 0.0
+            : static_cast<double>(row) / static_cast<double>(rows - 1);
+        const double v = basis.minV * (1.0 - tv) + basis.maxV * tv;
+        for (int col = 0; col < cols; ++col) {
+            const double tu = cols == 1
+                ? 0.0
+                : static_cast<double>(col) / static_cast<double>(cols - 1);
+            const double u = basis.minU * (1.0 - tu) + basis.maxU * tu;
+            const cv::Vec3d point = basis.origin + basis.u * u + basis.v * v;
+            coords(row, col) = {
+                static_cast<float>(point[0]),
+                static_cast<float>(point[1]),
+                static_cast<float>(point[2]),
+            };
+        }
+    }
+    return coords;
+}
+
+void writeTexturedPlaneSliceObj(const cv::Mat_<cv::Vec3f>& coords,
+                                const std::filesystem::path& objPath,
+                                const std::string& materialName,
+                                const std::string& mtlName)
+{
+    if (coords.empty()) {
+        throw std::runtime_error("cannot write empty control plane slice OBJ");
+    }
+
+    std::ofstream output(objPath);
+    if (!output.good()) {
+        throw std::runtime_error("could not open OBJ output: " + objPath.string());
+    }
+    output.imbue(std::locale::classic());
+    output << "# Textured reinit control-point fitted plane slice\n"
+           << "mtllib " << mtlName << '\n'
+           << "usemtl " << materialName << '\n';
+
+    for (int row = 0; row < coords.rows; ++row) {
+        for (int col = 0; col < coords.cols; ++col) {
+            const cv::Vec3f& point = coords(row, col);
+            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+        }
+    }
+
+    const double colDenom = std::max(1, coords.cols - 1);
+    const double rowDenom = std::max(1, coords.rows - 1);
+    for (int row = 0; row < coords.rows; ++row) {
+        for (int col = 0; col < coords.cols; ++col) {
+            output << "vt "
+                   << (static_cast<double>(col) / colDenom) << ' '
+                   << (1.0 - static_cast<double>(row) / rowDenom) << '\n';
+        }
+    }
+
+    const auto index = [&](int row, int col) {
+        return row * coords.cols + col + 1;
+    };
+    for (int row = 0; row + 1 < coords.rows; ++row) {
+        for (int col = 0; col + 1 < coords.cols; ++col) {
+            const int v00 = index(row, col);
+            const int v01 = index(row, col + 1);
+            const int v10 = index(row + 1, col);
+            const int v11 = index(row + 1, col + 1);
+            output << "f "
+                   << v00 << '/' << v00 << ' '
+                   << v01 << '/' << v01 << ' '
+                   << v11 << '/' << v11 << ' '
+                   << v10 << '/' << v10 << '\n';
+        }
+    }
+}
+
+void writeControlPointsObj(const std::vector<cv::Vec3d>& points,
+                           const std::filesystem::path& outputPath)
+{
+    std::ofstream output(outputPath);
+    if (!output.good()) {
+        throw std::runtime_error("could not open OBJ output: " + outputPath.string());
+    }
+    output.imbue(std::locale::classic());
+    output << "# Reinit control points\n";
+    for (const auto& point : points) {
+        output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+    }
+    if (!points.empty()) {
+        output << "p";
+        for (size_t i = 0; i < points.size(); ++i) {
+            output << ' ' << (i + 1);
+        }
+        output << '\n';
+    }
+    for (size_t i = 0; i + 1 < points.size(); ++i) {
+        output << "l " << (i + 1) << ' ' << (i + 2) << '\n';
+    }
+}
+
+void writeNamedPolylinesObj(const std::vector<vc::lasagna::LineDebugPolyline>& lines,
+                            const std::filesystem::path& outputPath)
+{
+    std::ofstream output(outputPath);
+    if (!output.good()) {
+        throw std::runtime_error("could not open OBJ output: " + outputPath.string());
+    }
+    output.imbue(std::locale::classic());
+    output << "# Reinit continuation rollout candidates\n";
+
+    size_t nextVertex = 1;
+    for (const auto& line : lines) {
+        output << "o " << objElementName(line.name) << '\n';
+        if (line.points.empty()) {
+            continue;
+        }
+        const size_t firstVertex = nextVertex;
+        for (const auto& point : line.points) {
+            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+            ++nextVertex;
+        }
+        if (line.points.size() >= 2) {
+            output << "l";
+            for (size_t index = 0; index < line.points.size(); ++index) {
+                output << ' ' << (firstVertex + index);
+            }
+            output << '\n';
+        } else {
+            output << "p " << firstVertex << '\n';
+        }
     }
 }
 
@@ -713,23 +1121,23 @@ void writeSurfaceObj(const QuadSurface& surface,
     }
 }
 
-cv::Mat renderSurfaceTexture(const QuadSurface& surface,
-                             Volume& textureVolume,
-                             int textureLevel,
-                             int renderScale)
+cv::Mat renderCoordsTexture(const cv::Mat_<cv::Vec3f>& baseCoords,
+                            Volume& textureVolume,
+                            int textureLevel,
+                            int renderScale,
+                            const char* label)
 {
-    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
-    if (!points || points->empty()) {
+    if (baseCoords.empty()) {
         throw std::runtime_error("surface has no points for texture rendering");
     }
     renderScale = std::max(1, renderScale);
     cv::Mat_<cv::Vec3f> coords;
     if (renderScale == 1) {
-        coords = points->clone();
+        coords = baseCoords.clone();
     } else {
-        cv::resize(*points,
+        cv::resize(baseCoords,
                    coords,
-                   cv::Size(points->cols * renderScale, points->rows * renderScale),
+                   cv::Size(baseCoords.cols * renderScale, baseCoords.rows * renderScale),
                    0.0,
                    0.0,
                    cv::INTER_LINEAR);
@@ -763,13 +1171,100 @@ cv::Mat renderSurfaceTexture(const QuadSurface& surface,
         *cache, startLevel, coords, sampled, coverage, options);
     const int covered = cv::countNonZero(coverage);
     const int total = coverage.rows * coverage.cols;
-    std::cout << "Strip texture sampling: start_level=" << startLevel
+    std::cout << label << ": start_level=" << startLevel
               << " render_scale=" << renderScale
               << " size=" << sampled.cols << "x" << sampled.rows
               << " covered=" << covered << "/" << total
               << " requested_chunks=" << stats.requestedChunks
               << " error_chunks=" << stats.errorChunks << '\n';
     return sampled;
+}
+
+cv::Mat renderSurfaceTexture(const QuadSurface& surface,
+                             Volume& textureVolume,
+                             int textureLevel,
+                             int renderScale)
+{
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (!points || points->empty()) {
+        throw std::runtime_error("surface has no points for texture rendering");
+    }
+    return renderCoordsTexture(*points,
+                               textureVolume,
+                               textureLevel,
+                               renderScale,
+                               "Strip texture sampling");
+}
+
+void writeTif(const std::filesystem::path& path, const cv::Mat& image);
+
+vc::lasagna::LineModel lineModelSliceFromFixedIndices(
+    const vc::lasagna::LineModel& line,
+    const std::vector<int>& fixedPointIndices)
+{
+    if (line.points.size() < 2) {
+        throw std::runtime_error("cannot slice line with fewer than two points");
+    }
+
+    int first = std::numeric_limits<int>::max();
+    int last = std::numeric_limits<int>::min();
+    const int maxIndex = static_cast<int>(line.points.size()) - 1;
+    for (const int index : fixedPointIndices) {
+        if (index < 0 || index > maxIndex) {
+            continue;
+        }
+        first = std::min(first, index);
+        last = std::max(last, index);
+    }
+    if (first == std::numeric_limits<int>::max() || last - first < 1) {
+        throw std::runtime_error("cannot slice line without at least two fixed control indices");
+    }
+
+    vc::lasagna::LineModel slice;
+    slice.points.reserve(static_cast<size_t>(last - first + 1));
+    for (int index = first; index <= last; ++index) {
+        slice.points.push_back(line.points[static_cast<size_t>(index)]);
+    }
+
+    if (line.displayFrameAnchorIndex >= first && line.displayFrameAnchorIndex <= last) {
+        slice.displayFrameAnchorIndex = line.displayFrameAnchorIndex - first;
+    } else {
+        slice.displayFrameAnchorIndex = static_cast<int>(slice.points.size() / 2);
+    }
+    return slice;
+}
+
+std::vector<cv::Vec3d> linePointsSliceFromFixedIndices(
+    const vc::lasagna::LineModel& line,
+    const std::vector<int>& fixedPointIndices)
+{
+    return linePointsFromModel(lineModelSliceFromFixedIndices(line, fixedPointIndices));
+}
+
+void writePartialSideSliceObjOutput(const vc::lasagna::LineModel& line,
+                                    const std::vector<int>& fixedPointIndices,
+                                    Volume& textureVolume,
+                                    int textureLevel,
+                                    int renderScale,
+                                    const std::filesystem::path& outputDir)
+{
+    const vc::lasagna::LineModel partialLine =
+        lineModelSliceFromFixedIndices(line, fixedPointIndices);
+    const auto surfaces = vc::lasagna::buildLineViewSurfaces(partialLine);
+    if (!surfaces.lineSideSlice) {
+        throw std::runtime_error("line view builder did not produce partial side strip");
+    }
+
+    const cv::Mat sideSliceTexture =
+        renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale);
+    writeTif(outputDir / "partial_side_slice.tif", sideSliceTexture);
+    writeSurfaceMtl(outputDir / "partial_side_slice.mtl",
+                    "partial_side_slice_texture",
+                    "partial_side_slice.tif");
+    writeSurfaceObj(*surfaces.lineSideSlice,
+                    outputDir / "partial_side_slice.obj",
+                    "partial_side_slice_texture",
+                    "partial_side_slice.mtl");
 }
 
 void writeTif(const std::filesystem::path& path, const cv::Mat& image)
@@ -784,6 +1279,51 @@ void writeTif(const std::filesystem::path& path, const cv::Mat& image)
     if (!cv::imwrite(path.string(), image, params)) {
         throw std::runtime_error("failed to write image: " + path.string());
     }
+}
+
+void writeReinitDebugObjOutput(
+    const std::vector<cv::Vec3d>& controlPoints,
+    const vc::lasagna::LineModel& finalLine,
+    const std::vector<int>& fixedPointIndices,
+    const std::vector<vc::lasagna::LineDebugPolyline>& continuationCandidateLines,
+    const std::filesystem::path& outputDir,
+    Volume* textureVolume,
+    int textureLevel,
+    int renderScale)
+{
+    ensureDirectory(outputDir);
+    if (textureVolume != nullptr) {
+        const PlaneSliceBasis basis = fitControlPointPlaneSlice(controlPoints);
+        const cv::Mat_<cv::Vec3f> planeCoords =
+            makePlaneSliceGrid(basis, 32.0, renderScale);
+        const cv::Mat planeTexture = renderCoordsTexture(planeCoords,
+                                                         *textureVolume,
+                                                         textureLevel,
+                                                         renderScale,
+                                                         "Control plane texture sampling");
+        writeTif(outputDir / "control_plane_slice.tif", planeTexture);
+        writeSurfaceMtl(outputDir / "control_plane_slice.mtl",
+                        "control_plane_slice_texture",
+                        "control_plane_slice.tif");
+        writeTexturedPlaneSliceObj(planeCoords,
+                                   outputDir / "control_plane_slice.obj",
+                                   "control_plane_slice_texture",
+                                   "control_plane_slice.mtl");
+        writePartialSideSliceObjOutput(finalLine,
+                                       fixedPointIndices,
+                                       *textureVolume,
+                                       textureLevel,
+                                       renderScale,
+                                       outputDir);
+    } else {
+        writePlaneSliceObj(controlPoints, outputDir / "control_plane_slice.obj");
+    }
+    writeControlPointsObj(controlPoints, outputDir / "control_points.obj");
+    const std::vector<cv::Vec3d> boundedLinePoints =
+        linePointsSliceFromFixedIndices(finalLine, fixedPointIndices);
+    writeLineObj(boundedLinePoints, outputDir / "final_line.obj");
+    writeNamedPolylinesObj(continuationCandidateLines,
+                           outputDir / "continuation_candidates.obj");
 }
 
 int scaledControlColumn(int sourceIndex, int renderScale, int cols)
@@ -1060,6 +1600,7 @@ int main(int argc, char** argv)
     std::filesystem::path fiberPath;
     std::filesystem::path outputPath;
     std::filesystem::path objOutputDir;
+    std::filesystem::path reinitDebugObjOutputDir;
     std::filesystem::path stripOutputDir;
     std::filesystem::path textureZarrPath;
     int textureLevel = 0;
@@ -1097,6 +1638,11 @@ int main(int argc, char** argv)
                 throw std::invalid_argument("--obj-output-dir requires a directory");
             }
             objOutputDir = argv[++i];
+        } else if (arg == "--reinit-debug-obj-output-dir") {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument("--reinit-debug-obj-output-dir requires a directory");
+            }
+            reinitDebugObjOutputDir = argv[++i];
         } else if (arg == "--strip-output-dir") {
             if (i + 1 >= argc) {
                 throw std::invalid_argument("--strip-output-dir requires a directory");
@@ -1129,8 +1675,11 @@ int main(int argc, char** argv)
 
     try {
         const bool wantsObjOutput = !objOutputDir.empty();
+        const bool wantsReinitDebugObjOutput = !reinitDebugObjOutputDir.empty();
         const bool wantsStripOutput = !stripOutputDir.empty();
-        const bool wantsTextureOutput = wantsObjOutput || wantsStripOutput;
+        const bool wantsTextureOutput = wantsObjOutput ||
+                                        wantsStripOutput ||
+                                        (wantsReinitDebugObjOutput && !textureZarrPath.empty());
         if (!outputPath.empty() && fiberPath.empty()) {
             throw std::invalid_argument("--output requires --fiber <fiber.json>");
         }
@@ -1149,8 +1698,14 @@ int main(int argc, char** argv)
         if (wantsTextureOutput && textureZarrPath.empty()) {
             throw std::invalid_argument("--obj-output-dir/--strip-output-dir require --texture-zarr <zarr>");
         }
-        if (!textureZarrPath.empty() && !wantsTextureOutput) {
-            throw std::invalid_argument("--texture-zarr requires --obj-output-dir or --strip-output-dir");
+        if (wantsReinitDebugObjOutput && !reinitReopt) {
+            throw std::invalid_argument("--reinit-debug-obj-output-dir requires --reinit-reopt");
+        }
+        if (wantsReinitDebugObjOutput && fiberPath.empty()) {
+            throw std::invalid_argument("--reinit-debug-obj-output-dir requires --fiber <fiber.json>");
+        }
+        if (!textureZarrPath.empty() && !wantsTextureOutput && !wantsReinitDebugObjOutput) {
+            throw std::invalid_argument("--texture-zarr requires --obj-output-dir, --strip-output-dir, or --reinit-debug-obj-output-dir");
         }
         if ((reopt || reinitReopt) && (benchmarkSolvers || benchmarkThreads || traceInit)) {
             throw std::invalid_argument("--reopt/--reinit-reopt cannot be combined with benchmark or seed trace modes");
@@ -1262,25 +1817,61 @@ int main(int argc, char** argv)
                 outputLine = result.optimization.line;
                 outputLinePoints = linePointsFromModel(result.optimization.line);
                 outputFixedIndices = result.fixedPointIndices;
-                printResidualSummary(result.optimization.report);
+                if (!result.failed) {
+                    printResidualSummary(result.optimization.report);
+                }
                 if (verbose) {
                     const PointMotionStats motionStats = pointMotionStats(fiber.linePoints, outputLinePoints);
                     printReinitSpanTable(result.spans);
-                    std::cout << "max_segment_candidate_final_cost_diff="
-                              << result.maxSegmentCandidateFinalCostDiff << '\n';
-                    printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
-                    std::cout << "Fiber reinit reoptimization complete: points="
-                              << result.optimization.line.points.size()
-                              << " iterations=" << result.optimization.report.iterations
-                              << " initial_cost=" << result.optimization.report.initialCost
-                              << " final_cost=" << result.optimization.report.finalCost
-                              << " valid_normals=" << result.optimization.report.validNormalSamples
-                              << " invalid_normals=" << result.optimization.report.invalidNormalSamples
-                              << " converged=" << result.optimization.report.converged
-                              << " line_length=" << lineLength(outputLinePoints)
-                              << "\n";
-                    printPointMotionStats(motionStats);
-                    printLosses(result.optimization.report);
+                    printReinitCandidateTable(result.spans);
+                    std::cout << "max_segment_candidate_alignment_score_diff="
+                              << result.maxSegmentCandidateAlignmentScoreDiff << '\n';
+                    if (result.failed) {
+                        std::cout << "Fiber reinit stopped at span "
+                                  << result.failedSegmentIndex
+                                  << ": " << result.failureReason << '\n';
+                    } else {
+                        printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
+                        std::cout << "Fiber reinit reoptimization complete: points="
+                                  << result.optimization.line.points.size()
+                                  << " iterations=" << result.optimization.report.iterations
+                                  << " initial_rms=" << result.optimization.report.initialRms
+                                  << " final_rms=" << result.optimization.report.finalRms
+                                  << " residuals=" << result.optimization.report.residuals
+                                  << " valid_normals=" << result.optimization.report.validNormalSamples
+                                  << " invalid_normals=" << result.optimization.report.invalidNormalSamples
+                                  << " converged=" << result.optimization.report.converged
+                                  << " line_length=" << lineLength(outputLinePoints)
+                                  << "\n";
+                        printPointMotionStats(motionStats);
+                        printLosses(result.optimization.report);
+                    }
+                }
+                std::vector<std::filesystem::path> debugObjDirs;
+                if (wantsReinitDebugObjOutput) {
+                    debugObjDirs.push_back(reinitDebugObjOutputDir);
+                }
+                if (wantsObjOutput) {
+                    debugObjDirs.push_back(objOutputDir / "reinit_debug");
+                }
+                const std::vector<cv::Vec3d>& debugControlPoints =
+                    result.debugControlPoints.empty() ? fiber.controlPoints : result.debugControlPoints;
+                for (const auto& debugObjDir : debugObjDirs) {
+                    writeReinitDebugObjOutput(debugControlPoints,
+                                              outputLine,
+                                              result.fixedPointIndices,
+                                              result.continuationCandidateLines,
+                                              debugObjDir,
+                                              textureVolume.get(),
+                                              textureLevel,
+                                              stripRenderScale);
+                    if (verbose) {
+                        std::cout << "Saved reinit debug OBJ output to "
+                                  << debugObjDir.string() << '\n';
+                    }
+                }
+                if (result.failed) {
+                    throw std::runtime_error(result.failureReason);
                 }
             } else if (reopt) {
                 const auto result = optimizer.optimizeExistingLine(fiber.linePoints,
@@ -1298,8 +1889,9 @@ int main(int argc, char** argv)
                     printSegmentMotionTable(fiber.linePoints, outputLinePoints, fixedIndices);
                     std::cout << "Fiber reoptimization complete: points=" << result.line.points.size()
                               << " iterations=" << result.report.iterations
-                              << " initial_cost=" << result.report.initialCost
-                              << " final_cost=" << result.report.finalCost
+                              << " initial_rms=" << result.report.initialRms
+                              << " final_rms=" << result.report.finalRms
+                              << " residuals=" << result.report.residuals
                               << " valid_normals=" << result.report.validNormalSamples
                               << " invalid_normals=" << result.report.invalidNormalSamples
                               << " converged=" << result.report.converged
@@ -1328,8 +1920,11 @@ int main(int argc, char** argv)
                 }
             }
             if (wantsObjOutput) {
+                const std::vector<cv::Vec3d> lineObjPoints = reinitReopt
+                    ? linePointsSliceFromFixedIndices(outputLine, outputFixedIndices)
+                    : outputLinePoints;
                 writeLineViewObjOutput(outputLine,
-                                       outputLinePoints,
+                                       lineObjPoints,
                                        *textureVolume,
                                        textureLevel,
                                        stripRenderScale,
@@ -1374,7 +1969,7 @@ int main(int argc, char** argv)
             std::cout.imbue(std::locale::classic());
             std::cout << std::scientific << std::setprecision(3);
             std::cout << "Thread benchmark:\n"
-                      << "threads   run       ms  ceres_ms prefetch_ms materialize_ms prefetch_calls chunks_read chunks_requested  iters   final_cost normal_cost status\n";
+                      << "threads   run       ms  ceres_ms prefetch_ms materialize_ms prefetch_calls chunks_read chunks_requested  iters    final_rms  normal_rms status\n";
             for (const int threads : threadCounts) {
                 auto trialConfig = config;
                 trialConfig.numThreads = threads;
@@ -1395,8 +1990,8 @@ int main(int argc, char** argv)
                               << std::setw(12) << result.report.normalPrefetchChunksRead
                               << std::setw(17) << result.report.normalPrefetchRequestedChunks
                               << std::setw(7) << result.report.iterations
-                              << std::setw(13) << result.report.finalCost
-                              << std::setw(12) << normalAlignmentCost(result.report)
+                              << std::setw(13) << result.report.finalRms
+                              << std::setw(12) << normalAlignmentRms(result.report)
                               << " " << (result.report.converged ? "ok" : "not_converged") << '\n';
                 }
             }
@@ -1418,7 +2013,7 @@ int main(int argc, char** argv)
             std::cout.imbue(std::locale::classic());
             std::cout << std::scientific << std::setprecision(3);
             std::cout << "Solver benchmark:\n"
-                      << "solver                    threads   run       ms  ceres_ms prefetch_ms materialize_ms prefetch_calls chunks_read chunks_requested  iters   final_cost normal_cost status\n";
+                      << "solver                    threads   run       ms  ceres_ms prefetch_ms materialize_ms prefetch_calls chunks_read chunks_requested  iters    final_rms  normal_rms status\n";
             for (const auto solver : solvers) {
                 for (const int threads : threadCounts) {
                     if (isSchurSolver(solver)) {
@@ -1447,8 +2042,8 @@ int main(int argc, char** argv)
                                   << std::setw(12) << result.report.normalPrefetchChunksRead
                                   << std::setw(17) << result.report.normalPrefetchRequestedChunks
                                   << std::setw(7) << result.report.iterations
-                                  << std::setw(13) << result.report.finalCost
-                                  << std::setw(12) << normalAlignmentCost(result.report)
+                                  << std::setw(13) << result.report.finalRms
+                                  << std::setw(12) << normalAlignmentRms(result.report)
                                   << " " << (result.report.converged ? "ok" : "not_converged") << '\n';
                     }
                 }
@@ -1462,8 +2057,9 @@ int main(int argc, char** argv)
         if (verbose) {
             std::cout << "Optimization complete: points=" << result.line.points.size()
                       << " iterations=" << result.report.iterations
-                      << " initial_cost=" << result.report.initialCost
-                      << " final_cost=" << result.report.finalCost
+                      << " initial_rms=" << result.report.initialRms
+                      << " final_rms=" << result.report.finalRms
+                      << " residuals=" << result.report.residuals
                       << " valid_normals=" << result.report.validNormalSamples
                       << " invalid_normals=" << result.report.invalidNormalSamples
                       << " converged=" << result.report.converged << "\n";

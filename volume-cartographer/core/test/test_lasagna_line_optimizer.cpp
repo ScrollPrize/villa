@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -526,6 +527,7 @@ TEST_CASE("LineOptimizer normal-aware control update uses two-sided span trials"
         CHECK(std::isfinite(span.candLeftClosestTargetDistance));
         CHECK(std::isfinite(span.candRightClosestTargetDistance));
         CHECK(span.points >= 2);
+        CHECK(span.candidates.size() >= 2);
     }
     CHECK(update.activeStart == update.controlPoints[1].optimizedIndex);
     CHECK(update.activeEnd == update.controlPoints[7].optimizedIndex);
@@ -690,6 +692,42 @@ TEST_CASE("LineOptimizer reinit reopt reports rollout candidates and preserves f
     CHECK(result.spans[0].leftControlIndex == 1);
     CHECK(result.spans[0].rightControlIndex == 0);
     CHECK(result.spans[0].chosen == "left");
+    REQUIRE(result.spans[0].candidates.size() >= 2);
+    CHECK(result.spans[0].candidates[0].name == "left");
+    CHECK(result.spans[0].candidates[1].name == "right");
+    int chosenCandidateCount = 0;
+    double bestAlignmentScore = std::numeric_limits<double>::infinity();
+    double chosenAlignmentScore = std::numeric_limits<double>::infinity();
+    for (const auto& candidate : result.spans[0].candidates) {
+        chosenCandidateCount += candidate.chosen ? 1 : 0;
+        if (candidate.usable) {
+            bestAlignmentScore = std::min(bestAlignmentScore, candidate.alignmentChoiceScore);
+        } else {
+            CHECK_FALSE(candidate.chosen);
+        }
+        if (candidate.chosen) {
+            CHECK(candidate.usable);
+            chosenAlignmentScore = candidate.alignmentChoiceScore;
+        }
+        CHECK(candidate.points >= 2);
+        CHECK(std::isfinite(candidate.finalCost));
+        CHECK(candidate.finalCostDelta >= 0.0);
+        CHECK(std::isfinite(candidate.finalRms));
+        CHECK(candidate.finalRmsDelta >= 0.0);
+        CHECK(std::isfinite(candidate.avgNormalAlignmentAbs));
+        CHECK(std::isfinite(candidate.p95NormalAlignmentAbs));
+        CHECK(std::isfinite(candidate.maxNormalAlignmentAbs));
+        CHECK(std::isfinite(candidate.alignmentChoiceScore));
+        CHECK(candidate.alignmentChoiceScoreDelta >= 0.0);
+        CHECK(candidate.avgNormalAlignmentAbs <= candidate.maxNormalAlignmentAbs + 1.0e-12);
+        CHECK(candidate.p95NormalAlignmentAbs <= candidate.maxNormalAlignmentAbs + 1.0e-12);
+        CHECK(candidate.alignmentChoiceScore ==
+              doctest::Approx((candidate.avgNormalAlignmentAbs +
+                               candidate.p95NormalAlignmentAbs +
+                               candidate.maxNormalAlignmentAbs) / 3.0));
+    }
+    CHECK(chosenCandidateCount == 1);
+    CHECK(chosenAlignmentScore == doctest::Approx(bestAlignmentScore));
     CHECK(result.maxSegmentCandidateFinalCostDiff >= 0.0);
 
     REQUIRE(result.fixedPointIndices.size() == 3);
@@ -714,6 +752,70 @@ TEST_CASE("LineOptimizer reinit reopt reports rollout candidates and preserves f
     CHECK(result.optimization.report.message.find("Reinitialized control spans") != std::string::npos);
     CHECK(result.optimization.report.message.find("lsgn") != std::string::npos);
     CHECK(result.optimization.report.message.find("reinit-reopt+global") != std::string::npos);
+}
+
+TEST_CASE("LineOptimizer reinitialization adds continuation candidates on both sides of seed")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 100.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 15; ++i) {
+        linePoints.push_back({static_cast<double>(i) * 50.0, 0.0, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {5.0, {250.0, 0.0, 0.0}, true, 5},
+        {10.0, {500.0, 0.0, 0.0}, false, 10},
+        {15.0, {750.0, 0.0, 0.0}, false, 15},
+    };
+
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(linePoints,
+                                                                      controls,
+                                                                      {0, 5, 10, 15},
+                                                                      5,
+                                                                      config);
+
+    REQUIRE(result.spans.size() == 3);
+    CHECK(result.spans[0].candContinueLeftRolloutSteps == 0);
+    CHECK(result.spans[0].candContinueRightRolloutSteps > 0);
+    CHECK(result.spans[1].candContinueLeftRolloutSteps == 0);
+    CHECK(result.spans[1].candContinueRightRolloutSteps == 0);
+    CHECK(result.spans[2].candContinueLeftRolloutSteps > 0);
+    CHECK(result.spans[2].candContinueRightRolloutSteps == 0);
+    CHECK(std::isfinite(result.spans[0].candContinueRightClosestTargetDistance));
+    CHECK(std::isfinite(result.spans[2].candContinueLeftClosestTargetDistance));
+    CHECK(result.spans[0].candidates.size() == 3);
+    CHECK(result.spans[1].candidates.size() == 2);
+    CHECK(result.spans[2].candidates.size() == 3);
+    CHECK(result.spans[0].candidates.back().name == "continue-right");
+    CHECK(result.spans[2].candidates.back().name == "continue-left");
+    REQUIRE(result.continuationCandidateLines.size() == 2);
+    CHECK(result.continuationCandidateLines[0].name == "reinit-span-continue-left-2");
+    CHECK(result.continuationCandidateLines[1].name == "reinit-span-continue-right-0");
+    for (const auto& line : result.continuationCandidateLines) {
+        CHECK(line.points.size() >= 2);
+    }
+    for (const auto& span : result.spans) {
+        for (const auto& candidate : span.candidates) {
+            if (candidate.chosen) {
+                CHECK(candidate.usable);
+            }
+        }
+    }
 }
 
 TEST_CASE("LineOptimizer reinit reopt handles degenerate projected rollout tangents")
