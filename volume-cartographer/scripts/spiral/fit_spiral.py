@@ -36,6 +36,7 @@ from sample_spiral import (
     get_spiral_yxs,
     get_theta,
     get_theta_and_radii,
+    get_winding_xy,
 )
 import sample_spiral
 
