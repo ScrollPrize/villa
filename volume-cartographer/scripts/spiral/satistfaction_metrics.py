@@ -1,8 +1,18 @@
+import json
+import os
+
 import numpy as np
 import torch
 
 from sample_spiral import get_theta_and_radii
-from spiral_helpers import _segmented_median_per_strip
+from spiral_helpers import (
+    compute_winding_range_and_input_extents,
+    save_mesh,
+    _segmented_median_per_strip,
+    _warn_if_inputs_exceed_flow_bounds,
+)
+from tracks import get_track_satisfied_counts_in_chunks
+from visualization import save_overlay
 
 
 # Thresholds defining the patch-satisfaction metrics.
@@ -459,3 +469,196 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
 
     satisfied_counts, per_point_satisfaction = _strip_satisfaction_from_target(ctx, target_normalised_per_strip)
     return satisfied_counts, lengths_cpu.clone(), per_point_satisfaction
+
+
+def save_overlay_and_print_satisfaction(
+    suffix,
+    *,
+    spiral_and_transform,
+    slice_to_spiral_transform,
+    dr_per_winding,
+    patches_list,
+    patches_dict,
+    unattached_pcl_strips,
+    tracks,
+    unverified_patches_list,
+    unverified_patches_dict,
+    out_path,
+    cfg,
+    z_begin,
+    z_end,
+    flow_field_radius,
+    flow_min_corner_spiral_zyx,
+    flow_max_corner_spiral_zyx,
+    zs_for_visualisation,
+    slice_yx,
+    scroll_slices_for_visualisation,
+    prediction_slices_for_visualisation,
+    quad_label_map,
+    z_to_umbilicus_yx,
+    downsample_factor,
+    voxel_size_um,
+    get_or_build_unattached_pcl_flat,
+    run_tag=None,
+):
+    satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
+        slice_to_spiral_transform, dr_per_winding, patches_list, z_begin, z_end, verbose=True,
+    )
+    satisfied_count = satisfied_patches.sum().item()
+    boundary_satisfied_count = boundary_satisfied_patches.sum().item()
+    total_count = satisfied_patches.numel()
+    satisfied_ratio = satisfied_count / max(total_count, 1)
+    print(f'satisfied_patches = {satisfied_count}/{total_count} ({satisfied_ratio * 100:.1f}%)')
+    boundary_satisfied_ratio = boundary_satisfied_count / max(total_count, 1)
+    print(f'boundary_satisfied_patches = {boundary_satisfied_count}/{total_count} ({boundary_satisfied_ratio * 100:.1f}%)')
+    satisfied_area = float(satisfied_areas.sum().item())
+    total_area = float(total_areas.sum().item())
+    satisfied_area_ratio = satisfied_area / max(total_area, 1e-9)
+    print(f'satisfied_area = {satisfied_area:.1f}/{total_area:.1f} ({satisfied_area_ratio * 100:.1f}%)')
+    unattached_pcl_per_point_satisfied = []
+    unattached_pcl_fully_satisfied = torch.zeros(len(unattached_pcl_strips), dtype=torch.bool)
+    if unattached_pcl_strips:
+        unattached_pcl_satisfied_counts, unattached_pcl_total_counts, unattached_pcl_per_point_satisfied = get_unattached_pcl_satisfied_counts(
+            slice_to_spiral_transform, dr_per_winding, unattached_pcl_strips, get_or_build_unattached_pcl_flat,
+        )
+        unattached_pcl_fully_satisfied = (unattached_pcl_satisfied_counts == unattached_pcl_total_counts)
+        fully_satisfied_pcls = int(unattached_pcl_fully_satisfied.sum().item())
+        num_pcls = len(unattached_pcl_strips)
+        fully_satisfied_ratio = fully_satisfied_pcls / max(num_pcls, 1)
+        print(f'satisfied_unattached_pcls = {fully_satisfied_pcls}/{num_pcls} ({fully_satisfied_ratio * 100:.1f}%)')
+        satisfied_points = int(unattached_pcl_satisfied_counts.sum().item())
+        total_points = int(unattached_pcl_total_counts.sum().item())
+        satisfied_point_ratio = satisfied_points / max(total_points, 1)
+        print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
+    if tracks:
+        # Free the patch/pcl eval tensors before the (much larger) track eval,
+        # and chunk the track eval so the full track set does not have to be
+        # materialised on the GPU at once. Guard against OOM so that a failure
+        # to compute the secondary track metric never prevents the mesh/overlay
+        # from being saved.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            track_satisfied_counts, track_total_counts = get_track_satisfied_counts_in_chunks(
+                slice_to_spiral_transform, dr_per_winding, tracks, metrics_config,
+            )
+            track_fully_satisfied = (track_satisfied_counts == track_total_counts)
+            fully_satisfied_tracks = int(track_fully_satisfied.sum().item())
+            num_valid_tracks = int(track_total_counts.numel())
+            fully_satisfied_track_ratio = fully_satisfied_tracks / max(num_valid_tracks, 1)
+            print(f'satisfied_tracks = {fully_satisfied_tracks}/{num_valid_tracks} ({fully_satisfied_track_ratio * 100:.1f}%)')
+            track_satisfied_points = int(track_satisfied_counts.sum().item())
+            track_total_points = int(track_total_counts.sum().item())
+            track_satisfied_point_ratio = track_satisfied_points / max(track_total_points, 1)
+            print(f'satisfied_track_points = {track_satisfied_points}/{track_total_points} ({track_satisfied_point_ratio * 100:.1f}%)')
+        except torch.OutOfMemoryError:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print('WARNING: skipped satisfied_tracks metric (CUDA OOM during track evaluation)')
+    # Unverified patches are reported entirely separately so they never inflate the verified
+    # satisfaction numbers.
+    unverified_patch_satisfaction_entries = []
+    if unverified_patches_list:
+        u_satisfied, u_sat_areas, u_tot_areas, _, _, _ = get_patch_satisfied_areas(
+            slice_to_spiral_transform, dr_per_winding, unverified_patches_list, z_begin, z_end, verbose=False,
+        )
+        u_count = int(u_satisfied.sum().item())
+        u_total = u_satisfied.numel()
+        u_ratio = u_count / max(u_total, 1)
+        print(f'unverified_satisfied_patches = {u_count}/{u_total} ({u_ratio * 100:.1f}%)')
+        u_sat_area = float(u_sat_areas.sum().item())
+        u_tot_area = float(u_tot_areas.sum().item())
+        u_area_ratio = u_sat_area / max(u_tot_area, 1e-9)
+        print(f'unverified_satisfied_area = {u_sat_area:.1f}/{u_tot_area:.1f} ({u_area_ratio * 100:.1f}%)')
+        for pid, sat_area_t, tot_area_t in zip(unverified_patches_dict.keys(), u_sat_areas.tolist(), u_tot_areas.tolist()):
+            fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
+            unverified_patch_satisfaction_entries.append({
+                'id': pid,
+                'satisfied_area': sat_area_t,
+                'total_area': tot_area_t,
+                'fraction': fraction,
+            })
+        unverified_patch_satisfaction_entries.sort(key=lambda e: e['fraction'])
+
+    patch_ids = list(patches_dict.keys())
+    patch_satisfaction_entries = []
+    for pid, sat_area_t, tot_area_t in zip(patch_ids, satisfied_areas.tolist(), total_areas.tolist()):
+        fraction = sat_area_t / tot_area_t if tot_area_t > 0 else 0.0
+        patch_satisfaction_entries.append({
+            'id': pid,
+            'satisfied_area': sat_area_t,
+            'total_area': tot_area_t,
+            'fraction': fraction,
+        })
+    patch_satisfaction_entries.sort(key=lambda e: e['fraction'])
+    pcl_satisfaction_entries = []
+    if unattached_pcl_strips:
+        sat_counts = unattached_pcl_satisfied_counts.tolist()
+        tot_counts = unattached_pcl_total_counts.tolist()
+        for strip, sc, tc in zip(unattached_pcl_strips, sat_counts, tot_counts):
+            fraction = sc / tc if tc > 0 else 0.0
+            pcl_satisfaction_entries.append({
+                'id': strip.get('id'),
+                'name': strip.get('name'),
+                'source_file': strip.get('source_file'),
+                'satisfied_points': int(sc),
+                'total_points': int(tc),
+                'fraction': fraction,
+            })
+        pcl_satisfaction_entries.sort(key=lambda e: e['fraction'])
+    with open(f'{out_path}/satisfied_{suffix}.json', 'w') as f:
+        json.dump({
+            'patches': patch_satisfaction_entries,
+            'pcls': pcl_satisfaction_entries,
+            'unverified_patches': unverified_patch_satisfaction_entries,
+        }, f, indent=2)
+    # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
+    # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
+    if satisfied_quad_masks:
+        satisfied_quads_flat = torch.cat([m.flatten() for m in satisfied_quad_masks])
+        quads_per_patch = torch.tensor([m.numel() for m in satisfied_quad_masks], dtype=torch.int64)
+        overall_satisfied_per_quad = satisfied_patches.to(torch.bool).repeat_interleave(quads_per_patch)
+    else:
+        satisfied_quads_flat = torch.zeros([0], dtype=torch.bool)
+        overall_satisfied_per_quad = torch.zeros([0], dtype=torch.bool)
+    quad_status_flat = torch.where(
+        overall_satisfied_per_quad,
+        torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
+        satisfied_quads_flat.to(torch.int64),
+    )
+    if os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
+        winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
+            slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
+            cfg, z_begin, z_end, get_or_build_unattached_pcl_flat,
+        )
+        _warn_if_inputs_exceed_flow_bounds(
+            list(patches_dict.keys()), patch_extents,
+            unattached_pcl_strips, pcl_extents,
+            flow_field_radius,
+            cfg,
+        )
+        save_overlay(
+            spiral_and_transform,
+            flow_min_corner_spiral_zyx, flow_max_corner_spiral_zyx,
+            zs_for_visualisation, slice_yx,
+            scroll_slices_for_visualisation, prediction_slices_for_visualisation,
+            quad_label_map, quad_status_flat,
+            unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
+            z_to_umbilicus_yx,
+            winding_range,
+            tracks,
+            out_path, suffix,
+            downsample_factor,
+        )
+    if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
+        def get_patch_satisfied_areas_for_mesh(transform, winding_delta, patches, verbose=False):
+            return get_patch_satisfied_areas(
+                transform, winding_delta, patches, z_begin, z_end, verbose=verbose,
+            )
+
+        save_mesh(
+            slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
+            out_path, cfg, z_begin, z_end, downsample_factor, voxel_size_um,
+            get_or_build_unattached_pcl_flat, get_patch_satisfied_areas_for_mesh,
+            run_tag=run_tag, name=suffix,
+        )
