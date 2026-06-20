@@ -1,6 +1,5 @@
 
 import os
-import dbm
 import copy
 import json
 import glob
@@ -29,6 +28,7 @@ from lasagna_data import prepare_lasagna_volume
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
 from point_collection import load_point_collection, link_points_to_patches, link_points_to_patches_pointcache, can_use_surface_index_backend, normalise_pcl_winding_annotations
+from tracks import load_tracks_from_dbm
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
     canonical_winding_samples,
@@ -4191,36 +4191,6 @@ def prepare_point_collections(patches):
     return cross_patch_point_collections, unattached_pcl_strips
 
 
-def load_tracks_from_dbm(path, z_lo, z_hi):
-    # Load tracks written by extract_surface_tracks.py. Each DBM value
-    # is a pickled list of (N, 3) int32 zyx arrays; we keep only tracks that
-    # lie entirely within [z_lo, z_hi).
-    z_lo_raw = z_lo * downsample_factor
-    z_hi_raw = z_hi * downsample_factor
-    tracks = []
-    with dbm.open(path, 'r') as db:
-        for key in tqdm(db.keys(), desc='loading tracks'):
-            entries = pickle.loads(db[key])
-            if not entries:
-                continue
-            # Vectorize the per-track z min/max across the whole key: concatenate
-            # every (non-empty) track's z column and reduce per segment with
-            # reduceat, rather than calling .min()/.max() once per track .
-            idx = [i for i in range(len(entries)) if len(entries[i])]
-            if not idx:
-                continue
-            lengths = np.fromiter((len(entries[i]) for i in idx), dtype=np.intp, count=len(idx))
-            zcat = np.concatenate([entries[i][:, 0] for i in idx])
-            offsets = np.zeros(len(idx), dtype=np.intp)
-            np.cumsum(lengths[:-1], out=offsets[1:])
-            zmins = np.minimum.reduceat(zcat, offsets)
-            zmaxs = np.maximum.reduceat(zcat, offsets)
-            keep = (zmins >= z_lo_raw) & (zmaxs < z_hi_raw)
-            for j in np.nonzero(keep)[0]:
-                tracks.append(entries[idx[j]].astype(np.float32) / downsample_factor)
-    return tracks
-
-
 def erode_patch_valid_region(patch, num_cells):
     """Erode the patch's valid-vertex region inward by `num_cells` grid cells,
     marking the removed vertices invalid (zyxs = -1) and re-deriving the patch.
@@ -4323,7 +4293,7 @@ def main():
 
     if tracks_dbm_path is not None:
         print(f'loading tracks from {tracks_dbm_path}')
-        tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
+        tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end, downsample_factor)
         print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')
     else:
         tracks = None
