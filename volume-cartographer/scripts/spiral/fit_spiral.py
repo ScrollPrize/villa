@@ -145,7 +145,6 @@ default_config = {
     'grad_mag_encode_scale': 1000.0,
     'grad_mag_factor': 0.25 * 4,  # 4 maps from 2um to 8um
     'spacing_integration_steps': 8,
-    'patch_stretch_loss_norm': 'L2',
     'loss_weight_patch_radius': 32.e0,
     'loss_weight_uv_distance': 0.,
     'loss_weight_patch_dt': 16.e0,
@@ -158,15 +157,11 @@ default_config = {
     'loss_weight_track_radius': 200.,
     'loss_weight_track_dt': 40.,
     'loss_weight_track_coverage': 0.0,
-    'loss_weight_patch_stretch': 0.0,
-    'loss_weight_bending': 0.0,
     'loss_weight_sym_dirichlet': 10.0,
     'loss_weight_dense_normals': 1.e2,
     'loss_weight_dense_spacing': 8.,
     'loss_weight_umbilicus': 5.,
     'loss_weight_shell_outer': 4.0,
-    'loss_weight_shell_no_cross': 0.0,
-    'loss_weight_shell_z_drift': 0.0,
     'loss_weight_shell_patch_radius': 0.0,
     'weight_decay_gap_expander': 1.e-2,
     'weight_decay_flow_field': 0.0,
@@ -194,9 +189,7 @@ default_config = {
     'shell_outer_winding_margin': 10,
     'shell_num_samples': 24576,
     'shell_num_theta_bins': 720,
-    'shell_near_outer_num_windings': 3,
     'shell_huber_delta': 4.0,
-    'shell_no_cross_margin': 2.0,
     'shell_table_smooth_sigma_z': 1.0,
     'shell_table_smooth_sigma_theta': 1.0,
     'shell_min_confidence': 0.25,
@@ -357,8 +350,6 @@ def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3., winding_range=
 def shell_losses_enabled():
     return (
         cfg['loss_weight_shell_outer'] > 0
-        or cfg['loss_weight_shell_no_cross'] > 0
-        or cfg['loss_weight_shell_z_drift'] > 0
         or cfg['loss_weight_shell_patch_radius'] > 0
     )
 
@@ -481,37 +472,21 @@ def _canonical_winding_samples(winding_indices, num_samples, dr_per_winding, dev
     ], dim=-1)
 
 
-def get_shell_losses(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx):
+def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx):
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if shell_map is None or outer_winding_idx is None:
-        return zero, zero, zero, {}
+        return zero, {}
 
     num_samples = max(1, int(cfg['shell_num_samples']))
     huber_delta = torch.as_tensor(cfg['shell_huber_delta'], device=device, dtype=torch.float32)
 
     outer_spiral = _canonical_winding_samples([outer_winding_idx], num_samples, dr_per_winding, device)[0]
-    near_count = max(1, int(cfg['shell_near_outer_num_windings']))
-    first_w = max(0, int(outer_winding_idx) - near_count + 1)
-    winding_indices = list(range(first_w, int(outer_winding_idx) + 1))
-    barrier_spiral = _canonical_winding_samples(winding_indices, max(1, num_samples // len(winding_indices)), dr_per_winding, device)
-
-    outer_count = outer_spiral.shape[0]
-    combined_scan = slice_to_spiral_transform.inv(torch.cat([
-        outer_spiral,
-        barrier_spiral.reshape(-1, 3),
-    ], dim=0))
-    outer_scan = combined_scan[:outer_count]
-    barrier_scan = combined_scan[outer_count:].reshape(*barrier_spiral.shape)
+    outer_scan = slice_to_spiral_transform.inv(outer_spiral)
 
     target_r, scan_r, confidence, valid = shell_map.lookup(outer_scan)
     residual = scan_r - target_r
     shell_outer_loss = _masked_mean(_huber_abs(residual, huber_delta), valid)
-    shell_z_drift_loss = _masked_mean(_huber_abs(outer_scan[..., 0] - outer_spiral[..., 0], huber_delta), valid)
-
-    barrier_target_r, barrier_scan_r, _, barrier_valid = shell_map.lookup(barrier_scan)
-    violation = F.relu(barrier_scan_r - barrier_target_r - cfg['shell_no_cross_margin'])
-    shell_no_cross_loss = _masked_mean(_huber_abs(violation, huber_delta), barrier_valid)
 
     metrics = {}
     with torch.no_grad():
@@ -520,14 +495,10 @@ def get_shell_losses(shell_map, slice_to_spiral_transform, dr_per_winding, outer
             metrics = {
                 'shell_outer_error_mean': abs_residual.mean(),
                 'shell_outer_error_p95': torch.quantile(abs_residual, 0.95),
-                'shell_z_drift_mean': (outer_scan[..., 0] - outer_spiral[..., 0]).abs()[valid].mean(),
                 'shell_confidence_mean': confidence[valid].mean(),
             }
-        if barrier_valid.any():
-            metrics['shell_no_cross_violation_p95'] = torch.quantile(violation[barrier_valid], 0.95)
-            metrics['shell_no_cross_violation_fraction'] = (violation[barrier_valid] > 0).to(torch.float32).mean()
 
-    return shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, metrics
+    return shell_outer_loss, metrics
 
 
 class CartesianFlowField(nn.Module):
@@ -2179,90 +2150,6 @@ def get_unattached_pcl_strip_losses(
     dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
 
     return radius_loss, dt_loss
-
-
-def get_patch_stretch_loss(slice_to_spiral_transform, num_points, patches, patch_sampling_probabilities, epsilon=1.0):
-    # Sample patch points and enforce that epsilon-steps along the discrete patch tangents
-    # (+i and +j neighbors in patch coordinates) preserve length in spiral space.
-    patch_idx = int(np.random.choice(len(patches), p=patch_sampling_probabilities))
-    patch = patches[patch_idx]
-    valid_indices = patch.valid_quad_indices
-    sampled = np.random.randint(len(valid_indices), size=num_points)
-    i_coords = valid_indices[sampled, 0]
-    j_coords = valid_indices[sampled, 1]
-
-    H, W = patch.valid_vertex_mask.shape
-    in_bounds_i = i_coords + 1 < H
-    in_bounds_j = j_coords + 1 < W
-    safe_i_next = (i_coords + 1).clamp(max=H - 1)
-    safe_j_next = (j_coords + 1).clamp(max=W - 1)
-    neighbor_i_valid = patch.valid_vertex_mask[safe_i_next, j_coords] & in_bounds_i
-    neighbor_j_valid = patch.valid_vertex_mask[i_coords, safe_j_next] & in_bounds_j
-    mask = (neighbor_i_valid & neighbor_j_valid).float().cuda()
-
-    scroll_zyx = patch.zyxs[i_coords, j_coords].cuda()
-    scroll_neighbor_i = patch.zyxs[safe_i_next, j_coords].cuda()
-    scroll_neighbor_j = patch.zyxs[i_coords, safe_j_next].cuda()
-    delta_i = scroll_neighbor_i - scroll_zyx
-    delta_j = scroll_neighbor_j - scroll_zyx
-    tangent_i = F.normalize(delta_i, dim=-1)
-    tangent_j = F.normalize(delta_j, dim=-1)
-
-    scroll_shift_i = scroll_zyx + tangent_i * epsilon
-    scroll_shift_j = scroll_zyx + tangent_j * epsilon
-    combined_scroll = torch.cat([scroll_zyx, scroll_shift_i, scroll_shift_j], dim=0)
-    combined_spiral = slice_to_spiral_transform(combined_scroll)
-    spiral_zyx, spiral_shift_i, spiral_shift_j = combined_spiral.chunk(3, dim=0)
-
-    stretch_i = torch.linalg.norm(spiral_shift_i - spiral_zyx, dim=-1) - epsilon
-    stretch_j = torch.linalg.norm(spiral_shift_j - spiral_zyx, dim=-1) - epsilon
-    if cfg['patch_stretch_loss_norm'] == 'L2':
-        stretch_residual = 0.5 * (stretch_i ** 2 + stretch_j ** 2)
-    elif cfg['patch_stretch_loss_norm'] == 'L1':
-        stretch_residual = 0.5 * (stretch_i.abs() + stretch_j.abs())
-    else:
-        raise ValueError(f"patch_stretch_loss_norm must be 'L1' or 'L2', got {cfg['patch_stretch_loss_norm']!r}")
-
-    denom = mask.sum().clamp(min=1)
-    stretch_loss = (stretch_residual * mask).sum() / denom
-    return stretch_loss
-
-
-def get_bending_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=1.0):
-    # Extrinsic bending penalty on the scroll-space image of the spiral surface, evaluated at points
-    # sampled uniformly over the spiral cylinder (see sample_spiral_surface_frame).
-    # At each point we take the orthonormal in-surface frame (e1, e2) in spiral space, form
-    # collinear triples (centre, centre +- e * epsilon) along it, map them to scroll space through the
-    # inverse transform, and take the second difference of the resulting scroll positions along each
-    # frame axis (a discrete directional second derivative of the map). We then project that onto the
-    # scroll-space surface normal (from cross of the pushed-forward frame vectors) and penalise its
-    # magnitude squared, so non-isometric stretching of the parameterisation (which lives in the
-    # tangent plane and is covered by the symmetric Dirichlet term) does not contribute.
-    device = dr_per_winding.device
-    if outer_winding_idx is None:
-        return torch.zeros([], device=device)
-
-    spiral_center, e1, e2 = sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points)
-
-    spiral_1_prev = spiral_center - e1 * epsilon
-    spiral_1_next = spiral_center + e1 * epsilon
-    spiral_2_prev = spiral_center - e2 * epsilon
-    spiral_2_next = spiral_center + e2 * epsilon
-    combined_spiral = torch.cat([spiral_center, spiral_1_prev, spiral_1_next, spiral_2_prev, spiral_2_next], dim=0)
-    combined_scroll = slice_to_spiral_transform.inv(combined_spiral)
-    scroll_center, scroll_1_prev, scroll_1_next, scroll_2_prev, scroll_2_next = combined_scroll.chunk(5, dim=0)
-
-    # Pushforward of e1, e2 via central differences (scroll-space tangent vectors).
-    tangent_1 = (scroll_1_next - scroll_1_prev) / (2.0 * epsilon)
-    tangent_2 = (scroll_2_next - scroll_2_prev) / (2.0 * epsilon)
-    normal = torch.linalg.cross(tangent_1, tangent_2, dim=-1)
-    normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-
-    second_diff_1 = (scroll_1_next + scroll_1_prev - 2.0 * scroll_center) / (epsilon ** 2)
-    second_diff_2 = (scroll_2_next + scroll_2_prev - 2.0 * scroll_center) / (epsilon ** 2)
-    bending_1 = ((second_diff_1 * normal).sum(dim=-1)) ** 2
-    bending_2 = ((second_diff_2 * normal).sum(dim=-1)) ** 2
-    return (bending_1 + bending_2).mean()
 
 
 def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=1.0):
@@ -4375,11 +4262,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
     shell_outer_winding_idx = None
     shell_valid_zyxs_gpu = None
     if shell_patch is not None and shell_losses_enabled():
-        if (
-            cfg['loss_weight_shell_outer'] > 0
-            or cfg['loss_weight_shell_no_cross'] > 0
-            or cfg['loss_weight_shell_z_drift'] > 0
-        ):
+        if cfg['loss_weight_shell_outer'] > 0:
             shell_map = ShellPolarMap(
                 shell_patch,
                 z_to_umbilicus_yx,
@@ -4684,24 +4567,6 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             losses['unverified_patch_radius'] = unverified_patch_radius_loss * cfg['loss_weight_unverified_patch_radius']
             losses['unverified_patch_dt'] = unverified_patch_dt_loss * cfg['loss_weight_unverified_patch_dt']
 
-        if cfg['loss_weight_patch_stretch'] > 0:
-            patch_stretch_loss = get_patch_stretch_loss(
-                slice_to_spiral_transform,
-                cfg['regularisation_num_points'],
-                patches_list,
-                patch_sampling_probabilities,
-            )
-            losses['patch_stretch'] = patch_stretch_loss * cfg['loss_weight_patch_stretch']
-
-        if cfg['loss_weight_bending'] > 0:
-            bending_loss = get_bending_loss(
-                slice_to_spiral_transform,
-                dr_per_winding,
-                shell_outer_winding_idx,
-                cfg['regularisation_num_points'],
-            )
-            losses['bending'] = bending_loss * cfg['loss_weight_bending']
-
         if cfg['loss_weight_sym_dirichlet'] > 0:
             sym_dirichlet_loss = get_symmetric_dirichlet_loss(
                 slice_to_spiral_transform,
@@ -4807,15 +4672,13 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
         shell_metrics = {}
         if shell_map is not None:
-            shell_outer_loss, shell_no_cross_loss, shell_z_drift_loss, shell_metrics = get_shell_losses(
+            shell_outer_loss, shell_metrics = get_shell_outer_loss(
                 shell_map,
                 slice_to_spiral_transform,
                 dr_per_winding,
                 shell_outer_winding_idx,
             )
             losses['shell_outer'] = shell_outer_loss * cfg['loss_weight_shell_outer']
-            losses['shell_no_cross'] = shell_no_cross_loss * cfg['loss_weight_shell_no_cross']
-            losses['shell_z_drift'] = shell_z_drift_loss * cfg['loss_weight_shell_z_drift']
 
         losses['umbilicus'] = umbilicus_loss * cfg['loss_weight_umbilicus']
 
