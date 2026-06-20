@@ -3827,6 +3827,7 @@ void CWindow::remapCurrentAtlas()
         vc::lasagna::LasagnaDataset dataset =
             vc::lasagna::LasagnaDataset::open(manifestPath);
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        // Source-fiber scaling is taken from the atlas's recorded sourceFiberScale metadata.
         const vc::atlas::Atlas rebuilt =
             vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
 
@@ -5211,6 +5212,19 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
             vc::atlas::repeatedAtlasDisplaySurface(*baseSurface,
                                                    displayRange.unwrapCount,
                                                    atlas.metadata.zeroWindingColumn);
+        // The atlas base mesh is full-res; the atlas viewer renders the working volume. Scale the
+        // display surface's world coordinates down to working space so it (and the overlay anchors
+        // projected through it) align with the working volume. The parametric scale() is unchanged.
+        const double atlasVolumeScale = _lineAnnotationController
+            ? _lineAnnotationController->volumeScale()
+            : 1.0;
+        if (atlasVolumeScale != 1.0) {
+            if (auto* displayPoints = displaySurface->rawPointsPtr()) {
+                for (auto& worldPoint : *displayPoints) {
+                    worldPoint *= static_cast<float>(atlasVolumeScale);
+                }
+            }
+        }
         displaySurface->id = ATLAS_INTERNAL_SURFACE_NAME;
         if (_state) {
             _state->setSurface(ATLAS_INTERNAL_SURFACE_NAME, displaySurface);
@@ -5294,8 +5308,8 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                     throw std::runtime_error(
                         "Selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
                 }
-                vc::atlas::rebuildAtlasFromSourceFibers(
-                    atlasDir, volpkgRoot, sampler);
+                // Source-fiber scaling is taken from the atlas's recorded sourceFiberScale metadata.
+                vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
                 displayAtlasFromDirectory(atlasDir);
             } catch (const std::exception& rebuildEx) {
                 QMessageBox::warning(
@@ -6010,6 +6024,10 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::createAtlasFromFiber);
             connect(widget,
+                    &CFiberWidget::addFibersToPointCollectionsRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::addFibersToPointCollections);
+            connect(widget,
                     &CFiberWidget::fiberSliceRequested,
                     this,
                     [this](uint64_t fiberId) {
@@ -6024,6 +6042,17 @@ void CWindow::CreateWidgets(void)
                             _lineAnnotationController->showFiberSlice(fiberId, _fiberSliceMdiArea);
                         }
                     });
+            connect(widget,
+                    &CFiberWidget::volumeScaleOverrideChanged,
+                    _lineAnnotationController.get(),
+                    [this](double scale) {
+                        _lineAnnotationController->setVolumeScaleOverride(
+                            scale > 0.0 ? std::optional<double>{scale} : std::nullopt);
+                    });
+            connect(_lineAnnotationController.get(),
+                    &LineAnnotationController::volumeScaleChanged,
+                    widget,
+                    &CFiberWidget::setVolumeScaleDisplay);
         };
         connect(_lineAnnotationController.get(),
                 &LineAnnotationController::fibersChanged,

@@ -32,6 +32,10 @@ class ViewerManager;
 class VolumePkg;
 class QWidget;
 
+namespace vc::lasagna {
+class LasagnaNormalSampler;
+}
+
 class LineAnnotationController : public QObject
 {
     Q_OBJECT
@@ -112,6 +116,8 @@ public:
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
     void createAtlasFromFiber(uint64_t fiberId);
+    void addFiberToPointCollection(uint64_t fiberId);
+    void addFibersToPointCollections(std::vector<uint64_t> fiberIds);
     void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
     void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
                                     QMdiArea* targetArea,
@@ -129,6 +135,14 @@ public:
     [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
         const std::filesystem::path& atlasFiberPath) const;
 
+    // Working-volume scale support. The active volume may be downsampled relative to the
+    // full-resolution Lasagna data; coordinates fed to Lasagna are scaled up to full-res and
+    // results scaled back down. `volumeScale` is the working-to-full-res ratio (1.0 = no scaling,
+    // 0.25 = a 4x downsampled working volume). An empty override means auto-detection.
+    [[nodiscard]] double volumeScale() const { return _volumeScale; }
+    void setVolumeScaleOverride(std::optional<double> scale);
+    void recomputeVolumeScale();
+
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
@@ -140,6 +154,7 @@ signals:
     void fiberSaved(uint64_t fiberId, uint64_t generation);
     void fibersDeleted(std::vector<uint64_t> fiberIds);
     void atlasCreated(std::filesystem::path atlasDir);
+    void volumeScaleChanged(double effectiveScale, bool autoDetected);
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -202,6 +217,10 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
+    // Auto-detect the working-to-full-res scale by comparing the active volume shape with the
+    // Lasagna source extent (`sampler` may be null when no dataset is loaded yet). Honors an
+    // active override and warns once when the ratio is not a clean power of two.
+    void updateVolumeScale(const vc::lasagna::LasagnaNormalSampler* sampler);
     bool needsFinalReinitReopt(const LineAnnotationSession& session) const;
     bool runFinalReinitReoptSynchronously(LineAnnotationSession& session,
                                           bool fireSuccessCallback);
@@ -256,9 +275,12 @@ private:
     [[nodiscard]] static std::string currentFiberDateTimeString();
     void ensureSessionFiberIdentity(LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
+    // `points` are in working-volume coordinates and are stored as-is; normals are sampled at the
+    // matching full-res Lasagna coordinates (points scaled by 1/volumeScale).
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
-        const vc::lasagna::NormalSampler* normalSampler);
+        const vc::lasagna::NormalSampler* normalSampler,
+        double volumeScale = 1.0);
     [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
         const std::vector<cv::Vec3d>& points);
     void saveSessionAsFiber(LineAnnotationSession& session);
@@ -297,4 +319,7 @@ private:
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
+    double _volumeScale = 1.0;
+    std::optional<double> _volumeScaleOverride;
+    bool _volumeScaleFallbackWarned = false;
 };

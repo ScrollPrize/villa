@@ -4,6 +4,7 @@
 #include <QAction>
 #include <QButtonGroup>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
 #include <QLabel>
@@ -49,6 +50,26 @@ void CFiberWidget::setupUi()
 {
     auto* mainWidget = new QWidget(this);
     auto* layout = new QVBoxLayout(mainWidget);
+
+    auto* volumeScaleLayout = new QHBoxLayout();
+    volumeScaleLayout->addWidget(new QLabel(tr("Volume scale:"), mainWidget));
+    _volumeScaleCombo = new QComboBox(mainWidget);
+    _volumeScaleCombo->setObjectName(QStringLiteral("fiberVolumeScaleCombo"));
+    _volumeScaleCombo->setToolTip(tr("Working-volume scale relative to the full-resolution Lasagna "
+                                     "data. 'Auto' detects it from the active volume shape."));
+    _volumeScaleCombo->addItem(tr("Auto"), 0.0);
+    _volumeScaleCombo->addItem(QStringLiteral("1"), 1.0);
+    _volumeScaleCombo->addItem(QStringLiteral("0.5"), 0.5);
+    _volumeScaleCombo->addItem(QStringLiteral("0.25"), 0.25);
+    _volumeScaleCombo->addItem(QStringLiteral("0.125"), 0.125);
+    volumeScaleLayout->addWidget(_volumeScaleCombo);
+    _volumeScaleInfoLabel = new QLabel(mainWidget);
+    volumeScaleLayout->addWidget(_volumeScaleInfoLabel, 1);
+    layout->addLayout(volumeScaleLayout);
+
+    connect(_volumeScaleCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
+        emit volumeScaleOverrideChanged(_volumeScaleCombo->currentData().toDouble());
+    });
 
     _nameLabel = new QLabel(mainWidget);
     _nameLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -246,6 +267,17 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
     }
     _deleteButton->setEnabled(canDeleteSelection());
     updateClassificationUi();
+}
+
+void CFiberWidget::setVolumeScaleDisplay(double effectiveScale, bool autoDetected)
+{
+    if (!_volumeScaleInfoLabel) {
+        return;
+    }
+    _volumeScaleInfoLabel->setText(
+        autoDetected
+            ? tr("detected: %1").arg(effectiveScale, 0, 'g', 4)
+            : tr("override: %1").arg(effectiveScale, 0, 'g', 4));
 }
 
 void CFiberWidget::setKnownTags(const std::vector<std::string>& tags)
@@ -515,6 +547,18 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
     connect(newAtlasAction, &QAction::triggered, this, [this]() {
         if (_selectedFiberId != 0) {
             emit newAtlasFromFiberRequested(_selectedFiberId);
+        }
+    });
+    const auto selectedForCollection = selectedFiberIds();
+    auto* addToCollectionAction = menu.addAction(
+        selectedForCollection.size() > 1
+            ? tr("Add %1 lines to point collections").arg(selectedForCollection.size())
+            : tr("Add to point collection"));
+    addToCollectionAction->setEnabled(!selectedForCollection.empty());
+    connect(addToCollectionAction, &QAction::triggered, this, [this]() {
+        const auto ids = selectedFiberIds();
+        if (!ids.empty()) {
+            emit addFibersToPointCollectionsRequested(ids);
         }
     });
     auto* renameAction = createRenameFiberFileAction(&menu);

@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -227,6 +230,61 @@ struct PySurfacePatchIndex {
                               own_1d(std::move(distance)), own_2d(std::move(ij), 2));
     }
 
+    // Single-nearest batched locate over an (N, 3) xyz array, parallelised across
+    // threads with the GIL released. Returns compact parallel arrays (not the ragged
+    // CSR of locate_all_xyz_batch):
+    //   (surf_idx[int32, N], distance[float32, N], ij[float32, N, 2])
+    // surf_idx[k] indexes surface_ids() (-1 if no surface within tolerance),
+    // distance[k] is +inf when there is no hit, and ij is (grid_y, grid_x). Uses the
+    // single-nearest locate() (cheaper than locateAll, which collects every hit);
+    // locate() takes only a shared read lock, so disjoint-index workers are safe.
+    nb::object locate_xyz_nearest_batch(XyzBatch xyzs, float tolerance) const
+    {
+        const size_t n = xyzs.shape(0);
+        const float* xyz = xyzs.data();  // the ndarray arg keeps this alive across the release
+
+        std::vector<int32_t> surf_idx(n, -1);
+        std::vector<float> distance(n, std::numeric_limits<float>::infinity());
+        std::vector<float> ij(2 * n, 0.0f);
+
+        {
+            nb::gil_scoped_release release;
+            unsigned hw = std::thread::hardware_concurrency();
+            if (hw == 0) { hw = 1; }
+            const size_t nthreads = std::min<size_t>(hw, std::max<size_t>(size_t{1}, n));
+
+            auto worker = [&](size_t lo, size_t hi) {
+                for (size_t k = lo; k < hi; ++k) {
+                    SurfacePatchIndex::PointQuery query;
+                    query.worldPoint = cv::Vec3f(xyz[3 * k + 0], xyz[3 * k + 1], xyz[3 * k + 2]);
+                    query.tolerance = tolerance;
+                    auto hit = index.locate(query);
+                    if (!hit) { continue; }
+                    auto it = idx_by_surface.find(hit->surface.get());
+                    surf_idx[k] = (it != idx_by_surface.end()) ? it->second : -1;
+                    distance[k] = hit->distance;
+                    const cv::Vec2f grid = hit->surface->ptrToGrid(hit->ptr);
+                    ij[2 * k + 0] = grid[1];
+                    ij[2 * k + 1] = grid[0];
+                }
+            };
+
+            std::vector<std::thread> threads;
+            threads.reserve(nthreads);
+            const size_t chunk = (n + nthreads - 1) / nthreads;
+            for (size_t t = 0; t < nthreads; ++t) {
+                const size_t lo = t * chunk;
+                const size_t hi = std::min(n, lo + chunk);
+                if (lo >= hi) { break; }
+                threads.emplace_back(worker, lo, hi);
+            }
+            for (auto& th : threads) { th.join(); }
+        }
+
+        return nb::make_tuple(own_1d(std::move(surf_idx)), own_1d(std::move(distance)),
+                              own_2d(std::move(ij), 2));
+    }
+
     bool empty() const { return index.empty(); }
     size_t surface_count() const { return index.surfaceCount(); }
     size_t patch_count() const { return index.patchCount(); }
@@ -252,6 +310,7 @@ NB_MODULE(surface_index, m) {
         .def("locate_xyz_batch", &PySurfacePatchIndex::locate_xyz_batch, nb::arg("xyzs"), nb::arg("tolerance"))
         .def("locate_all_xyz", &PySurfacePatchIndex::locate_all_xyz, nb::arg("xyz"), nb::arg("tolerance"))
         .def("locate_all_xyz_batch", &PySurfacePatchIndex::locate_all_xyz_batch, nb::arg("xyzs"), nb::arg("tolerance"))
+        .def("locate_xyz_nearest_batch", &PySurfacePatchIndex::locate_xyz_nearest_batch, nb::arg("xyzs"), nb::arg("tolerance"))
         .def("surface_ids", &PySurfacePatchIndex::surface_ids)
         .def("empty", &PySurfacePatchIndex::empty)
         .def("surface_count", &PySurfacePatchIndex::surface_count)

@@ -363,9 +363,13 @@ if(VC_BUILD_UI_TRACER OR VC_BUILD_APPS)
     set(CMAKE_AUTORCC ON)
     set(CMAKE_AUTOUIC ON)
 
-    find_package(Ceres REQUIRED)
     find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
 endif()
+# Ceres is required unconditionally: core/CMakeLists.txt always builds
+# vc_inpaint, vc_lasagna, vc_atlas and vc_tracer, all of which link
+# Ceres::ceres (vc_lasagna is also pulled into the Python bindings via
+# vc_lasagna_amgx).
+find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(nlohmann_json REQUIRED)

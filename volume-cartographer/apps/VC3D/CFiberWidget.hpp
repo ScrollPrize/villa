@@ -16,6 +16,7 @@ class QButtonGroup;
 class QAction;
 class QLineEdit;
 class QVBoxLayout;
+class QComboBox;
 
 class CFiberWidget : public QDockWidget
 {
@@ -51,6 +52,9 @@ public:
     QAction* createRenameFiberFileAction(QObject* parent);
     void setFibers(const std::vector<FiberEntry>& fibers);
     void setKnownTags(const std::vector<std::string>& tags);
+    // Reflect the controller's effective working-volume scale in the UI. `autoDetected` is true
+    // when the value came from auto-detection rather than a user override.
+    void setVolumeScaleDisplay(double effectiveScale, bool autoDetected);
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
@@ -62,8 +66,11 @@ signals:
     void fiberTagChanged(uint64_t fiberId, QString tag, bool enabled);
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void newAtlasFromFiberRequested(uint64_t fiberId);
+    void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
+    // Working-volume scale override chosen by the user; a value <= 0 requests auto-detection.
+    void volumeScaleOverrideChanged(double scale);
 
 private slots:
     void onSelectionChanged();
@@ -96,6 +103,8 @@ private:
 
     QListView* _listView;
     QStandardItemModel* _model;
+    QComboBox* _volumeScaleCombo;
+    QLabel* _volumeScaleInfoLabel;
     QLabel* _nameLabel;
     QLabel* _scoreLabel;
     QLabel* _autoLabel;

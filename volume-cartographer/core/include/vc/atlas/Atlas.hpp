@@ -37,6 +37,11 @@ struct AtlasMetadata {
     int seedLineIndex = 0;
     double seedAtlasU = 0.0;
     double seedAtlasV = 0.0;
+    // Multiplier that maps the stored source-fiber coordinates (in the working-volume frame at
+    // creation time) up to the full-resolution frame of this atlas's base mesh and mappings.
+    // 1.0 when the atlas was built on a full-resolution volume; 1/volumeScale when the active
+    // volume was downsampled. Used to reconcile working-coord source fibers with full-res anchors.
+    double sourceFiberScale = 1.0;
 };
 
 struct AtlasAnchor {
@@ -482,6 +487,8 @@ AtlasBaseMappingContext atlasBaseMappingContextFromSurface(
     std::shared_ptr<QuadSurface> baseSurface);
 AtlasBaseMappingContext loadAtlasBaseMappingContext(const std::filesystem::path& atlasDir,
                                                     const Atlas& atlas);
+// Source fibers are scaled up to the full-res frame using the atlas's recorded
+// AtlasMetadata::sourceFiberScale, so callers do not pass a scale explicitly.
 Atlas rebuildAtlasFromSourceFibers(const std::filesystem::path& atlasDir,
                                    const std::filesystem::path& volpkgRoot,
                                    const vc::lasagna::NormalSampler& normalSampler,

@@ -96,9 +96,8 @@ from matplotlib.patches import FancyArrowPatch
 from matplotlib.transforms import blended_transform_factory
 
 
-def load_graph(votes):
-    """Rebuild the patch tree (the anchor subtree) from a find_inconsistent_windings
-    votes dict.
+def load_graph(votes, full_graph=True):
+    """Rebuild the patch graph from a find_inconsistent_windings votes dict.
 
     Returns (nodes, edges, anchors, meta) where:
       nodes:   patch_id -> {'depth', 'acc'} (acc = winding(seed) - winding(entry))
@@ -106,23 +105,45 @@ def load_graph(votes):
       anchors: list of voter dicts (each carries abs_patch_id / annotation / vote)
       meta:    handy scalars pulled off the top level
 
-    The graph is the union of every voter's path: a tree rooted at the seed whose
-    leaves carry the absolute anchors that voted. (The detected loops are not drawn
-    on this graph -- they get their own per-loop view; see plot_loop_cycles.)
+    With `full_graph` (the default), the graph is the *entire* seed-rooted BFS tree:
+    every reached patch and the relative-pcl edge that first reached it, taken straight
+    from the votes file's `tree` field. This shows the inferred winding of all reached
+    patches and their connections, including patches no voter passed through.
+
+    With `full_graph` false (or when the votes file predates the `tree` field), the
+    graph is instead the union of every voter's path: the subtree rooted at the seed
+    whose leaves carry the absolute anchors that voted -- patches that lead to no vote
+    are omitted.
+
+    Either way the absolute anchors (the voted stars) come from `votes['votes']`; in
+    full-graph mode, reached patches that carry no anchor simply get no star. (The
+    detected loops are not drawn on this graph -- they get their own per-loop view; see
+    plot_loop_cycles.)
     """
     seed = votes['patch_id']
     all_voters = [v for vs in votes['votes'].values() for v in vs]
 
-    nodes = {seed: {'depth': 0, 'acc': 0.0}}
-    edges = {}
-    for v in all_voters:
-        acc = 0.0
-        for hop_i, h in enumerate(v['path']):
-            acc = acc - h['intra_patch_strip_delta'] - h['edge_winding_delta']
-            child = h['to_patch']
-            # BFS reaches each patch once, so this is idempotent across voters.
-            nodes.setdefault(child, {'depth': hop_i + 1, 'acc': acc})
-            edges.setdefault(child, h)
+    tree = votes.get('tree')
+    if full_graph and tree:
+        # The full BFS tree: every reached patch (depth + acc) and the hop record of the
+        # relative-pcl edge that first reached it (keyed by child patch).
+        nodes = {pid: {'depth': nd['depth'], 'acc': nd['acc']}
+                 for pid, nd in tree['nodes'].items()}
+        edges = dict(tree['edges'])
+    else:
+        if full_graph:
+            print('warning: votes file has no "tree" field (predates full-graph support); '
+                  'falling back to the anchor-subtree view')
+        nodes = {seed: {'depth': 0, 'acc': 0.0}}
+        edges = {}
+        for v in all_voters:
+            acc = 0.0
+            for hop_i, h in enumerate(v['path']):
+                acc = acc - h['intra_patch_strip_delta'] - h['edge_winding_delta']
+                child = h['to_patch']
+                # BFS reaches each patch once, so this is idempotent across voters.
+                nodes.setdefault(child, {'depth': hop_i + 1, 'acc': acc})
+                edges.setdefault(child, h)
 
     meta = {
         'seed': seed,
@@ -1067,6 +1088,12 @@ def write_combined_html(main_doc, loops_doc, output_html, seed, loops_total):
               help='winding_votes json written by find_inconsistent_windings.py.')
 @click.option('--output', default=None, type=click.Path(dir_okay=False),
               help='Output image path (default: winding_graph_<patch>.png next to the votes json).')
+@click.option('--full-graph/--anchor-subtree', 'full_graph', default=True,
+              help='--full-graph (default) draws every reached patch and its connections (the whole '
+                   'seed-rooted BFS tree from the votes file), so the inferred winding of all patches '
+                   'is shown. --anchor-subtree draws only the patches on a path to an absolute-winding '
+                   'anchor (the original view). Old votes files lacking the "tree" field always fall '
+                   'back to the anchor-subtree view.')
 @click.option('--seg-min-width', default=0.25, type=float,
               help='How far (in windings, must be < 0.5) each end of a patch line pokes past its '
                    'extreme known point. The default 0.25 runs the ends to the 1/4 and 3/4 marks of '
@@ -1106,12 +1133,27 @@ def write_combined_html(main_doc, loops_doc, output_html, seed, loops_total):
               help='Vertical scale of the HTML plot, in pixels per patch row (slot-height units).')
 @click.option('--html-label-width', default=260, type=int,
               help='Width (px) of the pinned left-hand patch-name column in the HTML.')
-def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_votes, loops_output,
-         loops_ncols, max_loop_cycles, label_mode, label_fontsize, dpi, want_html, html_output,
-         html_px_per_winding, html_row_px, html_label_width):
+def main(votes_path, output, full_graph, seg_min_width, slot_height, depth_gap, annotate_votes,
+         loops_output, loops_ncols, max_loop_cycles, label_mode, label_fontsize, dpi, want_html,
+         html_output, html_px_per_winding, html_row_px, html_label_width):
+    render(votes_path, output=output, full_graph=full_graph, seg_min_width=seg_min_width,
+           slot_height=slot_height, depth_gap=depth_gap, annotate_votes=annotate_votes,
+           loops_output=loops_output, loops_ncols=loops_ncols, max_loop_cycles=max_loop_cycles,
+           label_mode=label_mode, label_fontsize=label_fontsize, dpi=dpi, want_html=want_html,
+           html_output=html_output, html_px_per_winding=html_px_per_winding,
+           html_row_px=html_row_px, html_label_width=html_label_width)
+
+
+def render(votes_path, *, output=None, full_graph=True, seg_min_width=0.25, slot_height=1.0,
+           depth_gap=0.8, annotate_votes=True, loops_output=None, loops_ncols=6,
+           max_loop_cycles=48, label_mode='patch', label_fontsize=6.0, dpi=150, want_html=True,
+           html_output=None, html_px_per_winding=44.0, html_row_px=26.0, html_label_width=260):
+    """Render the winding graph (and per-loop view) for a find_inconsistent_windings votes
+    file. Importable so find_inconsistent_windings.py can plot straight after writing the
+    json; the click `main` above just forwards its parsed options here."""
     with open(votes_path) as f:
         votes = json.load(f)
-    nodes, edges, voters, meta = load_graph(votes)
+    nodes, edges, voters, meta = load_graph(votes, full_graph=full_graph)
     loop_cycles = votes.get('loop_cycles', [])
 
     seed = meta['seed']
@@ -1276,12 +1318,19 @@ def main(votes_path, output, seg_min_width, slot_height, depth_gap, annotate_vot
     ax.set_xlim(x_lo - 1, x_hi + 1)
     ax.set_ylim(y_min - slot_height, slot_height)
 
+    # Max winding reached: the inferred winding number (w0 - acc) of each reached patch's
+    # entry point, summarised as the span across all drawn patches. Integer model windings
+    # throughout, so report them rounded.
+    entry_windings = [entry_x(pid) - 0.5 for pid in nodes]
+    w_lo, w_hi = min(entry_windings), max(entry_windings)
     agree = 'AGREE' if meta['votes_agree'] else 'DISAGREE'
-    title = (f"winding graph for seed {seed}\n"
+    scope = 'full graph' if (full_graph and votes.get('tree')) else 'anchor subtree'
+    title = (f"winding graph for seed {seed} ({scope})\n"
              f"{len(nodes)} patches shown ({meta['num_patches_reached']} reached); "
              f"{meta['num_direct_votes']} direct + {meta['num_long_range_votes']} long-range votes; "
              f"votes {agree} ({', '.join(str(w) for w in vote_windings)}); "
-             f"dr/winding={meta['dr_per_winding']:.3f}")
+             f"dr/winding={meta['dr_per_winding']:.3f}\n"
+             f"winding span [{w_lo:+.0f}, {w_hi:+.0f}]  (max winding reached {w_hi:+.0f})")
     ax.set_title(title, fontsize=10)
 
     # legend.

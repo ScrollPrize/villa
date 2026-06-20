@@ -11,12 +11,14 @@
 #include "ViewerManager.hpp"
 #include "overlays/FiberSliceOverlayController.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/ui/VCCollection.hpp"
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -97,6 +99,9 @@ struct LineAnnotationController::LineAnnotationSession {
     double focusedLinePosition = 0.0;
     std::optional<cv::Vec3d> focusedControlPoint;
     cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
+    // Working-to-full-res scale snapshotted when an optimization is launched, so async results
+    // are scaled back by the same factor even if the active volume changes mid-run.
+    double volumeScale = 1.0;
     LineAnnotationController::InitialDirectionMode initialDirectionMode =
         LineAnnotationController::InitialDirectionMode::Sideways;
     std::vector<std::string> generatedSurfaceNames;
@@ -184,6 +189,88 @@ void atlasDebug(const std::string& message)
 double elapsedMs(Clock::time_point start, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+// Working-volume <-> full-res Lasagna coordinate scaling. `factor` is the multiplier applied to
+// positions: use 1/volumeScale to scale working coords up to full-res before feeding Lasagna, and
+// volumeScale to scale Lasagna results back down to working coords. Normals are directions and are
+// left untouched.
+void scaleLinePoints(std::vector<cv::Vec3d>& points, double factor)
+{
+    if (factor == 1.0) {
+        return;
+    }
+    for (auto& point : points) {
+        point *= factor;
+    }
+}
+
+void scaleControlPoints(std::vector<vc::lasagna::LineControlPoint>& controls, double factor)
+{
+    if (factor == 1.0) {
+        return;
+    }
+    for (auto& control : controls) {
+        control.volumePoint *= factor;
+    }
+}
+
+void scaleLineModelPositions(vc::lasagna::LineModel& model, double factor)
+{
+    if (factor == 1.0) {
+        return;
+    }
+    for (auto& point : model.points) {
+        point.position *= factor;
+    }
+    for (auto& segment : model.segmentSamples) {
+        for (auto& sample : segment.samples) {
+            sample.position *= factor;
+        }
+    }
+}
+
+// Scale a fiber polyline (positions + control points) between working and full-res space.
+void scaleFiberPolyline(vc::atlas::FiberPolyline& polyline, double factor)
+{
+    if (factor == 1.0) {
+        return;
+    }
+    for (auto& point : polyline.points) {
+        point.position *= factor;
+    }
+    for (auto& control : polyline.controlPoints) {
+        control *= factor;
+    }
+}
+
+// Scale a full-res intersection result down to working coordinates. sourcePoint/targetPoint are
+// positions and sourceArclength/targetArclength are distances along the fiber, so all scale by
+// volumeScale. windingDistance is a winding measure (not a spatial length) and is left untouched.
+void scaleIntersectionResultToWorking(vc::atlas::FiberIntersectionResult& result, double volumeScale)
+{
+    if (volumeScale == 1.0) {
+        return;
+    }
+    result.sourcePoint *= volumeScale;
+    result.targetPoint *= volumeScale;
+    result.sourceArclength *= volumeScale;
+    result.targetArclength *= volumeScale;
+}
+
+// True when `ratio` (workingDim / fullResDim) is a clean inverse power of two (1, 1/2, 1/4, ...).
+bool isInversePowerOfTwo(double ratio)
+{
+    if (!(ratio > 0.0) || !std::isfinite(ratio) || ratio > 1.0 + 1.0e-6) {
+        return false;
+    }
+    const double inv = 1.0 / ratio;
+    const double rounded = std::round(inv);
+    if (std::abs(inv - rounded) > 1.0e-3 * std::max(1.0, inv)) {
+        return false;
+    }
+    const auto asInt = static_cast<long long>(rounded);
+    return asInt >= 1 && (asInt & (asInt - 1)) == 0;
 }
 
 bool finiteDirection(const cv::Vec3d& v)
@@ -531,10 +618,15 @@ generatedControlMarkers(const std::vector<vc::lasagna::LineControlPoint>& contro
     return markers;
 }
 
+// The atlas pred-snap set is stored in full-res coordinates while session control points are in
+// working coordinates. `volumeScale` is the working-to-full-res ratio: control points are scaled
+// up to match the stored full-res keys, and snap points are scaled back down for display.
 std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker>
 generatedPredSnapMarkers(const std::vector<vc::lasagna::LineControlPoint>& controls,
-                         const vc::atlas::AtlasPredSnapSet& predSnapSet)
+                         const vc::atlas::AtlasPredSnapSet& predSnapSet,
+                         double volumeScale)
 {
+    const double upScale = (volumeScale != 0.0) ? 1.0 / volumeScale : 1.0;
     std::unordered_map<std::string, const vc::atlas::AtlasPredSnapPoint*> snapsByControl;
     snapsByControl.reserve(predSnapSet.points.size());
     for (const auto& point : predSnapSet.points) {
@@ -550,13 +642,13 @@ generatedPredSnapMarkers(const std::vector<vc::lasagna::LineControlPoint>& contr
     for (size_t i = 0; i < controls.size(); ++i) {
         const auto& control = controls[i];
         const auto it = snapsByControl.find(
-            vc::atlas::atlasPredSnapControlPointKey(control.volumePoint));
+            vc::atlas::atlasPredSnapControlPointKey(control.volumePoint * upScale));
         if (it == snapsByControl.end() || !it->second || !it->second->predSnapPoint) {
             continue;
         }
         vc3d::line_annotation::GeneratedOverlay::PredSnapMarker marker;
         marker.controlPoint = toVec3f(control.volumePoint);
-        marker.snapPoint = toVec3f(*it->second->predSnapPoint);
+        marker.snapPoint = toVec3f(*it->second->predSnapPoint * volumeScale);
         marker.linePosition = control.linePosition;
         marker.controlIndex = i;
         marker.manual = it->second->source == vc::atlas::AtlasPredSnapSource::Manual;
@@ -1240,7 +1332,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     }
 
     try {
-        session->optimizedLine = lineModelFromPoints(it->linePoints, session->normalSampler.get());
+        session->optimizedLine =
+            lineModelFromPoints(it->linePoints, session->normalSampler.get(), _volumeScale);
     } catch (const std::exception& ex) {
         showError(tr("Could not reopen fiber %1: %2")
                       .arg(fiberId)
@@ -1641,6 +1734,10 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         }
         vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
+        // This path opens the dataset directly (not via ensureDatasetForSession), so the cached
+        // working-volume scale may be stale (e.g. creating an atlas right after opening a volpkg,
+        // before any line-annotation session). Recompute it from the current volume + this dataset.
+        updateVolumeScale(&sampler);
         const fs::path initShellDir =
             vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
         atlasDebug("selected_manifest=" + manifestPath.string());
@@ -1666,6 +1763,19 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         }
         input.controlPoints = fiberIt->controlPoints;
         input.linePoints = fiberIt->linePoints;
+        // The atlas is built against full-res Lasagna shells and sampler; scale the working-space
+        // fiber up to full-res so normal sampling and shell projection land in the right place.
+        const double atlasInputScale = (_volumeScale != 0.0) ? 1.0 / _volumeScale : 1.0;
+        const cv::Vec3d rawSampleSeed = fiberIt->linePoints[fiberIt->linePoints.size() / 2];
+        scaleLinePoints(input.controlPoints, atlasInputScale);
+        scaleLinePoints(input.linePoints, atlasInputScale);
+        const cv::Vec3d scaledSampleSeed = input.linePoints[input.linePoints.size() / 2];
+        Logger()->info("Atlas creation: volumeScale={} inputScale={} working_mid={},{},{} "
+                       "scaled_mid={},{},{}",
+                       _volumeScale,
+                       atlasInputScale,
+                       rawSampleSeed[0], rawSampleSeed[1], rawSampleSeed[2],
+                       scaledSampleSeed[0], scaledSampleSeed[1], scaledSampleSeed[2]);
         vc::atlas::validateFiberInputControlPoints(input);
         atlasDebug("fiber line_points=" + std::to_string(input.linePoints.size()) +
                    " control_points=" + std::to_string(input.controlPoints.size()));
@@ -1697,6 +1807,9 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
                                                        selected,
                                                        zeroWindingColumn,
                                                        std::move(mapping));
+        // Record the working->full-res scale used to build this atlas so later loads/rebuilds can
+        // reconcile the working-coord source fiber JSON with these full-res mappings.
+        atlas.metadata.sourceFiberScale = atlasInputScale;
         vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
                                          atlasDir / atlas.metadata.baseMeshPath);
         atlas.save(atlasDir);
@@ -1710,6 +1823,50 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         emit atlasCreated(atlasDir);
     } catch (const std::exception& ex) {
         showError(tr("Could not create atlas: %1").arg(QString::fromStdString(ex.what())));
+    }
+}
+
+void LineAnnotationController::addFiberToPointCollection(uint64_t fiberId)
+{
+    auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (fiberIt == _fibers.end()) {
+        showError(tr("Selected fiber is not available"));
+        return;
+    }
+    if (fiberIt->controlPoints.empty()) {
+        showError(tr("Selected fiber has no control points"));
+        return;
+    }
+
+    auto* col = _state ? _state->pointCollection() : nullptr;
+    if (!col) {
+        showError(tr("No point collection is available"));
+        return;
+    }
+
+    const std::string name = col->generateNewCollectionName("fiber");
+    const uint64_t collectionId = col->addCollection(name);
+
+    CollectionMetadata meta;
+    meta.absolute_winding_number = false;
+    col->setCollectionMetadata(collectionId, meta);
+
+    std::vector<cv::Vec3f> points;
+    points.reserve(fiberIt->controlPoints.size());
+    for (const auto& cp : fiberIt->controlPoints) {
+        points.emplace_back(static_cast<float>(cp[0]),
+                            static_cast<float>(cp[1]),
+                            static_cast<float>(cp[2]));
+    }
+    col->addPoints(name, points);
+}
+
+void LineAnnotationController::addFibersToPointCollections(std::vector<uint64_t> fiberIds)
+{
+    for (uint64_t fiberId : fiberIds) {
+        addFiberToPointCollection(fiberId);
     }
 }
 
@@ -1842,7 +1999,10 @@ void LineAnnotationController::showIntersectionInspection(
         cleanupIntersectionInspectionSurfaces();
         _intersectionInspection = std::make_unique<IntersectionInspectionSession>();
         _intersectionInspection->targetArea = targetArea;
+        // The result comes from the full-res atlas search; scale it down so the inspection (built
+        // from working-space stored fibers) is consistent.
         _intersectionInspection->result = result;
+        scaleIntersectionResultToWorking(_intersectionInspection->result, _volumeScale);
         _intersectionInspection->atlasDir = std::move(atlasDir);
         targetArea->installEventFilter(this);
         if (auto* viewport = targetArea->viewport()) {
@@ -2397,7 +2557,9 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     "not showing a synthetic strip");
             }
             side.editSession->optimizedLine =
-                lineModelFromPoints(side.fiber->linePoints, side.editSession->normalSampler.get());
+                lineModelFromPoints(side.fiber->linePoints,
+                                    side.editSession->normalSampler.get(),
+                                    _volumeScale);
             side.lineViews = vc::lasagna::buildLineViewSurfaces(side.editSession->optimizedLine);
             Logger()->info("Intersection {} strip built from sampled normals: fiber={} points={} surface={} side_slice={}",
                            side.displayPrefix,
@@ -2759,7 +2921,8 @@ void LineAnnotationController::rebuildIntersectionInspection()
                             views.controlPoints = generatedControlMarkers(session->controlPoints);
                             views.predSnapPoints =
                                 generatedPredSnapMarkers(session->controlPoints,
-                                                         session->predSnapSet);
+                                                         session->predSnapSet,
+                                                         _volumeScale);
                             vc3d::line_annotation::applyGeneratedOverlay(
                                 chunkedViewer,
                                 surfaceName,
@@ -2862,6 +3025,7 @@ void LineAnnotationController::rebuildIntersectionInspection()
                 side.triplet.currentLinePosition,
                 side.triplet.nextLinePosition,
             };
+            const double volumeScale = _volumeScale;
             auto applyGeneratedStripOverlay =
                 [chunkedViewer,
                  key = side.stripSurfaceName,
@@ -2869,7 +3033,8 @@ void LineAnnotationController::rebuildIntersectionInspection()
                  lineUpVectors,
                  session,
                  focus,
-                 markerLinePositions]() {
+                 markerLinePositions,
+                 volumeScale]() {
                     if (!chunkedViewer || !session) {
                         return;
                     }
@@ -2879,7 +3044,8 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     views.controlPoints = generatedControlMarkers(session->controlPoints);
                     views.predSnapPoints =
                         generatedPredSnapMarkers(session->controlPoints,
-                                                 session->predSnapSet);
+                                                 session->predSnapSet,
+                                                 volumeScale);
                     auto overlay = vc3d::line_annotation::makeGeneratedStripOverlay(
                         views,
                         focus,
@@ -3323,6 +3489,8 @@ std::vector<vc::atlas::FiberPolyline> LineAnnotationController::fiberSnapshots()
 {
     std::vector<vc::atlas::FiberPolyline> snapshots;
     snapshots.reserve(_fibers.size());
+    // Snapshots feed the full-res atlas/intersection subsystem; scale up from working space.
+    const double upScale = (_volumeScale != 0.0) ? 1.0 / _volumeScale : 1.0;
     for (const auto& fiber : _fibers) {
         vc::atlas::FiberPolyline snapshot;
         snapshot.id = fiber.id;
@@ -3332,6 +3500,7 @@ std::vector<vc::atlas::FiberPolyline> LineAnnotationController::fiberSnapshots()
         for (const auto& point : fiber.linePoints) {
             snapshot.points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
         }
+        scaleFiberPolyline(snapshot, upScale);
         snapshots.push_back(std::move(snapshot));
     }
     return snapshots;
@@ -3351,7 +3520,10 @@ std::vector<vc::atlas::FiberPolyline> LineAnnotationController::fiberSnapshotsFr
 std::vector<LineAnnotationController::FiberSnapshotWithPath>
 LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
 {
-    auto snapshotForFiber = [](const StoredFiber& fiber) {
+    // Atlas/intersection search runs in full-res Lasagna space, so emit snapshots scaled up from
+    // the working-space stored fibers.
+    const double upScale = (_volumeScale != 0.0) ? 1.0 / _volumeScale : 1.0;
+    auto snapshotForFiber = [upScale](const StoredFiber& fiber) {
         vc::atlas::FiberPolyline snapshot;
         snapshot.id = 0;
         snapshot.generation = fiber.generation;
@@ -3360,6 +3532,7 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
         for (const auto& point : fiber.linePoints) {
             snapshot.points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
         }
+        scaleFiberPolyline(snapshot, upScale);
         return snapshot;
     };
     auto relativeFiberPath = [](const StoredFiber& fiber) {
@@ -3454,6 +3627,7 @@ void LineAnnotationController::onSurfaceChanged(std::string name,
 void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg> /*pkg*/)
 {
     loadFibersForCurrentPackage();
+    recomputeVolumeScale();
 }
 
 void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
@@ -3558,16 +3732,25 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         if (pane->dialog) {
             pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
             pane->dialog->setGeneratedPredSnapPoints(
-                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
+                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet, _volumeScale));
         }
         return;
     }
+
+    // The span update samples and optimizes in full-res Lasagna space; scale working coordinates
+    // up for the call and scale the results back down before storing them in the session.
+    session.volumeScale = _volumeScale;
+    const double scale = session.volumeScale;
+    const double inputScale = (scale != 0.0) ? 1.0 / scale : 1.0;
 
     std::vector<cv::Vec3d> currentLinePoints;
     currentLinePoints.reserve(session.optimizedLine.points.size());
     for (const auto& point : session.optimizedLine.points) {
         currentLinePoints.push_back(point.position);
     }
+    scaleLinePoints(currentLinePoints, inputScale);
+    auto controlPointsFull = session.controlPoints;
+    scaleControlPoints(controlPointsFull, inputScale);
 
     vc::lasagna::LineControlPointUpdateResult update;
     const std::string updateEventName = editedExistingControl
@@ -3579,7 +3762,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         updateConfig.segmentsPerSide = 200;
         updateConfig.segmentLength = kLineSegmentLength;
         update = vc::lasagna::updateExistingLineControlPoint(std::move(currentLinePoints),
-                                                             std::move(session.controlPoints),
+                                                             std::move(controlPointsFull),
                                                              changedControlIndex,
                                                              *session.normalSampler,
                                                              updateConfig);
@@ -3587,8 +3770,12 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         showError(tr("Could not update line control point: %1").arg(QString::fromStdString(ex.what())));
         return;
     }
+    // Build the line model from the full-res points so normals are sampled correctly, then scale
+    // positions (and the control points) back down to the working volume.
     session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
+    scaleLineModelPositions(session.optimizedLine, scale);
     session.controlPoints = update.controlPoints;
+    scaleControlPoints(session.controlPoints, scale);
     session.finalReinitClean = false;
     if (update.changedControlIndex >= 0 &&
         update.changedControlIndex < static_cast<int>(session.controlPoints.size())) {
@@ -3644,21 +3831,27 @@ void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& s
         return;
     }
 
+    // The Lasagna sampler and the atlas pred-snap set are both full-res; scale the working-space
+    // clicked point and control point up before sampling/storing.
+    const double inputScale = (_volumeScale != 0.0) ? 1.0 / _volumeScale : 1.0;
+    const cv::Vec3d clickedFull = clicked * inputScale;
+    const cv::Vec3d controlFull = session.controlPoints[nearestIndex].volumePoint * inputScale;
+
     std::optional<double> predDtValue;
     if (session.normalSampler) {
-        predDtValue = session.normalSampler->samplePredDt(clicked);
+        predDtValue = session.normalSampler->samplePredDt(clickedFull);
     }
 
     try {
         session.predSnapSet = vc::atlas::setManualAtlasPredSnapPoint(
             *session.atlasDir,
             atlasFiberPath,
-            session.controlPoints[nearestIndex].volumePoint,
-            clicked,
+            controlFull,
+            clickedFull,
             predDtValue);
         if (pane->dialog) {
             pane->dialog->setGeneratedPredSnapPoints(
-                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
+                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet, _volumeScale));
         }
     } catch (const std::exception& ex) {
         showError(tr("Could not save pred-snap point: %1")
@@ -3824,7 +4017,103 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
 
     session.selectedDatasetLocation = selected;
     session.selectedManifestPath = manifestPath;
+    updateVolumeScale(session.normalSampler.get());
     return true;
+}
+
+void LineAnnotationController::updateVolumeScale(const vc::lasagna::LasagnaNormalSampler* sampler)
+{
+    if (_volumeScaleOverride.has_value()) {
+        _volumeScale = *_volumeScaleOverride;
+        _volumeScaleFallbackWarned = false;
+        emit volumeScaleChanged(_volumeScale, false);
+        return;
+    }
+
+    double detected = 1.0;
+    bool detectedOk = false;
+    bool mismatch = false;
+
+    std::shared_ptr<Volume> volume = _state ? _state->currentVolume() : nullptr;
+    if (volume && sampler) {
+        const std::array<int, 3> workingXyz = volume->shapeXyz();
+        const std::array<double, 3> fullXyz = sampler->normalSourceExtentXyz();
+        bool valid = true;
+        double ratio = 0.0;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (fullXyz[axis] <= 0.0 || workingXyz[axis] <= 0) {
+                valid = false;
+                break;
+            }
+            const double axisRatio = static_cast<double>(workingXyz[axis]) / fullXyz[axis];
+            if (axis == 0) {
+                ratio = axisRatio;
+            } else if (std::abs(axisRatio - ratio) > 1.0e-2 * std::max(1.0, ratio)) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid && isInversePowerOfTwo(ratio)) {
+            detected = ratio;
+            detectedOk = true;
+        } else if (valid) {
+            mismatch = true;
+        }
+    }
+
+    _volumeScale = detectedOk ? detected : 1.0;
+    if (mismatch) {
+        if (!_volumeScaleFallbackWarned) {
+            Logger()->warn("Line annotation: active volume / Lasagna shapes are not a clean "
+                           "power-of-2 ratio; falling back to volume scale 1.0");
+            showError(tr("Could not auto-detect a power-of-2 volume scale between the active volume "
+                         "and the Lasagna data. Falling back to a scale of 1.0; set the scale "
+                         "manually if the volume is downsampled."));
+            _volumeScaleFallbackWarned = true;
+        }
+    } else {
+        _volumeScaleFallbackWarned = false;
+    }
+    emit volumeScaleChanged(_volumeScale, true);
+}
+
+void LineAnnotationController::recomputeVolumeScale()
+{
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->normalSampler) {
+            updateVolumeScale(pane.session->normalSampler.get());
+            return;
+        }
+    }
+
+    // No open line-annotation session: detect from the volpkg's selected Lasagna dataset so the
+    // scale is correct for atlas/search/display paths that don't open a session.
+    if (_state && _state->vpkg()) {
+        const fs::path manifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
+        std::error_code ec;
+        if (!manifestPath.empty() && fs::exists(manifestPath, ec)) {
+            try {
+                vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+                vc::lasagna::LasagnaNormalSampler sampler(dataset);
+                updateVolumeScale(&sampler);
+                return;
+            } catch (const std::exception& ex) {
+                Logger()->warn("Could not open Lasagna dataset for volume-scale detection: {}",
+                               ex.what());
+            }
+        }
+    }
+    updateVolumeScale(nullptr);
+}
+
+void LineAnnotationController::setVolumeScaleOverride(std::optional<double> scale)
+{
+    if (scale.has_value() && (!(*scale > 0.0) || !std::isfinite(*scale) || *scale > 1.0)) {
+        showError(tr("Volume scale must be a positive value of at most 1.0."));
+        return;
+    }
+    _volumeScaleOverride = scale;
+    recomputeVolumeScale();
 }
 
 bool LineAnnotationController::needsFinalReinitReopt(const LineAnnotationSession& session) const
@@ -3847,6 +4136,13 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                       .arg(QString::fromStdString(task.error)));
         return false;
     }
+
+    // The optimizer ran in full-res Lasagna space; scale its outputs back down to the working
+    // volume before storing them in the session (which is kept in working coordinates).
+    const double resultScale = session.volumeScale;
+    task.seedPoint *= resultScale;
+    scaleControlPoints(task.controlPoints, resultScale);
+    scaleLineModelPositions(task.result.line, resultScale);
 
     auto* pane = paneForSurface(session.surfaceName);
     session.taskState = LineAnnotationSession::TaskState::Succeeded;
@@ -3940,13 +4236,19 @@ bool LineAnnotationController::runFinalReinitReoptSynchronously(LineAnnotationSe
         return false;
     }
 
+    session.volumeScale = _volumeScale;
+    const double inputScale = (session.volumeScale != 0.0) ? 1.0 / session.volumeScale : 1.0;
     std::vector<cv::Vec3d> initialLinePoints;
     initialLinePoints.reserve(session.optimizedLine.points.size());
     for (const auto& point : session.optimizedLine.points) {
         initialLinePoints.push_back(point.position);
     }
+    // Optimize in full-res Lasagna space; applyOptimizationTaskResult scales results back down.
+    scaleLinePoints(initialLinePoints, inputScale);
+    auto controlPoints = session.controlPoints;
+    scaleControlPoints(controlPoints, inputScale);
     OptimizationTaskResult task = optimizeLineWithSampler(session.selectedManifestPath,
-                                                          session.controlPoints,
+                                                          std::move(controlPoints),
                                                           std::move(initialLinePoints),
                                                           session.sourceSliceNormal,
                                                           session.initialDirectionMode,
@@ -4000,6 +4302,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
         return;
     }
     session.taskState = LineAnnotationSession::TaskState::Running;
+    session.volumeScale = _volumeScale;
     session.error.clear();
     auto seedIt = std::find_if(session.controlPoints.begin(),
                                session.controlPoints.end(),
@@ -4034,6 +4337,11 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     for (const auto& point : session.optimizedLine.points) {
         initialLinePoints.push_back(point.position);
     }
+    // Scale working-volume coordinates up to full-res Lasagna space for optimization; results are
+    // scaled back down in applyOptimizationTaskResult.
+    const double inputScale = (session.volumeScale != 0.0) ? 1.0 / session.volumeScale : 1.0;
+    scaleControlPoints(controlPoints, inputScale);
+    scaleLinePoints(initialLinePoints, inputScale);
     const cv::Vec3d sourceSliceNormal = session.sourceSliceNormal;
     const InitialDirectionMode directionMode = session.initialDirectionMode;
     auto dataset = session.dataset;
@@ -4196,7 +4504,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         }
     }
     generatedViews.predSnapPoints =
-        generatedPredSnapMarkers(session.controlPoints, session.predSnapSet);
+        generatedPredSnapMarkers(session.controlPoints, session.predSnapSet, _volumeScale);
     generatedViews.initialCenterIndex = static_cast<int>(std::llround(std::clamp(
         session.focusedLinePosition,
         0.0,
@@ -4209,14 +4517,12 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     _state->setSurface(generatedViews.currentCutName, generatedViews.currentCutSurface);
     session.generatedSurfaceNames.push_back(generatedViews.currentCutName);
 
-    generatedViews.bottomCutSurfaces.reserve(7);
-    for (int i = 0; i < 7; ++i) {
-        const std::string surfaceName = "line-bottom-cut-" + std::to_string(i);
-        auto plane = std::make_shared<PlaneSurface>(seedPoint, cv::Vec3f{1.0f, 0.0f, 0.0f});
-        _state->setSurface(surfaceName, plane);
-        session.generatedSurfaceNames.push_back(surfaceName);
-        generatedViews.bottomCutSurfaces.push_back({surfaceName, std::move(plane)});
-    }
+    generatedViews.sideCutName = "line-side-cut";
+    generatedViews.sideCutSurface = std::make_shared<PlaneSurface>(
+        seedPoint,
+        cv::Vec3f{1.0f, 0.0f, 0.0f});
+    _state->setSurface(generatedViews.sideCutName, generatedViews.sideCutSurface);
+    session.generatedSurfaceNames.push_back(generatedViews.sideCutName);
 
     auto* pane = paneForSurface(session.surfaceName);
     if (!pane || !pane->dialog) {
@@ -4788,7 +5094,8 @@ double LineAnnotationController::lineLengthVx(const std::vector<cv::Vec3d>& poin
 
 vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
     const std::vector<cv::Vec3d>& points,
-    const vc::lasagna::NormalSampler* normalSampler)
+    const vc::lasagna::NormalSampler* normalSampler,
+    double volumeScale)
 {
     if (points.empty()) {
         throw std::runtime_error("Fiber has no line points");
@@ -4797,9 +5104,14 @@ vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
         throw std::runtime_error("No Lasagna normal sampler is available for this fiber");
     }
 
+    // Sample normals at full-res Lasagna coordinates while keeping working-space positions.
+    const double inputScale = (volumeScale != 0.0) ? 1.0 / volumeScale : 1.0;
+    std::vector<cv::Vec3d> samplePoints = points;
+    scaleLinePoints(samplePoints, inputScale);
+
     std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
     const vc::lasagna::NormalBatchReport batchReport =
-        normalSampler->sampleNormalBatch(points, false, samples);
+        normalSampler->sampleNormalBatch(samplePoints, false, samples);
     (void)batchReport;
     if (samples.size() != points.size()) {
         throw std::runtime_error("Normal sampler returned the wrong number of samples");

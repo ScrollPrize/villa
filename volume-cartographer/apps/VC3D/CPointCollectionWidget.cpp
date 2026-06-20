@@ -10,6 +10,7 @@
             [receiver](int s) { receiver->slot(static_cast<Qt::CheckState>(s)); })
 
 #include <QStandardItem>
+#include <QCollator>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
@@ -39,6 +40,19 @@ bool corrResultPositionMatches(const CorrPointResult& r, const cv::Vec3f& curren
            std::abs(r.p[0] - currentPos[0]) < kTol &&
            std::abs(r.p[1] - currentPos[1]) < kTol &&
            std::abs(r.p[2] - currentPos[2]) < kTol;
+}
+
+// Numeric-aware ("natural") comparison so collection names like
+// "1", "2", "15", "100" sort by value instead of lexicographically.
+bool naturalNameLess(const std::string& a, const std::string& b)
+{
+    static QCollator collator = [] {
+        QCollator c;
+        c.setNumericMode(true);
+        c.setCaseSensitivity(Qt::CaseInsensitive);
+        return c;
+    }();
+    return collator.compare(QString::fromStdString(a), QString::fromStdString(b)) < 0;
 }
 } // namespace
 
@@ -270,7 +284,7 @@ void CPointCollectionWidget::refreshTree()
     }
     std::sort(sorted_collections.begin(), sorted_collections.end(),
               [](const VCCollection::Collection& a, const VCCollection::Collection& b) {
-        return a.name < b.name;
+        return naturalNameLess(a.name, b.name);
     });
 
     // Iterate through sorted collections and add to tree
@@ -393,7 +407,16 @@ void CPointCollectionWidget::onCollectionsAdded(const std::vector<uint64_t>& col
         QStandardItem *col_pos_item = new QStandardItem();
         col_pos_item->setFlags(col_pos_item->flags() & ~Qt::ItemIsEditable);
 
-        _model->appendRow({name_item, count_item, col_winding_item, col_err_item, col_pos_item});
+        // Insert at the natural-sorted position so live-added collections stay
+        // ordered (matching refreshTree's sort) instead of being pinned to the bottom.
+        int insertRow = _model->rowCount();
+        for (int row = 0; row < _model->rowCount(); ++row) {
+            if (naturalNameLess(collection.name, _model->item(row, 0)->text().toStdString())) {
+                insertRow = row;
+                break;
+            }
+        }
+        _model->insertRow(insertRow, {name_item, count_item, col_winding_item, col_err_item, col_pos_item});
 
         for(const auto& point_pair : collection.points) {
             onPointAdded(point_pair.second);

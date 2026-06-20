@@ -27,7 +27,7 @@ from torchdiffeq import odeint
 
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
-from point_collection import load_point_collection, link_points_to_patches, can_use_surface_index_backend, normalise_pcl_winding_annotations
+from point_collection import load_point_collection, link_points_to_patches, link_points_to_patches_pointcache, can_use_surface_index_backend, normalise_pcl_winding_annotations
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 
 
@@ -5208,36 +5208,36 @@ def link_points_to_patches_cached(
     patch_ids_str = '_'.join(sorted(patches.keys()))
     hashed_patches = hashlib.sha256(bytes(patch_ids_str, 'ascii')).hexdigest()[:8]
 
-    pcl_locations = []
-    for collection_id in sorted(point_collections.keys()):
-        collection = point_collections[collection_id]
-        for point_id in sorted(collection['points'].keys()):
-            point = collection['points'][point_id]
-            pcl_locations.append(tuple(point['p']))
-    hashed_pcls = hashlib.sha256(pickle.dumps(pcl_locations)).hexdigest()[:8]
-
     backend = 'surface-index' if surface_index_tolerance is not None and can_use_surface_index_backend(patches) else 'torch'
+    # Per-point cache: key by patch set + linking config only (NOT the pcl set and NOT
+    # annotations). Changing the --pcl set, editing annotations, or moving a few points
+    # only links the points whose POSITION is new; everything else is reused, and a
+    # re-run with no new positions does no linking work (the surface index is never
+    # rebuilt). The pcl-content hash is intentionally dropped from the filename.
     cache_filename = (
-        f'{cache_path}/point_patch_links-{hashed_patches}_{hashed_pcls}'
-        f'_backend-{backend}_tol-{tolerance}_idx-tol-{surface_index_tolerance}.pkl'
+        f'{cache_path}/point_links-{hashed_patches}'
+        f'_backend-{backend}_tol-{tolerance}_idx-tol-{surface_index_tolerance}_dscale-{distance_scale}.pkl'
     )
 
+    point_link_cache = {}
     if os.path.exists(cache_filename):
         with open(cache_filename, 'rb') as fp:
-            point_collections_cached = pickle.load(fp)
-        point_collections.clear()
-        point_collections.update(point_collections_cached)
-    else:
-        link_points_to_patches(
-            patches,
-            point_collections,
-            tolerance,
-            surface_index_tolerance=surface_index_tolerance,
-            distance_scale=distance_scale,
-        )
+            point_link_cache = pickle.load(fp)
+    n_cached_before = len(point_link_cache)
+
+    link_points_to_patches_pointcache(
+        patches,
+        point_collections,
+        tolerance,
+        surface_index_tolerance=surface_index_tolerance,
+        distance_scale=distance_scale,
+        cache=point_link_cache,
+    )
+
+    if len(point_link_cache) != n_cached_before:
         os.makedirs(cache_path, exist_ok=True)
         with open(cache_filename, 'wb') as fp:
-            pickle.dump(point_collections, fp)
+            pickle.dump(point_link_cache, fp)
 
 
 def prepare_point_collections(patches):
