@@ -102,6 +102,7 @@ public:
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setOptimizationBusy(bool busy);
+    void setOptimizationStatus(bool optimized);
     void setCloseAfterFinalizationAllowed(bool allowed);
 
 signals:
@@ -194,6 +195,7 @@ private:
     QComboBox* _shiftScrollCombo = nullptr;
     QLabel* _sliceStepLabel = nullptr;
     QLabel* _bottomSliceStepLabel = nullptr;
+    QLabel* _optimizationStatusLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
     QPushButton* _fullOptimizationButton = nullptr;
     QPushButton* _resetViewsButton = nullptr;

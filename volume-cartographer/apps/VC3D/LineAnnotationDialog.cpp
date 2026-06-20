@@ -211,6 +211,9 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _bottomSliceStepLabel->installEventFilter(this);
     updateBottomSliceStepLabel();
     buttonLayout->addWidget(_bottomSliceStepLabel);
+    _optimizationStatusLabel = new QLabel(tr("not optimized"), buttonRow);
+    _optimizationStatusLabel->installEventFilter(this);
+    buttonLayout->addWidget(_optimizationStatusLabel);
     _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
     _showAsMeshButton->setEnabled(false);
     _showAsMeshButton->installEventFilter(this);
@@ -316,6 +319,14 @@ void LineAnnotationDialog::setOptimizationBusy(bool busy)
     if (busy) {
         _optimizationOverlay->raise();
     }
+}
+
+void LineAnnotationDialog::setOptimizationStatus(bool optimized)
+{
+    if (!_optimizationStatusLabel) {
+        return;
+    }
+    _optimizationStatusLabel->setText(optimized ? tr("optimized") : tr("not optimized"));
 }
 
 void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)

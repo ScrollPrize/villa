@@ -151,6 +151,12 @@ private:
         Segmentation,
     };
 
+    enum class SessionOptimizationState {
+        Unoptimized,
+        Incremental,
+        Optimized,
+    };
+
     struct LineAnnotationSession;
     struct IntersectionInspectionSession;
     struct StoredFiber {
@@ -202,12 +208,16 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
-    bool needsFinalReinitReopt(const LineAnnotationSession& session) const;
-    bool runFinalReinitReoptSynchronously(LineAnnotationSession& session,
-                                          bool fireSuccessCallback);
+    bool needsFinalOptimization(const LineAnnotationSession& session) const;
+    bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
+                                                  bool fireSuccessCallback);
+    void setSessionOptimizationState(LineAnnotationSession& session,
+                                     SessionOptimizationState state);
+    void refreshSessionOptimizationStatus(const LineAnnotationSession& session);
     bool applyOptimizationTaskResult(LineAnnotationSession& session,
                                      OptimizationTaskResult task,
                                      bool updateGeneratedViews,
+                                     SessionOptimizationState resultOptimizationState,
                                      const std::string& eventOverride = {},
                                      bool fireSuccessCallback = true);
     void requestFinalizedClose(const std::string& surfaceName);
