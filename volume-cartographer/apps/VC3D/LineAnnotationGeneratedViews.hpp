@@ -86,6 +86,7 @@ struct GeneratedViews {
                          std::numeric_limits<float>::quiet_NaN()};
     int seedLineIndex = -1;
     int initialCenterIndex = 0;
+    std::optional<std::pair<double, double>> initialStripLinePositionRange;
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;

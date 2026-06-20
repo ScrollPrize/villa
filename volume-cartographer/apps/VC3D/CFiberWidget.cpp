@@ -4,6 +4,8 @@
 #include <QAction>
 #include <QButtonGroup>
 #include <QCheckBox>
+#include <QColor>
+#include <QHeaderView>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
 #include <QLabel>
@@ -11,12 +13,35 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QSignalBlocker>
+#include <QStringList>
+#include <QTreeView>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
+#include <set>
 #include <utility>
 
 namespace {
+
+enum FiberColumn {
+    kNameColumn = 0,
+    kDirectionColumn,
+    kLengthColumn,
+    kControlPointsColumn,
+    kLinePointsColumn,
+    kTagsColumn,
+    kMeanAlignErrorColumn,
+    kMaxAlignErrorColumn,
+    kColumnCount,
+};
+
+constexpr int kFiberIdRole = Qt::UserRole + 1;
+constexpr int kIsSpanRole = Qt::UserRole + 2;
+constexpr int kSpanFirstControlIndexRole = Qt::UserRole + 3;
+constexpr int kSpanSecondControlIndexRole = Qt::UserRole + 4;
+constexpr double kHighlightThresholdDegrees = 45.0;
 
 void addUniqueSorted(std::vector<std::string>& values, const std::string& value)
 {
@@ -33,6 +58,132 @@ void addUniqueSorted(std::vector<std::string>& values, const std::string& value)
 bool containsTag(const std::vector<std::string>& tags, const std::string& tag)
 {
     return std::find(tags.begin(), tags.end(), tag) != tags.end();
+}
+
+QStandardItem* readOnlyItem(const QString& text = QString())
+{
+    auto* item = new QStandardItem(text);
+    item->setEditable(false);
+    return item;
+}
+
+QString formatDouble(double value, int precision = 1)
+{
+    if (!std::isfinite(value)) {
+        return QStringLiteral("-");
+    }
+    return QString::number(value, 'f', precision);
+}
+
+QString formatTags(const std::vector<std::string>& tags)
+{
+    QStringList parts;
+    parts.reserve(static_cast<qsizetype>(tags.size()));
+    for (const auto& tag : tags) {
+        const QString text = QString::fromStdString(tag).trimmed();
+        if (!text.isEmpty()) {
+            parts.push_back(text);
+        }
+    }
+    parts.removeDuplicates();
+    parts.sort();
+    return parts.join(QStringLiteral(", "));
+}
+
+QString formatMetric(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
+                     bool showMetrics)
+{
+    if (!showMetrics) {
+        return QStringLiteral("-");
+    }
+    if (metric.pending) {
+        return QStringLiteral("...");
+    }
+    if (!metric.error.empty()) {
+        return QStringLiteral("err");
+    }
+    if (!metric.available) {
+        return QStringLiteral("-");
+    }
+    return formatDouble(metric.meanErrorDegrees, 1);
+}
+
+QString formatMaxMetric(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
+                        bool showMetrics)
+{
+    if (!showMetrics) {
+        return QStringLiteral("-");
+    }
+    if (metric.pending) {
+        return QStringLiteral("...");
+    }
+    if (!metric.error.empty()) {
+        return QStringLiteral("err");
+    }
+    if (!metric.available) {
+        return QStringLiteral("-");
+    }
+    return formatDouble(metric.maxErrorDegrees, 1);
+}
+
+QString metricTooltip(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
+                      bool showMetrics)
+{
+    if (!showMetrics) {
+        return QObject::tr("Enable Calc metrics to sample Lasagna normal alignment errors.");
+    }
+    if (metric.pending) {
+        return QObject::tr("Sampling Lasagna normals.");
+    }
+    if (!metric.error.empty()) {
+        return QString::fromStdString(metric.error);
+    }
+    if (!metric.available) {
+        return QObject::tr("Metric has not been calculated.");
+    }
+    return QObject::tr("%1 samples").arg(metric.sampleCount);
+}
+
+bool shouldHighlight(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
+                     bool showMetrics)
+{
+    return showMetrics &&
+           metric.available &&
+           std::isfinite(metric.maxErrorDegrees) &&
+           metric.maxErrorDegrees > kHighlightThresholdDegrees;
+}
+
+void applyRowMetadata(const QList<QStandardItem*>& row,
+                      uint64_t fiberId,
+                      bool isSpan,
+                      const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
+                      bool showMetrics)
+{
+    const bool highlight = shouldHighlight(metric, showMetrics);
+    const QColor warningColor(255, 232, 232);
+    const QString tooltip = metricTooltip(metric, showMetrics);
+    for (QStandardItem* item : row) {
+        if (!item) {
+            continue;
+        }
+        item->setData(QVariant::fromValue(fiberId), kFiberIdRole);
+        item->setData(isSpan, kIsSpanRole);
+        if (highlight) {
+            item->setBackground(warningColor);
+        }
+        item->setToolTip(tooltip);
+    }
+}
+
+void applySpanMetadata(const QList<QStandardItem*>& row, int firstControlIndex, int secondControlIndex)
+{
+    for (QStandardItem* item : row) {
+        if (!item) {
+            continue;
+        }
+        item->setData(firstControlIndex, kSpanFirstControlIndexRole);
+        item->setData(secondControlIndex, kSpanSecondControlIndexRole);
+    }
 }
 
 } // namespace
@@ -62,20 +213,63 @@ void CFiberWidget::setupUi()
     _autoLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(_autoLabel);
 
-    _model = new QStandardItemModel(this);
-    _listView = new QListView(mainWidget);
-    _listView->setModel(_model);
-    _listView->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    _listView->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    _listView->setContextMenuPolicy(Qt::CustomContextMenu);
-    layout->addWidget(_listView, 1);
+    _calcMetricsCheckBox = new QCheckBox(tr("Calc metrics"), mainWidget);
+    _calcMetricsCheckBox->setObjectName(QStringLiteral("fiberCalcMetricsCheckBox"));
+    _calcMetricsCheckBox->setToolTip(
+        tr("Sample Lasagna normal alignment errors for the listed fibers."));
+    layout->addWidget(_calcMetricsCheckBox);
+    connect(_calcMetricsCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
+        rebuildModel();
+        if (checked) {
+            emit metricsCalculationRequested();
+        }
+    });
 
-    connect(_listView->selectionModel(), &QItemSelectionModel::selectionChanged,
+    _model = new QStandardItemModel(this);
+    _model->setColumnCount(kColumnCount);
+    _model->setHorizontalHeaderLabels({
+        tr("id/name"),
+        tr("dir"),
+        tr("len"),
+        tr("cps"),
+        tr("pts"),
+        tr("tags"),
+        tr("mean align deg"),
+        tr("max align deg"),
+    });
+    _treeView = new QTreeView(mainWidget);
+    _treeView->setObjectName(QStringLiteral("fiberTreeView"));
+    _treeView->setModel(_model);
+    _treeView->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _treeView->setSelectionBehavior(QAbstractItemView::SelectRows);
+    _treeView->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    _treeView->setContextMenuPolicy(Qt::CustomContextMenu);
+    _treeView->setAlternatingRowColors(true);
+    _treeView->setRootIsDecorated(true);
+    _treeView->setItemsExpandable(true);
+    _treeView->header()->setSectionResizeMode(QHeaderView::Interactive);
+    _treeView->header()->setStretchLastSection(false);
+    _treeView->header()->setSectionsClickable(true);
+    _treeView->header()->setSortIndicatorShown(true);
+    _treeView->header()->setSortIndicator(_sortColumn, _sortOrder);
+    _treeView->setColumnWidth(kNameColumn, 220);
+    _treeView->setColumnWidth(kDirectionColumn, 42);
+    _treeView->setColumnWidth(kLengthColumn, 72);
+    _treeView->setColumnWidth(kControlPointsColumn, 48);
+    _treeView->setColumnWidth(kLinePointsColumn, 48);
+    _treeView->setColumnWidth(kTagsColumn, 110);
+    _treeView->setColumnWidth(kMeanAlignErrorColumn, 110);
+    _treeView->setColumnWidth(kMaxAlignErrorColumn, 105);
+    layout->addWidget(_treeView, 1);
+
+    connect(_treeView->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &CFiberWidget::onSelectionChanged);
-    connect(_listView, &QListView::doubleClicked,
+    connect(_treeView, &QTreeView::doubleClicked,
             this, &CFiberWidget::onDoubleClicked);
-    connect(_listView, &QWidget::customContextMenuRequested,
+    connect(_treeView, &QWidget::customContextMenuRequested,
             this, &CFiberWidget::showContextMenu);
+    connect(_treeView->header(), &QHeaderView::sectionClicked,
+            this, &CFiberWidget::onHeaderSectionClicked);
 
     layout->addWidget(new QLabel(tr("Tags:"), mainWidget));
     _tagListWidget = new QWidget(mainWidget);
@@ -142,32 +336,38 @@ void CFiberWidget::setupUi()
     setWidget(mainWidget);
 }
 
-QString CFiberWidget::labelForFiber(const FiberEntry& fiber)
+QString CFiberWidget::displayNameForFiber(const FiberEntry& fiber)
 {
     const QString fileName = QString::fromStdString(fiber.fileName);
-    const QString nameText = fileName.isEmpty()
-        ? tr("Fiber %1").arg(fiber.id)
-        : tr("Fiber %1  %2").arg(fiber.id).arg(fileName);
-    return tr("%1  cp=%2  pts=%3  len=%4 vx")
-        .arg(nameText)
-        .arg(fiber.controlPointCount)
-        .arg(fiber.linePointCount)
-        .arg(fiber.lengthVx, 0, 'f', 1);
+    return fileName.isEmpty()
+        ? QString::number(fiber.id)
+        : tr("%1  %2").arg(fiber.id).arg(fileName);
+}
+
+QString CFiberWidget::directionForFiber(const FiberEntry& fiber)
+{
+    if (fiber.manualHvTag == "H" || fiber.manualHvTag == "V") {
+        return QString::fromStdString(fiber.manualHvTag);
+    }
+    if (fiber.automaticHvTag == "H" || fiber.automaticHvTag == "V") {
+        return QString::fromStdString(fiber.automaticHvTag);
+    }
+    return QStringLiteral("-");
 }
 
 std::vector<uint64_t> CFiberWidget::selectedFiberIds() const
 {
     std::vector<uint64_t> ids;
-    if (!_listView || !_listView->selectionModel()) {
+    if (!_treeView || !_treeView->selectionModel()) {
         return ids;
     }
 
-    const auto indexes = _listView->selectionModel()->selectedIndexes();
+    const auto indexes = _treeView->selectionModel()->selectedRows(kNameColumn);
     ids.reserve(static_cast<size_t>(indexes.size()));
     for (const QModelIndex& index : indexes) {
         auto* item = _model->itemFromIndex(index);
         if (item) {
-            const uint64_t id = item->data().toULongLong();
+            const uint64_t id = item->data(kFiberIdRole).toULongLong();
             if (id != 0) {
                 ids.push_back(id);
             }
@@ -224,21 +424,14 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
 {
     const std::vector<uint64_t> previousSelection = selectedFiberIds();
     _fibers = fibers;
-    std::sort(_fibers.begin(), _fibers.end(), [](const FiberEntry& a, const FiberEntry& b) {
-        return a.id < b.id;
-    });
+    sortFibers();
     for (const auto& fiber : _fibers) {
         for (const auto& tag : fiber.tags) {
             addUniqueSorted(_knownTags, tag);
         }
     }
 
-    _model->clear();
-    for (const auto& fiber : _fibers) {
-        auto* item = new QStandardItem(labelForFiber(fiber));
-        item->setData(QVariant::fromValue(fiber.id));
-        _model->appendRow(item);
-    }
+    rebuildModel();
 
     _selectedFiberId = 0;
     if (!previousSelection.empty()) {
@@ -246,6 +439,175 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
     }
     _deleteButton->setEnabled(canDeleteSelection());
     updateClassificationUi();
+}
+
+void CFiberWidget::rebuildModel()
+{
+    std::set<uint64_t> expandedFibers;
+    if (_treeView) {
+        for (int row = 0; row < _model->rowCount(); ++row) {
+            QStandardItem* item = _model->item(row, kNameColumn);
+            if (item && _treeView->isExpanded(item->index())) {
+                expandedFibers.insert(item->data(kFiberIdRole).toULongLong());
+            }
+        }
+    }
+
+    const bool showMetrics = _calcMetricsCheckBox && _calcMetricsCheckBox->isChecked();
+    _model->removeRows(0, _model->rowCount());
+    _model->setColumnCount(kColumnCount);
+    _model->setHorizontalHeaderLabels({
+        tr("id/name"),
+        tr("dir"),
+        tr("len"),
+        tr("cps"),
+        tr("pts"),
+        tr("tags"),
+        tr("mean align deg"),
+        tr("max align deg"),
+    });
+    if (_treeView && _treeView->header()) {
+        _treeView->header()->setSortIndicator(_sortColumn, _sortOrder);
+    }
+
+    for (const auto& fiber : _fibers) {
+        QList<QStandardItem*> row{
+            readOnlyItem(displayNameForFiber(fiber)),
+            readOnlyItem(directionForFiber(fiber)),
+            readOnlyItem(formatDouble(fiber.lengthVx, 1)),
+            readOnlyItem(QString::number(fiber.controlPointCount)),
+            readOnlyItem(QString::number(fiber.linePointCount)),
+            readOnlyItem(formatTags(fiber.tags)),
+            readOnlyItem(formatMetric(fiber.alignment, showMetrics)),
+            readOnlyItem(formatMaxMetric(fiber.alignment, showMetrics)),
+        };
+        applyRowMetadata(row, fiber.id, false, fiber.alignment, showMetrics);
+
+        QStandardItem* root = row[kNameColumn];
+        for (const auto& span : fiber.spans) {
+            const QString spanName = tr("span %1  cp %2-%3")
+                .arg(span.spanIndex + 1)
+                .arg(span.firstControlIndex + 1)
+                .arg(span.secondControlIndex + 1);
+            QList<QStandardItem*> childRow{
+                readOnlyItem(spanName),
+                readOnlyItem(directionForFiber(fiber)),
+                readOnlyItem(formatDouble(span.lengthVx, 1)),
+                readOnlyItem(QString::number(span.controlPointCount)),
+                readOnlyItem(QString::number(span.linePointCount)),
+                readOnlyItem(QString()),
+                readOnlyItem(formatMetric(span.alignment, showMetrics)),
+                readOnlyItem(formatMaxMetric(span.alignment, showMetrics)),
+            };
+            applyRowMetadata(childRow, fiber.id, true, span.alignment, showMetrics);
+            applySpanMetadata(childRow, span.firstControlIndex, span.secondControlIndex);
+            root->appendRow(childRow);
+        }
+
+        _model->appendRow(row);
+        if (_treeView && expandedFibers.find(fiber.id) != expandedFibers.end()) {
+            _treeView->setExpanded(root->index(), true);
+        }
+    }
+}
+
+void CFiberWidget::sortFibers()
+{
+    const int column = std::clamp(_sortColumn, 0, kColumnCount - 1);
+    const bool ascending = _sortOrder == Qt::AscendingOrder;
+    auto compareText = [ascending](const QString& lhs, const QString& rhs) {
+        const int cmp = QString::localeAwareCompare(lhs, rhs);
+        return ascending ? cmp < 0 : cmp > 0;
+    };
+    auto compareNumber = [ascending](double lhs, double rhs) {
+        if (lhs == rhs) {
+            return false;
+        }
+        return ascending ? lhs < rhs : lhs > rhs;
+    };
+    auto metricValue = [](const FiberEntry::AlignmentMetrics& metric) {
+        return metric.available && std::isfinite(metric.maxErrorDegrees)
+            ? std::optional<double>(metric.maxErrorDegrees)
+            : std::nullopt;
+    };
+    auto metricMeanValue = [](const FiberEntry::AlignmentMetrics& metric) {
+        return metric.available && std::isfinite(metric.meanErrorDegrees)
+            ? std::optional<double>(metric.meanErrorDegrees)
+            : std::nullopt;
+    };
+    auto compareOptionalNumber = [ascending](std::optional<double> lhs,
+                                             std::optional<double> rhs) {
+        if (lhs && rhs) {
+            if (*lhs == *rhs) {
+                return false;
+            }
+            return ascending ? *lhs < *rhs : *lhs > *rhs;
+        }
+        if (lhs != rhs) {
+            return lhs.has_value();
+        }
+        return false;
+    };
+
+    std::stable_sort(_fibers.begin(), _fibers.end(), [&](const FiberEntry& lhs, const FiberEntry& rhs) {
+        bool different = false;
+        bool less = false;
+        switch (column) {
+        case kNameColumn: {
+            const QString a = displayNameForFiber(lhs);
+            const QString b = displayNameForFiber(rhs);
+            different = QString::localeAwareCompare(a, b) != 0;
+            less = compareText(a, b);
+            break;
+        }
+        case kDirectionColumn: {
+            const QString a = directionForFiber(lhs);
+            const QString b = directionForFiber(rhs);
+            different = QString::localeAwareCompare(a, b) != 0;
+            less = compareText(a, b);
+            break;
+        }
+        case kLengthColumn:
+            different = lhs.lengthVx != rhs.lengthVx;
+            less = compareNumber(lhs.lengthVx, rhs.lengthVx);
+            break;
+        case kControlPointsColumn:
+            different = lhs.controlPointCount != rhs.controlPointCount;
+            less = compareNumber(lhs.controlPointCount, rhs.controlPointCount);
+            break;
+        case kLinePointsColumn:
+            different = lhs.linePointCount != rhs.linePointCount;
+            less = compareNumber(lhs.linePointCount, rhs.linePointCount);
+            break;
+        case kTagsColumn: {
+            const QString a = formatTags(lhs.tags);
+            const QString b = formatTags(rhs.tags);
+            different = QString::localeAwareCompare(a, b) != 0;
+            less = compareText(a, b);
+            break;
+        }
+        case kMeanAlignErrorColumn: {
+            const auto a = metricMeanValue(lhs.alignment);
+            const auto b = metricMeanValue(rhs.alignment);
+            different = a != b;
+            less = compareOptionalNumber(a, b);
+            break;
+        }
+        case kMaxAlignErrorColumn: {
+            const auto a = metricValue(lhs.alignment);
+            const auto b = metricValue(rhs.alignment);
+            different = a != b;
+            less = compareOptionalNumber(a, b);
+            break;
+        }
+        default:
+            break;
+        }
+        if (different) {
+            return less;
+        }
+        return ascending ? lhs.id < rhs.id : lhs.id > rhs.id;
+    });
 }
 
 void CFiberWidget::setKnownTags(const std::vector<std::string>& tags)
@@ -265,8 +627,8 @@ void CFiberWidget::setKnownTags(const std::vector<std::string>& tags)
 QStandardItem* CFiberWidget::findFiberItem(uint64_t fiberId)
 {
     for (int i = 0; i < _model->rowCount(); ++i) {
-        auto* item = _model->item(i);
-        if (item && item->data().toULongLong() == fiberId) {
+        auto* item = _model->item(i, kNameColumn);
+        if (item && item->data(kFiberIdRole).toULongLong() == fiberId) {
             return item;
         }
     }
@@ -280,7 +642,7 @@ void CFiberWidget::selectFiber(uint64_t fiberId)
 
 void CFiberWidget::selectFibers(const std::vector<uint64_t>& fiberIds)
 {
-    if (!_listView || !_listView->selectionModel()) {
+    if (!_treeView || !_treeView->selectionModel()) {
         _selectedFiberId = 0;
         if (_deleteButton) {
             _deleteButton->setEnabled(false);
@@ -289,20 +651,22 @@ void CFiberWidget::selectFibers(const std::vector<uint64_t>& fiberIds)
         return;
     }
 
-    _listView->selectionModel()->clearSelection();
+    _treeView->selectionModel()->clearSelection();
     QModelIndex firstSelectedIndex;
     for (uint64_t fiberId : fiberIds) {
         auto* item = findFiberItem(fiberId);
         if (!item) {
             continue;
         }
-        _listView->selectionModel()->select(item->index(), QItemSelectionModel::Select);
+        _treeView->selectionModel()->select(item->index(),
+                                            QItemSelectionModel::Select |
+                                            QItemSelectionModel::Rows);
         if (!firstSelectedIndex.isValid()) {
             firstSelectedIndex = item->index();
         }
     }
     if (firstSelectedIndex.isValid()) {
-        _listView->scrollTo(firstSelectedIndex);
+        _treeView->scrollTo(firstSelectedIndex);
     }
 
     const auto selected = selectedFiberIds();
@@ -333,9 +697,16 @@ void CFiberWidget::onDoubleClicked(const QModelIndex& index)
     if (!item) {
         return;
     }
-    const uint64_t fiberId = item->data().toULongLong();
+    const uint64_t fiberId = item->data(kFiberIdRole).toULongLong();
     if (fiberId != 0) {
-        emit fiberOpenRequested(fiberId);
+        if (item->data(kIsSpanRole).toBool()) {
+            emit fiberSpanOpenRequested(
+                fiberId,
+                item->data(kSpanFirstControlIndexRole).toInt(),
+                item->data(kSpanSecondControlIndexRole).toInt());
+        } else {
+            emit fiberOpenRequested(fiberId);
+        }
     }
 }
 
@@ -377,11 +748,34 @@ void CFiberWidget::onAddTagClicked()
     if (tag.isEmpty()) {
         return;
     }
+    const std::vector<uint64_t> previousSelection = selectedFiberIds();
     _newTagEdit->clear();
     addUniqueSorted(_knownTags, tag.toStdString());
     applyTagLocally(_selectedFiberId, tag.toStdString(), true);
+    sortFibers();
+    rebuildModel();
+    selectFibers(previousSelection);
     emit fiberTagChanged(_selectedFiberId, tag, true);
     rebuildTagList();
+}
+
+void CFiberWidget::onHeaderSectionClicked(int section)
+{
+    if (section < 0 || section >= kColumnCount) {
+        return;
+    }
+    const std::vector<uint64_t> previousSelection = selectedFiberIds();
+    if (_sortColumn == section) {
+        _sortOrder = _sortOrder == Qt::AscendingOrder
+            ? Qt::DescendingOrder
+            : Qt::AscendingOrder;
+    } else {
+        _sortColumn = section;
+        _sortOrder = Qt::AscendingOrder;
+    }
+    sortFibers();
+    rebuildModel();
+    selectFibers(previousSelection);
 }
 
 const CFiberWidget::FiberEntry* CFiberWidget::selectedFiber() const
@@ -431,7 +825,11 @@ void CFiberWidget::requestFiberTagChange(const QString& tag, bool enabled)
     if (_selectedFiberId == 0) {
         return;
     }
+    const std::vector<uint64_t> previousSelection = selectedFiberIds();
     applyTagLocally(_selectedFiberId, tag.toStdString(), enabled);
+    sortFibers();
+    rebuildModel();
+    selectFibers(previousSelection);
     emit fiberTagChanged(_selectedFiberId, tag, enabled);
 }
 
@@ -460,9 +858,7 @@ void CFiberWidget::updateClassificationUi()
         _scoreLabel->setText(tr("z dist: -    control len: -\nH score: -    V score: -"));
         _autoLabel->setText(tr("Auto: -"));
     } else {
-        const QString name = QString::fromStdString(fiber->fileName).isEmpty()
-            ? tr("Fiber %1").arg(fiber->id)
-            : QString::fromStdString(fiber->fileName);
+        const QString name = displayNameForFiber(*fiber);
         _nameLabel->setText(tr("%1\ncp=%2    pts=%3    len=%4 vx")
                                 .arg(name)
                                 .arg(fiber->controlPointCount)
@@ -495,10 +891,10 @@ void CFiberWidget::updateClassificationUi()
 
 void CFiberWidget::showContextMenu(const QPoint& pos)
 {
-    QModelIndex index = _listView->indexAt(pos);
+    QModelIndex index = _treeView->indexAt(pos);
     if (index.isValid()) {
         if (auto* item = _model->itemFromIndex(index)) {
-            const uint64_t clickedId = item->data().toULongLong();
+            const uint64_t clickedId = item->data(kFiberIdRole).toULongLong();
             const auto selected = selectedFiberIds();
             if (std::find(selected.begin(), selected.end(), clickedId) == selected.end()) {
                 selectFiber(clickedId);
@@ -525,7 +921,7 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
     connect(deleteAction, &QAction::triggered, this, [this]() {
         requestDeleteSelectedFibers();
     });
-    menu.exec(_listView->viewport()->mapToGlobal(pos));
+    menu.exec(_treeView->viewport()->mapToGlobal(pos));
 }
 
 void CFiberWidget::requestDeleteSelectedFibers()

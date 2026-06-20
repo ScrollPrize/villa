@@ -40,6 +40,8 @@ namespace {
 constexpr float kCurrentCutRotationStepRadians = 3.14159265358979323846f / 36.0f;
 constexpr bool kGeneratedLineAnnotationOverlaysEnabled = true;
 constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
+constexpr float kNominalGeneratedRowWidth = 900.0f;
+constexpr float kNominalGeneratedRowHeight = 260.0f;
 
 std::string staticStripOverlayKey(const std::string& surfaceName)
 {
@@ -70,8 +72,6 @@ CChunkedVolumeViewer::CameraState generatedPaneCamera(CChunkedVolumeViewer* view
         return camera;
     }
 
-    constexpr float kNominalGeneratedRowWidth = 900.0f;
-    constexpr float kNominalGeneratedRowHeight = 260.0f;
     constexpr float kPadding = 0.85f;
     const float scaleX = kNominalGeneratedRowWidth / static_cast<float>(std::max(1, size.width));
     const float scaleY = kNominalGeneratedRowHeight / static_cast<float>(std::max(1, size.height));
@@ -99,6 +99,35 @@ std::optional<cv::Vec2f> generatedStripSurfaceCenter(CChunkedVolumeViewer* viewe
     const float centerRow = static_cast<float>(points->rows / 2);
     const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
     return cv::Vec2f{surfaceX, surfaceY};
+}
+
+std::optional<float> generatedStripScaleForLinePositionRange(
+    CChunkedVolumeViewer* viewer,
+    const std::optional<std::pair<double, double>>& range)
+{
+    if (!range) {
+        return std::nullopt;
+    }
+    auto* quad = viewer ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
+    if (!quad || !std::isfinite(range->first) || !std::isfinite(range->second)) {
+        return std::nullopt;
+    }
+    const cv::Vec2f scale = quad->scale();
+    const double lineSpan = std::abs(range->second - range->first);
+    if (!std::isfinite(lineSpan) || lineSpan <= 1.0e-6 || scale[0] == 0.0f) {
+        return std::nullopt;
+    }
+    const double surfaceSpan = lineSpan / std::abs(static_cast<double>(scale[0]));
+    if (!std::isfinite(surfaceSpan) || surfaceSpan <= 1.0e-6) {
+        return std::nullopt;
+    }
+    constexpr double kViewportFill = 0.82;
+    const double focusedScale =
+        (static_cast<double>(kNominalGeneratedRowWidth) * kViewportFill) / surfaceSpan;
+    if (!std::isfinite(focusedScale)) {
+        return std::nullopt;
+    }
+    return static_cast<float>(std::clamp(focusedScale, 0.5, 64.0));
 }
 
 bool finitePoint(const cv::Vec3f& point)
@@ -717,6 +746,11 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     generatedStripSurfaceCenter(viewer, _currentLinePosition)) {
                 stripCamera.surfacePtrX = (*center)[0];
                 stripCamera.surfacePtrY = (*center)[1];
+            }
+            if (const auto focusedScale = generatedStripScaleForLinePositionRange(
+                    viewer,
+                    views.initialStripLinePositionRange)) {
+                stripCamera.scale = *focusedScale;
             }
         }
         viewer->applyCameraState(stripCamera, false);
