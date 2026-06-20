@@ -115,9 +115,10 @@ struct LineAnnotationController::LineAnnotationSession {
     vc::atlas::AtlasPredSnapSet predSnapSet;
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
-    bool controlPointsDirtySinceOptimization = false;
-    bool finalReinitClean = false;
-    bool finalReinitClosePending = false;
+    LineAnnotationController::SessionOptimizationState optimizationState =
+        LineAnnotationController::SessionOptimizationState::Unoptimized;
+    LineAnnotationController::SessionOptimizationState pendingOptimizationState =
+        LineAnnotationController::SessionOptimizationState::Optimized;
     bool disableInitialGeneratedHoverFollow = false;
     std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
 };
@@ -254,6 +255,85 @@ std::optional<size_t> controlPointIndexAtLinePosition(
         }
     }
     return bestIndex;
+}
+
+int controlLineIndex(const vc::lasagna::LineControlPoint& control, int maxIndex)
+{
+    if (control.optimizedIndex >= 0) {
+        return std::clamp(control.optimizedIndex, 0, maxIndex);
+    }
+    if (std::isfinite(control.linePosition)) {
+        return std::clamp(static_cast<int>(std::llround(control.linePosition)), 0, maxIndex);
+    }
+    return 0;
+}
+
+std::pair<int, int> activeRangeAroundDeletedControl(
+    const std::vector<vc::lasagna::LineControlPoint>& controls,
+    double deletedLinePosition,
+    int linePointCount,
+    int spanRadius)
+{
+    if (linePointCount <= 0) {
+        return {-1, -1};
+    }
+    const int maxIndex = linePointCount - 1;
+    if (controls.empty() || !std::isfinite(deletedLinePosition)) {
+        return {0, maxIndex};
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> sortedControls;
+    sortedControls.reserve(controls.size());
+    for (const auto& control : controls) {
+        if (std::isfinite(control.linePosition)) {
+            sortedControls.push_back(control);
+        }
+    }
+    if (sortedControls.empty()) {
+        return {0, maxIndex};
+    }
+    std::stable_sort(sortedControls.begin(),
+                     sortedControls.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.linePosition < b.linePosition;
+                     });
+
+    const auto insertion = std::lower_bound(
+        sortedControls.begin(),
+        sortedControls.end(),
+        deletedLinePosition,
+        [](const vc::lasagna::LineControlPoint& control, double position) {
+            return control.linePosition < position;
+        });
+    const int insertionIndex = static_cast<int>(std::distance(sortedControls.begin(), insertion));
+    int leftControl = insertionIndex - 1;
+    int rightControl = insertionIndex;
+
+    bool includeLeftOpenEnd = leftControl < 0;
+    bool includeRightOpenEnd = rightControl >= static_cast<int>(sortedControls.size());
+    if (!includeLeftOpenEnd) {
+        for (int span = 0; span < spanRadius && leftControl > 0; ++span) {
+            --leftControl;
+        }
+    }
+    if (!includeRightOpenEnd) {
+        for (int span = 0;
+             span < spanRadius && rightControl + 1 < static_cast<int>(sortedControls.size());
+             ++span) {
+            ++rightControl;
+        }
+    }
+
+    int activeStart = includeLeftOpenEnd
+        ? 0
+        : controlLineIndex(sortedControls[static_cast<size_t>(leftControl)], maxIndex);
+    int activeEnd = includeRightOpenEnd
+        ? maxIndex
+        : controlLineIndex(sortedControls[static_cast<size_t>(rightControl)], maxIndex);
+    if (activeEnd < activeStart) {
+        std::swap(activeStart, activeEnd);
+    }
+    return {activeStart, activeEnd};
 }
 
 QString controlPointInfoText(const std::vector<vc::lasagna::LineControlPoint>& controls,
@@ -799,7 +879,6 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.segmentLength = kLineSegmentLength;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.05;
         config.samplesPerSegment = 1;
         config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
@@ -836,6 +915,11 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
                                                               std::move(fixedIndices),
                                                               displayFrameAnchorIndex,
                                                               config);
+            if (reinitialized.failed) {
+                task.ok = false;
+                task.error = reinitialized.failureReason;
+                return task;
+            }
             task.result = std::move(reinitialized.optimization);
         } else if (!forceFullOptimization && initialLinePoints.size() >= 2) {
             std::vector<int> fixedIndices;
@@ -848,6 +932,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
                 const int index = std::clamp(static_cast<int>(std::llround(control.linePosition)),
                                              0,
                                              static_cast<int>(initialLinePoints.size()) - 1);
+                initialLinePoints[static_cast<size_t>(index)] = control.volumePoint;
                 fixedIndices.push_back(index);
                 if (control.isSeed) {
                     displayFrameAnchorIndex = index;
@@ -1159,7 +1244,7 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     return;
                 }
                 auto& session = *pane->session;
-                if (!session.controlPointsDirtySinceOptimization) {
+                if (session.optimizationState == SessionOptimizationState::Optimized) {
                     return;
                 }
                 if (session.taskState == LineAnnotationSession::TaskState::Running) {
@@ -1172,14 +1257,16 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                 if (!ensureDatasetForSession(session)) {
                     return;
                 }
-                startOptimization(session, true);
+                startOptimization(session, false);
             });
     connect(dialog, &QObject::destroyed, this, [this, surfaceName]() {
         cleanupSurfaceName(surfaceName);
     });
 
+    refreshSessionOptimizationStatus(*session);
     if (!session->optimizedLine.points.empty()) {
         session->taskState = LineAnnotationSession::TaskState::Succeeded;
+        setSessionOptimizationState(*session, SessionOptimizationState::Optimized);
         materializeGeneratedViews(*session);
     }
     if (!session->deferShowUntilGenerated || !session->optimizedLine.points.empty()) {
@@ -1313,6 +1400,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     if (_currentAtlasDir) {
         attachAtlasPredSnaps(*it, *session, *_currentAtlasDir);
     }
+    setSessionOptimizationState(*session, SessionOptimizationState::Optimized);
 
     CChunkedVolumeViewer::CameraState camera;
     camera.scale = 1.0f;
@@ -3199,7 +3287,7 @@ void LineAnnotationController::saveOpenFibers()
             session.controlPoints.empty()) {
             continue;
         }
-        if (!runFinalReinitReoptSynchronously(session, false)) {
+        if (!finalizeSessionOptimizationSynchronously(session, false)) {
             continue;
         }
         saveSessionAsFiber(session);
@@ -3482,7 +3570,7 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
     session.focusedLinePosition = 0.0;
     session.focusedControlPoint = seedPoint;
     session.controlPoints = {{0.0, seedPoint, true, -1}};
-    session.controlPointsDirtySinceOptimization = false;
+    setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     startOptimization(session);
 }
 
@@ -3542,7 +3630,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     session.focusedLinePosition = linePosition;
     session.focusedControlPoint = clicked;
-    session.finalReinitClean = false;
+    setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     const bool autoReoptimize =
         !pane->dialog ||
         pane->dialog->reoptimizationMode() ==
@@ -3554,7 +3642,6 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         writeLineDebugJson(noReoptEventName,
                            session.controlPoints,
                            linePointsToJson(session.optimizedLine));
-        session.controlPointsDirtySinceOptimization = true;
         if (pane->dialog) {
             pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
             pane->dialog->setGeneratedPredSnapPoints(
@@ -3589,7 +3676,6 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
     session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
     session.controlPoints = update.controlPoints;
-    session.finalReinitClean = false;
     if (update.changedControlIndex >= 0 &&
         update.changedControlIndex < static_cast<int>(session.controlPoints.size())) {
         const auto& changed = session.controlPoints[static_cast<size_t>(update.changedControlIndex)];
@@ -3711,8 +3797,9 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     }
 
     const bool deletedSeed = selected->isSeed;
+    const int linePointCount = static_cast<int>(session.optimizedLine.points.size());
     session.controlPoints.erase(selected);
-    session.finalReinitClean = false;
+    setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     if (session.controlPoints.empty()) {
         return;
     }
@@ -3763,13 +3850,18 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
         pane->dialog->reoptimizationMode() ==
             LineAnnotationDialog::ReoptimizationMode::AutoReoptimize;
     if (autoReoptimize) {
-        startOptimization(session, true);
+        const auto activeRange = activeRangeAroundDeletedControl(session.controlPoints,
+                                                                linePosition,
+                                                                linePointCount,
+                                                                3);
+        startOptimization(session, false, activeRange.first, activeRange.second);
         return;
     }
 
-    session.controlPointsDirtySinceOptimization = true;
     if (pane->dialog) {
         pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
+        pane->dialog->setGeneratedPredSnapPoints(
+            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
     }
 }
 
@@ -3827,16 +3919,35 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     return true;
 }
 
-bool LineAnnotationController::needsFinalReinitReopt(const LineAnnotationSession& session) const
+bool LineAnnotationController::needsFinalOptimization(const LineAnnotationSession& session) const
 {
-    return !session.finalReinitClean &&
+    return session.optimizationState != SessionOptimizationState::Optimized &&
            !session.optimizedLine.points.empty() &&
-           session.controlPoints.size() >= 2;
+           !session.controlPoints.empty();
+}
+
+void LineAnnotationController::refreshSessionOptimizationStatus(
+    const LineAnnotationSession& session)
+{
+    auto* pane = paneForSurface(session.surfaceName);
+    if (pane && pane->dialog) {
+        pane->dialog->setOptimizationStatus(
+            session.optimizationState == SessionOptimizationState::Optimized);
+    }
+}
+
+void LineAnnotationController::setSessionOptimizationState(
+    LineAnnotationSession& session,
+    SessionOptimizationState state)
+{
+    session.optimizationState = state;
+    refreshSessionOptimizationStatus(session);
 }
 
 bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession& session,
                                                            OptimizationTaskResult task,
                                                            bool updateGeneratedViews,
+                                                           SessionOptimizationState resultOptimizationState,
                                                            const std::string& eventOverride,
                                                            bool fireSuccessCallback)
 {
@@ -3855,7 +3966,6 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     session.optimizationReport = task.result.report;
     session.optimizedLine = std::move(task.result.line);
     session.controlPoints = std::move(task.controlPoints);
-    session.controlPointsDirtySinceOptimization = false;
     for (auto& control : session.controlPoints) {
         double bestDistance = std::numeric_limits<double>::infinity();
         int bestIndex = -1;
@@ -3885,12 +3995,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     }
 
     const std::string eventName = eventOverride.empty() ? task.eventName : eventOverride;
-    if (eventName.find("reinit_reopt") != std::string::npos ||
-        !needsFinalReinitReopt(session)) {
-        session.finalReinitClean = true;
-    } else {
-        session.finalReinitClean = false;
-    }
+    setSessionOptimizationState(session, resultOptimizationState);
 
     const std::string resultEvent = eventName.empty()
         ? "optimization_result"
@@ -3926,17 +4031,18 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     return true;
 }
 
-bool LineAnnotationController::runFinalReinitReoptSynchronously(LineAnnotationSession& session,
-                                                                bool fireSuccessCallback)
+bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
+    LineAnnotationSession& session,
+    bool fireSuccessCallback)
 {
-    if (!needsFinalReinitReopt(session)) {
+    if (!needsFinalOptimization(session)) {
         return true;
     }
     if (!ensureDatasetForSession(session)) {
         return false;
     }
     if (!session.normalSampler) {
-        showError(tr("Could not run final line reinitialization: no Lasagna dataset is loaded."));
+        showError(tr("Could not run final line optimization: no Lasagna dataset is loaded."));
         return false;
     }
 
@@ -3950,14 +4056,15 @@ bool LineAnnotationController::runFinalReinitReoptSynchronously(LineAnnotationSe
                                                           std::move(initialLinePoints),
                                                           session.sourceSliceNormal,
                                                           session.initialDirectionMode,
-                                                          true,
+                                                          false,
                                                           -1,
                                                           -1,
                                                           *session.normalSampler);
     return applyOptimizationTaskResult(session,
                                        std::move(task),
                                        false,
-                                       "final_reinit_reopt",
+                                       SessionOptimizationState::Optimized,
+                                       "final_full_line_opt",
                                        fireSuccessCallback);
 }
 
@@ -3979,16 +4086,18 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
         showError(tr("Line optimization is already running."));
         return;
     }
-    if (!needsFinalReinitReopt(session)) {
+    if (!needsFinalOptimization(session)) {
         pane->dialog->setCloseAfterFinalizationAllowed(true);
         pane->dialog->close();
         return;
     }
-    if (!ensureDatasetForSession(session)) {
+    if (!finalizeSessionOptimizationSynchronously(session, false)) {
         return;
     }
-    session.finalReinitClosePending = true;
-    startOptimization(session, true);
+    saveSessionAsFiber(session);
+    session.suppressFiberSave = true;
+    pane->dialog->setCloseAfterFinalizationAllowed(true);
+    pane->dialog->close();
 }
 
 void LineAnnotationController::startOptimization(LineAnnotationSession& session,
@@ -4018,6 +4127,12 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     if (auto* pane = paneForSurface(surfaceName); pane && pane->dialog) {
         pane->dialog->setOptimizationBusy(true);
     }
+    const bool localOptimization = !forceFullOptimization &&
+        activeStart >= 0 &&
+        activeEnd >= activeStart;
+    session.pendingOptimizationState = localOptimization
+        ? SessionOptimizationState::Incremental
+        : SessionOptimizationState::Optimized;
     connect(watcher,
             &QFutureWatcher<OptimizationTaskResult>::finished,
             this,
@@ -4097,31 +4212,18 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
 
     OptimizationTaskResult task = watcher->result();
     session.watcher = nullptr;
-    const bool closePending = session.finalReinitClosePending;
-    // Save/close finalization continues using session after applying the result;
-    // callbacks may rebuild intersection panes and invalidate this reference.
     const bool ok = applyOptimizationTaskResult(session,
                                                std::move(task),
                                                true,
+                                               session.pendingOptimizationState,
                                                {},
-                                               !closePending);
+                                               true);
     if (pane->dialog) {
         pane->dialog->setOptimizationBusy(false);
     }
-    if (ok) {
-        if (closePending) {
-            session.finalReinitClosePending = false;
-            saveSessionAsFiber(session);
-            session.suppressFiberSave = true;
-            if (pane->dialog) {
-                pane->dialog->setCloseAfterFinalizationAllowed(true);
-                pane->dialog->close();
-            }
-        }
-        return;
+    if (!ok) {
+        setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     }
-
-    session.finalReinitClosePending = false;
 }
 
 bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)
@@ -4255,7 +4357,7 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
         showError(tr("Run line optimization before exporting generated meshes."));
         return;
     }
-    if (!runFinalReinitReoptSynchronously(session, false)) {
+    if (!finalizeSessionOptimizationSynchronously(session, false)) {
         return;
     }
     if (!session.suppressGeneratedViews && !materializeGeneratedViews(session)) {
@@ -4893,6 +4995,7 @@ LineAnnotationController::makeIntersectionLineSession(
         : cv::Vec3d{0.0, 0.0, 1.0};
     session->optimizedLine = syntheticLineModelFromPoints(fiber.linePoints);
     session->taskState = LineAnnotationSession::TaskState::Succeeded;
+    session->optimizationState = SessionOptimizationState::Optimized;
     session->suppressGeneratedViews = true;
     session->optimizationSucceededCallback =
         [callback = std::move(onOptimizationSucceeded)](LineAnnotationSession&) {
@@ -4941,7 +5044,7 @@ LineAnnotationController::makeIntersectionLineSession(
 void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session)
 {
     try {
-        if (!runFinalReinitReoptSynchronously(session, false)) {
+        if (!finalizeSessionOptimizationSynchronously(session, false)) {
             return;
         }
         ensureSessionFiberIdentity(session);

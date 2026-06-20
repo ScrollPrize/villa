@@ -26,6 +26,7 @@ constexpr double kEpsilon = 1.0e-12;
 constexpr double kControlSpanInitPriorWeight = 0.05;
 constexpr int kLocalControlOptimizationSegments = 3;
 constexpr double kMovedControlDistanceThreshold = 1.0e-6;
+constexpr double kReinitSeedMaxNormalAlignmentAbs = 0.17364817766693033; // sin(10 deg)
 
 [[nodiscard]] double length(const cv::Vec3d& v)
 {
@@ -841,6 +842,23 @@ struct LossAccumulator {
     return total;
 }
 
+[[nodiscard]] int totalResidualCount(const std::vector<LineOptimizationLossReport>& losses)
+{
+    int total = 0;
+    for (const auto& loss : losses) {
+        total += loss.residuals;
+    }
+    return total;
+}
+
+[[nodiscard]] double ceresResidualRms(double cost, int residuals)
+{
+    if (residuals <= 0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return std::sqrt(std::max(0.0, 2.0 * cost) / static_cast<double>(residuals));
+}
+
 [[nodiscard]] cv::Vec3d straightnessSplitNormalAt(const std::array<double, 3>& point,
                                                   const NormalSampler& sampler)
 {
@@ -1003,8 +1021,72 @@ struct SpanDeviationMetrics {
     double maxEvenStepDeviation = 0.0;
     double maxTangentSmoothDeviation = 0.0;
     double maxNormalSmoothDeviation = 0.0;
+    double avgNormalAlignmentAbs = 0.0;
+    double p95NormalAlignmentAbs = 0.0;
     double maxNormalAlignmentAbs = 0.0;
+    int normalAlignmentSamples = 0;
 };
+
+[[nodiscard]] double percentile(std::vector<double> values, double fraction)
+{
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    fraction = std::clamp(fraction, 0.0, 1.0);
+    const double position = fraction * static_cast<double>(values.size() - 1);
+    const size_t lower = static_cast<size_t>(std::floor(position));
+    const size_t upper = static_cast<size_t>(std::ceil(position));
+    if (lower == upper) {
+        return values[lower];
+    }
+    const double t = position - static_cast<double>(lower);
+    return values[lower] * (1.0 - t) + values[upper] * t;
+}
+
+[[nodiscard]] double alignmentChoiceScore(const SpanDeviationMetrics& metrics)
+{
+    if (metrics.normalAlignmentSamples <= 0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return (metrics.avgNormalAlignmentAbs +
+            metrics.p95NormalAlignmentAbs +
+            metrics.maxNormalAlignmentAbs) / 3.0;
+}
+
+enum class SpanCandidateAnchorSide {
+    Left,
+    Right,
+};
+
+[[nodiscard]] double endpointDirectionDot(
+    const std::vector<std::array<double, 3>>& points,
+    SpanCandidateAnchorSide anchorSide,
+    const cv::Vec3d& referenceDirection)
+{
+    if (points.size() < 2) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const cv::Vec3d reference = normalizedOrZero(referenceDirection);
+    if (length(reference) <= kEpsilon) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    const auto point = [](const std::array<double, 3>& value) {
+        return cv::Vec3d{value[0], value[1], value[2]};
+    };
+    const cv::Vec3d startDirection =
+        normalizedOrZero(point(points[1]) - point(points[0]));
+    const cv::Vec3d endDirection =
+        normalizedOrZero(point(points[points.size() - 2]) - point(points.back()));
+    const cv::Vec3d connectedDirection =
+        anchorSide == SpanCandidateAnchorSide::Left ? startDirection : endDirection;
+    if (length(connectedDirection) <= kEpsilon) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    return connectedDirection.dot(reference);
+}
 
 [[nodiscard]] SpanDeviationMetrics spanDeviationMetrics(
     const std::vector<std::array<double, 3>>& points,
@@ -1031,6 +1113,9 @@ struct SpanDeviationMetrics {
             std::max(metrics.maxNormalSmoothDeviation, std::abs(normalComponent));
     }
 
+    double normalAlignmentAbsSum = 0.0;
+    std::vector<double> normalAlignmentAbsValues;
+    normalAlignmentAbsValues.reserve(points.size() * static_cast<size_t>(config.samplesPerSegment + 1));
     for (size_t segment = 0; segment + 1 < points.size(); ++segment) {
         const cv::Vec3d a{points[segment][0], points[segment][1], points[segment][2]};
         const cv::Vec3d b{points[segment + 1][0], points[segment + 1][1], points[segment + 1][2]};
@@ -1048,9 +1133,18 @@ struct SpanDeviationMetrics {
             if (!normalSample.valid || length(normal) <= kEpsilon) {
                 continue;
             }
+            const double alignmentAbs = std::abs(tangent.dot(normal));
+            normalAlignmentAbsSum += alignmentAbs;
+            normalAlignmentAbsValues.push_back(alignmentAbs);
             metrics.maxNormalAlignmentAbs =
-                std::max(metrics.maxNormalAlignmentAbs, std::abs(tangent.dot(normal)));
+                std::max(metrics.maxNormalAlignmentAbs, alignmentAbs);
         }
+    }
+    metrics.normalAlignmentSamples = static_cast<int>(normalAlignmentAbsValues.size());
+    if (metrics.normalAlignmentSamples > 0) {
+        metrics.avgNormalAlignmentAbs =
+            normalAlignmentAbsSum / static_cast<double>(metrics.normalAlignmentSamples);
+        metrics.p95NormalAlignmentAbs = percentile(std::move(normalAlignmentAbsValues), 0.95);
     }
     return metrics;
 }
@@ -1691,7 +1785,12 @@ struct SpanRolloutResult {
 struct OptimizedControlSpan {
     std::vector<std::array<double, 3>> points;
     LineReinitializationSpanReport report;
+    bool failed = false;
+    std::string failureReason;
     double candidateFinalCostDiff = 0.0;
+    double candidateFinalRmsDiff = 0.0;
+    double candidateAlignmentScoreDiff = 0.0;
+    std::vector<LineDebugPolyline> continuationCandidateLines;
 };
 
 [[nodiscard]] cv::Vec3d projectedChordTangentAtStart(
@@ -1820,6 +1919,66 @@ struct OptimizedControlSpan {
         return negative;
     }
     return positive;
+}
+
+[[nodiscard]] SpanRolloutResult directedSpanRolloutCandidate(
+    const cv::Vec3d& start,
+    const cv::Vec3d& target,
+    const cv::Vec3d& startDirection,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config)
+{
+    const double budget = std::max(2.0 * length(target - start), 1000.0);
+    const int steps = std::max(1, static_cast<int>(std::ceil(budget / config.segmentLength)));
+    const cv::Vec3d tangent = projectedDirectionAtStart(start, startDirection, sampler);
+    return signedSpanRolloutCandidate(start,
+                                      target,
+                                      tangent,
+                                      1,
+                                      sampler,
+                                      config,
+                                      steps);
+}
+
+[[nodiscard]] SpanRolloutResult existingSpanCandidate(
+    const std::vector<cv::Vec3d>& linePoints,
+    int leftIndex,
+    int rightIndex,
+    const cv::Vec3d& leftPoint,
+    const cv::Vec3d& rightPoint,
+    const LineOptimizationConfig& config)
+{
+    std::vector<cv::Vec3d> existing;
+    if (!linePoints.empty()) {
+        const int maxIndex = static_cast<int>(linePoints.size()) - 1;
+        leftIndex = std::clamp(leftIndex, 0, maxIndex);
+        rightIndex = std::clamp(rightIndex, 0, maxIndex);
+        if (leftIndex <= rightIndex) {
+            existing.reserve(static_cast<size_t>(rightIndex - leftIndex + 1));
+            for (int index = leftIndex; index <= rightIndex; ++index) {
+                existing.push_back(linePoints[static_cast<size_t>(index)]);
+            }
+        } else {
+            existing.reserve(static_cast<size_t>(leftIndex - rightIndex + 1));
+            for (int index = leftIndex; index >= rightIndex; --index) {
+                existing.push_back(linePoints[static_cast<size_t>(index)]);
+            }
+        }
+    }
+    if (existing.size() < 2) {
+        existing = {leftPoint, rightPoint};
+    }
+
+    SpanRolloutResult result;
+    result.rolloutSteps = 0;
+    result.truncatedPoints = static_cast<int>(existing.size());
+    result.selectedSign = 0;
+    result.closestTargetDistance = 0.0;
+    result.points = endpointCorrectedResampledSpan(existing,
+                                                   leftPoint,
+                                                   rightPoint,
+                                                   config.segmentLength);
+    return result;
 }
 
 [[nodiscard]] std::vector<std::array<double, 3>> toArrayPoints(const std::vector<cv::Vec3d>& points)
@@ -2276,6 +2435,9 @@ struct GlobalSolveResult {
     std::vector<std::array<double, 3>> points;
     double initialCost = 0.0;
     double finalCost = 0.0;
+    double initialRms = 0.0;
+    double finalRms = 0.0;
+    int residuals = 0;
     int iterations = 0;
     bool usable = false;
     double milliseconds = 0.0;
@@ -2442,6 +2604,7 @@ private:
                  &prefetchedSamples,
                  activeStart,
                  activeEnd);
+    const int residuals = problem.NumResiduals();
 
     fillPrefetchedNormalSamples(initialPoints,
                                 sampler,
@@ -2477,6 +2640,9 @@ private:
     result.points = std::move(initialPoints);
     result.initialCost = initialCost;
     result.finalCost = summary.final_cost;
+    result.initialRms = ceresResidualRms(initialCost, residuals);
+    result.finalRms = ceresResidualRms(summary.final_cost, residuals);
+    result.residuals = residuals;
     result.iterations = static_cast<int>(summary.iterations.size());
     result.usable = summary.IsSolutionUsable();
     result.milliseconds = elapsedMs(chainStart, Clock::now());
@@ -2521,20 +2687,46 @@ struct LineDifference {
     out.imbue(std::locale::classic());
     out << std::scientific << std::setprecision(3);
     out << "Line annotation Lasagna candidate comparison:\n"
-        << "candidate                   ms  iters    init_cost   final_cost   rms_vs_inc   max_vs_inc\n";
+        << "candidate                   ms  iters     init_rms    final_rms   rms_vs_inc   max_vs_inc\n";
     const auto& reference = results.front();
     for (const auto& result : results) {
         const LineDifference diff = compareLines(reference.points, result.points);
         out << std::left << std::setw(24) << result.name
             << std::right << std::setw(10) << result.milliseconds
             << std::setw(7) << result.iterations
-            << std::setw(13) << result.initialCost
-            << std::setw(13) << result.finalCost
+            << std::setw(13) << result.initialRms
+            << std::setw(13) << result.finalRms
             << std::setw(13) << diff.rms
             << std::setw(13) << diff.max
             << '\n';
     }
     return out.str();
+}
+
+[[nodiscard]] const LineReinitializationCandidateReport* spanCandidateReport(
+    const LineReinitializationSpanReport& report,
+    const char* name)
+{
+    for (const auto& candidate : report.candidates) {
+        if (candidate.name == name) {
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] double initialRmsForCandidate(const LineReinitializationSpanReport& report,
+                                            const char* name)
+{
+    const auto* candidate = spanCandidateReport(report, name);
+    return candidate ? candidate->initialRms : 0.0;
+}
+
+[[nodiscard]] double finalRmsForCandidate(const LineReinitializationSpanReport& report,
+                                          const char* name)
+{
+    const auto* candidate = spanCandidateReport(report, name);
+    return candidate ? candidate->finalRms : 0.0;
 }
 
 [[nodiscard]] OptimizedControlSpan optimizedControlSpan(
@@ -2545,7 +2737,10 @@ struct LineDifference {
     int segmentIndex,
     int leftControlIndex,
     int rightControlIndex,
-    std::string candidatePrefix)
+    std::string candidatePrefix,
+    std::optional<SpanRolloutResult> existingRollout = std::nullopt,
+    std::optional<cv::Vec3d> leftContinuationDirection = std::nullopt,
+    std::optional<cv::Vec3d> rightContinuationDirection = std::nullopt)
 {
     if (length(rightPoint - leftPoint) <= kEpsilon) {
         throw std::invalid_argument("Adjacent reinitialization control points are coincident");
@@ -2566,43 +2761,347 @@ struct LineDifference {
     spanConfig.printSolverProgress = false;
     const cv::Vec3d seedTangent = projectedChordTangentAtStart(leftPoint, rightPoint, sampler);
     const auto spanStart = Clock::now();
-    GlobalSolveResult leftSolved =
-        solveGlobalCandidate(candidatePrefix + "-left-" + std::to_string(segmentIndex),
-                             toArrayPoints(leftRollout.points),
-                             evenStepSpanConstraints(leftRollout.points.size() - 1,
-                                                     segmentIndex),
-                             {0, static_cast<int>(leftRollout.points.size()) - 1},
-                             sampler,
-                             spanConfig,
-                             seedTangent,
-                             false,
-                             spanStart);
-    GlobalSolveResult rightSolved =
-        solveGlobalCandidate(candidatePrefix + "-right-" + std::to_string(segmentIndex),
-                             toArrayPoints(rightRollout.points),
-                             evenStepSpanConstraints(rightRollout.points.size() - 1,
-                                                     segmentIndex),
-                             {0, static_cast<int>(rightRollout.points.size()) - 1},
-                             sampler,
-                             spanConfig,
-                             seedTangent,
-                             false,
-                             spanStart);
+    const auto solveRollout = [&](std::string name, const SpanRolloutResult& rollout) {
+        return solveGlobalCandidate(std::move(name),
+                                    toArrayPoints(rollout.points),
+                                    evenStepSpanConstraints(rollout.points.size() - 1,
+                                                            segmentIndex),
+                                    {0, static_cast<int>(rollout.points.size()) - 1},
+                                    sampler,
+                                    spanConfig,
+                                    seedTangent,
+                                    false,
+                                    spanStart);
+    };
 
-    const bool chooseLeft = leftSolved.finalCost <= rightSolved.finalCost;
-    const GlobalSolveResult& chosen = chooseLeft ? leftSolved : rightSolved;
+    GlobalSolveResult leftSolved =
+        solveRollout(candidatePrefix + "-left-" + std::to_string(segmentIndex), leftRollout);
+    GlobalSolveResult rightSolved =
+        solveRollout(candidatePrefix + "-right-" + std::to_string(segmentIndex), rightRollout);
+
+    std::optional<GlobalSolveResult> existingSolved;
+    if (existingRollout.has_value()) {
+        existingSolved =
+            solveRollout(candidatePrefix + "-existing-" + std::to_string(segmentIndex),
+                         *existingRollout);
+    }
+
+    std::optional<SpanRolloutResult> continueLeftRollout;
+    std::optional<GlobalSolveResult> continueLeftSolved;
+    if (leftContinuationDirection.has_value() &&
+        length(normalizedOrZero(*leftContinuationDirection)) > kEpsilon) {
+        continueLeftRollout = directedSpanRolloutCandidate(leftPoint,
+                                                           rightPoint,
+                                                           *leftContinuationDirection,
+                                                           sampler,
+                                                           config);
+        continueLeftSolved =
+            solveRollout(candidatePrefix + "-continue-left-" + std::to_string(segmentIndex),
+                         *continueLeftRollout);
+    }
+
+    std::optional<SpanRolloutResult> continueRightRollout;
+    std::optional<GlobalSolveResult> continueRightSolved;
+    if (rightContinuationDirection.has_value() &&
+        length(normalizedOrZero(*rightContinuationDirection)) > kEpsilon) {
+        continueRightRollout = directedSpanRolloutCandidate(rightPoint,
+                                                            leftPoint,
+                                                            *rightContinuationDirection,
+                                                            sampler,
+                                                            config);
+        std::reverse(continueRightRollout->points.begin(), continueRightRollout->points.end());
+        if (!continueRightRollout->points.empty()) {
+            continueRightRollout->points.front() = leftPoint;
+            continueRightRollout->points.back() = rightPoint;
+        }
+        continueRightSolved =
+            solveRollout(candidatePrefix + "-continue-right-" + std::to_string(segmentIndex),
+                         *continueRightRollout);
+    }
+
+    const SpanDeviationMetrics leftMetrics =
+        spanDeviationMetrics(leftSolved.points, sampler, config);
+    const SpanDeviationMetrics rightMetrics =
+        spanDeviationMetrics(rightSolved.points, sampler, config);
+    std::optional<SpanDeviationMetrics> existingMetrics;
+    if (existingSolved.has_value()) {
+        existingMetrics = spanDeviationMetrics(existingSolved->points, sampler, config);
+    }
+    std::optional<SpanDeviationMetrics> continueLeftMetrics;
+    if (continueLeftSolved.has_value()) {
+        continueLeftMetrics = spanDeviationMetrics(continueLeftSolved->points, sampler, config);
+    }
+    std::optional<SpanDeviationMetrics> continueRightMetrics;
+    if (continueRightSolved.has_value()) {
+        continueRightMetrics = spanDeviationMetrics(continueRightSolved->points, sampler, config);
+    }
+
+    const auto normalizedReference =
+        [](const std::optional<cv::Vec3d>& direction) -> std::optional<cv::Vec3d> {
+        if (!direction.has_value()) {
+            return std::nullopt;
+        }
+        const cv::Vec3d normalized = normalizedOrZero(*direction);
+        if (length(normalized) <= kEpsilon) {
+            return std::nullopt;
+        }
+        return normalized;
+    };
+    const std::optional<cv::Vec3d> leftReferenceDirection =
+        normalizedReference(leftContinuationDirection);
+    const std::optional<cv::Vec3d> rightReferenceDirection =
+        normalizedReference(rightContinuationDirection);
+    const auto leftReferenceDot = [&](const GlobalSolveResult& candidate) {
+        return leftReferenceDirection.has_value()
+            ? endpointDirectionDot(candidate.points,
+                                   SpanCandidateAnchorSide::Left,
+                                   *leftReferenceDirection)
+            : std::numeric_limits<double>::quiet_NaN();
+    };
+    const auto rightReferenceDot = [&](const GlobalSolveResult& candidate) {
+        return rightReferenceDirection.has_value()
+            ? endpointDirectionDot(candidate.points,
+                                   SpanCandidateAnchorSide::Right,
+                                   *rightReferenceDirection)
+            : std::numeric_limits<double>::quiet_NaN();
+    };
+    const auto matchesReferenceDirections =
+        [](const GlobalSolveResult& candidate, double /*leftDot*/, double /*rightDot*/) {
+        if (!candidate.usable) {
+            return false;
+        }
+        return true;
+    };
+
+    const double leftCandidateLeftDot = leftReferenceDot(leftSolved);
+    const double leftCandidateRightDot = rightReferenceDot(leftSolved);
+    const double rightCandidateLeftDot = leftReferenceDot(rightSolved);
+    const double rightCandidateRightDot = rightReferenceDot(rightSolved);
+    const double existingCandidateLeftDot =
+        existingSolved.has_value()
+            ? leftReferenceDot(*existingSolved)
+            : std::numeric_limits<double>::quiet_NaN();
+    const double existingCandidateRightDot =
+        existingSolved.has_value()
+            ? rightReferenceDot(*existingSolved)
+            : std::numeric_limits<double>::quiet_NaN();
+    const double continueLeftCandidateLeftDot =
+        continueLeftSolved.has_value()
+            ? leftReferenceDot(*continueLeftSolved)
+            : std::numeric_limits<double>::quiet_NaN();
+    const double continueLeftCandidateRightDot =
+        continueLeftSolved.has_value()
+            ? rightReferenceDot(*continueLeftSolved)
+            : std::numeric_limits<double>::quiet_NaN();
+    const double continueRightCandidateLeftDot =
+        continueRightSolved.has_value()
+            ? leftReferenceDot(*continueRightSolved)
+            : std::numeric_limits<double>::quiet_NaN();
+    const double continueRightCandidateRightDot =
+        continueRightSolved.has_value()
+            ? rightReferenceDot(*continueRightSolved)
+            : std::numeric_limits<double>::quiet_NaN();
+
+    const bool leftSelectable =
+        matchesReferenceDirections(leftSolved, leftCandidateLeftDot, leftCandidateRightDot);
+    const bool rightSelectable =
+        matchesReferenceDirections(rightSolved, rightCandidateLeftDot, rightCandidateRightDot);
+    const bool existingSelectable =
+        existingSolved.has_value() &&
+        matchesReferenceDirections(*existingSolved,
+                                   existingCandidateLeftDot,
+                                   existingCandidateRightDot);
+    const bool continueLeftSelectable =
+        continueLeftSolved.has_value() &&
+        matchesReferenceDirections(*continueLeftSolved,
+                                   continueLeftCandidateLeftDot,
+                                   continueLeftCandidateRightDot);
+    const bool continueRightSelectable =
+        continueRightSolved.has_value() &&
+        matchesReferenceDirections(*continueRightSolved,
+                                   continueRightCandidateLeftDot,
+                                   continueRightCandidateRightDot);
+
+    const GlobalSolveResult* chosen = nullptr;
+    const char* chosenName = "";
+    double minFinalCost = std::numeric_limits<double>::infinity();
+    double maxFinalCost = -std::numeric_limits<double>::infinity();
+    double minFinalRms = std::numeric_limits<double>::infinity();
+    double maxFinalRms = -std::numeric_limits<double>::infinity();
+    double minAlignmentScore = std::numeric_limits<double>::infinity();
+    double maxAlignmentScore = -std::numeric_limits<double>::infinity();
+    double chosenAlignmentScore = std::numeric_limits<double>::infinity();
+    const auto includeCandidate = [&](const GlobalSolveResult& candidate,
+                                      const char* name,
+                                      const SpanDeviationMetrics& metrics,
+                                      bool selectable) {
+        if (!selectable) {
+            return;
+        }
+        const double score = alignmentChoiceScore(metrics);
+        minFinalCost = std::min(minFinalCost, candidate.finalCost);
+        maxFinalCost = std::max(maxFinalCost, candidate.finalCost);
+        minFinalRms = std::min(minFinalRms, candidate.finalRms);
+        maxFinalRms = std::max(maxFinalRms, candidate.finalRms);
+        minAlignmentScore = std::min(minAlignmentScore, score);
+        maxAlignmentScore = std::max(maxAlignmentScore, score);
+        if (chosen == nullptr || score < chosenAlignmentScore) {
+            chosen = &candidate;
+            chosenName = name;
+            chosenAlignmentScore = score;
+        }
+    };
+    includeCandidate(leftSolved, "left", leftMetrics, leftSelectable);
+    includeCandidate(rightSolved, "right", rightMetrics, rightSelectable);
+    if (existingSolved.has_value() && existingMetrics.has_value()) {
+        includeCandidate(*existingSolved,
+                         "existing",
+                         *existingMetrics,
+                         existingSelectable);
+    }
+    if (continueLeftSolved.has_value() && continueLeftMetrics.has_value()) {
+        includeCandidate(*continueLeftSolved,
+                         "continue-left",
+                         *continueLeftMetrics,
+                         continueLeftSelectable);
+    }
+    if (continueRightSolved.has_value() && continueRightMetrics.has_value()) {
+        includeCandidate(*continueRightSolved,
+                         "continue-right",
+                         *continueRightMetrics,
+                         continueRightSelectable);
+    }
+
+    const bool spanFailed = chosen == nullptr;
+    std::string failureReason;
+    if (spanFailed) {
+        const auto appendCandidateDots =
+            [&](std::ostringstream& error,
+                const char* name,
+                double leftDot,
+                double rightDot) {
+            error << ' ' << name << '=';
+            if (leftReferenceDirection.has_value() && rightReferenceDirection.has_value()) {
+                error << "(left_ref=" << leftDot << ",right_ref=" << rightDot << ')';
+            } else if (leftReferenceDirection.has_value()) {
+                error << leftDot;
+            } else if (rightReferenceDirection.has_value()) {
+                error << rightDot;
+            } else {
+                error << "no_reference";
+            }
+        };
+        std::ostringstream error;
+        error.imbue(std::locale::classic());
+        error << std::scientific << std::setprecision(3)
+              << "No reinitialization rollout candidate for span " << segmentIndex
+              << " is usable"
+              << " dots:";
+        appendCandidateDots(error, "left", leftCandidateLeftDot, leftCandidateRightDot);
+        appendCandidateDots(error, "right", rightCandidateLeftDot, rightCandidateRightDot);
+        if (existingSolved.has_value()) {
+            appendCandidateDots(error,
+                                "existing",
+                                existingCandidateLeftDot,
+                                existingCandidateRightDot);
+        }
+        if (continueLeftSolved.has_value()) {
+            appendCandidateDots(error,
+                                "continue-left",
+                                continueLeftCandidateLeftDot,
+                                continueLeftCandidateRightDot);
+        }
+        if (continueRightSolved.has_value()) {
+            appendCandidateDots(error,
+                                "continue-right",
+                                continueRightCandidateLeftDot,
+                                continueRightCandidateRightDot);
+        }
+        failureReason = error.str();
+    }
 
     OptimizedControlSpan result;
-    result.points = chosen.points;
-    result.candidateFinalCostDiff = std::abs(leftSolved.finalCost - rightSolved.finalCost);
+    result.failed = spanFailed;
+    result.failureReason = failureReason;
+    if (!spanFailed) {
+        result.points = chosen->points;
+    }
+    result.candidateFinalCostDiff =
+        (std::isfinite(maxFinalCost) && std::isfinite(minFinalCost))
+            ? maxFinalCost - minFinalCost
+            : 0.0;
+    result.candidateFinalRmsDiff =
+        (std::isfinite(maxFinalRms) && std::isfinite(minFinalRms))
+            ? maxFinalRms - minFinalRms
+            : 0.0;
+    result.candidateAlignmentScoreDiff =
+        (std::isfinite(maxAlignmentScore) && std::isfinite(minAlignmentScore))
+            ? maxAlignmentScore - minAlignmentScore
+            : 0.0;
     result.report.segmentIndex = segmentIndex;
     result.report.leftControlIndex = leftControlIndex;
     result.report.rightControlIndex = rightControlIndex;
-    result.report.points = static_cast<int>(chosen.points.size());
+    result.report.points = spanFailed ? 0 : static_cast<int>(chosen->points.size());
     result.report.candLeftRolloutSteps = leftRollout.rolloutSteps;
     result.report.candLeftTruncatedPoints = leftRollout.truncatedPoints;
     result.report.candRightRolloutSteps = rightRollout.rolloutSteps;
     result.report.candRightTruncatedPoints = rightRollout.truncatedPoints;
+    if (continueLeftRollout.has_value()) {
+        result.continuationCandidateLines.push_back({
+            candidatePrefix + "-continue-left-" + std::to_string(segmentIndex),
+            continueLeftRollout->points,
+        });
+        result.report.candContinueLeftRolloutSteps = continueLeftRollout->rolloutSteps;
+        result.report.candContinueLeftTruncatedPoints = continueLeftRollout->truncatedPoints;
+        result.report.candContinueLeftClosestTargetDistance =
+            continueLeftRollout->closestTargetDistance;
+    }
+    if (continueRightRollout.has_value()) {
+        result.continuationCandidateLines.push_back({
+            candidatePrefix + "-continue-right-" + std::to_string(segmentIndex),
+            continueRightRollout->points,
+        });
+        result.report.candContinueRightRolloutSteps = continueRightRollout->rolloutSteps;
+        result.report.candContinueRightTruncatedPoints = continueRightRollout->truncatedPoints;
+        result.report.candContinueRightClosestTargetDistance =
+            continueRightRollout->closestTargetDistance;
+    }
+    if (spanFailed) {
+        const auto solvedPolyline = [](const GlobalSolveResult& solved) {
+            std::vector<cv::Vec3d> line;
+            line.reserve(solved.points.size());
+            for (const auto& point : solved.points) {
+                line.push_back(toVec3d(point));
+            }
+            return line;
+        };
+        result.continuationCandidateLines.push_back({
+            candidatePrefix + "-failed-left-" + std::to_string(segmentIndex),
+            solvedPolyline(leftSolved),
+        });
+        result.continuationCandidateLines.push_back({
+            candidatePrefix + "-failed-right-" + std::to_string(segmentIndex),
+            solvedPolyline(rightSolved),
+        });
+        if (existingSolved.has_value()) {
+            result.continuationCandidateLines.push_back({
+                candidatePrefix + "-failed-existing-" + std::to_string(segmentIndex),
+                solvedPolyline(*existingSolved),
+            });
+        }
+        if (continueLeftSolved.has_value()) {
+            result.continuationCandidateLines.push_back({
+                candidatePrefix + "-failed-continue-left-" + std::to_string(segmentIndex),
+                solvedPolyline(*continueLeftSolved),
+            });
+        }
+        if (continueRightSolved.has_value()) {
+            result.continuationCandidateLines.push_back({
+                candidatePrefix + "-failed-continue-right-" + std::to_string(segmentIndex),
+                solvedPolyline(*continueRightSolved),
+            });
+        }
+    }
     result.report.candLeftSelectedSign = leftRollout.selectedSign;
     result.report.candRightSelectedSign = rightRollout.selectedSign;
     result.report.candLeftClosestTargetDistance = leftRollout.closestTargetDistance;
@@ -2611,12 +3110,87 @@ struct LineDifference {
     result.report.candLeftFinalCost = leftSolved.finalCost;
     result.report.candRightInitialCost = rightSolved.initialCost;
     result.report.candRightFinalCost = rightSolved.finalCost;
-    const SpanDeviationMetrics deviations = spanDeviationMetrics(chosen.points, sampler, config);
-    result.report.chosenMaxEvenStepDeviation = deviations.maxEvenStepDeviation;
-    result.report.chosenMaxTangentSmoothDeviation = deviations.maxTangentSmoothDeviation;
-    result.report.chosenMaxNormalSmoothDeviation = deviations.maxNormalSmoothDeviation;
-    result.report.chosenMaxNormalAlignmentAbs = deviations.maxNormalAlignmentAbs;
-    result.report.chosen = chooseLeft ? "left" : "right";
+    if (continueLeftSolved.has_value()) {
+        result.report.candContinueLeftInitialCost = continueLeftSolved->initialCost;
+        result.report.candContinueLeftFinalCost = continueLeftSolved->finalCost;
+    }
+    if (continueRightSolved.has_value()) {
+        result.report.candContinueRightInitialCost = continueRightSolved->initialCost;
+        result.report.candContinueRightFinalCost = continueRightSolved->finalCost;
+    }
+    result.report.candidates.reserve(2 +
+                                     (existingSolved.has_value() ? 1 : 0) +
+                                     (continueLeftSolved.has_value() ? 1 : 0) +
+                                     (continueRightSolved.has_value() ? 1 : 0));
+    const auto addCandidateReport = [&](const char* name,
+                                        const SpanRolloutResult& rollout,
+                                        const GlobalSolveResult& solved,
+                                        const SpanDeviationMetrics& deviations,
+                                        bool selectable) {
+        LineReinitializationCandidateReport candidate;
+        const double alignmentScore = alignmentChoiceScore(deviations);
+        candidate.name = name;
+        candidate.rolloutSteps = rollout.rolloutSteps;
+        candidate.truncatedPoints = rollout.truncatedPoints;
+        candidate.selectedSign = rollout.selectedSign;
+        candidate.points = static_cast<int>(solved.points.size());
+        candidate.residuals = solved.residuals;
+        candidate.iterations = solved.iterations;
+        candidate.usable = selectable;
+        candidate.chosen = candidate.name == chosenName;
+        candidate.closestTargetDistance = rollout.closestTargetDistance;
+        candidate.initialCost = solved.initialCost;
+        candidate.finalCost = solved.finalCost;
+        candidate.initialRms = solved.initialRms;
+        candidate.finalRms = solved.finalRms;
+        candidate.finalRmsDelta = std::max(0.0, solved.finalRms - minFinalRms);
+        candidate.finalCostDelta = std::max(0.0, solved.finalCost - minFinalCost);
+        candidate.avgNormalAlignmentAbs = deviations.avgNormalAlignmentAbs;
+        candidate.p95NormalAlignmentAbs = deviations.p95NormalAlignmentAbs;
+        candidate.maxNormalAlignmentAbs = deviations.maxNormalAlignmentAbs;
+        candidate.alignmentChoiceScore = alignmentScore;
+        candidate.alignmentChoiceScoreDelta =
+            (std::isfinite(alignmentScore) && std::isfinite(minAlignmentScore))
+                ? std::max(0.0, alignmentScore - minAlignmentScore)
+                : 0.0;
+        result.report.candidates.push_back(std::move(candidate));
+    };
+    addCandidateReport("left", leftRollout, leftSolved, leftMetrics, leftSelectable);
+    addCandidateReport("right", rightRollout, rightSolved, rightMetrics, rightSelectable);
+    if (existingRollout.has_value() && existingSolved.has_value() &&
+        existingMetrics.has_value()) {
+        addCandidateReport("existing",
+                           *existingRollout,
+                           *existingSolved,
+                           *existingMetrics,
+                           existingSelectable);
+    }
+    if (continueLeftRollout.has_value() && continueLeftSolved.has_value() &&
+        continueLeftMetrics.has_value()) {
+        addCandidateReport("continue-left",
+                           *continueLeftRollout,
+                           *continueLeftSolved,
+                           *continueLeftMetrics,
+                           continueLeftSelectable);
+    }
+    if (continueRightRollout.has_value() && continueRightSolved.has_value() &&
+        continueRightMetrics.has_value()) {
+        addCandidateReport("continue-right",
+                           *continueRightRollout,
+                           *continueRightSolved,
+                           *continueRightMetrics,
+                           continueRightSelectable);
+    }
+    if (!spanFailed) {
+        const SpanDeviationMetrics deviations = spanDeviationMetrics(chosen->points, sampler, config);
+        result.report.chosenMaxEvenStepDeviation = deviations.maxEvenStepDeviation;
+        result.report.chosenMaxTangentSmoothDeviation = deviations.maxTangentSmoothDeviation;
+        result.report.chosenMaxNormalSmoothDeviation = deviations.maxNormalSmoothDeviation;
+        result.report.chosenMaxNormalAlignmentAbs = deviations.maxNormalAlignmentAbs;
+        result.report.chosen = chosenName;
+    } else {
+        result.report.chosen = "failed";
+    }
     return result;
 }
 
@@ -3185,6 +3759,10 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
                                                    true);
         result.report.initialCost = totalWeightedCost(result.report.finalLosses);
         result.report.finalCost = result.report.initialCost;
+        result.report.residuals = totalResidualCount(result.report.finalLosses);
+        result.report.initialRms = ceresResidualRms(result.report.initialCost,
+                                                   result.report.residuals);
+        result.report.finalRms = result.report.initialRms;
         result.report.iterations = 0;
         result.report.validNormalSamples = finalValidSamples;
         result.report.invalidNormalSamples = finalInvalidSamples;
@@ -3200,12 +3778,12 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
         message.imbue(std::locale::classic());
         message << std::scientific << std::setprecision(3)
                 << "Line annotation Lasagna selected candidate:\n"
-                << "candidate                   ms  iters    init_cost   final_cost\n"
+                << "candidate                   ms  iters     init_rms    final_rms\n"
                 << std::left << std::setw(24) << "normal-construct-init"
                 << std::right << std::setw(10) << elapsedMs(directNormalStart, Clock::now())
                 << std::setw(7) << 0
-                << std::setw(13) << result.report.initialCost
-                << std::setw(13) << result.report.finalCost
+                << std::setw(13) << result.report.initialRms
+                << std::setw(13) << result.report.finalRms
                 << "\n\nGlobal optimization disabled; returning normal-transport initialization.";
         result.report.message = message.str();
         return result;
@@ -3237,6 +3815,9 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
                                  seedIndex);
     result.report.initialCost = selected.initialCost;
     result.report.finalCost = selected.finalCost;
+    result.report.initialRms = selected.initialRms;
+    result.report.finalRms = selected.finalRms;
+    result.report.residuals = selected.residuals;
     result.report.iterations = selected.iterations;
     result.report.validNormalSamples = finalValidSamples;
     result.report.invalidNormalSamples = finalInvalidSamples;
@@ -3252,12 +3833,12 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     message.imbue(std::locale::classic());
     message << std::scientific << std::setprecision(3)
             << "Line annotation Lasagna selected candidate:\n"
-            << "candidate                   ms  iters    init_cost   final_cost\n"
+            << "candidate                   ms  iters     init_rms    final_rms\n"
             << std::left << std::setw(24) << selected.name
             << std::right << std::setw(10) << selected.milliseconds
             << std::setw(7) << selected.iterations
-            << std::setw(13) << selected.initialCost
-            << std::setw(13) << selected.finalCost
+            << std::setw(13) << selected.initialRms
+            << std::setw(13) << selected.finalRms
             << "\n\nNormal prefetch/materialization:\n"
             << "calls=" << selected.prefetchTiming.calls
             << " ceres_solve_ms=" << selected.ceresSolveMs
@@ -3416,6 +3997,9 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
                                  displayFrameAnchorIndex);
     result.report.initialCost = selected.initialCost;
     result.report.finalCost = selected.finalCost;
+    result.report.initialRms = selected.initialRms;
+    result.report.finalRms = selected.finalRms;
+    result.report.residuals = selected.residuals;
     result.report.iterations = selected.iterations;
     result.report.validNormalSamples = finalValidSamples;
     result.report.invalidNormalSamples = finalInvalidSamples;
@@ -3439,12 +4023,12 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     message.imbue(std::locale::classic());
     message << std::scientific << std::setprecision(3)
             << "Line annotation Lasagna selected candidate:\n"
-            << "candidate                   ms  iters    init_cost   final_cost\n"
+            << "candidate                   ms  iters     init_rms    final_rms\n"
             << std::left << std::setw(24) << selected.name
             << std::right << std::setw(10) << selected.milliseconds
             << std::setw(7) << selected.iterations
-            << std::setw(13) << selected.initialCost
-            << std::setw(13) << selected.finalCost
+            << std::setw(13) << selected.initialRms
+            << std::setw(13) << selected.finalRms
             << "\n\nExisting-line optimization:\n"
             << "active_points=[" << activeStart << ", " << activeEnd << "]"
             << " total_points=" << selected.points.size()
@@ -3545,15 +4129,182 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
         originalControlIndices.push_back(tagged.second);
     }
 
-    std::vector<std::vector<std::array<double, 3>>> optimizedSpans;
-    optimizedSpans.reserve(controlPoints.size() - 1);
-    std::vector<LineReinitializationSpanReport> spanReports;
-    spanReports.reserve(controlPoints.size() - 1);
+    std::vector<std::vector<std::array<double, 3>>> optimizedSpans(controlPoints.size() - 1);
+    std::vector<LineReinitializationSpanReport> spanReports(controlPoints.size() - 1);
+    std::vector<LineDebugPolyline> continuationCandidateLines;
     double maxCandidateFinalDiff = 0.0;
+    double maxCandidateFinalRmsDiff = 0.0;
+    double maxCandidateAlignmentScoreDiff = 0.0;
 
-    for (size_t controlIndex = 0; controlIndex + 1 < controlPoints.size(); ++controlIndex) {
+    int seedControlIndex = -1;
+    for (size_t controlIndex = 0; controlIndex < controlPoints.size(); ++controlIndex) {
+        if (controlPoints[controlIndex].isSeed) {
+            seedControlIndex = static_cast<int>(controlIndex);
+            break;
+        }
+    }
+    int initialSeedSpanIndex = -1;
+
+    const auto directionFromLeftSpan = [](const std::vector<std::array<double, 3>>& span)
+        -> std::optional<cv::Vec3d> {
+        if (span.size() < 2) {
+            return std::nullopt;
+        }
+        return toVec3d(span.back()) - toVec3d(span[span.size() - 2]);
+    };
+    const auto directionFromRightSpan = [](const std::vector<std::array<double, 3>>& span)
+        -> std::optional<cv::Vec3d> {
+        if (span.size() < 2) {
+            return std::nullopt;
+        }
+        return toVec3d(span.front()) - toVec3d(span[1]);
+    };
+    const auto originalDirectionFromLeftSide =
+        [&](const LineControlPoint& control) -> std::optional<cv::Vec3d> {
+        if (linePoints.empty()) {
+            return std::nullopt;
+        }
+        const int index = std::clamp(control.optimizedIndex, 0, inputMaxIndex);
+        for (int other = index - 1; other >= 0; --other) {
+            const cv::Vec3d direction =
+                linePoints[static_cast<size_t>(index)] -
+                linePoints[static_cast<size_t>(other)];
+            if (length(direction) > kEpsilon) {
+                return direction;
+            }
+        }
+        for (int other = index + 1; other <= inputMaxIndex; ++other) {
+            const cv::Vec3d direction =
+                linePoints[static_cast<size_t>(other)] -
+                linePoints[static_cast<size_t>(index)];
+            if (length(direction) > kEpsilon) {
+                return direction;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto originalDirectionFromRightSide =
+        [&](const LineControlPoint& control) -> std::optional<cv::Vec3d> {
+        if (linePoints.empty()) {
+            return std::nullopt;
+        }
+        const int index = std::clamp(control.optimizedIndex, 0, inputMaxIndex);
+        for (int other = index + 1; other <= inputMaxIndex; ++other) {
+            const cv::Vec3d direction =
+                linePoints[static_cast<size_t>(index)] -
+                linePoints[static_cast<size_t>(other)];
+            if (length(direction) > kEpsilon) {
+                return direction;
+            }
+        }
+        for (int other = index - 1; other >= 0; --other) {
+            const cv::Vec3d direction =
+                linePoints[static_cast<size_t>(other)] -
+                linePoints[static_cast<size_t>(index)];
+            if (length(direction) > kEpsilon) {
+                return direction;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto buildPartialFailureResult =
+        [&](size_t failedSpanIndex, const OptimizedControlSpan& failedSpan) {
+            std::vector<bool> includeControl(controlPoints.size(), false);
+            for (size_t spanIndex = 0; spanIndex < optimizedSpans.size(); ++spanIndex) {
+                if (optimizedSpans[spanIndex].size() >= 2) {
+                    includeControl[spanIndex] = true;
+                    includeControl[spanIndex + 1] = true;
+                }
+            }
+            includeControl[failedSpanIndex] = true;
+            includeControl[failedSpanIndex + 1] = true;
+
+            std::vector<cv::Vec3d> debugControlPoints;
+            debugControlPoints.reserve(controlPoints.size());
+            for (size_t controlIndex = 0; controlIndex < controlPoints.size(); ++controlIndex) {
+                if (includeControl[controlIndex]) {
+                    debugControlPoints.push_back(controlPoints[controlIndex].volumePoint);
+                }
+            }
+
+            std::vector<cv::Vec3d> partialPoints;
+            std::vector<int> partialFixedPointIndices;
+            int previousSpanIndex = -1;
+            for (size_t spanIndex = 0; spanIndex < optimizedSpans.size(); ++spanIndex) {
+                const auto& span = optimizedSpans[spanIndex];
+                if (span.size() < 2) {
+                    continue;
+                }
+                const bool contiguous = previousSpanIndex >= 0 &&
+                                        static_cast<size_t>(previousSpanIndex + 1) == spanIndex;
+                if (partialPoints.empty()) {
+                    partialFixedPointIndices.push_back(0);
+                    for (const auto& point : span) {
+                        partialPoints.push_back(toVec3d(point));
+                    }
+                } else if (contiguous) {
+                    for (size_t pointIndex = 1; pointIndex < span.size(); ++pointIndex) {
+                        partialPoints.push_back(toVec3d(span[pointIndex]));
+                    }
+                } else {
+                    for (const auto& point : span) {
+                        partialPoints.push_back(toVec3d(point));
+                    }
+                }
+                partialFixedPointIndices.push_back(static_cast<int>(partialPoints.size()) - 1);
+                previousSpanIndex = static_cast<int>(spanIndex);
+            }
+            if (partialPoints.size() < 2) {
+                partialPoints = {
+                    controlPoints[failedSpanIndex].volumePoint,
+                    controlPoints[failedSpanIndex + 1].volumePoint,
+                };
+                partialFixedPointIndices = {0, 1};
+            }
+
+            std::vector<LineReinitializationSpanReport> partialReports;
+            partialReports.reserve(spanReports.size());
+            for (size_t spanIndex = 0; spanIndex < spanReports.size(); ++spanIndex) {
+                if (optimizedSpans[spanIndex].size() >= 2 || spanIndex == failedSpanIndex) {
+                    partialReports.push_back(spanReports[spanIndex]);
+                }
+            }
+
+            LineReinitializationOptimizationResult partial;
+            partial.failed = true;
+            partial.failedSegmentIndex = static_cast<int>(failedSpanIndex);
+            partial.initialSeedSpanIndex = initialSeedSpanIndex;
+            partial.failureReason = failedSpan.failureReason;
+            partial.spans = std::move(partialReports);
+            partial.maxSegmentCandidateFinalCostDiff = maxCandidateFinalDiff;
+            partial.maxSegmentCandidateFinalRmsDiff = maxCandidateFinalRmsDiff;
+            partial.maxSegmentCandidateAlignmentScoreDiff = maxCandidateAlignmentScoreDiff;
+            partial.fixedPointIndices = std::move(partialFixedPointIndices);
+            partial.debugControlPoints = std::move(debugControlPoints);
+            partial.continuationCandidateLines = continuationCandidateLines;
+            partial.optimization.line =
+                buildLineModel(toArrayPoints(partialPoints),
+                               normalSampler_,
+                               {},
+                               partial.fixedPointIndices.empty()
+                                   ? 0
+                                   : partial.fixedPointIndices[partial.fixedPointIndices.size() / 2]);
+            partial.optimization.report.converged = false;
+            partial.optimization.report.message = failedSpan.failureReason;
+            return partial;
+        };
+    const auto solveSpan = [&](size_t controlIndex,
+                               std::optional<cv::Vec3d> leftContinuationDirection,
+                               std::optional<cv::Vec3d> rightContinuationDirection) {
         const LineControlPoint& left = controlPoints[controlIndex];
         const LineControlPoint& right = controlPoints[controlIndex + 1];
+        const SpanRolloutResult existingRollout =
+            existingSpanCandidate(linePoints,
+                                  left.optimizedIndex,
+                                  right.optimizedIndex,
+                                  left.volumePoint,
+                                  right.volumePoint,
+                                  config);
         OptimizedControlSpan span =
             optimizedControlSpan(left.volumePoint,
                                  right.volumePoint,
@@ -3562,11 +4313,141 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                                  static_cast<int>(controlIndex),
                                  originalControlIndices[controlIndex],
                                  originalControlIndices[controlIndex + 1],
-                                 "reinit-span");
+                                 "reinit-span",
+                                 existingRollout,
+                                 leftContinuationDirection,
+                                 rightContinuationDirection);
+        return span;
+    };
+    const auto recordSpanCandidateRange = [&](const OptimizedControlSpan& span) {
         maxCandidateFinalDiff = std::max(maxCandidateFinalDiff,
                                          span.candidateFinalCostDiff);
-        spanReports.push_back(span.report);
-        optimizedSpans.push_back(std::move(span.points));
+        maxCandidateFinalRmsDiff = std::max(maxCandidateFinalRmsDiff,
+                                            span.candidateFinalRmsDiff);
+        maxCandidateAlignmentScoreDiff = std::max(maxCandidateAlignmentScoreDiff,
+                                                  span.candidateAlignmentScoreDiff);
+    };
+    const auto appendSpanDebugLines = [&](OptimizedControlSpan& span) {
+        for (auto& candidateLine : span.continuationCandidateLines) {
+            continuationCandidateLines.push_back(std::move(candidateLine));
+        }
+    };
+    const auto acceptSpan = [&](size_t controlIndex, OptimizedControlSpan span)
+        -> std::optional<LineReinitializationOptimizationResult> {
+        recordSpanCandidateRange(span);
+        spanReports[controlIndex] = span.report;
+        appendSpanDebugLines(span);
+        if (span.failed) {
+            return buildPartialFailureResult(controlIndex, span);
+        }
+        optimizedSpans[controlIndex] = std::move(span.points);
+        return std::nullopt;
+    };
+
+    if (seedControlIndex >= 0) {
+        if (seedControlIndex + 1 < static_cast<int>(controlPoints.size())) {
+            initialSeedSpanIndex = seedControlIndex;
+            OptimizedControlSpan span =
+                solveSpan(static_cast<size_t>(initialSeedSpanIndex),
+                          originalDirectionFromLeftSide(controlPoints[static_cast<size_t>(seedControlIndex)]),
+                          std::nullopt);
+            if (auto failure = acceptSpan(static_cast<size_t>(initialSeedSpanIndex),
+                                          std::move(span))) {
+                return *failure;
+            }
+        } else {
+            initialSeedSpanIndex = seedControlIndex - 1;
+            OptimizedControlSpan span =
+                solveSpan(static_cast<size_t>(initialSeedSpanIndex),
+                          std::nullopt,
+                          originalDirectionFromRightSide(controlPoints[static_cast<size_t>(seedControlIndex)]));
+            if (auto failure = acceptSpan(static_cast<size_t>(initialSeedSpanIndex),
+                                          std::move(span))) {
+                return *failure;
+            }
+        }
+    } else {
+        std::optional<OptimizedControlSpan> bestSeedAttempt;
+        size_t bestSeedAttemptIndex = 0;
+        double bestSeedAttemptAlignment = std::numeric_limits<double>::infinity();
+        for (size_t spanIndex = 0; spanIndex < optimizedSpans.size(); ++spanIndex) {
+            OptimizedControlSpan span =
+                solveSpan(spanIndex,
+                          originalDirectionFromLeftSide(controlPoints[spanIndex]),
+                          originalDirectionFromRightSide(controlPoints[spanIndex + 1]));
+            if (!span.failed &&
+                span.report.chosenMaxNormalAlignmentAbs <= kReinitSeedMaxNormalAlignmentAbs) {
+                initialSeedSpanIndex = static_cast<int>(spanIndex);
+                if (auto failure = acceptSpan(spanIndex, std::move(span))) {
+                    return *failure;
+                }
+                break;
+            }
+
+            const double alignment = span.failed
+                ? std::numeric_limits<double>::infinity()
+                : span.report.chosenMaxNormalAlignmentAbs;
+            if (!bestSeedAttempt.has_value() ||
+                alignment < bestSeedAttemptAlignment) {
+                bestSeedAttemptIndex = spanIndex;
+                bestSeedAttemptAlignment = alignment;
+                bestSeedAttempt = std::move(span);
+            }
+        }
+
+        if (initialSeedSpanIndex < 0) {
+            OptimizedControlSpan failedSeedSpan =
+                bestSeedAttempt.has_value()
+                    ? std::move(*bestSeedAttempt)
+                    : solveSpan(0,
+                                originalDirectionFromLeftSide(controlPoints.front()),
+                                originalDirectionFromRightSide(controlPoints[1]));
+            std::ostringstream error;
+            error.imbue(std::locale::classic());
+            error << std::scientific << std::setprecision(3)
+                  << "No reinitialization seed span has max normal-alignment angle error below 10 degrees"
+                  << " threshold_abs_dot=" << kReinitSeedMaxNormalAlignmentAbs;
+            if (std::isfinite(bestSeedAttemptAlignment)) {
+                error << " best_span=" << bestSeedAttemptIndex
+                      << " best_abs_dot=" << bestSeedAttemptAlignment;
+            } else {
+                error << " best_span=" << bestSeedAttemptIndex
+                      << " best_abs_dot=unavailable";
+            }
+            failedSeedSpan.failed = true;
+            failedSeedSpan.failureReason = error.str();
+            recordSpanCandidateRange(failedSeedSpan);
+            spanReports[bestSeedAttemptIndex] = failedSeedSpan.report;
+            appendSpanDebugLines(failedSeedSpan);
+            return buildPartialFailureResult(bestSeedAttemptIndex, failedSeedSpan);
+        }
+    }
+
+    for (size_t spanIndex = static_cast<size_t>(initialSeedSpanIndex) + 1;
+         spanIndex < optimizedSpans.size();
+         ++spanIndex) {
+        std::optional<cv::Vec3d> leftContinuationDirection =
+            directionFromLeftSpan(optimizedSpans[spanIndex - 1]);
+        OptimizedControlSpan span =
+            solveSpan(spanIndex, leftContinuationDirection, std::nullopt);
+        if (auto failure = acceptSpan(spanIndex, std::move(span))) {
+            return *failure;
+        }
+    }
+
+    for (size_t controlIndex = static_cast<size_t>(initialSeedSpanIndex);
+         controlIndex > 0;
+         --controlIndex) {
+        const size_t spanIndex = controlIndex - 1;
+        std::optional<cv::Vec3d> rightContinuationDirection;
+        if (spanIndex + 1 < optimizedSpans.size()) {
+            rightContinuationDirection = directionFromRightSpan(optimizedSpans[spanIndex + 1]);
+        }
+        OptimizedControlSpan span =
+            solveSpan(spanIndex, std::nullopt, rightContinuationDirection);
+        if (auto failure = acceptSpan(spanIndex, std::move(span))) {
+            return *failure;
+        }
     }
 
     std::vector<cv::Vec3d> stitchedInternal;
@@ -3690,10 +4571,14 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
             << std::setw(8) << "lnear"
             << std::setw(5) << "rsgn"
             << std::setw(8) << "rnear"
-            << std::setw(8) << "linit"
-            << std::setw(8) << "lfinal"
-            << std::setw(8) << "rinit"
-            << std::setw(8) << "rfinal"
+            << std::setw(8) << "clnear"
+            << std::setw(8) << "crnear"
+            << std::setw(9) << "lirms"
+            << std::setw(9) << "lfrms"
+            << std::setw(9) << "rirms"
+            << std::setw(9) << "rfrms"
+            << std::setw(9) << "clfrms"
+            << std::setw(9) << "crfrms"
             << std::setw(8) << "mxstep"
             << std::setw(8) << "mxtan"
             << std::setw(8) << "mxnorm"
@@ -3708,25 +4593,34 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                 << std::setw(8) << report.candLeftClosestTargetDistance
                 << std::setw(5) << report.candRightSelectedSign
                 << std::setw(8) << report.candRightClosestTargetDistance
-                << std::setw(8) << report.candLeftInitialCost
-                << std::setw(8) << report.candLeftFinalCost
-                << std::setw(8) << report.candRightInitialCost
-                << std::setw(8) << report.candRightFinalCost
+                << std::setw(8) << report.candContinueLeftClosestTargetDistance
+                << std::setw(8) << report.candContinueRightClosestTargetDistance
+                << std::setw(9) << initialRmsForCandidate(report, "left")
+                << std::setw(9) << finalRmsForCandidate(report, "left")
+                << std::setw(9) << initialRmsForCandidate(report, "right")
+                << std::setw(9) << finalRmsForCandidate(report, "right")
+                << std::setw(9) << finalRmsForCandidate(report, "continue-left")
+                << std::setw(9) << finalRmsForCandidate(report, "continue-right")
                 << std::setw(8) << report.chosenMaxEvenStepDeviation
                 << std::setw(8) << report.chosenMaxTangentSmoothDeviation
                 << std::setw(8) << report.chosenMaxNormalSmoothDeviation
                 << std::setw(8) << report.chosenMaxNormalAlignmentAbs
                 << ' ' << report.chosen << '\n';
     }
-    message << "max_segment_candidate_final_cost_diff=" << maxCandidateFinalDiff << "\n\n"
+    message << "max_segment_candidate_alignment_score_diff="
+            << maxCandidateAlignmentScoreDiff << "\n\n"
             << finalOptimization.report.message;
     finalOptimization.report.message = message.str();
 
     LineReinitializationOptimizationResult result;
     result.optimization = std::move(finalOptimization);
     result.spans = std::move(spanReports);
+    result.initialSeedSpanIndex = initialSeedSpanIndex;
     result.maxSegmentCandidateFinalCostDiff = maxCandidateFinalDiff;
+    result.maxSegmentCandidateFinalRmsDiff = maxCandidateFinalRmsDiff;
+    result.maxSegmentCandidateAlignmentScoreDiff = maxCandidateAlignmentScoreDiff;
     result.fixedPointIndices = std::move(stitchedControlIndices);
+    result.continuationCandidateLines = std::move(continuationCandidateLines);
     return result;
 }
 
@@ -3854,6 +4748,9 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
                                  displayFrameAnchorIndex);
     result.report.initialCost = selected.initialCost;
     result.report.finalCost = selected.finalCost;
+    result.report.initialRms = selected.initialRms;
+    result.report.finalRms = selected.finalRms;
+    result.report.residuals = selected.residuals;
     result.report.iterations = selected.iterations;
     result.report.validNormalSamples = finalValidSamples;
     result.report.invalidNormalSamples = finalInvalidSamples;
@@ -3870,12 +4767,12 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
     message.imbue(std::locale::classic());
     message << std::scientific << std::setprecision(3)
             << "Line annotation Lasagna selected candidate:\n"
-            << "candidate                   ms  iters    init_cost   final_cost\n"
+            << "candidate                   ms  iters     init_rms    final_rms\n"
             << std::left << std::setw(24) << selected.name
             << std::right << std::setw(10) << selected.milliseconds
             << std::setw(7) << selected.iterations
-            << std::setw(13) << selected.initialCost
-            << std::setw(13) << selected.finalCost
+            << std::setw(13) << selected.initialRms
+            << std::setw(13) << selected.finalRms
             << "\n\nFixed control point indices:";
     for (const int index : fixedPointIndices) {
         message << ' ' << index;
