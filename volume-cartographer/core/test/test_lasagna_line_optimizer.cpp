@@ -57,6 +57,25 @@ public:
     mutable std::vector<cv::Vec3d> sampledPoints;
 };
 
+class StepXThenZNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    explicit StepXThenZNormalSampler(double xThreshold)
+        : xThreshold_(xThreshold)
+    {
+    }
+
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override
+    {
+        if (volumePoint[0] < xThreshold_) {
+            return {{1.0, 0.0, 0.0}, true, {}};
+        }
+        return {{0.0, 0.0, 1.0}, true, {}};
+    }
+
+private:
+    double xThreshold_ = 0.0;
+};
+
 class BatchOnlyZNormalSampler final : public vc::lasagna::NormalSampler {
 public:
     vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& /*volumePoint*/) const override
@@ -680,6 +699,7 @@ TEST_CASE("LineOptimizer reinit reopt reports rollout candidates and preserves f
                                                                       config);
 
     REQUIRE(result.spans.size() == 2);
+    CHECK(result.initialSeedSpanIndex == 1);
     CHECK(result.spans[0].candLeftRolloutSteps == 10);
     CHECK(result.spans[0].candRightRolloutSteps == 10);
     CHECK(result.spans[0].candLeftTruncatedPoints == 3);
@@ -695,6 +715,11 @@ TEST_CASE("LineOptimizer reinit reopt reports rollout candidates and preserves f
     REQUIRE(result.spans[0].candidates.size() >= 2);
     CHECK(result.spans[0].candidates[0].name == "left");
     CHECK(result.spans[0].candidates[1].name == "right");
+    CHECK(std::any_of(result.spans[0].candidates.begin(),
+                      result.spans[0].candidates.end(),
+                      [](const auto& candidate) {
+                          return candidate.name == "existing";
+                      }));
     int chosenCandidateCount = 0;
     double bestAlignmentScore = std::numeric_limits<double>::infinity();
     double chosenAlignmentScore = std::numeric_limits<double>::infinity();
@@ -790,22 +815,29 @@ TEST_CASE("LineOptimizer reinitialization adds continuation candidates on both s
                                                                       config);
 
     REQUIRE(result.spans.size() == 3);
+    CHECK(result.initialSeedSpanIndex == 1);
     CHECK(result.spans[0].candContinueLeftRolloutSteps == 0);
     CHECK(result.spans[0].candContinueRightRolloutSteps > 0);
-    CHECK(result.spans[1].candContinueLeftRolloutSteps == 0);
+    CHECK(result.spans[1].candContinueLeftRolloutSteps > 0);
     CHECK(result.spans[1].candContinueRightRolloutSteps == 0);
     CHECK(result.spans[2].candContinueLeftRolloutSteps > 0);
     CHECK(result.spans[2].candContinueRightRolloutSteps == 0);
     CHECK(std::isfinite(result.spans[0].candContinueRightClosestTargetDistance));
+    CHECK(std::isfinite(result.spans[1].candContinueLeftClosestTargetDistance));
     CHECK(std::isfinite(result.spans[2].candContinueLeftClosestTargetDistance));
-    CHECK(result.spans[0].candidates.size() == 3);
-    CHECK(result.spans[1].candidates.size() == 2);
-    CHECK(result.spans[2].candidates.size() == 3);
+    CHECK(result.spans[0].candidates.size() == 4);
+    CHECK(result.spans[1].candidates.size() == 4);
+    CHECK(result.spans[2].candidates.size() == 4);
+    CHECK(result.spans[0].candidates[2].name == "existing");
+    CHECK(result.spans[1].candidates[2].name == "existing");
+    CHECK(result.spans[2].candidates[2].name == "existing");
     CHECK(result.spans[0].candidates.back().name == "continue-right");
+    CHECK(result.spans[1].candidates.back().name == "continue-left");
     CHECK(result.spans[2].candidates.back().name == "continue-left");
-    REQUIRE(result.continuationCandidateLines.size() == 2);
-    CHECK(result.continuationCandidateLines[0].name == "reinit-span-continue-left-2");
-    CHECK(result.continuationCandidateLines[1].name == "reinit-span-continue-right-0");
+    REQUIRE(result.continuationCandidateLines.size() == 3);
+    CHECK(result.continuationCandidateLines[0].name == "reinit-span-continue-left-1");
+    CHECK(result.continuationCandidateLines[1].name == "reinit-span-continue-left-2");
+    CHECK(result.continuationCandidateLines[2].name == "reinit-span-continue-right-0");
     for (const auto& line : result.continuationCandidateLines) {
         CHECK(line.points.size() >= 2);
     }
@@ -816,6 +848,89 @@ TEST_CASE("LineOptimizer reinitialization adds continuation candidates on both s
             }
         }
     }
+}
+
+TEST_CASE("LineOptimizer seedless reinitialization scans for first low-alignment seed span")
+{
+    StepXThenZNormalSampler sampler(100.0);
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 100.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 6; ++i) {
+        linePoints.push_back({static_cast<double>(i) * 50.0, 0.0, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {2.0, {100.0, 0.0, 0.0}, false, 2},
+        {4.0, {200.0, 0.0, 0.0}, false, 4},
+        {6.0, {300.0, 0.0, 0.0}, false, 6},
+    };
+
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(linePoints,
+                                                                      controls,
+                                                                      {0, 2, 4, 6},
+                                                                      0,
+                                                                      config);
+
+    CHECK_FALSE(result.failed);
+    REQUIRE(result.spans.size() == 3);
+    CHECK(result.initialSeedSpanIndex == 1);
+    CHECK(result.spans[0].chosenMaxNormalAlignmentAbs > 0.9);
+    CHECK(result.spans[1].chosenMaxNormalAlignmentAbs < 1.0e-9);
+}
+
+TEST_CASE("LineOptimizer seedless reinitialization fails when no seed span passes alignment gate")
+{
+    ConstantNormalSampler sampler({1.0, 0.0, 0.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 100.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int i = 0; i <= 4; ++i) {
+        linePoints.push_back({static_cast<double>(i) * 50.0, 0.0, 0.0});
+    }
+
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {2.0, {100.0, 0.0, 0.0}, false, 2},
+        {4.0, {200.0, 0.0, 0.0}, false, 4},
+    };
+
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(linePoints,
+                                                                      controls,
+                                                                      {0, 2, 4},
+                                                                      0,
+                                                                      config);
+
+    CHECK(result.failed);
+    CHECK(result.initialSeedSpanIndex == -1);
+    CHECK(result.failedSegmentIndex == 0);
+    CHECK(result.failureReason.find("No reinitialization seed span") != std::string::npos);
+    CHECK(result.optimization.report.converged == false);
 }
 
 TEST_CASE("LineOptimizer reinit reopt handles degenerate projected rollout tangents")
@@ -896,7 +1011,6 @@ TEST_CASE("LineOptimizer reproduces las008 seed then added-control edit without 
     config.segmentLength = 32.0;
     config.straightnessWeight = 0.1;
     config.tangentStraightnessWeight = 5.0;
-    config.normalStraightnessWeight = 0.05;
     config.samplesPerSegment = 1;
     config.maxIterations = 1000;
     config.differentiableNormalSampling = true;
@@ -1004,7 +1118,6 @@ TEST_CASE("LineOptimizer detects jump in saved las008 fiber 5 and reoptimizes it
     config.segmentLength = 32.0;
     config.straightnessWeight = 0.1;
     config.tangentStraightnessWeight = 5.0;
-    config.normalStraightnessWeight = 0.05;
     config.samplesPerSegment = 1;
     config.maxIterations = 1000;
     config.differentiableNormalSampling = true;

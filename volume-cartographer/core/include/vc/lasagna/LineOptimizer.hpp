@@ -123,6 +123,7 @@ struct LineReinitializationOptimizationResult {
     std::vector<LineReinitializationSpanReport> spans;
     bool failed = false;
     int failedSegmentIndex = -1;
+    int initialSeedSpanIndex = -1;
     std::string failureReason;
     double maxSegmentCandidateFinalCostDiff = 0.0;
     double maxSegmentCandidateFinalRmsDiff = 0.0;

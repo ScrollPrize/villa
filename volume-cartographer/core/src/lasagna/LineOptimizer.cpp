@@ -26,6 +26,7 @@ constexpr double kEpsilon = 1.0e-12;
 constexpr double kControlSpanInitPriorWeight = 0.05;
 constexpr int kLocalControlOptimizationSegments = 3;
 constexpr double kMovedControlDistanceThreshold = 1.0e-6;
+constexpr double kReinitSeedMaxNormalAlignmentAbs = 0.17364817766693033; // sin(10 deg)
 
 [[nodiscard]] double length(const cv::Vec3d& v)
 {
@@ -1939,6 +1940,47 @@ struct OptimizedControlSpan {
                                       steps);
 }
 
+[[nodiscard]] SpanRolloutResult existingSpanCandidate(
+    const std::vector<cv::Vec3d>& linePoints,
+    int leftIndex,
+    int rightIndex,
+    const cv::Vec3d& leftPoint,
+    const cv::Vec3d& rightPoint,
+    const LineOptimizationConfig& config)
+{
+    std::vector<cv::Vec3d> existing;
+    if (!linePoints.empty()) {
+        const int maxIndex = static_cast<int>(linePoints.size()) - 1;
+        leftIndex = std::clamp(leftIndex, 0, maxIndex);
+        rightIndex = std::clamp(rightIndex, 0, maxIndex);
+        if (leftIndex <= rightIndex) {
+            existing.reserve(static_cast<size_t>(rightIndex - leftIndex + 1));
+            for (int index = leftIndex; index <= rightIndex; ++index) {
+                existing.push_back(linePoints[static_cast<size_t>(index)]);
+            }
+        } else {
+            existing.reserve(static_cast<size_t>(leftIndex - rightIndex + 1));
+            for (int index = leftIndex; index >= rightIndex; --index) {
+                existing.push_back(linePoints[static_cast<size_t>(index)]);
+            }
+        }
+    }
+    if (existing.size() < 2) {
+        existing = {leftPoint, rightPoint};
+    }
+
+    SpanRolloutResult result;
+    result.rolloutSteps = 0;
+    result.truncatedPoints = static_cast<int>(existing.size());
+    result.selectedSign = 0;
+    result.closestTargetDistance = 0.0;
+    result.points = endpointCorrectedResampledSpan(existing,
+                                                   leftPoint,
+                                                   rightPoint,
+                                                   config.segmentLength);
+    return result;
+}
+
 [[nodiscard]] std::vector<std::array<double, 3>> toArrayPoints(const std::vector<cv::Vec3d>& points)
 {
     std::vector<std::array<double, 3>> out;
@@ -2696,6 +2738,7 @@ struct LineDifference {
     int leftControlIndex,
     int rightControlIndex,
     std::string candidatePrefix,
+    std::optional<SpanRolloutResult> existingRollout = std::nullopt,
     std::optional<cv::Vec3d> leftContinuationDirection = std::nullopt,
     std::optional<cv::Vec3d> rightContinuationDirection = std::nullopt)
 {
@@ -2736,6 +2779,13 @@ struct LineDifference {
     GlobalSolveResult rightSolved =
         solveRollout(candidatePrefix + "-right-" + std::to_string(segmentIndex), rightRollout);
 
+    std::optional<GlobalSolveResult> existingSolved;
+    if (existingRollout.has_value()) {
+        existingSolved =
+            solveRollout(candidatePrefix + "-existing-" + std::to_string(segmentIndex),
+                         *existingRollout);
+    }
+
     std::optional<SpanRolloutResult> continueLeftRollout;
     std::optional<GlobalSolveResult> continueLeftSolved;
     if (leftContinuationDirection.has_value() &&
@@ -2773,6 +2823,10 @@ struct LineDifference {
         spanDeviationMetrics(leftSolved.points, sampler, config);
     const SpanDeviationMetrics rightMetrics =
         spanDeviationMetrics(rightSolved.points, sampler, config);
+    std::optional<SpanDeviationMetrics> existingMetrics;
+    if (existingSolved.has_value()) {
+        existingMetrics = spanDeviationMetrics(existingSolved->points, sampler, config);
+    }
     std::optional<SpanDeviationMetrics> continueLeftMetrics;
     if (continueLeftSolved.has_value()) {
         continueLeftMetrics = spanDeviationMetrics(continueLeftSolved->points, sampler, config);
@@ -2812,14 +2866,8 @@ struct LineDifference {
             : std::numeric_limits<double>::quiet_NaN();
     };
     const auto matchesReferenceDirections =
-        [&](const GlobalSolveResult& candidate, double leftDot, double rightDot) {
+        [](const GlobalSolveResult& candidate, double /*leftDot*/, double /*rightDot*/) {
         if (!candidate.usable) {
-            return false;
-        }
-        if (leftReferenceDirection.has_value() && !(leftDot > 0.0)) {
-            return false;
-        }
-        if (rightReferenceDirection.has_value() && !(rightDot > 0.0)) {
             return false;
         }
         return true;
@@ -2829,6 +2877,14 @@ struct LineDifference {
     const double leftCandidateRightDot = rightReferenceDot(leftSolved);
     const double rightCandidateLeftDot = leftReferenceDot(rightSolved);
     const double rightCandidateRightDot = rightReferenceDot(rightSolved);
+    const double existingCandidateLeftDot =
+        existingSolved.has_value()
+            ? leftReferenceDot(*existingSolved)
+            : std::numeric_limits<double>::quiet_NaN();
+    const double existingCandidateRightDot =
+        existingSolved.has_value()
+            ? rightReferenceDot(*existingSolved)
+            : std::numeric_limits<double>::quiet_NaN();
     const double continueLeftCandidateLeftDot =
         continueLeftSolved.has_value()
             ? leftReferenceDot(*continueLeftSolved)
@@ -2850,6 +2906,11 @@ struct LineDifference {
         matchesReferenceDirections(leftSolved, leftCandidateLeftDot, leftCandidateRightDot);
     const bool rightSelectable =
         matchesReferenceDirections(rightSolved, rightCandidateLeftDot, rightCandidateRightDot);
+    const bool existingSelectable =
+        existingSolved.has_value() &&
+        matchesReferenceDirections(*existingSolved,
+                                   existingCandidateLeftDot,
+                                   existingCandidateRightDot);
     const bool continueLeftSelectable =
         continueLeftSolved.has_value() &&
         matchesReferenceDirections(*continueLeftSolved,
@@ -2892,6 +2953,12 @@ struct LineDifference {
     };
     includeCandidate(leftSolved, "left", leftMetrics, leftSelectable);
     includeCandidate(rightSolved, "right", rightMetrics, rightSelectable);
+    if (existingSolved.has_value() && existingMetrics.has_value()) {
+        includeCandidate(*existingSolved,
+                         "existing",
+                         *existingMetrics,
+                         existingSelectable);
+    }
     if (continueLeftSolved.has_value() && continueLeftMetrics.has_value()) {
         includeCandidate(*continueLeftSolved,
                          "continue-left",
@@ -2928,10 +2995,16 @@ struct LineDifference {
         error.imbue(std::locale::classic());
         error << std::scientific << std::setprecision(3)
               << "No reinitialization rollout candidate for span " << segmentIndex
-              << " matches the adjacent span direction within 90 degrees"
+              << " is usable"
               << " dots:";
         appendCandidateDots(error, "left", leftCandidateLeftDot, leftCandidateRightDot);
         appendCandidateDots(error, "right", rightCandidateLeftDot, rightCandidateRightDot);
+        if (existingSolved.has_value()) {
+            appendCandidateDots(error,
+                                "existing",
+                                existingCandidateLeftDot,
+                                existingCandidateRightDot);
+        }
         if (continueLeftSolved.has_value()) {
             appendCandidateDots(error,
                                 "continue-left",
@@ -3010,6 +3083,12 @@ struct LineDifference {
             candidatePrefix + "-failed-right-" + std::to_string(segmentIndex),
             solvedPolyline(rightSolved),
         });
+        if (existingSolved.has_value()) {
+            result.continuationCandidateLines.push_back({
+                candidatePrefix + "-failed-existing-" + std::to_string(segmentIndex),
+                solvedPolyline(*existingSolved),
+            });
+        }
         if (continueLeftSolved.has_value()) {
             result.continuationCandidateLines.push_back({
                 candidatePrefix + "-failed-continue-left-" + std::to_string(segmentIndex),
@@ -3040,6 +3119,7 @@ struct LineDifference {
         result.report.candContinueRightFinalCost = continueRightSolved->finalCost;
     }
     result.report.candidates.reserve(2 +
+                                     (existingSolved.has_value() ? 1 : 0) +
                                      (continueLeftSolved.has_value() ? 1 : 0) +
                                      (continueRightSolved.has_value() ? 1 : 0));
     const auto addCandidateReport = [&](const char* name,
@@ -3077,6 +3157,14 @@ struct LineDifference {
     };
     addCandidateReport("left", leftRollout, leftSolved, leftMetrics, leftSelectable);
     addCandidateReport("right", rightRollout, rightSolved, rightMetrics, rightSelectable);
+    if (existingRollout.has_value() && existingSolved.has_value() &&
+        existingMetrics.has_value()) {
+        addCandidateReport("existing",
+                           *existingRollout,
+                           *existingSolved,
+                           *existingMetrics,
+                           existingSelectable);
+    }
     if (continueLeftRollout.has_value() && continueLeftSolved.has_value() &&
         continueLeftMetrics.has_value()) {
         addCandidateReport("continue-left",
@@ -4048,27 +4136,14 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     double maxCandidateFinalRmsDiff = 0.0;
     double maxCandidateAlignmentScoreDiff = 0.0;
 
-    int rolloutAnchorControlIndex = -1;
+    int seedControlIndex = -1;
     for (size_t controlIndex = 0; controlIndex < controlPoints.size(); ++controlIndex) {
         if (controlPoints[controlIndex].isSeed) {
-            rolloutAnchorControlIndex = static_cast<int>(controlIndex);
+            seedControlIndex = static_cast<int>(controlIndex);
             break;
         }
     }
-    if (rolloutAnchorControlIndex < 0) {
-        double bestAnchorDistance = std::numeric_limits<double>::infinity();
-        for (size_t controlIndex = 0; controlIndex < controlPoints.size(); ++controlIndex) {
-            const double distance = std::abs(controlPoints[controlIndex].linePosition -
-                                             static_cast<double>(displayFrameAnchorIndex));
-            if (distance < bestAnchorDistance) {
-                bestAnchorDistance = distance;
-                rolloutAnchorControlIndex = static_cast<int>(controlIndex);
-            }
-        }
-    }
-    rolloutAnchorControlIndex = std::clamp(rolloutAnchorControlIndex,
-                                           0,
-                                           static_cast<int>(controlPoints.size()) - 1);
+    int initialSeedSpanIndex = -1;
 
     const auto directionFromLeftSpan = [](const std::vector<std::array<double, 3>>& span)
         -> std::optional<cv::Vec3d> {
@@ -4083,6 +4158,54 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
             return std::nullopt;
         }
         return toVec3d(span.front()) - toVec3d(span[1]);
+    };
+    const auto originalDirectionFromLeftSide =
+        [&](const LineControlPoint& control) -> std::optional<cv::Vec3d> {
+        if (linePoints.empty()) {
+            return std::nullopt;
+        }
+        const int index = std::clamp(control.optimizedIndex, 0, inputMaxIndex);
+        for (int other = index - 1; other >= 0; --other) {
+            const cv::Vec3d direction =
+                linePoints[static_cast<size_t>(index)] -
+                linePoints[static_cast<size_t>(other)];
+            if (length(direction) > kEpsilon) {
+                return direction;
+            }
+        }
+        for (int other = index + 1; other <= inputMaxIndex; ++other) {
+            const cv::Vec3d direction =
+                linePoints[static_cast<size_t>(other)] -
+                linePoints[static_cast<size_t>(index)];
+            if (length(direction) > kEpsilon) {
+                return direction;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto originalDirectionFromRightSide =
+        [&](const LineControlPoint& control) -> std::optional<cv::Vec3d> {
+        if (linePoints.empty()) {
+            return std::nullopt;
+        }
+        const int index = std::clamp(control.optimizedIndex, 0, inputMaxIndex);
+        for (int other = index + 1; other <= inputMaxIndex; ++other) {
+            const cv::Vec3d direction =
+                linePoints[static_cast<size_t>(index)] -
+                linePoints[static_cast<size_t>(other)];
+            if (length(direction) > kEpsilon) {
+                return direction;
+            }
+        }
+        for (int other = index - 1; other >= 0; --other) {
+            const cv::Vec3d direction =
+                linePoints[static_cast<size_t>(other)] -
+                linePoints[static_cast<size_t>(index)];
+            if (length(direction) > kEpsilon) {
+                return direction;
+            }
+        }
+        return std::nullopt;
     };
     const auto buildPartialFailureResult =
         [&](size_t failedSpanIndex, const OptimizedControlSpan& failedSpan) {
@@ -4150,6 +4273,7 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
             LineReinitializationOptimizationResult partial;
             partial.failed = true;
             partial.failedSegmentIndex = static_cast<int>(failedSpanIndex);
+            partial.initialSeedSpanIndex = initialSeedSpanIndex;
             partial.failureReason = failedSpan.failureReason;
             partial.spans = std::move(partialReports);
             partial.maxSegmentCandidateFinalCostDiff = maxCandidateFinalDiff;
@@ -4169,12 +4293,18 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
             partial.optimization.report.message = failedSpan.failureReason;
             return partial;
         };
-    const auto initializeSpan = [&](size_t controlIndex,
-                                    std::optional<cv::Vec3d> leftContinuationDirection,
-                                    std::optional<cv::Vec3d> rightContinuationDirection)
-        -> std::optional<LineReinitializationOptimizationResult> {
+    const auto solveSpan = [&](size_t controlIndex,
+                               std::optional<cv::Vec3d> leftContinuationDirection,
+                               std::optional<cv::Vec3d> rightContinuationDirection) {
         const LineControlPoint& left = controlPoints[controlIndex];
         const LineControlPoint& right = controlPoints[controlIndex + 1];
+        const SpanRolloutResult existingRollout =
+            existingSpanCandidate(linePoints,
+                                  left.optimizedIndex,
+                                  right.optimizedIndex,
+                                  left.volumePoint,
+                                  right.volumePoint,
+                                  config);
         OptimizedControlSpan span =
             optimizedControlSpan(left.volumePoint,
                                  right.volumePoint,
@@ -4184,18 +4314,29 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                                  originalControlIndices[controlIndex],
                                  originalControlIndices[controlIndex + 1],
                                  "reinit-span",
+                                 existingRollout,
                                  leftContinuationDirection,
                                  rightContinuationDirection);
+        return span;
+    };
+    const auto recordSpanCandidateRange = [&](const OptimizedControlSpan& span) {
         maxCandidateFinalDiff = std::max(maxCandidateFinalDiff,
                                          span.candidateFinalCostDiff);
         maxCandidateFinalRmsDiff = std::max(maxCandidateFinalRmsDiff,
                                             span.candidateFinalRmsDiff);
         maxCandidateAlignmentScoreDiff = std::max(maxCandidateAlignmentScoreDiff,
                                                   span.candidateAlignmentScoreDiff);
-        spanReports[controlIndex] = span.report;
+    };
+    const auto appendSpanDebugLines = [&](OptimizedControlSpan& span) {
         for (auto& candidateLine : span.continuationCandidateLines) {
             continuationCandidateLines.push_back(std::move(candidateLine));
         }
+    };
+    const auto acceptSpan = [&](size_t controlIndex, OptimizedControlSpan span)
+        -> std::optional<LineReinitializationOptimizationResult> {
+        recordSpanCandidateRange(span);
+        spanReports[controlIndex] = span.report;
+        appendSpanDebugLines(span);
         if (span.failed) {
             return buildPartialFailureResult(controlIndex, span);
         }
@@ -4203,19 +4344,98 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
         return std::nullopt;
     };
 
-    for (size_t controlIndex = static_cast<size_t>(rolloutAnchorControlIndex);
-         controlIndex + 1 < controlPoints.size();
-         ++controlIndex) {
-        std::optional<cv::Vec3d> leftContinuationDirection;
-        if (controlIndex > 0) {
-            leftContinuationDirection = directionFromLeftSpan(optimizedSpans[controlIndex - 1]);
+    if (seedControlIndex >= 0) {
+        if (seedControlIndex + 1 < static_cast<int>(controlPoints.size())) {
+            initialSeedSpanIndex = seedControlIndex;
+            OptimizedControlSpan span =
+                solveSpan(static_cast<size_t>(initialSeedSpanIndex),
+                          originalDirectionFromLeftSide(controlPoints[static_cast<size_t>(seedControlIndex)]),
+                          std::nullopt);
+            if (auto failure = acceptSpan(static_cast<size_t>(initialSeedSpanIndex),
+                                          std::move(span))) {
+                return *failure;
+            }
+        } else {
+            initialSeedSpanIndex = seedControlIndex - 1;
+            OptimizedControlSpan span =
+                solveSpan(static_cast<size_t>(initialSeedSpanIndex),
+                          std::nullopt,
+                          originalDirectionFromRightSide(controlPoints[static_cast<size_t>(seedControlIndex)]));
+            if (auto failure = acceptSpan(static_cast<size_t>(initialSeedSpanIndex),
+                                          std::move(span))) {
+                return *failure;
+            }
         }
-        if (auto failure = initializeSpan(controlIndex, leftContinuationDirection, std::nullopt)) {
+    } else {
+        std::optional<OptimizedControlSpan> bestSeedAttempt;
+        size_t bestSeedAttemptIndex = 0;
+        double bestSeedAttemptAlignment = std::numeric_limits<double>::infinity();
+        for (size_t spanIndex = 0; spanIndex < optimizedSpans.size(); ++spanIndex) {
+            OptimizedControlSpan span =
+                solveSpan(spanIndex,
+                          originalDirectionFromLeftSide(controlPoints[spanIndex]),
+                          originalDirectionFromRightSide(controlPoints[spanIndex + 1]));
+            if (!span.failed &&
+                span.report.chosenMaxNormalAlignmentAbs <= kReinitSeedMaxNormalAlignmentAbs) {
+                initialSeedSpanIndex = static_cast<int>(spanIndex);
+                if (auto failure = acceptSpan(spanIndex, std::move(span))) {
+                    return *failure;
+                }
+                break;
+            }
+
+            const double alignment = span.failed
+                ? std::numeric_limits<double>::infinity()
+                : span.report.chosenMaxNormalAlignmentAbs;
+            if (!bestSeedAttempt.has_value() ||
+                alignment < bestSeedAttemptAlignment) {
+                bestSeedAttemptIndex = spanIndex;
+                bestSeedAttemptAlignment = alignment;
+                bestSeedAttempt = std::move(span);
+            }
+        }
+
+        if (initialSeedSpanIndex < 0) {
+            OptimizedControlSpan failedSeedSpan =
+                bestSeedAttempt.has_value()
+                    ? std::move(*bestSeedAttempt)
+                    : solveSpan(0,
+                                originalDirectionFromLeftSide(controlPoints.front()),
+                                originalDirectionFromRightSide(controlPoints[1]));
+            std::ostringstream error;
+            error.imbue(std::locale::classic());
+            error << std::scientific << std::setprecision(3)
+                  << "No reinitialization seed span has max normal-alignment angle error below 10 degrees"
+                  << " threshold_abs_dot=" << kReinitSeedMaxNormalAlignmentAbs;
+            if (std::isfinite(bestSeedAttemptAlignment)) {
+                error << " best_span=" << bestSeedAttemptIndex
+                      << " best_abs_dot=" << bestSeedAttemptAlignment;
+            } else {
+                error << " best_span=" << bestSeedAttemptIndex
+                      << " best_abs_dot=unavailable";
+            }
+            failedSeedSpan.failed = true;
+            failedSeedSpan.failureReason = error.str();
+            recordSpanCandidateRange(failedSeedSpan);
+            spanReports[bestSeedAttemptIndex] = failedSeedSpan.report;
+            appendSpanDebugLines(failedSeedSpan);
+            return buildPartialFailureResult(bestSeedAttemptIndex, failedSeedSpan);
+        }
+    }
+
+    for (size_t spanIndex = static_cast<size_t>(initialSeedSpanIndex) + 1;
+         spanIndex < optimizedSpans.size();
+         ++spanIndex) {
+        std::optional<cv::Vec3d> leftContinuationDirection =
+            directionFromLeftSpan(optimizedSpans[spanIndex - 1]);
+        OptimizedControlSpan span =
+            solveSpan(spanIndex, leftContinuationDirection, std::nullopt);
+        if (auto failure = acceptSpan(spanIndex, std::move(span))) {
             return *failure;
         }
     }
 
-    for (size_t controlIndex = static_cast<size_t>(rolloutAnchorControlIndex);
+    for (size_t controlIndex = static_cast<size_t>(initialSeedSpanIndex);
          controlIndex > 0;
          --controlIndex) {
         const size_t spanIndex = controlIndex - 1;
@@ -4223,7 +4443,9 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
         if (spanIndex + 1 < optimizedSpans.size()) {
             rightContinuationDirection = directionFromRightSpan(optimizedSpans[spanIndex + 1]);
         }
-        if (auto failure = initializeSpan(spanIndex, std::nullopt, rightContinuationDirection)) {
+        OptimizedControlSpan span =
+            solveSpan(spanIndex, std::nullopt, rightContinuationDirection);
+        if (auto failure = acceptSpan(spanIndex, std::move(span))) {
             return *failure;
         }
     }
@@ -4393,6 +4615,7 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     LineReinitializationOptimizationResult result;
     result.optimization = std::move(finalOptimization);
     result.spans = std::move(spanReports);
+    result.initialSeedSpanIndex = initialSeedSpanIndex;
     result.maxSegmentCandidateFinalCostDiff = maxCandidateFinalDiff;
     result.maxSegmentCandidateFinalRmsDiff = maxCandidateFinalRmsDiff;
     result.maxSegmentCandidateAlignmentScoreDiff = maxCandidateAlignmentScoreDiff;

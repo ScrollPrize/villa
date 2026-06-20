@@ -116,6 +116,7 @@ struct LineAnnotationController::LineAnnotationSession {
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
     bool controlPointsDirtySinceOptimization = false;
+    bool controlPointsDirtySinceFinalReinit = false;
     bool finalReinitClean = false;
     bool finalReinitClosePending = false;
     bool disableInitialGeneratedHoverFollow = false;
@@ -799,7 +800,6 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.segmentLength = kLineSegmentLength;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.05;
         config.samplesPerSegment = 1;
         config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
@@ -836,6 +836,11 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
                                                               std::move(fixedIndices),
                                                               displayFrameAnchorIndex,
                                                               config);
+            if (reinitialized.failed) {
+                task.ok = false;
+                task.error = reinitialized.failureReason;
+                return task;
+            }
             task.result = std::move(reinitialized.optimization);
         } else if (!forceFullOptimization && initialLinePoints.size() >= 2) {
             std::vector<int> fixedIndices;
@@ -3543,6 +3548,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     session.focusedLinePosition = linePosition;
     session.focusedControlPoint = clicked;
     session.finalReinitClean = false;
+    session.controlPointsDirtySinceFinalReinit = true;
     const bool autoReoptimize =
         !pane->dialog ||
         pane->dialog->reoptimizationMode() ==
@@ -3713,6 +3719,7 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     const bool deletedSeed = selected->isSeed;
     session.controlPoints.erase(selected);
     session.finalReinitClean = false;
+    session.controlPointsDirtySinceFinalReinit = true;
     if (session.controlPoints.empty()) {
         return;
     }
@@ -3829,7 +3836,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
 
 bool LineAnnotationController::needsFinalReinitReopt(const LineAnnotationSession& session) const
 {
-    return !session.finalReinitClean &&
+    return session.controlPointsDirtySinceFinalReinit &&
+           !session.finalReinitClean &&
            !session.optimizedLine.points.empty() &&
            session.controlPoints.size() >= 2;
 }
@@ -3888,6 +3896,9 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     if (eventName.find("reinit_reopt") != std::string::npos ||
         !needsFinalReinitReopt(session)) {
         session.finalReinitClean = true;
+        if (eventName.find("reinit_reopt") != std::string::npos) {
+            session.controlPointsDirtySinceFinalReinit = false;
+        }
     } else {
         session.finalReinitClean = false;
     }

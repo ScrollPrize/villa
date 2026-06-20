@@ -311,7 +311,6 @@ vc::lasagna::LineOptimizationConfig configLikeVc3d(
     config.segmentLength = kLineSegmentLength;
     config.straightnessWeight = 0.1;
     config.tangentStraightnessWeight = 5.0;
-    config.normalStraightnessWeight = 0.05;
     config.samplesPerSegment = 1;
     config.maxIterations = options.maxIterations;
     config.differentiableNormalSampling = true;

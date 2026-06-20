@@ -1677,6 +1677,15 @@ int main(int argc, char** argv)
         const bool wantsObjOutput = !objOutputDir.empty();
         const bool wantsReinitDebugObjOutput = !reinitDebugObjOutputDir.empty();
         const bool wantsStripOutput = !stripOutputDir.empty();
+        const bool reinitDebugFailureMode =
+            reinitReopt && (wantsObjOutput || wantsReinitDebugObjOutput || wantsStripOutput);
+        std::filesystem::path effectiveOutputPath = outputPath;
+        if (reinitDebugFailureMode && !effectiveOutputPath.empty()) {
+            if (verbose) {
+                std::cout << "Ignoring --output for reinit debug-output run; partial debug output is enabled\n";
+            }
+            effectiveOutputPath.clear();
+        }
         const bool wantsTextureOutput = wantsObjOutput ||
                                         wantsStripOutput ||
                                         (wantsReinitDebugObjOutput && !textureZarrPath.empty());
@@ -1735,7 +1744,6 @@ int main(int argc, char** argv)
         config.segmentLength = 32.0;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
-        config.normalStraightnessWeight = 0.05;
         config.samplesPerSegment = 1;
         config.maxIterations = 1000;
         config.differentiableNormalSampling = differentiableNormalSampling;
@@ -1745,9 +1753,6 @@ int main(int argc, char** argv)
         config.tangentGuideWeight = 1.0;
         config.tangentGuideMode =
             vc::lasagna::LineOptimizationConfig::TangentGuideMode::ProjectVectorOntoTangentPlane;
-        if (reopt || reinitReopt) {
-            config.normalStraightnessWeight *= 10.0;
-        }
 
         if (!fiberPath.empty()) {
             const FiberInput fiber = loadFiberInput(fiberPath);
@@ -1771,7 +1776,7 @@ int main(int argc, char** argv)
                 std::cout << "Fiber input:\n"
                           << "fiber=" << fiberPath.string() << '\n'
                           << "manifest=" << manifestPath.string() << '\n'
-                          << "output=" << (outputPath.empty() ? std::string{"<none>"} : outputPath.string()) << '\n'
+                          << "output=" << (effectiveOutputPath.empty() ? std::string{"<none>"} : effectiveOutputPath.string()) << '\n'
                           << "line_points=" << fiber.linePoints.size()
                           << " control_points=" << fiber.controlPoints.size()
                           << " fixed_points=" << fixedIndices.size()
@@ -1794,6 +1799,7 @@ int main(int argc, char** argv)
             vc::lasagna::LineModel outputLine =
                 makeLineModelFromPoints(fiber.linePoints, sampler, displayFrameAnchorIndex);
             std::vector<int> outputFixedIndices = fixedIndices;
+            bool reinitFailedWithoutDebugOutput = false;
 
             if (reinitReopt) {
                 std::vector<vc::lasagna::LineControlPoint> controls;
@@ -1871,7 +1877,30 @@ int main(int argc, char** argv)
                     }
                 }
                 if (result.failed) {
-                    throw std::runtime_error(result.failureReason);
+                    if (reinitDebugFailureMode) {
+                        if (wantsStripOutput) {
+                            writeStripImages(outputLine,
+                                             outputFixedIndices,
+                                             *textureVolume,
+                                             textureLevel,
+                                             stripRenderScale,
+                                             stripOutputDir);
+                            if (verbose) {
+                                std::cout << "Saved partial strip render output to "
+                                          << stripOutputDir.string() << '\n';
+                            }
+                        }
+                        throw std::runtime_error(result.failureReason);
+                    }
+                    outputLine = makeLineModelFromPoints(fiber.linePoints,
+                                                         sampler,
+                                                         displayFrameAnchorIndex);
+                    outputLinePoints = fiber.linePoints;
+                    outputFixedIndices = fixedIndices;
+                    reinitFailedWithoutDebugOutput = true;
+                    if (verbose) {
+                        std::cout << "Keeping original fiber line because reinit failed without debug output\n";
+                    }
                 }
             } else if (reopt) {
                 const auto result = optimizer.optimizeExistingLine(fiber.linePoints,
@@ -1911,13 +1940,15 @@ int main(int argc, char** argv)
             if (verbose) {
                 printLineViewDiagnostics(outputLine);
             }
-            if (!outputPath.empty()) {
-                saveReoptimizedFiber(fiber, outputLinePoints, outputPath);
+            if (!effectiveOutputPath.empty() && !reinitFailedWithoutDebugOutput) {
+                saveReoptimizedFiber(fiber, outputLinePoints, effectiveOutputPath);
                 if (verbose) {
                     std::cout << "Saved " << (reinitReopt ? "reinitialized/reoptimized" :
                                               (reopt ? "reoptimized" : "original"))
-                              << " fiber to " << outputPath.string() << '\n';
+                              << " fiber to " << effectiveOutputPath.string() << '\n';
                 }
+            } else if (!effectiveOutputPath.empty() && verbose) {
+                std::cout << "Skipped --output because reinit failed without debug output\n";
             }
             if (wantsObjOutput) {
                 const std::vector<cv::Vec3d> lineObjPoints = reinitReopt
