@@ -25,6 +25,7 @@ import pyro.distributions
 from einops import rearrange
 from torchdiffeq import odeint
 
+from lasagna_data import prepare_lasagna_volume
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
 from point_collection import load_point_collection, link_points_to_patches, link_points_to_patches_pointcache, can_use_surface_index_backend, normalise_pcl_winding_annotations
@@ -1641,71 +1642,6 @@ def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
     e1 = F.pad(torch.zeros_like(tangential_yx), (1, 0), value=1.)  # (1, 0, 0) -> z-axis
     e2 = F.pad(tangential_yx, (1, 0), value=0.)  # (0, ty, tx)
     return spiral_zyx, e1, e2
-
-
-def prepare_lasagna_volume(scroll_zarr):
-    # Densely load the precomputed nx/ny normal-component and grad_mag (windings-per-base-voxel)
-    # zarrs over the z-ROI into a compact uint8 volume that can be pushed to the GPU and sampled by
-    # get_lasagna_losses. The raw bytes are kept as-is (no radius averaging, no decode) and
-    # only rescaled to floats at sample time; channel layout is (nx_u8, ny_u8, grad_mag_u8), nz is
-    # reconstructed as sqrt(1 - nx^2 - ny^2), and per-channel validity is derived from
-    # (nx_u8 != 0) | (ny_u8 != 0) for the normal direction and (grad_mag_u8 != 0) for the spacing.
-    if cfg['loss_weight_dense_normals'] <= 0 and cfg['loss_weight_dense_spacing'] <= 0:
-        return None
-
-    use_normals = cfg['loss_weight_dense_normals'] > 0
-    use_spacing = cfg['loss_weight_dense_spacing'] > 0
-    if use_normals and (not normal_nx_zarr_path or not normal_ny_zarr_path):
-        raise RuntimeError('dense normal loss is enabled, but one of the nx/ny zarr paths is not set')
-    if use_spacing and not grad_mag_zarr_path:
-        raise RuntimeError('dense spacing loss is enabled, but grad_mag zarr path is not set')
-
-    print(f'loading lasagna zarrs group {normal_zarr_group}')
-    nx_array = ny_array = grad_mag_array = None
-    reference_shape = None
-    if use_normals:
-        nx_root = zarr.open(normal_nx_zarr_path, mode='r')
-        ny_root = zarr.open(normal_ny_zarr_path, mode='r')
-        nx_array = nx_root[normal_zarr_group]
-        ny_array = ny_root[normal_zarr_group]
-        if nx_array.shape != ny_array.shape:
-            raise ValueError(f'nx/ny normal zarr shapes differ: {nx_array.shape} vs {ny_array.shape}')
-        reference_shape = nx_array.shape
-    if use_spacing:
-        grad_mag_root = zarr.open(grad_mag_zarr_path, mode='r')
-        grad_mag_array = grad_mag_root[normal_zarr_group]
-        if reference_shape is None:
-            reference_shape = grad_mag_array.shape
-        elif grad_mag_array.shape != reference_shape:
-            raise ValueError(f'grad_mag zarr shape {grad_mag_array.shape} differs from dense normal shape {reference_shape}')
-
-    if scroll_zarr is not None:
-        expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / downsample_factor).astype(np.int64))
-        if tuple(reference_shape) != expected_shape:
-            print(
-                f'WARNING: lasagna zarr shape {reference_shape} does not match '
-                f'ceil(scroll_zarr.shape / downsample_factor) {expected_shape}'
-            )
-
-    z_size = int(reference_shape[0])
-    z_lo = max(0, z_begin)
-    z_hi = min(z_size, z_end)
-    if z_hi <= z_lo:
-        raise RuntimeError(f'lasagna z-ROI [{z_lo}, {z_hi}) is empty (zarr z size {z_size})')
-
-    roi_shape = (z_hi - z_lo, reference_shape[1], reference_shape[2])
-    print(f'loading lasagna for z in [{z_lo}, {z_hi}) (shape {roi_shape[0]}, {roi_shape[1]}, {roi_shape[2]})')
-    nx_u8 = np.ascontiguousarray(nx_array[z_lo:z_hi], dtype=np.uint8) if use_normals else np.zeros(roi_shape, dtype=np.uint8)
-    ny_u8 = np.ascontiguousarray(ny_array[z_lo:z_hi], dtype=np.uint8) if use_normals else np.zeros(roi_shape, dtype=np.uint8)
-    grad_mag_u8 = np.ascontiguousarray(grad_mag_array[z_lo:z_hi], dtype=np.uint8) if use_spacing else np.zeros(roi_shape, dtype=np.uint8)
-    volume = np.stack([nx_u8, ny_u8, grad_mag_u8], axis=0)  # 3 (nx, ny, grad_mag), z, y, x  uint8
-    print(f'lasagna: loaded {volume.nbytes / 1e9:.2f} GB volume {volume.shape}')
-    volume = torch.from_numpy(volume).to(device='cuda')
-    return {
-        'volume': volume,
-        'z_origin': z_lo,
-        'shape': tuple(volume.shape[1:]),  # z, y, x
-    }
 
 
 def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=2.0):
@@ -4372,7 +4308,18 @@ def main():
 
     patches, unverified_patches, shell_patch = prepare_patches()
     cross_patch_point_collections, unattached_pcl_strips = prepare_point_collections(patches)
-    lasagna_volume = prepare_lasagna_volume(scroll_zarr_array)
+    lasagna_volume = prepare_lasagna_volume(
+        scroll_zarr_array,
+        use_normals=cfg['loss_weight_dense_normals'] > 0,
+        use_spacing=cfg['loss_weight_dense_spacing'] > 0,
+        normal_nx_zarr_path=normal_nx_zarr_path,
+        normal_ny_zarr_path=normal_ny_zarr_path,
+        grad_mag_zarr_path=grad_mag_zarr_path,
+        normal_zarr_group=normal_zarr_group,
+        z_begin=z_begin,
+        z_end=z_end,
+        downsample_factor=downsample_factor,
+    )
 
     if tracks_dbm_path is not None:
         print(f'loading tracks from {tracks_dbm_path}')
