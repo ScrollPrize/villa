@@ -6108,7 +6108,12 @@ void CWindow::CreateWidgets(void)
             connect(widget,
                     &CFiberWidget::metricsCalculationRequested,
                     _lineAnnotationController.get(),
-                    &LineAnnotationController::calculateFiberAlignmentMetrics);
+                    [this](std::vector<uint64_t> orderedFiberIds) {
+                        if (_lineAnnotationController) {
+                            _lineAnnotationController->calculateFiberAlignmentMetrics(
+                                std::move(orderedFiberIds));
+                        }
+                    });
             connect(widget,
                     &CFiberWidget::manualHvTagChanged,
                     _lineAnnotationController.get(),

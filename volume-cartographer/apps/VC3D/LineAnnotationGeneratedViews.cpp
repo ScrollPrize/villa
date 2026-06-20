@@ -37,16 +37,6 @@ QPointF generatedStripControlPointToScene(
 
 } // namespace
 
-QColor generatedLineTailColor(const QColor& baseColor)
-{
-    QColor color;
-    color.setRed(std::clamp(static_cast<int>(std::round(baseColor.red() * 0.75)), 0, 255));
-    color.setGreen(std::clamp(static_cast<int>(std::round(baseColor.green() * 0.75)), 0, 255));
-    color.setBlue(std::clamp(static_cast<int>(std::round(baseColor.blue() * 0.75)), 0, 255));
-    color.setAlpha(std::clamp(static_cast<int>(std::round(baseColor.alpha() * 0.75)), 0, 255));
-    return color;
-}
-
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                           QuadSurface* surface,
                                           double linePosition)
@@ -202,10 +192,6 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     lineStyle.penColor = QColor(0, 220, 255, 190);
     lineStyle.penWidth = 1.0;
     lineStyle.z = 150.0;
-
-    ViewerOverlayControllerBase::OverlayStyle tailLineStyle = lineStyle;
-    tailLineStyle.penColor = generatedLineTailColor(lineStyle.penColor);
-    tailLineStyle.z = lineStyle.z - 1.0;
 
     ViewerOverlayControllerBase::OverlayStyle seedStyle;
     seedStyle.penColor = QColor(255, 230, 0, 220);
@@ -407,15 +393,13 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         for (size_t i = 1; i < sceneLine.size(); ++i) {
             const auto& previous = sceneLine[i - 1];
             const auto& current = sceneLine[i];
-            const auto& style = generatedLineSegmentIsTail(previous.second,
-                                                           current.second,
-                                                           controlRange)
-                ? tailLineStyle
-                : lineStyle;
+            if (generatedLineSegmentIsTail(previous.second, current.second, controlRange)) {
+                continue;
+            }
             primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
                 {previous.first, current.first},
                 false,
-                style});
+                lineStyle});
         }
     }
 

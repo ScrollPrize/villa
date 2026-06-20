@@ -7,6 +7,7 @@
 #include <QLineEdit>
 #include <QMetaObject>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QStandardItemModel>
 #include <QTreeView>
 
@@ -107,6 +108,8 @@ int main(int argc, char** argv)
             "Fiber tree tags column did not show fiber tags");
     require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("-"),
             "Metrics should be hidden before Calc metrics is enabled");
+    require(widget.orderedFiberIds() == std::vector<uint64_t>({1, 2, 3}),
+            "Initial fiber order should match the sorted list order");
 
     int spanOpenRequests = 0;
     uint64_t spanOpenFiberId = 0;
@@ -132,19 +135,31 @@ int main(int argc, char** argv)
             "Span double-click emitted the wrong control point range");
 
     int metricRequests = 0;
+    std::vector<uint64_t> metricRequestOrder;
     QObject::connect(&widget,
                      &CFiberWidget::metricsCalculationRequested,
                      &widget,
-                     [&]() {
+                     [&](std::vector<uint64_t> orderedFiberIds) {
                          ++metricRequests;
+                         metricRequestOrder = std::move(orderedFiberIds);
                      });
     auto* calcMetrics = widget.findChild<QCheckBox*>(QStringLiteral("fiberCalcMetricsCheckBox"));
     require(calcMetrics != nullptr, "Calc metrics checkbox was not found");
     auto* model = qobject_cast<QStandardItemModel*>(treeView->model());
     require(model != nullptr, "Fiber tree should use a standard item model");
+    QMetaObject::invokeMethod(treeView->header(),
+                              "sectionClicked",
+                              Q_ARG(int, 2));
+    QMetaObject::invokeMethod(treeView->header(),
+                              "sectionClicked",
+                              Q_ARG(int, 2));
+    require(widget.orderedFiberIds() == std::vector<uint64_t>({3, 2, 1}),
+            "Fiber order should track the current sorted list order");
     QStandardItem* secondItemBeforeMetrics = model->item(1, 0);
     calcMetrics->setChecked(true);
     require(metricRequests == 1, "Calc metrics checkbox did not emit one request");
+    require(metricRequestOrder == std::vector<uint64_t>({3, 2, 1}),
+            "Calc metrics request should use the current fiber list order");
     require(model->item(1, 0) == secondItemBeforeMetrics,
             "Toggling Calc metrics should update cells without rebuilding the fiber rows");
     require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("25.0"),
@@ -293,6 +308,33 @@ int main(int argc, char** argv)
     require(!multiRenameAction->isEnabled(), "Multi-selection should disable Rename JSON file action");
     require(!newTagEdit->isEnabled(), "Multi-selection should disable new tag text field");
     require(!addTagButton->isEnabled(), "Multi-selection should disable add tag button");
+
+    CFiberWidget scrollWidget;
+    std::vector<CFiberWidget::FiberEntry> manyFibers;
+    manyFibers.reserve(80);
+    for (uint64_t id = 1; id <= 80; ++id) {
+        manyFibers.push_back(makeFiber(id,
+                                       "fiber_" + std::to_string(id) + ".json",
+                                       2,
+                                       20,
+                                       static_cast<double>(id)));
+    }
+    scrollWidget.setFibers(manyFibers);
+    scrollWidget.resize(520, 260);
+    scrollWidget.show();
+    QApplication::processEvents();
+    auto* scrollTree = scrollWidget.findChild<QTreeView*>(QStringLiteral("fiberTreeView"));
+    require(scrollTree != nullptr, "Scrollable fiber tree view was not found");
+    auto* scrollBar = scrollTree->verticalScrollBar();
+    require(scrollBar != nullptr, "Fiber tree vertical scrollbar was not found");
+    require(scrollBar->maximum() > 0, "Fiber tree did not become scrollable for regression test");
+    const int preservedScroll = std::max(1, scrollBar->maximum() / 2);
+    scrollBar->setValue(preservedScroll);
+    QApplication::processEvents();
+    scrollWidget.selectFiber(70);
+    QApplication::processEvents();
+    require(scrollBar->value() == preservedScroll,
+            "Programmatic fiber selection should not scroll the fiber list");
 
     int confirmations = 0;
     int batchDeletes = 0;

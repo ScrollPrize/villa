@@ -69,6 +69,7 @@ public:
     bool canCreateAtlasFromSelection() const;
     bool canShowFiberSlice() const;
     bool canRenameFiberFile() const;
+    std::vector<uint64_t> orderedFiberIds() const;
     QAction* createShowFiberSliceAction(QObject* parent);
     QAction* createRenameFiberFileAction(QObject* parent);
     void setFibers(const std::vector<FiberEntry>& fibers);
@@ -91,7 +92,7 @@ signals:
     void newAtlasFromFiberRequested(uint64_t fiberId);
     void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
-    void metricsCalculationRequested();
+    void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
 
 private slots:
     void onSelectionChanged();

@@ -12,6 +12,7 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QStringList>
 #include <QTreeView>
@@ -223,7 +224,7 @@ void CFiberWidget::setupUi()
     connect(_calcMetricsCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
         refreshMetricDisplays();
         if (checked) {
-            emit metricsCalculationRequested();
+            emit metricsCalculationRequested(orderedFiberIds());
         }
     });
 
@@ -398,6 +399,18 @@ bool CFiberWidget::canShowFiberSlice() const
 bool CFiberWidget::canRenameFiberFile() const
 {
     return selectedFiberIds().size() == 1;
+}
+
+std::vector<uint64_t> CFiberWidget::orderedFiberIds() const
+{
+    std::vector<uint64_t> ids;
+    ids.reserve(_fibers.size());
+    for (const auto& fiber : _fibers) {
+        if (fiber.id != 0) {
+            ids.push_back(fiber.id);
+        }
+    }
+    return ids;
 }
 
 QAction* CFiberWidget::createShowFiberSliceAction(QObject* parent)
@@ -747,8 +760,12 @@ void CFiberWidget::selectFibers(const std::vector<uint64_t>& fiberIds)
         return;
     }
 
+    auto* verticalScrollBar = _treeView->verticalScrollBar();
+    auto* horizontalScrollBar = _treeView->horizontalScrollBar();
+    const int previousVerticalScroll = verticalScrollBar ? verticalScrollBar->value() : 0;
+    const int previousHorizontalScroll = horizontalScrollBar ? horizontalScrollBar->value() : 0;
+
     _treeView->selectionModel()->clearSelection();
-    QModelIndex firstSelectedIndex;
     for (uint64_t fiberId : fiberIds) {
         auto* item = findFiberItem(fiberId);
         if (!item) {
@@ -757,12 +774,12 @@ void CFiberWidget::selectFibers(const std::vector<uint64_t>& fiberIds)
         _treeView->selectionModel()->select(item->index(),
                                             QItemSelectionModel::Select |
                                             QItemSelectionModel::Rows);
-        if (!firstSelectedIndex.isValid()) {
-            firstSelectedIndex = item->index();
-        }
     }
-    if (firstSelectedIndex.isValid()) {
-        _treeView->scrollTo(firstSelectedIndex);
+    if (verticalScrollBar) {
+        verticalScrollBar->setValue(previousVerticalScroll);
+    }
+    if (horizontalScrollBar) {
+        horizontalScrollBar->setValue(previousHorizontalScroll);
     }
 
     const auto selected = selectedFiberIds();

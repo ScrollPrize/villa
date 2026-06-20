@@ -13,11 +13,13 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
 
 #include "LineAnnotationFiberClassification.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -136,6 +138,8 @@ public:
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
     void calculateFiberAlignmentMetrics();
+    void calculateFiberAlignmentMetrics(std::vector<uint64_t> orderedFiberIds);
+    void requestFiberAlignmentMetrics(uint64_t fiberId);
     void createAtlasFromFiber(uint64_t fiberId);
     void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
     void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
@@ -326,11 +330,25 @@ private:
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForSpan(
         uint64_t fiberId,
         int spanIndex) const;
+    [[nodiscard]] bool hasCachedAlignmentForFiber(uint64_t fiberId) const;
+    [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId) const;
+    [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId,
+                                                  uint64_t requestToken) const;
+    [[nodiscard]] std::optional<std::filesystem::path> resolveAlignmentMetricsManifestPath();
+    void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
+    void publishFiberAlignmentMetrics(uint64_t fiberId,
+                                      CachedFiberAlignmentMetrics metrics);
+    void publishPendingFiberAlignmentMetrics(const StoredFiber& fiber);
+    void publishUnavailableFiberAlignmentMetrics(uint64_t fiberId);
+    void invalidateFiberAlignmentMetrics(uint64_t fiberId, bool notify);
+    [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedSpanAlignmentMetric>
+        generatedSpanAlignmentMetricsForSession(const LineAnnotationSession& session) const;
+    void updateGeneratedViewMetricsForFiber(uint64_t fiberId);
     [[nodiscard]] static CachedFiberAlignmentMetrics calculateAlignmentMetricsForFiber(
         const StoredFiber& fiber,
         const std::vector<ControlSpanRecord>& spans,
         const vc::lasagna::NormalSampler& sampler);
-    void finishFiberAlignmentMetrics();
+    void finishFiberAlignmentMetrics(QFutureWatcher<FiberMetricsTaskResult>* watcher);
     void showError(const QString& message) const;
     void cleanupIntersectionInspectionSurfaces();
     void rebuildIntersectionInspection();
@@ -360,7 +378,10 @@ private:
     std::vector<StoredFiber> _fibers;
     std::vector<std::string> _knownFiberTags;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
-    QPointer<QFutureWatcher<FiberMetricsTaskResult>> _fiberMetricsWatcher;
+    std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;
+    std::unordered_map<uint64_t, uint64_t> _pendingFiberAlignmentMetricTokens;
+    std::vector<QPointer<QFutureWatcher<FiberMetricsTaskResult>>> _fiberMetricsWatchers;
+    uint64_t _nextFiberAlignmentMetricToken = 0;
     uint64_t _fiberMetricsGeneration = 0;
     bool _fiberMetricsPending = false;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;

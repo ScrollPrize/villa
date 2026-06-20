@@ -12,7 +12,10 @@
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QEvent>
+#include <QFont>
 #include <QGraphicsPathItem>
+#include <QGraphicsRectItem>
+#include <QGraphicsSimpleTextItem>
 #include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -42,6 +45,7 @@ constexpr bool kGeneratedLineAnnotationOverlaysEnabled = true;
 constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
 constexpr float kNominalGeneratedRowWidth = 900.0f;
 constexpr float kNominalGeneratedRowHeight = 260.0f;
+constexpr double kSpanMetricHighlightThresholdDegrees = 45.0;
 
 std::string staticStripOverlayKey(const std::string& surfaceName)
 {
@@ -133,6 +137,55 @@ std::optional<float> generatedStripScaleForLinePositionRange(
 bool finitePoint(const cv::Vec3f& point)
 {
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+bool shouldShowSpanAlignmentMetric(
+    const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
+{
+    return metric.pending ||
+           !metric.error.empty() ||
+           (metric.available && std::isfinite(metric.maxErrorDegrees));
+}
+
+bool shouldHighlightSpanAlignmentMetric(
+    const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
+{
+    return metric.available &&
+           std::isfinite(metric.maxErrorDegrees) &&
+           metric.maxErrorDegrees > kSpanMetricHighlightThresholdDegrees;
+}
+
+QString spanAlignmentMetricText(
+    const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
+{
+    if (metric.pending) {
+        return QStringLiteral("...");
+    }
+    if (!metric.error.empty()) {
+        return QStringLiteral("err");
+    }
+    if (!metric.available || !std::isfinite(metric.maxErrorDegrees)) {
+        return {};
+    }
+    return QStringLiteral("%1%2")
+        .arg(QString::number(std::llround(metric.maxErrorDegrees)))
+        .arg(QChar(0x00b0));
+}
+
+QString spanAlignmentMetricToolTip(
+    const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
+{
+    if (metric.pending) {
+        return QObject::tr("Sampling Lasagna normals.");
+    }
+    if (!metric.error.empty()) {
+        return QString::fromStdString(metric.error);
+    }
+    if (metric.available && std::isfinite(metric.maxErrorDegrees)) {
+        return QObject::tr("Max normal-alignment error: %1 degrees")
+            .arg(QString::number(metric.maxErrorDegrees, 'f', 1));
+    }
+    return {};
 }
 
 void installComboEventFilter(QComboBox* combo, QObject* filter)
@@ -304,6 +357,7 @@ void LineAnnotationDialog::setGeneratedControlPoints(
         return;
     }
     _generatedViews.controlPoints = std::move(controlPoints);
+    _generatedViews.spanAlignmentMetrics.clear();
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
@@ -318,6 +372,16 @@ void LineAnnotationDialog::setGeneratedPredSnapPoints(
     }
     _generatedViews.predSnapPoints = std::move(predSnapPoints);
     rebuildGeneratedOverlays();
+}
+
+void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
+    std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+    _generatedViews.spanAlignmentMetrics = std::move(spanAlignmentMetrics);
+    updateGeneratedDynamicOverlaysFast(false, true);
 }
 
 void LineAnnotationDialog::setOptimizationBusy(bool busy)
@@ -934,7 +998,7 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
     if (bottomChanged) {
         _bottomCenterPosition = position;
     }
-    rebuildGeneratedDynamicOverlays(updateCurrentCutOverlay);
+    rebuildGeneratedDynamicOverlays(updateCurrentCutOverlay, false);
 }
 
 void LineAnnotationDialog::cancelControlPointPreviewAnimation()
@@ -1361,7 +1425,8 @@ void LineAnnotationDialog::clearFastGeneratedOverlayItemRefs()
     _fastCurrentCutOverlayItems = {};
 }
 
-void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay)
+void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
+                                                              bool updateSpanLabels)
 {
     if (!kGeneratedLineAnnotationOverlaysEnabled) {
         return;
@@ -1381,9 +1446,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastStripOverlayItems.resize(index + 1);
         }
         auto& entry = _fastStripOverlayItems[index];
+        const size_t spanLabelCount = _generatedViews.spanAlignmentMetrics.size();
         const bool recreate = entry.viewer != viewer ||
                               entry.surfaceName != surfaceName ||
-                              !entry.currentLine;
+                              !entry.currentLine ||
+                              entry.spanLabels.size() != spanLabelCount;
         if (!recreate) {
             return &entry;
         }
@@ -1399,13 +1466,37 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         currentPen.setCapStyle(Qt::RoundCap);
 
         std::vector<QGraphicsItem*> items;
-        items.reserve(1);
+        items.reserve(1 + spanLabelCount * 2);
         entry.currentLine = new QGraphicsPathItem();
         entry.currentLine->setPen(currentPen);
         entry.currentLine->setBrush(Qt::NoBrush);
         entry.currentLine->setZValue(153.0);
         entry.currentLine->setVisible(false);
         items.push_back(entry.currentLine);
+        entry.spanLabels.reserve(spanLabelCount);
+        QFont labelFont;
+        labelFont.setPointSize(9);
+        labelFont.setBold(true);
+        for (size_t labelIndex = 0; labelIndex < spanLabelCount; ++labelIndex) {
+            auto* background = new QGraphicsRectItem();
+            background->setPen(Qt::NoPen);
+            background->setBrush(QColor(20, 20, 20, 155));
+            background->setZValue(164.0);
+            background->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+            background->setVisible(false);
+
+            auto* text = new QGraphicsSimpleTextItem();
+            text->setFont(labelFont);
+            text->setBrush(QBrush(QColor(255, 255, 255, 245)));
+            text->setPen(Qt::NoPen);
+            text->setZValue(165.0);
+            text->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+            text->setVisible(false);
+
+            entry.spanLabels.push_back({background, text});
+            items.push_back(background);
+            items.push_back(text);
+        }
         viewer->setOverlayGroup(overlayKey, items);
         return &entry;
     };
@@ -1447,6 +1538,76 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             entry->currentLine->setVisible(true);
         } else {
             entry->currentLine->setVisible(false);
+        }
+
+        if (updateSpanLabels) {
+            const bool haveViewport = view &&
+                                      viewport &&
+                                      viewport->width() > 0 &&
+                                      viewport->height() > 0;
+            for (size_t labelIndex = 0; labelIndex < entry->spanLabels.size(); ++labelIndex) {
+                auto& labelItems = entry->spanLabels[labelIndex];
+                auto* background = labelItems.background;
+                auto* text = labelItems.text;
+                if (!background || !text) {
+                    continue;
+                }
+                background->setVisible(false);
+                text->setVisible(false);
+                if (labelIndex >= _generatedViews.spanAlignmentMetrics.size() || !haveViewport) {
+                    continue;
+                }
+
+                const auto& metric = _generatedViews.spanAlignmentMetrics[labelIndex];
+                if (!shouldShowSpanAlignmentMetric(metric)) {
+                    continue;
+                }
+                const auto centerLinePosition =
+                    vc3d::line_annotation::generatedSpanAlignmentMetricCenterLinePosition(metric);
+                if (!centerLinePosition) {
+                    continue;
+                }
+                const QPointF centerScenePoint =
+                    vc3d::line_annotation::generatedStripLinePositionToScene(
+                        viewer,
+                        quad,
+                        *centerLinePosition);
+                if (!std::isfinite(centerScenePoint.x()) ||
+                    !std::isfinite(centerScenePoint.y())) {
+                    continue;
+                }
+
+                const QRect viewportRect = viewport->rect();
+                const int labelViewportY =
+                    std::max(viewportRect.top(), viewportRect.bottom() - 18);
+                const QPointF labelYScene =
+                    view->mapToScene(QPoint(viewportRect.center().x(), labelViewportY));
+                const QString label = spanAlignmentMetricText(metric);
+                if (label.isEmpty()) {
+                    continue;
+                }
+                const bool highlighted = shouldHighlightSpanAlignmentMetric(metric);
+                const QColor textColor = highlighted
+                    ? QColor(150, 0, 0, 245)
+                    : QColor(255, 255, 255, 245);
+                const QColor backgroundColor = highlighted
+                    ? QColor(255, 232, 232, 235)
+                    : QColor(20, 20, 20, 155);
+                text->setText(label);
+                text->setBrush(QBrush(textColor));
+                text->setToolTip(spanAlignmentMetricToolTip(metric));
+                const QRectF textRect = text->boundingRect();
+                const QPointF textPos(centerScenePoint.x() - textRect.width() * 0.5,
+                                      labelYScene.y() - textRect.height());
+                text->setPos(textPos);
+
+                background->setBrush(QBrush(backgroundColor));
+                background->setRect(textRect.adjusted(-4.0, -2.0, 4.0, 2.0));
+                background->setPos(textPos);
+                background->setToolTip(text->toolTip());
+                background->setVisible(true);
+                text->setVisible(true);
+            }
         }
     }
 
@@ -1549,9 +1710,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.seedPoints->setPath(seedPath);
 }
 
-void LineAnnotationDialog::rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay)
+void LineAnnotationDialog::rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay,
+                                                           bool updateSpanLabels)
 {
-    updateGeneratedDynamicOverlaysFast(updateCurrentCutOverlay);
+    updateGeneratedDynamicOverlaysFast(updateCurrentCutOverlay, updateSpanLabels);
 }
 
 void LineAnnotationDialog::rebuildGeneratedOverlays()

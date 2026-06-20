@@ -101,6 +101,8 @@ struct LineAnnotationController::LineAnnotationSession {
     LineAnnotationController::InitialDirectionMode initialDirectionMode =
         LineAnnotationController::InitialDirectionMode::Sideways;
     std::vector<std::string> generatedSurfaceNames;
+    std::string generatedLineSurfaceName;
+    std::string generatedLineSideSliceName;
     std::string error;
     QPointer<QFutureWatcher<OptimizationTaskResult>> watcher;
     bool deferShowUntilGenerated = false;
@@ -123,6 +125,7 @@ struct LineAnnotationController::LineAnnotationSession {
     std::optional<std::pair<double, double>> initialStripLinePositionRange;
     bool disableInitialGeneratedHoverFollow = false;
     std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
+    bool fiberMetricsMatchStoredFiber = false;
 };
 
 struct LineAnnotationController::FiberMetricsTaskResult {
@@ -130,6 +133,8 @@ struct LineAnnotationController::FiberMetricsTaskResult {
     uint64_t generation = 0;
     fs::path manifestPath;
     std::string error;
+    std::vector<uint64_t> requestedFiberIds;
+    std::unordered_map<uint64_t, uint64_t> requestTokens;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> metrics;
 };
 
@@ -1385,6 +1390,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
 
     try {
         session->optimizedLine = lineModelFromPoints(it->linePoints, session->normalSampler.get());
+        session->fiberMetricsMatchStoredFiber = true;
     } catch (const std::exception& ex) {
         showError(tr("Could not reopen fiber %1: %2")
                       .arg(fiberId)
@@ -1559,7 +1565,7 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
                                  }),
                   _fibers.end());
     for (uint64_t deletedId : deletedIds) {
-        _fiberAlignmentMetrics.erase(deletedId);
+        invalidateFiberAlignmentMetrics(deletedId, false);
     }
     for (const auto& pane : _panes) {
         if (pane.session && std::binary_search(deletedIds.begin(),
@@ -1792,111 +1798,29 @@ void LineAnnotationController::calculateFiberAlignmentMetrics()
     if (_fibers.empty()) {
         return;
     }
-    if (_fiberMetricsPending) {
+    std::vector<uint64_t> fiberIds;
+    fiberIds.reserve(_fibers.size());
+    for (const auto& fiber : _fibers) {
+        fiberIds.push_back(fiber.id);
+    }
+    requestFiberAlignmentMetricsForFibers(std::move(fiberIds));
+}
+
+void LineAnnotationController::calculateFiberAlignmentMetrics(std::vector<uint64_t> orderedFiberIds)
+{
+    if (orderedFiberIds.empty()) {
+        calculateFiberAlignmentMetrics();
         return;
     }
-    if (!_state || !_state->vpkg()) {
-        showError(tr("No volume package loaded."));
+    requestFiberAlignmentMetricsForFibers(std::move(orderedFiberIds));
+}
+
+void LineAnnotationController::requestFiberAlignmentMetrics(uint64_t fiberId)
+{
+    if (fiberId == 0) {
         return;
     }
-
-    auto vpkg = _state->vpkg();
-    std::string selected = vpkg->selectedLasagnaDataset();
-    fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-    if (selected.empty() || manifestPath.empty()) {
-        const fs::path startDir = vpkg->path().empty()
-            ? fs::path{}
-            : vpkg->path().parent_path();
-        auto picked = _datasetPicker ? _datasetPicker(_parentWidget, startDir)
-                                     : std::optional<std::string>{};
-        if (!picked || picked->empty()) {
-            return;
-        }
-        selected = *picked;
-        manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
-        vpkg->setSelectedLasagnaDataset(selected);
-    }
-
-    std::vector<StoredFiber> fibers = _fibers;
-
-    _fiberMetricsPending = true;
-    _fiberAlignmentMetrics.clear();
-    const uint64_t generation = ++_fiberMetricsGeneration;
-    emit fiberAlignmentMetricsReset(true);
-
-    auto* watcher = new QFutureWatcher<FiberMetricsTaskResult>(this);
-    _fiberMetricsWatcher = watcher;
-    connect(watcher,
-            &QFutureWatcher<FiberMetricsTaskResult>::finished,
-            this,
-            [this, watcher]() {
-                finishFiberAlignmentMetrics();
-                watcher->deleteLater();
-            });
-    QPointer<LineAnnotationController> self(this);
-    watcher->setFuture(QtConcurrent::run([generation,
-                                           self,
-                                           manifestPath,
-                                           fibers = std::move(fibers)]() mutable {
-        FiberMetricsTaskResult result;
-        result.generation = generation;
-        result.manifestPath = manifestPath;
-        try {
-            vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(manifestPath);
-            vc::lasagna::LasagnaNormalSampler sampler(dataset);
-            result.metrics.reserve(fibers.size());
-            for (const auto& fiber : fibers) {
-                const std::vector<ControlSpanRecord> spans =
-                    LineAnnotationController::controlSpansForFiber(fiber);
-                CachedFiberAlignmentMetrics metrics;
-                try {
-                    metrics = LineAnnotationController::calculateAlignmentMetricsForFiber(
-                        fiber,
-                        spans,
-                        sampler);
-                } catch (const std::exception& ex) {
-                    metrics.fiber.error = ex.what();
-                    metrics.spans.resize(spans.size());
-                    for (auto& spanMetric : metrics.spans) {
-                        spanMetric.error = metrics.fiber.error;
-                    }
-                } catch (...) {
-                    metrics.fiber.error = "Unknown Lasagna normal metric calculation error.";
-                    metrics.spans.resize(spans.size());
-                    for (auto& spanMetric : metrics.spans) {
-                        spanMetric.error = metrics.fiber.error;
-                    }
-                }
-                result.metrics.emplace(fiber.id, metrics);
-                if (self) {
-                    QMetaObject::invokeMethod(self.data(),
-                                              [self, generation, fiberId = fiber.id, metrics]() mutable {
-                                                  if (!self ||
-                                                      generation != self->_fiberMetricsGeneration ||
-                                                      !self->_fiberMetricsPending) {
-                                                      return;
-                                                  }
-                                                  self->_fiberAlignmentMetrics[fiberId] = std::move(metrics);
-                                                  const auto& cached = self->_fiberAlignmentMetrics.at(fiberId);
-                                                  emit self->fiberAlignmentMetricsUpdated(
-                                                      fiberId,
-                                                      cached.fiber,
-                                                      cached.spans);
-                                              },
-                                              Qt::QueuedConnection);
-                }
-            }
-            result.ok = true;
-        } catch (const std::exception& ex) {
-            result.ok = false;
-            result.error = ex.what();
-        } catch (...) {
-            result.ok = false;
-            result.error = "Unknown Lasagna normal metric calculation error.";
-        }
-        return result;
-    }));
+    requestFiberAlignmentMetricsForFibers({fiberId});
 }
 
 void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
@@ -3646,7 +3570,7 @@ LineAnnotationController::cachedAlignmentForFiber(uint64_t fiberId) const
         return metricIt->second.fiber;
     }
     FiberSummary::AlignmentMetrics metric;
-    metric.pending = _fiberMetricsPending;
+    metric.pending = isAlignmentPendingForFiber(fiberId);
     return metric;
 }
 
@@ -3660,8 +3584,270 @@ LineAnnotationController::cachedAlignmentForSpan(uint64_t fiberId, int spanIndex
         return metricIt->second.spans[static_cast<size_t>(spanIndex)];
     }
     FiberSummary::AlignmentMetrics metric;
-    metric.pending = _fiberMetricsPending;
+    metric.pending = isAlignmentPendingForFiber(fiberId);
     return metric;
+}
+
+bool LineAnnotationController::hasCachedAlignmentForFiber(uint64_t fiberId) const
+{
+    return _fiberAlignmentMetrics.find(fiberId) != _fiberAlignmentMetrics.end();
+}
+
+bool LineAnnotationController::isAlignmentPendingForFiber(uint64_t fiberId) const
+{
+    return _pendingFiberAlignmentMetrics.find(fiberId) !=
+           _pendingFiberAlignmentMetrics.end();
+}
+
+bool LineAnnotationController::isAlignmentPendingForFiber(uint64_t fiberId,
+                                                          uint64_t requestToken) const
+{
+    const auto tokenIt = _pendingFiberAlignmentMetricTokens.find(fiberId);
+    return tokenIt != _pendingFiberAlignmentMetricTokens.end() &&
+           tokenIt->second == requestToken &&
+           isAlignmentPendingForFiber(fiberId);
+}
+
+std::optional<fs::path> LineAnnotationController::resolveAlignmentMetricsManifestPath()
+{
+    if (!_state || !_state->vpkg()) {
+        showError(tr("No volume package loaded."));
+        return std::nullopt;
+    }
+
+    auto vpkg = _state->vpkg();
+    std::string selected = vpkg->selectedLasagnaDataset();
+    fs::path manifestPath = vpkg->selectedLasagnaDatasetPath();
+    if (!selected.empty() && !manifestPath.empty()) {
+        return manifestPath;
+    }
+
+    const fs::path startDir = vpkg->path().empty()
+        ? fs::path{}
+        : vpkg->path().parent_path();
+    auto picked = _datasetPicker ? _datasetPicker(_parentWidget, startDir)
+                                 : std::optional<std::string>{};
+    if (!picked || picked->empty()) {
+        return std::nullopt;
+    }
+    selected = *picked;
+    manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
+    vpkg->setSelectedLasagnaDataset(selected);
+    return manifestPath;
+}
+
+void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds)
+{
+    std::vector<uint64_t> orderedFiberIds;
+    orderedFiberIds.reserve(fiberIds.size());
+    std::unordered_set<uint64_t> seenFiberIds;
+    seenFiberIds.reserve(fiberIds.size());
+    for (const uint64_t fiberId : fiberIds) {
+        if (fiberId == 0 || !seenFiberIds.insert(fiberId).second) {
+            continue;
+        }
+        orderedFiberIds.push_back(fiberId);
+    }
+    fiberIds = std::move(orderedFiberIds);
+    if (fiberIds.empty()) {
+        return;
+    }
+
+    std::vector<StoredFiber> fibers;
+    std::vector<uint64_t> requestTokens;
+    fibers.reserve(fiberIds.size());
+    requestTokens.reserve(fiberIds.size());
+    for (const uint64_t fiberId : fiberIds) {
+        if (hasCachedAlignmentForFiber(fiberId)) {
+            updateGeneratedViewMetricsForFiber(fiberId);
+            continue;
+        }
+        if (isAlignmentPendingForFiber(fiberId)) {
+            updateGeneratedViewMetricsForFiber(fiberId);
+            continue;
+        }
+        auto fiberIt = std::find_if(_fibers.begin(),
+                                    _fibers.end(),
+                                    [fiberId](const StoredFiber& fiber) {
+                                        return fiber.id == fiberId;
+                                    });
+        if (fiberIt == _fibers.end()) {
+            continue;
+        }
+        _pendingFiberAlignmentMetrics.insert(fiberId);
+        const uint64_t requestToken = ++_nextFiberAlignmentMetricToken;
+        _pendingFiberAlignmentMetricTokens[fiberId] = requestToken;
+        fibers.push_back(*fiberIt);
+        requestTokens.push_back(requestToken);
+        publishPendingFiberAlignmentMetrics(*fiberIt);
+    }
+    _fiberMetricsPending = !_pendingFiberAlignmentMetrics.empty();
+    if (fibers.empty()) {
+        return;
+    }
+
+    const auto manifestPath = resolveAlignmentMetricsManifestPath();
+    if (!manifestPath) {
+        for (const auto& fiber : fibers) {
+            _pendingFiberAlignmentMetrics.erase(fiber.id);
+            _pendingFiberAlignmentMetricTokens.erase(fiber.id);
+            publishUnavailableFiberAlignmentMetrics(fiber.id);
+        }
+        _fiberMetricsPending = !_pendingFiberAlignmentMetrics.empty();
+        return;
+    }
+
+    const uint64_t generation = _fiberMetricsGeneration;
+    auto* watcher = new QFutureWatcher<FiberMetricsTaskResult>(this);
+    _fiberMetricsWatchers.push_back(watcher);
+    connect(watcher,
+            &QFutureWatcher<FiberMetricsTaskResult>::finished,
+            this,
+            [this, watcher]() {
+                finishFiberAlignmentMetrics(watcher);
+                watcher->deleteLater();
+            });
+    QPointer<LineAnnotationController> self(this);
+    watcher->setFuture(QtConcurrent::run([generation,
+                                           self,
+                                           resolvedManifestPath = *manifestPath,
+                                           fibers = std::move(fibers),
+                                           requestTokens = std::move(requestTokens)]() mutable {
+        FiberMetricsTaskResult result;
+        result.ok = true;
+        result.generation = generation;
+        result.manifestPath = resolvedManifestPath;
+        result.requestedFiberIds.reserve(fibers.size());
+        for (size_t i = 0; i < fibers.size(); ++i) {
+            const uint64_t fiberId = fibers[i].id;
+            result.requestedFiberIds.push_back(fiberId);
+            if (i < requestTokens.size()) {
+                result.requestTokens.emplace(fiberId, requestTokens[i]);
+            }
+        }
+
+        auto errorMetricsForFiber = [](const StoredFiber& fiber, const std::string& error) {
+            CachedFiberAlignmentMetrics metrics;
+            metrics.fiber.error = error;
+            metrics.spans.resize(LineAnnotationController::controlSpansForFiber(fiber).size());
+            for (auto& spanMetric : metrics.spans) {
+                spanMetric.error = error;
+            }
+            return metrics;
+        };
+
+        try {
+            vc::lasagna::LasagnaDataset dataset =
+                vc::lasagna::LasagnaDataset::open(resolvedManifestPath);
+            vc::lasagna::LasagnaNormalSampler sampler(dataset);
+            result.metrics.reserve(fibers.size());
+            for (size_t i = 0; i < fibers.size(); ++i) {
+                const auto& fiber = fibers[i];
+                const std::vector<ControlSpanRecord> spans =
+                    LineAnnotationController::controlSpansForFiber(fiber);
+                CachedFiberAlignmentMetrics metrics;
+                try {
+                    metrics = LineAnnotationController::calculateAlignmentMetricsForFiber(
+                        fiber,
+                        spans,
+                        sampler);
+                } catch (const std::exception& ex) {
+                    metrics = errorMetricsForFiber(fiber, ex.what());
+                } catch (...) {
+                    metrics = errorMetricsForFiber(
+                        fiber,
+                        "Unknown Lasagna normal metric calculation error.");
+                }
+                result.metrics.emplace(fiber.id, metrics);
+                if (self) {
+                    const uint64_t requestToken =
+                        i < requestTokens.size() ? requestTokens[i] : uint64_t{0};
+                    QMetaObject::invokeMethod(
+                        self.data(),
+                        [self, generation, fiberId = fiber.id, requestToken, metrics]() mutable {
+                            if (!self ||
+                                generation != self->_fiberMetricsGeneration ||
+                                !self->isAlignmentPendingForFiber(fiberId, requestToken)) {
+                                return;
+                            }
+                            self->publishFiberAlignmentMetrics(fiberId, std::move(metrics));
+                        },
+                        Qt::QueuedConnection);
+                }
+            }
+        } catch (const std::exception& ex) {
+            result.ok = false;
+            result.error = ex.what();
+            for (const auto& fiber : fibers) {
+                result.metrics.emplace(fiber.id, errorMetricsForFiber(fiber, result.error));
+            }
+        } catch (...) {
+            result.ok = false;
+            result.error = "Unknown Lasagna normal metric calculation error.";
+            for (const auto& fiber : fibers) {
+                result.metrics.emplace(fiber.id, errorMetricsForFiber(fiber, result.error));
+            }
+        }
+        return result;
+    }));
+}
+
+void LineAnnotationController::publishFiberAlignmentMetrics(
+    uint64_t fiberId,
+    CachedFiberAlignmentMetrics metrics)
+{
+    metrics.fiber.pending = false;
+    for (auto& spanMetric : metrics.spans) {
+        spanMetric.pending = false;
+    }
+    _pendingFiberAlignmentMetrics.erase(fiberId);
+    _pendingFiberAlignmentMetricTokens.erase(fiberId);
+    _fiberMetricsPending = !_pendingFiberAlignmentMetrics.empty();
+    _fiberAlignmentMetrics[fiberId] = std::move(metrics);
+    const auto& cached = _fiberAlignmentMetrics.at(fiberId);
+    emit fiberAlignmentMetricsUpdated(fiberId, cached.fiber, cached.spans);
+    updateGeneratedViewMetricsForFiber(fiberId);
+}
+
+void LineAnnotationController::publishPendingFiberAlignmentMetrics(const StoredFiber& fiber)
+{
+    CachedFiberAlignmentMetrics metrics;
+    metrics.fiber.pending = true;
+    metrics.spans.resize(controlSpansForFiber(fiber).size());
+    for (auto& spanMetric : metrics.spans) {
+        spanMetric.pending = true;
+    }
+    emit fiberAlignmentMetricsUpdated(fiber.id, metrics.fiber, metrics.spans);
+    updateGeneratedViewMetricsForFiber(fiber.id);
+}
+
+void LineAnnotationController::publishUnavailableFiberAlignmentMetrics(uint64_t fiberId)
+{
+    std::vector<FiberSummary::AlignmentMetrics> spanMetrics;
+    auto fiberIt = std::find_if(_fibers.begin(),
+                                _fibers.end(),
+                                [fiberId](const StoredFiber& fiber) {
+                                    return fiber.id == fiberId;
+                                });
+    if (fiberIt != _fibers.end()) {
+        spanMetrics.resize(controlSpansForFiber(*fiberIt).size());
+    }
+    emit fiberAlignmentMetricsUpdated(fiberId, FiberSummary::AlignmentMetrics{}, spanMetrics);
+    updateGeneratedViewMetricsForFiber(fiberId);
+}
+
+void LineAnnotationController::invalidateFiberAlignmentMetrics(uint64_t fiberId, bool notify)
+{
+    if (fiberId == 0) {
+        return;
+    }
+    _fiberAlignmentMetrics.erase(fiberId);
+    _pendingFiberAlignmentMetrics.erase(fiberId);
+    _pendingFiberAlignmentMetricTokens.erase(fiberId);
+    _fiberMetricsPending = !_pendingFiberAlignmentMetrics.empty();
+    if (notify) {
+        publishUnavailableFiberAlignmentMetrics(fiberId);
+    }
 }
 
 std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fiberSummaries() const
@@ -3900,6 +4086,11 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         return;
     }
 
+    if (session.fiberId != 0 && session.fiberMetricsMatchStoredFiber) {
+        session.fiberMetricsMatchStoredFiber = false;
+        invalidateFiberAlignmentMetrics(session.fiberId, true);
+    }
+
     const double maxPosition = static_cast<double>(session.optimizedLine.points.size() - 1);
     linePosition = std::clamp(linePosition, 0.0, maxPosition);
     const cv::Vec3d clicked(volumePoint[0], volumePoint[1], volumePoint[2]);
@@ -4076,6 +4267,11 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     }
     if (!ensureDatasetForSession(session)) {
         return;
+    }
+
+    if (session.fiberId != 0 && session.fiberMetricsMatchStoredFiber) {
+        session.fiberMetricsMatchStoredFiber = false;
+        invalidateFiberAlignmentMetrics(session.fiberId, true);
     }
 
     const double maxPosition = static_cast<double>(session.optimizedLine.points.size() - 1);
@@ -4413,6 +4609,10 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     if (session.controlPoints.empty()) {
         return;
     }
+    if (session.fiberId != 0 && session.fiberMetricsMatchStoredFiber) {
+        session.fiberMetricsMatchStoredFiber = false;
+        invalidateFiberAlignmentMetrics(session.fiberId, true);
+    }
     session.taskState = LineAnnotationSession::TaskState::Running;
     session.error.clear();
     auto seedIt = std::find_if(session.controlPoints.begin(),
@@ -4531,35 +4731,116 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     }
 }
 
-void LineAnnotationController::finishFiberAlignmentMetrics()
+void LineAnnotationController::finishFiberAlignmentMetrics(
+    QFutureWatcher<FiberMetricsTaskResult>* watcher)
 {
-    auto* watcher = _fiberMetricsWatcher.data();
     if (!watcher) {
         return;
     }
+    _fiberMetricsWatchers.erase(
+        std::remove_if(_fiberMetricsWatchers.begin(),
+                       _fiberMetricsWatchers.end(),
+                       [watcher](const QPointer<QFutureWatcher<FiberMetricsTaskResult>>& item) {
+                           return item.data() == watcher || item.isNull();
+                       }),
+        _fiberMetricsWatchers.end());
 
     FiberMetricsTaskResult result = watcher->future().result();
     if (result.generation != _fiberMetricsGeneration) {
         return;
     }
 
-    _fiberMetricsPending = false;
-    _fiberMetricsWatcher = nullptr;
     if (!result.ok) {
-        _fiberAlignmentMetrics.clear();
         showError(tr("Could not calculate fiber alignment metrics: %1")
                       .arg(QString::fromStdString(result.error)));
-        emit fiberAlignmentMetricsReset(false);
-        return;
     }
 
-    for (const auto& [fiberId, metrics] : result.metrics) {
-        if (_fiberAlignmentMetrics.find(fiberId) != _fiberAlignmentMetrics.end()) {
+    for (uint64_t fiberId : result.requestedFiberIds) {
+        const auto tokenIt = result.requestTokens.find(fiberId);
+        if (tokenIt == result.requestTokens.end() ||
+            !isAlignmentPendingForFiber(fiberId, tokenIt->second)) {
             continue;
         }
-        emit fiberAlignmentMetricsUpdated(fiberId, metrics.fiber, metrics.spans);
+        auto metricIt = result.metrics.find(fiberId);
+        if (metricIt != result.metrics.end()) {
+            publishFiberAlignmentMetrics(fiberId, std::move(metricIt->second));
+        } else {
+            _pendingFiberAlignmentMetrics.erase(fiberId);
+            _pendingFiberAlignmentMetricTokens.erase(fiberId);
+            publishUnavailableFiberAlignmentMetrics(fiberId);
+        }
     }
-    _fiberAlignmentMetrics = std::move(result.metrics);
+    _fiberMetricsPending = !_pendingFiberAlignmentMetrics.empty();
+}
+
+std::vector<vc3d::line_annotation::GeneratedSpanAlignmentMetric>
+LineAnnotationController::generatedSpanAlignmentMetricsForSession(
+    const LineAnnotationSession& session) const
+{
+    std::vector<vc3d::line_annotation::GeneratedSpanAlignmentMetric> metrics;
+    if (session.fiberId == 0 ||
+        !session.fiberMetricsMatchStoredFiber ||
+        session.controlPoints.size() < 2) {
+        return metrics;
+    }
+
+    const auto controls = generatedControlMarkers(session.controlPoints);
+    struct ControlRef {
+        size_t index = 0;
+        double linePosition = std::numeric_limits<double>::quiet_NaN();
+    };
+    std::vector<ControlRef> sortedControls;
+    sortedControls.reserve(controls.size());
+    for (size_t i = 0; i < controls.size(); ++i) {
+        if (std::isfinite(controls[i].linePosition)) {
+            sortedControls.push_back({i, controls[i].linePosition});
+        }
+    }
+    std::sort(sortedControls.begin(),
+              sortedControls.end(),
+              [](const ControlRef& lhs, const ControlRef& rhs) {
+                  if (lhs.linePosition == rhs.linePosition) {
+                      return lhs.index < rhs.index;
+                  }
+                  return lhs.linePosition < rhs.linePosition;
+              });
+    if (sortedControls.size() < 2) {
+        return metrics;
+    }
+
+    metrics.reserve(sortedControls.size() - 1);
+    int spanIndex = 0;
+    for (size_t i = 1; i < sortedControls.size(); ++i) {
+        const auto& first = sortedControls[i - 1];
+        const auto& second = sortedControls[i];
+        if (second.linePosition <= first.linePosition) {
+            continue;
+        }
+        auto metric = vc3d::line_annotation::makeGeneratedSpanAlignmentMetric(
+            spanIndex,
+            static_cast<int>(first.index),
+            static_cast<int>(second.index),
+            controls);
+        const auto alignment = cachedAlignmentForSpan(session.fiberId, spanIndex);
+        metric.available = alignment.available;
+        metric.pending = alignment.pending;
+        metric.maxErrorDegrees = alignment.maxErrorDegrees;
+        metric.error = alignment.error;
+        metrics.push_back(std::move(metric));
+        ++spanIndex;
+    }
+    return metrics;
+}
+
+void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiberId)
+{
+    for (const auto& pane : _panes) {
+        if (!pane.session || !pane.dialog || pane.session->fiberId != fiberId) {
+            continue;
+        }
+        pane.dialog->setGeneratedSpanAlignmentMetrics(
+            generatedSpanAlignmentMetricsForSession(*pane.session));
+    }
 }
 
 bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)
@@ -4584,11 +4865,16 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         _state->setSurface(name, nullptr);
     }
     session.generatedSurfaceNames.clear();
+    const std::string generatedPrefix = session.surfaceName.empty()
+        ? nextSurfaceName()
+        : session.surfaceName;
+    session.generatedLineSurfaceName = generatedPrefix + "_line_surface";
+    session.generatedLineSideSliceName = generatedPrefix + "_line_side_slice";
 
-    _state->setSurface("line-surface", views.lineSurface);
-    _state->setSurface("line-side-slice", views.lineSideSlice);
-    session.generatedSurfaceNames.push_back("line-surface");
-    session.generatedSurfaceNames.push_back("line-side-slice");
+    _state->setSurface(session.generatedLineSurfaceName, views.lineSurface);
+    _state->setSurface(session.generatedLineSideSliceName, views.lineSideSlice);
+    session.generatedSurfaceNames.push_back(session.generatedLineSurfaceName);
+    session.generatedSurfaceNames.push_back(session.generatedLineSideSliceName);
 
     std::vector<cv::Vec3f> linePoints;
     linePoints.reserve(session.optimizedLine.points.size());
@@ -4608,9 +4894,9 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         : seedPoint;
 
     LineAnnotationDialog::GeneratedViews generatedViews;
-    generatedViews.lineSurfaceName = "line-surface";
+    generatedViews.lineSurfaceName = session.generatedLineSurfaceName;
     generatedViews.lineSurfaceTitle = tr("Line Surface");
-    generatedViews.lineSideSliceName = "line-side-slice";
+    generatedViews.lineSideSliceName = session.generatedLineSideSliceName;
     generatedViews.lineSideSliceTitle = tr("Line Side Slice");
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
@@ -4633,15 +4919,31 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             generatedViews.seedLineIndex = static_cast<int>(std::llround(marker.linePosition));
         }
     }
+    const auto controlLinePositionRange =
+        vc3d::line_annotation::generatedControlLinePositionRange(
+            generatedViews.controlPoints);
     generatedViews.predSnapPoints =
         generatedPredSnapMarkers(session.controlPoints, session.predSnapSet);
-    generatedViews.initialCenterIndex = static_cast<int>(std::llround(std::clamp(
-        session.focusedLinePosition,
-        0.0,
-        static_cast<double>(std::max<size_t>(1, session.optimizedLine.points.size()) - 1))));
-    generatedViews.initialStripLinePositionRange = session.initialStripLinePositionRange;
+    const double maxLinePosition =
+        static_cast<double>(std::max<size_t>(1, session.optimizedLine.points.size()) - 1);
+    double initialCenterPosition = std::clamp(session.focusedLinePosition,
+                                             0.0,
+                                             maxLinePosition);
+    if (controlLinePositionRange) {
+        initialCenterPosition = std::clamp(initialCenterPosition,
+                                           controlLinePositionRange->first,
+                                           controlLinePositionRange->second);
+    }
+    generatedViews.initialCenterIndex =
+        static_cast<int>(std::llround(initialCenterPosition));
+    generatedViews.initialStripLinePositionRange =
+        session.initialStripLinePositionRange
+            ? session.initialStripLinePositionRange
+            : controlLinePositionRange;
+    generatedViews.spanAlignmentMetrics =
+        generatedSpanAlignmentMetricsForSession(session);
 
-    generatedViews.currentCutName = "line-current-cut";
+    generatedViews.currentCutName = generatedPrefix + "_line_current_cut";
     generatedViews.currentCutSurface = std::make_shared<PlaneSurface>(
         seedPoint,
         cv::Vec3f{1.0f, 0.0f, 0.0f});
@@ -4650,7 +4952,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
 
     generatedViews.bottomCutSurfaces.reserve(7);
     for (int i = 0; i < 7; ++i) {
-        const std::string surfaceName = "line-bottom-cut-" + std::to_string(i);
+        const std::string surfaceName =
+            generatedPrefix + "_line_bottom_cut_" + std::to_string(i);
         auto plane = std::make_shared<PlaneSurface>(seedPoint, cv::Vec3f{1.0f, 0.0f, 0.0f});
         _state->setSurface(surfaceName, plane);
         session.generatedSurfaceNames.push_back(surfaceName);
@@ -4678,6 +4981,12 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         session.error = "Failed to create generated annotation viewers.";
         showError(tr("Could not create generated line annotation viewers."));
         return false;
+    }
+    if (session.fiberId != 0 &&
+        session.fiberMetricsMatchStoredFiber &&
+        !hasCachedAlignmentForFiber(session.fiberId) &&
+        !isAlignmentPendingForFiber(session.fiberId)) {
+        requestFiberAlignmentMetrics(session.fiberId);
     }
     return true;
 }
@@ -4787,12 +5096,15 @@ std::vector<fs::path> LineAnnotationController::saveGeneratedQuadMeshes(LineAnno
 
     const fs::path pathsDir = resolveMeshExportPathsDir();
     const std::vector<std::pair<std::string, std::string>> exports = {
-        {"line-surface", "surface"},
-        {"line-side-slice", "side_slice"},
+        {session.generatedLineSurfaceName, "surface"},
+        {session.generatedLineSideSliceName, "side_slice"},
     };
 
     std::vector<fs::path> savedPaths;
     for (const auto& [surfaceName, stem] : exports) {
+        if (surfaceName.empty()) {
+            continue;
+        }
         auto surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(surfaceName));
         if (!surface) {
             continue;
@@ -4835,6 +5147,7 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
 
     const auto before = _panes.size();
     std::vector<std::string> generatedSurfaceNames;
+    std::shared_ptr<LineAnnotationSession> sessionToSave;
     for (const auto& pane : _panes) {
         if (pane.surfaceName == surfaceName && pane.session && pane.session->watcher) {
             auto* watcher = pane.session->watcher.data();
@@ -4851,7 +5164,7 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
                 pane.session->taskState == LineAnnotationSession::TaskState::Succeeded &&
                 !pane.session->optimizedLine.points.empty() &&
                 !pane.session->controlPoints.empty()) {
-                saveSessionAsFiber(*pane.session);
+                sessionToSave = pane.session;
             }
         }
     }
@@ -4863,6 +5176,10 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
                  _panes.end());
     if (before == _panes.size()) {
         return;
+    }
+
+    if (sessionToSave) {
+        saveSessionAsFiber(*sessionToSave);
     }
 
     if (_state) {
@@ -4952,6 +5269,10 @@ void LineAnnotationController::loadFibersForCurrentPackage()
 {
     _fibers.clear();
     _fiberAlignmentMetrics.clear();
+    _pendingFiberAlignmentMetrics.clear();
+    _pendingFiberAlignmentMetricTokens.clear();
+    ++_nextFiberAlignmentMetricToken;
+    ++_fiberMetricsGeneration;
     _fiberMetricsPending = false;
     if (!_state || !_state->vpkg()) {
         emitFiberSummaries();
@@ -5248,6 +5569,16 @@ LineAnnotationController::calculateAlignmentMetricsForFiber(
             ++count;
         }
 
+        void add(const Accumulator& other)
+        {
+            if (other.count <= 0) {
+                return;
+            }
+            sum += other.sum;
+            max = count == 0 ? other.max : std::max(max, other.max);
+            count += other.count;
+        }
+
         FiberSummary::AlignmentMetrics toMetrics(const std::string& error = {}) const
         {
             FiberSummary::AlignmentMetrics metric;
@@ -5315,12 +5646,17 @@ LineAnnotationController::calculateAlignmentMetricsForFiber(
         return accumulator;
     };
 
-    result.fiber = accumulateRange(0, fiber.linePoints.size() - 1).toMetrics();
+    Accumulator fiberAccumulator;
     for (size_t i = 0; i < spans.size(); ++i) {
         const auto& span = spans[i];
-        result.spans[i] =
-            accumulateRange(span.firstLineIndex, span.lastLineIndex).toMetrics();
+        const Accumulator spanAccumulator =
+            accumulateRange(span.firstLineIndex, span.lastLineIndex);
+        result.spans[i] = spanAccumulator.toMetrics();
+        fiberAccumulator.add(spanAccumulator);
     }
+    result.fiber = spans.empty()
+        ? accumulateRange(0, fiber.linePoints.size() - 1).toMetrics()
+        : fiberAccumulator.toMetrics();
     return result;
 }
 
@@ -5533,6 +5869,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         session.fiberSequence = fiber.sequence;
         session.fiberFileName = fiber.fileName;
         session.fiberTags = fiber.tags;
+        session.fiberMetricsMatchStoredFiber = true;
         const uint64_t savedFiberId = fiber.id;
         const uint64_t savedGeneration = fiber.generation;
 
@@ -5549,7 +5886,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         } else {
             *it = std::move(fiber);
         }
-        _fiberAlignmentMetrics.erase(savedFiberId);
+        invalidateFiberAlignmentMetrics(savedFiberId, true);
         addKnownFiberTags(session.fiberTags);
         emitFiberSummaries();
         emit fiberSaved(savedFiberId, savedGeneration);
