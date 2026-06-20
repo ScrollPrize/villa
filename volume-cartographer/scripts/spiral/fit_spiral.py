@@ -140,7 +140,6 @@ default_config = {
     'track_coverage_radius_tol': 0.5,
     'track_coverage_tau_init': 0.5,
     'track_coverage_tau_final': 0.05,
-    'normals_num_points': 6000,
     'dense_normals_num_points': 60_000,
     'regularisation_num_points': 4500,
     'grad_mag_encode_scale': 1000.0,
@@ -162,7 +161,6 @@ default_config = {
     'loss_weight_patch_stretch': 0.0,
     'loss_weight_bending': 0.0,
     'loss_weight_sym_dirichlet': 10.0,
-    'loss_weight_patch_normals': 0.0,
     'loss_weight_dense_normals': 1.e2,
     'loss_weight_dense_spacing': 8.,
     'loss_weight_umbilicus': 5.,
@@ -239,7 +237,6 @@ z_range_scaled_count_keys = (
     'abs_winding_num_pcls',
     'unattached_pcl_num_per_step',
     'track_num_per_step',
-    'normals_num_points',
     'dense_normals_num_points',
     'regularisation_num_points',
     'shell_num_samples',
@@ -2184,15 +2181,9 @@ def get_unattached_pcl_strip_losses(
     return radius_loss, dt_loss
 
 
-def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, patches, patch_sampling_probabilities, epsilon=1.0):
-    # Sample patch points and enforce, at each point, two local rigidity properties of the scroll->spiral transform:
-    #   (stretch) epsilon-steps along the discrete patch tangents (+i and +j neighbors in patch coordinates) preserve
-    #             length in spiral space;
-    #   (normals) the patch surface normal -- the cross-product of the +i and +j patch coordinate deltas -- matches the
-    #             outward radial direction in spiral space. This is checked in scroll space: the spiral-space radial
-    #             direction is pulled back to scroll space as a covector via J^T (see get_radial_normal_in_scroll_space)
-    #             and compared against the measured normal there.
-    # The normal's sign relative to outward is ambiguous; |cosine| absorbs that.
+def get_patch_stretch_loss(slice_to_spiral_transform, num_points, patches, patch_sampling_probabilities, epsilon=1.0):
+    # Sample patch points and enforce that epsilon-steps along the discrete patch tangents
+    # (+i and +j neighbors in patch coordinates) preserve length in spiral space.
     patch_idx = int(np.random.choice(len(patches), p=patch_sampling_probabilities))
     patch = patches[patch_idx]
     valid_indices = patch.valid_quad_indices
@@ -2207,7 +2198,6 @@ def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, pa
     safe_j_next = (j_coords + 1).clamp(max=W - 1)
     neighbor_i_valid = patch.valid_vertex_mask[safe_i_next, j_coords] & in_bounds_i
     neighbor_j_valid = patch.valid_vertex_mask[i_coords, safe_j_next] & in_bounds_j
-    # Require both neighbors so the cross-product normal is well-defined.
     mask = (neighbor_i_valid & neighbor_j_valid).float().cuda()
 
     scroll_zyx = patch.zyxs[i_coords, j_coords].cuda()
@@ -2217,7 +2207,6 @@ def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, pa
     delta_j = scroll_neighbor_j - scroll_zyx
     tangent_i = F.normalize(delta_i, dim=-1)
     tangent_j = F.normalize(delta_j, dim=-1)
-    scroll_normal = F.normalize(torch.linalg.cross(delta_i, delta_j, dim=-1), dim=-1)
 
     scroll_shift_i = scroll_zyx + tangent_i * epsilon
     scroll_shift_j = scroll_zyx + tangent_j * epsilon
@@ -2234,13 +2223,9 @@ def get_patch_stretch_and_normals_loss(slice_to_spiral_transform, num_points, pa
     else:
         raise ValueError(f"patch_stretch_loss_norm must be 'L1' or 'L2', got {cfg['patch_stretch_loss_norm']!r}")
 
-    predicted_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx)
-    normals_residual = 1. - (predicted_normal * scroll_normal).sum(dim=-1).abs()
-
     denom = mask.sum().clamp(min=1)
     stretch_loss = (stretch_residual * mask).sum() / denom
-    normals_loss = (normals_residual * mask).sum() / denom
-    return stretch_loss, normals_loss
+    return stretch_loss
 
 
 def get_bending_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=1.0):
@@ -4699,15 +4684,14 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
             losses['unverified_patch_radius'] = unverified_patch_radius_loss * cfg['loss_weight_unverified_patch_radius']
             losses['unverified_patch_dt'] = unverified_patch_dt_loss * cfg['loss_weight_unverified_patch_dt']
 
-        if cfg['loss_weight_patch_stretch'] > 0 or cfg['loss_weight_patch_normals'] > 0:
-            patch_stretch_loss, patch_normals_loss = get_patch_stretch_and_normals_loss(
+        if cfg['loss_weight_patch_stretch'] > 0:
+            patch_stretch_loss = get_patch_stretch_loss(
                 slice_to_spiral_transform,
                 cfg['regularisation_num_points'],
                 patches_list,
                 patch_sampling_probabilities,
             )
             losses['patch_stretch'] = patch_stretch_loss * cfg['loss_weight_patch_stretch']
-            losses['patch_normals'] = patch_normals_loss * cfg['loss_weight_patch_normals']
 
         if cfg['loss_weight_bending'] > 0:
             bending_loss = get_bending_loss(
