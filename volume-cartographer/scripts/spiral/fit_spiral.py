@@ -12,7 +12,6 @@ import hashlib
 import trimesh
 import datetime
 import itertools
-import colorsys
 import numpy as np
 import scipy.ndimage
 import torch.nn as nn
@@ -28,7 +27,13 @@ from lasagna_data import prepare_lasagna_volume
 from tifxyz import load_tifxyz, save_tifxyz
 from geom_utils import interp1d
 from point_collection import load_point_collection, link_points_to_patches, link_points_to_patches_pointcache, can_use_surface_index_backend, normalise_pcl_winding_annotations
-from tracks import load_tracks_from_dbm
+from tracks import (
+    get_track_losses,
+    get_track_satisfied_counts_in_chunks,
+    load_tracks_from_dbm,
+    prepare_main_phase_tracks,
+    render_spiral_on_tracks_for_slice,
+)
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
     canonical_winding_samples,
@@ -2341,121 +2346,6 @@ def _segmented_median_per_strip(ctx):
     return sorted_norm[median_indices]
 
 
-def _mode_winding_per_strip(strip_id, winding_idx_per_point, S, device):
-    # Per strip, return the discrete winding index (round(normalised / dr))
-    # that the most points fall on. Ties are broken by the smaller winding
-    # index. Strips with no points get 0.
-    mode_winding_per_strip = torch.zeros(S, dtype=torch.int64, device=device)
-    if winding_idx_per_point.numel() == 0:
-        return mode_winding_per_strip
-
-    w_min = winding_idx_per_point.min()
-    w_max = winding_idx_per_point.max()
-    w_span = (w_max - w_min + 1).to(torch.int64)
-    composite = strip_id.to(torch.int64) * w_span + (winding_idx_per_point - w_min).to(torch.int64)
-    sorted_comp, _ = torch.sort(composite)
-    unique_comp, counts = torch.unique_consecutive(sorted_comp, return_counts=True)
-    u_strip = unique_comp // w_span
-    u_widx = (unique_comp % w_span) + w_min
-
-    # Pick per-strip row with max count (smallest winding wins ties) via a
-    # composite-sort: key = strip-major, then count-descending, then
-    # winding-ascending. The first row for each strip after sorting is the
-    # winner.
-    counts_max = counts.max().to(torch.int64)
-    widx_min = u_widx.min().to(torch.int64)
-    widx_max = u_widx.max().to(torch.int64)
-    widx_span = (widx_max - widx_min + 1).to(torch.int64)
-    key = (
-        u_strip * ((counts_max + 1) * widx_span)
-        + (counts_max - counts.to(torch.int64)) * widx_span
-        + (u_widx.to(torch.int64) - widx_min)
-    )
-    order = torch.argsort(key)
-    sorted_strip = u_strip[order]
-    sorted_widx = u_widx[order]
-    new_strip = torch.cat([
-        torch.ones(1, dtype=torch.bool, device=device),
-        sorted_strip[1:] != sorted_strip[:-1],
-    ])
-    first_idx = torch.nonzero(new_strip, as_tuple=False).squeeze(-1)
-    mode_winding_per_strip[sorted_strip[first_idx]] = sorted_widx[first_idx].to(torch.int64)
-    return mode_winding_per_strip
-
-
-def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks):
-    # Tracks are unannotated strips. For each track, infer the integer winding it
-    # most often lies near, then reuse the same per-point spiral-space and scan-
-    # space satisfaction checks as unattached PCLs. Returns values aligned to
-    # `valid_track_indices`, since tracks with fewer than two points are skipped.
-    device = dr_per_winding.device
-    if not tracks:
-        empty = torch.zeros(0, dtype=torch.int64)
-        return empty, empty, empty, [], empty
-
-    valid_track_indices = [i for i, track in enumerate(tracks) if len(track) >= 2]
-    if not valid_track_indices:
-        empty = torch.zeros(0, dtype=torch.int64)
-        return empty, empty, empty, [], empty
-
-    strip_arrays = [
-        (
-            np.asarray(tracks[i], dtype=np.float32),
-            np.zeros(len(tracks[i]), dtype=np.float32),
-        )
-        for i in valid_track_indices
-    ]
-    flat = _build_strip_flat_bundle(strip_arrays, device)
-    ctx, lengths_cpu, S = _build_strip_spiral_context(
-        slice_to_spiral_transform, dr_per_winding, flat, len(valid_track_indices),
-    )
-    valid_track_indices_t = torch.tensor(valid_track_indices, dtype=torch.int64)
-    if ctx is None:
-        per_point = [torch.zeros([int(n.item())], dtype=torch.bool) for n in lengths_cpu]
-        return valid_track_indices_t, torch.zeros(S, dtype=torch.int64), lengths_cpu.clone(), per_point, torch.zeros(S, dtype=torch.int64)
-
-    dr = ctx['dr']
-    strip_id = ctx['strip_id']
-    normalised_radii = ctx['normalised_radii']
-
-    with torch.no_grad():
-        winding_idx_per_point = torch.round(normalised_radii / dr).to(torch.int64)
-        mode_winding_per_strip = _mode_winding_per_strip(strip_id, winding_idx_per_point, S, device)
-        target_normalised_per_strip = mode_winding_per_strip.to(dr.dtype) * dr
-
-    satisfied_counts, per_point_satisfaction = _strip_satisfaction_from_target(ctx, target_normalised_per_strip)
-    return (
-        valid_track_indices_t,
-        satisfied_counts,
-        lengths_cpu.clone(),
-        per_point_satisfaction,
-        mode_winding_per_strip.cpu(),
-    )
-
-
-def get_track_satisfied_counts_in_chunks(slice_to_spiral_transform, dr_per_winding, tracks, chunk_size=500_000):
-    # Memory-safe wrapper around get_track_satisfied_counts for very large track
-    # sets (the full z-range has tens of millions of tracks, whose flat point
-    # tensors do not fit in GPU memory at once). Every per-track quantity
-    # (winding-mode, unwrap, satisfaction) is independent across tracks, so
-    # splitting the track list into contiguous chunks of whole tracks and
-    # concatenating the per-track results yields identical satisfied/total
-    # counts to a single pass. Returns only the two tensors the metric needs:
-    # (satisfied_counts, total_counts), each 1-D int64 over the valid tracks.
-    sat_parts, tot_parts = [], []
-    for start in range(0, len(tracks), chunk_size):
-        chunk = tracks[start:start + chunk_size]
-        _, sat, tot, _, _ = get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, chunk)
-        sat_parts.append(sat)
-        tot_parts.append(tot)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    if not sat_parts:
-        empty = torch.zeros(0, dtype=torch.int64)
-        return empty, empty
-    return torch.cat(sat_parts), torch.cat(tot_parts)
-
-
 def get_face_indices(h, w):
     indices = torch.arange(h * w).view(h, w)
     top_left = indices[:-1, :-1].flatten()
@@ -3139,10 +3029,10 @@ def save_overlay(
         # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
         overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
         if tracks:
-            _render_spiral_on_tracks_for_slice(
+            render_spiral_on_tracks_for_slice(
                 spiral_zyx, spiral_density, dr_per_winding,
                 slice_z, tracks, [],
-                out_path, suffix,
+                out_path, suffix, downsample_factor,
             )
         if os.environ.get('FIT_SPIRAL_SAVE_DISPLACEMENT') == '1':
             slice_zyx = torch.cat([torch.full([*slice_yx.shape[:2], 1], slice_z, device=device), slice_yx], dim=-1)
@@ -3178,20 +3068,20 @@ def _build_anchor_kdtree(anchor_zyx):
     return cKDTree(np.ascontiguousarray(anchor_np, dtype=np.float32))
 
 
-def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
-    # Returns a boolean numpy mask, True where the track point is farther than `threshold`
-    # from every anchor. `track_zyx` is an (N, 3) array (numpy or tensor); `anchor_tree` is
+def _points_far_from_anchors_mask(points_zyx, anchor_tree, threshold):
+    # Returns a boolean numpy mask, True where the point is farther than `threshold`
+    # from every anchor. `points_zyx` is an (N, 3) array (numpy or tensor); `anchor_tree` is
     # a cKDTree built by _build_anchor_kdtree (or None). Uses a fixed-radius nearest-neighbour
     # query — O(N log A), parallel across cores — instead of the full pairwise distance matrix.
-    if isinstance(track_zyx, torch.Tensor):
-        track_np = track_zyx.detach().cpu().numpy()
+    if isinstance(points_zyx, torch.Tensor):
+        points_np = points_zyx.detach().cpu().numpy()
     else:
-        track_np = np.asarray(track_zyx)
-    track_np = np.ascontiguousarray(track_np, dtype=np.float32)
+        points_np = np.asarray(points_zyx)
+    points_np = np.ascontiguousarray(points_np, dtype=np.float32)
     if threshold <= 0 or anchor_tree is None:
-        return np.ones(track_np.shape[0], dtype=bool)
+        return np.ones(points_np.shape[0], dtype=bool)
     # query returns dist == inf for points with no anchor within distance_upper_bound.
-    dist, _ = anchor_tree.query(track_np, k=1, distance_upper_bound=float(threshold), workers=-1)
+    dist, _ = anchor_tree.query(points_np, k=1, distance_upper_bound=float(threshold), workers=-1)
     return np.isinf(dist)
 
 
@@ -3199,7 +3089,7 @@ def _mask_patches_near_trusted_geometry(patches_dict, anchor_tree, radius):
     # For each patch in `patches_dict`, invalidate (set zyxs -> -1) every currently-valid vertex
     # lying within `radius` (scroll space, downsampled voxels) of any trusted-geometry anchor in
     # `anchor_tree`, then re-derive the patch's masks/area. Patches left with no valid quad are
-    # dropped. This is the patch analogue of the track-exclusion in _prepare_main_phase_tracks:
+    # dropped. This is the patch analogue of the DBM-track exclusion in tracks.py:
     # untrusted patches only constrain regions the trusted inputs don't already cover, so they
     # can't fight verified geometry. Mutates and returns a possibly-smaller dict; a non-positive
     # radius or empty tree leaves everything intact.
@@ -3211,7 +3101,7 @@ def _mask_patches_near_trusted_geometry(patches_dict, anchor_tree, radius):
     for pid, patch in patches_dict.items():
         zyxs_np = patch.zyxs.reshape(-1, 3).cpu().numpy()
         valid_flat = patch.valid_vertex_mask.reshape(-1).cpu().numpy()
-        far = _track_points_far_from_anchors_mask(zyxs_np, anchor_tree, radius)  # True => keep
+        far = _points_far_from_anchors_mask(zyxs_np, anchor_tree, radius)  # True => keep
         invalidate = valid_flat & ~far
         if invalidate.any():
             mask2d = torch.from_numpy(invalidate.reshape(patch.zyxs.shape[:2]))
@@ -3234,151 +3124,6 @@ def _mask_patches_near_trusted_geometry(patches_dict, anchor_tree, radius):
     return kept
 
 
-def _prepare_main_phase_tracks(tracks, patch_atlas, unattached_pcl_strips, exclusion_radius, device):
-    # Drop every track point that lies within `exclusion_radius` of any patch vertex / pcl
-    # strip point, then drop tracks left with fewer than 2 points. Returns a flat per-point
-    # zyx tensor plus per-track offsets and lengths, all on `device`.
-    if not tracks:
-        return None
-    print('removing tracks near patches')
-    anchor_scroll = _collect_anchor_scroll_zyxs(patch_atlas, unattached_pcl_strips, device)
-    anchor_tree = _build_anchor_kdtree(anchor_scroll)
-    flat_zyx_np = np.concatenate([t.astype(np.float32) for t in tracks], axis=0)
-    track_id_np = np.concatenate([
-        np.full(len(t), i, dtype=np.int64) for i, t in enumerate(tracks)
-    ])
-    keep_np = _track_points_far_from_anchors_mask(flat_zyx_np, anchor_tree, exclusion_radius)
-    flat_zyx_np = flat_zyx_np[keep_np]
-    track_id_np = track_id_np[keep_np]
-    num_tracks_orig = len(tracks)
-    new_lengths = np.bincount(track_id_np, minlength=num_tracks_orig)
-    surviving = np.where(new_lengths >= 2)[0]
-    print(f'kept {len(surviving)} / {len(tracks)} tracks')
-    if len(surviving) == 0:
-        return None
-    old_to_new = -np.ones(num_tracks_orig, dtype=np.int64)
-    old_to_new[surviving] = np.arange(len(surviving))
-    new_id = old_to_new[track_id_np]
-    keep2 = new_id >= 0
-    flat_zyx_np = flat_zyx_np[keep2]
-    new_id = new_id[keep2]
-    # Stable sort by new track id so same-track points end up contiguous; the within-track
-    # ordering is preserved.
-    sort_idx = np.argsort(new_id, kind='stable')
-    flat_zyx_np = flat_zyx_np[sort_idx]
-    lengths_new = new_lengths[surviving].astype(np.int64)
-    offsets_new = np.concatenate([[0], np.cumsum(lengths_new)]).astype(np.int64)
-    print(
-        f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
-        f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
-    )
-    return {
-        'flat_zyx': torch.from_numpy(flat_zyx_np).to(device=device),
-        'offsets': torch.from_numpy(offsets_new).to(device=device),
-        'lengths': torch.from_numpy(lengths_new).to(device=device),
-    }
-
-
-def _sample_prepared_track_points(prepared_tracks, candidate_track_ids, num_tracks_per_step, num_points_per_track):
-    flat_zyx = prepared_tracks['flat_zyx']
-    offsets = prepared_tracks['offsets']
-    lengths = prepared_tracks['lengths']
-    device = flat_zyx.device
-    num_tracks = int(lengths.numel())
-    if num_tracks == 0 or num_tracks_per_step <= 0 or num_points_per_track <= 0:
-        return None
-
-    if candidate_track_ids is None:
-        num_candidates = num_tracks
-        k = min(int(num_tracks_per_step), num_candidates)
-        track_idx = torch.randint(num_candidates, (k,), device=device)
-    else:
-        if candidate_track_ids.numel() == 0:
-            return None
-        num_candidates = int(candidate_track_ids.numel())
-        k = min(int(num_tracks_per_step), num_candidates)
-        candidate_sel = torch.randint(num_candidates, (k,), device=device)
-        track_idx = candidate_track_ids[candidate_sel]
-
-    track_lengths_sample = lengths[track_idx]
-    track_offsets_sample = offsets[track_idx]
-    point_idx_within = (
-        torch.rand([k, num_points_per_track], device=device)
-        * track_lengths_sample[:, None].to(torch.float32)
-    ).to(torch.int64)
-    point_idx_within, _ = torch.sort(point_idx_within, dim=-1)
-    flat_idx = (track_offsets_sample[:, None] + point_idx_within).reshape(-1)
-    sampled_scroll = flat_zyx[flat_idx].view(k, num_points_per_track, 3)
-    return track_idx, flat_idx, sampled_scroll
-
-
-def _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding):
-    radius_hinge_margin = dr_per_winding.detach() * cfg['track_radius_loss_margin']
-    if cfg['track_radius_target'] == 'mean':
-        radius_target_per_track = shifted_radii.mean(dim=-1, keepdim=True)
-    elif cfg['track_radius_target'] == 'median':
-        radius_target_per_track = shifted_radii.median(dim=-1, keepdim=True).values
-    else:
-        raise ValueError(f"track_radius_target must be 'mean' or 'median', got {cfg['track_radius_target']!r}")
-    deviations = (shifted_radii - radius_target_per_track).abs()
-    hinged = F.relu(deviations - radius_hinge_margin)
-    within_p = cfg['track_radius_within_norm_p']
-    if within_p == 1.0:
-        return hinged.mean()
-    # Emphasise the worst within-track point: the satisfied_tracks metric requires
-    # ALL points in the spiral band, so a per-track p-norm (p>1) over the residuals
-    # targets the binding point. +1e-5 mirrors the dt loss, avoiding the x**(1/p)
-    # zero-gradient singularity.
-    per_track = ((hinged + 1.e-5) ** within_p).mean(dim=-1) ** (1.0 / within_p)
-    return per_track.mean()
-
-
-def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, num_tracks_per_step, num_points_per_track, compute_dt=True, dt_max_winding=None):
-    # Sample K tracks (with replacement) and M points per track, transform to spiral space, and
-    # compute two losses analogous to the patch radius/DT losses: (1) each point's deviation
-    # from the track's mean shifted-radius beyond the radius hinge margin; (2) each point
-    # should snap to its target integer winding, with the target taken from the snapped
-    # track median.
-    device = dr_per_winding.device
-    zero = torch.zeros([], device=device)
-    if prepared_tracks is None:
-        return zero, zero
-    sample = _sample_prepared_track_points(prepared_tracks, None, num_tracks_per_step, num_points_per_track)
-    if sample is None:
-        return zero, zero
-    _, _, sampled_scroll = sample
-    k = sampled_scroll.shape[0]
-    M = sampled_scroll.shape[1]
-    sampled_spiral = slice_to_spiral_transform(sampled_scroll.reshape(-1, 3)).reshape(k, M, 3)
-    theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
-    shifted_radii = _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding)
-    dt_hinge_margin = dr_per_winding.detach() * cfg['track_dt_loss_margin']
-    radius_loss = _same_radius_loss_for_shifted_radii(shifted_radii, dr_per_winding)
-
-    if not compute_dt:
-        return radius_loss, zero
-
-    target_shifted_radii = torch.round(shifted_radii.median(dim=-1, keepdim=True).values / dr_per_winding) * dr_per_winding
-    target_radii = target_shifted_radii + theta / (2 * np.pi) * dr_per_winding
-    target_spiral_zyxs = torch.stack([
-        sampled_spiral[..., 0],
-        torch.sin(theta) * target_radii,
-        torch.cos(theta) * target_radii,
-    ], dim=-1).detach()
-    target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
-
-    within_p = cfg['track_dt_within_track_norm_p']
-    across_p = cfg['track_dt_norm_p']
-    point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
-    point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
-    track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
-    # Progressive DT: only tracks whose snapped winding is within the current cutoff contribute.
-    active_mask = _progressive_dt_active_mask(target_shifted_radii.squeeze(-1), dr_per_winding, dt_max_winding)
-    dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
-
-    return radius_loss, dt_loss
-
-
 @torch.no_grad()
 def _rasterize_spiral_for_slice(spiral_and_transform, slice_to_spiral_transform, slice_yx, slice_z, winding_range):
     # Transform a full slice from scroll into spiral space (in chunks to bound peak VRAM)
@@ -3396,58 +3141,6 @@ def _rasterize_spiral_for_slice(spiral_and_transform, slice_to_spiral_transform,
     spiral_zyx = torch.cat(spiral_pieces, dim=0).reshape(*slice_zyx.shape)
     spiral_density = spiral_and_transform.get_spiral_density(spiral_zyx, winding_range=winding_range)
     return spiral_zyx, spiral_density
-
-
-def _render_spiral_on_tracks_for_slice(
-    spiral_zyx, spiral_density, dr_per_winding,
-    slice_z, all_tracks, snapped_tracks,
-    out_path, name_suffix,
-):
-    # Per-slice render of the spiral density (per-winding hued) with track points within
-    # a narrow z slab drawn on top; points from tracks in `snapped_tracks` use a brighter
-    # palette so it's easy to see which tracks are currently being snapped to.
-    z_window = 5
-    point_radius = 1
-    target_ids = {id(t) for t in snapped_tracks}
-
-    def track_colour(track, is_target):
-        # Stable per-track hue from id(track); saturation/value picks the bright
-        # ("snap target") vs grey-ish ("not enabled") palette.
-        hue = ((id(track) * 2654435761) & 0xFFFFFFFF) / 2 ** 32
-        sat, val = (0.9, 1.0) if is_target else (0.35, 0.75)
-        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
-        return (int(r * 255), int(g * 255), int(b * 255))
-
-    _, _, shifted_radius = get_theta_and_radii(spiral_zyx[..., 1:], dr_per_winding)
-    winding_idx = (shifted_radius / dr_per_winding).round().to(torch.int64).clamp_min(0)
-    num_winding_hues = 6
-    hue_min, hue_max = 1.5 / 6, 5.25 / 6
-    hue_fraction = hue_min + (winding_idx % num_winding_hues).to(torch.float32) / num_winding_hues * (hue_max - hue_min)
-    hue = hue_fraction * 2 * np.pi
-    hsv = torch.stack([hue, torch.full_like(hue, 0.5), torch.ones_like(hue)])
-    spiral_colours = kornia.color.hsv_to_rgb(hsv).permute(1, 2, 0) * 255
-    canvas = (spiral_colours * spiral_density[..., None]).to(torch.uint8).cpu().numpy()
-    image = Image.fromarray(canvas)
-    draw = ImageDraw.Draw(image)
-
-    # Draw non-target tracks first so target tracks paint on top.
-    for is_target in (False, True):
-        for track in all_tracks:
-            if (id(track) in target_ids) != is_target:
-                continue
-            zs = track[:, 0]
-            in_slab = np.abs(zs.astype(np.float32) - float(slice_z)) <= z_window
-            if not in_slab.any():
-                continue
-            colour = track_colour(track, is_target)
-            for idx in np.nonzero(in_slab)[0]:
-                y = float(track[idx, 1])
-                x = float(track[idx, 2])
-                draw.ellipse(
-                    [x - point_radius, y - point_radius, x + point_radius, y + point_radius],
-                    fill=colour,
-                )
-    image.save(f'{out_path}/spiral_on_tracks_s{int(slice_z) * downsample_factor:05}_{name_suffix}.png', compress_level=3)
 
 
 def get_flow_field_high_res_lr_scale(iteration):
@@ -3705,7 +3398,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 torch.cuda.empty_cache()
             try:
                 track_satisfied_counts, track_total_counts = get_track_satisfied_counts_in_chunks(
-                    slice_to_spiral_transform, dr_per_winding, tracks,
+                    slice_to_spiral_transform, dr_per_winding, tracks, metrics_config,
                 )
                 track_fully_satisfied = (track_satisfied_counts == track_total_counts)
                 fully_satisfied_tracks = int(track_fully_satisfied.sum().item())
@@ -3817,8 +3510,9 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
     prepared_main_tracks = None
     if (cfg['loss_weight_track_radius'] > 0 or cfg['loss_weight_track_dt'] > 0) and tracks:
-        prepared_main_tracks = _prepare_main_phase_tracks(
-            tracks, patch_atlas, unattached_pcl_strips,
+        trusted_anchor_scroll = _collect_anchor_scroll_zyxs(patch_atlas, unattached_pcl_strips, device)
+        prepared_main_tracks = prepare_main_phase_tracks(
+            tracks, trusted_anchor_scroll,
             float(cfg['track_exclusion_radius']), device,
         )
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
@@ -3931,8 +3625,7 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
                 slice_to_spiral_transform,
                 dr_per_winding,
                 prepared_main_tracks,
-                cfg['track_num_per_step'],
-                cfg['track_num_points_per_step'],
+                cfg,
                 compute_dt=compute_track_dt,
                 dt_max_winding=track_dt_max_winding,
             )
