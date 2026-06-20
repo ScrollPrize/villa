@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from sample_spiral import get_theta_and_radii
+from spiral_helpers import _segmented_median_per_strip
 
 
 # Thresholds defining the patch-satisfaction metrics.
@@ -458,32 +459,3 @@ def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_windin
 
     satisfied_counts, per_point_satisfaction = _strip_satisfaction_from_target(ctx, target_normalised_per_strip)
     return satisfied_counts, lengths_cpu.clone(), per_point_satisfaction
-
-
-def _segmented_median_per_strip(ctx):
-    # Segmented median: sort the flat values with a composite key
-    # (strip_id-major, normalised_radii-minor) so values for each strip end
-    # up contiguous and sorted within their range. Per-strip median is then
-    # at start + (length - 1) // 2 (matching torch.median's lower-median
-    # convention for even lengths). Float64 keeps headroom against
-    # strip_id * val_range overflow for hundreds-of-thousands of strips.
-    normalised_radii = ctx['normalised_radii']
-    strip_id = ctx['strip_id']
-    starts = ctx['starts']
-    lengths = ctx['lengths']
-    S = ctx['S']
-    device = ctx['device']
-    if normalised_radii.numel() == 0:
-        return torch.zeros(S, dtype=normalised_radii.dtype, device=device)
-
-    val_min = normalised_radii.min().to(torch.float64)
-    val_max = normalised_radii.max().to(torch.float64)
-    val_range = (val_max - val_min) + 1.0
-    composite = (
-        strip_id.to(torch.float64) * val_range
-        + (normalised_radii.to(torch.float64) - val_min)
-    )
-    order = torch.argsort(composite)
-    sorted_norm = normalised_radii[order]
-    median_indices = starts[:-1] + (lengths - 1) // 2
-    return sorted_norm[median_indices]
