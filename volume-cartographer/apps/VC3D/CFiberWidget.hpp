@@ -72,6 +72,10 @@ public:
     QAction* createShowFiberSliceAction(QObject* parent);
     QAction* createRenameFiberFileAction(QObject* parent);
     void setFibers(const std::vector<FiberEntry>& fibers);
+    void setAlignmentMetricsPending(bool pending);
+    void updateAlignmentMetrics(uint64_t fiberId,
+                                const FiberEntry::AlignmentMetrics& alignment,
+                                const std::vector<FiberEntry::AlignmentMetrics>& spanAlignments);
     void setKnownTags(const std::vector<std::string>& tags);
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
@@ -105,6 +109,10 @@ private:
     void rebuildModel();
     void sortFibers();
     QStandardItem* findFiberItem(uint64_t fiberId);
+    QList<QStandardItem*> rowItemsForNameItem(QStandardItem* nameItem) const;
+    void updateMetricDisplayForRow(QStandardItem* nameItem,
+                                   const FiberEntry::AlignmentMetrics& alignment);
+    void refreshMetricDisplays();
     const FiberEntry* selectedFiber() const;
     void updateClassificationUi();
     void rebuildTagList();

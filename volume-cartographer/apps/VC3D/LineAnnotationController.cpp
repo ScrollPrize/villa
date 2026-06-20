@@ -1818,16 +1818,11 @@ void LineAnnotationController::calculateFiberAlignmentMetrics()
     }
 
     std::vector<StoredFiber> fibers = _fibers;
-    std::unordered_map<uint64_t, std::vector<ControlSpanRecord>> spansByFiber;
-    spansByFiber.reserve(fibers.size());
-    for (const auto& fiber : fibers) {
-        spansByFiber.emplace(fiber.id, controlSpansForFiber(fiber));
-    }
 
     _fiberMetricsPending = true;
     _fiberAlignmentMetrics.clear();
     const uint64_t generation = ++_fiberMetricsGeneration;
-    emitFiberSummaries();
+    emit fiberAlignmentMetricsReset(true);
 
     auto* watcher = new QFutureWatcher<FiberMetricsTaskResult>(this);
     _fiberMetricsWatcher = watcher;
@@ -1842,8 +1837,7 @@ void LineAnnotationController::calculateFiberAlignmentMetrics()
     watcher->setFuture(QtConcurrent::run([generation,
                                            self,
                                            manifestPath,
-                                           fibers = std::move(fibers),
-                                           spansByFiber = std::move(spansByFiber)]() mutable {
+                                           fibers = std::move(fibers)]() mutable {
         FiberMetricsTaskResult result;
         result.generation = generation;
         result.manifestPath = manifestPath;
@@ -1853,11 +1847,8 @@ void LineAnnotationController::calculateFiberAlignmentMetrics()
             vc::lasagna::LasagnaNormalSampler sampler(dataset);
             result.metrics.reserve(fibers.size());
             for (const auto& fiber : fibers) {
-                const auto spansIt = spansByFiber.find(fiber.id);
-                const std::vector<ControlSpanRecord> emptySpans;
-                const auto& spans = spansIt == spansByFiber.end()
-                    ? emptySpans
-                    : spansIt->second;
+                const std::vector<ControlSpanRecord> spans =
+                    LineAnnotationController::controlSpansForFiber(fiber);
                 CachedFiberAlignmentMetrics metrics;
                 try {
                     metrics = LineAnnotationController::calculateAlignmentMetricsForFiber(
@@ -1887,7 +1878,11 @@ void LineAnnotationController::calculateFiberAlignmentMetrics()
                                                       return;
                                                   }
                                                   self->_fiberAlignmentMetrics[fiberId] = std::move(metrics);
-                                                  self->emitFiberSummaries();
+                                                  const auto& cached = self->_fiberAlignmentMetrics.at(fiberId);
+                                                  emit self->fiberAlignmentMetricsUpdated(
+                                                      fiberId,
+                                                      cached.fiber,
+                                                      cached.spans);
                                               },
                                               Qt::QueuedConnection);
                 }
@@ -3589,7 +3584,7 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
 }
 
 std::vector<LineAnnotationController::ControlSpanRecord>
-LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber) const
+LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber)
 {
     std::vector<ControlSpanRecord> spans;
     if (fiber.controlPoints.size() < 2 || fiber.linePoints.size() < 2) {
@@ -4554,12 +4549,17 @@ void LineAnnotationController::finishFiberAlignmentMetrics()
         _fiberAlignmentMetrics.clear();
         showError(tr("Could not calculate fiber alignment metrics: %1")
                       .arg(QString::fromStdString(result.error)));
-        emitFiberSummaries();
+        emit fiberAlignmentMetricsReset(false);
         return;
     }
 
+    for (const auto& [fiberId, metrics] : result.metrics) {
+        if (_fiberAlignmentMetrics.find(fiberId) != _fiberAlignmentMetrics.end()) {
+            continue;
+        }
+        emit fiberAlignmentMetricsUpdated(fiberId, metrics.fiber, metrics.spans);
+    }
     _fiberAlignmentMetrics = std::move(result.metrics);
-    emitFiberSummaries();
 }
 
 bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)

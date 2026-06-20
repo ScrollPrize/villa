@@ -170,6 +170,8 @@ void applyRowMetadata(const QList<QStandardItem*>& row,
         item->setData(isSpan, kIsSpanRole);
         if (highlight) {
             item->setBackground(warningColor);
+        } else {
+            item->setData(QVariant(), Qt::BackgroundRole);
         }
         item->setToolTip(tooltip);
     }
@@ -219,7 +221,7 @@ void CFiberWidget::setupUi()
         tr("Sample Lasagna normal alignment errors for the listed fibers."));
     layout->addWidget(_calcMetricsCheckBox);
     connect(_calcMetricsCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
-        rebuildModel();
+        refreshMetricDisplays();
         if (checked) {
             emit metricsCalculationRequested();
         }
@@ -441,6 +443,47 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
     updateClassificationUi();
 }
 
+void CFiberWidget::setAlignmentMetricsPending(bool pending)
+{
+    FiberEntry::AlignmentMetrics metric;
+    metric.pending = pending;
+    for (auto& fiber : _fibers) {
+        fiber.alignment = metric;
+        for (auto& span : fiber.spans) {
+            span.alignment = metric;
+        }
+    }
+    refreshMetricDisplays();
+}
+
+void CFiberWidget::updateAlignmentMetrics(
+    uint64_t fiberId,
+    const FiberEntry::AlignmentMetrics& alignment,
+    const std::vector<FiberEntry::AlignmentMetrics>& spanAlignments)
+{
+    auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const FiberEntry& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (fiberIt == _fibers.end()) {
+        return;
+    }
+
+    fiberIt->alignment = alignment;
+    const size_t spanCount = std::min(fiberIt->spans.size(), spanAlignments.size());
+    for (size_t i = 0; i < spanCount; ++i) {
+        fiberIt->spans[i].alignment = spanAlignments[i];
+    }
+
+    QStandardItem* root = findFiberItem(fiberId);
+    if (!root) {
+        return;
+    }
+    updateMetricDisplayForRow(root, alignment);
+    for (int row = 0; row < root->rowCount() && row < static_cast<int>(spanAlignments.size()); ++row) {
+        updateMetricDisplayForRow(root->child(row, kNameColumn), spanAlignments[static_cast<size_t>(row)]);
+    }
+}
+
 void CFiberWidget::rebuildModel()
 {
     std::set<uint64_t> expandedFibers;
@@ -507,6 +550,59 @@ void CFiberWidget::rebuildModel()
         _model->appendRow(row);
         if (_treeView && expandedFibers.find(fiber.id) != expandedFibers.end()) {
             _treeView->setExpanded(root->index(), true);
+        }
+    }
+}
+
+QList<QStandardItem*> CFiberWidget::rowItemsForNameItem(QStandardItem* nameItem) const
+{
+    QList<QStandardItem*> row;
+    if (!nameItem || !_model) {
+        return row;
+    }
+    row.reserve(kColumnCount);
+    QStandardItem* parent = nameItem->parent();
+    const int rowIndex = nameItem->row();
+    for (int column = 0; column < kColumnCount; ++column) {
+        row.push_back(parent ? parent->child(rowIndex, column)
+                             : _model->item(rowIndex, column));
+    }
+    return row;
+}
+
+void CFiberWidget::updateMetricDisplayForRow(
+    QStandardItem* nameItem,
+    const FiberEntry::AlignmentMetrics& alignment)
+{
+    QList<QStandardItem*> row = rowItemsForNameItem(nameItem);
+    if (row.size() < kColumnCount || !row[kNameColumn]) {
+        return;
+    }
+
+    const bool showMetrics = _calcMetricsCheckBox && _calcMetricsCheckBox->isChecked();
+    if (row[kMeanAlignErrorColumn]) {
+        row[kMeanAlignErrorColumn]->setText(formatMetric(alignment, showMetrics));
+    }
+    if (row[kMaxAlignErrorColumn]) {
+        row[kMaxAlignErrorColumn]->setText(formatMaxMetric(alignment, showMetrics));
+    }
+
+    const uint64_t fiberId = row[kNameColumn]->data(kFiberIdRole).toULongLong();
+    const bool isSpan = row[kNameColumn]->data(kIsSpanRole).toBool();
+    applyRowMetadata(row, fiberId, isSpan, alignment, showMetrics);
+}
+
+void CFiberWidget::refreshMetricDisplays()
+{
+    for (const auto& fiber : _fibers) {
+        QStandardItem* root = findFiberItem(fiber.id);
+        if (!root) {
+            continue;
+        }
+        updateMetricDisplayForRow(root, fiber.alignment);
+        for (int row = 0; row < root->rowCount() && row < static_cast<int>(fiber.spans.size()); ++row) {
+            updateMetricDisplayForRow(root->child(row, kNameColumn),
+                                      fiber.spans[static_cast<size_t>(row)].alignment);
         }
     }
 }

@@ -5991,28 +5991,30 @@ void CWindow::CreateWidgets(void)
     }
 
     if (_lineAnnotationController) {
-        auto updateFiberList = [this](const std::vector<LineAnnotationController::FiberSummary>& fibers) {
+        auto toFiberWidgetAlignment =
+            [](const LineAnnotationController::FiberSummary::AlignmentMetrics& source) {
+                CFiberWidget::FiberEntry::AlignmentMetrics alignment;
+                alignment.available = source.available;
+                alignment.pending = source.pending;
+                alignment.sampleCount = source.sampleCount;
+                alignment.meanErrorDegrees = source.meanErrorDegrees;
+                alignment.maxErrorDegrees = source.maxErrorDegrees;
+                alignment.error = source.error;
+                return alignment;
+            };
+        auto updateFiberList =
+            [this, toFiberWidgetAlignment](const std::vector<LineAnnotationController::FiberSummary>& fibers) {
             std::vector<CFiberWidget::FiberEntry> entries;
             entries.reserve(fibers.size());
             for (const auto& fiber : fibers) {
-                CFiberWidget::FiberEntry::AlignmentMetrics alignment;
-                alignment.available = fiber.alignment.available;
-                alignment.pending = fiber.alignment.pending;
-                alignment.sampleCount = fiber.alignment.sampleCount;
-                alignment.meanErrorDegrees = fiber.alignment.meanErrorDegrees;
-                alignment.maxErrorDegrees = fiber.alignment.maxErrorDegrees;
-                alignment.error = fiber.alignment.error;
+                CFiberWidget::FiberEntry::AlignmentMetrics alignment =
+                    toFiberWidgetAlignment(fiber.alignment);
 
                 std::vector<CFiberWidget::FiberEntry::SpanEntry> spans;
                 spans.reserve(fiber.spans.size());
                 for (const auto& span : fiber.spans) {
-                    CFiberWidget::FiberEntry::AlignmentMetrics spanAlignment;
-                    spanAlignment.available = span.alignment.available;
-                    spanAlignment.pending = span.alignment.pending;
-                    spanAlignment.sampleCount = span.alignment.sampleCount;
-                    spanAlignment.meanErrorDegrees = span.alignment.meanErrorDegrees;
-                    spanAlignment.maxErrorDegrees = span.alignment.maxErrorDegrees;
-                    spanAlignment.error = span.alignment.error;
+                    CFiberWidget::FiberEntry::AlignmentMetrics spanAlignment =
+                        toFiberWidgetAlignment(span.alignment);
                     spans.push_back(CFiberWidget::FiberEntry::SpanEntry{
                         span.spanIndex,
                         span.firstControlIndex,
@@ -6051,6 +6053,37 @@ void CWindow::CreateWidgets(void)
                 _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
             }
             updateAtlasFiberDocks();
+        };
+        auto updateFiberMetricRows =
+            [this, toFiberWidgetAlignment](
+                uint64_t fiberId,
+                LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
+                const std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics>& spanAlignments) {
+                std::vector<CFiberWidget::FiberEntry::AlignmentMetrics> widgetSpanAlignments;
+                widgetSpanAlignments.reserve(spanAlignments.size());
+                for (const auto& spanAlignment : spanAlignments) {
+                    widgetSpanAlignments.push_back(toFiberWidgetAlignment(spanAlignment));
+                }
+                const CFiberWidget::FiberEntry::AlignmentMetrics widgetAlignment =
+                    toFiberWidgetAlignment(alignment);
+                if (_fiberWidget) {
+                    _fiberWidget->updateAlignmentMetrics(fiberId,
+                                                         widgetAlignment,
+                                                         widgetSpanAlignments);
+                }
+                if (_fiberSliceWidget) {
+                    _fiberSliceWidget->updateAlignmentMetrics(fiberId,
+                                                              widgetAlignment,
+                                                              widgetSpanAlignments);
+                }
+            };
+        auto setFiberMetricsPending = [this](bool pending) {
+            if (_fiberWidget) {
+                _fiberWidget->setAlignmentMetricsPending(pending);
+            }
+            if (_fiberSliceWidget) {
+                _fiberSliceWidget->setAlignmentMetricsPending(pending);
+            }
         };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
             if (!widget || !_lineAnnotationController) {
@@ -6112,6 +6145,14 @@ void CWindow::CreateWidgets(void)
                 &LineAnnotationController::fibersChanged,
                 this,
                 updateFiberList);
+        connect(_lineAnnotationController.get(),
+                &LineAnnotationController::fiberAlignmentMetricsReset,
+                this,
+                setFiberMetricsPending);
+        connect(_lineAnnotationController.get(),
+                &LineAnnotationController::fiberAlignmentMetricsUpdated,
+                this,
+                updateFiberMetricRows);
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
         updateFiberList(_lineAnnotationController->fiberSummaries());

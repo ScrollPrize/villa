@@ -162,6 +162,11 @@ public:
 
 signals:
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
+    void fiberAlignmentMetricsReset(bool pending);
+    void fiberAlignmentMetricsUpdated(
+        uint64_t fiberId,
+        LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
+        std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics> spanAlignments);
     void fiberSaved(uint64_t fiberId, uint64_t generation);
     void fibersDeleted(std::vector<uint64_t> fiberIds);
     void atlasCreated(std::filesystem::path atlasDir);
@@ -314,8 +319,8 @@ private:
     void saveSessionAsFiber(LineAnnotationSession& session);
     void saveFiber(const StoredFiber& fiber) const;
     [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
-    [[nodiscard]] std::vector<ControlSpanRecord> controlSpansForFiber(
-        const StoredFiber& fiber) const;
+    [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
+        const StoredFiber& fiber);
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForFiber(
         uint64_t fiberId) const;
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForSpan(

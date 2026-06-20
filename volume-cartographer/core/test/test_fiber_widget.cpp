@@ -7,6 +7,7 @@
 #include <QLineEdit>
 #include <QMetaObject>
 #include <QPushButton>
+#include <QStandardItemModel>
 #include <QTreeView>
 
 #include <cstdlib>
@@ -139,8 +140,13 @@ int main(int argc, char** argv)
                      });
     auto* calcMetrics = widget.findChild<QCheckBox*>(QStringLiteral("fiberCalcMetricsCheckBox"));
     require(calcMetrics != nullptr, "Calc metrics checkbox was not found");
+    auto* model = qobject_cast<QStandardItemModel*>(treeView->model());
+    require(model != nullptr, "Fiber tree should use a standard item model");
+    QStandardItem* secondItemBeforeMetrics = model->item(1, 0);
     calcMetrics->setChecked(true);
     require(metricRequests == 1, "Calc metrics checkbox did not emit one request");
+    require(model->item(1, 0) == secondItemBeforeMetrics,
+            "Toggling Calc metrics should update cells without rebuilding the fiber rows");
     require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("25.0"),
             "Mean alignment error metric was not displayed");
     require(treeView->model()->index(1, 7).data().toString() == QStringLiteral("50.0"),
@@ -152,6 +158,23 @@ int main(int argc, char** argv)
             "Span max alignment error metric was not displayed");
     require(treeView->model()->index(1, 7, secondParent).data(Qt::BackgroundRole).isValid(),
             "Span row with max alignment error > 45 deg was not highlighted");
+    widget.setAlignmentMetricsPending(true);
+    require(model->item(1, 0) == secondItemBeforeMetrics,
+            "Marking metrics pending should update cells without rebuilding the fiber rows");
+    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("..."),
+            "Pending metric state should be displayed in-place");
+    widget.updateAlignmentMetrics(
+        2,
+        makeMetric(26.0, 51.0, 60),
+        {makeMetric(9.0, 21.0, 27), makeMetric(32.0, 53.0, 33)});
+    require(model->item(1, 0) == secondItemBeforeMetrics,
+            "Live metric update should update cells without rebuilding the fiber rows");
+    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("26.0"),
+            "Live fiber mean alignment metric was not displayed");
+    require(treeView->model()->index(1, 7).data().toString() == QStringLiteral("51.0"),
+            "Live fiber max alignment metric was not displayed");
+    require(treeView->model()->index(1, 7, secondParent).data().toString() == QStringLiteral("53.0"),
+            "Live span alignment metric was not displayed");
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
                               Q_ARG(int, 2));
