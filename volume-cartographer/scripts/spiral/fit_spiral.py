@@ -141,8 +141,6 @@ default_config = {
     'track_coverage_tau_init': 0.5,
     'track_coverage_tau_final': 0.05,
     'normals_num_points': 6000,
-    'pcl_normals_num_points': 12000,
-    'pcl_normals_sample_radius': 1,
     'dense_normals_num_points': 60_000,
     'regularisation_num_points': 4500,
     'grad_mag_encode_scale': 1000.0,
@@ -165,7 +163,6 @@ default_config = {
     'loss_weight_bending': 0.0,
     'loss_weight_sym_dirichlet': 10.0,
     'loss_weight_patch_normals': 0.0,
-    'loss_weight_pcl_normals': 0.0,
     'loss_weight_dense_normals': 1.e2,
     'loss_weight_dense_spacing': 8.,
     'loss_weight_umbilicus': 5.,
@@ -243,7 +240,6 @@ z_range_scaled_count_keys = (
     'unattached_pcl_num_per_step',
     'track_num_per_step',
     'normals_num_points',
-    'pcl_normals_num_points',
     'dense_normals_num_points',
     'regularisation_num_points',
     'shell_num_samples',
@@ -1881,153 +1877,8 @@ def _get_or_build_unattached_pcl_flat(pcl_strips, device):
     return flat
 
 
-def _sample_zarr_block_at_zyx(array, zyx, radius):
-    center = np.rint(zyx).astype(np.int64)
-    shape = np.array(array.shape, dtype=np.int64)
-    if np.any(center < 0) or np.any(center >= shape):
-        return None
-    lo = np.maximum(center - radius, 0)
-    hi = np.minimum(center + radius + 1, shape)
-    block = array[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
-    if block.size == 0:
-        return None
-    return block
-
-
 def _decode_uint8_normal_component(value):
     return (value - 128.0) / 127.0
-
-
-def _sample_zarr_normal_zyx_at_zyx(nx_array, ny_array, zyx, radius):
-    nx_u8 = _sample_zarr_block_at_zyx(nx_array, zyx, radius)
-    ny_u8 = _sample_zarr_block_at_zyx(ny_array, zyx, radius)
-    if nx_u8 is None or ny_u8 is None:
-        return None
-    if nx_u8.shape != ny_u8.shape:
-        raise ValueError(f'nx/ny normal sample shapes differ: {nx_u8.shape} vs {ny_u8.shape}')
-
-    valid = (nx_u8 != 0) | (ny_u8 != 0)
-    if not valid.any():
-        return None
-
-    nx = _decode_uint8_normal_component(nx_u8.astype(np.float32, copy=False))[valid]
-    ny = _decode_uint8_normal_component(ny_u8.astype(np.float32, copy=False))[valid]
-    nz = np.sqrt(np.maximum(0.0, 1.0 - nx * nx - ny * ny)).astype(np.float32, copy=False)
-
-    if radius <= 0 or nx.size == 1:
-        n_xyz = np.array([float(nx.mean()), float(ny.mean()), float(nz.mean())], dtype=np.float32)
-    else:
-        mat = np.array([
-            [np.mean(nx * nx), np.mean(nx * ny), np.mean(nx * nz)],
-            [np.mean(nx * ny), np.mean(ny * ny), np.mean(ny * nz)],
-            [np.mean(nx * nz), np.mean(ny * nz), np.mean(nz * nz)],
-        ], dtype=np.float32)
-        vals, vecs = np.linalg.eigh(mat)
-        n_xyz = vecs[:, int(np.argmax(vals))].astype(np.float32)
-        if n_xyz[2] < 0:
-            n_xyz = -n_xyz
-
-    norm = float(np.linalg.norm(n_xyz))
-    if not np.isfinite(norm) or norm <= 0:
-        return None
-    n_xyz /= norm
-    return np.array([n_xyz[2], n_xyz[1], n_xyz[0]], dtype=np.float32)
-
-
-def _collect_pcl_normal_zyxs(point_collections, unattached_pcl_strips):
-    zyxs = []
-    seen = set()
-
-    def add_zyx(zyx):
-        zyx = np.asarray(zyx, dtype=np.float32)
-        if not (z_begin <= zyx[0] < z_end):
-            return
-        key = tuple(np.round(zyx, 3))
-        if key in seen:
-            return
-        seen.add(key)
-        zyxs.append(zyx)
-
-    for pcl in point_collections:
-        for point in pcl['points'].values():
-            if 'zyx' in point:
-                add_zyx(point['zyx'])
-
-    for strip in unattached_pcl_strips:
-        for zyx in strip['zyxs']:
-            add_zyx(zyx)
-
-    if not zyxs:
-        return np.zeros([0, 3], dtype=np.float32)
-    return np.stack(zyxs, axis=0).astype(np.float32, copy=False)
-
-
-def prepare_pcl_normal_samples(point_collections, unattached_pcl_strips, scroll_zarr):
-    if cfg['loss_weight_pcl_normals'] <= 0:
-        return None
-    if not normal_nx_zarr_path or not normal_ny_zarr_path:
-        raise RuntimeError('PCL normal loss is enabled, but FIT_SPIRAL_NORMAL_NX_ZARR_PATH/FIT_SPIRAL_NORMAL_NY_ZARR_PATH is not set')
-
-    print(f'loading PCL normal zarrs group {normal_zarr_group}')
-    nx_root = zarr.open(normal_nx_zarr_path, mode='r')
-    ny_root = zarr.open(normal_ny_zarr_path, mode='r')
-    nx_array = nx_root[normal_zarr_group]
-    ny_array = ny_root[normal_zarr_group]
-    if nx_array.shape != ny_array.shape:
-        raise ValueError(f'nx/ny normal zarr shapes differ: {nx_array.shape} vs {ny_array.shape}')
-
-    if scroll_zarr is not None:
-        expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / downsample_factor).astype(np.int64))
-        if tuple(nx_array.shape) != expected_shape:
-            print(
-                f'WARNING: normal zarr shape {nx_array.shape} does not match '
-                f'ceil(scroll_zarr.shape / downsample_factor) {expected_shape}'
-            )
-        else:
-            print(f'normal zarr shape {nx_array.shape} matches current optimisation grid {expected_shape}')
-
-    multiscales = dict(nx_root.attrs).get('multiscales', [])
-    if multiscales:
-        datasets = {d.get('path'): d for d in multiscales[0].get('datasets', [])}
-        scale = datasets.get(normal_zarr_group, {}).get('coordinateTransformations', [{}])[0].get('scale')
-        if scale is not None:
-            print(f'normal zarr group {normal_zarr_group} coordinate scale: {scale}')
-
-    zyxs = _collect_pcl_normal_zyxs(point_collections, unattached_pcl_strips)
-    if len(zyxs) == 0:
-        print('no PCL points available for normal loss')
-        return None
-
-    radius = int(cfg['pcl_normals_sample_radius'])
-    sampled_zyxs = []
-    sampled_normals = []
-    for zyx in tqdm(zyxs, 'sampling PCL normals'):
-        normal_zyx = _sample_zarr_normal_zyx_at_zyx(nx_array, ny_array, zyx, radius)
-        if normal_zyx is None:
-            continue
-        sampled_zyxs.append(zyx)
-        sampled_normals.append(normal_zyx)
-
-    if not sampled_zyxs:
-        print(f'no valid PCL normals sampled from {len(zyxs)} PCL points')
-        return None
-
-    sampled_zyxs = np.stack(sampled_zyxs, axis=0).astype(np.float32, copy=False)
-    sampled_normals = np.stack(sampled_normals, axis=0).astype(np.float32, copy=False)
-    print(f'PCL normals: sampled {len(sampled_zyxs)}/{len(zyxs)} points using radius {radius}')
-    return {
-        'zyxs': sampled_zyxs,
-        'normals': sampled_normals,
-    }
-
-
-def _pcl_normal_samples_to_gpu(pcl_normal_samples, device):
-    if pcl_normal_samples is None:
-        return None
-    return {
-        'zyxs': torch.from_numpy(pcl_normal_samples['zyxs']).to(device=device),
-        'normals': torch.from_numpy(pcl_normal_samples['normals']).to(device=device),
-    }
 
 
 def get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spiral_zyx=None, epsilon=6.0):
@@ -2086,24 +1937,6 @@ def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
     e1 = F.pad(torch.zeros_like(tangential_yx), (1, 0), value=1.)  # (1, 0, 0) -> z-axis
     e2 = F.pad(tangential_yx, (1, 0), value=0.)  # (0, ty, tx)
     return spiral_zyx, e1, e2
-
-
-def get_pcl_normals_loss(slice_to_spiral_transform, pcl_normal_samples, num_points, epsilon=6.0):
-    if pcl_normal_samples is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        return torch.zeros([], device=device)
-    n = pcl_normal_samples['zyxs'].shape[0]
-    if n == 0:
-        return torch.zeros([], device=pcl_normal_samples['zyxs'].device)
-
-    device = pcl_normal_samples['zyxs'].device
-    sampled = np.random.choice(n, num_points, replace=n < num_points)
-    sampled_t = torch.from_numpy(sampled).to(device=device, dtype=torch.long)
-    scroll_zyx = pcl_normal_samples['zyxs'][sampled_t]
-    target_normal = F.normalize(pcl_normal_samples['normals'][sampled_t], dim=-1)
-
-    scroll_normal = get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, epsilon=epsilon)
-    return (1. - (scroll_normal * target_normal).sum(dim=-1).abs()).mean()
 
 
 def prepare_lasagna_volume(scroll_zarr):
@@ -4462,7 +4295,7 @@ def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding
     return w_inner + (w_outer - w_inner) * f_warped
 
 
-def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, tracks, pcl_normal_samples, lasagna_volume, shell_patch, z_to_umbilicus_yx, out_path, unverified_patches_dict=None):
+def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_strips, tracks, lasagna_volume, shell_patch, z_to_umbilicus_yx, out_path, unverified_patches_dict=None):
     patches_list = list(patches_dict.values())
     patch_sampling_probabilities = _prepare_patch_sampling_cache(patches_list, cfg['patch_loss_z_margin'])
 
@@ -4476,7 +4309,6 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
     rendering_slices_downsample_factor = 2  # stride the scroll by this along zyx for rendering
 
     device = torch.device('cuda')
-    pcl_normal_samples = _pcl_normal_samples_to_gpu(pcl_normal_samples, device)
 
     # Untrusted 'unverified' patches: mask away wherever they fall near trusted geometry (verified
     # patch vertices + pcl strips, same anchor cloud used for snap-anchors / track-exclusion), then
@@ -4900,13 +4732,6 @@ def fit_spiral_3d(scroll_zarr, patches_dict, point_collections, unattached_pcl_s
 
         if cfg['loss_weight_abs_winding'] > 0 and point_collections:
             losses['abs_winding'] = get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections) * cfg['loss_weight_abs_winding']
-
-        if cfg['loss_weight_pcl_normals'] > 0 and pcl_normal_samples is not None:
-            losses['pcl_normals'] = get_pcl_normals_loss(
-                slice_to_spiral_transform,
-                pcl_normal_samples,
-                cfg['pcl_normals_num_points'],
-            ) * cfg['loss_weight_pcl_normals']
 
         if (cfg['loss_weight_dense_normals'] > 0 or cfg['loss_weight_dense_spacing'] > 0) and lasagna_volume is not None:
             dense_normals_loss, dense_spacing_loss = get_lasagna_losses(
@@ -5500,11 +5325,6 @@ def main():
 
     patches, unverified_patches, shell_patch = prepare_patches()
     cross_patch_point_collections, unattached_pcl_strips = prepare_point_collections(patches)
-    pcl_normal_samples = prepare_pcl_normal_samples(
-        list(cross_patch_point_collections.values()),
-        unattached_pcl_strips,
-        scroll_zarr_array,
-    )
     lasagna_volume = prepare_lasagna_volume(scroll_zarr_array)
 
     if tracks_dbm_path is not None:
@@ -5528,7 +5348,6 @@ def main():
         list(cross_patch_point_collections.values()),
         unattached_pcl_strips,
         tracks,
-        pcl_normal_samples,
         lasagna_volume,
         shell_patch,
         umbilicus,
