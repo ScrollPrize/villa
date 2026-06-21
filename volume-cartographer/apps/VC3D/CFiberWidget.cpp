@@ -454,6 +454,9 @@ void CFiberWidget::setFibers(const std::vector<FiberEntry>& fibers)
     }
     _deleteButton->setEnabled(canDeleteSelection());
     updateClassificationUi();
+    if (_calcMetricsCheckBox && _calcMetricsCheckBox->isChecked()) {
+        emit metricsCalculationRequested(orderedFiberIds());
+    }
 }
 
 void CFiberWidget::setAlignmentMetricsPending(bool pending)

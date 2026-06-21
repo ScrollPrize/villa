@@ -202,6 +202,11 @@ int main(int argc, char** argv)
     require(treeView->model()->index(0, 0, sortedSecondParent).data().toString().contains(
                 QStringLiteral("span 1")),
             "Sorting top-level fibers should preserve child span order");
+    widget.setFibers({first, second, third});
+    require(metricRequests == 2,
+            "Refreshing the fiber list while metrics are checked should request metrics again");
+    require(metricRequestOrder == std::vector<uint64_t>({3, 2, 1}),
+            "Refresh-time metric request should preserve the current fiber list order");
 
     auto* deleteButton = widget.findChild<QPushButton*>(QStringLiteral("fiberDeleteButton"));
     require(deleteButton != nullptr, "Fiber delete button was not found");
