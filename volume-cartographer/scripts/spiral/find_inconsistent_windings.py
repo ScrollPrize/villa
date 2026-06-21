@@ -102,11 +102,14 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra as csgraph_dijkstra, connected_components
 from scipy.optimize import milp, LinearConstraint, Bounds
 
-# Import fit_spiral as a module so we can install the checkpoint's cfg + the
-# patches/pcl/z-range onto its globals before calling its loaders (which read the
-# module globals `cfg`, `patches_path`, `pcl_json_paths`, `z_begin`, `z_end`).
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import fit_spiral as fs
+# Import the archived fit_spiral module as an interim compatibility shim so we
+# can still reuse prepare_patches() / prepare_point_collections() while the
+# active fit_spiral.py rewrite keeps those phases inline in main().
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SCRIPT_DIR)
+sys.path.insert(0, os.path.join(_SCRIPT_DIR, 'archive'))
+import fit_spiral_old as fs
+from tracks import _unwrap_track_shifted_radii
 # Reuse connect_overlapping_patches' valid-quad graph + path reconstruction so a
 # within-patch strip follows a fringe-avoiding path through valid quads only
 # (never slicing through invalid regions, where theta would jump and the unwrap
@@ -330,7 +333,7 @@ def strip_winding_delta(transform, dr, graph, from_ij, to_ij, step_size):
     cumulative_adjustment_windings = step_adjustment_windings.sum()
     delta_windings = int(round(float((-cumulative_adjustment_windings).item())))
 
-    shifted_uw = fs._unwrap_track_shifted_radii(theta[None], shifted[None], dr)[0]
+    shifted_uw = _unwrap_track_shifted_radii(theta[None], shifted[None], dr)[0]
     residual_windings = float(((shifted_uw[-1] - shifted_uw[0]) / dr).item())
     return {
         'delta_windings': delta_windings,
@@ -410,7 +413,7 @@ def pcl_edge_unwrap_adjustment_windings(transform, dr, pa, pb):
         spiral = transform(zyx)
         theta, _, _ = fs.get_theta_and_radii(spiral[..., 1:], dr)
         zero_shifted = torch.zeros_like(theta)
-        adjustments = fs._unwrap_track_shifted_radii(theta[None], zero_shifted[None], dr)[0]
+        adjustments = _unwrap_track_shifted_radii(theta[None], zero_shifted[None], dr)[0]
     return int(round(float((adjustments[-1] / dr).item())))
 
 

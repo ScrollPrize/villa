@@ -796,18 +796,9 @@ def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding
 
 def main():
 
-    # ==========================================================================
-    # Run setup
-    # ==========================================================================
-
     np.random.seed(cfg['random_seed'])
     torch.random.manual_seed(cfg['random_seed'])
     umbilicus = umbilicus_z_to_yx(downsample_factor)
-
-    # ==========================================================================
-    # Volume input
-    # ==========================================================================
-
     if scroll_zarr_path:
         print('loading volume zarr')
         scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
@@ -1145,7 +1136,7 @@ def main():
     )
 
     # ==========================================================================
-    # Auxiliary loss inputs
+    # lasagna and tracks loading
     # ==========================================================================
 
     lasagna_volume = prepare_lasagna_volume(
@@ -1169,7 +1160,7 @@ def main():
         tracks = None
 
     # ==========================================================================
-    # Patch sampling caches and output path
+    # patch cache / atlas construction
     # ==========================================================================
 
     def prepare_patch_sampling_cache(patches):
@@ -1249,9 +1240,9 @@ def main():
     patch_atlas = PatchGpuAtlas(verified_patches, device='cuda')
     print(f'patch GPU atlas: {patch_atlas.memory_mb():.1f} MB')
 
-    # ==========================================================================
-    # Trusted geometry and unverified patches
-    # ==========================================================================
+    # ==========================================================================================
+    # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
+    # ==========================================================================================
 
     num_slices_for_visualisation = cfg.get('num_slices_for_visualization', 20)
     rendering_slices_downsample_factor = cfg.get('rendering_slices_downsample_factor', 2)
