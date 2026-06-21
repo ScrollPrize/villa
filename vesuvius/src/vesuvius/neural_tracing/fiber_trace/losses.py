@@ -104,8 +104,10 @@ def compute_fiber_trace_loss(
         max_samples=max_contrastive_samples,
     )
     positive_mask = batch.labels == POSITIVE_LABEL
-    fw = masked_cosine_loss(outputs["fw"], batch.target_fw, positive_mask)
-    up = sign_ambiguous_up_loss(outputs["up"], batch.target_up, positive_mask)
+    fw = masked_cosine_loss(outputs["fw"], batch.target_fw_xyz, positive_mask)
+    up = sign_ambiguous_up_loss(
+        outputs["up"], batch.target_up_xyz, positive_mask & batch.target_up_valid
+    )
     total = (
         float(contrastive_weight) * contrastive
         + float(fw_weight) * fw

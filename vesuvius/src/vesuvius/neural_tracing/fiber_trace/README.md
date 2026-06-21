@@ -17,20 +17,23 @@ Training records are `vc3d_fiber` version 1 JSON files:
 }
 ```
 
-The JSON points are interpreted in VC3D `x, y, z` order. Volume crops and masks
-are indexed in zarr `z, y, x` order, so the loader converts points before
-sampling or classifying voxels.
+The JSON points are interpreted in VC3D `x, y, z` order and remain `xyz`
+through all geometry calculations. Volume crops, masks, zarr reads, and tensor
+spatial axes are `z, y, x`; the loader converts `xyz -> zyx` only when indexing
+dense arrays.
 
 Each dataset config entry must provide:
 
 - `volume_path`: image zarr store
 - `volume_scale`: pyramid level, default `0`
 - `mask_path` or `grad_mag_path`: mandatory valid-data source
+- `nx_path` and `ny_path`: mandatory Lasagna hemisphere-encoded normal channels
 - `fiber_paths` or `fiber_glob`: one or more VC3D fiber JSON files
 
 Remote zarr paths use the existing `vesuvius.neural_tracing.datasets.common`
 zarr/cache support. Missing mask or grad-mag data is an error, and mask shape
-must match the selected image volume level.
+must match the selected image volume level. Normal channel shapes must also
+match the selected image volume level.
 
 ## Batch Construction
 
@@ -45,16 +48,26 @@ composition. Batch size must be even for this MVP.
 
 ## Direction Conditioning
 
-Each crop receives normalized `fw(3)` and `up(3)` conditioning. The local GT
-forward vector is derived from the nearest fiber line tangent. With probability
+Each crop receives normalized `fw(3)` and `up(3)` conditioning in `xyz`
+component order. The local GT forward vector is derived from the nearest fiber
+line tangent. With probability
 `positive_direction_probability` the conditioning direction is a small angular
 jitter around the tangent; otherwise it is a random unit vector. Random
 directions are still classified against the GT tangent and are not assumed to
 be negative.
 
-The `up` vector is built by orthogonalizing a supplied normal when available or
-by choosing a stable perpendicular fallback. The loss treats `up` and `-up` as
-equivalent.
+The `up` vector is built by decoding Lasagna `nx`/`ny` channels as
+`(value - 128) / 127`, reconstructing `nz = sqrt(1 - nx^2 - ny^2)` with
+`nz >= 0`, and projecting that normal away from the local `fw`:
+
+```text
+up_xyz = normalize(normal_xyz - dot(normal_xyz, fw_xyz) * fw_xyz)
+```
+
+Degenerate projected normals mark up supervision invalid by default. Set
+`degenerate_up_policy: "raise"` to fail the crop instead. The only arbitrary
+perpendicular fallback is the explicit opt-in `allow_arbitrary_up_fallback:
+true`; it is disabled by default. The loss treats `up` and `-up` as equivalent.
 
 ## Voxel Classification
 
@@ -67,7 +80,8 @@ For every output voxel:
   `negative`
 - voxels in the geometric or angular tolerance band are `ignore`
 
-The classifier also emits target local `fw` and `up` vector fields.
+The classifier also emits target local `fw` and `up` vector fields in `xyz`
+component order plus a `target_up_valid` mask.
 
 ## Model And Losses
 
@@ -103,8 +117,10 @@ losses, and optionally writes a checkpoint.
 Implemented:
 
 - VC3D fiber JSON parser and validation
-- tangent, conditioning direction, up-vector, and voxel classification helpers
-- fixed-size single-fiber batch builder using zarr image and mask/grad-mag data
+- tangent, conditioning direction, Lasagna-normal-derived up-vector, and voxel
+  classification helpers
+- fixed-size single-fiber batch builder using zarr image, mask/grad-mag, and
+  `nx`/`ny` normal data
 - direction-conditioned U-Net model/head
 - contrastive and direction losses
 - JSON-config train entrypoint

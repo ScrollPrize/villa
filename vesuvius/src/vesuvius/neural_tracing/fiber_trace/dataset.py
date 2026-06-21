@@ -8,34 +8,24 @@ from typing import Any
 
 import numpy as np
 import torch
-import zarr
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber, load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace.geometry import (
     classify_voxels,
     construct_up_vector,
+    decode_lasagna_normals_xyz,
     perturb_direction,
     random_unit_vector,
     tangent_at_point,
+    xyz_to_zyx,
+    zyx_to_xyz,
 )
-
-
-try:
-    from vesuvius.neural_tracing.datasets.common import (
-        _read_volume_crop_from_patch as _common_read_volume_crop_from_patch,
-        open_zarr as _common_open_zarr,
-    )
-except Exception:  # pragma: no cover - exercised only with incompatible optional deps
-    _common_read_volume_crop_from_patch = None
-    _common_open_zarr = None
-
-
-try:
-    from zarr.errors import PathNotFoundError
-except Exception:  # pragma: no cover - compatibility with older zarr
-
-    class PathNotFoundError(Exception):
-        pass
+from vesuvius.neural_tracing.fiber_trace.labels import POSITIVE_LABEL
+from vesuvius.neural_tracing.datasets.common import (
+    _read_volume_crop_from_patch as _common_read_volume_crop_from_patch,
+    open_zarr as _common_open_zarr,
+    open_zarr_group as _common_open_zarr_group,
+)
 
 
 @dataclass(frozen=True)
@@ -43,10 +33,11 @@ class FiberTraceBatch:
     volume: torch.Tensor
     valid_mask: torch.Tensor
     labels: torch.Tensor
-    target_fw: torch.Tensor
-    target_up: torch.Tensor
-    cond_fw: torch.Tensor
-    cond_up: torch.Tensor
+    target_fw_xyz: torch.Tensor
+    target_up_xyz: torch.Tensor
+    target_up_valid: torch.Tensor
+    cond_fw_xyz: torch.Tensor
+    cond_up_xyz: torch.Tensor
     crop_origin_zyx: torch.Tensor
     crop_kinds: tuple[str, ...]
     fiber_paths: tuple[str, ...]
@@ -57,10 +48,11 @@ class FiberTraceBatch:
             volume=self.volume.to(device),
             valid_mask=self.valid_mask.to(device),
             labels=self.labels.to(device),
-            target_fw=self.target_fw.to(device),
-            target_up=self.target_up.to(device),
-            cond_fw=self.cond_fw.to(device),
-            cond_up=self.cond_up.to(device),
+            target_fw_xyz=self.target_fw_xyz.to(device),
+            target_up_xyz=self.target_up_xyz.to(device),
+            target_up_valid=self.target_up_valid.to(device),
+            cond_fw_xyz=self.cond_fw_xyz.to(device),
+            cond_up_xyz=self.cond_up_xyz.to(device),
             crop_origin_zyx=self.crop_origin_zyx.to(device),
             crop_kinds=self.crop_kinds,
             fiber_paths=self.fiber_paths,
@@ -73,6 +65,8 @@ class _FiberRecord:
     fiber: Vc3dFiber
     volume: Any
     mask: Any
+    nx: Any | None
+    ny: Any | None
     volume_scale: int
     dataset_config: dict[str, Any]
     valid_threshold: float
@@ -90,17 +84,15 @@ def _as_zyx3(value: Any, *, key: str) -> tuple[int, int, int]:
 def _open_zarr_array(
     path: str | Path, *, scale: int, auth_json_path: str | None, config: dict[str, Any]
 ):
-    if _common_open_zarr is not None:
-        try:
-            return _common_open_zarr(
-                path, scale=scale, auth_json_path=auth_json_path, config=config
-            )
-        except (KeyError, PathNotFoundError):
-            pass
-    arr = zarr.open(str(path), mode="r")
-    if hasattr(arr, "keys") and str(scale) in arr:
-        return arr[str(scale)]
-    return arr
+    return _common_open_zarr(
+        path, scale=scale, auth_json_path=auth_json_path, config=config
+    )
+
+
+def _open_zarr_group(
+    path: str | Path, *, auth_json_path: str | None, config: dict[str, Any]
+):
+    return _common_open_zarr_group(path, auth_json_path=auth_json_path, config=config)
 
 
 def _read_raw_crop(
@@ -126,15 +118,6 @@ def _read_raw_crop(
     return out
 
 
-def _normalize_zscore(crop: np.ndarray) -> np.ndarray:
-    arr = crop.astype(np.float32, copy=False)
-    mean = float(arr.mean())
-    std = float(arr.std())
-    if not np.isfinite(std) or std <= 1e-6:
-        return arr - mean
-    return (arr - mean) / std
-
-
 def _read_image_crop_from_patch(
     patch: Any,
     crop_shape: tuple[int, int, int],
@@ -143,22 +126,12 @@ def _read_image_crop_from_patch(
     *,
     image_normalization: str,
 ) -> np.ndarray:
-    if _common_read_volume_crop_from_patch is not None:
-        return _common_read_volume_crop_from_patch(
-            patch,
-            crop_shape,
-            min_corner,
-            max_corner,
-            image_normalization=image_normalization,
-        )
-    crop = _read_raw_crop(patch.volume, crop_shape, min_corner)
-    if image_normalization == "unit":
-        return crop.astype(np.float32, copy=False) / 255.0
-    if image_normalization == "zscore":
-        return _normalize_zscore(crop)
-    raise ValueError(
-        f"Unknown image_normalization '{image_normalization}' "
-        f"(expected 'zscore' or 'unit')."
+    return _common_read_volume_crop_from_patch(
+        patch,
+        crop_shape,
+        min_corner,
+        max_corner,
+        image_normalization=image_normalization,
     )
 
 
@@ -213,6 +186,17 @@ class FiberTraceBatchBuilder:
         self.random_valid_max_attempts = int(
             self.config.get("random_valid_max_attempts", 256)
         )
+        self.allow_arbitrary_up_fallback = bool(
+            self.config.get("allow_arbitrary_up_fallback", False)
+        )
+        self.degenerate_up_policy = str(
+            self.config.get("degenerate_up_policy", "invalid")
+        )
+        if self.degenerate_up_policy not in {"invalid", "raise"}:
+            raise ValueError(
+                "degenerate_up_policy must be 'invalid' or 'raise', "
+                f"got {self.degenerate_up_policy!r}"
+            )
 
         datasets = self.config.get("datasets")
         self.records: list[_FiberRecord] = []
@@ -233,6 +217,29 @@ class FiberTraceBatchBuilder:
                         "_array_records mask shape must match volume shape: "
                         f"volume={tuple(volume.shape)} mask={tuple(mask.shape)}"
                     )
+                nx = record_config.get("nx")
+                ny = record_config.get("ny")
+                if nx is None or ny is None:
+                    if not self.allow_arbitrary_up_fallback:
+                        raise ValueError(
+                            "_array_records entries must provide Lasagna nx and ny "
+                            "normal channels"
+                        )
+                    nx_arr = None
+                    ny_arr = None
+                else:
+                    nx_arr = np.asarray(nx)
+                    ny_arr = np.asarray(ny)
+                    if nx_arr.ndim != 3 or ny_arr.ndim != 3:
+                        raise ValueError("_array_records nx and ny must be 3D arrays")
+                    if tuple(nx_arr.shape) != tuple(volume.shape) or tuple(
+                        ny_arr.shape
+                    ) != tuple(volume.shape):
+                        raise ValueError(
+                            "_array_records normal channel shapes must match volume shape: "
+                            f"volume={tuple(volume.shape)} nx={tuple(nx_arr.shape)} "
+                            f"ny={tuple(ny_arr.shape)}"
+                        )
                 fiber = record_config.get("fiber")
                 if fiber is None:
                     fiber = load_vc3d_fiber(record_config["fiber_path"])
@@ -241,6 +248,8 @@ class FiberTraceBatchBuilder:
                         fiber=fiber,
                         volume=volume,
                         mask=mask,
+                        nx=nx_arr,
+                        ny=ny_arr,
                         volume_scale=0,
                         dataset_config=record_config,
                         valid_threshold=float(
@@ -266,6 +275,13 @@ class FiberTraceBatchBuilder:
                 raise ValueError(
                     "dataset entry must provide mask_path or grad_mag_path"
                 )
+            nx_path = dataset_config.get("nx_path")
+            ny_path = dataset_config.get("ny_path")
+            if (not nx_path or not ny_path) and not self.allow_arbitrary_up_fallback:
+                raise ValueError(
+                    "dataset entry must provide explicit Lasagna nx_path and ny_path "
+                    "normal channels"
+                )
 
             volume_scale = int(dataset_config.get("volume_scale", 0))
             mask_scale = int(
@@ -273,6 +289,7 @@ class FiberTraceBatchBuilder:
                     "mask_scale", dataset_config.get("grad_mag_scale", volume_scale)
                 )
             )
+            normal_scale = int(dataset_config.get("normal_scale", volume_scale))
             volume = _open_zarr_array(
                 volume_path,
                 scale=volume_scale,
@@ -287,10 +304,46 @@ class FiberTraceBatchBuilder:
                 ),
                 config=self.config,
             )
+            if nx_path and ny_path:
+                nx = _open_zarr_array(
+                    nx_path,
+                    scale=int(dataset_config.get("nx_scale", normal_scale)),
+                    auth_json_path=dataset_config.get(
+                        "nx_auth_json",
+                        dataset_config.get(
+                            "normal_auth_json", dataset_config.get("volume_auth_json")
+                        ),
+                    ),
+                    config=self.config,
+                )
+                ny = _open_zarr_array(
+                    ny_path,
+                    scale=int(dataset_config.get("ny_scale", normal_scale)),
+                    auth_json_path=dataset_config.get(
+                        "ny_auth_json",
+                        dataset_config.get(
+                            "normal_auth_json", dataset_config.get("volume_auth_json")
+                        ),
+                    ),
+                    config=self.config,
+                )
+            else:
+                nx = None
+                ny = None
             if tuple(volume.shape) != tuple(mask.shape):
                 raise ValueError(
                     "mask/grad-mag shape must match volume shape at selected levels: "
                     f"volume={tuple(volume.shape)} mask={tuple(mask.shape)}"
+                )
+            if nx is not None and tuple(volume.shape) != tuple(nx.shape):
+                raise ValueError(
+                    "nx normal shape must match volume shape at selected levels: "
+                    f"volume={tuple(volume.shape)} nx={tuple(nx.shape)}"
+                )
+            if ny is not None and tuple(volume.shape) != tuple(ny.shape):
+                raise ValueError(
+                    "ny normal shape must match volume shape at selected levels: "
+                    f"volume={tuple(volume.shape)} ny={tuple(ny.shape)}"
                 )
 
             valid_threshold = float(
@@ -304,6 +357,8 @@ class FiberTraceBatchBuilder:
                         fiber=load_vc3d_fiber(fiber_path),
                         volume=volume,
                         mask=mask,
+                        nx=nx,
+                        ny=ny,
                         volume_scale=volume_scale,
                         dataset_config=dataset_config,
                         valid_threshold=valid_threshold,
@@ -320,6 +375,34 @@ class FiberTraceBatchBuilder:
             return self.records[int(record_index)]
         return self.records[int(self.rng.integers(0, len(self.records)))]
 
+    def _normal_at_zyx(
+        self, record: _FiberRecord, center_zyx: np.ndarray
+    ) -> tuple[np.ndarray | None, bool]:
+        if record.nx is None or record.ny is None:
+            if self.allow_arbitrary_up_fallback:
+                return None, True
+            raise ValueError("Lasagna nx/ny normal channels are required")
+        center = np.asarray(center_zyx, dtype=np.int64)
+        shape = np.asarray(record.nx.shape, dtype=np.int64)
+        if np.any(center < 0) or np.any(center >= shape):
+            return np.zeros(3, dtype=np.float32), False
+        nx_vox = np.asarray(
+            record.nx[
+                center[0] : center[0] + 1,
+                center[1] : center[1] + 1,
+                center[2] : center[2] + 1,
+            ]
+        )
+        ny_vox = np.asarray(
+            record.ny[
+                center[0] : center[0] + 1,
+                center[1] : center[1] + 1,
+                center[2] : center[2] + 1,
+            ]
+        )
+        normal_xyz, valid = decode_lasagna_normals_xyz(nx_vox, ny_vox)
+        return normal_xyz.reshape(-1, 3)[0], bool(valid.reshape(-1)[0])
+
     def _sample_random_valid_center(self, record: _FiberRecord) -> np.ndarray:
         shape = np.asarray(record.mask.shape, dtype=np.int64)
         for _ in range(self.random_valid_max_attempts):
@@ -334,30 +417,59 @@ class FiberTraceBatchBuilder:
                 ]
             )
             if value.size and float(value.reshape(-1)[0]) > record.valid_threshold:
-                return center
+                _, normal_valid = self._normal_at_zyx(record, center)
+                if normal_valid:
+                    return center
 
         mask_np = np.asarray(record.mask[:])
-        valid_coords = np.argwhere(mask_np > record.valid_threshold)
+        valid_mask = mask_np > record.valid_threshold
+        if record.nx is not None and record.ny is not None:
+            _, normal_valid = decode_lasagna_normals_xyz(
+                np.asarray(record.nx[:]), np.asarray(record.ny[:])
+            )
+            valid_mask = valid_mask & normal_valid
+        valid_coords = np.argwhere(valid_mask)
         if valid_coords.size == 0:
-            raise ValueError("mask/grad-mag volume contains no valid voxels")
+            raise ValueError("mask/grad-mag and nx/ny volumes contain no valid voxels")
         return valid_coords[int(self.rng.integers(0, valid_coords.shape[0]))].astype(
             np.int64, copy=False
         )
 
     def _sample_conditioning(
-        self, tangent_zyx: np.ndarray
+        self, tangent_xyz: np.ndarray, normal_xyz: np.ndarray | None
     ) -> tuple[np.ndarray, np.ndarray, str]:
         if float(self.rng.random()) < self.positive_direction_probability:
             fw = perturb_direction(
-                tangent_zyx,
+                tangent_xyz,
                 max_angle_degrees=self.positive_direction_jitter_degrees,
                 rng=self.rng,
             )
             direction_kind = "gt_tangent"
         else:
-            fw = random_unit_vector(self.rng)
+            fw = None
+            for _ in range(16):
+                candidate = random_unit_vector(self.rng)
+                try:
+                    construct_up_vector(
+                        candidate,
+                        normal_xyz,
+                        allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
+                    )
+                except ValueError:
+                    continue
+                fw = candidate
+                break
+            if fw is None:
+                raise ValueError(
+                    "could not sample a random conditioning direction with a valid "
+                    "Lasagna normal up vector"
+                )
             direction_kind = "random"
-        up = construct_up_vector(fw)
+        up = construct_up_vector(
+            fw,
+            normal_xyz,
+            allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
+        )
         return (
             fw.astype(np.float32, copy=False),
             up.astype(np.float32, copy=False),
@@ -369,14 +481,16 @@ class FiberTraceBatchBuilder:
     ) -> dict[str, Any]:
         fiber = record.fiber
         if crop_kind == "gt_control":
-            controls = fiber.control_points_zyx
-            center = np.rint(
-                controls[int(self.rng.integers(0, controls.shape[0]))]
-            ).astype(np.int64)
+            controls_xyz = fiber.control_points_xyz
+            center_xyz = controls_xyz[int(self.rng.integers(0, controls_xyz.shape[0]))]
+            center = np.rint(xyz_to_zyx(center_xyz)).astype(np.int64)
         elif crop_kind == "random_valid":
             center = self._sample_random_valid_center(record)
         else:
             raise ValueError(f"unsupported crop_kind {crop_kind!r}")
+        center_normal_xyz, center_normal_valid = self._normal_at_zyx(record, center)
+        if not center_normal_valid:
+            raise ValueError(f"sampled {crop_kind} center has invalid Lasagna nx/ny")
 
         crop_size_np = np.asarray(self.crop_size, dtype=np.int64)
         min_corner = center - (crop_size_np // 2)
@@ -393,32 +507,60 @@ class FiberTraceBatchBuilder:
             _read_raw_crop(record.mask, self.crop_size, min_corner)
             > record.valid_threshold
         )
+        if record.nx is None or record.ny is None:
+            if not self.allow_arbitrary_up_fallback:
+                raise ValueError("Lasagna nx/ny normal channels are required")
+            normal_xyz_crop = None
+            normal_valid_crop = np.ones(self.crop_size, dtype=bool)
+        else:
+            nx_crop = _read_raw_crop(record.nx, self.crop_size, min_corner)
+            ny_crop = _read_raw_crop(record.ny, self.crop_size, min_corner)
+            normal_xyz_crop, normal_valid_crop = decode_lasagna_normals_xyz(
+                nx_crop, ny_crop
+            )
+            valid_crop = valid_crop & normal_valid_crop
         if not bool(valid_crop.any()):
             raise ValueError(
-                f"sampled {crop_kind} crop has no valid mask/grad-mag voxels"
+                f"sampled {crop_kind} crop has no valid mask/grad-mag and nx/ny voxels"
             )
 
-        tangent = tangent_at_point(fiber.line_points_zyx, center.astype(np.float32))
-        cond_fw, cond_up, direction_kind = self._sample_conditioning(tangent)
+        tangent_xyz = tangent_at_point(
+            fiber.line_points_xyz, zyx_to_xyz(center.astype(np.float32))
+        )
+        cond_fw_xyz, cond_up_xyz, direction_kind = self._sample_conditioning(
+            tangent_xyz, center_normal_xyz
+        )
         classified = classify_voxels(
             crop_origin_zyx=min_corner,
             crop_shape=self.crop_size,
-            line_points_zyx=fiber.line_points_zyx,
-            cond_fw_zyx=cond_fw,
+            line_points_xyz=fiber.line_points_xyz,
+            cond_fw_xyz=cond_fw_xyz,
             valid_mask=valid_crop,
+            normal_xyz=normal_xyz_crop,
+            normal_valid_mask=normal_valid_crop,
+            allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
+            degenerate_up_policy=self.degenerate_up_policy,
             positive_radius=self.positive_radius,
             ignore_radius=self.ignore_radius,
             positive_cosine=self.positive_cosine,
             negative_cosine=self.negative_cosine,
         )
+        positive_labels = classified["labels"] == POSITIVE_LABEL
+        if bool(positive_labels.any()) and not bool(
+            (positive_labels & classified["target_up_valid"]).any()
+        ):
+            raise ValueError(
+                f"sampled {crop_kind} crop has no valid up-vector supervision"
+            )
         return {
             "volume": volume_crop.astype(np.float32, copy=False),
             "valid_mask": valid_crop,
             "labels": classified["labels"],
-            "target_fw": classified["target_fw"],
-            "target_up": classified["target_up"],
-            "cond_fw": cond_fw,
-            "cond_up": cond_up,
+            "target_fw_xyz": classified["target_fw_xyz"],
+            "target_up_xyz": classified["target_up_xyz"],
+            "target_up_valid": classified["target_up_valid"],
+            "cond_fw_xyz": cond_fw_xyz,
+            "cond_up_xyz": cond_up_xyz,
             "origin": min_corner.astype(np.int64, copy=False),
             "crop_kind": crop_kind,
             "direction_kind": direction_kind,
@@ -441,17 +583,20 @@ class FiberTraceBatchBuilder:
             labels=torch.from_numpy(
                 np.stack([s["labels"] for s in samples], axis=0)
             ).to(torch.long),
-            target_fw=torch.from_numpy(
-                np.stack([s["target_fw"] for s in samples], axis=0)
+            target_fw_xyz=torch.from_numpy(
+                np.stack([s["target_fw_xyz"] for s in samples], axis=0)
             ).to(torch.float32),
-            target_up=torch.from_numpy(
-                np.stack([s["target_up"] for s in samples], axis=0)
+            target_up_xyz=torch.from_numpy(
+                np.stack([s["target_up_xyz"] for s in samples], axis=0)
             ).to(torch.float32),
-            cond_fw=torch.from_numpy(
-                np.stack([s["cond_fw"] for s in samples], axis=0)
+            target_up_valid=torch.from_numpy(
+                np.stack([s["target_up_valid"] for s in samples], axis=0)
+            ).to(torch.bool),
+            cond_fw_xyz=torch.from_numpy(
+                np.stack([s["cond_fw_xyz"] for s in samples], axis=0)
             ).to(torch.float32),
-            cond_up=torch.from_numpy(
-                np.stack([s["cond_up"] for s in samples], axis=0)
+            cond_up_xyz=torch.from_numpy(
+                np.stack([s["cond_up_xyz"] for s in samples], axis=0)
             ).to(torch.float32),
             crop_origin_zyx=torch.from_numpy(
                 np.stack([s["origin"] for s in samples], axis=0)

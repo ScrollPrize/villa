@@ -46,30 +46,32 @@ class DirectionConditionedFiberTraceModel(nn.Module):
         )
 
     def forward(
-        self, volume: Tensor, cond_fw: Tensor, cond_up: Tensor
+        self, volume: Tensor, cond_fw_xyz: Tensor, cond_up_xyz: Tensor
     ) -> dict[str, Tensor]:
         if volume.ndim != 5:
             raise ValueError(
                 f"volume must have shape [B, C, D, H, W], got {tuple(volume.shape)}"
             )
-        if cond_fw.shape != (volume.shape[0], 3):
+        if cond_fw_xyz.shape != (volume.shape[0], 3):
             raise ValueError(
-                f"cond_fw must have shape [B, 3], got {tuple(cond_fw.shape)}"
+                f"cond_fw_xyz must have shape [B, 3], got {tuple(cond_fw_xyz.shape)}"
             )
-        if cond_up.shape != (volume.shape[0], 3):
+        if cond_up_xyz.shape != (volume.shape[0], 3):
             raise ValueError(
-                f"cond_up must have shape [B, 3], got {tuple(cond_up.shape)}"
+                f"cond_up_xyz must have shape [B, 3], got {tuple(cond_up_xyz.shape)}"
             )
 
-        cond_fw = F.normalize(cond_fw.to(dtype=volume.dtype), dim=1)
-        cond_up = F.normalize(cond_up.to(dtype=volume.dtype), dim=1)
+        cond_fw_xyz = F.normalize(cond_fw_xyz.to(dtype=volume.dtype), dim=1)
+        cond_up_xyz = F.normalize(cond_up_xyz.to(dtype=volume.dtype), dim=1)
         features = self.backbone(volume)
         if tuple(features.shape[2:]) != tuple(volume.shape[2:]):
             features = F.interpolate(
                 features, size=volume.shape[2:], mode="trilinear", align_corners=False
             )
 
-        cond = torch.cat([cond_fw, cond_up], dim=1).view(volume.shape[0], 6, 1, 1, 1)
+        cond = torch.cat([cond_fw_xyz, cond_up_xyz], dim=1).view(
+            volume.shape[0], 6, 1, 1, 1
+        )
         cond = cond.expand(-1, -1, *features.shape[2:])
         raw = self.head(torch.cat([features, cond], dim=1))
         embedding = F.normalize(raw[:, : self.embedding_dim], dim=1)

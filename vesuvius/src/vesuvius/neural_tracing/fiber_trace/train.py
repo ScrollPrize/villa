@@ -45,7 +45,7 @@ def run_training(config: dict[str, Any]) -> None:
     for step in range(1, steps + 1):
         batch = batch_builder.sample_batch().to(device)
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(batch.volume, batch.cond_fw, batch.cond_up)
+        outputs = model(batch.volume, batch.cond_fw_xyz, batch.cond_up_xyz)
         losses = compute_fiber_trace_loss(
             outputs,
             batch,

@@ -7,11 +7,13 @@ import numpy as np
 import pytest
 import torch
 
+import vesuvius.neural_tracing.fiber_trace.dataset as fiber_dataset
 from vesuvius.neural_tracing.fiber_trace.dataset import FiberTraceBatchBuilder
 from vesuvius.neural_tracing.fiber_trace.fiber_json import parse_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace.geometry import (
     classify_voxels,
     construct_up_vector,
+    decode_lasagna_normals_xyz,
     tangent_at_point,
 )
 from vesuvius.neural_tracing.fiber_trace.labels import (
@@ -44,6 +46,8 @@ def _synthetic_config(
 ) -> dict:
     volume = np.arange(16 * 16 * 16, dtype=np.float32).reshape(16, 16, 16)
     mask = np.ones((16, 16, 16), dtype=np.uint8)
+    nx = np.full((16, 16, 16), 128, dtype=np.uint8)
+    ny = np.full((16, 16, 16), 128, dtype=np.uint8)
     fiber_path = tmp_path / "fiber.json"
     _write_fiber(fiber_path)
     return {
@@ -59,13 +63,15 @@ def _synthetic_config(
             {
                 "volume": volume,
                 "mask": mask,
+                "nx": nx,
+                "ny": ny,
                 "fiber_path": str(fiber_path),
             }
         ],
     }
 
 
-def test_parse_vc3d_fiber_validates_and_exposes_zyx_order():
+def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
     fiber = parse_vc3d_fiber(
         {
             "type": "vc3d_fiber",
@@ -77,6 +83,9 @@ def test_parse_vc3d_fiber_validates_and_exposes_zyx_order():
     )
     assert fiber.version == 1
     assert fiber.generation == 7
+    np.testing.assert_array_equal(
+        fiber.line_points_xyz[0], np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    )
     np.testing.assert_array_equal(
         fiber.line_points_zyx[0], np.array([3.0, 2.0, 1.0], dtype=np.float32)
     )
@@ -106,22 +115,46 @@ def test_tangent_uses_line_points_and_control_point_query():
         {
             "type": "vc3d_fiber",
             "version": 1,
-            "line_points": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-            "control_points": [[1.0, 0.0, 0.0]],
+            "line_points": [[0.0, 0.0, 0.0], [2.0, 1.0, 0.0], [4.0, 2.0, 0.0]],
+            "control_points": [[2.0, 1.0, 0.0]],
         }
     )
-    tangent = tangent_at_point(fiber.line_points_zyx, fiber.control_points_zyx[0])
-    np.testing.assert_allclose(tangent, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    tangent = tangent_at_point(fiber.line_points_xyz, fiber.control_points_xyz[0])
+    np.testing.assert_allclose(
+        tangent,
+        np.array([2.0, 1.0, 0.0], dtype=np.float32) / np.sqrt(5.0),
+        atol=1e-6,
+    )
 
 
-def test_up_vector_construction_and_sign_ambiguous_loss():
+def test_lasagna_normal_decoding_and_up_projection():
+    normals, valid = decode_lasagna_normals_xyz(
+        np.array([128, 128, 255, 0], dtype=np.uint8),
+        np.array([128, 255, 128, 0], dtype=np.uint8),
+    )
+    np.testing.assert_allclose(normals[0], np.array([0.0, 0.0, 1.0]), atol=1e-6)
+    np.testing.assert_allclose(normals[1], np.array([0.0, 1.0, 0.0]), atol=1e-6)
+    np.testing.assert_allclose(normals[2], np.array([1.0, 0.0, 0.0]), atol=1e-6)
+    assert bool(valid[:3].all())
+    assert not bool(valid[3])
+
     up = construct_up_vector(
-        np.array([0.0, 0.0, 1.0], dtype=np.float32),
-        np.array([0.0, 1.0, 1.0], dtype=np.float32),
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        np.array([0.0, 1.0, 0.0], dtype=np.float32),
     )
     np.testing.assert_allclose(
         up, np.array([0.0, 1.0, 0.0], dtype=np.float32), atol=1e-6
     )
+    with pytest.raises(ValueError, match="normal_xyz is required"):
+        construct_up_vector(np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    with pytest.raises(ValueError, match="degenerate"):
+        construct_up_vector(
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        )
+
+
+def test_sign_ambiguous_loss():
 
     target = torch.tensor([[[[[0.0]]], [[[1.0]]], [[[0.0]]]]])
     pred = -target
@@ -146,6 +179,7 @@ def test_batch_builder_samples_one_fiber_with_half_gt_and_half_random_crops(
     assert len(set(batch.fiber_paths)) == 1
     assert bool((batch.labels == POSITIVE_LABEL).any())
     assert bool((batch.labels == NEGATIVE_LABEL).any())
+    assert bool((batch.target_up_valid & (batch.labels == POSITIVE_LABEL)).any())
 
 
 def test_missing_mask_fails_loudly(tmp_path: Path):
@@ -165,33 +199,175 @@ def test_missing_mask_fails_loudly(tmp_path: Path):
         FiberTraceBatchBuilder(config)
 
 
+def test_missing_normals_fail_loudly(tmp_path: Path):
+    fiber_path = tmp_path / "fiber.json"
+    _write_fiber(fiber_path)
+    config = {
+        "crop_size": [8, 8, 8],
+        "batch_size": 2,
+        "datasets": [
+            {
+                "volume_path": str(tmp_path / "volume.zarr"),
+                "mask_path": str(tmp_path / "mask.zarr"),
+                "fiber_paths": [str(fiber_path)],
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="nx_path and ny_path"):
+        FiberTraceBatchBuilder(config)
+
+
+def test_array_record_normal_shape_mismatch_fails(tmp_path: Path):
+    fiber_path = tmp_path / "fiber.json"
+    _write_fiber(fiber_path)
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config["_array_records"][0]["ny"] = np.full((15, 16, 16), 128, dtype=np.uint8)
+    with pytest.raises(ValueError, match="normal channel shapes"):
+        FiberTraceBatchBuilder(config)
+
+
+def test_remote_zarr_requires_cache_dir_before_network(tmp_path: Path):
+    fiber_path = tmp_path / "fiber.json"
+    _write_fiber(fiber_path)
+    config = {
+        "crop_size": [8, 8, 8],
+        "batch_size": 2,
+        "datasets": [
+            {
+                "volume_path": "https://example.com/volume.zarr",
+                "mask_path": "https://example.com/mask.zarr",
+                "nx_path": "https://example.com/nx.zarr",
+                "ny_path": "https://example.com/ny.zarr",
+                "fiber_paths": [str(fiber_path)],
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="volume_cache_dir"):
+        FiberTraceBatchBuilder(config)
+
+
+def test_zarr_access_uses_common_helpers_without_direct_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fiber_path = tmp_path / "fiber.json"
+    _write_fiber(fiber_path)
+    volume = np.zeros((16, 16, 16), dtype=np.uint8)
+    mask = np.ones((16, 16, 16), dtype=np.uint8)
+    nx = np.full((16, 16, 16), 128, dtype=np.uint8)
+    ny = np.full((16, 16, 16), 128, dtype=np.uint8)
+    calls: list[tuple[str, str, int | None]] = []
+
+    def fake_open_group(path, *, auth_json_path=None, config=None):
+        calls.append(("group", str(path), None))
+        return {"0": volume}
+
+    def fake_open_zarr(path, *, scale=None, auth_json_path=None, config=None):
+        calls.append(("array", str(path), int(scale)))
+        return {"volume": volume, "mask": mask, "nx": nx, "ny": ny}[str(path)]
+
+    monkeypatch.setattr(fiber_dataset, "_common_open_zarr_group", fake_open_group)
+    monkeypatch.setattr(fiber_dataset, "_common_open_zarr", fake_open_zarr)
+
+    FiberTraceBatchBuilder(
+        {
+            "crop_size": [8, 8, 8],
+            "batch_size": 2,
+            "datasets": [
+                {
+                    "volume_path": "volume",
+                    "mask_path": "mask",
+                    "nx_path": "nx",
+                    "ny_path": "ny",
+                    "fiber_paths": [str(fiber_path)],
+                }
+            ],
+        }
+    )
+    assert calls == [
+        ("array", "volume", 0),
+        ("array", "mask", 0),
+        ("array", "nx", 0),
+        ("array", "ny", 0),
+    ]
+
+
 def test_voxel_classification_positive_negative_and_ignore():
-    line = np.array([[4.0, 4.0, 2.0], [4.0, 4.0, 6.0]], dtype=np.float32)
+    line = np.array([[2.0, 3.0, 5.0], [6.0, 3.0, 5.0]], dtype=np.float32)
     mask = np.ones((9, 9, 9), dtype=bool)
     mask[1, 1, 1] = False
+    normal_xyz = np.zeros((9, 9, 9, 3), dtype=np.float32)
+    normal_xyz[..., 2] = 1.0
     result = classify_voxels(
         crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
         crop_shape=(9, 9, 9),
-        line_points_zyx=line,
-        cond_fw_zyx=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
         valid_mask=mask,
-        positive_radius=1.0,
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        positive_radius=0.25,
         ignore_radius=2.0,
     )
-    assert int(result["labels"][4, 4, 4]) == POSITIVE_LABEL
+    assert int(result["labels"][5, 3, 4]) == POSITIVE_LABEL
     assert int(result["labels"][0, 0, 0]) == NEGATIVE_LABEL
     assert int(result["labels"][1, 1, 1]) == IGNORE_INDEX
+    np.testing.assert_allclose(
+        result["target_fw_xyz"][:, 5, 3, 4],
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        result["target_up_xyz"][:, 5, 3, 4],
+        np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        atol=1e-6,
+    )
+    assert bool(result["target_up_valid"][5, 3, 4])
 
     wrong_dir = classify_voxels(
         crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
         crop_shape=(9, 9, 9),
-        line_points_zyx=line,
-        cond_fw_zyx=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
-        positive_radius=1.0,
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        positive_radius=0.25,
         ignore_radius=2.0,
     )
-    assert int(wrong_dir["labels"][4, 4, 4]) == NEGATIVE_LABEL
+    assert int(wrong_dir["labels"][5, 3, 4]) == NEGATIVE_LABEL
+
+
+def test_degenerate_up_vectors_are_invalid_or_raise():
+    line = np.array([[2.0, 3.0, 5.0], [6.0, 3.0, 5.0]], dtype=np.float32)
+    normal_xyz = np.zeros((9, 9, 9, 3), dtype=np.float32)
+    normal_xyz[..., 0] = 1.0
+    result = classify_voxels(
+        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
+        crop_shape=(9, 9, 9),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        positive_radius=0.25,
+        ignore_radius=2.0,
+    )
+    assert int(result["labels"][5, 3, 4]) == POSITIVE_LABEL
+    assert not bool(result["target_up_valid"][5, 3, 4])
+
+    with pytest.raises(ValueError, match="degenerate"):
+        classify_voxels(
+            crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
+            crop_shape=(9, 9, 9),
+            line_points_xyz=line,
+            cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            valid_mask=np.ones((9, 9, 9), dtype=bool),
+            normal_xyz=normal_xyz,
+            normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+            degenerate_up_policy="raise",
+            positive_radius=0.25,
+            ignore_radius=2.0,
+        )
 
 
 def test_supervised_contrastive_loss_is_finite_on_synthetic_embeddings():
@@ -218,7 +394,7 @@ def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
         features_per_stage=(2,),
         head_channels=4,
     )
-    outputs = model(batch.volume, batch.cond_fw, batch.cond_up)
+    outputs = model(batch.volume, batch.cond_fw_xyz, batch.cond_up_xyz)
     assert outputs["embedding"].shape == (2, 6, 8, 8, 8)
     assert outputs["fw"].shape == (2, 3, 8, 8, 8)
 
