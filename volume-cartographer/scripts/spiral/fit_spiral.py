@@ -795,15 +795,28 @@ def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding
 
 
 def main():
+
+    # ==========================================================================
+    # Run setup
+    # ==========================================================================
+
     np.random.seed(cfg['random_seed'])
     torch.random.manual_seed(cfg['random_seed'])
     umbilicus = umbilicus_z_to_yx(downsample_factor)
+
+    # ==========================================================================
+    # Volume input
+    # ==========================================================================
 
     if scroll_zarr_path:
         print('loading volume zarr')
         scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
     else:
         scroll_zarr = None
+
+    # ==========================================================================
+    # Patch loading and ROI filtering
+    # ==========================================================================
 
     def load_patches_from_dir(path):
         patches = {}
@@ -849,6 +862,10 @@ def main():
                 del patches[patch_id]
                 continue
 
+    # ==========================================================================
+    # Point collection loading
+    # ==========================================================================
+
     # Load all pcls, transform into (downsampled) voxel space, link every point to patches,
     # and split into cross-patch / unattached sets. Verified patches must already be
     # downsampled and filtered to the z-roi.
@@ -875,6 +892,10 @@ def main():
         return False
 
     link_distance_tolerance = 2.5
+
+    # ==========================================================================
+    # Point-to-patch linking
+    # ==========================================================================
 
     # Link every point of every pcl to patches (adds 'on_patch' to attached points).
     # Using the vc3d surface patch index, identify which pcl points lie on patch surfaces.
@@ -985,6 +1006,10 @@ def main():
 
     if between_pcls:
         print(f'attached {len(between_pcls)} between_patches collection(s) to their named patches only')
+
+    # ==========================================================================
+    # Point collection classification
+    # ==========================================================================
 
     # Classify each pcl from how its points attach to patches:
     #  - >= 2 attached points => acts as a cross-patch pcl (winding-number loss), using only
@@ -1119,6 +1144,10 @@ def main():
         f'{len(unattached_pcl_strips)} unattached'
     )
 
+    # ==========================================================================
+    # Auxiliary loss inputs
+    # ==========================================================================
+
     lasagna_volume = prepare_lasagna_volume(
         scroll_zarr,
         use_normals=cfg['loss_weight_dense_normals'] > 0,
@@ -1138,6 +1167,10 @@ def main():
         print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')
     else:
         tracks = None
+
+    # ==========================================================================
+    # Patch sampling caches and output path
+    # ==========================================================================
 
     def prepare_patch_sampling_cache(patches):
         patch_areas = np.empty(len(patches), dtype=np.float32)
@@ -1215,6 +1248,10 @@ def main():
 
     patch_atlas = PatchGpuAtlas(verified_patches, device='cuda')
     print(f'patch GPU atlas: {patch_atlas.memory_mb():.1f} MB')
+
+    # ==========================================================================
+    # Trusted geometry and unverified patches
+    # ==========================================================================
 
     num_slices_for_visualisation = cfg.get('num_slices_for_visualization', 20)
     rendering_slices_downsample_factor = cfg.get('rendering_slices_downsample_factor', 2)
@@ -1324,6 +1361,10 @@ def main():
         unverified_patch_sampling_probabilities = prepare_patch_sampling_cache(unverified_patches_list)
         unverified_patch_atlas = PatchGpuAtlas(unverified_patches, device='cuda')
 
+    # ==========================================================================
+    # Visualization inputs
+    # ==========================================================================
+
     all_zs = np.arange(z_begin, z_end)
     zs_for_visualisation = np.linspace(z_begin, z_end - 1, min(num_slices_for_visualisation, z_end - 1 - z_begin),
                                        dtype=np.int64)
@@ -1360,6 +1401,10 @@ def main():
         torch.arange(subvolume_shape[2], dtype=torch.float32),
         indexing='ij'
     ), axis=-1).to(device)
+
+    # ==========================================================================
+    # Model construction and resume
+    # ==========================================================================
 
     # Load the resume checkpoint (if any) before constructing the model. The
     # model's parameter tensors are shaped by the z-range it was trained with,
@@ -1404,6 +1449,10 @@ def main():
     )
     spiral_and_transform.to(device)
 
+    # ==========================================================================
+    # Shell loss setup
+    # ==========================================================================
+
     shell_map = None
     shell_outer_winding_idx = None
     shell_valid_zyxs_gpu = None
@@ -1444,6 +1493,10 @@ def main():
                 f'gap_expander_num_windings {cfg["gap_expander_num_windings"]}; '
                 'increase gap_expander_num_windings or lower shell_outer_winding_idx'
             )
+
+    # ==========================================================================
+    # Optimizer and checkpoint helpers
+    # ==========================================================================
 
     flow_field_params = list(spiral_and_transform.flow_field.parameters())
     gap_expander_params = list(spiral_and_transform.gap_expander_params.parameters())
@@ -1495,6 +1548,10 @@ def main():
     else:
         profiler = None
 
+    # ==========================================================================
+    # Track training inputs
+    # ==========================================================================
+
     prepared_main_tracks = None
     if using_tracks:
         prepared_main_tracks = prepare_main_phase_tracks(
@@ -1507,6 +1564,10 @@ def main():
 
     slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
     dr_per_winding = spiral_and_transform.get_dr_per_winding()
+
+    # ==========================================================================
+    # Training loop
+    # ==========================================================================
 
     for iteration in tqdm(range(start_iteration, num_training_steps)):
         spiral_and_transform.flow_field.flow_scales[1] = get_flow_field_high_res_lr_scale(iteration)
@@ -1677,6 +1738,10 @@ def main():
                 **shell_metrics,
                 **log_metrics,
             })
+
+    # ==========================================================================
+    # Final outputs
+    # ==========================================================================
 
     suffix = 'fitted'
     save_model(suffix)
