@@ -17,7 +17,6 @@ from vesuvius.neural_tracing.fiber_trace.geometry import (
     construct_up_vector,
     decode_lasagna_normals_xyz,
     perturb_direction,
-    random_unit_vector,
     tangent_at_point,
     xyz_to_zyx,
     zyx_to_xyz,
@@ -35,6 +34,7 @@ class FiberTraceBatch:
     volume: torch.Tensor
     valid_mask: torch.Tensor
     labels: torch.Tensor
+    target_id: torch.Tensor
     target_fw_xyz: torch.Tensor
     target_up_xyz: torch.Tensor
     target_up_valid: torch.Tensor
@@ -50,6 +50,7 @@ class FiberTraceBatch:
             volume=self.volume.to(device),
             valid_mask=self.valid_mask.to(device),
             labels=self.labels.to(device),
+            target_id=self.target_id.to(device),
             target_fw_xyz=self.target_fw_xyz.to(device),
             target_up_xyz=self.target_up_xyz.to(device),
             target_up_valid=self.target_up_valid.to(device),
@@ -431,15 +432,30 @@ class FiberTraceBatchBuilder:
         self.positive_direction_jitter_degrees = float(
             self.config.get("positive_direction_jitter_degrees", 10.0)
         )
+        self.negative_direction_min_degrees = float(
+            self.config.get("negative_direction_min_degrees", 60.0)
+        )
+        self.negative_direction_max_degrees = float(
+            self.config.get("negative_direction_max_degrees", 180.0)
+        )
         self.positive_radius = float(self.config.get("positive_radius", 1.5))
         self.ignore_radius = float(
             self.config.get("ignore_radius", max(3.0, self.positive_radius))
         )
+        self.normal_plane_jitter_voxels = float(
+            self.config.get("normal_plane_jitter_voxels", 40.0)
+        )
+        self.normal_perpendicular_jitter_voxels = float(
+            self.config.get("normal_perpendicular_jitter_voxels", 10.0)
+        )
+        self.negative_cone_distance_voxels = float(
+            self.config.get("negative_cone_distance_voxels", 30.0)
+        )
         self.positive_cosine = float(
-            self.config.get("positive_cosine", np.cos(np.deg2rad(30.0)))
+            self.config.get("positive_cosine", np.cos(np.deg2rad(45.0)))
         )
         self.negative_cosine = float(
-            self.config.get("negative_cosine", np.cos(np.deg2rad(75.0)))
+            self.config.get("negative_cosine", np.cos(np.deg2rad(60.0)))
         )
         self.random_valid_max_attempts = int(
             self.config.get("random_valid_max_attempts", 256)
@@ -818,36 +834,38 @@ class FiberTraceBatchBuilder:
                 return center
         raise ValueError("mask/grad-mag and nx/ny volumes contain no valid voxels")
 
-    def _sample_conditioning(
-        self, tangent_xyz: np.ndarray, normal_xyz: np.ndarray | None
+    def _sample_jittered_conditioning(
+        self,
+        tangent_xyz: np.ndarray,
+        normal_xyz: np.ndarray | None,
+        *,
+        min_angle_degrees: float,
+        max_angle_degrees: float,
+        direction_kind: str,
     ) -> tuple[np.ndarray, np.ndarray, str]:
-        if float(self.rng.random()) < self.positive_direction_probability:
-            fw = perturb_direction(
+        fw = None
+        for _ in range(32):
+            candidate = perturb_direction(
                 tangent_xyz,
-                max_angle_degrees=self.positive_direction_jitter_degrees,
+                min_angle_degrees=min_angle_degrees,
+                max_angle_degrees=max_angle_degrees,
                 rng=self.rng,
             )
-            direction_kind = "gt_tangent"
-        else:
-            fw = None
-            for _ in range(16):
-                candidate = random_unit_vector(self.rng)
-                try:
-                    construct_up_vector(
-                        candidate,
-                        normal_xyz,
-                        allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
-                    )
-                except ValueError:
-                    continue
-                fw = candidate
-                break
-            if fw is None:
-                raise ValueError(
-                    "could not sample a random conditioning direction with a valid "
-                    "Lasagna normal up vector"
+            try:
+                construct_up_vector(
+                    candidate,
+                    normal_xyz,
+                    allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
                 )
-            direction_kind = "random"
+            except ValueError:
+                continue
+            fw = candidate
+            break
+        if fw is None:
+            raise ValueError(
+                f"could not sample a {direction_kind} conditioning direction with "
+                "a valid Lasagna normal up vector"
+            )
         up = construct_up_vector(
             fw,
             normal_xyz,
@@ -859,13 +877,19 @@ class FiberTraceBatchBuilder:
             direction_kind,
         )
 
-    def _sample_one_crop(
-        self, record: _FiberRecord, *, crop_kind: str
+    def _sample_crop_base(
+        self,
+        record: _FiberRecord,
+        *,
+        crop_kind: str,
+        control_index: int | None = None,
     ) -> dict[str, Any]:
         fiber = record.fiber
         if crop_kind == "gt_control":
             controls_xyz = fiber.control_points_xyz
-            center_xyz = controls_xyz[int(self.rng.integers(0, controls_xyz.shape[0]))]
+            if control_index is None:
+                control_index = int(self.rng.integers(0, controls_xyz.shape[0]))
+            center_xyz = controls_xyz[int(control_index)]
             center = np.rint(
                 xyz_to_zyx(center_xyz) / float(record.volume_spacing_base)
             ).astype(np.int64)
@@ -933,50 +957,135 @@ class FiberTraceBatchBuilder:
             fiber.line_points_xyz,
             zyx_to_xyz(center.astype(np.float32) * float(record.volume_spacing_base)),
         )
-        cond_fw_xyz, cond_up_xyz, direction_kind = self._sample_conditioning(
-            tangent_xyz, center_normal_xyz
-        )
+
+        return {
+            "volume": volume_crop.astype(np.float32, copy=False),
+            "valid_mask": valid_crop,
+            "normal_xyz": normal_xyz_crop,
+            "normal_valid_mask": normal_valid_crop,
+            "center_normal_xyz": center_normal_xyz,
+            "tangent_xyz": tangent_xyz,
+            "origin": min_corner.astype(np.int64, copy=False),
+            "crop_kind": crop_kind,
+        }
+
+    def _make_conditioned_sample(
+        self,
+        record: _FiberRecord,
+        crop_base: dict[str, Any],
+        *,
+        direction_kind: str,
+        positive_target_id: int,
+    ) -> dict[str, Any]:
+        if direction_kind == "positive":
+            cond_fw_xyz, cond_up_xyz, direction_kind = self._sample_jittered_conditioning(
+                crop_base["tangent_xyz"],
+                crop_base["center_normal_xyz"],
+                min_angle_degrees=0.0,
+                max_angle_degrees=self.positive_direction_jitter_degrees,
+                direction_kind=direction_kind,
+            )
+        elif direction_kind == "negative":
+            cond_fw_xyz, cond_up_xyz, direction_kind = self._sample_jittered_conditioning(
+                crop_base["tangent_xyz"],
+                crop_base["center_normal_xyz"],
+                min_angle_degrees=self.negative_direction_min_degrees,
+                max_angle_degrees=self.negative_direction_max_degrees,
+                direction_kind=direction_kind,
+            )
+        else:
+            raise ValueError(f"unsupported direction_kind {direction_kind!r}")
+
         classified = classify_voxels(
-            crop_origin_zyx=min_corner,
+            crop_origin_zyx=crop_base["origin"],
             crop_shape=self.crop_size,
-            line_points_xyz=fiber.line_points_xyz / float(record.volume_spacing_base),
+            line_points_xyz=record.fiber.line_points_xyz
+            / float(record.volume_spacing_base),
             cond_fw_xyz=cond_fw_xyz,
-            valid_mask=valid_crop,
-            normal_xyz=normal_xyz_crop,
-            normal_valid_mask=normal_valid_crop,
+            valid_mask=crop_base["valid_mask"],
+            normal_xyz=crop_base["normal_xyz"],
+            normal_valid_mask=crop_base["normal_valid_mask"],
             allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
             degenerate_up_policy=self.degenerate_up_policy,
             positive_radius=self.positive_radius,
             ignore_radius=self.ignore_radius,
+            normal_plane_jitter_voxels=self.normal_plane_jitter_voxels,
+            normal_perpendicular_jitter_voxels=self.normal_perpendicular_jitter_voxels,
+            negative_cone_distance_voxels=self.negative_cone_distance_voxels,
             positive_cosine=self.positive_cosine,
             negative_cosine=self.negative_cosine,
+            positive_target_id=positive_target_id,
         )
         positive_labels = classified["labels"] == POSITIVE_LABEL
         if bool(positive_labels.any()) and not bool(
             (positive_labels & classified["target_up_valid"]).any()
         ):
             raise ValueError(
-                f"sampled {crop_kind} crop has no valid up-vector supervision"
+                f"sampled {crop_base['crop_kind']} crop has no valid up-vector supervision"
             )
         return {
-            "volume": volume_crop.astype(np.float32, copy=False),
-            "valid_mask": valid_crop,
+            "volume": crop_base["volume"],
+            "valid_mask": crop_base["valid_mask"],
             "labels": classified["labels"],
+            "target_id": classified["target_id"],
             "target_fw_xyz": classified["target_fw_xyz"],
             "target_up_xyz": classified["target_up_xyz"],
             "target_up_valid": classified["target_up_valid"],
             "cond_fw_xyz": cond_fw_xyz,
             "cond_up_xyz": cond_up_xyz,
-            "origin": min_corner.astype(np.int64, copy=False),
-            "crop_kind": crop_kind,
+            "origin": crop_base["origin"],
+            "crop_kind": crop_base["crop_kind"],
             "direction_kind": direction_kind,
         }
 
     def sample_batch(self, *, record_index: int | None = None) -> FiberTraceBatch:
-        record = self._sample_record(record_index)
-        half = self.batch_size // 2
-        crop_kinds = ("gt_control",) * half + ("random_valid",) * half
-        samples = [self._sample_one_crop(record, crop_kind=kind) for kind in crop_kinds]
+        if record_index is None:
+            selected_record_index = int(self.rng.integers(0, len(self.records)))
+        else:
+            selected_record_index = int(record_index)
+        record = self.records[selected_record_index]
+        pair_count = self.batch_size // 2
+        gt_pair_count = (pair_count + 1) // 2
+        random_pair_count = pair_count - gt_pair_count
+        crop_kinds = ("gt_control",) * gt_pair_count + (
+            "random_valid",
+        ) * random_pair_count
+
+        control_indices: list[int | None] = []
+        if gt_pair_count:
+            control_count = int(record.fiber.control_points_xyz.shape[0])
+            replace = gt_pair_count > control_count
+            choices = self.rng.choice(
+                control_count, size=gt_pair_count, replace=replace
+            )
+            control_indices = [int(choice) for choice in choices]
+
+        samples: list[dict[str, Any]] = []
+        gt_index = 0
+        for kind in crop_kinds:
+            control_index = None
+            if kind == "gt_control":
+                control_index = control_indices[gt_index]
+                gt_index += 1
+            crop_base = self._sample_crop_base(
+                record, crop_kind=kind, control_index=control_index
+            )
+            samples.append(
+                self._make_conditioned_sample(
+                    record,
+                    crop_base,
+                    direction_kind="positive",
+                    positive_target_id=selected_record_index,
+                )
+            )
+            samples.append(
+                self._make_conditioned_sample(
+                    record,
+                    crop_base,
+                    direction_kind="negative",
+                    positive_target_id=selected_record_index,
+                )
+            )
         fiber_path = str(record.fiber.path) if record.fiber.path is not None else ""
 
         return FiberTraceBatch(
@@ -988,6 +1097,9 @@ class FiberTraceBatchBuilder:
             ).to(torch.bool),
             labels=torch.from_numpy(
                 np.stack([s["labels"] for s in samples], axis=0)
+            ).to(torch.long),
+            target_id=torch.from_numpy(
+                np.stack([s["target_id"] for s in samples], axis=0)
             ).to(torch.long),
             target_fw_xyz=torch.from_numpy(
                 np.stack([s["target_fw_xyz"] for s in samples], axis=0)

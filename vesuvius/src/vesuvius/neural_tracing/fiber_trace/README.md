@@ -4,6 +4,9 @@ This package contains the first training path for tracing VC3D fiber JSON
 records with direction-conditioned 3D crops. It is intentionally separate from
 the row/column surface tracing and Lasagna sparse-solve samplers.
 
+See [SPEC.md](SPEC.md) for the original fiber tracing training spec, the
+Lasagna/Vesuvius convention decisions, and the current implementation status.
+
 ## Data Schema
 
 Training records are `vc3d_fiber` version 1 JSON files:
@@ -50,23 +53,27 @@ manifest path is the intended training spec.
 ## Batch Construction
 
 Batches are single-fiber batches. For batch size `N`, the builder samples one
-fiber record and emits:
+fiber record, selects `N / 2` crop centers, and emits two conditioning variants
+for each selected crop:
 
-- `N / 2` crops centered on random GT control points from that fiber
-- `N / 2` crops centered on random valid mask/grad-mag voxels
+- a positive-conditioned copy jittered 0 to 45 degrees from the local tangent
+- a negative-conditioned copy jittered 60 to 180 degrees from the local tangent
 
-The batch stores crop kind metadata so tests and trainers can verify the
-composition. Batch size must be even for this MVP.
+Selected centers prefer GT control points from the same fiber line, using
+multiple distinct control points when possible, and then random valid
+mask/grad-mag voxels when the batch has room. The batch stores crop kind and
+direction kind metadata so tests and trainers can verify the composition. Batch
+size must be even for this MVP.
 
 ## Direction Conditioning
 
 Each crop receives normalized `fw(3)` and `up(3)` conditioning in `xyz`
 component order. The local GT forward vector is derived from the nearest fiber
-line tangent. With probability
-`positive_direction_probability` the conditioning direction is a small angular
-jitter around the tangent; otherwise it is a random unit vector. Random
-directions are still classified against the GT tangent and are not assumed to
-be negative.
+line tangent. Each selected crop receives a positive-conditioned and
+negative-conditioned copy. Positive copies use
+`positive_direction_jitter_degrees`, normally 45 degrees. Negative copies use
+`negative_direction_min_degrees` and `negative_direction_max_degrees`, normally
+60 and 180 degrees.
 
 The `up` vector is built by decoding Lasagna `nx`/`ny` channels as
 `(value - 128) / 127`, reconstructing `nz = sqrt(1 - nx^2 - ny^2)` with
@@ -86,20 +93,27 @@ true`; it is disabled by default. The loss treats `up` and `-up` as equivalent.
 For every output voxel:
 
 - invalid mask/grad-mag voxels are `ignore`
-- voxels within `positive_radius` of the fiber polyline and aligned with the
-  conditioning direction are `positive`
-- voxels far enough from the polyline, or close but direction-disagreeing, are
-  `negative`
-- voxels in the geometric or angular tolerance band are `ignore`
+- voxels in the normal-frame positive zone and aligned with the conditioning
+  direction are `positive`
+- voxels in that same positive zone become `negative` only when the
+  conditioning direction disagrees by at least 60 degrees
+- cone negatives come only from the two lateral 90 degree cone zones and only
+  when the absolute distance to the Lasagna-normal plane is at least
+  `negative_cone_distance_voxels`
+- all other valid voxels are `ignore`
 
 The classifier also emits target local `fw` and `up` vector fields in `xyz`
-component order plus a `target_up_valid` mask.
+component order plus a `target_up_valid` mask and dense `target_id` tensor.
+Positive voxels carry the selected fiber-line identity, explicit negatives
+carry `NEGATIVE_ONLY_ID`, and ignored voxels carry `IGNORE_ID`.
 
-`positive_radius` and `ignore_radius` are measured in the selected training
-grid, not always base-level voxels. If `base_volume_scale` is `2`, then one
-training voxel spans `4` base voxels. The fiber coordinates remain base `xyz`;
-the loader divides them by `2**base_volume_scale` only for voxel
-classification.
+`normal_plane_jitter_voxels` and `normal_perpendicular_jitter_voxels` are
+measured in the selected training grid, not always base-level voxels. If
+`base_volume_scale` is `2`, then one training voxel spans `4` base voxels. The
+fiber coordinates remain base `xyz`; the loader divides them by
+`2**base_volume_scale` only for voxel classification. `positive_radius` and
+`ignore_radius` are accepted as legacy/debug fallback config, but they are not
+the documented training path.
 
 ## Model And Losses
 
@@ -114,20 +128,32 @@ and `up` conditioning with the U-Net features and outputs:
 
 Losses are:
 
-- supervised contrastive / InfoNCE over classified positive and negative voxels
+- hard supervised contrastive / InfoNCE over classified positives and explicit
+  negatives
 - cosine forward-vector loss on positive voxels
 - sign-ambiguous cosine up-vector loss on positive voxels
 
-`loss.max_contrastive_samples` caps the number of classified voxels used by the
-contrastive term per batch. It limits memory/time for dense crops and does not
-change which voxels are labeled positive, negative, or ignored.
+The contrastive loss anchors only on positive voxels. Positives with the same
+fiber-line `target_id` attract each other across control-point crops, while
+explicit negatives are denominator-only and are never pulled together. Soft
+distance-weighted contrastive loss is intentionally deferred.
+
+`loss.max_contrastive_samples` caps the number of positive and negative voxels
+used by the contrastive term per batch. Positives and negatives are sampled
+separately so explicit negatives do not crowd out all anchors.
 
 ## Config Knobs
 
-Use the runnable smoke template:
+Use the runnable smoke template for a one-step import/data-path check:
 
 ```bash
 PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace.train vesuvius/src/vesuvius/neural_tracing/configs/fiber_trace_lasagna_smoke.json
+```
+
+Use the starter training template for a longer run:
+
+```bash
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace.train vesuvius/src/vesuvius/neural_tracing/configs/fiber_trace_lasagna_train.json
 ```
 
 Replace only the dataset paths first:
@@ -141,20 +167,29 @@ Replace only the dataset paths first:
 used by the Lasagna training zarr path. Use `"unit"` only for uint8 smoke tests
 where `value / 255` is intended.
 
-`positive_direction_probability: 0.5` means half of crop conditioning directions
-are jittered from the true local fiber tangent and half are random directions.
-This tests the direction-conditioned spec: the same crop can be positive or
-negative depending on the requested forward direction.
+`positive_direction_probability` is a legacy/debug knob from the earlier
+single-conditioning MVP and is not used by the paired-conditioning training
+path.
 
-`positive_direction_jitter_degrees: 10.0` is the angular perturbation applied to
-the true tangent when sampling a positive conditioning direction. It makes the
-positive branch tolerant to small orientation noise without changing the target
-fiber tangent.
+`positive_direction_jitter_degrees: 45.0` in the training template comes from
+the spec: conditioning directions up to 45 degrees wrong are still supervised
+to output the correct direction, up vector, and positive embedding.
 
-`positive_radius: 1.5` marks voxels close enough to the fiber centerline to be
-eligible positive, after direction agreement. `ignore_radius: 3.0` creates a
-buffer around the fiber so near-miss voxels are ignored instead of trained as
-hard negatives. Both are in selected training-grid voxels.
+`negative_direction_min_degrees: 60.0` and
+`negative_direction_max_degrees: 180.0` define the paired negative-conditioning
+range.
+
+`positive_cosine: 0.7071067811865476` is `cos(45 degrees)`.
+`negative_cosine: 0.5` is `cos(60 degrees)`, matching the spec's 60+ degree
+off-direction negative samples.
+
+`normal_plane_jitter_voxels: 40.0` and
+`normal_perpendicular_jitter_voxels: 10.0` define the normal-frame positive
+zone. `negative_cone_distance_voxels: 30.0` defines the cone-negative minimum
+distance away from the Lasagna-normal plane.
+
+`positive_radius` and `ignore_radius` are kept only for legacy/debug fallback
+behavior when the named normal-frame fields are omitted.
 
 ## Entrypoint
 

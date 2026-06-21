@@ -1,0 +1,52 @@
+{
+  "seed": 0,
+  "device": "cuda",
+  "num_steps": 1,
+  "log_every": 1,
+  "batch_size": 2,
+  "crop_size": [64, 64, 64],
+  "image_normalization": "zscore",
+  "positive_direction_probability": 0.5,
+  "positive_direction_jitter_degrees": 45.0,
+  "negative_direction_min_degrees": 60.0,
+  "negative_direction_max_degrees": 180.0,
+  "normal_plane_jitter_voxels": 40.0,
+  "normal_perpendicular_jitter_voxels": 10.0,
+  "negative_cone_distance_voxels": 30.0,
+  "positive_radius": 1.5,
+  "ignore_radius": 3.0,
+  "positive_cosine": 0.7071067811865476,
+  "negative_cosine": 0.5,
+  "degenerate_up_policy": "invalid",
+  "allow_arbitrary_up_fallback": false,
+  "random_valid_max_attempts": 256,
+  "volume_cache_dir": "/tmp/vesuvius_fiber_trace_zarr_cache",
+  "datasets": [
+    {
+      "base_volume_path": "/path/to/base-image.ome.zarr",
+      "base_volume_scale": 0,
+      "lasagna_manifest_path": "/path/to/prediction.lasagna.json",
+      "fiber_glob": "/path/to/fibers/*.json",
+      "valid_mask_threshold": 0.0
+    }
+  ],
+  "model": {
+    "input_channels": 1,
+    "backbone_channels": 16,
+    "embedding_dim": 16,
+    "features_per_stage": [16, 32],
+    "head_channels": 32
+  },
+  "optimizer": {
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001
+  },
+  "loss": {
+    "temperature": 0.1,
+    "contrastive_weight": 1.0,
+    "fw_weight": 1.0,
+    "up_weight": 1.0,
+    "max_contrastive_samples": 4096
+  },
+  "checkpoint_path": "runs/fiber_trace_smoke.pt"
+}

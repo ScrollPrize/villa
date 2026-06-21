@@ -7,7 +7,13 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from vesuvius.neural_tracing.fiber_trace.dataset import FiberTraceBatch
-from vesuvius.neural_tracing.fiber_trace.labels import IGNORE_INDEX, POSITIVE_LABEL
+from vesuvius.neural_tracing.fiber_trace.labels import (
+    IGNORE_ID,
+    IGNORE_INDEX,
+    NEGATIVE_LABEL,
+    NEGATIVE_ONLY_ID,
+    POSITIVE_LABEL,
+)
 
 
 @dataclass(frozen=True)
@@ -22,9 +28,21 @@ def _zero_like_loss(reference: Tensor) -> Tensor:
     return reference.sum() * 0.0
 
 
+def _sample_mask_indices(mask: Tensor, max_count: int) -> Tensor:
+    idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
+    max_count = int(max_count)
+    if max_count > 0 and idx.numel() > max_count:
+        keep = torch.linspace(
+            0, idx.numel() - 1, steps=max_count, device=idx.device
+        ).to(torch.long)
+        idx = idx[keep]
+    return idx
+
+
 def supervised_contrastive_loss(
     embeddings: Tensor,
     labels: Tensor,
+    target_id: Tensor | None = None,
     *,
     temperature: float = 0.1,
     ignore_index: int = IGNORE_INDEX,
@@ -38,28 +56,78 @@ def supervised_contrastive_loss(
         raise ValueError(
             f"labels shape {tuple(labels.shape)} does not match embeddings spatial shape"
         )
+    if target_id is None:
+        target_id = torch.full_like(labels, int(IGNORE_ID))
+        target_id = torch.where(
+            labels == POSITIVE_LABEL,
+            torch.ones_like(target_id),
+            target_id,
+        )
+        target_id = torch.where(
+            labels == NEGATIVE_LABEL,
+            torch.full_like(target_id, int(NEGATIVE_ONLY_ID)),
+            target_id,
+        )
+    elif target_id.shape != labels.shape:
+        raise ValueError(
+            f"target_id shape {tuple(target_id.shape)} does not match labels shape"
+        )
 
     emb = embeddings.permute(0, 2, 3, 4, 1).reshape(-1, embeddings.shape[1])
     lab = labels.reshape(-1)
-    valid = lab != int(ignore_index)
-    emb = emb[valid]
-    lab = lab[valid]
-    if emb.shape[0] < 2:
+    ids = target_id.reshape(-1)
+    is_positive = (lab == int(POSITIVE_LABEL)) & (ids != int(IGNORE_ID)) & (
+        ids != int(NEGATIVE_ONLY_ID)
+    )
+    is_negative = lab == int(NEGATIVE_LABEL)
+
+    pos_idx = _sample_mask_indices(is_positive, 0)
+    neg_idx = _sample_mask_indices(is_negative, 0)
+    max_samples = int(max_samples)
+    if max_samples > 0 and pos_idx.numel() + neg_idx.numel() > max_samples:
+        if pos_idx.numel() == 0:
+            pos_budget = 0
+        elif neg_idx.numel() == 0:
+            pos_budget = max_samples
+        else:
+            min_positive_budget = 2 if max_samples >= 2 else 1
+            pos_budget = min(
+                pos_idx.numel(), max(min_positive_budget, max_samples // 2)
+            )
+        neg_budget = min(neg_idx.numel(), max_samples - pos_budget)
+        remaining = max_samples - pos_budget - neg_budget
+        if remaining > 0:
+            extra_pos = min(pos_idx.numel() - pos_budget, remaining)
+            pos_budget += extra_pos
+            remaining -= extra_pos
+        if remaining > 0:
+            neg_budget += min(neg_idx.numel() - neg_budget, remaining)
+        pos_idx = _sample_mask_indices(is_positive, int(pos_budget))
+        neg_idx = _sample_mask_indices(is_negative, int(neg_budget))
+
+    sample_idx = torch.cat([pos_idx, neg_idx], dim=0)
+    if sample_idx.numel() < 2:
         return _zero_like_loss(embeddings)
 
-    max_samples = int(max_samples)
-    if max_samples > 0 and emb.shape[0] > max_samples:
-        idx = torch.linspace(
-            0, emb.shape[0] - 1, steps=max_samples, device=emb.device
-        ).to(torch.long)
-        emb = emb[idx]
-        lab = lab[idx]
+    emb = emb[sample_idx]
+    lab = lab[sample_idx]
+    ids = ids[sample_idx]
+    positive_sample = (lab == int(POSITIVE_LABEL)) & (ids != int(IGNORE_ID)) & (
+        ids != int(NEGATIVE_ONLY_ID)
+    )
+    if emb.shape[0] < 2:
+        return _zero_like_loss(embeddings)
 
     emb = F.normalize(emb, dim=1)
     logits = emb @ emb.T / max(float(temperature), 1e-6)
     eye = torch.eye(logits.shape[0], device=logits.device, dtype=torch.bool)
-    positive = (lab[:, None] == lab[None, :]) & ~eye
-    anchors = positive.any(dim=1)
+    positive = (
+        positive_sample[:, None]
+        & positive_sample[None, :]
+        & (ids[:, None] == ids[None, :])
+        & ~eye
+    )
+    anchors = positive_sample & positive.any(dim=1)
     if not bool(anchors.any()):
         return _zero_like_loss(embeddings)
 
@@ -100,6 +168,7 @@ def compute_fiber_trace_loss(
     contrastive = supervised_contrastive_loss(
         outputs["embedding"],
         batch.labels,
+        batch.target_id,
         temperature=temperature,
         max_samples=max_contrastive_samples,
     )

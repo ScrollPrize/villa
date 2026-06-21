@@ -6,7 +6,9 @@ import numpy as np
 
 from vesuvius.neural_tracing.fiber_trace.labels import (
     IGNORE_INDEX,
+    IGNORE_ID,
     NEGATIVE_LABEL,
+    NEGATIVE_ONLY_ID,
     POSITIVE_LABEL,
 )
 
@@ -86,14 +88,18 @@ def perturb_direction(
     direction: np.ndarray,
     *,
     max_angle_degrees: float,
+    min_angle_degrees: float = 0.0,
     rng: np.random.Generator,
 ) -> np.ndarray:
     base = normalize_vector(direction)
-    max_angle = max(0.0, float(max_angle_degrees)) * math.pi / 180.0
+    min_angle_degrees = max(0.0, float(min_angle_degrees))
+    max_angle_degrees = max(min_angle_degrees, float(max_angle_degrees))
+    min_angle = min_angle_degrees * math.pi / 180.0
+    max_angle = max_angle_degrees * math.pi / 180.0
     if max_angle <= 1e-8:
         return base
     u, v = _orthonormal_basis_from_forward(base)
-    angle = float(rng.uniform(0.0, max_angle))
+    angle = float(rng.uniform(min_angle, max_angle))
     phase = float(rng.uniform(0.0, 2.0 * math.pi))
     offset = math.cos(phase) * u + math.sin(phase) * v
     return normalize_vector(math.cos(angle) * base + math.sin(angle) * offset)
@@ -205,11 +211,11 @@ def decode_lasagna_normals_xyz(
     return normals.astype(np.float32, copy=False), valid.astype(bool, copy=False)
 
 
-def nearest_polyline_distance_and_tangent(
+def nearest_polyline_projection(
     coords_xyz: np.ndarray,
     line_points_xyz: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return nearest segment distance and tangent for xyz coordinates.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return nearest segment distance, tangent, and closest point.
 
     Args:
         coords_xyz: `[..., 3]` coordinate grid.
@@ -227,6 +233,7 @@ def nearest_polyline_distance_and_tangent(
     flat = coords.reshape(-1, 3)
     best_dist_sq = np.full(flat.shape[0], np.inf, dtype=np.float32)
     best_tangent = np.zeros((flat.shape[0], 3), dtype=np.float32)
+    best_closest = np.zeros((flat.shape[0], 3), dtype=np.float32)
 
     for start, end in zip(points[:-1], points[1:], strict=True):
         seg = end - start
@@ -241,6 +248,7 @@ def nearest_polyline_distance_and_tangent(
         update = dist_sq < best_dist_sq
         best_dist_sq[update] = dist_sq[update]
         best_tangent[update] = tangent
+        best_closest[update] = closest[update]
 
     if not bool(np.isfinite(best_dist_sq).any()):
         raise ValueError("fiber line has no non-degenerate segments")
@@ -248,6 +256,16 @@ def nearest_polyline_distance_and_tangent(
     shape = coords.shape[:-1]
     dist = np.sqrt(best_dist_sq).reshape(shape).astype(np.float32, copy=False)
     tangent = best_tangent.reshape(*shape, 3).astype(np.float32, copy=False)
+    closest = best_closest.reshape(*shape, 3).astype(np.float32, copy=False)
+    return dist, tangent, closest
+
+
+def nearest_polyline_distance_and_tangent(
+    coords_xyz: np.ndarray,
+    line_points_xyz: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return nearest segment distance and tangent for xyz coordinates."""
+    dist, tangent, _ = nearest_polyline_projection(coords_xyz, line_points_xyz)
     return dist, tangent
 
 
@@ -264,8 +282,12 @@ def classify_voxels(
     degenerate_up_policy: str = "invalid",
     positive_radius: float = 1.5,
     ignore_radius: float = 3.0,
+    normal_plane_jitter_voxels: float | None = None,
+    normal_perpendicular_jitter_voxels: float | None = None,
+    negative_cone_distance_voxels: float | None = None,
     positive_cosine: float = 0.8660254037844386,
     negative_cosine: float = 0.25881904510252074,
+    positive_target_id: int = 0,
 ) -> dict[str, np.ndarray]:
     crop_shape = tuple(int(v) for v in crop_shape)
     if len(crop_shape) != 3:
@@ -285,6 +307,13 @@ def classify_voxels(
     if not bool(valid.any()):
         raise ValueError("valid_mask contains no valid voxels after normal validation")
 
+    if normal_plane_jitter_voxels is None:
+        normal_plane_jitter_voxels = float(positive_radius)
+    if normal_perpendicular_jitter_voxels is None:
+        normal_perpendicular_jitter_voxels = float(positive_radius)
+    if negative_cone_distance_voxels is None:
+        negative_cone_distance_voxels = float(ignore_radius)
+
     zz, yy, xx = np.meshgrid(
         np.arange(crop_shape[0], dtype=np.float32),
         np.arange(crop_shape[1], dtype=np.float32),
@@ -296,7 +325,7 @@ def classify_voxels(
         [xx + origin[2], yy + origin[1], zz + origin[0]],
         axis=-1,
     )
-    distance, tangent_xyz = nearest_polyline_distance_and_tangent(
+    distance, tangent_xyz, closest_xyz = nearest_polyline_projection(
         coords_xyz, line_points_xyz
     )
     tangent_xyz = normalize_vectors(tangent_xyz)
@@ -304,15 +333,78 @@ def classify_voxels(
     agreement = np.sum(tangent_xyz * cond_fw.reshape(1, 1, 1, 3), axis=-1)
 
     labels = np.full(crop_shape, IGNORE_INDEX, dtype=np.int64)
-    near = distance <= float(positive_radius)
-    far = distance > float(ignore_radius)
-    aligned = agreement >= float(positive_cosine)
-    disagreed = agreement <= float(negative_cosine)
+    target_id = np.full(crop_shape, IGNORE_ID, dtype=np.int64)
 
-    positive = valid & near & aligned
-    negative = valid & (far | (near & disagreed))
+    if normal_xyz is None:
+        if not allow_arbitrary_up_fallback:
+            raise ValueError("normal_xyz is required for fiber trace label geometry")
+        normal_for_geometry, normal_geometry_valid = construct_up_vectors(
+            tangent_xyz,
+            None,
+            allow_arbitrary_up_fallback=True,
+        )
+    else:
+        normal_arr = np.asarray(normal_xyz, dtype=np.float32)
+        if normal_arr.shape != crop_shape + (3,):
+            raise ValueError(
+                f"normal_xyz shape {normal_arr.shape!r} must match crop shape "
+                f"{crop_shape + (3,)!r}"
+            )
+        normal_for_geometry = normalize_vectors(normal_arr)
+        normal_geometry_valid = np.isfinite(normal_arr).all(axis=-1)
+        normal_geometry_valid &= np.linalg.norm(normal_arr, axis=-1) > 1e-6
+
+    valid = valid & normal_geometry_valid
+    offset_xyz = coords_xyz - closest_xyz
+    plane_offset = np.sum(offset_xyz * normal_for_geometry, axis=-1)
+    in_plane_offset = offset_xyz - plane_offset[..., None] * normal_for_geometry
+    in_plane_distance = np.linalg.norm(in_plane_offset, axis=-1)
+    perpendicular_distance = np.abs(plane_offset)
+
+    aligned = agreement >= (float(positive_cosine) - 1e-6)
+    disagreed = agreement <= (float(negative_cosine) + 1e-6)
+
+    positive_zone = (
+        valid
+        & (in_plane_distance <= float(normal_plane_jitter_voxels))
+        & (perpendicular_distance <= float(normal_perpendicular_jitter_voxels))
+    )
+
+    lateral = np.cross(normal_for_geometry, tangent_xyz).astype(
+        np.float32, copy=False
+    )
+    lateral_norm = np.linalg.norm(lateral, axis=-1, keepdims=True)
+    lateral_valid = lateral_norm[..., 0] > 1e-6
+    lateral = np.divide(
+        lateral,
+        np.maximum(lateral_norm, 1e-6),
+        out=np.zeros_like(lateral, dtype=np.float32),
+    )
+    in_plane_norm = np.linalg.norm(in_plane_offset, axis=-1, keepdims=True)
+    in_plane_dir = np.divide(
+        in_plane_offset,
+        np.maximum(in_plane_norm, 1e-6),
+        out=np.zeros_like(in_plane_offset, dtype=np.float32),
+    )
+    lateral_alignment = np.abs(np.sum(in_plane_dir * lateral, axis=-1))
+    inside_lateral_cone = (
+        lateral_valid
+        & (in_plane_norm[..., 0] > 1e-6)
+        & (lateral_alignment >= math.cos(math.radians(45.0)))
+    )
+
+    cone_negative = (
+        valid
+        & inside_lateral_cone
+        & (perpendicular_distance >= float(negative_cone_distance_voxels))
+    )
+    direction_negative = positive_zone & disagreed
+    positive = positive_zone & aligned
+    negative = (cone_negative | direction_negative) & ~positive
     labels[negative] = NEGATIVE_LABEL
+    target_id[negative] = NEGATIVE_ONLY_ID
     labels[positive] = POSITIVE_LABEL
+    target_id[positive] = int(positive_target_id)
 
     up_policy = str(degenerate_up_policy)
     if up_policy not in {"invalid", "raise"}:
@@ -334,9 +426,12 @@ def classify_voxels(
 
     return {
         "labels": labels,
+        "target_id": target_id,
         "target_fw_xyz": target_fw_xyz,
         "target_up_xyz": target_up_xyz,
         "target_up_valid": target_up_valid.astype(bool, copy=False),
         "distance": distance,
+        "in_plane_distance": in_plane_distance.astype(np.float32, copy=False),
+        "perpendicular_distance": perpendicular_distance.astype(np.float32, copy=False),
         "agreement": agreement.astype(np.float32, copy=False),
     }

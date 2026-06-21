@@ -17,8 +17,10 @@ from vesuvius.neural_tracing.fiber_trace.geometry import (
     tangent_at_point,
 )
 from vesuvius.neural_tracing.fiber_trace.labels import (
+    IGNORE_ID,
     IGNORE_INDEX,
     NEGATIVE_LABEL,
+    NEGATIVE_ONLY_ID,
     POSITIVE_LABEL,
 )
 from vesuvius.neural_tracing.fiber_trace.losses import (
@@ -56,9 +58,16 @@ def _synthetic_config(
         "seed": 123,
         "image_normalization": "unit",
         "positive_direction_probability": 1.0,
-        "positive_direction_jitter_degrees": 0.0,
+        "positive_direction_jitter_degrees": 45.0,
+        "negative_direction_min_degrees": 60.0,
+        "negative_direction_max_degrees": 180.0,
+        "normal_plane_jitter_voxels": 40.0,
+        "normal_perpendicular_jitter_voxels": 10.0,
+        "negative_cone_distance_voxels": 30.0,
         "positive_radius": 1.25,
         "ignore_radius": 2.5,
+        "positive_cosine": float(np.cos(np.deg2rad(45.0))),
+        "negative_cosine": float(np.cos(np.deg2rad(60.0))),
         "_array_records": [
             {
                 "volume": volume,
@@ -164,7 +173,7 @@ def test_sign_ambiguous_loss():
     )
 
 
-def test_batch_builder_samples_one_fiber_with_half_gt_and_half_random_crops(
+def test_batch_builder_samples_one_fiber_with_paired_conditioning_variants(
     tmp_path: Path,
 ):
     builder = FiberTraceBatchBuilder(
@@ -174,11 +183,19 @@ def test_batch_builder_samples_one_fiber_with_half_gt_and_half_random_crops(
 
     assert batch.volume.shape == (4, 1, 16, 16, 16)
     assert batch.labels.shape == (4, 16, 16, 16)
+    assert batch.target_id.shape == (4, 16, 16, 16)
     assert batch.crop_kinds.count("gt_control") == 2
     assert batch.crop_kinds.count("random_valid") == 2
+    assert batch.direction_kinds == ("positive", "negative", "positive", "negative")
+    assert torch.equal(batch.crop_origin_zyx[0], batch.crop_origin_zyx[1])
+    assert torch.equal(batch.crop_origin_zyx[2], batch.crop_origin_zyx[3])
     assert len(set(batch.fiber_paths)) == 1
     assert bool((batch.labels == POSITIVE_LABEL).any())
     assert bool((batch.labels == NEGATIVE_LABEL).any())
+    assert bool((batch.target_id[batch.labels == POSITIVE_LABEL] == 0).all())
+    assert bool(
+        (batch.target_id[batch.labels == NEGATIVE_LABEL] == NEGATIVE_ONLY_ID).all()
+    )
     assert bool((batch.target_up_valid & (batch.labels == POSITIVE_LABEL)).any())
 
 
@@ -391,7 +408,7 @@ def test_lasagna_manifest_drives_channels_and_scaled_sampling(
     ]
 
 
-def test_voxel_classification_positive_negative_and_ignore():
+def test_voxel_classification_uses_normal_plane_positive_zone():
     line = np.array([[2.0, 3.0, 5.0], [6.0, 3.0, 5.0]], dtype=np.float32)
     mask = np.ones((9, 9, 9), dtype=bool)
     mask[1, 1, 1] = False
@@ -405,12 +422,19 @@ def test_voxel_classification_positive_negative_and_ignore():
         valid_mask=mask,
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
-        positive_radius=0.25,
-        ignore_radius=2.0,
+        normal_plane_jitter_voxels=1.0,
+        normal_perpendicular_jitter_voxels=1.0,
+        negative_cone_distance_voxels=3.0,
+        positive_cosine=float(np.cos(np.deg2rad(45.0))),
+        negative_cosine=float(np.cos(np.deg2rad(60.0))),
+        positive_target_id=7,
     )
     assert int(result["labels"][5, 3, 4]) == POSITIVE_LABEL
-    assert int(result["labels"][0, 0, 0]) == NEGATIVE_LABEL
+    assert int(result["target_id"][5, 3, 4]) == 7
+    assert int(result["labels"][5, 5, 4]) == IGNORE_INDEX
+    assert int(result["labels"][7, 5, 4]) == IGNORE_INDEX
     assert int(result["labels"][1, 1, 1]) == IGNORE_INDEX
+    assert int(result["target_id"][1, 1, 1]) == IGNORE_ID
     np.testing.assert_allclose(
         result["target_fw_xyz"][:, 5, 3, 4],
         np.array([1.0, 0.0, 0.0], dtype=np.float32),
@@ -423,18 +447,100 @@ def test_voxel_classification_positive_negative_and_ignore():
     )
     assert bool(result["target_up_valid"][5, 3, 4])
 
-    wrong_dir = classify_voxels(
+
+def test_voxel_classification_cone_negatives_and_positive_precedence():
+    line = np.array([[2.0, 3.0, 5.0], [6.0, 3.0, 5.0]], dtype=np.float32)
+    normal_xyz = np.zeros((9, 9, 9, 3), dtype=np.float32)
+    normal_xyz[..., 2] = 1.0
+    result = classify_voxels(
         crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
-        cond_fw_xyz=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+        cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
-        positive_radius=0.25,
-        ignore_radius=2.0,
+        normal_plane_jitter_voxels=1.0,
+        normal_perpendicular_jitter_voxels=1.0,
+        negative_cone_distance_voxels=3.0,
+        positive_target_id=11,
     )
-    assert int(wrong_dir["labels"][5, 3, 4]) == NEGATIVE_LABEL
+    assert int(result["labels"][8, 5, 4]) == NEGATIVE_LABEL
+    assert int(result["target_id"][8, 5, 4]) == NEGATIVE_ONLY_ID
+    assert int(result["labels"][7, 5, 4]) == IGNORE_INDEX
+    assert int(result["labels"][8, 3, 8]) == IGNORE_INDEX
+
+    overlap = classify_voxels(
+        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
+        crop_shape=(9, 9, 9),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_plane_jitter_voxels=3.0,
+        normal_perpendicular_jitter_voxels=3.0,
+        negative_cone_distance_voxels=2.0,
+        positive_target_id=12,
+    )
+    assert int(overlap["labels"][7, 5, 4]) == POSITIVE_LABEL
+    assert int(overlap["target_id"][7, 5, 4]) == 12
+
+
+def test_voxel_classification_direction_pairs_label_near_fiber_zone():
+    line = np.array([[2.0, 3.0, 5.0], [6.0, 3.0, 5.0]], dtype=np.float32)
+    normal_xyz = np.zeros((9, 9, 9, 3), dtype=np.float32)
+    normal_xyz[..., 2] = 1.0
+    positive = classify_voxels(
+        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
+        crop_shape=(9, 9, 9),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_plane_jitter_voxels=1.0,
+        normal_perpendicular_jitter_voxels=1.0,
+        negative_cone_distance_voxels=3.0,
+        positive_cosine=float(np.cos(np.deg2rad(45.0))),
+        negative_cosine=float(np.cos(np.deg2rad(60.0))),
+    )
+    assert int(positive["labels"][5, 3, 4]) == POSITIVE_LABEL
+
+    negative = classify_voxels(
+        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
+        crop_shape=(9, 9, 9),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array([0.5, np.sqrt(3.0) / 2.0, 0.0], dtype=np.float32),
+        valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_plane_jitter_voxels=1.0,
+        normal_perpendicular_jitter_voxels=1.0,
+        negative_cone_distance_voxels=3.0,
+        positive_cosine=float(np.cos(np.deg2rad(45.0))),
+        negative_cosine=float(np.cos(np.deg2rad(60.0))),
+    )
+    assert int(negative["labels"][5, 3, 4]) == NEGATIVE_LABEL
+
+    transition = classify_voxels(
+        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
+        crop_shape=(9, 9, 9),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array(
+            [np.cos(np.deg2rad(50.0)), np.sin(np.deg2rad(50.0)), 0.0],
+            dtype=np.float32,
+        ),
+        valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_plane_jitter_voxels=1.0,
+        normal_perpendicular_jitter_voxels=1.0,
+        negative_cone_distance_voxels=3.0,
+        positive_cosine=float(np.cos(np.deg2rad(45.0))),
+        negative_cosine=float(np.cos(np.deg2rad(60.0))),
+    )
+    assert int(transition["labels"][5, 3, 4]) == IGNORE_INDEX
 
 
 def test_degenerate_up_vectors_are_invalid_or_raise():
@@ -479,9 +585,60 @@ def test_supervised_contrastive_loss_is_finite_on_synthetic_embeddings():
     labels = torch.tensor(
         [[[[POSITIVE_LABEL, POSITIVE_LABEL, NEGATIVE_LABEL, NEGATIVE_LABEL]]]]
     )
-    loss = supervised_contrastive_loss(embeddings, labels, temperature=0.1)
+    target_id = torch.tensor([[[[3, 3, NEGATIVE_ONLY_ID, NEGATIVE_ONLY_ID]]]])
+    loss = supervised_contrastive_loss(embeddings, labels, target_id, temperature=0.1)
     assert torch.isfinite(loss)
     assert float(loss) >= 0.0
+
+
+def test_supervised_contrastive_negatives_are_denominator_only():
+    labels = torch.tensor(
+        [[[[POSITIVE_LABEL, POSITIVE_LABEL, NEGATIVE_LABEL, NEGATIVE_LABEL]]]]
+    )
+    target_id = torch.tensor([[[[5, 5, NEGATIVE_ONLY_ID, NEGATIVE_ONLY_ID]]]])
+
+    embeddings_same_neg = torch.zeros((1, 2, 1, 1, 4), dtype=torch.float32)
+    embeddings_same_neg[:, :, 0, 0, 0] = torch.tensor([1.0, 0.0])
+    embeddings_same_neg[:, :, 0, 0, 1] = torch.tensor([1.0, 0.0])
+    embeddings_same_neg[:, :, 0, 0, 2] = torch.tensor([0.0, 1.0])
+    embeddings_same_neg[:, :, 0, 0, 3] = torch.tensor([0.0, 1.0])
+
+    embeddings_opposed_neg = embeddings_same_neg.clone()
+    embeddings_opposed_neg[:, :, 0, 0, 3] = torch.tensor([0.0, -1.0])
+
+    same_loss = supervised_contrastive_loss(
+        embeddings_same_neg, labels, target_id, temperature=0.1
+    )
+    opposed_loss = supervised_contrastive_loss(
+        embeddings_opposed_neg, labels, target_id, temperature=0.1
+    )
+    assert float(same_loss) == pytest.approx(float(opposed_loss), abs=1e-6)
+
+
+def test_supervised_contrastive_same_line_positives_attract_across_crops():
+    labels = torch.full((2, 1, 1, 2), IGNORE_INDEX, dtype=torch.long)
+    labels[0, 0, 0, 0] = POSITIVE_LABEL
+    labels[1, 0, 0, 0] = POSITIVE_LABEL
+    labels[0, 0, 0, 1] = NEGATIVE_LABEL
+    target_id = torch.full_like(labels, IGNORE_ID)
+    target_id[0, 0, 0, 0] = 9
+    target_id[1, 0, 0, 0] = 9
+    target_id[0, 0, 0, 1] = NEGATIVE_ONLY_ID
+
+    aligned = torch.zeros((2, 2, 1, 1, 2), dtype=torch.float32)
+    aligned[0, :, 0, 0, 0] = torch.tensor([1.0, 0.0])
+    aligned[1, :, 0, 0, 0] = torch.tensor([1.0, 0.0])
+    aligned[0, :, 0, 0, 1] = torch.tensor([0.0, 1.0])
+    opposed = aligned.clone()
+    opposed[1, :, 0, 0, 0] = torch.tensor([-1.0, 0.0])
+
+    aligned_loss = supervised_contrastive_loss(
+        aligned, labels, target_id, temperature=0.1
+    )
+    opposed_loss = supervised_contrastive_loss(
+        opposed, labels, target_id, temperature=0.1
+    )
+    assert float(aligned_loss) < float(opposed_loss)
 
 
 def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
