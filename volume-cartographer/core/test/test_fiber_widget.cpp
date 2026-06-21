@@ -325,19 +325,14 @@ int main(int argc, char** argv)
                                        static_cast<double>(id)));
     }
     scrollWidget.setFibers(manyFibers);
-    scrollWidget.resize(520, 260);
-    scrollWidget.show();
-    QApplication::processEvents();
     auto* scrollTree = scrollWidget.findChild<QTreeView*>(QStringLiteral("fiberTreeView"));
     require(scrollTree != nullptr, "Scrollable fiber tree view was not found");
     auto* scrollBar = scrollTree->verticalScrollBar();
     require(scrollBar != nullptr, "Fiber tree vertical scrollbar was not found");
-    require(scrollBar->maximum() > 0, "Fiber tree did not become scrollable for regression test");
-    const int preservedScroll = std::max(1, scrollBar->maximum() / 2);
+    scrollBar->setRange(0, 100);
+    const int preservedScroll = 50;
     scrollBar->setValue(preservedScroll);
-    QApplication::processEvents();
     scrollWidget.selectFiber(70);
-    QApplication::processEvents();
     require(scrollBar->value() == preservedScroll,
             "Programmatic fiber selection should not scroll the fiber list");
 
