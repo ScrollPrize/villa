@@ -427,6 +427,24 @@ bool atlasSearchFiberMatchesTags(const std::vector<std::string>& fiberTags,
     return true;
 }
 
+bool atlasSearchFiberHasAnyTag(const std::vector<std::string>& fiberTags,
+                               const QStringList& excludedTags)
+{
+    if (excludedTags.isEmpty()) {
+        return false;
+    }
+    std::set<QString> normalizedFiberTags;
+    for (const auto& tag : fiberTags) {
+        normalizedFiberTags.insert(QString::fromStdString(tag).trimmed());
+    }
+    for (const QString& tag : excludedTags) {
+        if (normalizedFiberTags.find(tag) != normalizedFiberTags.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<int> atlasSearchResultIndexForItem(const QTreeWidgetItem* item)
 {
     if (!item) {
@@ -1293,6 +1311,14 @@ QDockWidget* createAtlasSearchDock(QWidget* parent)
     tagFilter->setToolTip(QObject::tr(
         "Only consider fibers that have all listed tags. Separate tags with commas or spaces."));
     form->addRow(QObject::tr("Fiber tags"), tagFilter);
+
+    auto* excludeTagFilter = new QLineEdit(content);
+    excludeTagFilter->setObjectName(QStringLiteral("atlasSearchExcludeTagFilterEdit"));
+    excludeTagFilter->setPlaceholderText(QObject::tr("bad, skip"));
+    excludeTagFilter->setClearButtonEnabled(true);
+    excludeTagFilter->setToolTip(QObject::tr(
+        "Exclude fibers that have any listed tag. Separate tags with commas or spaces."));
+    form->addRow(QObject::tr("Exclude tags"), excludeTagFilter);
 
     auto* maxDistance = new QDoubleSpinBox(content);
     maxDistance->setObjectName(QStringLiteral("atlasSearchMaxDistanceSpin"));
@@ -3746,6 +3772,10 @@ void CWindow::updateAtlasSearchDocks()
                 QStringLiteral("atlasSearchTagFilterEdit"))) {
             tagFilter->setEnabled(hasSnapshots);
         }
+        if (auto* excludeTagFilter = dock->widget()->findChild<QLineEdit*>(
+                QStringLiteral("atlasSearchExcludeTagFilterEdit"))) {
+            excludeTagFilter->setEnabled(hasSnapshots);
+        }
         if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
             cancel->setEnabled(false);
         }
@@ -4200,6 +4230,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
     vc::atlas::FiberIntersectionBroadPhaseOptions broad;
     int searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
     QStringList requiredTags;
+    QStringList excludedTags;
     auto readSearchControls = [&](QDockWidget* dock) {
         if (!dock || !dock->widget()) {
             return false;
@@ -4213,6 +4244,11 @@ void CWindow::startAtlasFiberIntersectionSearch()
         if (auto* tagFilter = dock->widget()->findChild<QLineEdit*>(
                 QStringLiteral("atlasSearchTagFilterEdit"))) {
             requiredTags = atlasSearchTagList(tagFilter->text());
+            found = true;
+        }
+        if (auto* excludeTagFilter = dock->widget()->findChild<QLineEdit*>(
+                QStringLiteral("atlasSearchExcludeTagFilterEdit"))) {
+            excludedTags = atlasSearchTagList(excludeTagFilter->text());
             found = true;
         }
         if (auto* spin = dock->widget()->findChild<QDoubleSpinBox*>(
@@ -4360,15 +4396,17 @@ void CWindow::startAtlasFiberIntersectionSearch()
     qInfo().noquote() << QStringLiteral("[atlas-search] phase=1 prepare_inputs end completed=%1 total=%2")
         .arg(static_cast<qulonglong>(preparedFibers))
         .arg(static_cast<qulonglong>(fiberSnapshots.size()));
-    if (!requiredTags.isEmpty()) {
-        auto keepTagged = [&snapshotsByRuntimeId, &requiredTags](std::vector<uint64_t>& ids) {
+    if (!requiredTags.isEmpty() || !excludedTags.isEmpty()) {
+        auto keepTagged = [&snapshotsByRuntimeId, &requiredTags, &excludedTags](std::vector<uint64_t>& ids) {
             ids.erase(std::remove_if(ids.begin(),
                                      ids.end(),
-                                     [&snapshotsByRuntimeId, &requiredTags](uint64_t id) {
+                                     [&snapshotsByRuntimeId, &requiredTags, &excludedTags](uint64_t id) {
                                          const auto it = snapshotsByRuntimeId.find(id);
                                          return it == snapshotsByRuntimeId.end() ||
                                                 !atlasSearchFiberMatchesTags(it->second.tags,
-                                                                             requiredTags);
+                                                                             requiredTags) ||
+                                                atlasSearchFiberHasAnyTag(it->second.tags,
+                                                                          excludedTags);
                                      }),
                       ids.end());
         };
@@ -5953,16 +5991,49 @@ void CWindow::CreateWidgets(void)
     }
 
     if (_lineAnnotationController) {
-        auto updateFiberList = [this](const std::vector<LineAnnotationController::FiberSummary>& fibers) {
+        auto toFiberWidgetAlignment =
+            [](const LineAnnotationController::FiberSummary::AlignmentMetrics& source) {
+                CFiberWidget::FiberEntry::AlignmentMetrics alignment;
+                alignment.available = source.available;
+                alignment.pending = source.pending;
+                alignment.sampleCount = source.sampleCount;
+                alignment.meanErrorDegrees = source.meanErrorDegrees;
+                alignment.maxErrorDegrees = source.maxErrorDegrees;
+                alignment.error = source.error;
+                return alignment;
+            };
+        auto updateFiberList =
+            [this, toFiberWidgetAlignment](const std::vector<LineAnnotationController::FiberSummary>& fibers) {
             std::vector<CFiberWidget::FiberEntry> entries;
             entries.reserve(fibers.size());
             for (const auto& fiber : fibers) {
+                CFiberWidget::FiberEntry::AlignmentMetrics alignment =
+                    toFiberWidgetAlignment(fiber.alignment);
+
+                std::vector<CFiberWidget::FiberEntry::SpanEntry> spans;
+                spans.reserve(fiber.spans.size());
+                for (const auto& span : fiber.spans) {
+                    CFiberWidget::FiberEntry::AlignmentMetrics spanAlignment =
+                        toFiberWidgetAlignment(span.alignment);
+                    spans.push_back(CFiberWidget::FiberEntry::SpanEntry{
+                        span.spanIndex,
+                        span.firstControlIndex,
+                        span.secondControlIndex,
+                        span.controlPointCount,
+                        span.linePointCount,
+                        span.lengthVx,
+                        spanAlignment,
+                    });
+                }
+
                 entries.push_back(CFiberWidget::FiberEntry{
                     fiber.id,
                     fiber.name,
                     fiber.controlPointCount,
                     fiber.linePointCount,
                     fiber.lengthVx,
+                    alignment,
+                    spans,
                     fiber.hvZDistance,
                     fiber.hvFiberLength,
                     fiber.horizontalScore,
@@ -5983,6 +6054,37 @@ void CWindow::CreateWidgets(void)
             }
             updateAtlasFiberDocks();
         };
+        auto updateFiberMetricRows =
+            [this, toFiberWidgetAlignment](
+                uint64_t fiberId,
+                LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
+                const std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics>& spanAlignments) {
+                std::vector<CFiberWidget::FiberEntry::AlignmentMetrics> widgetSpanAlignments;
+                widgetSpanAlignments.reserve(spanAlignments.size());
+                for (const auto& spanAlignment : spanAlignments) {
+                    widgetSpanAlignments.push_back(toFiberWidgetAlignment(spanAlignment));
+                }
+                const CFiberWidget::FiberEntry::AlignmentMetrics widgetAlignment =
+                    toFiberWidgetAlignment(alignment);
+                if (_fiberWidget) {
+                    _fiberWidget->updateAlignmentMetrics(fiberId,
+                                                         widgetAlignment,
+                                                         widgetSpanAlignments);
+                }
+                if (_fiberSliceWidget) {
+                    _fiberSliceWidget->updateAlignmentMetrics(fiberId,
+                                                              widgetAlignment,
+                                                              widgetSpanAlignments);
+                }
+            };
+        auto setFiberMetricsPending = [this](bool pending) {
+            if (_fiberWidget) {
+                _fiberWidget->setAlignmentMetricsPending(pending);
+            }
+            if (_fiberSliceWidget) {
+                _fiberSliceWidget->setAlignmentMetricsPending(pending);
+            }
+        };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
             if (!widget || !_lineAnnotationController) {
                 return;
@@ -5992,6 +6094,10 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::openFiber);
             connect(widget,
+                    &CFiberWidget::fiberSpanOpenRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::openFiberSpan);
+            connect(widget,
                     &CFiberWidget::deleteFibersRequested,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::deleteFibers);
@@ -5999,6 +6105,15 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::renameFiberFileRequested,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::renameFiberFile);
+            connect(widget,
+                    &CFiberWidget::metricsCalculationRequested,
+                    _lineAnnotationController.get(),
+                    [this](std::vector<uint64_t> orderedFiberIds) {
+                        if (_lineAnnotationController) {
+                            _lineAnnotationController->calculateFiberAlignmentMetrics(
+                                std::move(orderedFiberIds));
+                        }
+                    });
             connect(widget,
                     &CFiberWidget::manualHvTagChanged,
                     _lineAnnotationController.get(),
@@ -6035,6 +6150,14 @@ void CWindow::CreateWidgets(void)
                 &LineAnnotationController::fibersChanged,
                 this,
                 updateFiberList);
+        connect(_lineAnnotationController.get(),
+                &LineAnnotationController::fiberAlignmentMetricsReset,
+                this,
+                setFiberMetricsPending);
+        connect(_lineAnnotationController.get(),
+                &LineAnnotationController::fiberAlignmentMetricsUpdated,
+                this,
+                updateFiberMetricRows);
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
         updateFiberList(_lineAnnotationController->fiberSummaries());

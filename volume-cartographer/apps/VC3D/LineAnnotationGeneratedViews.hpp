@@ -68,6 +68,18 @@ struct GeneratedOverlay {
     bool currentLineMarkerAsCross = false;
 };
 
+struct GeneratedSpanAlignmentMetric {
+    int spanIndex = 0;
+    int firstControlIndex = 0;
+    int secondControlIndex = 0;
+    double firstControlLinePosition = std::numeric_limits<double>::quiet_NaN();
+    double secondControlLinePosition = std::numeric_limits<double>::quiet_NaN();
+    double maxErrorDegrees = 0.0;
+    bool available = false;
+    bool pending = false;
+    std::string error;
+};
+
 struct GeneratedViews {
     std::string lineSurfaceName;
     QString lineSurfaceTitle;
@@ -86,9 +98,11 @@ struct GeneratedViews {
                          std::numeric_limits<float>::quiet_NaN()};
     int seedLineIndex = -1;
     int initialCenterIndex = 0;
+    std::optional<std::pair<double, double>> initialStripLinePositionRange;
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
+    std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
 };
 
 struct GeneratedControlPointLinePositionIndex {
@@ -224,6 +238,39 @@ inline bool validGeneratedLinePosition(double position, size_t pointCount)
            pointCount > 0 &&
            position >= 0.0 &&
            position <= static_cast<double>(pointCount - 1);
+}
+
+inline GeneratedSpanAlignmentMetric makeGeneratedSpanAlignmentMetric(
+    int spanIndex,
+    int firstControlIndex,
+    int secondControlIndex,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    GeneratedSpanAlignmentMetric metric;
+    metric.spanIndex = spanIndex;
+    metric.firstControlIndex = firstControlIndex;
+    metric.secondControlIndex = secondControlIndex;
+    if (firstControlIndex >= 0 &&
+        static_cast<size_t>(firstControlIndex) < controlPoints.size()) {
+        metric.firstControlLinePosition =
+            controlPoints[static_cast<size_t>(firstControlIndex)].linePosition;
+    }
+    if (secondControlIndex >= 0 &&
+        static_cast<size_t>(secondControlIndex) < controlPoints.size()) {
+        metric.secondControlLinePosition =
+            controlPoints[static_cast<size_t>(secondControlIndex)].linePosition;
+    }
+    return metric;
+}
+
+inline std::optional<double> generatedSpanAlignmentMetricCenterLinePosition(
+    const GeneratedSpanAlignmentMetric& metric)
+{
+    if (!std::isfinite(metric.firstControlLinePosition) ||
+        !std::isfinite(metric.secondControlLinePosition)) {
+        return std::nullopt;
+    }
+    return (metric.firstControlLinePosition + metric.secondControlLinePosition) * 0.5;
 }
 
 inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& linePoints,

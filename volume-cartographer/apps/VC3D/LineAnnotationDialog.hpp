@@ -20,6 +20,8 @@
 class CState;
 class QComboBox;
 class QGraphicsPathItem;
+class QGraphicsRectItem;
+class QGraphicsSimpleTextItem;
 class QLabel;
 class QMdiArea;
 class QMdiSubWindow;
@@ -61,9 +63,15 @@ public:
     };
 
     struct FastStripOverlayItems {
+        struct SpanLabelItems {
+            QGraphicsRectItem* background = nullptr;
+            QGraphicsSimpleTextItem* text = nullptr;
+        };
+
         QPointer<CChunkedVolumeViewer> viewer;
         std::string surfaceName;
         QGraphicsPathItem* currentLine = nullptr;
+        std::vector<SpanLabelItems> spanLabels;
     };
 
     struct FastCurrentCutOverlayItems {
@@ -74,6 +82,7 @@ public:
     };
 
     using GeneratedOverlay = vc3d::line_annotation::GeneratedOverlay;
+    using GeneratedSpanAlignmentMetric = vc3d::line_annotation::GeneratedSpanAlignmentMetric;
     using GeneratedViews = vc3d::line_annotation::GeneratedViews;
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
 
@@ -101,6 +110,8 @@ public:
     ShiftScrollMode shiftScrollMode() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
+    void setGeneratedSpanAlignmentMetrics(
+        std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     void setOptimizationBusy(bool busy);
     void setOptimizationStatus(bool optimized);
     void setCloseAfterFinalizationAllowed(bool allowed);
@@ -156,8 +167,10 @@ private:
     void setCurrentCutFollowsStripMouse(bool follows);
     double snappedControlPointPosition(double position) const;
     void rebuildGeneratedStaticStripOverlays();
-    void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true);
-    void updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay);
+    void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true,
+                                         bool updateSpanLabels = true);
+    void updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
+                                            bool updateSpanLabels);
     void clearFastGeneratedOverlayItemRefs();
     void rebuildGeneratedOverlays();
     void installGeneratedViewShortcuts();
