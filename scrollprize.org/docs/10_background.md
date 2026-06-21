@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="The history of the Herculaneum scrolls: papyri carbonized by the eruption of Vesuvius in 79 AD and found in the Villa of the Papyri, a buried Roman library."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="The history of the Herculaneum scrolls: papyri carbonized by the eruption of Vesuvius in 79 AD and found in the Villa of the Papyri, a buried Roman library."
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="The history of the Herculaneum scrolls: papyri carbonized by the eruption of Vesuvius in 79 AD and found in the Villa of the Papyri, a buried Roman library."
   />
   <meta
     property="twitter:image"

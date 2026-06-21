@@ -1,0 +1,42 @@
+/* Click-to-zoom lightbox (see src/clientModules/imageZoom.js) and a safe
+   aspect-ratio guard for images that now carry intrinsic width/height. */
+
+/* Keep responsive images from distorting once width/height attributes are set. */
+.markdown img[width][height] {
+  height: auto;
+}
+
+/* Affordance: content images open a full-resolution lightbox on click. */
+.markdown img.zoomable,
+img.zoomable {
+  cursor: zoom-in;
+}
+
+.img-zoom-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  background: rgba(0, 0, 0, 0.9);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+  cursor: zoom-out;
+}
+
+.img-zoom-overlay.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.img-zoom-overlay__img {
+  max-width: 96vw;
+  max-height: 96vh;
+  width: auto;
+  height: auto;
+  border-radius: 4px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+}

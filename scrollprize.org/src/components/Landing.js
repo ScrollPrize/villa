@@ -1530,22 +1530,11 @@ export function Landing() {
   useBrokenLinks().collectAnchor("educelab-funders");
   useBrokenLinks().collectAnchor("our-story");
 
-  // JSON-LD (Organization + WebSite)
+  // siteUrl is used by the OpenGraph/Twitter tags below. Sitewide JSON-LD
+  // (Organization + WebSite) is injected via headTags in docusaurus.config.js
+  // so it is present in the server-rendered static HTML (react-helmet drops
+  // <script> children from SSR output).
   const siteUrl = (siteConfig?.url ?? "") + (siteConfig?.baseUrl ?? "/");
-  const orgJsonLd = {
-    "@context": "https://schema.org",
-    "@type": "Organization",
-    "name": "Vesuvius Challenge",
-    "url": siteUrl,
-    "logo": siteUrl + "img/social/opengraph.jpg",
-    "sameAs": ["https://twitter.com/scrollprize","https://github.com/ScrollPrize"],
-  };
-  const webSiteJsonLd = {
-    "@context": "https://schema.org",
-    "@type": "WebSite",
-    "name": "Vesuvius Challenge",
-    "url": siteUrl
-  };
 
   const heroVideo = useRef(null);
   const unrollVideo = useRef(null);
@@ -1601,10 +1590,10 @@ export function Landing() {
   return (
     <>
       <Head>
-        <title>Vesuvius Challenge</title>
+        <title>Vesuvius Challenge — Reading the Herculaneum Scrolls with AI</title>
         <meta
           name="description"
-          content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+          content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded."
         />
         <link rel="canonical" href={canonicalUrl} />
         {/* Preload the LCP poster image */}
@@ -1612,20 +1601,16 @@ export function Landing() {
         {/* OpenGraph/Twitter */}
         <meta property="og:type" content="website" />
         <meta property="og:url" content={siteUrl} />
-        <meta property="og:title" content="Vesuvius Challenge" />
-        <meta property="og:description" content="A machine learning and computer vision competition with $1,800,500 awarded in prizes" />
+        <meta property="og:title" content="Vesuvius Challenge — Reading the Herculaneum Scrolls with AI" />
+        <meta property="og:description" content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded." />
         <meta property="og:image" content={siteUrl + "img/social/opengraph.jpg"} />
         <meta property="og:image:width" content="1200" />
         <meta property="og:image:height" content="630" />
         <meta name="twitter:card" content="summary_large_image" />
-        <meta name="twitter:title" content="Vesuvius Challenge" />
-        <meta name="twitter:description" content="A machine learning and computer vision competition with $1,800,500 awarded in prizes" />
+        <meta name="twitter:title" content="Vesuvius Challenge — Reading the Herculaneum Scrolls with AI" />
+        <meta name="twitter:description" content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded." />
         <meta name="twitter:image" content={siteUrl + "img/social/opengraph.jpg"} />
-        {/* JSON-LD */}
-        <script type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(orgJsonLd) }} />
-        <script type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(webSiteJsonLd) }} />
+        {/* Sitewide JSON-LD (Organization + WebSite) is injected via headTags in docusaurus.config.js */}
       </Head>
       <div className="absolute inset-0 z-0 md:block hidden">
         {stories({ unrollVideo }).map((s, index) => (

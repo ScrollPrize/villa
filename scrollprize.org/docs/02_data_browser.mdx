@@ -2,9 +2,13 @@
 title: "Data Browser"
 sidebar_label: "Browser"
 hide_table_of_contents: true
+description: "Unified browser for all released Vesuvius Challenge samples, indexing Herculaneum scrolls and fragments by sample ID with links to their X-ray CT volumes."
 ---
 
 import AtlasBrowser from '@site/src/components/AtlasBrowser';
+import JsonLd from '@site/src/components/JsonLd';
+
+<JsonLd data={{ "@context":"https://schema.org","@type":"Dataset","name":"Herculaneum Scrolls — Sample Data Browser","description":"Unified, searchable index of all released Vesuvius Challenge samples, grouping Herculaneum scrolls and fragments by sample ID and linking to their X-ray CT volumes and artifacts.","url":"https://scrollprize.org/data_browser","creator":{"@type":"Organization","name":"Vesuvius Challenge","url":"https://scrollprize.org/"},"measurementTechnique":"X-ray computed tomography","keywords":["Herculaneum scrolls","papyri","X-ray CT","virtual unwrapping","ink detection","machine learning"],"isAccessibleForFree":true,"license":"https://dl.ash2txt.org/LICENSE.txt","distribution":{"@type":"DataDownload","encodingFormat":"image/tiff","contentUrl":"https://scrollprize.org/data_browser"} }} />
 
 This is the unified browser for all released samples (scrolls and fragments), grouped by sample ID and linked to their available artifacts.
 

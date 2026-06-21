@@ -1,0 +1,34 @@
+# Vesuvius Challenge
+
+> Vesuvius Challenge is a machine learning, computer vision, and geometry competition reading the carbonized Herculaneum scrolls — ~1,800 papyrus rolls buried and carbonized by the eruption of Mount Vesuvius in 79 AD. Using high-resolution X-ray CT scanning, "virtual unwrapping," and AI ink detection, the project recovers text without physically opening the fragile scrolls. In 2023 a $700,000 Grand Prize was awarded for reading the first passages; by 2025 ~70% of scroll PHerc. 172 had been digitally unwrapped. Over $1,800,500 in prizes has been awarded. Founded by Nat Friedman and Daniel Gross with Prof. Brent Seales (EduceLab, University of Kentucky).
+
+## Start here
+- [Get Started](https://scrollprize.org/get_started): how to join and make your first contribution
+- [Virtual Unwrapping](https://scrollprize.org/unwrapping): the X-ray CT → segmentation → ink-detection pipeline
+- [History: the Herculaneum scrolls & Villa of the Papyri](https://scrollprize.org/background)
+- [Master Plan](https://scrollprize.org/master_plan): roadmap to reading entire scrolls
+
+## Open problems & methods
+- [Ink Detection](https://scrollprize.org/ink_detection)
+- [Segmentation](https://scrollprize.org/segmentation)
+- [Representation](https://scrollprize.org/open_problem_rep)
+
+## Prizes
+- [Open Prizes](https://scrollprize.org/prizes)
+- [2023 Grand Prize — "we can read the scrolls"](https://scrollprize.org/grandprize)
+- [First Letters Prize](https://scrollprize.org/firstletters)
+
+## Data (open)
+- [Data overview](https://scrollprize.org/data)
+- [Datasets](https://scrollprize.org/data_datasets) | [Segments](https://scrollprize.org/data_segments) | [Fragments](https://scrollprize.org/data_fragments)
+
+## Tutorials
+- [Tutorials index](https://scrollprize.org/tutorial)
+
+## Results & community
+- [Winners](https://scrollprize.org/winners)
+- [Community Projects](https://scrollprize.org/community_projects)
+- [FAQ](https://scrollprize.org/faq)
+
+## Updates
+- Announcements blog: https://scrollprize.substack.com

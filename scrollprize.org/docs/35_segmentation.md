@@ -9,7 +9,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Tutorial on segmenting Herculaneum scrolls in VC3D: install the volume-cartographer image, seed and grow meshes, and trace papyrus surfaces in 3D CT volumes."
   />
 
   <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Tutorial on segmenting Herculaneum scrolls in VC3D: install the volume-cartographer image, seed and grow meshes, and trace papyrus surfaces in 3D CT volumes."
   />
   <meta
     property="og:image"
@@ -29,7 +29,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Tutorial on segmenting Herculaneum scrolls in VC3D: install the volume-cartographer image, seed and grow meshes, and trace papyrus surfaces in 3D CT volumes."
   />
   <meta
     property="twitter:image"

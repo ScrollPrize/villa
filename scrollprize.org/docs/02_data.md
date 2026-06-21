@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge open data portal: synchrotron X-ray CT volumes, segments, and meshes of the carbonized Herculaneum scrolls for virtual unwrapping research."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge open data portal: synchrotron X-ray CT volumes, segments, and meshes of the carbonized Herculaneum scrolls for virtual unwrapping research."
   />
   <meta
     property="og:image"
@@ -28,13 +28,17 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge open data portal: synchrotron X-ray CT volumes, segments, and meshes of the carbonized Herculaneum scrolls for virtual unwrapping research."
   />
   <meta
     property="twitter:image"
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
+
+import JsonLd from '@site/src/components/JsonLd';
+
+<JsonLd data={{ "@context":"https://schema.org","@type":"Dataset","name":"Herculaneum Scrolls — X-ray CT Data Portal","description":"Open data portal aggregating synchrotron micro-CT volumes, extracted surface segments, meshes, and ML predictions of the carbonized Herculaneum scrolls and fragments.","url":"https://scrollprize.org/data","creator":{"@type":"Organization","name":"Vesuvius Challenge","url":"https://scrollprize.org/"},"measurementTechnique":"X-ray computed tomography","keywords":["Herculaneum scrolls","papyri","X-ray CT","virtual unwrapping","ink detection","machine learning"],"isAccessibleForFree":true,"license":"https://dl.ash2txt.org/LICENSE.txt","distribution":{"@type":"DataDownload","encodingFormat":"image/tiff","contentUrl":"https://scrollprize.org/data"} }} />
 
 > **Work‑in‑progress 👷‍♀️**
 > We are transitioning data hosting to a new repository. During the transition, some assets may appear in one location before the other. Both repositories follow the same organization structure.

@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Frequently asked questions about Vesuvius Challenge: reading the Herculaneum scrolls with micro-CT and machine learning, prizes, data, papyrus, and CT scanning."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Frequently asked questions about Vesuvius Challenge: reading the Herculaneum scrolls with micro-CT and machine learning, prizes, data, papyrus, and CT scanning."
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Frequently asked questions about Vesuvius Challenge: reading the Herculaneum scrolls with micro-CT and machine learning, prizes, data, papyrus, and CT scanning."
   />
   <meta
     property="twitter:image"

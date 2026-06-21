@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Segments are mapped written surfaces inside the Herculaneum scrolls, exported from X-ray CT as OBJ meshes, flattened surface volumes, and composite images."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Segments are mapped written surfaces inside the Herculaneum scrolls, exported from X-ray CT as OBJ meshes, flattened surface volumes, and composite images."
   />
   <meta
     property="og:image"
@@ -28,13 +28,17 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Segments are mapped written surfaces inside the Herculaneum scrolls, exported from X-ray CT as OBJ meshes, flattened surface volumes, and composite images."
   />
   <meta
     property="twitter:image"
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
+
+import JsonLd from '@site/src/components/JsonLd';
+
+<JsonLd data={{ "@context":"https://schema.org","@type":"Dataset","name":"Herculaneum Scrolls — Segmented Surface Volumes","description":"Mapped written surfaces from inside the Herculaneum scrolls, derived from X-ray CT as OBJ meshes with flattened surface volumes, UV coordinates, and composite texture images.","url":"https://scrollprize.org/data_segments","creator":{"@type":"Organization","name":"Vesuvius Challenge","url":"https://scrollprize.org/"},"measurementTechnique":"X-ray computed tomography","keywords":["Herculaneum scrolls","papyri","X-ray CT","virtual unwrapping","ink detection","machine learning"],"isAccessibleForFree":true,"license":"https://dl.ash2txt.org/LICENSE.txt","distribution":{"@type":"DataDownload","encodingFormat":"image/tiff","contentUrl":"https://scrollprize.org/data_segments"} }} />
 
 **Where are the segments?** Segments are separated by [scroll](https://dl.ash2txt.org/full-scrolls/) on our data server. Navigate to the /*.volpkg/paths directory (eg., [/full-scrolls/Scroll1/PHercParis4.volpkg/paths/](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/)).
 
