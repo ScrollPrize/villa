@@ -14,6 +14,7 @@ from vesuvius.neural_tracing.fiber_trace.geometry import (
     classify_voxels,
     construct_up_vector,
     decode_lasagna_normals_xyz,
+    folded_frame_error_degrees,
     tangent_at_point,
 )
 from vesuvius.neural_tracing.fiber_trace.labels import (
@@ -58,15 +59,15 @@ def _synthetic_config(
         "seed": 123,
         "image_normalization": "unit",
         "positive_direction_probability": 1.0,
-        "positive_direction_jitter_degrees": 45.0,
+        "positive_direction_jitter_degrees": 30.0,
         "negative_direction_min_degrees": 60.0,
-        "negative_direction_max_degrees": 180.0,
+        "negative_direction_max_degrees": 90.0,
         "normal_plane_jitter_voxels": 40.0,
         "normal_perpendicular_jitter_voxels": 10.0,
         "negative_cone_distance_voxels": 30.0,
         "positive_radius": 1.25,
         "ignore_radius": 2.5,
-        "positive_cosine": float(np.cos(np.deg2rad(45.0))),
+        "positive_cosine": float(np.cos(np.deg2rad(30.0))),
         "negative_cosine": float(np.cos(np.deg2rad(60.0))),
         "_array_records": [
             {
@@ -173,6 +174,33 @@ def test_sign_ambiguous_loss():
     )
 
 
+def test_folded_frame_error_boundaries():
+    target_fw = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    target_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+    for raw_degrees, expected_degrees in [
+        (0.0, 0.0),
+        (30.0, 30.0),
+        (60.0, 60.0),
+        (90.0, 90.0),
+        (120.0, 60.0),
+        (150.0, 30.0),
+        (180.0, 0.0),
+    ]:
+        radians = np.deg2rad(raw_degrees)
+        cond_fw = np.array([np.cos(radians), np.sin(radians), 0.0], dtype=np.float32)
+        error = folded_frame_error_degrees(cond_fw, target_up, target_fw, target_up)
+        assert float(error) == pytest.approx(expected_degrees, abs=1e-4)
+
+    coupled_error = folded_frame_error_degrees(
+        -target_fw,
+        -target_up,
+        target_fw,
+        target_up,
+    )
+    assert float(coupled_error) == pytest.approx(0.0, abs=1e-4)
+
+
 def test_batch_builder_samples_one_fiber_with_paired_conditioning_variants(
     tmp_path: Path,
 ):
@@ -197,6 +225,20 @@ def test_batch_builder_samples_one_fiber_with_paired_conditioning_variants(
         (batch.target_id[batch.labels == NEGATIVE_LABEL] == NEGATIVE_ONLY_ID).all()
     )
     assert bool((batch.target_up_valid & (batch.labels == POSITIVE_LABEL)).any())
+    target_fw = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    target_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    folded_errors = folded_frame_error_degrees(
+        batch.cond_fw_xyz.numpy(),
+        batch.cond_up_xyz.numpy(),
+        target_fw,
+        target_up,
+    )
+    positive_errors = folded_errors[np.array(batch.direction_kinds) == "positive"]
+    negative_errors = folded_errors[np.array(batch.direction_kinds) == "negative"]
+    assert bool((positive_errors >= -1e-4).all())
+    assert bool((positive_errors <= 30.0 + 1e-4).all())
+    assert bool((negative_errors >= 60.0 - 1e-4).all())
+    assert bool((negative_errors <= 90.0 + 1e-4).all())
 
 
 def test_missing_mask_fails_loudly(tmp_path: Path):
@@ -213,6 +255,13 @@ def test_missing_mask_fails_loudly(tmp_path: Path):
         ],
     }
     with pytest.raises(ValueError, match="mask_path or grad_mag_path"):
+        FiberTraceBatchBuilder(config)
+
+
+def test_negative_direction_max_is_folded_frame_degree_bound(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config["negative_direction_max_degrees"] = 120.0
+    with pytest.raises(ValueError, match="negative_direction_max_degrees"):
         FiberTraceBatchBuilder(config)
 
 
@@ -419,13 +468,14 @@ def test_voxel_classification_uses_normal_plane_positive_zone():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=mask,
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
         negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(45.0))),
+        positive_cosine=float(np.cos(np.deg2rad(30.0))),
         negative_cosine=float(np.cos(np.deg2rad(60.0))),
         positive_target_id=7,
     )
@@ -457,6 +507,7 @@ def test_voxel_classification_cone_negatives_and_positive_precedence():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
@@ -475,6 +526,7 @@ def test_voxel_classification_cone_negatives_and_positive_precedence():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
@@ -496,13 +548,14 @@ def test_voxel_classification_direction_pairs_label_near_fiber_zone():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
         negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(45.0))),
+        positive_cosine=float(np.cos(np.deg2rad(30.0))),
         negative_cosine=float(np.cos(np.deg2rad(60.0))),
     )
     assert int(positive["labels"][5, 3, 4]) == POSITIVE_LABEL
@@ -512,13 +565,14 @@ def test_voxel_classification_direction_pairs_label_near_fiber_zone():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([0.5, np.sqrt(3.0) / 2.0, 0.0], dtype=np.float32),
+        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
         negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(45.0))),
+        positive_cosine=float(np.cos(np.deg2rad(30.0))),
         negative_cosine=float(np.cos(np.deg2rad(60.0))),
     )
     assert int(negative["labels"][5, 3, 4]) == NEGATIVE_LABEL
@@ -531,16 +585,57 @@ def test_voxel_classification_direction_pairs_label_near_fiber_zone():
             [np.cos(np.deg2rad(50.0)), np.sin(np.deg2rad(50.0)), 0.0],
             dtype=np.float32,
         ),
+        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
         negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(45.0))),
+        positive_cosine=float(np.cos(np.deg2rad(30.0))),
         negative_cosine=float(np.cos(np.deg2rad(60.0))),
     )
     assert int(transition["labels"][5, 3, 4]) == IGNORE_INDEX
+
+    positive_equivalent = classify_voxels(
+        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
+        crop_shape=(9, 9, 9),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array(
+            [np.cos(np.deg2rad(150.0)), np.sin(np.deg2rad(150.0)), 0.0],
+            dtype=np.float32,
+        ),
+        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_plane_jitter_voxels=1.0,
+        normal_perpendicular_jitter_voxels=1.0,
+        negative_cone_distance_voxels=3.0,
+        positive_cosine=float(np.cos(np.deg2rad(30.0))),
+        negative_cosine=float(np.cos(np.deg2rad(60.0))),
+    )
+    assert int(positive_equivalent["labels"][5, 3, 4]) == POSITIVE_LABEL
+
+    negative_equivalent = classify_voxels(
+        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
+        crop_shape=(9, 9, 9),
+        line_points_xyz=line,
+        cond_fw_xyz=np.array(
+            [np.cos(np.deg2rad(120.0)), np.sin(np.deg2rad(120.0)), 0.0],
+            dtype=np.float32,
+        ),
+        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_xyz=normal_xyz,
+        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
+        normal_plane_jitter_voxels=1.0,
+        normal_perpendicular_jitter_voxels=1.0,
+        negative_cone_distance_voxels=3.0,
+        positive_cosine=float(np.cos(np.deg2rad(30.0))),
+        negative_cosine=float(np.cos(np.deg2rad(60.0))),
+    )
+    assert int(negative_equivalent["labels"][5, 3, 4]) == NEGATIVE_LABEL
 
 
 def test_degenerate_up_vectors_are_invalid_or_raise():
@@ -552,6 +647,7 @@ def test_degenerate_up_vectors_are_invalid_or_raise():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        cond_up_xyz=np.array([0.0, 1.0, 0.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
@@ -567,6 +663,7 @@ def test_degenerate_up_vectors_are_invalid_or_raise():
             crop_shape=(9, 9, 9),
             line_points_xyz=line,
             cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            cond_up_xyz=np.array([0.0, 1.0, 0.0], dtype=np.float32),
             valid_mask=np.ones((9, 9, 9), dtype=bool),
             normal_xyz=normal_xyz,
             normal_valid_mask=np.ones((9, 9, 9), dtype=bool),

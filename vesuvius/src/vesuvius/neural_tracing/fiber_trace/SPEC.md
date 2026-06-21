@@ -46,7 +46,7 @@ Negatives:
   plane by at least `K = 30` voxels.
 - Random valid volume samples only contribute labels where the explicit
   positive-zone, cone-negative, or direction-disagreement rules apply.
-- Conditioning directions at least 60 degrees off the local fiber tangent should
+- Conditioning frames with folded frame error from 60 to 90 degrees should
   create negative samples for the same patch.
 - Voxels outside the positive and negative zones are ignored.
 
@@ -55,11 +55,23 @@ Direction conditioning:
 - `fw` is the local fiber tangent from the line geometry.
 - `up` is derived from the Lasagna normal by projecting the normal away from
   `fw` and normalizing.
-- Conditioning directions up to 45 degrees away from the true tangent should
-  still supervise the model to output the correct target direction, up vector,
-  and positive embedding for the local fiber.
-- Conditioning directions 60 degrees or more away should supervise negatives for
-  the same patch.
+- Direction labels use folded frame-equivalent angular error, not raw `fw`
+  angle. Lasagna normal/up sign ambiguity makes both target up signs valid;
+  after also folding the equivalent pair `(fw, up) == (-fw, -up)`, the usable
+  error range is 0 to 90 degrees.
+- Conditioning frames with folded error up to 30 degrees should still supervise
+  the model to output the correct target direction, up vector, and positive
+  embedding for the local fiber.
+- Conditioning frames with folded error from 30 to 60 degrees are ignored for
+  direction conditioning.
+- Conditioning frames with folded error from 60 to 90 degrees supervise
+  negatives for the same local positive zone. There is no 90 to 180 degree
+  negative band; raw angles above 90 fold back toward positive-equivalent
+  frames.
+- For a simple raw `fw` rotation around a stable up axis: raw 0..30 and
+  150..180 degrees are positive-equivalent, raw 30..60 and 120..150 degrees
+  are ignored, raw 60..120 degrees are negative-conditioning candidates, and
+  raw 90 degrees is maximally wrong.
 
 Jitter semantics:
 
@@ -145,10 +157,12 @@ Implemented:
   `normal_perpendicular_jitter_voxels = 10` define the positive zone.
 - `negative_cone_distance_voxels = 30` defines the minimum distance from the
   normal-defined plane for cone negatives.
-- `positive_direction_jitter_degrees = 45.0`,
-  `positive_cosine = cos(45 degrees) = 0.7071067811865476`, and
-  `negative_cosine = cos(60 degrees) = 0.5` implement the 45/60 degree
-  direction thresholds.
+- `positive_direction_jitter_degrees = 30.0`,
+  `positive_cosine = cos(30 degrees) = 0.8660254037844386`,
+  `negative_direction_min_degrees = 60.0`,
+  `negative_direction_max_degrees = 90.0`, and
+  `negative_cosine = cos(60 degrees) = 0.5` implement the folded 30/60/90
+  degree direction thresholds.
 - `positive_radius` and `ignore_radius` remain accepted only as legacy/debug
   fallback values when the named normal-frame fields are omitted.
 

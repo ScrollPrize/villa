@@ -56,8 +56,10 @@ Batches are single-fiber batches. For batch size `N`, the builder samples one
 fiber record, selects `N / 2` crop centers, and emits two conditioning variants
 for each selected crop:
 
-- a positive-conditioned copy jittered 0 to 45 degrees from the local tangent
-- a negative-conditioned copy jittered 60 to 180 degrees from the local tangent
+- a positive-conditioned copy jittered 0 to 30 folded frame degrees from the
+  local tangent/up frame
+- a negative-conditioned copy jittered 60 to 90 folded frame degrees from the
+  local tangent/up frame
 
 Selected centers prefer GT control points from the same fiber line, using
 multiple distinct control points when possible, and then random valid
@@ -71,9 +73,17 @@ Each crop receives normalized `fw(3)` and `up(3)` conditioning in `xyz`
 component order. The local GT forward vector is derived from the nearest fiber
 line tangent. Each selected crop receives a positive-conditioned and
 negative-conditioned copy. Positive copies use
-`positive_direction_jitter_degrees`, normally 45 degrees. Negative copies use
-`negative_direction_min_degrees` and `negative_direction_max_degrees`, normally
-60 and 180 degrees.
+`positive_direction_jitter_degrees`, normally 30 folded frame degrees. Negative
+copies use `negative_direction_min_degrees` and
+`negative_direction_max_degrees`, normally 60 and 90 folded frame degrees.
+
+Voxel direction labels use folded frame-equivalent angular error, not raw `fw`
+angle. Lasagna normal/up sign ambiguity makes both target up signs valid; after
+also folding the equivalent pair `(fw, up) == (-fw, -up)`, the usable error
+range is 0 to 90 degrees. For a simple raw `fw` rotation around a stable up
+axis, raw 0..30 and 150..180 degrees are positive-equivalent, raw 30..60 and
+120..150 degrees are ignored, raw 60..120 degrees are negative-conditioning
+candidates, and raw 90 degrees is maximally wrong.
 
 The `up` vector is built by decoding Lasagna `nx`/`ny` channels as
 `(value - 128) / 127`, reconstructing `nz = sqrt(1 - nx^2 - ny^2)` with
@@ -93,10 +103,10 @@ true`; it is disabled by default. The loss treats `up` and `-up` as equivalent.
 For every output voxel:
 
 - invalid mask/grad-mag voxels are `ignore`
-- voxels in the normal-frame positive zone and aligned with the conditioning
-  direction are `positive`
+- voxels in the normal-frame positive zone with folded frame error up to
+  30 degrees are `positive`
 - voxels in that same positive zone become `negative` only when the
-  conditioning direction disagrees by at least 60 degrees
+  folded frame error is from 60 to 90 degrees
 - cone negatives come only from the two lateral 90 degree cone zones and only
   when the absolute distance to the Lasagna-normal plane is at least
   `negative_cone_distance_voxels`
@@ -171,17 +181,17 @@ where `value / 255` is intended.
 single-conditioning MVP and is not used by the paired-conditioning training
 path.
 
-`positive_direction_jitter_degrees: 45.0` in the training template comes from
-the spec: conditioning directions up to 45 degrees wrong are still supervised
-to output the correct direction, up vector, and positive embedding.
+`positive_direction_jitter_degrees: 30.0` in the training template comes from
+the spec: conditioning frames up to 30 folded degrees wrong are still
+supervised to output the correct direction, up vector, and positive embedding.
 
 `negative_direction_min_degrees: 60.0` and
-`negative_direction_max_degrees: 180.0` define the paired negative-conditioning
-range.
+`negative_direction_max_degrees: 90.0` define the paired negative-conditioning
+range in folded frame degrees.
 
-`positive_cosine: 0.7071067811865476` is `cos(45 degrees)`.
-`negative_cosine: 0.5` is `cos(60 degrees)`, matching the spec's 60+ degree
-off-direction negative samples.
+`positive_cosine: 0.8660254037844386` is `cos(30 degrees)`.
+`negative_cosine: 0.5` is `cos(60 degrees)`, matching the folded negative
+threshold.
 
 `normal_plane_jitter_voxels: 40.0` and
 `normal_perpendicular_jitter_voxels: 10.0` define the normal-frame positive

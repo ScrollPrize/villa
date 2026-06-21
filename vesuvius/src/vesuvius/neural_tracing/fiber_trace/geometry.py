@@ -176,6 +176,68 @@ def construct_up_vectors(
     return out.reshape(fw.shape), valid.reshape(fw.shape[:-1])
 
 
+def folded_frame_agreement(
+    cond_fw_xyz: np.ndarray,
+    cond_up_xyz: np.ndarray | None,
+    target_fw_xyz: np.ndarray,
+    target_up_xyz: np.ndarray | None = None,
+    *,
+    target_up_valid: np.ndarray | None = None,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Return best frame-equivalent agreement in the folded 0..90 degree range.
+
+    Lasagna normal sign ambiguity makes both target up signs valid. Combining
+    those choices with the equivalent pair flip `(fw, up) == (-fw, -up)` makes
+    the forward and up axes unoriented for conditioning comparisons.
+    """
+    cond_fw = normalize_vectors(np.asarray(cond_fw_xyz, dtype=np.float32), eps=eps)
+    target_fw = normalize_vectors(np.asarray(target_fw_xyz, dtype=np.float32), eps=eps)
+    fw_agreement = np.abs(np.sum(cond_fw * target_fw, axis=-1))
+
+    if cond_up_xyz is None or target_up_xyz is None:
+        return np.clip(fw_agreement, 0.0, 1.0).astype(np.float32, copy=False)
+
+    cond_up_raw = np.asarray(cond_up_xyz, dtype=np.float32)
+    target_up_raw = np.asarray(target_up_xyz, dtype=np.float32)
+    cond_up = normalize_vectors(cond_up_raw, eps=eps)
+    target_up = normalize_vectors(target_up_raw, eps=eps)
+    up_agreement = np.abs(np.sum(cond_up * target_up, axis=-1))
+    frame_agreement = np.minimum(fw_agreement, up_agreement)
+
+    cond_up_ok = np.linalg.norm(cond_up_raw, axis=-1) > eps
+    target_up_ok = np.linalg.norm(target_up_raw, axis=-1) > eps
+    up_ok = cond_up_ok & target_up_ok
+    if target_up_valid is not None:
+        up_ok = up_ok & np.asarray(target_up_valid, dtype=bool)
+
+    agreement = np.where(up_ok, frame_agreement, fw_agreement)
+    return np.clip(agreement, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def folded_frame_error_degrees(
+    cond_fw_xyz: np.ndarray,
+    cond_up_xyz: np.ndarray | None,
+    target_fw_xyz: np.ndarray,
+    target_up_xyz: np.ndarray | None = None,
+    *,
+    target_up_valid: np.ndarray | None = None,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    agreement = folded_frame_agreement(
+        cond_fw_xyz,
+        cond_up_xyz,
+        target_fw_xyz,
+        target_up_xyz,
+        target_up_valid=target_up_valid,
+        eps=eps,
+    )
+    return np.asarray(
+        np.degrees(np.arccos(np.clip(agreement, 0.0, 1.0))),
+        dtype=np.float32,
+    )
+
+
 def decode_lasagna_normals_xyz(
     nx_encoded: np.ndarray,
     ny_encoded: np.ndarray,
@@ -276,6 +338,7 @@ def classify_voxels(
     line_points_xyz: np.ndarray,
     cond_fw_xyz: np.ndarray,
     valid_mask: np.ndarray,
+    cond_up_xyz: np.ndarray | None = None,
     normal_xyz: np.ndarray | None = None,
     normal_valid_mask: np.ndarray | None = None,
     allow_arbitrary_up_fallback: bool = False,
@@ -286,7 +349,7 @@ def classify_voxels(
     normal_perpendicular_jitter_voxels: float | None = None,
     negative_cone_distance_voxels: float | None = None,
     positive_cosine: float = 0.8660254037844386,
-    negative_cosine: float = 0.25881904510252074,
+    negative_cosine: float = 0.5,
     positive_target_id: int = 0,
 ) -> dict[str, np.ndarray]:
     crop_shape = tuple(int(v) for v in crop_shape)
@@ -330,7 +393,9 @@ def classify_voxels(
     )
     tangent_xyz = normalize_vectors(tangent_xyz)
     cond_fw = normalize_vector(cond_fw_xyz)
-    agreement = np.sum(tangent_xyz * cond_fw.reshape(1, 1, 1, 3), axis=-1)
+    cond_up = None
+    if cond_up_xyz is not None:
+        cond_up = normalize_vector(cond_up_xyz)
 
     labels = np.full(crop_shape, IGNORE_INDEX, dtype=np.int64)
     target_id = np.full(crop_shape, IGNORE_ID, dtype=np.int64)
@@ -355,14 +420,34 @@ def classify_voxels(
         normal_geometry_valid &= np.linalg.norm(normal_arr, axis=-1) > 1e-6
 
     valid = valid & normal_geometry_valid
+    target_up_xyz, target_up_valid = construct_up_vectors(
+        tangent_xyz,
+        normal_xyz,
+        allow_arbitrary_up_fallback=allow_arbitrary_up_fallback,
+    )
+    target_up_valid = target_up_valid & valid
+    folded_agreement = folded_frame_agreement(
+        cond_fw,
+        cond_up,
+        tangent_xyz,
+        target_up_xyz,
+        target_up_valid=target_up_valid,
+    )
+    folded_error_degrees = folded_frame_error_degrees(
+        cond_fw,
+        cond_up,
+        tangent_xyz,
+        target_up_xyz,
+        target_up_valid=target_up_valid,
+    )
     offset_xyz = coords_xyz - closest_xyz
     plane_offset = np.sum(offset_xyz * normal_for_geometry, axis=-1)
     in_plane_offset = offset_xyz - plane_offset[..., None] * normal_for_geometry
     in_plane_distance = np.linalg.norm(in_plane_offset, axis=-1)
     perpendicular_distance = np.abs(plane_offset)
 
-    aligned = agreement >= (float(positive_cosine) - 1e-6)
-    disagreed = agreement <= (float(negative_cosine) + 1e-6)
+    aligned = folded_agreement >= (float(positive_cosine) - 1e-6)
+    disagreed = folded_agreement <= (float(negative_cosine) + 1e-6)
 
     positive_zone = (
         valid
@@ -412,12 +497,6 @@ def classify_voxels(
             "degenerate_up_policy must be 'invalid' or 'raise', "
             f"got {degenerate_up_policy!r}"
         )
-    target_up_xyz, target_up_valid = construct_up_vectors(
-        tangent_xyz,
-        normal_xyz,
-        allow_arbitrary_up_fallback=allow_arbitrary_up_fallback,
-    )
-    target_up_valid = target_up_valid & valid
     if up_policy == "raise" and bool((positive & ~target_up_valid).any()):
         raise ValueError("positive voxels contain degenerate Lasagna normal up vectors")
 
@@ -433,5 +512,9 @@ def classify_voxels(
         "distance": distance,
         "in_plane_distance": in_plane_distance.astype(np.float32, copy=False),
         "perpendicular_distance": perpendicular_distance.astype(np.float32, copy=False),
-        "agreement": agreement.astype(np.float32, copy=False),
+        "agreement": folded_agreement.astype(np.float32, copy=False),
+        "folded_frame_agreement": folded_agreement.astype(np.float32, copy=False),
+        "folded_frame_error_degrees": folded_error_degrees.astype(
+            np.float32, copy=False
+        ),
     }

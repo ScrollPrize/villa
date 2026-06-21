@@ -430,13 +430,13 @@ class FiberTraceBatchBuilder:
             self.config.get("positive_direction_probability", 0.5)
         )
         self.positive_direction_jitter_degrees = float(
-            self.config.get("positive_direction_jitter_degrees", 10.0)
+            self.config.get("positive_direction_jitter_degrees", 30.0)
         )
         self.negative_direction_min_degrees = float(
             self.config.get("negative_direction_min_degrees", 60.0)
         )
         self.negative_direction_max_degrees = float(
-            self.config.get("negative_direction_max_degrees", 180.0)
+            self.config.get("negative_direction_max_degrees", 90.0)
         )
         self.positive_radius = float(self.config.get("positive_radius", 1.5))
         self.ignore_radius = float(
@@ -452,11 +452,37 @@ class FiberTraceBatchBuilder:
             self.config.get("negative_cone_distance_voxels", 30.0)
         )
         self.positive_cosine = float(
-            self.config.get("positive_cosine", np.cos(np.deg2rad(45.0)))
+            self.config.get("positive_cosine", np.cos(np.deg2rad(30.0)))
         )
         self.negative_cosine = float(
             self.config.get("negative_cosine", np.cos(np.deg2rad(60.0)))
         )
+        if not np.isfinite(self.positive_direction_jitter_degrees):
+            raise ValueError("positive_direction_jitter_degrees must be finite")
+        if self.positive_direction_jitter_degrees < 0.0:
+            raise ValueError("positive_direction_jitter_degrees must be >= 0")
+        if self.positive_direction_jitter_degrees > 90.0:
+            raise ValueError(
+                "positive_direction_jitter_degrees is a folded-frame angle and "
+                "must be <= 90"
+            )
+        if (
+            not np.isfinite(self.negative_direction_min_degrees)
+            or not np.isfinite(self.negative_direction_max_degrees)
+        ):
+            raise ValueError("negative direction folded-frame degrees must be finite")
+        if self.negative_direction_min_degrees < 0.0:
+            raise ValueError("negative_direction_min_degrees must be >= 0")
+        if self.negative_direction_max_degrees > 90.0:
+            raise ValueError(
+                "negative_direction_max_degrees is a folded-frame maximum and "
+                "must be <= 90"
+            )
+        if self.negative_direction_min_degrees > self.negative_direction_max_degrees:
+            raise ValueError(
+                "negative_direction_min_degrees must be <= "
+                "negative_direction_max_degrees"
+            )
         self.random_valid_max_attempts = int(
             self.config.get("random_valid_max_attempts", 256)
         )
@@ -1002,6 +1028,7 @@ class FiberTraceBatchBuilder:
             line_points_xyz=record.fiber.line_points_xyz
             / float(record.volume_spacing_base),
             cond_fw_xyz=cond_fw_xyz,
+            cond_up_xyz=cond_up_xyz,
             valid_mask=crop_base["valid_mask"],
             normal_xyz=crop_base["normal_xyz"],
             normal_valid_mask=crop_base["normal_valid_mask"],
