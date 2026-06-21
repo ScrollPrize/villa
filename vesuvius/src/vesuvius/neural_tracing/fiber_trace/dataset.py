@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import glob
+import importlib.util
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,8 +70,84 @@ class _FiberRecord:
     nx: Any | None
     ny: Any | None
     volume_scale: int
+    volume_spacing_base: float
+    mask_spacing_base: float
+    nx_spacing_base: float | None
+    ny_spacing_base: float | None
     dataset_config: dict[str, Any]
     valid_threshold: float
+
+
+_REMOTE_PREFIXES = ("http://", "https://", "s3://")
+
+
+def _is_remote_path(path: str | Path) -> bool:
+    return str(path).startswith(_REMOTE_PREFIXES)
+
+
+def _resolve_config_relative_path(path: str | Path, config: dict[str, Any]) -> str:
+    path_s = str(path)
+    if _is_remote_path(path_s):
+        return path_s
+    path_obj = Path(path_s).expanduser()
+    if path_obj.is_absolute():
+        return str(path_obj)
+    config_dir = config.get("_config_dir") or config.get("config_dir")
+    if config_dir:
+        return str((Path(config_dir).expanduser() / path_obj).resolve())
+    return str((Path.cwd() / path_obj).resolve())
+
+
+def _scale_level_to_spacing_base(scale_level: int) -> float:
+    scale_level = int(scale_level)
+    if scale_level < 0:
+        raise ValueError(f"scale level must be >= 0, got {scale_level}")
+    return float(1 << scale_level)
+
+
+def _omezarr_level_shape(
+    base_shape_zyx: tuple[int, int, int], scale_level: int
+) -> tuple[int, int, int]:
+    z, y, x = (int(v) for v in base_shape_zyx)
+    for _ in range(max(0, int(scale_level))):
+        z = max(1, (z + 1) // 2)
+        y = max(1, (y + 1) // 2)
+        x = max(1, (x + 1) // 2)
+    return z, y, x
+
+
+class _SpatialChannelView:
+    """3D view over a 3D zarr or one channel of a CZYX zarr."""
+
+    def __init__(self, array: Any, *, channel_index: int, label: str) -> None:
+        self.array = array
+        self.channel_index = int(channel_index)
+        self.label = str(label)
+        shape = tuple(int(v) for v in getattr(array, "shape", ()))
+        if len(shape) == 3:
+            self._shape = shape
+            self._is_czyx = False
+        elif len(shape) == 4:
+            if self.channel_index < 0 or self.channel_index >= shape[0]:
+                raise ValueError(
+                    f"{self.label} channel index {self.channel_index} is out of "
+                    f"bounds for CZYX shape {shape}"
+                )
+            self._shape = shape[1:]
+            self._is_czyx = True
+        else:
+            raise ValueError(f"{self.label} must be a 3D or CZYX array, got {shape}")
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return self._shape
+
+    def __getitem__(self, key: Any) -> Any:
+        if self._is_czyx:
+            if not isinstance(key, tuple):
+                key = (key,)
+            return self.array[(self.channel_index,) + key]
+        return self.array[key]
 
 
 def _as_zyx3(value: Any, *, key: str) -> tuple[int, int, int]:
@@ -95,6 +173,107 @@ def _open_zarr_group(
     return _common_open_zarr_group(path, auth_json_path=auth_json_path, config=config)
 
 
+def _open_zarr_array_resolved(
+    path: str | Path, *, scale: int, auth_json_path: str | None, config: dict[str, Any]
+):
+    return _open_zarr_array(
+        _resolve_config_relative_path(path, config),
+        scale=scale,
+        auth_json_path=auth_json_path,
+        config=config,
+    )
+
+
+def _load_lasagna_volume(path: str | Path, config: dict[str, Any]) -> Any:
+    resolved = _resolve_config_relative_path(path, config)
+    if _is_remote_path(resolved):
+        raise ValueError("lasagna_manifest_path must be a local .lasagna.json file")
+    try:
+        from lasagna.lasagna_volume import LasagnaVolume
+    except ImportError:
+        try:
+            from lasagna_volume import LasagnaVolume
+        except ImportError:
+            repo_root = Path(__file__).resolve().parents[5]
+            module_path = repo_root / "lasagna" / "lasagna_volume.py"
+            if not module_path.exists():
+                raise
+            spec = importlib.util.spec_from_file_location(
+                "_fiber_trace_lasagna_volume", module_path
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"could not load LasagnaVolume from {module_path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            LasagnaVolume = module.LasagnaVolume
+
+    return LasagnaVolume.load(resolved)
+
+
+def _manifest_group_root_and_level(volume: Any, group: Any) -> tuple[str, int]:
+    group_path = Path(group.zarr_path)
+    abs_path = group_path if group_path.is_absolute() else volume.path.parent / group_path
+    data_level = int(group.scaledown)
+    if abs_path.name.isdigit():
+        data_level = int(abs_path.name)
+        abs_path = abs_path.parent
+    return str(abs_path.resolve()), data_level
+
+
+def _spatial_shape(array: Any, *, label: str) -> tuple[int, int, int]:
+    return _SpatialChannelView(array, channel_index=0, label=label).shape
+
+
+def _volume_shape_zyx(array: Any, *, label: str) -> tuple[int, int, int]:
+    shape = tuple(int(v) for v in getattr(array, "shape", ()))
+    if len(shape) != 3:
+        raise ValueError(f"{label} must be a 3D ZYX array, got shape={shape}")
+    return shape
+
+
+def _validate_shape(
+    shape: tuple[int, int, int],
+    expected: tuple[int, int, int],
+    *,
+    label: str,
+    context: str,
+) -> None:
+    if tuple(shape) != tuple(expected):
+        raise ValueError(
+            f"{label} shape mismatch: shape={tuple(shape)} expected={tuple(expected)} "
+            f"from {context}"
+        )
+
+
+def _open_manifest_channel(
+    volume: Any,
+    channel_name: str,
+    *,
+    auth_json_path: str | None,
+    config: dict[str, Any],
+) -> tuple[_SpatialChannelView, float]:
+    group, channel_index = volume.channel_group(channel_name)
+    root_path, data_level = _manifest_group_root_and_level(volume, group)
+    array = _open_zarr_array(
+        root_path, scale=data_level, auth_json_path=auth_json_path, config=config
+    )
+    view = _SpatialChannelView(array, channel_index=channel_index, label=channel_name)
+    if volume.base_shape_zyx is not None:
+        expected = _omezarr_level_shape(volume.base_shape_zyx, int(group.scaledown))
+        _validate_shape(
+            view.shape,
+            expected,
+            label=f"Lasagna {channel_name}",
+            context=(
+                f"base_shape_zyx={volume.base_shape_zyx} "
+                f"scaledown={group.scaledown}"
+            ),
+        )
+    spacing_base = float(group.sd_fac) * float(volume.source_to_base)
+    return view, spacing_base
+
+
 def _read_raw_crop(
     array: Any, crop_shape: tuple[int, int, int], min_corner: np.ndarray
 ) -> np.ndarray:
@@ -118,6 +297,82 @@ def _read_raw_crop(
     return out
 
 
+def _read_scaled_channel_crop(
+    array: Any,
+    crop_shape: tuple[int, int, int],
+    min_corner: np.ndarray,
+    *,
+    dst_spacing_base: float,
+    src_spacing_base: float,
+) -> np.ndarray:
+    dst_spacing_base = float(dst_spacing_base)
+    src_spacing_base = float(src_spacing_base)
+    if dst_spacing_base <= 0.0 or src_spacing_base <= 0.0:
+        raise ValueError(
+            "channel spacing must be positive: "
+            f"dst={dst_spacing_base} src={src_spacing_base}"
+        )
+    if abs(dst_spacing_base - src_spacing_base) < 1e-6:
+        return _read_raw_crop(array, crop_shape, min_corner)
+
+    sample_axes = [
+        np.arange(int(crop_shape[axis]), dtype=np.int64) + int(min_corner[axis])
+        for axis in range(3)
+    ]
+    src_axes = [
+        np.floor(axis.astype(np.float64) * dst_spacing_base / src_spacing_base).astype(
+            np.int64
+        )
+        for axis in sample_axes
+    ]
+    src_shape = np.asarray(array.shape, dtype=np.int64)
+    valid_axes = [
+        (src_axes[axis] >= 0) & (src_axes[axis] < src_shape[axis])
+        for axis in range(3)
+    ]
+    sample_dtype = np.asarray(array[0:1, 0:1, 0:1]).dtype
+    out = np.zeros(crop_shape, dtype=sample_dtype)
+    if not all(bool(valid.any()) for valid in valid_axes):
+        return out
+
+    z_idx = src_axes[0][valid_axes[0]]
+    y_idx = src_axes[1][valid_axes[1]]
+    x_idx = src_axes[2][valid_axes[2]]
+    z0, z1 = int(z_idx.min()), int(z_idx.max()) + 1
+    y0, y1 = int(y_idx.min()), int(y_idx.max()) + 1
+    x0, x1 = int(x_idx.min()), int(x_idx.max()) + 1
+    block = np.asarray(array[z0:z1, y0:y1, x0:x1])
+    data = block[np.ix_(z_idx - z0, y_idx - y0, x_idx - x0)]
+    out[np.ix_(valid_axes[0], valid_axes[1], valid_axes[2])] = data
+    return out
+
+
+def _value_at_sample_zyx(
+    array: Any,
+    sample_zyx: np.ndarray,
+    *,
+    sample_spacing_base: float,
+    array_spacing_base: float,
+) -> tuple[np.ndarray, bool]:
+    sample_zyx = np.asarray(sample_zyx, dtype=np.float64)
+    array_zyx = np.floor(
+        sample_zyx * float(sample_spacing_base) / float(array_spacing_base)
+    ).astype(np.int64)
+    shape = np.asarray(array.shape, dtype=np.int64)
+    if np.any(array_zyx < 0) or np.any(array_zyx >= shape):
+        return np.zeros((), dtype=np.asarray(array[0:1, 0:1, 0:1]).dtype), False
+    value = np.asarray(
+        array[
+            array_zyx[0] : array_zyx[0] + 1,
+            array_zyx[1] : array_zyx[1] + 1,
+            array_zyx[2] : array_zyx[2] + 1,
+        ]
+    )
+    if value.size == 0:
+        return np.zeros((), dtype=np.asarray(array[0:1, 0:1, 0:1]).dtype), False
+    return value.reshape(-1)[0], True
+
+
 def _read_image_crop_from_patch(
     patch: Any,
     crop_shape: tuple[int, int, int],
@@ -135,13 +390,16 @@ def _read_image_crop_from_patch(
     )
 
 
-def _resolve_fiber_paths(dataset_config: dict[str, Any]) -> list[Path]:
+def _resolve_fiber_paths(
+    dataset_config: dict[str, Any], config: dict[str, Any]
+) -> list[Path]:
     paths: list[Path] = []
     for item in dataset_config.get("fiber_paths", []) or []:
-        paths.append(Path(item))
+        paths.append(Path(_resolve_config_relative_path(item, config)))
     fiber_glob = dataset_config.get("fiber_glob")
     if fiber_glob:
-        paths.extend(Path(path) for path in sorted(glob.glob(str(fiber_glob))))
+        resolved_glob = _resolve_config_relative_path(fiber_glob, config)
+        paths.extend(Path(path) for path in sorted(glob.glob(resolved_glob)))
     if not paths:
         raise ValueError("dataset entry must provide fiber_paths or fiber_glob")
     return paths
@@ -251,6 +509,10 @@ class FiberTraceBatchBuilder:
                         nx=nx_arr,
                         ny=ny_arr,
                         volume_scale=0,
+                        volume_spacing_base=1.0,
+                        mask_spacing_base=1.0,
+                        nx_spacing_base=None if nx_arr is None else 1.0,
+                        ny_spacing_base=None if ny_arr is None else 1.0,
                         dataset_config=record_config,
                         valid_threshold=float(
                             record_config.get("valid_mask_threshold", 0.0)
@@ -265,93 +527,205 @@ class FiberTraceBatchBuilder:
             if array_records is not None:
                 break
             dataset_config = dict(dataset_config_raw)
-            volume_path = dataset_config.get("volume_path")
+            lasagna_manifest_path = (
+                dataset_config.get("lasagna_manifest_path")
+                or dataset_config.get("lasagna_json")
+                or dataset_config.get("manifest_path")
+            )
+            volume_path = dataset_config.get("base_volume_path") or dataset_config.get(
+                "volume_path"
+            )
             if not volume_path:
-                raise ValueError("dataset entry missing volume_path")
-            mask_path = dataset_config.get("mask_path") or dataset_config.get(
-                "grad_mag_path"
-            )
-            if not mask_path:
-                raise ValueError(
-                    "dataset entry must provide mask_path or grad_mag_path"
+                raise ValueError("dataset entry missing base_volume_path")
+            if not lasagna_manifest_path:
+                mask_path_raw = dataset_config.get("mask_path") or dataset_config.get(
+                    "grad_mag_path"
                 )
-            nx_path = dataset_config.get("nx_path")
-            ny_path = dataset_config.get("ny_path")
-            if (not nx_path or not ny_path) and not self.allow_arbitrary_up_fallback:
-                raise ValueError(
-                    "dataset entry must provide explicit Lasagna nx_path and ny_path "
-                    "normal channels"
-                )
+                if not mask_path_raw:
+                    raise ValueError(
+                        "dataset entry must provide lasagna_manifest_path, "
+                        "mask_path or grad_mag_path"
+                    )
+                if (
+                    not dataset_config.get("nx_path")
+                    or not dataset_config.get("ny_path")
+                ) and not self.allow_arbitrary_up_fallback:
+                    raise ValueError(
+                        "dataset entry must provide lasagna_manifest_path or explicit "
+                        "Lasagna nx_path and ny_path normal channels"
+                    )
 
-            volume_scale = int(dataset_config.get("volume_scale", 0))
-            mask_scale = int(
+            volume_scale = int(
                 dataset_config.get(
-                    "mask_scale", dataset_config.get("grad_mag_scale", volume_scale)
+                    "base_volume_scale", dataset_config.get("volume_scale", 0)
                 )
             )
-            normal_scale = int(dataset_config.get("normal_scale", volume_scale))
-            volume = _open_zarr_array(
+            volume_spacing_base = _scale_level_to_spacing_base(volume_scale)
+            volume = _open_zarr_array_resolved(
                 volume_path,
                 scale=volume_scale,
-                auth_json_path=dataset_config.get("volume_auth_json"),
-                config=self.config,
-            )
-            mask = _open_zarr_array(
-                mask_path,
-                scale=mask_scale,
                 auth_json_path=dataset_config.get(
-                    "mask_auth_json", dataset_config.get("volume_auth_json")
+                    "base_volume_auth_json", dataset_config.get("volume_auth_json")
                 ),
                 config=self.config,
             )
-            if nx_path and ny_path:
-                nx = _open_zarr_array(
-                    nx_path,
-                    scale=int(dataset_config.get("nx_scale", normal_scale)),
-                    auth_json_path=dataset_config.get(
-                        "nx_auth_json",
-                        dataset_config.get(
-                            "normal_auth_json", dataset_config.get("volume_auth_json")
-                        ),
-                    ),
-                    config=self.config,
+
+            if lasagna_manifest_path:
+                lasagna_volume = _load_lasagna_volume(
+                    lasagna_manifest_path, self.config
                 )
-                ny = _open_zarr_array(
-                    ny_path,
-                    scale=int(dataset_config.get("ny_scale", normal_scale)),
-                    auth_json_path=dataset_config.get(
-                        "ny_auth_json",
-                        dataset_config.get(
-                            "normal_auth_json", dataset_config.get("volume_auth_json")
+                if lasagna_volume.base_shape_zyx is None:
+                    raise ValueError(
+                        "Lasagna manifest must provide base_shape_zyx for fiber "
+                        "trace training"
+                    )
+                base_level0 = (
+                    volume
+                    if volume_scale == 0
+                    else _open_zarr_array_resolved(
+                        volume_path,
+                        scale=0,
+                        auth_json_path=dataset_config.get(
+                            "base_volume_auth_json",
+                            dataset_config.get("volume_auth_json"),
                         ),
-                    ),
-                    config=self.config,
+                        config=self.config,
+                    )
                 )
+                _validate_shape(
+                    _volume_shape_zyx(base_level0, label="base volume level 0"),
+                    tuple(lasagna_volume.base_shape_zyx),
+                    label="base volume level 0",
+                    context=f"Lasagna manifest {lasagna_manifest_path}",
+                )
+                _validate_shape(
+                    _volume_shape_zyx(volume, label="base volume selected level"),
+                    _omezarr_level_shape(lasagna_volume.base_shape_zyx, volume_scale),
+                    label="base volume selected level",
+                    context=(
+                        f"base_shape_zyx={lasagna_volume.base_shape_zyx} "
+                        f"base_volume_scale={volume_scale}"
+                    ),
+                )
+                try:
+                    mask, mask_spacing_base = _open_manifest_channel(
+                        lasagna_volume,
+                        "grad_mag",
+                        auth_json_path=dataset_config.get("lasagna_auth_json"),
+                        config=self.config,
+                    )
+                except KeyError as exc:
+                    raise ValueError(
+                        "Lasagna manifest missing required grad_mag channel"
+                    ) from exc
+                if self.allow_arbitrary_up_fallback:
+                    nx = None
+                    ny = None
+                    nx_spacing_base = None
+                    ny_spacing_base = None
+                else:
+                    try:
+                        nx, nx_spacing_base = _open_manifest_channel(
+                            lasagna_volume,
+                            "nx",
+                            auth_json_path=dataset_config.get("lasagna_auth_json"),
+                            config=self.config,
+                        )
+                        ny, ny_spacing_base = _open_manifest_channel(
+                            lasagna_volume,
+                            "ny",
+                            auth_json_path=dataset_config.get("lasagna_auth_json"),
+                            config=self.config,
+                        )
+                    except KeyError as exc:
+                        raise ValueError(
+                            "Lasagna manifest missing required nx/ny normal channels"
+                        ) from exc
+                    if abs(float(nx_spacing_base) - float(ny_spacing_base)) > 1e-6:
+                        raise ValueError(
+                            "Lasagna nx and ny normal channel spacing mismatch: "
+                            f"nx={nx_spacing_base} ny={ny_spacing_base}"
+                        )
             else:
-                nx = None
-                ny = None
-            if tuple(volume.shape) != tuple(mask.shape):
-                raise ValueError(
-                    "mask/grad-mag shape must match volume shape at selected levels: "
-                    f"volume={tuple(volume.shape)} mask={tuple(mask.shape)}"
+                mask_path = dataset_config.get("mask_path") or dataset_config.get(
+                    "grad_mag_path"
                 )
-            if nx is not None and tuple(volume.shape) != tuple(nx.shape):
-                raise ValueError(
-                    "nx normal shape must match volume shape at selected levels: "
-                    f"volume={tuple(volume.shape)} nx={tuple(nx.shape)}"
+                if not mask_path:
+                    raise ValueError(
+                        "dataset entry must provide lasagna_manifest_path or "
+                        "mask_path/grad_mag_path"
+                    )
+                nx_path = dataset_config.get("nx_path")
+                ny_path = dataset_config.get("ny_path")
+                if (
+                    not nx_path or not ny_path
+                ) and not self.allow_arbitrary_up_fallback:
+                    raise ValueError(
+                        "dataset entry must provide lasagna_manifest_path or explicit "
+                        "Lasagna nx_path and ny_path normal channels"
+                    )
+                mask_scale = int(
+                    dataset_config.get(
+                        "mask_scale",
+                        dataset_config.get("grad_mag_scale", volume_scale),
+                    )
                 )
-            if ny is not None and tuple(volume.shape) != tuple(ny.shape):
-                raise ValueError(
-                    "ny normal shape must match volume shape at selected levels: "
-                    f"volume={tuple(volume.shape)} ny={tuple(ny.shape)}"
+                normal_scale = int(dataset_config.get("normal_scale", volume_scale))
+                mask = _open_zarr_array_resolved(
+                    mask_path,
+                    scale=mask_scale,
+                    auth_json_path=dataset_config.get(
+                        "mask_auth_json", dataset_config.get("volume_auth_json")
+                    ),
+                    config=self.config,
                 )
+                mask_spacing_base = _scale_level_to_spacing_base(mask_scale)
+                if nx_path and ny_path:
+                    nx_scale = int(dataset_config.get("nx_scale", normal_scale))
+                    ny_scale = int(dataset_config.get("ny_scale", normal_scale))
+                    nx = _open_zarr_array_resolved(
+                        nx_path,
+                        scale=nx_scale,
+                        auth_json_path=dataset_config.get(
+                            "nx_auth_json",
+                            dataset_config.get(
+                                "normal_auth_json",
+                                dataset_config.get("volume_auth_json"),
+                            ),
+                        ),
+                        config=self.config,
+                    )
+                    ny = _open_zarr_array_resolved(
+                        ny_path,
+                        scale=ny_scale,
+                        auth_json_path=dataset_config.get(
+                            "ny_auth_json",
+                            dataset_config.get(
+                                "normal_auth_json",
+                                dataset_config.get("volume_auth_json"),
+                            ),
+                        ),
+                        config=self.config,
+                    )
+                    nx_spacing_base = _scale_level_to_spacing_base(nx_scale)
+                    ny_spacing_base = _scale_level_to_spacing_base(ny_scale)
+                    if abs(float(nx_spacing_base) - float(ny_spacing_base)) > 1e-6:
+                        raise ValueError(
+                            "Lasagna nx_path and ny_path scale mismatch: "
+                            f"nx_scale={nx_scale} ny_scale={ny_scale}"
+                        )
+                else:
+                    nx = None
+                    ny = None
+                    nx_spacing_base = None
+                    ny_spacing_base = None
 
             valid_threshold = float(
                 dataset_config.get(
                     "valid_mask_threshold", self.config.get("valid_mask_threshold", 0.0)
                 )
             )
-            for fiber_path in _resolve_fiber_paths(dataset_config):
+            for fiber_path in _resolve_fiber_paths(dataset_config, self.config):
                 self.records.append(
                     _FiberRecord(
                         fiber=load_vc3d_fiber(fiber_path),
@@ -360,6 +734,10 @@ class FiberTraceBatchBuilder:
                         nx=nx,
                         ny=ny,
                         volume_scale=volume_scale,
+                        volume_spacing_base=volume_spacing_base,
+                        mask_spacing_base=mask_spacing_base,
+                        nx_spacing_base=nx_spacing_base,
+                        ny_spacing_base=ny_spacing_base,
                         dataset_config=dataset_config,
                         valid_threshold=valid_threshold,
                     )
@@ -382,58 +760,63 @@ class FiberTraceBatchBuilder:
             if self.allow_arbitrary_up_fallback:
                 return None, True
             raise ValueError("Lasagna nx/ny normal channels are required")
-        center = np.asarray(center_zyx, dtype=np.int64)
-        shape = np.asarray(record.nx.shape, dtype=np.int64)
-        if np.any(center < 0) or np.any(center >= shape):
+        if record.nx_spacing_base is None or record.ny_spacing_base is None:
+            raise ValueError("Lasagna nx/ny spacing metadata is required")
+        nx_value, nx_ok = _value_at_sample_zyx(
+            record.nx,
+            center_zyx,
+            sample_spacing_base=record.volume_spacing_base,
+            array_spacing_base=record.nx_spacing_base,
+        )
+        ny_value, ny_ok = _value_at_sample_zyx(
+            record.ny,
+            center_zyx,
+            sample_spacing_base=record.volume_spacing_base,
+            array_spacing_base=record.ny_spacing_base,
+        )
+        if not nx_ok or not ny_ok:
             return np.zeros(3, dtype=np.float32), False
-        nx_vox = np.asarray(
-            record.nx[
-                center[0] : center[0] + 1,
-                center[1] : center[1] + 1,
-                center[2] : center[2] + 1,
-            ]
-        )
-        ny_vox = np.asarray(
-            record.ny[
-                center[0] : center[0] + 1,
-                center[1] : center[1] + 1,
-                center[2] : center[2] + 1,
-            ]
-        )
+        nx_vox = np.asarray([nx_value])
+        ny_vox = np.asarray([ny_value])
         normal_xyz, valid = decode_lasagna_normals_xyz(nx_vox, ny_vox)
         return normal_xyz.reshape(-1, 3)[0], bool(valid.reshape(-1)[0])
 
     def _sample_random_valid_center(self, record: _FiberRecord) -> np.ndarray:
-        shape = np.asarray(record.mask.shape, dtype=np.int64)
+        shape = np.asarray(record.volume.shape, dtype=np.int64)
         for _ in range(self.random_valid_max_attempts):
             center = np.asarray(
                 [self.rng.integers(0, int(size)) for size in shape], dtype=np.int64
             )
-            value = np.asarray(
-                record.mask[
-                    center[0] : center[0] + 1,
-                    center[1] : center[1] + 1,
-                    center[2] : center[2] + 1,
-                ]
+            value, mask_ok = _value_at_sample_zyx(
+                record.mask,
+                center,
+                sample_spacing_base=record.volume_spacing_base,
+                array_spacing_base=record.mask_spacing_base,
             )
-            if value.size and float(value.reshape(-1)[0]) > record.valid_threshold:
+            if mask_ok and float(value) > record.valid_threshold:
                 _, normal_valid = self._normal_at_zyx(record, center)
                 if normal_valid:
                     return center
 
         mask_np = np.asarray(record.mask[:])
         valid_mask = mask_np > record.valid_threshold
-        if record.nx is not None and record.ny is not None:
-            _, normal_valid = decode_lasagna_normals_xyz(
-                np.asarray(record.nx[:]), np.asarray(record.ny[:])
-            )
-            valid_mask = valid_mask & normal_valid
-        valid_coords = np.argwhere(valid_mask)
-        if valid_coords.size == 0:
+        valid_mask_coords = np.argwhere(valid_mask)
+        if valid_mask_coords.size == 0:
             raise ValueError("mask/grad-mag and nx/ny volumes contain no valid voxels")
-        return valid_coords[int(self.rng.integers(0, valid_coords.shape[0]))].astype(
-            np.int64, copy=False
-        )
+        order = self.rng.permutation(valid_mask_coords.shape[0])
+        for idx in order:
+            mask_center = valid_mask_coords[int(idx)]
+            center = np.rint(
+                mask_center.astype(np.float64)
+                * float(record.mask_spacing_base)
+                / float(record.volume_spacing_base)
+            ).astype(np.int64)
+            if np.any(center < 0) or np.any(center >= shape):
+                continue
+            _, normal_valid = self._normal_at_zyx(record, center)
+            if normal_valid:
+                return center
+        raise ValueError("mask/grad-mag and nx/ny volumes contain no valid voxels")
 
     def _sample_conditioning(
         self, tangent_xyz: np.ndarray, normal_xyz: np.ndarray | None
@@ -483,7 +866,9 @@ class FiberTraceBatchBuilder:
         if crop_kind == "gt_control":
             controls_xyz = fiber.control_points_xyz
             center_xyz = controls_xyz[int(self.rng.integers(0, controls_xyz.shape[0]))]
-            center = np.rint(xyz_to_zyx(center_xyz)).astype(np.int64)
+            center = np.rint(
+                xyz_to_zyx(center_xyz) / float(record.volume_spacing_base)
+            ).astype(np.int64)
         elif crop_kind == "random_valid":
             center = self._sample_random_valid_center(record)
         else:
@@ -504,7 +889,13 @@ class FiberTraceBatchBuilder:
             image_normalization=self.image_normalization,
         )
         valid_crop = (
-            _read_raw_crop(record.mask, self.crop_size, min_corner)
+            _read_scaled_channel_crop(
+                record.mask,
+                self.crop_size,
+                min_corner,
+                dst_spacing_base=record.volume_spacing_base,
+                src_spacing_base=record.mask_spacing_base,
+            )
             > record.valid_threshold
         )
         if record.nx is None or record.ny is None:
@@ -513,8 +904,22 @@ class FiberTraceBatchBuilder:
             normal_xyz_crop = None
             normal_valid_crop = np.ones(self.crop_size, dtype=bool)
         else:
-            nx_crop = _read_raw_crop(record.nx, self.crop_size, min_corner)
-            ny_crop = _read_raw_crop(record.ny, self.crop_size, min_corner)
+            if record.nx_spacing_base is None or record.ny_spacing_base is None:
+                raise ValueError("Lasagna nx/ny spacing metadata is required")
+            nx_crop = _read_scaled_channel_crop(
+                record.nx,
+                self.crop_size,
+                min_corner,
+                dst_spacing_base=record.volume_spacing_base,
+                src_spacing_base=record.nx_spacing_base,
+            )
+            ny_crop = _read_scaled_channel_crop(
+                record.ny,
+                self.crop_size,
+                min_corner,
+                dst_spacing_base=record.volume_spacing_base,
+                src_spacing_base=record.ny_spacing_base,
+            )
             normal_xyz_crop, normal_valid_crop = decode_lasagna_normals_xyz(
                 nx_crop, ny_crop
             )
@@ -525,7 +930,8 @@ class FiberTraceBatchBuilder:
             )
 
         tangent_xyz = tangent_at_point(
-            fiber.line_points_xyz, zyx_to_xyz(center.astype(np.float32))
+            fiber.line_points_xyz,
+            zyx_to_xyz(center.astype(np.float32) * float(record.volume_spacing_base)),
         )
         cond_fw_xyz, cond_up_xyz, direction_kind = self._sample_conditioning(
             tangent_xyz, center_normal_xyz
@@ -533,7 +939,7 @@ class FiberTraceBatchBuilder:
         classified = classify_voxels(
             crop_origin_zyx=min_corner,
             crop_shape=self.crop_size,
-            line_points_xyz=fiber.line_points_xyz,
+            line_points_xyz=fiber.line_points_xyz / float(record.volume_spacing_base),
             cond_fw_xyz=cond_fw_xyz,
             valid_mask=valid_crop,
             normal_xyz=normal_xyz_crop,

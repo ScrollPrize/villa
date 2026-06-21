@@ -263,7 +263,12 @@ def test_zarr_access_uses_common_helpers_without_direct_fallback(
 
     def fake_open_zarr(path, *, scale=None, auth_json_path=None, config=None):
         calls.append(("array", str(path), int(scale)))
-        return {"volume": volume, "mask": mask, "nx": nx, "ny": ny}[str(path)]
+        return {
+            str((Path.cwd() / "volume").resolve()): volume,
+            str((Path.cwd() / "mask").resolve()): mask,
+            str((Path.cwd() / "nx").resolve()): nx,
+            str((Path.cwd() / "ny").resolve()): ny,
+        }[str(path)]
 
     monkeypatch.setattr(fiber_dataset, "_common_open_zarr_group", fake_open_group)
     monkeypatch.setattr(fiber_dataset, "_common_open_zarr", fake_open_zarr)
@@ -284,10 +289,105 @@ def test_zarr_access_uses_common_helpers_without_direct_fallback(
         }
     )
     assert calls == [
-        ("array", "volume", 0),
-        ("array", "mask", 0),
-        ("array", "nx", 0),
-        ("array", "ny", 0),
+        ("array", str((Path.cwd() / "volume").resolve()), 0),
+        ("array", str((Path.cwd() / "mask").resolve()), 0),
+        ("array", str((Path.cwd() / "nx").resolve()), 0),
+        ("array", str((Path.cwd() / "ny").resolve()), 0),
+    ]
+
+
+def test_lasagna_manifest_drives_channels_and_scaled_sampling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fiber_path = tmp_path / "fiber.json"
+    _write_fiber(fiber_path)
+    (tmp_path / "umbilicus.json").write_text(
+        json.dumps({"control_points": [{"x": 8, "y": 8, "z": 8}]}),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "pred.lasagna.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "source_to_base": 1.0,
+                "base_shape_zyx": [16, 16, 16],
+                "umbilicus_json": "umbilicus.json",
+                "groups": {
+                    "grad_mag": {
+                        "zarr": "grad_mag.ome.zarr/2",
+                        "scaledown": 2,
+                        "channels": ["grad_mag"],
+                    },
+                    "nx": {
+                        "zarr": "normal.ome.zarr/2",
+                        "scaledown": 2,
+                        "channels": ["nx", "ny"],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    base_root = tmp_path / "base.ome.zarr"
+    grad_root = tmp_path / "grad_mag.ome.zarr"
+    normal_root = tmp_path / "normal.ome.zarr"
+    base0 = np.zeros((16, 16, 16), dtype=np.uint8)
+    base1 = np.zeros((8, 8, 8), dtype=np.uint8)
+    grad = np.ones((4, 4, 4), dtype=np.uint8)
+    normals = np.stack(
+        [
+            np.full((4, 4, 4), 128, dtype=np.uint8),
+            np.full((4, 4, 4), 128, dtype=np.uint8),
+        ],
+        axis=0,
+    )
+    calls: list[tuple[str, int]] = []
+
+    def fake_open_zarr(path, *, scale=None, auth_json_path=None, config=None):
+        calls.append((str(path), int(scale)))
+        if str(path) == str(base_root.resolve()) and int(scale) == 0:
+            return base0
+        if str(path) == str(base_root.resolve()) and int(scale) == 1:
+            return base1
+        if str(path) == str(grad_root.resolve()) and int(scale) == 2:
+            return grad
+        if str(path) == str(normal_root.resolve()) and int(scale) == 2:
+            return normals
+        raise AssertionError((path, scale))
+
+    monkeypatch.setattr(fiber_dataset, "_common_open_zarr", fake_open_zarr)
+    builder = FiberTraceBatchBuilder(
+        {
+            "crop_size": [4, 4, 4],
+            "batch_size": 2,
+            "seed": 1,
+            "image_normalization": "unit",
+            "positive_direction_probability": 1.0,
+            "positive_direction_jitter_degrees": 0.0,
+            "datasets": [
+                {
+                    "base_volume_path": str(base_root),
+                    "base_volume_scale": 1,
+                    "lasagna_manifest_path": str(manifest_path),
+                    "fiber_paths": [str(fiber_path)],
+                }
+            ],
+        },
+        rng=np.random.default_rng(3),
+    )
+    batch = builder.sample_batch(record_index=0)
+
+    assert batch.volume.shape == (2, 1, 4, 4, 4)
+    assert bool((batch.labels == POSITIVE_LABEL).any())
+    assert bool((batch.target_up_valid & (batch.labels == POSITIVE_LABEL)).any())
+    assert calls[:5] == [
+        (str(base_root.resolve()), 1),
+        (str(base_root.resolve()), 0),
+        (str(grad_root.resolve()), 2),
+        (str(normal_root.resolve()), 2),
+        (str(normal_root.resolve()), 2),
     ]
 
 

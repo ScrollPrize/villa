@@ -22,18 +22,30 @@ through all geometry calculations. Volume crops, masks, zarr reads, and tensor
 spatial axes are `z, y, x`; the loader converts `xyz -> zyx` only when indexing
 dense arrays.
 
-Each dataset config entry must provide:
+The preferred dataset config entry provides:
 
-- `volume_path`: image zarr store
-- `volume_scale`: pyramid level, default `0`
-- `mask_path` or `grad_mag_path`: mandatory valid-data source
-- `nx_path` and `ny_path`: mandatory Lasagna hemisphere-encoded normal channels
+- `base_volume_path`: base image OME-Zarr store
+- `base_volume_scale`: base image OME-Zarr pyramid level used as the training
+  grid, default `0`; level `L` has voxel spacing `2**L` in base voxels
+- `lasagna_manifest_path`: `.lasagna.json` manifest with `base_shape_zyx` and
+  `grad_mag`, `nx`, and `ny` channel groups
 - `fiber_paths` or `fiber_glob`: one or more VC3D fiber JSON files
+
+The loader validates that `base_volume_path` level 0 has shape equal to the
+manifest `base_shape_zyx`. Image crops are read at `base_volume_scale`.
+`grad_mag`, `nx`, and `ny` are opened through the manifest, using each group's
+`scaledown` and channel index. These Lasagna channels do not have to be the
+same shape as the selected base image level; they are sampled into the selected
+training grid according to the manifest scale convention.
 
 Remote zarr paths use the existing `vesuvius.neural_tracing.datasets.common`
 zarr/cache support. Missing mask or grad-mag data is an error, and mask shape
-must match the selected image volume level. Normal channel shapes must also
-match the selected image volume level.
+must align with the selected image volume level through the manifest. Normal
+channel shapes must align the same way.
+
+Legacy raw-path config with `volume_path`, `grad_mag_path` or `mask_path`, and
+`nx_path`/`ny_path` is still accepted for tests and direct debugging, but the
+manifest path is the intended training spec.
 
 ## Batch Construction
 
@@ -83,6 +95,12 @@ For every output voxel:
 The classifier also emits target local `fw` and `up` vector fields in `xyz`
 component order plus a `target_up_valid` mask.
 
+`positive_radius` and `ignore_radius` are measured in the selected training
+grid, not always base-level voxels. If `base_volume_scale` is `2`, then one
+training voxel spans `4` base voxels. The fiber coordinates remain base `xyz`;
+the loader divides them by `2**base_volume_scale` only for voxel
+classification.
+
 ## Model And Losses
 
 `DirectionConditionedFiberTraceModel` uses the existing
@@ -99,6 +117,44 @@ Losses are:
 - supervised contrastive / InfoNCE over classified positive and negative voxels
 - cosine forward-vector loss on positive voxels
 - sign-ambiguous cosine up-vector loss on positive voxels
+
+`loss.max_contrastive_samples` caps the number of classified voxels used by the
+contrastive term per batch. It limits memory/time for dense crops and does not
+change which voxels are labeled positive, negative, or ignored.
+
+## Config Knobs
+
+Use the runnable smoke template:
+
+```bash
+PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace.train vesuvius/src/vesuvius/neural_tracing/configs/fiber_trace_lasagna_smoke.json
+```
+
+Replace only the dataset paths first:
+
+- `base_volume_path`: the scan OME-Zarr
+- `base_volume_scale`: which scan OME-Zarr level to train on
+- `lasagna_manifest_path`: the Lasagna `.lasagna.json`
+- `fiber_glob` or `fiber_paths`: VC3D fiber JSON files
+
+`image_normalization: "zscore"` normalizes each CT crop with the same helper
+used by the Lasagna training zarr path. Use `"unit"` only for uint8 smoke tests
+where `value / 255` is intended.
+
+`positive_direction_probability: 0.5` means half of crop conditioning directions
+are jittered from the true local fiber tangent and half are random directions.
+This tests the direction-conditioned spec: the same crop can be positive or
+negative depending on the requested forward direction.
+
+`positive_direction_jitter_degrees: 10.0` is the angular perturbation applied to
+the true tangent when sampling a positive conditioning direction. It makes the
+positive branch tolerant to small orientation noise without changing the target
+fiber tangent.
+
+`positive_radius: 1.5` marks voxels close enough to the fiber centerline to be
+eligible positive, after direction agreement. `ignore_radius: 3.0` creates a
+buffer around the fiber so near-miss voxels are ignored instead of trained as
+hard negatives. Both are in selected training-grid voxels.
 
 ## Entrypoint
 
