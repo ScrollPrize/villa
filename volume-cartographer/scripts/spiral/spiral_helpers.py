@@ -10,6 +10,20 @@ from sample_spiral import get_spiral_yxs, get_theta_and_radii
 from tifxyz import load_tifxyz, save_tifxyz
 
 
+def scale_patch(patch, downsample_factor):
+    patch.scale *= downsample_factor
+    patch.zyxs /= downsample_factor
+    patch.valid_zyxs /= downsample_factor
+    patch.area /= downsample_factor ** 2
+
+
+def patch_intersects_z_roi(patch, z_begin, z_end):
+    zs = patch.valid_zyxs[..., 0]
+    if zs.numel() == 0:
+        return False
+    return bool(((zs >= z_begin) & (zs < z_end)).any().item())
+
+
 def scale_counts_for_z_range(
     config,
     z_begin,

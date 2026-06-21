@@ -337,11 +337,12 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
     return np.isinf(dist)
 
 
-def prepare_main_phase_tracks(tracks, anchor_scroll_zyxs, exclusion_radius, device):
+def prepare_main_phase_tracks(tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None):
     if not tracks:
         return None
     print('removing tracks near patches')
-    anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
+    if anchor_tree is None:
+        anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
     flat_zyx_np = np.concatenate([t.astype(np.float32) for t in tracks], axis=0)
     track_id_np = np.concatenate([
         np.full(len(t), i, dtype=np.int64) for i, t in enumerate(tracks)
