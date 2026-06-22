@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vesuvius.neural_tracing.fiber_trace.dataset as fiber_dataset
+import vesuvius.neural_tracing.fiber_trace.train as fiber_train
 from vesuvius.neural_tracing.fiber_trace.dataset import FiberTraceBatchBuilder
 from vesuvius.neural_tracing.fiber_trace.fiber_json import parse_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace.geometry import (
@@ -255,6 +256,13 @@ def test_missing_mask_fails_loudly(tmp_path: Path):
         ],
     }
     with pytest.raises(ValueError, match="mask_path or grad_mag_path"):
+        FiberTraceBatchBuilder(config)
+
+
+def test_valid_mask_threshold_key_is_removed(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config["_array_records"][0]["valid_mask_threshold"] = 0.0
+    with pytest.raises(ValueError, match="valid_mask_threshold was removed"):
         FiberTraceBatchBuilder(config)
 
 
@@ -756,3 +764,104 @@ def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
     assert torch.isfinite(losses.total)
     losses.total.backward()
     assert any(param.grad is not None for param in model.parameters())
+
+
+def test_test_fiber_glob_builds_separate_test_config():
+    config = {
+        "datasets": [
+            {
+                "base_volume_path": "/base.zarr",
+                "lasagna_manifest_path": "/pred.lasagna.json",
+                "fiber_glob": "/train/*.json",
+                "test_fiber_glob": "/test/*.json",
+            }
+        ]
+    }
+
+    test_config = fiber_train._make_test_config(config)
+
+    assert test_config is not None
+    assert test_config["datasets"][0]["fiber_glob"] == "/test/*.json"
+    assert "test_fiber_glob" in test_config["datasets"][0]
+
+
+def test_training_writes_tensorboard_text_and_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class FakeWriter:
+        def __init__(self, log_dir: Path) -> None:
+            self.log_dir = Path(log_dir)
+            self.scalars: list[tuple[str, float, int]] = []
+            self.texts: list[tuple[str, str, int]] = []
+            self.closed = False
+
+        def add_scalar(self, tag: str, value: float, step: int) -> None:
+            self.scalars.append((tag, float(value), int(step)))
+
+        def add_text(self, tag: str, text: str, step: int) -> None:
+            self.texts.append((tag, str(text), int(step)))
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    writers: list[FakeWriter] = []
+
+    def fake_make_summary_writer(log_dir: Path, *, enabled: bool):
+        assert enabled
+        writer = FakeWriter(log_dir)
+        writers.append(writer)
+        return writer
+
+    monkeypatch.setattr(fiber_train, "_make_summary_writer", fake_make_summary_writer)
+
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config.update(
+        {
+            "device": "cpu",
+            "num_steps": 1,
+            "log_every": 100,
+            "run_path": str(tmp_path / "runs"),
+            "run_name": "unit run",
+            "run_datestr": "20260102_030405",
+            "_test_array_records": config["_array_records"],
+            "model": {
+                "input_channels": 1,
+                "backbone_channels": 2,
+                "embedding_dim": 4,
+                "features_per_stage": [2],
+                "head_channels": 4,
+            },
+            "loss": {"max_contrastive_samples": 256},
+        }
+    )
+
+    result = fiber_train.run_training(config)
+
+    run_dir = tmp_path / "runs" / "unit_run_20260102_030405"
+    assert Path(result["run_dir"]) == run_dir
+    assert (run_dir / "snapshots" / "current.pt").is_file()
+    assert (run_dir / "snapshots" / "best.pt").is_file()
+    assert writers and writers[0].closed
+    assert writers[0].log_dir == run_dir
+    assert any(
+        tag == "config/json" and '"run_name": "unit run"' in text
+        for tag, text, _ in writers[0].texts
+    )
+    scalar_tags = {tag for tag, _, _ in writers[0].scalars}
+    assert {
+        "train/total",
+        "train/contrastive",
+        "train/fw",
+        "train/up",
+    } <= scalar_tags
+    assert {"test/total", "test/contrastive", "test/fw", "test/up"} <= scalar_tags
+
+
+def test_training_rejects_legacy_checkpoint_path(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config["checkpoint_path"] = str(tmp_path / "model.pt")
+    with pytest.raises(ValueError, match="checkpoint_path was replaced"):
+        fiber_train.run_training(config)

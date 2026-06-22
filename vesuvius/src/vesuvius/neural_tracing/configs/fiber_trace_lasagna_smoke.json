@@ -2,7 +2,10 @@
   "seed": 0,
   "device": "cuda",
   "num_steps": 1,
-  "log_every": 1,
+  "log_every": 100,
+  "run_path": "runs/fiber_trace",
+  "run_name": "fiber_trace_smoke",
+  "tensorboard_enabled": true,
   "batch_size": 2,
   "crop_size": [64, 64, 64],
   "image_normalization": "zscore",
@@ -26,8 +29,8 @@
       "base_volume_path": "/path/to/base-image.ome.zarr",
       "base_volume_scale": 0,
       "lasagna_manifest_path": "/path/to/prediction.lasagna.json",
-      "fiber_glob": "/path/to/fibers/*.json",
-      "valid_mask_threshold": 0.0
+      "fiber_glob": "/path/to/train_fibers/*.json",
+      "test_fiber_glob": "/path/to/test_fibers/*.json"
     }
   ],
   "model": {
@@ -47,6 +50,5 @@
     "fw_weight": 1.0,
     "up_weight": 1.0,
     "max_contrastive_samples": 4096
-  },
-  "checkpoint_path": "runs/fiber_trace_smoke.pt"
+  }
 }

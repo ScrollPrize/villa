@@ -76,10 +76,18 @@ class _FiberRecord:
     nx_spacing_base: float | None
     ny_spacing_base: float | None
     dataset_config: dict[str, Any]
-    valid_threshold: float
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
+
+
+def _reject_valid_mask_threshold_key(config: dict[str, Any], *, context: str) -> None:
+    if "valid_mask_threshold" not in config:
+        return
+    raise ValueError(
+        "valid_mask_threshold was removed; mask/grad-mag validity is always "
+        f"binary value > 0 in {context}"
+    )
 
 
 def _is_remote_path(path: str | Path) -> bool:
@@ -413,6 +421,7 @@ class FiberTraceBatchBuilder:
         self, config: dict[str, Any], *, rng: np.random.Generator | None = None
     ) -> None:
         self.config = dict(config)
+        _reject_valid_mask_threshold_key(self.config, context="top-level config")
         self.rng = (
             rng
             if rng is not None
@@ -508,6 +517,9 @@ class FiberTraceBatchBuilder:
                 )
             for record_raw in array_records:
                 record_config = dict(record_raw)
+                _reject_valid_mask_threshold_key(
+                    record_config, context="_array_records entry"
+                )
                 volume = np.asarray(record_config["volume"])
                 mask = np.asarray(record_config["mask"])
                 if volume.ndim != 3 or mask.ndim != 3:
@@ -556,9 +568,6 @@ class FiberTraceBatchBuilder:
                         nx_spacing_base=None if nx_arr is None else 1.0,
                         ny_spacing_base=None if ny_arr is None else 1.0,
                         dataset_config=record_config,
-                        valid_threshold=float(
-                            record_config.get("valid_mask_threshold", 0.0)
-                        ),
                     )
                 )
         else:
@@ -569,6 +578,7 @@ class FiberTraceBatchBuilder:
             if array_records is not None:
                 break
             dataset_config = dict(dataset_config_raw)
+            _reject_valid_mask_threshold_key(dataset_config, context="dataset entry")
             lasagna_manifest_path = (
                 dataset_config.get("lasagna_manifest_path")
                 or dataset_config.get("lasagna_json")
@@ -762,11 +772,6 @@ class FiberTraceBatchBuilder:
                     nx_spacing_base = None
                     ny_spacing_base = None
 
-            valid_threshold = float(
-                dataset_config.get(
-                    "valid_mask_threshold", self.config.get("valid_mask_threshold", 0.0)
-                )
-            )
             for fiber_path in _resolve_fiber_paths(dataset_config, self.config):
                 self.records.append(
                     _FiberRecord(
@@ -781,7 +786,6 @@ class FiberTraceBatchBuilder:
                         nx_spacing_base=nx_spacing_base,
                         ny_spacing_base=ny_spacing_base,
                         dataset_config=dataset_config,
-                        valid_threshold=valid_threshold,
                     )
                 )
         if not self.records:
@@ -835,13 +839,13 @@ class FiberTraceBatchBuilder:
                 sample_spacing_base=record.volume_spacing_base,
                 array_spacing_base=record.mask_spacing_base,
             )
-            if mask_ok and float(value) > record.valid_threshold:
+            if mask_ok and float(value) > 0.0:
                 _, normal_valid = self._normal_at_zyx(record, center)
                 if normal_valid:
                     return center
 
         mask_np = np.asarray(record.mask[:])
-        valid_mask = mask_np > record.valid_threshold
+        valid_mask = mask_np > 0.0
         valid_mask_coords = np.argwhere(valid_mask)
         if valid_mask_coords.size == 0:
             raise ValueError("mask/grad-mag and nx/ny volumes contain no valid voxels")
@@ -946,7 +950,7 @@ class FiberTraceBatchBuilder:
                 dst_spacing_base=record.volume_spacing_base,
                 src_spacing_base=record.mask_spacing_base,
             )
-            > record.valid_threshold
+            > 0.0
         )
         if record.nx is None or record.ny is None:
             if not self.allow_arbitrary_up_fallback:

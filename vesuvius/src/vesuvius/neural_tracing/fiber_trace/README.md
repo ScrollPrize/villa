@@ -33,13 +33,17 @@ The preferred dataset config entry provides:
 - `lasagna_manifest_path`: `.lasagna.json` manifest with `base_shape_zyx` and
   `grad_mag`, `nx`, and `ny` channel groups
 - `fiber_paths` or `fiber_glob`: one or more VC3D fiber JSON files
+- optional `test_fiber_paths` or `test_fiber_glob`: held-out VC3D fiber JSON
+  files for TensorBoard test-loss logging
 
 The loader validates that `base_volume_path` level 0 has shape equal to the
 manifest `base_shape_zyx`. Image crops are read at `base_volume_scale`.
 `grad_mag`, `nx`, and `ny` are opened through the manifest, using each group's
 `scaledown` and channel index. These Lasagna channels do not have to be the
 same shape as the selected base image level; they are sampled into the selected
-training grid according to the manifest scale convention.
+training grid according to the manifest scale convention. Mask/grad-mag
+validity is binary: voxels with value `> 0` are valid and value `0` is invalid.
+There is no configurable validity threshold.
 
 Remote zarr paths use the existing `vesuvius.neural_tracing.datasets.common`
 zarr/cache support. Missing mask or grad-mag data is an error, and mask shape
@@ -172,6 +176,9 @@ Replace only the dataset paths first:
 - `base_volume_scale`: which scan OME-Zarr level to train on
 - `lasagna_manifest_path`: the Lasagna `.lasagna.json`
 - `fiber_glob` or `fiber_paths`: VC3D fiber JSON files
+- `test_fiber_glob` or `test_fiber_paths`: optional held-out VC3D fiber JSON
+  files for test-loss logging; use top-level `test_datasets` for a separate
+  test volume/manifest
 
 `image_normalization: "zscore"` normalizes each CT crop with the same helper
 used by the Lasagna training zarr path. Use `"unit"` only for uint8 smoke tests
@@ -209,9 +216,14 @@ Run a training smoke or short job with:
 python -m vesuvius.neural_tracing.fiber_trace.train /path/to/config.json
 ```
 
-The current trainer is intentionally minimal: it samples batches directly from
-`FiberTraceBatchBuilder`, runs one model forward/backward per step, logs scalar
-losses, and optionally writes a checkpoint.
+Each run creates `run_path/run_name_YYYYmmdd_HHMMSS/`. TensorBoard event files
+are written directly in that run directory, including scalar losses every
+`log_every` steps and a `config/json` text entry with the training config. Model
+snapshots are written to:
+
+- `snapshots/current.pt`: most recent logged model
+- `snapshots/best.pt`: best logged model by `test/total` when a test split is
+  configured, otherwise by `train/total`
 
 ## Current Status
 
@@ -224,7 +236,8 @@ Implemented:
   `nx`/`ny` normal data
 - direction-conditioned U-Net model/head
 - contrastive and direction losses
-- JSON-config train entrypoint
+- JSON-config train entrypoint with TensorBoard scalar/config logging and
+  current/best snapshots
 - unit and smoke tests on synthetic volumes
 
 Out of scope for this MVP:

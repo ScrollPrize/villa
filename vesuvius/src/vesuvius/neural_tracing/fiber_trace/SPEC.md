@@ -93,12 +93,17 @@ The intended config inputs are:
 - `base_volume_scale`: scan OME-Zarr level used as the training grid.
 - `lasagna_manifest_path`: Lasagna `.lasagna.json` manifest.
 - `fiber_paths` or `fiber_glob`: VC3D fiber JSON files.
+- optional `test_fiber_paths` or `test_fiber_glob`: held-out VC3D fiber JSON
+  files for test-loss logging.
 
 The Lasagna manifest must provide:
 
 - `base_shape_zyx`, matching `base_volume_path` level 0.
 - `grad_mag` channel group.
 - `nx` and `ny` normal channel groups.
+
+The `grad_mag`/mask validity convention is binary. Value `0` is invalid and
+any value `> 0` is valid; there is no configurable validity threshold.
 
 Coordinate convention:
 
@@ -163,6 +168,8 @@ Implemented:
   `negative_direction_max_degrees = 90.0`, and
   `negative_cosine = cos(60 degrees) = 0.5` implement the folded 30/60/90
   degree direction thresholds.
+- `run_path` and `run_name` create per-run directories with TensorBoard scalar
+  and config-text logging plus `snapshots/current.pt` and `snapshots/best.pt`.
 - `positive_radius` and `ignore_radius` remain accepted only as legacy/debug
   fallback values when the named normal-frame fields are omitted.
 
@@ -189,6 +196,7 @@ Before running either config, replace:
 - `base_volume_path`
 - `lasagna_manifest_path`
 - `fiber_glob` or `fiber_paths`
+- optional `test_fiber_glob` or `test_fiber_paths`
 - `volume_cache_dir` when using remote zarrs
 
 ## Next Implementation Plan
