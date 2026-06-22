@@ -8,18 +8,18 @@ hide_title: true
 <head>
   <html data-theme="dark" />
 
-  <meta name="description" content="Stay tuned for next stages" />
+  <meta name="description" content="The 2023 Vesuvius Challenge Grand Prize submission window has closed. Review teams are evaluating entries — stay tuned as we announce results and next stages." />
 
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://scrollprize.org/submissions_closed" />
   <meta property="og:title" content="Grand Prize submissions now closed" />
-  <meta property="og:description" content="Stay tuned for next stages" />
+  <meta property="og:description" content="The 2023 Vesuvius Challenge Grand Prize submission window has closed. Review teams are evaluating entries — stay tuned as we announce results and next stages." />
   <meta property="og:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 
   <meta property="twitter:card" content="summary_large_image" />
   <meta property="twitter:url" content="https://scrollprize.org/submissions_closed" />
   <meta property="twitter:title" content="Grand Prize Submissions Now Closed" />
-  <meta property="twitter:description" content="Stay tuned for next stages" />
+  <meta property="twitter:description" content="The 2023 Vesuvius Challenge Grand Prize submission window has closed. Review teams are evaluating entries — stay tuned as we announce results and next stages." />
   <meta property="twitter:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 </head>
 
@@ -36,7 +36,7 @@ hide_title: true
   }}>now closed</span>
 </h1>
 
-<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">Stay tuned for next stages</div>
+<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">The 2023 Vesuvius Challenge Grand Prize submission window has closed. Review teams are evaluating entries — stay tuned as we announce results and next stages.</div>
 
 <div className="opacity-60 mb-8 italic">January 1, 2024</div>
 

@@ -6,8 +6,9 @@
   "scripts": {
     "preinstall": "[ \"${AGENTS_AGENT_MODE:-0}\" != \"1\" ] || [ \"${AGENTS_ALLOW_INSTALL:-0}\" = \"1\" ] || { echo \"Install is disabled by default in agent mode. Set AGENTS_ALLOW_INSTALL=1 to install dependencies.\"; exit 1; }",
     "docusaurus": "docusaurus",
-    "start": "docusaurus start --host 0.0.0.0",
-    "build": "docusaurus build",
+    "gen:imgdims": "node scripts/genImageDimensions.js",
+    "start": "node scripts/genImageDimensions.js && docusaurus start --host 0.0.0.0",
+    "build": "node scripts/genImageDimensions.js && docusaurus build",
     "swizzle": "docusaurus swizzle",
     "deploy": "docusaurus deploy",
     "clear": "docusaurus clear",

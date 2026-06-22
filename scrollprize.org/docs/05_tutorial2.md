@@ -9,7 +9,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge representation tutorial: train an nnU-Net model to segment recto surfaces in Herculaneum scroll CT volumes, from data prep to inference."
   />
 
   <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge representation tutorial: train an nnU-Net model to segment recto surfaces in Herculaneum scroll CT volumes, from data prep to inference."
   />
   <meta
     property="og:image"
@@ -29,7 +29,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge representation tutorial: train an nnU-Net model to segment recto surfaces in Herculaneum scroll CT volumes, from data prep to inference."
   />
   <meta
     property="twitter:image"

@@ -9,7 +9,7 @@ slug: "2024_gp_submissions"
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="How to submit a 2024 Vesuvius Challenge Grand Prize entry: required unwrapped images, methodology, hallucination mitigation, and the technical review process."
   />
 
   <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@ slug: "2024_gp_submissions"
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="How to submit a 2024 Vesuvius Challenge Grand Prize entry: required unwrapped images, methodology, hallucination mitigation, and the technical review process."
   />
   <meta
     property="og:image"
@@ -29,7 +29,7 @@ slug: "2024_gp_submissions"
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="How to submit a 2024 Vesuvius Challenge Grand Prize entry: required unwrapped images, methodology, hallucination mitigation, and the technical review process."
   />
   <meta
     property="twitter:image"

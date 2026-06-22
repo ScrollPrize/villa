@@ -19,3 +19,6 @@ static/data/latestPosts.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Generated build-time image dimension manifest
+.image-dimensions.json

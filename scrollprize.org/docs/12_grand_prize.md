@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Rules for the 2023 Vesuvius Challenge Grand Prize: read four passages from sealed Herculaneum scrolls via 3D X-ray. $700k first place, now awarded."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Rules for the 2023 Vesuvius Challenge Grand Prize: read four passages from sealed Herculaneum scrolls via 3D X-ray. $700k first place, now awarded."
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Rules for the 2023 Vesuvius Challenge Grand Prize: read four passages from sealed Herculaneum scrolls via 3D X-ray. $700k first place, now awarded."
   />
   <meta
     property="twitter:image"
@@ -36,6 +36,8 @@ hide_table_of_contents: true
   />
 </head>
 
+
+_The 2023 Grand Prize has been awarded — see [the announcement](/grandprize)._
 
 The \$700,000 Grand Prize will go to the first team to read four passages of text from the inside of the two intact scrolls. We also have prizes for second place (\$100,000) and third place (\$50,000). More details on the qualifying criteria are available [here](#qualifying-criteria).
 

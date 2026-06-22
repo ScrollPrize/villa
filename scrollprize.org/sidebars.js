@@ -11,27 +11,18 @@
 
 // @ts-check
 
+const brandHeader = {
+  type: 'html',
+  value:
+    '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>',
+};
+
 /** @type {import('@docusaurus/plugin-content-docs').SidebarsConfig} */
 const sidebars = {
-  jobsSidebar: [
-    {
-      type: 'html',
-      value: '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>'
-    },
-    { type: 'doc', id: 'jobs' },
-  ],
-  villaModelSidebar: [
-    {
-      type: 'html',
-      value: '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>'
-    },
-    { type: 'doc', id: 'villa_model' },
-  ],
+  // Single, unified menu used across the whole site so every important page is
+  // reachable from one coherent navigation surface.
   overviewSidebar: [
-    {
-      type: 'html',
-      value: '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>'
-    },
+    brandHeader,
     {
       type: 'category',
       label: 'Overview',
@@ -41,15 +32,6 @@ const sidebars = {
         { type: 'doc', id: 'prizes' },
         { type: 'doc', id: 'unwrapping' },
         { type: 'doc', id: 'master_plan' },
-      ]
-    },
-    {
-      type: 'category',
-      label: 'Competition',
-      link: { type: 'doc', id: 'winners' },
-      items: [
-        { type: 'doc', id: 'winners' },
-        { type: 'doc', id: 'community_projects' },
       ],
     },
     {
@@ -62,6 +44,7 @@ const sidebars = {
         { type: 'doc', id: 'data_browser', label: 'Data Browser' },
         { type: 'doc', id: 'data_segments' },
         { type: 'doc', id: 'data_datasets' },
+        { type: 'doc', id: 'data_fragments' },
       ],
     },
     {
@@ -73,11 +56,34 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'tutorial1' },
         { type: 'doc', id: 'tutorial2' },
-        { type: 'doc', id: 'segmentation' },
+        { type: 'doc', id: 'tutorial3' },
         { type: 'doc', id: 'tutorial5' },
+        { type: 'doc', id: 'segmentation' },
+        { type: 'doc', id: 'ink_detection' },
+        { type: 'doc', id: 'tutorial_VC' },
       ],
     },
     { type: 'doc', id: 'faq' },
+    {
+      type: 'category',
+      label: 'Milestones & Results',
+      link: { type: 'doc', id: 'winners' },
+      items: [
+        { type: 'doc', id: 'firstletters' },
+        { type: 'doc', id: 'grandprize' },
+        { type: 'doc', id: 'grand_prize' },
+        { type: 'doc', id: 'community_projects' },
+      ],
+    },
+    {
+      type: 'category',
+      label: 'The Scrolls',
+      link: { type: 'doc', id: 'background' },
+      items: [
+        { type: 'doc', id: 'villa_model' },
+        { type: 'doc', id: 'livestream' },
+      ],
+    },
     {
       type: 'link',
       label: 'Discord',
@@ -99,16 +105,19 @@ const sidebars = {
       href: 'https://donate.stripe.com/aEUg101vt9eN8gM144',
     },
     { type: 'doc', id: 'jobs' },
-  ],
-  archiveSidebar: [
     {
-      type: 'html',
-      value: '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>'
+      type: 'category',
+      label: 'Archive',
+      collapsible: true,
+      collapsed: true,
+      items: [
+        { type: 'doc', id: '28_2024_prizes' },
+        { type: 'doc', id: '30_2024_gp_submissions' },
+        { type: 'doc', id: 'open_source_prizes' },
+        { type: 'doc', id: 'private_prizes' },
+        { type: 'doc', id: 'submissions_closed' },
+      ],
     },
-    { type: 'doc', id: 'background' },
-    { type: 'doc', id: 'firstletters' },
-    { type: 'doc', id: 'grandprize' },
-    { type: 'doc', id: 'livestream' },
   ],
 };
 
