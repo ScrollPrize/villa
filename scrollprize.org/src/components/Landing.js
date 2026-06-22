@@ -330,13 +330,6 @@ const prizes = [
   //   href: "/winners",
   // },
   {
-    title: "Unwrapping at Scale Prize",
-    prizeMoney: "$200,000",
-    description: "Automate virtual unwrapping",
-    requirement: "",
-    href: "prizes#unwrapping-at-scale-prize",
-  },
-  {
     title: "First Letters / First Title Prizes",
     prizeMoney: "7 x $60,000",
     description:
