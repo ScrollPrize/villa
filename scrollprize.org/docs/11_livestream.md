@@ -38,6 +38,10 @@ hide_table_of_contents: true
 
 Be sure to check [Discord](https://discord.com/invite/uTfNwwecCQ), [Substack](https://scrollprize.substack.com/), and [X](https://x.com/scrollprize) for livestream announcements!
 
+### June 25, 2026 - Press Conference
+
+<iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/96oTlQm0KBw"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
+
 ### July 31, 2024 - Office Hours
 
 <iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/0p3dKM41sRw?si=b62rYGLlDMrb1781"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
