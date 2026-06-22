@@ -44,6 +44,8 @@ if (typeof document !== "undefined") {
     const t = e.target;
     if (!(t instanceof HTMLImageElement)) return;
     if (!t.classList.contains("zoomable")) return;
+    // images inside a link should follow the link, not open the lightbox
+    if (t.closest("a")) return;
     // ignore tiny/icon images
     if (t.naturalWidth && t.naturalWidth < 80) return;
     const full = t.getAttribute("data-zoom-src") || t.currentSrc || t.src;

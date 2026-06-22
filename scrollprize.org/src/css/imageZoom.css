@@ -12,6 +12,13 @@ img.zoomable {
   cursor: zoom-in;
 }
 
+/* Images wrapped in a link follow the link (handled in imageZoom.js), so show
+   the normal link cursor rather than the misleading zoom-in cursor. */
+.markdown a img.zoomable,
+a img.zoomable {
+  cursor: pointer;
+}
+
 .img-zoom-overlay {
   position: fixed;
   inset: 0;
