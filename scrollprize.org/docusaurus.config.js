@@ -48,6 +48,25 @@ const webSiteJsonLd = {
   publisher: { "@type": "Organization", name: "Vesuvius Challenge" },
 };
 
+// The sitemap's per-page <lastmod> is derived from git history. Some build
+// environments have no git repository available — notably Vercel monorepo
+// subdir builds, which run in a copied directory with no .git — and there the
+// git lookup throws and aborts the whole build. Detect git up-front and only
+// enable lastmod when it's actually available; otherwise omit it (the prior
+// behavior) so the build always succeeds.
+function gitLastmodSupported() {
+  try {
+    require("child_process").execSync("git rev-parse --is-inside-work-tree", {
+      cwd: __dirname,
+      stdio: "ignore",
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+const SITEMAP_LASTMOD = gitLastmodSupported() ? "date" : null;
+
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: "Vesuvius Challenge",
@@ -128,7 +147,7 @@ const config = {
           anonymizeIP: false,
         },
         sitemap: {
-          lastmod: 'date',
+          lastmod: SITEMAP_LASTMOD,
           changefreq: null,
           priority: null,
           filename: 'sitemap.xml',
