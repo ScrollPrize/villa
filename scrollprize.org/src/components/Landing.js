@@ -1519,6 +1519,11 @@ const BuildingBlock = ({ title, description, showDividerMobile = true, showDivid
 export function Landing() {
   const { siteConfig } = useDocusaurusContext();
   const canonicalUrl = `${siteConfig?.url ?? ""}${siteConfig?.baseUrl ?? "/"}`;
+
+  // EMBARGO FLAG — local preview only. Keep false in any online commit/deploy;
+  // flip to true on 2026-06-25 (Naples press conference) to launch publicly.
+  const SHOW_BREAKING = true;
+
   useBrokenLinks().collectAnchor("sponsors");
   useBrokenLinks().collectAnchor("educelab-funders");
   useBrokenLinks().collectAnchor("our-story");
@@ -1667,6 +1672,61 @@ export function Landing() {
                   </span>
                 </p>
               </div>
+
+              {SHOW_BREAKING && (
+                <a
+                  href="/firstscroll"
+                  className="block no-underline hover:no-underline mb-8 group"
+                >
+                  <div
+                    className="relative overflow-hidden rounded-2xl border border-solid border-[#F5653F60] bg-[#131114cc] text-white p-5 md:p-6 hover:-translate-y-1 transition-transform ease-in-out duration-300"
+                    style={{
+                      boxShadow:
+                        "0px 2.767px 2.214px 0px rgba(0, 0, 0, 0.09), 0px 6.65px 5.32px 0px rgba(0, 0, 0, 0.13), 0px 12.522px 10.017px 0px rgba(0, 0, 0, 0.16), 0px 22.336px 17.869px 0px rgba(0, 0, 0, 0.19), 0px 41.778px 33.422px 0px rgba(0, 0, 0, 0.23), 0px 100px 80px 0px rgba(0, 0, 0, 0.32)",
+                    }}
+                  >
+                    <div className="flex flex-col md:flex-row md:items-center gap-4 md:gap-6">
+                      <div className="flex-1 min-w-0">
+                        <span
+                          className="inline-block text-xs font-black uppercase tracking-widest text-white px-2.5 py-1 rounded-full mb-3"
+                          style={{
+                            background:
+                              "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
+                          }}
+                        >
+                          Breaking
+                        </span>
+                        <div className="text-2xl md:text-4xl font-black !mb-1 leading-none tracking-tighter">
+                          We read an{" "}
+                          <span
+                            style={{
+                              background:
+                                "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
+                              WebkitBackgroundClip: "text",
+                              WebkitTextFillColor: "transparent",
+                              backgroundClip: "text",
+                              textFillColor: "transparent",
+                            }}
+                          >
+                            entire Herculaneum scroll
+                          </span>
+                        </div>
+                        <p className="opacity-70 md:text-lg !mb-0 tracking-tight">
+                          PHerc. 1667, sealed since 79&nbsp;AD, has been virtually
+                          unwrapped and read end&nbsp;to&nbsp;end. Read the announcement →
+                        </p>
+                      </div>
+                      <div className="hidden md:block w-[44%] shrink-0">
+                        <img
+                          src="/img/firstscroll/banner-strip.webp"
+                          alt="The unwrapped writing surface of PHerc. 1667, columns of ancient Greek."
+                          className="rounded-lg w-full h-[120px] object-cover"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </a>
+              )}
 
               <div className="grid items-start max-w-8xl">
                 <LatestPosts />
