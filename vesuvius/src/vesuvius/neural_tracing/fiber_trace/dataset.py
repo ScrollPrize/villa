@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import importlib.util
 import sys
 import time
@@ -14,9 +15,9 @@ import torch
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber, load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace.geometry import (
-    construct_up_vector,
     decode_lasagna_normals_xyz,
     perturb_direction,
+    random_unit_vector,
     tangent_at_point,
     xyz_to_zyx,
     zyx_to_xyz,
@@ -24,6 +25,8 @@ from vesuvius.neural_tracing.fiber_trace.geometry import (
 from vesuvius.neural_tracing.fiber_trace.labels import IGNORE_ID, IGNORE_INDEX
 from vesuvius.neural_tracing.datasets.common import (
     _read_volume_crop_from_patch as _common_read_volume_crop_from_patch,
+    begin_zarr_cache_trace,
+    end_zarr_cache_trace,
     open_zarr as _common_open_zarr,
 )
 
@@ -38,11 +41,10 @@ class FiberTraceBatch:
     labels: torch.Tensor
     target_id: torch.Tensor
     target_fw_xyz: torch.Tensor
-    target_up_xyz: torch.Tensor
-    target_up_valid: torch.Tensor
+    center_normal_xyz: torch.Tensor
     cond_fw_xyz: torch.Tensor
-    cond_up_xyz: torch.Tensor
     crop_origin_zyx: torch.Tensor
+    sample_local_zyx: torch.Tensor
     line_points_xyz: torch.Tensor
     positive_target_id: torch.Tensor
     crop_kinds: tuple[str, ...]
@@ -59,11 +61,10 @@ class FiberTraceBatch:
             labels=self.labels.to(device),
             target_id=self.target_id.to(device),
             target_fw_xyz=self.target_fw_xyz.to(device),
-            target_up_xyz=self.target_up_xyz.to(device),
-            target_up_valid=self.target_up_valid.to(device),
+            center_normal_xyz=self.center_normal_xyz.to(device),
             cond_fw_xyz=self.cond_fw_xyz.to(device),
-            cond_up_xyz=self.cond_up_xyz.to(device),
             crop_origin_zyx=self.crop_origin_zyx.to(device),
+            sample_local_zyx=self.sample_local_zyx.to(device),
             line_points_xyz=self.line_points_xyz.to(device),
             positive_target_id=self.positive_target_id.to(device),
             crop_kinds=self.crop_kinds,
@@ -78,8 +79,6 @@ class FiberTraceBatch:
         labels: torch.Tensor,
         target_id: torch.Tensor,
         target_fw_xyz: torch.Tensor,
-        target_up_xyz: torch.Tensor,
-        target_up_valid: torch.Tensor,
     ) -> "FiberTraceBatch":
         return FiberTraceBatch(
             volume=self.volume,
@@ -90,17 +89,30 @@ class FiberTraceBatch:
             labels=labels,
             target_id=target_id,
             target_fw_xyz=target_fw_xyz,
-            target_up_xyz=target_up_xyz,
-            target_up_valid=target_up_valid,
+            center_normal_xyz=self.center_normal_xyz,
             cond_fw_xyz=self.cond_fw_xyz,
-            cond_up_xyz=self.cond_up_xyz,
             crop_origin_zyx=self.crop_origin_zyx,
+            sample_local_zyx=self.sample_local_zyx,
             line_points_xyz=self.line_points_xyz,
             positive_target_id=self.positive_target_id,
             crop_kinds=self.crop_kinds,
             fiber_paths=self.fiber_paths,
             direction_kinds=self.direction_kinds,
         )
+
+
+@dataclass
+class FiberTraceDebugTableState:
+    rows: int = 0
+    legend_printed: bool = False
+
+
+@dataclass(frozen=True)
+class ZarrChunkRequest:
+    store: Any
+    store_identity: str
+    key: str
+    label: str
 
 
 @dataclass(frozen=True)
@@ -534,6 +546,84 @@ def _chunk_ranges_for_bbox(
     return tuple((int(first[axis]), int(last[axis])) for axis in range(3))  # type: ignore[return-value]
 
 
+def _zarr_store_identity(store: Any) -> str:
+    url = getattr(store, "_url", None)
+    cache_dir = getattr(store, "_cache_dir", None)
+    if url is not None:
+        return f"{type(store).__module__}.{type(store).__name__}:{url}:{cache_dir}"
+    path = getattr(store, "path", None)
+    if path is not None:
+        return f"{type(store).__module__}.{type(store).__name__}:{path}"
+    return f"{type(store).__module__}.{type(store).__name__}:{repr(store)}"
+
+
+def _is_remote_cached_store(store: Any) -> bool:
+    return getattr(store, "_url", None) is not None and getattr(
+        store, "_cache_dir", None
+    ) is not None
+
+
+def _chunk_requests_for_bbox(
+    array: Any,
+    bbox: tuple[np.ndarray, np.ndarray] | None,
+    *,
+    label: str,
+) -> list[ZarrChunkRequest]:
+    if bbox is None:
+        return []
+
+    channel_index: int | None = None
+    spatial_array = array
+    zarr_array = array
+    if isinstance(array, _SpatialChannelView):
+        spatial_array = array
+        zarr_array = array.array
+        channel_index = int(array.channel_index)
+
+    chunks = _array_chunks_zyx(spatial_array)
+    store = getattr(zarr_array, "store", None)
+    chunk_key_fn = getattr(zarr_array, "_chunk_key", None)
+    if chunks is None or store is None or not callable(chunk_key_fn):
+        return []
+    if not _is_remote_cached_store(store):
+        return []
+
+    starts, ends = bbox
+    chunk_np = np.asarray(chunks, dtype=np.int64)
+    first = np.asarray(starts, dtype=np.int64) // chunk_np
+    last = (np.asarray(ends, dtype=np.int64) - 1) // chunk_np
+    if np.any(last < first):
+        return []
+
+    zarr_chunks = tuple(int(v) for v in getattr(zarr_array, "chunks", ()))
+    zarr_shape = tuple(int(v) for v in getattr(zarr_array, "shape", ()))
+    store_identity = _zarr_store_identity(store)
+    requests: list[ZarrChunkRequest] = []
+    for chunk_z in range(int(first[0]), int(last[0]) + 1):
+        for chunk_y in range(int(first[1]), int(last[1]) + 1):
+            for chunk_x in range(int(first[2]), int(last[2]) + 1):
+                spatial_coords = (chunk_z, chunk_y, chunk_x)
+                if len(zarr_shape) == 4:
+                    if channel_index is None:
+                        channel_index = 0
+                    if len(zarr_chunks) != 4 or int(zarr_chunks[0]) <= 0:
+                        continue
+                    coords = (int(channel_index) // int(zarr_chunks[0]),) + spatial_coords
+                elif len(zarr_shape) == 3:
+                    coords = spatial_coords
+                else:
+                    continue
+                requests.append(
+                    ZarrChunkRequest(
+                        store=store,
+                        store_identity=store_identity,
+                        key=str(chunk_key_fn(coords)),
+                        label=str(label),
+                    )
+                )
+    return requests
+
+
 def _chunk_index_for_zyx(
     array: Any, array_zyx: np.ndarray
 ) -> tuple[int, int, int] | None:
@@ -574,6 +664,27 @@ def _read_image_crop_from_patch(
     )
 
 
+def _center_crop_array(
+    array: np.ndarray | None,
+    crop_shape: tuple[int, int, int],
+    offset_zyx: np.ndarray,
+) -> np.ndarray | None:
+    if array is None:
+        return None
+    offset = np.asarray(offset_zyx, dtype=np.int64)
+    z0, y0, x0 = (int(v) for v in offset)
+    z_size, y_size, x_size = (int(v) for v in crop_shape)
+    return array[z0 : z0 + z_size, y0 : y0 + y_size, x0 : x0 + x_size]
+
+
+def _stable_seed_from_parts(*parts: Any) -> int:
+    digest = hashlib.blake2b(digest_size=16)
+    for part in parts:
+        digest.update(str(part).encode("utf-8"))
+        digest.update(b"\0")
+    return int.from_bytes(digest.digest(), byteorder="little", signed=False)
+
+
 def _resolve_fiber_paths(
     dataset_config: dict[str, Any], config: dict[str, Any]
 ) -> list[Path]:
@@ -593,16 +704,70 @@ class FiberTraceBatchBuilder:
     """Sample single-fiber training batches from VC3D fiber JSON records."""
 
     def __init__(
-        self, config: dict[str, Any], *, rng: np.random.Generator | None = None
+        self,
+        config: dict[str, Any],
+        *,
+        debug_table_state: FiberTraceDebugTableState | None = None,
     ) -> None:
         self.config = dict(config)
         _reject_valid_mask_threshold_key(self.config, context="top-level config")
-        self.rng = (
-            rng
-            if rng is not None
-            else np.random.default_rng(self.config.get("seed", None))
-        )
+        seed_value = self.config.get("seed", 0)
+        if seed_value is None:
+            seed_value = 0
+        self._base_seed = int(seed_value)
         self.crop_size = _as_zyx3(self.config.get("crop_size", 64), key="crop_size")
+        self.augmentation_crop_size = _as_zyx3(
+            self.config.get("augmentation_crop_size", self.crop_size),
+            key="augmentation_crop_size",
+        )
+        crop_np = np.asarray(self.crop_size, dtype=np.int64)
+        aug_crop_np = np.asarray(self.augmentation_crop_size, dtype=np.int64)
+        if np.any(aug_crop_np < crop_np):
+            raise ValueError(
+                "augmentation_crop_size must be greater than or equal to crop_size, "
+                f"got augmentation_crop_size={self.augmentation_crop_size} "
+                f"crop_size={self.crop_size}"
+            )
+        if np.any((aug_crop_np - crop_np) % 2 != 0):
+            raise ValueError(
+                "augmentation_crop_size and crop_size must differ by an even number "
+                "on each axis so the post-augmentation center crop remains centered"
+            )
+        self._post_augmentation_crop_offset = (aug_crop_np - crop_np) // 2
+        margin_values = [
+            key
+            for key in ("control_point_margin_voxels", "cp_margin_voxels")
+            if key in self.config
+        ]
+        if len(margin_values) == 2 and (
+            float(self.config[margin_values[0]]) != float(self.config[margin_values[1]])
+        ):
+            raise ValueError(
+                "control_point_margin_voxels and cp_margin_voxels must match "
+                "when both are provided"
+            )
+        configured_margin = (
+            self.config[margin_values[0]] if margin_values else None
+        )
+        max_supported_margin = min((int(size) - 1) // 2 for size in self.crop_size)
+        if configured_margin is None:
+            self.control_point_margin_voxels = int(
+                min(40, max(0, max_supported_margin))
+            )
+        else:
+            margin = int(configured_margin)
+            if margin < 0:
+                raise ValueError(
+                    "control_point_margin_voxels must be >= 0, "
+                    f"got {configured_margin}"
+                )
+            if margin > max_supported_margin:
+                raise ValueError(
+                    "control_point_margin_voxels must leave at least that many "
+                    "voxels on both sides of every crop axis: "
+                    f"got {margin} for crop_size={self.crop_size}"
+                )
+            self.control_point_margin_voxels = margin
         self.batch_size = int(self.config.get("batch_size", 2))
         if self.batch_size <= 0 or self.batch_size % 2 != 0:
             raise ValueError(
@@ -610,17 +775,8 @@ class FiberTraceBatchBuilder:
             )
 
         self.image_normalization = str(self.config.get("image_normalization", "zscore"))
-        self.positive_direction_probability = float(
-            self.config.get("positive_direction_probability", 0.5)
-        )
         self.positive_direction_jitter_degrees = float(
             self.config.get("positive_direction_jitter_degrees", 30.0)
-        )
-        self.negative_direction_min_degrees = float(
-            self.config.get("negative_direction_min_degrees", 60.0)
-        )
-        self.negative_direction_max_degrees = float(
-            self.config.get("negative_direction_max_degrees", 90.0)
         )
         self.positive_radius = float(self.config.get("positive_radius", 1.5))
         self.ignore_radius = float(
@@ -635,55 +791,51 @@ class FiberTraceBatchBuilder:
         self.negative_cone_distance_voxels = float(
             self.config.get("negative_cone_distance_voxels", 30.0)
         )
-        self.positive_cosine = float(
-            self.config.get("positive_cosine", np.cos(np.deg2rad(30.0)))
-        )
-        self.negative_cosine = float(
-            self.config.get("negative_cosine", np.cos(np.deg2rad(60.0)))
-        )
+        for removed_key in (
+            "positive_direction_probability",
+            "negative_direction_min_degrees",
+            "negative_direction_max_degrees",
+            "positive_cosine",
+            "negative_cosine",
+        ):
+            if removed_key in self.config:
+                raise ValueError(
+                    f"{removed_key} was removed; labels are geometry-derived and "
+                    "direction conditioning only uses positive_direction_jitter_degrees"
+                )
         if not np.isfinite(self.positive_direction_jitter_degrees):
             raise ValueError("positive_direction_jitter_degrees must be finite")
         if self.positive_direction_jitter_degrees < 0.0:
             raise ValueError("positive_direction_jitter_degrees must be >= 0")
         if self.positive_direction_jitter_degrees > 90.0:
             raise ValueError(
-                "positive_direction_jitter_degrees is a folded-frame angle and "
-                "must be <= 90"
-            )
-        if (
-            not np.isfinite(self.negative_direction_min_degrees)
-            or not np.isfinite(self.negative_direction_max_degrees)
-        ):
-            raise ValueError("negative direction folded-frame degrees must be finite")
-        if self.negative_direction_min_degrees < 0.0:
-            raise ValueError("negative_direction_min_degrees must be >= 0")
-        if self.negative_direction_max_degrees > 90.0:
-            raise ValueError(
-                "negative_direction_max_degrees is a folded-frame maximum and "
-                "must be <= 90"
-            )
-        if self.negative_direction_min_degrees > self.negative_direction_max_degrees:
-            raise ValueError(
-                "negative_direction_min_degrees must be <= "
-                "negative_direction_max_degrees"
+                "positive_direction_jitter_degrees is a forward-angle jitter and "
+                "must be <= 90 degrees"
             )
         self.random_valid_max_attempts = int(
             self.config.get("random_valid_max_attempts", 256)
         )
-        self.allow_arbitrary_up_fallback = bool(
-            self.config.get("allow_arbitrary_up_fallback", False)
+        self.random_negative_pool_size = int(
+            self.config.get("random_negative_pool_size", 1000)
         )
-        self.degenerate_up_policy = str(
-            self.config.get("degenerate_up_policy", "invalid")
-        )
-        if self.degenerate_up_policy not in {"invalid", "raise"}:
+        if self.random_negative_pool_size <= 0:
             raise ValueError(
-                "degenerate_up_policy must be 'invalid' or 'raise', "
-                f"got {self.degenerate_up_policy!r}"
+                "random_negative_pool_size must be a positive integer, "
+                f"got {self.random_negative_pool_size}"
             )
-        self.debug_sampling = bool(self.config.get("debug_sampling", False))
-        self._debug_sampling_count = 0
+        self.debug_sampling = bool(
+            self.config.get("debug_sampling", False)
+            or self.config.get("debug_cache", False)
+        )
         self._debug_sampling_limit = int(self.config.get("debug_sampling_limit", 0))
+        self._debug_table_state = (
+            debug_table_state
+            if debug_table_state is not None
+            else FiberTraceDebugTableState()
+        )
+        self._debug_batch_header_every = int(
+            self.config.get("debug_batch_header_every", 20)
+        )
 
         datasets = self.config.get("datasets")
         self.records: list[_FiberRecord] = []
@@ -710,13 +862,10 @@ class FiberTraceBatchBuilder:
                 nx = record_config.get("nx")
                 ny = record_config.get("ny")
                 if nx is None or ny is None:
-                    if not self.allow_arbitrary_up_fallback:
-                        raise ValueError(
-                            "_array_records entries must provide Lasagna nx and ny "
-                            "normal channels"
-                        )
-                    nx_arr = None
-                    ny_arr = None
+                    raise ValueError(
+                        "_array_records entries must provide Lasagna nx and ny "
+                        "normal channels"
+                    )
                 else:
                     nx_arr = np.asarray(nx)
                     ny_arr = np.asarray(ny)
@@ -821,34 +970,28 @@ class FiberTraceBatchBuilder:
                 raise ValueError(
                     "Lasagna manifest missing required grad_mag channel"
                 ) from exc
-            if self.allow_arbitrary_up_fallback:
-                nx = None
-                ny = None
-                nx_spacing_base = None
-                ny_spacing_base = None
-            else:
-                try:
-                    nx, nx_spacing_base = _open_manifest_channel(
-                        lasagna_volume,
-                        "nx",
-                        auth_json_path=dataset_config.get("lasagna_auth_json"),
-                        config=self.config,
-                    )
-                    ny, ny_spacing_base = _open_manifest_channel(
-                        lasagna_volume,
-                        "ny",
-                        auth_json_path=dataset_config.get("lasagna_auth_json"),
-                        config=self.config,
-                    )
-                except KeyError as exc:
-                    raise ValueError(
-                        "Lasagna manifest missing required nx/ny normal channels"
-                    ) from exc
-                if abs(float(nx_spacing_base) - float(ny_spacing_base)) > 1e-6:
-                    raise ValueError(
-                        "Lasagna nx and ny normal channel spacing mismatch: "
-                        f"nx={nx_spacing_base} ny={ny_spacing_base}"
-                    )
+            try:
+                nx, nx_spacing_base = _open_manifest_channel(
+                    lasagna_volume,
+                    "nx",
+                    auth_json_path=dataset_config.get("lasagna_auth_json"),
+                    config=self.config,
+                )
+                ny, ny_spacing_base = _open_manifest_channel(
+                    lasagna_volume,
+                    "ny",
+                    auth_json_path=dataset_config.get("lasagna_auth_json"),
+                    config=self.config,
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    "Lasagna manifest missing required nx/ny normal channels"
+                ) from exc
+            if abs(float(nx_spacing_base) - float(ny_spacing_base)) > 1e-6:
+                raise ValueError(
+                    "Lasagna nx and ny normal channel spacing mismatch: "
+                    f"nx={nx_spacing_base} ny={ny_spacing_base}"
+                )
 
             for fiber_path in _resolve_fiber_paths(dataset_config, self.config):
                 self.records.append(
@@ -868,23 +1011,240 @@ class FiberTraceBatchBuilder:
                 )
         if not self.records:
             raise ValueError("no fiber records were loaded")
+        self._random_negative_center_pools: dict[tuple[Any, ...], np.ndarray] = {}
+        self._record_random_negative_pool_keys: list[tuple[Any, ...]] = []
+        self._build_random_negative_center_pools()
+        self._sample_batch_count = 0
+        self.last_cache_stats: Any | None = None
+        self.last_sample_ms = 0.0
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def _debug_sampling_print(self, message: str) -> None:
+    def _rng_for(
+        self,
+        purpose: str,
+        *,
+        iteration: int,
+        batch_slot: int = 0,
+        record_index: int = 0,
+        extra: int = 0,
+    ) -> np.random.Generator:
+        return np.random.default_rng(
+            _stable_seed_from_parts(
+                self._base_seed,
+                purpose,
+                int(iteration),
+                int(batch_slot),
+                int(record_index),
+                int(extra),
+            )
+        )
+
+    def _random_negative_pool_key(self, record: _FiberRecord) -> tuple[Any, ...]:
+        return (
+            id(record.volume),
+            id(record.mask),
+            id(record.nx),
+            id(record.ny),
+            float(record.volume_spacing_base),
+            float(record.mask_spacing_base),
+            None if record.nx_spacing_base is None else float(record.nx_spacing_base),
+            None if record.ny_spacing_base is None else float(record.ny_spacing_base),
+        )
+
+    def _build_random_negative_center_pools(self) -> None:
+        raw_seed = self.config.get("random_negative_seed", self._base_seed)
+        negative_seed = 0 if raw_seed is None else int(raw_seed)
+        for record_index, record in enumerate(self.records):
+            key = self._random_negative_pool_key(record)
+            self._record_random_negative_pool_keys.append(key)
+            if key in self._random_negative_center_pools:
+                continue
+            pool_index = len(self._random_negative_center_pools)
+            rng = np.random.default_rng(
+                _stable_seed_from_parts(
+                    negative_seed,
+                    "random_negative_pool",
+                    pool_index,
+                    record_index,
+                )
+            )
+            centers = [
+                self._sample_random_valid_center(record, rng=rng)
+                for _ in range(self.random_negative_pool_size)
+            ]
+            self._random_negative_center_pools[key] = np.stack(centers, axis=0)
+
+    def _random_negative_center_for_patch(
+        self,
+        *,
+        record_index: int,
+        batch_ordinal: int,
+        negative_index: int,
+    ) -> np.ndarray:
+        key = self._record_random_negative_pool_keys[int(record_index)]
+        pool = self._random_negative_center_pools[key]
+        pool_index = (
+            int(record_index) * 1_000_003
+            + int(batch_ordinal) * 65_537
+            + int(negative_index)
+        ) % int(pool.shape[0])
+        return pool[pool_index].astype(np.int64, copy=True)
+
+    def _control_point_local_zyx(
+        self,
+        *,
+        batch_ordinal: int,
+        patch_index: int,
+        record_index: int,
+        control_index: int,
+    ) -> np.ndarray:
+        crop_np = np.asarray(self.crop_size, dtype=np.int64)
+        margin = int(self.control_point_margin_voxels)
+        low = np.full(3, margin, dtype=np.int64)
+        high = crop_np - margin - 1
+        rng = self._rng_for(
+            "control_point_crop_offset",
+            iteration=batch_ordinal,
+            batch_slot=patch_index,
+            record_index=record_index,
+            extra=control_index,
+        )
+        choose_high = rng.integers(0, 2, size=3, dtype=np.int64).astype(bool)
+        return np.where(choose_high, high, low).astype(np.int64, copy=False)
+
+    def _control_center_zyx(
+        self, record: _FiberRecord, control_index: int
+    ) -> np.ndarray:
+        center_xyz = record.fiber.control_points_xyz[int(control_index)]
+        return np.rint(
+            xyz_to_zyx(center_xyz) / float(record.volume_spacing_base)
+        ).astype(np.int64)
+
+    def _batch_crop_specs(
+        self,
+        *,
+        record_index: int | None,
+        batch_ordinal: int,
+    ) -> list[dict[str, Any]]:
+        if record_index is None:
+            record_rng = self._rng_for("record", iteration=batch_ordinal)
+            selected_record_index = int(record_rng.integers(0, len(self.records)))
+        else:
+            selected_record_index = int(record_index)
+        record = self.records[selected_record_index]
+        gt_count = self.batch_size // 2
+        random_negative_count = self.batch_size - gt_count
+        specs: list[dict[str, Any]] = []
+
+        for patch_index in range(gt_count):
+            control_count = int(record.fiber.control_points_xyz.shape[0])
+            control_index = int(
+                self._rng_for(
+                    "control_index",
+                    iteration=batch_ordinal,
+                    batch_slot=patch_index,
+                    record_index=selected_record_index,
+                ).integers(0, control_count)
+            )
+            local_zyx = self._control_point_local_zyx(
+                batch_ordinal=batch_ordinal,
+                patch_index=patch_index,
+                record_index=selected_record_index,
+                control_index=control_index,
+            )
+            specs.append(
+                {
+                    "record": record,
+                    "record_index": selected_record_index,
+                    "patch_index": patch_index,
+                    "crop_kind": "gt_control",
+                    "control_index": control_index,
+                    "center_zyx": self._control_center_zyx(record, control_index),
+                    "sample_local_zyx": local_zyx,
+                }
+            )
+
+        for negative_index in range(random_negative_count):
+            patch_index = gt_count + negative_index
+            specs.append(
+                {
+                    "record": record,
+                    "record_index": selected_record_index,
+                    "patch_index": patch_index,
+                    "crop_kind": "random_negative",
+                    "control_index": None,
+                    "center_zyx": self._random_negative_center_for_patch(
+                        record_index=selected_record_index,
+                        batch_ordinal=batch_ordinal,
+                        negative_index=negative_index,
+                    ),
+                    "sample_local_zyx": np.asarray(self.crop_size, dtype=np.int64)
+                    // 2,
+                }
+            )
+        return specs
+
+    def _debug_batch_row(
+        self,
+        *,
+        iteration: int | None,
+        total_ms: float,
+        cache_stats: Any,
+    ) -> None:
         if not self.debug_sampling:
             return
-        if self._debug_sampling_limit > 0:
-            if self._debug_sampling_count >= self._debug_sampling_limit:
-                return
-            self._debug_sampling_count += 1
-        print(f"[fiber_trace:sample] {message}", flush=True)
+        state = self._debug_table_state
+        if self._debug_sampling_limit > 0 and state.rows >= self._debug_sampling_limit:
+            return
+        every = max(1, int(self._debug_batch_header_every))
+        if not state.legend_printed:
+            print(
+                "fiber_trace batch columns: it=iteration data=batch data-loading ms "
+                "hit/dl/mis=cache events hms/dms=cache-hit/download ms "
+                "hMiB/s/dMiB/s=cache-hit/download throughput",
+                flush=True,
+            )
+            state.legend_printed = True
+        if state.rows % every == 0:
+            print(
+                "   it      data  hit  dl mis      hms      dms   hMiB/s   dMiB/s",
+                flush=True,
+            )
+        state.rows += 1
+        cache_mib = float(getattr(cache_stats, "cache_hit_bytes", 0)) / (1024.0 * 1024.0)
+        download_mib = float(getattr(cache_stats, "download_bytes", 0)) / (1024.0 * 1024.0)
+        cache_ms = float(getattr(cache_stats, "cache_hit_ms", 0.0))
+        download_ms = float(getattr(cache_stats, "download_ms", 0.0))
+        cache_mib_s = cache_mib / max(cache_ms / 1000.0, 1e-9) if cache_mib > 0.0 else 0.0
+        download_mib_s = (
+            download_mib / max(download_ms / 1000.0, 1e-9)
+            if download_mib > 0.0
+            else 0.0
+        )
 
-    def _sample_record(self, record_index: int | None) -> _FiberRecord:
+        print(
+            f"{'-' if iteration is None else int(iteration):>5} "
+            f"{total_ms:9.1f} "
+            f"{int(getattr(cache_stats, 'cache_hits', 0)):3d} "
+            f"{int(getattr(cache_stats, 'downloads', 0)):2d} "
+            f"{int(getattr(cache_stats, 'missing', 0)) + int(getattr(cache_stats, 'negative_hits', 0)):3d} "
+            f"{cache_ms:8.1f} {download_ms:8.1f} "
+            f"{cache_mib_s:8.1f} {download_mib_s:8.1f}",
+            flush=True,
+        )
+
+    def _sample_record(
+        self,
+        record_index: int | None,
+        *,
+        batch_ordinal: int = 0,
+    ) -> _FiberRecord:
         if record_index is not None:
             return self.records[int(record_index)]
-        return self.records[int(self.rng.integers(0, len(self.records)))]
+        rng = self._rng_for("record", iteration=batch_ordinal)
+        return self.records[int(rng.integers(0, len(self.records)))]
 
     def _channel_value_info(
         self,
@@ -930,12 +1290,6 @@ class FiberTraceBatchBuilder:
         self, record: _FiberRecord, center_zyx: np.ndarray
     ) -> dict[str, Any]:
         if record.nx is None or record.ny is None:
-            if self.allow_arbitrary_up_fallback:
-                return {
-                    "normal_xyz": None,
-                    "normal_valid": True,
-                    "reason": "arbitrary_up_fallback",
-                }
             raise ValueError("Lasagna nx/ny normal channels are required")
         if record.nx_spacing_base is None or record.ny_spacing_base is None:
             raise ValueError("Lasagna nx/ny spacing metadata is required")
@@ -1005,11 +1359,13 @@ class FiberTraceBatchBuilder:
         info = self._normal_sample_info(record, center_zyx)
         return info["normal_xyz"], bool(info["normal_valid"])
 
-    def _sample_random_valid_center(self, record: _FiberRecord) -> np.ndarray:
+    def _sample_random_valid_center(
+        self, record: _FiberRecord, *, rng: np.random.Generator
+    ) -> np.ndarray:
         shape = np.asarray(record.volume.shape, dtype=np.int64)
         for _ in range(self.random_valid_max_attempts):
             center = np.asarray(
-                [self.rng.integers(0, int(size)) for size in shape], dtype=np.int64
+                [rng.integers(0, int(size)) for size in shape], dtype=np.int64
             )
             value, mask_ok = _value_at_sample_zyx(
                 record.mask,
@@ -1030,45 +1386,24 @@ class FiberTraceBatchBuilder:
     def _sample_jittered_conditioning(
         self,
         tangent_xyz: np.ndarray,
-        normal_xyz: np.ndarray | None,
         *,
-        min_angle_degrees: float,
-        max_angle_degrees: float,
-        direction_kind: str,
-    ) -> tuple[np.ndarray, np.ndarray, str]:
-        fw = None
-        for _ in range(32):
-            candidate = perturb_direction(
-                tangent_xyz,
-                min_angle_degrees=min_angle_degrees,
-                max_angle_degrees=max_angle_degrees,
-                rng=self.rng,
-            )
-            try:
-                construct_up_vector(
-                    candidate,
-                    normal_xyz,
-                    allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
-                )
-            except ValueError:
-                continue
-            fw = candidate
-            break
-        if fw is None:
-            raise ValueError(
-                f"could not sample a {direction_kind} conditioning direction with "
-                "a valid Lasagna normal up vector"
-            )
-        up = construct_up_vector(
-            fw,
-            normal_xyz,
-            allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, str]:
+        fw = perturb_direction(
+            tangent_xyz,
+            min_angle_degrees=0.0,
+            max_angle_degrees=self.positive_direction_jitter_degrees,
+            rng=rng,
         )
         return (
             fw.astype(np.float32, copy=False),
-            up.astype(np.float32, copy=False),
-            direction_kind,
+            "gt_jitter",
         )
+
+    def _sample_random_conditioning(
+        self, *, rng: np.random.Generator
+    ) -> tuple[np.ndarray, str]:
+        return random_unit_vector(rng).astype(np.float32, copy=False), "random"
 
     def _sample_crop_base(
         self,
@@ -1076,26 +1411,29 @@ class FiberTraceBatchBuilder:
         *,
         crop_kind: str,
         control_index: int | None = None,
+        center_zyx: np.ndarray | None = None,
+        control_point_local_zyx: np.ndarray | None = None,
     ) -> dict[str, Any]:
         fiber = record.fiber
-        if crop_kind == "gt_control":
-            controls_xyz = fiber.control_points_xyz
+        if center_zyx is not None:
+            center = np.asarray(center_zyx, dtype=np.int64)
+            if control_point_local_zyx is None:
+                final_local_zyx = np.asarray(self.crop_size, dtype=np.int64) // 2
+            else:
+                final_local_zyx = np.asarray(control_point_local_zyx, dtype=np.int64)
+        elif crop_kind == "gt_control":
             if control_index is None:
-                control_index = int(self.rng.integers(0, controls_xyz.shape[0]))
-            center_xyz = controls_xyz[int(control_index)]
-            center = np.rint(
-                xyz_to_zyx(center_xyz) / float(record.volume_spacing_base)
-            ).astype(np.int64)
-        elif crop_kind == "random_valid":
-            center = self._sample_random_valid_center(record)
+                control_index = 0
+            center = self._control_center_zyx(record, int(control_index))
+            if control_point_local_zyx is None:
+                final_local_zyx = np.asarray(self.crop_size, dtype=np.int64) // 2
+            else:
+                final_local_zyx = np.asarray(control_point_local_zyx, dtype=np.int64)
+        elif crop_kind == "random_negative":
+            raise ValueError("random_negative center must be selected before loading")
         else:
             raise ValueError(f"unsupported crop_kind {crop_kind!r}")
         center_normal_info = self._normal_sample_info(record, center)
-        self._debug_sampling_print(
-            f"sampled center crop_kind={crop_kind!r} control_index={control_index} "
-            f"fiber_path={record.fiber.path} "
-            f"{self._format_normal_sample_info(center_normal_info)}"
-        )
         if not bool(center_normal_info["normal_valid"]):
             raise ValueError(
                 f"sampled {crop_kind} center has unusable Lasagna nx/ny: "
@@ -1103,102 +1441,50 @@ class FiberTraceBatchBuilder:
             )
         center_normal_xyz = center_normal_info["normal_xyz"]
 
-        crop_size_np = np.asarray(self.crop_size, dtype=np.int64)
-        min_corner = center - (crop_size_np // 2)
-        max_corner = min_corner + crop_size_np
+        read_crop_size_np = np.asarray(self.augmentation_crop_size, dtype=np.int64)
+        crop_offset = self._post_augmentation_crop_offset
+        read_min_corner = center - final_local_zyx - crop_offset
+        read_max_corner = read_min_corner + read_crop_size_np
+        min_corner = read_min_corner + crop_offset
         patch = SimpleNamespace(volume=record.volume, scale=record.volume_scale)
-        volume_bbox = _raw_source_bbox_zyx(record.volume, self.crop_size, min_corner)
-        volume_t0 = time.perf_counter()
         volume_crop = _read_image_crop_from_patch(
             patch,
-            self.crop_size,
-            min_corner,
-            max_corner,
+            self.augmentation_crop_size,
+            read_min_corner,
+            read_max_corner,
             image_normalization=self.image_normalization,
         )
-        self._debug_sampling_print(
-            f"read crop field='base' crop_kind={crop_kind!r} "
-            f"origin_zyx={_format_optional_array(min_corner)} "
-            f"shape={self.crop_size} src_bbox={_format_bbox(volume_bbox)} "
-            f"chunks={_chunk_ranges_for_bbox(record.volume, volume_bbox)} "
-            f"elapsed_ms={(time.perf_counter() - volume_t0) * 1000.0:.2f}"
-        )
-        mask_bbox = _scaled_source_bbox_zyx(
-            record.mask,
-            self.crop_size,
-            min_corner,
-            dst_spacing_base=record.volume_spacing_base,
-            src_spacing_base=record.mask_spacing_base,
-        )
-        mask_t0 = time.perf_counter()
         mask_crop = _read_scaled_channel_crop(
             record.mask,
-            self.crop_size,
-            min_corner,
+            self.augmentation_crop_size,
+            read_min_corner,
             dst_spacing_base=record.volume_spacing_base,
             src_spacing_base=record.mask_spacing_base,
         )
-        valid_count = int((mask_crop > 0.0).sum()) if self.debug_sampling else -1
-        self._debug_sampling_print(
-            f"read crop field='grad_mag' crop_kind={crop_kind!r} "
-            f"origin_zyx={_format_optional_array(min_corner)} "
-            f"shape={self.crop_size} src_bbox={_format_bbox(mask_bbox)} "
-            f"chunks={_chunk_ranges_for_bbox(record.mask, mask_bbox)} "
-            f"valid_voxels={valid_count} "
-            f"elapsed_ms={(time.perf_counter() - mask_t0) * 1000.0:.2f}"
-        )
         if record.nx is None or record.ny is None:
-            if not self.allow_arbitrary_up_fallback:
-                raise ValueError("Lasagna nx/ny normal channels are required")
-            nx_crop = None
-            ny_crop = None
+            raise ValueError("Lasagna nx/ny normal channels are required")
         else:
             if record.nx_spacing_base is None or record.ny_spacing_base is None:
                 raise ValueError("Lasagna nx/ny spacing metadata is required")
-            nx_bbox = _scaled_source_bbox_zyx(
-                record.nx,
-                self.crop_size,
-                min_corner,
-                dst_spacing_base=record.volume_spacing_base,
-                src_spacing_base=record.nx_spacing_base,
-            )
-            nx_t0 = time.perf_counter()
             nx_crop = _read_scaled_channel_crop(
                 record.nx,
-                self.crop_size,
-                min_corner,
+                self.augmentation_crop_size,
+                read_min_corner,
                 dst_spacing_base=record.volume_spacing_base,
                 src_spacing_base=record.nx_spacing_base,
             )
-            self._debug_sampling_print(
-                f"read crop field='nx' crop_kind={crop_kind!r} "
-                f"origin_zyx={_format_optional_array(min_corner)} "
-                f"shape={self.crop_size} src_bbox={_format_bbox(nx_bbox)} "
-                f"chunks={_chunk_ranges_for_bbox(record.nx, nx_bbox)} "
-                f"elapsed_ms={(time.perf_counter() - nx_t0) * 1000.0:.2f}"
-            )
-            ny_bbox = _scaled_source_bbox_zyx(
-                record.ny,
-                self.crop_size,
-                min_corner,
-                dst_spacing_base=record.volume_spacing_base,
-                src_spacing_base=record.ny_spacing_base,
-            )
-            ny_t0 = time.perf_counter()
             ny_crop = _read_scaled_channel_crop(
                 record.ny,
-                self.crop_size,
-                min_corner,
+                self.augmentation_crop_size,
+                read_min_corner,
                 dst_spacing_base=record.volume_spacing_base,
                 src_spacing_base=record.ny_spacing_base,
             )
-            self._debug_sampling_print(
-                f"read crop field='ny' crop_kind={crop_kind!r} "
-                f"origin_zyx={_format_optional_array(min_corner)} "
-                f"shape={self.crop_size} src_bbox={_format_bbox(ny_bbox)} "
-                f"chunks={_chunk_ranges_for_bbox(record.ny, ny_bbox)} "
-                f"elapsed_ms={(time.perf_counter() - ny_t0) * 1000.0:.2f}"
-            )
+
+        volume_crop = _center_crop_array(volume_crop, self.crop_size, crop_offset)
+        mask_crop = _center_crop_array(mask_crop, self.crop_size, crop_offset)
+        nx_crop = _center_crop_array(nx_crop, self.crop_size, crop_offset)
+        ny_crop = _center_crop_array(ny_crop, self.crop_size, crop_offset)
 
         tangent_xyz = tangent_at_point(
             fiber.line_points_xyz,
@@ -1213,6 +1499,7 @@ class FiberTraceBatchBuilder:
             "center_normal_xyz": center_normal_xyz,
             "tangent_xyz": tangent_xyz,
             "origin": min_corner.astype(np.int64, copy=False),
+            "sample_local_zyx": (center - min_corner).astype(np.int64, copy=False),
             "crop_kind": crop_kind,
         }
 
@@ -1221,36 +1508,26 @@ class FiberTraceBatchBuilder:
         record: _FiberRecord,
         crop_base: dict[str, Any],
         *,
-        direction_kind: str,
         positive_target_id: int,
+        rng: np.random.Generator,
     ) -> dict[str, Any]:
-        if direction_kind == "positive":
-            cond_fw_xyz, cond_up_xyz, direction_kind = self._sample_jittered_conditioning(
+        if crop_base["crop_kind"] == "gt_control":
+            cond_fw_xyz, direction_kind = self._sample_jittered_conditioning(
                 crop_base["tangent_xyz"],
-                crop_base["center_normal_xyz"],
-                min_angle_degrees=0.0,
-                max_angle_degrees=self.positive_direction_jitter_degrees,
-                direction_kind=direction_kind,
-            )
-        elif direction_kind == "negative":
-            cond_fw_xyz, cond_up_xyz, direction_kind = self._sample_jittered_conditioning(
-                crop_base["tangent_xyz"],
-                crop_base["center_normal_xyz"],
-                min_angle_degrees=self.negative_direction_min_degrees,
-                max_angle_degrees=self.negative_direction_max_degrees,
-                direction_kind=direction_kind,
+                rng=rng,
             )
         else:
-            raise ValueError(f"unsupported direction_kind {direction_kind!r}")
+            cond_fw_xyz, direction_kind = self._sample_random_conditioning(rng=rng)
 
         return {
             "volume": crop_base["volume"],
             "mask_values": crop_base["mask_values"],
             "nx_values": crop_base["nx_values"],
             "ny_values": crop_base["ny_values"],
+            "center_normal_xyz": crop_base["center_normal_xyz"],
             "cond_fw_xyz": cond_fw_xyz,
-            "cond_up_xyz": cond_up_xyz,
             "origin": crop_base["origin"],
+            "sample_local_zyx": crop_base["sample_local_zyx"],
             "line_points_xyz": record.fiber.line_points_xyz
             / float(record.volume_spacing_base),
             "positive_target_id": positive_target_id,
@@ -1258,52 +1535,130 @@ class FiberTraceBatchBuilder:
             "direction_kind": direction_kind,
         }
 
-    def sample_batch(self, *, record_index: int | None = None) -> FiberTraceBatch:
-        if record_index is None:
-            selected_record_index = int(self.rng.integers(0, len(self.records)))
-        else:
-            selected_record_index = int(record_index)
-        record = self.records[selected_record_index]
-        pair_count = self.batch_size // 2
-        gt_pair_count = (pair_count + 1) // 2
-        random_pair_count = pair_count - gt_pair_count
-        crop_kinds = ("gt_control",) * gt_pair_count + (
-            "random_valid",
-        ) * random_pair_count
+    def prefetch_chunk_requests_for_iteration(
+        self,
+        *,
+        iteration: int,
+        record_index: int | None = None,
+    ) -> list[ZarrChunkRequest]:
+        specs = self._batch_crop_specs(
+            record_index=record_index,
+            batch_ordinal=int(iteration),
+        )
+        requests: list[ZarrChunkRequest] = []
+        read_crop_size_np = np.asarray(self.augmentation_crop_size, dtype=np.int64)
+        crop_offset = self._post_augmentation_crop_offset
+        for spec in specs:
+            record = spec["record"]
+            center = np.asarray(spec["center_zyx"], dtype=np.int64)
+            sample_local_zyx = np.asarray(spec["sample_local_zyx"], dtype=np.int64)
+            read_min_corner = center - sample_local_zyx - crop_offset
+            read_shape = tuple(int(v) for v in read_crop_size_np)
 
-        control_indices: list[int | None] = []
-        if gt_pair_count:
-            control_count = int(record.fiber.control_points_xyz.shape[0])
-            replace = gt_pair_count > control_count
-            choices = self.rng.choice(
-                control_count, size=gt_pair_count, replace=replace
-            )
-            control_indices = [int(choice) for choice in choices]
-
-        samples: list[dict[str, Any]] = []
-        gt_index = 0
-        for kind in crop_kinds:
-            control_index = None
-            if kind == "gt_control":
-                control_index = control_indices[gt_index]
-                gt_index += 1
-            crop_base = self._sample_crop_base(
-                record, crop_kind=kind, control_index=control_index
-            )
-            samples.append(
-                self._make_conditioned_sample(
-                    record,
-                    crop_base,
-                    direction_kind="positive",
-                    positive_target_id=selected_record_index,
+            requests.extend(
+                _chunk_requests_for_bbox(
+                    record.volume,
+                    _raw_source_bbox_zyx(
+                        record.volume,
+                        read_shape,
+                        read_min_corner,
+                    ),
+                    label="base",
                 )
             )
+            requests.extend(
+                _chunk_requests_for_bbox(
+                    record.mask,
+                    _scaled_source_bbox_zyx(
+                        record.mask,
+                        read_shape,
+                        read_min_corner,
+                        dst_spacing_base=record.volume_spacing_base,
+                        src_spacing_base=record.mask_spacing_base,
+                    ),
+                    label="grad_mag",
+                )
+            )
+            if record.nx is not None and record.nx_spacing_base is not None:
+                requests.extend(
+                    _chunk_requests_for_bbox(
+                        record.nx,
+                        _scaled_source_bbox_zyx(
+                            record.nx,
+                            read_shape,
+                            read_min_corner,
+                            dst_spacing_base=record.volume_spacing_base,
+                            src_spacing_base=record.nx_spacing_base,
+                        ),
+                        label="nx",
+                    )
+                )
+            if record.ny is not None and record.ny_spacing_base is not None:
+                requests.extend(
+                    _chunk_requests_for_bbox(
+                        record.ny,
+                        _scaled_source_bbox_zyx(
+                            record.ny,
+                            read_shape,
+                            read_min_corner,
+                            dst_spacing_base=record.volume_spacing_base,
+                            src_spacing_base=record.ny_spacing_base,
+                        ),
+                        label="ny",
+                    )
+                )
+        return requests
+
+    def sample_batch(
+        self,
+        *,
+        record_index: int | None = None,
+        iteration: int | None = None,
+        debug: bool | None = None,
+        emit_debug_row: bool = True,
+    ) -> FiberTraceBatch:
+        trace_enabled = bool(
+            self.debug_sampling if debug is None else self.debug_sampling and debug
+        )
+        self.last_cache_stats = None
+        self.last_sample_ms = 0.0
+        if trace_enabled:
+            begin_zarr_cache_trace()
+        batch_t0 = time.perf_counter()
+        batch_ordinal = int(iteration) if iteration is not None else self._sample_batch_count
+        specs = self._batch_crop_specs(
+            record_index=record_index,
+            batch_ordinal=batch_ordinal,
+        )
+        selected_record_index = int(specs[0]["record_index"])
+        record = specs[0]["record"]
+
+        samples: list[dict[str, Any]] = []
+        for spec in specs:
+            patch_index = int(spec["patch_index"])
+            control_index = spec["control_index"]
+            crop_base = self._sample_crop_base(
+                record,
+                crop_kind=str(spec["crop_kind"]),
+                control_index=control_index,
+                center_zyx=np.asarray(spec["center_zyx"], dtype=np.int64),
+                control_point_local_zyx=np.asarray(
+                    spec["sample_local_zyx"], dtype=np.int64
+                ),
+            )
+            direction_rng = self._rng_for(
+                "direction_conditioning",
+                iteration=batch_ordinal,
+                batch_slot=patch_index,
+                record_index=selected_record_index,
+                extra=-1 if control_index is None else int(control_index),
+            )
             samples.append(
                 self._make_conditioned_sample(
                     record,
                     crop_base,
-                    direction_kind="negative",
                     positive_target_id=selected_record_index,
+                    rng=direction_rng,
                 )
             )
         fiber_path = str(record.fiber.path) if record.fiber.path is not None else ""
@@ -1319,7 +1674,7 @@ class FiberTraceBatchBuilder:
                 np.stack([s["ny_values"] for s in samples], axis=0)
             )
 
-        return FiberTraceBatch(
+        batch = FiberTraceBatch(
             volume=torch.from_numpy(
                 np.stack([s["volume"] for s in samples], axis=0)[:, None]
             ).to(torch.float32),
@@ -1338,18 +1693,17 @@ class FiberTraceBatchBuilder:
             target_fw_xyz=torch.zeros(
                 (sample_count, 3) + crop_shape, dtype=torch.float32
             ),
-            target_up_xyz=torch.zeros(
-                (sample_count, 3) + crop_shape, dtype=torch.float32
-            ),
-            target_up_valid=torch.zeros((sample_count,) + crop_shape, dtype=torch.bool),
+            center_normal_xyz=torch.from_numpy(
+                np.stack([s["center_normal_xyz"] for s in samples], axis=0)
+            ).to(torch.float32),
             cond_fw_xyz=torch.from_numpy(
                 np.stack([s["cond_fw_xyz"] for s in samples], axis=0)
             ).to(torch.float32),
-            cond_up_xyz=torch.from_numpy(
-                np.stack([s["cond_up_xyz"] for s in samples], axis=0)
-            ).to(torch.float32),
             crop_origin_zyx=torch.from_numpy(
                 np.stack([s["origin"] for s in samples], axis=0)
+            ).to(torch.long),
+            sample_local_zyx=torch.from_numpy(
+                np.stack([s["sample_local_zyx"] for s in samples], axis=0)
             ).to(torch.long),
             line_points_xyz=torch.from_numpy(
                 np.stack([s["line_points_xyz"] for s in samples], axis=0)
@@ -1361,3 +1715,14 @@ class FiberTraceBatchBuilder:
             fiber_paths=tuple(fiber_path for _ in samples),
             direction_kinds=tuple(str(s["direction_kind"]) for s in samples),
         )
+        cache_stats = end_zarr_cache_trace() if trace_enabled else None
+        self.last_cache_stats = cache_stats
+        self.last_sample_ms = (time.perf_counter() - batch_t0) * 1000.0
+        if trace_enabled and emit_debug_row:
+            self._debug_batch_row(
+                iteration=iteration,
+                total_ms=self.last_sample_ms,
+                cache_stats=cache_stats,
+            )
+        self._sample_batch_count += 1
+        return batch

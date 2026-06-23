@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+import zarr
 
 import vesuvius.neural_tracing.fiber_trace.dataset as fiber_dataset
 import vesuvius.neural_tracing.fiber_trace.train as fiber_train
-from vesuvius.neural_tracing.fiber_trace.dataset import FiberTraceBatchBuilder
+from vesuvius.neural_tracing.fiber_trace.dataset import (
+    FiberTraceBatch,
+    FiberTraceBatchBuilder,
+)
 from vesuvius.neural_tracing.fiber_trace.fiber_json import parse_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace.geometry import (
     classify_voxels,
-    construct_up_vector,
     decode_lasagna_normals_xyz,
-    folded_frame_error_degrees,
     tangent_at_point,
 )
 from vesuvius.neural_tracing.fiber_trace.labels import (
@@ -27,7 +30,6 @@ from vesuvius.neural_tracing.fiber_trace.labels import (
 )
 from vesuvius.neural_tracing.fiber_trace.losses import (
     compute_fiber_trace_loss,
-    sign_ambiguous_up_loss,
     supervised_contrastive_loss,
 )
 from vesuvius.neural_tracing.fiber_trace.model import (
@@ -59,17 +61,13 @@ def _synthetic_config(
         "batch_size": batch_size,
         "seed": 123,
         "image_normalization": "unit",
-        "positive_direction_probability": 1.0,
         "positive_direction_jitter_degrees": 30.0,
-        "negative_direction_min_degrees": 60.0,
-        "negative_direction_max_degrees": 90.0,
         "normal_plane_jitter_voxels": 40.0,
         "normal_perpendicular_jitter_voxels": 10.0,
         "negative_cone_distance_voxels": 30.0,
+        "random_negative_pool_size": 8,
         "positive_radius": 1.25,
         "ignore_radius": 2.5,
-        "positive_cosine": float(np.cos(np.deg2rad(30.0))),
-        "negative_cosine": float(np.cos(np.deg2rad(60.0))),
         "_array_records": [
             {
                 "volume": volume,
@@ -138,7 +136,7 @@ def test_tangent_uses_line_points_and_control_point_query():
     )
 
 
-def test_lasagna_normal_decoding_and_up_projection():
+def test_lasagna_normal_decoding():
     normals, valid = decode_lasagna_normals_xyz(
         np.array([128, 128, 255, 0], dtype=np.uint8),
         np.array([128, 255, 128, 0], dtype=np.uint8),
@@ -150,65 +148,11 @@ def test_lasagna_normal_decoding_and_up_projection():
     assert np.isfinite(normals[3]).all()
     assert float(np.linalg.norm(normals[3])) == pytest.approx(1.0, abs=1e-6)
 
-    up = construct_up_vector(
-        np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        np.array([0.0, 1.0, 0.0], dtype=np.float32),
-    )
-    np.testing.assert_allclose(
-        up, np.array([0.0, 1.0, 0.0], dtype=np.float32), atol=1e-6
-    )
-    with pytest.raises(ValueError, match="normal_xyz is required"):
-        construct_up_vector(np.array([1.0, 0.0, 0.0], dtype=np.float32))
-    with pytest.raises(ValueError, match="degenerate"):
-        construct_up_vector(
-            np.array([1.0, 0.0, 0.0], dtype=np.float32),
-            np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        )
 
-
-def test_sign_ambiguous_loss():
-
-    target = torch.tensor([[[[[0.0]]], [[[1.0]]], [[[0.0]]]]])
-    pred = -target
-    mask = torch.ones((1, 1, 1, 1), dtype=torch.bool)
-    assert float(sign_ambiguous_up_loss(pred, target, mask)) == pytest.approx(
-        0.0, abs=1e-6
-    )
-
-
-def test_folded_frame_error_boundaries():
-    target_fw = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    target_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-
-    for raw_degrees, expected_degrees in [
-        (0.0, 0.0),
-        (30.0, 30.0),
-        (60.0, 60.0),
-        (90.0, 90.0),
-        (120.0, 60.0),
-        (150.0, 30.0),
-        (180.0, 0.0),
-    ]:
-        radians = np.deg2rad(raw_degrees)
-        cond_fw = np.array([np.cos(radians), np.sin(radians), 0.0], dtype=np.float32)
-        error = folded_frame_error_degrees(cond_fw, target_up, target_fw, target_up)
-        assert float(error) == pytest.approx(expected_degrees, abs=1e-4)
-
-    coupled_error = folded_frame_error_degrees(
-        -target_fw,
-        -target_up,
-        target_fw,
-        target_up,
-    )
-    assert float(coupled_error) == pytest.approx(0.0, abs=1e-4)
-
-
-def test_batch_builder_samples_one_fiber_with_paired_conditioning_variants(
+def test_batch_builder_samples_one_fiber_with_mixed_and_random_negative_crops(
     tmp_path: Path,
 ):
-    builder = FiberTraceBatchBuilder(
-        _synthetic_config(tmp_path), rng=np.random.default_rng(5)
-    )
+    builder = FiberTraceBatchBuilder(_synthetic_config(tmp_path))
     batch = fiber_train.classify_batch_on_device(
         builder.sample_batch(record_index=0), builder.config
     )
@@ -217,32 +161,114 @@ def test_batch_builder_samples_one_fiber_with_paired_conditioning_variants(
     assert batch.labels.shape == (4, 16, 16, 16)
     assert batch.target_id.shape == (4, 16, 16, 16)
     assert batch.crop_kinds.count("gt_control") == 2
-    assert batch.crop_kinds.count("random_valid") == 2
-    assert batch.direction_kinds == ("positive", "negative", "positive", "negative")
-    assert torch.equal(batch.crop_origin_zyx[0], batch.crop_origin_zyx[1])
-    assert torch.equal(batch.crop_origin_zyx[2], batch.crop_origin_zyx[3])
+    assert batch.crop_kinds.count("random_negative") == 2
+    assert batch.direction_kinds == ("gt_jitter", "gt_jitter", "random", "random")
     assert len(set(batch.fiber_paths)) == 1
-    assert bool((batch.labels == POSITIVE_LABEL).any())
-    assert bool((batch.labels == NEGATIVE_LABEL).any())
+    assert bool((batch.labels[:2] == POSITIVE_LABEL).any())
+    assert bool((batch.labels[2:][batch.valid_mask[2:]] == NEGATIVE_LABEL).all())
+    assert not bool((batch.labels[2:] == POSITIVE_LABEL).any())
     assert bool((batch.target_id[batch.labels == POSITIVE_LABEL] == 0).all())
     assert bool(
         (batch.target_id[batch.labels == NEGATIVE_LABEL] == NEGATIVE_ONLY_ID).all()
     )
-    assert bool((batch.target_up_valid & (batch.labels == POSITIVE_LABEL)).any())
     target_fw = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    target_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    folded_errors = folded_frame_error_degrees(
-        batch.cond_fw_xyz.numpy(),
-        batch.cond_up_xyz.numpy(),
-        target_fw,
-        target_up,
+    gt_cond = torch.nn.functional.normalize(batch.cond_fw_xyz[:2], dim=1).numpy()
+    gt_errors = np.degrees(np.arccos(np.clip(gt_cond @ target_fw, -1.0, 1.0)))
+    assert bool((gt_errors >= -1e-4).all())
+    assert bool((gt_errors <= 30.0 + 1e-4).all())
+
+
+def test_debug_cache_logs_one_table_row_per_batch(tmp_path: Path, capsys):
+    config = _synthetic_config(tmp_path, batch_size=4, crop_size=(8, 8, 8))
+    config["debug_cache"] = True
+    builder = FiberTraceBatchBuilder(config)
+
+    builder.sample_batch(record_index=0, iteration=7)
+
+    output = capsys.readouterr().out
+    lines = output.splitlines()
+    assert lines[0].startswith("fiber_trace batch columns:")
+    assert "data=batch data-loading ms" in lines[0]
+    assert "throughput" in lines[0]
+    assert "it" in lines[1]
+    assert "data" in lines[1]
+    assert "rec" not in lines[1]
+    assert "k" not in lines[1]
+    assert "ctl" not in lines[1]
+    assert "hMiB/s" in lines[1]
+    assert "dMiB/s" in lines[1]
+    assert {"hit", "dl", "mis", "hms", "dms"} <= set(lines[1].split())
+    data_lines = [line for line in lines if line.split()[:1] == ["7"]]
+    assert len(data_lines) == 1
+    assert data_lines[0].split()[0] == "7"
+    assert "=" not in data_lines[0]
+    assert "oz" not in lines[1]
+    assert "bz" not in lines[1]
+    assert "[fiber_trace:patch]" not in output
+    assert "[fiber_trace:sample]" not in output
+    assert "_DiskCacheStore" not in output
+
+
+def test_iteration_sampling_is_deterministic_and_stateless(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=4, crop_size=(8, 8, 8))
+    first_builder = FiberTraceBatchBuilder(config)
+    first = first_builder.sample_batch(record_index=0, iteration=5)
+    _ = first_builder.sample_batch(record_index=0, iteration=2)
+    repeated = first_builder.sample_batch(record_index=0, iteration=5)
+
+    second_builder = FiberTraceBatchBuilder(config)
+    second = second_builder.sample_batch(record_index=0, iteration=5)
+
+    for other in (repeated, second):
+        torch.testing.assert_close(other.volume, first.volume)
+        torch.testing.assert_close(other.mask_values, first.mask_values)
+        torch.testing.assert_close(other.cond_fw_xyz, first.cond_fw_xyz)
+        torch.testing.assert_close(other.crop_origin_zyx, first.crop_origin_zyx)
+        torch.testing.assert_close(other.sample_local_zyx, first.sample_local_zyx)
+        assert other.crop_kinds == first.crop_kinds
+        assert other.direction_kinds == first.direction_kinds
+
+
+def test_control_point_crop_offset_keeps_configured_margin(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(16, 16, 16))
+    config["control_point_margin_voxels"] = 3
+    builder = FiberTraceBatchBuilder(config)
+
+    batch = builder.sample_batch(record_index=0, iteration=4)
+    origin = batch.crop_origin_zyx[0].numpy()
+    controls_zyx = np.array([[8, 8, 8], [8, 8, 10]], dtype=np.int64)
+    local_options = controls_zyx - origin[None, :]
+
+    assert any(
+        bool(np.all((local == 3) | (local == 12))) for local in local_options
     )
-    positive_errors = folded_errors[np.array(batch.direction_kinds) == "positive"]
-    negative_errors = folded_errors[np.array(batch.direction_kinds) == "negative"]
-    assert bool((positive_errors >= -1e-4).all())
-    assert bool((positive_errors <= 30.0 + 1e-4).all())
-    assert bool((negative_errors >= 60.0 - 1e-4).all())
-    assert bool((negative_errors <= 90.0 + 1e-4).all())
+    sample_local = batch.sample_local_zyx[0].numpy()
+    assert bool(np.all((sample_local == 3) | (sample_local == 12)))
+
+
+def test_control_point_margin_rejects_impossible_crop(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(16, 16, 16))
+    config["control_point_margin_voxels"] = 8
+    with pytest.raises(ValueError, match="control_point_margin_voxels"):
+        FiberTraceBatchBuilder(config)
+
+
+def test_augmentation_crop_size_is_center_trimmed_to_crop_size(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config["augmentation_crop_size"] = [12, 12, 12]
+    builder = FiberTraceBatchBuilder(config)
+
+    crop_base = builder._sample_crop_base(
+        builder.records[0], crop_kind="gt_control", control_index=0
+    )
+
+    assert crop_base["volume"].shape == (8, 8, 8)
+    assert crop_base["mask_values"].shape == (8, 8, 8)
+    assert crop_base["nx_values"].shape == (8, 8, 8)
+    assert crop_base["ny_values"].shape == (8, 8, 8)
+    np.testing.assert_array_equal(
+        crop_base["origin"], np.array([4, 4, 4], dtype=np.int64)
+    )
 
 
 def test_sampled_control_outside_normals_reports_mapping(tmp_path: Path):
@@ -257,7 +283,7 @@ def test_sampled_control_outside_normals_reports_mapping(tmp_path: Path):
     config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
     config["_array_records"][0]["fiber_path"] = str(fiber_path)
 
-    builder = FiberTraceBatchBuilder(config, rng=np.random.default_rng(0))
+    builder = FiberTraceBatchBuilder(config)
     with pytest.raises(ValueError, match="nx_zyx=.*reason='mapped outside nx/ny volume'"):
         builder.sample_batch(record_index=0)
 
@@ -286,10 +312,10 @@ def test_valid_mask_threshold_key_is_removed(tmp_path: Path):
         FiberTraceBatchBuilder(config)
 
 
-def test_negative_direction_max_is_folded_frame_degree_bound(tmp_path: Path):
+def test_removed_direction_label_threshold_keys_are_rejected(tmp_path: Path):
     config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
-    config["negative_direction_max_degrees"] = 120.0
-    with pytest.raises(ValueError, match="negative_direction_max_degrees"):
+    config["negative_direction_max_degrees"] = 90.0
+    with pytest.raises(ValueError, match="negative_direction_max_degrees was removed"):
         FiberTraceBatchBuilder(config)
 
 
@@ -615,7 +641,6 @@ def test_lasagna_manifest_drives_channels_and_scaled_sampling(
             "batch_size": 2,
             "seed": 1,
             "image_normalization": "unit",
-            "positive_direction_probability": 1.0,
             "positive_direction_jitter_degrees": 0.0,
             "datasets": [
                 {
@@ -626,7 +651,6 @@ def test_lasagna_manifest_drives_channels_and_scaled_sampling(
                 }
             ],
         },
-        rng=np.random.default_rng(3),
     )
     batch = fiber_train.classify_batch_on_device(
         builder.sample_batch(record_index=0), builder.config
@@ -634,7 +658,6 @@ def test_lasagna_manifest_drives_channels_and_scaled_sampling(
 
     assert batch.volume.shape == (2, 1, 4, 4, 4)
     assert bool((batch.labels == POSITIVE_LABEL).any())
-    assert bool((batch.target_up_valid & (batch.labels == POSITIVE_LABEL)).any())
     assert calls[:5] == [
         (str(base_root.resolve()), 1),
         (str(base_root.resolve()), 0),
@@ -655,15 +678,12 @@ def test_voxel_classification_uses_normal_plane_positive_zone():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=mask,
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
         negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(30.0))),
-        negative_cosine=float(np.cos(np.deg2rad(60.0))),
         positive_target_id=7,
     )
     assert int(result["labels"][5, 3, 4]) == POSITIVE_LABEL
@@ -677,12 +697,6 @@ def test_voxel_classification_uses_normal_plane_positive_zone():
         np.array([1.0, 0.0, 0.0], dtype=np.float32),
         atol=1e-6,
     )
-    np.testing.assert_allclose(
-        result["target_up_xyz"][:, 5, 3, 4],
-        np.array([0.0, 0.0, 1.0], dtype=np.float32),
-        atol=1e-6,
-    )
-    assert bool(result["target_up_valid"][5, 3, 4])
 
 
 def test_voxel_classification_cone_negatives_and_positive_precedence():
@@ -694,7 +708,6 @@ def test_voxel_classification_cone_negatives_and_positive_precedence():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
@@ -703,9 +716,11 @@ def test_voxel_classification_cone_negatives_and_positive_precedence():
         negative_cone_distance_voxels=3.0,
         positive_target_id=11,
     )
-    assert int(result["labels"][8, 5, 4]) == NEGATIVE_LABEL
-    assert int(result["target_id"][8, 5, 4]) == NEGATIVE_ONLY_ID
-    assert int(result["labels"][7, 5, 4]) == IGNORE_INDEX
+    assert int(result["labels"][8, 3, 4]) == NEGATIVE_LABEL
+    assert int(result["target_id"][8, 3, 4]) == NEGATIVE_ONLY_ID
+    assert int(result["labels"][2, 3, 4]) == NEGATIVE_LABEL
+    assert int(result["labels"][8, 4, 4]) == IGNORE_INDEX
+    assert int(result["labels"][8, 6, 4]) == IGNORE_INDEX
     assert int(result["labels"][8, 3, 8]) == IGNORE_INDEX
 
     overlap = classify_voxels(
@@ -713,7 +728,6 @@ def test_voxel_classification_cone_negatives_and_positive_precedence():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
@@ -726,7 +740,45 @@ def test_voxel_classification_cone_negatives_and_positive_precedence():
     assert int(overlap["target_id"][7, 5, 4]) == 12
 
 
-def test_voxel_classification_direction_pairs_label_near_fiber_zone():
+def test_device_classification_uses_normal_axis_cone_negatives():
+    shape = (9, 9, 9)
+    batch = FiberTraceBatch(
+        volume=torch.zeros((1, 1) + shape, dtype=torch.float32),
+        mask_values=torch.ones((1,) + shape, dtype=torch.uint8),
+        nx_values=torch.full((1,) + shape, 255, dtype=torch.uint8),
+        ny_values=torch.full((1,) + shape, 128, dtype=torch.uint8),
+        valid_mask=torch.zeros((1,) + shape, dtype=torch.bool),
+        labels=torch.full((1,) + shape, IGNORE_INDEX, dtype=torch.long),
+        target_id=torch.full((1,) + shape, IGNORE_ID, dtype=torch.long),
+        target_fw_xyz=torch.zeros((1, 3) + shape, dtype=torch.float32),
+        center_normal_xyz=torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32),
+        cond_fw_xyz=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.long),
+        sample_local_zyx=torch.tensor([[4, 4, 4]], dtype=torch.long),
+        line_points_xyz=torch.tensor(
+            [[[2.0, 3.0, 5.0], [6.0, 3.0, 5.0]]], dtype=torch.float32
+        ),
+        positive_target_id=torch.tensor([4], dtype=torch.long),
+        crop_kinds=("unit",),
+        fiber_paths=("",),
+        direction_kinds=("gt_jitter",),
+    )
+
+    classified = fiber_train.classify_batch_on_device(
+        batch,
+        {
+            "normal_plane_jitter_voxels": 1.0,
+            "normal_perpendicular_jitter_voxels": 1.0,
+            "negative_cone_distance_voxels": 3.0,
+        },
+    )
+
+    assert int(classified.labels[0, 8, 3, 4]) == NEGATIVE_LABEL
+    assert int(classified.labels[0, 2, 3, 4]) == NEGATIVE_LABEL
+    assert int(classified.labels[0, 8, 4, 4]) == IGNORE_INDEX
+
+
+def test_voxel_classification_ignores_conditioning_direction_for_labels():
     line = np.array([[2.0, 3.0, 5.0], [6.0, 3.0, 5.0]], dtype=np.float32)
     normal_xyz = np.zeros((9, 9, 9, 3), dtype=np.float32)
     normal_xyz[..., 2] = 1.0
@@ -735,129 +787,29 @@ def test_voxel_classification_direction_pairs_label_near_fiber_zone():
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
         negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(30.0))),
-        negative_cosine=float(np.cos(np.deg2rad(60.0))),
     )
     assert int(positive["labels"][5, 3, 4]) == POSITIVE_LABEL
 
-    negative = classify_voxels(
+    rotated = classify_voxels(
         crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
         crop_shape=(9, 9, 9),
         line_points_xyz=line,
         cond_fw_xyz=np.array([0.5, np.sqrt(3.0) / 2.0, 0.0], dtype=np.float32),
-        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
         negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(30.0))),
-        negative_cosine=float(np.cos(np.deg2rad(60.0))),
     )
-    assert int(negative["labels"][5, 3, 4]) == NEGATIVE_LABEL
-
-    transition = classify_voxels(
-        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
-        crop_shape=(9, 9, 9),
-        line_points_xyz=line,
-        cond_fw_xyz=np.array(
-            [np.cos(np.deg2rad(50.0)), np.sin(np.deg2rad(50.0)), 0.0],
-            dtype=np.float32,
-        ),
-        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
-        valid_mask=np.ones((9, 9, 9), dtype=bool),
-        normal_xyz=normal_xyz,
-        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
-        normal_plane_jitter_voxels=1.0,
-        normal_perpendicular_jitter_voxels=1.0,
-        negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(30.0))),
-        negative_cosine=float(np.cos(np.deg2rad(60.0))),
-    )
-    assert int(transition["labels"][5, 3, 4]) == IGNORE_INDEX
-
-    positive_equivalent = classify_voxels(
-        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
-        crop_shape=(9, 9, 9),
-        line_points_xyz=line,
-        cond_fw_xyz=np.array(
-            [np.cos(np.deg2rad(150.0)), np.sin(np.deg2rad(150.0)), 0.0],
-            dtype=np.float32,
-        ),
-        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
-        valid_mask=np.ones((9, 9, 9), dtype=bool),
-        normal_xyz=normal_xyz,
-        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
-        normal_plane_jitter_voxels=1.0,
-        normal_perpendicular_jitter_voxels=1.0,
-        negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(30.0))),
-        negative_cosine=float(np.cos(np.deg2rad(60.0))),
-    )
-    assert int(positive_equivalent["labels"][5, 3, 4]) == POSITIVE_LABEL
-
-    negative_equivalent = classify_voxels(
-        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
-        crop_shape=(9, 9, 9),
-        line_points_xyz=line,
-        cond_fw_xyz=np.array(
-            [np.cos(np.deg2rad(120.0)), np.sin(np.deg2rad(120.0)), 0.0],
-            dtype=np.float32,
-        ),
-        cond_up_xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
-        valid_mask=np.ones((9, 9, 9), dtype=bool),
-        normal_xyz=normal_xyz,
-        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
-        normal_plane_jitter_voxels=1.0,
-        normal_perpendicular_jitter_voxels=1.0,
-        negative_cone_distance_voxels=3.0,
-        positive_cosine=float(np.cos(np.deg2rad(30.0))),
-        negative_cosine=float(np.cos(np.deg2rad(60.0))),
-    )
-    assert int(negative_equivalent["labels"][5, 3, 4]) == NEGATIVE_LABEL
-
-
-def test_degenerate_up_vectors_are_invalid_or_raise():
-    line = np.array([[2.0, 3.0, 5.0], [6.0, 3.0, 5.0]], dtype=np.float32)
-    normal_xyz = np.zeros((9, 9, 9, 3), dtype=np.float32)
-    normal_xyz[..., 0] = 1.0
-    result = classify_voxels(
-        crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
-        crop_shape=(9, 9, 9),
-        line_points_xyz=line,
-        cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-        cond_up_xyz=np.array([0.0, 1.0, 0.0], dtype=np.float32),
-        valid_mask=np.ones((9, 9, 9), dtype=bool),
-        normal_xyz=normal_xyz,
-        normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
-        positive_radius=0.25,
-        ignore_radius=2.0,
-    )
-    assert int(result["labels"][5, 3, 4]) == POSITIVE_LABEL
-    assert not bool(result["target_up_valid"][5, 3, 4])
-
-    with pytest.raises(ValueError, match="degenerate"):
-        classify_voxels(
-            crop_origin_zyx=np.array([0, 0, 0], dtype=np.int64),
-            crop_shape=(9, 9, 9),
-            line_points_xyz=line,
-            cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-            cond_up_xyz=np.array([0.0, 1.0, 0.0], dtype=np.float32),
-            valid_mask=np.ones((9, 9, 9), dtype=bool),
-            normal_xyz=normal_xyz,
-            normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
-            degenerate_up_policy="raise",
-            positive_radius=0.25,
-            ignore_radius=2.0,
-        )
+    assert int(rotated["labels"][5, 3, 4]) == POSITIVE_LABEL
+    np.testing.assert_array_equal(rotated["labels"], positive["labels"])
 
 
 def test_supervised_contrastive_loss_is_finite_on_synthetic_embeddings():
@@ -927,7 +879,7 @@ def test_supervised_contrastive_same_line_positives_attract_across_crops():
 
 def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
     config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
-    builder = FiberTraceBatchBuilder(config, rng=np.random.default_rng(9))
+    builder = FiberTraceBatchBuilder(config)
     batch = fiber_train.classify_batch_on_device(
         builder.sample_batch(record_index=0), builder.config
     )
@@ -937,14 +889,101 @@ def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
         features_per_stage=(2,),
         head_channels=4,
     )
-    outputs = model(batch.volume, batch.cond_fw_xyz, batch.cond_up_xyz)
+    outputs = model(batch.volume, batch.cond_fw_xyz)
     assert outputs["embedding"].shape == (2, 6, 8, 8, 8)
     assert outputs["fw"].shape == (2, 3, 8, 8, 8)
+    assert "up" not in outputs
 
     losses = compute_fiber_trace_loss(outputs, batch, max_contrastive_samples=512)
     assert torch.isfinite(losses.total)
+    assert float(losses.total.detach()) == pytest.approx(
+        float(losses.contrastive.detach()), abs=1e-6
+    )
     losses.total.backward()
     assert any(param.grad is not None for param in model.parameters())
+
+
+def test_sample_plane_visualization_fuses_labels_to_uint8_values():
+    volume = torch.zeros((1, 1, 3, 3, 3), dtype=torch.float32)
+    labels = torch.full((3, 3, 3), IGNORE_INDEX, dtype=torch.long)
+    labels[1, 0, 0] = NEGATIVE_LABEL
+    labels[1, 1, 1] = POSITIVE_LABEL
+    embedding_similarity = torch.zeros((3, 3, 3), dtype=torch.float32)
+    embedding_similarity[1, 0, 0] = -1.0
+    embedding_similarity[1, 1, 1] = 1.0
+    grid = fiber_train._slice_grid(
+        shape_zyx=(3, 3, 3),
+        center_xyz=torch.tensor([1.0, 1.0, 1.0]),
+        axis_u_xyz=torch.tensor([1.0, 0.0, 0.0]),
+        axis_v_xyz=torch.tensor([0.0, 1.0, 0.0]),
+        size=5,
+        device=torch.device("cpu"),
+    )
+
+    images = fiber_train._sample_plane_image(
+        volume, labels, grid, embedding_similarity=embedding_similarity
+    )
+
+    label_image = images["labels"]
+    assert label_image.dtype == torch.uint8
+    assert int(label_image[1, 1]) == 0
+    assert int(label_image[2, 2]) == 255
+    assert int(label_image[0, 0]) == 63
+    cos_image = images["cos_emb_cp"]
+    assert float(cos_image[1, 1]) == pytest.approx(0.0, abs=1e-6)
+    assert float(cos_image[2, 2]) == pytest.approx(1.0, abs=1e-6)
+    assert float(cos_image[0, 0]) == pytest.approx(63.0 / 255.0, abs=1e-6)
+
+
+def test_sample_plane_grid_even_size_has_reference_pixel():
+    grid = fiber_train._slice_grid(
+        shape_zyx=(8, 8, 8),
+        center_xyz=torch.tensor([4.0, 4.0, 4.0]),
+        axis_u_xyz=torch.tensor([1.0, 0.0, 0.0]),
+        axis_v_xyz=torch.tensor([0.0, 1.0, 0.0]),
+        size=8,
+        device=torch.device("cpu"),
+    )
+
+    center_grid = grid[0, 0, 4, 4]
+
+    torch.testing.assert_close(
+        center_grid,
+        torch.tensor([1.0 / 7.0, 1.0 / 7.0, 1.0 / 7.0], dtype=torch.float32),
+    )
+
+
+def test_sample_plane_visualization_marks_reference_cross_without_overwriting_center():
+    volume = torch.zeros((1, 1, 5, 5, 5), dtype=torch.float32)
+    labels = torch.full((5, 5, 5), IGNORE_INDEX, dtype=torch.long)
+    labels[2, 2, 2] = POSITIVE_LABEL
+    embedding_similarity = torch.zeros((5, 5, 5), dtype=torch.float32)
+    embedding_similarity[2, 2, 2] = 1.0
+    grid = fiber_train._slice_grid(
+        shape_zyx=(5, 5, 5),
+        center_xyz=torch.tensor([2.0, 2.0, 2.0]),
+        axis_u_xyz=torch.tensor([1.0, 0.0, 0.0]),
+        axis_v_xyz=torch.tensor([0.0, 1.0, 0.0]),
+        size=5,
+        device=torch.device("cpu"),
+    )
+
+    images = fiber_train._sample_plane_image(
+        volume,
+        labels,
+        grid,
+        embedding_similarity=embedding_similarity,
+        center_marker_yx=(2, 2),
+    )
+
+    assert float(images["cos_emb_cp"][2, 2]) == pytest.approx(1.0, abs=1e-6)
+    assert int(images["labels"][2, 2]) == 255
+    assert float(images["image"][2, 1]) == pytest.approx(1.0, abs=1e-6)
+    assert float(images["image"][2, 3]) == pytest.approx(1.0, abs=1e-6)
+    assert float(images["cos_emb_cp"][1, 2]) == pytest.approx(0.0, abs=1e-6)
+    assert float(images["cos_emb_cp"][3, 2]) == pytest.approx(0.0, abs=1e-6)
+    assert int(images["labels"][1, 2]) == 0
+    assert int(images["labels"][3, 2]) == 0
 
 
 def test_test_fiber_glob_builds_separate_test_config():
@@ -966,8 +1005,230 @@ def test_test_fiber_glob_builds_separate_test_config():
     assert "test_fiber_glob" in test_config["datasets"][0]
 
 
-def test_training_writes_tensorboard_text_and_snapshots(
+def _prefetch_zarr_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    fiber_path = tmp_path / "fiber.json"
+    _write_fiber(fiber_path)
+    manifest_path = tmp_path / "pred.lasagna.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+
+    base_root = tmp_path / "base.ome.zarr"
+    grad_root = tmp_path / "grad_mag.ome.zarr"
+    normal_root = tmp_path / "normal.ome.zarr"
+    base = zarr.open(
+        str(base_root),
+        mode="w",
+        path="0",
+        shape=(16, 16, 16),
+        chunks=(8, 8, 8),
+        dtype="u1",
+        dimension_separator="/",
+    )
+    base[:] = np.arange(16 * 16 * 16, dtype=np.uint16).reshape(16, 16, 16) % 255
+    setattr(base.store, "_url", "s3://example/base.ome.zarr")
+    setattr(base.store, "_cache_dir", str(tmp_path / "cache" / "base"))
+    grad = zarr.open(
+        str(grad_root),
+        mode="w",
+        path="0",
+        shape=(16, 16, 16),
+        chunks=(8, 8, 8),
+        dtype="u1",
+        dimension_separator="/",
+    )
+    grad[:] = 1
+    normals = zarr.open(
+        str(normal_root),
+        mode="w",
+        path="0",
+        shape=(2, 16, 16, 16),
+        chunks=(1, 8, 8, 8),
+        dtype="u1",
+        dimension_separator="/",
+    )
+    normals[:] = 128
+
+    class FakeLasagnaVolume:
+        path = manifest_path
+        base_shape_zyx = (16, 16, 16)
+        source_to_base = 1.0
+
+        def channel_group(self, channel_name: str):
+            if channel_name == "grad_mag":
+                return (
+                    SimpleNamespace(
+                        zarr_path="grad_mag.ome.zarr/0",
+                        scaledown=0,
+                        sd_fac=1.0,
+                    ),
+                    0,
+                )
+            if channel_name == "nx":
+                return (
+                    SimpleNamespace(
+                        zarr_path="normal.ome.zarr/0",
+                        scaledown=0,
+                        sd_fac=1.0,
+                    ),
+                    0,
+                )
+            if channel_name == "ny":
+                return (
+                    SimpleNamespace(
+                        zarr_path="normal.ome.zarr/0",
+                        scaledown=0,
+                        sd_fac=1.0,
+                    ),
+                    1,
+                )
+            raise KeyError(channel_name)
+
+    monkeypatch.setattr(
+        fiber_dataset,
+        "_load_lasagna_volume",
+        lambda path, config: FakeLasagnaVolume(),
+    )
+
+    def fake_open_zarr(path, *, scale=None, auth_json_path=None, config=None):
+        if str(path) == "s3://example/base.ome.zarr" and int(scale) == 0:
+            return base
+        if str(path) == str(grad_root.resolve()) and int(scale) == 0:
+            return grad
+        if str(path) == str(normal_root.resolve()) and int(scale) == 0:
+            return normals
+        raise AssertionError((path, scale))
+
+    monkeypatch.setattr(fiber_dataset, "_common_open_zarr", fake_open_zarr)
+    return {
+        "crop_size": [8, 8, 8],
+        "batch_size": 2,
+        "seed": 3,
+        "image_normalization": "unit",
+        "positive_direction_jitter_degrees": 0.0,
+        "control_point_margin_voxels": 3,
+        "random_negative_pool_size": 2,
+        "random_valid_max_attempts": 64,
+        "num_steps": 1,
+        "log_every": 1,
+        "tensorboard_enabled": False,
+        "datasets": [
+            {
+                "base_volume_path": "s3://example/base.ome.zarr",
+                "lasagna_manifest_path": str(manifest_path),
+                "fiber_paths": [str(fiber_path)],
+            }
+        ],
+    }
+
+
+def test_prefetch_chunk_requests_use_zarr_chunk_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    config = _prefetch_zarr_config(tmp_path, monkeypatch)
+    builder = FiberTraceBatchBuilder(config)
+
+    requests = builder.prefetch_chunk_requests_for_iteration(iteration=1)
+    labels = {request.label for request in requests}
+
+    assert labels == {"base"}
+    assert requests
+    assert all(request.key.startswith("0/") for request in requests)
+    assert any(request.key.count("/") == 3 for request in requests)
+
+
+def test_prefetch_mode_fetches_chunks_with_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    config = _prefetch_zarr_config(tmp_path, monkeypatch)
+
+    result = fiber_train.run_prefetch(config, max_workers=2)
+    output = capsys.readouterr().out
+
+    assert result["unique_chunks"] > 0
+    assert result["pending_chunks"] > 0
+    assert result["cached_chunks"] == 0
+    assert result["bytes"] > 0
+    assert result["errors"] == 0
+    assert "prefetch chunks:" in output
+    assert "pending=" in output
+    assert "eta=" in output
+    assert "MiB/s" in output
+
+
+def test_prefetch_mode_skips_already_cached_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    config = _prefetch_zarr_config(tmp_path, monkeypatch)
+    builder = FiberTraceBatchBuilder(config)
+    requests = fiber_train._dedupe_chunk_requests(
+        builder.prefetch_chunk_requests_for_iteration(iteration=1)
+    )
+    assert requests
+    for request in requests:
+        cache_dir = Path(getattr(request.store, "_cache_dir"))
+        cache_path = cache_dir / request.key
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(b"cached")
+
+    result = fiber_train.run_prefetch(config, max_workers=2)
+    output = capsys.readouterr().out
+
+    assert result["unique_chunks"] == len(requests)
+    assert result["cached_chunks"] == len(requests)
+    assert result["pending_chunks"] == 0
+    assert result["bytes"] == 0
+    assert "pending=0" in output
+
+
+def test_prefetch_mode_adds_test_batch_once(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[str, int]] = []
+
+    class FakeStore:
+        def __getitem__(self, key: str) -> bytes:
+            return b"x"
+
+    class FakeBuilder:
+        def __init__(self, config: dict, **kwargs) -> None:
+            self.name = "test" if config.get("is_test") else "train"
+
+        def prefetch_chunk_requests_for_iteration(self, *, iteration: int):
+            calls.append((self.name, int(iteration)))
+            return [
+                fiber_dataset.ZarrChunkRequest(
+                    store=FakeStore(),
+                    store_identity=self.name,
+                    key=f"{self.name}/{iteration}",
+                    label="base",
+                )
+            ]
+
+    monkeypatch.setattr(fiber_train, "FiberTraceBatchBuilder", FakeBuilder)
+    monkeypatch.setattr(
+        fiber_train,
+        "_make_test_config",
+        lambda config: {"is_test": True},
+    )
+
+    result = fiber_train.run_prefetch({"num_steps": 5}, max_workers=1)
+
+    assert calls == [
+        ("train", 1),
+        ("train", 2),
+        ("train", 3),
+        ("train", 4),
+        ("train", 5),
+        ("test", 1),
+    ]
+    assert result["unique_chunks"] == 6
+
+
+def test_training_writes_tensorboard_text_and_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
     class FakeWriter:
         def __init__(self, log_dir: Path) -> None:
@@ -1012,6 +1273,7 @@ def test_training_writes_tensorboard_text_and_snapshots(
             "run_path": str(tmp_path / "runs"),
             "run_name": "unit run",
             "run_datestr": "20260102_030405",
+            "debug_cache": True,
             "_test_array_records": config["_array_records"],
             "model": {
                 "input_channels": 1,
@@ -1025,6 +1287,7 @@ def test_training_writes_tensorboard_text_and_snapshots(
     )
 
     result = fiber_train.run_training(config)
+    output = capsys.readouterr().out
 
     run_dir = tmp_path / "runs" / "unit_run_20260102_030405"
     assert Path(result["run_dir"]) == run_dir
@@ -1040,15 +1303,23 @@ def test_training_writes_tensorboard_text_and_snapshots(
     assert {
         "train/total",
         "train/contrastive",
-        "train/fw",
-        "train/up",
     } <= scalar_tags
-    assert {"test/total", "test/contrastive", "test/fw", "test/up"} <= scalar_tags
+    assert output.count("fiber_trace batch columns:") == 0
+    assert output.count("fiber_trace step columns:") == 1
+    assert output.count("   it      data       aug") == 1
+    assert "step=1 " not in output
+    step_rows = [
+        line
+        for line in output.splitlines()
+        if line.split()[:1] == ["1"] and len(line.split()) == 14
+    ]
+    assert len(step_rows) == 1
+    assert {"test/total", "test/contrastive"} <= scalar_tags
     image_tags = {tag for tag, _, _ in writers[0].images}
     expected_image_tags = {
         f"train_sample/{view}/{name}"
         for view in ("side", "top", "cross")
-        for name in ("image", "positive", "undef", "negative")
+        for name in ("image", "labels", "cos_emb_cp")
     }
     assert expected_image_tags <= image_tags
     assert all(

@@ -9,21 +9,17 @@
   "tensorboard_enabled": true,
   "batch_size": 2,
   "crop_size": [64, 64, 64],
+  "augmentation_crop_size": [96, 96, 96],
   "image_normalization": "zscore",
-  "positive_direction_probability": 0.5,
   "positive_direction_jitter_degrees": 30.0,
-  "negative_direction_min_degrees": 60.0,
-  "negative_direction_max_degrees": 90.0,
+  "control_point_margin_voxels": 31,
   "normal_plane_jitter_voxels": 40.0,
   "normal_perpendicular_jitter_voxels": 10.0,
   "negative_cone_distance_voxels": 30.0,
   "positive_radius": 1.5,
   "ignore_radius": 3.0,
-  "positive_cosine": 0.8660254037844386,
-  "negative_cosine": 0.5,
-  "degenerate_up_policy": "invalid",
-  "allow_arbitrary_up_fallback": false,
   "random_valid_max_attempts": 256,
+  "random_negative_pool_size": 1000,
   "volume_cache_dir": "/tmp/vesuvius_fiber_trace_zarr_cache",
   "datasets": [
     {
@@ -48,8 +44,6 @@
   "loss": {
     "temperature": 0.1,
     "contrastive_weight": 1.0,
-    "fw_weight": 1.0,
-    "up_weight": 1.0,
     "max_contrastive_samples": 4096
   }
 }

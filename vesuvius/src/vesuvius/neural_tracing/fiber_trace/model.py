@@ -37,17 +37,15 @@ class DirectionConditionedFiberTraceModel(nn.Module):
         )
         self.head = nn.Sequential(
             nn.Conv3d(
-                self.backbone_channels + 6, int(head_channels), kernel_size=1, bias=True
+                self.backbone_channels + 3, int(head_channels), kernel_size=1, bias=True
             ),
             nn.SiLU(inplace=True),
             nn.Conv3d(
-                int(head_channels), self.embedding_dim + 6, kernel_size=1, bias=True
+                int(head_channels), self.embedding_dim + 3, kernel_size=1, bias=True
             ),
         )
 
-    def forward(
-        self, volume: Tensor, cond_fw_xyz: Tensor, cond_up_xyz: Tensor
-    ) -> dict[str, Tensor]:
+    def forward(self, volume: Tensor, cond_fw_xyz: Tensor) -> dict[str, Tensor]:
         if volume.ndim != 5:
             raise ValueError(
                 f"volume must have shape [B, C, D, H, W], got {tuple(volume.shape)}"
@@ -56,28 +54,20 @@ class DirectionConditionedFiberTraceModel(nn.Module):
             raise ValueError(
                 f"cond_fw_xyz must have shape [B, 3], got {tuple(cond_fw_xyz.shape)}"
             )
-        if cond_up_xyz.shape != (volume.shape[0], 3):
-            raise ValueError(
-                f"cond_up_xyz must have shape [B, 3], got {tuple(cond_up_xyz.shape)}"
-            )
 
         cond_fw_xyz = F.normalize(cond_fw_xyz.to(dtype=volume.dtype), dim=1)
-        cond_up_xyz = F.normalize(cond_up_xyz.to(dtype=volume.dtype), dim=1)
         features = self.backbone(volume)
         if tuple(features.shape[2:]) != tuple(volume.shape[2:]):
             features = F.interpolate(
                 features, size=volume.shape[2:], mode="trilinear", align_corners=False
             )
 
-        cond = torch.cat([cond_fw_xyz, cond_up_xyz], dim=1).view(
-            volume.shape[0], 6, 1, 1, 1
-        )
+        cond = cond_fw_xyz.view(volume.shape[0], 3, 1, 1, 1)
         cond = cond.expand(-1, -1, *features.shape[2:])
         raw = self.head(torch.cat([features, cond], dim=1))
         embedding = F.normalize(raw[:, : self.embedding_dim], dim=1)
         fw = F.normalize(raw[:, self.embedding_dim : self.embedding_dim + 3], dim=1)
-        up = F.normalize(raw[:, self.embedding_dim + 3 : self.embedding_dim + 6], dim=1)
-        return {"embedding": embedding, "fw": fw, "up": up}
+        return {"embedding": embedding, "fw": fw}
 
 
 def build_fiber_trace_model(

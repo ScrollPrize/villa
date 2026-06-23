@@ -26,6 +26,52 @@ import warnings
 _HTTP_PREFIXES = ('http://', 'https://')
 
 
+@dataclass
+class ZarrCacheTraceStats:
+    cache_hits: int = 0
+    downloads: int = 0
+    negative_hits: int = 0
+    missing: int = 0
+    cache_hit_bytes: int = 0
+    download_bytes: int = 0
+    cache_hit_ms: float = 0.0
+    download_ms: float = 0.0
+    missing_ms: float = 0.0
+
+
+_CACHE_TRACE_LOCAL = threading.local()
+
+
+def begin_zarr_cache_trace() -> None:
+    _CACHE_TRACE_LOCAL.stats = ZarrCacheTraceStats()
+
+
+def end_zarr_cache_trace() -> ZarrCacheTraceStats:
+    stats = getattr(_CACHE_TRACE_LOCAL, "stats", None)
+    _CACHE_TRACE_LOCAL.stats = None
+    return stats if isinstance(stats, ZarrCacheTraceStats) else ZarrCacheTraceStats()
+
+
+def _record_zarr_cache_event(kind: str, *, byte_count: int = 0, elapsed_ms: float = 0.0) -> None:
+    stats = getattr(_CACHE_TRACE_LOCAL, "stats", None)
+    if not isinstance(stats, ZarrCacheTraceStats):
+        return
+    if kind == "cache_hit":
+        stats.cache_hits += 1
+        stats.cache_hit_bytes += int(byte_count)
+        stats.cache_hit_ms += float(elapsed_ms)
+    elif kind == "download":
+        stats.downloads += 1
+        stats.download_bytes += int(byte_count)
+        stats.download_ms += float(elapsed_ms)
+    elif kind == "negative_hit":
+        stats.negative_hits += 1
+        stats.missing_ms += float(elapsed_ms)
+    elif kind == "missing":
+        stats.missing += 1
+        stats.missing_ms += float(elapsed_ms)
+
+
 class OfflineCacheMiss(Exception):
     """Raised when a zarr chunk fetch is attempted in offline mode but the
     chunk is not present in the local _DiskCacheStore cache (neither as data
@@ -86,13 +132,11 @@ class _DiskCacheStore(zarr.storage.Store):
         url: str,
         offline: bool = False,
         retry_budget_seconds: float = 0.0,
-        debug: bool = False,
     ) -> None:
         super().__init__()
         self._remote = remote
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
-        self._debug = bool(debug)
         self._url = str(url)
         # Namespace cache by the normalized remote URL to prevent cross-dataset
         # chunk-key collisions. Zarr chunk keys are relative paths inside one
@@ -102,10 +146,6 @@ class _DiskCacheStore(zarr.storage.Store):
         scheme, sep, rest = normalized.partition('://')
         subdir = os.path.join(scheme, rest) if sep else normalized
         self._cache_dir = os.path.join(cache_dir, subdir)
-
-    def _debug_print(self, message: str) -> None:
-        if self._debug:
-            print(f"[_DiskCacheStore] {message}", flush=True)
 
     # Suffix appended to the cached path to mark a "known-missing" chunk.
     # Zarr chunk keys don't contain this pattern, so there's no collision
@@ -180,10 +220,10 @@ class _DiskCacheStore(zarr.storage.Store):
             try:
                 with open(cached, 'rb') as f:
                     data = f.read()
-                self._debug_print(
-                    f"cache_hit url={self._url!r} key={key!r} "
-                    f"bytes={len(data)} elapsed_ms={(time.perf_counter() - start) * 1000.0:.2f} "
-                    f"path={cached!r}"
+                _record_zarr_cache_event(
+                    "cache_hit",
+                    byte_count=len(data),
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
                 )
                 return data
             except FileNotFoundError:
@@ -191,10 +231,9 @@ class _DiskCacheStore(zarr.storage.Store):
                 pass
         # Negative cache hit → known-missing, skip the remote round-trip.
         if os.path.isfile(marker):
-            self._debug_print(
-                f"negative_cache_hit url={self._url!r} key={key!r} "
-                f"elapsed_ms={(time.perf_counter() - start) * 1000.0:.2f} "
-                f"marker={marker!r}"
+            _record_zarr_cache_event(
+                "negative_hit",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
             )
             raise KeyError(key)
 
@@ -204,7 +243,6 @@ class _DiskCacheStore(zarr.storage.Store):
                 f"({self._cache_dir})"
             )
 
-        fetch_start = time.perf_counter()
         try:
             result = self._remote_get_with_retry(key)
         except KeyError:
@@ -212,10 +250,9 @@ class _DiskCacheStore(zarr.storage.Store):
                 self._atomic_write_bytes(marker, b"")
             except OSError:
                 pass
-            self._debug_print(
-                f"remote_missing url={self._url!r} key={key!r} "
-                f"elapsed_ms={(time.perf_counter() - start) * 1000.0:.2f} "
-                f"marker={marker!r}"
+            _record_zarr_cache_event(
+                "missing",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
             )
             raise
 
@@ -224,11 +261,10 @@ class _DiskCacheStore(zarr.storage.Store):
         else:
             result = bytes(result)
         self._atomic_write_bytes(cached, result)
-        self._debug_print(
-            f"download url={self._url!r} key={key!r} bytes={len(result)} "
-            f"fetch_ms={(time.perf_counter() - fetch_start) * 1000.0:.2f} "
-            f"elapsed_ms={(time.perf_counter() - start) * 1000.0:.2f} "
-            f"path={cached!r}"
+        _record_zarr_cache_event(
+            "download",
+            byte_count=len(result),
+            elapsed_ms=(time.perf_counter() - start) * 1000.0,
         )
         return result
 
@@ -369,7 +405,6 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
         cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
         offline = bool(config.get('volume_cache_offline', False))
         retry_budget = float(config.get('volume_cache_retry_seconds', 0.0))
-        debug_cache = bool(config.get('debug_cache', False))
 
     if is_http:
         storage_opts = {}
@@ -391,7 +426,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
         )
         store = _DiskCacheStore(
             remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget, debug=debug_cache,
+            offline=offline, retry_budget_seconds=retry_budget,
         )
         return zarr.open(store, path=str(scale), mode='r')
 
@@ -403,7 +438,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
         )
         store = _DiskCacheStore(
             remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget, debug=debug_cache,
+            offline=offline, retry_budget_seconds=retry_budget,
         )
         return zarr.open(store, path=str(scale), mode='r')
 
@@ -438,7 +473,6 @@ def open_zarr_group(path, auth_json_path=None, config=None):
         cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
         offline = bool(config.get('volume_cache_offline', False))
         retry_budget = float(config.get('volume_cache_retry_seconds', 0.0))
-        debug_cache = bool(config.get('debug_cache', False))
 
     if is_http:
         storage_opts = {}
@@ -453,7 +487,7 @@ def open_zarr_group(path, auth_json_path=None, config=None):
         )
         store = _DiskCacheStore(
             remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget, debug=debug_cache,
+            offline=offline, retry_budget_seconds=retry_budget,
         )
         return zarr.open(store, mode='r')
 
@@ -465,7 +499,7 @@ def open_zarr_group(path, auth_json_path=None, config=None):
         )
         store = _DiskCacheStore(
             remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget, debug=debug_cache,
+            offline=offline, retry_budget_seconds=retry_budget,
         )
         return zarr.open(store, mode='r')
 

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +16,8 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.fiber_trace.dataset import (
     FiberTraceBatch,
     FiberTraceBatchBuilder,
+    FiberTraceDebugTableState,
+    ZarrChunkRequest,
 )
 from vesuvius.neural_tracing.fiber_trace.labels import (
     IGNORE_ID,
@@ -143,8 +148,6 @@ def _loss_kwargs(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "temperature": float(loss_cfg.get("temperature", 0.1)),
         "contrastive_weight": float(loss_cfg.get("contrastive_weight", 1.0)),
-        "fw_weight": float(loss_cfg.get("fw_weight", 1.0)),
-        "up_weight": float(loss_cfg.get("up_weight", 1.0)),
         "max_contrastive_samples": int(loss_cfg.get("max_contrastive_samples", 4096)),
     }
 
@@ -153,85 +156,6 @@ def _normalize_vectors_torch(vec: torch.Tensor, *, eps: float = 1e-6) -> torch.T
     return vec.to(dtype=torch.float32) / torch.linalg.vector_norm(
         vec.to(dtype=torch.float32), dim=-1, keepdim=True
     ).clamp_min(float(eps))
-
-
-def _fallback_up_vectors_torch(fw_xyz: torch.Tensor) -> torch.Tensor:
-    fw = _normalize_vectors_torch(fw_xyz)
-    helper_x = torch.zeros_like(fw)
-    helper_x[..., 0] = 1.0
-    helper_y = torch.zeros_like(fw)
-    helper_y[..., 1] = 1.0
-    helper = torch.where((fw[..., 0].abs() < 0.9)[..., None], helper_x, helper_y)
-    return _normalize_vectors_torch(torch.cross(fw, helper, dim=-1))
-
-
-def _construct_up_vectors_torch(
-    fw_xyz: torch.Tensor,
-    normal_xyz: torch.Tensor | None,
-    *,
-    allow_arbitrary_up_fallback: bool,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    fw = _normalize_vectors_torch(fw_xyz, eps=eps)
-    if normal_xyz is None:
-        if not allow_arbitrary_up_fallback:
-            raise ValueError("normal_xyz is required for fiber trace label geometry")
-        return _fallback_up_vectors_torch(fw), torch.ones(
-            fw.shape[:-1], device=fw.device, dtype=torch.bool
-        )
-
-    normal = _normalize_vectors_torch(normal_xyz, eps=eps)
-    up = normal - torch.sum(normal * fw, dim=-1, keepdim=True) * fw
-    up_norm = torch.linalg.vector_norm(up, dim=-1, keepdim=True)
-    valid = torch.isfinite(normal_xyz).all(dim=-1) & (up_norm[..., 0] > float(eps))
-    up = up / up_norm.clamp_min(float(eps))
-    if allow_arbitrary_up_fallback:
-        fallback = _fallback_up_vectors_torch(fw)
-        up = torch.where(valid[..., None], up, fallback)
-        valid = torch.ones_like(valid)
-    return up, valid
-
-
-def _folded_frame_agreement_torch(
-    cond_fw_xyz: torch.Tensor,
-    cond_up_xyz: torch.Tensor | None,
-    target_fw_xyz: torch.Tensor,
-    target_up_xyz: torch.Tensor | None,
-    *,
-    target_up_valid: torch.Tensor | None,
-) -> torch.Tensor:
-    cond_fw = _normalize_vectors_torch(cond_fw_xyz)
-    target_fw = _normalize_vectors_torch(target_fw_xyz)
-    fw_agreement = torch.sum(cond_fw * target_fw, dim=-1).abs()
-    if cond_up_xyz is None or target_up_xyz is None:
-        return fw_agreement.clamp(0.0, 1.0)
-
-    cond_up_raw = cond_up_xyz.to(dtype=torch.float32)
-    target_up_raw = target_up_xyz.to(dtype=torch.float32)
-    cond_up = _normalize_vectors_torch(cond_up_raw)
-    target_up = _normalize_vectors_torch(target_up_raw)
-    up_agreement = torch.sum(cond_up * target_up, dim=-1).abs()
-    frame_agreement = torch.minimum(fw_agreement, up_agreement)
-    up_ok = (torch.linalg.vector_norm(cond_up_raw, dim=-1) > 1e-6) & (
-        torch.linalg.vector_norm(target_up_raw, dim=-1) > 1e-6
-    )
-    if target_up_valid is not None:
-        up_ok = up_ok & target_up_valid
-    return torch.where(up_ok, frame_agreement, fw_agreement).clamp(0.0, 1.0)
-
-
-def _decode_lasagna_normals_torch(
-    nx_values: torch.Tensor, ny_values: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    nx = (nx_values.to(dtype=torch.float32) - 128.0) / 127.0
-    ny = (ny_values.to(dtype=torch.float32) - 128.0) / 127.0
-    nz = torch.sqrt((1.0 - nx * nx - ny * ny).clamp_min(0.0))
-    normal = torch.stack([nx, ny, nz], dim=-1)
-    norm = torch.linalg.vector_norm(normal, dim=-1, keepdim=True)
-    valid = torch.isfinite(normal).all(dim=-1) & (norm[..., 0] > 1e-6)
-    normal = normal / norm.clamp_min(1e-6)
-    normal = torch.where(valid[..., None], normal, torch.zeros_like(normal))
-    return normal, valid
 
 
 def _nearest_polyline_projection_torch(
@@ -283,23 +207,10 @@ def classify_batch_on_device(
     base_coords_zyx = torch.stack([zz, yy, xx], dim=-1)
 
     valid_mask = batch.mask_values > 0.0
-    allow_fallback = bool(config.get("allow_arbitrary_up_fallback", False))
-    if batch.nx_values is None or batch.ny_values is None:
-        if not allow_fallback:
-            raise ValueError("Lasagna nx/ny normal channels are required")
-        normal_xyz = None
-        normal_valid = torch.ones_like(valid_mask, dtype=torch.bool)
-    else:
-        normal_xyz, normal_valid = _decode_lasagna_normals_torch(
-            batch.nx_values, batch.ny_values
-        )
-        valid_mask = valid_mask & normal_valid
 
     labels = torch.full_like(batch.labels, int(IGNORE_INDEX))
     target_id = torch.full_like(batch.target_id, int(IGNORE_ID))
     target_fw_xyz = torch.zeros_like(batch.target_fw_xyz)
-    target_up_xyz = torch.zeros_like(batch.target_up_xyz)
-    target_up_valid = torch.zeros_like(batch.target_up_valid)
 
     positive_radius = float(config.get("positive_radius", 1.5))
     ignore_radius = float(config.get("ignore_radius", max(3.0, positive_radius)))
@@ -312,10 +223,6 @@ def classify_batch_on_device(
     negative_cone_distance = float(
         config.get("negative_cone_distance_voxels", ignore_radius)
     )
-    positive_cosine = float(config.get("positive_cosine", 0.8660254037844386))
-    negative_cosine = float(config.get("negative_cosine", 0.5))
-    degenerate_up_policy = str(config.get("degenerate_up_policy", "invalid"))
-
     for idx in range(bsz):
         origin_zyx = batch.crop_origin_zyx[idx].to(device=device, dtype=torch.float32)
         coords_zyx = base_coords_zyx + origin_zyx
@@ -327,69 +234,41 @@ def classify_batch_on_device(
         )
         tangent_xyz = _normalize_vectors_torch(tangent_xyz)
 
-        normal_i = None if normal_xyz is None else normal_xyz[idx]
-        if normal_i is None:
-            normal_for_geometry, normal_geometry_valid = _construct_up_vectors_torch(
-                tangent_xyz,
-                None,
-                allow_arbitrary_up_fallback=allow_fallback,
-            )
-        else:
-            normal_for_geometry = _normalize_vectors_torch(normal_i)
-            normal_geometry_valid = torch.isfinite(normal_i).all(dim=-1) & (
-                torch.linalg.vector_norm(normal_i, dim=-1) > 1e-6
-            )
+        normal_i = batch.center_normal_xyz[idx].to(
+            device=device, dtype=torch.float32
+        )
+        normal_geometry_valid = torch.isfinite(normal_i).all() & (
+            torch.linalg.vector_norm(normal_i) > 1e-6
+        )
+        normal_for_geometry = normal_i / torch.linalg.vector_norm(normal_i).clamp_min(
+            1e-6
+        )
 
         valid = valid_mask[idx] & normal_geometry_valid
-        target_up_i, target_up_valid_i = _construct_up_vectors_torch(
-            tangent_xyz,
-            normal_i,
-            allow_arbitrary_up_fallback=allow_fallback,
-        )
-        target_up_valid_i = target_up_valid_i & valid
-        agreement = _folded_frame_agreement_torch(
-            batch.cond_fw_xyz[idx],
-            batch.cond_up_xyz[idx],
-            tangent_xyz,
-            target_up_i,
-            target_up_valid=target_up_valid_i,
-        )
-
         offset_xyz = coords_xyz - closest_xyz
         plane_offset = torch.sum(offset_xyz * normal_for_geometry, dim=-1)
         in_plane_offset = offset_xyz - plane_offset[..., None] * normal_for_geometry
         in_plane_distance = torch.linalg.vector_norm(in_plane_offset, dim=-1)
         perpendicular_distance = plane_offset.abs()
 
-        aligned = agreement >= (positive_cosine - 1e-6)
-        disagreed = agreement <= (negative_cosine + 1e-6)
         positive_zone = (
             valid
             & (in_plane_distance <= normal_plane_jitter)
             & (perpendicular_distance <= normal_perp_jitter)
         )
 
-        lateral = torch.cross(normal_for_geometry, tangent_xyz, dim=-1)
-        lateral_norm = torch.linalg.vector_norm(lateral, dim=-1, keepdim=True)
-        lateral_valid = lateral_norm[..., 0] > 1e-6
-        lateral = lateral / lateral_norm.clamp_min(1e-6)
-        in_plane_norm = torch.linalg.vector_norm(in_plane_offset, dim=-1, keepdim=True)
-        in_plane_dir = in_plane_offset / in_plane_norm.clamp_min(1e-6)
-        lateral_alignment = torch.sum(in_plane_dir * lateral, dim=-1).abs()
-        inside_lateral_cone = (
-            lateral_valid
-            & (in_plane_norm[..., 0] > 1e-6)
-            & (lateral_alignment >= 0.7071067811865476)
+        cone_radius = (perpendicular_distance - negative_cone_distance).clamp_min(0.0)
+        inside_normal_cone = (
+            (perpendicular_distance >= negative_cone_distance)
+            & (in_plane_distance <= cone_radius)
         )
-
-        cone_negative = (
-            valid
-            & inside_lateral_cone
-            & (perpendicular_distance >= negative_cone_distance)
-        )
-        direction_negative = positive_zone & disagreed
-        positive = positive_zone & aligned
-        negative = (cone_negative | direction_negative) & ~positive
+        cone_negative = valid & inside_normal_cone
+        if str(batch.crop_kinds[idx]) == "random_negative":
+            positive = torch.zeros_like(valid, dtype=torch.bool)
+            negative = valid
+        else:
+            positive = positive_zone
+            negative = cone_negative & ~positive
 
         labels[idx] = torch.where(
             negative, torch.full_like(labels[idx], int(NEGATIVE_LABEL)), labels[idx]
@@ -411,20 +290,13 @@ def classify_batch_on_device(
             target_id[idx],
         )
 
-        if degenerate_up_policy == "raise" and bool((positive & ~target_up_valid_i).any()):
-            raise ValueError("positive voxels contain degenerate Lasagna normal up vectors")
-
         target_fw_xyz[idx] = tangent_xyz.movedim(-1, 0)
-        target_up_xyz[idx] = target_up_i.movedim(-1, 0)
-        target_up_valid[idx] = target_up_valid_i
 
     return batch.with_classification(
         valid_mask=valid_mask,
         labels=labels,
         target_id=target_id,
         target_fw_xyz=target_fw_xyz,
-        target_up_xyz=target_up_xyz,
-        target_up_valid=target_up_valid,
     )
 
 
@@ -434,19 +306,67 @@ def _compute_losses(
     device: torch.device,
     config: dict[str, Any],
     loss_kwargs: dict[str, Any],
-) -> tuple[Any, FiberTraceBatch]:
-    batch = batch_builder.sample_batch().to(device)
+    *,
+    iteration: int | None = None,
+    debug_batch: bool = True,
+) -> tuple[Any, FiberTraceBatch, dict[str, torch.Tensor], dict[str, float]]:
+    data_t0 = time.perf_counter()
+    batch = batch_builder.sample_batch(
+        iteration=iteration, debug=debug_batch, emit_debug_row=False
+    )
+    data_ms = (time.perf_counter() - data_t0) * 1000.0
+
+    aug_t0 = time.perf_counter()
+    batch = batch.to(device)
     batch = classify_batch_on_device(batch, config)
-    outputs = model(batch.volume, batch.cond_fw_xyz, batch.cond_up_xyz)
-    return compute_fiber_trace_loss(outputs, batch, **loss_kwargs), batch
+    _sync_timing_device(device)
+    aug_ms = (time.perf_counter() - aug_t0) * 1000.0
+
+    fw_t0 = time.perf_counter()
+    outputs = model(batch.volume, batch.cond_fw_xyz)
+    losses = compute_fiber_trace_loss(outputs, batch, **loss_kwargs)
+    _sync_timing_device(device)
+    fw_ms = (time.perf_counter() - fw_t0) * 1000.0
+    timings = {"data_ms": data_ms, "aug_ms": aug_ms, "fw_ms": fw_ms}
+    cache_stats = getattr(batch_builder, "last_cache_stats", None)
+    if cache_stats is not None:
+        cache_mib = float(getattr(cache_stats, "cache_hit_bytes", 0)) / (
+            1024.0 * 1024.0
+        )
+        download_mib = float(getattr(cache_stats, "download_bytes", 0)) / (
+            1024.0 * 1024.0
+        )
+        cache_ms = float(getattr(cache_stats, "cache_hit_ms", 0.0))
+        download_ms = float(getattr(cache_stats, "download_ms", 0.0))
+        timings.update(
+            {
+                "cache_hits": float(getattr(cache_stats, "cache_hits", 0)),
+                "cache_downloads": float(getattr(cache_stats, "downloads", 0)),
+                "cache_missing": float(
+                    int(getattr(cache_stats, "missing", 0))
+                    + int(getattr(cache_stats, "negative_hits", 0))
+                ),
+                "cache_hit_ms": cache_ms,
+                "cache_download_ms": download_ms,
+                "cache_mib_s": (
+                    cache_mib / max(cache_ms / 1000.0, 1e-9)
+                    if cache_mib > 0.0
+                    else 0.0
+                ),
+                "download_mib_s": (
+                    download_mib / max(download_ms / 1000.0, 1e-9)
+                    if download_mib > 0.0
+                    else 0.0
+                ),
+            }
+        )
+    return losses, batch, outputs, timings
 
 
 def _loss_scalars(losses) -> dict[str, float]:
     return {
         "total": float(losses.total.detach().cpu()),
         "contrastive": float(losses.contrastive.detach().cpu()),
-        "fw": float(losses.fw.detach().cpu()),
-        "up": float(losses.up.detach().cpu()),
     }
 
 
@@ -455,6 +375,53 @@ def _log_scalars(writer: Any, prefix: str, scalars: dict[str, float], step: int)
         return
     for name, value in scalars.items():
         writer.add_scalar(f"{prefix}/{name}", value, step)
+
+
+def _sync_timing_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _print_step_timing(
+    *,
+    step: int,
+    timings: dict[str, float],
+    row_index: int,
+    header_every: int,
+    print_legend: bool,
+) -> None:
+    if print_legend:
+        print(
+            "fiber_trace step columns: it=iteration data=batch sample/load ms "
+            "aug=device transfer + label/augmentation ms fw=forward+loss ms "
+            "bw=backward ms opt=optimizer ms step=total ms "
+            "hit/dl/mis=cache events hms/dms=cache-hit/download ms "
+            "hMiB/s/dMiB/s=cache-hit/download throughput",
+            flush=True,
+        )
+    if row_index % max(1, int(header_every)) == 0:
+        print(
+            "   it      data       aug        fw        bw       opt      step "
+            " hit  dl mis      hms      dms   hMiB/s   dMiB/s",
+            flush=True,
+        )
+    print(
+        f"{int(step):5d} "
+        f"{float(timings.get('data_ms', 0.0)):9.1f} "
+        f"{float(timings.get('aug_ms', 0.0)):9.1f} "
+        f"{float(timings.get('fw_ms', 0.0)):9.1f} "
+        f"{float(timings.get('bw_ms', 0.0)):9.1f} "
+        f"{float(timings.get('opt_ms', 0.0)):8.1f} "
+        f"{float(timings.get('step_ms', 0.0)):9.1f} "
+        f"{int(timings.get('cache_hits', 0.0)):4d} "
+        f"{int(timings.get('cache_downloads', 0.0)):3d} "
+        f"{int(timings.get('cache_missing', 0.0)):3d} "
+        f"{float(timings.get('cache_hit_ms', 0.0)):8.1f} "
+        f"{float(timings.get('cache_download_ms', 0.0)):8.1f} "
+        f"{float(timings.get('cache_mib_s', 0.0)):8.1f} "
+        f"{float(timings.get('download_mib_s', 0.0)):8.1f}",
+        flush=True,
+    )
 
 
 def _normalize_vector(vec: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
@@ -468,44 +435,53 @@ def _normalize_vector(vec: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor
     return fallback.to(device=vec.device, dtype=torch.float32)
 
 
+def _sample_local_zyx_tuple(batch: FiberTraceBatch, sample_index: int) -> tuple[int, int, int]:
+    shape_zyx = tuple(int(v) for v in batch.labels.shape[-3:])
+    local = batch.sample_local_zyx[int(sample_index)].detach().cpu().numpy()
+    return tuple(
+        max(0, min(int(shape_zyx[axis]) - 1, int(local[axis]))) for axis in range(3)
+    )
+
+
 def _orthonormal_sample_frame(
     batch: FiberTraceBatch, sample_index: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sample_index = int(sample_index)
     device = batch.volume.device
-    shape_zyx = batch.labels.shape[-3:]
-    center_zyx = tuple(min(int(size) - 1, int(size) // 2) for size in shape_zyx)
+    center_zyx = _sample_local_zyx_tuple(batch, sample_index)
     fallback_fw = _normalize_vector(
         batch.cond_fw_xyz[sample_index],
         torch.tensor([1.0, 0.0, 0.0], device=device),
-    )
-    fallback_up = _normalize_vector(
-        batch.cond_up_xyz[sample_index],
-        torch.tensor([0.0, 1.0, 0.0], device=device),
     )
     fw = _normalize_vector(
         batch.target_fw_xyz[(sample_index, slice(None)) + center_zyx],
         fallback_fw,
     )
-    up_valid = bool(batch.target_up_valid[(sample_index,) + center_zyx].detach().cpu())
-    up_candidate = batch.target_up_xyz[(sample_index, slice(None)) + center_zyx]
-    up_source = up_candidate if up_valid else fallback_up
-    up = _normalize_vector(up_source, fallback_up)
-    up = up - torch.sum(up * fw) * fw
-    up = _normalize_vector(up, fallback_up)
-    right = torch.cross(fw, up, dim=0)
-    if float(torch.linalg.vector_norm(right).detach().cpu()) <= 1e-6:
+    fallback_axis = torch.tensor([0.0, 0.0, 1.0], device=device)
+    if abs(float(torch.sum(fw * fallback_axis).detach().cpu())) > 0.9:
         fallback_axis = torch.tensor([0.0, 1.0, 0.0], device=device)
-        if abs(float(torch.sum(fw * fallback_axis).detach().cpu())) > 0.9:
-            fallback_axis = torch.tensor([0.0, 0.0, 1.0], device=device)
-        up = _normalize_vector(
+    normal_axis = fallback_axis
+    normal_candidate = batch.center_normal_xyz[sample_index].to(
+        device=device, dtype=torch.float32
+    )
+    normal_norm = torch.linalg.vector_norm(normal_candidate)
+    if (
+        bool(torch.isfinite(normal_norm).detach().cpu())
+        and float(normal_norm.detach().cpu()) > 1e-6
+    ):
+        normal_axis = normal_candidate / normal_norm.clamp_min(1e-6)
+    normal_axis = normal_axis - torch.sum(normal_axis * fw) * fw
+    normal_axis = _normalize_vector(normal_axis, fallback_axis)
+    right = torch.cross(fw, normal_axis, dim=0)
+    if float(torch.linalg.vector_norm(right).detach().cpu()) <= 1e-6:
+        normal_axis = _normalize_vector(
             fallback_axis - torch.sum(fallback_axis * fw) * fw,
-            fallback_up,
+            fallback_axis,
         )
-        right = torch.cross(fw, up, dim=0)
+        right = torch.cross(fw, normal_axis, dim=0)
     right = _normalize_vector(right, torch.tensor([0.0, 0.0, 1.0], device=device))
-    up = _normalize_vector(torch.cross(right, fw, dim=0), up)
-    return fw, up, right
+    normal_axis = _normalize_vector(torch.cross(right, fw, dim=0), normal_axis)
+    return fw, normal_axis, right
 
 
 def _normalize_image_for_tb(image: torch.Tensor) -> torch.Tensor:
@@ -533,7 +509,7 @@ def _slice_grid(
     device: torch.device,
 ) -> torch.Tensor:
     coords = torch.arange(size, device=device, dtype=torch.float32)
-    coords = coords - (float(size) - 1.0) * 0.5
+    coords = coords - float(size // 2)
     grid_v, grid_u = torch.meshgrid(coords, coords, indexing="ij")
     pos_xyz = (
         center_xyz.view(1, 1, 3)
@@ -556,10 +532,41 @@ def _slice_grid(
     return torch.stack((x_norm, y_norm, z_norm), dim=-1).view(1, 1, size, size, 3)
 
 
+def _draw_center_cross(
+    image: torch.Tensor,
+    *,
+    center_yx: tuple[int, int],
+    low_value: float,
+    high_value: float,
+) -> torch.Tensor:
+    marked = image.clone()
+    height, width = (int(v) for v in marked.shape[-2:])
+    if height <= 0 or width <= 0:
+        return marked
+    center_y = max(0, min(height - 1, int(center_yx[0])))
+    center_x = max(0, min(width - 1, int(center_yx[1])))
+    radius = max(2, min(6, min(height, width) // 16))
+    x0 = max(0, center_x - radius)
+    x1 = min(width, center_x + radius + 1)
+    y0 = max(0, center_y - radius)
+    y1 = min(height, center_y + radius + 1)
+    if x0 < center_x:
+        marked[center_y, x0:center_x] = high_value
+    if center_x + 1 < x1:
+        marked[center_y, center_x + 1 : x1] = high_value
+    if y0 < center_y:
+        marked[y0:center_y, center_x] = low_value
+    if center_y + 1 < y1:
+        marked[center_y + 1 : y1, center_x] = low_value
+    return marked
+
+
 def _sample_plane_image(
     volume: torch.Tensor,
     labels: torch.Tensor,
     grid: torch.Tensor,
+    embedding_similarity: torch.Tensor | None = None,
+    center_marker_yx: tuple[int, int] | None = None,
 ) -> dict[str, torch.Tensor]:
     image = F.grid_sample(
         volume,
@@ -568,25 +575,89 @@ def _sample_plane_image(
         padding_mode="zeros",
         align_corners=True,
     )[0, 0, 0]
-    masks = {
-        "positive": labels == int(POSITIVE_LABEL),
-        "undef": (labels != int(POSITIVE_LABEL)) & (labels != int(NEGATIVE_LABEL)),
-        "negative": labels == int(NEGATIVE_LABEL),
+    encoded_labels = torch.full(labels.shape, 127.0, device=labels.device)
+    encoded_labels = torch.where(
+        labels == int(NEGATIVE_LABEL),
+        torch.zeros_like(encoded_labels),
+        encoded_labels,
+    )
+    encoded_labels = torch.where(
+        labels == int(POSITIVE_LABEL),
+        torch.full_like(encoded_labels, 255.0),
+        encoded_labels,
+    )
+    sampled_labels = F.grid_sample(
+        encoded_labels.unsqueeze(0).unsqueeze(0),
+        grid,
+        mode="nearest",
+        padding_mode="zeros",
+        align_corners=True,
+    )[0, 0, 0]
+    in_bounds = (grid[0, 0].abs() <= 1.0).all(dim=-1)
+    yy, xx = torch.meshgrid(
+        torch.arange(sampled_labels.shape[0], device=sampled_labels.device),
+        torch.arange(sampled_labels.shape[1], device=sampled_labels.device),
+        indexing="ij",
+    )
+    outside_checker = torch.where(
+        ((yy // 8 + xx // 8) % 2) == 0,
+        torch.full_like(sampled_labels, 63.0),
+        torch.full_like(sampled_labels, 191.0),
+    )
+    sampled_labels = torch.where(
+        in_bounds,
+        sampled_labels,
+        outside_checker,
+    )
+    image_out = _normalize_image_for_tb(image)
+    label_out = sampled_labels.round().clamp(0.0, 255.0).to(torch.uint8)
+    if center_marker_yx is not None:
+        image_out = _draw_center_cross(
+            image_out,
+            center_yx=center_marker_yx,
+            low_value=0.0,
+            high_value=1.0,
+        )
+        label_out = _draw_center_cross(
+            label_out,
+            center_yx=center_marker_yx,
+            low_value=0.0,
+            high_value=255.0,
+        )
+    images = {
+        "image": image_out,
+        "labels": label_out,
     }
-    sampled_masks = {}
-    for name, mask in masks.items():
-        sampled_masks[name] = F.grid_sample(
-            mask.to(dtype=torch.float32).unsqueeze(0).unsqueeze(0),
+    if embedding_similarity is not None:
+        sampled_cos = F.grid_sample(
+            embedding_similarity.to(dtype=torch.float32).unsqueeze(0).unsqueeze(0),
             grid,
-            mode="nearest",
+            mode="bilinear",
             padding_mode="zeros",
             align_corners=True,
         )[0, 0, 0]
-    return {"image": _normalize_image_for_tb(image), **sampled_masks}
+        sampled_cos = torch.where(
+            in_bounds,
+            sampled_cos,
+            (outside_checker / 127.5) - 1.0,
+        )
+        cos_out = ((sampled_cos.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(
+            0.0, 1.0
+        )
+        if center_marker_yx is not None:
+            cos_out = _draw_center_cross(
+                cos_out,
+                center_yx=center_marker_yx,
+                low_value=0.0,
+                high_value=1.0,
+            )
+        images["cos_emb_cp"] = cos_out
+    return images
 
 
 def _log_training_sample_visualization(
     writer: Any,
+    model: torch.nn.Module | None,
     batch: FiberTraceBatch,
     *,
     step: int,
@@ -602,19 +673,39 @@ def _log_training_sample_visualization(
     depth, height, width = shape_zyx
     size = max(depth, height, width)
     device = batch.volume.device
+    center_zyx = _sample_local_zyx_tuple(batch, sample_index)
     center_xyz = torch.tensor(
-        [float(width // 2), float(height // 2), float(depth // 2)],
+        [float(center_zyx[2]), float(center_zyx[1]), float(center_zyx[0])],
         device=device,
         dtype=torch.float32,
     )
-    fw, up, right = _orthonormal_sample_frame(batch, sample_index)
+    fw, normal_axis, right = _orthonormal_sample_frame(batch, sample_index)
     planes = {
-        "side": (fw, up),
+        "side": (fw, normal_axis),
         "top": (fw, right),
-        "cross": (right, up),
+        "cross": (right, normal_axis),
     }
     volume = batch.volume[sample_index : sample_index + 1]
     labels = batch.labels[sample_index].to(device=device)
+    embedding_similarity = None
+    if model is not None:
+        was_training = bool(model.training)
+        model.eval()
+        try:
+            ideal_outputs = model(
+                volume,
+                fw.view(1, 3).to(device=device, dtype=volume.dtype),
+            )
+        finally:
+            if was_training:
+                model.train()
+        embedding = ideal_outputs["embedding"][0].to(device=device, dtype=torch.float32)
+        ref = embedding[(slice(None),) + center_zyx]
+        ref = ref / torch.linalg.vector_norm(ref).clamp_min(1e-6)
+        embedding_n = embedding / torch.linalg.vector_norm(
+            embedding, dim=0, keepdim=True
+        ).clamp_min(1e-6)
+        embedding_similarity = torch.sum(embedding_n * ref.view(-1, 1, 1, 1), dim=0)
     for plane_name, (axis_u, axis_v) in planes.items():
         grid = _slice_grid(
             shape_zyx=shape_zyx,
@@ -624,7 +715,13 @@ def _log_training_sample_visualization(
             size=size,
             device=device,
         )
-        images = _sample_plane_image(volume, labels, grid)
+        images = _sample_plane_image(
+            volume,
+            labels,
+            grid,
+            embedding_similarity=embedding_similarity,
+            center_marker_yx=(size // 2, size // 2),
+        )
         for image_name, image in images.items():
             writer.add_image(
                 f"train_sample/{plane_name}/{image_name}",
@@ -658,6 +755,212 @@ def _save_snapshot(
     )
 
 
+def _dedupe_chunk_requests(
+    requests: list[ZarrChunkRequest],
+) -> list[ZarrChunkRequest]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[ZarrChunkRequest] = []
+    for request in requests:
+        key = (request.store_identity, request.key)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(request)
+    return unique
+
+
+def _fetch_prefetch_chunk(request: ZarrChunkRequest) -> tuple[str, int, float]:
+    start = time.perf_counter()
+    try:
+        data = request.store[request.key]
+    except KeyError:
+        return "missing", 0, (time.perf_counter() - start) * 1000.0
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+    return "ok", len(data), (time.perf_counter() - start) * 1000.0
+
+
+def _prefetch_chunk_is_cached(request: ZarrChunkRequest) -> bool:
+    cache_dir = getattr(request.store, "_cache_dir", None)
+    if cache_dir is None:
+        return False
+    cached = os.path.join(str(cache_dir), request.key)
+    if os.path.isfile(cached):
+        return True
+    marker_suffix = getattr(request.store, "_NEGATIVE_MARKER_SUFFIX", ".__notfound__")
+    return os.path.isfile(cached + str(marker_suffix))
+
+
+def _format_eta(seconds: float | None) -> str:
+    if seconds is None or not bool(seconds >= 0.0) or seconds == float("inf"):
+        return "--:--"
+    total_seconds = int(round(seconds))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _prefetch_progress_line(
+    *,
+    done: int,
+    total: int,
+    bytes_read: int,
+    started_at: float,
+    missing: int,
+    errors: int,
+) -> str:
+    elapsed = max(time.perf_counter() - started_at, 1e-9)
+    mib = float(bytes_read) / (1024.0 * 1024.0)
+    mib_s = mib / elapsed
+    eta_seconds = None
+    if done > 0:
+        eta_seconds = elapsed * float(max(total - done, 0)) / float(done)
+    width = 24
+    filled = int(width * done / max(total, 1))
+    bar = "#" * filled + "-" * (width - filled)
+    return (
+        f"prefetch [{bar}] {done}/{total} chunks "
+        f"{mib:.1f} MiB {mib_s:.1f} MiB/s "
+        f"eta={_format_eta(eta_seconds)} missing={missing} errors={errors}"
+    )
+
+
+def run_prefetch(
+    config: dict[str, Any],
+    *,
+    max_workers: int | None = None,
+) -> dict[str, Any]:
+    _reject_legacy_checkpoint_path(config)
+    steps = int(config.get("num_steps", config.get("steps", 1)))
+    if steps <= 0:
+        raise ValueError(f"num_steps/steps must be positive, got {steps}")
+    configured_workers = (
+        max_workers
+        if max_workers is not None
+        else config.get("prefetch_workers", 16)
+    )
+    if configured_workers is None:
+        configured_workers = 16
+    worker_count = int(configured_workers)
+    worker_count = max(1, min(16, worker_count))
+
+    debug_table_state = FiberTraceDebugTableState()
+    batch_builder = FiberTraceBatchBuilder(
+        config, debug_table_state=debug_table_state
+    )
+    test_config = _make_test_config(config)
+    test_batch_builder = (
+        FiberTraceBatchBuilder(test_config, debug_table_state=debug_table_state)
+        if test_config is not None
+        else None
+    )
+
+    requests: list[ZarrChunkRequest] = []
+    for step in range(1, steps + 1):
+        requests.extend(
+            batch_builder.prefetch_chunk_requests_for_iteration(iteration=step)
+        )
+    if test_batch_builder is not None:
+        requests.extend(
+            test_batch_builder.prefetch_chunk_requests_for_iteration(iteration=1)
+        )
+
+    unique_requests = _dedupe_chunk_requests(requests)
+    cached_requests = [
+        request for request in unique_requests if _prefetch_chunk_is_cached(request)
+    ]
+    pending_requests = [
+        request for request in unique_requests if not _prefetch_chunk_is_cached(request)
+    ]
+    total = len(pending_requests)
+    print(
+        f"prefetch chunks: generated={len(requests)} unique={len(unique_requests)} "
+        f"cached={len(cached_requests)} pending={total} "
+        f"steps={steps} workers={worker_count}",
+        flush=True,
+    )
+    if total == 0:
+        return {
+            "generated_chunks": len(requests),
+            "unique_chunks": len(unique_requests),
+            "cached_chunks": len(cached_requests),
+            "pending_chunks": 0,
+            "bytes": 0,
+            "missing": 0,
+            "errors": 0,
+            "elapsed_seconds": 0.0,
+            "mib_s": 0.0,
+        }
+
+    started_at = time.perf_counter()
+    done = 0
+    bytes_read = 0
+    missing = 0
+    error_count = 0
+    errors: list[str] = []
+    next_print_at = 0.0
+    pool_workers = min(worker_count, total)
+    with ThreadPoolExecutor(max_workers=pool_workers) as executor:
+        futures = [
+            executor.submit(_fetch_prefetch_chunk, request)
+            for request in pending_requests
+        ]
+        for future in as_completed(futures):
+            done += 1
+            try:
+                status, byte_count, _elapsed_ms = future.result()
+            except Exception as exc:
+                status = "error"
+                byte_count = 0
+                error_count += 1
+                if len(errors) < 5:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+            if status == "missing":
+                missing += 1
+            elif status == "error":
+                pass
+            else:
+                bytes_read += int(byte_count)
+
+            now = time.perf_counter()
+            if now >= next_print_at or done == total:
+                print(
+                    "\r"
+                    + _prefetch_progress_line(
+                        done=done,
+                        total=total,
+                        bytes_read=bytes_read,
+                        started_at=started_at,
+                        missing=missing,
+                        errors=error_count,
+                    ),
+                    end="",
+                    flush=True,
+                )
+                next_print_at = now + 0.25
+    print("", flush=True)
+
+    elapsed_seconds = max(time.perf_counter() - started_at, 1e-9)
+    mib = float(bytes_read) / (1024.0 * 1024.0)
+    if error_count:
+        preview = "; ".join(errors)
+        raise RuntimeError(f"prefetch failed for {error_count} chunks: {preview}")
+
+    return {
+        "generated_chunks": len(requests),
+        "unique_chunks": len(unique_requests),
+        "cached_chunks": len(cached_requests),
+        "pending_chunks": total,
+        "bytes": bytes_read,
+        "missing": missing,
+        "errors": error_count,
+        "elapsed_seconds": elapsed_seconds,
+        "mib_s": mib / elapsed_seconds,
+    }
+
+
 def run_training(config: dict[str, Any]) -> dict[str, Any]:
     device = torch.device(
         config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
@@ -666,10 +969,15 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         torch.manual_seed(int(config["seed"]))
     _reject_legacy_checkpoint_path(config)
 
-    batch_builder = FiberTraceBatchBuilder(config)
+    debug_table_state = FiberTraceDebugTableState()
+    batch_builder = FiberTraceBatchBuilder(
+        config, debug_table_state=debug_table_state
+    )
     test_config = _make_test_config(config)
     test_batch_builder = (
-        FiberTraceBatchBuilder(test_config) if test_config is not None else None
+        FiberTraceBatchBuilder(test_config, debug_table_state=debug_table_state)
+        if test_config is not None
+        else None
     )
     run_dir, snapshot_dir = _resolve_run_layout(config)
     current_snapshot = snapshot_dir / "current.pt"
@@ -697,6 +1005,10 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     best_metric_name = (
         "test/total" if test_batch_builder is not None else "train/total"
     )
+    debug_timing = bool(config.get("debug_sampling", False) or config.get("debug_cache", False))
+    debug_step_rows = 0
+    debug_step_header_every = int(config.get("debug_step_header_every", 20))
+    debug_step_legend_printed = False
 
     try:
         if writer is not None:
@@ -707,12 +1019,30 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
 
         model.train()
         for step in range(1, steps + 1):
+            step_t0 = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
-            losses, train_batch = _compute_losses(
-                model, batch_builder, device, config, loss_kwargs
+            losses, train_batch, train_outputs, step_timings = _compute_losses(
+                model, batch_builder, device, config, loss_kwargs, iteration=step
             )
+            bw_t0 = time.perf_counter()
             losses.total.backward()
+            _sync_timing_device(device)
+            step_timings["bw_ms"] = (time.perf_counter() - bw_t0) * 1000.0
+            opt_t0 = time.perf_counter()
             optimizer.step()
+            _sync_timing_device(device)
+            step_timings["opt_ms"] = (time.perf_counter() - opt_t0) * 1000.0
+            step_timings["step_ms"] = (time.perf_counter() - step_t0) * 1000.0
+            if debug_timing:
+                _print_step_timing(
+                    step=step,
+                    timings=step_timings,
+                    row_index=debug_step_rows,
+                    header_every=debug_step_header_every,
+                    print_legend=not debug_step_legend_printed,
+                )
+                debug_step_rows += 1
+                debug_step_legend_printed = True
 
             should_log = step % log_every == 0 or step == steps
             should_visualize = (
@@ -728,8 +1058,14 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
             if should_log and test_batch_builder is not None:
                 model.eval()
                 with torch.no_grad():
-                    test_losses, _ = _compute_losses(
-                        model, test_batch_builder, device, test_config, loss_kwargs
+                    test_losses, _, _, _ = _compute_losses(
+                        model,
+                        test_batch_builder,
+                        device,
+                        test_config,
+                        loss_kwargs,
+                        iteration=step,
+                        debug_batch=False,
                     )
                 test_scalars = _loss_scalars(test_losses)
                 model.train()
@@ -742,6 +1078,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 with torch.no_grad():
                     _log_training_sample_visualization(
                         writer,
+                        model,
                         train_batch,
                         step=step,
                         sample_index=sample_visualization_index,
@@ -782,18 +1119,15 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
 
             message = (
                 f"step={step} train_total={train_scalars['total']:.6f} "
-                f"train_contrastive={train_scalars['contrastive']:.6f} "
-                f"train_fw={train_scalars['fw']:.6f} "
-                f"train_up={train_scalars['up']:.6f}"
+                f"train_contrastive={train_scalars['contrastive']:.6f}"
             )
             if test_scalars is not None:
                 message += (
                     f" test_total={test_scalars['total']:.6f} "
-                    f"test_contrastive={test_scalars['contrastive']:.6f} "
-                    f"test_fw={test_scalars['fw']:.6f} "
-                    f"test_up={test_scalars['up']:.6f}"
+                    f"test_contrastive={test_scalars['contrastive']:.6f}"
                 )
-            print(message, flush=True)
+            if not debug_timing:
+                print(message, flush=True)
     finally:
         if writer is not None:
             writer.close()
@@ -810,9 +1144,27 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train the fiber tracing MVP model.")
+    parser.add_argument(
+        "--prefetch",
+        action="store_true",
+        help=(
+            "Generate the zarr chunk list for this training config and download "
+            "those chunks into the configured cache instead of training."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-workers",
+        type=int,
+        default=None,
+        help="Maximum parallel chunk downloads for --prefetch, capped at 16.",
+    )
     parser.add_argument("config", help="Path to a fiber trace training config JSON.")
     args = parser.parse_args(argv)
-    run_training(_load_config(args.config))
+    config = _load_config(args.config)
+    if args.prefetch:
+        run_prefetch(config, max_workers=args.prefetch_workers)
+    else:
+        run_training(config)
 
 
 if __name__ == "__main__":

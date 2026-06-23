@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -20,8 +21,6 @@ from vesuvius.neural_tracing.fiber_trace.labels import (
 class FiberTraceLoss:
     total: Tensor
     contrastive: Tensor
-    fw: Tensor
-    up: Tensor
 
 
 def _zero_like_loss(reference: Tensor) -> Tensor:
@@ -39,6 +38,55 @@ def _sample_mask_indices(mask: Tensor, max_count: int) -> Tensor:
     return idx
 
 
+def _deterministic_positions(length: int, count: int, *, device: torch.device) -> Tensor:
+    length = int(length)
+    count = int(count)
+    if length <= 0 or count <= 0:
+        return torch.empty((0,), device=device, dtype=torch.long)
+    if length == 1:
+        return torch.zeros((count,), device=device, dtype=torch.long)
+    stride = min(104729, length - 1)
+    while math.gcd(stride, length) != 1:
+        stride -= 1
+        if stride <= 0:
+            stride = 1
+            break
+    return (torch.arange(count, device=device, dtype=torch.long) * int(stride)) % length
+
+
+def _take_deterministic(idx: Tensor, count: int) -> Tensor:
+    positions = _deterministic_positions(
+        int(idx.numel()), int(count), device=idx.device
+    )
+    if positions.numel() == 0:
+        return idx[:0]
+    return idx[positions]
+
+
+def _sample_positive_pairs(pos_idx: Tensor, ids: Tensor, count: int) -> tuple[Tensor, Tensor]:
+    count = int(count)
+    if count <= 0 or pos_idx.numel() < 2:
+        empty = pos_idx[:0]
+        return empty, empty
+
+    left_parts: list[Tensor] = []
+    right_parts: list[Tensor] = []
+    for target_id in torch.unique(ids[pos_idx]):
+        group = pos_idx[ids[pos_idx] == target_id]
+        if group.numel() < 2:
+            continue
+        left_parts.append(group)
+        right_parts.append(torch.roll(group, shifts=-1, dims=0))
+    if not left_parts:
+        empty = pos_idx[:0]
+        return empty, empty
+
+    left = torch.cat(left_parts, dim=0)
+    right = torch.cat(right_parts, dim=0)
+    positions = _deterministic_positions(int(left.numel()), count, device=left.device)
+    return left[positions], right[positions]
+
+
 def supervised_contrastive_loss(
     embeddings: Tensor,
     labels: Tensor,
@@ -48,6 +96,12 @@ def supervised_contrastive_loss(
     ignore_index: int = IGNORE_INDEX,
     max_samples: int = 4096,
 ) -> Tensor:
+    """Sample positive-positive and positive-negative embedding pairs.
+
+    Positives with the same target id are attraction pairs. Explicit negatives
+    are only tested against positives; negative-negative relationships are not
+    part of the objective.
+    """
     if embeddings.ndim != 5:
         raise ValueError(
             f"embeddings must have shape [B, E, D, H, W], got {tuple(embeddings.shape)}"
@@ -83,76 +137,46 @@ def supervised_contrastive_loss(
 
     pos_idx = _sample_mask_indices(is_positive, 0)
     neg_idx = _sample_mask_indices(is_negative, 0)
-    max_samples = int(max_samples)
-    if max_samples > 0 and pos_idx.numel() + neg_idx.numel() > max_samples:
-        if pos_idx.numel() == 0:
-            pos_budget = 0
-        elif neg_idx.numel() == 0:
-            pos_budget = max_samples
-        else:
-            min_positive_budget = 2 if max_samples >= 2 else 1
-            pos_budget = min(
-                pos_idx.numel(), max(min_positive_budget, max_samples // 2)
-            )
-        neg_budget = min(neg_idx.numel(), max_samples - pos_budget)
-        remaining = max_samples - pos_budget - neg_budget
-        if remaining > 0:
-            extra_pos = min(pos_idx.numel() - pos_budget, remaining)
-            pos_budget += extra_pos
-            remaining -= extra_pos
-        if remaining > 0:
-            neg_budget += min(neg_idx.numel() - neg_budget, remaining)
-        pos_idx = _sample_mask_indices(is_positive, int(pos_budget))
-        neg_idx = _sample_mask_indices(is_negative, int(neg_budget))
-
-    sample_idx = torch.cat([pos_idx, neg_idx], dim=0)
-    if sample_idx.numel() < 2:
+    if pos_idx.numel() == 0:
         return _zero_like_loss(embeddings)
 
-    emb = emb[sample_idx]
-    lab = lab[sample_idx]
-    ids = ids[sample_idx]
-    positive_sample = (lab == int(POSITIVE_LABEL)) & (ids != int(IGNORE_ID)) & (
-        ids != int(NEGATIVE_ONLY_ID)
+    max_samples = int(max_samples)
+    pair_budget = (
+        max_samples
+        if max_samples > 0
+        else int(pos_idx.numel()) + int(neg_idx.numel())
     )
-    if emb.shape[0] < 2:
+    if pair_budget <= 0:
         return _zero_like_loss(embeddings)
 
     emb = F.normalize(emb, dim=1)
-    logits = emb @ emb.T / max(float(temperature), 1e-6)
-    eye = torch.eye(logits.shape[0], device=logits.device, dtype=torch.bool)
-    positive = (
-        positive_sample[:, None]
-        & positive_sample[None, :]
-        & (ids[:, None] == ids[None, :])
-        & ~eye
-    )
-    anchors = positive_sample & positive.any(dim=1)
-    if not bool(anchors.any()):
+    temp = max(float(temperature), 1e-6)
+    pos_pair_budget = pair_budget if neg_idx.numel() == 0 else max(1, pair_budget // 2)
+    neg_pair_budget = pair_budget - pos_pair_budget
+
+    pos_a, pos_b = _sample_positive_pairs(pos_idx, ids, pos_pair_budget)
+    if neg_idx.numel() > 0 and neg_pair_budget > 0:
+        neg_a = _take_deterministic(pos_idx, neg_pair_budget)
+        neg_b = _take_deterministic(neg_idx, neg_pair_budget)
+    else:
+        neg_a = pos_idx[:0]
+        neg_b = neg_idx[:0]
+
+    total = _zero_like_loss(embeddings)
+    pair_count = 0
+    if pos_a.numel() > 0:
+        pos_cos = torch.sum(emb[pos_a] * emb[pos_b], dim=1).clamp(-1.0, 1.0)
+        pos_loss = F.softplus(-pos_cos / temp)
+        total = total + pos_loss.sum()
+        pair_count += int(pos_loss.numel())
+    if neg_a.numel() > 0:
+        neg_cos = torch.sum(emb[neg_a] * emb[neg_b], dim=1).clamp(-1.0, 1.0)
+        neg_loss = F.softplus(neg_cos / temp)
+        total = total + neg_loss.sum()
+        pair_count += int(neg_loss.numel())
+    if pair_count == 0:
         return _zero_like_loss(embeddings)
-
-    logits_no_self = logits.masked_fill(eye, float("-inf"))
-    log_den = torch.logsumexp(logits_no_self, dim=1)
-    log_num = torch.logsumexp(logits.masked_fill(~positive, float("-inf")), dim=1)
-    return -(log_num[anchors] - log_den[anchors]).mean()
-
-
-def masked_cosine_loss(pred: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-    if not bool(mask.any()):
-        return _zero_like_loss(pred)
-    pred_n = F.normalize(pred, dim=1)
-    target_n = F.normalize(target, dim=1)
-    cosine = torch.sum(pred_n * target_n, dim=1).clamp(-1.0, 1.0)
-    return (1.0 - cosine)[mask].mean()
-
-
-def sign_ambiguous_up_loss(pred: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-    if not bool(mask.any()):
-        return _zero_like_loss(pred)
-    pred_n = F.normalize(pred, dim=1)
-    target_n = F.normalize(target, dim=1)
-    cosine = torch.sum(pred_n * target_n, dim=1).clamp(-1.0, 1.0)
-    return (1.0 - cosine.abs())[mask].mean()
+    return total / float(pair_count)
 
 
 def compute_fiber_trace_loss(
@@ -161,8 +185,6 @@ def compute_fiber_trace_loss(
     *,
     temperature: float = 0.1,
     contrastive_weight: float = 1.0,
-    fw_weight: float = 1.0,
-    up_weight: float = 1.0,
     max_contrastive_samples: int = 4096,
 ) -> FiberTraceLoss:
     contrastive = supervised_contrastive_loss(
@@ -172,14 +194,5 @@ def compute_fiber_trace_loss(
         temperature=temperature,
         max_samples=max_contrastive_samples,
     )
-    positive_mask = batch.labels == POSITIVE_LABEL
-    fw = masked_cosine_loss(outputs["fw"], batch.target_fw_xyz, positive_mask)
-    up = sign_ambiguous_up_loss(
-        outputs["up"], batch.target_up_xyz, positive_mask & batch.target_up_valid
-    )
-    total = (
-        float(contrastive_weight) * contrastive
-        + float(fw_weight) * fw
-        + float(up_weight) * up
-    )
-    return FiberTraceLoss(total=total, contrastive=contrastive, fw=fw, up=up)
+    total = float(contrastive_weight) * contrastive
+    return FiberTraceLoss(total=total, contrastive=contrastive)

@@ -61,69 +61,55 @@ scale, shape, channel, and coordinate metadata.
 ## Batch Construction
 
 Batches are single-fiber batches. For batch size `N`, the builder samples one
-fiber record, selects `N / 2` crop centers, and emits two conditioning variants
-for each selected crop:
+fiber record and emits:
 
-- a positive-conditioned copy jittered 0 to 30 folded frame degrees from the
-  local tangent/up frame
-- a negative-conditioned copy jittered 60 to 90 folded frame degrees from the
-  local tangent/up frame
+- `N / 2` GT control-point crops with mixed positive/ignore/negative labels
+  derived from the selected fiber line and Lasagna normal geometry
+- `N / 2` random valid crops whose valid voxels are explicit negatives
 
-Selected centers prefer GT control points from the same fiber line, using
-multiple distinct control points when possible, and then random valid
-mask/grad-mag voxels when the batch has room. The batch stores crop kind and
-direction kind metadata so tests and trainers can verify the composition. Batch
-size must be even for this MVP.
+GT crops choose control points with deterministic per-iteration random streams;
+duplicates are allowed when the sampled slots collide. The crop is offset so the
+control point is not forced to the crop center while still retaining the
+configured `control_point_margin_voxels` around it. Random-negative centers are
+precomputed before batch sampling from valid `grad_mag > 0` voxels with valid
+Lasagna normal channels. `random_negative_pool_size` controls the pool size,
+defaulting to `1000`; batch sampling then selects from that pool by
+deterministic modulo. The batch stores crop kind and direction kind metadata so
+tests and trainers can verify the composition. Batch size must be even for this
+MVP.
 
 ## Direction Conditioning
 
-Each crop receives normalized `fw(3)` and `up(3)` conditioning in `xyz`
-component order. The local GT forward vector is derived from the nearest fiber
-line tangent. Each selected crop receives a positive-conditioned and
-negative-conditioned copy. Positive copies use
-`positive_direction_jitter_degrees`, normally 30 folded frame degrees. Negative
-copies use `negative_direction_min_degrees` and
-`negative_direction_max_degrees`, normally 60 and 90 folded frame degrees.
+Each crop receives one normalized `fw(3)` conditioning vector in `xyz`
+component order. GT control-point crops condition on the local fiber tangent at
+the sampled control point with up to `positive_direction_jitter_degrees` of
+forward-direction augmentation, normally 30 degrees. Random-negative crops use
+an independent random forward condition.
 
-Voxel direction labels use folded frame-equivalent angular error, not raw `fw`
-angle. Lasagna normal/up sign ambiguity makes both target up signs valid; after
-also folding the equivalent pair `(fw, up) == (-fw, -up)`, the usable error
-range is 0 to 90 degrees. For a simple raw `fw` rotation around a stable up
-axis, raw 0..30 and 150..180 degrees are positive-equivalent, raw 30..60 and
-120..150 degrees are ignored, raw 60..120 degrees are negative-conditioning
-candidates, and raw 90 degrees is maximally wrong.
+Conditioning direction does not change voxel labels. It is only an input to the
+model head. The label masks come from fiber-line geometry, the Lasagna normal
+channels, and the random-negative crop kind.
 
-The `up` vector is built by decoding Lasagna `nx`/`ny` channels as
-`(value - 128) / 127`, reconstructing `nz = sqrt(1 - nx^2 - ny^2)` with
-`nz >= 0`, and projecting that normal away from the local `fw`:
-
-```text
-up_xyz = normalize(normal_xyz - dot(normal_xyz, fw_xyz) * fw_xyz)
-```
-
-Degenerate projected normals mark up supervision invalid by default. Set
-`degenerate_up_policy: "raise"` to fail the crop instead. The only arbitrary
-perpendicular fallback is the explicit opt-in `allow_arbitrary_up_fallback:
-true`; it is disabled by default. The loss treats `up` and `-up` as equivalent.
+Lasagna normals are decoded from `nx`/`ny` channels through Lasagna's own normal
+decoder. For GT crops, the selected control-point normal is used for label
+geometry and slice visualization, not as model conditioning. Normal channels are
+required.
 
 ## Voxel Classification
 
 For every output voxel:
 
 - invalid mask/grad-mag voxels are `ignore`
-- voxels in the normal-frame positive zone with folded frame error up to
-  30 degrees are `positive`
-- voxels in that same positive zone become `negative` only when the
-  folded frame error is from 60 to 90 degrees
-- cone negatives come only from the two lateral 90 degree cone zones and only
-  when the absolute distance to the Lasagna-normal plane is at least
-  `negative_cone_distance_voxels`
+- GT-control crop voxels in the normal-frame positive zone are `positive`
+- cone negatives come only from the normal-axis double cone above/below the
+  local sheet, starting at `negative_cone_distance_voxels`
+- random-negative crop valid voxels are explicit `negative`
 - all other valid voxels are `ignore`
 
-The classifier also emits target local `fw` and `up` vector fields in `xyz`
-component order plus a `target_up_valid` mask and dense `target_id` tensor.
-Positive voxels carry the selected fiber-line identity, explicit negatives
-carry `NEGATIVE_ONLY_ID`, and ignored voxels carry `IGNORE_ID`.
+The classifier also emits target local `fw` vectors in `xyz` component order
+plus a dense `target_id` tensor. Positive voxels carry the selected fiber-line
+identity, explicit negatives carry `NEGATIVE_ONLY_ID`, and ignored voxels carry
+`IGNORE_ID`.
 
 `normal_plane_jitter_voxels` and `normal_perpendicular_jitter_voxels` are
 measured in the selected training grid, not always base-level voxels. If
@@ -133,32 +119,34 @@ fiber coordinates remain base `xyz`; the loader divides them by
 `ignore_radius` are accepted as legacy/debug fallback config, but they are not
 the documented training path.
 
+`crop_size` is the final model/input label crop size. `augmentation_crop_size`
+is the larger outer crop read before post-augmentation center trimming; it must
+be at least `crop_size` and differ by an even number on each axis. The starter
+configs trim 16 voxels per side (`64 -> 96`, `128 -> 160`), which removes
+modest padded or interpolated borders without the larger read cost of a
+32-voxel margin.
+
 ## Model And Losses
 
 `DirectionConditionedFiberTraceModel` uses the existing
 `Vesuvius3dUnetModel` as a compact 3D U-Net feature backbone and adds a
 direction-conditioned head. The head concatenates broadcast normalized `fw`
-and `up` conditioning with the U-Net features and outputs:
+conditioning with the U-Net features and outputs:
 
 - L2-normalized embedding
 - normalized predicted `fw`
-- normalized predicted `up`
 
 Losses are:
 
-- hard supervised contrastive / InfoNCE over classified positives and explicit
+- pairwise embedding contrastive loss over classified positives and explicit
   negatives
-- cosine forward-vector loss on positive voxels
-- sign-ambiguous cosine up-vector loss on positive voxels
 
-The contrastive loss anchors only on positive voxels. Positives with the same
-fiber-line `target_id` attract each other across control-point crops, while
-explicit negatives are denominator-only and are never pulled together. Soft
-distance-weighted contrastive loss is intentionally deferred.
+The contrastive loss samples positive-positive pairs from matching fiber-line
+`target_id`s and positive-negative pairs against explicit negatives. Negative
+voxels are never paired with each other. Soft distance-weighted contrastive loss
+is intentionally deferred.
 
-`loss.max_contrastive_samples` caps the number of positive and negative voxels
-used by the contrastive term per batch. Positives and negatives are sampled
-separately so explicit negatives do not crowd out all anchors.
+`loss.max_contrastive_samples` caps the sampled pair budget per batch.
 
 ## Config Knobs
 
@@ -188,39 +176,52 @@ Replace only the dataset paths first:
 used by the Lasagna training zarr path. Use `"unit"` only for uint8 smoke tests
 where `value / 255` is intended.
 
-`positive_direction_probability` is a legacy/debug knob from the earlier
-single-conditioning MVP and is not used by the paired-conditioning training
-path.
+`positive_direction_jitter_degrees: 30.0` controls the GT control-point forward
+conditioning augmentation. Direction conditioning does not change labels.
 
-`positive_direction_jitter_degrees: 30.0` in the training template comes from
-the spec: conditioning frames up to 30 folded degrees wrong are still
-supervised to output the correct direction, up vector, and positive embedding.
+`control_point_margin_voxels` controls the deterministic GT crop offset. The
+selected control point is placed at either that margin or the opposite-side
+margin on each crop axis. If omitted, the builder uses `min(40, floor((size -
+1) / 2))` per the smallest crop axis; explicit values that cannot fit the crop
+are rejected.
 
-`negative_direction_min_degrees: 60.0` and
-`negative_direction_max_degrees: 90.0` define the paired negative-conditioning
-range in folded frame degrees.
-
-`positive_cosine: 0.8660254037844386` is `cos(30 degrees)`.
-`negative_cosine: 0.5` is `cos(60 degrees)`, matching the folded negative
-threshold.
+Legacy label-conditioning keys such as `positive_direction_probability`,
+`negative_direction_min_degrees`, `negative_direction_max_degrees`,
+`positive_cosine`, and `negative_cosine` are rejected.
 
 `normal_plane_jitter_voxels: 40.0` and
 `normal_perpendicular_jitter_voxels: 10.0` define the normal-frame positive
 zone. `negative_cone_distance_voxels: 30.0` defines the cone-negative minimum
-distance away from the Lasagna-normal plane.
+distance away from the Lasagna-normal plane, where the normal-axis double cone
+starts.
+
+`random_negative_pool_size: 1000` precomputes the deterministic random-negative
+center pool before training batches are sampled. Training batches select from
+that pool by modulo instead of probing random valid voxels during batch
+construction.
+
+Sampling streams are deterministic by purpose and keyed from `seed`, iteration,
+batch slot, record index, and control index where relevant. Re-running a given
+training iteration samples the same record, crop offsets, conditioning vectors,
+and random-negative pool entries independent of previous sampler calls.
 
 `positive_radius` and `ignore_radius` are kept only for legacy/debug fallback
 behavior when the named normal-frame fields are omitted.
 
 `sample_visualization_every: 10000` logs one training sample to TensorBoard on
-that interval. The trainer writes three oriented crop-center slices:
+that interval. The trainer writes three oriented slices through the sampled
+point:
 
 - `side`: fiber direction by sampled up/normal direction
 - `top`: fiber direction by binormal
 - `cross`: binormal by sampled up/normal direction, perpendicular to the fiber
 
 Each view is logged under `train_sample/<view>/` as one normalized `image`
-slice plus separate `positive`, `undef`, and `negative` class-mask images.
+slice plus one fused `labels` image using negative/undefined/positive values
+`0/127/255`, and one fixed-scale `cos_emb_cp` image for predicted embedding
+cosine against the sampled-point embedding. Slice samples outside the crop are
+black in `image` and shown as a coarse `63/191` checkerboard in label/cosine
+views.
 
 ## Entrypoint
 
@@ -229,6 +230,17 @@ Run a training smoke or short job with:
 ```bash
 python -m vesuvius.neural_tracing.fiber_trace.train /path/to/config.json
 ```
+
+To prefetch the zarr chunks that the same training config will touch, run:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace.train --prefetch /path/to/config.json
+```
+
+`--prefetch` builds the deterministic train/test crop chunk list for
+`num_steps`, deduplicates chunk keys, then downloads the chunks into
+`volume_cache_dir` with up to 16 parallel workers. Use `--prefetch-workers N`
+to lower the worker count.
 
 Each run creates `run_path/run_name_YYYYmmdd_HHMMSS/`. TensorBoard event files
 are written directly in that run directory, including scalar losses every
@@ -245,14 +257,16 @@ written to:
 Implemented:
 
 - VC3D fiber JSON parser and validation
-- tangent, conditioning direction, Lasagna-normal-derived up-vector, and voxel
+- tangent, forward-conditioning direction, Lasagna-normal geometry, and voxel
   classification helpers
 - fixed-size single-fiber batch builder using zarr image, mask/grad-mag, and
-  `nx`/`ny` normal data
+  fixed sampled-point `nx`/`ny` normal data decoded through Lasagna
 - direction-conditioned U-Net model/head
-- contrastive and direction losses
+- pairwise embedding contrastive loss
 - JSON-config train entrypoint with TensorBoard scalar/config logging and
   sample-slice visualization plus current/best snapshots
+- one debug timing/cache row per training step when `debug_sampling` or
+  `debug_cache` is enabled
 - unit and smoke tests on synthetic volumes
 
 Out of scope for this MVP:
