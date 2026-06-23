@@ -1143,12 +1143,16 @@ def test_sample_plane_visualization_marks_reference_cross_without_overwriting_ce
 
     assert float(images["cos_emb_cp"][2, 2]) == pytest.approx(1.0, abs=1e-6)
     assert int(images["labels"][2, 2]) == 255
-    assert float(images["image"][2, 1]) == pytest.approx(1.0, abs=1e-6)
-    assert float(images["image"][2, 3]) == pytest.approx(1.0, abs=1e-6)
-    assert float(images["cos_emb_cp"][1, 2]) == pytest.approx(0.0, abs=1e-6)
-    assert float(images["cos_emb_cp"][3, 2]) == pytest.approx(0.0, abs=1e-6)
-    assert int(images["labels"][1, 2]) == 0
-    assert int(images["labels"][3, 2]) == 0
+    assert float(images["image"][2, 1]) == pytest.approx(0.0, abs=1e-6)
+    assert float(images["image"][2, 3]) == pytest.approx(0.0, abs=1e-6)
+    assert float(images["image"][2, 0]) == pytest.approx(1.0, abs=1e-6)
+    assert float(images["image"][2, 4]) == pytest.approx(1.0, abs=1e-6)
+    assert float(images["cos_emb_cp"][2, 1]) == pytest.approx(0.5, abs=1e-6)
+    assert float(images["cos_emb_cp"][2, 3]) == pytest.approx(0.5, abs=1e-6)
+    assert int(images["labels"][2, 1]) == 127
+    assert int(images["labels"][2, 3]) == 127
+    assert int(images["labels"][0, 2]) == 0
+    assert int(images["labels"][4, 2]) == 0
 
 
 def test_training_sample_visualization_uses_cp_local_reference_not_crop_center():
@@ -1215,6 +1219,19 @@ def test_training_sample_visualization_uses_cp_local_reference_not_crop_center()
     label_image = writer.images["train_sample/cross/labels"]
     assert label_image.dtype == torch.uint8
     assert bool((label_image == 127).any())
+
+    principal_yx = writer.images["train_sample/principal_yx/cos_emb_cp"][0]
+    assert tuple(principal_yx.shape) == (8, 16)
+    assert float(principal_yx[2, 3]) == pytest.approx(1.0, abs=1e-6)
+    assert float(principal_yx[4, 10]) == pytest.approx(1.0, abs=1e-6)
+
+    principal_zx = writer.images["train_sample/principal_zx/cos_emb_cp"][0]
+    assert float(principal_zx[1, 3]) == pytest.approx(1.0, abs=1e-6)
+    assert float(principal_zx[5, 10]) == pytest.approx(1.0, abs=1e-6)
+
+    principal_zy = writer.images["train_sample/principal_zy/cos_emb_cp"][0]
+    assert float(principal_zy[1, 2]) == pytest.approx(1.0, abs=1e-6)
+    assert float(principal_zy[5, 12]) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_test_fiber_glob_builds_separate_test_config():
@@ -1597,6 +1614,13 @@ def test_training_writes_tensorboard_text_and_snapshots(
         for view in ("side", "top", "cross")
         for name in ("image", "labels", "cos_emb_cp", "cos_emb_other_cp")
     }
+    expected_image_tags.update(
+        {
+            f"{prefix}/{view}/cos_emb_cp"
+            for prefix in ("train_sample", "test_sample")
+            for view in ("principal_yx", "principal_zx", "principal_zy")
+        }
+    )
     assert expected_image_tags <= image_tags
     assert all(
         shape == (1, 8, 16) and step == 1 for _, shape, step in writers[0].images

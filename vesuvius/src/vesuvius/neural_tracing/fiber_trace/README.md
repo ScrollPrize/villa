@@ -255,6 +255,9 @@ CP embedding when two GT samples are available. Slice samples outside the crop
 are black in `image` and shown as a coarse `63/191` checkerboard in label/cosine
 views.
 
+The same self-CP cosine is also logged as three axis-aligned principal slices
+through the rounded CP under `principal_yx`, `principal_zx`, and `principal_zy`.
+
 ## Entrypoint
 
 Run a training smoke or short job with:

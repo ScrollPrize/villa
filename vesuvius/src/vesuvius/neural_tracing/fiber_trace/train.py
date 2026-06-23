@@ -617,18 +617,23 @@ def _draw_center_cross(
     center_y = max(0, min(height - 1, int(center_yx[0])))
     center_x = max(0, min(width - 1, int(center_yx[1])))
     radius = max(2, min(6, min(height, width) // 16))
+    gap = max(1, min(3, radius // 2))
     x0 = max(0, center_x - radius)
     x1 = min(width, center_x + radius + 1)
     y0 = max(0, center_y - radius)
     y1 = min(height, center_y + radius + 1)
-    if x0 < center_x:
-        marked[center_y, x0:center_x] = high_value
-    if center_x + 1 < x1:
-        marked[center_y, center_x + 1 : x1] = high_value
-    if y0 < center_y:
-        marked[y0:center_y, center_x] = low_value
-    if center_y + 1 < y1:
-        marked[center_y + 1 : y1, center_x] = low_value
+    left_end = max(x0, center_x - gap)
+    right_start = min(x1, center_x + gap + 1)
+    top_end = max(y0, center_y - gap)
+    bottom_start = min(y1, center_y + gap + 1)
+    if x0 < left_end:
+        marked[center_y, x0:left_end] = high_value
+    if right_start < x1:
+        marked[center_y, right_start:x1] = high_value
+    if y0 < top_end:
+        marked[y0:top_end, center_x] = low_value
+    if bottom_start < y1:
+        marked[bottom_start:y1, center_x] = low_value
     return marked
 
 
@@ -754,6 +759,44 @@ def _embedding_similarity_to_reference(
     return torch.sum(embedding_n * reference.view(-1, 1, 1, 1), dim=0)
 
 
+def _cos_similarity_to_tb_image(
+    similarity: torch.Tensor,
+    *,
+    center_marker_yx: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    image = ((similarity.to(dtype=torch.float32).clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(
+        0.0, 1.0
+    )
+    if center_marker_yx is not None:
+        image = _draw_center_cross(
+            image,
+            center_yx=center_marker_yx,
+            low_value=0.0,
+            high_value=1.0,
+        )
+    return image
+
+
+def _principal_cosine_slices(
+    similarity_zyx: torch.Tensor, cp_local_zyx: tuple[int, int, int]
+) -> dict[str, torch.Tensor]:
+    depth, height, width = (int(v) for v in similarity_zyx.shape[-3:])
+    z = max(0, min(depth - 1, int(cp_local_zyx[0])))
+    y = max(0, min(height - 1, int(cp_local_zyx[1])))
+    x = max(0, min(width - 1, int(cp_local_zyx[2])))
+    return {
+        "principal_yx": _cos_similarity_to_tb_image(
+            similarity_zyx[z, :, :], center_marker_yx=(y, x)
+        ),
+        "principal_zx": _cos_similarity_to_tb_image(
+            similarity_zyx[:, y, :], center_marker_yx=(z, x)
+        ),
+        "principal_zy": _cos_similarity_to_tb_image(
+            similarity_zyx[:, :, x], center_marker_yx=(z, y)
+        ),
+    }
+
+
 def _log_stitched_training_sample_visualization(
     writer: Any,
     model: torch.nn.Module | None,
@@ -864,6 +907,11 @@ def _log_stitched_training_sample_visualization(
                 )["cos_emb_cp"]
             for image_name, image in images.items():
                 stitched.setdefault((plane_name, image_name), []).append(image)
+        if own_similarity is not None:
+            for plane_name, image in _principal_cosine_slices(
+                own_similarity, payload["cp_local_zyx"]
+            ).items():
+                stitched.setdefault((plane_name, "cos_emb_cp"), []).append(image)
 
     for (plane_name, image_name), images in stitched.items():
         combined = torch.cat(images, dim=-1)

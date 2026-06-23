@@ -194,9 +194,11 @@ Implemented:
   slice, one fused label image using negative/undefined/positive values
   `0/127/255`, a fixed-scale predicted embedding cosine image against that
   sample's rounded CP embedding, and an `other_cp` cosine view against the other
-  selected CP when available. `test_visualization_every` logs the first fixed
-  test batch the same way under `test_sample/...`. Out-of-crop slice samples are
-  black in image views and a coarse `63/191` checkerboard in label/cosine views.
+  selected CP when available. The same self-CP cosine is also logged as
+  axis-aligned `principal_yx`, `principal_zx`, and `principal_zy` slices through
+  the rounded CP. `test_visualization_every` logs the first fixed test batch the
+  same way under `test_sample/...`. Out-of-crop slice samples are black in image
+  views and a coarse `63/191` checkerboard in label/cosine views.
 - Label geometry uses the explicit normal-frame fields only; legacy radius
   fallbacks are not part of the config/API.
 
