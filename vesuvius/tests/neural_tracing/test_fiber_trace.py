@@ -66,6 +66,7 @@ def _synthetic_config(
         "positive_direction_jitter_degrees": 30.0,
         "normal_plane_jitter_voxels": 40.0,
         "normal_perpendicular_jitter_voxels": 10.0,
+        "positive_along_fiber_limit_voxels": 40.0,
         "negative_cone_distance_voxels": 30.0,
         "random_negative_pool_size": 8,
         "_array_records": [
@@ -160,22 +161,35 @@ def test_batch_builder_samples_one_fiber_with_mixed_and_random_negative_crops(
     assert batch.volume.shape == (4, 1, 16, 16, 16)
     assert batch.labels.shape == (4, 16, 16, 16)
     assert batch.target_id.shape == (4, 16, 16, 16)
-    assert batch.crop_kinds.count("gt_control") == 2
-    assert batch.crop_kinds.count("random_negative") == 2
-    assert batch.direction_kinds == ("gt_jitter", "gt_jitter", "random", "random")
+    assert batch.crop_kinds.count("gt_control") == 3
+    assert batch.crop_kinds.count("random_negative") == 1
+    assert batch.direction_kinds == ("gt_jitter", "gt_jitter", "gt_jitter", "random")
     assert len(set(batch.fiber_paths)) == 1
-    assert bool((batch.labels[:2] == POSITIVE_LABEL).any())
-    assert bool((batch.labels[2:][batch.valid_mask[2:]] == NEGATIVE_LABEL).all())
-    assert not bool((batch.labels[2:] == POSITIVE_LABEL).any())
+    assert bool((batch.labels[:3] == POSITIVE_LABEL).any())
+    assert bool((batch.labels[3:][batch.valid_mask[3:]] == NEGATIVE_LABEL).all())
+    assert not bool((batch.labels[3:] == POSITIVE_LABEL).any())
     assert bool((batch.target_id[batch.labels == POSITIVE_LABEL] == 0).all())
     assert bool(
         (batch.target_id[batch.labels == NEGATIVE_LABEL] == NEGATIVE_ONLY_ID).all()
     )
     target_fw = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    gt_cond = torch.nn.functional.normalize(batch.cond_fw_xyz[:2], dim=1).numpy()
+    gt_cond = torch.nn.functional.normalize(batch.cond_fw_xyz[:3], dim=1).numpy()
     gt_errors = np.degrees(np.arccos(np.clip(gt_cond @ target_fw, -1.0, 1.0)))
     assert bool((gt_errors >= -1e-4).all())
     assert bool((gt_errors <= 30.0 + 1e-4).all())
+
+
+def test_visualization_sample_selection_uses_first_two_gt_crops_only(tmp_path: Path):
+    builder = FiberTraceBatchBuilder(
+        _synthetic_config(tmp_path, batch_size=8, crop_size=(16, 16, 16))
+    )
+    batch = builder.sample_batch(record_index=0, iteration=0)
+
+    assert batch.crop_kinds.count("gt_control") == 6
+    assert batch.crop_kinds.count("random_negative") == 2
+    assert fiber_train._visualization_positive_sample_indices(
+        batch, fallback_index=0
+    ) == [0, 1]
 
 
 def test_debug_cache_logs_one_table_row_per_batch(tmp_path: Path, capsys):
@@ -671,6 +685,7 @@ def test_lasagna_manifest_drives_channels_and_scaled_sampling(
             "positive_direction_jitter_degrees": 0.0,
             "normal_plane_jitter_voxels": 40.0,
             "normal_perpendicular_jitter_voxels": 10.0,
+            "positive_along_fiber_limit_voxels": 40.0,
             "negative_cone_distance_voxels": 30.0,
             "datasets": [
                 {
@@ -709,15 +724,18 @@ def test_voxel_classification_uses_normal_plane_positive_zone():
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
         valid_mask=mask,
+        positive_center_zyx=np.array([5, 3, 4], dtype=np.int64),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
+        positive_along_fiber_limit_voxels=1.0,
         negative_cone_distance_voxels=3.0,
         positive_target_id=7,
     )
     assert int(result["labels"][5, 3, 4]) == POSITIVE_LABEL
     assert int(result["target_id"][5, 3, 4]) == 7
+    assert int(result["labels"][5, 3, 6]) == IGNORE_INDEX
     assert int(result["labels"][5, 5, 4]) == IGNORE_INDEX
     assert int(result["labels"][7, 5, 4]) == IGNORE_INDEX
     assert int(result["labels"][1, 1, 1]) == IGNORE_INDEX
@@ -739,10 +757,12 @@ def test_voxel_classification_cone_negatives_and_positive_precedence():
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
+        positive_center_zyx=np.array([5, 3, 4], dtype=np.int64),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
+        positive_along_fiber_limit_voxels=1.0,
         negative_cone_distance_voxels=3.0,
         positive_target_id=11,
     )
@@ -759,10 +779,12 @@ def test_voxel_classification_cone_negatives_and_positive_precedence():
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
+        positive_center_zyx=np.array([5, 3, 4], dtype=np.int64),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=3.0,
         normal_perpendicular_jitter_voxels=3.0,
+        positive_along_fiber_limit_voxels=3.0,
         negative_cone_distance_voxels=2.0,
         positive_target_id=12,
     )
@@ -799,6 +821,7 @@ def test_device_classification_uses_normal_axis_cone_negatives():
         {
             "normal_plane_jitter_voxels": 1.0,
             "normal_perpendicular_jitter_voxels": 1.0,
+            "positive_along_fiber_limit_voxels": 1.0,
             "negative_cone_distance_voxels": 3.0,
         },
     )
@@ -818,10 +841,12 @@ def test_voxel_classification_ignores_conditioning_direction_for_labels():
         line_points_xyz=line,
         cond_fw_xyz=np.array([1.0, 0.0, 0.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
+        positive_center_zyx=np.array([5, 3, 4], dtype=np.int64),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
+        positive_along_fiber_limit_voxels=1.0,
         negative_cone_distance_voxels=3.0,
     )
     assert int(positive["labels"][5, 3, 4]) == POSITIVE_LABEL
@@ -832,10 +857,12 @@ def test_voxel_classification_ignores_conditioning_direction_for_labels():
         line_points_xyz=line,
         cond_fw_xyz=np.array([0.5, np.sqrt(3.0) / 2.0, 0.0], dtype=np.float32),
         valid_mask=np.ones((9, 9, 9), dtype=bool),
+        positive_center_zyx=np.array([5, 3, 4], dtype=np.int64),
         normal_xyz=normal_xyz,
         normal_valid_mask=np.ones((9, 9, 9), dtype=bool),
         normal_plane_jitter_voxels=1.0,
         normal_perpendicular_jitter_voxels=1.0,
+        positive_along_fiber_limit_voxels=1.0,
         negative_cone_distance_voxels=3.0,
     )
     assert int(rotated["labels"][5, 3, 4]) == POSITIVE_LABEL
@@ -952,6 +979,50 @@ def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
     )
     losses.total.backward()
     assert any(param.grad is not None for param in model.parameters())
+
+
+def test_contrastive_pair_sampler_shuffles_full_batch_lists():
+    labels = torch.full((2, 1, 1, 8), IGNORE_INDEX, dtype=torch.long)
+    target_id = torch.full_like(labels, IGNORE_ID)
+    labels[0, 0, 0, 0] = POSITIVE_LABEL
+    labels[1, 0, 0, 0] = POSITIVE_LABEL
+    target_id[labels == POSITIVE_LABEL] = 7
+    labels[0, 0, 0, 1:] = NEGATIVE_LABEL
+    labels[1, 0, 0, 1:] = NEGATIVE_LABEL
+    target_id[labels == NEGATIVE_LABEL] = NEGATIVE_ONLY_ID
+
+    first = sample_contrastive_pair_indices(
+        labels, target_id, max_samples=6, seed=11
+    )
+    again = sample_contrastive_pair_indices(
+        labels, target_id, max_samples=6, seed=11
+    )
+    changed = sample_contrastive_pair_indices(
+        labels, target_id, max_samples=6, seed=12
+    )
+
+    first_flat = first.flat_indices
+    pos_left = first_flat[first.pos_a]
+    pos_right = first_flat[first.pos_b]
+    neg_left = first_flat[first.neg_a]
+    neg_right = first_flat[first.neg_b]
+
+    assert first.pos_a.numel() == 3
+    assert first.neg_a.numel() == 3
+    assert set(pos_left.tolist()) <= {0, 8}
+    assert set(pos_right.tolist()) <= {0, 8}
+    assert bool(torch.all(pos_left != pos_right))
+    assert set(neg_left.tolist()) <= {0, 8}
+    assert all(int(item) not in {0, 8} for item in neg_right.tolist())
+
+    torch.testing.assert_close(first.flat_indices, again.flat_indices)
+    torch.testing.assert_close(first.pos_a, again.pos_a)
+    torch.testing.assert_close(first.pos_b, again.pos_b)
+    torch.testing.assert_close(first.neg_a, again.neg_a)
+    torch.testing.assert_close(first.neg_b, again.neg_b)
+
+    changed_neg_right = changed.flat_indices[changed.neg_b]
+    assert not torch.equal(neg_right, changed_neg_right)
 
 
 def test_model_builder_derives_requested_unet_depth_and_condition_width():
@@ -1128,6 +1199,10 @@ def test_training_sample_visualization_uses_cp_local_reference_not_crop_center()
     other = writer.images["train_sample/cross/cos_emb_other_cp"][0]
     assert float(other[4, 4]) == pytest.approx(0.5, abs=1e-6)
     assert float(other[4, 12]) == pytest.approx(0.5, abs=1e-6)
+
+    label_image = writer.images["train_sample/cross/labels"]
+    assert label_image.dtype == torch.uint8
+    assert bool((label_image == 127).any())
 
 
 def test_test_fiber_glob_builds_separate_test_config():

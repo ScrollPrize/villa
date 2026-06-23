@@ -752,7 +752,7 @@ class FiberTraceBatchBuilder:
         max_supported_margin = min((int(size) - 1) // 2 for size in self.crop_size)
         if configured_margin is None:
             self.control_point_margin_voxels = int(
-                min(40, max(0, max_supported_margin))
+                min(10, max(0, max_supported_margin))
             )
         else:
             margin = int(configured_margin)
@@ -1138,8 +1138,8 @@ class FiberTraceBatchBuilder:
         else:
             selected_record_index = int(record_index)
         record = self.records[selected_record_index]
-        gt_count = self.batch_size // 2
-        random_negative_count = self.batch_size - gt_count
+        random_negative_count = self.batch_size // 4
+        gt_count = self.batch_size - random_negative_count
         specs: list[dict[str, Any]] = []
 
         for patch_index in range(gt_count):

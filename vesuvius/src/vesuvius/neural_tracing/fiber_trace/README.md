@@ -63,9 +63,10 @@ scale, shape, channel, and coordinate metadata.
 Batches are single-fiber batches. For batch size `N`, the builder samples one
 fiber record and emits:
 
-- `N / 2` GT control-point crops with mixed positive/ignore/negative labels
-  derived from the selected fiber line and Lasagna normal geometry
-- `N / 2` random valid crops whose valid voxels are explicit negatives
+- `N - floor(N / 4)` GT control-point crops with mixed
+  positive/ignore/negative labels derived from the selected fiber line and
+  Lasagna normal geometry
+- `floor(N / 4)` random valid crops whose valid voxels are explicit negatives
 
 GT crops choose control points with deterministic per-iteration random streams;
 duplicates are allowed when the sampled slots collide. The crop is offset so the
@@ -100,7 +101,8 @@ required.
 For every output voxel:
 
 - invalid mask/grad-mag voxels are `ignore`
-- GT-control crop voxels in the normal-frame positive zone are `positive`
+- GT-control crop voxels in the normal-frame positive zone and within the
+  configured along-fiber CP window are `positive`
 - cone negatives come only from the normal-axis double cone above/below the
   local sheet, starting at `negative_cone_distance_voxels`
 - random-negative crop valid voxels are explicit `negative`
@@ -142,10 +144,11 @@ Losses are:
 - pairwise embedding contrastive loss over classified positives and explicit
   negatives
 
-The contrastive loss samples positive-positive pairs from matching fiber-line
-`target_id`s and positive-negative pairs against explicit negatives. Negative
-voxels are never paired with each other. Soft distance-weighted contrastive loss
-is intentionally deferred.
+The contrastive loss samples pseudo-random deterministic positive-positive
+pairs from matching fiber-line `target_id`s across the whole flattened batch and
+positive-negative pairs against explicit negatives across that same batch.
+Negative voxels are never paired with each other. Soft distance-weighted
+contrastive loss is intentionally deferred.
 
 `loss.max_contrastive_samples` caps the sampled pair budget per batch.
 
@@ -195,7 +198,7 @@ conditioning augmentation. Direction conditioning does not change labels.
 
 `control_point_margin_voxels` controls the deterministic GT crop offset. The
 selected control point is placed at either that margin or the opposite-side
-margin on each crop axis. If omitted, the builder uses `min(40, floor((size -
+margin on each crop axis. If omitted, the builder uses `min(10, floor((size -
 1) / 2))` per the smallest crop axis; explicit values that cannot fit the crop
 are rejected.
 
@@ -203,11 +206,13 @@ Legacy label-conditioning keys such as `positive_direction_probability`,
 `negative_direction_min_degrees`, `negative_direction_max_degrees`,
 `positive_cosine`, and `negative_cosine` are rejected.
 
-`normal_plane_jitter_voxels: 40.0` and
-`normal_perpendicular_jitter_voxels: 10.0` define the normal-frame positive
-zone. `negative_cone_distance_voxels: 30.0` defines the cone-negative minimum
-distance away from the Lasagna-normal plane, where the normal-axis double cone
-starts.
+`normal_plane_jitter_voxels: 40.0`,
+`normal_perpendicular_jitter_voxels: 10.0`, and
+`positive_along_fiber_limit_voxels: 40.0` define the positive zone around the
+rounded CP. Voxels past the along-fiber limit default back to ignore unless they
+independently satisfy the cone-negative rule. `negative_cone_distance_voxels:
+30.0` defines the cone-negative minimum distance away from the Lasagna-normal
+plane, where the normal-axis double cone starts.
 
 `random_negative_pool_size: 1000` precomputes the deterministic random-negative
 center pool before training batches are sampled. Training batches select from

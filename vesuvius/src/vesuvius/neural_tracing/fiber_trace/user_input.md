@@ -8,14 +8,14 @@
 
 # batch data selection
 - each batch is only data from one fiber
-- (half of batch): randomly sample cps from the randomly selected fiber (dataset size == fiber count)
-- (other half of batch): random volume samples - using a deterministic pseudo random dist with a (configurable current) modulus of 1000 so we always use same samples
+- (3/4 of batch, rounded up by using `N - floor(N / 4)`): randomly sample cps from the randomly selected fiber (dataset size == fiber count)
+- (1/4 of batch, rounded down by using `floor(N / 4)`): random volume samples - using a deterministic pseudo random dist with a (configurable current) modulus of 1000 so we always use same samples
 - batch offset:
-    - the pos samples should not be centered just on the cps, we want to shift eh crop center as far as possbile, just retaining a 40vx margin around the cp (this offset too should be deteministic)
+    - the pos samples should not be centered just on the cps, we want to shift eh crop center as far as possbile, just retaining a 10vx margin around the cp (this offset too should be deteministic)
 
 # label areas
 - given the normal plane from the lasagna data at the cp
-- positive (this is the fiber): within +-40vx in the plane and +-10vx perpendicaul
+- positive (this is the fiber): within +-40vx along the fiber from the rounded CP, within +-40vx in the normal plane cross-fiber direction, and +-10vx perpendicular
 - neg: non-cp batch samples and samples from cp batch samples that are:
     - at least 30vx from the cp normal plane
     - AND in the 90° cone along the normal (in both direction) that originates at the line

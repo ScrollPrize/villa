@@ -204,10 +204,12 @@ def classify_voxels(
     line_points_xyz: np.ndarray,
     cond_fw_xyz: np.ndarray,
     valid_mask: np.ndarray,
+    positive_center_zyx: np.ndarray,
     normal_xyz: np.ndarray | None = None,
     normal_valid_mask: np.ndarray | None = None,
     normal_plane_jitter_voxels: float,
     normal_perpendicular_jitter_voxels: float,
+    positive_along_fiber_limit_voxels: float,
     negative_cone_distance_voxels: float,
     positive_target_id: int = 0,
     full_negative: bool = False,
@@ -267,11 +269,18 @@ def classify_voxels(
     in_plane_offset = offset_xyz - plane_offset[..., None] * normal_for_geometry
     in_plane_distance = np.linalg.norm(in_plane_offset, axis=-1)
     perpendicular_distance = np.abs(plane_offset)
+    positive_center_xyz = zyx_to_xyz(
+        np.asarray(positive_center_zyx, dtype=np.float32)
+    )
+    along_fiber_distance = np.abs(
+        np.sum((closest_xyz - positive_center_xyz) * tangent_xyz, axis=-1)
+    )
 
     positive_zone = (
         valid
         & (in_plane_distance <= float(normal_plane_jitter_voxels))
         & (perpendicular_distance <= float(normal_perpendicular_jitter_voxels))
+        & (along_fiber_distance <= float(positive_along_fiber_limit_voxels))
     )
 
     cone_start = float(negative_cone_distance_voxels)
@@ -301,4 +310,5 @@ def classify_voxels(
         "distance": distance,
         "in_plane_distance": in_plane_distance.astype(np.float32, copy=False),
         "perpendicular_distance": perpendicular_distance.astype(np.float32, copy=False),
+        "along_fiber_distance": along_fiber_distance.astype(np.float32, copy=False),
     }

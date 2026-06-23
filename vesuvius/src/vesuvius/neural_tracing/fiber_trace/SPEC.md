@@ -64,7 +64,8 @@ Jitter semantics:
   normal and up to `+/-10` voxels perpendicular to that plane.
 - GT crop placement is deterministic per iteration. The selected control point
   is placed at `control_point_margin_voxels` from one crop side, or the same
-  margin from the opposite side, independently per axis.
+  margin from the opposite side, independently per axis. The default margin is
+  `10` voxels, clamped only when a smaller crop cannot fit it.
 - Because the model is fully convolutional, the crop should generate many
   labeled samples within a crop and across crops by checking output voxels
   against the ground-truth fiber/control-point geometry and the per-output-voxel
@@ -137,8 +138,9 @@ Implemented:
 - Lasagna `grad_mag`, `nx`, and `ny` lookup through manifest channel groups and
   group `scaledown`.
 - Dense crop training with:
-  - half GT control-point crops with mixed positive/ignore/cone-negative labels;
-  - half random valid `grad_mag` crops labeled as explicit negatives.
+  - `N - floor(N / 4)` GT control-point crops with mixed
+    positive/ignore/cone-negative labels;
+  - `floor(N / 4)` random valid `grad_mag` crops labeled as explicit negatives.
 - `augmentation_crop_size` reads a larger outer crop before post-augmentation
   center trimming to the final `crop_size`, keeping padded/interpolated borders
   out of the model input and label crop.
@@ -159,15 +161,20 @@ Implemented:
   - explicit negatives carry `NEGATIVE_ONLY_ID`;
   - ignored voxels carry `IGNORE_ID`.
 - Pairwise contrastive loss:
-  - same-identity positives attract across control-point crops;
-  - positive-negative pairs repel;
+  - same-identity positives attract across control-point crops after a
+    deterministic pseudo-random shuffle over the whole flattened batch;
+  - positive-negative pairs repel after independently shuffling the positive and
+    explicit-negative lists over the whole flattened batch;
   - negative-negative pairs are not used.
 - Per-voxel labels from normal-frame positive zones, cone negative zones, and
   random-negative crops.
-- `normal_plane_jitter_voxels = 40` and
-  `normal_perpendicular_jitter_voxels = 10` define the positive zone.
+- `normal_plane_jitter_voxels = 40`,
+  `normal_perpendicular_jitter_voxels = 10`, and
+  `positive_along_fiber_limit_voxels = 40` define the positive zone around the
+  rounded CP. Voxels past the along-fiber limit default to ignore unless they
+  independently satisfy the cone-negative rule.
 - `control_point_margin_voxels` controls GT crop offset. Omit it to use
-  `min(40, floor((min(crop_size) - 1) / 2))`; explicit values must fit every
+  `min(10, floor((min(crop_size) - 1) / 2))`; explicit values must fit every
   crop axis.
 - `negative_cone_distance_voxels = 30` defines the minimum distance from the
   normal-defined plane where the normal-axis cone negatives start.
@@ -219,8 +226,8 @@ Before running either config, replace:
 - optionally `sample_limit`; when set, deterministic sample ordinals wrap after
   that many training samples so longer debug runs reuse the same bounded sample
   set and prefetch only downloads that bounded set
-- optionally `control_point_margin_voxels`; use `40` for `128^3` crops, while
-  `64^3` crops can fit at most `31`
+- optionally `control_point_margin_voxels`; omit it or set `10` to let the CP
+  move as close as 10 voxels from the final crop border
 - optionally `augmentation_crop_size`; the starter configs use a 16 voxel
   per-side trim margin
 

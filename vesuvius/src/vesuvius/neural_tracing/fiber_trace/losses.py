@@ -63,6 +63,23 @@ def _deterministic_positions(length: int, count: int, *, device: torch.device) -
     return (torch.arange(count, device=device, dtype=torch.long) * int(stride)) % length
 
 
+def _shuffle_indices(idx: Tensor, *, seed: int, salt: int) -> Tensor:
+    if idx.numel() <= 1:
+        return idx
+    generator_seed = int(seed) * 1_000_003 + int(salt) * 9_176 + 123_457
+    try:
+        generator = torch.Generator(device=idx.device)
+        generator.manual_seed(generator_seed)
+        order = torch.randperm(
+            idx.numel(), device=idx.device, generator=generator
+        )
+    except (TypeError, RuntimeError):
+        generator = torch.Generator()
+        generator.manual_seed(generator_seed)
+        order = torch.randperm(idx.numel(), generator=generator).to(idx.device)
+    return idx[order]
+
+
 def _take_deterministic(idx: Tensor, count: int) -> Tensor:
     positions = _deterministic_positions(
         int(idx.numel()), int(count), device=idx.device
@@ -121,6 +138,7 @@ def sample_contrastive_pair_indices(
     target_id: Tensor | None = None,
     *,
     max_samples: int = 4096,
+    seed: int = 0,
 ) -> ContrastivePairSamples:
     """Sample flattened voxel indices for positive-positive and positive-negative pairs.
 
@@ -136,8 +154,12 @@ def sample_contrastive_pair_indices(
     )
     is_negative = lab == int(NEGATIVE_LABEL)
 
-    pos_idx = _sample_mask_indices(is_positive, 0)
-    neg_idx = _sample_mask_indices(is_negative, 0)
+    pos_idx = _shuffle_indices(
+        _sample_mask_indices(is_positive, 0), seed=seed, salt=11
+    )
+    neg_idx = _shuffle_indices(
+        _sample_mask_indices(is_negative, 0), seed=seed, salt=23
+    )
     empty = torch.empty((0,), device=labels.device, dtype=torch.long)
     if pos_idx.numel() == 0:
         return ContrastivePairSamples(empty, empty, empty, empty, empty)
@@ -231,6 +253,7 @@ def supervised_contrastive_loss(
     temperature: float = 0.1,
     ignore_index: int = IGNORE_INDEX,
     max_samples: int = 4096,
+    seed: int = 0,
 ) -> Tensor:
     """Sample positive-positive and positive-negative embedding pairs.
 
@@ -249,7 +272,7 @@ def supervised_contrastive_loss(
         )
 
     samples = sample_contrastive_pair_indices(
-        labels, target_id, max_samples=max_samples
+        labels, target_id, max_samples=max_samples, seed=seed
     )
     flat = embeddings.permute(0, 2, 3, 4, 1).reshape(-1, embeddings.shape[1])
     sampled = flat[samples.flat_indices] if samples.flat_indices.numel() else flat[:0]
@@ -266,6 +289,7 @@ def compute_fiber_trace_loss(
     contrastive_weight: float = 1.0,
     max_contrastive_samples: int = 4096,
     contrastive_samples: ContrastivePairSamples | None = None,
+    seed: int = 0,
 ) -> FiberTraceLoss:
     if contrastive_samples is None:
         contrastive = supervised_contrastive_loss(
@@ -274,6 +298,7 @@ def compute_fiber_trace_loss(
             batch.target_id,
             temperature=temperature,
             max_samples=max_contrastive_samples,
+            seed=seed,
         )
     else:
         contrastive = sampled_supervised_contrastive_loss(

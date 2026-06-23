@@ -217,6 +217,7 @@ def classify_batch_on_device(
 
     normal_plane_jitter = float(config["normal_plane_jitter_voxels"])
     normal_perp_jitter = float(config["normal_perpendicular_jitter_voxels"])
+    positive_along_fiber_limit = float(config["positive_along_fiber_limit_voxels"])
     negative_cone_distance = float(config["negative_cone_distance_voxels"])
     for idx in range(bsz):
         origin_zyx = batch.crop_origin_zyx[idx].to(device=device, dtype=torch.float32)
@@ -245,11 +246,22 @@ def classify_batch_on_device(
         in_plane_offset = offset_xyz - plane_offset[..., None] * normal_for_geometry
         in_plane_distance = torch.linalg.vector_norm(in_plane_offset, dim=-1)
         perpendicular_distance = plane_offset.abs()
+        positive_center_zyx = origin_zyx + batch.sample_local_zyx[idx].to(
+            device=device, dtype=torch.float32
+        )
+        positive_center_xyz = torch.stack(
+            [positive_center_zyx[2], positive_center_zyx[1], positive_center_zyx[0]]
+        )
+        along_fiber_distance = torch.sum(
+            (closest_xyz - positive_center_xyz.view(1, 1, 1, 3)) * tangent_xyz,
+            dim=-1,
+        ).abs()
 
         positive_zone = (
             valid
             & (in_plane_distance <= normal_plane_jitter)
             & (perpendicular_distance <= normal_perp_jitter)
+            & (along_fiber_distance <= positive_along_fiber_limit)
         )
 
         cone_radius = (perpendicular_distance - negative_cone_distance).clamp_min(0.0)
@@ -318,6 +330,7 @@ def _compute_losses(
         batch.labels,
         batch.target_id,
         max_samples=loss_kwargs["max_contrastive_samples"],
+        seed=0 if iteration is None else int(iteration),
     )
     outputs = model(
         batch.volume,
@@ -658,14 +671,14 @@ def _sample_plane_image(
 
 
 def _visualization_positive_sample_indices(
-    batch: FiberTraceBatch, *, fallback_index: int, max_samples: int = 2
+    batch: FiberTraceBatch, *, fallback_index: int
 ) -> list[int]:
     batch_size = int(batch.volume.shape[0])
     indices = [
         idx
         for idx, kind in enumerate(batch.crop_kinds)
         if idx < batch_size and str(kind) == "gt_control"
-    ][: int(max_samples)]
+    ][:2]
     if indices:
         return indices
     if batch_size <= 0:
@@ -796,7 +809,7 @@ def _log_stitched_training_sample_visualization(
                 stitched.setdefault((plane_name, image_name), []).append(image)
 
     for (plane_name, image_name), images in stitched.items():
-        combined = torch.cat([image.to(torch.float32) for image in images], dim=-1)
+        combined = torch.cat(images, dim=-1)
         writer.add_image(
             f"train_sample/{plane_name}/{image_name}",
             combined.detach().cpu().unsqueeze(0),
