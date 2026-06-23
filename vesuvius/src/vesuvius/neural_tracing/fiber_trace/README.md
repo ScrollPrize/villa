@@ -39,20 +39,24 @@ The preferred dataset config entry provides:
 The loader validates that `base_volume_path` level 0 has shape equal to the
 manifest `base_shape_zyx`. Image crops are read at `base_volume_scale`.
 `grad_mag`, `nx`, and `ny` are opened through the manifest, using each group's
-`scaledown` and channel index. These Lasagna channels do not have to be the
-same shape as the selected base image level; they are sampled into the selected
-training grid according to the manifest scale convention. Mask/grad-mag
-validity is binary: voxels with value `> 0` are valid and value `0` is invalid.
-There is no configurable validity threshold.
+`scaledown` and channel index. Shape validation follows Lasagna's convention:
+`base_shape_zyx` plus group `scaledown` determine the zarr shape, while
+`group.sd_fac * source_to_base` determines the channel spacing in base voxels.
+These Lasagna channels do not have to be the same shape as the selected base
+image level; they are sampled into the selected training grid according to the
+manifest scale convention. Mask/grad-mag validity is binary: voxels with value
+`> 0` are valid and value `0` is invalid. There is no configurable validity
+threshold.
 
 Remote zarr paths use the existing `vesuvius.neural_tracing.datasets.common`
 zarr/cache support. Missing mask or grad-mag data is an error, and mask shape
 must align with the selected image volume level through the manifest. Normal
 channel shapes must align the same way.
 
-Legacy raw-path config with `volume_path`, `grad_mag_path` or `mask_path`, and
-`nx_path`/`ny_path` is still accepted for tests and direct debugging, but the
-manifest path is the intended training spec.
+Manifest-less derivative channel configuration is not supported. Dataset
+entries with legacy `volume_path` or raw `grad_mag_path`, `mask_path`,
+`nx_path`, or `ny_path` keys are rejected because they bypass Lasagna manifest
+scale, shape, channel, and coordinate metadata.
 
 ## Batch Construction
 
@@ -208,6 +212,16 @@ distance away from the Lasagna-normal plane.
 `positive_radius` and `ignore_radius` are kept only for legacy/debug fallback
 behavior when the named normal-frame fields are omitted.
 
+`sample_visualization_every: 10000` logs one training sample to TensorBoard on
+that interval. The trainer writes three oriented crop-center slices:
+
+- `side`: fiber direction by sampled up/normal direction
+- `top`: fiber direction by binormal
+- `cross`: binormal by sampled up/normal direction, perpendicular to the fiber
+
+Each view is logged under `train_sample/<view>/` as one normalized `image`
+slice plus separate `positive`, `undef`, and `negative` class-mask images.
+
 ## Entrypoint
 
 Run a training smoke or short job with:
@@ -218,8 +232,9 @@ python -m vesuvius.neural_tracing.fiber_trace.train /path/to/config.json
 
 Each run creates `run_path/run_name_YYYYmmdd_HHMMSS/`. TensorBoard event files
 are written directly in that run directory, including scalar losses every
-`log_every` steps and a `config/json` text entry with the training config. Model
-snapshots are written to:
+`log_every` steps, sample-slice images every `sample_visualization_every` steps,
+and a `config/json` text entry with the training config. Model snapshots are
+written to:
 
 - `snapshots/current.pt`: most recent logged model
 - `snapshots/best.pt`: best logged model by `test/total` when a test split is
@@ -237,7 +252,7 @@ Implemented:
 - direction-conditioned U-Net model/head
 - contrastive and direction losses
 - JSON-config train entrypoint with TensorBoard scalar/config logging and
-  current/best snapshots
+  sample-slice visualization plus current/best snapshots
 - unit and smoke tests on synthetic volumes
 
 Out of scope for this MVP:

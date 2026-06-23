@@ -102,6 +102,10 @@ The Lasagna manifest must provide:
 - `grad_mag` channel group.
 - `nx` and `ny` normal channel groups.
 
+Manifest channel shape and spacing follow Lasagna's loader convention:
+`base_shape_zyx` with group `scaledown` validates zarr shape, and
+`group.sd_fac * source_to_base` gives channel spacing in base voxels.
+
 The `grad_mag`/mask validity convention is binary. Value `0` is invalid and
 any value `> 0` is valid; there is no configurable validity threshold.
 
@@ -116,12 +120,13 @@ Coordinate convention:
 
 Zarr convention:
 
-- Training reads use
-  `vesuvius.neural_tracing.datasets.common.open_zarr()`,
-  `open_zarr_group()`, and `_read_volume_crop_from_patch()`.
+- Training reads use `vesuvius.neural_tracing.datasets.common.open_zarr()`
+  and `_read_volume_crop_from_patch()`.
 - Remote HTTP/S3 paths require explicit `volume_cache_dir`.
 - Direct `zarr.open()` fallbacks are not allowed in the fiber tracing training
   path.
+- Manifest-less derivative channel keys such as `grad_mag_path`, `mask_path`,
+  `nx_path`, and `ny_path` are rejected.
 
 Normal convention:
 
@@ -170,6 +175,9 @@ Implemented:
   degree direction thresholds.
 - `run_path` and `run_name` create per-run directories with TensorBoard scalar
   and config-text logging plus `snapshots/current.pt` and `snapshots/best.pt`.
+- `sample_visualization_every = 10000` logs one training sample to TensorBoard
+  as side/top/cross oriented slices. Each view has one normalized image slice
+  and separate positive, undefined, and negative label-mask images.
 - `positive_radius` and `ignore_radius` remain accepted only as legacy/debug
   fallback values when the named normal-frame fields are omitted.
 
@@ -197,6 +205,7 @@ Before running either config, replace:
 - `lasagna_manifest_path`
 - `fiber_glob` or `fiber_paths`
 - optional `test_fiber_glob` or `test_fiber_paths`
+- `sample_visualization_every`
 - `volume_cache_dir` when using remote zarrs
 
 ## Next Implementation Plan

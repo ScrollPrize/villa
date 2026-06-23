@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import importlib.util
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,6 @@ import torch
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber, load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace.geometry import (
-    classify_voxels,
     construct_up_vector,
     decode_lasagna_normals_xyz,
     perturb_direction,
@@ -21,17 +21,19 @@ from vesuvius.neural_tracing.fiber_trace.geometry import (
     xyz_to_zyx,
     zyx_to_xyz,
 )
-from vesuvius.neural_tracing.fiber_trace.labels import POSITIVE_LABEL
+from vesuvius.neural_tracing.fiber_trace.labels import IGNORE_ID, IGNORE_INDEX
 from vesuvius.neural_tracing.datasets.common import (
     _read_volume_crop_from_patch as _common_read_volume_crop_from_patch,
     open_zarr as _common_open_zarr,
-    open_zarr_group as _common_open_zarr_group,
 )
 
 
 @dataclass(frozen=True)
 class FiberTraceBatch:
     volume: torch.Tensor
+    mask_values: torch.Tensor
+    nx_values: torch.Tensor | None
+    ny_values: torch.Tensor | None
     valid_mask: torch.Tensor
     labels: torch.Tensor
     target_id: torch.Tensor
@@ -41,6 +43,8 @@ class FiberTraceBatch:
     cond_fw_xyz: torch.Tensor
     cond_up_xyz: torch.Tensor
     crop_origin_zyx: torch.Tensor
+    line_points_xyz: torch.Tensor
+    positive_target_id: torch.Tensor
     crop_kinds: tuple[str, ...]
     fiber_paths: tuple[str, ...]
     direction_kinds: tuple[str, ...]
@@ -48,6 +52,9 @@ class FiberTraceBatch:
     def to(self, device: torch.device | str) -> "FiberTraceBatch":
         return FiberTraceBatch(
             volume=self.volume.to(device),
+            mask_values=self.mask_values.to(device),
+            nx_values=None if self.nx_values is None else self.nx_values.to(device),
+            ny_values=None if self.ny_values is None else self.ny_values.to(device),
             valid_mask=self.valid_mask.to(device),
             labels=self.labels.to(device),
             target_id=self.target_id.to(device),
@@ -57,6 +64,39 @@ class FiberTraceBatch:
             cond_fw_xyz=self.cond_fw_xyz.to(device),
             cond_up_xyz=self.cond_up_xyz.to(device),
             crop_origin_zyx=self.crop_origin_zyx.to(device),
+            line_points_xyz=self.line_points_xyz.to(device),
+            positive_target_id=self.positive_target_id.to(device),
+            crop_kinds=self.crop_kinds,
+            fiber_paths=self.fiber_paths,
+            direction_kinds=self.direction_kinds,
+        )
+
+    def with_classification(
+        self,
+        *,
+        valid_mask: torch.Tensor,
+        labels: torch.Tensor,
+        target_id: torch.Tensor,
+        target_fw_xyz: torch.Tensor,
+        target_up_xyz: torch.Tensor,
+        target_up_valid: torch.Tensor,
+    ) -> "FiberTraceBatch":
+        return FiberTraceBatch(
+            volume=self.volume,
+            mask_values=self.mask_values,
+            nx_values=self.nx_values,
+            ny_values=self.ny_values,
+            valid_mask=valid_mask,
+            labels=labels,
+            target_id=target_id,
+            target_fw_xyz=target_fw_xyz,
+            target_up_xyz=target_up_xyz,
+            target_up_valid=target_up_valid,
+            cond_fw_xyz=self.cond_fw_xyz,
+            cond_up_xyz=self.cond_up_xyz,
+            crop_origin_zyx=self.crop_origin_zyx,
+            line_points_xyz=self.line_points_xyz,
+            positive_target_id=self.positive_target_id,
             crop_kinds=self.crop_kinds,
             fiber_paths=self.fiber_paths,
             direction_kinds=self.direction_kinds,
@@ -79,6 +119,24 @@ class _FiberRecord:
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
+_MANIFESTLESS_DATASET_KEYS = frozenset(
+    {
+        "volume_path",
+        "mask_path",
+        "grad_mag_path",
+        "mask_scale",
+        "grad_mag_scale",
+        "mask_auth_json",
+        "nx_path",
+        "ny_path",
+        "normal_scale",
+        "normal_auth_json",
+        "nx_scale",
+        "ny_scale",
+        "nx_auth_json",
+        "ny_auth_json",
+    }
+)
 
 
 def _reject_valid_mask_threshold_key(config: dict[str, Any], *, context: str) -> None:
@@ -87,6 +145,17 @@ def _reject_valid_mask_threshold_key(config: dict[str, Any], *, context: str) ->
     raise ValueError(
         "valid_mask_threshold was removed; mask/grad-mag validity is always "
         f"binary value > 0 in {context}"
+    )
+
+
+def _reject_manifestless_dataset_keys(dataset_config: dict[str, Any]) -> None:
+    present = sorted(_MANIFESTLESS_DATASET_KEYS.intersection(dataset_config))
+    if not present:
+        return
+    keys = ", ".join(present)
+    raise ValueError(
+        "manifest-less Lasagna channel configuration is not supported. "
+        f"Remove {keys} and use lasagna_manifest_path with base_volume_path."
     )
 
 
@@ -151,6 +220,18 @@ class _SpatialChannelView:
     def shape(self) -> tuple[int, int, int]:
         return self._shape
 
+    @property
+    def chunks(self) -> tuple[int, int, int] | None:
+        chunks = getattr(self.array, "chunks", None)
+        if chunks is None:
+            return None
+        chunks_tuple = tuple(int(v) for v in chunks)
+        if self._is_czyx and len(chunks_tuple) == 4:
+            return chunks_tuple[1:]
+        if not self._is_czyx and len(chunks_tuple) == 3:
+            return chunks_tuple
+        return None
+
     def __getitem__(self, key: Any) -> Any:
         if self._is_czyx:
             if not isinstance(key, tuple):
@@ -174,12 +255,6 @@ def _open_zarr_array(
     return _common_open_zarr(
         path, scale=scale, auth_json_path=auth_json_path, config=config
     )
-
-
-def _open_zarr_group(
-    path: str | Path, *, auth_json_path: str | None, config: dict[str, Any]
-):
-    return _common_open_zarr_group(path, auth_json_path=auth_json_path, config=config)
 
 
 def _open_zarr_array_resolved(
@@ -382,6 +457,106 @@ def _value_at_sample_zyx(
     return value.reshape(-1)[0], True
 
 
+def _array_chunks_zyx(array: Any) -> tuple[int, int, int] | None:
+    chunks = getattr(array, "chunks", None)
+    if chunks is None:
+        return None
+    chunks_tuple = tuple(int(v) for v in chunks)
+    if len(chunks_tuple) == 3:
+        return chunks_tuple
+    if len(chunks_tuple) == 4:
+        return chunks_tuple[1:]
+    return None
+
+
+def _raw_source_bbox_zyx(
+    array: Any, crop_shape: tuple[int, int, int], min_corner: np.ndarray
+) -> tuple[np.ndarray, np.ndarray] | None:
+    shape = np.asarray(array.shape, dtype=np.int64)
+    max_corner = np.asarray(min_corner, dtype=np.int64) + np.asarray(
+        crop_shape, dtype=np.int64
+    )
+    starts = np.maximum(np.asarray(min_corner, dtype=np.int64), 0)
+    ends = np.minimum(max_corner, shape)
+    if not bool(np.all(ends > starts)):
+        return None
+    return starts, ends
+
+
+def _scaled_source_bbox_zyx(
+    array: Any,
+    crop_shape: tuple[int, int, int],
+    min_corner: np.ndarray,
+    *,
+    dst_spacing_base: float,
+    src_spacing_base: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    sample_axes = [
+        np.arange(int(crop_shape[axis]), dtype=np.int64) + int(min_corner[axis])
+        for axis in range(3)
+    ]
+    src_axes = [
+        np.floor(
+            axis.astype(np.float64) * float(dst_spacing_base) / float(src_spacing_base)
+        ).astype(np.int64)
+        for axis in sample_axes
+    ]
+    src_shape = np.asarray(array.shape, dtype=np.int64)
+    valid_axes = [
+        (src_axes[axis] >= 0) & (src_axes[axis] < src_shape[axis])
+        for axis in range(3)
+    ]
+    if not all(bool(valid.any()) for valid in valid_axes):
+        return None
+    starts = np.asarray(
+        [int(src_axes[axis][valid_axes[axis]].min()) for axis in range(3)],
+        dtype=np.int64,
+    )
+    ends = np.asarray(
+        [int(src_axes[axis][valid_axes[axis]].max()) + 1 for axis in range(3)],
+        dtype=np.int64,
+    )
+    return starts, ends
+
+
+def _chunk_ranges_for_bbox(
+    array: Any, bbox: tuple[np.ndarray, np.ndarray] | None
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+    if bbox is None:
+        return None
+    chunks = _array_chunks_zyx(array)
+    if chunks is None:
+        return None
+    starts, ends = bbox
+    chunk_np = np.asarray(chunks, dtype=np.int64)
+    first = starts // chunk_np
+    last = (ends - 1) // chunk_np
+    return tuple((int(first[axis]), int(last[axis])) for axis in range(3))  # type: ignore[return-value]
+
+
+def _chunk_index_for_zyx(
+    array: Any, array_zyx: np.ndarray
+) -> tuple[int, int, int] | None:
+    chunks = _array_chunks_zyx(array)
+    if chunks is None:
+        return None
+    chunk_np = np.asarray(chunks, dtype=np.int64)
+    return tuple(int(v) for v in (np.asarray(array_zyx, dtype=np.int64) // chunk_np))
+
+
+def _format_optional_array(value: np.ndarray | None) -> str:
+    if value is None:
+        return "None"
+    return repr(tuple(int(v) for v in np.asarray(value, dtype=np.int64)))
+
+
+def _format_bbox(bbox: tuple[np.ndarray, np.ndarray] | None) -> str:
+    if bbox is None:
+        return "None"
+    starts, ends = bbox
+    return f"{_format_optional_array(starts)}:{_format_optional_array(ends)}"
+
+
 def _read_image_crop_from_patch(
     patch: Any,
     crop_shape: tuple[int, int, int],
@@ -506,6 +681,9 @@ class FiberTraceBatchBuilder:
                 "degenerate_up_policy must be 'invalid' or 'raise', "
                 f"got {self.degenerate_up_policy!r}"
             )
+        self.debug_sampling = bool(self.config.get("debug_sampling", False))
+        self._debug_sampling_count = 0
+        self._debug_sampling_limit = int(self.config.get("debug_sampling_limit", 0))
 
         datasets = self.config.get("datasets")
         self.records: list[_FiberRecord] = []
@@ -579,39 +757,15 @@ class FiberTraceBatchBuilder:
                 break
             dataset_config = dict(dataset_config_raw)
             _reject_valid_mask_threshold_key(dataset_config, context="dataset entry")
-            lasagna_manifest_path = (
-                dataset_config.get("lasagna_manifest_path")
-                or dataset_config.get("lasagna_json")
-                or dataset_config.get("manifest_path")
-            )
-            volume_path = dataset_config.get("base_volume_path") or dataset_config.get(
-                "volume_path"
-            )
+            _reject_manifestless_dataset_keys(dataset_config)
+            lasagna_manifest_path = dataset_config.get("lasagna_manifest_path")
+            volume_path = dataset_config.get("base_volume_path")
             if not volume_path:
                 raise ValueError("dataset entry missing base_volume_path")
             if not lasagna_manifest_path:
-                mask_path_raw = dataset_config.get("mask_path") or dataset_config.get(
-                    "grad_mag_path"
-                )
-                if not mask_path_raw:
-                    raise ValueError(
-                        "dataset entry must provide lasagna_manifest_path, "
-                        "mask_path or grad_mag_path"
-                    )
-                if (
-                    not dataset_config.get("nx_path")
-                    or not dataset_config.get("ny_path")
-                ) and not self.allow_arbitrary_up_fallback:
-                    raise ValueError(
-                        "dataset entry must provide lasagna_manifest_path or explicit "
-                        "Lasagna nx_path and ny_path normal channels"
-                    )
+                raise ValueError("dataset entry missing lasagna_manifest_path")
 
-            volume_scale = int(
-                dataset_config.get(
-                    "base_volume_scale", dataset_config.get("volume_scale", 0)
-                )
-            )
+            volume_scale = int(dataset_config.get("base_volume_scale", 0))
             volume_spacing_base = _scale_level_to_spacing_base(volume_scale)
             volume = _open_zarr_array_resolved(
                 volume_path,
@@ -622,155 +776,79 @@ class FiberTraceBatchBuilder:
                 config=self.config,
             )
 
-            if lasagna_manifest_path:
-                lasagna_volume = _load_lasagna_volume(
-                    lasagna_manifest_path, self.config
+            lasagna_volume = _load_lasagna_volume(lasagna_manifest_path, self.config)
+            if lasagna_volume.base_shape_zyx is None:
+                raise ValueError(
+                    "Lasagna manifest must provide base_shape_zyx for fiber "
+                    "trace training"
                 )
-                if lasagna_volume.base_shape_zyx is None:
-                    raise ValueError(
-                        "Lasagna manifest must provide base_shape_zyx for fiber "
-                        "trace training"
-                    )
-                base_level0 = (
-                    volume
-                    if volume_scale == 0
-                    else _open_zarr_array_resolved(
-                        volume_path,
-                        scale=0,
-                        auth_json_path=dataset_config.get(
-                            "base_volume_auth_json",
-                            dataset_config.get("volume_auth_json"),
-                        ),
+            base_level0 = (
+                volume
+                if volume_scale == 0
+                else _open_zarr_array_resolved(
+                    volume_path,
+                    scale=0,
+                    auth_json_path=dataset_config.get(
+                        "base_volume_auth_json",
+                        dataset_config.get("volume_auth_json"),
+                    ),
+                    config=self.config,
+                )
+            )
+            _validate_shape(
+                _volume_shape_zyx(base_level0, label="base volume level 0"),
+                tuple(lasagna_volume.base_shape_zyx),
+                label="base volume level 0",
+                context=f"Lasagna manifest {lasagna_manifest_path}",
+            )
+            _validate_shape(
+                _volume_shape_zyx(volume, label="base volume selected level"),
+                _omezarr_level_shape(lasagna_volume.base_shape_zyx, volume_scale),
+                label="base volume selected level",
+                context=(
+                    f"base_shape_zyx={lasagna_volume.base_shape_zyx} "
+                    f"base_volume_scale={volume_scale}"
+                ),
+            )
+            try:
+                mask, mask_spacing_base = _open_manifest_channel(
+                    lasagna_volume,
+                    "grad_mag",
+                    auth_json_path=dataset_config.get("lasagna_auth_json"),
+                    config=self.config,
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    "Lasagna manifest missing required grad_mag channel"
+                ) from exc
+            if self.allow_arbitrary_up_fallback:
+                nx = None
+                ny = None
+                nx_spacing_base = None
+                ny_spacing_base = None
+            else:
+                try:
+                    nx, nx_spacing_base = _open_manifest_channel(
+                        lasagna_volume,
+                        "nx",
+                        auth_json_path=dataset_config.get("lasagna_auth_json"),
                         config=self.config,
                     )
-                )
-                _validate_shape(
-                    _volume_shape_zyx(base_level0, label="base volume level 0"),
-                    tuple(lasagna_volume.base_shape_zyx),
-                    label="base volume level 0",
-                    context=f"Lasagna manifest {lasagna_manifest_path}",
-                )
-                _validate_shape(
-                    _volume_shape_zyx(volume, label="base volume selected level"),
-                    _omezarr_level_shape(lasagna_volume.base_shape_zyx, volume_scale),
-                    label="base volume selected level",
-                    context=(
-                        f"base_shape_zyx={lasagna_volume.base_shape_zyx} "
-                        f"base_volume_scale={volume_scale}"
-                    ),
-                )
-                try:
-                    mask, mask_spacing_base = _open_manifest_channel(
+                    ny, ny_spacing_base = _open_manifest_channel(
                         lasagna_volume,
-                        "grad_mag",
+                        "ny",
                         auth_json_path=dataset_config.get("lasagna_auth_json"),
                         config=self.config,
                     )
                 except KeyError as exc:
                     raise ValueError(
-                        "Lasagna manifest missing required grad_mag channel"
+                        "Lasagna manifest missing required nx/ny normal channels"
                     ) from exc
-                if self.allow_arbitrary_up_fallback:
-                    nx = None
-                    ny = None
-                    nx_spacing_base = None
-                    ny_spacing_base = None
-                else:
-                    try:
-                        nx, nx_spacing_base = _open_manifest_channel(
-                            lasagna_volume,
-                            "nx",
-                            auth_json_path=dataset_config.get("lasagna_auth_json"),
-                            config=self.config,
-                        )
-                        ny, ny_spacing_base = _open_manifest_channel(
-                            lasagna_volume,
-                            "ny",
-                            auth_json_path=dataset_config.get("lasagna_auth_json"),
-                            config=self.config,
-                        )
-                    except KeyError as exc:
-                        raise ValueError(
-                            "Lasagna manifest missing required nx/ny normal channels"
-                        ) from exc
-                    if abs(float(nx_spacing_base) - float(ny_spacing_base)) > 1e-6:
-                        raise ValueError(
-                            "Lasagna nx and ny normal channel spacing mismatch: "
-                            f"nx={nx_spacing_base} ny={ny_spacing_base}"
-                        )
-            else:
-                mask_path = dataset_config.get("mask_path") or dataset_config.get(
-                    "grad_mag_path"
-                )
-                if not mask_path:
+                if abs(float(nx_spacing_base) - float(ny_spacing_base)) > 1e-6:
                     raise ValueError(
-                        "dataset entry must provide lasagna_manifest_path or "
-                        "mask_path/grad_mag_path"
+                        "Lasagna nx and ny normal channel spacing mismatch: "
+                        f"nx={nx_spacing_base} ny={ny_spacing_base}"
                     )
-                nx_path = dataset_config.get("nx_path")
-                ny_path = dataset_config.get("ny_path")
-                if (
-                    not nx_path or not ny_path
-                ) and not self.allow_arbitrary_up_fallback:
-                    raise ValueError(
-                        "dataset entry must provide lasagna_manifest_path or explicit "
-                        "Lasagna nx_path and ny_path normal channels"
-                    )
-                mask_scale = int(
-                    dataset_config.get(
-                        "mask_scale",
-                        dataset_config.get("grad_mag_scale", volume_scale),
-                    )
-                )
-                normal_scale = int(dataset_config.get("normal_scale", volume_scale))
-                mask = _open_zarr_array_resolved(
-                    mask_path,
-                    scale=mask_scale,
-                    auth_json_path=dataset_config.get(
-                        "mask_auth_json", dataset_config.get("volume_auth_json")
-                    ),
-                    config=self.config,
-                )
-                mask_spacing_base = _scale_level_to_spacing_base(mask_scale)
-                if nx_path and ny_path:
-                    nx_scale = int(dataset_config.get("nx_scale", normal_scale))
-                    ny_scale = int(dataset_config.get("ny_scale", normal_scale))
-                    nx = _open_zarr_array_resolved(
-                        nx_path,
-                        scale=nx_scale,
-                        auth_json_path=dataset_config.get(
-                            "nx_auth_json",
-                            dataset_config.get(
-                                "normal_auth_json",
-                                dataset_config.get("volume_auth_json"),
-                            ),
-                        ),
-                        config=self.config,
-                    )
-                    ny = _open_zarr_array_resolved(
-                        ny_path,
-                        scale=ny_scale,
-                        auth_json_path=dataset_config.get(
-                            "ny_auth_json",
-                            dataset_config.get(
-                                "normal_auth_json",
-                                dataset_config.get("volume_auth_json"),
-                            ),
-                        ),
-                        config=self.config,
-                    )
-                    nx_spacing_base = _scale_level_to_spacing_base(nx_scale)
-                    ny_spacing_base = _scale_level_to_spacing_base(ny_scale)
-                    if abs(float(nx_spacing_base) - float(ny_spacing_base)) > 1e-6:
-                        raise ValueError(
-                            "Lasagna nx_path and ny_path scale mismatch: "
-                            f"nx_scale={nx_scale} ny_scale={ny_scale}"
-                        )
-                else:
-                    nx = None
-                    ny = None
-                    nx_spacing_base = None
-                    ny_spacing_base = None
 
             for fiber_path in _resolve_fiber_paths(dataset_config, self.config):
                 self.records.append(
@@ -794,38 +872,138 @@ class FiberTraceBatchBuilder:
     def __len__(self) -> int:
         return len(self.records)
 
+    def _debug_sampling_print(self, message: str) -> None:
+        if not self.debug_sampling:
+            return
+        if self._debug_sampling_limit > 0:
+            if self._debug_sampling_count >= self._debug_sampling_limit:
+                return
+            self._debug_sampling_count += 1
+        print(f"[fiber_trace:sample] {message}", flush=True)
+
     def _sample_record(self, record_index: int | None) -> _FiberRecord:
         if record_index is not None:
             return self.records[int(record_index)]
         return self.records[int(self.rng.integers(0, len(self.records)))]
 
-    def _normal_at_zyx(
+    def _channel_value_info(
+        self,
+        array: Any,
+        sample_zyx: np.ndarray,
+        *,
+        sample_spacing_base: float,
+        array_spacing_base: float,
+    ) -> dict[str, Any]:
+        sample_zyx_f = np.asarray(sample_zyx, dtype=np.float64)
+        array_zyx = np.floor(
+            sample_zyx_f * float(sample_spacing_base) / float(array_spacing_base)
+        ).astype(np.int64)
+        shape = np.asarray(array.shape, dtype=np.int64)
+        in_bounds = bool(np.all(array_zyx >= 0) and np.all(array_zyx < shape))
+        info: dict[str, Any] = {
+            "array_zyx": array_zyx,
+            "shape": tuple(int(v) for v in shape),
+            "chunks": _array_chunks_zyx(array),
+            "chunk_index": _chunk_index_for_zyx(array, array_zyx)
+            if in_bounds
+            else None,
+            "in_bounds": in_bounds,
+            "value": None,
+            "read_ok": False,
+        }
+        if not in_bounds:
+            return info
+        value = np.asarray(
+            array[
+                array_zyx[0] : array_zyx[0] + 1,
+                array_zyx[1] : array_zyx[1] + 1,
+                array_zyx[2] : array_zyx[2] + 1,
+            ]
+        )
+        if value.size == 0:
+            return info
+        info["value"] = value.reshape(-1)[0]
+        info["read_ok"] = True
+        return info
+
+    def _normal_sample_info(
         self, record: _FiberRecord, center_zyx: np.ndarray
-    ) -> tuple[np.ndarray | None, bool]:
+    ) -> dict[str, Any]:
         if record.nx is None or record.ny is None:
             if self.allow_arbitrary_up_fallback:
-                return None, True
+                return {
+                    "normal_xyz": None,
+                    "normal_valid": True,
+                    "reason": "arbitrary_up_fallback",
+                }
             raise ValueError("Lasagna nx/ny normal channels are required")
         if record.nx_spacing_base is None or record.ny_spacing_base is None:
             raise ValueError("Lasagna nx/ny spacing metadata is required")
-        nx_value, nx_ok = _value_at_sample_zyx(
+
+        center = np.asarray(center_zyx, dtype=np.int64)
+        nx_info = self._channel_value_info(
             record.nx,
-            center_zyx,
+            center,
             sample_spacing_base=record.volume_spacing_base,
             array_spacing_base=record.nx_spacing_base,
         )
-        ny_value, ny_ok = _value_at_sample_zyx(
+        ny_info = self._channel_value_info(
             record.ny,
-            center_zyx,
+            center,
             sample_spacing_base=record.volume_spacing_base,
             array_spacing_base=record.ny_spacing_base,
         )
-        if not nx_ok or not ny_ok:
-            return np.zeros(3, dtype=np.float32), False
-        nx_vox = np.asarray([nx_value])
-        ny_vox = np.asarray([ny_value])
-        normal_xyz, valid = decode_lasagna_normals_xyz(nx_vox, ny_vox)
-        return normal_xyz.reshape(-1, 3)[0], bool(valid.reshape(-1)[0])
+        reason = ""
+        normal_xyz = np.zeros(3, dtype=np.float32)
+        normal_valid = False
+        if not bool(nx_info["read_ok"]) or not bool(ny_info["read_ok"]):
+            reason = "mapped outside nx/ny volume"
+        else:
+            nx_vox = np.asarray([nx_info["value"]])
+            ny_vox = np.asarray([ny_info["value"]])
+            normal_arr, valid_arr = decode_lasagna_normals_xyz(nx_vox, ny_vox)
+            normal_xyz = normal_arr.reshape(-1, 3)[0]
+            normal_valid = bool(valid_arr.reshape(-1)[0])
+            if not normal_valid:
+                reason = "Lasagna normal decode produced non-finite or zero vector"
+
+        return {
+            "center_zyx": center,
+            "center_xyz": zyx_to_xyz(
+                center.astype(np.float32) * float(record.volume_spacing_base)
+            ),
+            "volume_spacing_base": record.volume_spacing_base,
+            "nx_spacing_base": record.nx_spacing_base,
+            "ny_spacing_base": record.ny_spacing_base,
+            "nx": nx_info,
+            "ny": ny_info,
+            "normal_xyz": normal_xyz,
+            "normal_valid": normal_valid,
+            "reason": reason,
+        }
+
+    def _format_normal_sample_info(self, info: dict[str, Any]) -> str:
+        nx = info.get("nx", {})
+        ny = info.get("ny", {})
+        return (
+            f"center_zyx={_format_optional_array(info.get('center_zyx'))} "
+            f"center_xyz={tuple(float(v) for v in np.asarray(info.get('center_xyz', []), dtype=np.float32))} "
+            f"volume_spacing_base={info.get('volume_spacing_base')} "
+            f"nx_zyx={_format_optional_array(nx.get('array_zyx'))} "
+            f"ny_zyx={_format_optional_array(ny.get('array_zyx'))} "
+            f"nx_value={nx.get('value')} ny_value={ny.get('value')} "
+            f"nx_shape={nx.get('shape')} ny_shape={ny.get('shape')} "
+            f"nx_chunks={nx.get('chunks')} ny_chunks={ny.get('chunks')} "
+            f"nx_chunk={nx.get('chunk_index')} ny_chunk={ny.get('chunk_index')} "
+            f"normal_xyz={tuple(float(v) for v in np.asarray(info.get('normal_xyz', []), dtype=np.float32))} "
+            f"reason={info.get('reason')!r}"
+        )
+
+    def _normal_at_zyx(
+        self, record: _FiberRecord, center_zyx: np.ndarray
+    ) -> tuple[np.ndarray | None, bool]:
+        info = self._normal_sample_info(record, center_zyx)
+        return info["normal_xyz"], bool(info["normal_valid"])
 
     def _sample_random_valid_center(self, record: _FiberRecord) -> np.ndarray:
         shape = np.asarray(record.volume.shape, dtype=np.int64)
@@ -844,25 +1022,10 @@ class FiberTraceBatchBuilder:
                 if normal_valid:
                     return center
 
-        mask_np = np.asarray(record.mask[:])
-        valid_mask = mask_np > 0.0
-        valid_mask_coords = np.argwhere(valid_mask)
-        if valid_mask_coords.size == 0:
-            raise ValueError("mask/grad-mag and nx/ny volumes contain no valid voxels")
-        order = self.rng.permutation(valid_mask_coords.shape[0])
-        for idx in order:
-            mask_center = valid_mask_coords[int(idx)]
-            center = np.rint(
-                mask_center.astype(np.float64)
-                * float(record.mask_spacing_base)
-                / float(record.volume_spacing_base)
-            ).astype(np.int64)
-            if np.any(center < 0) or np.any(center >= shape):
-                continue
-            _, normal_valid = self._normal_at_zyx(record, center)
-            if normal_valid:
-                return center
-        raise ValueError("mask/grad-mag and nx/ny volumes contain no valid voxels")
+        raise ValueError(
+            "could not sample a random valid center from mask/grad-mag and nx/ny "
+            f"after {self.random_valid_max_attempts} attempts"
+        )
 
     def _sample_jittered_conditioning(
         self,
@@ -927,14 +1090,25 @@ class FiberTraceBatchBuilder:
             center = self._sample_random_valid_center(record)
         else:
             raise ValueError(f"unsupported crop_kind {crop_kind!r}")
-        center_normal_xyz, center_normal_valid = self._normal_at_zyx(record, center)
-        if not center_normal_valid:
-            raise ValueError(f"sampled {crop_kind} center has invalid Lasagna nx/ny")
+        center_normal_info = self._normal_sample_info(record, center)
+        self._debug_sampling_print(
+            f"sampled center crop_kind={crop_kind!r} control_index={control_index} "
+            f"fiber_path={record.fiber.path} "
+            f"{self._format_normal_sample_info(center_normal_info)}"
+        )
+        if not bool(center_normal_info["normal_valid"]):
+            raise ValueError(
+                f"sampled {crop_kind} center has unusable Lasagna nx/ny: "
+                f"{self._format_normal_sample_info(center_normal_info)}"
+            )
+        center_normal_xyz = center_normal_info["normal_xyz"]
 
         crop_size_np = np.asarray(self.crop_size, dtype=np.int64)
         min_corner = center - (crop_size_np // 2)
         max_corner = min_corner + crop_size_np
         patch = SimpleNamespace(volume=record.volume, scale=record.volume_scale)
+        volume_bbox = _raw_source_bbox_zyx(record.volume, self.crop_size, min_corner)
+        volume_t0 = time.perf_counter()
         volume_crop = _read_image_crop_from_patch(
             patch,
             self.crop_size,
@@ -942,24 +1116,53 @@ class FiberTraceBatchBuilder:
             max_corner,
             image_normalization=self.image_normalization,
         )
-        valid_crop = (
-            _read_scaled_channel_crop(
-                record.mask,
-                self.crop_size,
-                min_corner,
-                dst_spacing_base=record.volume_spacing_base,
-                src_spacing_base=record.mask_spacing_base,
-            )
-            > 0.0
+        self._debug_sampling_print(
+            f"read crop field='base' crop_kind={crop_kind!r} "
+            f"origin_zyx={_format_optional_array(min_corner)} "
+            f"shape={self.crop_size} src_bbox={_format_bbox(volume_bbox)} "
+            f"chunks={_chunk_ranges_for_bbox(record.volume, volume_bbox)} "
+            f"elapsed_ms={(time.perf_counter() - volume_t0) * 1000.0:.2f}"
+        )
+        mask_bbox = _scaled_source_bbox_zyx(
+            record.mask,
+            self.crop_size,
+            min_corner,
+            dst_spacing_base=record.volume_spacing_base,
+            src_spacing_base=record.mask_spacing_base,
+        )
+        mask_t0 = time.perf_counter()
+        mask_crop = _read_scaled_channel_crop(
+            record.mask,
+            self.crop_size,
+            min_corner,
+            dst_spacing_base=record.volume_spacing_base,
+            src_spacing_base=record.mask_spacing_base,
+        )
+        valid_count = int((mask_crop > 0.0).sum()) if self.debug_sampling else -1
+        self._debug_sampling_print(
+            f"read crop field='grad_mag' crop_kind={crop_kind!r} "
+            f"origin_zyx={_format_optional_array(min_corner)} "
+            f"shape={self.crop_size} src_bbox={_format_bbox(mask_bbox)} "
+            f"chunks={_chunk_ranges_for_bbox(record.mask, mask_bbox)} "
+            f"valid_voxels={valid_count} "
+            f"elapsed_ms={(time.perf_counter() - mask_t0) * 1000.0:.2f}"
         )
         if record.nx is None or record.ny is None:
             if not self.allow_arbitrary_up_fallback:
                 raise ValueError("Lasagna nx/ny normal channels are required")
-            normal_xyz_crop = None
-            normal_valid_crop = np.ones(self.crop_size, dtype=bool)
+            nx_crop = None
+            ny_crop = None
         else:
             if record.nx_spacing_base is None or record.ny_spacing_base is None:
                 raise ValueError("Lasagna nx/ny spacing metadata is required")
+            nx_bbox = _scaled_source_bbox_zyx(
+                record.nx,
+                self.crop_size,
+                min_corner,
+                dst_spacing_base=record.volume_spacing_base,
+                src_spacing_base=record.nx_spacing_base,
+            )
+            nx_t0 = time.perf_counter()
             nx_crop = _read_scaled_channel_crop(
                 record.nx,
                 self.crop_size,
@@ -967,6 +1170,21 @@ class FiberTraceBatchBuilder:
                 dst_spacing_base=record.volume_spacing_base,
                 src_spacing_base=record.nx_spacing_base,
             )
+            self._debug_sampling_print(
+                f"read crop field='nx' crop_kind={crop_kind!r} "
+                f"origin_zyx={_format_optional_array(min_corner)} "
+                f"shape={self.crop_size} src_bbox={_format_bbox(nx_bbox)} "
+                f"chunks={_chunk_ranges_for_bbox(record.nx, nx_bbox)} "
+                f"elapsed_ms={(time.perf_counter() - nx_t0) * 1000.0:.2f}"
+            )
+            ny_bbox = _scaled_source_bbox_zyx(
+                record.ny,
+                self.crop_size,
+                min_corner,
+                dst_spacing_base=record.volume_spacing_base,
+                src_spacing_base=record.ny_spacing_base,
+            )
+            ny_t0 = time.perf_counter()
             ny_crop = _read_scaled_channel_crop(
                 record.ny,
                 self.crop_size,
@@ -974,13 +1192,12 @@ class FiberTraceBatchBuilder:
                 dst_spacing_base=record.volume_spacing_base,
                 src_spacing_base=record.ny_spacing_base,
             )
-            normal_xyz_crop, normal_valid_crop = decode_lasagna_normals_xyz(
-                nx_crop, ny_crop
-            )
-            valid_crop = valid_crop & normal_valid_crop
-        if not bool(valid_crop.any()):
-            raise ValueError(
-                f"sampled {crop_kind} crop has no valid mask/grad-mag and nx/ny voxels"
+            self._debug_sampling_print(
+                f"read crop field='ny' crop_kind={crop_kind!r} "
+                f"origin_zyx={_format_optional_array(min_corner)} "
+                f"shape={self.crop_size} src_bbox={_format_bbox(ny_bbox)} "
+                f"chunks={_chunk_ranges_for_bbox(record.ny, ny_bbox)} "
+                f"elapsed_ms={(time.perf_counter() - ny_t0) * 1000.0:.2f}"
             )
 
         tangent_xyz = tangent_at_point(
@@ -990,9 +1207,9 @@ class FiberTraceBatchBuilder:
 
         return {
             "volume": volume_crop.astype(np.float32, copy=False),
-            "valid_mask": valid_crop,
-            "normal_xyz": normal_xyz_crop,
-            "normal_valid_mask": normal_valid_crop,
+            "mask_values": mask_crop,
+            "nx_values": nx_crop,
+            "ny_values": ny_crop,
             "center_normal_xyz": center_normal_xyz,
             "tangent_xyz": tangent_xyz,
             "origin": min_corner.astype(np.int64, copy=False),
@@ -1026,45 +1243,17 @@ class FiberTraceBatchBuilder:
         else:
             raise ValueError(f"unsupported direction_kind {direction_kind!r}")
 
-        classified = classify_voxels(
-            crop_origin_zyx=crop_base["origin"],
-            crop_shape=self.crop_size,
-            line_points_xyz=record.fiber.line_points_xyz
-            / float(record.volume_spacing_base),
-            cond_fw_xyz=cond_fw_xyz,
-            cond_up_xyz=cond_up_xyz,
-            valid_mask=crop_base["valid_mask"],
-            normal_xyz=crop_base["normal_xyz"],
-            normal_valid_mask=crop_base["normal_valid_mask"],
-            allow_arbitrary_up_fallback=self.allow_arbitrary_up_fallback,
-            degenerate_up_policy=self.degenerate_up_policy,
-            positive_radius=self.positive_radius,
-            ignore_radius=self.ignore_radius,
-            normal_plane_jitter_voxels=self.normal_plane_jitter_voxels,
-            normal_perpendicular_jitter_voxels=self.normal_perpendicular_jitter_voxels,
-            negative_cone_distance_voxels=self.negative_cone_distance_voxels,
-            positive_cosine=self.positive_cosine,
-            negative_cosine=self.negative_cosine,
-            positive_target_id=positive_target_id,
-        )
-        positive_labels = classified["labels"] == POSITIVE_LABEL
-        if bool(positive_labels.any()) and not bool(
-            (positive_labels & classified["target_up_valid"]).any()
-        ):
-            raise ValueError(
-                f"sampled {crop_base['crop_kind']} crop has no valid up-vector supervision"
-            )
         return {
             "volume": crop_base["volume"],
-            "valid_mask": crop_base["valid_mask"],
-            "labels": classified["labels"],
-            "target_id": classified["target_id"],
-            "target_fw_xyz": classified["target_fw_xyz"],
-            "target_up_xyz": classified["target_up_xyz"],
-            "target_up_valid": classified["target_up_valid"],
+            "mask_values": crop_base["mask_values"],
+            "nx_values": crop_base["nx_values"],
+            "ny_values": crop_base["ny_values"],
             "cond_fw_xyz": cond_fw_xyz,
             "cond_up_xyz": cond_up_xyz,
             "origin": crop_base["origin"],
+            "line_points_xyz": record.fiber.line_points_xyz
+            / float(record.volume_spacing_base),
+            "positive_target_id": positive_target_id,
             "crop_kind": crop_base["crop_kind"],
             "direction_kind": direction_kind,
         }
@@ -1118,29 +1307,41 @@ class FiberTraceBatchBuilder:
                 )
             )
         fiber_path = str(record.fiber.path) if record.fiber.path is not None else ""
+        sample_count = len(samples)
+        crop_shape = self.crop_size
+        nx_values = None
+        ny_values = None
+        if all(s["nx_values"] is not None for s in samples):
+            nx_values = torch.from_numpy(
+                np.stack([s["nx_values"] for s in samples], axis=0)
+            )
+            ny_values = torch.from_numpy(
+                np.stack([s["ny_values"] for s in samples], axis=0)
+            )
 
         return FiberTraceBatch(
             volume=torch.from_numpy(
                 np.stack([s["volume"] for s in samples], axis=0)[:, None]
             ).to(torch.float32),
-            valid_mask=torch.from_numpy(
-                np.stack([s["valid_mask"] for s in samples], axis=0)
-            ).to(torch.bool),
-            labels=torch.from_numpy(
-                np.stack([s["labels"] for s in samples], axis=0)
-            ).to(torch.long),
-            target_id=torch.from_numpy(
-                np.stack([s["target_id"] for s in samples], axis=0)
-            ).to(torch.long),
-            target_fw_xyz=torch.from_numpy(
-                np.stack([s["target_fw_xyz"] for s in samples], axis=0)
-            ).to(torch.float32),
-            target_up_xyz=torch.from_numpy(
-                np.stack([s["target_up_xyz"] for s in samples], axis=0)
-            ).to(torch.float32),
-            target_up_valid=torch.from_numpy(
-                np.stack([s["target_up_valid"] for s in samples], axis=0)
-            ).to(torch.bool),
+            mask_values=torch.from_numpy(
+                np.stack([s["mask_values"] for s in samples], axis=0)
+            ),
+            nx_values=nx_values,
+            ny_values=ny_values,
+            valid_mask=torch.zeros((sample_count,) + crop_shape, dtype=torch.bool),
+            labels=torch.full(
+                (sample_count,) + crop_shape, int(IGNORE_INDEX), dtype=torch.long
+            ),
+            target_id=torch.full(
+                (sample_count,) + crop_shape, int(IGNORE_ID), dtype=torch.long
+            ),
+            target_fw_xyz=torch.zeros(
+                (sample_count, 3) + crop_shape, dtype=torch.float32
+            ),
+            target_up_xyz=torch.zeros(
+                (sample_count, 3) + crop_shape, dtype=torch.float32
+            ),
+            target_up_valid=torch.zeros((sample_count,) + crop_shape, dtype=torch.bool),
             cond_fw_xyz=torch.from_numpy(
                 np.stack([s["cond_fw_xyz"] for s in samples], axis=0)
             ).to(torch.float32),
@@ -1150,6 +1351,12 @@ class FiberTraceBatchBuilder:
             crop_origin_zyx=torch.from_numpy(
                 np.stack([s["origin"] for s in samples], axis=0)
             ).to(torch.long),
+            line_points_xyz=torch.from_numpy(
+                np.stack([s["line_points_xyz"] for s in samples], axis=0)
+            ).to(torch.float32),
+            positive_target_id=torch.tensor(
+                [int(s["positive_target_id"]) for s in samples], dtype=torch.long
+            ),
             crop_kinds=tuple(str(s["crop_kind"]) for s in samples),
             fiber_paths=tuple(fiber_path for _ in samples),
             direction_kinds=tuple(str(s["direction_kind"]) for s in samples),

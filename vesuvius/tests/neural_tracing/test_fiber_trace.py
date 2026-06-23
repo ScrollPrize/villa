@@ -146,8 +146,9 @@ def test_lasagna_normal_decoding_and_up_projection():
     np.testing.assert_allclose(normals[0], np.array([0.0, 0.0, 1.0]), atol=1e-6)
     np.testing.assert_allclose(normals[1], np.array([0.0, 1.0, 0.0]), atol=1e-6)
     np.testing.assert_allclose(normals[2], np.array([1.0, 0.0, 0.0]), atol=1e-6)
-    assert bool(valid[:3].all())
-    assert not bool(valid[3])
+    assert bool(valid.all())
+    assert np.isfinite(normals[3]).all()
+    assert float(np.linalg.norm(normals[3])) == pytest.approx(1.0, abs=1e-6)
 
     up = construct_up_vector(
         np.array([1.0, 0.0, 0.0], dtype=np.float32),
@@ -208,7 +209,9 @@ def test_batch_builder_samples_one_fiber_with_paired_conditioning_variants(
     builder = FiberTraceBatchBuilder(
         _synthetic_config(tmp_path), rng=np.random.default_rng(5)
     )
-    batch = builder.sample_batch(record_index=0)
+    batch = fiber_train.classify_batch_on_device(
+        builder.sample_batch(record_index=0), builder.config
+    )
 
     assert batch.volume.shape == (4, 1, 16, 16, 16)
     assert batch.labels.shape == (4, 16, 16, 16)
@@ -242,7 +245,24 @@ def test_batch_builder_samples_one_fiber_with_paired_conditioning_variants(
     assert bool((negative_errors <= 90.0 + 1e-4).all())
 
 
-def test_missing_mask_fails_loudly(tmp_path: Path):
+def test_sampled_control_outside_normals_reports_mapping(tmp_path: Path):
+    fiber_path = tmp_path / "outside_fiber.json"
+    fiber_payload = {
+        "type": "vc3d_fiber",
+        "version": 1,
+        "line_points": [[float(x), 8.0, 8.0] for x in range(20, 30)],
+        "control_points": [[1000.0, 8.0, 8.0]],
+    }
+    fiber_path.write_text(json.dumps(fiber_payload), encoding="utf-8")
+    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config["_array_records"][0]["fiber_path"] = str(fiber_path)
+
+    builder = FiberTraceBatchBuilder(config, rng=np.random.default_rng(0))
+    with pytest.raises(ValueError, match="nx_zyx=.*reason='mapped outside nx/ny volume'"):
+        builder.sample_batch(record_index=0)
+
+
+def test_missing_lasagna_manifest_fails_loudly(tmp_path: Path):
     fiber_path = tmp_path / "fiber.json"
     _write_fiber(fiber_path)
     config = {
@@ -250,12 +270,12 @@ def test_missing_mask_fails_loudly(tmp_path: Path):
         "batch_size": 2,
         "datasets": [
             {
-                "volume_path": str(tmp_path / "missing.zarr"),
+                "base_volume_path": str(tmp_path / "missing.zarr"),
                 "fiber_paths": [str(fiber_path)],
             }
         ],
     }
-    with pytest.raises(ValueError, match="mask_path or grad_mag_path"):
+    with pytest.raises(ValueError, match="lasagna_manifest_path"):
         FiberTraceBatchBuilder(config)
 
 
@@ -273,21 +293,59 @@ def test_negative_direction_max_is_folded_frame_degree_bound(tmp_path: Path):
         FiberTraceBatchBuilder(config)
 
 
-def test_missing_normals_fail_loudly(tmp_path: Path):
+def test_manifest_missing_normals_fails_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     fiber_path = tmp_path / "fiber.json"
     _write_fiber(fiber_path)
+    (tmp_path / "umbilicus.json").write_text(
+        json.dumps({"control_points": [{"x": 8, "y": 8, "z": 8}]}),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "pred.lasagna.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "source_to_base": 1.0,
+                "base_shape_zyx": [16, 16, 16],
+                "umbilicus_json": "umbilicus.json",
+                "groups": {
+                    "grad_mag": {
+                        "zarr": "grad_mag.ome.zarr/0",
+                        "scaledown": 0,
+                        "channels": ["grad_mag"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    base = np.zeros((16, 16, 16), dtype=np.uint8)
+    grad = np.ones((16, 16, 16), dtype=np.uint8)
+    base_root = tmp_path / "base.ome.zarr"
+    grad_root = tmp_path / "grad_mag.ome.zarr"
+
+    def fake_open_zarr(path, *, scale=None, auth_json_path=None, config=None):
+        if str(path) == str(base_root.resolve()) and int(scale) == 0:
+            return base
+        if str(path) == str(grad_root.resolve()) and int(scale) == 0:
+            return grad
+        raise AssertionError((path, scale))
+
+    monkeypatch.setattr(fiber_dataset, "_common_open_zarr", fake_open_zarr)
     config = {
         "crop_size": [8, 8, 8],
         "batch_size": 2,
         "datasets": [
             {
-                "volume_path": str(tmp_path / "volume.zarr"),
-                "mask_path": str(tmp_path / "mask.zarr"),
+                "base_volume_path": str(base_root),
+                "lasagna_manifest_path": str(manifest_path),
                 "fiber_paths": [str(fiber_path)],
             }
         ],
     }
-    with pytest.raises(ValueError, match="nx_path and ny_path"):
+    with pytest.raises(ValueError, match="missing required nx/ny"):
         FiberTraceBatchBuilder(config)
 
 
@@ -308,10 +366,8 @@ def test_remote_zarr_requires_cache_dir_before_network(tmp_path: Path):
         "batch_size": 2,
         "datasets": [
             {
-                "volume_path": "https://example.com/volume.zarr",
-                "mask_path": "https://example.com/mask.zarr",
-                "nx_path": "https://example.com/nx.zarr",
-                "ny_path": "https://example.com/ny.zarr",
+                "base_volume_path": "https://example.com/volume.zarr",
+                "lasagna_manifest_path": str(tmp_path / "pred.lasagna.json"),
                 "fiber_paths": [str(fiber_path)],
             }
         ],
@@ -320,31 +376,58 @@ def test_remote_zarr_requires_cache_dir_before_network(tmp_path: Path):
         FiberTraceBatchBuilder(config)
 
 
-def test_zarr_access_uses_common_helpers_without_direct_fallback(
+def test_manifest_zarr_access_uses_common_helpers_without_direct_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     fiber_path = tmp_path / "fiber.json"
     _write_fiber(fiber_path)
+    (tmp_path / "umbilicus.json").write_text(
+        json.dumps({"control_points": [{"x": 8, "y": 8, "z": 8}]}),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "pred.lasagna.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "source_to_base": 1.0,
+                "base_shape_zyx": [16, 16, 16],
+                "umbilicus_json": "umbilicus.json",
+                "groups": {
+                    "grad_mag": {
+                        "zarr": "mask.ome.zarr/0",
+                        "scaledown": 0,
+                        "channels": ["grad_mag"],
+                    },
+                    "normal": {
+                        "zarr": "normal.ome.zarr/0",
+                        "scaledown": 0,
+                        "channels": ["nx", "ny"],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     volume = np.zeros((16, 16, 16), dtype=np.uint8)
     mask = np.ones((16, 16, 16), dtype=np.uint8)
-    nx = np.full((16, 16, 16), 128, dtype=np.uint8)
-    ny = np.full((16, 16, 16), 128, dtype=np.uint8)
+    normals = np.stack(
+        [
+            np.full((16, 16, 16), 128, dtype=np.uint8),
+            np.full((16, 16, 16), 128, dtype=np.uint8),
+        ],
+        axis=0,
+    )
     calls: list[tuple[str, str, int | None]] = []
-
-    def fake_open_group(path, *, auth_json_path=None, config=None):
-        calls.append(("group", str(path), None))
-        return {"0": volume}
 
     def fake_open_zarr(path, *, scale=None, auth_json_path=None, config=None):
         calls.append(("array", str(path), int(scale)))
         return {
-            str((Path.cwd() / "volume").resolve()): volume,
-            str((Path.cwd() / "mask").resolve()): mask,
-            str((Path.cwd() / "nx").resolve()): nx,
-            str((Path.cwd() / "ny").resolve()): ny,
+            str((tmp_path / "volume.ome.zarr").resolve()): volume,
+            str((tmp_path / "mask.ome.zarr").resolve()): mask,
+            str((tmp_path / "normal.ome.zarr").resolve()): normals,
         }[str(path)]
 
-    monkeypatch.setattr(fiber_dataset, "_common_open_zarr_group", fake_open_group)
     monkeypatch.setattr(fiber_dataset, "_common_open_zarr", fake_open_zarr)
 
     FiberTraceBatchBuilder(
@@ -353,21 +436,115 @@ def test_zarr_access_uses_common_helpers_without_direct_fallback(
             "batch_size": 2,
             "datasets": [
                 {
-                    "volume_path": "volume",
-                    "mask_path": "mask",
-                    "nx_path": "nx",
-                    "ny_path": "ny",
+                    "base_volume_path": str(tmp_path / "volume.ome.zarr"),
+                    "lasagna_manifest_path": str(manifest_path),
                     "fiber_paths": [str(fiber_path)],
                 }
             ],
         }
     )
     assert calls == [
-        ("array", str((Path.cwd() / "volume").resolve()), 0),
-        ("array", str((Path.cwd() / "mask").resolve()), 0),
-        ("array", str((Path.cwd() / "nx").resolve()), 0),
-        ("array", str((Path.cwd() / "ny").resolve()), 0),
+        ("array", str((tmp_path / "volume.ome.zarr").resolve()), 0),
+        ("array", str((tmp_path / "mask.ome.zarr").resolve()), 0),
+        ("array", str((tmp_path / "normal.ome.zarr").resolve()), 0),
+        ("array", str((tmp_path / "normal.ome.zarr").resolve()), 0),
     ]
+
+
+def test_manifestless_channel_paths_are_rejected(tmp_path: Path):
+    fiber_path = tmp_path / "fiber.json"
+    _write_fiber(fiber_path)
+    config = {
+        "crop_size": [8, 8, 8],
+        "batch_size": 2,
+        "datasets": [
+            {
+                "base_volume_path": str(tmp_path / "volume.ome.zarr"),
+                "lasagna_manifest_path": str(tmp_path / "pred.lasagna.json"),
+                "grad_mag_path": str(tmp_path / "mask.ome.zarr"),
+                "nx_path": str(tmp_path / "nx.ome.zarr"),
+                "ny_path": str(tmp_path / "ny.ome.zarr"),
+                "fiber_paths": [str(fiber_path)],
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="manifest-less"):
+        FiberTraceBatchBuilder(config)
+
+
+def test_lasagna_manifest_source_to_base_contributes_channel_spacing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fiber_path = tmp_path / "fiber.json"
+    _write_fiber(fiber_path)
+    (tmp_path / "umbilicus.json").write_text(
+        json.dumps({"control_points": [{"x": 8, "y": 8, "z": 8}]}),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "pred.lasagna.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "source_to_base": 2.0,
+                "base_shape_zyx": [16, 16, 16],
+                "umbilicus_json": "umbilicus.json",
+                "groups": {
+                    "grad_mag": {
+                        "zarr": "grad_mag.ome.zarr/1",
+                        "scaledown": 1,
+                        "channels": ["grad_mag"],
+                    },
+                    "normal": {
+                        "zarr": "normal.ome.zarr/1",
+                        "scaledown": 1,
+                        "channels": ["nx", "ny"],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    base = np.zeros((16, 16, 16), dtype=np.uint8)
+    grad = np.ones((8, 8, 8), dtype=np.uint8)
+    normals = np.stack(
+        [
+            np.full((8, 8, 8), 128, dtype=np.uint8),
+            np.full((8, 8, 8), 128, dtype=np.uint8),
+        ],
+        axis=0,
+    )
+    base_root = tmp_path / "base.ome.zarr"
+    grad_root = tmp_path / "grad_mag.ome.zarr"
+    normal_root = tmp_path / "normal.ome.zarr"
+
+    def fake_open_zarr(path, *, scale=None, auth_json_path=None, config=None):
+        if str(path) == str(base_root.resolve()) and int(scale) == 0:
+            return base
+        if str(path) == str(grad_root.resolve()) and int(scale) == 1:
+            return grad
+        if str(path) == str(normal_root.resolve()) and int(scale) == 1:
+            return normals
+        raise AssertionError((path, scale))
+
+    monkeypatch.setattr(fiber_dataset, "_common_open_zarr", fake_open_zarr)
+    builder = FiberTraceBatchBuilder(
+        {
+            "crop_size": [8, 8, 8],
+            "batch_size": 2,
+            "datasets": [
+                {
+                    "base_volume_path": str(base_root),
+                    "lasagna_manifest_path": str(manifest_path),
+                    "fiber_paths": [str(fiber_path)],
+                }
+            ],
+        }
+    )
+    record = builder.records[0]
+    assert record.mask_spacing_base == pytest.approx(4.0)
+    assert record.nx_spacing_base == pytest.approx(4.0)
+    assert record.ny_spacing_base == pytest.approx(4.0)
 
 
 def test_lasagna_manifest_drives_channels_and_scaled_sampling(
@@ -451,7 +628,9 @@ def test_lasagna_manifest_drives_channels_and_scaled_sampling(
         },
         rng=np.random.default_rng(3),
     )
-    batch = builder.sample_batch(record_index=0)
+    batch = fiber_train.classify_batch_on_device(
+        builder.sample_batch(record_index=0), builder.config
+    )
 
     assert batch.volume.shape == (2, 1, 4, 4, 4)
     assert bool((batch.labels == POSITIVE_LABEL).any())
@@ -749,7 +928,9 @@ def test_supervised_contrastive_same_line_positives_attract_across_crops():
 def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
     config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
     builder = FiberTraceBatchBuilder(config, rng=np.random.default_rng(9))
-    batch = builder.sample_batch(record_index=0)
+    batch = fiber_train.classify_batch_on_device(
+        builder.sample_batch(record_index=0), builder.config
+    )
     model = DirectionConditionedFiberTraceModel(
         backbone_channels=2,
         embedding_dim=6,
@@ -793,6 +974,7 @@ def test_training_writes_tensorboard_text_and_snapshots(
             self.log_dir = Path(log_dir)
             self.scalars: list[tuple[str, float, int]] = []
             self.texts: list[tuple[str, str, int]] = []
+            self.images: list[tuple[str, tuple[int, ...], int]] = []
             self.closed = False
 
         def add_scalar(self, tag: str, value: float, step: int) -> None:
@@ -800,6 +982,9 @@ def test_training_writes_tensorboard_text_and_snapshots(
 
         def add_text(self, tag: str, text: str, step: int) -> None:
             self.texts.append((tag, str(text), int(step)))
+
+        def add_image(self, tag: str, image: torch.Tensor, step: int) -> None:
+            self.images.append((tag, tuple(image.shape), int(step)))
 
         def flush(self) -> None:
             pass
@@ -823,6 +1008,7 @@ def test_training_writes_tensorboard_text_and_snapshots(
             "device": "cpu",
             "num_steps": 1,
             "log_every": 100,
+            "sample_visualization_every": 1,
             "run_path": str(tmp_path / "runs"),
             "run_name": "unit run",
             "run_datestr": "20260102_030405",
@@ -858,6 +1044,16 @@ def test_training_writes_tensorboard_text_and_snapshots(
         "train/up",
     } <= scalar_tags
     assert {"test/total", "test/contrastive", "test/fw", "test/up"} <= scalar_tags
+    image_tags = {tag for tag, _, _ in writers[0].images}
+    expected_image_tags = {
+        f"train_sample/{view}/{name}"
+        for view in ("side", "top", "cross")
+        for name in ("image", "positive", "undef", "negative")
+    }
+    assert expected_image_tags <= image_tags
+    assert all(
+        shape == (1, 8, 8) and step == 1 for _, shape, step in writers[0].images
+    )
 
 
 def test_training_rejects_legacy_checkpoint_path(tmp_path: Path):

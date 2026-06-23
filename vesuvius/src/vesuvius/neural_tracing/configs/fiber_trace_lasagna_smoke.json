@@ -3,6 +3,7 @@
   "device": "cuda",
   "num_steps": 1,
   "log_every": 100,
+  "sample_visualization_every": 10000,
   "run_path": "runs/fiber_trace",
   "run_name": "fiber_trace_smoke",
   "tensorboard_enabled": true,

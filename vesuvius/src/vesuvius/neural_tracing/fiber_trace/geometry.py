@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from lasagna.omezarr_pyramid import _decode_normals as _lasagna_decode_normals
 
 from vesuvius.neural_tracing.fiber_trace.labels import (
     IGNORE_INDEX,
@@ -242,13 +243,14 @@ def decode_lasagna_normals_xyz(
     nx_encoded: np.ndarray,
     ny_encoded: np.ndarray,
     *,
-    invalid_tolerance: float = 1e-4,
     eps: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Decode Lasagna uint8 hemisphere normals into xyz vectors.
 
-    Lasagna stores only `nx` and `ny` as `(value - 128) / 127`; `nz` is the
-    non-negative hemisphere component.
+    Mirrors Lasagna's own normal handling: decode `(nx, ny)` with the
+    hemisphere convention, clamp `nz`, and normalize. Validity here means the
+    decoded values are finite and have non-zero norm; semantic validity is
+    still driven by the Lasagna `grad_mag > 0` mask.
     """
     nx_raw = np.asarray(nx_encoded)
     ny_raw = np.asarray(ny_encoded)
@@ -256,13 +258,10 @@ def decode_lasagna_normals_xyz(
         raise ValueError(
             f"nx/ny normal shapes must match, got {nx_raw.shape!r} vs {ny_raw.shape!r}"
         )
-    nx = (nx_raw.astype(np.float32, copy=False) - 128.0) / 127.0
-    ny = (ny_raw.astype(np.float32, copy=False) - 128.0) / 127.0
-    nz_sq = 1.0 - nx * nx - ny * ny
-    valid = np.isfinite(nx) & np.isfinite(ny) & (nz_sq >= -float(invalid_tolerance))
-    nz = np.sqrt(np.maximum(nz_sq, 0.0)).astype(np.float32, copy=False)
+    nx, ny, nz = _lasagna_decode_normals(nx_raw, ny_raw)
     normals = np.stack([nx, ny, nz], axis=-1).astype(np.float32, copy=False)
     norms = np.linalg.norm(normals, axis=-1, keepdims=True)
+    valid = np.isfinite(normals).all(axis=-1)
     valid &= np.isfinite(norms[..., 0]) & (norms[..., 0] > eps)
     normals = np.divide(
         normals,

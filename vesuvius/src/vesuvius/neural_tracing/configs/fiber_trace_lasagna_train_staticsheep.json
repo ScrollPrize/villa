@@ -1,14 +1,14 @@
 {
   "seed": 0,
   "device": "cuda",
-  "num_steps": 100000,
-  "log_every": 100,
-  "sample_visualization_every": 10000,
+  "num_steps": 100,
+  "log_every": 1,
+  "sample_visualization_every": 1,
   "run_path": "runs/fiber_trace",
-  "run_name": "fiber_trace_train",
+  "run_name": "fiber_trace_train_staticsheep",
   "tensorboard_enabled": true,
-  "batch_size": 2,
-  "crop_size": [64, 64, 64],
+  "batch_size": 8,
+  "crop_size": [128, 128, 128],
   "image_normalization": "zscore",
   "positive_direction_probability": 0.5,
   "positive_direction_jitter_degrees": 30.0,
@@ -24,14 +24,16 @@
   "degenerate_up_policy": "invalid",
   "allow_arbitrary_up_fallback": false,
   "random_valid_max_attempts": 256,
-  "volume_cache_dir": "/tmp/vesuvius_fiber_trace_zarr_cache",
+  "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache",
+  "debug_sampling": true,
+  "debug_cache": true,
   "datasets": [
     {
-      "base_volume_path": "/path/to/base-image.ome.zarr",
-      "base_volume_scale": 0,
-      "lasagna_manifest_path": "/path/to/prediction.lasagna.json",
-      "fiber_glob": "/path/to/train_fibers/*.json",
-      "test_fiber_glob": "/path/to/test_fibers/*.json"
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "lasagna_manifest_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json",
+      "fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_2026-06-16/*.json",
+      "test_fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_test_2026-06-22/*.json"
     }
   ],
   "model": {

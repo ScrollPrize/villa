@@ -86,11 +86,14 @@ class _DiskCacheStore(zarr.storage.Store):
         url: str,
         offline: bool = False,
         retry_budget_seconds: float = 0.0,
+        debug: bool = False,
     ) -> None:
         super().__init__()
         self._remote = remote
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
+        self._debug = bool(debug)
+        self._url = str(url)
         # Namespace cache by the normalized remote URL to prevent cross-dataset
         # chunk-key collisions. Zarr chunk keys are relative paths inside one
         # store (e.g. "c/0/1/2"), so without a per-URL prefix every dataset
@@ -99,6 +102,10 @@ class _DiskCacheStore(zarr.storage.Store):
         scheme, sep, rest = normalized.partition('://')
         subdir = os.path.join(scheme, rest) if sep else normalized
         self._cache_dir = os.path.join(cache_dir, subdir)
+
+    def _debug_print(self, message: str) -> None:
+        if self._debug:
+            print(f"[_DiskCacheStore] {message}", flush=True)
 
     # Suffix appended to the cached path to mark a "known-missing" chunk.
     # Zarr chunk keys don't contain this pattern, so there's no collision
@@ -164,6 +171,7 @@ class _DiskCacheStore(zarr.storage.Store):
             raise
 
     def __getitem__(self, key):
+        start = time.perf_counter()
         cached = os.path.join(self._cache_dir, key)
         marker = cached + self._NEGATIVE_MARKER_SUFFIX
 
@@ -171,12 +179,23 @@ class _DiskCacheStore(zarr.storage.Store):
         if os.path.isfile(cached):
             try:
                 with open(cached, 'rb') as f:
-                    return f.read()
+                    data = f.read()
+                self._debug_print(
+                    f"cache_hit url={self._url!r} key={key!r} "
+                    f"bytes={len(data)} elapsed_ms={(time.perf_counter() - start) * 1000.0:.2f} "
+                    f"path={cached!r}"
+                )
+                return data
             except FileNotFoundError:
                 # Raced with a concurrent replace; fall through to re-fetch.
                 pass
         # Negative cache hit → known-missing, skip the remote round-trip.
         if os.path.isfile(marker):
+            self._debug_print(
+                f"negative_cache_hit url={self._url!r} key={key!r} "
+                f"elapsed_ms={(time.perf_counter() - start) * 1000.0:.2f} "
+                f"marker={marker!r}"
+            )
             raise KeyError(key)
 
         if self._offline:
@@ -185,6 +204,7 @@ class _DiskCacheStore(zarr.storage.Store):
                 f"({self._cache_dir})"
             )
 
+        fetch_start = time.perf_counter()
         try:
             result = self._remote_get_with_retry(key)
         except KeyError:
@@ -192,6 +212,11 @@ class _DiskCacheStore(zarr.storage.Store):
                 self._atomic_write_bytes(marker, b"")
             except OSError:
                 pass
+            self._debug_print(
+                f"remote_missing url={self._url!r} key={key!r} "
+                f"elapsed_ms={(time.perf_counter() - start) * 1000.0:.2f} "
+                f"marker={marker!r}"
+            )
             raise
 
         if not isinstance(result, (bytes, bytearray, memoryview)):
@@ -199,6 +224,12 @@ class _DiskCacheStore(zarr.storage.Store):
         else:
             result = bytes(result)
         self._atomic_write_bytes(cached, result)
+        self._debug_print(
+            f"download url={self._url!r} key={key!r} bytes={len(result)} "
+            f"fetch_ms={(time.perf_counter() - fetch_start) * 1000.0:.2f} "
+            f"elapsed_ms={(time.perf_counter() - start) * 1000.0:.2f} "
+            f"path={cached!r}"
+        )
         return result
 
     def get(self, key, default=None):
@@ -338,6 +369,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
         cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
         offline = bool(config.get('volume_cache_offline', False))
         retry_budget = float(config.get('volume_cache_retry_seconds', 0.0))
+        debug_cache = bool(config.get('debug_cache', False))
 
     if is_http:
         storage_opts = {}
@@ -359,7 +391,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
         )
         store = _DiskCacheStore(
             remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget,
+            offline=offline, retry_budget_seconds=retry_budget, debug=debug_cache,
         )
         return zarr.open(store, path=str(scale), mode='r')
 
@@ -371,7 +403,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
         )
         store = _DiskCacheStore(
             remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget,
+            offline=offline, retry_budget_seconds=retry_budget, debug=debug_cache,
         )
         return zarr.open(store, path=str(scale), mode='r')
 
@@ -406,6 +438,7 @@ def open_zarr_group(path, auth_json_path=None, config=None):
         cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
         offline = bool(config.get('volume_cache_offline', False))
         retry_budget = float(config.get('volume_cache_retry_seconds', 0.0))
+        debug_cache = bool(config.get('debug_cache', False))
 
     if is_http:
         storage_opts = {}
@@ -420,7 +453,7 @@ def open_zarr_group(path, auth_json_path=None, config=None):
         )
         store = _DiskCacheStore(
             remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget,
+            offline=offline, retry_budget_seconds=retry_budget, debug=debug_cache,
         )
         return zarr.open(store, mode='r')
 
@@ -432,7 +465,7 @@ def open_zarr_group(path, auth_json_path=None, config=None):
         )
         store = _DiskCacheStore(
             remote, cache_dir, url=path,
-            offline=offline, retry_budget_seconds=retry_budget,
+            offline=offline, retry_budget_seconds=retry_budget, debug=debug_cache,
         )
         return zarr.open(store, mode='r')
 
