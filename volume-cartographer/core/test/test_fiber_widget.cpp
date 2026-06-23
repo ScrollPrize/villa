@@ -80,13 +80,13 @@ int main(int argc, char** argv)
     ensureApplication(argc, argv, app);
 
     CFiberWidget widget;
-    auto first = makeFiber(1, "fibers/1.json", 2, 20, 12.0, {"source-a"});
+    auto first = makeFiber(1, "aa_20260605T184821587_000001.json", 2, 20, 12.0, {"source-a"});
     first.spans.push_back({0, 0, 1, 2, 20, 12.0, makeMetric(8.0, 12.0, 38)});
     auto second = makeFiber(2, "kb_20260605T184821587_000002.json", 3, 30, 24.0, {"review"});
     second.alignment = makeMetric(25.0, 50.0, 58);
     second.spans.push_back({0, 0, 1, 2, 14, 11.0, makeMetric(7.0, 20.0, 26)});
     second.spans.push_back({1, 1, 2, 2, 17, 13.0, makeMetric(31.0, 52.0, 32)});
-    auto third = makeFiber(3, "fibers/3.json", 4, 40, 36.0);
+    auto third = makeFiber(3, "zz_20260605T184821587_000003.json", 4, 40, 36.0);
 
     widget.setFibers({first, second, third});
     widget.setKnownTags({"review", "source-a", "todo"});
@@ -97,11 +97,12 @@ int main(int argc, char** argv)
     require(treeView->model()->columnCount() == 8, "Fiber tree should expose eight columns");
     require(treeView->header()->sectionResizeMode(0) == QHeaderView::Interactive,
             "Fiber tree header should allow changing column widths");
-    require(treeView->model()->index(1, 0).data().toString().contains(
-                QStringLiteral("kb_20260605T184821587_000002.json")),
-            "Fiber tree row did not include the fiber filename");
-    require(treeView->model()->index(1, 0).data().toString() != QStringLiteral("Fiber 2"),
-            "Fiber tree row should not use the old synthetic Fiber N label");
+    require(treeView->model()->index(1, 0).data().toString() == QStringLiteral("kb_..._000002"),
+            "Fiber tree row should show the shortened JSON stem without the internal ID");
+    require(!treeView->model()->index(1, 0).data().toString().contains(QStringLiteral(".json")),
+            "Fiber tree row should not show the JSON extension");
+    require(!treeView->model()->index(1, 0).data().toString().startsWith(QStringLiteral("2 ")),
+            "Fiber tree row should not show the runtime fiber ID");
     require(treeView->model()->rowCount(treeView->model()->index(1, 0)) == 2,
             "Fiber tree row did not expose span children");
     require(treeView->model()->index(1, 5).data().toString() == QStringLiteral("review"),
@@ -196,7 +197,7 @@ int main(int argc, char** argv)
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
                               Q_ARG(int, 2));
-    require(treeView->model()->index(0, 0).data().toString().contains(QStringLiteral("fibers/3.json")),
+    require(treeView->model()->index(0, 0).data().toString() == QStringLiteral("zz_..._000003"),
             "Sorting by length descending should reorder only top-level fibers");
     const QModelIndex sortedSecondParent = treeView->model()->index(1, 0);
     require(treeView->model()->index(0, 0, sortedSecondParent).data().toString().contains(
@@ -318,23 +319,61 @@ int main(int argc, char** argv)
     std::vector<CFiberWidget::FiberEntry> manyFibers;
     manyFibers.reserve(80);
     for (uint64_t id = 1; id <= 80; ++id) {
-        manyFibers.push_back(makeFiber(id,
-                                       "fiber_" + std::to_string(id) + ".json",
-                                       2,
-                                       20,
-                                       static_cast<double>(id)));
+        auto fiber = makeFiber(id,
+                               "fiber_" + std::to_string(id) + ".json",
+                               2,
+                               20,
+                               static_cast<double>(id));
+        if (id % 2 == 0) {
+            fiber.tags.push_back("review");
+        }
+        if (id % 3 == 0) {
+            fiber.tags.push_back("source-a");
+        }
+        manyFibers.push_back(std::move(fiber));
     }
     scrollWidget.setFibers(manyFibers);
+    scrollWidget.setKnownTags({"review", "source-a", "todo", "needs-proofread"});
+    scrollWidget.resize(520, 300);
+    scrollWidget.show();
+    QApplication::processEvents();
     auto* scrollTree = scrollWidget.findChild<QTreeView*>(QStringLiteral("fiberTreeView"));
     require(scrollTree != nullptr, "Scrollable fiber tree view was not found");
     auto* scrollBar = scrollTree->verticalScrollBar();
     require(scrollBar != nullptr, "Fiber tree vertical scrollbar was not found");
-    scrollBar->setRange(0, 100);
-    const int preservedScroll = 50;
+    require(scrollBar->maximum() > 0, "Fiber tree should have a vertical scroll range");
+    const int preservedScroll = scrollBar->maximum() / 2;
     scrollBar->setValue(preservedScroll);
     scrollWidget.selectFiber(70);
     require(scrollBar->value() == preservedScroll,
             "Programmatic fiber selection should not scroll the fiber list");
+
+    const auto tagCheckboxesBefore =
+        scrollWidget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
+    require(tagCheckboxesBefore.size() == 4, "Scrollable fiber widget should expose four tag checkboxes");
+    scrollBar->setValue(scrollBar->maximum());
+    QApplication::processEvents();
+    const int directSelectionScroll = scrollBar->value();
+    const int directSelectionMaximum = scrollBar->maximum();
+    const QRect directSelectionViewport = scrollTree->viewport()->geometry();
+    const QModelIndex directSelectionIndex = scrollTree->model()->index(
+        scrollTree->model()->rowCount() - 2,
+        0);
+    require(directSelectionIndex.isValid(), "Direct selection target was not valid");
+    scrollTree->selectionModel()->select(directSelectionIndex,
+                                         QItemSelectionModel::ClearAndSelect |
+                                         QItemSelectionModel::Rows);
+    QApplication::processEvents();
+    require(scrollBar->value() == directSelectionScroll,
+            "Tree selection changes should not move the fiber list scrollbar");
+    require(scrollBar->maximum() == directSelectionMaximum,
+            "Tree selection changes should not resize the fiber list scroll range");
+    require(scrollTree->viewport()->geometry() == directSelectionViewport,
+            "Tree selection changes should not resize the fiber list viewport");
+    const auto tagCheckboxesAfter =
+        scrollWidget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
+    require(tagCheckboxesAfter == tagCheckboxesBefore,
+            "Tree selection changes should update tag checkboxes in place");
 
     int confirmations = 0;
     int batchDeletes = 0;

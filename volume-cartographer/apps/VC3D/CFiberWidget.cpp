@@ -61,6 +61,89 @@ bool containsTag(const std::vector<std::string>& tags, const std::string& tag)
     return std::find(tags.begin(), tags.end(), tag) != tags.end();
 }
 
+bool allDigits(const QString& text)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
+    for (const QChar ch : text) {
+        if (!ch.isDigit()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool looksLikeFiberTimestamp(const QString& text)
+{
+    if (text.size() < 10 || text[8] != QLatin1Char('T')) {
+        return false;
+    }
+    for (int i = 0; i < text.size(); ++i) {
+        if (i == 8) {
+            continue;
+        }
+        if (!text[i].isDigit()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QString displayStemForFiberFile(QString fileName)
+{
+    fileName = fileName.trimmed();
+    const int slash = std::max(fileName.lastIndexOf(QLatin1Char('/')),
+                               fileName.lastIndexOf(QLatin1Char('\\')));
+    if (slash >= 0) {
+        fileName = fileName.mid(slash + 1);
+    }
+    if (fileName.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) {
+        fileName.chop(5);
+    }
+    if (fileName.isEmpty()) {
+        return QString();
+    }
+
+    const int lastSeparator = fileName.lastIndexOf(QLatin1Char('_'));
+    const int timestampSeparator = lastSeparator > 0
+        ? fileName.lastIndexOf(QLatin1Char('_'), lastSeparator - 1)
+        : -1;
+    if (timestampSeparator >= 0 && lastSeparator > timestampSeparator) {
+        const QString prefix = fileName.left(timestampSeparator);
+        const QString timestamp =
+            fileName.mid(timestampSeparator + 1, lastSeparator - timestampSeparator - 1);
+        const QString sequence = fileName.mid(lastSeparator + 1);
+        if (!prefix.isEmpty() &&
+            looksLikeFiberTimestamp(timestamp) &&
+            sequence.size() == 6 &&
+            allDigits(sequence)) {
+            return prefix + QStringLiteral("_..._") + sequence;
+        }
+    }
+
+    return fileName;
+}
+
+std::vector<QCheckBox*> tagCheckboxesInLayout(QVBoxLayout* layout)
+{
+    std::vector<QCheckBox*> checkboxes;
+    if (!layout) {
+        return checkboxes;
+    }
+
+    for (int i = 0; i < layout->count(); ++i) {
+        QLayoutItem* item = layout->itemAt(i);
+        if (!item) {
+            continue;
+        }
+        if (auto* checkbox = qobject_cast<QCheckBox*>(item->widget())) {
+            checkboxes.push_back(checkbox);
+        }
+    }
+    return checkboxes;
+}
+
 QStandardItem* readOnlyItem(const QString& text = QString())
 {
     auto* item = new QStandardItem(text);
@@ -206,6 +289,7 @@ void CFiberWidget::setupUi()
 
     _nameLabel = new QLabel(mainWidget);
     _nameLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _nameLabel->setMinimumHeight(_nameLabel->fontMetrics().lineSpacing() * 2);
     layout->addWidget(_nameLabel);
 
     _scoreLabel = new QLabel(mainWidget);
@@ -341,10 +425,8 @@ void CFiberWidget::setupUi()
 
 QString CFiberWidget::displayNameForFiber(const FiberEntry& fiber)
 {
-    const QString fileName = QString::fromStdString(fiber.fileName);
-    return fileName.isEmpty()
-        ? QString::number(fiber.id)
-        : tr("%1  %2").arg(fiber.id).arg(fileName);
+    const QString name = displayStemForFiberFile(QString::fromStdString(fiber.fileName));
+    return name.isEmpty() ? tr("unnamed") : name;
 }
 
 QString CFiberWidget::directionForFiber(const FiberEntry& fiber)
@@ -908,24 +990,47 @@ void CFiberWidget::rebuildTagList()
         return;
     }
 
-    while (auto* item = _tagListLayout->takeAt(0)) {
-        delete item->widget();
-        delete item;
+    auto checkboxes = tagCheckboxesInLayout(_tagListLayout);
+    bool canReuseCheckboxes = checkboxes.size() == _knownTags.size();
+    if (canReuseCheckboxes) {
+        for (size_t i = 0; i < _knownTags.size(); ++i) {
+            if (checkboxes[i]->text() != QString::fromStdString(_knownTags[i])) {
+                canReuseCheckboxes = false;
+                break;
+            }
+        }
+    }
+
+    if (!canReuseCheckboxes) {
+        while (auto* item = _tagListLayout->takeAt(0)) {
+            delete item->widget();
+            delete item;
+        }
+
+        for (const auto& tag : _knownTags) {
+            const QString tagText = QString::fromStdString(tag);
+            auto* checkbox = new QCheckBox(tagText, _tagListWidget);
+            checkbox->setObjectName(QStringLiteral("fiberTagCheckBox"));
+            connect(checkbox, &QCheckBox::toggled, this, [this, tagText](bool checked) {
+                requestFiberTagChange(tagText, checked);
+            });
+            _tagListLayout->addWidget(checkbox);
+        }
+        _tagListLayout->addStretch(1);
+        checkboxes = tagCheckboxesInLayout(_tagListLayout);
     }
 
     const FiberEntry* fiber = selectedFiber();
     const bool hasSelection = fiber != nullptr;
-    for (const auto& tag : _knownTags) {
-        auto* checkbox = new QCheckBox(QString::fromStdString(tag), _tagListWidget);
-        checkbox->setObjectName(QStringLiteral("fiberTagCheckBox"));
+    for (size_t i = 0; i < checkboxes.size() && i < _knownTags.size(); ++i) {
+        QCheckBox* checkbox = checkboxes[i];
+        if (!checkbox) {
+            continue;
+        }
+        const QSignalBlocker blocker(checkbox);
         checkbox->setEnabled(hasSelection);
-        checkbox->setChecked(hasSelection && containsTag(fiber->tags, tag));
-        connect(checkbox, &QCheckBox::toggled, this, [this, tagText = QString::fromStdString(tag)](bool checked) {
-            requestFiberTagChange(tagText, checked);
-        });
-        _tagListLayout->addWidget(checkbox);
+        checkbox->setChecked(hasSelection && containsTag(fiber->tags, _knownTags[i]));
     }
-    _tagListLayout->addStretch(1);
 
     const bool canEditTags = hasSelection;
     if (_newTagEdit) {
