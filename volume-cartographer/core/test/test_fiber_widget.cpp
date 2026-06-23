@@ -318,23 +318,61 @@ int main(int argc, char** argv)
     std::vector<CFiberWidget::FiberEntry> manyFibers;
     manyFibers.reserve(80);
     for (uint64_t id = 1; id <= 80; ++id) {
-        manyFibers.push_back(makeFiber(id,
-                                       "fiber_" + std::to_string(id) + ".json",
-                                       2,
-                                       20,
-                                       static_cast<double>(id)));
+        auto fiber = makeFiber(id,
+                               "fiber_" + std::to_string(id) + ".json",
+                               2,
+                               20,
+                               static_cast<double>(id));
+        if (id % 2 == 0) {
+            fiber.tags.push_back("review");
+        }
+        if (id % 3 == 0) {
+            fiber.tags.push_back("source-a");
+        }
+        manyFibers.push_back(std::move(fiber));
     }
     scrollWidget.setFibers(manyFibers);
+    scrollWidget.setKnownTags({"review", "source-a", "todo", "needs-proofread"});
+    scrollWidget.resize(520, 300);
+    scrollWidget.show();
+    QApplication::processEvents();
     auto* scrollTree = scrollWidget.findChild<QTreeView*>(QStringLiteral("fiberTreeView"));
     require(scrollTree != nullptr, "Scrollable fiber tree view was not found");
     auto* scrollBar = scrollTree->verticalScrollBar();
     require(scrollBar != nullptr, "Fiber tree vertical scrollbar was not found");
-    scrollBar->setRange(0, 100);
-    const int preservedScroll = 50;
+    require(scrollBar->maximum() > 0, "Fiber tree should have a vertical scroll range");
+    const int preservedScroll = scrollBar->maximum() / 2;
     scrollBar->setValue(preservedScroll);
     scrollWidget.selectFiber(70);
     require(scrollBar->value() == preservedScroll,
             "Programmatic fiber selection should not scroll the fiber list");
+
+    const auto tagCheckboxesBefore =
+        scrollWidget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
+    require(tagCheckboxesBefore.size() == 4, "Scrollable fiber widget should expose four tag checkboxes");
+    scrollBar->setValue(scrollBar->maximum());
+    QApplication::processEvents();
+    const int directSelectionScroll = scrollBar->value();
+    const int directSelectionMaximum = scrollBar->maximum();
+    const QRect directSelectionViewport = scrollTree->viewport()->geometry();
+    const QModelIndex directSelectionIndex = scrollTree->model()->index(
+        scrollTree->model()->rowCount() - 2,
+        0);
+    require(directSelectionIndex.isValid(), "Direct selection target was not valid");
+    scrollTree->selectionModel()->select(directSelectionIndex,
+                                         QItemSelectionModel::ClearAndSelect |
+                                         QItemSelectionModel::Rows);
+    QApplication::processEvents();
+    require(scrollBar->value() == directSelectionScroll,
+            "Tree selection changes should not move the fiber list scrollbar");
+    require(scrollBar->maximum() == directSelectionMaximum,
+            "Tree selection changes should not resize the fiber list scroll range");
+    require(scrollTree->viewport()->geometry() == directSelectionViewport,
+            "Tree selection changes should not resize the fiber list viewport");
+    const auto tagCheckboxesAfter =
+        scrollWidget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
+    require(tagCheckboxesAfter == tagCheckboxesBefore,
+            "Tree selection changes should update tag checkboxes in place");
 
     int confirmations = 0;
     int batchDeletes = 0;
