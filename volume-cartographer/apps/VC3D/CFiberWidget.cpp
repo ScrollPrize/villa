@@ -61,6 +61,70 @@ bool containsTag(const std::vector<std::string>& tags, const std::string& tag)
     return std::find(tags.begin(), tags.end(), tag) != tags.end();
 }
 
+bool allDigits(const QString& text)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
+    for (const QChar ch : text) {
+        if (!ch.isDigit()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool looksLikeFiberTimestamp(const QString& text)
+{
+    if (text.size() < 10 || text[8] != QLatin1Char('T')) {
+        return false;
+    }
+    for (int i = 0; i < text.size(); ++i) {
+        if (i == 8) {
+            continue;
+        }
+        if (!text[i].isDigit()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QString displayStemForFiberFile(QString fileName)
+{
+    fileName = fileName.trimmed();
+    const int slash = std::max(fileName.lastIndexOf(QLatin1Char('/')),
+                               fileName.lastIndexOf(QLatin1Char('\\')));
+    if (slash >= 0) {
+        fileName = fileName.mid(slash + 1);
+    }
+    if (fileName.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) {
+        fileName.chop(5);
+    }
+    if (fileName.isEmpty()) {
+        return QString();
+    }
+
+    const int lastSeparator = fileName.lastIndexOf(QLatin1Char('_'));
+    const int timestampSeparator = lastSeparator > 0
+        ? fileName.lastIndexOf(QLatin1Char('_'), lastSeparator - 1)
+        : -1;
+    if (timestampSeparator >= 0 && lastSeparator > timestampSeparator) {
+        const QString prefix = fileName.left(timestampSeparator);
+        const QString timestamp =
+            fileName.mid(timestampSeparator + 1, lastSeparator - timestampSeparator - 1);
+        const QString sequence = fileName.mid(lastSeparator + 1);
+        if (!prefix.isEmpty() &&
+            looksLikeFiberTimestamp(timestamp) &&
+            sequence.size() == 6 &&
+            allDigits(sequence)) {
+            return prefix + QStringLiteral("_..._") + sequence;
+        }
+    }
+
+    return fileName;
+}
+
 std::vector<QCheckBox*> tagCheckboxesInLayout(QVBoxLayout* layout)
 {
     std::vector<QCheckBox*> checkboxes;
@@ -361,10 +425,8 @@ void CFiberWidget::setupUi()
 
 QString CFiberWidget::displayNameForFiber(const FiberEntry& fiber)
 {
-    const QString fileName = QString::fromStdString(fiber.fileName);
-    return fileName.isEmpty()
-        ? QString::number(fiber.id)
-        : tr("%1  %2").arg(fiber.id).arg(fileName);
+    const QString name = displayStemForFiberFile(QString::fromStdString(fiber.fileName));
+    return name.isEmpty() ? tr("unnamed") : name;
 }
 
 QString CFiberWidget::directionForFiber(const FiberEntry& fiber)
