@@ -1,0 +1,54 @@
+{
+  "seed": 0,
+  "device": "cuda",
+  "num_steps": 10000,
+  "_sample_limit": 100,
+  "log_every": 10,
+  "test_every": 100,
+  "test_sample_count": 4,
+  "test_start_iteration": 1,
+  "sample_visualization_every": 1,
+  "test_visualization_every": 100,
+  "run_path": "runs/fiber_trace",
+  "run_name": "fiber_trace_train_staticsheep",
+  "tensorboard_enabled": true,
+  "batch_size": 8,
+  "crop_size": [64, 64, 64],
+  "augmentation_crop_size": [64, 64, 64],
+  "image_normalization": "zscore",
+  "positive_direction_jitter_degrees": 30.0,
+  "normal_plane_jitter_voxels": 5.0,
+  "normal_perpendicular_jitter_voxels": 2.0,
+  "positive_along_fiber_limit_voxels": 5.0,
+  "negative_cone_distance_voxels": 10.0,
+  "random_valid_max_attempts": 256,
+  "_volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache",
+  "debug_sampling": false,
+  "debug_cache": true,
+  "datasets": [
+    {
+      "base_volume_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/s1/PHercParis4.volpkg/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/",
+      "base_volume_scale": 2,
+      "lasagna_manifest_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json",
+      "fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_2026-06-16/*.json",
+      "test_fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_test_2026-06-22/*.json"
+    }
+  ],
+  "model": {
+    "input_channels": 1,
+    "unet_base_channels": 16,
+    "unet_depth": 6,
+    "conditioned_feature_channels": 32,
+    "embedding_dim": 16,
+    "head_channels": 32
+  },
+  "optimizer": {
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001
+  },
+  "loss": {
+    "temperature": 0.1,
+    "contrastive_weight": 1.0,
+    "max_contrastive_samples": 16384
+  }
+}
