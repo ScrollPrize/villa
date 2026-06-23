@@ -115,9 +115,8 @@ identity, explicit negatives carry `NEGATIVE_ONLY_ID`, and ignored voxels carry
 measured in the selected training grid, not always base-level voxels. If
 `base_volume_scale` is `2`, then one training voxel spans `4` base voxels. The
 fiber coordinates remain base `xyz`; the loader divides them by
-`2**base_volume_scale` only for voxel classification. `positive_radius` and
-`ignore_radius` are accepted as legacy/debug fallback config, but they are not
-the documented training path.
+`2**base_volume_scale` only for voxel classification. The normal-frame geometry
+knobs are explicit; there are no legacy radius fallbacks.
 
 `crop_size` is the final model/input label crop size. `augmentation_crop_size`
 is the larger outer crop read before post-augmentation center trimming; it must
@@ -130,8 +129,10 @@ modest padded or interpolated borders without the larger read cost of a
 
 `DirectionConditionedFiberTraceModel` uses the existing
 `Vesuvius3dUnetModel` as a compact 3D U-Net feature backbone and adds a
-direction-conditioned head. The head concatenates broadcast normalized `fw`
-conditioning with the U-Net features and outputs:
+direction-conditioned head. During training, contrastive pair voxels are sampled
+from the dense labels first, then the head is applied only to the selected U-Net
+feature vectors with their normalized `fw` conditioning. The dense head path is
+kept for debug visualization. The head outputs:
 
 - L2-normalized embedding
 - normalized predicted `fw`
@@ -224,9 +225,6 @@ samples, step 11 reuses step 1's sample, step 12 reuses step 2's sample, and so
 on. Optimizer step count, logging, and snapshot cadence are unchanged; only the
 data sample ordinal is folded.
 
-`positive_radius` and `ignore_radius` are kept only for legacy/debug fallback
-behavior when the named normal-frame fields are omitted.
-
 `sample_visualization_every: 10000` logs up to two GT/control-point training
 samples to TensorBoard on that interval. The trainer writes three oriented
 slices through each sampled point:
@@ -235,12 +233,14 @@ slices through each sampled point:
 - `top`: fiber direction by binormal
 - `cross`: binormal by sampled up/normal direction, perpendicular to the fiber
 
-Each view is logged under `train_sample/pos0/<view>/` and
-`train_sample/pos1/<view>/` as one normalized `image` slice plus one fused
-`labels` image using negative/undefined/positive values `0/127/255`, and one
-fixed-scale `cos_emb_cp` image for predicted embedding cosine against the
-sampled-point embedding. Slice samples outside the crop are black in `image`
-and shown as a coarse `63/191` checkerboard in label/cosine views.
+Each view is logged under `train_sample/<view>/` with the selected GT samples
+stitched side by side. The logged images are one normalized `image` slice, one
+fused `labels` image using negative/undefined/positive values `0/127/255`, one
+fixed-scale `cos_emb_cp` image for predicted embedding cosine against that
+sample's rounded CP embedding, and `cos_emb_other_cp` against the other selected
+CP embedding when two GT samples are available. Slice samples outside the crop
+are black in `image` and shown as a coarse `63/191` checkerboard in label/cosine
+views.
 
 ## Entrypoint
 

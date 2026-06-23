@@ -206,11 +206,9 @@ def classify_voxels(
     valid_mask: np.ndarray,
     normal_xyz: np.ndarray | None = None,
     normal_valid_mask: np.ndarray | None = None,
-    positive_radius: float = 1.5,
-    ignore_radius: float = 3.0,
-    normal_plane_jitter_voxels: float | None = None,
-    normal_perpendicular_jitter_voxels: float | None = None,
-    negative_cone_distance_voxels: float | None = None,
+    normal_plane_jitter_voxels: float,
+    normal_perpendicular_jitter_voxels: float,
+    negative_cone_distance_voxels: float,
     positive_target_id: int = 0,
     full_negative: bool = False,
 ) -> dict[str, np.ndarray]:
@@ -231,13 +229,6 @@ def classify_voxels(
         valid = valid & normal_valid
     if not bool(valid.any()):
         raise ValueError("valid_mask contains no valid voxels after normal validation")
-
-    if normal_plane_jitter_voxels is None:
-        normal_plane_jitter_voxels = float(positive_radius)
-    if normal_perpendicular_jitter_voxels is None:
-        normal_perpendicular_jitter_voxels = float(positive_radius)
-    if negative_cone_distance_voxels is None:
-        negative_cone_distance_voxels = float(ignore_radius)
 
     zz, yy, xx = np.meshgrid(
         np.arange(crop_shape[0], dtype=np.float32),

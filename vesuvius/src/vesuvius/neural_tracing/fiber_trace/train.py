@@ -26,7 +26,10 @@ from vesuvius.neural_tracing.fiber_trace.labels import (
     NEGATIVE_ONLY_ID,
     POSITIVE_LABEL,
 )
-from vesuvius.neural_tracing.fiber_trace.losses import compute_fiber_trace_loss
+from vesuvius.neural_tracing.fiber_trace.losses import (
+    compute_fiber_trace_loss,
+    sample_contrastive_pair_indices,
+)
 from vesuvius.neural_tracing.fiber_trace.model import build_fiber_trace_model
 
 
@@ -212,17 +215,9 @@ def classify_batch_on_device(
     target_id = torch.full_like(batch.target_id, int(IGNORE_ID))
     target_fw_xyz = torch.zeros_like(batch.target_fw_xyz)
 
-    positive_radius = float(config.get("positive_radius", 1.5))
-    ignore_radius = float(config.get("ignore_radius", max(3.0, positive_radius)))
-    normal_plane_jitter = float(
-        config.get("normal_plane_jitter_voxels", positive_radius)
-    )
-    normal_perp_jitter = float(
-        config.get("normal_perpendicular_jitter_voxels", positive_radius)
-    )
-    negative_cone_distance = float(
-        config.get("negative_cone_distance_voxels", ignore_radius)
-    )
+    normal_plane_jitter = float(config["normal_plane_jitter_voxels"])
+    normal_perp_jitter = float(config["normal_perpendicular_jitter_voxels"])
+    negative_cone_distance = float(config["negative_cone_distance_voxels"])
     for idx in range(bsz):
         origin_zyx = batch.crop_origin_zyx[idx].to(device=device, dtype=torch.float32)
         coords_zyx = base_coords_zyx + origin_zyx
@@ -319,8 +314,19 @@ def _compute_losses(
     batch = batch.to(device)
     batch = classify_batch_on_device(batch, config)
 
-    outputs = model(batch.volume, batch.cond_fw_xyz)
-    losses = compute_fiber_trace_loss(outputs, batch, **loss_kwargs)
+    contrastive_samples = sample_contrastive_pair_indices(
+        batch.labels,
+        batch.target_id,
+        max_samples=loss_kwargs["max_contrastive_samples"],
+    )
+    outputs = model(
+        batch.volume,
+        batch.cond_fw_xyz,
+        sample_indices=contrastive_samples.flat_indices,
+    )
+    losses = compute_fiber_trace_loss(
+        outputs, batch, contrastive_samples=contrastive_samples, **loss_kwargs
+    )
     timings = {"data_ms": data_ms}
     cache_stats = getattr(batch_builder, "last_cache_stats", None)
     if cache_stats is not None:
@@ -667,80 +673,135 @@ def _visualization_positive_sample_indices(
     return [max(0, min(int(fallback_index), batch_size - 1))]
 
 
-def _log_single_training_sample_visualization(
+def _embedding_similarity_to_reference(
+    embedding: torch.Tensor, reference: torch.Tensor
+) -> torch.Tensor:
+    embedding = embedding.to(dtype=torch.float32)
+    reference = reference.to(device=embedding.device, dtype=torch.float32)
+    reference = reference / torch.linalg.vector_norm(reference).clamp_min(1e-6)
+    embedding_n = embedding / torch.linalg.vector_norm(
+        embedding, dim=0, keepdim=True
+    ).clamp_min(1e-6)
+    return torch.sum(embedding_n * reference.view(-1, 1, 1, 1), dim=0)
+
+
+def _log_stitched_training_sample_visualization(
     writer: Any,
     model: torch.nn.Module | None,
     batch: FiberTraceBatch,
     *,
     step: int,
-    sample_index: int,
-    tag_prefix: str,
+    sample_indices: list[int],
 ) -> None:
-    if writer is None or not hasattr(writer, "add_image"):
+    if writer is None or not hasattr(writer, "add_image") or not sample_indices:
         return
-    batch_size = int(batch.volume.shape[0])
-    if batch_size <= 0:
-        return
-    sample_index = max(0, min(int(sample_index), batch_size - 1))
     shape_zyx = tuple(int(v) for v in batch.labels.shape[-3:])
     depth, height, width = shape_zyx
     size = max(depth, height, width)
     device = batch.volume.device
-    center_zyx = _sample_local_zyx_tuple(batch, sample_index)
-    center_xyz = torch.tensor(
-        [float(center_zyx[2]), float(center_zyx[1]), float(center_zyx[0])],
-        device=device,
-        dtype=torch.float32,
-    )
-    fw, normal_axis, right = _orthonormal_sample_frame(batch, sample_index)
-    planes = {
-        "side": (fw, normal_axis),
-        "top": (fw, right),
-        "cross": (right, normal_axis),
-    }
-    volume = batch.volume[sample_index : sample_index + 1]
-    labels = batch.labels[sample_index].to(device=device)
-    embedding_similarity = None
-    if model is not None:
+
+    sample_payloads: list[dict[str, Any]] = []
+    ideal_volumes: list[torch.Tensor] = []
+    ideal_fw: list[torch.Tensor] = []
+    for sample_index in sample_indices:
+        cp_local_zyx = _sample_local_zyx_tuple(batch, sample_index)
+        cp_local_xyz = torch.tensor(
+            [float(cp_local_zyx[2]), float(cp_local_zyx[1]), float(cp_local_zyx[0])],
+            device=device,
+            dtype=torch.float32,
+        )
+        fw, normal_axis, right = _orthonormal_sample_frame(batch, sample_index)
+        sample_payloads.append(
+            {
+                "sample_index": int(sample_index),
+                "cp_local_zyx": cp_local_zyx,
+                "cp_local_xyz": cp_local_xyz,
+                "fw": fw,
+                "planes": {
+                    "side": (fw, normal_axis),
+                    "top": (fw, right),
+                    "cross": (right, normal_axis),
+                },
+            }
+        )
+        ideal_volumes.append(batch.volume[sample_index : sample_index + 1])
+        ideal_fw.append(fw.to(device=device, dtype=batch.volume.dtype))
+
+    embeddings: list[torch.Tensor | None] = [None] * len(sample_payloads)
+    refs: list[torch.Tensor | None] = [None] * len(sample_payloads)
+    if model is not None and ideal_volumes:
+        volume = torch.cat(ideal_volumes, dim=0)
+        cond_fw = torch.stack(ideal_fw, dim=0)
         was_training = bool(model.training)
         model.eval()
         try:
-            ideal_outputs = model(
-                volume,
-                fw.view(1, 3).to(device=device, dtype=volume.dtype),
-            )
+            ideal_outputs = model(volume, cond_fw)
         finally:
             if was_training:
                 model.train()
-        embedding = ideal_outputs["embedding"][0].to(device=device, dtype=torch.float32)
-        ref = embedding[(slice(None),) + center_zyx]
-        ref = ref / torch.linalg.vector_norm(ref).clamp_min(1e-6)
-        embedding_n = embedding / torch.linalg.vector_norm(
-            embedding, dim=0, keepdim=True
-        ).clamp_min(1e-6)
-        embedding_similarity = torch.sum(embedding_n * ref.view(-1, 1, 1, 1), dim=0)
-    for plane_name, (axis_u, axis_v) in planes.items():
-        grid = _slice_grid(
-            shape_zyx=shape_zyx,
-            center_xyz=center_xyz,
-            axis_u_xyz=axis_u,
-            axis_v_xyz=axis_v,
-            size=size,
-            device=device,
+        dense_embedding = ideal_outputs["embedding"].to(
+            device=device, dtype=torch.float32
         )
-        images = _sample_plane_image(
-            volume,
-            labels,
-            grid,
-            embedding_similarity=embedding_similarity,
-            center_marker_yx=(size // 2, size // 2),
+        for pos, payload in enumerate(sample_payloads):
+            embedding = dense_embedding[pos]
+            cp_local_zyx = payload["cp_local_zyx"]
+            embeddings[pos] = embedding
+            refs[pos] = embedding[(slice(None),) + cp_local_zyx]
+
+    stitched: dict[tuple[str, str], list[torch.Tensor]] = {}
+    for pos, payload in enumerate(sample_payloads):
+        sample_index = int(payload["sample_index"])
+        volume = batch.volume[sample_index : sample_index + 1]
+        labels = batch.labels[sample_index].to(device=device)
+        embedding = embeddings[pos]
+        own_ref = refs[pos]
+        other_ref = None
+        if len(refs) > 1:
+            other_ref = refs[(pos + 1) % len(refs)]
+        own_similarity = (
+            None
+            if embedding is None or own_ref is None
+            else _embedding_similarity_to_reference(embedding, own_ref)
         )
-        for image_name, image in images.items():
-            writer.add_image(
-                f"{tag_prefix}/{plane_name}/{image_name}",
-                image.detach().cpu().unsqueeze(0),
-                int(step),
+        other_similarity = (
+            None
+            if embedding is None or other_ref is None
+            else _embedding_similarity_to_reference(embedding, other_ref)
+        )
+        for plane_name, (axis_u, axis_v) in payload["planes"].items():
+            grid = _slice_grid(
+                shape_zyx=shape_zyx,
+                center_xyz=payload["cp_local_xyz"],
+                axis_u_xyz=axis_u,
+                axis_v_xyz=axis_v,
+                size=size,
+                device=device,
             )
+            images = _sample_plane_image(
+                volume,
+                labels,
+                grid,
+                embedding_similarity=own_similarity,
+                center_marker_yx=(size // 2, size // 2),
+            )
+            if other_similarity is not None:
+                images["cos_emb_other_cp"] = _sample_plane_image(
+                    volume,
+                    labels,
+                    grid,
+                    embedding_similarity=other_similarity,
+                    center_marker_yx=(size // 2, size // 2),
+                )["cos_emb_cp"]
+            for image_name, image in images.items():
+                stitched.setdefault((plane_name, image_name), []).append(image)
+
+    for (plane_name, image_name), images in stitched.items():
+        combined = torch.cat([image.to(torch.float32) for image in images], dim=-1)
+        writer.add_image(
+            f"train_sample/{plane_name}/{image_name}",
+            combined.detach().cpu().unsqueeze(0),
+            int(step),
+        )
 
 
 def _log_training_sample_visualization(
@@ -751,17 +812,15 @@ def _log_training_sample_visualization(
     step: int,
     sample_index: int = 0,
 ) -> None:
-    for pos_idx, selected_index in enumerate(
-        _visualization_positive_sample_indices(batch, fallback_index=sample_index)
-    ):
-        _log_single_training_sample_visualization(
-            writer,
-            model,
-            batch,
-            step=step,
-            sample_index=selected_index,
-            tag_prefix=f"train_sample/pos{pos_idx}",
-        )
+    _log_stitched_training_sample_visualization(
+        writer,
+        model,
+        batch,
+        step=step,
+        sample_indices=_visualization_positive_sample_indices(
+            batch, fallback_index=sample_index
+        ),
+    )
 
 
 def _save_snapshot(

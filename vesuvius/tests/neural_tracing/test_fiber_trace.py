@@ -30,6 +30,7 @@ from vesuvius.neural_tracing.fiber_trace.labels import (
 )
 from vesuvius.neural_tracing.fiber_trace.losses import (
     compute_fiber_trace_loss,
+    sample_contrastive_pair_indices,
     supervised_contrastive_loss,
 )
 from vesuvius.neural_tracing.fiber_trace.model import (
@@ -67,8 +68,6 @@ def _synthetic_config(
         "normal_perpendicular_jitter_voxels": 10.0,
         "negative_cone_distance_voxels": 30.0,
         "random_negative_pool_size": 8,
-        "positive_radius": 1.25,
-        "ignore_radius": 2.5,
         "_array_records": [
             {
                 "volume": volume,
@@ -670,6 +669,9 @@ def test_lasagna_manifest_drives_channels_and_scaled_sampling(
             "seed": 1,
             "image_normalization": "unit",
             "positive_direction_jitter_degrees": 0.0,
+            "normal_plane_jitter_voxels": 40.0,
+            "normal_perpendicular_jitter_voxels": 10.0,
+            "negative_cone_distance_voxels": 30.0,
             "datasets": [
                 {
                     "base_volume_path": str(base_root),
@@ -922,7 +924,28 @@ def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
     assert outputs["fw"].shape == (2, 3, 8, 8, 8)
     assert "up" not in outputs
 
-    losses = compute_fiber_trace_loss(outputs, batch, max_contrastive_samples=512)
+    samples = sample_contrastive_pair_indices(
+        batch.labels, batch.target_id, max_samples=512
+    )
+    assert samples.flat_indices.numel() > 0
+    sampled_outputs = model(
+        batch.volume, batch.cond_fw_xyz, sample_indices=samples.flat_indices
+    )
+    assert sampled_outputs["embedding"].shape == (
+        samples.flat_indices.numel(),
+        6,
+    )
+    dense_embedding = outputs["embedding"].permute(0, 2, 3, 4, 1).reshape(-1, 6)
+    torch.testing.assert_close(
+        sampled_outputs["embedding"], dense_embedding[samples.flat_indices]
+    )
+
+    losses = compute_fiber_trace_loss(
+        sampled_outputs,
+        batch,
+        max_contrastive_samples=512,
+        contrastive_samples=samples,
+    )
     assert torch.isfinite(losses.total)
     assert float(losses.total.detach()) == pytest.approx(
         float(losses.contrastive.detach()), abs=1e-6
@@ -1043,6 +1066,68 @@ def test_sample_plane_visualization_marks_reference_cross_without_overwriting_ce
     assert float(images["cos_emb_cp"][3, 2]) == pytest.approx(0.0, abs=1e-6)
     assert int(images["labels"][1, 2]) == 0
     assert int(images["labels"][3, 2]) == 0
+
+
+def test_training_sample_visualization_uses_cp_local_reference_not_crop_center():
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.images: dict[str, torch.Tensor] = {}
+
+        def add_image(self, tag: str, image: torch.Tensor, step: int) -> None:
+            del step
+            self.images[tag] = image.detach().clone()
+
+    class FakeModel(torch.nn.Module):
+        def forward(
+            self, volume: torch.Tensor, cond_fw_xyz: torch.Tensor
+        ) -> dict[str, torch.Tensor]:
+            del cond_fw_xyz
+            batch_size = int(volume.shape[0])
+            embedding = torch.zeros((batch_size, 2, 8, 8, 8), dtype=volume.dtype)
+            embedding[0, 1] = 1.0
+            embedding[1, 0] = 1.0
+            embedding[0, :, 1, 2, 3] = torch.tensor([1.0, 0.0])
+            embedding[1, :, 5, 4, 2] = torch.tensor([0.0, 1.0])
+            return {"embedding": embedding}
+
+    batch = FiberTraceBatch(
+        volume=torch.zeros((2, 1, 8, 8, 8), dtype=torch.float32),
+        mask_values=torch.ones((2, 8, 8, 8), dtype=torch.float32),
+        nx_values=None,
+        ny_values=None,
+        valid_mask=torch.ones((2, 8, 8, 8), dtype=torch.bool),
+        labels=torch.full((2, 8, 8, 8), IGNORE_INDEX, dtype=torch.long),
+        target_id=torch.full((2, 8, 8, 8), IGNORE_ID, dtype=torch.long),
+        target_fw_xyz=torch.zeros((2, 3, 8, 8, 8), dtype=torch.float32),
+        center_normal_xyz=torch.tensor(
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=torch.float32
+        ),
+        cond_fw_xyz=torch.tensor(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32
+        ),
+        crop_origin_zyx=torch.zeros((2, 3), dtype=torch.long),
+        sample_local_zyx=torch.tensor([[1, 2, 3], [5, 4, 2]], dtype=torch.long),
+        line_points_xyz=torch.zeros((2, 2, 3), dtype=torch.float32),
+        positive_target_id=torch.tensor([0, 0], dtype=torch.long),
+        crop_kinds=("gt_control", "gt_control"),
+        fiber_paths=("fiber.json", "fiber.json"),
+        direction_kinds=("gt_jitter", "gt_jitter"),
+    )
+    batch.target_fw_xyz[:, 0] = 1.0
+
+    writer = FakeWriter()
+    fiber_train._log_training_sample_visualization(
+        writer, FakeModel(), batch, step=1
+    )
+
+    cos = writer.images["train_sample/cross/cos_emb_cp"][0]
+    assert tuple(cos.shape) == (8, 16)
+    assert float(cos[4, 4]) == pytest.approx(1.0, abs=1e-6)
+    assert float(cos[4, 12]) == pytest.approx(1.0, abs=1e-6)
+
+    other = writer.images["train_sample/cross/cos_emb_other_cp"][0]
+    assert float(other[4, 4]) == pytest.approx(0.5, abs=1e-6)
+    assert float(other[4, 12]) == pytest.approx(0.5, abs=1e-6)
 
 
 def test_test_fiber_glob_builds_separate_test_config():
@@ -1420,14 +1505,13 @@ def test_training_writes_tensorboard_text_and_snapshots(
     assert {"test/total", "test/contrastive"} <= scalar_tags
     image_tags = {tag for tag, _, _ in writers[0].images}
     expected_image_tags = {
-        f"train_sample/{sample}/{view}/{name}"
-        for sample in ("pos0", "pos1")
+        f"train_sample/{view}/{name}"
         for view in ("side", "top", "cross")
-        for name in ("image", "labels", "cos_emb_cp")
+        for name in ("image", "labels", "cos_emb_cp", "cos_emb_other_cp")
     }
     assert expected_image_tags <= image_tags
     assert all(
-        shape == (1, 8, 8) and step == 1 for _, shape, step in writers[0].images
+        shape == (1, 8, 16) and step == 1 for _, shape, step in writers[0].images
     )
 
 

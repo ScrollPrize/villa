@@ -778,19 +778,6 @@ class FiberTraceBatchBuilder:
         self.positive_direction_jitter_degrees = float(
             self.config.get("positive_direction_jitter_degrees", 30.0)
         )
-        self.positive_radius = float(self.config.get("positive_radius", 1.5))
-        self.ignore_radius = float(
-            self.config.get("ignore_radius", max(3.0, self.positive_radius))
-        )
-        self.normal_plane_jitter_voxels = float(
-            self.config.get("normal_plane_jitter_voxels", 40.0)
-        )
-        self.normal_perpendicular_jitter_voxels = float(
-            self.config.get("normal_perpendicular_jitter_voxels", 10.0)
-        )
-        self.negative_cone_distance_voxels = float(
-            self.config.get("negative_cone_distance_voxels", 30.0)
-        )
         for removed_key in (
             "positive_direction_probability",
             "negative_direction_min_degrees",

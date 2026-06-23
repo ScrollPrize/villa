@@ -146,7 +146,9 @@ Implemented:
   GT crop offset, direction jitter, and random-negative pool lookup are keyed by
   `seed`, iteration, slot, record, and control index where relevant instead of
   mutable RNG state.
-- Direction-conditioned U-Net head outputting embedding and `fw`.
+- Direction-conditioned U-Net head outputting embedding and `fw`; training
+  applies this head only to sampled contrastive-pair voxel features, while the
+  dense head path remains available for visualization/debug output.
 - U-Net model sizing via `unet_base_channels`, `unet_depth`,
   `conditioned_feature_channels`, `head_channels`, and `embedding_dim`. The
   default training shape is base 16, depth 7, conditioned feature width 64,
@@ -177,13 +179,14 @@ Implemented:
   and config-text logging plus `snapshots/current.pt` and `snapshots/best.pt`.
 - `sample_visualization_every = 10000` logs up to two GT/control-point training
   samples to TensorBoard as side/top/cross oriented slices through each sampled
-  point. Each view has one normalized image slice plus one fused label image
-  using negative/undefined/positive values `0/127/255`, plus a fixed-scale
-  predicted embedding cosine image against the sampled-point embedding.
-  Out-of-crop slice samples are black in image views and a coarse `63/191`
-  checkerboard in label/cosine views.
-- `positive_radius` and `ignore_radius` remain accepted only as legacy/debug
-  fallback values when the named normal-frame fields are omitted.
+  point, stitched side by side per view. Each view has one normalized image
+  slice, one fused label image using negative/undefined/positive values
+  `0/127/255`, a fixed-scale predicted embedding cosine image against that
+  sample's rounded CP embedding, and an `other_cp` cosine view against the other
+  selected CP when available. Out-of-crop slice samples are black in image views
+  and a coarse `63/191` checkerboard in label/cosine views.
+- Label geometry uses the explicit normal-frame fields only; legacy radius
+  fallbacks are not part of the config/API.
 
 Not implemented yet:
 

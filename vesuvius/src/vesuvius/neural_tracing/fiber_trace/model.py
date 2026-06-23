@@ -57,7 +57,19 @@ class DirectionConditionedFiberTraceModel(nn.Module):
             ),
         )
 
-    def forward(self, volume: Tensor, cond_fw_xyz: Tensor) -> dict[str, Tensor]:
+    def _apply_head_to_vectors(self, values: Tensor) -> Tensor:
+        first = self.head[0]
+        second = self.head[2]
+        hidden = F.linear(values, first.weight.flatten(1), first.bias)
+        hidden = F.silu(hidden, inplace=False)
+        return F.linear(hidden, second.weight.flatten(1), second.bias)
+
+    def forward(
+        self,
+        volume: Tensor,
+        cond_fw_xyz: Tensor,
+        sample_indices: Tensor | None = None,
+    ) -> dict[str, Tensor]:
         if volume.ndim != 5:
             raise ValueError(
                 f"volume must have shape [B, C, D, H, W], got {tuple(volume.shape)}"
@@ -73,6 +85,32 @@ class DirectionConditionedFiberTraceModel(nn.Module):
             features = F.interpolate(
                 features, size=volume.shape[2:], mode="trilinear", align_corners=False
             )
+
+        if sample_indices is not None:
+            if sample_indices.ndim != 1:
+                raise ValueError(
+                    "sample_indices must be a 1D flattened [B, D, H, W] index tensor"
+                )
+            sample_indices = sample_indices.to(device=features.device, dtype=torch.long)
+            spatial_size = int(features.shape[2] * features.shape[3] * features.shape[4])
+            flat_features = features.permute(0, 2, 3, 4, 1).reshape(
+                -1, features.shape[1]
+            )
+            sampled_features = flat_features[sample_indices]
+            batch_indices = torch.div(
+                sample_indices, spatial_size, rounding_mode="floor"
+            )
+            sampled_cond = cond_fw_xyz[batch_indices]
+            raw = self._apply_head_to_vectors(
+                torch.cat([sampled_features, sampled_cond], dim=1)
+            )
+            embedding = F.normalize(raw[:, : self.embedding_dim], dim=1)
+            fw = F.normalize(raw[:, self.embedding_dim : self.embedding_dim + 3], dim=1)
+            return {
+                "embedding": embedding,
+                "fw": fw,
+                "sample_indices": sample_indices,
+            }
 
         cond = cond_fw_xyz.view(volume.shape[0], 3, 1, 1, 1)
         cond = cond.expand(-1, -1, *features.shape[2:])
