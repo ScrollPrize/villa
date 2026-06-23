@@ -1580,7 +1580,8 @@ def test_training_writes_tensorboard_text_and_snapshots(
     assert {"test/total", "test/contrastive"} <= scalar_tags
     image_tags = {tag for tag, _, _ in writers[0].images}
     expected_image_tags = {
-        f"train_sample/{view}/{name}"
+        f"{prefix}/{view}/{name}"
+        for prefix in ("train_sample", "test_sample")
         for view in ("side", "top", "cross")
         for name in ("image", "labels", "cos_emb_cp", "cos_emb_other_cp")
     }
@@ -1588,6 +1589,83 @@ def test_training_writes_tensorboard_text_and_snapshots(
     assert all(
         shape == (1, 8, 16) and step == 1 for _, shape, step in writers[0].images
     )
+
+
+def test_training_uses_fixed_test_samples_and_snapshots_on_test_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    original_make_test_config = fiber_train._make_test_config
+
+    def marked_test_config(config: dict):
+        test_config = original_make_test_config(config)
+        assert test_config is not None
+        test_config["is_test"] = True
+        return test_config
+
+    sample_calls: list[tuple[str, int | None]] = []
+    original_sample_batch = FiberTraceBatchBuilder.sample_batch
+
+    def recording_sample_batch(self, *args, **kwargs):
+        sample_calls.append(
+            (
+                "test" if self.config.get("is_test") else "train",
+                kwargs.get("iteration"),
+            )
+        )
+        return original_sample_batch(self, *args, **kwargs)
+
+    snapshot_calls: list[tuple[str, int, str]] = []
+    original_save_snapshot = fiber_train._save_snapshot
+
+    def recording_save_snapshot(path: Path, **kwargs) -> None:
+        snapshot_calls.append(
+            (Path(path).name, int(kwargs["step"]), str(kwargs["metric_name"]))
+        )
+        original_save_snapshot(path, **kwargs)
+
+    monkeypatch.setattr(fiber_train, "_make_test_config", marked_test_config)
+    monkeypatch.setattr(FiberTraceBatchBuilder, "sample_batch", recording_sample_batch)
+    monkeypatch.setattr(fiber_train, "_save_snapshot", recording_save_snapshot)
+
+    config = _synthetic_config(tmp_path, batch_size=4, crop_size=(8, 8, 8))
+    config.update(
+        {
+            "device": "cpu",
+            "num_steps": 2,
+            "log_every": 99,
+            "test_every": 1,
+            "test_sample_count": 2,
+            "test_start_iteration": 50,
+            "sample_visualization_every": 0,
+            "test_visualization_every": 0,
+            "tensorboard_enabled": False,
+            "run_path": str(tmp_path / "runs"),
+            "run_name": "fixed test",
+            "run_datestr": "20260102_030405",
+            "_test_array_records": config["_array_records"],
+            "model": {
+                "input_channels": 1,
+                "backbone_channels": 2,
+                "embedding_dim": 4,
+                "features_per_stage": [2],
+                "head_channels": 4,
+            },
+            "loss": {"max_contrastive_samples": 128},
+        }
+    )
+
+    fiber_train.run_training(config)
+
+    assert sample_calls == [
+        ("train", 1),
+        ("test", 50),
+        ("test", 51),
+        ("train", 2),
+        ("test", 50),
+        ("test", 51),
+    ]
+    assert ("current.pt", 1, "test/total") in snapshot_calls
+    assert ("current.pt", 2, "test/total") in snapshot_calls
 
 
 def test_training_rejects_legacy_checkpoint_path(tmp_path: Path):

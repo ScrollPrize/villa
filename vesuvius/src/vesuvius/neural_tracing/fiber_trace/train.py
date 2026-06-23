@@ -383,6 +383,62 @@ def _loss_scalars(losses) -> dict[str, float]:
     }
 
 
+def _average_scalar_dicts(scalars: list[dict[str, float]]) -> dict[str, float]:
+    if not scalars:
+        return {}
+    keys = sorted(set().union(*(item.keys() for item in scalars)))
+    return {
+        key: sum(float(item[key]) for item in scalars if key in item)
+        / float(sum(1 for item in scalars if key in item))
+        for key in keys
+    }
+
+
+def _compute_test_scalars(
+    model: torch.nn.Module,
+    batch_builder: FiberTraceBatchBuilder,
+    device: torch.device,
+    config: dict[str, Any],
+    loss_kwargs: dict[str, Any],
+    *,
+    start_iteration: int,
+    sample_count: int,
+) -> dict[str, float]:
+    was_training = bool(model.training)
+    model.eval()
+    scalars: list[dict[str, float]] = []
+    try:
+        with torch.no_grad():
+            for offset in range(int(sample_count)):
+                losses, _, _, _ = _compute_losses(
+                    model,
+                    batch_builder,
+                    device,
+                    config,
+                    loss_kwargs,
+                    iteration=int(start_iteration) + int(offset),
+                    debug_batch=False,
+                )
+                scalars.append(_loss_scalars(losses))
+    finally:
+        if was_training:
+            model.train()
+    return _average_scalar_dicts(scalars)
+
+
+def _sample_classified_batch(
+    batch_builder: FiberTraceBatchBuilder,
+    device: torch.device,
+    config: dict[str, Any],
+    *,
+    iteration: int,
+) -> FiberTraceBatch:
+    batch = batch_builder.sample_batch(
+        iteration=int(iteration), debug=False, emit_debug_row=False
+    ).to(device)
+    return classify_batch_on_device(batch, config)
+
+
 def _log_scalars(writer: Any, prefix: str, scalars: dict[str, float], step: int) -> None:
     if writer is None:
         return
@@ -705,6 +761,7 @@ def _log_stitched_training_sample_visualization(
     *,
     step: int,
     sample_indices: list[int],
+    tag_prefix: str = "train_sample",
 ) -> None:
     if writer is None or not hasattr(writer, "add_image") or not sample_indices:
         return
@@ -811,7 +868,7 @@ def _log_stitched_training_sample_visualization(
     for (plane_name, image_name), images in stitched.items():
         combined = torch.cat(images, dim=-1)
         writer.add_image(
-            f"train_sample/{plane_name}/{image_name}",
+            f"{tag_prefix}/{plane_name}/{image_name}",
             combined.detach().cpu().unsqueeze(0),
             int(step),
         )
@@ -824,6 +881,7 @@ def _log_training_sample_visualization(
     *,
     step: int,
     sample_index: int = 0,
+    tag_prefix: str = "train_sample",
 ) -> None:
     _log_stitched_training_sample_visualization(
         writer,
@@ -833,6 +891,7 @@ def _log_training_sample_visualization(
         sample_indices=_visualization_positive_sample_indices(
             batch, fallback_index=sample_index
         ),
+        tag_prefix=tag_prefix,
     )
 
 
@@ -973,9 +1032,14 @@ def run_prefetch(
             batch_builder.prefetch_chunk_requests_for_iteration(iteration=step)
         )
     if test_batch_builder is not None:
-        requests.extend(
-            test_batch_builder.prefetch_chunk_requests_for_iteration(iteration=1)
-        )
+        test_sample_count = max(1, int(config.get("test_sample_count", 1)))
+        test_start_iteration = int(config.get("test_start_iteration", 1))
+        for offset in range(test_sample_count):
+            requests.extend(
+                test_batch_builder.prefetch_chunk_requests_for_iteration(
+                    iteration=test_start_iteration + offset
+                )
+            )
 
     unique_requests = _dedupe_chunk_requests(requests)
     cached_requests = [
@@ -1107,14 +1171,25 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     loss_kwargs = _loss_kwargs(config)
     steps = int(config.get("num_steps", config.get("steps", 1)))
     log_every = max(1, int(config.get("log_every", 100)))
+    test_every = int(config.get("test_every", log_every))
+    if test_every < 0:
+        raise ValueError("test_every must be >= 0")
+    test_sample_count = int(config.get("test_sample_count", 1))
+    if test_sample_count <= 0:
+        raise ValueError("test_sample_count must be positive")
+    test_start_iteration = int(config.get("test_start_iteration", 1))
     sample_visualization_every = int(config.get("sample_visualization_every", 10000))
     if sample_visualization_every < 0:
         raise ValueError("sample_visualization_every must be >= 0")
     sample_visualization_index = int(config.get("sample_visualization_index", 0))
-    best_metric = float("inf")
-    best_metric_name = (
-        "test/total" if test_batch_builder is not None else "train/total"
+    test_visualization_every = int(
+        config.get("test_visualization_every", sample_visualization_every)
     )
+    if test_visualization_every < 0:
+        raise ValueError("test_visualization_every must be >= 0")
+    best_metric = float("inf")
+    test_enabled = test_batch_builder is not None and test_every > 0
+    best_metric_name = "test/total" if test_enabled else "train/total"
     debug_timing = bool(config.get("debug_sampling", False) or config.get("debug_cache", False))
     debug_step_rows = 0
     debug_step_header_every = int(config.get("debug_step_header_every", 20))
@@ -1138,14 +1213,23 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
             optimizer.step()
 
             should_log = step % log_every == 0 or step == steps
+            should_test = test_enabled and (step % test_every == 0 or step == steps)
             should_visualize = (
                 writer is not None
                 and sample_visualization_every > 0
                 and step % sample_visualization_every == 0
             )
+            should_visualize_test = (
+                writer is not None
+                and test_batch_builder is not None
+                and test_visualization_every > 0
+                and step % test_visualization_every == 0
+            )
 
             train_row_scalars = (
-                _loss_scalars(losses) if debug_timing or should_log else None
+                _loss_scalars(losses)
+                if debug_timing or should_log or should_test
+                else None
             )
             train_scalars = train_row_scalars if should_log else None
             step_ms = (time.perf_counter() - step_t0) * 1000.0
@@ -1153,25 +1237,21 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 0.0, step_ms - float(step_timings.get("data_ms", 0.0))
             )
             test_scalars = None
-            if should_log and test_batch_builder is not None:
-                model.eval()
-                with torch.no_grad():
-                    test_losses, _, _, _ = _compute_losses(
-                        model,
-                        test_batch_builder,
-                        device,
-                        test_config,
-                        loss_kwargs,
-                        iteration=step,
-                        debug_batch=False,
-                    )
-                test_scalars = _loss_scalars(test_losses)
-                model.train()
+            if should_test and test_batch_builder is not None:
+                test_scalars = _compute_test_scalars(
+                    model,
+                    test_batch_builder,
+                    device,
+                    test_config,
+                    loss_kwargs,
+                    start_iteration=test_start_iteration,
+                    sample_count=test_sample_count,
+                )
 
             if should_log and train_scalars is not None:
                 _log_scalars(writer, "train", train_scalars, step)
-                if test_scalars is not None:
-                    _log_scalars(writer, "test", test_scalars, step)
+            if test_scalars is not None:
+                _log_scalars(writer, "test", test_scalars, step)
             if should_visualize:
                 with torch.no_grad():
                     _log_training_sample_visualization(
@@ -1181,7 +1261,25 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                         step=step,
                         sample_index=sample_visualization_index,
                     )
-            if writer is not None and (should_log or should_visualize):
+            if should_visualize_test and test_batch_builder is not None:
+                with torch.no_grad():
+                    test_batch = _sample_classified_batch(
+                        test_batch_builder,
+                        device,
+                        test_config,
+                        iteration=test_start_iteration,
+                    )
+                    _log_training_sample_visualization(
+                        writer,
+                        model,
+                        test_batch,
+                        step=step,
+                        sample_index=sample_visualization_index,
+                        tag_prefix="test_sample",
+                    )
+            if writer is not None and (
+                should_log or should_test or should_visualize or should_visualize_test
+            ):
                 writer.flush()
 
             if debug_timing:
@@ -1197,13 +1295,14 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 debug_step_rows += 1
                 debug_step_legend_printed = True
 
-            if not should_log or train_scalars is None:
+            should_snapshot = should_test or (not test_enabled and should_log)
+            if not should_snapshot or train_row_scalars is None:
                 continue
 
             metric_value = (
                 test_scalars["total"]
                 if test_scalars is not None
-                else train_scalars["total"]
+                else train_row_scalars["total"]
             )
             _save_snapshot(
                 current_snapshot,
@@ -1229,8 +1328,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 )
 
             message = (
-                f"step={step} train_total={train_scalars['total']:.6f} "
-                f"train_contrastive={train_scalars['contrastive']:.6f}"
+                f"step={step} train_total={train_row_scalars['total']:.6f} "
+                f"train_contrastive={train_row_scalars['contrastive']:.6f}"
             )
             if test_scalars is not None:
                 message += (

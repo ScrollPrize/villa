@@ -188,6 +188,14 @@ Replace only the dataset paths first:
 - `test_fiber_glob` or `test_fiber_paths`: optional held-out VC3D fiber JSON
   files for test-loss logging; use top-level `test_datasets` for a separate
   test volume/manifest
+- `test_every`: training-step interval for deterministic test evaluation and
+  snapshot writes
+- `test_sample_count`: number of fixed deterministic test batches averaged at
+  each test interval
+- `test_start_iteration`: first deterministic test sample ordinal; the evaluated
+  set is `test_start_iteration .. test_start_iteration + test_sample_count - 1`
+- `test_visualization_every`: interval for logging the first fixed test batch as
+  `test_sample/...` TensorBoard images
 
 `image_normalization: "zscore"` normalizes each CT crop with the same helper
 used by the Lasagna training zarr path. Use `"unit"` only for uint8 smoke tests
@@ -261,19 +269,21 @@ To prefetch the zarr chunks that the same training config will touch, run:
 python -m vesuvius.neural_tracing.fiber_trace.train --prefetch /path/to/config.json
 ```
 
-`--prefetch` builds the deterministic train/test crop chunk list for
-`num_steps`, deduplicates chunk keys, then downloads the chunks into
-`volume_cache_dir` with up to 16 parallel workers. Use `--prefetch-workers N`
-to lower the worker count.
+`--prefetch` builds the deterministic train crop chunk list for `num_steps` and
+the fixed test crop chunk list for `test_sample_count`, deduplicates chunk keys,
+then downloads the chunks into `volume_cache_dir` with up to 16 parallel
+workers. Use `--prefetch-workers N` to lower the worker count.
 
 Each run creates `run_path/run_name_YYYYmmdd_HHMMSS/`. TensorBoard event files
 are written directly in that run directory, including scalar losses every
-`log_every` steps, sample-slice images every `sample_visualization_every` steps,
-and a `config/json` text entry with the training config. Model snapshots are
-written to:
+`log_every` steps, deterministic test losses every `test_every` steps,
+train sample-slice images every `sample_visualization_every` steps, test
+sample-slice images every `test_visualization_every` steps, and a `config/json`
+text entry with the training config. Model snapshots are written on test
+intervals when a test split is configured, otherwise on log intervals:
 
-- `snapshots/current.pt`: most recent logged model
-- `snapshots/best.pt`: best logged model by `test/total` when a test split is
+- `snapshots/current.pt`: most recent evaluated model
+- `snapshots/best.pt`: best evaluated model by `test/total` when a test split is
   configured, otherwise by `train/total`
 
 ## Current Status

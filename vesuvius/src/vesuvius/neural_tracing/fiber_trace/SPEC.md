@@ -182,6 +182,9 @@ Implemented:
   conditioning augmentation. Direction conditioning does not alter labels.
 - Future folded direction bands may use 30/60/90 degree boundaries, but the
   current hard labels are geometry-derived only.
+- `test_every` controls deterministic test evaluation and snapshot cadence.
+  Each test evaluation averages the fixed sample ordinals
+  `test_start_iteration .. test_start_iteration + test_sample_count - 1`.
 - `run_path` and `run_name` create per-run directories with TensorBoard scalar
   and config-text logging plus `snapshots/current.pt` and `snapshots/best.pt`.
 - `sample_visualization_every = 10000` logs up to two GT/control-point training
@@ -190,8 +193,9 @@ Implemented:
   slice, one fused label image using negative/undefined/positive values
   `0/127/255`, a fixed-scale predicted embedding cosine image against that
   sample's rounded CP embedding, and an `other_cp` cosine view against the other
-  selected CP when available. Out-of-crop slice samples are black in image views
-  and a coarse `63/191` checkerboard in label/cosine views.
+  selected CP when available. `test_visualization_every` logs the first fixed
+  test batch the same way under `test_sample/...`. Out-of-crop slice samples are
+  black in image views and a coarse `63/191` checkerboard in label/cosine views.
 - Label geometry uses the explicit normal-frame fields only; legacy radius
   fallbacks are not part of the config/API.
 
@@ -219,6 +223,8 @@ Before running either config, replace:
 - `lasagna_manifest_path`
 - `fiber_glob` or `fiber_paths`
 - optional `test_fiber_glob` or `test_fiber_paths`
+- `test_every`, `test_sample_count`, `test_start_iteration`, and
+  `test_visualization_every`
 - `sample_visualization_every`
 - `volume_cache_dir` when using remote zarrs
 - `random_negative_pool_size`; the default `1000` precomputes deterministic
