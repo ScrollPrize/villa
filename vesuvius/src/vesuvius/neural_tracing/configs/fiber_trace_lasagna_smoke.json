@@ -32,10 +32,11 @@
   ],
   "model": {
     "input_channels": 1,
-    "backbone_channels": 16,
+    "unet_base_channels": 16,
+    "unet_depth": 7,
+    "conditioned_feature_channels": 64,
     "embedding_dim": 16,
-    "features_per_stage": [16, 32],
-    "head_channels": 32
+    "head_channels": 64
   },
   "optimizer": {
     "learning_rate": 0.001,

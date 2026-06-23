@@ -148,6 +148,19 @@ is intentionally deferred.
 
 `loss.max_contrastive_samples` caps the sampled pair budget per batch.
 
+Model sizing is controlled by:
+
+- `unet_base_channels`: first U-Net stage width.
+- `unet_depth`: number of U-Net stages. Without an explicit
+  `features_per_stage`, stage widths double from the base width.
+- `conditioned_feature_channels`: U-Net output width handed to the conditioned
+  head before appending the 3 direction channels.
+- `head_channels`: hidden width of the conditioned head.
+- `embedding_dim`: output embedding width per voxel.
+
+The starter configs use base `16`, depth `7`, conditioned feature width `64`,
+head width `64`, and embedding width `16`.
+
 ## Config Knobs
 
 Use the runnable smoke template for a one-step import/data-path check:
@@ -205,23 +218,29 @@ batch slot, record index, and control index where relevant. Re-running a given
 training iteration samples the same record, crop offsets, conditioning vectors,
 and random-negative pool entries independent of previous sampler calls.
 
+`sample_limit` optionally bounds the deterministic sample set used by training
+and prefetch. With `sample_limit: 10`, steps 1 through 10 use their normal
+samples, step 11 reuses step 1's sample, step 12 reuses step 2's sample, and so
+on. Optimizer step count, logging, and snapshot cadence are unchanged; only the
+data sample ordinal is folded.
+
 `positive_radius` and `ignore_radius` are kept only for legacy/debug fallback
 behavior when the named normal-frame fields are omitted.
 
-`sample_visualization_every: 10000` logs one training sample to TensorBoard on
-that interval. The trainer writes three oriented slices through the sampled
-point:
+`sample_visualization_every: 10000` logs up to two GT/control-point training
+samples to TensorBoard on that interval. The trainer writes three oriented
+slices through each sampled point:
 
 - `side`: fiber direction by sampled up/normal direction
 - `top`: fiber direction by binormal
 - `cross`: binormal by sampled up/normal direction, perpendicular to the fiber
 
-Each view is logged under `train_sample/<view>/` as one normalized `image`
-slice plus one fused `labels` image using negative/undefined/positive values
-`0/127/255`, and one fixed-scale `cos_emb_cp` image for predicted embedding
-cosine against the sampled-point embedding. Slice samples outside the crop are
-black in `image` and shown as a coarse `63/191` checkerboard in label/cosine
-views.
+Each view is logged under `train_sample/pos0/<view>/` and
+`train_sample/pos1/<view>/` as one normalized `image` slice plus one fused
+`labels` image using negative/undefined/positive values `0/127/255`, and one
+fixed-scale `cos_emb_cp` image for predicted embedding cosine against the
+sampled-point embedding. Slice samples outside the crop are black in `image`
+and shown as a coarse `63/191` checkerboard in label/cosine views.
 
 ## Entrypoint
 

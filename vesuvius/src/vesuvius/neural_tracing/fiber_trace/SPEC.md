@@ -147,6 +147,10 @@ Implemented:
   `seed`, iteration, slot, record, and control index where relevant instead of
   mutable RNG state.
 - Direction-conditioned U-Net head outputting embedding and `fw`.
+- U-Net model sizing via `unet_base_channels`, `unet_depth`,
+  `conditioned_feature_channels`, `head_channels`, and `embedding_dim`. The
+  default training shape is base 16, depth 7, conditioned feature width 64,
+  head width 64, and 16D embeddings.
 - Pairwise supervised contrastive embedding loss.
 - Dense `labels` and `target_id` tensors:
   - positive voxels carry the selected fiber-line identity;
@@ -171,13 +175,13 @@ Implemented:
   current hard labels are geometry-derived only.
 - `run_path` and `run_name` create per-run directories with TensorBoard scalar
   and config-text logging plus `snapshots/current.pt` and `snapshots/best.pt`.
-- `sample_visualization_every = 10000` logs one training sample to TensorBoard
-  as side/top/cross oriented slices through the sampled point. Each view has one
-  normalized image slice plus one fused label image using
-  negative/undefined/positive values `0/127/255`, plus a fixed-scale predicted
-  embedding cosine image against the sampled-point embedding. Out-of-crop slice
-  samples are black in image views and a coarse `63/191` checkerboard in
-  label/cosine views.
+- `sample_visualization_every = 10000` logs up to two GT/control-point training
+  samples to TensorBoard as side/top/cross oriented slices through each sampled
+  point. Each view has one normalized image slice plus one fused label image
+  using negative/undefined/positive values `0/127/255`, plus a fixed-scale
+  predicted embedding cosine image against the sampled-point embedding.
+  Out-of-crop slice samples are black in image views and a coarse `63/191`
+  checkerboard in label/cosine views.
 - `positive_radius` and `ignore_radius` remain accepted only as legacy/debug
   fallback values when the named normal-frame fields are omitted.
 
@@ -209,6 +213,9 @@ Before running either config, replace:
 - `volume_cache_dir` when using remote zarrs
 - `random_negative_pool_size`; the default `1000` precomputes deterministic
   random-negative centers before batch sampling
+- optionally `sample_limit`; when set, deterministic sample ordinals wrap after
+  that many training samples so longer debug runs reuse the same bounded sample
+  set and prefetch only downloads that bounded set
 - optionally `control_point_margin_voxels`; use `40` for `128^3` crops, while
   `64^3` crops can fit at most `31`
 - optionally `augmentation_crop_size`; the starter configs use a 16 voxel

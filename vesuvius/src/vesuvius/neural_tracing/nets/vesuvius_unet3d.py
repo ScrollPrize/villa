@@ -604,7 +604,7 @@ class Vesuvius3dUnetModel(nn.Module):
         
         # Kernel sizes and strides
         self.kernel_sizes = [[3, 3, 3]] * self.num_stages
-        self.strides = [[2, 2, 2]] * self.num_stages
+        self.strides = model_config.get('strides', [[2, 2, 2]] * self.num_stages)
         
         # Timestep embedding
         self.time_embedding = SinusoidalPositionEmbeddings(self.time_emb_dim) if self.time_emb_dim else None
@@ -679,4 +679,3 @@ class Vesuvius3dUnetModel(nn.Module):
         output = self.decoder(skips, time_emb)
         
         return output
-

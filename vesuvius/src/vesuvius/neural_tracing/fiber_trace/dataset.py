@@ -823,6 +823,15 @@ class FiberTraceBatchBuilder:
                 "random_negative_pool_size must be a positive integer, "
                 f"got {self.random_negative_pool_size}"
             )
+        raw_sample_limit = self.config.get("sample_limit")
+        if raw_sample_limit is None:
+            self.sample_limit: int | None = None
+        else:
+            self.sample_limit = int(raw_sample_limit)
+            if self.sample_limit <= 0:
+                raise ValueError(
+                    f"sample_limit must be a positive integer when set, got {raw_sample_limit}"
+                )
         self.debug_sampling = bool(
             self.config.get("debug_sampling", False)
             or self.config.get("debug_cache", False)
@@ -1091,6 +1100,14 @@ class FiberTraceBatchBuilder:
             + int(negative_index)
         ) % int(pool.shape[0])
         return pool[pool_index].astype(np.int64, copy=True)
+
+    def _limited_batch_ordinal(self, batch_ordinal: int) -> int:
+        batch_ordinal = int(batch_ordinal)
+        if self.sample_limit is None:
+            return batch_ordinal
+        if batch_ordinal <= 0:
+            return batch_ordinal % int(self.sample_limit)
+        return ((batch_ordinal - 1) % int(self.sample_limit)) + 1
 
     def _control_point_local_zyx(
         self,
@@ -1541,9 +1558,10 @@ class FiberTraceBatchBuilder:
         iteration: int,
         record_index: int | None = None,
     ) -> list[ZarrChunkRequest]:
+        batch_ordinal = self._limited_batch_ordinal(int(iteration))
         specs = self._batch_crop_specs(
             record_index=record_index,
-            batch_ordinal=int(iteration),
+            batch_ordinal=batch_ordinal,
         )
         requests: list[ZarrChunkRequest] = []
         read_crop_size_np = np.asarray(self.augmentation_crop_size, dtype=np.int64)
@@ -1625,7 +1643,10 @@ class FiberTraceBatchBuilder:
         if trace_enabled:
             begin_zarr_cache_trace()
         batch_t0 = time.perf_counter()
-        batch_ordinal = int(iteration) if iteration is not None else self._sample_batch_count
+        requested_batch_ordinal = (
+            int(iteration) if iteration is not None else self._sample_batch_count
+        )
+        batch_ordinal = self._limited_batch_ordinal(requested_batch_ordinal)
         specs = self._batch_crop_specs(
             record_index=record_index,
             batch_ordinal=batch_ordinal,

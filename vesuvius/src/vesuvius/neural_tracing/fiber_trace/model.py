@@ -16,28 +16,40 @@ class DirectionConditionedFiberTraceModel(nn.Module):
         self,
         *,
         input_channels: int = 1,
-        backbone_channels: int = 16,
+        conditioned_feature_channels: int = 64,
+        backbone_channels: int | None = None,
         embedding_dim: int = 16,
-        features_per_stage: tuple[int, ...] = (16, 32),
-        head_channels: int = 32,
+        features_per_stage: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024),
+        strides: tuple[tuple[int, int, int], ...] | None = None,
+        head_channels: int = 64,
     ) -> None:
         super().__init__()
         self.embedding_dim = int(embedding_dim)
-        self.backbone_channels = int(backbone_channels)
+        if backbone_channels is not None:
+            conditioned_feature_channels = int(backbone_channels)
+        self.conditioned_feature_channels = int(conditioned_feature_channels)
+        self.backbone_channels = self.conditioned_feature_channels
+        if strides is None:
+            strides = ((1, 1, 1),) + ((2, 2, 2),) * max(
+                0, len(features_per_stage) - 1
+            )
+        backbone_config = {
+            "features_per_stage": [int(v) for v in features_per_stage],
+            "strides": [list(map(int, stride)) for stride in strides],
+            "time_emb_dim": 0,
+            "squeeze_excitation": False,
+        }
         self.backbone = Vesuvius3dUnetModel(
             int(input_channels),
-            self.backbone_channels,
-            {
-                "model_config": {
-                    "features_per_stage": [int(v) for v in features_per_stage],
-                    "time_emb_dim": 0,
-                    "squeeze_excitation": False,
-                }
-            },
+            self.conditioned_feature_channels,
+            {"model_config": backbone_config},
         )
         self.head = nn.Sequential(
             nn.Conv3d(
-                self.backbone_channels + 3, int(head_channels), kernel_size=1, bias=True
+                self.conditioned_feature_channels + 3,
+                int(head_channels),
+                kernel_size=1,
+                bias=True,
             ),
             nn.SiLU(inplace=True),
             nn.Conv3d(
@@ -70,16 +82,86 @@ class DirectionConditionedFiberTraceModel(nn.Module):
         return {"embedding": embedding, "fw": fw}
 
 
+def _derive_features_per_stage(model_cfg: dict[str, Any]) -> tuple[int, ...]:
+    if "features_per_stage" in model_cfg:
+        features = tuple(int(v) for v in model_cfg["features_per_stage"])
+        if not features:
+            raise ValueError("model.features_per_stage must not be empty")
+        if any(value <= 0 for value in features):
+            raise ValueError("model.features_per_stage values must be positive")
+        return features
+
+    base = int(model_cfg.get("unet_base_channels", 16))
+    depth = int(model_cfg.get("unet_depth", 3))
+    if base <= 0:
+        raise ValueError(f"model.unet_base_channels must be positive, got {base}")
+    if depth <= 0:
+        raise ValueError(f"model.unet_depth must be positive, got {depth}")
+    return tuple(base * (2**stage) for stage in range(depth))
+
+
+def _derive_unet_strides(
+    features_per_stage: tuple[int, ...],
+    model_cfg: dict[str, Any],
+    crop_size: Any = None,
+) -> tuple[tuple[int, int, int], ...]:
+    if "strides" in model_cfg:
+        strides = tuple(tuple(int(v) for v in stride) for stride in model_cfg["strides"])
+        if len(strides) != len(features_per_stage):
+            raise ValueError(
+                "model.strides must have one stride per U-Net stage: "
+                f"got {len(strides)} for {len(features_per_stage)} stages"
+            )
+        if any(len(stride) != 3 for stride in strides):
+            raise ValueError("model.strides entries must be length-3")
+        if any(any(value <= 0 for value in stride) for stride in strides):
+            raise ValueError("model.strides values must be positive")
+        return strides
+    no_downsample_stages = 1
+    if crop_size is not None:
+        if isinstance(crop_size, int):
+            min_crop = int(crop_size)
+        elif isinstance(crop_size, (list, tuple)) and crop_size:
+            min_crop = min(int(v) for v in crop_size)
+        else:
+            raise ValueError(f"crop_size must be an int or sequence, got {crop_size!r}")
+        if min_crop <= 0:
+            raise ValueError(f"crop_size values must be positive, got {crop_size!r}")
+        max_downsamples = max(0, int(min_crop).bit_length() - 2)
+        no_downsample_stages = max(
+            1, len(features_per_stage) - int(max_downsamples)
+        )
+    no_downsample_stages = min(len(features_per_stage), no_downsample_stages)
+    return ((1, 1, 1),) * no_downsample_stages + ((2, 2, 2),) * (
+        len(features_per_stage) - no_downsample_stages
+    )
+
+
 def build_fiber_trace_model(
     config: dict[str, Any],
 ) -> DirectionConditionedFiberTraceModel:
     model_cfg = dict(config.get("model", config))
+    features_per_stage = _derive_features_per_stage(model_cfg)
+    strides = _derive_unet_strides(
+        features_per_stage,
+        model_cfg,
+        crop_size=config.get("crop_size"),
+    )
+    conditioned_feature_channels = int(
+        model_cfg.get(
+            "conditioned_feature_channels",
+            model_cfg.get("backbone_channels", 64),
+        )
+    )
+    if conditioned_feature_channels <= 0:
+        raise ValueError(
+            "model.conditioned_feature_channels/backbone_channels must be positive"
+        )
     return DirectionConditionedFiberTraceModel(
         input_channels=int(model_cfg.get("input_channels", 1)),
-        backbone_channels=int(model_cfg.get("backbone_channels", 16)),
+        conditioned_feature_channels=conditioned_feature_channels,
         embedding_dim=int(model_cfg.get("embedding_dim", 16)),
-        features_per_stage=tuple(
-            int(v) for v in model_cfg.get("features_per_stage", (16, 32))
-        ),
-        head_channels=int(model_cfg.get("head_channels", 32)),
+        features_per_stage=features_per_stage,
+        strides=strides,
+        head_channels=int(model_cfg.get("head_channels", 64)),
     )

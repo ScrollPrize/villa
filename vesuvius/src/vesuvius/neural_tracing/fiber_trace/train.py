@@ -316,18 +316,12 @@ def _compute_losses(
     )
     data_ms = (time.perf_counter() - data_t0) * 1000.0
 
-    aug_t0 = time.perf_counter()
     batch = batch.to(device)
     batch = classify_batch_on_device(batch, config)
-    _sync_timing_device(device)
-    aug_ms = (time.perf_counter() - aug_t0) * 1000.0
 
-    fw_t0 = time.perf_counter()
     outputs = model(batch.volume, batch.cond_fw_xyz)
     losses = compute_fiber_trace_loss(outputs, batch, **loss_kwargs)
-    _sync_timing_device(device)
-    fw_ms = (time.perf_counter() - fw_t0) * 1000.0
-    timings = {"data_ms": data_ms, "aug_ms": aug_ms, "fw_ms": fw_ms}
+    timings = {"data_ms": data_ms}
     cache_stats = getattr(batch_builder, "last_cache_stats", None)
     if cache_stats is not None:
         cache_mib = float(getattr(cache_stats, "cache_hit_bytes", 0)) / (
@@ -377,49 +371,51 @@ def _log_scalars(writer: Any, prefix: str, scalars: dict[str, float], step: int)
         writer.add_scalar(f"{prefix}/{name}", value, step)
 
 
-def _sync_timing_device(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
 def _print_step_timing(
     *,
     step: int,
     timings: dict[str, float],
+    train_scalars: dict[str, float] | None,
+    test_scalars: dict[str, float] | None,
     row_index: int,
     header_every: int,
     print_legend: bool,
 ) -> None:
+    def _loss_value(scalars: dict[str, float] | None, name: str) -> str:
+        if scalars is None:
+            return f"{'-':>9}"
+        return f"{float(scalars[name]):9.4f}"
+
     if print_legend:
         print(
             "fiber_trace step columns: it=iteration data=batch sample/load ms "
-            "aug=device transfer + label/augmentation ms fw=forward+loss ms "
-            "bw=backward ms opt=optimizer ms step=total ms "
+            "train=device transfer + labels + forward/loss + backward + optimizer ms "
             "hit/dl/mis=cache events hms/dms=cache-hit/download ms "
-            "hMiB/s/dMiB/s=cache-hit/download throughput",
+            "hMiB/s/dMiB/s=cache-hit/download throughput "
+            "trn/tst losses=total/contrastive",
             flush=True,
         )
     if row_index % max(1, int(header_every)) == 0:
         print(
-            "   it      data       aug        fw        bw       opt      step "
-            " hit  dl mis      hms      dms   hMiB/s   dMiB/s",
+            "   it      data     train "
+            " hit  dl mis      hms      dms   hMiB/s   dMiB/s   trn_tot   trn_con   tst_tot   tst_con",
             flush=True,
         )
     print(
         f"{int(step):5d} "
         f"{float(timings.get('data_ms', 0.0)):9.1f} "
-        f"{float(timings.get('aug_ms', 0.0)):9.1f} "
-        f"{float(timings.get('fw_ms', 0.0)):9.1f} "
-        f"{float(timings.get('bw_ms', 0.0)):9.1f} "
-        f"{float(timings.get('opt_ms', 0.0)):8.1f} "
-        f"{float(timings.get('step_ms', 0.0)):9.1f} "
+        f"{float(timings.get('train_ms', 0.0)):9.1f} "
         f"{int(timings.get('cache_hits', 0.0)):4d} "
         f"{int(timings.get('cache_downloads', 0.0)):3d} "
         f"{int(timings.get('cache_missing', 0.0)):3d} "
         f"{float(timings.get('cache_hit_ms', 0.0)):8.1f} "
         f"{float(timings.get('cache_download_ms', 0.0)):8.1f} "
         f"{float(timings.get('cache_mib_s', 0.0)):8.1f} "
-        f"{float(timings.get('download_mib_s', 0.0)):8.1f}",
+        f"{float(timings.get('download_mib_s', 0.0)):8.1f} "
+        f"{_loss_value(train_scalars, 'total')} "
+        f"{_loss_value(train_scalars, 'contrastive')} "
+        f"{_loss_value(test_scalars, 'total')} "
+        f"{_loss_value(test_scalars, 'contrastive')}",
         flush=True,
     )
 
@@ -655,13 +651,30 @@ def _sample_plane_image(
     return images
 
 
-def _log_training_sample_visualization(
+def _visualization_positive_sample_indices(
+    batch: FiberTraceBatch, *, fallback_index: int, max_samples: int = 2
+) -> list[int]:
+    batch_size = int(batch.volume.shape[0])
+    indices = [
+        idx
+        for idx, kind in enumerate(batch.crop_kinds)
+        if idx < batch_size and str(kind) == "gt_control"
+    ][: int(max_samples)]
+    if indices:
+        return indices
+    if batch_size <= 0:
+        return []
+    return [max(0, min(int(fallback_index), batch_size - 1))]
+
+
+def _log_single_training_sample_visualization(
     writer: Any,
     model: torch.nn.Module | None,
     batch: FiberTraceBatch,
     *,
     step: int,
-    sample_index: int = 0,
+    sample_index: int,
+    tag_prefix: str,
 ) -> None:
     if writer is None or not hasattr(writer, "add_image"):
         return
@@ -724,10 +737,31 @@ def _log_training_sample_visualization(
         )
         for image_name, image in images.items():
             writer.add_image(
-                f"train_sample/{plane_name}/{image_name}",
+                f"{tag_prefix}/{plane_name}/{image_name}",
                 image.detach().cpu().unsqueeze(0),
                 int(step),
             )
+
+
+def _log_training_sample_visualization(
+    writer: Any,
+    model: torch.nn.Module | None,
+    batch: FiberTraceBatch,
+    *,
+    step: int,
+    sample_index: int = 0,
+) -> None:
+    for pos_idx, selected_index in enumerate(
+        _visualization_positive_sample_indices(batch, fallback_index=sample_index)
+    ):
+        _log_single_training_sample_visualization(
+            writer,
+            model,
+            batch,
+            step=step,
+            sample_index=selected_index,
+            tag_prefix=f"train_sample/pos{pos_idx}",
+        )
 
 
 def _save_snapshot(
@@ -858,7 +892,11 @@ def run_prefetch(
     )
 
     requests: list[ZarrChunkRequest] = []
-    for step in range(1, steps + 1):
+    sample_limit = getattr(batch_builder, "sample_limit", None)
+    train_prefetch_steps = (
+        min(steps, int(sample_limit)) if sample_limit is not None else steps
+    )
+    for step in range(1, train_prefetch_steps + 1):
         requests.extend(
             batch_builder.prefetch_chunk_requests_for_iteration(iteration=step)
         )
@@ -878,7 +916,7 @@ def run_prefetch(
     print(
         f"prefetch chunks: generated={len(requests)} unique={len(unique_requests)} "
         f"cached={len(cached_requests)} pending={total} "
-        f"steps={steps} workers={worker_count}",
+        f"steps={steps} sample_steps={train_prefetch_steps} workers={worker_count}",
         flush=True,
     )
     if total == 0:
@@ -1024,25 +1062,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
             losses, train_batch, train_outputs, step_timings = _compute_losses(
                 model, batch_builder, device, config, loss_kwargs, iteration=step
             )
-            bw_t0 = time.perf_counter()
             losses.total.backward()
-            _sync_timing_device(device)
-            step_timings["bw_ms"] = (time.perf_counter() - bw_t0) * 1000.0
-            opt_t0 = time.perf_counter()
             optimizer.step()
-            _sync_timing_device(device)
-            step_timings["opt_ms"] = (time.perf_counter() - opt_t0) * 1000.0
-            step_timings["step_ms"] = (time.perf_counter() - step_t0) * 1000.0
-            if debug_timing:
-                _print_step_timing(
-                    step=step,
-                    timings=step_timings,
-                    row_index=debug_step_rows,
-                    header_every=debug_step_header_every,
-                    print_legend=not debug_step_legend_printed,
-                )
-                debug_step_rows += 1
-                debug_step_legend_printed = True
 
             should_log = step % log_every == 0 or step == steps
             should_visualize = (
@@ -1050,10 +1071,15 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 and sample_visualization_every > 0
                 and step % sample_visualization_every == 0
             )
-            if not should_log and not should_visualize:
-                continue
 
-            train_scalars = _loss_scalars(losses) if should_log else None
+            train_row_scalars = (
+                _loss_scalars(losses) if debug_timing or should_log else None
+            )
+            train_scalars = train_row_scalars if should_log else None
+            step_ms = (time.perf_counter() - step_t0) * 1000.0
+            step_timings["train_ms"] = max(
+                0.0, step_ms - float(step_timings.get("data_ms", 0.0))
+            )
             test_scalars = None
             if should_log and test_batch_builder is not None:
                 model.eval()
@@ -1083,8 +1109,21 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                         step=step,
                         sample_index=sample_visualization_index,
                     )
-            if writer is not None:
+            if writer is not None and (should_log or should_visualize):
                 writer.flush()
+
+            if debug_timing:
+                _print_step_timing(
+                    step=step,
+                    timings=step_timings,
+                    train_scalars=train_row_scalars,
+                    test_scalars=test_scalars,
+                    row_index=debug_step_rows,
+                    header_every=debug_step_header_every,
+                    print_legend=not debug_step_legend_printed,
+                )
+                debug_step_rows += 1
+                debug_step_legend_printed = True
 
             if not should_log or train_scalars is None:
                 continue

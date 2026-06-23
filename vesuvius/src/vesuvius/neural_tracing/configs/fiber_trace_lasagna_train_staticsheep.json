@@ -1,9 +1,10 @@
 {
   "seed": 0,
   "device": "cuda",
-  "num_steps": 100,
-  "log_every": 1,
-  "sample_visualization_every": 1,
+  "num_steps": 10000,
+  "sample_limit": 100,
+  "log_every": 10,
+  "sample_visualization_every": 10,
   "run_path": "runs/fiber_trace",
   "run_name": "fiber_trace_train_staticsheep",
   "tensorboard_enabled": true,
@@ -20,7 +21,7 @@
   "random_valid_max_attempts": 256,
   "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache",
   "debug_sampling": false,
-  "debug_cache": false,
+  "debug_cache": true,
   "datasets": [
     {
       "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
@@ -32,13 +33,14 @@
   ],
   "model": {
     "input_channels": 1,
-    "backbone_channels": 16,
+    "unet_base_channels": 16,
+    "unet_depth": 6,
+    "conditioned_feature_channels": 32,
     "embedding_dim": 16,
-    "features_per_stage": [16, 32],
     "head_channels": 32
   },
   "optimizer": {
-    "learning_rate": 0.001,
+    "learning_rate": 0.01,
     "weight_decay": 0.0001
   },
   "loss": {

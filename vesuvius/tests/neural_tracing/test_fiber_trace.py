@@ -34,6 +34,7 @@ from vesuvius.neural_tracing.fiber_trace.losses import (
 )
 from vesuvius.neural_tracing.fiber_trace.model import (
     DirectionConditionedFiberTraceModel,
+    build_fiber_trace_model,
 )
 
 
@@ -229,6 +230,33 @@ def test_iteration_sampling_is_deterministic_and_stateless(tmp_path: Path):
         assert other.direction_kinds == first.direction_kinds
 
 
+def test_sample_limit_reuses_initial_deterministic_samples(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=4, crop_size=(8, 8, 8))
+    config["sample_limit"] = 2
+    builder = FiberTraceBatchBuilder(config)
+
+    first = builder.sample_batch(record_index=0, iteration=1)
+    second = builder.sample_batch(record_index=0, iteration=2)
+    third = builder.sample_batch(record_index=0, iteration=3)
+    fourth = builder.sample_batch(record_index=0, iteration=4)
+
+    torch.testing.assert_close(third.volume, first.volume)
+    torch.testing.assert_close(third.cond_fw_xyz, first.cond_fw_xyz)
+    torch.testing.assert_close(third.crop_origin_zyx, first.crop_origin_zyx)
+    torch.testing.assert_close(third.sample_local_zyx, first.sample_local_zyx)
+    torch.testing.assert_close(fourth.volume, second.volume)
+    torch.testing.assert_close(fourth.cond_fw_xyz, second.cond_fw_xyz)
+    torch.testing.assert_close(fourth.crop_origin_zyx, second.crop_origin_zyx)
+    torch.testing.assert_close(fourth.sample_local_zyx, second.sample_local_zyx)
+
+
+def test_sample_limit_rejects_non_positive_values(tmp_path: Path):
+    config = _synthetic_config(tmp_path, batch_size=4, crop_size=(8, 8, 8))
+    config["sample_limit"] = 0
+    with pytest.raises(ValueError, match="sample_limit"):
+        FiberTraceBatchBuilder(config)
+
+
 def test_control_point_crop_offset_keeps_configured_margin(tmp_path: Path):
     config = _synthetic_config(tmp_path, batch_size=2, crop_size=(16, 16, 16))
     config["control_point_margin_voxels"] = 3
@@ -254,7 +282,7 @@ def test_control_point_margin_rejects_impossible_crop(tmp_path: Path):
 
 
 def test_augmentation_crop_size_is_center_trimmed_to_crop_size(tmp_path: Path):
-    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config = _synthetic_config(tmp_path, batch_size=4, crop_size=(8, 8, 8))
     config["augmentation_crop_size"] = [12, 12, 12]
     builder = FiberTraceBatchBuilder(config)
 
@@ -280,7 +308,7 @@ def test_sampled_control_outside_normals_reports_mapping(tmp_path: Path):
         "control_points": [[1000.0, 8.0, 8.0]],
     }
     fiber_path.write_text(json.dumps(fiber_payload), encoding="utf-8")
-    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config = _synthetic_config(tmp_path, batch_size=4, crop_size=(8, 8, 8))
     config["_array_records"][0]["fiber_path"] = str(fiber_path)
 
     builder = FiberTraceBatchBuilder(config)
@@ -903,6 +931,37 @@ def test_model_forward_loss_and_backward_smoke(tmp_path: Path):
     assert any(param.grad is not None for param in model.parameters())
 
 
+def test_model_builder_derives_requested_unet_depth_and_condition_width():
+    model = build_fiber_trace_model(
+        {
+            "model": {
+                "input_channels": 1,
+                "unet_base_channels": 16,
+                "unet_depth": 7,
+                "conditioned_feature_channels": 64,
+                "embedding_dim": 16,
+                "head_channels": 64,
+            }
+        }
+    )
+
+    assert model.backbone.features_per_stage == [16, 32, 64, 128, 256, 512, 1024]
+    assert model.backbone.strides == [
+        [1, 1, 1],
+        [2, 2, 2],
+        [2, 2, 2],
+        [2, 2, 2],
+        [2, 2, 2],
+        [2, 2, 2],
+        [2, 2, 2],
+    ]
+    assert model.conditioned_feature_channels == 64
+    assert model.embedding_dim == 16
+    assert model.head[0].in_channels == 67
+    assert model.head[0].out_channels == 64
+    assert model.head[2].out_channels == 19
+
+
 def test_sample_plane_visualization_fuses_labels_to_uint8_values():
     volume = torch.zeros((1, 1, 3, 3, 3), dtype=torch.float32)
     labels = torch.full((3, 3, 3), IGNORE_INDEX, dtype=torch.long)
@@ -1227,6 +1286,48 @@ def test_prefetch_mode_adds_test_batch_once(
     assert result["unique_chunks"] == 6
 
 
+def test_prefetch_mode_respects_sample_limit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[str, int]] = []
+
+    class FakeStore:
+        def __getitem__(self, key: str) -> bytes:
+            return b"x"
+
+    class FakeBuilder:
+        def __init__(self, config: dict, **kwargs) -> None:
+            self.name = "test" if config.get("is_test") else "train"
+            self.sample_limit = config.get("sample_limit")
+
+        def prefetch_chunk_requests_for_iteration(self, *, iteration: int):
+            calls.append((self.name, int(iteration)))
+            return [
+                fiber_dataset.ZarrChunkRequest(
+                    store=FakeStore(),
+                    store_identity=self.name,
+                    key=f"{self.name}/{iteration}",
+                    label="base",
+                )
+            ]
+
+    monkeypatch.setattr(fiber_train, "FiberTraceBatchBuilder", FakeBuilder)
+    monkeypatch.setattr(
+        fiber_train,
+        "_make_test_config",
+        lambda config: {"is_test": True, "sample_limit": config.get("sample_limit")},
+    )
+
+    result = fiber_train.run_prefetch({"num_steps": 5, "sample_limit": 2}, max_workers=1)
+
+    assert calls == [
+        ("train", 1),
+        ("train", 2),
+        ("test", 1),
+    ]
+    assert result["unique_chunks"] == 3
+
+
 def test_training_writes_tensorboard_text_and_snapshots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
@@ -1263,7 +1364,7 @@ def test_training_writes_tensorboard_text_and_snapshots(
 
     monkeypatch.setattr(fiber_train, "_make_summary_writer", fake_make_summary_writer)
 
-    config = _synthetic_config(tmp_path, batch_size=2, crop_size=(8, 8, 8))
+    config = _synthetic_config(tmp_path, batch_size=4, crop_size=(8, 8, 8))
     config.update(
         {
             "device": "cpu",
@@ -1306,7 +1407,9 @@ def test_training_writes_tensorboard_text_and_snapshots(
     } <= scalar_tags
     assert output.count("fiber_trace batch columns:") == 0
     assert output.count("fiber_trace step columns:") == 1
-    assert output.count("   it      data       aug") == 1
+    assert output.count("   it      data     train") == 1
+    assert "trn_tot" in output
+    assert "tst_tot" in output
     assert "step=1 " not in output
     step_rows = [
         line
@@ -1317,7 +1420,8 @@ def test_training_writes_tensorboard_text_and_snapshots(
     assert {"test/total", "test/contrastive"} <= scalar_tags
     image_tags = {tag for tag, _, _ in writers[0].images}
     expected_image_tags = {
-        f"train_sample/{view}/{name}"
+        f"train_sample/{sample}/{view}/{name}"
+        for sample in ("pos0", "pos1")
         for view in ("side", "top", "cross")
         for name in ("image", "labels", "cos_emb_cp")
     }
