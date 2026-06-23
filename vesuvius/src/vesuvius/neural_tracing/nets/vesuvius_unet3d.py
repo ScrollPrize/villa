@@ -331,6 +331,68 @@ class StackedResidualBlocks(nn.Module):
         return x
 
 
+class PixelShuffle3dUpsample(nn.Module):
+    """3D sub-pixel upsampling for decoder stages."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int,
+        scale_factor: Union[int, List[int], Tuple[int, int, int]],
+        *,
+        conv_op: Type[nn.Module],
+        bias: bool,
+    ):
+        super().__init__()
+        scale = maybe_convert_scalar_to_list(conv_op, scale_factor)
+        if len(scale) != 3:
+            raise ValueError(f"3D pixel shuffle scale must have length 3, got {scale}")
+        if any(int(value) <= 0 for value in scale):
+            raise ValueError(f"pixel shuffle scale values must be positive, got {scale}")
+        self.scale = tuple(int(value) for value in scale)
+        expanded_channels = int(output_channels) * int(np.prod(self.scale))
+        self.proj = conv_op(
+            int(input_channels),
+            expanded_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=bias,
+        )
+
+    def forward(self, x):
+        x = self.proj(x)
+        scale_d, scale_h, scale_w = self.scale
+        if (scale_d, scale_h, scale_w) == (1, 1, 1):
+            return x
+        batch, channels, depth, height, width = x.shape
+        scale_product = scale_d * scale_h * scale_w
+        if channels % scale_product != 0:
+            raise ValueError(
+                f"pixel shuffle input channels {channels} are not divisible by "
+                f"scale product {scale_product}"
+            )
+        out_channels = channels // scale_product
+        x = x.view(
+            batch,
+            out_channels,
+            scale_d,
+            scale_h,
+            scale_w,
+            depth,
+            height,
+            width,
+        )
+        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
+        return x.view(
+            batch,
+            out_channels,
+            depth * scale_d,
+            height * scale_h,
+            width * scale_w,
+        )
+
+
 class Encoder(nn.Module):
     """3D U-Net Encoder with BasicBlockD residual blocks and timestep conditioning."""
     def __init__(self,
@@ -449,12 +511,13 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """3D U-Net Decoder with BasicBlockD residual blocks, transpose convolutions, skip connections, and timestep conditioning."""
+    """3D U-Net Decoder with residual blocks, skip connections, and timestep conditioning."""
     def __init__(self,
                  encoder,
                  num_classes: int,
                  n_conv_per_stage: Union[int, Tuple[int, ...], List[int]],
                  deep_supervision,
+                 upsample_mode: str = 'transpose',
                  nonlin_first: bool = False,
                  norm_op: Union[None, Type[nn.Module]] = None,
                  norm_op_kwargs: dict = None,
@@ -477,6 +540,13 @@ class Decoder(nn.Module):
         assert len(n_conv_per_stage) == n_stages_encoder - 1, \
             f"n_conv_per_stage must have {n_stages_encoder - 1} entries"
 
+        upsample_mode = str(upsample_mode).lower()
+        if upsample_mode not in {'transpose', 'pixelshuffle'}:
+            raise ValueError(
+                "upsample_mode must be 'transpose' or 'pixelshuffle', "
+                f"got {upsample_mode!r}"
+            )
+        self.upsample_mode = upsample_mode
         transpconv_op = get_matching_convtransp(conv_op=encoder.conv_op)
         conv_bias = encoder.conv_bias if conv_bias is None else conv_bias
         norm_op = encoder.norm_op if norm_op is None else norm_op
@@ -496,11 +566,19 @@ class Decoder(nn.Module):
             input_features_skip = encoder.output_channels[-(s + 1)]
             stride_for_transpconv = encoder.strides[-s]
             
-            # Transpose convolution
-            transpconvs.append(transpconv_op(
-                input_features_below, input_features_skip, stride_for_transpconv, 
-                stride_for_transpconv, bias=encoder.conv_bias
-            ))
+            if self.upsample_mode == 'pixelshuffle':
+                transpconvs.append(PixelShuffle3dUpsample(
+                    input_features_below,
+                    input_features_skip,
+                    stride_for_transpconv,
+                    conv_op=encoder.conv_op,
+                    bias=encoder.conv_bias,
+                ))
+            else:
+                transpconvs.append(transpconv_op(
+                    input_features_below, input_features_skip, stride_for_transpconv,
+                    stride_for_transpconv, bias=encoder.conv_bias
+                ))
             
             # Decoder stage - always use BasicBlockD
             stages.append(StackedResidualBlocks(
@@ -528,10 +606,19 @@ class Decoder(nn.Module):
         self.seg_layers = nn.ModuleList(seg_layers)
         
         # Final transpose convolution to match input size
-        self.final_transpconv = transpconv_op(
-            encoder.output_channels[0], encoder.output_channels[0], 
-            encoder.strides[0], encoder.strides[0], bias=encoder.conv_bias
-        )
+        if self.upsample_mode == 'pixelshuffle':
+            self.final_transpconv = PixelShuffle3dUpsample(
+                encoder.output_channels[0],
+                encoder.output_channels[0],
+                encoder.strides[0],
+                conv_op=encoder.conv_op,
+                bias=encoder.conv_bias,
+            )
+        else:
+            self.final_transpconv = transpconv_op(
+                encoder.output_channels[0], encoder.output_channels[0],
+                encoder.strides[0], encoder.strides[0], bias=encoder.conv_bias
+            )
         
         self.final_seg_layer = encoder.conv_op(encoder.output_channels[0], num_classes, 1, 1, 0, bias=True)
 
@@ -575,7 +662,7 @@ class Vesuvius3dUnetModel(nn.Module):
     - BasicBlockD residual blocks with squeeze-excitation in both encoder and decoder
     - 6-stage encoder with features: [32, 64, 128, 256, 320, 320]
     - Skip connections between encoder and decoder
-    - Transpose convolutions for upsampling in decoder
+    - Transpose or pixel-shuffle upsampling in decoder
     - Timestep conditioning via FiLM layers
     - Configurable input/output channels
     """
@@ -605,6 +692,7 @@ class Vesuvius3dUnetModel(nn.Module):
         # Kernel sizes and strides
         self.kernel_sizes = [[3, 3, 3]] * self.num_stages
         self.strides = model_config.get('strides', [[2, 2, 2]] * self.num_stages)
+        self.decoder_upsample_mode = model_config.get('decoder_upsample_mode', 'transpose')
         
         # Timestep embedding
         self.time_embedding = SinusoidalPositionEmbeddings(self.time_emb_dim) if self.time_emb_dim else None
@@ -641,6 +729,7 @@ class Vesuvius3dUnetModel(nn.Module):
             num_classes=self.out_channels,
             n_conv_per_stage=[1] * (self.num_stages - 1),
             deep_supervision=False,
+            upsample_mode=self.decoder_upsample_mode,
             time_emb_dim=self.time_emb_dim
         )
 

@@ -41,7 +41,8 @@
     "unet_depth": 6,
     "conditioned_feature_channels": 32,
     "embedding_dim": 16,
-    "head_channels": 32
+    "head_channels": 32,
+    "decoder_upsample_mode": "pixelshuffle"
   },
   "optimizer": {
     "learning_rate": 0.01,

@@ -1063,9 +1063,38 @@ def test_model_builder_derives_requested_unet_depth_and_condition_width():
     ]
     assert model.conditioned_feature_channels == 64
     assert model.embedding_dim == 16
+    assert model.backbone.decoder.upsample_mode == "pixelshuffle"
     assert model.head[0].in_channels == 67
     assert model.head[0].out_channels == 64
     assert model.head[2].out_channels == 19
+
+
+def test_model_pixelshuffle_decoder_keeps_dense_and_sampled_output_shapes():
+    model = build_fiber_trace_model(
+        {
+            "model": {
+                "input_channels": 1,
+                "features_per_stage": [2, 4],
+                "strides": [[1, 1, 1], [2, 2, 2]],
+                "conditioned_feature_channels": 4,
+                "embedding_dim": 3,
+                "head_channels": 4,
+                "decoder_upsample_mode": "pixelshuffle",
+            }
+        }
+    )
+    model.eval()
+    volume = torch.randn((1, 1, 8, 8, 8), dtype=torch.float32)
+    cond = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+
+    dense = model(volume, cond)
+    sampled = model(volume, cond, sample_indices=torch.tensor([0, 73, 511]))
+
+    assert model.backbone.decoder.upsample_mode == "pixelshuffle"
+    assert dense["embedding"].shape == (1, 3, 8, 8, 8)
+    assert dense["fw"].shape == (1, 3, 8, 8, 8)
+    assert sampled["embedding"].shape == (3, 3)
+    assert sampled["fw"].shape == (3, 3)
 
 
 def test_sample_plane_visualization_fuses_labels_to_uint8_values():

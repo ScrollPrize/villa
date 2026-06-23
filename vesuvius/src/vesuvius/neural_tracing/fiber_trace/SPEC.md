@@ -153,9 +153,10 @@ Implemented:
   applies this head only to sampled contrastive-pair voxel features, while the
   dense head path remains available for visualization/debug output.
 - U-Net model sizing via `unet_base_channels`, `unet_depth`,
-  `conditioned_feature_channels`, `head_channels`, and `embedding_dim`. The
-  default training shape is base 16, depth 7, conditioned feature width 64,
-  head width 64, and 16D embeddings.
+  `conditioned_feature_channels`, `head_channels`, `embedding_dim`, and
+  `decoder_upsample_mode`. The default training shape is base 16, depth 7,
+  conditioned feature width 64, head width 64, 16D embeddings, and 3D
+  pixel-shuffle decoder upsampling.
 - Pairwise supervised contrastive embedding loss.
 - Dense `labels` and `target_id` tensors:
   - positive voxels carry the selected fiber-line identity;

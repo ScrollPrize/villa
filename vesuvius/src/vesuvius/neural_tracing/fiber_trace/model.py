@@ -22,6 +22,7 @@ class DirectionConditionedFiberTraceModel(nn.Module):
         features_per_stage: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024),
         strides: tuple[tuple[int, int, int], ...] | None = None,
         head_channels: int = 64,
+        decoder_upsample_mode: str = "pixelshuffle",
     ) -> None:
         super().__init__()
         self.embedding_dim = int(embedding_dim)
@@ -38,6 +39,7 @@ class DirectionConditionedFiberTraceModel(nn.Module):
             "strides": [list(map(int, stride)) for stride in strides],
             "time_emb_dim": 0,
             "squeeze_excitation": False,
+            "decoder_upsample_mode": str(decoder_upsample_mode),
         }
         self.backbone = Vesuvius3dUnetModel(
             int(input_channels),
@@ -202,4 +204,5 @@ def build_fiber_trace_model(
         features_per_stage=features_per_stage,
         strides=strides,
         head_channels=int(model_cfg.get("head_channels", 64)),
+        decoder_upsample_mode=str(model_cfg.get("decoder_upsample_mode", "pixelshuffle")),
     )

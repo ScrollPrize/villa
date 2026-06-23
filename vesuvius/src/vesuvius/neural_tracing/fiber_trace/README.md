@@ -161,9 +161,11 @@ Model sizing is controlled by:
   head before appending the 3 direction channels.
 - `head_channels`: hidden width of the conditioned head.
 - `embedding_dim`: output embedding width per voxel.
+- `decoder_upsample_mode`: U-Net decoder upsampling, either `pixelshuffle` for
+  3D sub-pixel upsampling or `transpose` for transpose convolutions.
 
 The starter configs use base `16`, depth `7`, conditioned feature width `64`,
-head width `64`, and embedding width `16`.
+head width `64`, embedding width `16`, and `pixelshuffle` upsampling.
 
 ## Config Knobs
 
