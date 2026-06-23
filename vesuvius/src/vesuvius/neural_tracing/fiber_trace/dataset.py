@@ -1115,8 +1115,13 @@ class FiberTraceBatchBuilder:
             record_index=record_index,
             extra=control_index,
         )
-        choose_high = rng.integers(0, 2, size=3, dtype=np.int64).astype(bool)
-        return np.where(choose_high, high, low).astype(np.int64, copy=False)
+        return np.asarray(
+            [
+                rng.integers(int(lo), int(hi) + 1, dtype=np.int64)
+                for lo, hi in zip(low, high, strict=True)
+            ],
+            dtype=np.int64,
+        )
 
     def _control_center_zyx(
         self, record: _FiberRecord, control_index: int

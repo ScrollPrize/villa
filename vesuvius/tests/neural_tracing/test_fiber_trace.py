@@ -281,10 +281,22 @@ def test_control_point_crop_offset_keeps_configured_margin(tmp_path: Path):
     local_options = controls_zyx - origin[None, :]
 
     assert any(
-        bool(np.all((local == 3) | (local == 12))) for local in local_options
+        bool(np.all((local >= 3) & (local <= 12))) for local in local_options
     )
     sample_local = batch.sample_local_zyx[0].numpy()
-    assert bool(np.all((sample_local == 3) | (sample_local == 12)))
+    assert bool(np.all((sample_local >= 3) & (sample_local <= 12)))
+
+    locals_by_iteration = np.stack(
+        [
+            builder.sample_batch(record_index=0, iteration=iteration)
+            .sample_local_zyx[0]
+            .numpy()
+            for iteration in range(1, 9)
+        ],
+        axis=0,
+    )
+    assert bool(np.all((locals_by_iteration >= 3) & (locals_by_iteration <= 12)))
+    assert bool(((locals_by_iteration > 3) & (locals_by_iteration < 12)).any())
 
 
 def test_control_point_margin_rejects_impossible_crop(tmp_path: Path):

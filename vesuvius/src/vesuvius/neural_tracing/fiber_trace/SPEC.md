@@ -63,9 +63,10 @@ Jitter semantics:
 - Same-sample jitter target: up to `+/-40` voxels in the plane of the Lasagna
   normal and up to `+/-10` voxels perpendicular to that plane.
 - GT crop placement is deterministic per iteration. The selected control point
-  is placed at `control_point_margin_voxels` from one crop side, or the same
-  margin from the opposite side, independently per axis. The default margin is
-  `10` voxels, clamped only when a smaller crop cannot fit it.
+  is sampled uniformly from the integer local crop interval
+  `[control_point_margin_voxels, crop_size - control_point_margin_voxels - 1]`
+  on each axis. The default margin is `10` voxels, clamped only when a smaller
+  crop cannot fit it.
 - Because the model is fully convolutional, the crop should generate many
   labeled samples within a crop and across crops by checking output voxels
   against the ground-truth fiber/control-point geometry and the per-output-voxel

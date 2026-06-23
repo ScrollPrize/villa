@@ -70,11 +70,11 @@ fiber record and emits:
 
 GT crops choose control points with deterministic per-iteration random streams;
 duplicates are allowed when the sampled slots collide. The crop is offset so the
-control point is not forced to the crop center while still retaining the
-configured `control_point_margin_voxels` around it. Random-negative centers are
-precomputed before batch sampling from valid `grad_mag > 0` voxels with valid
-Lasagna normal channels. `random_negative_pool_size` controls the pool size,
-defaulting to `1000`; batch sampling then selects from that pool by
+control point can land anywhere in the final crop interior while still retaining
+at least `control_point_margin_voxels` to every crop border. Random-negative
+centers are precomputed before batch sampling from valid `grad_mag > 0` voxels
+with valid Lasagna normal channels. `random_negative_pool_size` controls the pool
+size, defaulting to `1000`; batch sampling then selects from that pool by
 deterministic modulo. The batch stores crop kind and direction kind metadata so
 tests and trainers can verify the composition. Batch size must be even for this
 MVP.
@@ -205,10 +205,10 @@ where `value / 255` is intended.
 conditioning augmentation. Direction conditioning does not change labels.
 
 `control_point_margin_voxels` controls the deterministic GT crop offset. The
-selected control point is placed at either that margin or the opposite-side
-margin on each crop axis. If omitted, the builder uses `min(10, floor((size -
-1) / 2))` per the smallest crop axis; explicit values that cannot fit the crop
-are rejected.
+selected control point is sampled uniformly from the integer local crop interval
+`[margin, crop_size - margin - 1]` on each axis. If omitted, the builder uses
+`min(10, floor((size - 1) / 2))` per the smallest crop axis; explicit values that
+cannot fit the crop are rejected.
 
 Legacy label-conditioning keys such as `positive_direction_probability`,
 `negative_direction_min_degrees`, `negative_direction_max_degrees`,

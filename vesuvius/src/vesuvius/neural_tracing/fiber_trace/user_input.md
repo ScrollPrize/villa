@@ -11,7 +11,7 @@
 - (3/4 of batch, rounded up by using `N - floor(N / 4)`): randomly sample cps from the randomly selected fiber (dataset size == fiber count)
 - (1/4 of batch, rounded down by using `floor(N / 4)`): random volume samples - using a deterministic pseudo random dist with a (configurable current) modulus of 1000 so we always use same samples
 - batch offset:
-    - the pos samples should not be centered just on the cps, we want to shift eh crop center as far as possbile, just retaining a 10vx margin around the cp (this offset too should be deteministic)
+    - the pos samples should not be centered just on the cps; randomly/deterministically place the cp anywhere inside the crop while retaining a 10vx margin to every crop border
 
 # label areas
 - given the normal plane from the lasagna data at the cp
