@@ -1101,6 +1101,12 @@ int main(int argc, char *argv[])
         ("iso-cutoff", po::value<int>()->default_value(0), "Highpass (0-255)")
         ("composite-start", po::value<int>(), "Composite start offset")
         ("composite-end", po::value<int>(), "Composite end offset")
+        ("composite", po::bool_switch()->default_value(false),
+            "Collapse the sampled band into a single image using --accum-type as the reducer "
+            "(max/mean/median, in addition to the implicit alpha/beerlambert). The band spans "
+            "[--composite-start, --composite-end] layers along the normal at --slice-step spacing; "
+            "use a symmetric range (e.g. --composite-start=-54 --composite-end=54) for a centered "
+            "projection.")
         ("num-parts", po::value<int>()->default_value(1), "Parts for multi-VM")
         ("part-id", po::value<int>()->default_value(0), "Part ID (0-indexed)")
         ("merge-tiff-parts", po::bool_switch()->default_value(false), "Merge partial TIFFs from multi-VM render")
@@ -1221,12 +1227,23 @@ int main(int argc, char *argv[])
     else if (accum_type_str == "beerlam" || accum_type_str == "beerlambert") accumType = AccumType::BeerLambert;
     else { logPrintf(stderr, "Error: invalid --accum-type\n"); return EXIT_FAILURE; }
 
-    const bool isCompositeMode = (accumType == AccumType::Alpha || accumType == AccumType::BeerLambert);
+    // alpha/beerlambert reducers only make sense over a collapsed band, so they always imply
+    // composite mode. --composite extends the same band-collapsing path to max/mean/median, which
+    // the core compositor (readCompositeFastImpl) already implements.
+    const bool requestComposite = parsed["composite"].as<bool>();
+    const bool isCompositeMode = requestComposite
+        || accumType == AccumType::Alpha || accumType == AccumType::BeerLambert;
     int compositeStart = 0, compositeEnd = num_slices - 1;
 
     CompositeParams compositeParams;
     if (isCompositeMode) {
-        compositeParams.method = (accumType == AccumType::Alpha) ? "alpha" : "beerLambert";
+        switch (accumType) {
+            case AccumType::Alpha:       compositeParams.method = "alpha"; break;
+            case AccumType::BeerLambert: compositeParams.method = "beerLambert"; break;
+            case AccumType::Max:         compositeParams.method = "max"; break;
+            case AccumType::Mean:        compositeParams.method = "mean"; break;
+            case AccumType::Median:      compositeParams.method = "median"; break;
+        }
         compositeParams.alphaMin = parsed["alpha-min"].as<float>() / 255.0f;
         compositeParams.alphaMax = parsed["alpha-max"].as<float>() / 255.0f;
         compositeParams.alphaOpacity = parsed["alpha-opacity"].as<float>() / 255.0f;
@@ -1244,7 +1261,7 @@ int main(int argc, char *argv[])
             logPrintf(stdout, "  alpha: min=%.0f max=%.0f opacity=%.0f cutoff=%.0f\n",
                       compositeParams.alphaMin*255, compositeParams.alphaMax*255,
                       compositeParams.alphaOpacity*255, compositeParams.alphaCutoff*10000);
-        else
+        else if (compositeParams.method == "beerLambert")
             logPrintf(stdout, "  BL: ext=%.1f em=%.1f amb=%.1f\n",
                       compositeParams.blExtinction, compositeParams.blEmission, compositeParams.blAmbient);
         if (compositeParams.isoCutoff > 0) logPrintf(stdout, "  iso cutoff: %d\n", int(compositeParams.isoCutoff));
@@ -1374,6 +1391,13 @@ int main(int argc, char *argv[])
 
     const bool output_is_u16 = (chunk_cache->dtype() == vc::render::ChunkDtype::UInt16);
     logPrintf(stdout, "Source dtype: %s\n", output_is_u16 ? "uint16" : "uint8");
+
+    // The composite path is u8-only (renderBands/renderTiles run it under if constexpr T==uint8_t),
+    // so on a uint16 source it would silently emit empty output. Fail fast instead.
+    if (isCompositeMode && output_is_u16) {
+        logPrintf(stderr, "Error: composite/alpha rendering requires a uint8 volume (source is uint16)\n");
+        return EXIT_FAILURE;
+    }
     if (output_is_u16 && isCompositeMode)
         logPrintf(stderr, "Warning: composite forces 8-bit output (source is 16-bit)\n");
     {
