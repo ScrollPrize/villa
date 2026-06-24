@@ -97,8 +97,9 @@ int main(int argc, char** argv)
     require(treeView->model()->columnCount() == 8, "Fiber tree should expose eight columns");
     require(treeView->header()->sectionResizeMode(0) == QHeaderView::Interactive,
             "Fiber tree header should allow changing column widths");
-    require(treeView->model()->index(1, 0).data().toString() == QStringLiteral("kb_..._000002"),
-            "Fiber tree row should show the shortened JSON stem without the internal ID");
+    require(treeView->model()->index(1, 0).data().toString() ==
+                QStringLiteral("kb_20260605T184821587_000002"),
+            "Fiber tree row should keep the full JSON stem without the internal ID");
     require(!treeView->model()->index(1, 0).data().toString().contains(QStringLiteral(".json")),
             "Fiber tree row should not show the JSON extension");
     require(!treeView->model()->index(1, 0).data().toString().startsWith(QStringLiteral("2 ")),
@@ -197,7 +198,8 @@ int main(int argc, char** argv)
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
                               Q_ARG(int, 2));
-    require(treeView->model()->index(0, 0).data().toString() == QStringLiteral("zz_..._000003"),
+    require(treeView->model()->index(0, 0).data().toString() ==
+                QStringLiteral("zz_20260605T184821587_000003"),
             "Sorting by length descending should reorder only top-level fibers");
     const QModelIndex sortedSecondParent = treeView->model()->index(1, 0);
     require(treeView->model()->index(0, 0, sortedSecondParent).data().toString().contains(
