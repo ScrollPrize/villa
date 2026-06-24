@@ -1101,7 +1101,9 @@ int main(int argc, char *argv[])
         ("iso-cutoff", po::value<int>()->default_value(0), "Highpass (0-255)")
         ("composite-start", po::value<int>(), "Composite start offset")
         ("composite-end", po::value<int>(), "Composite end offset")
-        ("composite", po::bool_switch()->default_value(false),
+        // Named '--composite-collapse' rather than '--composite' so it is not an abbreviation
+        // prefix of --composite-start/--composite-end under boost's allow_guessing.
+        ("composite-collapse", po::bool_switch()->default_value(false),
             "Collapse the sampled band into a single image using --accum-type as the reducer "
             "(max/mean/median, in addition to the implicit alpha/beerlambert). The band spans "
             "[--composite-start, --composite-end] layers along the normal at --slice-step spacing; "
@@ -1228,9 +1230,9 @@ int main(int argc, char *argv[])
     else { logPrintf(stderr, "Error: invalid --accum-type\n"); return EXIT_FAILURE; }
 
     // alpha/beerlambert reducers only make sense over a collapsed band, so they always imply
-    // composite mode. --composite extends the same band-collapsing path to max/mean/median, which
-    // the core compositor (readCompositeFastImpl) already implements.
-    const bool requestComposite = parsed["composite"].as<bool>();
+    // composite mode. --composite-collapse extends the same band-collapsing path to max/mean/median,
+    // which the core compositor (readCompositeFastImpl) already implements.
+    const bool requestComposite = parsed["composite-collapse"].as<bool>();
     const bool isCompositeMode = requestComposite
         || accumType == AccumType::Alpha || accumType == AccumType::BeerLambert;
     int compositeStart = 0, compositeEnd = num_slices - 1;
