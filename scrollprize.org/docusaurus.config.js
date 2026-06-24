@@ -290,6 +290,7 @@ const config = {
       };
     },
     './plugins/fetch-substack-posts',
+    './plugins/atlas-data',
     [
       "@docusaurus/plugin-client-redirects",
       {
