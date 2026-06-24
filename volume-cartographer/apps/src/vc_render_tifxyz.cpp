@@ -629,8 +629,10 @@ static void renderBands(
         std::vector<cv::Mat> slices;
 
         if (isComposite) {
-            // Composite mode: always u8 — callers always instantiate with T=uint8_t
-            cv::Mat_<uint8_t> compOut;
+            // Composite mode: always u8 — callers always instantiate with T=uint8_t.
+            // readCompositeFast writes into a pre-allocated buffer (it never calls create), and
+            // skips non-finite pixels, so size + zero it here.
+            cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
             if constexpr (std::is_same_v<T, uint8_t>) {
                 readCompositeFast(compOut, cache, level, base, dirs,
                                   float(sliceStep * dsScale),
@@ -838,7 +840,9 @@ static void renderTiles(
             std::vector<cv::Mat_<T>> raw;
             if (isComposite) {
                 if constexpr (std::is_same_v<T, uint8_t>) {
-                    cv::Mat_<uint8_t> compOut;
+                    // readCompositeFast writes into a pre-allocated buffer (it never calls create),
+                    // and skips non-finite pixels, so size + zero it here.
+                    cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
                     readCompositeFast(compOut, cache, level, base, dirs,
                                       float(sliceStep * dsScale),
                                       compositeStart, compositeEnd,
