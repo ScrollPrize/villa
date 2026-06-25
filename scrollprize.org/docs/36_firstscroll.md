@@ -71,11 +71,11 @@ Today that changes. We have **completely virtually unwrapped and read PHerc. 166
 
 ## From a sealed lump to a readable book
 
-PHerc. 1667 began as a blackened, rolled mass of carbonized papyrus. To read it, we never unrolled it physically. Instead, we scanned it with high-resolution X-rays, reconstructed the coiled sheet inside the volume, computationally flattened it into a readable surface, and used machine learning to bring out the faint traces of ancient ink.
+PHerc. 1667 began as a blackened, rolled mass of carbonized papyrus. To read it, we never unrolled it physically. Instead, we scanned it with high-resolution X-rays, reconstructed the wound sheet inside the volume, flattened it into a readable surface, and used machine learning to bring out the faint traces of ancient ink.
 
 <figure className="">
   <img src="/img/firstscroll/fig1.webp" alt="PHerc. 1667 from sealed roll to readable text: a photograph of the carbonized roll, transverse and longitudinal CT cross-sections, and the unwrapped surface showing columns of Greek." />
-  <figcaption className="mt-0">From object to text. The sealed, carbonized roll (top left); cross-sections through the X-ray scan revealing the tightly wound sheet inside (top); and the unwrapped surface, where columns of Greek writing emerge as the ink signal is recovered (bottom).</figcaption>
+  <figcaption className="mt-0">From object to text. The sealed, carbonized roll (top left); cross-sections through the X-ray scan revealing the spiraled sheet inside (top); and the unwrapped surface, where columns of Greek writing emerge as the ink signal is recovered (bottom).</figcaption>
 </figure>
 
 ## Three sealed scrolls, three milestones
@@ -98,18 +98,18 @@ Because the papyrus is damaged, the readings are fragmentary, with gaps where th
 
 <div className="opacity-60 italic mb-4 text-sm">Translated from the Greek; the full column-by-column transcription is in the <a href="/pdf/main.pdf" target="_blank" rel="noopener">preprint</a>.</div>
 
-### PHerc. Paris 4 — ink made visible by phase retrieval
+### PHerc. Paris 4 — ink made visible by higher resolution
 
-In a second scroll — **PHerc. Paris 4, the scroll the Vesuvius Challenge community knows as Scroll 1** — a phase-retrieval imaging technique makes the ink **directly visible inside the scroll itself**, in the three-dimensional X-ray data, for the first time. Segmented in 3D and projected back onto the unwrapped page, that ink matches the text read in the 2023 Grand Prize **one-to-one** — an independent confirmation, from entirely different data, that the reading is real.
+In a second scroll — **PHerc. Paris 4, the scroll the Vesuvius Challenge community knows as Scroll 1** — a higher-resolution imaging technique makes the ink **directly visible inside the scroll itself**, in the three-dimensional X-ray data, for the first time. Segmented in 3D and projected back onto the unwrapped page, that ink matches the text read in the 2023 Grand Prize **one-to-one** — an independent confirmation, from better data, that the reading is real.
 
 <figure className="">
-  <img src="/img/firstscroll/fig2.webp" alt="Phase-retrieved cross-section of PHerc. Paris 4 showing ink directly visible on the papyrus surface, with the ink segmented in three dimensions." />
-  <figcaption className="mt-0">Ink made visible by phase retrieval in PHerc. Paris 4 (Scroll 1). In a cross-section of the X-ray scan, the ink sits directly on the papyrus surface (left); it can then be segmented in three dimensions (red) and projected onto the unwrapped page.</figcaption>
+  <img src="/img/firstscroll/fig2.webp" alt="Higher-resolution cross-section of PHerc. Paris 4 showing ink directly visible on the papyrus surface, with the ink segmented in three dimensions." />
+  <figcaption className="mt-0">Ink made visible by higher resolution in PHerc. Paris 4 (Scroll 1). In a cross-section of the X-ray scan, the ink sits directly on the papyrus surface (left); it can then be segmented in three dimensions (red) and projected onto the unwrapped page.</figcaption>
 </figure>
 
 <figure className="">
   <img src="/img/firstscroll/fig3.webp" alt="PHerc. Paris 4: the 2023 Grand Prize reading compared with the 2024 high-resolution synchrotron result, showing markedly clearer letters." />
-  <figcaption className="mt-0">PHerc. Paris 4: the 2023 Vesuvius Challenge Grand Prize reading (top) and the new 3D ink segmentation (bottom) — the same text, recovered one-to-one from entirely different data.</figcaption>
+  <figcaption className="mt-0">PHerc. Paris 4: the 2023 Vesuvius Challenge Grand Prize reading (top) and the new 3D ink segmentation (bottom) — the same text, recovered one-to-one from better data.</figcaption>
 </figure>
 
 ### PHerc. 139 — a title, and an author
@@ -123,14 +123,14 @@ In a third scroll, PHerc. 139, we recover the scroll's **title and author attrib
 
 ## How it was done
 
-The scans were acquired with high-resolution phase-contrast X-ray microtomography on the BM18 beamline at the [European Synchrotron Radiation Facility (ESRF)](https://www.esrf.fr/) in Grenoble — an instrument able to resolve the wafer-thin, tightly wound layers of a Herculaneum roll. The work was carried out in collaboration with the National Library of Naples “Vittorio Emanuele III”, which safeguards the Herculaneum papyri. From those volumes, the team reconstructed the scroll's geometry, traced and flattened its surface into a readable sheet, and trained machine-learning models to detect ink that is almost indistinguishable from the carbonized papyrus beneath it. Each reading was then examined and transcribed by papyrologists.
+The scans were acquired with high-resolution phase-contrast X-ray microtomography on the BM18 beamline at the [European Synchrotron Radiation Facility (ESRF)](https://www.esrf.fr/) in Grenoble — an instrument able to resolve the wafer-thin, densely packed layers of a Herculaneum roll. The work was carried out in collaboration with the National Library of Naples “Vittorio Emanuele III”, which safeguards the Herculaneum papyri. From those volumes, the team reconstructed the scroll's geometry, traced and flattened its surface into a readable sheet, and trained machine-learning models to detect ink that is almost indistinguishable from the carbonized papyrus beneath it. Each reading was then examined and transcribed by papyrologists.
 
 <figure className="">
   <video autoPlay playsInline loop muted className="w-[100%] rounded-lg" poster="/img/firstscroll/crosscut-poster.webp">
     <source src="/img/firstscroll/crosscut.webm" type="video/webm" />
     <source src="/img/firstscroll/crosscut.mp4" type="video/mp4" />
   </video>
-  <figcaption className="mt-0">A cross-section sweeping through the X-ray scan of PHerc. 1667, revealing the coiled sheet of papyrus wound inside the sealed roll.</figcaption>
+  <figcaption className="mt-0">A cross-section sweeping through the X-ray scan of PHerc. 1667, revealing the sheet of papyrus wound inside the sealed roll.</figcaption>
 </figure>
 
 Crucially, all of this is **open**. The tomographic data, reconstructed surfaces and transcriptions are released under a Creative Commons licence at [scrollprize.org/data](/data) and archived at the ESRF, and the code is on [GitHub](https://github.com/ScrollPrize/villa). Anyone can check the work, build on it, and apply it to the scrolls that remain.
