@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import BrowserOnly from '@docusaurus/BrowserOnly';
 
-const ATLAS_CSS_URL = '/atlas/assets/index-C4x8WcgQ.css';
-const ATLAS_JS_URL = '/atlas/assets/index-HAPdQJi6.js';
+const ATLAS_CSS_URL = '/atlas/assets/index-D2ndtC4F.css';
+const ATLAS_JS_URL = '/atlas/assets/index-Cx66wXfT.js';
 const ATLAS_READY_EVENT = 'atlas-container-ready';
 const ATLAS_GLOBAL_FLAG = '__atlasBrowserLoaded';
 
