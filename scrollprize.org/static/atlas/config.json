@@ -1,4 +1,46 @@
 {
   "metadataUrl": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.json",
-  "version": "0.1"
+  "version": "0.1",
+  "dataAccess": {
+    "usages": ["public-read"],
+    "rewrites": [
+      {
+        "from": "s3://vesuvius-challenge-open-data/",
+        "to": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/"
+      },
+      {
+        "from": "s3://vesuvius-challenge/",
+        "to": "https://data.aws.ash2txt.org/samples/"
+      }
+    ],
+    "browser": {
+      "base": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/",
+      "indexTemplate": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html#{path}"
+    },
+    "thumbnails": [
+      {
+        "prefix": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/",
+        "cacheBase": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/_thumbnails/",
+        "serviceBase": "https://thumbs.aws.ash2txt.org/"
+      },
+      {
+        "prefix": "https://data.aws.ash2txt.org/samples/",
+        "cacheBase": "https://data.aws.ash2txt.org/samples/_thumbnails/",
+        "serviceBase": "https://thumbs-vc.aws.ash2txt.org/"
+      }
+    ],
+    "zarrProxy": {
+      "rules": [
+        {
+          "match": "data.aws.ash2txt.org/samples/",
+          "proxyBase": "https://zarr.aws.ash2txt.org/data"
+        },
+        {
+          "match": "vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/",
+          "proxyBase": "https://zarr.aws.ash2txt.org/open-data"
+        }
+      ],
+      "defaultProxyBase": "https://zarr.aws.ash2txt.org/data"
+    }
+  }
 }
