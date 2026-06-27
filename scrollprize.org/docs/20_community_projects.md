@@ -55,7 +55,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🌟 Highlighted
 
-- [vesuvius](https://github.com/scrollprize/vesuvius): Python library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
+- [vesuvius](https://github.com/ScrollPrize/villa/tree/main/vesuvius): Python library for accessing Vesuvius Challenge data. Allows direct access to scroll data without managing download scripts or storing terabytes of CT scans locally.
 
 - [Segment browser](https://github.com/jrudolph/vesuvius-browser) is a web-based tool to browse layers and open source ink detection results of all released segments. By Johannes Rudolph
 
