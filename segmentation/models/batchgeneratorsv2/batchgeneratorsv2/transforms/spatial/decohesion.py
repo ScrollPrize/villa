@@ -49,7 +49,6 @@ class DecohesionTransform(ImageOnlyTransform):
 
     @staticmethod
     def _causal_smear(img: torch.Tensor, taxis: int, k: torch.Tensor) -> torch.Tensor:
-        C = img.shape[0]
         dim = img.ndim - 1
         K = int(k.shape[0])
 
@@ -63,21 +62,30 @@ class DecohesionTransform(ImageOnlyTransform):
         if not (0 <= spatial_axis < dim):
             raise ValueError(f"taxis={taxis} out of range for img of shape {tuple(img.shape)}")
 
-        pad = [0, 0] * dim
-        pad_idx = (dim - 1 - spatial_axis) * 2
-        pad[pad_idx] = K - 1
-        x = F.pad(img.unsqueeze(0), pad, mode='constant', value=0.0)
-
-        ks = [1] * dim
-        ks[spatial_axis] = K
-        w = torch.flip(k, dims=[0]).to(dtype=x.dtype, device=x.device)
-        w = w.view([1, 1] + ks).expand(C, 1, *ks).contiguous()
-
-        if dim == 3:
-            out = F.conv3d(x, w, groups=C)
+        last = img.ndim - 1
+        if taxis == last:
+            moved = img.contiguous()
+            permuted = False
+            perm = None
         else:
-            out = F.conv2d(x, w, groups=C)
-        return out.squeeze(0)
+            perm = list(range(img.ndim))
+            perm[taxis], perm[last] = perm[last], perm[taxis]
+            moved = img.permute(perm).contiguous()
+            permuted = True
+
+        head_shape = moved.shape[:-1]
+        L = moved.shape[-1]
+
+        x = moved.reshape(-1, 1, L)
+        x = F.pad(x, (K - 1, 0), mode='constant', value=0.0)
+
+        w = torch.flip(k, dims=[0]).to(dtype=x.dtype, device=x.device).view(1, 1, K)
+        y = F.conv1d(x, w)
+        y = y.reshape(*head_shape, L)
+
+        if permuted:
+            y = y.permute(perm).contiguous()
+        return y
 
     def _density_weight(self, img: torch.Tensor, strength: float) -> torch.Tensor:
         if not self.density_modulated:
