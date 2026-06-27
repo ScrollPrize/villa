@@ -366,6 +366,12 @@ const creators = [
 
 const sponsors = [
   {
+    name: "Nat Friedman",
+    amount: 2250000,
+    href: "https://nat.org/",
+    image: "/img/landing/nat.webp",
+  },
+  {
     name: "Musk Foundation",
     amount: 2084000,
     href: "https://www.muskfoundation.org/",
@@ -382,12 +388,6 @@ const sponsors = [
     amount: 250000,
     href: "https://twitter.com/JosephJacks_",
     image: "/img/landing/Joseph Jacks.webp",
-  },
-  {
-    name: "Nat Friedman",
-    amount: 225000,
-    href: "https://nat.org/",
-    image: "/img/landing/nat.webp",
   },
   {
     name: "Daniel Gross",
