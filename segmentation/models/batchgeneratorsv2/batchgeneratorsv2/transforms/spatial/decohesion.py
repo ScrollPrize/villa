@@ -9,7 +9,7 @@ Addresses ScrollPrize/villa issue #201, the *Decohesion* item:
 IMAGE-ONLY: decohesion is an imaging artifact -- it changes appearance, NOT
 geometry, so it must not touch the segmentation/labels.
 """
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -49,15 +49,35 @@ class DecohesionTransform(ImageOnlyTransform):
 
     @staticmethod
     def _causal_smear(img: torch.Tensor, taxis: int, k: torch.Tensor) -> torch.Tensor:
-        out = k[0] * img
-        n = img.shape[taxis]
-        for i in range(1, k.shape[0]):
-            dst = [slice(None)] * img.ndim
-            src = [slice(None)] * img.ndim
-            dst[taxis] = slice(i, None)
-            src[taxis] = slice(0, n - i)
-            out[tuple(dst)] = out[tuple(dst)] + k[i] * img[tuple(src)]
-        return out
+        C = img.shape[0]
+        dim = img.ndim - 1
+        K = int(k.shape[0])
+
+        if K == 1:
+            return k[0] * img
+
+        if dim not in (2, 3):
+            raise ValueError(f"_causal_smear supports 2D or 3D inputs, got dim={dim}")
+
+        spatial_axis = taxis - 1
+        if not (0 <= spatial_axis < dim):
+            raise ValueError(f"taxis={taxis} out of range for img of shape {tuple(img.shape)}")
+
+        pad = [0, 0] * dim
+        pad_idx = (dim - 1 - spatial_axis) * 2
+        pad[pad_idx] = K - 1
+        x = F.pad(img.unsqueeze(0), pad, mode='constant', value=0.0)
+
+        ks = [1] * dim
+        ks[spatial_axis] = K
+        w = torch.flip(k, dims=[0]).to(dtype=x.dtype, device=x.device)
+        w = w.view([1, 1] + ks).expand(C, 1, *ks).contiguous()
+
+        if dim == 3:
+            out = F.conv3d(x, w, groups=C)
+        else:
+            out = F.conv2d(x, w, groups=C)
+        return out.squeeze(0)
 
     def _density_weight(self, img: torch.Tensor, strength: float) -> torch.Tensor:
         if not self.density_modulated:
