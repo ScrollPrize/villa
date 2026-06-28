@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="A LEGO brick model of the Villa dei Papiri, where the Herculaneum scrolls were found, with free build instructions, a 3D model viewer, CAD files, and renders."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="A LEGO brick model of the Villa dei Papiri, where the Herculaneum scrolls were found, with free build instructions, a 3D model viewer, CAD files, and renders."
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="A LEGO brick model of the Villa dei Papiri, where the Herculaneum scrolls were found, with free build instructions, a 3D model viewer, CAD files, and renders."
   />
   <meta
     property="twitter:image"

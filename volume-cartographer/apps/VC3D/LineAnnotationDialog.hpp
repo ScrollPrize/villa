@@ -20,6 +20,9 @@
 
 class CState;
 class QComboBox;
+class QGraphicsPathItem;
+class QGraphicsRectItem;
+class QGraphicsSimpleTextItem;
 class QLabel;
 class QMdiArea;
 class QMdiSubWindow;
@@ -61,7 +64,27 @@ public:
         QPointer<QMdiSubWindow> subWindow;
     };
 
+    struct FastStripOverlayItems {
+        struct SpanLabelItems {
+            QGraphicsRectItem* background = nullptr;
+            QGraphicsSimpleTextItem* text = nullptr;
+        };
+
+        QPointer<CChunkedVolumeViewer> viewer;
+        std::string surfaceName;
+        QGraphicsPathItem* currentLine = nullptr;
+        std::vector<SpanLabelItems> spanLabels;
+    };
+
+    struct FastCurrentCutOverlayItems {
+        QPointer<CChunkedVolumeViewer> viewer;
+        QGraphicsPathItem* centerPoint = nullptr;
+        QGraphicsPathItem* controlPoints = nullptr;
+        QGraphicsPathItem* seedPoints = nullptr;
+    };
+
     using GeneratedOverlay = vc3d::line_annotation::GeneratedOverlay;
+    using GeneratedSpanAlignmentMetric = vc3d::line_annotation::GeneratedSpanAlignmentMetric;
     using GeneratedViews = vc3d::line_annotation::GeneratedViews;
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
 
@@ -89,7 +112,10 @@ public:
     ShiftScrollMode shiftScrollMode() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
+    void setGeneratedSpanAlignmentMetrics(
+        std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     void setOptimizationBusy(bool busy);
+    void setOptimizationStatus(bool optimized);
     void setCloseAfterFinalizationAllowed(bool allowed);
 
 signals:
@@ -133,20 +159,26 @@ private:
     // per event. Discrete callers (keyboard jumps, clicks, scroll) keep calling
     // setCurrentLinePosition directly for immediate response.
     void requestCurrentLinePosition(double position);
-    void setCurrentLinePosition(double position);
+    void setCurrentLinePosition(double position, bool updateCurrentCutOverlay = true);
     void cancelControlPointPreviewAnimation();
     void jumpToPreviousControlPoint();
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
     bool shiftCurrentCutPlaneStraightByScrollSteps(int steps);
+    void handleShiftScrollModeChanged();
     void setCurrentCutFollowsStripMouse(bool follows);
     double snappedControlPointPosition(double position) const;
     void rebuildGeneratedStaticStripOverlays();
-    void rebuildGeneratedDynamicOverlays();
+    void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true,
+                                         bool updateSpanLabels = true);
+    void updateGeneratedDynamicOverlaysFast(bool updateCurrentCutOverlay,
+                                            bool updateSpanLabels);
+    void clearFastGeneratedOverlayItemRefs();
     void rebuildGeneratedOverlays();
     void installGeneratedViewShortcuts();
     void resetGeneratedViews();
+    bool toggleCurrentCutFollowFromKeyboard();
     bool rotateCurrentCut(vc3d::line_annotation::GeneratedCutRotationAxis axis, float radians);
     cv::Vec3f currentCutViewerCenterVolumePoint() const;
     void captureInitialGeneratedViewState();
@@ -156,9 +188,7 @@ private:
                                const GeneratedOverlay& overlay);
     void clearControlPointContextPreview(const std::string& surfaceName,
                                          CChunkedVolumeViewer* viewer);
-    GeneratedOverlay stripOverlay() const;
     GeneratedOverlay staticStripOverlay() const;
-    GeneratedOverlay dynamicStripOverlay() const;
     GeneratedOverlay zSliceOverlay(double linePosition,
                                    bool emphasized,
                                    CChunkedVolumeViewer* viewer,
@@ -183,6 +213,7 @@ private:
     QComboBox* _reoptimizationCombo = nullptr;
     QComboBox* _shiftScrollCombo = nullptr;
     QLabel* _sliceStepLabel = nullptr;
+    QLabel* _optimizationStatusLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
     QPushButton* _fullOptimizationButton = nullptr;
     QPushButton* _resetViewsButton = nullptr;
@@ -203,6 +234,8 @@ private:
     QList<int> _savedTopSplitterSizes;
     QList<int> _savedStripSplitterSizes;
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
+    std::vector<FastStripOverlayItems> _fastStripOverlayItems;
+    FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
@@ -235,6 +268,7 @@ private:
     cv::Matx33f _currentCutManualRotation = cv::Matx33f::eye();
     bool _currentCutManualRotationActive = false;
     bool _currentCutStraightOffsetActive = false;
+    bool _generatedOverlayRefreshQueued = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
     bool _haveInitialCurrentCutCamera = false;

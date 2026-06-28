@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Recorded Vesuvius Challenge livestreams, office hours, and Q&A talks, including the 2023 Grand Prize and First Letters presentations on the Herculaneum scrolls."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Recorded Vesuvius Challenge livestreams, office hours, and Q&A talks, including the 2023 Grand Prize and First Letters presentations on the Herculaneum scrolls."
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Recorded Vesuvius Challenge livestreams, office hours, and Q&A talks, including the 2023 Grand Prize and First Letters presentations on the Herculaneum scrolls."
   />
   <meta
     property="twitter:image"
@@ -37,6 +37,10 @@ hide_table_of_contents: true
 </head>
 
 Be sure to check [Discord](https://discord.com/invite/uTfNwwecCQ), [Substack](https://scrollprize.substack.com/), and [X](https://x.com/scrollprize) for livestream announcements!
+
+### June 25, 2026 - Press Conference
+
+<iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/96oTlQm0KBw"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
 
 ### July 31, 2024 - Office Hours
 

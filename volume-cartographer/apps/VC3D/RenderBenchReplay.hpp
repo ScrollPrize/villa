@@ -3,6 +3,7 @@
 #include <QPointer>
 #include <QString>
 
+#include <algorithm>
 #include <functional>
 #include <vector>
 
@@ -37,6 +38,12 @@ public:
     bool load(const QString& path);
 
     void setWarmPass(bool warm) { _warm = warm; }
+    void setOffscreen4k(bool enabled) { _offscreen4k = enabled; }
+    void setSkipChunkComplete(bool enabled) { _skipChunkComplete = enabled; }
+    void setSkipFastRender(bool enabled) { _skipFastRender = enabled; }
+    void setTimedProfile(bool enabled) { _timedProfile = enabled; }
+    void setTimedProfilePeriodMs(int periodMs) { _timedProfilePeriodMs = periodMs; }
+    void setReplayLimit(int limit) { _replayLimit = std::max(0, limit); }
 
     // Opens the recorded volume+segment in the window, then replays every
     // keyframe. Calls QApplication::quit() on completion. Blocking (pumps the
@@ -45,6 +52,12 @@ public:
 
 private:
     bool _warm = false;
+    bool _offscreen4k = false;
+    bool _skipChunkComplete = false;
+    bool _skipFastRender = false;
+    bool _timedProfile = false;
+    int _timedProfilePeriodMs = 200;
+    int _replayLimit = 0;
     Header _header;
     std::vector<Keyframe> _keyframes;
 

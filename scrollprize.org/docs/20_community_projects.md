@@ -9,7 +9,7 @@ hide_title: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Open-source tools built by the Vesuvius Challenge community for data access, segmentation, and ink detection to help read the buried Herculaneum scrolls."
   />
 
   <meta property="og:type" content="website" />
@@ -17,7 +17,7 @@ hide_title: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Open-source tools built by the Vesuvius Challenge community for data access, segmentation, and ink detection to help read the buried Herculaneum scrolls."
   />
   <meta
     property="og:image"
@@ -29,7 +29,7 @@ hide_title: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Open-source tools built by the Vesuvius Challenge community for data access, segmentation, and ink detection to help read the buried Herculaneum scrolls."
   />
   <meta
     property="twitter:image"

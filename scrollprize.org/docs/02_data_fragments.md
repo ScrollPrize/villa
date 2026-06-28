@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Detached Herculaneum papyrus fragments with X-ray CT volumes, multispectral photos, and hand-labeled ink masks, scanned at Diamond Light Source and ESRF."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Detached Herculaneum papyrus fragments with X-ray CT volumes, multispectral photos, and hand-labeled ink masks, scanned at Diamond Light Source and ESRF."
   />
   <meta
     property="og:image"
@@ -28,13 +28,17 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Detached Herculaneum papyrus fragments with X-ray CT volumes, multispectral photos, and hand-labeled ink masks, scanned at Diamond Light Source and ESRF."
   />
   <meta
     property="twitter:image"
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
+
+import JsonLd from '@site/src/components/JsonLd';
+
+<JsonLd data={{ "@context":"https://schema.org","@type":"Dataset","name":"Herculaneum Scrolls — Detached Papyrus Fragments","description":"Detached Herculaneum papyrus fragments scanned by X-ray CT at Diamond Light Source and ESRF, with multispectral photographs and hand-labeled ink masks for supervised ink detection.","url":"https://scrollprize.org/data_fragments","creator":{"@type":"Organization","name":"Vesuvius Challenge","url":"https://scrollprize.org/"},"measurementTechnique":"X-ray computed tomography","keywords":["Herculaneum scrolls","papyri","X-ray CT","virtual unwrapping","ink detection","machine learning"],"isAccessibleForFree":true,"license":"https://dl.ash2txt.org/LICENSE.txt","distribution":{"@type":"DataDownload","encodingFormat":"image/tiff","contentUrl":"https://scrollprize.org/data_fragments"} }} />
 
 <!-- ====================================================== -->
 

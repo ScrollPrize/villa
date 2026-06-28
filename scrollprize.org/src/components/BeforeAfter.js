@@ -1,6 +1,11 @@
 import React, { useState, useRef, useEffect } from "react";
 
-const BeforeAfter = ({ beforeImage, afterImage }) => {
+const BeforeAfter = ({
+  beforeImage,
+  afterImage,
+  altBefore = "Before",
+  altAfter = "After",
+}) => {
   const [sliderPosition, setSliderPosition] = useState(50);
   const containerRef = useRef(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -47,13 +52,17 @@ const BeforeAfter = ({ beforeImage, afterImage }) => {
     >
       <img
         src={afterImage}
-        alt="After"
+        alt={altAfter}
+        loading="lazy"
+        decoding="async"
         className="absolute top-0 left-0 w-full h-full object-cover pointer-events-none"
       />
 
       <img
         src={beforeImage}
-        alt="Before"
+        alt={altBefore}
+        loading="lazy"
+        decoding="async"
         className="absolute top-0 left-0 w-full h-full object-cover pointer-events-none"
         style={{
           clipPath: `inset(0 ${100 - sliderPosition}% 0 0)`,

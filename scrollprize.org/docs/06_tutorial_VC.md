@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge Volume Cartographer tutorial: install VC, then manually segment a Herculaneum scroll sheet and flatten it into a textured surface volume."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge Volume Cartographer tutorial: install VC, then manually segment a Herculaneum scroll sheet and flatten it into a textured surface volume."
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge Volume Cartographer tutorial: install VC, then manually segment a Herculaneum scroll sheet and flatten it into a textured surface volume."
   />
   <meta
     property="twitter:image"

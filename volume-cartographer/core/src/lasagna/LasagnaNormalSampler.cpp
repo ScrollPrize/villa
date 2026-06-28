@@ -1086,18 +1086,6 @@ public:
         return predDt_->spacing;
     }
 
-    // Extent of the coordinate space sampleNormal() expects, in volume-point units
-    // (XYZ order). A volumePoint maps to a voxel index via volumePoint / spacing, so the
-    // sampled coordinate space spans [0, shape * spacing) on each axis. Derived from the
-    // grad_mag channel (shared spatial frame with nx/ny).
-    [[nodiscard]] std::array<double, 3> coordinateExtentXyz() const
-    {
-        const double sp = gradMag_.spacing;
-        return {static_cast<double>(gradMag_.shapeZYX[2]) * sp,
-                static_cast<double>(gradMag_.shapeZYX[1]) * sp,
-                static_cast<double>(gradMag_.shapeZYX[0]) * sp};
-    }
-
     [[nodiscard]] double windingDistance(const cv::Vec3d& a,
                                          const cv::Vec3d& b,
                                          double stepVx) const
@@ -1429,11 +1417,6 @@ bool LasagnaNormalSampler::hasPredDtChannel() const
 std::optional<double> LasagnaNormalSampler::predDtSpacing() const
 {
     return impl_->predDtSpacing();
-}
-
-std::array<double, 3> LasagnaNormalSampler::normalSourceExtentXyz() const
-{
-    return impl_->coordinateExtentXyz();
 }
 
 double LasagnaNormalSampler::windingDistance(const cv::Vec3d& a,

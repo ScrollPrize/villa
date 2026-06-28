@@ -30,6 +30,9 @@ struct LineOptimizationIterationReport {
 struct LineOptimizationReport {
     double initialCost = 0.0;
     double finalCost = 0.0;
+    double initialRms = 0.0;
+    double finalRms = 0.0;
+    int residuals = 0;
     int iterations = 0;
     int validNormalSamples = 0;
     int invalidNormalSamples = 0;
@@ -51,6 +54,35 @@ struct LineOptimizationResult {
     LineOptimizationReport report;
 };
 
+struct LineDebugPolyline {
+    std::string name;
+    std::vector<cv::Vec3d> points;
+};
+
+struct LineReinitializationCandidateReport {
+    std::string name;
+    int rolloutSteps = 0;
+    int truncatedPoints = 0;
+    int selectedSign = 0;
+    int points = 0;
+    int residuals = 0;
+    int iterations = 0;
+    bool usable = false;
+    bool chosen = false;
+    double closestTargetDistance = 0.0;
+    double initialCost = 0.0;
+    double finalCost = 0.0;
+    double initialRms = 0.0;
+    double finalRms = 0.0;
+    double finalRmsDelta = 0.0;
+    double finalCostDelta = 0.0;
+    double avgNormalAlignmentAbs = 0.0;
+    double p95NormalAlignmentAbs = 0.0;
+    double maxNormalAlignmentAbs = 0.0;
+    double alignmentChoiceScore = 0.0;
+    double alignmentChoiceScoreDelta = 0.0;
+};
+
 struct LineReinitializationSpanReport {
     int segmentIndex = -1;
     int leftControlIndex = -1;
@@ -60,26 +92,45 @@ struct LineReinitializationSpanReport {
     int candLeftTruncatedPoints = 0;
     int candRightRolloutSteps = 0;
     int candRightTruncatedPoints = 0;
+    int candContinueLeftRolloutSteps = 0;
+    int candContinueLeftTruncatedPoints = 0;
+    int candContinueRightRolloutSteps = 0;
+    int candContinueRightTruncatedPoints = 0;
     int candLeftSelectedSign = 0;
     int candRightSelectedSign = 0;
     double candLeftClosestTargetDistance = 0.0;
     double candRightClosestTargetDistance = 0.0;
+    double candContinueLeftClosestTargetDistance = 0.0;
+    double candContinueRightClosestTargetDistance = 0.0;
     double candLeftInitialCost = 0.0;
     double candLeftFinalCost = 0.0;
     double candRightInitialCost = 0.0;
     double candRightFinalCost = 0.0;
+    double candContinueLeftInitialCost = 0.0;
+    double candContinueLeftFinalCost = 0.0;
+    double candContinueRightInitialCost = 0.0;
+    double candContinueRightFinalCost = 0.0;
     double chosenMaxEvenStepDeviation = 0.0;
     double chosenMaxTangentSmoothDeviation = 0.0;
     double chosenMaxNormalSmoothDeviation = 0.0;
     double chosenMaxNormalAlignmentAbs = 0.0;
     std::string chosen;
+    std::vector<LineReinitializationCandidateReport> candidates;
 };
 
 struct LineReinitializationOptimizationResult {
     LineOptimizationResult optimization;
     std::vector<LineReinitializationSpanReport> spans;
+    bool failed = false;
+    int failedSegmentIndex = -1;
+    int initialSeedSpanIndex = -1;
+    std::string failureReason;
     double maxSegmentCandidateFinalCostDiff = 0.0;
+    double maxSegmentCandidateFinalRmsDiff = 0.0;
+    double maxSegmentCandidateAlignmentScoreDiff = 0.0;
     std::vector<int> fixedPointIndices;
+    std::vector<cv::Vec3d> debugControlPoints;
+    std::vector<LineDebugPolyline> continuationCandidateLines;
 };
 
 struct LineControlPoint {

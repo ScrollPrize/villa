@@ -4,6 +4,7 @@
 #include <QPointF>
 #include <QPointer>
 #include <QString>
+#include <QFutureWatcher>
 
 #include <cstdint>
 #include <filesystem>
@@ -11,11 +12,14 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
 
 #include "LineAnnotationFiberClassification.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -31,10 +35,6 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
-
-namespace vc::lasagna {
-class LasagnaNormalSampler;
-}
 
 class LineAnnotationController : public QObject
 {
@@ -59,11 +59,32 @@ public:
     };
 
     struct FiberSummary {
+        struct AlignmentMetrics {
+            bool available = false;
+            bool pending = false;
+            int sampleCount = 0;
+            double meanErrorDegrees = 0.0;
+            double maxErrorDegrees = 0.0;
+            std::string error;
+        };
+
+        struct SpanSummary {
+            int spanIndex = 0;
+            int firstControlIndex = 0;
+            int secondControlIndex = 0;
+            int controlPointCount = 0;
+            int linePointCount = 0;
+            double lengthVx = 0.0;
+            AlignmentMetrics alignment;
+        };
+
         uint64_t id = 0;
         std::string name;
         int controlPointCount = 0;
         int linePointCount = 0;
         double lengthVx = 0.0;
+        AlignmentMetrics alignment;
+        std::vector<SpanSummary> spans;
         double hvZDistance = 0.0;
         double hvFiberLength = 0.0;
         double horizontalScore = 0.0;
@@ -108,6 +129,7 @@ public:
     void openFiber(uint64_t fiberId);
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
+    void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void deleteFiber(uint64_t fiberId);
     void deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
@@ -115,6 +137,9 @@ public:
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
+    void calculateFiberAlignmentMetrics();
+    void calculateFiberAlignmentMetrics(std::vector<uint64_t> orderedFiberIds);
+    void requestFiberAlignmentMetrics(uint64_t fiberId);
     void createAtlasFromFiber(uint64_t fiberId);
     void addFiberToPointCollection(uint64_t fiberId);
     void addFibersToPointCollections(std::vector<uint64_t> fiberIds);
@@ -135,14 +160,6 @@ public:
     [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
         const std::filesystem::path& atlasFiberPath) const;
 
-    // Working-volume scale support. The active volume may be downsampled relative to the
-    // full-resolution Lasagna data; coordinates fed to Lasagna are scaled up to full-res and
-    // results scaled back down. `volumeScale` is the working-to-full-res ratio (1.0 = no scaling,
-    // 0.25 = a 4x downsampled working volume). An empty override means auto-detection.
-    [[nodiscard]] double volumeScale() const { return _volumeScale; }
-    void setVolumeScaleOverride(std::optional<double> scale);
-    void recomputeVolumeScale();
-
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
@@ -151,10 +168,14 @@ public:
 
 signals:
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
+    void fiberAlignmentMetricsReset(bool pending);
+    void fiberAlignmentMetricsUpdated(
+        uint64_t fiberId,
+        LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
+        std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics> spanAlignments);
     void fiberSaved(uint64_t fiberId, uint64_t generation);
     void fibersDeleted(std::vector<uint64_t> fiberIds);
     void atlasCreated(std::filesystem::path atlasDir);
-    void volumeScaleChanged(double effectiveScale, bool autoDetected);
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -166,8 +187,28 @@ private:
         Segmentation,
     };
 
+    enum class SessionOptimizationState {
+        Unoptimized,
+        Incremental,
+        Optimized,
+    };
+
     struct LineAnnotationSession;
     struct IntersectionInspectionSession;
+    struct FiberMetricsTaskResult;
+    struct ControlSpanRecord {
+        int spanIndex = 0;
+        int firstControlIndex = 0;
+        int secondControlIndex = 0;
+        size_t firstLineIndex = 0;
+        size_t lastLineIndex = 0;
+        double lengthVx = 0.0;
+        int linePointCount = 0;
+    };
+    struct CachedFiberAlignmentMetrics {
+        FiberSummary::AlignmentMetrics fiber;
+        std::vector<FiberSummary::AlignmentMetrics> spans;
+    };
     struct StoredFiber {
         uint64_t id = 0;
         std::string username;
@@ -204,7 +245,8 @@ private:
                        bool deferShowUntilGenerated = false);
     void openFiberWithControlPoint(uint64_t fiberId,
                                    std::optional<int> controlPointIndex,
-                                   std::optional<int> linePointIndex = std::nullopt);
+                                   std::optional<int> linePointIndex = std::nullopt,
+                                   std::optional<std::pair<int, int>> spanControlIndices = std::nullopt);
     void handleLineSeed(const std::string& surfaceName,
                         cv::Vec3f volumePoint,
                         InitialDirectionMode directionMode);
@@ -217,16 +259,16 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
-    // Auto-detect the working-to-full-res scale by comparing the active volume shape with the
-    // Lasagna source extent (`sampler` may be null when no dataset is loaded yet). Honors an
-    // active override and warns once when the ratio is not a clean power of two.
-    void updateVolumeScale(const vc::lasagna::LasagnaNormalSampler* sampler);
-    bool needsFinalReinitReopt(const LineAnnotationSession& session) const;
-    bool runFinalReinitReoptSynchronously(LineAnnotationSession& session,
-                                          bool fireSuccessCallback);
+    bool needsFinalOptimization(const LineAnnotationSession& session) const;
+    bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
+                                                  bool fireSuccessCallback);
+    void setSessionOptimizationState(LineAnnotationSession& session,
+                                     SessionOptimizationState state);
+    void refreshSessionOptimizationStatus(const LineAnnotationSession& session);
     bool applyOptimizationTaskResult(LineAnnotationSession& session,
                                      OptimizationTaskResult task,
                                      bool updateGeneratedViews,
+                                     SessionOptimizationState resultOptimizationState,
                                      const std::string& eventOverride = {},
                                      bool fireSuccessCallback = true);
     void requestFinalizedClose(const std::string& surfaceName);
@@ -275,17 +317,40 @@ private:
     [[nodiscard]] static std::string currentFiberDateTimeString();
     void ensureSessionFiberIdentity(LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
-    // `points` are in working-volume coordinates and are stored as-is; normals are sampled at the
-    // matching full-res Lasagna coordinates (points scaled by 1/volumeScale).
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
-        const vc::lasagna::NormalSampler* normalSampler,
-        double volumeScale = 1.0);
+        const vc::lasagna::NormalSampler* normalSampler);
     [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
         const std::vector<cv::Vec3d>& points);
     void saveSessionAsFiber(LineAnnotationSession& session);
     void saveFiber(const StoredFiber& fiber) const;
     [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
+    [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
+        const StoredFiber& fiber);
+    [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForFiber(
+        uint64_t fiberId) const;
+    [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForSpan(
+        uint64_t fiberId,
+        int spanIndex) const;
+    [[nodiscard]] bool hasCachedAlignmentForFiber(uint64_t fiberId) const;
+    [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId) const;
+    [[nodiscard]] bool isAlignmentPendingForFiber(uint64_t fiberId,
+                                                  uint64_t requestToken) const;
+    [[nodiscard]] std::optional<std::filesystem::path> resolveAlignmentMetricsManifestPath();
+    void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
+    void publishFiberAlignmentMetrics(uint64_t fiberId,
+                                      CachedFiberAlignmentMetrics metrics);
+    void publishPendingFiberAlignmentMetrics(const StoredFiber& fiber);
+    void publishUnavailableFiberAlignmentMetrics(uint64_t fiberId);
+    void invalidateFiberAlignmentMetrics(uint64_t fiberId, bool notify);
+    [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedSpanAlignmentMetric>
+        generatedSpanAlignmentMetricsForSession(const LineAnnotationSession& session) const;
+    void updateGeneratedViewMetricsForFiber(uint64_t fiberId);
+    [[nodiscard]] static CachedFiberAlignmentMetrics calculateAlignmentMetricsForFiber(
+        const StoredFiber& fiber,
+        const std::vector<ControlSpanRecord>& spans,
+        const vc::lasagna::NormalSampler& sampler);
+    void finishFiberAlignmentMetrics(QFutureWatcher<FiberMetricsTaskResult>* watcher);
     void showError(const QString& message) const;
     void cleanupIntersectionInspectionSurfaces();
     void rebuildIntersectionInspection();
@@ -314,12 +379,16 @@ private:
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
     std::vector<std::string> _knownFiberTags;
+    std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
+    std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;
+    std::unordered_map<uint64_t, uint64_t> _pendingFiberAlignmentMetricTokens;
+    std::vector<QPointer<QFutureWatcher<FiberMetricsTaskResult>>> _fiberMetricsWatchers;
+    uint64_t _nextFiberAlignmentMetricToken = 0;
+    uint64_t _fiberMetricsGeneration = 0;
+    bool _fiberMetricsPending = false;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
-    double _volumeScale = 1.0;
-    std::optional<double> _volumeScaleOverride;
-    bool _volumeScaleFallbackWarned = false;
 };

@@ -282,22 +282,6 @@ FiberInput loadSourceFiberInput(const fs::path& fiberPath,
     return input;
 }
 
-// Scale a source fiber (stored in working-volume coordinates) up to the full-resolution frame of
-// the atlas base mesh and Lasagna sampler. `scale` is AtlasMetadata::sourceFiberScale; 1.0 leaves
-// the fiber untouched.
-void scaleFiberInputPoints(FiberInput& input, double scale)
-{
-    if (scale == 1.0) {
-        return;
-    }
-    for (auto& point : input.linePoints) {
-        point *= scale;
-    }
-    for (auto& point : input.controlPoints) {
-        point *= scale;
-    }
-}
-
 void validateMappingControlAnchorsAgainstFiber(const FiberMapping& mapping,
                                                const FiberInput& fiber,
                                                const fs::path& mappingPath)
@@ -421,7 +405,6 @@ Atlas loadAtlasContextForRebuild(const fs::path& atlasDir)
     atlas.metadata.sourceBaseMeshPath = metadata.value("source_base_mesh_path", std::string{});
     atlas.metadata.zeroWindingColumn = metadata.at("zero_winding_column").get<int>();
     atlas.metadata.seedLineIndex = metadata.value("seed_line_index", 0);
-    atlas.metadata.sourceFiberScale = metadata.value("source_fiber_scale", 1.0);
     if (metadata.contains("seed_atlas") && metadata["seed_atlas"].is_array() &&
         metadata["seed_atlas"].size() == 2) {
         atlas.metadata.seedAtlasU = metadata["seed_atlas"][0].get<double>();
@@ -1020,7 +1003,6 @@ void Atlas::save(const fs::path& atlasDir) const
         {"zero_winding_column", metadata.zeroWindingColumn},
         {"seed_line_index", metadata.seedLineIndex},
         {"seed_atlas", nlohmann::json::array({metadata.seedAtlasU, metadata.seedAtlasV})},
-        {"source_fiber_scale", metadata.sourceFiberScale},
     };
     writeJsonFile(atlasDir / "metadata.json", metadataJson);
 
@@ -1086,7 +1068,6 @@ Atlas Atlas::load(const fs::path& atlasDir,
     atlas.metadata.sourceBaseMeshPath = metadata.value("source_base_mesh_path", std::string{});
     atlas.metadata.zeroWindingColumn = metadata.at("zero_winding_column").get<int>();
     atlas.metadata.seedLineIndex = metadata.value("seed_line_index", 0);
-    atlas.metadata.sourceFiberScale = metadata.value("source_fiber_scale", 1.0);
     if (metadata.contains("seed_atlas") && metadata["seed_atlas"].is_array() &&
         metadata["seed_atlas"].size() == 2) {
         atlas.metadata.seedAtlasU = metadata["seed_atlas"][0].get<double>();
@@ -1150,10 +1131,7 @@ Atlas Atlas::load(const fs::path& atlasDir,
                                          mapping.fiberPath.generic_string() +
                                          "; rebuild required");
             }
-            FiberInput sourceFiber = loadSourceFiberInput(fiberPath, mapping.fiberPath);
-            // Mapping anchors are stored in the full-res frame; scale the working-coord source
-            // fiber up by the atlas's recorded scale before comparing world positions.
-            scaleFiberInputPoints(sourceFiber, atlas.metadata.sourceFiberScale);
+            const FiberInput sourceFiber = loadSourceFiberInput(fiberPath, mapping.fiberPath);
             validateMappingControlAnchorsAgainstFiber(mapping, sourceFiber, mappingPath);
             atlas.fibers.push_back(std::move(mapping));
         }
@@ -1235,10 +1213,7 @@ Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
         }
         const fs::path fiberPath = resolveAtlasRelativePath(
             atlasDir, volpkgRoot, oldMapping.fiberPath);
-        FiberInput input = loadSourceFiberInput(fiberPath, oldMapping.fiberPath);
-        // Source fibers are stored in working-volume coordinates; scale them up to the full-res
-        // frame shared by the base mesh and the Lasagna normal sampler before mapping.
-        scaleFiberInputPoints(input, legacy.metadata.sourceFiberScale);
+        const FiberInput input = loadSourceFiberInput(fiberPath, oldMapping.fiberPath);
         rebuilt.fibers.push_back(
             mapFiberToBaseSurface(input, baseSurface, baseIndex, normalSampler, options));
         rebuiltInputs.push_back(input);
@@ -2134,8 +2109,7 @@ AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
         const bool existed = fs::exists(attachmentPath);
         const fs::path fiberPath =
             resolveAtlasRelativePath(atlasDir, volpkgRoot, mapping.fiberPath);
-        FiberInput input = loadSourceFiberInput(fiberPath, mapping.fiberPath);
-        scaleFiberInputPoints(input, atlas.metadata.sourceFiberScale);
+        const FiberInput input = loadSourceFiberInput(fiberPath, mapping.fiberPath);
         (void)ensureAtlasPredSnapSet(atlasDir, input, mapping, baseSurface, sampler);
         if (!existed && fs::exists(attachmentPath)) {
             ++report.attachmentsCreated;
@@ -3086,8 +3060,7 @@ AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
                   << mapping.fiberPath.generic_string()
                   << " controls=" << mapping.controlAnchors.size()
                   << std::endl;
-        FiberInput input = loadSourceFiberInput(fiberPath, mapping.fiberPath);
-        scaleFiberInputPoints(input, atlas.metadata.sourceFiberScale);
+        const FiberInput input = loadSourceFiberInput(fiberPath, mapping.fiberPath);
         AtlasPredSnapSet set = ensureAtlasPredSnapSet(atlasDir,
                                                       input,
                                                       mapping,
@@ -3734,8 +3707,7 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
                                      " references missing fiber path: " +
                                      mapping.fiberPath.generic_string());
         }
-        FiberInput sourceFiber = loadSourceFiberInput(fiberPath, mapping.fiberPath);
-        scaleFiberInputPoints(sourceFiber, exportData.atlas.metadata.sourceFiberScale);
+        const FiberInput sourceFiber = loadSourceFiberInput(fiberPath, mapping.fiberPath);
         validateMappingControlAnchorsAgainstFiber(mapping, sourceFiber, mappingFiles[i]);
 
         LasagnaAtlasObject object;

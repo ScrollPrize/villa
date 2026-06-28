@@ -24,6 +24,7 @@
 #include <omp.h>
 #include <blosc.h>
 #include <cstdlib>
+#include <cstring>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -56,6 +57,15 @@ static void setThreadPoliciesEarly()
 __attribute__((section(".preinit_array"), used))
 static auto preinitFn = &setThreadPoliciesEarly;
 #endif
+
+static bool hasCliFlag(int argc, char* argv[], const char* flag)
+{
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && std::strcmp(argv[i], flag) == 0)
+            return true;
+    }
+    return false;
+}
 
 __attribute__((visibility("default")))
 auto main(int argc, char* argv[]) -> int
@@ -121,6 +131,14 @@ auto main(int argc, char* argv[]) -> int
     // compare or debug the dedup path.
     if (qEnvironmentVariableIsEmpty("VC_DISABLE_FETCHINTERACTIVE_DEDUP")) {
         qputenv("VC_DISABLE_FETCHINTERACTIVE_DEDUP", "1");
+    }
+
+    // Qt selects its platform plugin while QApplication is constructed, before
+    // QCommandLineParser runs. Pre-scan this replay flag so the flag alone is
+    // enough for headless offscreen benchmarking.
+    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM") &&
+        hasCliFlag(argc, argv, "--replay-offscreen-4k")) {
+        qputenv("QT_QPA_PLATFORM", "offscreen");
     }
 
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
@@ -200,6 +218,40 @@ auto main(int argc, char* argv[]) -> int
         "With --replay, run a discarded warm-up pass before the timed pass.");
     parser.addOption(replayWarmOption);
 
+    QCommandLineOption replayOffscreen4kOption(
+        "replay-offscreen-4k",
+        "With --replay, force the replay viewport to 3840x2160.");
+    parser.addOption(replayOffscreen4kOption);
+
+    QCommandLineOption replayLimitOption(
+        "replay-limit",
+        "With --replay, replay only the first N recorded keyframes (0 = all).",
+        "frames",
+        "0");
+    parser.addOption(replayLimitOption);
+
+    QCommandLineOption replaySkipChunkCompleteOption(
+        "replay-skip-chunk-complete",
+        "With --replay, advance after the first full render instead of waiting for chunk-complete quiet settle.");
+    parser.addOption(replaySkipChunkCompleteOption);
+
+    QCommandLineOption replaySkipFastRenderOption(
+        "replay-skip-fast-render",
+        "With --replay, skip any fast-render phase and submit the full render directly.");
+    parser.addOption(replaySkipFastRenderOption);
+
+    QCommandLineOption replayTimedProfileOption(
+        "replay-timed-profile",
+        "With --replay, switch frames on a fixed timer and print one row per paint.");
+    parser.addOption(replayTimedProfileOption);
+
+    QCommandLineOption replayTimedProfilePeriodOption(
+        "replay-timed-profile-period-ms",
+        "With --replay-timed-profile, milliseconds between frame switches.",
+        "ms",
+        "200");
+    parser.addOption(replayTimedProfilePeriodOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
@@ -211,8 +263,18 @@ auto main(int argc, char* argv[]) -> int
     benchOptions.recordPath = parser.value(recordOption).trimmed();
     benchOptions.replayPath = parser.value(replayOption).trimmed();
     benchOptions.replayWarm = parser.isSet(replayWarmOption);
+    benchOptions.replayOffscreen4k = parser.isSet(replayOffscreen4kOption);
+    benchOptions.replaySkipChunkComplete = parser.isSet(replaySkipChunkCompleteOption);
+    benchOptions.replaySkipFastRender = parser.isSet(replaySkipFastRenderOption);
+    benchOptions.replayTimedProfile = parser.isSet(replayTimedProfileOption);
+    bool limitOk = false;
+    const int replayLimit = parser.value(replayLimitOption).toInt(&limitOk);
+    benchOptions.replayLimit = (limitOk && replayLimit > 0) ? replayLimit : 0;
+    bool periodOk = false;
+    const int timedPeriod = parser.value(replayTimedProfilePeriodOption).toInt(&periodOk);
+    benchOptions.replayTimedProfilePeriodMs = (periodOk && timedPeriod > 0) ? timedPeriod : 200;
 
-    if (parser.isSet(profileOption) || !benchOptions.replayPath.isEmpty()) {
+    if (parser.isSet(profileOption)) {
         SetProfileLoggingEnabled(true);
         Logger()->info("[vc3d-profile] enabled");
     }

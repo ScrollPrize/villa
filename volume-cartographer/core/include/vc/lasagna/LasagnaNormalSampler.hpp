@@ -3,7 +3,6 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
-#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
@@ -33,9 +32,6 @@ public:
     [[nodiscard]] std::optional<double> samplePredDt(const cv::Vec3d& volumePoint) const;
     [[nodiscard]] bool hasPredDtChannel() const;
     [[nodiscard]] std::optional<double> predDtSpacing() const;
-    // Extent (XYZ order) of the coordinate space sampleNormal() expects, in volume-point
-    // units. Used to relate a downsampled working volume to the full-res Lasagna source.
-    [[nodiscard]] std::array<double, 3> normalSourceExtentXyz() const;
     [[nodiscard]] double windingDistance(const cv::Vec3d& a,
                                          const cv::Vec3d& b,
                                          double stepVx = 8.0) const;

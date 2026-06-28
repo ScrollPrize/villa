@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Curated Vesuvius Challenge datasets from Herculaneum scrolls: labeled papyrus fibers, volumetric instance labels, and a Grand Prize region X-ray CT volume."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Curated Vesuvius Challenge datasets from Herculaneum scrolls: labeled papyrus fibers, volumetric instance labels, and a Grand Prize region X-ray CT volume."
   />
   <meta
     property="og:image"
@@ -28,13 +28,17 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Curated Vesuvius Challenge datasets from Herculaneum scrolls: labeled papyrus fibers, volumetric instance labels, and a Grand Prize region X-ray CT volume."
   />
   <meta
     property="twitter:image"
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
+
+import JsonLd from '@site/src/components/JsonLd';
+
+<JsonLd data={{ "@context":"https://schema.org","@type":"Dataset","name":"Herculaneum Scrolls — Curated Datasets","description":"Task-specific curated bundles from the Herculaneum scrolls, including manually labeled papyrus fibers, volumetric instance segmentation labels, and the Scroll 1 Grand Prize region.","url":"https://scrollprize.org/data_datasets","creator":{"@type":"Organization","name":"Vesuvius Challenge","url":"https://scrollprize.org/"},"measurementTechnique":"X-ray computed tomography","keywords":["Herculaneum scrolls","papyri","X-ray CT","virtual unwrapping","ink detection","machine learning"],"isAccessibleForFree":true,"license":"https://dl.ash2txt.org/LICENSE.txt","distribution":{"@type":"DataDownload","encodingFormat":"image/tiff","contentUrl":"https://scrollprize.org/data_datasets"} }} />
 
 # Curated Datasets
 

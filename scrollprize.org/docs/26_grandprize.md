@@ -23,6 +23,10 @@ hide_title: true
   <meta property="twitter:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
 </head>
 
+import JsonLd from '@site/src/components/JsonLd';
+
+<JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"Vesuvius Challenge 2023 Grand Prize awarded: we can read the scrolls","datePublished":"2024-02-05","dateModified":"2024-02-05","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/social/opengraph.jpg","mainEntityOfPage":"https://scrollprize.org/grandprize"}} />
+
 <h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">Vesuvius Challenge 2023 Grand Prize awarded: <span style={{
   background:
     "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
@@ -39,6 +43,8 @@ hide_title: true
 We’re announcing the winners of the Vesuvius Challenge 2023 Grand Prize. We’ll look at how they did it, what the scrolls say, and what comes next.
 
 *Join us for a celebration at the Getty Villa Museum in Los Angeles on March 16th, 4pm. <a href="https://www.getty.edu/visit/cal/events/ev_4074.html">More information here</a>.*
+
+_Looking for the original 2023 Grand Prize rules? See [the Grand Prize page](/grand_prize)._
 
 
 
@@ -59,14 +65,14 @@ Two thousand years ago, a volcanic eruption buried an ancient library of papyrus
 In the 18th century the scrolls were discovered. Hundreds of them are now stored in a library in Naples, Italy; these lumps of carbonized ash cannot be opened without severely damaging them. But how can we read them if they remain rolled up?
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[50.5%] mr-4 mb-2"><img src="/img/grandprize/scroll-1-scale.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">The scroll read by the winners.</figcaption></div>
-  <div className="w-[45%]"><img src="/img/grandprize/unrolled-orig.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Result of an attempt to physically unroll a scroll.</figcaption></div>
+  <div className="w-[50.5%] mr-4 mb-2"><img src="/img/grandprize/scroll-1-scale.webp" className="w-[100%]" alt="The carbonized Herculaneum scroll read by the winners, shown next to a scale."/><figcaption className="mt-[-6px]">The scroll read by the winners.</figcaption></div>
+  <div className="w-[45%]"><img src="/img/grandprize/unrolled-orig.webp" className="w-[100%]" alt="Fragments resulting from an attempt to physically unroll a scroll."/><figcaption className="mt-[-6px]">Result of an attempt to physically unroll a scroll.</figcaption></div>
 </div>
 
 On March 15th, 2023, Nat Friedman, Daniel Gross, and Brent Seales launched the <a href="https://scrollprize.org">Vesuvius Challenge</a> to answer this question. Scrolls from the Institut de France were imaged at the Diamond Light Source particle accelerator near Oxford. We released these high-resolution CT scans of the scrolls, and we offered more than \$1M in prizes, put forward by many generous donors.
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[41%] mr-4 mb-2"><img src="/img/grandprize/seth-diamond.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Seth Parker <a href="https://scrollprize.substack.com/p/new-scans-of-herculaneum-papyri-at">scanning</a> a scroll at the <a href="https://www.diamond.ac.uk/">Diamond Light Source</a> particle accelerator.</figcaption></div>
+  <div className="w-[41%] mr-4 mb-2"><img src="/img/grandprize/seth-diamond.webp" className="w-[100%]" alt="Seth Parker scanning a scroll at the Diamond Light Source particle accelerator."/><figcaption className="mt-[-6px]">Seth Parker <a href="https://scrollprize.substack.com/p/new-scans-of-herculaneum-papyri-at">scanning</a> a scroll at the <a href="https://www.diamond.ac.uk/">Diamond Light Source</a> particle accelerator.</figcaption></div>
   <div className="w-[54%]">
     <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/scanning2.webp">
       <source src="/img/tutorials/scanning2.webm" type="video/webm"/>
@@ -80,7 +86,7 @@ A global community of competitors and collaborators assembled to crack the probl
 Less than a year later, in December 2023, they succeeded. Finally, after 275 years, we can begin to read the scrolls:
 
 <div className="mb-4">
-  <a target="_blank" href="/img/grandprize/text_bcb-smaller.webp"><img src="/img/grandprize/text_bcb-smaller.webp" className="w-[100%]"/></a>
+  <a target="_blank" href="/img/grandprize/text_bcb-smaller.webp"><img src="/img/grandprize/text_bcb-smaller.webp" className="w-[100%]" alt="Recovered Greek text from PHerc. Paris. 4 (Institut de France), unseen for 2,000 years."/></a>
   <figcaption className="mt-[-6px]">Text from PHerc.Paris. 4 (Institut de France), unseen for 2,000 years. Roughly 95% of the scroll remains to be read.</figcaption>
 </div>
 
@@ -98,9 +104,9 @@ The results of this review were clear and unanimous: the Vesuvius Challenge Gran
 
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[45%] sm:w-[31%] mr-4 mb-2"><img src="/img/grandprize/youssef-smaller.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Youssef Nader</figcaption></div>
-  <div className="w-[45%] sm:w-[31%] mr-4 mb-2"><img src="/img/grandprize/luke-smaller.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Luke Farritor</figcaption></div>
-  <div className="w-[45%] sm:w-[31%]"><img src="/img/grandprize/julian-smaller.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Julian Schilliger</figcaption></div>
+  <div className="w-[45%] sm:w-[31%] mr-4 mb-2"><img src="/img/grandprize/youssef-smaller.webp" className="w-[100%]" alt="Portrait of Grand Prize winner Youssef Nader."/><figcaption className="mt-[-6px]">Youssef Nader</figcaption></div>
+  <div className="w-[45%] sm:w-[31%] mr-4 mb-2"><img src="/img/grandprize/luke-smaller.webp" className="w-[100%]" alt="Portrait of Grand Prize winner Luke Farritor."/><figcaption className="mt-[-6px]">Luke Farritor</figcaption></div>
+  <div className="w-[45%] sm:w-[31%]"><img src="/img/grandprize/julian-smaller.webp" className="w-[100%]" alt="Portrait of Grand Prize winner Julian Schilliger."/><figcaption className="mt-[-6px]">Julian Schilliger</figcaption></div>
 </div>
 
 All three winning team members have been strong community contributors since the very beginning of Vesuvius Challenge. You may remember Youssef. He is the Egyptian PhD student in Berlin who was able to read a few columns of text back in October, winning the second-place [First Letters Prize](firstletters). His results back then were particularly clear and readable, which made him the natural lead for the team that formed.
@@ -114,19 +120,19 @@ For the Grand Prize, they assembled into a superteam, crushing it by creating wh
 The submission contains results from three different model architectures, each supporting the findings of the others, with the strongest images often coming from a [TimeSformer](https://arxiv.org/abs/2102.05095)-based model. Multiple measures prevent overfitting and hallucination, including results from multiple architectures, a study across input/output window sizes, label smoothing, and varying validation folds. Like with all our prizes, this ink detection code has been made public as open source (on [GitHub](https://github.com/younader/Vesuvius-Grandprize-Winner)), leveling up everyone in the community.
 
 <div className="mb-4">
-  <a target="_blank" href="/img/grandprize/youssef_text_wbb.png"><img src="/img/grandprize/youssef_text_wbb-smaller.webp" className="w-[100%]"/></a>
+  <a target="_blank" href="/img/grandprize/youssef_text_wbb.png"><img src="/img/grandprize/youssef_text_wbb-smaller.webp" className="w-[100%]" alt="The winners' main Grand Prize submission image, recovered text from a TimeSformer 64x64 model."/></a>
   <figcaption className="mt-[-6px]">The winners’ main submission image (TimeSformer 64x64).</figcaption>
 </div>
 
 In addition to unparalleled ink detection, the winning submission contained the strongest auto-segmentation approach we have seen to date (more about the process of “segmentation” below). [ThaumatoAnakalyptor](https://github.com/schillij95/ThaumatoAnakalyptor) (roughly: Miracle Uncoverer) by Julian generates massive papyrus segments from multiple scrolls. Re-segmentations of well known areas validate previous ink findings, and entirely new segmentations reveal writing elsewhere, such as the outermost wrap of the scroll!
 
 <div className="flex flex-wrap mb-4">
-  <div className="w-[24%]"><img src="/img/grandprize/autoseg_paragraph_1.webp"/></div>
-  <div className="w-[21%]"><img src="/img/grandprize/autoseg_paragraph_2.webp"/></div>
-  <div className="w-[52%]"><img src="/img/grandprize/autoseg_paragraph_3_4.webp"/></div>
-  <div className="w-[36.85%]"><img src="/img/grandprize/autoseg_outermost_sheet.webp"/></div>
-  <div className="w-[30%]"><img src="/img/grandprize/autoseg_recto.webp"/></div>
-  <div className="w-[30%]"><img src="/img/grandprize/autoseg_recto_64.webp"/></div>
+  <div className="w-[24%]"><img src="/img/grandprize/autoseg_paragraph_1.webp" alt="Auto-segmentation output showing a paragraph of recovered scroll text."/></div>
+  <div className="w-[21%]"><img src="/img/grandprize/autoseg_paragraph_2.webp" alt="Auto-segmentation output showing a paragraph of recovered scroll text."/></div>
+  <div className="w-[52%]"><img src="/img/grandprize/autoseg_paragraph_3_4.webp" alt="Auto-segmentation output showing two paragraphs of recovered scroll text."/></div>
+  <div className="w-[36.85%]"><img src="/img/grandprize/autoseg_outermost_sheet.webp" alt="Auto-segmentation output revealing writing on the outermost wrap of the scroll."/></div>
+  <div className="w-[30%]"><img src="/img/grandprize/autoseg_recto.webp" alt="Auto-segmentation output of a newly segmented region of the scroll."/></div>
+  <div className="w-[30%]"><img src="/img/grandprize/autoseg_recto_64.webp" alt="Auto-segmentation output of a newly segmented region of the scroll."/></div>
   <figcaption className="mt-[-6px]">Outputs from auto-segmentation. The top row overlaps with the submission image, the bottom row has new segments. Much work remains to improve this promising tool.</figcaption>
 </div>
 
@@ -137,17 +143,17 @@ Congratulations to Youssef, Luke, and Julian. You are the well-deserved winners 
 Of the remaining submissions, the scores from our team of papyrologists identify a three-way tie for runner up. These entries show remarkably similar readability to each other, but still stand out from the rest by being significantly more readable. Congratulations to the following teams, each taking home \$50,000!
 
 <div className="mb-4">
-  <a target="_blank" href="/img/grandprize/sq_text_wbb.webp"><img src="/img/grandprize/sq_text_wbb-smaller.webp" className="w-[100%]"/></a>
+  <a target="_blank" href="/img/grandprize/sq_text_wbb.webp"><img src="/img/grandprize/sq_text_wbb-smaller.webp" className="w-[100%]" alt="Recovered scroll text from runner-up Shao-Qian Mah's submission."/></a>
   <figcaption className="mt-[-6px]">Shao-Qian Mah. <a href="https://github.com/SQMah/Vesuvius-Grand-Prize-Submission/">GitHub</a></figcaption>
 </div>
 
 <div className="mb-4">
-  <a target="_blank" href="/img/grandprize/elian_text_wbb.webp"><img src="/img/grandprize/elian_text_wbb-smaller.webp" className="w-[100%]"/></a>
+  <a target="_blank" href="/img/grandprize/elian_text_wbb.webp"><img src="/img/grandprize/elian_text_wbb-smaller.webp" className="w-[100%]" alt="Recovered scroll text from the runner-up submission by Elian Rafael Dal Prá and team."/></a>
   <figcaption className="mt-[-6px]">Elian Rafael Dal Prá, Sean Johnson, Leonardo Scabini, Raí Fernando Dal Prá, João Vitor Brentigani Torezan, Daniel Baldin Franceschini, Bruno Pereira Kellm, Marcelo Soccol Gris, and Odemir Martinez Bruno. <a href="https://github.com/erdpx/vesuvius-grand-prize">GitHub</a></figcaption>
 </div>
 
 <div className="mb-4">
-  <a target="_blank" href="/img/grandprize/lou_text_wbb.webp"><img src="/img/grandprize/lou_text_wbb-smaller.webp" className="w-[100%]"/></a>
+  <a target="_blank" href="/img/grandprize/lou_text_wbb.webp"><img src="/img/grandprize/lou_text_wbb-smaller.webp" className="w-[100%]" alt="Recovered scroll text from the runner-up submission by Louis Schlessinger and Arefeh Sherafati."/></a>
   <figcaption className="mt-[-6px]">Louis Schlessinger and Arefeh Sherafati. <a href="https://github.com/lschlessinger1/vesuvius-grand-prize-submission">GitHub</a></figcaption>
 </div>
 
@@ -169,7 +175,7 @@ Initial, rough draft transcriptions:
 
 <div className="pl-8 flex w-[100%] flex-wrap">
   <div className="sm:w-[48%] sm:mr-4 max-w-[300px]">
-    <a target="_blank" href="/img/grandprize/col-8.webp"><img className="w-[100%]" src="/img/grandprize/col-8.webp"/></a>
+    <a target="_blank" href="/img/grandprize/col-8.webp"><img className="w-[100%]" src="/img/grandprize/col-8.webp" alt="Recovered Greek text of column -8 of the scroll, with a draft transcription."/></a>
   </div>
   <div className="sm:w-[48%] text-[80%]">
 
@@ -195,7 +201,7 @@ Initial, rough draft transcriptions:
 
 <div className="pl-8 flex w-[100%] flex-wrap mb-4">
   <div className="sm:w-[48%] sm:mr-4 max-w-[300px]">
-    <a target="_blank" href="/img/grandprize/col-7.webp"><img className="w-[100%]" src="/img/grandprize/col-7.webp"/></a>
+    <a target="_blank" href="/img/grandprize/col-7.webp"><img className="w-[100%]" src="/img/grandprize/col-7.webp" alt="Recovered Greek text of column -7 of the scroll, with a draft transcription."/></a>
   </div>
   <div className="sm:w-[48%] text-[80%]">
 
@@ -219,7 +225,7 @@ Later in the scroll:
 
 <div className="pl-8 flex w-[100%] flex-wrap mb-4">
   <div className="sm:w-[48%] sm:mr-4 max-w-[300px]">
-    <a target="_blank" href="/img/grandprize/col-2.webp"><img className="w-[100%]" src="/img/grandprize/col-2.webp"/></a>
+    <a target="_blank" href="/img/grandprize/col-2.webp"><img className="w-[100%]" src="/img/grandprize/col-2.webp" alt="Recovered Greek text of column -2 of the scroll, with a draft transcription."/></a>
   </div>
   <div className="sm:w-[48%] text-[80%]">
 
@@ -244,7 +250,7 @@ Finally the scroll concludes:
 
 <div className="pl-8 flex w-[100%] flex-wrap">
   <div className="sm:w-[48%] sm:mr-4 max-w-[300px]">
-    <a target="_blank" href="/img/grandprize/col-1.webp"><img className="w-[100%]" src="/img/grandprize/col-1.webp"/></a>
+    <a target="_blank" href="/img/grandprize/col-1.webp"><img className="w-[100%]" src="/img/grandprize/col-1.webp" alt="Recovered Greek text of the final column of the scroll, with a draft transcription."/></a>
   </div>
   <div className="sm:w-[48%] text-[80%]">
 
@@ -334,8 +340,8 @@ Finally, ink detection. Stephen Parsons at Brent’s lab had [shown](https://ukn
 1. **Crackle pattern.** Last summer, Casey Handmer <a href="https://caseyhandmer.wordpress.com/2023/08/05/reading-ancient-scrolls/">discovered</a> a strange pattern of “crackle” by looking at raw flattened surface volumes. This pattern appeared to form letters. Casey won the First Ink Prize for this monumental discovery and shared it with the community, and a flurry of activity followed.
 
 <figure className="max-w-[500px] ml-8">
-    <img className="w-[47%] mr-4" src="/img/firstletters/pi1.webp" />
-    <img className="w-[47%]" src="/img/firstletters/pi2.webp" />
+    <img className="w-[47%] mr-4" src="/img/firstletters/pi1.webp" alt="Crackle pattern in the scroll surface volume forming the shape of a letter." />
+    <img className="w-[47%]" src="/img/firstletters/pi2.webp" alt="Annotation highlighting the crackle pattern that forms a letter." />
 </figure>
 
 <div className="ml-8 mb-4">Luke Farritor (Grand Prize winner), immediately started hunting for more crackle in flattened surface volumes produced by the segmentation team. He then trained a machine learning model on the shapes he found, which led directly to him winning the <a href="/firstletters">First Letters Prize</a> in October.</div>
@@ -343,9 +349,9 @@ Finally, ink detection. Stephen Parsons at Brent’s lab had [shown](https://ukn
 2. **Kaggle competition.** Separately, <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection">hundreds of teams</a> tried building the best machine learning model for detecting ink in open fragments — pieces that had broken off during the physical unrolling process of scrolls, hundreds of years ago. Instead of labeling crackle (which wasn’t known yet), they had the benefit of ground truth data directly from photos of these fragments.
 
 <div className="flex flex-wrap ml-8">
-  <div className="sm:w-[32%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/fr1.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Photo of Fragment 1</figcaption></div>
-  <div className="sm:w-[30%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/ir-fr1.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Aligned infrared</figcaption></div>
-  <div className="sm:w-[30%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/inklabels-fr1.webp" className="w-[100%]"/><figcaption className="mt-[-6px]">Aligned binary ink labels</figcaption></div>
+  <div className="sm:w-[32%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/fr1.webp" className="w-[100%]" alt="Photo of detached scroll Fragment 1."/><figcaption className="mt-[-6px]">Photo of Fragment 1</figcaption></div>
+  <div className="sm:w-[30%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/ir-fr1.webp" className="w-[100%]" alt="Aligned infrared photo of Fragment 1 showing visible ink."/><figcaption className="mt-[-6px]">Aligned infrared</figcaption></div>
+  <div className="sm:w-[30%] mb-2 mr-2" style={{ maxWidth: "calc(33% - 8px)" }}><img src="/img/data/inklabels-fr1.webp" className="w-[100%]" alt="Aligned binary ink labels for Fragment 1."/><figcaption className="mt-[-6px]">Aligned binary ink labels</figcaption></div>
 </div>
 
 <div className="ml-8 mb-4">This resulted in excellent models, but they did not seem to work on the flattened segments which the segmentation team produced. That was, until Youssef Nader (Grand Prize winner) used domain adaptation techniques on them, the start of a technique that ultimately won him the second place First Letters Prize.</div>
@@ -359,13 +365,13 @@ With Vesuvius Challenge, we hope not only to solve the problem of reading the He
 1. **An inspiring goal and a clear target.** There are many worthy causes in the world, so it helps that our goal is unusual for a computing competition. It drew more press and donations early on, it attracted an intrinsically motivated community, and it increased our probability of success to begin with (emerging research area => a higher marginal utility of dollars spent). We’d love to see more projects that are “out there,” for exactly these reasons!
 
 <div className="mb-4 ml-8">
-  <img src="/img/grandprize/banner.webp" className="w-[100%] max-w-[400px]"/>
+  <img src="/img/grandprize/banner.webp" className="w-[100%] max-w-[400px]" alt="Vesuvius Challenge promotional banner."/>
 </div>
 
 2. **A solid starting point.** The foundation was laid by <a href="https://www2.cs.uky.edu/dri/">Dr. Seales and his team</a>. They spent two decades making the first scroll scans, building <a href="community_projects#volume-cartographer">Volume Cartographer</a>, demonstrating the <a href="https://www2.cs.uky.edu/dri/the-scroll-from-en-gedi/">first success</a> in virtual unwrapping, and <a href="https://uknowledge.uky.edu/cs_etds/138/">proving</a> that Herculaneum ink can be detected in CT.
 
 <div className="mb-4 ml-8">
-  <img src="/img/landing/brent1.webp" className="w-[100%] max-w-[600px]"/>
+  <img src="/img/landing/brent1.webp" className="w-[100%] max-w-[600px]" alt="Brent Seales, Seth Parker, and Michael Drakopoulos at the particle accelerator."/>
   <figcaption className="mt-[-6px]">Brent Seales, Seth Parker, and Michael Drakopoulos at the particle accelerator.</figcaption>
 </div>
 
@@ -374,8 +380,8 @@ With Vesuvius Challenge, we hope not only to solve the problem of reading the He
 <div className="ml-8 mb-4">Instead, we blended competition and cooperation by adding <a href="/winners">“progress prizes”</a> along the way. These were smaller prizes (often in the \$1,000-10,000 range) every ~2 months. To win a progress prize, you had to publish your code or research as open source, thereby benefiting the entire community.</div>
 
 <div className="mb-4 ml-8">
-  <img src="/img/grandprize/winners1.webp" className="w-[100%]"/>
-  <img src="/img/grandprize/winners3.webp" className="w-[100%]"/>
+  <img src="/img/grandprize/winners1.webp" className="w-[100%]" alt="A group of Vesuvius Challenge prize winners."/>
+  <img src="/img/grandprize/winners3.webp" className="w-[100%]" alt="More Vesuvius Challenge prize winners."/>
   <figcaption className="mt-[-6px]">Some of the many prize winners.</figcaption>
 </div>
 
@@ -388,9 +394,9 @@ With Vesuvius Challenge, we hope not only to solve the problem of reading the He
 <div className="ml-8 mb-4">We were not dogmatically attached to just being referees; we were willing to run out onto the field and kick the ball a little. So we did what we thought would maximize success, and for the critical bottleneck of segmentation, that meant hiring a team.</div>
 
 <div className="flex flex-wrap mb-4 ml-8">
-  <div className="w-[30%] mr-4 mb-2"><img src="/img/grandprize/ben-smaller.webp"/></div>
-  <div className="w-[30%] mr-4 mb-2"><img src="/img/grandprize/david.webp"/></div>
-  <div className="w-[25%]"><img src="/img/grandprize/konrad-smaller.webp"/></div>
+  <div className="w-[30%] mr-4 mb-2"><img src="/img/grandprize/ben-smaller.webp" alt="Portrait of segmentation team member Ben Kyles."/></div>
+  <div className="w-[30%] mr-4 mb-2"><img src="/img/grandprize/david.webp" alt="Portrait of segmentation team member David Josey."/></div>
+  <div className="w-[25%]"><img src="/img/grandprize/konrad-smaller.webp" alt="Portrait of segmentation team member Konrad Rosenberg."/></div>
   <figcaption className="mt-[-6px]">Our wonderful segmentation team: Ben, David, and Konrad. Also a big shout-out to former team members!</figcaption>
 </div>
 
@@ -399,7 +405,7 @@ With Vesuvius Challenge, we hope not only to solve the problem of reading the He
 5. **Maximizing surface area for breakthroughs.** Our success was the result of many smaller breakthroughs by a broad group of people. It’s remarkable how many things had to come together to make this happen. Remove any of these, and we would not have succeeded, at least not within this timeframe.
 
 <div className="mb-4 ml-8">
-  <img src="/img/grandprize/steps.webp" className="w-[100%] max-w-[400px]"/>
+  <img src="/img/grandprize/steps.webp" className="w-[100%] max-w-[400px]" alt="Diagram of the many breakthroughs and steps that led to reading the scroll."/>
 </div>
 
 <div className="ml-8 mb-4">There are many more contributions than we can list here - even ideas and discoveries landing outside the critical path were still important, because a massive search space had to be exhausted to find the ideas that worked. Given the right framework, the collective intelligence of a community like this is very powerful.</div>
@@ -443,7 +449,7 @@ The potential of tens of thousands of scrolls, still buried, waiting to be disco
 Read more detail about what comes next in our [Master Plan](master_plan).
 
 <div className="mb-4">
-  <img src="/img/landing/rocio-espin-pinar-villa-papyri-small.webp" className="w-[100%] max-w-[600px]"/>
+  <img src="/img/landing/rocio-espin-pinar-villa-papyri-small.webp" className="w-[100%] max-w-[600px]" alt="Artist's reconstruction of the Villa of the Papyri by Rocio Espin Pinar."/>
 </div>
 
 ## Thank you

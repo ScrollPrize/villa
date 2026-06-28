@@ -1,7 +1,6 @@
 #pragma once
 
 #include <QDockWidget>
-#include <QListView>
 #include <QStandardItemModel>
 #include <QPushButton>
 #include <QString>
@@ -14,9 +13,10 @@
 class QLabel;
 class QButtonGroup;
 class QAction;
+class QCheckBox;
 class QLineEdit;
+class QTreeView;
 class QVBoxLayout;
-class QComboBox;
 
 class CFiberWidget : public QDockWidget
 {
@@ -24,11 +24,32 @@ class CFiberWidget : public QDockWidget
 
 public:
     struct FiberEntry {
+        struct AlignmentMetrics {
+            bool available = false;
+            bool pending = false;
+            int sampleCount = 0;
+            double meanErrorDegrees = 0.0;
+            double maxErrorDegrees = 0.0;
+            std::string error;
+        };
+
+        struct SpanEntry {
+            int spanIndex = 0;
+            int firstControlIndex = 0;
+            int secondControlIndex = 0;
+            int controlPointCount = 0;
+            int linePointCount = 0;
+            double lengthVx = 0.0;
+            AlignmentMetrics alignment;
+        };
+
         uint64_t id = 0;
         std::string fileName;
         int controlPointCount = 0;
         int linePointCount = 0;
         double lengthVx = 0.0;
+        AlignmentMetrics alignment;
+        std::vector<SpanEntry> spans;
         double hvZDistance = 0.0;
         double hvFiberLength = 0.0;
         double horizontalScore = 0.0;
@@ -48,13 +69,15 @@ public:
     bool canCreateAtlasFromSelection() const;
     bool canShowFiberSlice() const;
     bool canRenameFiberFile() const;
+    std::vector<uint64_t> orderedFiberIds() const;
     QAction* createShowFiberSliceAction(QObject* parent);
     QAction* createRenameFiberFileAction(QObject* parent);
     void setFibers(const std::vector<FiberEntry>& fibers);
+    void setAlignmentMetricsPending(bool pending);
+    void updateAlignmentMetrics(uint64_t fiberId,
+                                const FiberEntry::AlignmentMetrics& alignment,
+                                const std::vector<FiberEntry::AlignmentMetrics>& spanAlignments);
     void setKnownTags(const std::vector<std::string>& tags);
-    // Reflect the controller's effective working-volume scale in the UI. `autoDetected` is true
-    // when the value came from auto-detection rather than a user override.
-    void setVolumeScaleDisplay(double effectiveScale, bool autoDetected);
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
@@ -65,12 +88,12 @@ signals:
     void manualHvTagChanged(uint64_t fiberId, QString tag);
     void fiberTagChanged(uint64_t fiberId, QString tag, bool enabled);
     void hvScoreRecalculationRequested(uint64_t fiberId);
+    void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void newAtlasFromFiberRequested(uint64_t fiberId);
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
-    // Working-volume scale override chosen by the user; a value <= 0 requests auto-detection.
-    void volumeScaleOverrideChanged(double scale);
+    void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
 
 private slots:
     void onSelectionChanged();
@@ -80,11 +103,18 @@ private slots:
     void onManualHvResetClicked();
     void onRecalculateHvScoreClicked();
     void onAddTagClicked();
+    void onHeaderSectionClicked(int section);
     void showContextMenu(const QPoint& pos);
 
 private:
     void setupUi();
+    void rebuildModel();
+    void sortFibers();
     QStandardItem* findFiberItem(uint64_t fiberId);
+    QList<QStandardItem*> rowItemsForNameItem(QStandardItem* nameItem) const;
+    void updateMetricDisplayForRow(QStandardItem* nameItem,
+                                   const FiberEntry::AlignmentMetrics& alignment);
+    void refreshMetricDisplays();
     const FiberEntry* selectedFiber() const;
     void updateClassificationUi();
     void rebuildTagList();
@@ -94,17 +124,19 @@ private:
     void requestShowFiberSlice();
     void requestRenameFiberFile();
     bool confirmDeleteFibers(const std::vector<uint64_t>& fiberIds);
-    static QString labelForFiber(const FiberEntry& fiber);
+    static QString displayNameForFiber(const FiberEntry& fiber);
+    static QString directionForFiber(const FiberEntry& fiber);
 
     uint64_t _selectedFiberId = 0;
     std::vector<FiberEntry> _fibers;
     std::vector<std::string> _knownTags;
     std::function<bool(const std::vector<uint64_t>&)> _deleteConfirmationForTesting;
+    int _sortColumn = 0;
+    Qt::SortOrder _sortOrder = Qt::AscendingOrder;
 
-    QListView* _listView;
+    QCheckBox* _calcMetricsCheckBox;
+    QTreeView* _treeView;
     QStandardItemModel* _model;
-    QComboBox* _volumeScaleCombo;
-    QLabel* _volumeScaleInfoLabel;
     QLabel* _nameLabel;
     QLabel* _scoreLabel;
     QLabel* _autoLabel;
