@@ -75,7 +75,12 @@ required_formulae=(
   cmake
   ninja
   pkgconf
-  qt
+  # Homebrew split the Qt 6 formula into qtbase/qtsvg/qtdeclarative. VC3D's
+  # required Qt6 components come from qtbase; keep the split formulae explicit
+  # so the dependency check works on current Homebrew.
+  qtbase
+  qtsvg
+  qtdeclarative
   ceres-solver
   eigen
   opencv
@@ -163,6 +168,11 @@ fi
 for keg in lapack openblas; do
   if [[ -d "$brew_prefix/opt/$keg" ]]; then
     export PKG_CONFIG_PATH="$brew_prefix/opt/$keg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export CMAKE_PREFIX_PATH="$brew_prefix/opt/$keg${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+  fi
+done
+for keg in qtbase qtsvg qtdeclarative opencv; do
+  if [[ -d "$brew_prefix/opt/$keg" ]]; then
     export CMAKE_PREFIX_PATH="$brew_prefix/opt/$keg${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
   fi
 done
