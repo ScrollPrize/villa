@@ -5340,8 +5340,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                     throw std::runtime_error(
                         "Selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
                 }
-                vc::atlas::rebuildAtlasFromSourceFibers(
-                    atlasDir, volpkgRoot, sampler);
+                vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
                 displayAtlasFromDirectory(atlasDir);
             } catch (const std::exception& rebuildEx) {
                 QMessageBox::warning(
@@ -6132,6 +6131,10 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::newAtlasFromFiberRequested,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::createAtlasFromFiber);
+            connect(widget,
+                    &CFiberWidget::addFibersToPointCollectionsRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::addFibersToPointCollections);
             connect(widget,
                     &CFiberWidget::fiberSliceRequested,
                     this,

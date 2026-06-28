@@ -141,6 +141,8 @@ public:
     void calculateFiberAlignmentMetrics(std::vector<uint64_t> orderedFiberIds);
     void requestFiberAlignmentMetrics(uint64_t fiberId);
     void createAtlasFromFiber(uint64_t fiberId);
+    void addFiberToPointCollection(uint64_t fiberId);
+    void addFibersToPointCollections(std::vector<uint64_t> fiberIds);
     void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
     void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
                                     QMdiArea* targetArea,

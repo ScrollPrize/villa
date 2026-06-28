@@ -11,12 +11,14 @@
 #include "ViewerManager.hpp"
 #include "overlays/FiberSliceOverlayController.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/ui/VCCollection.hpp"
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -1933,6 +1935,50 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
     }
 }
 
+void LineAnnotationController::addFiberToPointCollection(uint64_t fiberId)
+{
+    auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (fiberIt == _fibers.end()) {
+        showError(tr("Selected fiber is not available"));
+        return;
+    }
+    if (fiberIt->controlPoints.empty()) {
+        showError(tr("Selected fiber has no control points"));
+        return;
+    }
+
+    auto* col = _state ? _state->pointCollection() : nullptr;
+    if (!col) {
+        showError(tr("No point collection is available"));
+        return;
+    }
+
+    const std::string name = col->generateNewCollectionName("fiber");
+    const uint64_t collectionId = col->addCollection(name);
+
+    CollectionMetadata meta;
+    meta.absolute_winding_number = false;
+    col->setCollectionMetadata(collectionId, meta);
+
+    std::vector<cv::Vec3f> points;
+    points.reserve(fiberIt->controlPoints.size());
+    for (const auto& cp : fiberIt->controlPoints) {
+        points.emplace_back(static_cast<float>(cp[0]),
+                            static_cast<float>(cp[1]),
+                            static_cast<float>(cp[2]));
+    }
+    col->addPoints(name, points);
+}
+
+void LineAnnotationController::addFibersToPointCollections(std::vector<uint64_t> fiberIds)
+{
+    for (uint64_t fiberId : fiberIds) {
+        addFiberToPointCollection(fiberId);
+    }
+}
+
 void LineAnnotationController::showFiberSlice(uint64_t fiberId, QMdiArea* targetArea)
 {
     namespace fslice = vc3d::fiber_slice;
@@ -2617,7 +2663,8 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     "not showing a synthetic strip");
             }
             side.editSession->optimizedLine =
-                lineModelFromPoints(side.fiber->linePoints, side.editSession->normalSampler.get());
+                lineModelFromPoints(side.fiber->linePoints,
+                                    side.editSession->normalSampler.get());
             side.lineViews = vc::lasagna::buildLineViewSurfaces(side.editSession->optimizedLine);
             Logger()->info("Intersection {} strip built from sampled normals: fiber={} points={} surface={} side_slice={}",
                            side.displayPrefix,
@@ -4950,15 +4997,12 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     _state->setSurface(generatedViews.currentCutName, generatedViews.currentCutSurface);
     session.generatedSurfaceNames.push_back(generatedViews.currentCutName);
 
-    generatedViews.bottomCutSurfaces.reserve(7);
-    for (int i = 0; i < 7; ++i) {
-        const std::string surfaceName =
-            generatedPrefix + "_line_bottom_cut_" + std::to_string(i);
-        auto plane = std::make_shared<PlaneSurface>(seedPoint, cv::Vec3f{1.0f, 0.0f, 0.0f});
-        _state->setSurface(surfaceName, plane);
-        session.generatedSurfaceNames.push_back(surfaceName);
-        generatedViews.bottomCutSurfaces.push_back({surfaceName, std::move(plane)});
-    }
+    generatedViews.sideCutName = "line-side-cut";
+    generatedViews.sideCutSurface = std::make_shared<PlaneSurface>(
+        seedPoint,
+        cv::Vec3f{1.0f, 0.0f, 0.0f});
+    _state->setSurface(generatedViews.sideCutName, generatedViews.sideCutSurface);
+    session.generatedSurfaceNames.push_back(generatedViews.sideCutName);
 
     auto* pane = paneForSurface(session.surfaceName);
     if (!pane || !pane->dialog) {

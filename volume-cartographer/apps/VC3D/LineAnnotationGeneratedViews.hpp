@@ -87,7 +87,8 @@ struct GeneratedViews {
     QString lineSideSliceTitle;
     std::string currentCutName;
     std::shared_ptr<PlaneSurface> currentCutSurface;
-    std::vector<std::pair<std::string, std::shared_ptr<PlaneSurface>>> bottomCutSurfaces;
+    std::string sideCutName;
+    std::shared_ptr<PlaneSurface> sideCutSurface;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
