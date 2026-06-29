@@ -11,15 +11,13 @@ from spiral_helpers import _huber_abs
 cfg = None
 z_begin = None
 z_end = None
-downsample_factor = None
 
 
-def configure_losses(config, z_begin_value, z_end_value, downsample_factor_value):
-    global cfg, z_begin, z_end, downsample_factor
+def configure_losses(config, z_begin_value, z_end_value):
+    global cfg, z_begin, z_end
     cfg = config
     z_begin = z_begin_value
     z_end = z_end_value
-    downsample_factor = downsample_factor_value
 
 
 def _masked_mean(values, mask):
@@ -793,7 +791,7 @@ def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points):
 
 
 
-def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=2.0):
+def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None):
     # Sample points uniformly over the spiral cylinder (a disk of radius
     # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI). Two losses are computed:
     #   (normals) the spiral radial covector at each sample is pulled back to scroll space via
@@ -806,8 +804,7 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     #             them. grad_mag is a density, not a distance, so the number of windings the
     #             segment actually crosses is the line integral of that density along it; for a
     #             correct fit the integral equals 1 (one winding). The density is decoded from
-    #             grad_mag and converted from base-volume to current-grid voxels via
-    #             downsample_factor.
+    #             grad_mag in windings per full-resolution voxel.
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if lasagna_volume is None or outer_winding_idx is None:
@@ -816,6 +813,9 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     volume = lasagna_volume['volume']  # 3 (nx, ny, grad_mag), z, y, x  uint8
     z_size, y_size, x_size = lasagna_volume['shape']
     z_origin = lasagna_volume['z_origin']
+    lasagna_scale = lasagna_volume['lasagna_scale']
+    if epsilon is None:
+        epsilon = cfg['dense_normals_finite_difference_epsilon']
 
     dr = dr_per_winding.detach()
     r_max = dr * float(outer_winding_idx)
@@ -838,7 +838,7 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     # Look up the precomputed scroll-space targets at the midpoint of the displacement (the
     # geometric centre of the one-winding step in scroll space).
     scroll_mid = ((scroll_inner + scroll_outer) / 2).detach()
-    sample_zyx = scroll_mid.round().long()
+    sample_zyx = (scroll_mid / lasagna_scale).round().long()
     zi = sample_zyx[:, 0] - z_origin
     yi = sample_zyx[:, 1]
     xi = sample_zyx[:, 2]
@@ -863,12 +863,12 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     # the one-winding scroll-space segment (scroll_inner -> scroll_outer) is the line integral of
     # this density along it, so we sample the density at evenly spaced midpoints along the segment
     # and accumulate density * dl (a midpoint Riemann sum). For a correct fit the integral equals 1.
-    density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * downsample_factor
+    density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale']
     num_steps = int(cfg['spacing_integration_steps'])
     step_frac = (torch.arange(num_steps, device=device).float() + 0.5) / num_steps  # midpoints in [0, 1]
     # [num_points, num_steps, 3] scroll-space samples along scroll_inner -> scroll_outer
     integration_zyx = scroll_inner[:, None, :] + step_frac[None, :, None] * scroll_displacement[:, None, :]
-    int_idx = integration_zyx.detach().round().long()
+    int_idx = (integration_zyx.detach() / lasagna_scale).round().long()
     izi = int_idx[..., 0] - z_origin
     iyi = int_idx[..., 1]
     ixi = int_idx[..., 2]
@@ -976,7 +976,7 @@ def get_unattached_pcl_strip_losses(
 
 
 
-def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=1.0):
+def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, outer_winding_idx, num_points, epsilon=None):
     # In-surface symmetric Dirichlet energy of the spiral<->scroll map, evaluated at points sampled
     # uniformly over the spiral cylinder (see sample_spiral_surface_frame).
     # At each point we take the orthonormal in-surface frame (e1, e2) in spiral space, map it to scroll
@@ -988,6 +988,8 @@ def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, oute
     device = dr_per_winding.device
     if outer_winding_idx is None:
         return torch.zeros([], device=device)
+    if epsilon is None:
+        epsilon = cfg['sym_dirichlet_finite_difference_epsilon']
 
     spiral_zyx, e1, e2 = sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points)
 
@@ -1015,5 +1017,4 @@ def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, oute
     # Per-sample cap so a single near-degenerate sample doesn't dominate the batch mean / gradient.
     energy = energy.clamp(max=1.e2)
     return energy.mean()
-
 

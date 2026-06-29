@@ -13,11 +13,11 @@ from sample_spiral import get_bounding_windings, get_theta, get_theta_and_radii
 from tracks import render_spiral_on_tracks_for_slice
 
 
-def _compute_patch_lines_by_slice(patches, slice_zs, cache_path, downsample_factor):
+def _compute_patch_lines_by_slice(patches, slice_zs, cache_path, cache_version='full_res_v1'):
     all_zs = np.array(slice_zs)
     patch_ids_str = '_'.join(sorted(str(id(p)) for p in patches))
     hashed_patches = hashlib.sha256(bytes(patch_ids_str, 'ascii')).hexdigest()[:8]
-    cache_filename = f'{cache_path}/patches-{hashed_patches}_lines_v3_ds-{downsample_factor}_slices-{hash(tuple(all_zs))}.pkl'
+    cache_filename = f'{cache_path}/patches-{hashed_patches}_lines_v3_{cache_version}_slices-{hash(tuple(all_zs))}.pkl'
 
     if os.path.exists(cache_filename):
         with open(cache_filename, 'rb') as fp:
@@ -55,10 +55,10 @@ def _compute_patch_lines_by_slice(patches, slice_zs, cache_path, downsample_fact
     return lines_by_slice
 
 
-def overlay_patches_on_slices(patches, slice_zs, slice_shape, cache_path, downsample_factor):
+def overlay_patches_on_slices(patches, slice_zs, slice_shape, cache_path, cache_version='full_res_v1', canvas_scale=1):
     color_slices = torch.zeros([len(slice_zs), *slice_shape, 3], dtype=torch.uint8)
     quad_label_slices = torch.zeros(color_slices.shape[:-1], dtype=torch.int32, device=color_slices.device)
-    lines_by_slice = _compute_patch_lines_by_slice(patches, slice_zs, cache_path, downsample_factor)
+    lines_by_slice = _compute_patch_lines_by_slice(patches, slice_zs, cache_path, cache_version)
     patch_colors = [tuple(np.random.randint(100, 256, size=3).tolist()) for _ in patches]
 
     # Each patch contributes (H-1)*(W-1) grid quads (row-major, including invalid ones - they
@@ -78,7 +78,7 @@ def overlay_patches_on_slices(patches, slice_zs, slice_shape, cache_path, downsa
             color = patch_colors[patch_idx] if patch_idx < len(patch_colors) else (255, 255, 255)
             offset = int(quad_offsets[patch_idx])
             for line_xy, quad_idx in zip(lines, line_quad_indices):
-                line_points = line_xy.flatten().tolist()
+                line_points = (line_xy / canvas_scale).flatten().tolist()
                 color_draw.line(line_points, fill=color)
                 quad_label_draw.line(line_points, fill=int(offset + int(quad_idx) + 1))
         color_slices[slice_idx] = torch.from_numpy(np.array(color_img))
@@ -134,7 +134,7 @@ def save_overlay(
     winding_range,
     tracks,
     out_path, suffix,
-    downsample_factor,
+    render_volume_scale=1,
 ):
 
     device = slice_yx.device
@@ -191,7 +191,7 @@ def save_overlay(
         image = Image.fromarray(canvas)
         if unattached_pcl_strips:
             draw = ImageDraw.Draw(image)
-            pcl_z_window = 4
+            pcl_z_window = 16
             point_radius = 1
             pcl_palette = [(200, 0, 0), (230, 140, 0), (255, 200, 0)]  # matches status_palette[0:3]
             for k, strip in enumerate(unattached_pcl_strips):
@@ -202,8 +202,8 @@ def save_overlay(
                 fully = bool(unattached_pcl_fully_satisfied[k].item())
                 per_point_sat = unattached_pcl_per_point_satisfied[k].numpy()
                 for idx in np.nonzero(in_slab)[0]:
-                    y = float(zyxs[idx, 1])
-                    x = float(zyxs[idx, 2])
+                    y = float(zyxs[idx, 1]) / render_volume_scale
+                    x = float(zyxs[idx, 2]) / render_volume_scale
                     if fully:
                         colour = pcl_palette[2]
                     elif per_point_sat[idx]:
@@ -267,15 +267,16 @@ def save_overlay(
             spiral_and_transform, slice_to_spiral_transform, slice_yx, slice_z, winding_range,
         )
         slice = scroll_slices_for_visualisation[vis_slice_idx].to(device)
-        # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z * downsample_factor:05}')
-        # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z * downsample_factor:05}')
-        overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z * downsample_factor:05}')
+        # overlay_on_scroll(slice_zyx, spiral_zyx, spiral_density, slice, f'scroll_s{slice_z:05}')
+        # overlay_on_predictions(spiral_density, prediction_slices_for_visualisation[vis_slice_idx].to(device), slice > 0., f'pred_s{slice_z:05}')
+        overlay_on_patch_satisfaction(spiral_density, spiral_zyx, quad_label_map[vis_slice_idx], slice_z, f'patches_s{slice_z:05}')
         if tracks:
             render_spiral_on_tracks_for_slice(
                 spiral_zyx, spiral_density, dr_per_winding,
                 slice_z, tracks, [],
-                out_path, suffix, downsample_factor,
+                out_path, suffix,
+                render_volume_scale=render_volume_scale,
             )
         if os.environ.get('FIT_SPIRAL_SAVE_DISPLACEMENT') == '1':
             slice_zyx = torch.cat([torch.full([*slice_yx.shape[:2], 1], slice_z, device=device), slice_yx], dim=-1)
-            visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z * downsample_factor:05}')
+            visualise_field(spiral_zyx - slice_zyx, f'displacement_s{slice_z:05}')

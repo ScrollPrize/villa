@@ -62,7 +62,6 @@ from spiral_helpers import (
     load_fiber_point_collections,
     scale_counts_for_z_range,
     _infer_shell_outer_winding_idx,
-    scale_patch,
     patch_intersects_z_roi
 )
 import sample_spiral
@@ -97,14 +96,14 @@ run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
 shell_path = f'{dataset_path}/s1_2um_outer'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'
 spiral_outward_sense = 'CW'  # CW | ACW
-umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', downsample_factor=f)
+umbilicus_z_to_yx = lambda: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', coordinate_scale=1.0)
 scroll_name = 's1'
 z_begin, z_end = 7000, 17000
-voxel_size_um = 2.4 * 4  # before downsampling
+voxel_size_um = 2.4
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
-downsample_factor = 4
-z_begin //= downsample_factor
-z_end //= downsample_factor
+coordinate_system_version = 'full_res_v1'
+lasagna_scale = 4
+render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 
 default_config = {
     'random_seed': 1,
@@ -120,19 +119,19 @@ default_config = {
     'num_flow_integration_steps': 3,
     'flow_integration_solver': 'rk4',
     'num_flow_timesteps': 1,
-    'flow_bounds_z_margin': 40,
-    'flow_bounds_radius': 800,
-    'flow_voxel_resolution': 4,
+    'flow_bounds_z_margin': 160,
+    'flow_bounds_radius': 3200,
+    'flow_voxel_resolution': 16,
     'flow_field_type': 'cartesian',  # 'cartesian' or 'cylindrical'
     'flow_field_high_res_lr_scale_initial': 3.0e-1,
     'flow_field_high_res_lr_scale_final': 3.0e-1,
     'flow_field_high_res_lr_ramp_start_step': 0,
     'flow_field_high_res_lr_ramp_steps': 1,
-    'gap_expander_logit_resolution': 6,
+    'gap_expander_logit_resolution': 24,
     'gap_expander_num_windings': 130,
     'gap_expander_lr_scale': 0.3,
-    'linear_z_resolution': 12,
-    'initial_dr_per_winding': 4.,
+    'linear_z_resolution': 48,
+    'initial_dr_per_winding': 16.,
     'patch_radius_loss_margin': 0.025,
     'patch_radius_loss_inv': False,
     'patch_loss_z_margin': 0,
@@ -154,7 +153,7 @@ default_config = {
     'unverified_num_patches_per_step': 120,
     'unverified_num_patches_per_step_for_dt': 80,
     'unverified_num_points_per_patch': 800,
-    'unverified_patch_exclusion_radius': 16.0,  # mask unverified-patch vertices within this of trusted geometry (downsampled voxels)
+    'unverified_patch_exclusion_radius': 64.0,  # mask unverified-patch vertices within this of trusted geometry (full-res voxels)
     'rel_winding_num_pcls': 48,
     'rel_winding_num_patch_pairs_per_pcl': 4,
     'rel_winding_adjacent_patches_only': True,
@@ -163,7 +162,7 @@ default_config = {
     'fiber_min_point_spacing': 40.,
     'unattached_pcl_num_per_step': 84,
     'unattached_pcl_num_points_per_step': 32,
-    'unattached_pcl_min_point_spacing': 4.,
+    'unattached_pcl_min_point_spacing': 16.,
     'track_num_per_step': 48000,
     'track_num_points_per_step': 24,
     'track_exclusion_radius': 0.0,
@@ -176,23 +175,25 @@ default_config = {
     'dense_normals_num_points': 60_000,
     'regularisation_num_points': 4500,
     'grad_mag_encode_scale': 1000.0,
-    'grad_mag_factor': 0.25 * 4,  # 4 maps from 2um to 8um
+    'grad_mag_factor': 0.25,
     'spacing_integration_steps': 8,
-    'loss_weight_patch_radius': 32.e0,
-    'loss_weight_patch_dt': 16.e0,
-    'loss_weight_unverified_patch_radius': 8.e0,
-    'loss_weight_unverified_patch_dt': 4.e0,
-    'loss_weight_rel_winding': 20.,
-    'loss_weight_abs_winding': 20.,
-    'loss_weight_unattached_pcl_radius': 8.e0,
-    'loss_weight_unattached_pcl_dt': 16.e0,
-    'loss_weight_track_radius': 200.,
-    'loss_weight_track_dt': 40.,
+    'dense_normals_finite_difference_epsilon': 8.0,
+    'sym_dirichlet_finite_difference_epsilon': 4.0,
+    'loss_weight_patch_radius': 8.e0,
+    'loss_weight_patch_dt': 4.e0,
+    'loss_weight_unverified_patch_radius': 2.e0,
+    'loss_weight_unverified_patch_dt': 1.e0,
+    'loss_weight_rel_winding': 5.,
+    'loss_weight_abs_winding': 5.,
+    'loss_weight_unattached_pcl_radius': 2.e0,
+    'loss_weight_unattached_pcl_dt': 4.e0,
+    'loss_weight_track_radius': 50.,
+    'loss_weight_track_dt': 10.,
     'loss_weight_sym_dirichlet': 10.0,
     'loss_weight_dense_normals': 1.e2,
     'loss_weight_dense_spacing': 8.,
-    'loss_weight_umbilicus': 5.,
-    'loss_weight_shell_outer': 4.0,
+    'loss_weight_umbilicus': 1.25,
+    'loss_weight_shell_outer': 1.0,
     'loss_weight_shell_patch_radius': 0.0,
     'weight_decay_gap_expander': 1.e-2,
     'weight_decay_flow_field': 0.0,
@@ -205,13 +206,13 @@ default_config = {
     'dt_progressive_exponent': 1.0,  # warp on the time fraction; 1.0 = linear in winding, <1 = slower later (~0.5 ≈ constant area rate)
     'output_first_winding': 10,
     'output_winding_margin': 4,
-    'output_step_size': 20,
+    'output_step_size': 80,
     'shell_outer_winding_idx': 130,
     'shell_outer_winding_margin': 10,
     'shell_num_samples': 24576,
     'shell_num_theta_bins': 720,
-    'shell_huber_delta': 4.0,
-    'shell_table_smooth_sigma_z': 1.0,
+    'shell_huber_delta': 16.0,
+    'shell_table_smooth_sigma_z': 4.0,
     'shell_table_smooth_sigma_theta': 1.0,
     'shell_min_confidence': 0.25,
 }
@@ -232,7 +233,7 @@ def get_env_config_overrides():
 
 
 # The per-step object-sample counts above are tuned for the z 7000-16500 range
-# (~9500 un-downsampled slices). For a smaller/larger z-range each loss term sees
+# (~9500 full-resolution slices). For a smaller/larger z-range each loss term sees
 # proportionally fewer/more objects, so scale_counts_for_z_range() scales these
 # counts linearly with the number of slices (points-PER-object stays fixed).
 def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3., winding_range=None):
@@ -498,7 +499,7 @@ def main():
 
     np.random.seed(cfg['random_seed'])
     torch.random.manual_seed(cfg['random_seed'])
-    umbilicus = umbilicus_z_to_yx(downsample_factor)
+    umbilicus = umbilicus_z_to_yx()
     if scroll_zarr_path:
         print('loading volume zarr')
         scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
@@ -525,7 +526,6 @@ def main():
         if not shell_path:
             raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
         shell_patch = load_tifxyz(shell_path)
-        scale_patch(shell_patch, downsample_factor)
 
     if cfg['disable_patches']:
         verified_patches = {}
@@ -545,10 +545,6 @@ def main():
 
     for patches in (verified_patches, unverified_patches):
         for patch_id, patch in list(patches.items()):
-            # scale the patch zyx coords by the downsample factor -- this does not
-            # reduce the size of the zyxs array itself
-            scale_patch(patch, downsample_factor)
-
             # we erode cells this distance from any invalid cell to catch annotation errors
             # which are hard to detect at the edges of patches
             cells_to_erode = int(cfg['erode_patches'])
@@ -566,9 +562,9 @@ def main():
     # Point collection loading
     # ==========================================================================
 
-    # Load all pcls, transform into (downsampled) voxel space, link every point to patches,
-    # and split into cross-patch / unattached sets. Verified patches must already be
-    # downsampled and filtered to the z-roi.
+    # Load all pcls in full-resolution voxel space, link every point to patches,
+    # and split into cross-patch / unattached sets. Verified patches must already
+    # be filtered to the z-roi.
     point_collections = {}
     next_id = 0
     for pattern in pcl_json_paths:
@@ -595,7 +591,7 @@ def main():
 
     for pcl in point_collections.values():
         for point in pcl['points'].values():
-            point['zyx'] = np.array([point['p'][2], point['p'][1], point['p'][0]]) / downsample_factor
+            point['zyx'] = np.array([point['p'][2], point['p'][1], point['p'][0]], dtype=np.float32)
 
     def pcl_intersects_z_roi(pcl):
         for point in pcl['points'].values():
@@ -777,12 +773,12 @@ def main():
         normal_zarr_group=normal_zarr_group,
         z_begin=z_begin,
         z_end=z_end,
-        downsample_factor=downsample_factor,
+        lasagna_scale=lasagna_scale,
     )
 
     if tracks_dbm_path is not None:
         print(f'loading tracks from {tracks_dbm_path}')
-        tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end, downsample_factor)
+        tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
         print(f'loaded {len(tracks)} tracks within z-roi [{z_begin}, {z_end})')
     else:
         tracks = None
@@ -858,7 +854,7 @@ def main():
     print(f'fitting {num_verified_patches} patches')
 
     out_base_dir = os.environ.get('FIT_SPIRAL_OUT_DIR', './out')
-    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin * downsample_factor}-{z_end * downsample_factor}_{num_verified_patches}-patch'
+    out_path = f'{out_base_dir}/{datetime.date.today()}_{scroll_name}_slice-{z_begin}-{z_end}_{num_verified_patches}-patch'
     if not wandb.run.name.startswith('dummy-'):
         out_path += '_' + wandb.run.name
     if run_tag:
@@ -996,14 +992,17 @@ def main():
     if scroll_zarr is not None:
         subvolume_shape = tuple([z_end - z_begin, *scroll_zarr.shape[1:]])
         print('loading slices for visualisation')
+        vis_zs = np.floor(zs_for_visualisation / render_volume_scale).astype(np.int64)
         scroll_slices_for_visualisation = (
-                    torch.from_numpy(scroll_zarr[zs_for_visualisation]).to(torch.float32) / np.iinfo(
+                    torch.from_numpy(scroll_zarr[vis_zs]).to(torch.float32) / np.iinfo(
                 scroll_zarr.dtype).max * 0.75 * 255).to(torch.uint8)
+        render_z_begin = int(np.floor(z_begin / render_volume_scale))
+        render_z_end = int(np.ceil(z_end / render_volume_scale))
         scroll_slices_for_rendering = (torch.from_numpy(scroll_zarr[
-                                                            z_begin: z_end: rendering_slices_downsample_factor, ::rendering_slices_downsample_factor, ::rendering_slices_downsample_factor]).to(
+                                                            render_z_begin: render_z_end: rendering_slices_downsample_factor, ::rendering_slices_downsample_factor, ::rendering_slices_downsample_factor]).to(
             torch.int32) // (np.iinfo(scroll_zarr.dtype).max // 255)).to(torch.uint8)
     else:
-        subvolume_shape = [z_end - z_begin, 32693 // 4 // downsample_factor, 32693 // 4 // downsample_factor]
+        subvolume_shape = [z_end - z_begin, int(np.ceil(32693 / render_volume_scale)), int(np.ceil(32693 / render_volume_scale))]
         scroll_slices_for_visualisation = torch.zeros([len(zs_for_visualisation), *subvolume_shape[1:]])
         scroll_slices_for_rendering = None
 
@@ -1012,14 +1011,15 @@ def main():
         zs_for_visualisation,
         subvolume_shape[1:],
         cache_path,
-        downsample_factor,
+        cache_version=coordinate_system_version,
+        canvas_scale=render_volume_scale,
     )
 
     slice_yx = torch.stack(torch.meshgrid(
         torch.arange(subvolume_shape[1], dtype=torch.float32),
         torch.arange(subvolume_shape[2], dtype=torch.float32),
         indexing='ij'
-    ), axis=-1).to(device)
+    ), axis=-1).to(device) * render_volume_scale
 
     # ==========================================================================
     # Model construction and resume
@@ -1037,6 +1037,18 @@ def main():
     model_z_begin, model_z_end = z_begin, z_end
     if resume_path:
         resume_checkpoint = torch.load(resume_path, map_location='cpu')
+        checkpoint_coordinate_system = resume_checkpoint.get('coordinate_system_version') if isinstance(resume_checkpoint, dict) else None
+        if checkpoint_coordinate_system != coordinate_system_version:
+            raise RuntimeError(
+                f'checkpoint {resume_path} has coordinate_system_version={checkpoint_coordinate_system!r}; '
+                f'this script requires {coordinate_system_version!r}. Old fit-space checkpoints are incompatible.'
+            )
+        checkpoint_lasagna_scale = resume_checkpoint.get('lasagna_scale') if isinstance(resume_checkpoint, dict) else None
+        if checkpoint_lasagna_scale != lasagna_scale:
+            raise RuntimeError(
+                f'checkpoint {resume_path} has lasagna_scale={checkpoint_lasagna_scale!r}; '
+                f'this run uses lasagna_scale={lasagna_scale!r}'
+            )
         if isinstance(resume_checkpoint, dict) and 'z_begin' in resume_checkpoint:
             model_z_begin, model_z_end = resume_checkpoint['z_begin'], resume_checkpoint['z_end']
             if (model_z_begin, model_z_end) != (z_begin, z_end):
@@ -1142,6 +1154,8 @@ def main():
             'spiral_and_transform': spiral_and_transform.state_dict(),
             'optimiser': optimiser.state_dict(),
             'cfg': dict(cfg),
+            'coordinate_system_version': coordinate_system_version,
+            'lasagna_scale': lasagna_scale,
             'z_begin': z_begin,
             'z_end': z_end,
         }, f'{out_path}/checkpoint_{suffix}.ckpt')
@@ -1444,7 +1458,7 @@ def main():
             prediction_slices_for_visualisation=prediction_slices_for_visualisation,
             quad_label_map=quad_label_map,
             z_to_umbilicus_yx=umbilicus,
-            downsample_factor=downsample_factor,
+            render_volume_scale=render_volume_scale,
             voxel_size_um=voxel_size_um,
             get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
             run_tag=run_tag,
@@ -1471,14 +1485,14 @@ if __name__ == '__main__':
             'shell_num_samples',
         )
         z_range_scale, z_range_num_slices = scale_counts_for_z_range(
-            config, z_begin, z_end, downsample_factor,
+            config, z_begin, z_end,
             reference_z_range_num_slices, z_range_scaled_count_keys,
         )
         split_divisor = split_counts_across_ranks(config, z_range_scaled_count_keys)
         if is_main_process():
             print(
                 f'scaled per-step counts by {z_range_scale:.3f} for the {z_range_num_slices}-slice '
-                f'z-range [{z_begin * downsample_factor}, {z_end * downsample_factor}) '
+                f'z-range [{z_begin}, {z_end}) '
                 f'(reference {reference_z_range_num_slices} slices):\n  '
                 + '\n  '.join(f'{k}={config[k]}' for k in z_range_scaled_count_keys)
             )
@@ -1491,7 +1505,7 @@ if __name__ == '__main__':
             wandb_mode = 'disabled'
         wandb.init(project='scrolls', config=config, mode=wandb_mode)
         cfg = wandb.config
-        configure_losses(cfg, z_begin, z_end, downsample_factor)
+        configure_losses(cfg, z_begin, z_end)
         main()
     finally:
         maybe_destroy_distributed()

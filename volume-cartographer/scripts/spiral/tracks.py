@@ -13,12 +13,10 @@ from tqdm import tqdm
 from sample_spiral import get_theta_and_radii
 
 
-def load_tracks_from_dbm(path, z_lo, z_hi, downsample_factor):
+def load_tracks_from_dbm(path, z_lo, z_hi):
     # Load tracks written by extract_surface_tracks.py. Each DBM value is a
     # pickled list of (N, 3) int32 zyx arrays; keep only tracks that lie entirely
-    # within [z_lo, z_hi) after accounting for downsampling.
-    z_lo_raw = z_lo * downsample_factor
-    z_hi_raw = z_hi * downsample_factor
+    # within the full-resolution [z_lo, z_hi) ROI.
     tracks = []
     with dbm.open(path, 'r') as db:
         for key in tqdm(db.keys(), desc='loading tracks'):
@@ -37,9 +35,9 @@ def load_tracks_from_dbm(path, z_lo, z_hi, downsample_factor):
             np.cumsum(lengths[:-1], out=offsets[1:])
             zmins = np.minimum.reduceat(zcat, offsets)
             zmaxs = np.maximum.reduceat(zcat, offsets)
-            keep = (zmins >= z_lo_raw) & (zmaxs < z_hi_raw)
+            keep = (zmins >= z_lo) & (zmaxs < z_hi)
             for j in np.nonzero(keep)[0]:
-                tracks.append(entries[idx[j]].astype(np.float32) / downsample_factor)
+                tracks.append(entries[idx[j]].astype(np.float32))
     return tracks
 
 
@@ -464,9 +462,10 @@ def get_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks,
 def render_spiral_on_tracks_for_slice(
     spiral_zyx, spiral_density, dr_per_winding,
     slice_z, all_tracks, snapped_tracks,
-    out_path, name_suffix, downsample_factor,
+    out_path, name_suffix,
+    render_volume_scale=1,
 ):
-    z_window = 5
+    z_window = 20
     point_radius = 1
     target_ids = {id(t) for t in snapped_tracks}
 
@@ -498,10 +497,10 @@ def render_spiral_on_tracks_for_slice(
                 continue
             colour = track_colour(track, is_target)
             for idx in np.nonzero(in_slab)[0]:
-                y = float(track[idx, 1])
-                x = float(track[idx, 2])
+                y = float(track[idx, 1]) / render_volume_scale
+                x = float(track[idx, 2]) / render_volume_scale
                 draw.ellipse(
                     [x - point_radius, y - point_radius, x + point_radius, y + point_radius],
                     fill=colour,
                 )
-    image.save(f'{out_path}/spiral_on_tracks_s{int(slice_z) * downsample_factor:05}_{name_suffix}.png', compress_level=3)
+    image.save(f'{out_path}/spiral_on_tracks_s{int(slice_z):05}_{name_suffix}.png', compress_level=3)

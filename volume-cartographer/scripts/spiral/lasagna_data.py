@@ -82,7 +82,7 @@ def prepare_lasagna_volume(
     normal_zarr_group,
     z_begin,
     z_end,
-    downsample_factor,
+    lasagna_scale,
 ):
     # Densely load the precomputed nx/ny normal-component and grad_mag
     # (windings-per-base-voxel) zarrs over the z-ROI into a compact uint8 volume.
@@ -114,16 +114,16 @@ def prepare_lasagna_volume(
             raise ValueError(f'grad_mag zarr shape {grad_mag_array.shape} differs from dense normal shape {reference_shape}')
 
     if scroll_zarr is not None:
-        expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / downsample_factor).astype(np.int64))
+        expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / lasagna_scale).astype(np.int64))
         if tuple(reference_shape) != expected_shape:
             print(
                 f'WARNING: lasagna zarr shape {reference_shape} does not match '
-                f'ceil(scroll_zarr.shape / downsample_factor) {expected_shape}'
+                f'ceil(scroll_zarr.shape / lasagna_scale) {expected_shape}'
             )
 
     z_size = int(reference_shape[0])
-    z_lo = max(0, z_begin)
-    z_hi = min(z_size, z_end)
+    z_lo = max(0, int(np.floor(z_begin / lasagna_scale)))
+    z_hi = min(z_size, int(np.ceil(z_end / lasagna_scale)))
     if z_hi <= z_lo:
         raise RuntimeError(f'lasagna z-ROI [{z_lo}, {z_hi}) is empty (zarr z size {z_size})')
 
@@ -142,5 +142,6 @@ def prepare_lasagna_volume(
     return {
         'volume': volume,
         'z_origin': z_lo,
+        'lasagna_scale': lasagna_scale,
         'shape': tuple(volume.shape[1:]),  # z, y, x
     }

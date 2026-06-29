@@ -496,7 +496,7 @@ def save_overlay_and_print_satisfaction(
     prediction_slices_for_visualisation,
     quad_label_map,
     z_to_umbilicus_yx,
-    downsample_factor,
+    render_volume_scale,
     voxel_size_um,
     get_or_build_unattached_pcl_flat,
     run_tag=None,
@@ -648,7 +648,7 @@ def save_overlay_and_print_satisfaction(
             winding_range,
             tracks,
             out_path, suffix,
-            downsample_factor,
+            render_volume_scale=render_volume_scale,
         )
     if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
         def get_patch_satisfied_areas_for_mesh(transform, winding_delta, patches, verbose=False):
@@ -658,7 +658,7 @@ def save_overlay_and_print_satisfaction(
 
         save_mesh(
             slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
-            out_path, cfg, z_begin, z_end, downsample_factor, voxel_size_um,
+            out_path, cfg, z_begin, z_end, voxel_size_um,
             get_or_build_unattached_pcl_flat, get_patch_satisfied_areas_for_mesh,
             run_tag=run_tag, name=suffix,
         )

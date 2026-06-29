@@ -29,13 +29,10 @@ def scale_counts_for_z_range(
     config,
     z_begin,
     z_end,
-    downsample_factor,
     reference_z_range_num_slices,
     z_range_scaled_count_keys,
 ):
-    # z_begin/z_end have already been divided by downsample_factor; multiply back so
-    # the scale is expressed in (and matches) un-downsampled slice counts.
-    num_slices = (z_end - z_begin) * downsample_factor
+    num_slices = z_end - z_begin
     scale = num_slices / reference_z_range_num_slices
     for key in z_range_scaled_count_keys:
         config[key] = max(1, round(config[key] * scale))
@@ -570,7 +567,6 @@ def save_mesh(
     cfg,
     z_begin,
     z_end,
-    downsample_factor,
     voxel_size_um,
     get_or_build_unattached_pcl_flat,
     get_patch_satisfied_areas,
@@ -590,7 +586,7 @@ def save_mesh(
     if cfg['shell_outer_winding_idx'] is not None:
         max_winding_idx = min(max_winding_idx, cfg['shell_outer_winding_idx'])
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
-    grid_spacing = cfg['output_step_size'] // downsample_factor
+    grid_spacing = cfg['output_step_size']
     z_margin = cfg['flow_bounds_z_margin']
     spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True)
     num_thetas_by_winding = [len(yxs_for_winding) for yxs_for_winding in spiral_yxs_by_winding]
@@ -619,7 +615,7 @@ def save_mesh(
         satisfied_patches, boundary_satisfied_patches, target_winding_idx_per_patch,
     )
 
-    step_size = grid_spacing * downsample_factor
+    step_size = grid_spacing
     tag_suffix = f'_{run_tag}' if run_tag else ''
     out_dir = f'{out_path}/meshes/{name}{tag_suffix}'
     os.makedirs(out_dir, exist_ok=True)
@@ -629,14 +625,14 @@ def save_mesh(
             if num_thetas >= 2 and winding_idx >= min_winding_idx:
                 winding_slice = variant_zyxs[:, offset:offset + num_thetas]
                 invalid_mask = (winding_slice == -1.0).all(dim=-1).cpu().numpy()
-                winding_zyxs = (winding_slice * downsample_factor).cpu().numpy().astype(np.float32)
+                winding_zyxs = winding_slice.cpu().numpy().astype(np.float32)
                 winding_zyxs[invalid_mask] = -1.0
                 save_tifxyz(
                     winding_zyxs,
                     out_dir,
                     uuid=f'w{winding_idx:03d}{uuid_suffix}{tag_suffix}',
                     step_size=step_size,
-                    voxel_size_um=voxel_size_um * downsample_factor,
+                    voxel_size_um=voxel_size_um,
                     source=f'fit_spiral {name}{uuid_suffix}',
                 )
             offset += num_thetas
