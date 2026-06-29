@@ -124,25 +124,28 @@ std::set<QuadSurface *>& SurfTrackerData::surfs(const cv::Vec2i& loc)
 
 const std::set<QuadSurface *>& SurfTrackerData::surfsC(const cv::Vec2i& loc) const
 {
-    if (!_surfs.contains(loc))
-        return _emptysurfs;
-    else
-        return _surfs.find(loc)->second;
+    // Single hash lookup instead of contains() + find().
+    auto it = _surfs.find(loc);
+    return it == _surfs.end() ? _emptysurfs : it->second;
 }
 
 cv::Vec3d SurfTrackerData::lookup_int(QuadSurface *sm, const cv::Vec2i& p)
 {
-    auto id = std::make_pair(sm, p);
-    if (!_data.contains(id))
+    // Single hash lookup (find) instead of contains() + loc()'s operator[],
+    // and bind rawPoints() once (it is a virtual call returning a ref-counted
+    // cv::Mat header by value) instead of calling it on every use.
+    auto it = _data.find(std::make_pair(sm, p));
+    if (it == _data.end())
         throw std::runtime_error("error, lookup failed!");
-    cv::Vec2d l = loc(sm, p);
+    cv::Vec2d l = it->second;
     if (l[0] == -1)
         return {-1, -1, -1};
     else {
-        cv::Rect bounds = {0, 0, sm->rawPoints().rows - 2, sm->rawPoints().cols - 2};
+        const cv::Mat_<cv::Vec3f> pts = sm->rawPoints();
+        cv::Rect bounds = {0, 0, pts.rows - 2, pts.cols - 2};
         cv::Vec2i li = {static_cast<int>(floor(l[0])), static_cast<int>(floor(l[1]))};
         if (bounds.contains(cv::Point(li)))
-            return at_int_inv(sm->rawPoints(), l);
+            return at_int_inv(pts, l);
         else
             return {-1, -1, -1};
     }
@@ -150,24 +153,25 @@ cv::Vec3d SurfTrackerData::lookup_int(QuadSurface *sm, const cv::Vec2i& p)
 
 bool SurfTrackerData::valid_int(QuadSurface *sm, const cv::Vec2i& p)
 {
-    auto id = std::make_pair(sm, p);
-    if (!_data.contains(id))
+    auto it = _data.find(std::make_pair(sm, p));
+    if (it == _data.end())
         return false;
-    cv::Vec2d l = loc(sm, p);
+    cv::Vec2d l = it->second;
     if (l[0] == -1)
         return false;
     else {
-        cv::Rect bounds = {0, 0, sm->rawPoints().rows - 2, sm->rawPoints().cols - 2};
+        const cv::Mat_<cv::Vec3f> pts = sm->rawPoints();
+        cv::Rect bounds = {0, 0, pts.rows - 2, pts.cols - 2};
         cv::Vec2i li = {static_cast<int>(floor(l[0])), static_cast<int>(floor(l[1]))};
         if (bounds.contains(cv::Point(li)))
         {
-            if (sm->rawPoints()(li[0], li[1])[0] == -1)
+            if (pts(li[0], li[1])[0] == -1)
                 return false;
-            if (sm->rawPoints()(li[0] + 1, li[1])[0] == -1)
+            if (pts(li[0] + 1, li[1])[0] == -1)
                 return false;
-            if (sm->rawPoints()(li[0], li[1] + 1)[0] == -1)
+            if (pts(li[0], li[1] + 1)[0] == -1)
                 return false;
-            if (sm->rawPoints()(li[0] + 1, li[1] + 1)[0] == -1)
+            if (pts(li[0] + 1, li[1] + 1)[0] == -1)
                 return false;
             return true;
         }
@@ -181,9 +185,10 @@ cv::Vec3d SurfTrackerData::lookup_int_loc(QuadSurface *sm, const cv::Vec2f& l)
     if (l[0] == -1)
         return {-1, -1, -1};
     else {
-        cv::Rect bounds = {0, 0, sm->rawPoints().rows - 2, sm->rawPoints().cols - 2};
+        const cv::Mat_<cv::Vec3f> pts = sm->rawPoints();
+        cv::Rect bounds = {0, 0, pts.rows - 2, pts.cols - 2};
         if (bounds.contains(cv::Point(l)))
-            return at_int_inv(sm->rawPoints(), l);
+            return at_int_inv(pts, l);
         else
             return {-1, -1, -1};
     }
