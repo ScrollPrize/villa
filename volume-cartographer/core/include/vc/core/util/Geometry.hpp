@@ -10,6 +10,13 @@ cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc);
 // 1 <= row <= rows-2 and 1 <= col <= cols-2 (no clamping inside).
 cv::Vec3f grid_normal_int(const cv::Mat_<cv::Vec3f> &points, int row, int col);
 
+// Flip surface normals in place (negate each vector). grid_normal uses the
+// right-handed convention N = dP/dU x dP/dV, which points away from the scroll
+// centre when the text is readable; some renders need the opposite direction.
+// Invalid normals (NaN sentinels, as produced by grid_normal) are left
+// untouched so validity is preserved.
+void flip_surface_normals(cv::Mat_<cv::Vec3f> &normals);
+
 
 // Bilinear interpolation at fractional coordinates
 cv::Vec3f at_int(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &p);
