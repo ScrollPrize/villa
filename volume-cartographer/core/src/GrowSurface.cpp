@@ -1306,10 +1306,10 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         }
                         mutex.lock_shared();
                         if (data_out.has(test_surf, {j,i})) {
-                            mutex.unlock();
+                            mutex.unlock_shared();
                             continue;
                         }
-                        mutex.unlock();
+                        mutex.unlock_shared();
 
                         int count = 0;
                         cv::Vec3f loc_3d = test_surf->loc_raw(hit.ptr);
@@ -2761,7 +2761,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                         data_th.loc(s, added) = data.loc(s, added);
                 }
             }
-            mutex.unlock();
+            mutex.unlock_shared();
             mutex.lock();
             added_points_threads[omp_get_thread_num()].resize(0);
             mutex.unlock();
