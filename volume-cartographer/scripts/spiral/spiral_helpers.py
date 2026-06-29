@@ -1,4 +1,5 @@
 import json
+import glob
 import os
 
 import numpy as np
@@ -39,6 +40,110 @@ def scale_counts_for_z_range(
     for key in z_range_scaled_count_keys:
         config[key] = max(1, round(config[key] * scale))
     return scale, num_slices
+
+
+def _decimate_ordered_points_min_spacing(points, min_spacing):
+    if min_spacing <= 0 or len(points) <= 1:
+        return points
+
+    keep = [0]
+    last_kept = points[0]
+    for i in range(1, len(points)):
+        if np.linalg.norm(points[i] - last_kept) >= min_spacing:
+            keep.append(i)
+            last_kept = points[i]
+    return points[keep]
+
+
+def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0):
+    # Fiber JSONs are stored as one vc3d_fiber per file. Their line_points are
+    # x/y/z coordinates at 4x the scale used by the regular PCL JSONs.
+    with open(path, 'r') as f:
+        data = json.load(f)
+
+    points_xyz = data.get('line_points') or data.get('control_points') or []
+    if not points_xyz:
+        print(f'WARNING: fiber {path} has no line_points/control_points; skipping')
+        return None
+
+    points_xyz = np.asarray(points_xyz, dtype=np.float32)
+    if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
+        print(f'WARNING: fiber {path} points have shape {points_xyz.shape}; expected (N, 3); skipping')
+        return None
+
+    points_xyz = points_xyz * coordinate_scale
+    original_num_points = len(points_xyz)
+    points_xyz = _decimate_ordered_points_min_spacing(points_xyz, min_point_spacing)
+    name = data.get('name') or os.path.splitext(os.path.basename(path))[0]
+    thing = data.get('webknossos', {}).get('thing', {})
+    wk_color = thing.get('color', {})
+    color = [
+        float(wk_color.get('r', 0.0)),
+        float(wk_color.get('g', 0.0)),
+        float(wk_color.get('b', 0.0)),
+    ]
+
+    collection = {
+        'id': collection_id,
+        'name': name,
+        'points': {},
+        'metadata': {
+            'source_format': data.get('type', 'vc3d_fiber'),
+            'fiber_version': data.get('version'),
+            'fiber_generation': data.get('generation'),
+            'fiber_sequence': data.get('sequence'),
+            'fiber_started_at': data.get('started_at'),
+            'fiber_tags': data.get('tags', []),
+            'hv_classification': data.get('hv_classification', {}),
+            'input_coordinate_scale': coordinate_scale,
+            'fiber_min_point_spacing': min_point_spacing,
+            'fiber_original_num_points': original_num_points,
+        },
+        'color': color,
+    }
+    for point_id, p in enumerate(points_xyz):
+        collection['points'][point_id] = {
+            'id': point_id,
+            'collectionId': collection_id,
+            'p': p.tolist(),
+            'winding_annotation': float('nan'),
+            'creation_time': 0,
+        }
+    return collection
+
+
+def load_fiber_point_collections(path, next_id, min_point_spacing=20.0):
+    if not path:
+        return {}, next_id
+    fiber_paths = sorted(glob.glob(os.path.join(path, '*.json')))
+    if not fiber_paths:
+        print(f'no fiber point collections found in {path}')
+        return {}, next_id
+
+    point_collections = {}
+    total_points = 0
+    skipped = 0
+    for fiber_path in fiber_paths:
+        try:
+            pcl = load_fiber_point_collection(fiber_path, next_id, min_point_spacing=min_point_spacing)
+        except Exception as e:
+            print(f'WARNING: failed to load fiber {fiber_path}: {e}')
+            skipped += 1
+            continue
+        if pcl is None:
+            skipped += 1
+            continue
+        pcl['source_file'] = fiber_path
+        point_collections[next_id] = pcl
+        total_points += len(pcl['points'])
+        next_id += 1
+
+    print(
+        f'Loaded {len(point_collections)} fiber point collections '
+        f'({total_points} points, min spacing {min_point_spacing:g} vx) from {path}'
+        + (f'; skipped {skipped}' if skipped else '')
+    )
+    return point_collections, next_id
 
 
 def _huber_abs(residual, delta):

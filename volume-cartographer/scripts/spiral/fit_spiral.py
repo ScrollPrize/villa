@@ -65,6 +65,7 @@ from losses import (
 from spiral_helpers import (
     erode_patch_valid_region,
     load_patches,
+    load_fiber_point_collections,
     scale_counts_for_z_range,
     _infer_shell_outer_winding_idx,
     scale_patch,
@@ -105,7 +106,7 @@ umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.
 scroll_name = 's1'
 z_begin, z_end = 6500, 17000
 voxel_size_um = 2.4 * 4  # before downsampling
-cache_path = '../cache'
+cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 downsample_factor = 4
 z_begin //= downsample_factor
 z_end //= downsample_factor
@@ -147,7 +148,8 @@ default_config = {
     'num_patches_per_step': 360,
     'num_patches_per_step_for_dt': 240,
     'num_points_per_patch': 800,
-    'erode_patches': 2,  # if >0, erode every patch's valid region (verified + unverified) by this many grid cells
+    'erode_patches': 1,  # if >0, erode every patch's valid region (verified + unverified) by this many grid cells
+    'disable_patches': False,  # fit on PCLs + tracks only; load no verified/unverified patches
     'unverified_patch_radius_loss_margin': 0.025,
     'unverified_patch_radius_loss_inv': False,
     'unverified_patch_radius_within_norm_p': 3.0,
@@ -163,6 +165,7 @@ default_config = {
     'rel_winding_adjacent_patches_only': True,
     'abs_winding_num_pcls': 48,
     'abs_winding_num_points_per_pcl': 4,
+    'fiber_min_point_spacing': 40.,
     'unattached_pcl_num_per_step': 84,
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 4.,
@@ -844,15 +847,24 @@ def main():
                 continue
         return patches
 
-    shell_patch = load_tifxyz(shell_path)
-    scale_patch(shell_patch, downsample_factor)
+    shell_patch = None
+    if shell_losses_enabled():
+        if not shell_path:
+            raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
+        shell_patch = load_tifxyz(shell_path)
+        scale_patch(shell_patch, downsample_factor)
 
-    verified_patches = load_patches_from_dir(verified_patches_path)
-    unverified_patches = {}
-    if unverified_patches_path is not None:
-        unverified_patches = load_patches_from_dir(unverified_patches_path)
+    if cfg['disable_patches']:
+        verified_patches = {}
+        unverified_patches = {}
+        print('disable_patches=True: skipping all verified/unverified patch loading')
+    else:
+        verified_patches = load_patches_from_dir(verified_patches_path)
+        unverified_patches = {}
+        if unverified_patches_path is not None:
+            unverified_patches = load_patches_from_dir(unverified_patches_path)
 
-    if not verified_patches:
+    if not verified_patches and not cfg['disable_patches']:
         raise RuntimeError('No patches could be loaded')
 
     print(f" loaded {len(verified_patches)} patches")
@@ -892,8 +904,21 @@ def main():
             loaded = load_point_collection(path) or {}
             for pcl in loaded.values():
                 pcl['source_file'] = path
+                # Absolute-winding status is determined solely by the source file:
+                # only pcls loaded from abs_winding.json carry absolute winding
+                # numbers. Any metadata key in another file is ignored.
+                pcl.setdefault('metadata', {})['winding_is_absolute'] = (
+                    os.path.basename(path) == 'abs_winding.json'
+                )
                 point_collections[next_id] = pcl
                 next_id += 1
+
+    fiber_point_collections, next_id = load_fiber_point_collections(
+        fibers_path,
+        next_id,
+        min_point_spacing=cfg['fiber_min_point_spacing'],
+    )
+    point_collections.update(fiber_point_collections)
 
     for pcl in point_collections.values():
         for point in pcl['points'].values():
@@ -1783,13 +1808,10 @@ if __name__ == '__main__':
                 policy = f'split by {split_divisor}' if split_divisor > 1 else 'scale-up (full counts per rank)'
                 print(f'distributed: world_size={get_world_size()}, per-step counts {policy}')
 
-        wandb_mode = os.environ.get('WANDB_MODE')
+        wandb_mode = os.environ.get('WANDB_MODE', 'disabled')
         if not is_main_process():
             wandb_mode = 'disabled'
-        if wandb_mode is None:
-            wandb.init(project='scrolls', config=config)
-        else:
-            wandb.init(project='scrolls', config=config, mode=wandb_mode)
+        wandb.init(project='scrolls', config=config, mode=wandb_mode)
         cfg = wandb.config
         configure_losses(cfg, z_begin, z_end, downsample_factor)
         main()
