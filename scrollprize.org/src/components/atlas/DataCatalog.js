@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { toHttp, neuroglancerUrl } from "./dataAccess";
 
 // DataCatalog — the "Data & access" panel for a scroll detail page.
 // Ported from the reference renderer (ref/scroll.html ~104-127): a set of
@@ -48,6 +49,12 @@ export default function DataCatalog({ scroll }) {
     "s3://vesuvius-challenge-open-data/",
   );
 
+  // Full-dataset ("samples") bucket paths for this item, and an optional
+  // Neuroglancer deep-link for its OME-Zarr volume (see ./dataAccess.js).
+  const samplesS3 = `s3://vesuvius-challenge/${scroll.id}/`;
+  const samplesHttp = toHttp(samplesS3);
+  const ngUrl = scroll.volume ? neuroglancerUrl(scroll.volume, scroll.display) : null;
+
   // Quick-link buttons (ref lines 108-112).
   const links = [];
   if (progress.wkUrl) {
@@ -60,6 +67,19 @@ export default function DataCatalog({ scroll }) {
         rel="noopener noreferrer"
       >
         webknossos viewer ↗
+      </a>,
+    );
+  }
+  if (ngUrl) {
+    links.push(
+      <a
+        key="ng"
+        className="dbtn"
+        href={ngUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        Open in Neuroglancer ↗
       </a>,
     );
   }
@@ -140,6 +160,8 @@ export default function DataCatalog({ scroll }) {
       </dl>
       <PathRow label="HTTP" value={httpBase} />
       <PathRow label="S3" value={s3uri} />
+      <PathRow label="Full dataset (HTTP)" value={samplesHttp} />
+      <PathRow label="Full dataset (S3)" value={samplesS3} />
       <PathRow label=".volpkg" value={scroll.legacy} />
     </div>
   );

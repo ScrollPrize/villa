@@ -6,17 +6,20 @@
       {
         "big": "45",
         "label": "scrolls & fragments scanned",
-        "sub": "27 scrolls · 18 fragments"
+        "sub": "27 scrolls · 18 fragments",
+        "derive": "all"
       },
       {
-        "big": "3",
+        "big": "6",
         "label": "with recovered text",
-        "sub": "Greek read; first Latin in progress"
+        "sub": "Greek read; first Latin in progress",
+        "derive": "text"
       },
       {
-        "big": "11",
+        "big": "9",
         "label": "with ink-detection results",
-        "sub": "predictions on unrolled surfaces & fragments"
+        "sub": "predictions on unrolled surfaces & fragments",
+        "derive": "ink"
       },
       {
         "big": "~4.3 PB",
@@ -46,13 +49,13 @@
       {
         "key": "ink",
         "label": "Ink detected",
-        "count": 11,
+        "count": 9,
         "desc": "ink-prediction results"
       },
       {
         "key": "text",
         "label": "Text recovered",
-        "count": 3,
+        "count": 6,
         "desc": "readable Greek/Latin"
       }
     ],
@@ -62,8 +65,8 @@
       "fragments": 18,
       "segmented": 7,
       "unrolled": 4,
-      "ink": 11,
-      "text": 3,
+      "ink": 9,
+      "text": 6,
       "at1um": 0,
       "subum": 3
     },
@@ -71,7 +74,7 @@
       "id": "PHercParis4",
       "display": "Scroll 1",
       "src": "readings/paris4_ink.jpg",
-      "cap": "Spiral-fit 3D ink prediction (winding excerpt)"
+      "cap": "Ink detection on the 2.4µm scan"
     }
   },
   "timeline": [
@@ -137,7 +140,7 @@
         "patches": 49936,
         "textFound": "Substantial text",
         "textRank": 4,
-        "unrolledPct": 40,
+        "unrolledPct": "To Be Estimated",
         "score": 4227.6,
         "wkUrl": "https://wk.aws.ash2txt.org/datasets/67a53a6c01000001019dbc46/view"
       },
@@ -148,22 +151,22 @@
         "ink": true,
         "text": true,
         "furthest": 4,
-        "unrolledPct": 40
+        "unrolledPct": "To Be Estimated"
       },
       "readings": {
-        "status": "Substantial continuous text recovered; ink clearly visible at 2.4µm.",
+        "status": "Substantial continuous Greek text recovered; ink clearly legible at 2.4µm.",
         "images": [
           {
             "src": "/img/data_browser/readings/paris4_ink.jpg",
-            "cap": "Spiral-fit 3D ink prediction (winding excerpt)"
+            "cap": "2.4µm ink detection (segment 20231210121321)"
           },
           {
-            "src": "/img/data_browser/readings/paris4_composite.jpg",
-            "cap": "3D ink composite (winding 0)"
+            "src": "/img/data_browser/readings/paris4_banner.jpg",
+            "cap": "Ink detection across windings 28–37 (2.4µm)"
           },
           {
-            "src": "/img/data_browser/readings/paris4_1um2um.jpg",
-            "cap": "1µm vs 2µm ink-detection composite (ResNet-152)"
+            "src": "/img/data_browser/readings/paris4_surface.jpg",
+            "cap": "Ink prediction overlaid on the 3D papyrus surface (2.4µm)"
           }
         ]
       }
@@ -201,10 +204,11 @@
       "note": "Scroll 3.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/photos/PHerc0332_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0332/",
+      "volume": "s3://vesuvius-challenge/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr",
       "content": {
         "work": "Not yet identified",
         "lang": "Greek (expected)",
-        "summary": "Segmented; ink-detection results exist but no continuous text recovered yet.",
+        "summary": "Segmented; no text recovered yet.",
         "caveat": null
       },
       "progress": {
@@ -220,20 +224,12 @@
         "scanned": true,
         "segmented": true,
         "unrolled": false,
-        "ink": true,
+        "ink": false,
         "text": false,
-        "furthest": 3,
+        "furthest": 1,
         "unrolledPct": 0
       },
-      "readings": {
-        "status": "Scroll 3 — segmented; 2µm ink prediction (legibility limited, no clear text yet).",
-        "images": [
-          {
-            "src": "/img/data_browser/readings/0332_ink.jpg",
-            "cap": "Ink prediction (2µm auto-trace)"
-          }
-        ]
-      }
+      "readings": null
     },
     "PHerc1667": {
       "display": "Scroll 4",
@@ -250,9 +246,9 @@
       "progress": {
         "segments": 21,
         "patches": null,
-        "textFound": "Full banner read",
+        "textFound": "Full scroll read",
         "textRank": 3,
-        "unrolledPct": 90,
+        "unrolledPct": 100,
         "score": 3477.8,
         "wkUrl": "https://wk.aws.ash2txt.org/datasets/67a6261a010000ad009dbd0a/view"
       },
@@ -263,11 +259,9 @@
         "ink": true,
         "text": true,
         "furthest": 4,
-        "unrolledPct": 90
+        "unrolledPct": 100
       },
-      "readings": {
-        "embargoed": true
-      }
+      "readings": null
     },
     "PHerc0172": {
       "display": "Scroll 5",
@@ -278,13 +272,13 @@
       "content": {
         "work": "Not yet identified",
         "lang": "Greek (expected)",
-        "summary": "Scroll 5 — roughly 70% geometrically unrolled (a segmentation milestone), but ink legibility is still limited, so little text has been read yet.",
-        "caveat": "Geometry is ahead of ink: unrolled ≠ readable."
+        "summary": "Scroll 5 — ~70% geometrically unrolled (a 2.5 m surface trace); text recovered from the unrolled surface.",
+        "caveat": null
       },
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "70% unrolled",
+        "textFound": "Text recovered",
         "textRank": 2,
         "unrolledPct": 70,
         "score": 2352.1,
@@ -295,20 +289,20 @@
         "segmented": true,
         "unrolled": true,
         "ink": true,
-        "text": false,
-        "furthest": 3,
+        "text": true,
+        "furthest": 4,
         "unrolledPct": 70
       },
       "readings": {
-        "status": "~70% geometrically unrolled (Nov 2025, a 2.5 m surface trace) — a segmentation milestone; ink legibility still limited.",
+        "status": "~70% geometrically unrolled (Nov 2025, a 2.5 m surface trace); text recovered from the unrolled surface (7.9µm).",
         "images": [
           {
             "src": "/img/data_browser/readings/0172_banner_full.jpg",
-            "cap": "Full Scroll 5 ink banner (200 dpi)"
+            "cap": "Ink detection across five consecutive windings (71–75) of the unrolled surface (7.9µm)"
           },
           {
             "src": "/img/data_browser/readings/0172_ink.jpg",
-            "cap": "Unrolled ink banner (auto-grown segment)"
+            "cap": "Ink detection on a single unrolled winding (w087, 7.9µm)"
           }
         ]
       }
@@ -323,7 +317,7 @@
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "Scanned",
+        "textFound": "Text recovered",
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.6,
@@ -333,9 +327,9 @@
         "scanned": true,
         "segmented": false,
         "unrolled": false,
-        "ink": false,
-        "text": false,
-        "furthest": 0,
+        "ink": true,
+        "text": true,
+        "furthest": 4,
         "unrolledPct": 0
       },
       "readings": null
@@ -397,9 +391,7 @@
         "furthest": 4,
         "unrolledPct": 20
       },
-      "readings": {
-        "embargoed": true
-      }
+      "readings": null
     },
     "PHerc0175A": {
       "display": "PHerc0175A",
@@ -421,20 +413,12 @@
         "scanned": true,
         "segmented": false,
         "unrolled": false,
-        "ink": true,
+        "ink": false,
         "text": false,
-        "furthest": 3,
+        "furthest": 0,
         "unrolledPct": 0
       },
-      "readings": {
-        "status": "Ink renders available (GP / Scroll-5 models).",
-        "images": [
-          {
-            "src": "/img/data_browser/readings/0175a_ink.jpg",
-            "cap": "Ink render (grand-prize model)"
-          }
-        ]
-      }
+      "readings": null
     },
     "PHerc0175B": {
       "display": "PHerc0175B",
@@ -635,7 +619,7 @@
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "Scanned",
+        "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.8,
@@ -645,9 +629,9 @@
         "scanned": true,
         "segmented": false,
         "unrolled": false,
-        "ink": false,
+        "ink": true,
         "text": false,
-        "furthest": 0,
+        "furthest": 3,
         "unrolledPct": 0
       },
       "readings": null
@@ -797,7 +781,7 @@
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "Scanned",
+        "textFound": "Text recovered",
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.8,
@@ -808,19 +792,11 @@
         "segmented": false,
         "unrolled": false,
         "ink": true,
-        "text": false,
-        "furthest": 3,
+        "text": true,
+        "furthest": 4,
         "unrolledPct": 0
       },
-      "readings": {
-        "status": "Fragment — ink detection works.",
-        "images": [
-          {
-            "src": "/img/data_browser/readings/0500p2_pred.jpg",
-            "cap": "Ink prediction over surface render (2µm)"
-          }
-        ]
-      }
+      "readings": null
     },
     "PHerc0800": {
       "display": "PHerc0800",
@@ -882,11 +858,12 @@
       "note": "",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0814/",
+      "volume": "s3://vesuvius-challenge/PHerc0814/representations/predictions/surfaces/20260309142202-surface-20260413222639-surface-m7-L2-th0.2.zarr",
       "content": null,
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "Scanned",
+        "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
         "score": 8.9,
@@ -901,15 +878,7 @@
         "furthest": 3,
         "unrolledPct": 0
       },
-      "readings": {
-        "status": "Fragment — ink detection works.",
-        "images": [
-          {
-            "src": "/img/data_browser/readings/0814_ink.jpg",
-            "cap": "Ink prediction (2µm)"
-          }
-        ]
-      }
+      "readings": null
     },
     "PHerc0826": {
       "display": "PHerc0826",
@@ -948,7 +917,7 @@
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "Scanned",
+        "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.6,
@@ -963,15 +932,7 @@
         "furthest": 3,
         "unrolledPct": 0
       },
-      "readings": {
-        "status": "Fragment — ink detection works.",
-        "images": [
-          {
-            "src": "/img/data_browser/readings/0841_ink.jpg",
-            "cap": "Ink prediction (2µm)"
-          }
-        ]
-      }
+      "readings": null
     },
     "PHerc0846A": {
       "display": "PHerc0846A",
@@ -1160,20 +1121,12 @@
         "scanned": true,
         "segmented": true,
         "unrolled": false,
-        "ink": true,
+        "ink": false,
         "text": false,
-        "furthest": 3,
+        "furthest": 1,
         "unrolledPct": 0
       },
-      "readings": {
-        "status": "Segmented; 2µm ink prediction (no clearly legible text).",
-        "images": [
-          {
-            "src": "/img/data_browser/readings/1451_ink.jpg",
-            "cap": "Ink prediction (winding 20, 2µm)"
-          }
-        ]
-      }
+      "readings": null
     },
     "PHerc1545": {
       "display": "PHerc1545",
@@ -1303,20 +1256,12 @@
         "scanned": true,
         "segmented": false,
         "unrolled": false,
-        "ink": true,
+        "ink": false,
         "text": false,
-        "furthest": 3,
+        "furthest": 0,
         "unrolledPct": 0
       },
-      "readings": {
-        "status": "Latin fragment — ink prediction available.",
-        "images": [
-          {
-            "src": "/img/data_browser/readings/manb_pred.jpg",
-            "cap": "Ink prediction (winding 0)"
-          }
-        ]
-      }
+      "readings": null
     },
     "PHercMANBp": {
       "display": "PHercMANBp",
@@ -1343,15 +1288,7 @@
         "furthest": 1,
         "unrolledPct": 0
       },
-      "readings": {
-        "status": "Latin fragment — ink detection does NOT work despite labels (photo→volume registration too far off).",
-        "images": [
-          {
-            "src": "/img/data_browser/readings/manbp_composite.jpg",
-            "cap": "CT composite used for photo→volume registration"
-          }
-        ]
-      }
+      "readings": null
     },
     "PHercParis1Fr34": {
       "display": "PHercParis1Fr34",

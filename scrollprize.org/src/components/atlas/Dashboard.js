@@ -74,7 +74,9 @@ export default function Dashboard({ dashboard, timeline }) {
               />
             </Link>
             <div className="cap">
-              {mq.display} — {mq.cap || ""} ·{" "}
+              {mq.id}
+              {mq.display && mq.display !== mq.id ? ` (${mq.display})` : ""} —{" "}
+              {mq.cap || ""} ·{" "}
               <Link className="lk" to={`/data_browser/${mq.id}`}>
                 open {mq.id} →
               </Link>

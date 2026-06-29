@@ -61,6 +61,7 @@ export default function ScrollCard({ scroll }) {
   const segN = progress.segments != null ? progress.segments : scroll.n_segments || 0;
 
   const isScroll = scroll.type === "scroll";
+  const nick = scroll.display && scroll.display !== scroll.id ? scroll.display : null;
   const cap = caption(scroll);
 
   // The 3D / image viewport.
@@ -77,7 +78,7 @@ export default function ScrollCard({ scroll }) {
         <img
           className="fragimg"
           src={photo}
-          alt={`Photo of ${scroll.display}`}
+          alt={`Photo of ${scroll.id}`}
           loading="lazy"
         />
       </div>
@@ -94,16 +95,17 @@ export default function ScrollCard({ scroll }) {
     <Link
       className="card"
       to={`/data_browser/${scroll.id}`}
-      aria-label={`${scroll.display} (${scroll.id}) — details`}
+      aria-label={`${scroll.id}${nick ? ` (${nick})` : ""} — details`}
     >
       <div className="chead">
         <span className="name">
-          {scroll.display}
+          {scroll.id}
           {readings ? <span className="rd">ink</span> : null}
         </span>
         <span className="pherc">
-          {scroll.id}
-          {imgN ? ` · 🖼 ${imgN}` : ""}
+          {nick ? nick : ""}
+          {nick && imgN ? " · " : ""}
+          {imgN ? `🖼 ${imgN}` : ""}
         </span>
       </div>
 

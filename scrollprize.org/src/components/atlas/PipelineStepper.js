@@ -20,7 +20,13 @@ export default function PipelineStepper({ stages }) {
   // Furthest reached stage label (defaults to "Scanned").
   const reached = STAGE_KEYS.filter((k) => st[k]);
   const furLabel = STAGE_LABEL[reached[reached.length - 1]] || "Scanned";
-  const pctTxt = st.unrolledPct ? `${st.unrolledPct}% unrolled` : "";
+  const up = st.unrolledPct;
+  const pctTxt =
+    typeof up === "number" && up
+      ? `${up}% unrolled`
+      : typeof up === "string" && up
+      ? `unrolled: ${up}`
+      : "";
 
   return (
     <div className="prog">

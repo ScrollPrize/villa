@@ -10,10 +10,10 @@
  *      (src/data/atlasOverlay.json) — display names, notes, readings, content,
  *      progress, stages, plus the dashboard / timeline / general copy.
  *
- * EMBARGO: PHerc1667 and PHerc0139 have recovered-text/ink READINGS that are
- * embargoed (Naples, 2026-06-25). Their geometry + factual metadata are public,
- * but their readings (status + images) are stripped to `null` here so they are
- * never published. The overlay marks them with `readings.embargoed === true`.
+ * EMBARGO: PHerc1667 and PHerc0139 had recovered-text/ink READINGS embargoed
+ * until the Naples reveal (2026-06-25); that embargo has lifted, so they are
+ * now published like any other scroll. The EMBARGOED set + `readings.embargoed`
+ * flag remain in place as the mechanism for any future embargo.
  *
  * Output: static/data_browser/index.json
  *
@@ -38,13 +38,16 @@ const MESH_MANIFEST_PATH = path.join(
 );
 const OUT_DIR = path.join(ROOT, "static", "data_browser");
 const OUT_PATH = path.join(OUT_DIR, "index.json");
+const DATA_ACCESS_PATH = path.join(ROOT, "src", "data", "atlasDataAccess.json");
 
 const S3_METADATA_URL =
   "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.json";
 const FETCH_TIMEOUT_MS = 25000;
 
-// Scrolls whose READINGS are embargoed — never publish their readings.
-const EMBARGOED = new Set(["PHerc1667", "PHerc0139"]);
+// Scrolls whose READINGS are embargoed — never publish their readings. The
+// Naples embargo (PHerc1667 + PHerc0139) lifted at the 2026-06-25 reveal, so
+// this set is now empty; the mechanism stays for any future embargo.
+const EMBARGOED = new Set([]);
 
 function readJsonIfExists(p) {
   try {
@@ -100,7 +103,8 @@ function deriveFacts(sample) {
   const pxVals = scanList.map((s) => s.px).filter((v) => v !== null && v !== undefined);
 
   return {
-    type: sampleProps.type ?? "?",
+    // Samples with no explicit type in the metadata are scrolls (per curation).
+    type: sampleProps.type && sampleProps.type !== "?" ? sampleProps.type : "scroll",
     desc: (sample.sample && sample.sample.description) || "",
     legacy: sampleProps.legacy_data_url ?? null,
     n_scans: Object.keys(scans).length,
@@ -113,7 +117,99 @@ function deriveFacts(sample) {
   };
 }
 
+// Parse a resolution like "2.4um" / "7.91um" out of an ink-detection filename.
+function umFromName(name) {
+  const m = String(name || "").match(/(\d+(?:\.\d+)?)um/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+// Friendly segment label: prefer the winding tag (w052 / w053-058), then the
+// auto-grown index, then a bare 14-digit timestamp id. A trailing variant
+// qualifier (jordi / v14 / v2 …) is appended so distinct segments covering the
+// same windings don't collapse to an identical label.
+function inkSegmentLabel(raw) {
+  const s = String(raw || "");
+  const ag = s.match(/auto_grown_\d+_(\d+)/i);
+  if (ag) return "auto-grown " + ag[1];
+  const w = s.match(/w(\d+(?:-\d+)?)/i);
+  const ts = s.match(/^(\d{14})/);
+  const base = w ? "w" + w[1] : ts ? ts[1] : s;
+  const v = s.match(/_(jordi|v\d+)/i);
+  return v ? `${base} · ${v[1]}` : base;
+}
+
+// Per-segment ink-detection predictions for a sample, as public HTTPS links —
+// the per-segment list the old atlas exposed. One entry per segment (its
+// finest-resolution run) with a downsampled preview for thumbnailing. Embargoed
+// scrolls expose nothing. `s3ToHttp` maps a segment's s3:// access-root to a
+// public https URL via the dataAccess rewrites.
+function extractInkSegments(sample, id, s3ToHttp) {
+  if (EMBARGOED.has(id)) return [];
+  const segs = (sample && sample.segments) || {};
+  const toUrls = (entries) =>
+    entries.map((d) => {
+      const o = (d.origins || [])[0] || {};
+      const root = ((o.access_roots || [])[0] || {}).url || "";
+      const p = o.path || "";
+      return { url: s3ToHttp(`${root}/${p}`), um: umFromName(p) };
+    });
+  const byUm = (a, b) => (a.um ?? 1e9) - (b.um ?? 1e9);
+  const out = [];
+  for (const key of Object.keys(segs)) {
+    const seg = segs[key];
+    const data = seg.data || [];
+    const fulls = toUrls(data.filter((d) => d.type === "ink-detection"));
+    if (!fulls.length) continue;
+    const downs = toUrls(data.filter((d) => d.type === "ink-detection-downsampled"));
+    const full = fulls.sort(byUm)[0];
+    const down = downs.sort(byUm)[0] || null;
+    const sid = seg.suffix || seg.long_id || key;
+    out.push({
+      id: key,
+      label: inkSegmentLabel(sid),
+      um: full.um,
+      full: full.url,
+      preview: down ? down.url : full.url,
+    });
+  }
+  // Order unwrap (winding) ranges in DECREASING order (highest winding first);
+  // segments without a winding number (auto-grown, legacy timestamp segments)
+  // sort to the end.
+  const wnum = (s) => {
+    const m = String(s.label).match(/^w(\d+)/i);
+    return m ? parseInt(m[1], 10) : null;
+  };
+  out.sort((a, b) => {
+    const wa = wnum(a);
+    const wb = wnum(b);
+    if (wa !== null && wb !== null) {
+      if (wa !== wb) return wb - wa;
+      return String(a.label).localeCompare(String(b.label), undefined, { numeric: true });
+    }
+    if (wa !== null) return -1;
+    if (wb !== null) return 1;
+    return String(a.label).localeCompare(String(b.label), undefined, { numeric: true });
+  });
+  return out;
+}
+
 // Merge curated overlay fields onto a scroll, applying the embargo strip.
+// A scroll that reached ink/text must also be segmented (and scanned), and text
+// implies ink — enforce that chain so the stepper never shows ink/text without
+// the prerequisite stages. `unrolled` stays independent: flat fragments get ink
+// without unrolling. Operates on a copy; recomputes the stored `furthest`.
+function normalizeStages(stages) {
+  if (!stages) return stages;
+  if (stages.text) stages.ink = true;
+  if (stages.ink) stages.segmented = true;
+  if (stages.segmented || stages.unrolled || stages.ink || stages.text) stages.scanned = true;
+  const ORDER = ["scanned", "segmented", "unrolled", "ink", "text"];
+  let f = 0;
+  ORDER.forEach((k, i) => { if (stages[k]) f = i; });
+  stages.furthest = f;
+  return stages;
+}
+
 function curatedFields(overlayScroll, id) {
   const o = overlayScroll || {};
   let readings = o.readings ?? null;
@@ -130,15 +226,64 @@ function curatedFields(overlayScroll, id) {
     bucketUrl: o.bucketUrl ?? null,
     content: o.content ?? null,
     progress: o.progress ?? null,
-    stages: o.stages ?? null,
+    stages: normalizeStages(o.stages ? { ...o.stages } : null),
     readings,
+    volume: o.volume ?? null,
   };
+}
+
+// Derive the count-based dashboard numbers from the per-scroll data so they can
+// never drift out of sync with the pipeline `stages`. Editorial fields (the PB
+// tile, the µm/Latin subs, labels, descriptions, totals.at1um/subum) are left
+// exactly as curated. Tiles opt in via a `derive` key ("all" | "ink" | "text").
+function deriveDashboard(dashboard, scrolls) {
+  if (!dashboard) return dashboard;
+  const cnt = (k) => scrolls.filter((s) => s.stages && s.stages[k]).length;
+  const counts = {
+    all: scrolls.length,
+    scrolls: scrolls.filter((s) => s.type === "scroll").length,
+    fragments: scrolls.filter((s) => s.type !== "scroll").length,
+    scanned: cnt("scanned"),
+    segmented: cnt("segmented"),
+    unrolled: cnt("unrolled"),
+    ink: cnt("ink"),
+    text: cnt("text"),
+  };
+  for (const f of dashboard.funnel || [])
+    if (counts[f.key] !== undefined) f.count = counts[f.key];
+  if (dashboard.totals)
+    for (const k of ["all", "scrolls", "fragments", "segmented", "unrolled", "ink", "text"])
+      dashboard.totals[k] = counts[k];
+  for (const t of dashboard.tiles || []) {
+    if (t.derive === "all") {
+      t.big = String(counts.all);
+      t.sub = `${counts.scrolls} scrolls · ${counts.fragments} fragments`;
+    } else if (t.derive && counts[t.derive] !== undefined) {
+      t.big = String(counts[t.derive]);
+    }
+  }
+  return dashboard;
 }
 
 function generate() {
   const overlay = readJsonIfExists(OVERLAY_PATH) || {};
   const overlayScrolls = overlay.scrolls || {};
   const meshManifest = readJsonIfExists(MESH_MANIFEST_PATH) || {};
+  const rewrites = ((readJsonIfExists(DATA_ACCESS_PATH) || {}).dataAccess || {}).rewrites || [];
+  const s3ToHttp = (url) => {
+    for (const r of rewrites) if (url.startsWith(r.from)) return r.to + url.slice(r.from.length);
+    return url;
+  };
+  // Furthest pipeline stage reached, as a 0..4 rank (text highest) — the primary
+  // grid order, so recovered scrolls rank above less-progressed ones regardless
+  // of their (sometimes stale) progress.score.
+  const STAGE_ORDER = ["scanned", "segmented", "unrolled", "ink", "text"];
+  const stageRank = (s) => {
+    const st = (s && s.stages) || {};
+    let r = 0;
+    STAGE_ORDER.forEach((k, i) => { if (st[k]) r = i; });
+    return r;
+  };
 
   return fetchMetadata()
     .then((meta) => {
@@ -152,13 +297,16 @@ function generate() {
         const facts = samples[id] ? deriveFacts(samples[id]) : null;
         const curated = curatedFields(overlayScrolls[id], id);
         const mesh = meshManifest[id] || null;
+        const inkSegments = samples[id]
+          ? extractInkSegments(samples[id], id, s3ToHttp)
+          : [];
 
         // Prefer S3 for factual fields; fall back to nothing for overlay-only
         // ids without S3 facts (still emit with what's available).
         return {
           id,
           // factual (S3) — null fields where S3 has no record for this id
-          type: facts ? facts.type : "?",
+          type: facts ? facts.type : "scroll",
           desc: facts ? facts.desc : "",
           legacy: facts ? facts.legacy : null,
           n_scans: facts ? facts.n_scans : 0,
@@ -173,11 +321,15 @@ function generate() {
           ...curated,
           // assets
           mesh,
+          inkSegments,
         };
       });
 
-      // Sort by progress.score desc (missing score -> 0).
+      // Sort by furthest pipeline stage (text first), then progress.score desc.
       scrolls.sort((a, b) => {
+        const ra = stageRank(a);
+        const rb = stageRank(b);
+        if (ra !== rb) return rb - ra;
         const sa = (a.progress && typeof a.progress.score === "number" && a.progress.score) || 0;
         const sb = (b.progress && typeof b.progress.score === "number" && b.progress.score) || 0;
         return sb - sa;
@@ -186,7 +338,7 @@ function generate() {
       const out = {
         updated: (overlay.dashboard && overlay.dashboard.updated) || null,
         _general: overlay._general || "",
-        dashboard: overlay.dashboard || null,
+        dashboard: deriveDashboard(overlay.dashboard || null, scrolls),
         timeline: overlay.timeline || [],
         scrolls,
       };
@@ -217,7 +369,7 @@ function generate() {
       const scrolls = ids
         .map((id) => ({
           id,
-          type: "?",
+          type: "scroll",
           desc: "",
           legacy: null,
           n_scans: 0,
@@ -230,8 +382,12 @@ function generate() {
           hasS3: false,
           ...curatedFields(overlayScrolls[id], id),
           mesh: meshManifest[id] || null,
+          inkSegments: [],
         }))
         .sort((a, b) => {
+          const ra = stageRank(a);
+          const rb = stageRank(b);
+          if (ra !== rb) return rb - ra;
           const sa = (a.progress && a.progress.score) || 0;
           const sb = (b.progress && b.progress.score) || 0;
           return sb - sa;
@@ -239,7 +395,7 @@ function generate() {
       const out = {
         updated: (overlay.dashboard && overlay.dashboard.updated) || null,
         _general: overlay._general || "",
-        dashboard: overlay.dashboard || null,
+        dashboard: deriveDashboard(overlay.dashboard || null, scrolls),
         timeline: overlay.timeline || [],
         scrolls,
       };

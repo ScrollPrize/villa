@@ -7,6 +7,7 @@ import JsonLd from "@site/src/components/JsonLd";
 import ScrollViewer from "./ScrollViewer";
 import DataCatalog from "./DataCatalog";
 import ReadingsGallery from "./ReadingsGallery";
+import InkSegmentsGallery from "./InkSegmentsGallery";
 import useDarkModeGuard from "./useDarkModeGuard";
 
 // ScrollDetailPage — the per-scroll detail route for the rebuilt /data_browser.
@@ -79,7 +80,9 @@ export default function ScrollDetailPage(props) {
 
   const canonical = `${SITE}/data_browser/${scroll.id}`;
   const metaDesc = metaDescription(scroll);
-  const pageTitle = `${scroll.display} (${scroll.id}) — Vesuvius Challenge`;
+  // Identify scrolls by their PHerc inventory name; keep "Scroll N" as a tag.
+  const nick = scroll.display && scroll.display !== scroll.id ? scroll.display : null;
+  const pageTitle = `${scroll.id}${nick ? ` (${nick})` : ""} — Vesuvius Challenge`;
 
   // og:image: scroll photo, else the first readings image if present.
   const firstReading =
@@ -95,9 +98,13 @@ export default function ScrollDetailPage(props) {
 
   // Stats panel values (ref lines 169-173).
   const status = progress.textFound || "Scanned";
-  const unrolledPctTxt = progress.unrolledPct
-    ? ` · ${progress.unrolledPct}% unrolled`
-    : "";
+  const up = progress.unrolledPct;
+  const unrolledPctTxt =
+    typeof up === "number" && up
+      ? ` · ${up}% unrolled`
+      : typeof up === "string" && up
+      ? ` · unrolled: ${up}`
+      : "";
   const segments =
     progress.segments != null ? progress.segments : scroll.n_segments;
   const segmentsTxt = segments != null ? Number(segments).toLocaleString() : "—";
@@ -113,8 +120,8 @@ export default function ScrollDetailPage(props) {
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "Dataset",
-    name: scroll.display,
-    alternateName: scroll.id,
+    name: scroll.id,
+    alternateName: scroll.display,
     description: metaDesc,
     url: canonical,
     license: LICENSE_URL,
@@ -144,14 +151,14 @@ export default function ScrollDetailPage(props) {
             ← all scrolls
           </Link>
           <h1>
-            {scroll.display}
+            {scroll.id}
+            {nick ? <span className="nick">{nick}</span> : null}
             <span
               className={`type ${scroll.type === "scroll" ? "" : "fragment"}`}
             >
               {scroll.type || "sample"}
             </span>
           </h1>
-          <div className="pherc">{scroll.id}</div>
           <div className="repo">📍 {scroll.repository || ""}</div>
 
           <div className="grid">
@@ -299,6 +306,12 @@ export default function ScrollDetailPage(props) {
 
             {/* Ink detection & renders */}
             <ReadingsGallery readings={readings} display={scroll.display} />
+
+            {/* Per-segment ink-detection predictions (from metadata.json) */}
+            <InkSegmentsGallery
+              segments={scroll.inkSegments}
+              display={scroll.display}
+            />
 
             {/* Footer */}
             <div className="footer">
