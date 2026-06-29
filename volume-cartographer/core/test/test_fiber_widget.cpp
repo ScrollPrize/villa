@@ -10,6 +10,7 @@
 #include <QScrollBar>
 #include <QStandardItemModel>
 #include <QTreeView>
+#include <QThreadPool>
 
 #include <cstdlib>
 #include <iostream>
@@ -78,6 +79,7 @@ int main(int argc, char** argv)
 
     std::unique_ptr<QApplication> app;
     ensureApplication(argc, argv, app);
+    QThreadPool::globalInstance()->setMaxThreadCount(1);
 
     CFiberWidget widget;
     auto first = makeFiber(1, "aa_20260605T184821587_000001.json", 2, 20, 12.0, {"source-a"});
@@ -409,5 +411,6 @@ int main(int argc, char** argv)
     require(batchDeletes == 1, "Confirmed delete did not emit one batch delete request");
     require(sameIds(deletedIds, {1, 3}), "Batch delete request IDs are wrong");
 
+    QThreadPool::globalInstance()->waitForDone();
     return 0;
 }
