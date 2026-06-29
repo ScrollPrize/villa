@@ -104,7 +104,7 @@ tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'
 spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda f: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', downsample_factor=f)
 scroll_name = 's1'
-z_begin, z_end = 6000, 18000
+z_begin, z_end = 7000, 17000
 voxel_size_um = 2.4 * 4  # before downsampling
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 downsample_factor = 4
