@@ -1,0 +1,25 @@
+[project]
+name = "spiral"
+version = "0.1.0"
+description = "Code and helpers to fit a canonical archimedan spiral to deformed scrolls"
+requires-python = ">=3.14"
+dependencies = [
+    "click>=8.4.2",
+    "crackle-codec>=0.42.0",
+    "einops>=0.8.2",
+    "kimimaro[all]>=5.8.1",
+    "kornia>=0.8.3",
+    "matplotlib>=3.11.0",
+    "networkx>=3.6.1",
+    "numpy>=2.5.0",
+    "opencv-python-headless>=4.13.0.92",
+    "pillow>=12.2.0",
+    "posix-ipc>=1.3.2",
+    "pyro-ppl>=1.9.1",
+    "scipy>=1.18.0",
+    "torchdiffeq>=0.2.5",
+    "tqdm>=4.68.3",
+    "trimesh>=4.12.2",
+    "wandb>=0.28.0",
+    "zarr>=3.2.1",
+]

@@ -26,3 +26,8 @@ VC_BUILD_APPS = "OFF"
 VC_BUILD_UI_TRACER = "OFF"
 VC_BUILD_FLATBOI = "OFF"
 VC_TESTING = "OFF"
+
+[tool.uv.workspace]
+members = [
+    "scripts/spiral",
+]
