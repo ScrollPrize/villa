@@ -99,7 +99,18 @@ function deriveFacts(sample) {
   const volumes = sample.volumes || {};
   const segments = sample.segments || {};
 
-  const scanList = Object.values(scans).map(scanFacts);
+  const scanList = Object.entries(scans).map(([sid, scan]) => {
+    const f = scanFacts(scan);
+    // Link a scan to the OME-Zarr volume reconstructed from it (→ Neuroglancer).
+    const vol = Object.values(volumes).find((v) => v.scan_id === sid);
+    let volume = null;
+    if (vol) {
+      const z = (vol.data || []).find((d) => /zarr/i.test(d.type));
+      const o = z && (z.origins || [])[0];
+      if (o && o.path) volume = `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}`;
+    }
+    return { ...f, volume };
+  });
   const pxVals = scanList.map((s) => s.px).filter((v) => v !== null && v !== undefined);
 
   // Distinct data licenses across the item's volumes (varies: EduceLab vs
@@ -178,25 +189,37 @@ function extractInkSegments(sample, id, s3ToHttp) {
   for (const key of Object.keys(segs)) {
     const seg = segs[key];
     const data = seg.data || [];
-    const fulls = toUrls(data.filter((d) => d.type === "ink-detection"));
-    if (!fulls.length) continue;
-    const downs = toUrls(data.filter((d) => d.type === "ink-detection-downsampled"));
-    const full = fulls.sort(byUm)[0];
-    const down = downs.sort(byUm)[0] || null;
     const sid = seg.suffix || seg.long_id || key;
     // Per-segment surface layers (→ Neuroglancer) and mesh (→ download).
     const oneUrl = (d) => {
       const o = d && (d.origins || [])[0];
       return o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
     };
+    // 2D ink-detection: the flattened prediction image + a downsampled preview.
+    const fulls = toUrls(data.filter((d) => d.type === "ink-detection"));
+    const downs = toUrls(data.filter((d) => d.type === "ink-detection-downsampled"));
+    const full = fulls.length ? fulls.sort(byUm)[0] : null;
+    const down = downs.sort(byUm)[0] || null;
+    // 3D ink (alpha-render): ink painted on the rendered surface. The full .tif
+    // is tens of MB (download only); the ds8 .jpg is the Thumbor thumbnail src.
+    // s3ToHttp so the jpg matches the thumbnail prefix and the tif is clickable.
+    const alphaEntry = data.find((d) => d.type === "alpha-render");
+    const alphaDsEntry = data.find((d) => d.type === "alpha-render-downsampled");
+    const alpha = alphaEntry ? s3ToHttp(oneUrl(alphaEntry)) : null;
+    const alphaPrev = alphaDsEntry ? s3ToHttp(oneUrl(alphaDsEntry)) : null;
+    // Emit a segment if it has EITHER a 2D ink prediction OR a 3D-ink preview
+    // (so the 3 alpha-only PHercParis4 segments still appear).
+    if (!full && !alphaPrev) continue;
     const layers = oneUrl(data.find((d) => d.type === "layers-zarr"));
     const mesh = oneUrl(data.find((d) => d.type === "obj-flattened" || d.type === "obj"));
     out.push({
       id: key,
       label: inkSegmentLabel(sid),
-      um: full.um,
-      full: full.url,
-      preview: down ? down.url : full.url,
+      um: full ? full.um : null,
+      full: full ? full.url : null,
+      preview: full ? (down ? down.url : full.url) : null,
+      alpha,
+      alphaPrev,
       layers,
       mesh,
     });
@@ -220,6 +243,57 @@ function extractInkSegments(sample, id, s3ToHttp) {
     return String(a.label).localeCompare(String(b.label), undefined, { numeric: true });
   });
   return out;
+}
+
+// Volume-level model predictions for a sample (surface-prediction / 3D-ink) —
+// the "Predictions" table the old atlas exposed. A prediction lives in the same
+// volume object as the base CT ome-zarr, so the volume's properties give the
+// base resolution/energy and the volume map key IS the base-volume id. The raw
+// s3:// zarr URL is kept as-is; the component builds Neuroglancer/Files links
+// via neuroglancerUrl()/toHttp(), exactly like scans[].volume.
+function extractPredictions(sample) {
+  const vols = (sample && sample.volumes) || {};
+  const oneUrl = (d) => {
+    const o = d && (d.origins || [])[0];
+    return o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
+  };
+  const out = [];
+  for (const [volKey, v] of Object.entries(vols)) {
+    const props = v.properties || {};
+    for (const d of v.data || []) {
+      if (d.type !== "surface-prediction-zarr" && d.type !== "ink-detection-3d-zarr")
+        continue;
+      const p = d.parameters || {};
+      out.push({
+        purpose: d.type.replace(/-zarr$/, ""), // surface-prediction | ink-detection-3d
+        baseVolume: volKey,
+        px: props.pixel_size_um ?? null,
+        energy: props.energy_keV ?? null,
+        model: p.model_id ?? null,
+        level: p.level ?? null,
+        threshold: p.threshold_value ?? null,
+        zarr: oneUrl(d),
+      });
+    }
+  }
+  // 3D-ink first (the showcase), then surface predictions by finest pixel size,
+  // then model id — a stable, meaningful order for the table.
+  const rank = (x) => (x.purpose === "ink-detection-3d" ? 0 : 1);
+  out.sort((a, b) => {
+    if (rank(a) !== rank(b)) return rank(a) - rank(b);
+    const pa = a.px ?? 1e9;
+    const pb = b.px ?? 1e9;
+    if (pa !== pb) return pa - pb;
+    return String(a.model || "").localeCompare(String(b.model || ""));
+  });
+  // Defensive de-dup on the identifying tuple.
+  const seen = new Set();
+  return out.filter((x) => {
+    const k = `${x.purpose}|${x.baseVolume}|${x.model}|${x.level}|${x.threshold}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 
 // Merge curated overlay fields onto a scroll, applying the embargo strip.
@@ -257,17 +331,26 @@ function curatedFields(overlayScroll, id) {
     progress: o.progress ?? null,
     stages: normalizeStages(o.stages ? { ...o.stages } : null),
     readings,
+    // DEPRECATED: surface-prediction Neuroglancer links now derive from
+    // scroll.predictions (see extractPredictions); kept for backward-compat only.
     volume: o.volume ?? null,
   };
 }
 
 // Derive the count-based dashboard numbers from the per-scroll data so they can
-// never drift out of sync with the pipeline `stages`. Editorial fields (the PB
-// tile, the µm/Latin subs, labels, descriptions, totals.at1um/subum) are left
-// exactly as curated. Tiles opt in via a `derive` key ("all" | "ink" | "text").
+// never drift out of sync with the pipeline `stages` or the scan metadata.
+// Editorial fields (the PB headline, Latin subs, labels, descriptions) are left
+// exactly as curated. Tiles opt in via a `derive` key: "all" | "ink" | "text"
+// set the big number; "resolution" sets the scan-resolution sub-label.
 function deriveDashboard(dashboard, scrolls) {
   if (!dashboard) return dashboard;
   const cnt = (k) => scrolls.filter((s) => s.stages && s.stages[k]).length;
+  // Scan-resolution facts across every sample's scans (for the data tile).
+  const scanPx = scrolls
+    .flatMap((s) => (s.scans || []).map((x) => x.px))
+    .filter((v) => v != null);
+  const subCount = scanPx.filter((v) => v < 2).length;
+  const finest = scanPx.length ? Math.min(...scanPx) : null;
   const counts = {
     all: scrolls.length,
     scrolls: scrolls.filter((s) => s.type === "scroll").length,
@@ -280,13 +363,18 @@ function deriveDashboard(dashboard, scrolls) {
   };
   for (const f of dashboard.funnel || [])
     if (counts[f.key] !== undefined) f.count = counts[f.key];
-  if (dashboard.totals)
+  if (dashboard.totals) {
     for (const k of ["all", "scrolls", "fragments", "segmented", "unrolled", "ink", "text"])
       dashboard.totals[k] = counts[k];
+    dashboard.totals.subum = subCount;
+  }
   for (const t of dashboard.tiles || []) {
     if (t.derive === "all") {
       t.big = String(counts.all);
       t.sub = `${counts.scrolls} scrolls · ${counts.fragments} fragments`;
+    } else if (t.derive === "resolution") {
+      if (finest != null)
+        t.sub = `${subCount} scan${subCount === 1 ? "" : "s"} at sub-2µm, down to ${finest.toFixed(1)}µm`;
     } else if (t.derive && counts[t.derive] !== undefined) {
       t.big = String(counts[t.derive]);
     }
@@ -329,6 +417,7 @@ function generate() {
         const inkSegments = samples[id]
           ? extractInkSegments(samples[id], id, s3ToHttp)
           : [];
+        const predictions = samples[id] ? extractPredictions(samples[id]) : [];
 
         // Prefer S3 for factual fields; fall back to nothing for overlay-only
         // ids without S3 facts (still emit with what's available).
@@ -353,6 +442,14 @@ function generate() {
           // assets
           mesh,
           inkSegments,
+          // predictions (volume-level) + derived flags/counts for cards & filters
+          predictions,
+          hasSurfacePred: predictions.some((p) => p.purpose === "surface-prediction"),
+          hasInk3d: predictions.some((p) => p.purpose === "ink-detection-3d"),
+          n_predictions: predictions.length,
+          n_inkSegments: inkSegments.filter((s) => s.full).length,
+          n_alpha: inkSegments.filter((s) => s.alphaPrev).length,
+          alphaHero: (inkSegments.find((s) => s.alphaPrev) || {}).alphaPrev || null,
         };
       });
 
@@ -379,9 +476,10 @@ function generate() {
       const withMesh = scrolls.filter((s) => s.mesh).length;
       const withReadings = scrolls.filter((s) => s.readings).length;
       const withContent = scrolls.filter((s) => s.content).length;
+      const withPred = scrolls.filter((s) => s.n_predictions).length;
       console.log(
         `[atlas] wrote ${scrolls.length} scrolls to ${path.relative(ROOT, OUT_PATH)} ` +
-          `(${withMesh} mesh, ${withReadings} readings, ${withContent} content)`
+          `(${withMesh} mesh, ${withReadings} readings, ${withContent} content, ${withPred} predictions)`
       );
     })
     .catch((err) => {
@@ -416,6 +514,13 @@ function generate() {
           ...curatedFields(overlayScrolls[id], id),
           mesh: meshManifest[id] || null,
           inkSegments: [],
+          predictions: [],
+          hasSurfacePred: false,
+          hasInk3d: false,
+          n_predictions: 0,
+          n_inkSegments: 0,
+          n_alpha: 0,
+          alphaHero: null,
         }))
         .sort((a, b) => {
           const ra = stageRank(a);

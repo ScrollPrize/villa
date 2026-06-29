@@ -51,11 +51,13 @@ export default function ScrollCard({ scroll }) {
   const mesh = scroll.mesh;
   const photo = scroll.photo;
 
-  // Image count badge: 3D model + photo + ink-reading images.
-  const imgN =
-    (mesh ? 1 : 0) +
-    (photo ? 1 : 0) +
-    (readings ? (readings.images || []).length : 0);
+  // Prediction signals (derived in genAtlasData.js from metadata.json).
+  const hasInk3d = !!scroll.hasInk3d;
+  const nInk = scroll.n_inkSegments || 0;
+  const nAlpha = scroll.n_alpha || 0;
+
+  // Honest image count: 3D model + photo + 2D-ink + 3D-ink renders.
+  const imgN = (mesh ? 1 : 0) + (photo ? 1 : 0) + nInk + nAlpha;
 
   // Segment count: explicit progress value, else the sample's n_segments.
   const segN = progress.segments != null ? progress.segments : scroll.n_segments || 0;
@@ -100,7 +102,22 @@ export default function ScrollCard({ scroll }) {
       <div className="chead">
         <span className="name">
           {scroll.id}
-          {readings ? <span className="rd">ink</span> : null}
+          {hasInk3d ? (
+            <span
+              className="pb ink3d"
+              title="3D ink prediction — detected ink mapped onto the rendered papyrus surface"
+            >
+              3D ink
+            </span>
+          ) : null}
+          {nInk > 0 ? (
+            <span
+              className="rd"
+              title="Ink-detection results on the flattened segment surfaces"
+            >
+              ink
+            </span>
+          ) : null}
         </span>
         <span className="pherc">
           {nick ? nick : ""}

@@ -41,6 +41,10 @@ export default function AtlasRendererProvider({ children }) {
   // StrictMode's double mount/unmount in development.
   const initedRef = useRef(false);
 
+  // Set if WebGL is unavailable, so cards degrade to a static placeholder
+  // instead of an uncaught "Error creating WebGL context" taking over the page.
+  const glFailedRef = useRef(false);
+
   // `paused` is the ONLY piece of React state, so a pause button can reflect
   // it. Default to true when the user prefers reduced motion.
   const [paused, setPausedState] = useState(() => {
@@ -98,6 +102,11 @@ export default function AtlasRendererProvider({ children }) {
     apiRef.current = {
       register(id, el, mesh) {
         if (!el) return;
+        if (glFailedRef.current) {
+          const ph = el.querySelector('.ph');
+          if (ph) ph.textContent = '3D unavailable';
+          return;
+        }
         const entry = {
           id,
           el,
@@ -145,11 +154,23 @@ export default function AtlasRendererProvider({ children }) {
       const canvas = canvasRef.current;
       if (!canvas) return;
 
-      const renderer = new THREE.WebGLRenderer({
-        canvas,
-        antialias: true,
-        alpha: true,
-      });
+      let renderer;
+      try {
+        renderer = new THREE.WebGLRenderer({
+          canvas,
+          antialias: true,
+          alpha: true,
+        });
+      } catch (glErr) {
+        // No WebGL: flag it so cards (registered now or later) show a static
+        // placeholder instead of spinning forever, and bail out of setup.
+        glFailedRef.current = true;
+        for (const entry of registryRef.current.values()) {
+          const ph = entry.el && entry.el.querySelector('.ph');
+          if (ph) ph.textContent = '3D unavailable';
+        }
+        return;
+      }
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
       renderer.setClearColor(0x000000, 0);
       renderer.autoClear = false; // we clear once per frame, then scissor-render each card
@@ -218,7 +239,9 @@ export default function AtlasRendererProvider({ children }) {
         rafRef.current = requestAnimationFrame(frame);
       };
       rafRef.current = requestAnimationFrame(frame);
-    })();
+    })().catch(() => {
+      glFailedRef.current = true;
+    });
 
     // ---- Cleanup on provider unmount. ----
     return () => {

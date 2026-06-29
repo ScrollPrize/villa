@@ -24,7 +24,8 @@
       {
         "big": "~4.3 PB",
         "label": "open research data",
-        "sub": "3 scans at sub-2µm · 0 at 1µm"
+        "sub": "3 scans at sub-2µm, down to 1.1µm",
+        "derive": "resolution"
       }
     ],
     "funnel": [
@@ -67,7 +68,6 @@
       "unrolled": 4,
       "ink": 9,
       "text": 6,
-      "at1um": 0,
       "subum": 3
     },
     "marquee": {
@@ -270,15 +270,15 @@
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0172/photos/PHerc0172_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0172/",
       "content": {
-        "work": "Philodemus, On Vices, Book 1",
+        "work": "Philodemus, On Vices (Περὶ κακιῶν), Book 1",
         "lang": "Greek",
-        "summary": "Scroll 5 — Philodemus, On Vices, Book 1, recovered from the unrolled surface.",
+        "summary": "Title recovered — Philodemus, On Vices, Book 1.",
         "caveat": null
       },
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "Text recovered",
+        "textFound": "Title found",
         "textRank": 2,
         "unrolledPct": 70,
         "score": 2352.1,
@@ -294,7 +294,7 @@
         "unrolledPct": 70
       },
       "readings": {
-        "status": "~70% geometrically unrolled (Nov 2025); text recovered from the unrolled surface (7.9µm).",
+        "status": "~70% geometrically unrolled (Nov 2025); title recovered from the unrolled surface (7.9µm).",
         "images": [
           {
             "src": "/img/data_browser/readings/0172_banner_full.jpg",

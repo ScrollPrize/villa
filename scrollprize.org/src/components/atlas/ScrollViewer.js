@@ -52,7 +52,14 @@ export default function ScrollViewer({ mesh }) {
       const W = container.clientWidth || 1;
       const H = container.clientHeight || 1;
 
-      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      let renderer;
+      try {
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      } catch (glErr) {
+        const ph = container.querySelector('.atlas-view-ph');
+        if (ph) ph.textContent = '3D viewer unavailable (WebGL disabled)';
+        return;
+      }
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
       renderer.setSize(W, H);
       renderer.setClearColor(0x000000, 0);
@@ -112,7 +119,10 @@ export default function ScrollViewer({ mesh }) {
           if (ph) ph.textContent = '3D load failed';
         }
       );
-    })();
+    })().catch(() => {
+      const ph = container.querySelector('.atlas-view-ph');
+      if (ph) ph.textContent = '3D viewer unavailable';
+    });
 
     // ---- Full disposal on unmount. ----
     return () => {

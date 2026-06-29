@@ -53,11 +53,22 @@ export default function DataCatalog({ scroll }) {
   // Neuroglancer deep-link for its OME-Zarr volume (see ./dataAccess.js).
   const samplesS3 = `s3://vesuvius-challenge/${scroll.id}/`;
   const samplesHttp = toHttp(samplesS3);
-  const ngUrl = scroll.volume ? neuroglancerUrl(scroll.volume, scroll.display) : null;
   const ctUrl = scroll.volumeZarr
     ? neuroglancerUrl(scroll.volumeZarr, `${scroll.display} CT`)
     : null;
   const licenses = scroll.licenses || [];
+
+  // Volume-level predictions are listed in their own Predictions table; here we
+  // only summarize the count in the metadata list.
+  const preds = scroll.predictions || [];
+  const nSurface = preds.filter((p) => p.purpose === "surface-prediction").length;
+  const nInk3d = preds.filter((p) => p.purpose === "ink-detection-3d").length;
+  const predsTxt = [
+    nSurface ? `${nSurface} surface` : null,
+    nInk3d ? `${nInk3d} 3D-ink` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   // Quick-link buttons (ref lines 108-112).
   const links = [];
@@ -84,19 +95,6 @@ export default function DataCatalog({ scroll }) {
         rel="noopener noreferrer"
       >
         CT in Neuroglancer ↗
-      </a>,
-    );
-  }
-  if (ngUrl) {
-    links.push(
-      <a
-        key="ng"
-        className="dbtn"
-        href={ngUrl}
-        target="_blank"
-        rel="noopener noreferrer"
-      >
-        Surface prediction in Neuroglancer ↗
       </a>,
     );
   }
@@ -167,6 +165,12 @@ export default function DataCatalog({ scroll }) {
         </dd>
         <dt>Formats</dt>
         <dd>CT volumes (TIFF stacks · OME-Zarr) · surface segments</dd>
+        {predsTxt ? (
+          <React.Fragment>
+            <dt>Predictions</dt>
+            <dd>{predsTxt}</dd>
+          </React.Fragment>
+        ) : null}
         <dt>License</dt>
         <dd>
           {licenses.length ? (

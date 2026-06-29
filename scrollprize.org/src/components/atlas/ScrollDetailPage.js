@@ -6,7 +6,8 @@ import BrowserOnly from "@docusaurus/BrowserOnly";
 import JsonLd from "@site/src/components/JsonLd";
 import ScrollViewer from "./ScrollViewer";
 import DataCatalog from "./DataCatalog";
-import { photoThumb } from "./dataAccess";
+import PredictionsPanel from "./PredictionsPanel";
+import { photoThumb, neuroglancerUrl } from "./dataAccess";
 import ReadingsGallery from "./ReadingsGallery";
 import InkSegmentsGallery from "./InkSegmentsGallery";
 import useDarkModeGuard from "./useDarkModeGuard";
@@ -290,7 +291,17 @@ export default function ScrollDetailPage(props) {
                       }${sc.loc || ""}`.trim();
                     return (
                       <div className="scan" key={i}>
-                        <span>{label || "—"}</span>
+                        {sc.volume ? (
+                          <a
+                            href={neuroglancerUrl(sc.volume, label)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            {label || "—"} ↗
+                          </a>
+                        ) : (
+                          <span>{label || "—"}</span>
+                        )}
                       </div>
                     );
                   })
@@ -312,6 +323,9 @@ export default function ScrollDetailPage(props) {
 
             {/* Data & access */}
             <DataCatalog scroll={scroll} />
+
+            {/* Model predictions (volume-level surface + 3D-ink) */}
+            <PredictionsPanel predictions={scroll.predictions} />
 
             {/* Ink detection & renders */}
             <ReadingsGallery readings={readings} display={scroll.display} />
