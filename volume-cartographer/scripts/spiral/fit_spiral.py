@@ -10,7 +10,6 @@ import numpy as np
 import scipy.ndimage
 import torch.nn as nn
 import torch.nn.functional as F
-from vc import surface_index
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 import pyro.distributions
@@ -33,7 +32,11 @@ from ddp_helpers import (
 from lasagna_data import prepare_lasagna_volume
 from tifxyz import load_tifxyz
 from geom_utils import expm_2x2, interp1d
-from point_collection import load_point_collection, normalise_pcl_winding_annotations
+from point_collection import (
+    link_points_to_patches,
+    load_point_collection,
+    normalise_pcl_winding_annotations,
+)
 from tracks import (
     get_track_losses,
     get_track_satisfied_counts_in_chunks,
@@ -911,113 +914,19 @@ def main():
 
     # Link every point of every pcl to patches (adds 'on_patch' to attached points).
     # Using the vc3d surface patch index, identify which pcl points lie on patch surfaces.
-    # a point is considered on a patch surface if it is within the link_distance_tolerance.
-    # for general pcls, when multiple patches are within tolerance, we prefer the one with
-    # the largest area. between-patches pcls below prefer nearest distance within the named pair.
-    # adds 'on_patch' to attached points
-    patch_surfaces = []
-    for patch_id, patch in verified_patches.items():
-        patch_zyx = patch.zyxs.detach().cpu().contiguous().numpy().astype(np.float32, copy=False)
-        patch_scale = patch.scale.detach().cpu().numpy() if hasattr(patch.scale, 'detach') else patch.scale
-        patch_surfaces.append(surface_index.QuadSurface(patch_id, patch_zyx, float(patch_scale[0]), float(patch_scale[1])))
-
-    patch_index = surface_index.SurfacePatchIndex()
-    patch_index.rebuild(patch_surfaces, bbox_padding=link_distance_tolerance, sampling_stride=1)
-    indexed_patch_ids = patch_index.surface_ids()
-    patch_areas = {patch_id: float(patch.area) for patch_id, patch in verified_patches.items()}
-
-    between_patches_prefix = 'between_patches__'
-    general_pcls = []
-    between_pcls = []
-    for pcl in point_collections.values():
-        patch_pair = None
-        name = pcl.get('name', '') or ''
-        if name.startswith(between_patches_prefix):
-            rest = name[len(between_patches_prefix):]
-            split_at = rest.find('__')
-            while split_at != -1:
-                patch_id_1 = rest[:split_at]
-                patch_id_2 = rest[split_at + 2:]
-                if patch_id_1 in verified_patches and patch_id_2 in verified_patches:
-                    patch_pair = (patch_id_1, patch_id_2)
-                    break
-                split_at = rest.find('__', split_at + 1)
-
-        if patch_pair is None:
-            general_pcls.append(pcl)
-        else:
-            between_pcls.append((pcl, patch_pair))
-
-    # non-pair pcls can attach to any verified patch; when several are within
-    # tolerance, prefer the largest patch area and use distance only as a tie-break.
-    for pcl in tqdm(general_pcls, 'linking points to patches'):
-        points = list(pcl['points'].values())
-        if not points:
-            continue
-
-        point_xyzs = np.ascontiguousarray([point['zyx'][::-1] for point in points], dtype=np.float32)
-        offsets, surface_indices, distances, ijs = patch_index.locate_all_xyz_batch(point_xyzs, link_distance_tolerance)
-        for point_idx, point in enumerate(points):
-            best_hit_idx = None
-            best_area = -1.0
-            best_distance = float('inf')
-            for hit_idx in range(int(offsets[point_idx]), int(offsets[point_idx + 1])):
-                surface_idx = int(surface_indices[hit_idx])
-                if surface_idx < 0:
-                    continue
-                patch_id = indexed_patch_ids[surface_idx]
-                area = patch_areas[patch_id]
-                distance = float(distances[hit_idx])
-                if area > best_area or (area == best_area and distance < best_distance):
-                    best_hit_idx = hit_idx
-                    best_area = area
-                    best_distance = distance
-
-            if best_hit_idx is None:
-                continue
-
-            surface_idx = int(surface_indices[best_hit_idx])
-            ij = ijs[best_hit_idx]
-            point['on_patch'] = {
-                'id': indexed_patch_ids[surface_idx],
-                'distance': best_distance,
-                'ij': [float(ij[0]), float(ij[1])],
-            }
-
-    # between_patches pcls connect overlapping patches and can attach only to their named patch pair.
-    for pcl, patch_pair in tqdm(between_pcls, 'linking between-patches points'):
-        points = list(pcl['points'].values())
-        if not points:
-            continue
-
-        allowed_patch_ids = set(patch_pair)
-        point_xyzs = np.ascontiguousarray([point['zyx'][::-1] for point in points], dtype=np.float32)
-        offsets, surface_indices, distances, ijs = patch_index.locate_all_xyz_batch(point_xyzs, link_distance_tolerance)
-        for point_idx, point in enumerate(points):
-            best_hit_idx = None
-            best_distance = float('inf')
-            for hit_idx in range(int(offsets[point_idx]), int(offsets[point_idx + 1])):
-                surface_idx = int(surface_indices[hit_idx])
-                if surface_idx < 0 or indexed_patch_ids[surface_idx] not in allowed_patch_ids:
-                    continue
-                distance = float(distances[hit_idx])
-                if distance < best_distance:
-                    best_hit_idx = hit_idx
-                    best_distance = distance
-
-            if best_hit_idx is None:
-                continue
-
-            surface_idx = int(surface_indices[best_hit_idx])
-            ij = ijs[best_hit_idx]
-            point['on_patch'] = {
-                'id': indexed_patch_ids[surface_idx],
-                'distance': best_distance,
-                'ij': [float(ij[0]), float(ij[1])],
-            }
-
-    if between_pcls:
-        print(f'attached {len(between_pcls)} between_patches collection(s) to their named patches only')
+    # A point is considered on a patch surface if it is within link_distance_tolerance.
+    # For general pcls, when multiple patches are within tolerance, prefer the largest
+    # patch area and use distance only as a tie-break. Between-patches pcls connect
+    # overlapping patches and attach only to their named patch pair, using nearest
+    # distance within that pair.
+    link_points_to_patches(
+        verified_patches,
+        point_collections,
+        tolerance=link_distance_tolerance,
+        surface_index_tolerance=link_distance_tolerance,
+        distance_scale=1.0,
+        general_hit_policy='largest_area',
+    )
 
     # ==========================================================================
     # Point collection classification

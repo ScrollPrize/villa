@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nanobind/nanobind.h>
@@ -285,6 +286,56 @@ struct PySurfacePatchIndex {
                               own_2d(std::move(ij), 2));
     }
 
+    // Like locate_all_xyz_batch, but evaluate only the surfaces whose indices
+    // into surface_ids() are present in subset. This avoids projecting against
+    // unrelated overlapping surfaces for between-patch point collections.
+    nb::object locate_all_xyz_batch_in(
+        XyzBatch xyzs,
+        nb::ndarray<nb::numpy, const int32_t, nb::shape<-1>, nb::c_contig> subset,
+        float tolerance) const
+    {
+        const size_t n = xyzs.shape(0);
+        const float* xyz = xyzs.data();
+
+        std::unordered_set<SurfacePatchIndex::SurfacePtr> include;
+        const size_t num_subset = subset.shape(0);
+        const int32_t* sub = subset.data();
+        include.reserve(num_subset);
+        for (size_t t = 0; t < num_subset; ++t) {
+            const int32_t surface_index = sub[t];
+            if (surface_index >= 0 && static_cast<size_t>(surface_index) < surfaces.size()) {
+                include.insert(surfaces[surface_index]);
+            }
+        }
+
+        std::vector<int64_t> offsets(n + 1, 0);
+        std::vector<int32_t> surf_idx;
+        std::vector<float> distance;
+        std::vector<float> ij;
+
+        {
+            nb::gil_scoped_release release;
+            for (size_t k = 0; k < n; ++k) {
+                SurfacePatchIndex::PointQuery query;
+                query.worldPoint = cv::Vec3f(xyz[3 * k + 0], xyz[3 * k + 1], xyz[3 * k + 2]);
+                query.tolerance = tolerance;
+                query.surfaces.include = &include;
+                for (const auto& hit : index.locateAll(query)) {
+                    auto it = idx_by_surface.find(hit.surface.get());
+                    surf_idx.push_back(it != idx_by_surface.end() ? it->second : -1);
+                    distance.push_back(hit.distance);
+                    const cv::Vec2f grid = hit.surface->ptrToGrid(hit.ptr);
+                    ij.push_back(grid[1]);
+                    ij.push_back(grid[0]);
+                }
+                offsets[k + 1] = static_cast<int64_t>(surf_idx.size());
+            }
+        }
+
+        return nb::make_tuple(own_1d(std::move(offsets)), own_1d(std::move(surf_idx)),
+                              own_1d(std::move(distance)), own_2d(std::move(ij), 2));
+    }
+
     bool empty() const { return index.empty(); }
     size_t surface_count() const { return index.surfaceCount(); }
     size_t patch_count() const { return index.patchCount(); }
@@ -311,6 +362,8 @@ NB_MODULE(surface_index, m) {
         .def("locate_all_xyz", &PySurfacePatchIndex::locate_all_xyz, nb::arg("xyz"), nb::arg("tolerance"))
         .def("locate_all_xyz_batch", &PySurfacePatchIndex::locate_all_xyz_batch, nb::arg("xyzs"), nb::arg("tolerance"))
         .def("locate_xyz_nearest_batch", &PySurfacePatchIndex::locate_xyz_nearest_batch, nb::arg("xyzs"), nb::arg("tolerance"))
+        .def("locate_all_xyz_batch_in", &PySurfacePatchIndex::locate_all_xyz_batch_in,
+             nb::arg("xyzs"), nb::arg("subset"), nb::arg("tolerance"))
         .def("surface_ids", &PySurfacePatchIndex::surface_ids)
         .def("empty", &PySurfacePatchIndex::empty)
         .def("surface_count", &PySurfacePatchIndex::surface_count)
