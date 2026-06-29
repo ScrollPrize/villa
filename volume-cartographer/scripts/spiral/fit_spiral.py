@@ -17,6 +17,19 @@ import pyro.distributions
 from einops import rearrange
 from torchdiffeq import odeint
 
+from ddp_helpers import (
+    StepTimer,
+    allreduce_grads_,
+    broadcast_model_params,
+    configure_torch_threads_from_env,
+    get_rank,
+    get_world_size,
+    is_distributed,
+    is_main_process,
+    maybe_destroy_distributed,
+    maybe_init_distributed,
+    split_counts_across_ranks,
+)
 from lasagna_data import prepare_lasagna_volume
 from tifxyz import load_tifxyz
 from geom_utils import interp1d
@@ -64,6 +77,9 @@ from satistfaction_metrics import (
 from visualization import overlay_patches_on_slices
 
 
+configure_torch_threads_from_env()
+
+
 # PHercParis4
 dataset_path = '/ephemeral/paul/spiral/dataset'
 scroll_zarr_path = None
@@ -93,6 +109,11 @@ z_end //= downsample_factor
 
 default_config = {
     'random_seed': 1,
+    # Multi-GPU batch policy (only relevant under torchrun, world size > 1):
+    #   True  -> split per-step object-sample counts by world_size so the effective
+    #            per-step batch matches single-GPU while each rank does less work.
+    #   False -> scale-up: every rank keeps full counts, giving an N x larger effective batch.
+    'distributed_split_batch': True,
     'learning_rate': 3.e-5,
     'exp_lr_schedule': True,
     'lr_final_factor': 0.3,
@@ -1527,6 +1548,8 @@ def main():
         for _ in range(start_iteration):
             lr_scheduler.step()
 
+    broadcast_model_params(spiral_and_transform)
+
     if False:
         profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -1560,7 +1583,27 @@ def main():
     # Training loop
     # ==========================================================================
 
-    for iteration in tqdm(range(start_iteration, num_training_steps)):
+    if is_distributed():
+        np.random.seed(cfg['random_seed'] + get_rank())
+        torch.manual_seed(cfg['random_seed'] + get_rank())
+    dist_grad_params = list(spiral_and_transform.parameters())
+    dist_grad_named = list(spiral_and_transform.named_parameters())
+    if is_main_process():
+        n_params = sum(p.numel() for p in dist_grad_params)
+        n_bytes = sum(p.numel() * p.element_size() for p in dist_grad_params)
+        print(
+            f'trainable parameters: {n_params:,} ({n_bytes / 1e6:.1f} MB) - '
+            'gradient volume all-reduced every step in distributed mode'
+        )
+    step_timer = StepTimer(
+        enabled=os.environ.get('FIT_SPIRAL_PROFILE_STEPS') == '1',
+        report=is_main_process(),
+    )
+    nonfinite_grad_steps = torch.zeros((), device=dist_grad_params[0].device)
+    nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in dist_grad_named}
+
+    for iteration in tqdm(range(start_iteration, num_training_steps), disable=not is_main_process()):
+        step_timer.start('fwd')
         spiral_and_transform.flow_field.flow_scales[1] = get_flow_field_high_res_lr_scale(iteration)
 
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
@@ -1709,92 +1752,137 @@ def main():
         losses['umbilicus'] = umbilicus_loss * cfg['loss_weight_umbilicus']
         loss = sum(losses.values())
 
+        step_timer.stop('fwd')
+        step_timer.start('bwd')
         loss.backward()
+        step_timer.stop('bwd')
+        step_timer.start('comm')
+        allreduce_grads_(dist_grad_params)
+        step_timer.stop('comm')
+
+        step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=nonfinite_grad_steps.device)
+        for name, p in dist_grad_named:
+            if p.grad is not None:
+                param_nonfinite = (~torch.isfinite(p.grad)).any()
+                step_had_nonfinite |= param_nonfinite
+                nonfinite_grad_by_param[name] += param_nonfinite.to(nonfinite_grad_steps.dtype)
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        nonfinite_grad_steps += step_had_nonfinite.to(nonfinite_grad_steps.dtype)
+
+        step_timer.start('opt')
         optimiser.step()
+        step_timer.stop('opt')
         optimiser.zero_grad(set_to_none=True)
         lr_scheduler.step()
+        step_timer.tick()
+        step_timer.maybe_report(iteration)
         if profiler is not None:
             profiler.step()
 
         if iteration % 200 == 0:
             # Only sync to CPU and log when we actually print, avoiding a per-iter
             # GPU->CPU sync that would otherwise stall CPU/GPU overlap.
-            print(f'step {iteration}: loss = {loss.item():.1f}, ' + ', '.join(f'{name} = {value.item():.1f}' for name, value in losses.items()))
-            if loss.isnan().item():
-                print('aborting due to NaN')
-                return
-            wandb.log({
-                'total_loss': loss.item(),
-                **{name + '_loss': value for name, value in losses.items()},
-                **shell_metrics,
-                **log_metrics,
-            })
+            if is_main_process():
+                print(f'step {iteration}: loss = {loss.item():.1f}, ' + ', '.join(f'{name} = {value.item():.1f}' for name, value in losses.items()))
+                n_sanitised = int(nonfinite_grad_steps.item())
+                if n_sanitised > 0:
+                    per_param = sorted(
+                        ((name, int(count.item())) for name, count in nonfinite_grad_by_param.items() if count.item() > 0),
+                        key=lambda name_count: -name_count[1],
+                    )
+                    by_param = ', '.join(f'{name}: {count}' for name, count in per_param)
+                    print(f'  ({n_sanitised} non-finite-gradient steps sanitised so far; by param: {by_param})')
+                wandb.log({
+                    'total_loss': loss.item(),
+                    'nonfinite_grad_steps': nonfinite_grad_steps.item(),
+                    **{f'nonfinite_grad_steps/{name}': count.item() for name, count in nonfinite_grad_by_param.items()},
+                    **{name + '_loss': value for name, value in losses.items()},
+                    **shell_metrics,
+                    **log_metrics,
+                })
 
     # ==========================================================================
     # Final outputs
     # ==========================================================================
 
     suffix = 'fitted'
-    save_model(suffix)
-    save_overlay_and_print_satisfaction(
-        suffix,
-        spiral_and_transform=spiral_and_transform,
-        slice_to_spiral_transform=slice_to_spiral_transform,
-        dr_per_winding=dr_per_winding,
-        patches_list=verified_patches_list,
-        patches_dict=verified_patches,
-        unattached_pcl_strips=unattached_pcl_strips,
-        tracks=tracks,
-        unverified_patches_list=unverified_patches_list,
-        unverified_patches_dict=unverified_patches,
-        out_path=out_path,
-        cfg=cfg,
-        z_begin=z_begin,
-        z_end=z_end,
-        flow_field_radius=flow_field_radius,
-        flow_min_corner_spiral_zyx=flow_min_corner_spiral_zyx,
-        flow_max_corner_spiral_zyx=flow_max_corner_spiral_zyx,
-        zs_for_visualisation=zs_for_visualisation,
-        slice_yx=slice_yx,
-        scroll_slices_for_visualisation=scroll_slices_for_visualisation,
-        prediction_slices_for_visualisation=prediction_slices_for_visualisation,
-        quad_label_map=quad_label_map,
-        z_to_umbilicus_yx=umbilicus,
-        downsample_factor=downsample_factor,
-        voxel_size_um=voxel_size_um,
-        get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
-        run_tag=run_tag,
-    )
+    if is_main_process():
+        save_model(suffix)
+        save_overlay_and_print_satisfaction(
+            suffix,
+            spiral_and_transform=spiral_and_transform,
+            slice_to_spiral_transform=slice_to_spiral_transform,
+            dr_per_winding=dr_per_winding,
+            patches_list=verified_patches_list,
+            patches_dict=verified_patches,
+            unattached_pcl_strips=unattached_pcl_strips,
+            tracks=tracks,
+            unverified_patches_list=unverified_patches_list,
+            unverified_patches_dict=unverified_patches,
+            out_path=out_path,
+            cfg=cfg,
+            z_begin=z_begin,
+            z_end=z_end,
+            flow_field_radius=flow_field_radius,
+            flow_min_corner_spiral_zyx=flow_min_corner_spiral_zyx,
+            flow_max_corner_spiral_zyx=flow_max_corner_spiral_zyx,
+            zs_for_visualisation=zs_for_visualisation,
+            slice_yx=slice_yx,
+            scroll_slices_for_visualisation=scroll_slices_for_visualisation,
+            prediction_slices_for_visualisation=prediction_slices_for_visualisation,
+            quad_label_map=quad_label_map,
+            z_to_umbilicus_yx=umbilicus,
+            downsample_factor=downsample_factor,
+            voxel_size_um=voxel_size_um,
+            get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
+            run_tag=run_tag,
+        )
 
 
 if __name__ == '__main__':
-    config = dict(default_config)
-    config.update(get_env_config_overrides())
-    reference_z_range_num_slices = 9500
-    z_range_scaled_count_keys = (
-        'num_patches_per_step',
-        'num_patches_per_step_for_dt',
-        'unverified_num_patches_per_step',
-        'unverified_num_patches_per_step_for_dt',
-        'rel_winding_num_pcls',
-        'abs_winding_num_pcls',
-        'unattached_pcl_num_per_step',
-        'track_num_per_step',
-        'dense_normals_num_points',
-        'regularisation_num_points',
-        'shell_num_samples',
-    )
-    z_range_scale, z_range_num_slices = scale_counts_for_z_range(
-        config, z_begin, z_end, downsample_factor,
-        reference_z_range_num_slices, z_range_scaled_count_keys,
-    )
-    print(
-        f'scaled per-step counts by {z_range_scale:.3f} for the {z_range_num_slices}-slice '
-        f'z-range [{z_begin * downsample_factor}, {z_end * downsample_factor}) '
-        f'(reference {reference_z_range_num_slices} slices):\n  '
-        + '\n  '.join(f'{k}={config[k]}' for k in z_range_scaled_count_keys)
-    )
-    wandb.init(project='scrolls', config=config)
-    cfg = wandb.config
-    configure_losses(cfg, z_begin, z_end, downsample_factor)
-    main()
+    maybe_init_distributed()
+    try:
+        config = dict(default_config)
+        config.update(get_env_config_overrides())
+        reference_z_range_num_slices = 9500
+        z_range_scaled_count_keys = (
+            'num_patches_per_step',
+            'num_patches_per_step_for_dt',
+            'unverified_num_patches_per_step',
+            'unverified_num_patches_per_step_for_dt',
+            'rel_winding_num_pcls',
+            'abs_winding_num_pcls',
+            'unattached_pcl_num_per_step',
+            'track_num_per_step',
+            'dense_normals_num_points',
+            'regularisation_num_points',
+            'shell_num_samples',
+        )
+        z_range_scale, z_range_num_slices = scale_counts_for_z_range(
+            config, z_begin, z_end, downsample_factor,
+            reference_z_range_num_slices, z_range_scaled_count_keys,
+        )
+        split_divisor = split_counts_across_ranks(config, z_range_scaled_count_keys)
+        if is_main_process():
+            print(
+                f'scaled per-step counts by {z_range_scale:.3f} for the {z_range_num_slices}-slice '
+                f'z-range [{z_begin * downsample_factor}, {z_end * downsample_factor}) '
+                f'(reference {reference_z_range_num_slices} slices):\n  '
+                + '\n  '.join(f'{k}={config[k]}' for k in z_range_scaled_count_keys)
+            )
+            if is_distributed():
+                policy = f'split by {split_divisor}' if split_divisor > 1 else 'scale-up (full counts per rank)'
+                print(f'distributed: world_size={get_world_size()}, per-step counts {policy}')
+
+        wandb_mode = os.environ.get('WANDB_MODE')
+        if not is_main_process():
+            wandb_mode = 'disabled'
+        if wandb_mode is None:
+            wandb.init(project='scrolls', config=config)
+        else:
+            wandb.init(project='scrolls', config=config, mode=wandb_mode)
+        cfg = wandb.config
+        configure_losses(cfg, z_begin, z_end, downsample_factor)
+        main()
+    finally:
+        maybe_destroy_distributed()
