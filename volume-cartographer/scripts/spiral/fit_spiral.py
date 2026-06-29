@@ -1364,6 +1364,9 @@ def main():
         step_timer.stop('fwd')
         step_timer.start('bwd')
         loss.backward()
+        apply_accumulated_field_grad = getattr(spiral_and_transform.flow_field, 'apply_accumulated_field_grad', None)
+        if apply_accumulated_field_grad is not None:
+            apply_accumulated_field_grad()
         step_timer.stop('bwd')
         step_timer.start('comm')
         allreduce_grads_(dist_grad_params)

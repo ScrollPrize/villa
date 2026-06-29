@@ -18,6 +18,83 @@ def sample_field(normalised_zyx, field_for_grid_sample):
     return field_samples.squeeze(0).squeeze(-2).squeeze(-1).T.view(*orig_shape[:-1], 3)  # *, zyx
 
 
+_CORNER_BITS_CACHE = {}
+
+
+def _corner_bits(device):
+    t = _CORNER_BITS_CACHE.get(device)
+    if t is None:
+        t = torch.tensor(
+            [[dz, dy, dx] for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)],
+            device=device,
+            dtype=torch.int64,
+        )
+        _CORNER_BITS_CACHE[device] = t
+    return t
+
+
+class _SparseAccumTrilinearSample(torch.autograd.Function):
+    # Trilinear sampling matching sample_field / grid_sample(align_corners=True,
+    # padding_mode='border'), with sparse field-gradient accumulation into a
+    # caller-owned dense buffer. This avoids materialising one full field-sized
+    # gradient tensor per sampler call in the RK4 integration loop.
+
+    @staticmethod
+    def _corners(pts, field):
+        shape = torch.tensor(field.shape[1:], device=pts.device, dtype=pts.dtype)
+        coord_raw = pts * (shape - 1)
+        coord = coord_raw.clamp(min=torch.zeros_like(shape), max=shape - 1)
+        lo = torch.nan_to_num(coord, nan=0.0).floor().clamp(
+            min=torch.zeros_like(shape),
+            max=shape - 2,
+        ).to(torch.int64)
+        frac = coord - lo.to(coord.dtype)
+        Y, X = field.shape[2], field.shape[3]
+        base = (lo[:, 0] * Y + lo[:, 1]) * X + lo[:, 2]
+        return coord_raw, shape, frac, base, (Y * X, X, 1)
+
+    @staticmethod
+    def forward(ctx, pts, field, acc):
+        ctx.set_materialize_grads(False)
+        out = sample_field(pts, field)
+        ctx.save_for_backward(pts, field)
+        ctx.acc = acc
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if grad_out is None:
+            return None, None, None
+        pts, field = ctx.saved_tensors
+        coord_raw, shape, frac, base, strides = _SparseAccumTrilinearSample._corners(pts, field)
+        flat_field = field.reshape(3, -1)
+        acc_flat = ctx.acc.reshape(3, -1)
+
+        corners = _corner_bits(pts.device)
+        strides_t = torch.tensor(strides, device=pts.device, dtype=torch.int64)
+        idx_all = base[:, None] + (corners * strides_t).sum(-1)[None, :]
+
+        f = torch.stack([1 - frac, frac], dim=-1)
+        fz = f[:, 0, corners[:, 0]]
+        fy = f[:, 1, corners[:, 1]]
+        fx = f[:, 2, corners[:, 2]]
+        w_all = fz * fy * fx
+
+        vals = (grad_out[:, None, :] * w_all[..., None]).permute(2, 0, 1).reshape(3, -1)
+        acc_flat.index_add_(1, idx_all.reshape(-1), vals)
+
+        gathered = flat_field[:, idx_all.reshape(-1)].view(3, *idx_all.shape)
+        v_dot_g = (gathered * grad_out.T[:, :, None]).sum(0)
+        signs = (2 * corners - 1).to(grad_out.dtype)
+        grad_coord = torch.stack([
+            (v_dot_g * signs[:, 0] * fy * fx).sum(1),
+            (v_dot_g * signs[:, 1] * fz * fx).sum(1),
+            (v_dot_g * signs[:, 2] * fz * fy).sum(1),
+        ], dim=-1)
+        unclipped = (coord_raw >= 0) & (coord_raw <= shape - 1)
+        return grad_coord * unclipped.to(grad_coord.dtype) * (shape - 1), None, None
+
+
 class CartesianFlowField(nn.Module):
 
     def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1, num_flow_timesteps=1):
@@ -31,6 +108,8 @@ class CartesianFlowField(nn.Module):
                 resolution,
             ]
         ])
+        self._pending_field = None
+        self._field_grad_acc = None
 
     def get_sampler(self, t):
         # Returns a callable mapping normalised zyx points in [0, 1] to flow velocity at time t.
@@ -42,6 +121,21 @@ class CartesianFlowField(nn.Module):
             # Time-invariant: HR flow is already at the target resolution, so skip interpolating it.
             lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')[0] * self.flow_scales[0]
             field = lr_upsampled + hr_flow[0] * self.flow_scales[1]
+            if not field.requires_grad:
+                return lambda y: sample_field(y, field)
+            if self._field_grad_acc is None or self._field_grad_acc.shape != field.shape:
+                self._field_grad_acc = torch.zeros_like(field)
+            else:
+                self._field_grad_acc.zero_()
+            self._pending_field = field
+            field_detached = field.detach()
+            acc = self._field_grad_acc
+
+            def sample(normalised_zyx):
+                flat = normalised_zyx.reshape(-1, 3)
+                return _SparseAccumTrilinearSample.apply(flat, field_detached, acc).view(*normalised_zyx.shape[:-1], 3)
+
+            return sample
         else:
             t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (self.num_flow_timesteps - 1)
             t_idx_before = int(t_scaled)
@@ -54,6 +148,11 @@ class CartesianFlowField(nn.Module):
                 for flow_interpolated in flows_interpolated
             )
         return lambda y: sample_field(y, field)
+
+    def apply_accumulated_field_grad(self):
+        if self._pending_field is not None:
+            self._pending_field.backward(gradient=self._field_grad_acc)
+            self._pending_field = None
 
 
 class CylindricalFlowField(nn.Module):
