@@ -107,7 +107,7 @@
       "date": "2025-11",
       "scroll": "PHerc0172",
       "title": "Scroll 5 ~70% unrolled",
-      "blurb": "A major virtual-unrolling milestone (a ~2.5 m surface trace), though ink legibility remains limited."
+      "blurb": "A major virtual-unrolling milestone, though ink legibility remained limited at the time."
     },
     {
       "date": "2024-02",
@@ -266,13 +266,13 @@
     "PHerc0172": {
       "display": "Scroll 5",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Scroll 5. ~70% geometrically unrolled by November 2025 (a 2.5 m trace of a ~7 m banner).",
+      "note": "Scroll 5. ~70% geometrically unrolled by November 2025.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0172/photos/PHerc0172_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0172/",
       "content": {
-        "work": "Not yet identified",
-        "lang": "Greek (expected)",
-        "summary": "Scroll 5 — ~70% geometrically unrolled (a 2.5 m surface trace); text recovered from the unrolled surface.",
+        "work": "Philodemus, On Vices, Book 1",
+        "lang": "Greek",
+        "summary": "Scroll 5 — Philodemus, On Vices, Book 1, recovered from the unrolled surface.",
         "caveat": null
       },
       "progress": {
@@ -294,7 +294,7 @@
         "unrolledPct": 70
       },
       "readings": {
-        "status": "~70% geometrically unrolled (Nov 2025, a 2.5 m surface trace); text recovered from the unrolled surface (7.9µm).",
+        "status": "~70% geometrically unrolled (Nov 2025); text recovered from the unrolled surface (7.9µm).",
         "images": [
           {
             "src": "/img/data_browser/readings/0172_banner_full.jpg",

@@ -54,6 +54,10 @@ export default function DataCatalog({ scroll }) {
   const samplesS3 = `s3://vesuvius-challenge/${scroll.id}/`;
   const samplesHttp = toHttp(samplesS3);
   const ngUrl = scroll.volume ? neuroglancerUrl(scroll.volume, scroll.display) : null;
+  const ctUrl = scroll.volumeZarr
+    ? neuroglancerUrl(scroll.volumeZarr, `${scroll.display} CT`)
+    : null;
+  const licenses = scroll.licenses || [];
 
   // Quick-link buttons (ref lines 108-112).
   const links = [];
@@ -70,6 +74,19 @@ export default function DataCatalog({ scroll }) {
       </a>,
     );
   }
+  if (ctUrl) {
+    links.push(
+      <a
+        key="ngct"
+        className="dbtn"
+        href={ctUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        CT in Neuroglancer ↗
+      </a>,
+    );
+  }
   if (ngUrl) {
     links.push(
       <a
@@ -79,7 +96,7 @@ export default function DataCatalog({ scroll }) {
         target="_blank"
         rel="noopener noreferrer"
       >
-        Open in Neuroglancer ↗
+        Surface prediction in Neuroglancer ↗
       </a>,
     );
   }
@@ -152,10 +169,20 @@ export default function DataCatalog({ scroll }) {
         <dd>CT volumes (TIFF stacks · OME-Zarr) · surface segments</dd>
         <dt>License</dt>
         <dd>
-          CC BY-NC 4.0 ·{" "}
-          <a href={LICENSE_URL} target="_blank" rel="noopener noreferrer">
-            terms
-          </a>
+          {licenses.length ? (
+            licenses.map((l, i) => (
+              <React.Fragment key={l.url}>
+                {i ? " · " : ""}
+                <a href={l.url} target="_blank" rel="noopener noreferrer">
+                  {l.name}
+                </a>
+              </React.Fragment>
+            ))
+          ) : (
+            <a href={LICENSE_URL} target="_blank" rel="noopener noreferrer">
+              CC BY-NC 4.0
+            </a>
+          )}
         </dd>
       </dl>
       <PathRow label="HTTP" value={httpBase} />

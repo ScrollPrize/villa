@@ -102,6 +102,24 @@ function deriveFacts(sample) {
   const scanList = Object.values(scans).map(scanFacts);
   const pxVals = scanList.map((s) => s.px).filter((v) => v !== null && v !== undefined);
 
+  // Distinct data licenses across the item's volumes (varies: EduceLab vs
+  // CC BY-NC), plus the first OME-Zarr CT volume for a Neuroglancer link.
+  const licenses = [];
+  const seenLic = new Set();
+  let volumeZarr = null;
+  for (const v of Object.values(volumes)) {
+    const lic = v.properties && v.properties.license;
+    if (lic && lic.url && !seenLic.has(lic.url)) {
+      seenLic.add(lic.url);
+      licenses.push({ name: lic.name || "License", url: lic.url });
+    }
+    if (!volumeZarr) {
+      const z = (v.data || []).find((d) => /zarr/i.test(d.type));
+      const o = z && (z.origins || [])[0];
+      if (o && o.path) volumeZarr = `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}`;
+    }
+  }
+
   return {
     // Samples with no explicit type in the metadata are scrolls (per curation).
     type: sampleProps.type && sampleProps.type !== "?" ? sampleProps.type : "scroll",
@@ -114,6 +132,8 @@ function deriveFacts(sample) {
     energies: uniqSortedNums(scanList.map((s) => s.energy)),
     locations: uniqStrings(scanList.map((s) => s.loc)),
     scans: scanList,
+    licenses,
+    volumeZarr,
   };
 }
 
@@ -164,12 +184,21 @@ function extractInkSegments(sample, id, s3ToHttp) {
     const full = fulls.sort(byUm)[0];
     const down = downs.sort(byUm)[0] || null;
     const sid = seg.suffix || seg.long_id || key;
+    // Per-segment surface layers (→ Neuroglancer) and mesh (→ download).
+    const oneUrl = (d) => {
+      const o = d && (d.origins || [])[0];
+      return o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
+    };
+    const layers = oneUrl(data.find((d) => d.type === "layers-zarr"));
+    const mesh = oneUrl(data.find((d) => d.type === "obj-flattened" || d.type === "obj"));
     out.push({
       id: key,
       label: inkSegmentLabel(sid),
       um: full.um,
       full: full.url,
       preview: down ? down.url : full.url,
+      layers,
+      mesh,
     });
   }
   // Order unwrap (winding) ranges in DECREASING order (highest winding first);
@@ -317,6 +346,8 @@ function generate() {
           locations: facts ? facts.locations : [],
           scans: facts ? facts.scans : [],
           hasS3: !!facts,
+          licenses: facts ? facts.licenses : [],
+          volumeZarr: facts ? facts.volumeZarr : null,
           // curated (overlay)
           ...curated,
           // assets
@@ -380,6 +411,8 @@ function generate() {
           locations: [],
           scans: [],
           hasS3: false,
+          licenses: [],
+          volumeZarr: null,
           ...curatedFields(overlayScrolls[id], id),
           mesh: meshManifest[id] || null,
           inkSegments: [],

@@ -77,6 +77,19 @@ export function neuroglancerUrl(volumeUrl, name = "volume") {
 // { cacheUrl, serviceUrl }: try the pre-baked S3 cache first, fall back to the
 // live Thumbor service on <img onError>. Both null if no thumbnail server
 // matches the image's prefix.
+// Optimized hero URL for an item's physical photo, via the Thumbor service
+// (host normalized so it matches a thumbnails[] prefix). Falls back to the
+// original URL if no thumbnail server matches.
+export function photoThumb(photoUrl, width = 1400) {
+  if (!photoUrl) return null;
+  const norm = photoUrl.replace(
+    "vesuvius-challenge-open-data.s3.amazonaws.com",
+    "vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
+  );
+  const { serviceUrl } = thumbnailUrls(norm, width, width);
+  return serviceUrl || photoUrl;
+}
+
 export function thumbnailUrls(imageUrl, width = 400, height = 400, fmt = "webp") {
   const t = (DA.thumbnails || []).find((s) => imageUrl && imageUrl.startsWith(s.prefix));
   if (!t) return { cacheUrl: null, serviceUrl: null };

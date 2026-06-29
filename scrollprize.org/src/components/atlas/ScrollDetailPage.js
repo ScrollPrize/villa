@@ -6,6 +6,7 @@ import BrowserOnly from "@docusaurus/BrowserOnly";
 import JsonLd from "@site/src/components/JsonLd";
 import ScrollViewer from "./ScrollViewer";
 import DataCatalog from "./DataCatalog";
+import { photoThumb } from "./dataAccess";
 import ReadingsGallery from "./ReadingsGallery";
 import InkSegmentsGallery from "./InkSegmentsGallery";
 import useDarkModeGuard from "./useDarkModeGuard";
@@ -179,8 +180,22 @@ export default function ScrollDetailPage(props) {
               </div>
             ) : null}
 
-            {/* 3D model / fragment photo panel */}
-            {mesh ? (
+            {/* Hero: the physical photograph if available, else the 3D model */}
+            {photo ? (
+              <div className="panel">
+                <h2>Photograph</h2>
+                <div className="fragview">
+                  <img
+                    src={photoThumb(photo, 1400)}
+                    alt={`Photograph of ${scroll.id}`}
+                    loading="lazy"
+                    onError={(e) => {
+                      e.currentTarget.src = photo;
+                    }}
+                  />
+                </div>
+              </div>
+            ) : mesh ? (
               <div className="panel">
                 <h2>3D model</h2>
                 <BrowserOnly
@@ -193,17 +208,6 @@ export default function ScrollDetailPage(props) {
                   {() => <ScrollViewer mesh={mesh} />}
                 </BrowserOnly>
               </div>
-            ) : photo ? (
-              <div className="panel">
-                <h2>Fragment</h2>
-                <div className="fragview">
-                  <img
-                    src={photo}
-                    alt={`photo of ${scroll.id}`}
-                    loading="lazy"
-                  />
-                </div>
-              </div>
             ) : (
               <div className="panel">
                 <h2>3D model</h2>
@@ -213,20 +217,25 @@ export default function ScrollDetailPage(props) {
               </div>
             )}
 
+            {/* Secondary 3D-model panel when the item also has a mesh */}
+            {photo && mesh ? (
+              <div className="panel">
+                <h2>3D model</h2>
+                <BrowserOnly
+                  fallback={
+                    <div className="atlas-view">
+                      <div className="ph">loading…</div>
+                    </div>
+                  }
+                >
+                  {() => <ScrollViewer mesh={mesh} />}
+                </BrowserOnly>
+              </div>
+            ) : null}
+
             {/* Stats panel */}
             <div className="panel">
-              {mesh && photo ? (
-                <div className="photo">
-                  <img
-                    src={photo}
-                    alt={`photo of ${scroll.id}`}
-                    loading="lazy"
-                  />
-                </div>
-              ) : null}
-              <h2 style={mesh && photo ? { marginTop: "14px" } : undefined}>
-                Stats
-              </h2>
+              <h2>Stats</h2>
               <dl>
                 <dt>Status</dt>
                 <dd>
