@@ -943,6 +943,13 @@ bool isChunkedViewer(VolumeViewerBase* viewer)
     return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
 }
 
+bool isAnnotationViewer(VolumeViewerBase* viewer)
+{
+    return viewer &&
+           viewer->asQObject() &&
+           viewer->asQObject()->property("vc_viewer_role").toString() == QStringLiteral("annotation");
+}
+
 bool moveOnSurfaceChangeEnabled()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -2277,16 +2284,17 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     } else if (!viewer->property("vc_annotation_focus_bound").toBool()) {
         const std::string surfaceName = viewer->surfName();
         const bool atlasFocusViewer = surfaceName == ATLAS_INTERNAL_SURFACE_NAME;
-        const bool lineFocusViewer = surfaceName.rfind("line-", 0) == 0;
+        const bool lineFocusViewer = surfaceName.rfind("line-", 0) == 0 ||
+                                     surfaceName.rfind("line_annotation_slice_", 0) == 0;
         if (atlasFocusViewer || lineFocusViewer) {
             connect(viewer,
                     &CChunkedVolumeViewer::sendVolumeClicked,
                     this,
-                    [this, atlasFocusViewer, lineFocusViewer, surfaceName](cv::Vec3f volLoc,
-                                                                           cv::Vec3f normal,
-                                                                           Surface*,
-                                                                           Qt::MouseButton button,
-                                                                           Qt::KeyboardModifiers modifiers) {
+                    [this, atlasFocusViewer, lineFocusViewer](cv::Vec3f volLoc,
+                                                              cv::Vec3f normal,
+                                                              Surface*,
+                                                              Qt::MouseButton button,
+                                                              Qt::KeyboardModifiers modifiers) {
                         if (button != Qt::LeftButton || !modifiers.testFlag(Qt::ControlModifier)) {
                             return;
                         }
@@ -2297,13 +2305,8 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                         const bool focused = centerFocusAt(volLoc, normal, sourceId);
                         if (atlasFocusViewer || (lineFocusViewer && focused)) {
                             switchToMainWorkspace();
-                        }
-                        if (lineFocusViewer && focused) {
-                            QTimer::singleShot(0, this, [this, surfaceName]() {
-                                if (_lineAnnotationController) {
-                                    _lineAnnotationController->closeFiberWindowForSurface(surfaceName);
-                                }
-                            });
+                            raise();
+                            activateWindow();
                         }
                     });
             viewer->setProperty("vc_annotation_focus_bound", true);
@@ -2973,13 +2976,12 @@ void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
     }
 
     _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
-        if (!viewer) {
+        if (!viewer || isAnnotationViewer(viewer)) {
             return;
         }
 
         const std::string name = viewer->surfName();
-        if (name == "xy plane" || name == "seg xz" || name == "seg yz" ||
-            name.rfind("line_annotation_slice_", 0) == 0) {
+        if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
             centerViewerOnVolumePointForNavigation(viewer, position);
         }
     });
@@ -3035,7 +3037,7 @@ bool CWindow::recenterViewersOnCurrentFocus()
 
     const cv::Vec3f position = focus->p;
     _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
-        if (viewer) {
+        if (viewer && !isAnnotationViewer(viewer)) {
             centerViewerOnVolumePointForNavigation(viewer, position);
         }
     });

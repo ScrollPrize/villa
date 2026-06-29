@@ -2,6 +2,7 @@
 
 #include <QAbstractItemView>
 #include <QAction>
+#include <QApplication>
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QColor>
@@ -12,8 +13,12 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPainter>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QStyle>
+#include <QStyledItemDelegate>
+#include <QStyleOptionViewItem>
 #include <QStringList>
 #include <QTreeView>
 #include <QVBoxLayout>
@@ -59,6 +64,218 @@ void addUniqueSorted(std::vector<std::string>& values, const std::string& value)
 bool containsTag(const std::vector<std::string>& tags, const std::string& tag)
 {
     return std::find(tags.begin(), tags.end(), tag) != tags.end();
+}
+
+bool allDigits(const QString& text)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
+    for (const QChar ch : text) {
+        if (!ch.isDigit()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool looksLikeFiberTimestamp(const QString& text)
+{
+    if (text.size() < 10 || text[8] != QLatin1Char('T')) {
+        return false;
+    }
+    for (int i = 0; i < text.size(); ++i) {
+        if (i == 8) {
+            continue;
+        }
+        if (!text[i].isDigit()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QString displayStemForFiberFile(QString fileName)
+{
+    fileName = fileName.trimmed();
+    const int slash = std::max(fileName.lastIndexOf(QLatin1Char('/')),
+                               fileName.lastIndexOf(QLatin1Char('\\')));
+    if (slash >= 0) {
+        fileName = fileName.mid(slash + 1);
+    }
+    if (fileName.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) {
+        fileName.chop(5);
+    }
+    if (fileName.isEmpty()) {
+        return QString();
+    }
+
+    return fileName;
+}
+
+struct FiberNameParts {
+    QString prefix;
+    QString timestamp;
+    QString sequence;
+};
+
+std::optional<FiberNameParts> splitFiberName(QString name)
+{
+    const int lastSeparator = name.lastIndexOf(QLatin1Char('_'));
+    const int timestampSeparator = lastSeparator > 0
+        ? name.lastIndexOf(QLatin1Char('_'), lastSeparator - 1)
+        : -1;
+    if (timestampSeparator >= 0 && lastSeparator > timestampSeparator) {
+        const QString prefix = name.left(timestampSeparator);
+        const QString timestamp =
+            name.mid(timestampSeparator + 1, lastSeparator - timestampSeparator - 1);
+        const QString sequence = name.mid(lastSeparator + 1);
+        if (!prefix.isEmpty() &&
+            looksLikeFiberTimestamp(timestamp) &&
+            sequence.size() == 6 &&
+            allDigits(sequence)) {
+            return FiberNameParts{prefix, timestamp, sequence};
+        }
+    }
+
+    return std::nullopt;
+}
+
+QString rightElideAscii(const QString& text, const QFontMetrics& metrics, int width)
+{
+    if (width <= 0) {
+        return QString();
+    }
+    if (metrics.horizontalAdvance(text) <= width) {
+        return text;
+    }
+
+    const QString ellipsis = QStringLiteral("...");
+    if (metrics.horizontalAdvance(ellipsis) > width) {
+        return QString();
+    }
+
+    for (int kept = text.size() - 1; kept >= 0; --kept) {
+        const QString candidate = text.left(kept) + ellipsis;
+        if (metrics.horizontalAdvance(candidate) <= width) {
+            return candidate;
+        }
+    }
+
+    return ellipsis;
+}
+
+QString elidePrefixBeforeSuffix(const QString& prefix,
+                                const QString& suffix,
+                                const QFontMetrics& metrics,
+                                int width)
+{
+    if (width <= 0) {
+        return QString();
+    }
+
+    const QString full = prefix + suffix;
+    if (metrics.horizontalAdvance(full) <= width) {
+        return full;
+    }
+
+    if (metrics.horizontalAdvance(suffix) >= width) {
+        return metrics.elidedText(suffix, Qt::ElideLeft, width);
+    }
+
+    const int prefixWidth = width - metrics.horizontalAdvance(suffix);
+    QString shortenedPrefix = rightElideAscii(prefix, metrics, prefixWidth);
+    QString candidate = shortenedPrefix + suffix;
+    if (!shortenedPrefix.isEmpty() && metrics.horizontalAdvance(candidate) <= width) {
+        return candidate;
+    }
+
+    return suffix;
+}
+
+QString adaptFiberNameToWidth(const QString& name, const QFontMetrics& metrics, int width)
+{
+    if (width <= 0 || metrics.horizontalAdvance(name) <= width) {
+        return name;
+    }
+
+    const std::optional<FiberNameParts> parts = splitFiberName(name);
+    if (!parts) {
+        return metrics.elidedText(name, Qt::ElideRight, width);
+    }
+
+    const QString fixedText = parts->prefix + QStringLiteral("__") + parts->sequence;
+    const int timestampWidth = width - metrics.horizontalAdvance(fixedText);
+    QString timestamp = rightElideAscii(parts->timestamp, metrics, timestampWidth);
+    if (timestamp.isEmpty()) {
+        timestamp = QStringLiteral("...");
+    }
+
+    const QString candidate = parts->prefix + QLatin1Char('_') + timestamp +
+                              QLatin1Char('_') + parts->sequence;
+    if (metrics.horizontalAdvance(candidate) <= width) {
+        return candidate;
+    }
+
+    return elidePrefixBeforeSuffix(parts->prefix,
+                                   QStringLiteral("_..._") + parts->sequence,
+                                   metrics,
+                                   width);
+}
+
+class FiberNameDelegate final : public QStyledItemDelegate
+{
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter* painter,
+               const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override
+    {
+        QStyleOptionViewItem adjusted(option);
+        initStyleOption(&adjusted, index);
+        const QString fullText = adjusted.text;
+
+        QStyle* style = adjusted.widget ? adjusted.widget->style() : QApplication::style();
+        adjusted.text.clear();
+        adjusted.textElideMode = Qt::ElideNone;
+        style->drawControl(QStyle::CE_ItemViewItem, &adjusted, painter, adjusted.widget);
+
+        const QRect textRect =
+            style->subElementRect(QStyle::SE_ItemViewItemText, &adjusted, adjusted.widget);
+        const QString displayText = adaptFiberNameToWidth(fullText,
+                                                          adjusted.fontMetrics,
+                                                          textRect.width());
+        const QPalette::ColorRole textRole =
+            adjusted.state & QStyle::State_Selected ? QPalette::HighlightedText : QPalette::Text;
+
+        style->drawItemText(painter,
+                            textRect,
+                            adjusted.displayAlignment,
+                            adjusted.palette,
+                            adjusted.state & QStyle::State_Enabled,
+                            displayText,
+                            textRole);
+    }
+};
+
+std::vector<QCheckBox*> tagCheckboxesInLayout(QVBoxLayout* layout)
+{
+    std::vector<QCheckBox*> checkboxes;
+    if (!layout) {
+        return checkboxes;
+    }
+
+    for (int i = 0; i < layout->count(); ++i) {
+        QLayoutItem* item = layout->itemAt(i);
+        if (!item) {
+            continue;
+        }
+        if (auto* checkbox = qobject_cast<QCheckBox*>(item->widget())) {
+            checkboxes.push_back(checkbox);
+        }
+    }
+    return checkboxes;
 }
 
 QStandardItem* readOnlyItem(const QString& text = QString())
@@ -206,6 +423,7 @@ void CFiberWidget::setupUi()
 
     _nameLabel = new QLabel(mainWidget);
     _nameLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _nameLabel->setMinimumHeight(_nameLabel->fontMetrics().lineSpacing() * 2);
     layout->addWidget(_nameLabel);
 
     _scoreLabel = new QLabel(mainWidget);
@@ -231,7 +449,7 @@ void CFiberWidget::setupUi()
     _model = new QStandardItemModel(this);
     _model->setColumnCount(kColumnCount);
     _model->setHorizontalHeaderLabels({
-        tr("id/name"),
+        tr("name"),
         tr("dir"),
         tr("len"),
         tr("cps"),
@@ -243,6 +461,7 @@ void CFiberWidget::setupUi()
     _treeView = new QTreeView(mainWidget);
     _treeView->setObjectName(QStringLiteral("fiberTreeView"));
     _treeView->setModel(_model);
+    _treeView->setItemDelegateForColumn(kNameColumn, new FiberNameDelegate(_treeView));
     _treeView->setEditTriggers(QAbstractItemView::NoEditTriggers);
     _treeView->setSelectionBehavior(QAbstractItemView::SelectRows);
     _treeView->setSelectionMode(QAbstractItemView::ExtendedSelection);
@@ -341,10 +560,8 @@ void CFiberWidget::setupUi()
 
 QString CFiberWidget::displayNameForFiber(const FiberEntry& fiber)
 {
-    const QString fileName = QString::fromStdString(fiber.fileName);
-    return fileName.isEmpty()
-        ? QString::number(fiber.id)
-        : tr("%1  %2").arg(fiber.id).arg(fileName);
+    const QString name = displayStemForFiberFile(QString::fromStdString(fiber.fileName));
+    return name.isEmpty() ? tr("unnamed") : name;
 }
 
 QString CFiberWidget::directionForFiber(const FiberEntry& fiber)
@@ -516,7 +733,7 @@ void CFiberWidget::rebuildModel()
     _model->removeRows(0, _model->rowCount());
     _model->setColumnCount(kColumnCount);
     _model->setHorizontalHeaderLabels({
-        tr("id/name"),
+        tr("name"),
         tr("dir"),
         tr("len"),
         tr("cps"),
@@ -908,24 +1125,47 @@ void CFiberWidget::rebuildTagList()
         return;
     }
 
-    while (auto* item = _tagListLayout->takeAt(0)) {
-        delete item->widget();
-        delete item;
+    auto checkboxes = tagCheckboxesInLayout(_tagListLayout);
+    bool canReuseCheckboxes = checkboxes.size() == _knownTags.size();
+    if (canReuseCheckboxes) {
+        for (size_t i = 0; i < _knownTags.size(); ++i) {
+            if (checkboxes[i]->text() != QString::fromStdString(_knownTags[i])) {
+                canReuseCheckboxes = false;
+                break;
+            }
+        }
+    }
+
+    if (!canReuseCheckboxes) {
+        while (auto* item = _tagListLayout->takeAt(0)) {
+            delete item->widget();
+            delete item;
+        }
+
+        for (const auto& tag : _knownTags) {
+            const QString tagText = QString::fromStdString(tag);
+            auto* checkbox = new QCheckBox(tagText, _tagListWidget);
+            checkbox->setObjectName(QStringLiteral("fiberTagCheckBox"));
+            connect(checkbox, &QCheckBox::toggled, this, [this, tagText](bool checked) {
+                requestFiberTagChange(tagText, checked);
+            });
+            _tagListLayout->addWidget(checkbox);
+        }
+        _tagListLayout->addStretch(1);
+        checkboxes = tagCheckboxesInLayout(_tagListLayout);
     }
 
     const FiberEntry* fiber = selectedFiber();
     const bool hasSelection = fiber != nullptr;
-    for (const auto& tag : _knownTags) {
-        auto* checkbox = new QCheckBox(QString::fromStdString(tag), _tagListWidget);
-        checkbox->setObjectName(QStringLiteral("fiberTagCheckBox"));
+    for (size_t i = 0; i < checkboxes.size() && i < _knownTags.size(); ++i) {
+        QCheckBox* checkbox = checkboxes[i];
+        if (!checkbox) {
+            continue;
+        }
+        const QSignalBlocker blocker(checkbox);
         checkbox->setEnabled(hasSelection);
-        checkbox->setChecked(hasSelection && containsTag(fiber->tags, tag));
-        connect(checkbox, &QCheckBox::toggled, this, [this, tagText = QString::fromStdString(tag)](bool checked) {
-            requestFiberTagChange(tagText, checked);
-        });
-        _tagListLayout->addWidget(checkbox);
+        checkbox->setChecked(hasSelection && containsTag(fiber->tags, _knownTags[i]));
     }
-    _tagListLayout->addStretch(1);
 
     const bool canEditTags = hasSelection;
     if (_newTagEdit) {

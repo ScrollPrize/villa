@@ -69,6 +69,7 @@ const sidebars = {
       label: 'Milestones & Results',
       link: { type: 'doc', id: 'winners' },
       items: [
+        { type: 'doc', id: 'firstscroll' },
         { type: 'doc', id: 'firstletters' },
         { type: 'doc', id: 'grandprize' },
         { type: 'doc', id: 'grand_prize' },
