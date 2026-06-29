@@ -419,10 +419,10 @@ public:
         _mutex.lock_shared();
         if (_chunks.count(id)) {
             chunk = _chunks[id];
-            _mutex.unlock();
+            _mutex.unlock_shared();
         }
         else {
-            _mutex.unlock();
+            _mutex.unlock_shared();
             chunk = cache_chunk_safe(id);
         }
 
