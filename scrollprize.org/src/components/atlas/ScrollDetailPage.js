@@ -22,16 +22,18 @@ import useDarkModeGuard from "./useDarkModeGuard";
 const SITE = "https://scrollprize.org";
 const LICENSE_URL = "https://dl.ash2txt.org/LICENSE.txt";
 
-// Pipeline stepper config (ref lines 130-131). The detail page uses the
-// `.steps2`/`.plab2` classes (distinct from the index card's `.steps`).
-const STAGE_KEYS = ["scanned", "segmented", "unrolled", "ink", "text"];
-const STAGE_LABEL = {
-  scanned: "Scanned",
-  segmented: "Segmented",
-  unrolled: "Unrolled",
-  ink: "Ink detected",
-  text: "Text recovered",
-};
+// Pipeline stepper config. 4 stages — segmentation and unrolling are merged
+// into one "Segmented" stage (unrolling is a subset of segmentation); per-scroll
+// unrolling progress is shown separately as "% unrolled". Uses the `.steps2` /
+// `.plab2` classes (distinct from the index card's `.steps`).
+const STAGES = [
+  { key: "scanned", label: "Scanned", cls: "f1" },
+  { key: "segmented", label: "Segmented", cls: "f2" },
+  { key: "ink", label: "Ink detected", cls: "f4" },
+  { key: "text", label: "Text recovered", cls: "f5" },
+];
+const stageReached = (stages, key) =>
+  key === "segmented" ? !!(stages.segmented || stages.unrolled) : !!stages[key];
 
 // Strip light markdown to plain text: drop images, unwrap links, remove
 // emphasis/heading/code markers. Used wherever we render desc/note/summary.
@@ -111,9 +113,9 @@ export default function ScrollDetailPage(props) {
     progress.segments != null ? progress.segments : scroll.n_segments;
   const segmentsTxt = segments != null ? Number(segments).toLocaleString() : "—";
 
-  // Furthest pipeline stage reached (ref line 134).
-  const reached = STAGE_KEYS.filter((k) => stages[k]);
-  const furthest = STAGE_LABEL[reached[reached.length - 1]] || "Scanned";
+  // Furthest pipeline stage reached.
+  const reachedStages = STAGES.filter((s) => stageReached(stages, s.key));
+  const furthest = (reachedStages[reachedStages.length - 1] || STAGES[0]).label;
 
   // Scan lines (ref line 102).
   const scans = scroll.scans || [];
@@ -267,13 +269,16 @@ export default function ScrollDetailPage(props) {
                 role="img"
                 aria-label="pipeline progress"
               >
-                {STAGE_KEYS.map((k, i) => (
-                  <span
-                    key={k}
-                    className={stages[k] ? `f${i + 1}` : ""}
-                    title={`${STAGE_LABEL[k]}${stages[k] ? " ✓" : ""}`}
-                  />
-                ))}
+                {STAGES.map((s) => {
+                  const on = stageReached(stages, s.key);
+                  return (
+                    <span
+                      key={s.key}
+                      className={on ? s.cls : ""}
+                      title={`${s.label}${on ? " ✓" : ""}`}
+                    />
+                  );
+                })}
               </div>
               <div className="plab2">
                 Reached: <b style={{ color: "var(--ink)" }}>{furthest}</b>

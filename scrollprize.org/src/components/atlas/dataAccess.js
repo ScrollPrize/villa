@@ -9,9 +9,11 @@
 //      handed a zarr2:// source to Neuroglancer);
 //   3. build a Thumbor thumbnail URL for a bucket image (the old atlas's `yv`).
 //
-// NOTE: the zarr proxy (zarr.aws.ash2txt.org) currently only decodes Blosc-LZ4;
-// the surface-prediction volumes are Blosc-Zstd, so their Neuroglancer links
-// won't load until the proxy gains Zstd support. LZ4 volumes work today.
+// NOTE: Neuroglancer reads these OME-Zarr stores directly from the bucket (both
+// data buckets send Access-Control-Allow-Origin: *) and decodes Blosc — LZ4 and
+// Zstd — natively, so we no longer route through the zarr.aws.ash2txt.org proxy
+// (which only handled LZ4 and stalled the Blosc-Zstd surface / CT / 3D-ink
+// prediction overlays).
 
 import cfg from "@site/src/data/atlasDataAccess.json";
 
@@ -37,19 +39,31 @@ export function toS3(url) {
   return url;
 }
 
-// Build the zarr proxy source string for a volume (old atlas `Ef`). Picks the
-// first zarrProxy rule whose `match` substring appears in the https URL and
-// rewrites it to `zarr2://{proxyBase}/{pathAfterMatch}`.
+// Build a browsable S3 index URL for a directory-like key (e.g. a `.zarr/`).
+// A direct GET on a prefix returns S3 "NoSuchKey", so for zarr stores etc. we
+// link to the bucket's index.html browser instead. Uses the configured
+// browser.indexTemplate; falls back to plain HTTPS when no browser is set or
+// the URL isn't under the browsable bucket.
+export function browseUrl(url) {
+  const https = toHttp(url);
+  const browser = DA.browser || {};
+  if (!browser.base || !browser.indexTemplate || !https.startsWith(browser.base)) {
+    return https;
+  }
+  const path = https.slice(browser.base.length);
+  return browser.indexTemplate.replace("{path}", path);
+}
+
+// Build the Neuroglancer zarr source for a volume. Both data buckets serve the
+// OME-Zarr with open CORS, so we hand Neuroglancer the bucket URL directly
+// (`zarr2://https://…`) and let it read the multiscale group and decode Blosc
+// (LZ4 or Zstd) itself — bypassing the LZ4-only zarr proxy. The trailing slash
+// is trimmed so Neuroglancer builds `…zarr/.zgroup`, not `…zarr//.zgroup`.
+// (The `dataAccess.zarrProxy` config is retained for reference but unused.)
 function zarrSource(volumeUrl) {
   const https = toHttp(volumeUrl);
-  const { rules = [], defaultProxyBase } = DA.zarrProxy || {};
-  for (const { match, proxyBase } of rules) {
-    if (https.includes(match)) {
-      const after = https.split(match)[1];
-      return `zarr2://${proxyBase}/${after}`;
-    }
-  }
-  return defaultProxyBase ? `zarr2://${defaultProxyBase}/${https}` : null;
+  if (!https) return null;
+  return `zarr2://${https.replace(/\/+$/, "")}`;
 }
 
 // Build a Neuroglancer deep-link that opens a single grayscale image layer for

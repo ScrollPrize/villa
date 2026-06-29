@@ -312,7 +312,7 @@ main {
 .atlas .tile .sub { font-size: 11px; color: var(--dim); margin-top: 3px; }
 .atlas .panel { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
 .atlas .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .7px; color: var(--dim); margin: 0 0 12px; }
-.atlas .funnel { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+.atlas .funnel { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 @media (max-width: 780px) { .atlas .funnel { grid-template-columns: repeat(2, 1fr); } }
 .atlas .stage { position: relative; }
 .atlas .stage .cnt { font-size: 23px; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -374,7 +374,7 @@ main {
   color: #5b6772; font-size: 12px; text-align: center; padding: 0 16px; }
 .atlas .view img.fragimg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; padding: 8px; }
 .atlas .prog { padding: 2px 16px 0; }
-.atlas .steps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+.atlas .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
 .atlas .steps span { height: 7px; border-radius: 3px; background: #222a33; }
 .atlas .steps .f1 { background: var(--s1); } .atlas .steps .f2 { background: var(--s2); } .atlas .steps .f3 { background: var(--s3); }
 .atlas .steps .f4 { background: var(--s4); } .atlas .steps .f5 { background: var(--s5); }
@@ -472,7 +472,7 @@ main {
 .atlas-detail .textpanel .work { font-size: 16px; font-weight: 650; color: var(--accent); margin-bottom: 6px; }
 .atlas-detail .textpanel .lang { color: var(--dim); font-weight: 400; font-size: 13px; }
 .atlas-detail .textpanel .caveat { color: #e7c98a; font-size: 12.5px; margin: 8px 0 0; }
-.atlas-detail .steps2 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin: 12px 0 4px; }
+.atlas-detail .steps2 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin: 12px 0 4px; }
 .atlas-detail .steps2 span { height: 7px; border-radius: 3px; background: #222a33; }
 .atlas-detail .steps2 .f1 { background: var(--s1); } .atlas-detail .steps2 .f2 { background: var(--s2); }
 .atlas-detail .steps2 .f3 { background: var(--s3); } .atlas-detail .steps2 .f4 { background: var(--s4); }

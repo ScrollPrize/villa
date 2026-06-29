@@ -1,25 +1,28 @@
 import React from "react";
 
-// The per-card progress block (".prog"). Ported from the reference renderer
-// (index.html ~229-238): a row of 5 step segments coloured per the stages a
-// sample has reached, plus a label showing the furthest stage and an optional
-// "N% unrolled" readout.
+// The per-card progress block (".prog"): a 4-stage pipeline —
+// Scanned → Segmented → Ink detected → Text recovered. Segmentation and
+// unrolling are merged into one "Segmented" stage (a surface is segmented
+// before it can be unrolled, and unrolling is a subset of segmentation);
+// per-scroll unrolling progress is kept separately as the "N% unrolled" readout.
 
-const STAGE_KEYS = ["scanned", "segmented", "unrolled", "ink", "text"];
-const STAGE_LABEL = {
-  scanned: "Scanned",
-  segmented: "Segmented",
-  unrolled: "Unrolled",
-  ink: "Ink detected",
-  text: "Text recovered",
-};
+const DISPLAY = [
+  { key: "scanned", label: "Scanned", cls: "f1" },
+  { key: "segmented", label: "Segmented", cls: "f2" },
+  { key: "ink", label: "Ink detected", cls: "f4" },
+  { key: "text", label: "Text recovered", cls: "f5" },
+];
+
+// "Segmented" is reached once a sample has any traced surface (segmented or
+// unrolled); the rest map straight to their stage flag.
+const reached = (st, key) =>
+  key === "segmented" ? !!(st.segmented || st.unrolled) : !!st[key];
 
 export default function PipelineStepper({ stages }) {
   const st = stages || { scanned: true };
 
-  // Furthest reached stage label (defaults to "Scanned").
-  const reached = STAGE_KEYS.filter((k) => st[k]);
-  const furLabel = STAGE_LABEL[reached[reached.length - 1]] || "Scanned";
+  const done = DISPLAY.filter((d) => reached(st, d.key));
+  const furLabel = (done[done.length - 1] || DISPLAY[0]).label;
   const up = st.unrolledPct;
   const pctTxt =
     typeof up === "number" && up
@@ -35,13 +38,16 @@ export default function PipelineStepper({ stages }) {
         role="img"
         aria-label={`pipeline: reached ${furLabel}`}
       >
-        {STAGE_KEYS.map((k, i) => (
-          <span
-            key={k}
-            className={st[k] ? `f${i + 1}` : ""}
-            title={`${STAGE_LABEL[k]}${st[k] ? " ✓" : ""}`}
-          />
-        ))}
+        {DISPLAY.map((d) => {
+          const on = reached(st, d.key);
+          return (
+            <span
+              key={d.key}
+              className={on ? d.cls : ""}
+              title={`${d.label}${on ? " ✓" : ""}`}
+            />
+          );
+        })}
       </div>
       <div className="plabel">
         <b>{furLabel}</b>

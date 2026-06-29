@@ -109,7 +109,10 @@ const config = {
       innerHTML: JSON.stringify(webSiteJsonLd),
     },
   ],
-  clientModules: [require.resolve("./src/clientModules/imageZoom.js")],
+  clientModules: [
+    require.resolve("./src/clientModules/imageZoom.js"),
+    require.resolve("./src/clientModules/gtagSafeStub.js"),
+  ],
   markdown: {
     mermaid: true,
   },

@@ -1,5 +1,5 @@
 import React from "react";
-import { neuroglancerUrl, toHttp } from "./dataAccess";
+import { neuroglancerUrl, browseUrl } from "./dataAccess";
 
 // PredictionsPanel — the volume-level "Predictions" table the old prebuilt
 // atlas exposed (model · purpose · base volume · resolution · level · threshold
@@ -59,7 +59,7 @@ export default function PredictionsPanel({ predictions }) {
                   ? `${p.px} µm${p.energy != null ? ` · ${p.energy} keV` : ""}`
                   : "—";
               const ng = p.zarr ? neuroglancerUrl(p.zarr, `${meta.label} prediction`) : null;
-              const files = p.zarr ? toHttp(p.zarr) : null;
+              const files = p.zarr ? browseUrl(p.zarr) : null;
               return (
                 <tr key={`${p.purpose}-${p.baseVolume}-${i}`}>
                   <td>
@@ -90,10 +90,6 @@ export default function PredictionsPanel({ predictions }) {
           </tbody>
         </table>
       </div>
-      <p className="predfoot">
-        Neuroglancer rendering of these prediction volumes is pending zarr-proxy
-        support for their compression codec; the Files links are live now.
-      </p>
     </div>
   );
 }

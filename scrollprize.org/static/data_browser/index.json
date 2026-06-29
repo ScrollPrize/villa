@@ -43,12 +43,6 @@
         "desc": "papyrus surface traced"
       },
       {
-        "key": "unrolled",
-        "label": "Unrolled",
-        "count": 4,
-        "desc": "surface virtually flattened"
-      },
-      {
         "key": "ink",
         "label": "Ink detected",
         "count": 9,
@@ -813,14 +807,14 @@
       "volumeZarr": "https://data.aws.ash2txt.org/samples/PHerc1667/volumes/20231107190228-3.240um-88keV-masked.zarr/",
       "display": "Scroll 4",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Scroll 4. Read at 2.4µm; a full-scroll ink 'banner' was recovered.",
+      "note": "Scroll 4 — the first Herculaneum scroll virtually unwrapped and read in full, end to end, without ever being physically opened. Scanned and read at 2.4µm.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667/photos/PHerc1667_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1667/",
       "content": {
-        "work": "Greek prose (content under study)",
+        "work": "Greek ethical treatise (likely Stoic)",
         "lang": "Greek",
-        "summary": "Scroll 4 — full-scroll ink banner read end to end, with good legibility outside damaged columns. The first scroll read essentially in its entirety.",
-        "caveat": "Some columns are damaged; a few words remain unresolved even at 2µm and start to appear at 1µm."
+        "summary": "Read end to end — the lower parts of about twenty-two columns across roughly 1.4 m of papyrus, transcribed and reviewed by papyrologists. A philosophical treatise on ethics; the evidence points to a Stoic work, and its final preserved column names Aristocreon, nephew and disciple of the Stoic Chrysippus, placing it in the 2nd century BC.",
+        "caveat": "Only the compact inner core survives — about 8 cm of an original 19–24 cm height — after earlier attempts to open the scroll by hand destroyed its outer layers, so only the lower parts of the columns remain."
       },
       "progress": {
         "segments": 21,
@@ -1799,14 +1793,14 @@
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260319133050-2.403um-0.2m-77keV-masked.zarr/",
       "display": "PHerc0139",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Title recovered: Philodemus, On the Gods, Book 8. ~20% unrolled; legibility still poor.",
+      "note": "Title and author attribution recovered: Philodemus, On the Gods, Book 8 — a treatise by the Epicurean philosopher. About 20% virtually unrolled.",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0139/",
       "content": {
         "work": "Philodemus, On the Gods (Περὶ θεῶν), Book 8",
         "lang": "Greek",
-        "summary": "Title recovered — a work of Philodemus, On the Gods, Book 8. About 20% unrolled; legibility is poor, and 1µm slabs give real reading gains over 2µm.",
-        "caveat": "~20% unrolled; ongoing work by M. D'Angelo / Marc on improving legibility."
+        "summary": "The scroll's title and author were recovered, identifying it as Philodemus, On the Gods, Book 8 — a work by the Epicurean philosopher. Reading the title of a still-rolled scroll reveals what it contains before any of its body columns are studied.",
+        "caveat": "About 20% is virtually unrolled; the title and author are secure, but the body text is still being recovered."
       },
       "progress": {
         "segments": 23,
