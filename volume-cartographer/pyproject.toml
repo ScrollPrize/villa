@@ -7,8 +7,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "volume-cartographer"
-version = "3.0.2"
-description = "Python bindings for Volume Cartographer volume access"
+version = "3.0.3"
+description = "Python bindings for Volume Cartographer"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -22,3 +22,7 @@ wheel.packages = []
 
 [tool.scikit-build.cmake.define]
 VC_BUILD_PYTHON = "ON"
+VC_BUILD_APPS = "OFF"
+VC_BUILD_UI_TRACER = "OFF"
+VC_BUILD_FLATBOI = "OFF"
+VC_TESTING = "OFF"

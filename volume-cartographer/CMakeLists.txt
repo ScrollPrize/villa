@@ -103,6 +103,7 @@ if(VC_ENABLE_COVERAGE)
 else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
+option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"         ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------
 foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
@@ -272,6 +273,14 @@ if(NOT _san AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE S
     add_link_options(${_lto})
 endif()
 
+# ---- PIC for python bindings -----------------------------------------------------
+# Python bindings link the static libs (vc_core, utils, ...) into .so modules,
+# which requires every translation unit to be -fPIC (otherwise thread_local
+# statics emit local-exec TPOFF32 relocations that ld rejects).
+if(VC_BUILD_PYTHON)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # ---- Warnings ---------------------------------------------------------------
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_compile_options(-Wno-unknown-warning-option)
@@ -348,11 +357,18 @@ if(VC_DEAD_CODE_REPORT)
 endif()
 
 # ---- Dependencies -----------------------------------------------------------
-find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
+if(VC_BUILD_UI_TRACER OR VC_BUILD_APPS)
+    find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
+    set(CMAKE_AUTOUIC ON)
 
+    find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
+endif()
+# Ceres is required unconditionally: core/CMakeLists.txt always builds
+# vc_inpaint, vc_lasagna, vc_atlas and vc_tracer, all of which link
+# Ceres::ceres (vc_lasagna is also pulled into the Python bindings via
+# vc_lasagna_amgx).
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -360,7 +376,6 @@ find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED)
 find_package(ZLIB REQUIRED)
-find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
 find_package(PkgConfig REQUIRED)
 # Blosc1 (libblosc-dev on Debian/Ubuntu; c-blosc on Homebrew). No upstream
 # CMake config is shipped, so locate by header+lib and wrap in an imported
@@ -423,7 +438,23 @@ endif()
 if(NOT TARGET LZ4::lz4)
     add_library(LZ4::lz4 ALIAS PkgConfig::lz4)
 endif()
-find_package(CGAL REQUIRED)
+if(VC_BUILD_APPS)
+    find_package(CGAL REQUIRED)
+endif()
+if(VC_BUILD_PYTHON)
+    find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -m nanobind --cmake_dir
+        OUTPUT_VARIABLE VC_NANOBIND_CMAKE_DIR
+        RESULT_VARIABLE VC_NANOBIND_CMAKE_DIR_RESULT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(VC_NANOBIND_CMAKE_DIR_RESULT EQUAL 0 AND VC_NANOBIND_CMAKE_DIR)
+        list(APPEND CMAKE_PREFIX_PATH "${VC_NANOBIND_CMAKE_DIR}")
+    endif()
+    find_package(nanobind CONFIG REQUIRED)
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     include_directories(${CMAKE_SOURCE_DIR}/core/openmp_stub)
