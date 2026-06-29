@@ -1,6 +1,59 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+def sample_field(normalised_zyx, field_for_grid_sample):
+    # normalised_zyx :: *, zyx in [0, 1]; field_for_grid_sample :: zyx, z, y, x
+    orig_shape = normalised_zyx.shape
+    zyx = (normalised_zyx * 2. - 1.).view(1, -1, 1, 1, 3)
+    field_samples = F.grid_sample(
+        input=field_for_grid_sample[None],
+        grid=zyx.flip(-1),
+        align_corners=True,
+        mode='bilinear',
+        padding_mode='border',
+    )  # 1, zyx, n, 1, 1
+    return field_samples.squeeze(0).squeeze(-2).squeeze(-1).T.view(*orig_shape[:-1], 3)  # *, zyx
+
+
+class CartesianFlowField(nn.Module):
+
+    def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1, num_flow_timesteps=1):
+        super().__init__()
+        self.num_flow_timesteps = num_flow_timesteps
+        self.flow_scales = [1., lr_scale_factor]
+        self.flows = nn.ParameterList([
+            nn.Parameter(torch.zeros([num_flow_timesteps, 3, *shape]))
+            for shape in [
+                [resolution[0] // spatial_scale_factor, resolution[1] // spatial_scale_factor, resolution[2] // spatial_scale_factor],
+                resolution,
+            ]
+        ])
+
+    def get_sampler(self, t):
+        # Returns a callable mapping normalised zyx points in [0, 1] to flow velocity at time t.
+        # Materialises the flow as a [3, Z, Y, X] cartesian tensor of zyx vector components once
+        # and reuses it across the (e.g. RK4) integrator's many sample calls.
+        lr_flow, hr_flow = self.flows[0], self.flows[1]
+        hr_shape = tuple(hr_flow.shape[2:])
+        if self.num_flow_timesteps == 1:
+            # Time-invariant: HR flow is already at the target resolution, so skip interpolating it.
+            lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')[0] * self.flow_scales[0]
+            field = lr_upsampled + hr_flow[0] * self.flow_scales[1]
+        else:
+            t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (self.num_flow_timesteps - 1)
+            t_idx_before = int(t_scaled)
+            flows_interpolated = [
+                F.interpolate(flow[t_idx_before : t_idx_before + 2], size=hr_shape, mode='trilinear') * flow_scale
+                for flow, flow_scale in zip(self.flows, self.flow_scales)
+            ]
+            field = sum(
+                torch.lerp(flow_interpolated[0], flow_interpolated[1], t_scaled % 1.)
+                for flow_interpolated in flows_interpolated
+            )
+        return lambda y: sample_field(y, field)
 
 
 class CylindricalFlowField(nn.Module):

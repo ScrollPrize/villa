@@ -200,6 +200,8 @@ def build_transform(checkpoint, model_z_begin, model_z_end):
         umbilicus_zyx=umbilicus_zyx,
         flow_min_corner_zyx=flow_min_corner,
         flow_max_corner_zyx=flow_max_corner,
+        config=cfg,
+        spiral_outward_sense=fs.spiral_outward_sense,
     )
     model.to(device)
     model.load_state_dict(checkpoint['spiral_and_transform'])
