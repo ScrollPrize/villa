@@ -231,6 +231,20 @@ void warpBilinearReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
     const float foy = float(oy);
     const float fsx = float(sx);
     const float fsy = float(sy);
+    // The mapping is separable: the source x sample (x0,x1,wx) depends only on
+    // dx, not dy. Precompute the x axis once per call instead of recomputing it
+    // for every one of the dh rows. Bit-identical to the per-pixel form (same
+    // float ops, same order). Filled single-threaded before the parallel row
+    // loop, which then only reads these (shared) arrays.
+    std::vector<int> x0v(dw), x1v(dw);
+    std::vector<float> wxv(dw);
+    for (int dx = 0; dx < dw; ++dx) {
+        float fx = fox + float(dx) * fsx;
+        fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
+        int x0 = int(fx);
+        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+        x0v[dx] = x0; x1v[dx] = x1; wxv[dx] = fx - float(x0);
+    }
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         float fy = foy + float(dy) * fsy;
@@ -238,19 +252,16 @@ void warpBilinearReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
         int y0 = int(fy);                  // floor since fy >= 0
         int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
         const float wy = fy - float(y0);
+        const float iwy = 1.0f - wy;
         const cv::Vec3f* row0 = src[y0];
         const cv::Vec3f* row1 = src[y1];
         cv::Vec3f* orow = dst[dy];
         for (int dx = 0; dx < dw; ++dx) {
-            float fx = fox + float(dx) * fsx;
-            fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
-            int x0 = int(fx);
-            int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
-            const float wx = fx - float(x0);
+            const int x0 = x0v[dx], x1 = x1v[dx];
+            const float wx = wxv[dx];
             const cv::Vec3f& p00 = row0[x0]; const cv::Vec3f& p01 = row0[x1];
             const cv::Vec3f& p10 = row1[x0]; const cv::Vec3f& p11 = row1[x1];
             const float iwx = 1.0f - wx;
-            const float iwy = 1.0f - wy;
             orow[dx] = (p00 * iwx + p01 * wx) * iwy
                      + (p10 * iwx + p11 * wx) * wy;
         }
@@ -267,6 +278,11 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
     const int dw = dst.cols, dh = dst.rows;
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
+    // Separable: precompute the nearest source x index per column once, instead
+    // of an std::lround per pixel (dw lrounds vs dw*dh). Bit-identical.
+    std::vector<int> sxv(dw);
+    for (int dx = 0; dx < dw; ++dx)
+        sxv[dx] = int(std::lround(fox + float(dx) * fsx));
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         const int sy_i = int(std::lround(foy + float(dy) * fsy));
@@ -277,7 +293,7 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
         }
         const uint8_t* srow = src[sy_i];
         for (int dx = 0; dx < dw; ++dx) {
-            const int sx_i = int(std::lround(fox + float(dx) * fsx));
+            const int sx_i = sxv[dx];
             orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
         }
     }
@@ -293,6 +309,11 @@ void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
     const int dw = dst.cols, dh = dst.rows;
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
+    // Separable: precompute the nearest source x index per column once (dw
+    // lrounds vs dw*dh per-pixel). Bit-identical.
+    std::vector<int> sxv(dw);
+    for (int dx = 0; dx < dw; ++dx)
+        sxv[dx] = int(std::lround(fox + float(dx) * fsx));
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         const int sy_i = int(std::lround(foy + float(dy) * fsy));
@@ -303,7 +324,7 @@ void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
         }
         const cv::Vec3f* srow = src[sy_i];
         for (int dx = 0; dx < dw; ++dx) {
-            const int sx_i = int(std::lround(fox + float(dx) * fsx));
+            const int sx_i = sxv[dx];
             orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
         }
     }
@@ -327,6 +348,17 @@ void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
     const float foy = float(oy);
     const float fsx = float(sx);
     const float fsy = float(sy);
+    // Separable: precompute the x axis once per call (x0=-1 marks an
+    // out-of-range column -> border). Bit-identical to the per-pixel form.
+    std::vector<int> x0v(dw), x1v(dw);
+    std::vector<float> wxv(dw);
+    for (int dx = 0; dx < dw; ++dx) {
+        float fx = fox + float(dx) * fsx;
+        if (fx < 0.0f || fx > sxmax) { x0v[dx] = -1; continue; }
+        int x0 = int(fx);
+        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+        x0v[dx] = x0; x1v[dx] = x1; wxv[dx] = fx - float(x0);
+    }
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         float fy = foy + float(dy) * fsy;
@@ -338,21 +370,17 @@ void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
         int y0 = int(fy);
         int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
         const float wy = fy - float(y0);
+        const float iwy = 1.0f - wy;
         const cv::Vec3f* row0 = src[y0];
         const cv::Vec3f* row1 = src[y1];
         for (int dx = 0; dx < dw; ++dx) {
-            float fx = fox + float(dx) * fsx;
-            if (fx < 0.0f || fx > sxmax) {
-                orow[dx] = border;
-                continue;
-            }
-            int x0 = int(fx);
-            int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
-            const float wx = fx - float(x0);
+            const int x0 = x0v[dx];
+            if (x0 < 0) { orow[dx] = border; continue; }
+            const int x1 = x1v[dx];
+            const float wx = wxv[dx];
             const cv::Vec3f& p00 = row0[x0]; const cv::Vec3f& p01 = row0[x1];
             const cv::Vec3f& p10 = row1[x0]; const cv::Vec3f& p11 = row1[x1];
             const float iwx = 1.0f - wx;
-            const float iwy = 1.0f - wy;
             orow[dx] = (p00 * iwx + p01 * wx) * iwy
                      + (p10 * iwx + p11 * wx) * wy;
         }
