@@ -513,17 +513,62 @@ public:
             json_meta_size = read_be_u32(current); current += sizeof(uint32_t);
         }
 
+        // cell_size_ comes straight from untrusted file bytes; a zero (or, via
+        // the u32->int read, a negative) value would divide-by-zero here (SIGFPE)
+        // and corrupt every subsequent grid_pos computation.
+        if (cell_size_ <= 0) {
+            throw std::runtime_error("Invalid GridStore file: cell_size must be > 0.");
+        }
+        if (bounds_.width < 0 || bounds_.height < 0) {
+            throw std::runtime_error("Invalid GridStore file: negative bounds.");
+        }
+
+        // Ceil-divide in 64-bit: bounds_.width can be up to INT_MAX (a valid u32
+        // that passes the >= 0 check), so bounds_.width + cell_size_ - 1 would
+        // overflow signed int (UB). The 64-bit intermediate is exact; any
+        // resulting absurd grid size is caught downstream by the bucket-region
+        // bounds checks.
         grid_size_ = cv::Size(
-            (bounds_.width + cell_size_ - 1) / cell_size_,
-            (bounds_.height + cell_size_ - 1) / cell_size_
+            static_cast<int>((static_cast<int64_t>(bounds_.width) + cell_size_ - 1) / cell_size_),
+            static_cast<int>((static_cast<int64_t>(bounds_.height) + cell_size_ - 1) / cell_size_)
         );
 
         paths_offset_in_file_ = paths_offset;
         buckets_offset_in_file_ = buckets_offset;
         file_version_ = version;
 
+        // v3 reads the bucket-index array (num_buckets+1 u32 entries at
+        // buckets_offset) on demand via read_be_u32_at, which does no bounds
+        // checking. Validate once here that the array lies within the file so
+        // those later reads cannot run off the end of the mapping. uint64 math
+        // avoids overflow on hostile offsets/counts.
+        if (version >= 3) {
+            const uint64_t bucket_index_bytes =
+                (static_cast<uint64_t>(num_buckets) + 1) * sizeof(uint32_t);
+            if (static_cast<uint64_t>(buckets_offset) + bucket_index_bytes
+                    > mmapped_data_->size) {
+                throw std::runtime_error(
+                    "Invalid GridStore file: bucket index array out of bounds.");
+            }
+            if (static_cast<uint64_t>(paths_offset) > mmapped_data_->size) {
+                throw std::runtime_error(
+                    "Invalid GridStore file: paths offset out of bounds.");
+            }
+        }
+
         if (version <= 2) {
-            // Legacy v1/v2 loading: Read bucket descriptors
+            // Legacy v1/v2 loading: Read bucket descriptors.
+            // num_buckets is untrusted; each descriptor is at least one u32 (the
+            // num_indices word), so the region needs >= num_buckets*4 bytes at
+            // buckets_offset. Reject files that could not contain that many
+            // buckets before the resize, otherwise a hostile num_buckets (up to
+            // ~4.3e9) drives a multi-GB allocation / OOM from a tiny file.
+            if (static_cast<uint64_t>(buckets_offset)
+                    + static_cast<uint64_t>(num_buckets) * sizeof(uint32_t)
+                    > mmapped_data_->size) {
+                throw std::runtime_error(
+                    "Invalid GridStore file: bucket descriptor region out of bounds.");
+            }
             grid_bucket_descriptors_.resize(num_buckets);
             const char* buckets_start = static_cast<const char*>(mmapped_data_->data) + buckets_offset;
             const char* current_bucket_ptr = buckets_start;
@@ -744,24 +789,43 @@ private:
             const char* data_start = static_cast<const char*>(mmapped_data_->data);
             const size_t bi_off = buckets_offset_in_file_;
 
+            // header[7] = num_buckets. The bucket-index array (num_buckets+1
+            // entries at bi_off) was bounds-validated against the file in
+            // load_mmap, so reads at index and index+1 are in-bounds as long as
+            // index < num_buckets.
+            const uint32_t num_buckets = read_be_u32_at(data_start, 7 * sizeof(uint32_t));
+            if (index >= num_buckets) {
+                throw std::runtime_error("Invalid GridStore file: bucket index out of range.");
+            }
+
             uint32_t start_idx = read_be_u32_at(data_start, bi_off + index * sizeof(uint32_t));
             uint32_t end_idx   = read_be_u32_at(data_start, bi_off + (index + 1) * sizeof(uint32_t));
+            // On a corrupt file end_idx may be < start_idx; the unsigned
+            // subtraction would then underflow to a huge count and drive an
+            // out-of-bounds read loop below.
+            if (end_idx < start_idx) {
+                throw std::runtime_error("Invalid GridStore file: inverted bucket index range.");
+            }
             uint32_t count = end_idx - start_idx;
 
             if (count > 0) {
-                // header[7] = num_buckets. header[8] is the total number of paths
-                // in the storage, not the count summed across all buckets — the
-                // last element of the bucket_indices array gives the total
-                // number of path offsets in the flat list.
-                uint32_t num_buckets = read_be_u32_at(data_start, 7 * sizeof(uint32_t));
+                // The last element of the bucket-index array is the total number
+                // of path offsets in the flat list.
                 uint32_t total_path_indices = read_be_u32_at(data_start, bi_off + num_buckets * sizeof(uint32_t));
 
-                if (start_idx + count > total_path_indices) {
+                if (end_idx > total_path_indices) {  // == start_idx + count, without overflow
                     throw std::runtime_error("Bucket data is out of bounds of the flat path offset list.");
                 }
 
-                const size_t bucket_indices_size = (num_buckets + 1) * sizeof(uint32_t);
+                const size_t bucket_indices_size = (static_cast<size_t>(num_buckets) + 1) * sizeof(uint32_t);
                 const size_t path_offsets_off = bi_off + bucket_indices_size;
+
+                // The path-offset array itself is read straight from the mapping;
+                // make sure the region we are about to touch lies within the file.
+                if (path_offsets_off + static_cast<uint64_t>(total_path_indices) * sizeof(uint32_t)
+                        > mmapped_data_->size) {
+                    throw std::runtime_error("Invalid GridStore file: path offset list out of bounds.");
+                }
 
                 bucket_ptr->reserve(count);
                 for (uint32_t i = 0; i < count; ++i) {
