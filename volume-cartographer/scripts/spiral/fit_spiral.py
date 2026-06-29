@@ -32,7 +32,7 @@ from ddp_helpers import (
 )
 from lasagna_data import prepare_lasagna_volume
 from tifxyz import load_tifxyz
-from geom_utils import interp1d
+from geom_utils import expm_2x2, interp1d
 from point_collection import load_point_collection, normalise_pcl_winding_annotations
 from tracks import (
     get_track_losses,
@@ -561,7 +561,7 @@ class VaryingLinearTransform(pyro.distributions.transforms.Transform):
             # In log-space, scaling by truncate_frac gives a geodesic interpolation
             # towards the identity at frac=0
             logits = logits * self.truncate_frac
-        M = torch.linalg.matrix_exp(logits)
+        M = expm_2x2(logits)
         yx_out = (M @ input_zyx[..., 1:, None]).squeeze(-1)
         return torch.cat([zs, yx_out], dim=-1)
 
