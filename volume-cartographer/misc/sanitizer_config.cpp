@@ -63,11 +63,15 @@ const char* __nsan_default_options(void)
 // called_from_lib (immediate-caller only) misses it — thread:QThread::start
 // matches the creation stack instead. libtbb isn't tsan-instrumented, so its
 // internal fences are invisible and TBB-backed OpenCV work (cv::LUT,
-// parallel_for) gets flagged as races in libopencv_*.
+// parallel_for) gets flagged as races in libopencv_*. Qt may also spin
+// QThreadPool/QDBus helpers during QApplication startup and offscreen widget
+// layout; those reports stay inside libQt6Core allocator/event internals.
 const char* __tsan_default_suppressions(void)
 {
     return
         "thread:QThread::start\n"
+        "race:QArrayData::\n"
+        "race:QCoreApplicationPrivate::sendPostedEvents\n"
         "called_from_lib:libtbb.so.12\n"
         "race:libtbb.so\n"
         "race:libtbbmalloc.so\n"

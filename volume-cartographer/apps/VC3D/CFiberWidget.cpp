@@ -1269,6 +1269,18 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
             emit newAtlasFromFiberRequested(_selectedFiberId);
         }
     });
+    const auto selectedForCollection = selectedFiberIds();
+    auto* addToCollectionAction = menu.addAction(
+        selectedForCollection.size() > 1
+            ? tr("Add %1 lines to point collections").arg(selectedForCollection.size())
+            : tr("Add to point collection"));
+    addToCollectionAction->setEnabled(!selectedForCollection.empty());
+    connect(addToCollectionAction, &QAction::triggered, this, [this]() {
+        const auto ids = selectedFiberIds();
+        if (!ids.empty()) {
+            emit addFibersToPointCollectionsRequested(ids);
+        }
+    });
     auto* renameAction = createRenameFiberFileAction(&menu);
     menu.addAction(renameAction);
     menu.addSeparator();
