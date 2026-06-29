@@ -742,7 +742,8 @@
           "model": "20260428123845",
           "level": null,
           "threshold": null,
-          "zarr": "s3://vesuvius-challenge-open-data/PHercParis4/representations/predictions/ink-3d/20260411134726-ink3d-20260428123845-v3-78k-fullsup.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHercParis4/representations/predictions/ink-3d/20260411134726-ink3d-20260428123845-v3-78k-fullsup.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": false,
@@ -2257,7 +2258,8 @@
           "model": "20250701154204",
           "level": null,
           "threshold": null,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0139/representations/predictions/surfaces/20250728140407-surface-20250701154204-surface-recto-090.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0139/representations/predictions/surfaces/20250728140407-surface-20250701154204-surface-recto-090.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/"
         },
         {
           "purpose": "surface-prediction",
@@ -2267,7 +2269,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0139/representations/predictions/surfaces/20250728140407-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0139/representations/predictions/surfaces/20250728140407-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -2366,7 +2369,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250526151718-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250526151718-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/"
         },
         {
           "purpose": "surface-prediction",
@@ -2376,7 +2380,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250820143440-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250820143440-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -2468,7 +2473,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0009B/representations/predictions/surfaces/20260319104112-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0009B/representations/predictions/surfaces/20260319104112-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20260319104112-2.401um-0.3m-77keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -2568,7 +2574,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0814/representations/predictions/surfaces/20260309142202-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0814/representations/predictions/surfaces/20260309142202-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0814/volumes/20260309142202-2.399um-0.2m-78keV-masked.zarr/"
         },
         {
           "purpose": "surface-prediction",
@@ -2578,7 +2585,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0814/representations/predictions/surfaces/20250804134230-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0814/representations/predictions/surfaces/20250804134230-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -2670,7 +2678,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0343P/representations/predictions/surfaces/20260304131111-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0343P/representations/predictions/surfaces/20260304131111-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0343P/volumes/20260304131111-2.215um-0.4m-111keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -2762,7 +2771,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0841/representations/predictions/surfaces/20260319124803-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0841/representations/predictions/surfaces/20260319124803-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0841/volumes/20260319124803-2.403um-0.2m-77keV-masked.zarr/"
         },
         {
           "purpose": "surface-prediction",
@@ -2772,7 +2782,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0841/representations/predictions/surfaces/20250821151531-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0841/representations/predictions/surfaces/20250821151531-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0841/volumes/20250821151531-9.366um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -2889,7 +2900,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -2986,7 +2998,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc1451/representations/predictions/surfaces/20260319101107-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc1451/representations/predictions/surfaces/20260319101107-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3078,7 +3091,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHercMANBp/representations/predictions/surfaces/20251216152116-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHercMANBp/representations/predictions/surfaces/20251216152116-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHercMANBp/volumes/20251216152116-2.399um-0.2m-78keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3170,7 +3184,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0846A/representations/predictions/surfaces/20260319102732-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0846A/representations/predictions/surfaces/20260319102732-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0846A/volumes/20260319102732-2.403um-0.2m-77keV-masked.zarr/"
         },
         {
           "purpose": "surface-prediction",
@@ -3180,7 +3195,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0846A/representations/predictions/surfaces/20250728152254-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0846A/representations/predictions/surfaces/20250728152254-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0846A/volumes/20250728152254-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3264,7 +3280,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHercMAN5/representations/predictions/surfaces/20260311104824-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHercMAN5/representations/predictions/surfaces/20260311104824-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHercMAN5/volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3421,7 +3438,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHercMANB/representations/predictions/surfaces/20260323091048-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHercMANB/representations/predictions/surfaces/20260323091048-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHercMANB/volumes/20260323091048-2.399um-0.2m-78keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3505,7 +3523,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc1299/representations/predictions/surfaces/20260309130042-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc1299/representations/predictions/surfaces/20260309130042-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3597,7 +3616,8 @@
           "model": "20260413222639",
           "level": 2,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc1203/representations/predictions/surfaces/20260319130212-surface-20260413222639-surface-m7-L2-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc1203/representations/predictions/surfaces/20260319130212-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc1203/volumes/20260319130212-2.403um-0.2m-77keV-masked.zarr/"
         },
         {
           "purpose": "surface-prediction",
@@ -3607,7 +3627,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc1203/representations/predictions/surfaces/20250820131727-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc1203/representations/predictions/surfaces/20250820131727-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc1203/volumes/20250820131727-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3691,7 +3712,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0175A/representations/predictions/surfaces/20250521115057-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0175A/representations/predictions/surfaces/20250521115057-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0175A/volumes/20250521115057-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3775,7 +3797,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0343/representations/predictions/surfaces/20250521140437-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0343/representations/predictions/surfaces/20250521140437-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0343/volumes/20250521140437-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3859,7 +3882,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0483B/representations/predictions/surfaces/20251124083638-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0483B/representations/predictions/surfaces/20251124083638-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0483B/volumes/20251124083638-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -3943,7 +3967,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0490A/representations/predictions/surfaces/20250521151210-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0490A/representations/predictions/surfaces/20250521151210-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0490A/volumes/20250521151210-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4027,7 +4052,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0306B/representations/predictions/surfaces/20250521133212-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0306B/representations/predictions/surfaces/20250521133212-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0306B/volumes/20250521133212-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4111,7 +4137,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc1218/representations/predictions/surfaces/20250521120456-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc1218/representations/predictions/surfaces/20250521120456-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc1218/volumes/20250521120456-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4195,7 +4222,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0175B/representations/predictions/surfaces/20250521125822-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0175B/representations/predictions/surfaces/20250521125822-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0175B/volumes/20250521125822-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4279,7 +4307,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0800/representations/predictions/surfaces/20250521135224-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0800/representations/predictions/surfaces/20250521135224-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4363,7 +4392,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0490B/representations/predictions/surfaces/20250521151215-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0490B/representations/predictions/surfaces/20250521151215-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0490B/volumes/20250521151215-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4447,7 +4477,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0483A/representations/predictions/surfaces/20250521140913-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0483A/representations/predictions/surfaces/20250521140913-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0483A/volumes/20250521140913-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4531,7 +4562,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0268/representations/predictions/surfaces/20251110183117-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0268/representations/predictions/surfaces/20251110183117-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0268/volumes/20251110183117-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4615,7 +4647,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc1447/representations/predictions/surfaces/20250521151220-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc1447/representations/predictions/surfaces/20250521151220-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4699,7 +4732,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0826/representations/predictions/surfaces/20250821151701-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0826/representations/predictions/surfaces/20250821151701-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0826/volumes/20250821151701-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4783,7 +4817,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0211/representations/predictions/surfaces/20250821151803-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0211/representations/predictions/surfaces/20250821151803-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4867,7 +4902,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0813/representations/predictions/surfaces/20250821151723-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0813/representations/predictions/surfaces/20250821151723-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -4951,7 +4987,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0125/representations/predictions/surfaces/20250821151825-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0125/representations/predictions/surfaces/20250821151825-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -5035,7 +5072,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0846B/representations/predictions/surfaces/20250804142305-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0846B/representations/predictions/surfaces/20250804142305-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0846B/volumes/20250804142305-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -5119,7 +5157,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0358/representations/predictions/surfaces/20250821151737-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0358/representations/predictions/surfaces/20250821151737-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0358/volumes/20250821151737-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -5203,7 +5242,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0191/representations/predictions/surfaces/20250821151635-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0191/representations/predictions/surfaces/20250821151635-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0191/volumes/20250821151635-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -5287,7 +5327,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0257/representations/predictions/surfaces/20250821151750-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0257/representations/predictions/surfaces/20250821151750-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0257/volumes/20250821151750-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -5371,7 +5412,8 @@
           "model": "20260413222639",
           "level": 0,
           "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc1545/representations/predictions/surfaces/20250821151648-surface-20260413222639-surface-m7-L0-th0.2.zarr/"
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc1545/representations/predictions/surfaces/20250821151648-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc1545/volumes/20250821151648-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,

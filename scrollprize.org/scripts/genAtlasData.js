@@ -260,6 +260,9 @@ function extractPredictions(sample) {
   const out = [];
   for (const [volKey, v] of Object.entries(vols)) {
     const props = v.properties || {};
+    // The raw CT this volume reconstructs (same volume object) — the base layer
+    // the prediction is overlaid onto in Neuroglancer.
+    const baseZarr = oneUrl((v.data || []).find((d) => d.type === "ome-zarr"));
     for (const d of v.data || []) {
       if (d.type !== "surface-prediction-zarr" && d.type !== "ink-detection-3d-zarr")
         continue;
@@ -273,6 +276,7 @@ function extractPredictions(sample) {
         level: p.level ?? null,
         threshold: p.threshold_value ?? null,
         zarr: oneUrl(d),
+        baseZarr,
       });
     }
   }

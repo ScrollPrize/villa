@@ -87,6 +87,36 @@ export function neuroglancerUrl(volumeUrl, name = "volume") {
   return NEUROGLANCER + encodeURIComponent(JSON.stringify(state));
 }
 
+// Build a Neuroglancer deep-link that overlays a prediction on the raw CT volume
+// it was computed from: the CT as a grayscale image layer, the prediction as a
+// colored additive layer on top. Returns null if the prediction has no usable
+// source; falls back to a prediction-only view when no base CT is given.
+// Mirrors the old atlas's multi-layer prediction "Overlay".
+export function neuroglancerOverlayUrl(baseUrl, predUrl, names = {}) {
+  const predSource = zarrSource(predUrl);
+  if (!predSource) return null;
+  const baseSource = zarrSource(baseUrl);
+  const layers = [];
+  if (baseSource) {
+    layers.push({
+      type: "image",
+      source: baseSource,
+      name: names.base || "CT volume",
+      shader:
+        "#uicontrol invlerp normalized\nvoid main() { emitGrayscale(normalized()); }",
+    });
+  }
+  layers.push({
+    type: "image",
+    source: predSource,
+    name: names.pred || "prediction",
+    blend: "additive",
+    shader:
+      '#uicontrol vec3 color color(default="#ff7a1a")\n#uicontrol invlerp normalized\nvoid main() { emitRGBA(vec4(color, normalized())); }',
+  });
+  return NEUROGLANCER + encodeURIComponent(JSON.stringify({ layers, layout: "4panel" }));
+}
+
 // Build Thumbor thumbnail URLs for a bucket image (old atlas `yv`). Returns
 // { cacheUrl, serviceUrl }: try the pre-baked S3 cache first, fall back to the
 // live Thumbor service on <img onError>. Both null if no thumbnail server
