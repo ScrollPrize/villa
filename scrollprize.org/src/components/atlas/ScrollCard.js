@@ -53,6 +53,10 @@ export default function ScrollCard({ scroll }) {
 
   // Prediction signals (derived in genAtlasData.js from metadata.json).
   const hasInk3d = !!scroll.hasInk3d;
+  // "ink" reflects the pipeline stage (matches the dashboard's "with
+  // ink-detection results" count), not just scrolls whose per-segment ink
+  // images happen to be published in the open-data metadata.
+  const hasInk = !!(scroll.stages && scroll.stages.ink);
   const nInk = scroll.n_inkSegments || 0;
   const nAlpha = scroll.n_alpha || 0;
 
@@ -110,10 +114,10 @@ export default function ScrollCard({ scroll }) {
               3D ink
             </span>
           ) : null}
-          {nInk > 0 ? (
+          {hasInk ? (
             <span
               className="rd"
-              title="Ink-detection results on the flattened segment surfaces"
+              title="Ink-detection results available for this scroll"
             >
               ink
             </span>
