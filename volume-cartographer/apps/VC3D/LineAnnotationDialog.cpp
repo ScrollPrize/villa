@@ -29,6 +29,7 @@
 #include <QResizeEvent>
 #include <QShortcut>
 #include <QSplitter>
+#include <QSpinBox>
 #include <QTimer>
 #include <QVariantAnimation>
 #include <QVBoxLayout>
@@ -273,6 +274,23 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             [this](int) {
                 handleShiftScrollModeChanged();
             });
+    auto* maxDistanceLabel = new QLabel(tr("Max CP dist"), buttonRow);
+    maxDistanceLabel->installEventFilter(this);
+    buttonLayout->addWidget(maxDistanceLabel);
+    _maxControlPointDistanceSpin = new QSpinBox(buttonRow);
+    _maxControlPointDistanceSpin->setObjectName(QStringLiteral("lineAnnotationMaxControlDistanceSpinBox"));
+    _maxControlPointDistanceSpin->setRange(0, 1000000);
+    _maxControlPointDistanceSpin->setValue(0);
+    _maxControlPointDistanceSpin->setSuffix(tr(" vx"));
+    _maxControlPointDistanceSpin->setSpecialValueText(tr("unlimited"));
+    _maxControlPointDistanceSpin->installEventFilter(this);
+    buttonLayout->addWidget(_maxControlPointDistanceSpin);
+    connect(_maxControlPointDistanceSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [this](int) {
+                updateGeneratedDynamicOverlaysFast(false, false);
+            });
     if (volumeSelectorFactory) {
         if (auto* volumeSelector = volumeSelectorFactory(buttonRow)) {
             volumeSelector->installEventFilter(this);
@@ -346,6 +364,11 @@ LineAnnotationDialog::ShiftScrollMode LineAnnotationDialog::shiftScrollMode() co
         return ShiftScrollMode::AlongLine;
     }
     return static_cast<ShiftScrollMode>(_shiftScrollCombo->currentData().toInt());
+}
+
+int LineAnnotationDialog::maxControlPointDistanceVx() const
+{
+    return _maxControlPointDistanceSpin ? _maxControlPointDistanceSpin->value() : 0;
 }
 
 void LineAnnotationDialog::setGeneratedControlPoints(
@@ -799,6 +822,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     emit generatedPredSnapPointRequested(_generatedViews.currentCutName,
                                                          volumePoint);
                 } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                    if (!controlPointPlacementAllowedAt(_currentLinePosition)) {
+                        return;
+                    }
                     setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
@@ -845,6 +871,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     emit generatedPredSnapPointRequested(_generatedViews.sideCutName,
                                                          volumePoint);
                 } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                    if (!controlPointPlacementAllowedAt(_currentLinePosition)) {
+                        return;
+                    }
                     setCurrentCutFollowsStripMouse(true);
                     emit generatedControlPointRequested(_generatedViews.sideCutName,
                                                         volumePoint,
@@ -929,6 +958,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         if (modifiers == Qt::ShiftModifier) {
                             emit generatedPredSnapPointRequested(surfaceName, volumePoint);
                         } else {
+                            if (!controlPointPlacementAllowedAt(position)) {
+                                return;
+                            }
                             emit generatedControlPointRequested(surfaceName, volumePoint, position);
                         }
                     }
@@ -1294,6 +1326,25 @@ void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
     _currentCutFollowsStripMouse = follows;
 }
 
+bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) const
+{
+    return vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+        linePosition,
+        _generatedViews.controlPoints,
+        static_cast<double>(maxControlPointDistanceVx()));
+}
+
+vc3d::line_annotation::GeneratedCurrentLineMarkerState
+LineAnnotationDialog::currentLineMarkerState() const
+{
+    if (maxControlPointDistanceVx() <= 0) {
+        return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral;
+    }
+    return controlPointPlacementAllowedAt(_currentLinePosition)
+        ? vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed
+        : vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked;
+}
+
 void LineAnnotationDialog::installGeneratedViewShortcuts()
 {
     const auto bindNavigationShortcut = [this](Qt::Key key, void (LineAnnotationDialog::*slot)()) {
@@ -1512,6 +1563,19 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         return;
     }
 
+    const auto markerColorForState =
+        [](vc3d::line_annotation::GeneratedCurrentLineMarkerState state) {
+            switch (state) {
+            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed:
+                return QColor(40, 220, 120, 245);
+            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked:
+                return QColor(255, 70, 70, 245);
+            case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral:
+            default:
+                return QColor(0, 245, 255, 245);
+            }
+        };
+
     const auto ensureStripItems =
         [this](size_t index,
                CChunkedVolumeViewer* viewer,
@@ -1590,6 +1654,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!entry || !quad) {
             continue;
         }
+
+        QPen currentPen(markerColorForState(currentLineMarkerState()));
+        currentPen.setWidthF(2.0);
+        currentPen.setCapStyle(Qt::RoundCap);
+        entry->currentLine->setPen(currentPen);
 
         const QPointF currentScenePoint =
             vc3d::line_annotation::generatedStripLinePositionToScene(viewer,

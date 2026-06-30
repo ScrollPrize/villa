@@ -309,6 +309,36 @@ TEST_CASE("line annotation fixed current slice snaps only within quarter line po
           doctest::Approx(19.7499));
 }
 
+TEST_CASE("line annotation max control distance uses previous flattened control")
+{
+    const std::vector<double> controlPositions{10.0, 100.0};
+
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+        250.0,
+        controlPositions,
+        0.0));
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+        70.0,
+        controlPositions,
+        80.0));
+    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+        95.0,
+        controlPositions,
+        80.0));
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+        100.25,
+        controlPositions,
+        80.0));
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+        5.0,
+        controlPositions,
+        80.0));
+    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+        5.0,
+        std::vector<double>{100.0},
+        80.0));
+}
+
 TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
 {
     CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");

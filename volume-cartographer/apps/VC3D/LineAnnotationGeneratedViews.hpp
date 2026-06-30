@@ -30,6 +30,12 @@ enum class GeneratedControlPointContextResult {
     NewLineAnnotationRequested,
 };
 
+enum class GeneratedCurrentLineMarkerState {
+    Neutral,
+    Allowed,
+    Blocked,
+};
+
 struct GeneratedOverlay {
     struct ControlPointMarker {
         cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
@@ -63,6 +69,8 @@ struct GeneratedOverlay {
     std::vector<ControlPointMarker> controlPoints;
     std::vector<PredSnapMarker> predSnapPoints;
     double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
+    GeneratedCurrentLineMarkerState currentLineMarkerState =
+        GeneratedCurrentLineMarkerState::Neutral;
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
     bool currentLineMarkerAsCross = false;
@@ -506,6 +514,64 @@ inline std::optional<double> closestGeneratedControlPointLinePosition(
         }
     }
     return closest;
+}
+
+inline bool generatedControlPointPlacementWithinPreviousDistance(
+    double linePosition,
+    const std::vector<double>& controlLinePositions,
+    double maxDistance,
+    double existingControlTolerance = 0.5)
+{
+    if (!std::isfinite(maxDistance) || maxDistance <= 0.0) {
+        return true;
+    }
+    if (!std::isfinite(linePosition)) {
+        return false;
+    }
+
+    double previous = -std::numeric_limits<double>::infinity();
+    double next = std::numeric_limits<double>::infinity();
+    for (const double controlPosition : controlLinePositions) {
+        if (!std::isfinite(controlPosition)) {
+            continue;
+        }
+        if (std::abs(controlPosition - linePosition) <= existingControlTolerance) {
+            return true;
+        }
+        if (controlPosition < linePosition && controlPosition > previous) {
+            previous = controlPosition;
+        }
+        if (controlPosition > linePosition && controlPosition < next) {
+            next = controlPosition;
+        }
+    }
+    if (std::isfinite(previous)) {
+        return (linePosition - previous) <= maxDistance + 1.0e-6;
+    }
+    if (std::isfinite(next)) {
+        return (next - linePosition) <= maxDistance + 1.0e-6;
+    }
+    if (controlLinePositions.empty()) {
+        return true;
+    }
+    return false;
+}
+
+inline bool generatedControlPointPlacementWithinPreviousDistance(
+    double linePosition,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double maxDistance,
+    double existingControlTolerance = 0.5)
+{
+    std::vector<double> positions;
+    positions.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        positions.push_back(control.linePosition);
+    }
+    return generatedControlPointPlacementWithinPreviousDistance(linePosition,
+                                                               positions,
+                                                               maxDistance,
+                                                               existingControlTolerance);
 }
 
 inline std::optional<size_t> nearestGeneratedControlPointIndex(

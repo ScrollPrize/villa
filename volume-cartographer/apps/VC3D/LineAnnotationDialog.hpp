@@ -34,6 +34,7 @@ class QTimer;
 class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
+class QSpinBox;
 class ViewerManager;
 class PlaneSurface;
 class QuadSurface;
@@ -110,6 +111,7 @@ public:
     InitialDirectionMode initialDirectionMode() const;
     ReoptimizationMode reoptimizationMode() const;
     ShiftScrollMode shiftScrollMode() const;
+    int maxControlPointDistanceVx() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
@@ -168,6 +170,8 @@ private:
     bool shiftCurrentCutPlaneStraightByScrollSteps(int steps);
     void handleShiftScrollModeChanged();
     void setCurrentCutFollowsStripMouse(bool follows);
+    bool controlPointPlacementAllowedAt(double linePosition) const;
+    vc3d::line_annotation::GeneratedCurrentLineMarkerState currentLineMarkerState() const;
     double snappedControlPointPosition(double position) const;
     void rebuildGeneratedStaticStripOverlays();
     void rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay = true,
@@ -212,6 +216,7 @@ private:
     QComboBox* _initialDirectionCombo = nullptr;
     QComboBox* _reoptimizationCombo = nullptr;
     QComboBox* _shiftScrollCombo = nullptr;
+    QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _sliceStepLabel = nullptr;
     QLabel* _optimizationStatusLabel = nullptr;
     QPushButton* _showAsMeshButton = nullptr;
