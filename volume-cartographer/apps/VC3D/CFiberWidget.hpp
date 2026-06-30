@@ -90,6 +90,7 @@ signals:
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void newAtlasFromFiberRequested(uint64_t fiberId);
+    void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);

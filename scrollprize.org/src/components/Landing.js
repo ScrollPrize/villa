@@ -853,7 +853,7 @@ const team = {
     {
       name: "Kilian Fleischer",
       title:
-        "Research Director and Papyrologist, University of Tübingen and CNR",
+        "Research Director and Papyrologist, University of Tübingen",
       href: "https://www.klassphil.uni-wuerzburg.de/team/pd-dr-kilian-fleischer/",
     },
     {
