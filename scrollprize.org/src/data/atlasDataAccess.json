@@ -1,4 +1,5 @@
 {
+  "_comment": "Data-access config preserved from the old prebuilt atlas (static/atlas/config.json on main, dropped by the data-browser redesign). Defines how to turn s3:// URIs into public HTTPS, the Thumbor thumbnail service, and the zarr proxy used to build Neuroglancer deep-links. Consumed by src/components/atlas/dataAccess.js.",
   "metadataUrl": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.json",
   "version": "0.1",
   "dataAccess": {
