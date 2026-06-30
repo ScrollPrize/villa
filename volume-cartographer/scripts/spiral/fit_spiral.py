@@ -101,7 +101,6 @@ scroll_name = 's1'
 z_begin, z_end = 7000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
-coordinate_system_version = 'full_res_v1'
 lasagna_scale = 4
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 
@@ -1011,7 +1010,6 @@ def main():
         zs_for_visualisation,
         subvolume_shape[1:],
         cache_path,
-        cache_version=coordinate_system_version,
         canvas_scale=render_volume_scale,
     )
 
@@ -1037,12 +1035,6 @@ def main():
     model_z_begin, model_z_end = z_begin, z_end
     if resume_path:
         resume_checkpoint = torch.load(resume_path, map_location='cpu')
-        checkpoint_coordinate_system = resume_checkpoint.get('coordinate_system_version') if isinstance(resume_checkpoint, dict) else None
-        if checkpoint_coordinate_system != coordinate_system_version:
-            raise RuntimeError(
-                f'checkpoint {resume_path} has coordinate_system_version={checkpoint_coordinate_system!r}; '
-                f'this script requires {coordinate_system_version!r}. Old fit-space checkpoints are incompatible.'
-            )
         checkpoint_lasagna_scale = resume_checkpoint.get('lasagna_scale') if isinstance(resume_checkpoint, dict) else None
         if checkpoint_lasagna_scale != lasagna_scale:
             raise RuntimeError(
@@ -1154,7 +1146,6 @@ def main():
             'spiral_and_transform': spiral_and_transform.state_dict(),
             'optimiser': optimiser.state_dict(),
             'cfg': dict(cfg),
-            'coordinate_system_version': coordinate_system_version,
             'lasagna_scale': lasagna_scale,
             'z_begin': z_begin,
             'z_end': z_end,
