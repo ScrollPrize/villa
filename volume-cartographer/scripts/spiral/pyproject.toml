@@ -1,7 +1,7 @@
 [project]
 name = "spiral"
 version = "0.1.0"
-description = "Code and helpers to fit a canonical archimedan spiral to deformed scrolls"
+description = "Code and helpers to fit a canonical archimedean spiral to deformed scrolls"
 requires-python = ">=3.14"
 dependencies = [
     "click>=8.4.2",
