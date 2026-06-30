@@ -442,9 +442,9 @@ OpenDataManifest parseOpenDataManifest(std::string_view jsonText, std::string ma
 
     OpenDataManifest manifest;
     manifest.manifestUrl = std::move(manifestUrl);
-    manifest.raw = std::move(root);
     manifest.samples = parseSamples(*metadata);
     manifest.models = parseModels(*metadata);
+    manifest.raw = std::move(root);
     return manifest;
 }
 
