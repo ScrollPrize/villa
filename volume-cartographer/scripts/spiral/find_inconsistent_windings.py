@@ -4,8 +4,8 @@ reach its patch -- both directly-attached absolute-winding pcls and, by a
 backwards BFS over patches, absolute-winding pcls on *other* patches that are
 linked to the seed patch through a chain of relative-winding pcls.
 
-It reuses fit_spiral's data loading (prepare_patches / prepare_point_collections)
-and its spiral transform, but does no fitting/training.
+It reuses fit_spiral's patch/point-collection loading phase and its spiral
+transform, but does no fitting/training.
 
 Two kinds of winding information feed the votes:
 
@@ -76,8 +76,7 @@ as a diagnostic, but propagation uses the integer seam-crossing delta.
 The transform's flow field is shaped by the checkpoint's own z-range; the
 --z-range arg only filters patches/pcls (and must lie within the checkpoint's
 range, like fit_spiral's resume path). Both are expressed in full-resolution
-scan z (divided by downsample_factor internally), matching fit_spiral's
-z_begin/z_end constants.
+scan z, matching fit_spiral's z_begin/z_end constants.
 
 Run from the spiral/ directory, e.g.
 
@@ -102,13 +101,10 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra as csgraph_dijkstra, connected_components
 from scipy.optimize import milp, LinearConstraint, Bounds
 
-# Import the archived fit_spiral module as an interim compatibility shim so we
-# can still reuse prepare_patches() / prepare_point_collections() while the
-# active fit_spiral.py rewrite keeps those phases inline in main().
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
-sys.path.insert(0, os.path.join(_SCRIPT_DIR, 'archive'))
-import fit_spiral_old as fs
+import fit_spiral as fs
+from sample_spiral import get_theta_and_radii
 from tracks import _unwrap_track_shifted_radii
 # Reuse connect_overlapping_patches' valid-quad graph + path reconstruction so a
 # within-patch strip follows a fringe-avoiding path through valid quads only
@@ -156,21 +152,24 @@ def _to_py(x):
     return x
 
 
-def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin_ds, filter_z_end_ds, umbilicus_path):
+def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path):
     """Point fit_spiral's module globals at the checkpoint's cfg and the
     user-supplied patches/pcls/filter-z-range so its loaders behave identically.
-    Returns the checkpoint's (model) downsampled z-range, which shapes the
-    transform's flow field independently of the filtering z-range."""
-    fs.cfg = dict(checkpoint['cfg'])
-    fs.patches_path = patches_dir
+    Returns the checkpoint's model z-range, which shapes the transform's flow
+    field independently of the filtering z-range."""
+    cfg = dict(fs.default_config)
+    cfg.update(checkpoint['cfg'])
+    fs.cfg = cfg
+    fs.verified_patches_path = patches_dir
     # Attachment is over the verified patch set only, so skip the (slow, unrelated)
     # unverified patches; they don't change the cross-patch / attached pcl set.
     fs.unverified_patches_path = None
+    fs.fibers_path = None
     fs.pcl_json_paths = list(pcl_paths)
-    fs.z_begin = filter_z_begin_ds
-    fs.z_end = filter_z_end_ds
+    fs.z_begin = filter_z_begin
+    fs.z_end = filter_z_end
     fs.umbilicus_z_to_yx = (
-        lambda f, path=umbilicus_path: fs.json_umbilicus_z_to_yx(path, downsample_factor=f)
+        lambda path=umbilicus_path: fs.json_umbilicus_z_to_yx(path, coordinate_scale=1.0)
     )
     # We don't compute shell losses; stop prepare_patches from loading the shell.
     fs.shell_losses_enabled = lambda: False
@@ -185,7 +184,7 @@ def build_transform(checkpoint, model_z_begin, model_z_end):
     cfg = fs.cfg
 
     all_zs = np.arange(model_z_begin, model_z_end)
-    umbilicus_fn = fs.umbilicus_z_to_yx(fs.downsample_factor)
+    umbilicus_fn = fs.umbilicus_z_to_yx()
     umbilicus_zyx = torch.from_numpy(
         np.concatenate([all_zs[:, None], umbilicus_fn(all_zs)], axis=-1).astype(np.float32)
     ).to(device)
@@ -236,7 +235,7 @@ def winding_at_points(transform, dr, zyx):
     """Per-point shifted-radius / dr (the model's raw winding number) for an
     (N, 3) scroll-space tensor; no unwrap (each point treated independently)."""
     spiral = transform(zyx)
-    _, _, shifted = fs.get_theta_and_radii(spiral[..., 1:], dr)
+    _, _, shifted = get_theta_and_radii(spiral[..., 1:], dr)
     return shifted / dr
 
 
@@ -326,7 +325,7 @@ def strip_winding_delta(transform, dr, graph, from_ij, to_ij, step_size):
         return None
 
     spiral = transform(zyx)
-    theta, _, shifted = fs.get_theta_and_radii(spiral[..., 1:], dr)
+    theta, _, shifted = get_theta_and_radii(spiral[..., 1:], dr)
     theta_diffs = theta.detach()[1:] - theta.detach()[:-1]
     step_adjustment_windings = (
         (theta_diffs > np.pi).to(shifted.dtype)
@@ -396,8 +395,7 @@ def build_abs_anchors_by_patch(cross_patch_pcls, patches):
                     'winding': int(round(w)),
                     'ij': np.array(p['on_patch']['ij'], dtype=np.float32),
                     'distance': float(p['on_patch'].get('distance', float('nan'))),
-                    # Raw (full-resolution, un-downsampled) [z, y, x]; point['p'] is the
-                    # raw [x, y, z] straight from the pcl json (point['zyx'] is /df).
+                    # Source [z, y, x]; point['p'] is [x, y, z] from the pcl json.
                     'zyx': np.asarray(p['p'], dtype=np.float32)[::-1],
                 })
     return anchors
@@ -413,7 +411,7 @@ def pcl_edge_unwrap_adjustment_windings(transform, dr, pa, pb):
     )
     with torch.no_grad():
         spiral = transform(zyx)
-        theta, _, _ = fs.get_theta_and_radii(spiral[..., 1:], dr)
+        theta, _, _ = get_theta_and_radii(spiral[..., 1:], dr)
         zero_shifted = torch.zeros_like(theta)
         adjustments = _unwrap_track_shifted_radii(theta[None], zero_shifted[None], dr)[0]
     return int(round(float((adjustments[-1] / dr).item())))
@@ -461,9 +459,8 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
             dwind = raw_dwind + branch_delta
             ija = np.array(pa['on_patch']['ij'], dtype=np.float32)
             ijb = np.array(pb['on_patch']['ij'], dtype=np.float32)
-            # Raw (full-resolution, un-downsampled) [z, y, x] of each attached point, so
-            # the departure/arrival dots can be located in the full-res volume later.
-            # point['p'] is the raw [x, y, z] from the pcl json (point['zyx'] is /df).
+            # Source [z, y, x] of each attached point, so the departure/arrival
+            # dots can be located in the volume later.
             za = np.asarray(pa['p'], dtype=np.float32)[::-1]
             zb = np.asarray(pb['p'], dtype=np.float32)[::-1]
             common = {'pcl_id': int(pid), 'pcl_name': pcl.get('name'), 'source_file': pcl.get('source_file'),
@@ -771,8 +768,7 @@ def find_disconnected_subgraphs(rel_adjacency, patches, seed_patch_id, top_patch
     (tie-break total area desc), each carrying a 1-based `rank`, `num_patches`,
     `num_edges` (unique undirected cross-patch edges with both ends in the component),
     `total_area`, the full `patch_ids`, and `largest_patches` -- the top `top_patches`
-    members by `patch.area`. Areas are in downsampled grid units^2 (the units of
-    `patch.area`)."""
+    members by `patch.area`."""
     nodes = sorted(rel_adjacency.keys())
     if not nodes:
         return {'num_components_total': 0, 'seed_component_num_patches': 0,
@@ -858,8 +854,7 @@ def parse_z_range(z_range):
                    'relative-winding pcls are used (absolute supply votes, relative supply the '
                    'long-range graph edges).')
 @click.option('--z-range', required=True,
-              help='Patch/pcl filtering z-range as "zlo,zhi" in full-resolution scan z '
-                   '(divided by downsample_factor internally). Must lie within the checkpoint z-range.')
+              help='Patch/pcl filtering z-range as "zlo,zhi". Must lie within the checkpoint z-range.')
 @click.option('--step-size', default=1.0, type=float,
               help='Sampling spacing (in tifxyz grid cells) along the valid-quad path within each '
                    'patch (spacing between samples is <= step-size).')
@@ -917,8 +912,7 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
         raise click.BadParameter('--max-hops must be >= 0 (or omitted for unlimited)')
 
     z_lo_raw, z_hi_raw = parse_z_range(z_range)
-    df = fs.downsample_factor
-    filter_z_begin, filter_z_end = z_lo_raw // df, z_hi_raw // df
+    filter_z_begin, filter_z_end = z_lo_raw, z_hi_raw
 
     umbilicus_path = resolve_umbilicus_path(patches_dir, umbilicus)
     print(f'using umbilicus {umbilicus_path}')
@@ -929,24 +923,23 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
         ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path
     )
     print(f'checkpoint (model) z-range: [{model_z_begin}, {model_z_end}); '
-          f'filtering z-range: [{filter_z_begin}, {filter_z_end}) (downsampled, df={df})')
+          f'filtering z-range: [{filter_z_begin}, {filter_z_end})')
     if not (filter_z_begin >= model_z_begin and filter_z_end <= model_z_end):
         raise SystemExit(
             f'filtering z-range [{filter_z_begin}, {filter_z_end}) extends beyond the checkpoint '
             f'z-range [{model_z_begin}, {model_z_end}); the transform is undefined outside its domain.'
         )
 
-    print('loading + z-filtering patches')
-    patches, _unverified, _shell = fs.prepare_patches()
+    print('loading + z-filtering patches and point-collections')
+    patches, _unverified, _shell, cross_patch_pcls, _unattached = fs.main(
+        load_only_patches_and_point_collections=True
+    )
     if patch_id not in patches:
         raise SystemExit(
             f'patch id {patch_id!r} not among {len(patches)} loaded patches (after z-filtering); '
             'check --patch-id / --z-range'
         )
     patch = patches[patch_id]
-
-    print('loading + linking point-collections')
-    cross_patch_pcls, _unattached = fs.prepare_point_collections(patches)
 
     print('rebuilding spiral transform from checkpoint')
     transform, dr = build_transform(ckpt, model_z_begin, model_z_end)
@@ -1285,9 +1278,8 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
         'umbilicus': os.path.abspath(umbilicus_path),
         'patch_id': patch_id,
         'pcl_paths': [os.path.abspath(p) for p in pcl_paths],
-        'downsample_factor': df,
-        'model_z_range_downsampled': [model_z_begin, model_z_end],
-        'filter_z_range_downsampled': [filter_z_begin, filter_z_end],
+        'model_z_range': [model_z_begin, model_z_end],
+        'filter_z_range': [filter_z_begin, filter_z_end],
         'step_size': step_size,
         'medial_weight': medial_weight,
         'max_hops': max_hops,
@@ -1296,8 +1288,8 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
         'top_patches_per_subgraph': top_patches_per_subgraph,
         'seed': {
             'ij': seed_ij.tolist(),
-            'zyx_downsampled': seed_zyx_ds.tolist(),
-            'xyz_raw': [float(seed_zyx_ds[2] * df), float(seed_zyx_ds[1] * df), float(seed_zyx_ds[0] * df)],
+            'zyx': seed_zyx_ds.tolist(),
+            'xyz': [float(seed_zyx_ds[2]), float(seed_zyx_ds[1]), float(seed_zyx_ds[0])],
         },
         'dr_per_winding': dr_value,
         'model_raw_winding_at_seed': seed_model_winding,

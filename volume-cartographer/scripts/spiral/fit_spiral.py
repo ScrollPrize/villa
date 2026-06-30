@@ -494,16 +494,19 @@ def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding
     return w_inner + (w_outer - w_inner) * f_warped
 
 
-def main():
+def main(load_only_patches_and_point_collections=False):
 
     np.random.seed(cfg['random_seed'])
     torch.random.manual_seed(cfg['random_seed'])
-    umbilicus = umbilicus_z_to_yx()
-    if scroll_zarr_path:
-        print('loading volume zarr')
-        scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
-    else:
+    if load_only_patches_and_point_collections:
         scroll_zarr = None
+    else:
+        umbilicus = umbilicus_z_to_yx()
+        if scroll_zarr_path:
+            print('loading volume zarr')
+            scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
+        else:
+            scroll_zarr = None
 
     # ==========================================================================
     # Patch loading and ROI filtering
@@ -757,6 +760,8 @@ def main():
         f'pcls: {len(cross_patch_pcls)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
+    if load_only_patches_and_point_collections:
+        return verified_patches, unverified_patches, shell_patch, cross_patch_pcls, unattached_pcl_strips
 
     # ==========================================================================
     # lasagna and tracks loading
