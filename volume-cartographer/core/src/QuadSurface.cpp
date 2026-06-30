@@ -642,9 +642,12 @@ void QuadSurface::unloadPoints()
     }
     _points.reset();
     _channels.clear();
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _validMaskCache = cv::Mat_<uint8_t>();
+        _validMaskAllValid = false;
+        _normalCache = cv::Mat_<cv::Vec3f>();
+    }
     _needsLoad = true;
     if (DebugLoggingEnabled()) {
         std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
@@ -653,9 +656,12 @@ void QuadSurface::unloadPoints()
 
 void QuadSurface::unloadCaches()
 {
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _validMaskCache = cv::Mat_<uint8_t>();
+        _validMaskAllValid = false;
+        _normalCache = cv::Mat_<cv::Vec3f>();
+    }
     // Release loaded channel pixel data but keep the keys so channel(name)
     // still knows which channels exist on disk and can lazy-reload them.
     for (auto& [_, mat] : _channels) {
@@ -670,6 +676,13 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
         return cv::Mat_<uint8_t>();
     }
 
+    // All access to _validMaskCache happens under _cacheMutex: gen() can call
+    // validMask() concurrently from OMP tile workers. The cache is published as
+    // a complete Mat below, so holding the lock for the whole accessor avoids
+    // both a duplicate build and a torn read of the Mat header. The returned
+    // header copy (made under the lock) keeps the pixel buffer alive for the
+    // caller after the lock is released.
+    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
     if (!_validMaskCache.empty() &&
         _validMaskCache.rows == _points->rows &&
         _validMaskCache.cols == _points->cols) {
@@ -739,9 +752,12 @@ void QuadSurface::invalidateCache()
     }
 
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _validMaskCache = cv::Mat_<uint8_t>();
+        _validMaskAllValid = false;
+        _normalCache = cv::Mat_<cv::Vec3f>();
+    }
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -777,8 +793,15 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     bool skipValidity = _validMaskAllValid;
 
     // --- warp coords and validity ----------------------------------------
-    cv::Mat_<cv::Vec3f>& coords_big = _genCoordsScratch;
-    cv::Mat_<uint8_t>& valid_big = _genValidScratch;
+    // Thread-local scratch: keeps the per-frame allocation-reuse optimization
+    // (Mat::create reuses the buffer when size+type match) while making gen()
+    // safe to call concurrently on one surface — each OMP worker owns its own
+    // buffers instead of racing on shared members.
+    thread_local cv::Mat_<cv::Vec3f> tl_coordsScratch;
+    thread_local cv::Mat_<cv::Vec3f> tl_normalsScratch;
+    thread_local cv::Mat_<uint8_t> tl_validScratch;
+    cv::Mat_<cv::Vec3f>& coords_big = tl_coordsScratch;
+    cv::Mat_<uint8_t>& valid_big = tl_validScratch;
 
     if (!_components.empty()) {
         // Multi-component surface: warp each component separately with
@@ -832,44 +855,53 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     }
 
     // --- normals: warp cached source-grid normals -------------------
-    cv::Mat_<cv::Vec3f>& normals_big = _genNormalsScratch;
+    cv::Mat_<cv::Vec3f>& normals_big = tl_normalsScratch;
     if (need_normals) {
-        // Build source-grid normal cache once per surface. Subsequent gen()
-        // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
-        // a different surface becomes active.
-        if (_normalCache.empty() || _normalCache.size() != _points->size()) {
-            _normalCache.create(_points->rows, _points->cols);
-            const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN());
-            const int rows = _points->rows;
-            const int cols = _points->cols;
-            // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
-            if (rows > 0) {
-                cv::Vec3f* top = _normalCache[0];
-                cv::Vec3f* bot = _normalCache[rows - 1];
-                for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
-            }
-            #pragma omp parallel for schedule(dynamic, 16)
-            for (int r = 1; r < rows - 1; r++) {
-                cv::Vec3f* dst = _normalCache[r];
-                const cv::Vec3f* row = (*_points)[r];
-                dst[0] = qn;
-                dst[cols - 1] = qn;
-                for (int c = 1; c < cols - 1; c++) {
-                    if (row[c][0] == -1.f) {
-                        dst[c] = qn;
-                    } else {
-                        dst[c] = grid_normal_int(*_points, r, c);
+        // Build the source-grid normal cache once per surface (subsequent gen()
+        // calls for panning/zooming reuse it; cleared by unloadCaches() when a
+        // different surface becomes active). Build *and* snapshot the cache
+        // header under _cacheMutex: concurrent gen() workers must not read
+        // _normalCache while another is still filling it, and create() marks the
+        // Mat non-empty before it is populated. The cheap header snapshot under
+        // the lock lets the expensive warp run lock-free on a stable buffer.
+        cv::Mat_<cv::Vec3f> normalCacheSnapshot;
+        {
+            std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+            if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+                _normalCache.create(_points->rows, _points->cols);
+                const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN());
+                const int rows = _points->rows;
+                const int cols = _points->cols;
+                // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
+                if (rows > 0) {
+                    cv::Vec3f* top = _normalCache[0];
+                    cv::Vec3f* bot = _normalCache[rows - 1];
+                    for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
+                }
+                #pragma omp parallel for schedule(dynamic, 16)
+                for (int r = 1; r < rows - 1; r++) {
+                    cv::Vec3f* dst = _normalCache[r];
+                    const cv::Vec3f* row = (*_points)[r];
+                    dst[0] = qn;
+                    dst[cols - 1] = qn;
+                    for (int c = 1; c < cols - 1; c++) {
+                        if (row[c][0] == -1.f) {
+                            dst[c] = qn;
+                        } else {
+                            dst[c] = grid_normal_int(*_points, r, c);
+                        }
                     }
                 }
             }
+            normalCacheSnapshot = _normalCache;
         }
         const cv::Vec3f qnVec(std::numeric_limits<float>::quiet_NaN(),
                               std::numeric_limits<float>::quiet_NaN(),
                               std::numeric_limits<float>::quiet_NaN());
         normals_big.create(h + 8, w + 8);
-        warpNearestConstVec3f(_normalCache, normals_big,
+        warpNearestConstVec3f(normalCacheSnapshot, normals_big,
                               ox, oy, sx, sy, qnVec);
     }
 
@@ -1258,8 +1290,11 @@ void QuadSurface::invalidateMask()
 {
     // Clear from memory
     _channels.erase("mask");
-    _validMaskCache = cv::Mat_<uint8_t>();
-    _validMaskAllValid = false;
+    {
+        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+        _validMaskCache = cv::Mat_<uint8_t>();
+        _validMaskAllValid = false;
+    }
 
     // Delete from disk
     if (!path.empty()) {

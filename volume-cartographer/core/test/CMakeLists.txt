@@ -327,6 +327,7 @@ vc_add_test(NAME test_plane_surface)
 vc_add_test(NAME test_compositing)
 
 vc_add_test(NAME test_quadsurface_basics)
+vc_add_test(NAME test_quadsurface_gen_concurrency)
 
 vc_add_test(NAME test_load_json)
 

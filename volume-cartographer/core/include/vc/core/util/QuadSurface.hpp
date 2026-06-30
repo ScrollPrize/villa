@@ -362,16 +362,19 @@ public:
     // because gen() can be called from concurrent OMP threads.
     mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
-    // gen() scratch buffers reused across render ticks. At 1920×1080 each
-    // coords/normals Mat is ~170 MiB of cv::Vec3f; submitRender fires every
-    // 16-33 ms so fresh allocations burn GB/sec through the allocator and
-    // page-fault every frame. cv::warpAffine writes these as dst: OpenCV's
-    // Mat::create reuses the buffer when size+type match the existing alloc,
-    // so these stay at one buffer per surface after steady state is reached.
-    // mutable because gen() is const.
-    mutable cv::Mat_<cv::Vec3f> _genCoordsScratch;
-    mutable cv::Mat_<cv::Vec3f> _genNormalsScratch;
-    mutable cv::Mat_<uint8_t> _genValidScratch;
+    // Guards lazy (re)builds and clears of the shared caches above
+    // (_validMaskCache, _validMaskAllValid, _normalCache). gen()/validMask()
+    // can run concurrently on a single surface from the renderer's OMP tile
+    // workers; without this two threads race to build/free the same cv::Mat.
+    // Lock ordering: always _loadMutex -> _cacheMutex, never the reverse.
+    mutable std::mutex _cacheMutex;
+    // gen()'s coords/normals/validity scratch buffers were previously shared
+    // mutable members reused across render ticks to avoid per-frame
+    // reallocation (each ~170 MiB at 1920×1080). That reuse is unsafe under
+    // concurrent gen(): one thread's Mat::create() reallocates the buffer
+    // while another reads it (the vc-render-tifxyz SIGSEGV). They are now
+    // thread_local locals inside gen(), preserving the per-thread allocation
+    // reuse without cross-thread sharing.
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
