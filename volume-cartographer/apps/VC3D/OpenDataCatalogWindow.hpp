@@ -39,6 +39,8 @@ private slots:
     void openSelectedVolumeUrl();
     void copySelectedSegmentUrl();
     void openSelectedSegmentUrl();
+    void cacheSelectedSegment();
+    void openSelectedSegmentCacheFolder();
     void openSelectedSample();
 
 private:
@@ -65,6 +67,7 @@ private:
     [[nodiscard]] const OpenDataSegment* selectedSegment() const;
     [[nodiscard]] QString selectedVolumeUrl() const;
     [[nodiscard]] QString selectedSegmentUrl() const;
+    [[nodiscard]] std::filesystem::path selectedSegmentCacheDir() const;
     [[nodiscard]] std::filesystem::path cacheRoot() const;
     [[nodiscard]] std::filesystem::path cachedManifestPath() const;
     [[nodiscard]] std::filesystem::path cacheMetadataPath() const;
@@ -86,6 +89,8 @@ private:
     QPushButton* _openVolumeUrlButton{nullptr};
     QPushButton* _copySegmentUrlButton{nullptr};
     QPushButton* _openSegmentUrlButton{nullptr};
+    QPushButton* _cacheSegmentButton{nullptr};
+    QPushButton* _openSegmentCacheFolderButton{nullptr};
 
     std::optional<OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;

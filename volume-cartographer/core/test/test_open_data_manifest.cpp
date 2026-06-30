@@ -238,7 +238,7 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     CHECK(ids.front() == "PHerc0139-20260311000000");
     REQUIRE(!progressEvents.empty());
     CHECK(progressEvents.back().status == "finished");
-    CHECK(progressEvents.back().completedFiles == 6);
+    CHECK(progressEvents.back().completedFiles == 0);
     CHECK(progressEvents.back().totalFiles == 6);
     CHECK(progressEvents.back().completedSegments == 1);
     std::ifstream metaIn(segmentDir / "meta.json", std::ios::binary);
@@ -247,6 +247,13 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     CHECK(meta.at("vc_open_data_segment_id").get<std::string>() == "20260311000000");
     CHECK(meta.at("vc_open_data_segment_long_id").get<std::string>() == "PHerc0139-20260311000000");
     CHECK(meta.at("vc_open_data_original_volume_id").get<std::string>() == "vol1");
+
+    std::ifstream originIn(segmentDir / "catalog-origin.json", std::ios::binary);
+    REQUIRE(originIn.good());
+    const auto origin = nlohmann::json::parse(originIn);
+    CHECK(origin.at("cache_state").get<std::string>() == "current");
+    CHECK(origin.at("sample_id").get<std::string>() == "PHerc0139");
+    CHECK(origin.at("segment_id").get<std::string>() == "20260311000000");
 
     std::filesystem::remove_all(cacheRoot);
 }

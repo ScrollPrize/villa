@@ -1,6 +1,7 @@
 #pragma once
 
 #include "OpenDataManifest.hpp"
+#include "OpenDataSegmentCache.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -25,22 +26,6 @@ struct OpenDataSampleProjectResult {
     std::string preferredVolumeId;
     std::vector<std::string> messages;
 };
-
-struct OpenDataSampleDownloadProgress {
-    int totalSegments = 0;
-    int completedSegments = 0;
-    int failedSegments = 0;
-    int totalFiles = 0;
-    int completedFiles = 0;
-    int activeWorkers = 0;
-    int totalWorkers = 0;
-    std::string segmentId;
-    std::string fileName;
-    std::string status;
-};
-
-using OpenDataSampleProgressCallback =
-    std::function<void(const OpenDataSampleDownloadProgress&)>;
 
 [[nodiscard]] std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     const OpenDataSample& sample,

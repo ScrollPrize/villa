@@ -1,5 +1,9 @@
 #include "OpenDataCatalogWindow.hpp"
 
+#include "OpenDataSegmentCache.hpp"
+#include "VCSettings.hpp"
+
+#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 
 #include <nlohmann/json.hpp>
@@ -204,7 +208,7 @@ void OpenDataCatalogWindow::buildUi()
     auto* segmentsPage = new QWidget(_tabs);
     auto* segmentsLayout = new QVBoxLayout(segmentsPage);
     _segmentsTable = new QTableWidget(segmentsPage);
-    _segmentsTable->setColumnCount(9);
+    _segmentsTable->setColumnCount(10);
     _segmentsTable->setHorizontalHeaderLabels({
         tr("Segment ID"),
         tr("Suffix"),
@@ -214,6 +218,7 @@ void OpenDataCatalogWindow::buildUi()
         tr("TIFXYZ"),
         tr("Ink"),
         tr("Layers Zarr"),
+        tr("Cache"),
         tr("Created")
     });
     _segmentsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -222,9 +227,13 @@ void OpenDataCatalogWindow::buildUi()
     _segmentsTable->horizontalHeader()->setStretchLastSection(true);
     _segmentsTable->verticalHeader()->hide();
     auto* segmentActions = new QHBoxLayout;
+    _cacheSegmentButton = new QPushButton(tr("Cache Selected"), segmentsPage);
+    _openSegmentCacheFolderButton = new QPushButton(tr("Open Cache Folder"), segmentsPage);
     _copySegmentUrlButton = new QPushButton(tr("Copy Source URL"), segmentsPage);
     _openSegmentUrlButton = new QPushButton(tr("Open Source URL"), segmentsPage);
     segmentActions->addStretch(1);
+    segmentActions->addWidget(_cacheSegmentButton);
+    segmentActions->addWidget(_openSegmentCacheFolderButton);
     segmentActions->addWidget(_copySegmentUrlButton);
     segmentActions->addWidget(_openSegmentUrlButton);
     segmentsLayout->addWidget(_segmentsTable, 1);
@@ -262,6 +271,8 @@ void OpenDataCatalogWindow::buildUi()
     connect(_openVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedVolumeUrl);
     connect(_copySegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedSegmentUrl);
     connect(_openSegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentUrl);
+    connect(_cacheSegmentButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::cacheSelectedSegment);
+    connect(_openSegmentCacheFolderButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentCacheFolder);
     connect(_openSampleButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSample);
     connect(closeButton, &QPushButton::clicked, this, &QDialog::accept);
 
@@ -521,7 +532,12 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
         _segmentsTable->setItem(row, 5, item(yesNo(segment.hasTifxyz())));
         _segmentsTable->setItem(row, 6, item(yesNo(segment.hasInkDetection())));
         _segmentsTable->setItem(row, 7, item(yesNo(segment.hasLayersZarr())));
-        _segmentsTable->setItem(row, 8, item(qstr(segment.createdAt)));
+        const auto state = cacheStateForSegment(
+            std::filesystem::path(vc3d::remoteCachePath().toStdString()),
+            *sample,
+            segment);
+        _segmentsTable->setItem(row, 8, item(QString::fromLatin1(cacheStateName(state))));
+        _segmentsTable->setItem(row, 9, item(qstr(segment.createdAt)));
     }
     _segmentsTable->resizeColumnsToContents();
     updateActionButtons();
@@ -623,10 +639,27 @@ QString OpenDataCatalogWindow::selectedSegmentUrl() const
     return artifactUrl(*artifact);
 }
 
+std::filesystem::path OpenDataCatalogWindow::selectedSegmentCacheDir() const
+{
+    const auto* sample = selectedSample();
+    const auto* segment = selectedSegment();
+    if (!sample || !segment) {
+        return {};
+    }
+    return openDataSegmentCacheDirectory(
+        std::filesystem::path(vc3d::remoteCachePath().toStdString()),
+        *sample,
+        *segment);
+}
+
 void OpenDataCatalogWindow::updateActionButtons()
 {
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
+    const auto* segment = selectedSegment();
+    const bool canCacheSegment = segment && segment->hasTifxyz();
+    const auto cacheDir = selectedSegmentCacheDir();
+    const bool hasCacheDir = !cacheDir.empty() && std::filesystem::is_directory(cacheDir);
     const bool canOpenSample = selectedSample() != nullptr &&
                                static_cast<bool>(_openSampleHandler) &&
                                !(_fetchWatcher && _fetchWatcher->isRunning() && !_manifest);
@@ -638,6 +671,12 @@ void OpenDataCatalogWindow::updateActionButtons()
     }
     if (_openVolumeUrlButton) {
         _openVolumeUrlButton->setEnabled(hasVolumeUrl);
+    }
+    if (_cacheSegmentButton) {
+        _cacheSegmentButton->setEnabled(canCacheSegment);
+    }
+    if (_openSegmentCacheFolderButton) {
+        _openSegmentCacheFolderButton->setEnabled(hasCacheDir);
     }
     if (_copySegmentUrlButton) {
         _copySegmentUrlButton->setEnabled(hasSegmentUrl);
@@ -687,6 +726,55 @@ void OpenDataCatalogWindow::openSelectedSegmentUrl()
     const QString url = selectedSegmentUrl();
     if (!url.isEmpty()) {
         QDesktopServices::openUrl(QUrl(url));
+    }
+}
+
+void OpenDataCatalogWindow::cacheSelectedSegment()
+{
+    const auto* sample = selectedSample();
+    const auto* segment = selectedSegment();
+    if (!sample || !segment || !segment->hasTifxyz()) {
+        return;
+    }
+
+    setStatus(tr("Caching segment %1...").arg(qstr(segment->id)));
+    OpenDataSample oneSegmentSample;
+    oneSegmentSample.id = sample->id;
+    oneSegmentSample.type = sample->type;
+    oneSegmentSample.description = sample->description;
+    oneSegmentSample.properties = sample->properties;
+    oneSegmentSample.segments.push_back(*segment);
+
+    auto pkg = VolumePkg::newEmpty();
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    auto result = reconcileOpenDataSampleSegments(
+        *pkg,
+        oneSegmentSample,
+        remoteRoot,
+        [&](const OpenDataSampleDownloadProgress& progress) {
+            if (!progress.segmentId.empty()) {
+                setStatus(tr("Caching %1: %2/%3 files")
+                              .arg(qstr(progress.segmentId))
+                              .arg(progress.completedFiles)
+                              .arg(progress.totalFiles));
+            }
+        });
+
+    populateDetails(sample);
+    QString message = tr("Cached %1 of %2 selected tifxyz segment(s).")
+                          .arg(result.cachedTifxyzSegments)
+                          .arg(result.supportedTifxyzSegments);
+    if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
+        message += tr(" %1").arg(qstr(result.messages.front()));
+    }
+    setStatus(message);
+}
+
+void OpenDataCatalogWindow::openSelectedSegmentCacheFolder()
+{
+    const auto dir = selectedSegmentCacheDir();
+    if (!dir.empty() && std::filesystem::is_directory(dir)) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(dir.string())));
     }
 }
 

@@ -39,6 +39,8 @@ set(srcs
     OpenDataManifest.hpp
     OpenDataSampleProject.cpp
     OpenDataSampleProject.hpp
+    OpenDataSegmentCache.cpp
+    OpenDataSegmentCache.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
