@@ -145,7 +145,7 @@ def _rasterize_spiral_for_slice(spiral_and_transform, slice_to_spiral_transform,
     return spiral_zyx, spiral_density
 
 
-@torch.inference_mode
+@torch.inference_mode()
 def save_overlay(
     spiral_and_transform,
     flow_min_corner_spiral_zyx, flow_max_corner_spiral_zyx,
