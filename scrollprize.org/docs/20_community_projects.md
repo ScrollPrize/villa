@@ -163,7 +163,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Gabor Filter for surface prediction](https://www.kaggle.com/code/bluetriad/scroll4-gaborfilters/notebook?scriptVersionId=265957590) by Ayush Mishra
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
-
+    - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/Hob3rMallow/scrollfiesta_public/issues/3) by pscamillo. A one-line OpenMP fix (3.8x end-to-end, byte-identical output) and a validated CUDA FP32 drop-in for the MLS-midpoint projection (~83% of meshing wall-clock), giving ~6x multi-cube throughput; benchmarks, validation and ready-to-merge branches in [BENCHMARKS.md](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md).
+      
 ### 📦 Materials
 
 #### 🌟 Highlighted
