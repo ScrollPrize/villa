@@ -109,19 +109,34 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     const float xScale = static_cast<float>(points.cols) / static_cast<float>(newSize.width);
     const float yScale = static_cast<float>(points.rows) / static_cast<float>(newSize.height);
 
+    // The source-x sample (x0,x1,fx) depends only on dstX, not dstY, so compute
+    // it once per column instead of once per pixel. Bit-identical to the
+    // per-pixel form (same float ops, same order); filled single-threaded before
+    // the parallel row loop, which then only reads these shared arrays.
+    std::vector<int> x0v(newSize.width), x1v(newSize.width);
+    std::vector<float> fxv(newSize.width);
+    for (int dstX = 0; dstX < newSize.width; ++dstX) {
+        float srcX = (static_cast<float>(dstX) + 0.5f) * xScale - 0.5f;
+        srcX = std::clamp(srcX, 0.0f, static_cast<float>(points.cols - 1));
+        const int x0 = static_cast<int>(std::floor(srcX));
+        x0v[dstX] = x0;
+        x1v[dstX] = std::min(x0 + 1, points.cols - 1);
+        fxv[dstX] = srcX - static_cast<float>(x0);
+    }
+
+    #pragma omp parallel for schedule(static)
     for (int dstY = 0; dstY < newSize.height; ++dstY) {
         float srcY = (static_cast<float>(dstY) + 0.5f) * yScale - 0.5f;
         srcY = std::clamp(srcY, 0.0f, static_cast<float>(points.rows - 1));
         const int y0 = static_cast<int>(std::floor(srcY));
         const int y1 = std::min(y0 + 1, points.rows - 1);
         const float fy = srcY - static_cast<float>(y0);
+        cv::Vec3f* dstRow = resampled[dstY];
 
         for (int dstX = 0; dstX < newSize.width; ++dstX) {
-            float srcX = (static_cast<float>(dstX) + 0.5f) * xScale - 0.5f;
-            srcX = std::clamp(srcX, 0.0f, static_cast<float>(points.cols - 1));
-            const int x0 = static_cast<int>(std::floor(srcX));
-            const int x1 = std::min(x0 + 1, points.cols - 1);
-            const float fx = srcX - static_cast<float>(x0);
+            const int x0 = x0v[dstX];
+            const int x1 = x1v[dstX];
+            const float fx = fxv[dstX];
 
             const cv::Vec3f& p00 = points(y0, x0);
             const cv::Vec3f& p01 = points(y0, x1);
@@ -134,7 +149,7 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
 
             const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
             const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
-            resampled(dstY, dstX) = top * (1.0f - fy) + bottom * fy;
+            dstRow[dstX] = top * (1.0f - fy) + bottom * fy;
         }
     }
 
@@ -155,15 +170,27 @@ cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
     cv::Mat dstToSrc;
     cv::invertAffineTransform(srcToDst, dstToSrc);
 
+    // Hoist the six affine coefficients out of the per-pixel loop. The Mat is
+    // loop-invariant, but the compiler cannot prove dstToSrc.at<double>() does
+    // not alias the warped store, so it reloads all six entries every pixel.
+    // Reading them into locals is bit-identical and lets each row run
+    // independently under OpenMP. (The mapping is NOT x-separable here — srcX
+    // depends on both dstX and dstY — so only the coefficient hoist applies,
+    // and the explicit m*dstX form is kept to preserve float rounding.)
+    const double m00 = dstToSrc.at<double>(0, 0);
+    const double m01 = dstToSrc.at<double>(0, 1);
+    const double m02 = dstToSrc.at<double>(0, 2);
+    const double m10 = dstToSrc.at<double>(1, 0);
+    const double m11 = dstToSrc.at<double>(1, 1);
+    const double m12 = dstToSrc.at<double>(1, 2);
+
     constexpr double kBoundsEpsilon = 1e-5;
+    #pragma omp parallel for schedule(static)
     for (int dstY = 0; dstY < dstSize.height; ++dstY) {
+        cv::Vec3f* dstRow = warped[dstY];
         for (int dstX = 0; dstX < dstSize.width; ++dstX) {
-            double srcX = dstToSrc.at<double>(0, 0) * dstX
-                        + dstToSrc.at<double>(0, 1) * dstY
-                        + dstToSrc.at<double>(0, 2);
-            double srcY = dstToSrc.at<double>(1, 0) * dstX
-                        + dstToSrc.at<double>(1, 1) * dstY
-                        + dstToSrc.at<double>(1, 2);
+            double srcX = m00 * dstX + m01 * dstY + m02;
+            double srcY = m10 * dstX + m11 * dstY + m12;
 
             if (srcX < -kBoundsEpsilon || srcY < -kBoundsEpsilon
                 || srcX > static_cast<double>(points.cols - 1) + kBoundsEpsilon
@@ -191,7 +218,7 @@ cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
 
             const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
             const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
-            warped(dstY, dstX) = top * (1.0f - fy) + bottom * fy;
+            dstRow[dstX] = top * (1.0f - fy) + bottom * fy;
         }
     }
 
