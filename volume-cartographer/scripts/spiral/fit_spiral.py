@@ -99,7 +99,7 @@ spiral_outward_sense = 'CW'  # CW | ACW
 umbilicus_z_to_yx = lambda: json_umbilicus_z_to_yx(f'{dataset_path}/umbilicus.json', coordinate_scale=1.0)
 scroll_name = 's1'
 z_begin, z_end = 7000, 17000
-voxel_size_um = 2.4
+voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 coordinate_system_version = 'full_res_v1'
 lasagna_scale = 4
@@ -206,7 +206,7 @@ default_config = {
     'dt_progressive_exponent': 1.0,  # warp on the time fraction; 1.0 = linear in winding, <1 = slower later (~0.5 ≈ constant area rate)
     'output_first_winding': 10,
     'output_winding_margin': 4,
-    'output_step_size': 80,
+    'output_step_size': 20,
     'shell_outer_winding_idx': 130,
     'shell_outer_winding_margin': 10,
     'shell_num_samples': 24576,

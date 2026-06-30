@@ -863,7 +863,7 @@ def get_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume
     # the one-winding scroll-space segment (scroll_inner -> scroll_outer) is the line integral of
     # this density along it, so we sample the density at evenly spaced midpoints along the segment
     # and accumulate density * dl (a midpoint Riemann sum). For a correct fit the integral equals 1.
-    density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale']
+    density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * lasagna_scale
     num_steps = int(cfg['spacing_integration_steps'])
     step_frac = (torch.arange(num_steps, device=device).float() + 0.5) / num_steps  # midpoints in [0, 1]
     # [num_points, num_steps, 3] scroll-space samples along scroll_inner -> scroll_outer
