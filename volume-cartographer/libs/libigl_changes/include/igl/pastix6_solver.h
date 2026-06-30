@@ -99,6 +99,10 @@ public:
         spm_.n       = static_cast<pastix_int_t>(L.rows());
         spm_.dof     = 1;
         spm_.layout  = SpmColMajor;
+        // spmInit leaves replicated = -1 ("uninitialized"); we build one full
+        // local (non-distributed) matrix, so it is replicated. Leaving it -1
+        // is a latent bug: PaStiX's distributed-path branches key off this.
+        spm_.replicated = 1;
 
         const pastix_int_t n = static_cast<pastix_int_t>(L.rows());
         const int* outer = L.outerIndexPtr();

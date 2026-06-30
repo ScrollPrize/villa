@@ -186,7 +186,20 @@ static cv::Mat_<cv::Vec3f> build_vertex_normals_from_faces(
 static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_fn, bool normalize_uv, bool align_grid, float keep_percent, bool clean_surface, float clean_sigma_k, bool inpaint_holes)
 {
     cv::Mat_<cv::Vec3f> points = surf->rawPoints();
-    
+
+    // Heal degenerate (collapsed grid-adjacent) cells before anything else.
+    // These tracer defects make zero-area triangles that NaN SLIM at iter 1;
+    // healthy adjacent cells are ~1/scale voxels apart. No-op if none found.
+    {
+        const cv::Vec2f sc = surf->scale();
+        const double scale = (std::isfinite(sc[0]) && sc[0] > 0.f) ? sc[0] : 0.0;
+        const int healed = vc::core::util::healDegenerateCells(points, scale);
+        if (healed > 0) {
+            std::cerr << "note: healed " << healed
+                      << " degenerate (collapsed) grid cell(s) before flattening\n";
+        }
+    }
+
     // Clean surface outliers if requested
     if (clean_surface) {
         std::cout << "Cleaning surface outliers..." << std::endl;
@@ -288,24 +301,79 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
         std::cout << "      (meta scale = [" << s[0] << ", " << s[1] << "])\n";
     }
 
-    int v_idx = 1;
+    // Expected healthy adjacent-cell spacing in voxels (= 1/scale); used to
+    // judge degenerate triangles scale-relatively below.
+    const double expected_step = (std::isfinite(uv_fac_x) && uv_fac_x > 0.f) ? double(uv_fac_x) : 1.0;
+
+    // Guard: never emit a zero-area triangle. healDegenerateCells repairs the
+    // vast majority of collapsed cells, but a few (e.g. fully-collapsed 2x2
+    // blocks) can't be separated locally -- and even one zero-area triangle
+    // makes SLIM's symmetric-Dirichlet system singular and NaN at iter 1. Skip
+    // any triangle whose three grid corners aren't geometrically distinct; the
+    // worst case is a sub-cell hole, which the flattener tolerates.
+    auto tri_ok = [&](cv::Vec2i A, cv::Vec2i B, cv::Vec2i C) -> bool {
+        const cv::Vec3d pa = points(A[0], A[1]);
+        const cv::Vec3d pb = points(B[0], B[1]);
+        const cv::Vec3d pc = points(C[0], C[1]);
+        const cv::Vec3d ab = pb - pa, ac = pc - pa;
+        // Reject if any edge is (near-)zero, or the triangle is a sliver:
+        // 2*area / (longest edge) is the shortest height; require it to be a
+        // meaningful fraction of the expected cell spacing. Scale-relative so
+        // it works regardless of coordinate magnitude (~1e4 here).
+        const double bc = cv::norm(pc - pb);
+        const double eAB = cv::norm(ab), eAC = cv::norm(ac);
+        const double emin = std::min(std::min(eAB, eAC), bc);
+        const double emax = std::max(std::max(eAB, eAC), bc);
+        if (emin < 1e-3 * expected_step) return false;     // collapsed edge
+        const double twiceArea = cv::norm(ab.cross(ac));
+        if (emax <= 0.0) return false;
+        const double height = twiceArea / emax;            // shortest altitude
+        return height > 1e-3 * expected_step;              // not a sliver
+    };
+
+    // Two passes so we never emit an orphan vertex (one referenced by no
+    // surviving triangle). An orphan leaves an all-zero row/col in SLIM's
+    // L = AᵀWA, which crashes the PaStiX Cholesky (heap corruption / SIGSEGV
+    // during factorization). Pass 1: collect surviving triangles as grid-cell
+    // triples and mark which cells are actually used. Pass 2: emit only used
+    // vertices (get_add_vertex dedups via idxs), then the faces.
+    struct Tri { cv::Vec2i a, b, c; };
+    std::vector<Tri> tris;
+    tris.reserve(static_cast<size_t>(points.rows) * points.cols * 2);
+    cv::Mat_<uchar> used(points.size(), uchar(0));
+
+    int n_skipped = 0;
     for (int j = 0; j < points.rows - 1; ++j)
         for (int i = 0; i < points.cols - 1; ++i)
             if (loc_valid(points, cv::Vec2d(j, i)))
             {
-                const int c00 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j,   i  }, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c01 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j,   i+1}, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c10 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j+1, i  }, normalize_uv, uv_fac_x, uv_fac_y);
-                const int c11 = get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, {j+1, i+1}, normalize_uv, uv_fac_x, uv_fac_y);
-                // faces unchanged: use same index for v/vt/vn
-                out << "f " << c10 << "/" << c10 << "/" << c10 << " "
-                           << c00 << "/" << c00 << "/" << c00 << " "
-                           << c01 << "/" << c01 << "/" << c01 << '\n';
-
-                out << "f " << c10 << "/" << c10 << "/" << c10 << " "
-                           << c01 << "/" << c01 << "/" << c01 << " "
-                           << c11 << "/" << c11 << "/" << c11 << '\n';
+                const cv::Vec2i L00{j, i}, L01{j, i+1}, L10{j+1, i}, L11{j+1, i+1};
+                if (tri_ok(L10, L00, L01)) {
+                    tris.push_back({L10, L00, L01});
+                    used(L10) = used(L00) = used(L01) = 1;
+                } else { ++n_skipped; }
+                if (tri_ok(L10, L01, L11)) {
+                    tris.push_back({L10, L01, L11});
+                    used(L10) = used(L01) = used(L11) = 1;
+                } else { ++n_skipped; }
             }
+
+    int v_idx = 1;
+    auto idx_of = [&](const cv::Vec2i& L) {
+        return get_add_vertex(out, griduv_ptr, points, normals, idxs, v_idx, L,
+                              normalize_uv, uv_fac_x, uv_fac_y);
+    };
+    for (const Tri& t : tris) {
+        const int a = idx_of(t.a), b = idx_of(t.b), c = idx_of(t.c);
+        // same index for v/vt/vn
+        out << "f " << a << "/" << a << "/" << a << " "
+                   << b << "/" << b << "/" << b << " "
+                   << c << "/" << c << "/" << c << '\n';
+    }
+    if (n_skipped > 0) {
+        std::cerr << "note: skipped " << n_skipped
+                  << " degenerate (zero-area) triangle(s) at emit\n";
+    }
 }
 
 int main(int argc, char *argv[])

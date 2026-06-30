@@ -255,4 +255,89 @@ int inpaintSurfaceHoles(cv::Mat_<cv::Vec3f>& points, double unit, int max_iters)
     return total_filled;
 }
 
+int healDegenerateCells(cv::Mat_<cv::Vec3f>& points,
+                        double scale,
+                        double min_edge_frac,
+                        cv::Mat_<uchar>* dropped_mask)
+{
+    const int rows = points.rows;
+    const int cols = points.cols;
+    if (rows <= 0 || cols <= 0) return 0;
+
+    // Expected healthy adjacent-cell spacing, in the same units as the points
+    // (voxels). meta scale is cells-per-voxel, so 1/scale voxels per cell.
+    double expected = (scale > 0.0) ? (1.0 / scale) : 0.0;
+    if (expected <= 0.0) {
+        // Fallback: median nonzero 4-neighbor step among valid cells.
+        std::vector<double> steps;
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) {
+                if (!isValid(points(r, c))) continue;
+                if (c + 1 < cols && isValid(points(r, c + 1))) {
+                    double d = cv::norm(points(r, c) - points(r, c + 1));
+                    if (d > 0.0) steps.push_back(d);
+                }
+                if (r + 1 < rows && isValid(points(r + 1, c))) {
+                    double d = cv::norm(points(r, c) - points(r + 1, c));
+                    if (d > 0.0) steps.push_back(d);
+                }
+            }
+        if (steps.empty()) return 0;
+        std::nth_element(steps.begin(), steps.begin() + steps.size() / 2, steps.end());
+        expected = steps[steps.size() / 2];
+    }
+    const double min_edge = min_edge_frac * expected;
+
+    cv::Mat_<uchar> dropped_total(rows, cols, uchar(0));
+    int total_dropped = 0;
+    const int kMaxPasses = 6;
+
+    // Detect collapsed cells, then drop whole *clusters* (dilated by one ring)
+    // rather than individual endpoints. A single bad point inpaints fine, but a
+    // fully-collapsed 2x2 block leaves each cell with collapsed in-block
+    // neighbors, so endpoint-only drops never give the solve a clean hole.
+    // Dropping the connected cluster + a 1-cell margin hands inpaintSurfaceHoles
+    // a proper interior hole with all-healthy boundary, which it interpolates
+    // cleanly. Iterate a few times since Ceres can still nudge a refill back.
+    for (int pass = 0; pass < kMaxPasses; ++pass) {
+        cv::Mat_<uchar> collapsed(rows, cols, uchar(0));
+        auto markPair = [&](int r0, int c0, int r1, int c1) {
+            if (!isValid(points(r0, c0)) || !isValid(points(r1, c1))) return;
+            if (cv::norm(points(r0, c0) - points(r1, c1)) < min_edge) {
+                collapsed(r0, c0) = 1;
+                collapsed(r1, c1) = 1;
+            }
+        };
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) {
+                if (c + 1 < cols) markPair(r, c, r, c + 1);
+                if (r + 1 < rows) markPair(r, c, r + 1, c);
+            }
+        if (cv::countNonZero(collapsed) == 0) break;  // converged
+
+        // Dilate the collapsed set by one ring (3x3) so each cluster is dropped
+        // as a unit with a margin; only drop currently-valid cells.
+        cv::Mat_<uchar> drop;
+        cv::dilate(collapsed, drop, cv::Mat::ones(3, 3, CV_8U));
+
+        int n_dropped = 0;
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c)
+                if (drop(r, c) && isValid(points(r, c))) {
+                    points(r, c) = cv::Vec3f(-1.f, -1.f, -1.f);
+                    dropped_total(r, c) = 1;
+                    ++n_dropped;
+                }
+        total_dropped += n_dropped;
+
+        // Refill the whole dropped region from its healthy boundary.
+        inpaintSurfaceHoles(points, expected);
+    }
+
+    if (dropped_mask) {
+        *dropped_mask = dropped_total;
+    }
+    return total_dropped;
+}
+
 } // namespace vc::core::util
