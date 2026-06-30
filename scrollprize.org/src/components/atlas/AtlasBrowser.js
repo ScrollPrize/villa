@@ -110,7 +110,7 @@ function AtlasBrowserInner() {
     if (typeFilter === "scroll" && s.type !== "scroll") return false;
     if (typeFilter === "fragment" && s.type === "scroll") return false;
     if (feat.pred && !(s.n_predictions > 0)) return false;
-    if (feat.ink && !(s.n_inkSegments > 0 || s.readings)) return false;
+    if (feat.ink && !(s.stages && s.stages.ink)) return false; // ink pipeline stage (matches the card badge + dashboard funnel)
     if (feat.ink3d && !s.hasInk3d) return false;
     if (feat.ct && !(s.mesh || s.volumeZarr)) return false;
     if (q) {
