@@ -9,7 +9,7 @@ Addresses ScrollPrize/villa issue #201, the *Decohesion* item:
 IMAGE-ONLY: decohesion is an imaging artifact -- it changes appearance, NOT
 geometry, so it must not touch the segmentation/labels.
 """
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -49,15 +49,43 @@ class DecohesionTransform(ImageOnlyTransform):
 
     @staticmethod
     def _causal_smear(img: torch.Tensor, taxis: int, k: torch.Tensor) -> torch.Tensor:
-        out = k[0] * img
-        n = img.shape[taxis]
-        for i in range(1, k.shape[0]):
-            dst = [slice(None)] * img.ndim
-            src = [slice(None)] * img.ndim
-            dst[taxis] = slice(i, None)
-            src[taxis] = slice(0, n - i)
-            out[tuple(dst)] = out[tuple(dst)] + k[i] * img[tuple(src)]
-        return out
+        dim = img.ndim - 1
+        K = int(k.shape[0])
+
+        if K == 1:
+            return k[0] * img
+
+        if dim not in (2, 3):
+            raise ValueError(f"_causal_smear supports 2D or 3D inputs, got dim={dim}")
+
+        spatial_axis = taxis - 1
+        if not (0 <= spatial_axis < dim):
+            raise ValueError(f"taxis={taxis} out of range for img of shape {tuple(img.shape)}")
+
+        last = img.ndim - 1
+        if taxis == last:
+            moved = img.contiguous()
+            permuted = False
+            perm = None
+        else:
+            perm = list(range(img.ndim))
+            perm[taxis], perm[last] = perm[last], perm[taxis]
+            moved = img.permute(perm).contiguous()
+            permuted = True
+
+        head_shape = moved.shape[:-1]
+        L = moved.shape[-1]
+
+        x = moved.reshape(-1, 1, L)
+        x = F.pad(x, (K - 1, 0), mode='constant', value=0.0)
+
+        w = torch.flip(k, dims=[0]).to(dtype=x.dtype, device=x.device).view(1, 1, K)
+        y = F.conv1d(x, w)
+        y = y.reshape(*head_shape, L)
+
+        if permuted:
+            y = y.permute(perm).contiguous()
+        return y
 
     def _density_weight(self, img: torch.Tensor, strength: float) -> torch.Tensor:
         if not self.density_modulated:
