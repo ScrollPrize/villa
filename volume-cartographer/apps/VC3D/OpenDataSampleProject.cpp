@@ -58,8 +58,10 @@ bool isSupportedRemoteZarr(const OpenDataVolume& volume,
         loweredUrl.substr(loweredUrl.size() - 5) == ".zarr") {
         return true;
     }
-    return containsInsensitive(artifact.type, "zarr") ||
-           containsInsensitive(volume.dataFormat, "zarr");
+    if (containsInsensitive(artifact.type, "zarr")) {
+        return true;
+    }
+    return artifact.type.empty() && containsInsensitive(volume.dataFormat, "zarr");
 }
 
 bool jsonStringEqualsInsensitive(const nlohmann::json& obj,
@@ -93,6 +95,21 @@ std::vector<std::string> volumeTags(const OpenDataVolume& volume,
         containsInsensitive(volume.suffix, "normal3d")) {
         addUnique("normal3d");
     }
+    if (containsInsensitive(artifact.type, "prediction") ||
+        containsInsensitive(artifact.type, "pred")) {
+        addUnique("prediction");
+    }
+    if (containsInsensitive(artifact.type, "surface") &&
+        containsInsensitive(artifact.type, "prediction")) {
+        addUnique("surface-prediction");
+    }
+    if (containsInsensitive(artifact.type, "ink")) {
+        addUnique("ink-detection");
+    }
+    if (containsInsensitive(artifact.type, "ink") &&
+        containsInsensitive(artifact.type, "3d")) {
+        addUnique("ink-detection-3d");
+    }
 
     return tags;
 }
@@ -108,6 +125,16 @@ bool hasVolumeEntry(const VolumePkg& pkg, const std::string& location)
 std::string volumeLabel(const OpenDataVolume& volume)
 {
     return volume.id.empty() ? std::string("<unnamed volume>") : volume.id;
+}
+
+std::string volumeArtifactLabel(const OpenDataVolume& volume,
+                                const OpenDataArtifact& artifact)
+{
+    auto label = volumeLabel(volume);
+    if (!artifact.type.empty()) {
+        label += " (" + artifact.type + ")";
+    }
+    return label;
 }
 
 std::string safePathComponent(std::string value)
@@ -216,44 +243,51 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     OpenDataSampleProjectResult result;
 
     for (const auto& volume : sample.volumes) {
-        const auto* artifact = preferredVolumeArtifact(volume);
-        if (!artifact) {
+        if (volume.artifacts.empty()) {
             ++result.skippedVolumes;
             result.messages.push_back("Skipped " + volumeLabel(volume) + ": no volume artifact.");
             continue;
         }
 
-        const std::string url = artifactUrl(*artifact);
-        if (!isSupportedRemoteZarr(volume, *artifact, url)) {
+        bool foundSupportedArtifact = false;
+        for (const auto& artifact : volume.artifacts) {
+            const std::string url = artifactUrl(artifact);
+            if (!isSupportedRemoteZarr(volume, artifact, url)) {
+                continue;
+            }
+
+            foundSupportedArtifact = true;
+            ++result.supportedVolumes;
+            if (result.preferredVolumeId.empty()) {
+                result.preferredVolumeId = volume.id;
+            }
+
+            const auto label = volumeArtifactLabel(volume, artifact);
+            if (hasVolumeEntry(pkg, url)) {
+                ++result.skippedVolumes;
+                result.messages.push_back("Skipped " + label + ": already attached.");
+                continue;
+            }
+
+            try {
+                if (pkg.addVolumeEntry(url, volumeTags(volume, artifact))) {
+                    ++result.attachedVolumeEntries;
+                } else {
+                    ++result.failedVolumes;
+                    result.messages.push_back("Failed to attach " + label + ".");
+                }
+            } catch (const std::exception& e) {
+                ++result.failedVolumes;
+                result.messages.push_back("Failed to attach " + label + ": " + e.what());
+            } catch (...) {
+                ++result.failedVolumes;
+                result.messages.push_back("Failed to attach " + label + ": unknown error.");
+            }
+        }
+
+        if (!foundSupportedArtifact) {
             ++result.skippedVolumes;
             result.messages.push_back("Skipped " + volumeLabel(volume) + ": unsupported volume artifact.");
-            continue;
-        }
-
-        ++result.supportedVolumes;
-        if (result.preferredVolumeId.empty()) {
-            result.preferredVolumeId = volume.id;
-        }
-
-        if (hasVolumeEntry(pkg, url)) {
-            ++result.skippedVolumes;
-            result.messages.push_back("Skipped " + volumeLabel(volume) + ": already attached.");
-            continue;
-        }
-
-        try {
-            if (pkg.addVolumeEntry(url, volumeTags(volume, *artifact))) {
-                ++result.attachedVolumeEntries;
-            } else {
-                ++result.failedVolumes;
-                result.messages.push_back("Failed to attach " + volumeLabel(volume) + ".");
-            }
-        } catch (const std::exception& e) {
-            ++result.failedVolumes;
-            result.messages.push_back("Failed to attach " + volumeLabel(volume) + ": " + e.what());
-        } catch (...) {
-            ++result.failedVolumes;
-            result.messages.push_back("Failed to attach " + volumeLabel(volume) + ": unknown error.");
         }
     }
 

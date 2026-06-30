@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <utility>
 #include <unistd.h>
 
 using namespace vc3d::opendata;
@@ -194,6 +195,50 @@ TEST_CASE("OpenDataManifest resolves public origins with the website rewrite tab
     const auto* ink = findArtifact(segment.artifacts, "ink_detection");
     REQUIRE(ink != nullptr);
     CHECK(ink->resolvedUrl == "https://example.test/data/PHerc0139/segments/20260311000000/ink.zarr");
+}
+
+TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a catalog volume")
+{
+    OpenDataSample sample;
+    sample.id = "PHerc0139";
+
+    OpenDataVolume volume;
+    volume.id = "scan-volume";
+    volume.dataFormat = "zarr";
+
+    auto artifact = [](std::string type, std::string url) {
+        OpenDataArtifact out;
+        out.type = std::move(type);
+        out.resolvedUrl = std::move(url);
+        return out;
+    };
+
+    volume.artifacts.push_back(artifact("ome-zarr", "http://127.0.0.1:9/base.zarr"));
+    volume.artifacts.push_back(artifact("surface-prediction-zarr", "http://127.0.0.1:9/surface.zarr"));
+    volume.artifacts.push_back(artifact("ink-detection-3d-zarr", "http://127.0.0.1:9/ink.zarr"));
+    volume.artifacts.push_back(artifact("obj", "http://127.0.0.1:9/mesh.obj"));
+    sample.volumes.push_back(std::move(volume));
+
+    auto pkg = VolumePkg::newEmpty();
+    const auto result = attachOpenDataSampleVolumes(*pkg, sample);
+
+    CHECK(result.supportedVolumes == 3);
+    CHECK(result.attachedVolumeEntries == 3);
+    CHECK(result.skippedVolumes == 0);
+    REQUIRE(pkg->volumeEntries().size() == 3);
+    CHECK(pkg->volumeEntries()[0].location == "http://127.0.0.1:9/base.zarr");
+    CHECK(pkg->volumeEntries()[1].location == "http://127.0.0.1:9/surface.zarr");
+    CHECK(pkg->volumeEntries()[2].location == "http://127.0.0.1:9/ink.zarr");
+
+    CHECK(std::find(pkg->volumeEntries()[1].tags.begin(),
+                    pkg->volumeEntries()[1].tags.end(),
+                    "prediction") != pkg->volumeEntries()[1].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[1].tags.begin(),
+                    pkg->volumeEntries()[1].tags.end(),
+                    "surface-prediction") != pkg->volumeEntries()[1].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
+                    pkg->volumeEntries()[2].tags.end(),
+                    "ink-detection-3d") != pkg->volumeEntries()[2].tags.end());
 }
 
 TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
