@@ -85,12 +85,6 @@ def _load_surface_index_backend():
         from vc import surface_index
         return surface_index
     except ImportError:
-        pass
-
-    try:
-        import vc_surface_index
-        return vc_surface_index
-    except ImportError:
         return None
 
 

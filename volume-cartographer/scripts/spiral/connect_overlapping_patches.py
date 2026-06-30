@@ -74,10 +74,7 @@ def load_patches(patches_path, limit=None, segment_id_filter=lambda s: True):
 
 def build_surface_index(patches, bbox_padding, sampling_stride):
     """Build a SurfacePatchIndex containing every patch, keyed by patch id."""
-    try:
-        from vc import surface_index
-    except ImportError:
-        import vc_surface_index as surface_index
+    from vc import surface_index
 
     surfaces = []
     for patch_id, patch in patches.items():
