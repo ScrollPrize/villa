@@ -492,6 +492,35 @@ if(VC_BUILD_PYTHON)
     add_subdirectory(python)
 endif()
 
+# ---- Install rules ----------------------------------------------------------
+# `cmake --install <build> --prefix <p> --component vc_runtime` lays the tree
+# out as <p>/bin (executables) + <p>/lib (their internal .so), which the apps
+# resolve via CMAKE_INSTALL_RPATH ($ORIGIN/../lib, set above) — no
+# LD_LIBRARY_PATH or ldconfig needed. Used by the Docker image.
+#
+# Rather than enumerate ~35 executables and the vc_* libs by hand, walk each
+# subdirectory's targets and install every EXECUTABLE and SHARED_LIBRARY
+# (static/interface/PCH helper targets are skipped — they aren't needed at
+# runtime). The vc_runtime component keeps this isolated from unrelated
+# dependency install rules (e.g. libigl's CMake config exports).
+set(_vc_install_dirs apps apps/VC3D core utils libs/c3d)
+if(VC_BUILD_FLATBOI)
+    list(APPEND _vc_install_dirs libs/flatboi)
+endif()
+foreach(_dir IN LISTS _vc_install_dirs)
+    get_property(_dir_targets DIRECTORY "${CMAKE_SOURCE_DIR}/${_dir}"
+                 PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_tgt IN LISTS _dir_targets)
+        get_target_property(_tgt_type ${_tgt} TYPE)
+        if(_tgt_type STREQUAL "EXECUTABLE" OR _tgt_type STREQUAL "SHARED_LIBRARY")
+            install(TARGETS ${_tgt}
+                COMPONENT vc_runtime
+                RUNTIME DESTINATION bin
+                LIBRARY DESTINATION lib)
+        endif()
+    endforeach()
+endforeach()
+
 if(VC_TESTING)
     enable_testing()
     add_subdirectory(core/test)
