@@ -100,6 +100,22 @@ cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
     return normed(n);
 }
 
+void flip_surface_normals(cv::Mat_<cv::Vec3f> &normals)
+{
+    for (int y = 0; y < normals.rows; ++y) {
+        cv::Vec3f* row = normals.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < normals.cols; ++x) {
+            cv::Vec3f& v = row[x];
+            // Leave NaN sentinels (invalid normals) untouched so validity is
+            // preserved; this mirrors the renderer's normalizeNormals skip.
+            if (v[0] != v[0]) continue;
+            v[0] = -v[0];
+            v[1] = -v[1];
+            v[2] = -v[2];
+        }
+    }
+}
+
 template <typename E>
 static E at_int_impl(const cv::Mat_<E> &points, const cv::Vec2f& p)
 {

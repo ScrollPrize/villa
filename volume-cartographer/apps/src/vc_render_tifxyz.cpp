@@ -3,6 +3,7 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
 #include "vc/core/util/StreamOperators.hpp"
@@ -265,6 +266,12 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
     surf->gen(&points, &normals, size, cv::Vec3f(0,0,0), render_scale, cv::Vec3f(u0, v0, 0));
 }
 
+// Set once from --flip-normals before rendering starts; read by every
+// prepareBaseAndDirs call. grid_normal's right-handed normals point away from
+// the scroll centre when text is readable, so renders that want the normal to
+// point into the scroll enable this (see issue #1044).
+static bool g_flipNormals = false;
+
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
                                 float scale_seg, float ds_scale,
                                 bool hasAffine, const AffineTransform& aff,
@@ -274,6 +281,7 @@ static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv
     dirs = nrm.clone();
     if (hasAffine) applyAffineTransform(base, dirs, aff);
     normalizeNormals(dirs);
+    if (g_flipNormals) flip_surface_normals(dirs);
     base *= ds_scale;
 }
 
@@ -1063,6 +1071,7 @@ int main(int argc, char *argv[])
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
         ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
         ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
+        ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals so the offset (w) direction points the opposite way (e.g. into the scroll); see issue #1044")
         ("zarr-output", po::value<std::string>(), "Output path for .zarr (optional)")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
@@ -1228,6 +1237,7 @@ int main(int argc, char *argv[])
     float scale_seg = parsed["scale-segmentation"].as<float>();
     double rotate_angle = parsed["rotate"].as<double>();
     int flip_axis = parsed["flip"].as<int>();
+    g_flipNormals = parsed["flip-normals"].as<bool>();
     const bool quickTif = parsed["quick-tif"].as<bool>();
 
     // --- Load affines ---
