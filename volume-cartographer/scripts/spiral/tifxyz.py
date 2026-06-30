@@ -319,10 +319,16 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
     valid_vertex = np.any(zyxs != -1, axis=-1)
     valid_quad = valid_vertex[:-1, :-1] & valid_vertex[1:, :-1] & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
     area_vx2 = int(valid_quad.sum()) * step_size ** 2
+    valid_zyxs = zyxs[valid_vertex]
+    bbox = (
+        [valid_zyxs.min(axis=0)[::-1].tolist(), valid_zyxs.max(axis=0)[::-1].tolist()]
+        if valid_vertex.any()
+        else [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
+    )
     with open(f'{path}/meta.json', 'w') as f:
         json.dump({
             'scale': [1 / step_size, 1 / step_size],
-            'bbox': [zyxs.min(axis=(0, 1))[::-1].tolist(), zyxs.max(axis=(0, 1))[::-1].tolist()],
+            'bbox': bbox,
             'area_vx2': area_vx2,
             'area_cm2': area_vx2 * voxel_size_um ** 2 / 1.e8,
             'format': 'tifxyz',
