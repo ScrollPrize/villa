@@ -2,8 +2,12 @@
 
 #include <utils/http_fetch.hpp>
 
+#include <array>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
+#include <string>
+#include <zlib.h>
 
 namespace vc {
 
@@ -43,14 +47,58 @@ std::string authErrorMessage(long status, const std::string& body)
     return message + ". Check your AWS credentials.";
 }
 
+bool hasGzipMagic(std::string_view body)
+{
+    return body.size() >= 2 &&
+           static_cast<unsigned char>(body[0]) == 0x1f &&
+           static_cast<unsigned char>(body[1]) == 0x8b;
+}
+
+std::string gzipInflate(std::string_view compressed)
+{
+    if (compressed.size() > std::numeric_limits<uInt>::max()) {
+        throw std::runtime_error("Gzip HTTP response is too large to decompress");
+    }
+
+    z_stream stream{};
+    if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) {
+        throw std::runtime_error("Failed to initialize gzip decompressor");
+    }
+
+    stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
+    stream.avail_in = static_cast<uInt>(compressed.size());
+
+    std::string output;
+    std::array<char, 64 * 1024> buffer{};
+    int rc = Z_OK;
+    do {
+        stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+        stream.avail_out = static_cast<uInt>(buffer.size());
+        rc = inflate(&stream, Z_NO_FLUSH);
+        if (rc != Z_OK && rc != Z_STREAM_END) {
+            inflateEnd(&stream);
+            throw std::runtime_error("Failed to decompress gzip HTTP response");
+        }
+        output.append(buffer.data(), buffer.size() - stream.avail_out);
+    } while (rc != Z_STREAM_END);
+
+    inflateEnd(&stream);
+    return output;
+}
+
 } // namespace
 
 std::string httpGetString(const std::string& url, const HttpAuth& auth)
 {
     auto client = makeTextClient(auth);
     auto resp = client.get(url);
-    if (resp.ok())
-        return std::string(resp.body_string());
+    if (resp.ok()) {
+        auto body = std::string(resp.body_string());
+        if (hasGzipMagic(body)) {
+            return gzipInflate(body);
+        }
+        return body;
+    }
 
     if (resp.status_code >= 400) {
         const auto body = std::string(resp.body_string());

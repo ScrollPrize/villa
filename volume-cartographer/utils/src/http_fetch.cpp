@@ -299,6 +299,7 @@ HttpResponse perform(const HttpClient::Config& config,
 
         // User agent
         curl_easy_setopt(curl, CURLOPT_USERAGENT, config.user_agent.c_str());
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
 
         // Process-wide abort hook — returning non-zero from the xfer
         // callback aborts the transfer immediately. Used for fast
@@ -451,6 +452,7 @@ HttpResponse HttpClient::put_file(std::string_view url,
         curl_easy_setopt(curl, CURLOPT_TIMEOUT,
                          static_cast<long>(config_.transfer_timeout.count()));
         curl_easy_setopt(curl, CURLOPT_USERAGENT, config_.user_agent.c_str());
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
         // Keep TCP connections alive so back-to-back fetches against
         // S3 don't pay the TLS handshake cost each time. curl_easy_reset
         // preserves the connection cache and SSL session IDs, so we just
