@@ -13,11 +13,34 @@ from sample_spiral import get_bounding_windings, get_theta, get_theta_and_radii
 from tracks import render_spiral_on_tracks_for_slice
 
 
+def _update_hash_with_array(hasher, array):
+    array = np.ascontiguousarray(array)
+    hasher.update(str(array.dtype).encode('ascii'))
+    hasher.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+    hasher.update(array.tobytes())
+
+
+def _patch_lines_cache_filename(patches, all_zs, cache_path, cache_version):
+    patch_hasher = hashlib.sha256()
+    for patch in patches:
+        uuid = getattr(patch, 'uuid', None)
+        if uuid is not None:
+            patch_hasher.update(str(uuid).encode('utf-8'))
+        patch_hasher.update(b'\0')
+        _update_hash_with_array(patch_hasher, patch.zyxs.detach().cpu().numpy())
+        _update_hash_with_array(patch_hasher, patch.valid_quad_mask.detach().cpu().numpy())
+    hashed_patches = patch_hasher.hexdigest()[:16]
+
+    slices_hasher = hashlib.sha256()
+    _update_hash_with_array(slices_hasher, all_zs)
+    hashed_slices = slices_hasher.hexdigest()[:16]
+
+    return f'{cache_path}/patches-{hashed_patches}_lines_v3_{cache_version}_slices-{hashed_slices}.pkl'
+
+
 def _compute_patch_lines_by_slice(patches, slice_zs, cache_path, cache_version='full_res_v1'):
     all_zs = np.array(slice_zs)
-    patch_ids_str = '_'.join(sorted(str(id(p)) for p in patches))
-    hashed_patches = hashlib.sha256(bytes(patch_ids_str, 'ascii')).hexdigest()[:8]
-    cache_filename = f'{cache_path}/patches-{hashed_patches}_lines_v3_{cache_version}_slices-{hash(tuple(all_zs))}.pkl'
+    cache_filename = _patch_lines_cache_filename(patches, all_zs, cache_path, cache_version)
 
     if os.path.exists(cache_filename):
         with open(cache_filename, 'rb') as fp:
