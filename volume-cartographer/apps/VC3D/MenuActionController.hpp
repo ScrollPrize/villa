@@ -42,6 +42,7 @@ private slots:
     void openVolpkg();
     void openRecentVolpkg();
     void attachRemoteZarr();
+    void showOpenDataCatalog();
     void showSettingsDialog();
     void showAboutDialog();
     void showKeybindings();
@@ -113,6 +114,7 @@ private:
     QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
+    QAction* _openDataCatalogAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};

@@ -33,6 +33,10 @@ set(srcs
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
     LineAnnotationGeneratedViews.hpp
+    OpenDataCatalogWindow.cpp
+    OpenDataCatalogWindow.hpp
+    OpenDataManifest.cpp
+    OpenDataManifest.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp

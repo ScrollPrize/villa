@@ -2,6 +2,7 @@
 
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
+#include "OpenDataCatalogWindow.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -122,6 +123,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
     connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
 
+    _openDataCatalogAct = new QAction(QObject::tr("Open Data Catalog..."), this);
+    connect(_openDataCatalogAct, &QAction::triggered, this, &MenuActionController::showOpenDataCatalog);
+
     _settingsAct = new QAction(QObject::tr("Settings"), this);
     connect(_settingsAct, &QAction::triggered, this, &MenuActionController::showSettingsDialog);
 
@@ -193,6 +197,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_convertLegacyAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachRemoteZarrAct);
+    _fileMenu->addAction(_openDataCatalogAct);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent project"), _fileMenu);
     _recentMenu->setEnabled(false);
@@ -439,6 +444,19 @@ void MenuActionController::attachRemoteZarr()
     }
 
     attachRemoteZarrUrl(url.trimmed());
+}
+
+void MenuActionController::showOpenDataCatalog()
+{
+    if (!_window) {
+        return;
+    }
+
+    auto* dialog = new vc3d::opendata::OpenDataCatalogWindow(_window);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
 }
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
