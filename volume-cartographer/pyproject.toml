@@ -10,7 +10,7 @@ name = "volume-cartographer"
 version = "3.0.3"
 description = "Python bindings for Volume Cartographer"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "numpy",
 ]
