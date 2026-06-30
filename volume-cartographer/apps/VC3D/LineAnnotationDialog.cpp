@@ -1340,7 +1340,10 @@ LineAnnotationDialog::currentLineMarkerState() const
     if (maxControlPointDistanceVx() <= 0) {
         return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral;
     }
-    return controlPointPlacementAllowedAt(_currentLinePosition)
+    return vc3d::line_annotation::generatedLinePositionWithinPreviousControlDistance(
+               _currentLinePosition,
+               _generatedViews.controlPoints,
+               static_cast<double>(maxControlPointDistanceVx()))
         ? vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed
         : vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked;
 }
