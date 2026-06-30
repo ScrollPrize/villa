@@ -30,7 +30,14 @@
   --ifm-navbar-link-color: white; */
 
   --ifm-navbar-padding-vertical: 0px;
-  --ifm-navbar-height: 45px; 
+  --ifm-navbar-height: 45px;
+}
+
+/* Native smooth scrolling for anchor jumps, back-to-top, and scroll-to-top on
+   navigation. Docusaurus uses a JS polyfill when this isn't set in CSS (see
+   @docusaurus/theme-common useSmoothScrollTo); honor reduced-motion. */
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
 }
 
 /* For readability concerns, you should choose a lighter palette in dark mode. */
@@ -356,7 +363,7 @@ main {
 .atlas .chip.on { color: #0b0d10; background: var(--accent); border-color: var(--accent); font-weight: 650; }
 .atlas .chipsep { width: 1px; height: 18px; background: var(--line); margin: 0 3px; align-self: center; }
 .atlas .gridfilters .hint { margin-left: auto; }
-.atlas-grid { display: grid; gap: 16px; padding: 0 0 60px; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); }
+.atlas-grid { display: grid; gap: 16px; padding: 0 0 60px; grid-template-columns: repeat(auto-fill, minmax(min(270px, 100%), 1fr)); }
 .atlas .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
   display: flex; flex-direction: column; text-decoration: none; color: inherit;
   transition: border-color .15s, transform .15s; }
@@ -403,9 +410,9 @@ main {
 .atlas-detail .pherc { font-size: 14px; }
 .atlas-detail .repo { color: var(--dim); font-size: 14px; margin-top: 4px; }
 .atlas-detail .type { vertical-align: middle; margin-left: 8px; padding: 1px 8px; }
-.atlas-detail .grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 18px; margin-top: 20px; align-items: start; }
-@media (max-width: 760px) { .atlas-detail .grid { grid-template-columns: 1fr; } }
-.atlas-detail .panel { padding: 18px 20px; }
+.atlas-detail .grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, .9fr); gap: 18px; margin-top: 20px; align-items: start; }
+@media (max-width: 760px) { .atlas-detail .grid { grid-template-columns: minmax(0, 1fr); } .atlas-detail .wrap { padding: 18px 16px 50px; } }
+.atlas-detail .panel { padding: 18px 20px; min-width: 0; }
 .atlas-view { height: 420px; border-radius: 12px; position: relative; overflow: hidden;
   background: radial-gradient(120% 120% at 50% 30%, #20262e, #0c0f13); }
 .atlas-view canvas { display: block; width: 100%; height: 100%; }
@@ -486,7 +493,7 @@ main {
 .atlas-detail dl.meta dt { color: var(--dim); } .atlas-detail dl.meta dd { margin: 0; text-align: right; }
 .atlas-detail .pathrow { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
 .atlas-detail .pathrow .plab { font-size: 11px; color: var(--dim); width: 46px; flex: none; }
-.atlas-detail .pathrow code { flex: 1; background: #0b0d10; border: 1px solid var(--line); border-radius: 6px;
+.atlas-detail .pathrow code { flex: 1; min-width: 0; background: #0b0d10; border: 1px solid var(--line); border-radius: 6px;
   padding: 5px 8px; font-size: 11.5px; overflow: auto; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }
 .atlas-detail .copybtn { background: #1b2027; border: 1px solid var(--line); color: var(--dim); border-radius: 6px;
   padding: 5px 9px; font-size: 11px; cursor: pointer; flex: none; }
