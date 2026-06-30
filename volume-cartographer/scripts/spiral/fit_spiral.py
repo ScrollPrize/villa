@@ -909,21 +909,124 @@ def main(load_only_patches_and_point_collections=False):
         if verified_patches_and_pcls_np.shape[0] > 0:
             trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
 
-    def _points_far_from_trusted_geometry(points_zyx, trusted_geometry_tree, threshold):
-        # Returns a boolean numpy mask, True where the point is farther than `threshold`
-        # from every anchor. `points_zyx` is an (N, 3) array (numpy or tensor); `trusted_geometry_tree`
-        # is a cKDTree built from trusted geometry (or None). Uses a fixed-radius nearest-neighbour
-        # query -- O(N log A), parallel across cores -- instead of the full pairwise distance matrix.
-        if isinstance(points_zyx, torch.Tensor):
-            points_np = points_zyx.detach().cpu().numpy()
-        else:
-            points_np = np.asarray(points_zyx)
+    def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
+        # Returns True for each point with at least one trusted-geometry anchor
+        # within `threshold`. query returns dist == inf for misses.
         points_np = np.ascontiguousarray(points_np, dtype=np.float32)
+        dist, _ = trusted_geometry_tree.query(
+            points_np,
+            k=1,
+            distance_upper_bound=float(threshold),
+            workers=-1,
+        )
+        return np.isfinite(dist)
+
+    def _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate):
+        if not vertices_to_invalidate.any():
+            return 0, False
+
+        invalid_mask_2d = torch.from_numpy(vertices_to_invalidate.reshape(patch.zyxs.shape[:2]))
+        patch.zyxs[invalid_mask_2d] = -1.0
+        n_masked = int(vertices_to_invalidate.sum())
+
+        new_valid_vertex_mask = torch.any(patch.zyxs != -1, dim=-1)
+        new_valid_quad_mask = (
+            new_valid_vertex_mask[:-1, :-1]
+            & new_valid_vertex_mask[1:, :-1]
+            & new_valid_vertex_mask[:-1, 1:]
+            & new_valid_vertex_mask[1:, 1:]
+        )
+
+        if not bool(new_valid_quad_mask.any()):
+            return n_masked, True
+
+        patch.__post_init__()
+        return n_masked, False
+
+    def _mask_unverified_patches_near_trusted_geometry(
+        unverified_patches,
+        trusted_geometry_tree,
+        threshold,
+        max_query_points=2_000_000,
+    ):
         if threshold <= 0 or trusted_geometry_tree is None:
-            return np.ones(points_np.shape[0], dtype=bool)
-        # query returns dist == inf for points with no anchor within distance_upper_bound.
-        dist, _ = trusted_geometry_tree.query(points_np, k=1, distance_upper_bound=float(threshold), workers=-1)
-        return np.isinf(dist)
+            return dict(unverified_patches), 0, 0
+
+        kept_unverified_patches = {}
+        n_masked_vertices = 0
+        n_dropped_patches = 0
+
+        batch_entries = []
+        batch_points = []
+        batch_total = 0
+
+        def flush_batch():
+            nonlocal batch_entries, batch_points, batch_total
+            nonlocal n_masked_vertices, n_dropped_patches
+
+            if batch_total == 0:
+                return
+
+            points_np = batch_points[0] if len(batch_points) == 1 else np.concatenate(batch_points, axis=0)
+            near_trusted = _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold)
+
+            offset = 0
+            for patch_id, patch, valid_indices in batch_entries:
+                n_valid = len(valid_indices)
+                patch_near_trusted = near_trusted[offset:offset + n_valid]
+                offset += n_valid
+
+                vertices_to_invalidate = np.zeros(patch.zyxs.shape[0] * patch.zyxs.shape[1], dtype=bool)
+                vertices_to_invalidate[valid_indices[patch_near_trusted]] = True
+                n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
+                n_masked_vertices += n_masked
+                if dropped:
+                    n_dropped_patches += 1
+                else:
+                    kept_unverified_patches[patch_id] = patch
+
+            batch_entries = []
+            batch_points = []
+            batch_total = 0
+
+        for patch_id, patch in unverified_patches.items():
+            zyxs_flat = patch.zyxs.reshape(-1, 3).cpu().numpy()
+            valid_flat = patch.valid_vertex_mask.reshape(-1).cpu().numpy()
+            valid_indices = np.flatnonzero(valid_flat)
+
+            if len(valid_indices) == 0:
+                kept_unverified_patches[patch_id] = patch
+                continue
+
+            if len(valid_indices) > max_query_points:
+                flush_batch()
+                vertices_to_invalidate = np.zeros(len(valid_flat), dtype=bool)
+                for start in range(0, len(valid_indices), max_query_points):
+                    chunk_indices = valid_indices[start:start + max_query_points]
+                    near_trusted = _query_near_trusted_geometry(
+                        zyxs_flat[chunk_indices],
+                        trusted_geometry_tree,
+                        threshold,
+                    )
+                    vertices_to_invalidate[chunk_indices[near_trusted]] = True
+
+                n_masked, dropped = _apply_unverified_patch_trusted_mask(patch, vertices_to_invalidate)
+                n_masked_vertices += n_masked
+                if dropped:
+                    n_dropped_patches += 1
+                else:
+                    kept_unverified_patches[patch_id] = patch
+                continue
+
+            if batch_total + len(valid_indices) > max_query_points:
+                flush_batch()
+
+            batch_entries.append((patch_id, patch, valid_indices))
+            batch_points.append(zyxs_flat[valid_indices])
+            batch_total += len(valid_indices)
+
+        flush_batch()
+        return kept_unverified_patches, n_masked_vertices, n_dropped_patches
 
     if unverified_patches:
         # For each unverified patch, invalidate (set zyxs -> -1) every currently-valid vertex
@@ -931,44 +1034,14 @@ def main(load_only_patches_and_point_collections=False):
         # masks/area. Patches left with no valid quad are dropped. This is the patch analogue
         # of the DBM-track exclusion in tracks.py: untrusted patches only constrain regions
         # the trusted inputs don't already cover, so they can't fight verified geometry.
-        kept_unverified_patches = {}
-        n_masked_vertices = 0
-        n_dropped_patches = 0
         exclusion_radius = float(cfg['unverified_patch_exclusion_radius'])
-
-        for patch_id, patch in unverified_patches.items():
-            zyxs_np = patch.zyxs.reshape(-1, 3).cpu().numpy()
-            valid_flat = patch.valid_vertex_mask.reshape(-1).cpu().numpy()
-
-            far_from_trusted_geometry = _points_far_from_trusted_geometry(
-                zyxs_np,
+        unverified_patches, n_masked_vertices, n_dropped_patches = (
+            _mask_unverified_patches_near_trusted_geometry(
+                unverified_patches,
                 trusted_geometry_tree,
                 exclusion_radius,
             )
-            vertices_to_invalidate = valid_flat & ~far_from_trusted_geometry
-
-            if vertices_to_invalidate.any():
-                invalid_mask_2d = torch.from_numpy(vertices_to_invalidate.reshape(patch.zyxs.shape[:2]))
-                patch.zyxs[invalid_mask_2d] = -1.0
-                n_masked_vertices += int(vertices_to_invalidate.sum())
-
-                new_valid_vertex_mask = torch.any(patch.zyxs != -1, dim=-1)
-                new_valid_quad_mask = (
-                    new_valid_vertex_mask[:-1, :-1]
-                    & new_valid_vertex_mask[1:, :-1]
-                    & new_valid_vertex_mask[:-1, 1:]
-                    & new_valid_vertex_mask[1:, 1:]
-                )
-
-                if not bool(new_valid_quad_mask.any()):
-                    n_dropped_patches += 1
-                    continue
-
-                patch.__post_init__()
-
-            kept_unverified_patches[patch_id] = patch
-
-        unverified_patches = kept_unverified_patches
+        )
         print(
             f'unverified patches: masked {n_masked_vertices} vertices near trusted geometry '
             f'(radius {exclusion_radius:.1f}), dropped {n_dropped_patches} fully-masked patches; '
