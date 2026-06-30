@@ -456,7 +456,7 @@ nb::object readChunk(Volume& volume,
 
 } // namespace
 
-NB_MODULE(vc, m)
+NB_MODULE(volume, m)
 {
     m.doc() = "Python bindings for Volume Cartographer zarr volume access";
 
