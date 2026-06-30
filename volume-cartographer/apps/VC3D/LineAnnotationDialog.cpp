@@ -1328,7 +1328,7 @@ void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 
 bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) const
 {
-    return vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+    return vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
         linePosition,
         _generatedViews.controlPoints,
         static_cast<double>(maxControlPointDistanceVx()));
@@ -1340,7 +1340,7 @@ LineAnnotationDialog::currentLineMarkerState() const
     if (maxControlPointDistanceVx() <= 0) {
         return vc3d::line_annotation::GeneratedCurrentLineMarkerState::Neutral;
     }
-    return vc3d::line_annotation::generatedLinePositionWithinPreviousControlDistance(
+    return vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
                _currentLinePosition,
                _generatedViews.controlPoints,
                static_cast<double>(maxControlPointDistanceVx()))

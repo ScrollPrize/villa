@@ -4146,7 +4146,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         for (const auto& control : session.controlPoints) {
             controlLinePositions.push_back(control.linePosition);
         }
-        if (!vc3d::line_annotation::generatedControlPointPlacementWithinPreviousDistance(
+        if (!vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
                 linePosition,
                 controlLinePositions,
                 static_cast<double>(pane->dialog->maxControlPointDistanceVx()))) {
