@@ -361,7 +361,7 @@ bool OpenDataSegment::hasArtifactType(std::string_view type) const
 
 bool OpenDataSegment::hasTifxyz() const
 {
-    return hasArtifactType("tifxyz");
+    return preferredTifxyzArtifact(*this) != nullptr;
 }
 
 bool OpenDataSegment::hasInkDetection() const
@@ -514,6 +514,38 @@ const OpenDataArtifact* findArtifact(const std::vector<OpenDataArtifact>& artifa
         return iequals(artifact.type, type);
     });
     return it == artifacts.end() ? nullptr : &*it;
+}
+
+const OpenDataArtifact* preferredTifxyzArtifact(const OpenDataSegment& segment) noexcept
+{
+    for (const auto* type : {"tifxyz-flattened", "tifxyz-transformed", "tifxyz", "tifxyz-normalized"}) {
+        if (const auto* artifact = findArtifact(segment.artifacts, type)) {
+            return artifact;
+        }
+    }
+    const auto flattened = std::find_if(
+        segment.artifacts.begin(), segment.artifacts.end(), [](const OpenDataArtifact& artifact) {
+            const auto type = lowerCopy(artifact.type);
+            return type.find("tifxyz") != std::string::npos &&
+                   type.find("flattened") != std::string::npos;
+        });
+    if (flattened != segment.artifacts.end()) {
+        return &*flattened;
+    }
+    const auto transformed = std::find_if(
+        segment.artifacts.begin(), segment.artifacts.end(), [](const OpenDataArtifact& artifact) {
+            const auto type = lowerCopy(artifact.type);
+            return type.find("tifxyz") != std::string::npos &&
+                   type.find("transformed") != std::string::npos;
+        });
+    if (transformed != segment.artifacts.end()) {
+        return &*transformed;
+    }
+    const auto anyTifxyz = std::find_if(
+        segment.artifacts.begin(), segment.artifacts.end(), [](const OpenDataArtifact& artifact) {
+            return containsInsensitive(artifact.type, "tifxyz");
+        });
+    return anyTifxyz == segment.artifacts.end() ? nullptr : &*anyTifxyz;
 }
 
 const OpenDataArtifact* preferredVolumeArtifact(const OpenDataVolume& volume) noexcept

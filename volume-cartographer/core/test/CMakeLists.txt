@@ -336,6 +336,8 @@ vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
     LIBS doctest::doctest vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 

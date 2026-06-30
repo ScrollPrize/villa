@@ -82,6 +82,11 @@ QString firstArtifactUrl(const std::vector<OpenDataArtifact>& artifacts, const Q
     return qstr(artifact->resolvedUrl.empty() ? artifact->sourcePath : artifact->resolvedUrl);
 }
 
+QString artifactUrl(const OpenDataArtifact& artifact)
+{
+    return qstr(artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl);
+}
+
 QString manifestJsonError(const std::exception& e)
 {
     return QStringLiteral("Could not parse cached open-data manifest: %1").arg(QString::fromUtf8(e.what()));
@@ -611,11 +616,11 @@ QString OpenDataCatalogWindow::selectedSegmentUrl() const
     if (!segment) {
         return {};
     }
-    const auto* artifact = findArtifact(segment->artifacts, "tifxyz");
+    const auto* artifact = preferredTifxyzArtifact(*segment);
     if (!artifact) {
         return firstArtifactUrl(segment->artifacts);
     }
-    return qstr(artifact->resolvedUrl.empty() ? artifact->sourcePath : artifact->resolvedUrl);
+    return artifactUrl(*artifact);
 }
 
 void OpenDataCatalogWindow::updateActionButtons()

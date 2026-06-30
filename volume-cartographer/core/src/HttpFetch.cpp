@@ -4,9 +4,11 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <zlib.h>
 
 namespace vc {
@@ -98,6 +100,26 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
             return gzipInflate(body);
         }
         return body;
+    }
+
+    if (resp.status_code >= 400) {
+        const auto body = std::string(resp.body_string());
+        if (isAuthError(resp.status_code, body))
+            throw std::runtime_error(authErrorMessage(resp.status_code, body));
+        if (resp.status_code >= 500) {
+            throw std::runtime_error(
+                "HTTP server error " + std::to_string(resp.status_code) + " fetching " + url);
+        }
+    }
+    return {};
+}
+
+std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth)
+{
+    auto client = makeTextClient(auth);
+    auto resp = client.get(url);
+    if (resp.ok()) {
+        return std::move(resp.body);
     }
 
     if (resp.status_code >= 400) {

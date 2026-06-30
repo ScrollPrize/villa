@@ -134,6 +134,9 @@ struct OpenDataManifest {
     const std::vector<OpenDataArtifact>& artifacts,
     std::string_view type) noexcept;
 
+[[nodiscard]] const OpenDataArtifact* preferredTifxyzArtifact(
+    const OpenDataSegment& segment) noexcept;
+
 [[nodiscard]] const OpenDataArtifact* preferredVolumeArtifact(
     const OpenDataVolume& volume) noexcept;
 

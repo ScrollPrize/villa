@@ -38,23 +38,28 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QMetaObject>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProcess>
+#include <QProgressDialog>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStringList>
 #include <QSettings>
 #include <QStyle>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QTreeWidget>
 #include <QTimer>
 #include <QTreeWidgetItem>
@@ -66,6 +71,7 @@
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -74,6 +80,12 @@ namespace
 constexpr int kMaxStoredRemoteUrls = 10;
 QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
+
+struct OpenDataOpenTaskResult {
+    std::shared_ptr<VolumePkg> pkg;
+    vc3d::opendata::OpenDataSampleProjectResult result;
+    QString error;
+};
 
 } // namespace
 
@@ -469,50 +481,128 @@ void MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         return;
     }
 
-    enum class Mode { Replace, Merge };
-    Mode mode = Mode::Replace;
-
     if (_window->_state->vpkg()) {
         QMessageBox prompt(_window);
         prompt.setWindowTitle(QObject::tr("Open Data Sample"));
         prompt.setText(QObject::tr("Open sample %1").arg(QString::fromStdString(sample.id)));
         prompt.setInformativeText(
-            QObject::tr("Replace the current project, or attach this sample's supported volumes to the current project?"));
+            QObject::tr("This will replace the current project."));
         auto* replaceButton = prompt.addButton(QObject::tr("Replace Project"), QMessageBox::AcceptRole);
-        auto* mergeButton = prompt.addButton(QObject::tr("Update Current"), QMessageBox::ActionRole);
         prompt.addButton(QMessageBox::Cancel);
         prompt.setDefaultButton(replaceButton);
         prompt.exec();
 
-        if (prompt.clickedButton() == mergeButton) {
-            mode = Mode::Merge;
-        } else if (prompt.clickedButton() != replaceButton) {
+        if (prompt.clickedButton() != replaceButton) {
             return;
         }
     }
 
-    const QString cacheDir = mode == Mode::Merge
-        ? remoteCacheDirectory(false)
-        : vc3d::remoteCachePath();
-    vc3d::opendata::OpenDataSampleProjectResult result;
+    const QString cacheDir = vc3d::remoteCachePath();
+    const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    _window->CloseVolume();
 
-    if (mode == Mode::Replace) {
-        _window->CloseVolume();
-        auto pkg = vc3d::opendata::createOpenDataSampleProject(
-            sample,
-            cacheDir.toStdString(),
-            &result);
-        _window->_state->setVpkg(pkg);
-    } else {
-        auto pkg = _window->_state->vpkg();
-        if (!pkg) {
-            return;
-        }
-        if (!cacheDir.isEmpty() && !pkg->hasRemoteCacheRoot()) {
-            pkg->setRemoteCacheRoot(cacheDir.toStdString());
-        }
-        result = vc3d::opendata::attachOpenDataSampleVolumes(*pkg, sample);
+    QPointer<QProgressDialog> progressDialog;
+    if (sampleCopy.tifxyzSegmentCount() > 0) {
+        auto* dialog = new QProgressDialog(
+            QObject::tr("Preparing segment downloads..."),
+            QString(),
+            0,
+            static_cast<int>(sampleCopy.tifxyzSegmentCount()) * 6,
+            _window);
+        dialog->setWindowTitle(QObject::tr("Open Data Sample"));
+        dialog->setCancelButton(nullptr);
+        dialog->setWindowModality(Qt::WindowModal);
+        dialog->setMinimumDuration(0);
+        dialog->setAutoClose(false);
+        dialog->setAutoReset(false);
+        dialog->show();
+        progressDialog = dialog;
     }
+
+    auto progressCallback =
+        [progressDialog](const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
+            if (!progressDialog) {
+                return;
+            }
+            QMetaObject::invokeMethod(
+                progressDialog.data(),
+                [progressDialog, progress]() {
+                    if (!progressDialog) {
+                        return;
+                    }
+                    const int totalDone = progress.completedSegments + progress.failedSegments;
+                    const QString segment = QString::fromStdString(progress.segmentId);
+                    const QString file = QString::fromStdString(progress.fileName);
+                    QString label = QObject::tr("Downloading segments with %1 worker(s): %2/%3 segments, %4/%5 files.")
+                                        .arg(progress.totalWorkers)
+                                        .arg(totalDone)
+                                        .arg(progress.totalSegments)
+                                        .arg(progress.completedFiles)
+                                        .arg(progress.totalFiles);
+                    if (!segment.isEmpty() && !file.isEmpty()) {
+                        label += QObject::tr("\n%1: %2").arg(segment, file);
+                    } else if (!segment.isEmpty()) {
+                        label += QObject::tr("\n%1").arg(segment);
+                    }
+                    if (progress.failedSegments > 0) {
+                        label += QObject::tr("\nFailures: %1").arg(progress.failedSegments);
+                    }
+                    progressDialog->setMaximum(std::max(progress.totalFiles, 1));
+                    progressDialog->setValue(std::min(progress.completedFiles,
+                                                      std::max(progress.totalFiles, 1)));
+                    progressDialog->setLabelText(label);
+                },
+                Qt::QueuedConnection);
+        };
+
+    QFutureWatcher<OpenDataOpenTaskResult> watcher;
+    watcher.setFuture(QtConcurrent::run(
+        [sampleCopy, cacheDir, progressCallback]() mutable {
+            OpenDataOpenTaskResult taskResult;
+            try {
+                taskResult.pkg = vc3d::opendata::createOpenDataSampleProject(
+                    sampleCopy,
+                    cacheDir.toStdString(),
+                    &taskResult.result,
+                    progressCallback);
+            } catch (const std::exception& e) {
+                taskResult.error = QString::fromUtf8(e.what());
+            } catch (...) {
+                taskResult.error = QObject::tr("Unknown error while opening open-data sample.");
+            }
+            return taskResult;
+        }));
+    while (!watcher.isFinished()) {
+        QApplication::processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(10);
+    }
+    OpenDataOpenTaskResult task = watcher.result();
+    if (progressDialog) {
+        progressDialog->close();
+        progressDialog->deleteLater();
+    }
+
+    if (!task.error.isEmpty()) {
+        QMessageBox::warning(
+            _window,
+            QObject::tr("Open Data Sample"),
+            QObject::tr("Failed to open sample %1:\n\n%2")
+                .arg(QString::fromStdString(sampleCopy.id), task.error));
+        return;
+    }
+
+    vc3d::opendata::OpenDataSampleProjectResult result = std::move(task.result);
+
+    auto pkg = std::move(task.pkg);
+    if (!pkg) {
+        QMessageBox::warning(
+            _window,
+            QObject::tr("Open Data Sample"),
+            QObject::tr("Failed to create sample project for %1.")
+                .arg(QString::fromStdString(sampleCopy.id)));
+        return;
+    }
+    _window->_state->setVpkg(pkg);
 
     _window->refreshCurrentVolumePackageUi(
         QString::fromStdString(result.preferredVolumeId),
@@ -520,17 +610,22 @@ void MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
     _window->UpdateView();
 
     QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
-                          .arg(QString::fromStdString(sample.id))
+                          .arg(QString::fromStdString(sampleCopy.id))
                           .arg(result.attachedVolumeEntries)
                           .arg(result.supportedVolumes);
-    if (sample.tifxyzSegmentCount() > 0) {
-        message += QObject::tr(" Segment caching is not implemented yet.");
+    if (sampleCopy.tifxyzSegmentCount() > 0) {
+        message += QObject::tr(" Cached %1 of %2 tifxyz segments; attached %3 segment source(s).")
+                       .arg(result.cachedTifxyzSegments)
+                       .arg(result.supportedTifxyzSegments)
+                       .arg(result.attachedSegmentEntries);
     }
     if (_window->statusBar()) {
         _window->statusBar()->showMessage(message, 7000);
     }
 
-    if (result.supportedVolumes == 0 || result.failedVolumes > 0) {
+    if (result.supportedVolumes == 0 ||
+        result.failedVolumes > 0 ||
+        result.failedTifxyzSegments > 0) {
         QString details;
         for (const auto& item : result.messages) {
             if (!details.isEmpty()) {

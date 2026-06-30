@@ -1,6 +1,7 @@
 #include "vc/core/util/Tiff.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -96,12 +97,15 @@ void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvT
 
     const auto params = getTiffParams(outType);
 
-    TIFF* tf = TIFFOpen(outPath.string().c_str(), "w");
-    if (!tf)
-        throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
-
     const uint32_t W = static_cast<uint32_t>(outImg.cols);
     const uint32_t H = static_cast<uint32_t>(outImg.rows);
+    const std::uint64_t pixelBytes =
+        static_cast<std::uint64_t>(W) * H * params.elemSize;
+    const char* mode = pixelBytes > 0xffff0000ULL ? "w8" : "w";
+
+    TIFF* tf = TIFFOpen(outPath.string().c_str(), mode);
+    if (!tf)
+        throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
 
     TIFFSetField(tf, TIFFTAG_IMAGEWIDTH,      W);
     TIFFSetField(tf, TIFFTAG_IMAGELENGTH,     H);

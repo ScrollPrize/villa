@@ -2,6 +2,13 @@
 #include <doctest/doctest.h>
 
 #include "OpenDataManifest.hpp"
+#include "OpenDataSampleProject.hpp"
+#include "vc/core/types/VolumePkg.hpp"
+
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 
 using namespace vc3d::opendata;
 
@@ -91,6 +98,24 @@ constexpr const char* kFixture = R"({
   }
 })";
 
+void writeFile(const std::filesystem::path& path, const std::string& body)
+{
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << body;
+    REQUIRE(out.good());
+}
+
+void copyFixtureFile(const std::filesystem::path& source,
+                     const std::filesystem::path& target)
+{
+    std::filesystem::create_directories(target.parent_path());
+    std::filesystem::copy_file(
+        source,
+        target,
+        std::filesystem::copy_options::overwrite_existing);
+}
+
 } // namespace
 
 TEST_CASE("OpenDataManifest parses samples and computes summary counts")
@@ -169,4 +194,90 @@ TEST_CASE("OpenDataManifest resolves public origins with the website rewrite tab
     const auto* ink = findArtifact(segment.artifacts, "ink_detection");
     REQUIRE(ink != nullptr);
     CHECK(ink->resolvedUrl == "https://example.test/data/PHerc0139/segments/20260311000000/ink.zarr");
+}
+
+TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
+{
+    const auto manifest = parseOpenDataManifest(kFixture);
+    const auto& sample = *manifest.findSample("PHerc0139");
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_sample_project_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    writeFile(segmentDir / "meta.json",
+              R"({"type":"seg","uuid":"out","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", segmentDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", segmentDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", segmentDir / "z.tif");
+    writeFile(segmentDir / "mask.tif", "optional");
+    writeFile(segmentDir / "overlapping.json", "{}");
+
+    auto pkg = VolumePkg::newEmpty();
+    OpenDataSampleProjectResult result;
+    std::vector<OpenDataSampleDownloadProgress> progressEvents;
+    attachOpenDataSampleSegments(
+        *pkg,
+        sample,
+        cacheRoot,
+        result,
+        [&](const OpenDataSampleDownloadProgress& progress) {
+            progressEvents.push_back(progress);
+        });
+
+    CHECK(result.supportedTifxyzSegments == 1);
+    CHECK(result.cachedTifxyzSegments == 1);
+    CHECK(result.attachedSegmentEntries == 1);
+    REQUIRE(pkg->segmentEntries().size() == 1);
+    CHECK(pkg->hasSegmentations());
+    const auto ids = pkg->segmentationIDs();
+    REQUIRE(ids.size() == 1);
+    CHECK(ids.front() == "PHerc0139-20260311000000");
+    REQUIRE(!progressEvents.empty());
+    CHECK(progressEvents.back().status == "finished");
+    CHECK(progressEvents.back().completedFiles == 6);
+    CHECK(progressEvents.back().totalFiles == 6);
+    CHECK(progressEvents.back().completedSegments == 1);
+    std::ifstream metaIn(segmentDir / "meta.json", std::ios::binary);
+    REQUIRE(metaIn.good());
+    const auto meta = nlohmann::json::parse(metaIn);
+    CHECK(meta.at("vc_open_data_segment_id").get<std::string>() == "20260311000000");
+    CHECK(meta.at("vc_open_data_segment_long_id").get<std::string>() == "PHerc0139-20260311000000");
+    CHECK(meta.at("vc_open_data_original_volume_id").get<std::string>() == "vol1");
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
+{
+    OpenDataSample sample;
+    sample.id = "Sample With Spaces";
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_cached_project_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    OpenDataSampleProjectResult firstResult;
+    auto first = createOpenDataSampleProject(sample, cacheRoot, &firstResult);
+    const auto projectPath = cacheRoot / "open_data" / "projects" /
+                             "Sample_With_Spaces.volpkg.json";
+    CHECK(std::filesystem::is_regular_file(projectPath));
+    CHECK(first->path() == projectPath);
+
+    first->setSelectedLasagnaDataset("cached-marker");
+
+    OpenDataSampleProjectResult secondResult;
+    auto second = createOpenDataSampleProject(sample, cacheRoot, &secondResult);
+    CHECK(second->path() == projectPath);
+    CHECK(second->selectedLasagnaDataset() == "cached-marker");
+    CHECK(std::any_of(secondResult.messages.begin(),
+                      secondResult.messages.end(),
+                      [](const std::string& message) {
+                          return message.find("Loaded cached sample project") != std::string::npos;
+                      }));
+
+    std::filesystem::remove_all(cacheRoot);
 }
