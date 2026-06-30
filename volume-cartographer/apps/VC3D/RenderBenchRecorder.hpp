@@ -38,6 +38,8 @@ public:
         float scale = 1.0f;
         float zOffset = 0.0f;
         float zDirX = 0.0f, zDirY = 0.0f, zDirZ = 0.0f;
+        int surfaceViewRotationQuarterTurns = 0;
+        bool surfaceViewFlippedHorizontally = false;
         int zSlice = 0;
         int dsScaleIdx = 0;
     };

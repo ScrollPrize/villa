@@ -2068,8 +2068,29 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(fResetViewShortcut, &QShortcut::activated, [this]() {
         if (auto* viewer = activeBaseViewer()) {
             viewer->resetSurfaceOffsets();
+            viewer->resetSurfaceViewOrientation();
             viewer->fitSurfaceInView();
             viewer->renderVisible(true);
+        }
+    });
+
+    fRotateSurfaceViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::RotateSurfaceView), this);
+    fRotateSurfaceViewShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fRotateSurfaceViewShortcut, &QShortcut::activated, [this]() {
+        if (auto* viewer = activeBaseViewer()) {
+            if (viewer->rotateSurfaceViewClockwise()) {
+                statusBar()->showMessage(tr("Surface view rotated clockwise"), 2000);
+            }
+        }
+    });
+
+    fFlipSurfaceViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::FlipSurfaceViewHorizontal), this);
+    fFlipSurfaceViewShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fFlipSurfaceViewShortcut, &QShortcut::activated, [this]() {
+        if (auto* viewer = activeBaseViewer()) {
+            if (viewer->flipSurfaceViewHorizontally()) {
+                statusBar()->showMessage(tr("Surface view flipped horizontally"), 2000);
+            }
         }
     });
 

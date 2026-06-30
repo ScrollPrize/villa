@@ -38,6 +38,8 @@ extern const ShortcutDef RawPointsOverlay;
 extern const ShortcutDef ZoomIn;
 extern const ShortcutDef ZoomOut;
 extern const ShortcutDef ResetView;
+extern const ShortcutDef RotateSurfaceView;
+extern const ShortcutDef FlipSurfaceViewHorizontal;
 extern const ShortcutDef WorldOffsetZPos;
 extern const ShortcutDef WorldOffsetZNeg;
 extern const ShortcutDef CycleNextSegment;
