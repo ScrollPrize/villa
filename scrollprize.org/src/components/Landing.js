@@ -693,11 +693,6 @@ const team = {
       href: "https://blog.virtual-void.net/",
     },
     {
-      name: "Forrest McDonald",
-      title: "Software Engineer",
-      href: "https://www.linkedin.com/in/forrest-mcdonald-a80b9885/",
-    },
-    {
       name: "David Josey",
       title: "ML Annotation Team Lead, PhD",
       href: "https://www.linkedin.com/in/davidsjosey/",
@@ -775,6 +770,11 @@ const team = {
       name: "Julian Schilliger",
       title: "Software Engineer",
       href: "https://www.linkedin.com/in/julian-schilliger-963b21294/",
+    },
+    {
+      name: "Forrest McDonald",
+      title: "Software Engineer",
+      href: "https://www.linkedin.com/in/forrest-mcdonald-a80b9885/",
     },
     {
       name: "Adrionna Fey",
