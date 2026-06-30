@@ -8,7 +8,7 @@ import React from "react";
 
 const DISPLAY = [
   { key: "scanned", label: "Scanned", cls: "f1" },
-  { key: "segmented", label: "Segmented", cls: "f2" },
+  { key: "segmented", label: "Segmenting", cls: "f2" },
   { key: "ink", label: "Ink detected", cls: "f4" },
   { key: "text", label: "Text recovered", cls: "f5" },
 ];

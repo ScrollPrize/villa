@@ -37,7 +37,7 @@
       },
       {
         "key": "segmented",
-        "label": "Segmented",
+        "label": "Segmenting",
         "count": 7,
         "desc": "papyrus surface traced"
       },
@@ -208,7 +208,7 @@
       "progress": {
         "segments": 10,
         "patches": null,
-        "textFound": "Segmented",
+        "textFound": "Segmenting",
         "textRank": 1,
         "unrolledPct": 0,
         "score": 1017.6,
@@ -1105,7 +1105,7 @@
       "progress": {
         "segments": 9,
         "patches": null,
-        "textFound": "Segmented",
+        "textFound": "Segmenting",
         "textRank": 1,
         "unrolledPct": 0,
         "score": 1016.6,
@@ -1267,7 +1267,7 @@
       "progress": {
         "segments": 11,
         "patches": null,
-        "textFound": "Segmented",
+        "textFound": "Segmenting",
         "textRank": 1,
         "unrolledPct": 0,
         "score": 8.9,

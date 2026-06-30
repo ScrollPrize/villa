@@ -49,7 +49,7 @@ export default function Dashboard({ dashboard }) {
           ))}
         </div>
         <div className="funnel-note">
-          Counts are scrolls/fragments that reached each stage. The Segmented
+          Counts are scrolls/fragments that reached each stage. The Segmenting
           stage covers surface tracing and unrolling; how far each scroll is
           unrolled is shown per scroll as its “% unrolled.”
         </div>
