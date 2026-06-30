@@ -1,0 +1,9 @@
+outputs/
+reports/
+textured_plys/
+scroll_meshes-*/
+*.zip
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
