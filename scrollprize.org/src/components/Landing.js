@@ -331,7 +331,7 @@ const prizes = [
   // },
   {
     title: "First Letters / First Title Prizes",
-    prizeMoney: "7 x $60,000",
+    prizeMoney: "$60,000 each",
     description:
       "Find the first letters or the title of a scroll",
     requirement: "",
