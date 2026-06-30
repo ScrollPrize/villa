@@ -15,6 +15,10 @@ class QMenuBar;
 class CWindow;
 class Volume;
 
+namespace vc3d::opendata {
+struct OpenDataSample;
+}
+
 class MenuActionController : public QObject
 {
     Q_OBJECT
@@ -75,6 +79,7 @@ private:
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
+    void openOpenDataSample(const vc3d::opendata::OpenDataSample& sample);
     bool tryResolveRemoteAuth(const QString& url,
                               vc::HttpAuth* authOut,
                               bool allowPrompt,

@@ -105,6 +105,12 @@ OpenDataCatalogWindow::~OpenDataCatalogWindow()
     }
 }
 
+void OpenDataCatalogWindow::setOpenSampleHandler(std::function<void(const OpenDataSample&)> handler)
+{
+    _openSampleHandler = std::move(handler);
+    updateActionButtons();
+}
+
 void OpenDataCatalogWindow::buildUi()
 {
     setWindowTitle(tr("Open Data Catalog"));
@@ -229,8 +235,10 @@ void OpenDataCatalogWindow::buildUi()
     auto* bottomRow = new QHBoxLayout;
     _statusLabel = new QLabel(this);
     _statusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _openSampleButton = new QPushButton(tr("Open Sample"), this);
     auto* closeButton = new QPushButton(tr("Close"), this);
     bottomRow->addWidget(_statusLabel, 1);
+    bottomRow->addWidget(_openSampleButton);
     bottomRow->addWidget(closeButton);
     mainLayout->addLayout(bottomRow);
 
@@ -249,6 +257,7 @@ void OpenDataCatalogWindow::buildUi()
     connect(_openVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedVolumeUrl);
     connect(_copySegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedSegmentUrl);
     connect(_openSegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentUrl);
+    connect(_openSampleButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSample);
     connect(closeButton, &QPushButton::clicked, this, &QDialog::accept);
 
     clearDetails();
@@ -349,6 +358,7 @@ void OpenDataCatalogWindow::setLoading(bool loading)
     if (loading && !_manifest) {
         setStatus(tr("Fetching open-data catalog..."));
     }
+    updateActionButtons();
 }
 
 void OpenDataCatalogWindow::persistFetchedManifest(const ManifestLoadResult& result) const
@@ -612,6 +622,12 @@ void OpenDataCatalogWindow::updateActionButtons()
 {
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
+    const bool canOpenSample = selectedSample() != nullptr &&
+                               static_cast<bool>(_openSampleHandler) &&
+                               !(_fetchWatcher && _fetchWatcher->isRunning() && !_manifest);
+    if (_openSampleButton) {
+        _openSampleButton->setEnabled(canOpenSample);
+    }
     if (_copyVolumeUrlButton) {
         _copyVolumeUrlButton->setEnabled(hasVolumeUrl);
     }
@@ -624,6 +640,15 @@ void OpenDataCatalogWindow::updateActionButtons()
     if (_openSegmentUrlButton) {
         _openSegmentUrlButton->setEnabled(hasSegmentUrl);
     }
+}
+
+void OpenDataCatalogWindow::openSelectedSample()
+{
+    const auto* sample = selectedSample();
+    if (!sample || !_openSampleHandler) {
+        return;
+    }
+    _openSampleHandler(*sample);
 }
 
 void OpenDataCatalogWindow::copySelectedVolumeUrl()

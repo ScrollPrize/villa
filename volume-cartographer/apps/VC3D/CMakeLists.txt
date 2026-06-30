@@ -37,6 +37,8 @@ set(srcs
     OpenDataCatalogWindow.hpp
     OpenDataManifest.cpp
     OpenDataManifest.hpp
+    OpenDataSampleProject.cpp
+    OpenDataSampleProject.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp

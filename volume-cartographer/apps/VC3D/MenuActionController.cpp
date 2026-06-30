@@ -3,6 +3,7 @@
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
+#include "OpenDataSampleProject.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -453,10 +454,95 @@ void MenuActionController::showOpenDataCatalog()
     }
 
     auto* dialog = new vc3d::opendata::OpenDataCatalogWindow(_window);
+    dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
+        openOpenDataSample(sample);
+    });
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->show();
     dialog->raise();
     dialog->activateWindow();
+}
+
+void MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)
+{
+    if (!_window || !_window->_state) {
+        return;
+    }
+
+    enum class Mode { Replace, Merge };
+    Mode mode = Mode::Replace;
+
+    if (_window->_state->vpkg()) {
+        QMessageBox prompt(_window);
+        prompt.setWindowTitle(QObject::tr("Open Data Sample"));
+        prompt.setText(QObject::tr("Open sample %1").arg(QString::fromStdString(sample.id)));
+        prompt.setInformativeText(
+            QObject::tr("Replace the current project, or attach this sample's supported volumes to the current project?"));
+        auto* replaceButton = prompt.addButton(QObject::tr("Replace Project"), QMessageBox::AcceptRole);
+        auto* mergeButton = prompt.addButton(QObject::tr("Update Current"), QMessageBox::ActionRole);
+        prompt.addButton(QMessageBox::Cancel);
+        prompt.setDefaultButton(replaceButton);
+        prompt.exec();
+
+        if (prompt.clickedButton() == mergeButton) {
+            mode = Mode::Merge;
+        } else if (prompt.clickedButton() != replaceButton) {
+            return;
+        }
+    }
+
+    const QString cacheDir = mode == Mode::Merge
+        ? remoteCacheDirectory(false)
+        : vc3d::remoteCachePath();
+    vc3d::opendata::OpenDataSampleProjectResult result;
+
+    if (mode == Mode::Replace) {
+        _window->CloseVolume();
+        auto pkg = vc3d::opendata::createOpenDataSampleProject(
+            sample,
+            cacheDir.toStdString(),
+            &result);
+        _window->_state->setVpkg(pkg);
+    } else {
+        auto pkg = _window->_state->vpkg();
+        if (!pkg) {
+            return;
+        }
+        if (!cacheDir.isEmpty() && !pkg->hasRemoteCacheRoot()) {
+            pkg->setRemoteCacheRoot(cacheDir.toStdString());
+        }
+        result = vc3d::opendata::attachOpenDataSampleVolumes(*pkg, sample);
+    }
+
+    _window->refreshCurrentVolumePackageUi(
+        QString::fromStdString(result.preferredVolumeId),
+        true);
+    _window->UpdateView();
+
+    QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
+                          .arg(QString::fromStdString(sample.id))
+                          .arg(result.attachedVolumeEntries)
+                          .arg(result.supportedVolumes);
+    if (sample.tifxyzSegmentCount() > 0) {
+        message += QObject::tr(" Segment caching is not implemented yet.");
+    }
+    if (_window->statusBar()) {
+        _window->statusBar()->showMessage(message, 7000);
+    }
+
+    if (result.supportedVolumes == 0 || result.failedVolumes > 0) {
+        QString details;
+        for (const auto& item : result.messages) {
+            if (!details.isEmpty()) {
+                details += QLatin1Char('\n');
+            }
+            details += QString::fromStdString(item);
+        }
+        QMessageBox::information(
+            _window,
+            QObject::tr("Open Data Sample"),
+            details.isEmpty() ? message : message + QObject::tr("\n\n%1").arg(details));
+    }
 }
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,

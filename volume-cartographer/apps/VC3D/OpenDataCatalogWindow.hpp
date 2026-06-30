@@ -7,6 +7,7 @@
 #include <QString>
 
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -27,6 +28,8 @@ public:
     explicit OpenDataCatalogWindow(QWidget* parent = nullptr);
     ~OpenDataCatalogWindow() override;
 
+    void setOpenSampleHandler(std::function<void(const OpenDataSample&)> handler);
+
 private slots:
     void reloadManifest();
     void onFetchFinished();
@@ -36,6 +39,7 @@ private slots:
     void openSelectedVolumeUrl();
     void copySelectedSegmentUrl();
     void openSelectedSegmentUrl();
+    void openSelectedSample();
 
 private:
     struct ManifestLoadResult {
@@ -77,6 +81,7 @@ private:
     QTableWidget* _segmentsTable{nullptr};
     QLabel* _statusLabel{nullptr};
     QPushButton* _refreshButton{nullptr};
+    QPushButton* _openSampleButton{nullptr};
     QPushButton* _copyVolumeUrlButton{nullptr};
     QPushButton* _openVolumeUrlButton{nullptr};
     QPushButton* _copySegmentUrlButton{nullptr};
@@ -85,6 +90,7 @@ private:
     std::optional<OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
+    std::function<void(const OpenDataSample&)> _openSampleHandler;
 };
 
 } // namespace vc3d::opendata
