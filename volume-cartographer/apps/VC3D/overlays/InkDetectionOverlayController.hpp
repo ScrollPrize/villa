@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -66,11 +67,17 @@ private:
     void loadSelectedImage();
     QImage renderSingleChannelImage(const cv::Mat_<uint8_t>& scalar,
                                     const std::string& colormapId) const;
+    void refreshOptionsForActiveSurface();
+    std::string activeSegmentKey() const;
+    bool optionMatchesSegment(const Option& option, const std::string& segmentKey) const;
     bool imageMatchesSurface(const QuadSurface& surface) const;
 
     CState* _state{nullptr};
+    std::vector<Option> _allOptions;
     std::vector<Option> _options;
     std::filesystem::path _selectedPath;
+    std::string _selectedSegmentKey;
+    std::unordered_map<std::string, std::filesystem::path> _selectedPathBySegment;
     LoadedImage _selectedImage;
     int _opacity{70};
     std::string _colormapId;

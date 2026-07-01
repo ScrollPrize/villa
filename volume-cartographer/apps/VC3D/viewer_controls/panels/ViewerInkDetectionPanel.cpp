@@ -109,11 +109,7 @@ void ViewerInkDetectionPanel::populateDetections()
         int row = 1;
         for (const auto& option : overlay->options()) {
             const QString path = QString::fromStdString(option.localPath.string());
-            QString label = option.label;
-            if (!option.segmentId.empty()) {
-                label += tr(" (%1)").arg(QString::fromStdString(option.segmentId));
-            }
-            _detectionCombo->addItem(label, path);
+            _detectionCombo->addItem(option.label, path);
             if (!target.isEmpty() && path == target) {
                 selectedIndex = row;
             }

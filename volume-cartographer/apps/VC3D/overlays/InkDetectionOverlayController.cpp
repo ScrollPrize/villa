@@ -12,10 +12,13 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <iterator>
 #include <set>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace {
 constexpr qreal kInkDetectionZ = 18.0;
@@ -182,6 +185,14 @@ InkDetectionOverlayController::InkDetectionOverlayController(CState* state, QObj
     if (_state) {
         connect(_state, &CState::vpkgChanged, this, &InkDetectionOverlayController::refreshAvailableDetections);
         connect(_state, &CState::surfacesLoaded, this, &InkDetectionOverlayController::refreshAvailableDetections);
+        connect(_state, &CState::surfaceChanged, this, [this](const std::string& name, std::shared_ptr<Surface>, bool isEditUpdate) {
+            if (isEditUpdate && name == "segmentation" && activeSegmentKey() == _selectedSegmentKey) {
+                return;
+            }
+            if (name.empty() || name == "segmentation") {
+                refreshOptionsForActiveSurface();
+            }
+        });
     }
     refreshAvailableDetections();
 }
@@ -238,21 +249,14 @@ void InkDetectionOverlayController::refreshAvailableDetections()
     }
 
     std::sort(next.begin(), next.end(), [](const Option& a, const Option& b) {
+        if (a.segmentId != b.segmentId) {
+            return a.segmentId < b.segmentId;
+        }
         return a.label < b.label;
     });
 
-    _options = std::move(next);
-    const bool selectedStillExists = !_selectedPath.empty() &&
-        std::any_of(_options.begin(), _options.end(), [&](const Option& option) {
-            return option.localPath == _selectedPath;
-        });
-    if (!selectedStillExists) {
-        _selectedPath.clear();
-        _selectedImage = {};
-        emit selectionChanged();
-        refreshAll();
-    }
-    emit availableDetectionsChanged();
+    _allOptions = std::move(next);
+    refreshOptionsForActiveSurface();
 }
 
 void InkDetectionOverlayController::setSelectedPath(const std::filesystem::path& path)
@@ -261,6 +265,9 @@ void InkDetectionOverlayController::setSelectedPath(const std::filesystem::path&
         return;
     }
     _selectedPath = path;
+    if (!_selectedSegmentKey.empty()) {
+        _selectedPathBySegment[_selectedSegmentKey] = _selectedPath;
+    }
     _selectedImage = {};
     loadSelectedImage();
     emit selectionChanged();
@@ -355,6 +362,77 @@ void InkDetectionOverlayController::collectPrimitives(
                      kInkDetectionZ);
 }
 
+void InkDetectionOverlayController::refreshOptionsForActiveSurface()
+{
+    if (!_selectedSegmentKey.empty()) {
+        _selectedPathBySegment[_selectedSegmentKey] = _selectedPath;
+    }
+
+    const std::string nextSegmentKey = activeSegmentKey();
+    std::vector<Option> next;
+    for (const auto& option : _allOptions) {
+        if (optionMatchesSegment(option, nextSegmentKey)) {
+            next.push_back(option);
+        }
+    }
+
+    std::filesystem::path nextSelectedPath;
+    if (const auto savedIt = _selectedPathBySegment.find(nextSegmentKey);
+        savedIt != _selectedPathBySegment.end()) {
+        const auto& savedPath = savedIt->second;
+        if (!savedPath.empty() &&
+            std::any_of(next.begin(), next.end(), [&](const Option& option) {
+                return option.localPath == savedPath;
+            })) {
+            nextSelectedPath = savedPath;
+        }
+    }
+
+    const bool sameOptions = next.size() == _options.size() &&
+        std::equal(next.begin(), next.end(), _options.begin(), [](const Option& a, const Option& b) {
+            return a.localPath == b.localPath;
+        });
+    if (nextSegmentKey == _selectedSegmentKey && sameOptions && nextSelectedPath == _selectedPath) {
+        return;
+    }
+
+    _selectedSegmentKey = nextSegmentKey;
+    _options = std::move(next);
+    _selectedPath = std::move(nextSelectedPath);
+
+    _selectedImage = {};
+    loadSelectedImage();
+    emit availableDetectionsChanged();
+    emit selectionChanged();
+    refreshAll();
+}
+
+std::string InkDetectionOverlayController::activeSegmentKey() const
+{
+    if (!_state) {
+        return {};
+    }
+    auto surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    if (!surface) {
+        return {};
+    }
+    if (auto active = _state->activeSurface().lock();
+        active.get() == surface.get() && !_state->activeSurfaceId().empty()) {
+        return _state->activeSurfaceId();
+    }
+    return surface->id;
+}
+
+bool InkDetectionOverlayController::optionMatchesSegment(
+    const Option& option,
+    const std::string& segmentKey) const
+{
+    if (segmentKey.empty()) {
+        return false;
+    }
+    return option.segmentId == segmentKey || option.segmentLongId == segmentKey;
+}
+
 void InkDetectionOverlayController::loadSelectedImage()
 {
     if (_selectedPath.empty()) {
@@ -432,10 +510,18 @@ bool InkDetectionOverlayController::imageMatchesSurface(const QuadSurface& surfa
         return option.localPath == _selectedPath;
     });
     if (optionIt == _options.end()) {
-        return true;
+        return false;
     }
-    if (optionIt->segmentId.empty() && optionIt->segmentLongId.empty()) {
-        return true;
+
+    std::string segmentKey = surface.id;
+    if (_state) {
+        if (auto active = _state->activeSurface().lock();
+            active.get() == &surface && !_state->activeSurfaceId().empty()) {
+            segmentKey = _state->activeSurfaceId();
+        }
+        if (segmentKey.empty()) {
+            segmentKey = _state->findSurfaceId(const_cast<QuadSurface*>(&surface));
+        }
     }
-    return surface.id == optionIt->segmentId || surface.id == optionIt->segmentLongId;
+    return optionMatchesSegment(*optionIt, segmentKey);
 }
