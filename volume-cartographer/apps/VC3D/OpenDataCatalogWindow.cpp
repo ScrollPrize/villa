@@ -377,11 +377,14 @@ void OpenDataCatalogWindow::buildUi()
 
     auto* topRow = new QHBoxLayout;
     _searchEdit = new QLineEdit(this);
-    _searchEdit->setPlaceholderText(tr("Search sample ID"));
+    _searchEdit->setPlaceholderText(tr("Filter sample ID"));
+    _searchEdit->setAccessibleName(tr("Filter"));
     _segmentsOnlyCheck = new QCheckBox(tr("Segments"), this);
     _tifxyzOnlyCheck = new QCheckBox(tr("TIFXYZ"), this);
     _inkOnlyCheck = new QCheckBox(tr("Ink"), this);
     _refreshButton = new QPushButton(tr("Refresh"), this);
+    _refreshButton->setToolTip(tr("Refresh the open-data catalog manifest from the remote source."));
+    _refreshButton->setStatusTip(tr("Refreshes the open-data catalog listing, including samples, scans, volumes, and segments."));
     topRow->addWidget(_searchEdit, 1);
     topRow->addWidget(_segmentsOnlyCheck);
     topRow->addWidget(_tifxyzOnlyCheck);
@@ -391,14 +394,12 @@ void OpenDataCatalogWindow::buildUi()
 
     auto* splitter = new QSplitter(Qt::Horizontal, this);
     _sampleTable = new QTableWidget(splitter);
-    _sampleTable->setColumnCount(9);
+    _sampleTable->setColumnCount(7);
     _sampleTable->setHorizontalHeaderLabels({
         tr("Sample ID"),
-        tr("Type"),
         tr("Scans"),
         tr("Volumes"),
         tr("Segments"),
-        tr("TIFXYZ"),
         tr("Ink"),
         tr("Local TIFXYZ"),
         tr("Sync")
@@ -625,10 +626,9 @@ void OpenDataCatalogWindow::applyManifest(OpenDataManifest manifest, QString sou
 {
     _manifest = std::move(manifest);
     populateSamples();
-    setStatus(tr("%1 catalog: %2 samples, %3 models. Source: %4")
+    setStatus(tr("%1 catalog: %2 samples. Source: %3")
                   .arg(fromCache ? tr("Cached") : tr("Live"))
                   .arg(_manifest->samples.size())
-                  .arg(_manifest->models.size())
                   .arg(sourceLabel));
 }
 
@@ -723,14 +723,12 @@ void OpenDataCatalogWindow::populateSamples()
         auto* idItem = item(qstr(sample.id));
         idItem->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(sampleIndex));
         _sampleTable->setItem(row, 0, idItem);
-        _sampleTable->setItem(row, 1, item(qstr(sample.type)));
-        _sampleTable->setItem(row, 2, numericItem(sample.scanCount()));
-        _sampleTable->setItem(row, 3, numericItem(sample.volumeCount()));
-        _sampleTable->setItem(row, 4, numericItem(sample.segmentCount()));
-        _sampleTable->setItem(row, 5, numericItem(sample.tifxyzSegmentCount()));
-        _sampleTable->setItem(row, 6, numericItem(sample.inkDetectionSegmentCount()));
-        _sampleTable->setItem(row, 7, item(localDataText(cacheSummary)));
-        _sampleTable->setItem(row, 8, item(syncStateText(cacheSummary)));
+        _sampleTable->setItem(row, 1, numericItem(sample.scanCount()));
+        _sampleTable->setItem(row, 2, numericItem(sample.volumeCount()));
+        _sampleTable->setItem(row, 3, numericItem(sample.segmentCount()));
+        _sampleTable->setItem(row, 4, numericItem(sample.inkDetectionSegmentCount()));
+        _sampleTable->setItem(row, 5, item(localDataText(cacheSummary)));
+        _sampleTable->setItem(row, 6, item(syncStateText(cacheSummary)));
     }
     _sampleTable->setSortingEnabled(true);
     _sampleTable->resizeColumnsToContents();
@@ -867,8 +865,8 @@ void OpenDataCatalogWindow::refreshSelectedSampleCacheStatus()
         QSignalBlocker blocker(_sampleTable);
         const bool sorting = _sampleTable->isSortingEnabled();
         _sampleTable->setSortingEnabled(false);
-        _sampleTable->setItem(row, 7, item(localDataText(cacheSummary)));
-        _sampleTable->setItem(row, 8, item(syncStateText(cacheSummary)));
+        _sampleTable->setItem(row, 5, item(localDataText(cacheSummary)));
+        _sampleTable->setItem(row, 6, item(syncStateText(cacheSummary)));
         _sampleTable->setSortingEnabled(sorting);
     }
     populateDetails(sample);
