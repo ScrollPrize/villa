@@ -434,7 +434,6 @@ bool SurfaceAffineTransformController::applyTransformPreview(bool allowRemoteFet
     }
 
     previewSurface->path.clear();
-    previewSurface->id.clear();
 
     transformSurfacePoints(previewSurface.get(), scale, matrix);
     refreshTransformedSurfaceState(previewSurface.get());

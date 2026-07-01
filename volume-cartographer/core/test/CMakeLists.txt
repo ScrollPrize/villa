@@ -79,6 +79,29 @@ vc_add_test(NAME test_segmentation_intersection_invalidation
     LIBS Qt6::Core Qt6::Gui Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+qt6_wrap_cpp(ink_detection_overlay_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.hpp)
+qt6_wrap_cpp(viewer_overlay_base_ink_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
+qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(vccollection_ink_detection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+vc_add_test(NAME test_ink_detection_overlay
+    SOURCES test_ink_detection_overlay.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            test_viewer_manager_stub.cpp
+            ${ink_detection_overlay_moc}
+            ${viewer_overlay_base_ink_moc}
+            ${cstate_ink_detection_moc}
+            ${vccollection_ink_detection_moc}
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(viewer_manager_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
