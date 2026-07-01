@@ -280,6 +280,45 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
                     "vc-open-data-volume-id:scan-volume") != pkg->volumeEntries()[0].tags.end());
 }
 
+TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
+{
+    OpenDataSample sample;
+    sample.id = "PHerc0139";
+
+    auto artifact = [](std::string url) {
+        OpenDataArtifact out;
+        out.type = "zarr";
+        out.resolvedUrl = std::move(url);
+        return out;
+    };
+    auto volume = [&](std::string id) {
+        OpenDataVolume out;
+        out.id = std::move(id);
+        out.dataFormat = "zarr";
+        out.artifacts.push_back(artifact("http://127.0.0.1:9/" + out.id + ".zarr"));
+        return out;
+    };
+    auto segment = [](std::string volumeId) {
+        OpenDataSegment out;
+        out.originalVolumeId = std::move(volumeId);
+        return out;
+    };
+
+    sample.volumes.push_back(volume("vol-a"));
+    sample.volumes.push_back(volume("vol-b"));
+    sample.volumes.push_back(volume("vol-c"));
+    sample.segments.push_back(segment("vol-a"));
+    sample.segments.push_back(segment("vol-b"));
+    sample.segments.push_back(segment("vol-b"));
+    sample.segments.push_back(segment("vol-c"));
+
+    auto pkg = VolumePkg::newEmpty();
+    const auto result = attachOpenDataSampleVolumes(*pkg, sample);
+
+    CHECK(result.supportedVolumes == 3);
+    CHECK(result.preferredVolumeId == "vol-b");
+}
+
 
 TEST_CASE("OpenDataSegmentCache discovers cached ink detection overlays")
 {

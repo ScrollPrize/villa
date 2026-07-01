@@ -8,6 +8,7 @@
 #include <cctype>
 #include <exception>
 #include <filesystem>
+#include <map>
 #include <system_error>
 
 namespace vc3d::opendata {
@@ -154,6 +155,36 @@ std::string safePathComponent(std::string value)
     return value.empty() ? std::string("unnamed") : value;
 }
 
+std::string segmentSourcePreferredVolumeId(
+    const OpenDataSample& sample,
+    const std::vector<std::string>& supportedVolumeIds)
+{
+    if (supportedVolumeIds.empty() || sample.segments.empty()) {
+        return {};
+    }
+
+    std::map<std::string, std::size_t> segmentCountsByVolumeId;
+    for (const auto& segment : sample.segments) {
+        if (!segment.originalVolumeId.empty()) {
+            ++segmentCountsByVolumeId[segment.originalVolumeId];
+        }
+    }
+
+    std::string preferredId;
+    std::size_t preferredCount = 0;
+    for (const auto& volumeId : supportedVolumeIds) {
+        const auto it = segmentCountsByVolumeId.find(volumeId);
+        const std::size_t count =
+            it == segmentCountsByVolumeId.end() ? 0 : it->second;
+        if (count > preferredCount) {
+            preferredId = volumeId;
+            preferredCount = count;
+        }
+    }
+
+    return preferredCount == 0 ? std::string{} : preferredId;
+}
+
 std::filesystem::path sampleProjectCachePath(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample)
@@ -244,6 +275,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     const OpenDataSample& sample)
 {
     OpenDataSampleProjectResult result;
+    std::vector<std::string> supportedVolumeIds;
 
     for (const auto& volume : sample.volumes) {
         if (volume.artifacts.empty()) {
@@ -259,6 +291,9 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                 continue;
             }
 
+            if (!foundSupportedArtifact && !volume.id.empty()) {
+                supportedVolumeIds.push_back(volume.id);
+            }
             foundSupportedArtifact = true;
             ++result.supportedVolumes;
             if (result.preferredVolumeId.empty()) {
@@ -294,6 +329,12 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             ++result.skippedVolumes;
             result.messages.push_back("Skipped " + volumeLabel(volume) + ": unsupported volume artifact.");
         }
+    }
+
+    if (const auto segmentPreferredId =
+            segmentSourcePreferredVolumeId(sample, supportedVolumeIds);
+        !segmentPreferredId.empty()) {
+        result.preferredVolumeId = segmentPreferredId;
     }
 
     return result;
