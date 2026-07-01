@@ -319,9 +319,36 @@ void InkDetectionOverlayController::setColormapId(const std::string& id)
     }
     _colormapId = id;
     if (_selectedImage.singleChannel && !_selectedImage.scalar.empty()) {
-        _selectedImage.image = renderSingleChannelImage(_selectedImage.scalar, _colormapId);
+        _selectedImage.baseImage = renderSingleChannelImage(_selectedImage.scalar, _colormapId);
+        _selectedImage.image = applyImageFlips(_selectedImage.baseImage);
         _selectedImage.colormapId = _colormapId;
     }
+    refreshAll();
+}
+
+void InkDetectionOverlayController::setHorizontalFlip(bool enabled)
+{
+    if (_horizontalFlip == enabled) {
+        return;
+    }
+    _horizontalFlip = enabled;
+    if (!_selectedImage.baseImage.isNull()) {
+        _selectedImage.image = applyImageFlips(_selectedImage.baseImage);
+    }
+    emit flipChanged(_horizontalFlip, _verticalFlip);
+    refreshAll();
+}
+
+void InkDetectionOverlayController::setVerticalFlip(bool enabled)
+{
+    if (_verticalFlip == enabled) {
+        return;
+    }
+    _verticalFlip = enabled;
+    if (!_selectedImage.baseImage.isNull()) {
+        _selectedImage.image = applyImageFlips(_selectedImage.baseImage);
+    }
+    emit flipChanged(_horizontalFlip, _verticalFlip);
     refreshAll();
 }
 
@@ -472,13 +499,22 @@ void InkDetectionOverlayController::loadSelectedImage()
     loaded.singleChannel = imageLooksSingleChannel(src);
     if (loaded.singleChannel) {
         loaded.scalar = toU8Scalar(src);
-        loaded.image = renderSingleChannelImage(loaded.scalar, _colormapId);
+        loaded.baseImage = renderSingleChannelImage(loaded.scalar, _colormapId);
         loaded.colormapId = _colormapId;
     } else {
-        loaded.image = colorMatToImage(src);
+        loaded.baseImage = colorMatToImage(src);
     }
+    loaded.image = applyImageFlips(loaded.baseImage);
 
     _selectedImage = std::move(loaded);
+}
+
+QImage InkDetectionOverlayController::applyImageFlips(const QImage& image) const
+{
+    if (image.isNull() || (!_horizontalFlip && !_verticalFlip)) {
+        return image;
+    }
+    return image.mirrored(_horizontalFlip, _verticalFlip);
 }
 
 QImage InkDetectionOverlayController::renderSingleChannelImage(

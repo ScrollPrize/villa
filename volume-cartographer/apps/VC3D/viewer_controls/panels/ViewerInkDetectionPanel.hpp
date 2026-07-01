@@ -4,6 +4,7 @@
 
 class QComboBox;
 class QLabel;
+class QPushButton;
 class QSlider;
 class ViewerManager;
 
@@ -24,4 +25,6 @@ private:
     QComboBox* _colormapCombo{nullptr};
     QSlider* _opacitySlider{nullptr};
     QLabel* _opacityValue{nullptr};
+    QPushButton* _horizontalFlipButton{nullptr};
+    QPushButton* _verticalFlipButton{nullptr};
 };

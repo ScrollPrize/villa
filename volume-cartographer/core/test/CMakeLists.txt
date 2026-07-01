@@ -100,7 +100,8 @@ vc_add_test(NAME test_ink_detection_overlay
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
+    DEFS VC_TESTING)
 
 qt6_wrap_cpp(viewer_manager_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives

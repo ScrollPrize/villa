@@ -7,6 +7,7 @@
 
 #include <QComboBox>
 #include <QLabel>
+#include <QPushButton>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QVBoxLayout>
@@ -41,12 +42,26 @@ ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, Q
     opacityRow->addControl(_opacityValue);
     layout->addWidget(opacityRow);
 
+    auto* flipRow = new LabeledControlRow(tr("Flip"), this);
+    _horizontalFlipButton = new QPushButton(tr("H Flip"), flipRow);
+    _horizontalFlipButton->setCheckable(true);
+    _horizontalFlipButton->setToolTip(tr("Mirror the ink detection overlay horizontally."));
+    _verticalFlipButton = new QPushButton(tr("V Flip"), flipRow);
+    _verticalFlipButton->setCheckable(true);
+    _verticalFlipButton->setToolTip(tr("Mirror the ink detection overlay vertically."));
+    flipRow->addControl(_horizontalFlipButton);
+    flipRow->addControl(_verticalFlipButton);
+    flipRow->addStretch(1);
+    layout->addWidget(flipRow);
+
     populateColormaps();
     populateDetections();
 
     if (auto* overlay = _viewerManager ? _viewerManager->inkDetectionOverlay() : nullptr) {
         _opacitySlider->setValue(overlay->opacity());
         _opacityValue->setText(QStringLiteral("%1%").arg(overlay->opacity()));
+        _horizontalFlipButton->setChecked(overlay->horizontalFlip());
+        _verticalFlipButton->setChecked(overlay->verticalFlip());
         connect(overlay, &InkDetectionOverlayController::availableDetectionsChanged,
                 this, &ViewerInkDetectionPanel::populateDetections);
         connect(overlay, &InkDetectionOverlayController::selectionChanged,
@@ -60,6 +75,17 @@ ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, Q
                 _opacityValue->setText(QStringLiteral("%1%").arg(opacity));
             }
             updateControlState();
+        });
+        connect(overlay, &InkDetectionOverlayController::flipChanged,
+                this, [this](bool horizontal, bool vertical) {
+            if (_horizontalFlipButton) {
+                const QSignalBlocker blocker(_horizontalFlipButton);
+                _horizontalFlipButton->setChecked(horizontal);
+            }
+            if (_verticalFlipButton) {
+                const QSignalBlocker blocker(_verticalFlipButton);
+                _verticalFlipButton->setChecked(vertical);
+            }
         });
     } else {
         _opacitySlider->setValue(70);
@@ -94,6 +120,18 @@ ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, Q
         }
         if (auto* overlay = _viewerManager ? _viewerManager->inkDetectionOverlay() : nullptr) {
             overlay->setOpacity(value);
+        }
+    });
+
+    connect(_horizontalFlipButton, &QPushButton::toggled, this, [this](bool checked) {
+        if (auto* overlay = _viewerManager ? _viewerManager->inkDetectionOverlay() : nullptr) {
+            overlay->setHorizontalFlip(checked);
+        }
+    });
+
+    connect(_verticalFlipButton, &QPushButton::toggled, this, [this](bool checked) {
+        if (auto* overlay = _viewerManager ? _viewerManager->inkDetectionOverlay() : nullptr) {
+            overlay->setVerticalFlip(checked);
         }
     });
 
@@ -161,5 +199,11 @@ void ViewerInkDetectionPanel::updateControlState()
     }
     if (_opacitySlider) {
         _opacitySlider->setEnabled(hasSelection);
+    }
+    if (_horizontalFlipButton) {
+        _horizontalFlipButton->setEnabled(hasSelection);
+    }
+    if (_verticalFlipButton) {
+        _verticalFlipButton->setEnabled(hasSelection);
     }
 }

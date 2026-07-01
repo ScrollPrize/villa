@@ -37,8 +37,13 @@ public:
     [[nodiscard]] const std::filesystem::path& selectedPath() const { return _selectedPath; }
     [[nodiscard]] int opacity() const { return _opacity; }
     [[nodiscard]] const std::string& colormapId() const { return _colormapId; }
+    [[nodiscard]] bool horizontalFlip() const { return _horizontalFlip; }
+    [[nodiscard]] bool verticalFlip() const { return _verticalFlip; }
     [[nodiscard]] bool selectedIsSingleChannel() const { return _selectedImage.singleChannel; }
     [[nodiscard]] bool hasLoadedSelection() const;
+#ifdef VC_TESTING
+    [[nodiscard]] const QImage& selectedImageForTesting() const { return _selectedImage.image; }
+#endif
 
 public slots:
     void refreshAvailableDetections();
@@ -47,11 +52,14 @@ public slots:
     void clearSelection();
     void setOpacity(int opacity);
     void setColormapId(const std::string& id);
+    void setHorizontalFlip(bool enabled);
+    void setVerticalFlip(bool enabled);
 
 signals:
     void availableDetectionsChanged();
     void selectionChanged();
     void opacityChanged(int opacity);
+    void flipChanged(bool horizontal, bool vertical);
 
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
@@ -60,6 +68,7 @@ protected:
 
 private:
     struct LoadedImage {
+        QImage baseImage;
         QImage image;
         cv::Mat_<uint8_t> scalar;
         bool singleChannel{false};
@@ -68,6 +77,7 @@ private:
     };
 
     void loadSelectedImage();
+    QImage applyImageFlips(const QImage& image) const;
     QImage renderSingleChannelImage(const cv::Mat_<uint8_t>& scalar,
                                     const std::string& colormapId) const;
     void refreshOptionsForActiveSurface();
@@ -85,4 +95,6 @@ private:
     int _opacity{70};
     int _opacityBeforeToggle{70};
     std::string _colormapId;
+    bool _horizontalFlip{false};
+    bool _verticalFlip{false};
 };
