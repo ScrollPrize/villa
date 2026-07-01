@@ -213,6 +213,8 @@ private:
     void updateOptimizationOverlayGeometry();
     void restoreWindowGeometry();
     void saveWindowGeometry() const;
+    void restoreGeneratedViewStateSettings();
+    void saveGeneratedViewStateSettings();
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
@@ -241,6 +243,11 @@ private:
     QList<int> _savedOuterSplitterSizes;
     QList<int> _savedTopSplitterSizes;
     QList<int> _savedStripSplitterSizes;
+    bool _haveSavedCurrentCutZoom = false;
+    float _savedCurrentCutZoom = 1.0f;
+    bool _haveSavedSideCutZoom = false;
+    float _savedSideCutZoom = 1.0f;
+    std::vector<float> _savedStripZooms;
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
     std::vector<FastStripOverlayItems> _fastStripOverlayItems;
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;

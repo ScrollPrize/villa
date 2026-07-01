@@ -32,6 +32,7 @@
 #include <QShortcut>
 #include <QSplitter>
 #include <QSpinBox>
+#include <QVariant>
 #include <QTimer>
 #include <QVariantAnimation>
 #include <QVBoxLayout>
@@ -207,6 +208,72 @@ void installComboEventFilter(QComboBox* combo, QObject* filter)
     }
 }
 
+QVariantList splitterSizesToVariantList(const QList<int>& sizes)
+{
+    QVariantList values;
+    values.reserve(sizes.size());
+    for (const int size : sizes) {
+        values.push_back(size);
+    }
+    return values;
+}
+
+QList<int> splitterSizesFromVariant(const QVariant& value)
+{
+    QList<int> sizes;
+    const QVariantList values = value.toList();
+    sizes.reserve(values.size());
+    for (const QVariant& entry : values) {
+        bool ok = false;
+        const int size = entry.toInt(&ok);
+        if (!ok || size < 0) {
+            return {};
+        }
+        sizes.push_back(size);
+    }
+    return sizes;
+}
+
+bool finiteZoom(float zoom)
+{
+    return std::isfinite(zoom) && zoom > 0.0f;
+}
+
+std::optional<float> zoomFromVariant(const QVariant& value)
+{
+    bool ok = false;
+    const float zoom = value.toFloat(&ok);
+    if (!ok || !finiteZoom(zoom)) {
+        return std::nullopt;
+    }
+    return zoom;
+}
+
+QVariantList zoomsToVariantList(const std::vector<float>& zooms)
+{
+    QVariantList values;
+    values.reserve(static_cast<int>(zooms.size()));
+    for (const float zoom : zooms) {
+        if (finiteZoom(zoom)) {
+            values.push_back(zoom);
+        }
+    }
+    return values;
+}
+
+std::vector<float> zoomsFromVariant(const QVariant& value)
+{
+    std::vector<float> zooms;
+    const QVariantList values = value.toList();
+    zooms.reserve(static_cast<size_t>(values.size()));
+    for (const QVariant& entry : values) {
+        if (const auto zoom = zoomFromVariant(entry)) {
+            zooms.push_back(*zoom);
+        }
+    }
+    return zooms;
+}
+
 cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
 {
     const float n = cv::norm(vector);
@@ -354,6 +421,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _layout->addWidget(_mdiArea);
 
     restoreWindowGeometry();
+    restoreGeneratedViewStateSettings();
 }
 
 void LineAnnotationDialog::showWithSavedGeometry()
@@ -474,6 +542,7 @@ void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
 void LineAnnotationDialog::closeEvent(QCloseEvent* event)
 {
     if (_closeAfterFinalizationAllowed) {
+        saveGeneratedViewStateSettings();
         saveWindowGeometry();
         QMainWindow::closeEvent(event);
         return;
@@ -818,10 +887,13 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         return false;
     }
     currentViewer->setObjectName(tr("Current Line Cut"));
-    currentViewer->applyCameraState(haveCurrentCutCamera
-                                        ? currentCutCamera
-                                        : generatedPaneCamera(currentViewer, camera),
-                                    false);
+    auto currentApplyCamera = haveCurrentCutCamera
+        ? currentCutCamera
+        : generatedPaneCamera(currentViewer, camera);
+    if (!haveCurrentCutCamera && _haveSavedCurrentCutZoom) {
+        currentApplyCamera.scale = _savedCurrentCutZoom;
+    }
+    currentViewer->applyCameraState(currentApplyCamera, false);
     if (!haveCurrentCutCamera && finitePoint(_generatedViews.focusPoint)) {
         currentViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
     }
@@ -871,10 +943,13 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         return false;
     }
     sideViewer->setObjectName(tr("Line Side Cut"));
-    sideViewer->applyCameraState(haveSideCutCamera
-                                     ? sideCutCamera
-                                     : generatedPaneCamera(sideViewer, camera),
-                                 false);
+    auto sideApplyCamera = haveSideCutCamera
+        ? sideCutCamera
+        : generatedPaneCamera(sideViewer, camera);
+    if (!haveSideCutCamera && _haveSavedSideCutZoom) {
+        sideApplyCamera.scale = _savedSideCutZoom;
+    }
+    sideViewer->applyCameraState(sideApplyCamera, false);
     if (!haveSideCutCamera && finitePoint(_generatedViews.focusPoint)) {
         sideViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
     }
@@ -947,6 +1022,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     viewer,
                     views.initialStripLinePositionRange)) {
                 stripCamera.scale = *focusedScale;
+            }
+            if (static_cast<size_t>(stripIndex) < _savedStripZooms.size()) {
+                stripCamera.scale = _savedStripZooms[static_cast<size_t>(stripIndex)];
             }
         }
         viewer->applyCameraState(stripCamera, false);
@@ -2283,5 +2361,97 @@ void LineAnnotationDialog::saveWindowGeometry() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::line_annotation::GEOMETRY, saveGeometry());
+    settings.sync();
+}
+
+void LineAnnotationDialog::restoreGeneratedViewStateSettings()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    _savedOuterSplitterSizes =
+        splitterSizesFromVariant(settings.value(
+            vc3d::settings::line_annotation::OUTER_SPLITTER_SIZES));
+    _savedTopSplitterSizes =
+        splitterSizesFromVariant(settings.value(
+            vc3d::settings::line_annotation::TOP_SPLITTER_SIZES));
+    _savedStripSplitterSizes =
+        splitterSizesFromVariant(settings.value(
+            vc3d::settings::line_annotation::STRIP_SPLITTER_SIZES));
+
+    if (const auto zoom =
+            zoomFromVariant(settings.value(
+                vc3d::settings::line_annotation::CURRENT_CUT_ZOOM))) {
+        _savedCurrentCutZoom = *zoom;
+        _haveSavedCurrentCutZoom = true;
+    }
+    if (const auto zoom =
+            zoomFromVariant(settings.value(
+                vc3d::settings::line_annotation::SIDE_CUT_ZOOM))) {
+        _savedSideCutZoom = *zoom;
+        _haveSavedSideCutZoom = true;
+    }
+    _savedStripZooms =
+        zoomsFromVariant(settings.value(
+            vc3d::settings::line_annotation::STRIP_ZOOMS));
+}
+
+void LineAnnotationDialog::saveGeneratedViewStateSettings()
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+
+    if (_generatedOuterSplitter) {
+        _savedOuterSplitterSizes = _generatedOuterSplitter->sizes();
+    }
+    if (_generatedTopSplitter) {
+        _savedTopSplitterSizes = _generatedTopSplitter->sizes();
+    }
+    if (_generatedStripSplitter) {
+        _savedStripSplitterSizes = _generatedStripSplitter->sizes();
+    }
+
+    _haveSavedCurrentCutZoom = false;
+    if (_currentCutViewer) {
+        _savedCurrentCutZoom = _currentCutViewer->cameraState().scale;
+        _haveSavedCurrentCutZoom = finiteZoom(_savedCurrentCutZoom);
+    }
+    _haveSavedSideCutZoom = false;
+    if (_sideCutViewer) {
+        _savedSideCutZoom = _sideCutViewer->cameraState().scale;
+        _haveSavedSideCutZoom = finiteZoom(_savedSideCutZoom);
+    }
+    _savedStripZooms.clear();
+    _savedStripZooms.reserve(_stripViewers.size());
+    for (const auto& viewer : _stripViewers) {
+        if (!viewer) {
+            continue;
+        }
+        const float zoom = viewer->cameraState().scale;
+        if (finiteZoom(zoom)) {
+            _savedStripZooms.push_back(zoom);
+        }
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::line_annotation::OUTER_SPLITTER_SIZES,
+                      splitterSizesToVariantList(_savedOuterSplitterSizes));
+    settings.setValue(vc3d::settings::line_annotation::TOP_SPLITTER_SIZES,
+                      splitterSizesToVariantList(_savedTopSplitterSizes));
+    settings.setValue(vc3d::settings::line_annotation::STRIP_SPLITTER_SIZES,
+                      splitterSizesToVariantList(_savedStripSplitterSizes));
+    if (_haveSavedCurrentCutZoom) {
+        settings.setValue(vc3d::settings::line_annotation::CURRENT_CUT_ZOOM,
+                          _savedCurrentCutZoom);
+    } else {
+        settings.remove(vc3d::settings::line_annotation::CURRENT_CUT_ZOOM);
+    }
+    if (_haveSavedSideCutZoom) {
+        settings.setValue(vc3d::settings::line_annotation::SIDE_CUT_ZOOM,
+                          _savedSideCutZoom);
+    } else {
+        settings.remove(vc3d::settings::line_annotation::SIDE_CUT_ZOOM);
+    }
+    settings.setValue(vc3d::settings::line_annotation::STRIP_ZOOMS,
+                      zoomsToVariantList(_savedStripZooms));
     settings.sync();
 }
