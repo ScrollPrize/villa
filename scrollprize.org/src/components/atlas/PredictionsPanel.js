@@ -59,10 +59,18 @@ export default function PredictionsPanel({ predictions }) {
                   ? `${p.px} µm${p.energy != null ? ` · ${p.energy} keV` : ""}`
                   : "—";
               const ng = p.zarr
-                ? neuroglancerOverlayUrl(p.baseZarr, p.zarr, {
-                    base: p.baseVolume ? `${p.baseVolume} CT` : "CT volume",
-                    pred: `${meta.label} prediction`,
-                  })
+                ? neuroglancerOverlayUrl(
+                    p.baseZarr,
+                    p.zarr,
+                    {
+                      base: p.baseVolume ? `${p.baseVolume} CT` : "CT volume",
+                      pred: `${meta.label} prediction`,
+                    },
+                    // The prediction ran on OME-Zarr `level` of the base CT, so
+                    // its voxels are 2^level larger — pass both so the overlay
+                    // scales the prediction to align with the CT (see dataAccess).
+                    { baseVoxelUm: p.px, level: p.level ?? 0 }
+                  )
                 : null;
               const files = p.zarr ? browseUrl(p.zarr) : null;
               return (

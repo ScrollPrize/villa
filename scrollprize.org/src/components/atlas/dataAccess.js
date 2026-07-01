@@ -87,34 +87,71 @@ export function neuroglancerUrl(volumeUrl, name = "volume") {
   return NEUROGLANCER + encodeURIComponent(JSON.stringify(state));
 }
 
+// Wrap a zarr source in a Neuroglancer image layer that carries an explicit
+// coordinate transform. Each OME-Zarr store declares its own level-0 as scale
+// [1,1,1] (dimensionless), so without a transform Neuroglancer places every
+// layer on the same voxel=1 grid — a prediction computed on a downscaled level
+// then renders 2^level times too small. We instead map each layer's physical
+// voxel size (µm) onto a shared 1 µm output grid via inputDimensions, so layers
+// with different voxel sizes align in real space regardless of their level.
+// When `voxelUm` is unknown we fall back to a dimensionless grid, preserving the
+// base:prediction ratio (base = 1, prediction = 2^level) even without units.
+function omeZarrLayer(source, name, voxelUm, physical, extra = {}) {
+  const unit = physical ? "m" : "";
+  const inScale = physical ? voxelUm * 1e-6 : voxelUm; // this layer's voxel size
+  const outScale = physical ? 1e-6 : 1; // shared 1 µm (or unitless) output grid
+  const out = { x: [outScale, unit], y: [outScale, unit], z: [outScale, unit] };
+  const inp = { x: [inScale, unit], y: [inScale, unit], z: [inScale, unit] };
+  return {
+    type: "image",
+    source: { url: source, transform: { outputDimensions: out, inputDimensions: inp } },
+    name,
+    ...extra,
+  };
+}
+
 // Build a Neuroglancer deep-link that overlays a prediction on the raw CT volume
 // it was computed from: the CT as a grayscale image layer, the prediction as a
 // colored additive layer on top. Returns null if the prediction has no usable
 // source; falls back to a prediction-only view when no base CT is given.
 // Mirrors the old atlas's multi-layer prediction "Overlay".
-export function neuroglancerOverlayUrl(baseUrl, predUrl, names = {}) {
+//
+// opts.level is the OME-Zarr level the prediction ran on (0 = full res); the
+// prediction's voxels are 2^level larger than the base's, so we give each layer
+// its true voxel size (opts.baseVoxelUm for the CT, baseVoxelUm·2^level for the
+// prediction) and let omeZarrLayer align them. Without baseVoxelUm we still
+// apply the 2^level ratio, just on a dimensionless grid.
+export function neuroglancerOverlayUrl(baseUrl, predUrl, names = {}, opts = {}) {
   const predSource = zarrSource(predUrl);
   if (!predSource) return null;
   const baseSource = zarrSource(baseUrl);
+  const level = opts.level || 0;
+  const physical = opts.baseVoxelUm != null;
+  const baseVox = physical ? opts.baseVoxelUm : 1;
+  const predVox = baseVox * Math.pow(2, level);
   const layers = [];
   if (baseSource) {
-    layers.push({
-      type: "image",
-      source: baseSource,
-      name: names.base || "CT volume",
-      shader:
-        "#uicontrol invlerp normalized\nvoid main() { emitGrayscale(normalized()); }",
-    });
+    layers.push(
+      omeZarrLayer(baseSource, names.base || "CT volume", baseVox, physical, {
+        shader:
+          "#uicontrol invlerp normalized\nvoid main() { emitGrayscale(normalized()); }",
+      })
+    );
   }
-  layers.push({
-    type: "image",
-    source: predSource,
-    name: names.pred || "prediction",
-    blend: "additive",
-    shader:
-      '#uicontrol vec3 color color(default="#ff7a1a")\n#uicontrol invlerp normalized\nvoid main() { emitRGBA(vec4(color, normalized())); }',
-  });
-  return NEUROGLANCER + encodeURIComponent(JSON.stringify({ layers, layout: "4panel" }));
+  layers.push(
+    omeZarrLayer(predSource, names.pred || "prediction", predVox, physical, {
+      blend: "additive",
+      shader:
+        '#uicontrol vec3 color color(default="#ff7a1a")\n#uicontrol invlerp normalized\nvoid main() { emitRGBA(vec4(color, normalized())); }',
+    })
+  );
+  const s = physical ? 1e-6 : 1;
+  const u = physical ? "m" : "";
+  const dimensions = { x: [s, u], y: [s, u], z: [s, u] };
+  return (
+    NEUROGLANCER +
+    encodeURIComponent(JSON.stringify({ dimensions, layers, layout: "4panel" }))
+  );
 }
 
 // Build Thumbor thumbnail URLs for a bucket image (old atlas `yv`). Returns
