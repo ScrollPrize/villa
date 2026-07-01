@@ -22,10 +22,12 @@
 #include <QMenu>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QItemSelectionModel>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 
 #include <filesystem>
+#include <optional>
 #include "utils/Json.hpp"
 
 #include "vc/ui/VCCollection.hpp"
@@ -117,6 +119,7 @@ void CPointCollectionWidget::setupUi()
             });
 
     _tree_view = new QTreeView(main_widget);
+    _tree_view->setObjectName(QStringLiteral("pointCollectionTreeView"));
     _model = new QStandardItemModel(this);
     _tree_view->setModel(_model);
     _tree_view->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -237,6 +240,7 @@ void CPointCollectionWidget::setupUi()
     _save_button = new QPushButton("Save");
     file_layout->addWidget(_save_button);
     _reset_button = new QPushButton("Clear All Points");
+    _reset_button->setObjectName(QStringLiteral("pointCollectionClearAllButton"));
     file_layout->addWidget(_reset_button);
     layout->addLayout(file_layout);
 
@@ -259,16 +263,7 @@ void CPointCollectionWidget::setupUi()
 void CPointCollectionWidget::refreshTree()
 {
     if (_model) {
-        _model->blockSignals(true);
-
-        // Remove all rows before clearing
-        if (_model->rowCount() > 0) {
-            _model->removeRows(0, _model->rowCount());
-        }
-
-        _model->clear();
-        _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
-        _model->blockSignals(false);
+        clearTreeModel();
     }
 
     if (!_point_collection) {
@@ -364,8 +359,15 @@ void CPointCollectionWidget::refreshTree()
 void CPointCollectionWidget::onResetClicked()
 {
     if (_point_collection) {
-        _tree_view->selectionModel()->clear();
+        if (auto* selection = _tree_view->selectionModel()) {
+            const QSignalBlocker selectionBlocker(selection);
+            selection->clear();
+            selection->setCurrentIndex(QModelIndex(), QItemSelectionModel::NoUpdate);
+        }
+        _selected_collection_id = 0;
+        _selected_point_id = 0;
         _point_collection->clearAll();
+        updateMetadataWidgets();
     }
 }
 
@@ -444,14 +446,10 @@ void CPointCollectionWidget::onCollectionChanged(uint64_t collectionId)
 void CPointCollectionWidget::onCollectionRemoved(uint64_t collectionId)
 {
     if (collectionId == static_cast<uint64_t>(-1)) { // Clear all
-        // Properly clear the model
-        if (_model) {
-            _model->blockSignals(true);
-            _model->removeRows(0, _model->rowCount());
-            _model->clear();
-            _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
-            _model->blockSignals(false);
-        }
+        _selected_collection_id = 0;
+        _selected_point_id = 0;
+        clearTreeModel();
+        updateMetadataWidgets();
         return;
     }
 
@@ -569,6 +567,24 @@ void CPointCollectionWidget::onPointRemoved(uint64_t pointId)
             }
         }
     }
+}
+
+void CPointCollectionWidget::clearTreeModel()
+{
+    if (!_model) {
+        return;
+    }
+
+    std::optional<QSignalBlocker> selectionBlocker;
+    if (_tree_view && _tree_view->selectionModel()) {
+        selectionBlocker.emplace(_tree_view->selectionModel());
+        _tree_view->selectionModel()->clear();
+        _tree_view->selectionModel()->setCurrentIndex(QModelIndex(), QItemSelectionModel::NoUpdate);
+    }
+
+    const QSignalBlocker modelBlocker(_model);
+    _model->clear();
+    _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
 }
 
 void CPointCollectionWidget::onSelectionChanged(const QItemSelection &selected, const QItemSelection &deselected)

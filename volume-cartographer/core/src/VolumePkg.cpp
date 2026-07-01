@@ -392,6 +392,34 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
     return true;
 }
 
+bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags)
+{
+    if (location.empty() || tags.empty()) return false;
+    for (auto& e : volumes_) {
+        if (e.location != location) continue;
+        bool changed = false;
+        for (const auto& tag : tags) {
+            if (tag.empty()) continue;
+            if (std::find(e.tags.begin(), e.tags.end(), tag) == e.tags.end()) {
+                e.tags.push_back(tag);
+                changed = true;
+            }
+        }
+        if (!changed) return false;
+
+        for (const auto& [id, volume] : loadedVolumes_) {
+            if (!volume) continue;
+            if (volume->isRemote() && volume->remoteUrl() == location) {
+                volumeTagsByID_[id] = e.tags;
+                break;
+            }
+        }
+        persistProjectState();
+        return true;
+    }
+    return false;
+}
+
 bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::string> tags)
 {
     if (location.empty()) return false;
