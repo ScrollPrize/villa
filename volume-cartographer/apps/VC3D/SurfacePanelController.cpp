@@ -59,6 +59,59 @@ bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
            upper->value() != kZRangeFilterUpperDefault;
 }
 
+QString surface_long_id(QuadSurface* surf)
+{
+    if (!surf || surf->meta.is_null()) {
+        return {};
+    }
+
+    for (const char* key : {
+             "vc_open_data_segment_long_id",
+             "segment_long_id",
+             "long_id",
+             "longId",
+         }) {
+        const auto value = vc::json::string_or(surf->meta, key, std::string{});
+        if (!value.empty()) {
+            return QString::fromStdString(value);
+        }
+    }
+
+    return {};
+}
+
+QString surface_timestamp(QuadSurface* surf)
+{
+    if (!surf || surf->meta.is_null() || !surf->meta.contains("date_last_modified")) {
+        return {};
+    }
+
+    return QString::fromStdString(surf->meta["date_last_modified"].get_string());
+}
+
+void set_surface_tree_item_text(SurfaceTreeWidgetItem* item,
+                                const std::string& id,
+                                QuadSurface* surf)
+{
+    if (!item || !surf) {
+        return;
+    }
+
+    const QString idText = QString::fromStdString(id);
+    const QString longIdText = surface_long_id(surf);
+    const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
+    const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
+
+    item->setText(SURFACE_ID_COLUMN, idText);
+    item->setToolTip(SURFACE_ID_COLUMN, idText);
+    item->setText(SURFACE_LONG_ID_COLUMN, longIdText);
+    item->setToolTip(SURFACE_LONG_ID_COLUMN, longIdText);
+    item->setText(SURFACE_AREA_COLUMN, QString::number(areaCm2, 'f', 3));
+    item->setText(SURFACE_AVG_COST_COLUMN, QString::number(avgCost, 'f', 3));
+    item->setText(SURFACE_OVERLAPS_COLUMN, QString::number(surf->overlappingIds().size()));
+    item->setText(TIMESTAMP_COLUMN, surface_timestamp(surf));
+}
+
 void sync_tag(utils::Json& dict, bool checked, const std::string& name, const std::string& username = {})
 {
     if (checked && !dict.count(name)) {
@@ -374,27 +427,16 @@ void SurfacePanelController::populateSurfaceTree()
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
 
         if (surf) {
-            item->setText(SURFACE_ID_COLUMN, QString::fromStdString(id));
-            const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
-            const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
-            item->setText(2, QString::number(areaCm2, 'f', 3));
-            item->setText(3, QString::number(avgCost, 'f', 3));
-            item->setText(4, QString::number(surf->overlappingIds().size()));
-            QString timestamp;
-            if (!surf->meta.is_null() && surf->meta.contains("date_last_modified")) {
-                timestamp = QString::fromStdString(surf->meta["date_last_modified"].get_string());
-            }
-            item->setText(5, timestamp);
+            set_surface_tree_item_text(item, id, surf.get());
             updateTreeItemIcon(item);
         } else {
             delete item;
         }
     }
 
-    _ui.treeWidget->resizeColumnToContents(0);
-    _ui.treeWidget->resizeColumnToContents(1);
-    _ui.treeWidget->resizeColumnToContents(2);
-    _ui.treeWidget->resizeColumnToContents(3);
+    for (int column = 0; column <= TIMESTAMP_COLUMN; ++column) {
+        _ui.treeWidget->resizeColumnToContents(column);
+    }
 }
 
 void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
@@ -418,23 +460,25 @@ void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
     double areaCm2 = -1.0;
     double avgCost = -1.0;
     int overlapCount = 0;
+    QString longId;
     QString timestamp;
 
     if (surf) {
         areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
         avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
         overlapCount = static_cast<int>(surf->overlappingIds().size());
-        if (!surf->meta.is_null() && surf->meta.contains("date_last_modified")) {
-            timestamp = QString::fromStdString(surf->meta["date_last_modified"].get_string());
-        }
+        longId = surface_long_id(surf.get());
+        timestamp = surface_timestamp(surf.get());
     }
 
     if (targetItem) {
         const QString areaText = areaCm2 >= 0.0 ? QString::number(areaCm2, 'f', 3) : QStringLiteral("-");
         const QString costText = avgCost >= 0.0 ? QString::number(avgCost, 'f', 3) : QStringLiteral("-");
-        targetItem->setText(2, areaText);
-        targetItem->setText(3, costText);
-        targetItem->setText(4, QString::number(overlapCount));
+        targetItem->setText(SURFACE_LONG_ID_COLUMN, longId);
+        targetItem->setToolTip(SURFACE_LONG_ID_COLUMN, longId);
+        targetItem->setText(SURFACE_AREA_COLUMN, areaText);
+        targetItem->setText(SURFACE_AVG_COST_COLUMN, costText);
+        targetItem->setText(SURFACE_OVERLAPS_COLUMN, QString::number(overlapCount));
         targetItem->setText(TIMESTAMP_COLUMN, timestamp);
         updateTreeItemIcon(targetItem);
     }
@@ -485,18 +529,8 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
             if (!item) {
                 item = new SurfaceTreeWidgetItem(_ui.treeWidget);
             }
-            item->setText(SURFACE_ID_COLUMN, QString::fromStdString(segId));
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
-            const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
-            const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
-            item->setText(2, QString::number(areaCm2, 'f', 3));
-            item->setText(3, QString::number(avgCost, 'f', 3));
-            item->setText(4, QString::number(surf->overlappingIds().size()));
-            QString timestamp;
-            if (!surf->meta.is_null() && surf->meta.contains("date_last_modified")) {
-                timestamp = QString::fromStdString(surf->meta["date_last_modified"].get_string());
-            }
-            item->setText(5, timestamp);
+            set_surface_tree_item_text(item, segId, surf.get());
             updateTreeItemIcon(item);
         }
     } catch (const std::exception& e) {
@@ -1675,7 +1709,11 @@ void SurfacePanelController::applyFiltersInternal()
         auto surf = getSurfaceById(id);
 
         if (hasSurfaceIdFilter && !id.empty()) {
-            show = show && QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive);
+            const bool idMatches =
+                QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive);
+            const bool longIdMatches =
+                item->text(SURFACE_LONG_ID_COLUMN).contains(surfaceIdFilterText, Qt::CaseInsensitive);
+            show = show && (idMatches || longIdMatches);
         }
 
         if (focusPointFilter) {
