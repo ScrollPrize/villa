@@ -16,13 +16,17 @@
 #include <QGuiApplication>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QImage>
 #include <QIODevice>
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPixmap>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QSaveFile>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QTableWidget>
@@ -32,10 +36,90 @@
 #include <QVBoxLayout>
 #include <QtConcurrent>
 
+#include <algorithm>
+#include <cstddef>
+#include <cmath>
 #include <exception>
+#include <limits>
+#include <utility>
 
 namespace vc3d::opendata {
 namespace {
+
+constexpr int kOverviewPhotoMaxHeight = 360;
+constexpr int kOverviewPhotoDefaultWidth = 420;
+
+class OverviewPhotoLabel : public QLabel {
+public:
+    using QLabel::QLabel;
+
+    void setSourceImage(QImage image)
+    {
+        _sourceImage = std::move(image);
+        updateScaledPixmap();
+    }
+
+    void clearSourceImage()
+    {
+        _sourceImage = {};
+        clear();
+    }
+
+    [[nodiscard]] bool hasHeightForWidth() const override
+    {
+        return true;
+    }
+
+    [[nodiscard]] int heightForWidth(int width) const override
+    {
+        if (_sourceImage.isNull() || width <= 0 || _sourceImage.width() <= 0) {
+            return QLabel::heightForWidth(width);
+        }
+        const int scaledHeight = static_cast<int>(
+            std::ceil(static_cast<double>(_sourceImage.height()) *
+                      static_cast<double>(width) /
+                      static_cast<double>(_sourceImage.width())));
+        return std::min(scaledHeight, kOverviewPhotoMaxHeight);
+    }
+
+    [[nodiscard]] QSize sizeHint() const override
+    {
+        if (_sourceImage.isNull()) {
+            return QLabel::sizeHint();
+        }
+        const int width = std::min(_sourceImage.width(), kOverviewPhotoDefaultWidth);
+        return {width, heightForWidth(width)};
+    }
+
+    [[nodiscard]] QSize minimumSizeHint() const override
+    {
+        return {0, 0};
+    }
+
+protected:
+    void resizeEvent(QResizeEvent* event) override
+    {
+        QLabel::resizeEvent(event);
+        updateScaledPixmap();
+    }
+
+private:
+    void updateScaledPixmap()
+    {
+        if (_sourceImage.isNull()) {
+            return;
+        }
+        const int targetWidth = std::max(1, width());
+        const QImage scaled = _sourceImage.scaled(
+            QSize(targetWidth, kOverviewPhotoMaxHeight),
+            Qt::KeepAspectRatio,
+            Qt::SmoothTransformation);
+        QLabel::setPixmap(QPixmap::fromImage(scaled));
+        setMinimumHeight(scaled.height());
+    }
+
+    QImage _sourceImage;
+};
 
 QString qstr(const std::string& value)
 {
@@ -91,6 +175,16 @@ QString artifactUrl(const OpenDataArtifact& artifact)
     return qstr(artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl);
 }
 
+QImage imageFromBytes(const std::vector<std::byte>& bytes)
+{
+    if (bytes.empty() || bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return {};
+    }
+    return QImage::fromData(
+        reinterpret_cast<const uchar*>(bytes.data()),
+        static_cast<int>(bytes.size()));
+}
+
 QString manifestJsonError(const std::exception& e)
 {
     return QStringLiteral("Could not parse cached open-data manifest: %1").arg(QString::fromUtf8(e.what()));
@@ -111,6 +205,10 @@ OpenDataCatalogWindow::~OpenDataCatalogWindow()
     if (_fetchWatcher) {
         _fetchWatcher->cancel();
         _fetchWatcher->waitForFinished();
+    }
+    for (auto* watcher : _photoWatchers) {
+        watcher->cancel();
+        watcher->waitForFinished();
     }
 }
 
@@ -161,11 +259,23 @@ void OpenDataCatalogWindow::buildUi()
     _sampleTable->verticalHeader()->hide();
 
     _tabs = new QTabWidget(splitter);
-    _overviewLabel = new QLabel(_tabs);
+    auto* overviewPage = new QWidget(_tabs);
+    auto* overviewLayout = new QVBoxLayout(overviewPage);
+    _overviewLabel = new QLabel(overviewPage);
     _overviewLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     _overviewLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
     _overviewLabel->setWordWrap(true);
-    _tabs->addTab(_overviewLabel, tr("Overview"));
+    _overviewPhotoLabel = new OverviewPhotoLabel(overviewPage);
+    _overviewPhotoLabel->setAlignment(Qt::AlignCenter);
+    _overviewPhotoLabel->setWordWrap(true);
+    _overviewPhotoLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _overviewPhotoLabel->setMaximumHeight(kOverviewPhotoMaxHeight);
+    _overviewPhotoLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    _overviewPhotoLabel->hide();
+    overviewLayout->addWidget(_overviewLabel, 0);
+    overviewLayout->addWidget(_overviewPhotoLabel, 0, Qt::AlignLeft | Qt::AlignTop);
+    overviewLayout->addStretch(1);
+    _tabs->addTab(overviewPage, tr("Overview"));
 
     _scansTable = new QTableWidget(_tabs);
     _scansTable->setColumnCount(4);
@@ -491,7 +601,7 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
 
     _overviewLabel->setText(
         tr("<b>%1</b><br>Type: %2<br>Scans: %3<br>Volumes: %4<br>Segments: %5<br>"
-           "TIFXYZ segments: %6<br>Ink detections: %7<br><br>%8")
+           "TIFXYZ segments: %6<br>Ink detections: %7<br>Photos: %8<br><br>%9")
             .arg(qstr(sample->id).toHtmlEscaped())
             .arg(qstr(sample->type).toHtmlEscaped())
             .arg(sample->scanCount())
@@ -499,7 +609,9 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
             .arg(sample->segmentCount())
             .arg(sample->tifxyzSegmentCount())
             .arg(sample->inkDetectionSegmentCount())
+            .arg(sample->artifacts.size())
             .arg(qstr(sample->description).toHtmlEscaped()));
+    loadOverviewPhoto(*sample);
 
     _scansTable->setRowCount(static_cast<int>(sample->scans.size()));
     for (int row = 0; row < static_cast<int>(sample->scans.size()); ++row) {
@@ -556,6 +668,16 @@ void OpenDataCatalogWindow::clearDetails()
     if (_overviewLabel) {
         _overviewLabel->setText(tr("No sample selected."));
     }
+    _pendingPhotoSampleId.clear();
+    for (auto* watcher : _photoWatchers) {
+        if (watcher && watcher->isRunning()) {
+            watcher->cancel();
+        }
+    }
+    if (_overviewPhotoLabel) {
+        static_cast<OverviewPhotoLabel*>(_overviewPhotoLabel)->clearSourceImage();
+        _overviewPhotoLabel->hide();
+    }
     if (_scansTable) {
         _scansTable->setRowCount(0);
     }
@@ -566,6 +688,104 @@ void OpenDataCatalogWindow::clearDetails()
         _segmentsTable->setRowCount(0);
     }
     updateActionButtons();
+}
+
+void OpenDataCatalogWindow::loadOverviewPhoto(const OpenDataSample& sample)
+{
+    _pendingPhotoSampleId = qstr(sample.id);
+    const auto* artifact = preferredPhotoArtifact(sample);
+    if (!artifact) {
+        if (_overviewPhotoLabel) {
+            static_cast<OverviewPhotoLabel*>(_overviewPhotoLabel)->clearSourceImage();
+            _overviewPhotoLabel->hide();
+        }
+        return;
+    }
+
+    const QString url = artifactUrl(*artifact);
+    if (url.isEmpty()) {
+        if (_overviewPhotoLabel) {
+            static_cast<OverviewPhotoLabel*>(_overviewPhotoLabel)->clearSourceImage();
+            _overviewPhotoLabel->hide();
+        }
+        return;
+    }
+
+    for (auto* activeWatcher : _photoWatchers) {
+        if (activeWatcher && activeWatcher->isRunning()) {
+            activeWatcher->cancel();
+        }
+    }
+    setOverviewPhotoText(tr("Loading photo..."));
+
+    auto* watcher = new QFutureWatcher<PhotoLoadResult>(this);
+    _photoWatcher = watcher;
+    _photoWatchers.push_back(watcher);
+    connect(watcher, &QFutureWatcher<PhotoLoadResult>::finished, this, [this, watcher]() {
+        onOverviewPhotoFinished(watcher);
+    });
+
+    const QString sampleId = _pendingPhotoSampleId;
+    watcher->setFuture(QtConcurrent::run([sampleId, url]() {
+        PhotoLoadResult result;
+        result.sampleId = sampleId;
+        result.url = url;
+        try {
+            result.image = imageFromBytes(vc::httpGetBytes(url.toStdString()));
+            if (result.image.isNull()) {
+                result.error = QStringLiteral("Could not decode photo.");
+            }
+        } catch (const std::exception& e) {
+            result.error = QString::fromUtf8(e.what());
+        } catch (...) {
+            result.error = QStringLiteral("Unknown error while fetching photo.");
+        }
+        return result;
+    }));
+}
+
+void OpenDataCatalogWindow::onOverviewPhotoFinished(QFutureWatcher<PhotoLoadResult>* watcher)
+{
+    if (!watcher) {
+        return;
+    }
+    if (_photoWatcher == watcher) {
+        _photoWatcher = nullptr;
+    }
+    _photoWatchers.erase(
+        std::remove(_photoWatchers.begin(), _photoWatchers.end(), watcher),
+        _photoWatchers.end());
+    const PhotoLoadResult result = watcher->result();
+    watcher->deleteLater();
+
+    if (result.sampleId != _pendingPhotoSampleId) {
+        return;
+    }
+    if (!result.error.isEmpty()) {
+        setOverviewPhotoText(tr("Photo unavailable"));
+        return;
+    }
+    setOverviewPhotoImage(result.image);
+}
+
+void OpenDataCatalogWindow::setOverviewPhotoText(const QString& text)
+{
+    if (!_overviewPhotoLabel) {
+        return;
+    }
+    static_cast<OverviewPhotoLabel*>(_overviewPhotoLabel)->clearSourceImage();
+    _overviewPhotoLabel->setText(text);
+    _overviewPhotoLabel->show();
+}
+
+void OpenDataCatalogWindow::setOverviewPhotoImage(const QImage& image)
+{
+    if (!_overviewPhotoLabel || image.isNull()) {
+        return;
+    }
+    _overviewPhotoLabel->setText({});
+    static_cast<OverviewPhotoLabel*>(_overviewPhotoLabel)->setSourceImage(image);
+    _overviewPhotoLabel->show();
 }
 
 const OpenDataSample* OpenDataCatalogWindow::selectedSample() const

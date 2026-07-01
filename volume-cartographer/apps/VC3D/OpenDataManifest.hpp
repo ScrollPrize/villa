@@ -89,6 +89,7 @@ struct OpenDataSample {
     std::string type;
     std::string description;
     nlohmann::json properties = nlohmann::json::object();
+    std::vector<OpenDataArtifact> artifacts;
     std::vector<OpenDataScan> scans;
     std::vector<OpenDataVolume> volumes;
     std::vector<OpenDataSegment> segments;
@@ -139,5 +140,8 @@ struct OpenDataManifest {
 
 [[nodiscard]] const OpenDataArtifact* preferredVolumeArtifact(
     const OpenDataVolume& volume) noexcept;
+
+[[nodiscard]] const OpenDataArtifact* preferredPhotoArtifact(
+    const OpenDataSample& sample) noexcept;
 
 } // namespace vc3d::opendata

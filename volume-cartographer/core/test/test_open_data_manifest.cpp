@@ -23,7 +23,18 @@ constexpr const char* kFixture = R"({
         "sample": {
           "type": "scroll",
           "description": "Example sample",
-          "unknown_sample_field": 7
+          "unknown_sample_field": 7,
+          "data": [{
+            "type": "photo",
+            "origins": [{
+              "path": "PHerc0139/photos/PHerc0139_photo.jpg",
+              "access_roots": [{
+                "type": "s3",
+                "url": "s3://vesuvius-challenge-open-data/",
+                "usage": "public-read"
+              }]
+            }]
+          }]
         },
         "scans": {
           "20240101000000": {
@@ -136,6 +147,11 @@ TEST_CASE("OpenDataManifest parses samples and computes summary counts")
     CHECK(sample->tifxyzSegmentCount() == 1);
     CHECK(sample->inkDetectionSegmentCount() == 1);
     CHECK(sample->properties.at("unknown_sample_field").get<int>() == 7);
+    REQUIRE(sample->artifacts.size() == 1);
+    const auto* photo = preferredPhotoArtifact(*sample);
+    REQUIRE(photo != nullptr);
+    CHECK(photo->resolvedUrl ==
+          "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/photos/PHerc0139_photo.jpg");
 
     REQUIRE(manifest.findModel("model-a") != nullptr);
 }

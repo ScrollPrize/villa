@@ -4,6 +4,7 @@
 
 #include <QDialog>
 #include <QFutureWatcher>
+#include <QImage>
 #include <QString>
 
 #include <filesystem>
@@ -51,6 +52,13 @@ private:
         QString error;
     };
 
+    struct PhotoLoadResult {
+        QString sampleId;
+        QString url;
+        QImage image;
+        QString error;
+    };
+
     void buildUi();
     void loadCachedManifestIfAvailable();
     void applyManifest(OpenDataManifest manifest, QString sourceLabel, bool fromCache);
@@ -61,6 +69,10 @@ private:
     void populateDetails(const OpenDataSample* sample);
     void clearDetails();
     void updateActionButtons();
+    void loadOverviewPhoto(const OpenDataSample& sample);
+    void onOverviewPhotoFinished(QFutureWatcher<PhotoLoadResult>* watcher);
+    void setOverviewPhotoText(const QString& text);
+    void setOverviewPhotoImage(const QImage& image);
 
     [[nodiscard]] const OpenDataSample* selectedSample() const;
     [[nodiscard]] const OpenDataVolume* selectedVolume() const;
@@ -79,6 +91,7 @@ private:
     QTableWidget* _sampleTable{nullptr};
     QTabWidget* _tabs{nullptr};
     QLabel* _overviewLabel{nullptr};
+    QLabel* _overviewPhotoLabel{nullptr};
     QTableWidget* _scansTable{nullptr};
     QTableWidget* _volumesTable{nullptr};
     QTableWidget* _segmentsTable{nullptr};
@@ -95,6 +108,9 @@ private:
     std::optional<OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
+    QFutureWatcher<PhotoLoadResult>* _photoWatcher{nullptr};
+    std::vector<QFutureWatcher<PhotoLoadResult>*> _photoWatchers;
+    QString _pendingPhotoSampleId;
     std::function<bool(const OpenDataSample&)> _openSampleHandler;
 };
 

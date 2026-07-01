@@ -298,6 +298,14 @@ OpenDataSample parseSample(std::string id, const nlohmann::json& sampleJson)
     if (sample.properties.empty()) {
         sample.properties = objectOrEmpty(sampleJson, "properties");
     }
+    if (sampleJson.is_object()) {
+        if (const auto sampleIt = sampleJson.find("sample"); sampleIt != sampleJson.end()) {
+            sample.artifacts = parseArtifacts(*sampleIt);
+        }
+    }
+    if (sample.artifacts.empty()) {
+        sample.artifacts = parseArtifacts(sampleJson);
+    }
     sample.scans = parseObjectMap(sampleJson, "scans", parseScan);
     sample.volumes = parseObjectMap(sampleJson, "volumes", parseVolume);
     sample.segments = parseObjectMap(sampleJson, "segments", parseSegment);
@@ -563,6 +571,23 @@ const OpenDataArtifact* preferredVolumeArtifact(const OpenDataVolume& volume) no
         return &*it;
     }
     return volume.artifacts.empty() ? nullptr : &volume.artifacts.front();
+}
+
+const OpenDataArtifact* preferredPhotoArtifact(const OpenDataSample& sample) noexcept
+{
+    for (const auto* type : {"photo", "image", "thumbnail"}) {
+        if (const auto* artifact = findArtifact(sample.artifacts, type)) {
+            return artifact;
+        }
+    }
+    const auto it = std::find_if(
+        sample.artifacts.begin(), sample.artifacts.end(), [](const OpenDataArtifact& artifact) {
+            const auto type = lowerCopy(artifact.type);
+            return type.find("photo") != std::string::npos ||
+                   type.find("image") != std::string::npos ||
+                   type.find("thumbnail") != std::string::npos;
+        });
+    return it == sample.artifacts.end() ? nullptr : &*it;
 }
 
 } // namespace vc3d::opendata
