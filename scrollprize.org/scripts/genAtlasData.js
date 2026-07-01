@@ -217,6 +217,7 @@ function extractInkSegments(sample, id, s3ToHttp) {
       label: inkSegmentLabel(sid),
       um: full ? full.um : null,
       full: full ? full.url : null,
+      down: down ? down.url : null,
       preview: full ? (down ? down.url : full.url) : null,
       alpha,
       alphaPrev,

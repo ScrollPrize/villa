@@ -4157,6 +4157,19 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     const double maxPosition = static_cast<double>(session.optimizedLine.points.size() - 1);
     linePosition = std::clamp(linePosition, 0.0, maxPosition);
+    if (pane->dialog && pane->dialog->maxControlPointDistanceVx() > 0) {
+        std::vector<double> controlLinePositions;
+        controlLinePositions.reserve(session.controlPoints.size());
+        for (const auto& control : session.controlPoints) {
+            controlLinePositions.push_back(control.linePosition);
+        }
+        if (!vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+                linePosition,
+                controlLinePositions,
+                static_cast<double>(pane->dialog->maxControlPointDistanceVx()))) {
+            return;
+        }
+    }
     const cv::Vec3d clicked(volumePoint[0], volumePoint[1], volumePoint[2]);
 
     auto nearest = session.controlPoints.end();

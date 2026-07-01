@@ -35,6 +35,20 @@ QPointF generatedStripControlPointToScene(
     return generatedStripLinePositionToScene(viewer, surface, control.linePosition);
 }
 
+QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
+                                       int alpha)
+{
+    switch (state) {
+    case GeneratedCurrentLineMarkerState::Allowed:
+        return QColor(40, 220, 120, alpha);
+    case GeneratedCurrentLineMarkerState::Blocked:
+        return QColor(255, 70, 70, alpha);
+    case GeneratedCurrentLineMarkerState::Neutral:
+    default:
+        return QColor(0, 245, 255, alpha);
+    }
+}
+
 } // namespace
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
@@ -209,8 +223,10 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     markerStyle.z = 151.0;
 
     ViewerOverlayControllerBase::OverlayStyle currentMarkerStyle = markerStyle;
-    currentMarkerStyle.penColor = QColor(0, 245, 255, 245);
-    currentMarkerStyle.brushColor = QColor(0, 245, 255, 210);
+    currentMarkerStyle.penColor =
+        generatedCurrentLineMarkerColor(overlay.currentLineMarkerState, 245);
+    currentMarkerStyle.brushColor =
+        generatedCurrentLineMarkerColor(overlay.currentLineMarkerState, 210);
     currentMarkerStyle.penWidth = 1.5;
     currentMarkerStyle.z = 153.0;
 

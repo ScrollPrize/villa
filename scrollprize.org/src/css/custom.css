@@ -468,6 +468,16 @@ main {
 .atlas .lightbox img { max-width: 96vw; max-height: 92vh; width: auto; height: auto; border-radius: 8px; box-shadow: 0 16px 50px rgba(0, 0, 0, .5); }
 .atlas .lightbox .lbclose { position: fixed; top: 14px; right: 20px; color: #fff; background: none; border: 0; font-size: 30px; line-height: 1; cursor: pointer; opacity: .8; }
 .atlas .lightbox .lbclose:hover { opacity: 1; }
+.atlas .lightbox .lbcap { position: fixed; left: 0; right: 0; bottom: 16px; text-align: center; color: #cdd6df; font-size: 13px; padding: 0 20px; pointer-events: none; }
+.atlas .lightbox .lbcap a { color: var(--accent); pointer-events: auto; }
+.atlas .lightbox img { cursor: default; }
+.atlas .lightbox .lbprev, .atlas .lightbox .lbnext { position: fixed; top: 50%; transform: translateY(-50%); color: #fff; background: none; border: 0; font-size: 50px; line-height: 1; cursor: pointer; opacity: .6; padding: 6px 16px; }
+.atlas .lightbox .lbprev:hover, .atlas .lightbox .lbnext:hover { opacity: 1; }
+.atlas .lightbox .lbprev { left: 4px; }
+.atlas .lightbox .lbnext { right: 4px; }
+.atlas .lightbox .lbspin { position: fixed; top: 50%; left: 50%; width: 40px; height: 40px; margin: -20px 0 0 -20px; border: 3px solid rgba(255, 255, 255, .25); border-top-color: #fff; border-radius: 50%; pointer-events: none; animation: atlaslbspin .8s linear infinite; }
+@keyframes atlaslbspin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .atlas .lightbox .lbspin { animation: none; } }
 @media (prefers-reduced-motion: no-preference) {
   .atlas .lightbox { animation: atlaslbfade .14s ease-out; }
   @keyframes atlaslbfade { from { opacity: 0; } to { opacity: 1; } }
