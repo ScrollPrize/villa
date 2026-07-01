@@ -277,6 +277,8 @@ namespace window {
 
 namespace line_annotation {
     constexpr auto GEOMETRY = "lineAnnotation/geometry";
+    constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
+    constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
 }
 
 // -----------------------------------------------------------------------------

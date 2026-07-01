@@ -285,12 +285,22 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _maxControlPointDistanceSpin->setValue(0);
     _maxControlPointDistanceSpin->setSuffix(tr(" vx"));
     _maxControlPointDistanceSpin->setSpecialValueText(tr("unlimited"));
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _maxControlPointDistanceSpin->setValue(
+            settings.value(vc3d::settings::line_annotation::MAX_CONTROL_POINT_DISTANCE_VX,
+                           vc3d::settings::line_annotation::MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT)
+                .toInt());
+    }
     _maxControlPointDistanceSpin->installEventFilter(this);
     buttonLayout->addWidget(_maxControlPointDistanceSpin);
     connect(_maxControlPointDistanceSpin,
             qOverload<int>(&QSpinBox::valueChanged),
             this,
-            [this](int) {
+            [this](int value) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.setValue(vc3d::settings::line_annotation::MAX_CONTROL_POINT_DISTANCE_VX,
+                                  value);
                 updateGeneratedDynamicOverlaysFast(false, false);
             });
     if (volumeSelectorFactory) {
