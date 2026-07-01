@@ -476,6 +476,16 @@ void LineAnnotationDialog::setGeneratedControlPoints(
     rebuildGeneratedOverlays();
 }
 
+void LineAnnotationDialog::setGeneratedBranchLinePoints(
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints)
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+    _generatedViews.branchLinePoints = std::move(branchLinePoints);
+    rebuildGeneratedOverlays();
+}
+
 void LineAnnotationDialog::setGeneratedPredSnapPoints(
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints)
 {
@@ -1157,6 +1167,12 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(const std::string& su
         emit generatedControlPointDeleteRequested(surfaceName,
                                                   selectedLinePosition,
                                                   selectedPoint);
+    };
+    options.addBranch = [this, surfaceName](size_t controlPointIndex) {
+        emit generatedControlPointBranchRequested(surfaceName, controlPointIndex);
+    };
+    options.openBranch = [this](uint64_t branchFiberId, int branchControlPointIndex) {
+        emit generatedControlPointBranchOpenRequested(branchFiberId, branchControlPointIndex);
     };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }

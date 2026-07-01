@@ -199,6 +199,18 @@ vc_add_test(NAME test_vccollection_signals
             ${vccollection_test_moc}
     LIBS doctest::doctest vc_core Qt6::Core Qt6::Test)
 
+qt6_wrap_cpp(point_collection_widget_moc
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CPointCollectionWidget.hpp
+    ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+vc_add_test(NAME test_point_collection_widget
+    SOURCES test_point_collection_widget.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/CPointCollectionWidget.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            ${point_collection_widget_moc}
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_quadsurface_save_roundtrip)
 
 vc_add_test(NAME test_atomic_imwrite_multi)

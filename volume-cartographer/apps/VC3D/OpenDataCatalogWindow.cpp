@@ -380,14 +380,12 @@ void OpenDataCatalogWindow::buildUi()
     _searchEdit->setPlaceholderText(tr("Filter sample ID"));
     _searchEdit->setAccessibleName(tr("Filter"));
     _segmentsOnlyCheck = new QCheckBox(tr("Segments"), this);
-    _tifxyzOnlyCheck = new QCheckBox(tr("TIFXYZ"), this);
     _inkOnlyCheck = new QCheckBox(tr("Ink"), this);
     _refreshButton = new QPushButton(tr("Refresh"), this);
     _refreshButton->setToolTip(tr("Refresh the open-data catalog manifest from the remote source."));
     _refreshButton->setStatusTip(tr("Refreshes the open-data catalog listing, including samples, scans, volumes, and segments."));
     topRow->addWidget(_searchEdit, 1);
     topRow->addWidget(_segmentsOnlyCheck);
-    topRow->addWidget(_tifxyzOnlyCheck);
     topRow->addWidget(_inkOnlyCheck);
     topRow->addWidget(_refreshButton);
     mainLayout->addLayout(topRow);
@@ -528,7 +526,6 @@ void OpenDataCatalogWindow::buildUi()
     connect(_refreshButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::reloadManifest);
     connect(_searchEdit, &QLineEdit::textChanged, this, &OpenDataCatalogWindow::updateSampleFilter);
     connect(_segmentsOnlyCheck, &QCheckBox::toggled, this, &OpenDataCatalogWindow::updateSampleFilter);
-    connect(_tifxyzOnlyCheck, &QCheckBox::toggled, this, &OpenDataCatalogWindow::updateSampleFilter);
     connect(_inkOnlyCheck, &QCheckBox::toggled, this, &OpenDataCatalogWindow::updateSampleFilter);
     connect(_sampleTable, &QTableWidget::cellDoubleClicked,
             this, [this](int row, int column) {
@@ -701,9 +698,6 @@ void OpenDataCatalogWindow::populateSamples()
             continue;
         }
         if (_segmentsOnlyCheck->isChecked() && sample.segmentCount() == 0) {
-            continue;
-        }
-        if (_tifxyzOnlyCheck->isChecked() && sample.tifxyzSegmentCount() == 0) {
             continue;
         }
         if (_inkOnlyCheck->isChecked() && sample.inkDetectionSegmentCount() == 0) {

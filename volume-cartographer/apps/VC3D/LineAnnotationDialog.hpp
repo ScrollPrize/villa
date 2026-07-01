@@ -5,6 +5,7 @@
 #include <QMetaObject>
 #include <QPointer>
 
+#include <cstdint>
 #include <memory>
 #include <functional>
 #include <map>
@@ -114,6 +115,7 @@ public:
     ShiftScrollMode shiftScrollMode() const;
     int maxControlPointDistanceVx() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
+    void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
@@ -130,6 +132,10 @@ signals:
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
+    void generatedControlPointBranchRequested(const std::string& surfaceName,
+                                              size_t controlPointIndex);
+    void generatedControlPointBranchOpenRequested(uint64_t branchFiberId,
+                                                   int branchControlPointIndex);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void showAsMeshRequested();

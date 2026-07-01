@@ -88,7 +88,6 @@ private:
 
     QLineEdit* _searchEdit{nullptr};
     QCheckBox* _segmentsOnlyCheck{nullptr};
-    QCheckBox* _tifxyzOnlyCheck{nullptr};
     QCheckBox* _inkOnlyCheck{nullptr};
     QTableWidget* _sampleTable{nullptr};
     QTabWidget* _tabs{nullptr};
