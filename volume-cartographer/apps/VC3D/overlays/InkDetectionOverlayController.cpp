@@ -279,6 +279,20 @@ void InkDetectionOverlayController::clearSelection()
     setSelectedPath({});
 }
 
+void InkDetectionOverlayController::toggleVisibility()
+{
+    if (!hasLoadedSelection()) {
+        return;
+    }
+
+    if (_opacity > 0) {
+        _opacityBeforeToggle = _opacity;
+        setOpacity(0);
+    } else {
+        setOpacity(_opacityBeforeToggle > 0 ? _opacityBeforeToggle : 70);
+    }
+}
+
 void InkDetectionOverlayController::setOpacity(int opacity)
 {
     const int clamped = std::clamp(opacity, 0, 100);
@@ -286,7 +300,16 @@ void InkDetectionOverlayController::setOpacity(int opacity)
         return;
     }
     _opacity = clamped;
+    if (_opacity > 0) {
+        _opacityBeforeToggle = _opacity;
+    }
+    emit opacityChanged(_opacity);
     refreshAll();
+}
+
+bool InkDetectionOverlayController::hasLoadedSelection() const
+{
+    return !_selectedPath.empty() && !_selectedImage.image.isNull();
 }
 
 void InkDetectionOverlayController::setColormapId(const std::string& id)

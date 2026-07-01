@@ -38,9 +38,11 @@ public:
     [[nodiscard]] int opacity() const { return _opacity; }
     [[nodiscard]] const std::string& colormapId() const { return _colormapId; }
     [[nodiscard]] bool selectedIsSingleChannel() const { return _selectedImage.singleChannel; }
+    [[nodiscard]] bool hasLoadedSelection() const;
 
 public slots:
     void refreshAvailableDetections();
+    void toggleVisibility();
     void setSelectedPath(const std::filesystem::path& path);
     void clearSelection();
     void setOpacity(int opacity);
@@ -49,6 +51,7 @@ public slots:
 signals:
     void availableDetectionsChanged();
     void selectionChanged();
+    void opacityChanged(int opacity);
 
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
@@ -80,5 +83,6 @@ private:
     std::unordered_map<std::string, std::filesystem::path> _selectedPathBySegment;
     LoadedImage _selectedImage;
     int _opacity{70};
+    int _opacityBeforeToggle{70};
     std::string _colormapId;
 };

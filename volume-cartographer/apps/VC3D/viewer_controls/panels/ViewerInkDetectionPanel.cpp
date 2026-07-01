@@ -51,6 +51,16 @@ ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, Q
                 this, &ViewerInkDetectionPanel::populateDetections);
         connect(overlay, &InkDetectionOverlayController::selectionChanged,
                 this, &ViewerInkDetectionPanel::updateControlState);
+        connect(overlay, &InkDetectionOverlayController::opacityChanged, this, [this](int opacity) {
+            if (_opacitySlider) {
+                const QSignalBlocker blocker(_opacitySlider);
+                _opacitySlider->setValue(opacity);
+            }
+            if (_opacityValue) {
+                _opacityValue->setText(QStringLiteral("%1%").arg(opacity));
+            }
+            updateControlState();
+        });
     } else {
         _opacitySlider->setValue(70);
         _opacityValue->setText(QStringLiteral("70%"));

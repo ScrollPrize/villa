@@ -2798,6 +2798,9 @@ void CWindow::toggleVolumeOverlayVisibility()
     if (_volumeOverlay) {
         _volumeOverlay->toggleVisibility();
     }
+    if (_inkDetectionOverlay && _inkDetectionOverlay->hasLoadedSelection()) {
+        _inkDetectionOverlay->toggleVisibility();
+    }
 }
 
 void CWindow::toggleFocusedView()
