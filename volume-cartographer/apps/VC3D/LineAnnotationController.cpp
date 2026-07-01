@@ -98,6 +98,7 @@ struct LineAnnotationController::LineAnnotationSession {
     vc::lasagna::LineModel optimizedLine;
     std::vector<vc::lasagna::LineControlPoint> controlPoints;
     std::vector<LineAnnotationController::FiberBranchRef> branches;
+    bool showLinkedLineOverlays = true;
     double focusedLinePosition = 0.0;
     std::optional<cv::Vec3d> focusedControlPoint;
     cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
@@ -4399,6 +4400,7 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     childToParent.branchControlPointIndex = static_cast<int>(controlPointIndex);
     childToParent.branchFileName = parentFileName;
     childSession->branches.push_back(childToParent);
+    childSession->showLinkedLineOverlays = false;
 
     if (pane->dialog) {
         pane->dialog->setGeneratedControlPoints(
@@ -5834,6 +5836,9 @@ LineAnnotationController::generatedBranchLinePointsForSession(
     const LineAnnotationSession& session) const
 {
     std::vector<std::vector<cv::Vec3f>> branches;
+    if (!session.showLinkedLineOverlays) {
+        return branches;
+    }
     std::unordered_set<uint64_t> seenFiberIds;
 
     auto linePointsForFiber = [this](uint64_t fiberId) -> std::vector<cv::Vec3d> {
