@@ -98,7 +98,7 @@ struct LineAnnotationController::LineAnnotationSession {
     vc::lasagna::LineModel optimizedLine;
     std::vector<vc::lasagna::LineControlPoint> controlPoints;
     std::vector<LineAnnotationController::FiberBranchRef> branches;
-    bool showLinkedLineOverlays = true;
+    bool showLinkedLineOverlays = false;
     double focusedLinePosition = 0.0;
     std::optional<cv::Vec3d> focusedControlPoint;
     cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
@@ -711,6 +711,44 @@ generatedControlMarkers(
         markers.push_back(std::move(marker));
     }
     return markers;
+}
+
+void remapBranchControlPointIndices(
+    const std::vector<vc::lasagna::LineControlPoint>& oldControls,
+    const std::vector<vc::lasagna::LineControlPoint>& newControls,
+    std::vector<LineAnnotationController::FiberBranchRef>& branches)
+{
+    if (branches.empty()) {
+        return;
+    }
+
+    constexpr double kMaxMatchDistanceSq = 1.0e-6;
+    for (auto& branch : branches) {
+        if (branch.controlPointIndex < 0 ||
+            static_cast<size_t>(branch.controlPointIndex) >= oldControls.size()) {
+            branch.controlPointIndex = -1;
+            continue;
+        }
+
+        const cv::Vec3d oldPoint = oldControls[static_cast<size_t>(branch.controlPointIndex)].volumePoint;
+        int bestIndex = -1;
+        double bestDistanceSq = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < newControls.size(); ++i) {
+            const cv::Vec3d delta = newControls[i].volumePoint - oldPoint;
+            const double distanceSq = delta.dot(delta);
+            if (distanceSq < bestDistanceSq) {
+                bestDistanceSq = distanceSq;
+                bestIndex = static_cast<int>(i);
+            }
+        }
+        branch.controlPointIndex = bestDistanceSq <= kMaxMatchDistanceSq ? bestIndex : -1;
+    }
+    branches.erase(std::remove_if(branches.begin(),
+                                  branches.end(),
+                                  [](const LineAnnotationController::FiberBranchRef& branch) {
+                                      return branch.controlPointIndex < 0;
+                                  }),
+                   branches.end());
 }
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker>
@@ -4295,6 +4333,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         currentLinePoints.push_back(point.position);
     }
 
+    const std::vector<vc::lasagna::LineControlPoint> branchRemapControls = session.controlPoints;
+
     vc::lasagna::LineControlPointUpdateResult update;
     const std::string updateEventName = editedExistingControl
         ? "control_edit_span_update"
@@ -4315,6 +4355,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
     session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
     session.controlPoints = update.controlPoints;
+    remapBranchControlPointIndices(branchRemapControls, session.controlPoints, session.branches);
+    syncReciprocalBranchControlPointReferences(session);
     if (update.changedControlIndex >= 0 &&
         update.changedControlIndex < static_cast<int>(session.controlPoints.size())) {
         const auto& changed = session.controlPoints[static_cast<size_t>(update.changedControlIndex)];
@@ -4532,7 +4574,10 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
     const bool deletedSeed = selected->isSeed;
     const int linePointCount = static_cast<int>(session.optimizedLine.points.size());
+    const std::vector<vc::lasagna::LineControlPoint> branchRemapControls = session.controlPoints;
     session.controlPoints.erase(selected);
+    remapBranchControlPointIndices(branchRemapControls, session.controlPoints, session.branches);
+    syncReciprocalBranchControlPointReferences(session);
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     if (session.controlPoints.empty()) {
         return;
@@ -4699,7 +4744,10 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     session.selectedManifestPath = task.manifestPath;
     session.optimizationReport = task.result.report;
     session.optimizedLine = std::move(task.result.line);
+    const std::vector<vc::lasagna::LineControlPoint> branchRemapControls = session.controlPoints;
     session.controlPoints = std::move(task.controlPoints);
+    remapBranchControlPointIndices(branchRemapControls, session.controlPoints, session.branches);
+    syncReciprocalBranchControlPointReferences(session);
     for (auto& control : session.controlPoints) {
         double bestDistance = std::numeric_limits<double>::infinity();
         int bestIndex = -1;
@@ -5893,6 +5941,38 @@ void LineAnnotationController::refreshBranchLineViews(uint64_t changedFiberId)
             generatedControlMarkers(pane.session->controlPoints, pane.session->branches));
         pane.dialog->setGeneratedBranchLinePoints(
             generatedBranchLinePointsForSession(*pane.session));
+    }
+}
+
+void LineAnnotationController::syncReciprocalBranchControlPointReferences(
+    const LineAnnotationSession& session)
+{
+    if (session.fiberId == 0) {
+        return;
+    }
+
+    auto updateBranches = [&session](std::vector<FiberBranchRef>& targetBranches) {
+        for (auto& targetBranch : targetBranches) {
+            if (targetBranch.branchFiberId != session.fiberId) {
+                continue;
+            }
+            for (const auto& sourceBranch : session.branches) {
+                if (sourceBranch.branchFiberId != 0 &&
+                    targetBranch.controlPointIndex == sourceBranch.branchControlPointIndex &&
+                    targetBranch.branchControlPointIndex != sourceBranch.controlPointIndex) {
+                    targetBranch.branchControlPointIndex = sourceBranch.controlPointIndex;
+                }
+            }
+        }
+    };
+
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session.get() != &session) {
+            updateBranches(pane.session->branches);
+        }
+    }
+    for (auto& fiber : _fibers) {
+        updateBranches(fiber.branches);
     }
 }
 

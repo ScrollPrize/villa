@@ -331,6 +331,7 @@ private:
     [[nodiscard]] std::vector<std::vector<cv::Vec3f>> generatedBranchLinePointsForSession(
         const LineAnnotationSession& session) const;
     void refreshBranchLineViews(uint64_t changedFiberId = 0);
+    void syncReciprocalBranchControlPointReferences(const LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
