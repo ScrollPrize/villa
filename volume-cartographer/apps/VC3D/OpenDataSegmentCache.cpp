@@ -861,7 +861,8 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
                         const OpenDataSegment& segment,
                         const std::filesystem::path& segmentDir,
                         std::string* errorOut,
-                        const std::function<void(const char*, const char*)>& fileProgress = {})
+                        const std::function<void(const char*, const char*)>& fileProgress = {},
+                        bool forceRefresh = false)
 {
     const auto* artifact = preferredTifxyzArtifact(segment);
     if (!artifact) {
@@ -875,7 +876,7 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
         return false;
     }
 
-    if (requiredFilesPresent(segmentDir)) {
+    if (!forceRefresh && requiredFilesPresent(segmentDir)) {
         const auto origin = readCatalogOrigin(segmentDir);
         if (!origin || originMatches(*origin, sample, segment, *artifact)) {
             normalizeCachedMetadata(url, segment, segmentDir / "meta.json");
@@ -1179,7 +1180,8 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     VolumePkg& pkg,
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
-    const OpenDataSampleProgressCallback& progressCallback)
+    const OpenDataSampleProgressCallback& progressCallback,
+    bool forceRefresh)
 {
     OpenDataSegmentCacheReconcileResult result;
     if (sample.tifxyzSegmentCount() == 0) {
@@ -1270,7 +1272,13 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
                 }
                 emitProgress(&segment, fileName, status);
             };
-            const bool cached = cacheTifxyzSegment(sample, segment, segmentDir, &error, fileProgress);
+            const bool cached = cacheTifxyzSegment(
+                sample,
+                segment,
+                segmentDir,
+                &error,
+                fileProgress,
+                forceRefresh);
             activeWorkers.fetch_sub(1, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lk(resultMutex);
             if (cached) {

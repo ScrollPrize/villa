@@ -10,6 +10,7 @@
 
 #include <QCheckBox>
 #include <QClipboard>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
@@ -21,6 +22,7 @@
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMetaObject>
 #include <QPixmap>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -28,6 +30,7 @@
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSplitter>
+#include <QStringList>
 #include <QStandardPaths>
 #include <QTableWidget>
 #include <QTableWidgetItem>
@@ -141,6 +144,95 @@ QString yesNo(bool value)
     return value ? QStringLiteral("Yes") : QStringLiteral("No");
 }
 
+QString cacheStateDisplay(OpenDataSegmentCacheState state)
+{
+    switch (state) {
+        case OpenDataSegmentCacheState::Missing: return QStringLiteral("Missing");
+        case OpenDataSegmentCacheState::Current: return QStringLiteral("Current");
+        case OpenDataSegmentCacheState::Incomplete: return QStringLiteral("Incomplete");
+        case OpenDataSegmentCacheState::Stale: return QStringLiteral("Stale");
+        case OpenDataSegmentCacheState::Orphaned: return QStringLiteral("Orphaned");
+    }
+    return QStringLiteral("Unknown");
+}
+
+struct SampleCacheSummary {
+    int total = 0;
+    int local = 0;
+    int current = 0;
+    int stale = 0;
+    int incomplete = 0;
+    int orphaned = 0;
+    int missing = 0;
+
+    [[nodiscard]] bool hasTifxyz() const noexcept { return total > 0; }
+    [[nodiscard]] bool hasLocal() const noexcept { return local > 0; }
+    [[nodiscard]] bool allCurrent() const noexcept { return total > 0 && current == total; }
+};
+
+SampleCacheSummary sampleCacheSummary(const std::filesystem::path& remoteCacheRoot,
+                                      const OpenDataSample& sample)
+{
+    SampleCacheSummary summary;
+    for (const auto& segment : sample.segments) {
+        if (!segment.hasTifxyz()) {
+            continue;
+        }
+        ++summary.total;
+        const auto state = cacheStateForSegment(remoteCacheRoot, sample, segment);
+        switch (state) {
+            case OpenDataSegmentCacheState::Missing:
+                ++summary.missing;
+                break;
+            case OpenDataSegmentCacheState::Current:
+                ++summary.local;
+                ++summary.current;
+                break;
+            case OpenDataSegmentCacheState::Stale:
+                ++summary.local;
+                ++summary.stale;
+                break;
+            case OpenDataSegmentCacheState::Incomplete:
+                ++summary.local;
+                ++summary.incomplete;
+                break;
+            case OpenDataSegmentCacheState::Orphaned:
+                ++summary.local;
+                ++summary.orphaned;
+                break;
+        }
+    }
+    return summary;
+}
+
+QString localDataText(const SampleCacheSummary& summary)
+{
+    if (!summary.hasTifxyz()) {
+        return QStringLiteral("-");
+    }
+    return QStringLiteral("%1/%2").arg(summary.local).arg(summary.total);
+}
+
+QString syncStateText(const SampleCacheSummary& summary)
+{
+    if (!summary.hasTifxyz()) {
+        return QStringLiteral("-");
+    }
+    if (summary.allCurrent()) {
+        return QStringLiteral("Current");
+    }
+    if (!summary.hasLocal()) {
+        return QStringLiteral("Not downloaded");
+    }
+    QStringList parts;
+    if (summary.stale > 0) parts.push_back(QStringLiteral("%1 stale").arg(summary.stale));
+    if (summary.incomplete > 0) parts.push_back(QStringLiteral("%1 incomplete").arg(summary.incomplete));
+    if (summary.orphaned > 0) parts.push_back(QStringLiteral("%1 orphaned").arg(summary.orphaned));
+    if (summary.missing > 0) parts.push_back(QStringLiteral("%1 missing").arg(summary.missing));
+    if (summary.current > 0) parts.push_back(QStringLiteral("%1 current").arg(summary.current));
+    return parts.isEmpty() ? QStringLiteral("Unknown") : parts.join(QStringLiteral(", "));
+}
+
 QTableWidgetItem* item(const QString& text)
 {
     auto* tableItem = new QTableWidgetItem(text);
@@ -241,7 +333,7 @@ void OpenDataCatalogWindow::buildUi()
 
     auto* splitter = new QSplitter(Qt::Horizontal, this);
     _sampleTable = new QTableWidget(splitter);
-    _sampleTable->setColumnCount(7);
+    _sampleTable->setColumnCount(9);
     _sampleTable->setHorizontalHeaderLabels({
         tr("Sample ID"),
         tr("Type"),
@@ -249,7 +341,9 @@ void OpenDataCatalogWindow::buildUi()
         tr("Volumes"),
         tr("Segments"),
         tr("TIFXYZ"),
-        tr("Ink")
+        tr("Ink"),
+        tr("Local TIFXYZ"),
+        tr("Sync")
     });
     _sampleTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     _sampleTable->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -359,9 +453,11 @@ void OpenDataCatalogWindow::buildUi()
     auto* bottomRow = new QHBoxLayout;
     _statusLabel = new QLabel(this);
     _statusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _syncSampleCacheButton = new QPushButton(tr("Sync Local Data"), this);
     _openSampleButton = new QPushButton(tr("Open Sample"), this);
     auto* closeButton = new QPushButton(tr("Close"), this);
     bottomRow->addWidget(_statusLabel, 1);
+    bottomRow->addWidget(_syncSampleCacheButton);
     bottomRow->addWidget(_openSampleButton);
     bottomRow->addWidget(closeButton);
     mainLayout->addLayout(bottomRow);
@@ -391,6 +487,7 @@ void OpenDataCatalogWindow::buildUi()
     connect(_openSegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentUrl);
     connect(_cacheSegmentButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::cacheSelectedSegment);
     connect(_openSegmentCacheFolderButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentCacheFolder);
+    connect(_syncSampleCacheButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::syncSelectedSampleCache);
     connect(_openSampleButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSample);
     connect(closeButton, &QPushButton::clicked, this, &QDialog::accept);
 
@@ -559,9 +656,11 @@ void OpenDataCatalogWindow::populateSamples()
     QSignalBlocker blocker(_sampleTable);
     _sampleTable->setSortingEnabled(false);
     _sampleTable->setRowCount(static_cast<int>(_visibleSampleIndexes.size()));
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
     for (int row = 0; row < static_cast<int>(_visibleSampleIndexes.size()); ++row) {
         const auto sampleIndex = _visibleSampleIndexes[static_cast<std::size_t>(row)];
         const auto& sample = _manifest->samples[sampleIndex];
+        const auto cacheSummary = sampleCacheSummary(remoteRoot, sample);
         auto* idItem = item(qstr(sample.id));
         idItem->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(sampleIndex));
         _sampleTable->setItem(row, 0, idItem);
@@ -571,6 +670,8 @@ void OpenDataCatalogWindow::populateSamples()
         _sampleTable->setItem(row, 4, numericItem(sample.segmentCount()));
         _sampleTable->setItem(row, 5, numericItem(sample.tifxyzSegmentCount()));
         _sampleTable->setItem(row, 6, numericItem(sample.inkDetectionSegmentCount()));
+        _sampleTable->setItem(row, 7, item(localDataText(cacheSummary)));
+        _sampleTable->setItem(row, 8, item(syncStateText(cacheSummary)));
     }
     _sampleTable->setSortingEnabled(true);
     _sampleTable->resizeColumnsToContents();
@@ -599,9 +700,12 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
         return;
     }
 
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
     _overviewLabel->setText(
         tr("<b>%1</b><br>Type: %2<br>Scans: %3<br>Volumes: %4<br>Segments: %5<br>"
-           "TIFXYZ segments: %6<br>Ink detections: %7<br>Photos: %8<br><br>%9")
+           "TIFXYZ segments: %6<br>Ink detections: %7<br>Photos: %8<br>"
+           "Local TIFXYZ: %9<br>Sync: %10<br><br>%11")
             .arg(qstr(sample->id).toHtmlEscaped())
             .arg(qstr(sample->type).toHtmlEscaped())
             .arg(sample->scanCount())
@@ -610,6 +714,8 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
             .arg(sample->tifxyzSegmentCount())
             .arg(sample->inkDetectionSegmentCount())
             .arg(sample->artifacts.size())
+            .arg(localDataText(cacheSummary).toHtmlEscaped())
+            .arg(syncStateText(cacheSummary).toHtmlEscaped())
             .arg(qstr(sample->description).toHtmlEscaped()));
     loadOverviewPhoto(*sample);
 
@@ -652,11 +758,8 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
         _segmentsTable->setItem(row, 5, item(yesNo(segment.hasTifxyz())));
         _segmentsTable->setItem(row, 6, item(yesNo(segment.hasInkDetection())));
         _segmentsTable->setItem(row, 7, item(yesNo(segment.hasLayersZarr())));
-        const auto state = cacheStateForSegment(
-            std::filesystem::path(vc3d::remoteCachePath().toStdString()),
-            *sample,
-            segment);
-        _segmentsTable->setItem(row, 8, item(QString::fromLatin1(cacheStateName(state))));
+        const auto state = cacheStateForSegment(remoteRoot, *sample, segment);
+        _segmentsTable->setItem(row, 8, item(cacheStateDisplay(state)));
         _segmentsTable->setItem(row, 9, item(qstr(segment.createdAt)));
     }
     _segmentsTable->resizeColumnsToContents();
@@ -688,6 +791,28 @@ void OpenDataCatalogWindow::clearDetails()
         _segmentsTable->setRowCount(0);
     }
     updateActionButtons();
+}
+
+void OpenDataCatalogWindow::refreshSelectedSampleCacheStatus()
+{
+    const auto* sample = selectedSample();
+    if (!sample || !_sampleTable) {
+        updateActionButtons();
+        return;
+    }
+
+    const int row = _sampleTable->currentRow();
+    if (row >= 0) {
+        const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+        const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
+        QSignalBlocker blocker(_sampleTable);
+        const bool sorting = _sampleTable->isSortingEnabled();
+        _sampleTable->setSortingEnabled(false);
+        _sampleTable->setItem(row, 7, item(localDataText(cacheSummary)));
+        _sampleTable->setItem(row, 8, item(syncStateText(cacheSummary)));
+        _sampleTable->setSortingEnabled(sorting);
+    }
+    populateDetails(sample);
 }
 
 void OpenDataCatalogWindow::loadOverviewPhoto(const OpenDataSample& sample)
@@ -884,15 +1009,27 @@ void OpenDataCatalogWindow::updateActionButtons()
 {
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
+    const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
     const bool canCacheSegment = segment && segment->hasTifxyz();
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto sampleSummary = sample
+        ? sampleCacheSummary(remoteRoot, *sample)
+        : SampleCacheSummary{};
     const auto cacheDir = selectedSegmentCacheDir();
     const bool hasCacheDir = !cacheDir.empty() && std::filesystem::is_directory(cacheDir);
-    const bool canOpenSample = selectedSample() != nullptr &&
+    const bool canOpenSample = sample != nullptr &&
                                static_cast<bool>(_openSampleHandler) &&
                                !(_fetchWatcher && _fetchWatcher->isRunning() && !_manifest);
+    const bool canSyncSample = sample != nullptr && sampleSummary.hasTifxyz();
     if (_openSampleButton) {
         _openSampleButton->setEnabled(canOpenSample);
+    }
+    if (_syncSampleCacheButton) {
+        _syncSampleCacheButton->setEnabled(canSyncSample);
+        _syncSampleCacheButton->setText(sampleSummary.hasLocal()
+            ? tr("Re-sync Local Data")
+            : tr("Sync Local Data"));
     }
     if (_copyVolumeUrlButton) {
         _copyVolumeUrlButton->setEnabled(hasVolumeUrl);
@@ -902,6 +1039,18 @@ void OpenDataCatalogWindow::updateActionButtons()
     }
     if (_cacheSegmentButton) {
         _cacheSegmentButton->setEnabled(canCacheSegment);
+        QString label = tr("Cache Selected");
+        if (sample && segment && segment->hasTifxyz()) {
+            const auto state = cacheStateForSegment(remoteRoot, *sample, *segment);
+            if (state == OpenDataSegmentCacheState::Current) {
+                label = tr("Re-sync Selected");
+            } else if (state == OpenDataSegmentCacheState::Stale ||
+                       state == OpenDataSegmentCacheState::Incomplete ||
+                       state == OpenDataSegmentCacheState::Orphaned) {
+                label = tr("Repair Selected");
+            }
+        }
+        _cacheSegmentButton->setText(label);
     }
     if (_openSegmentCacheFolderButton) {
         _openSegmentCacheFolderButton->setEnabled(hasCacheDir);
@@ -967,7 +1116,12 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
         return;
     }
 
-    setStatus(tr("Caching segment %1...").arg(qstr(segment->id)));
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto state = cacheStateForSegment(remoteRoot, *sample, *segment);
+    const bool forceRefresh = state != OpenDataSegmentCacheState::Missing;
+    setStatus(forceRefresh
+        ? tr("Re-syncing segment %1...").arg(qstr(segment->id))
+        : tr("Caching segment %1...").arg(qstr(segment->id)));
     OpenDataSample oneSegmentSample;
     oneSegmentSample.id = sample->id;
     oneSegmentSample.type = sample->type;
@@ -976,22 +1130,74 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
     oneSegmentSample.segments.push_back(*segment);
 
     auto pkg = VolumePkg::newEmpty();
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
     auto result = reconcileOpenDataSampleSegments(
         *pkg,
         oneSegmentSample,
         remoteRoot,
-        [&](const OpenDataSampleDownloadProgress& progress) {
+        [this](const OpenDataSampleDownloadProgress& progress) {
             if (!progress.segmentId.empty()) {
-                setStatus(tr("Caching %1: %2/%3 files")
-                              .arg(qstr(progress.segmentId))
-                              .arg(progress.completedFiles)
-                              .arg(progress.totalFiles));
+                const QString message = tr("Syncing %1: %2/%3 files")
+                    .arg(qstr(progress.segmentId))
+                    .arg(progress.completedFiles)
+                    .arg(progress.totalFiles);
+                QMetaObject::invokeMethod(this, [this, message]() {
+                    setStatus(message);
+                }, Qt::QueuedConnection);
             }
-        });
+        },
+        forceRefresh);
 
-    populateDetails(sample);
+    QCoreApplication::processEvents();
+    refreshSelectedSampleCacheStatus();
     QString message = tr("Cached %1 of %2 selected tifxyz segment(s).")
+                          .arg(result.cachedTifxyzSegments)
+                          .arg(result.supportedTifxyzSegments);
+    if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
+        message += tr(" %1").arg(qstr(result.messages.front()));
+    }
+    setStatus(message);
+}
+
+void OpenDataCatalogWindow::syncSelectedSampleCache()
+{
+    const auto* sample = selectedSample();
+    if (!sample || sample->tifxyzSegmentCount() == 0) {
+        return;
+    }
+
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const auto summary = sampleCacheSummary(remoteRoot, *sample);
+    const bool forceRefresh = summary.hasLocal();
+    setStatus(forceRefresh
+        ? tr("Re-syncing local data for %1...").arg(qstr(sample->id))
+        : tr("Caching local data for %1...").arg(qstr(sample->id)));
+
+    auto pkg = VolumePkg::newEmpty();
+    auto result = reconcileOpenDataSampleSegments(
+        *pkg,
+        *sample,
+        remoteRoot,
+        [this](const OpenDataSampleDownloadProgress& progress) {
+            QString message;
+            if (!progress.segmentId.empty()) {
+                message = tr("Syncing %1: %2/%3 files")
+                    .arg(qstr(progress.segmentId))
+                    .arg(progress.completedFiles)
+                    .arg(progress.totalFiles);
+            } else {
+                message = tr("Syncing local data: %1/%2 files")
+                    .arg(progress.completedFiles)
+                    .arg(progress.totalFiles);
+            }
+            QMetaObject::invokeMethod(this, [this, message]() {
+                setStatus(message);
+            }, Qt::QueuedConnection);
+        },
+        forceRefresh);
+
+    QCoreApplication::processEvents();
+    refreshSelectedSampleCacheStatus();
+    QString message = tr("Synced %1 of %2 tifxyz segment(s).")
                           .arg(result.cachedTifxyzSegments)
                           .arg(result.supportedTifxyzSegments);
     if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {

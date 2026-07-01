@@ -42,6 +42,7 @@ private slots:
     void openSelectedSegmentUrl();
     void cacheSelectedSegment();
     void openSelectedSegmentCacheFolder();
+    void syncSelectedSampleCache();
     void openSelectedSample();
 
 private:
@@ -68,6 +69,7 @@ private:
     void populateSamples();
     void populateDetails(const OpenDataSample* sample);
     void clearDetails();
+    void refreshSelectedSampleCacheStatus();
     void updateActionButtons();
     void loadOverviewPhoto(const OpenDataSample& sample);
     void onOverviewPhotoFinished(QFutureWatcher<PhotoLoadResult>* watcher);
@@ -104,6 +106,7 @@ private:
     QPushButton* _openSegmentUrlButton{nullptr};
     QPushButton* _cacheSegmentButton{nullptr};
     QPushButton* _openSegmentCacheFolderButton{nullptr};
+    QPushButton* _syncSampleCacheButton{nullptr};
 
     std::optional<OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;

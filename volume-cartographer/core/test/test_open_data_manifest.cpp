@@ -353,6 +353,52 @@ TEST_CASE("OpenDataSegmentCache discovers cached ink detection overlays")
     std::filesystem::remove_all(cacheRoot);
 }
 
+TEST_CASE("OpenDataSegmentCache reports local freshness against the live manifest")
+{
+    const auto manifest = parseOpenDataManifest(kFixture);
+    const auto& sample = *manifest.findSample("PHerc0139");
+    const auto& segment = sample.segments.front();
+    const auto* tifxyz = preferredTifxyzArtifact(segment);
+    REQUIRE(tifxyz != nullptr);
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_cache_state_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, segment);
+
+    CHECK(cacheStateForSegment(cacheRoot, sample, segment) == OpenDataSegmentCacheState::Missing);
+
+    writeFile(segmentDir / "meta.json", "{}");
+    CHECK(cacheStateForSegment(cacheRoot, sample, segment) == OpenDataSegmentCacheState::Incomplete);
+
+    writeFile(segmentDir / "x.tif", "x");
+    writeFile(segmentDir / "y.tif", "y");
+    writeFile(segmentDir / "z.tif", "z");
+    writeFile(segmentDir / "catalog-origin.json",
+              R"({"sample_id":"PHerc0139","segment_id":"20260311000000","resolved_http_url":"https://stale.example/old"})");
+    CHECK(cacheStateForSegment(cacheRoot, sample, segment) == OpenDataSegmentCacheState::Stale);
+
+    writeFile(segmentDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", segment.id},
+                  {"resolved_http_url", tifxyz->resolvedUrl},
+                  {"cache_state", "current"}
+              }.dump());
+    CHECK(cacheStateForSegment(cacheRoot, sample, segment) == OpenDataSegmentCacheState::Current);
+
+    writeFile(segmentDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", segment.id},
+                  {"resolved_http_url", tifxyz->resolvedUrl},
+                  {"cache_state", "orphaned"}
+              }.dump());
+    CHECK(cacheStateForSegment(cacheRoot, sample, segment) == OpenDataSegmentCacheState::Orphaned);
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
 {
     const auto manifest = parseOpenDataManifest(kFixture);
