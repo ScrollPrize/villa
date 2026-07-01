@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
@@ -104,6 +105,49 @@ TEST_CASE("VcDataset: removeChunk after writeChunk")
     CHECK(ds->removeChunk(0, 0, 0));
     CHECK_FALSE(ds->chunkExists(0, 0, 0));
     CHECK_FALSE(ds->removeChunk(0, 0, 0));
+    fs::remove_all(d);
+}
+
+TEST_CASE("VcDataset: writeChunkSkipEmpty skips all-fill chunks and drops stale ones")
+{
+    auto d = tmpDir("skipempty");
+    auto ds = vc::createZarrDataset(d, "arr",
+        {4, 4, 4}, {4, 4, 4},
+        vc::VcDtype::uint8, "none");
+    REQUIRE(ds);
+
+    // All-fill (zero) buffer: nothing written.
+    std::vector<uint8_t> empty(ds->defaultChunkSize(), 0);
+    CHECK_FALSE(ds->writeChunkSkipEmpty(0, 0, 0, empty.data(), empty.size()));
+    CHECK_FALSE(ds->chunkExists(0, 0, 0));
+
+    // Non-empty buffer: written.
+    std::vector<uint8_t> data(ds->defaultChunkSize(), 0);
+    data[3] = 0x42;
+    CHECK(ds->writeChunkSkipEmpty(0, 0, 0, data.data(), data.size()));
+    CHECK(ds->chunkExists(0, 0, 0));
+
+    // Re-writing an all-fill buffer removes the stale chunk.
+    CHECK_FALSE(ds->writeChunkSkipEmpty(0, 0, 0, empty.data(), empty.size()));
+    CHECK_FALSE(ds->chunkExists(0, 0, 0));
+    fs::remove_all(d);
+}
+
+TEST_CASE("createZarrDataset: blosc compressor metadata is numcodecs-compliant")
+{
+    auto d = tmpDir("blosc_meta");
+    auto ds = vc::createZarrDataset(d, "arr",
+        {8, 8, 8}, {8, 8, 8},
+        vc::VcDtype::uint8, "blosc", "/", /*fillValue=*/0, /*compressionLevel=*/7);
+    REQUIRE(ds);
+    std::ifstream f(d / "arr" / ".zarray");
+    std::string meta((std::istreambuf_iterator<char>(f)),
+                     std::istreambuf_iterator<char>());
+    CHECK(meta.find("\"cname\"") != std::string::npos);
+    CHECK(meta.find("\"shuffle\"") != std::string::npos);
+    CHECK(meta.find("\"blocksize\"") != std::string::npos);
+    CHECK(meta.find("\"clevel\": 7") != std::string::npos);
+    CHECK(meta.find("\"dimension_separator\": \"/\"") != std::string::npos);
     fs::remove_all(d);
 }
 
