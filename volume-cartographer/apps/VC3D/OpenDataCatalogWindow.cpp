@@ -10,6 +10,7 @@
 
 #include <QCheckBox>
 #include <QClipboard>
+#include <QColor>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDesktopServices>
@@ -35,6 +36,7 @@
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTabWidget>
+#include <QPalette>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QtConcurrent>
@@ -281,6 +283,58 @@ QImage imageFromBytes(const std::vector<std::byte>& bytes)
         static_cast<int>(bytes.size()));
 }
 
+QString cssColor(const QColor& color)
+{
+    return QStringLiteral("rgba(%1, %2, %3, %4)")
+        .arg(color.red())
+        .arg(color.green())
+        .arg(color.blue())
+        .arg(color.alpha());
+}
+
+QString catalogTabStyle(const QPalette& palette)
+{
+    const QColor inactiveBackground = palette.color(QPalette::Button);
+    const QColor inactiveText = palette.color(QPalette::ButtonText);
+    const QColor selectedBackground = palette.color(QPalette::Highlight);
+    const QColor selectedText = palette.color(QPalette::HighlightedText);
+    const QColor border = palette.color(QPalette::Mid);
+
+    return QStringLiteral(
+        "QTabWidget#openDataCatalogTabs::pane {"
+        "  border: 1px solid %1;"
+        "  top: -1px;"
+        "}"
+        "QTabWidget#openDataCatalogTabs QTabBar::tab {"
+        "  background: %2;"
+        "  color: %3;"
+        "  border: 1px solid %1;"
+        "  border-bottom-color: %1;"
+        "  padding: 6px 14px;"
+        "  min-width: 86px;"
+        "  margin-right: 2px;"
+        "}"
+        "QTabWidget#openDataCatalogTabs QTabBar::tab:!selected {"
+        "  margin-top: 3px;"
+        "}"
+        "QTabWidget#openDataCatalogTabs QTabBar::tab:selected {"
+        "  background: %4;"
+        "  color: %5;"
+        "  border-color: %4;"
+        "  border-bottom-color: %4;"
+        "  font-weight: 700;"
+        "}"
+        "QTabWidget#openDataCatalogTabs QTabBar::tab:hover:!selected {"
+        "  background: %6;"
+        "}")
+        .arg(cssColor(border),
+             cssColor(inactiveBackground),
+             cssColor(inactiveText),
+             cssColor(selectedBackground),
+             cssColor(selectedText),
+             cssColor(inactiveBackground.lighter(112)));
+}
+
 QString manifestJsonError(const std::exception& e)
 {
     return QStringLiteral("Could not parse cached open-data manifest: %1").arg(QString::fromUtf8(e.what()));
@@ -358,6 +412,8 @@ void OpenDataCatalogWindow::buildUi()
     _sampleTable->verticalHeader()->hide();
 
     _tabs = new QTabWidget(splitter);
+    _tabs->setObjectName(QStringLiteral("openDataCatalogTabs"));
+    _tabs->setStyleSheet(catalogTabStyle(_tabs->palette()));
     auto* overviewPage = new QWidget(_tabs);
     auto* overviewLayout = new QVBoxLayout(overviewPage);
     _overviewLabel = new QLabel(overviewPage);
