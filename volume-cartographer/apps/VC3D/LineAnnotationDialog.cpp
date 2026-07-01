@@ -4,6 +4,7 @@
 #include "Keybinds.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
+#include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -27,6 +28,7 @@
 #include <QPushButton>
 #include <QRect>
 #include <QResizeEvent>
+#include <QSettings>
 #include <QShortcut>
 #include <QSplitter>
 #include <QSpinBox>
@@ -340,6 +342,17 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _mdiArea = new QMdiArea(content);
     _mdiArea->installEventFilter(this);
     _layout->addWidget(_mdiArea);
+
+    restoreWindowGeometry();
+}
+
+void LineAnnotationDialog::showWithSavedGeometry()
+{
+    if (_restoredWindowGeometry) {
+        show();
+    } else {
+        showMaximized();
+    }
 }
 
 LineAnnotationDialog::InitialDirectionMode LineAnnotationDialog::initialDirectionMode() const
@@ -451,6 +464,7 @@ void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
 void LineAnnotationDialog::closeEvent(QCloseEvent* event)
 {
     if (_closeAfterFinalizationAllowed) {
+        saveWindowGeometry();
         QMainWindow::closeEvent(event);
         return;
     }
@@ -2238,4 +2252,26 @@ void LineAnnotationDialog::updateOptimizationOverlayGeometry()
     if (_optimizationOverlay->isVisible()) {
         _optimizationOverlay->raise();
     }
+}
+
+void LineAnnotationDialog::restoreWindowGeometry()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QByteArray savedGeometry =
+        settings.value(vc3d::settings::line_annotation::GEOMETRY).toByteArray();
+    if (savedGeometry.isEmpty()) {
+        return;
+    }
+    _restoredWindowGeometry = restoreGeometry(savedGeometry);
+    if (!_restoredWindowGeometry) {
+        settings.remove(vc3d::settings::line_annotation::GEOMETRY);
+        settings.sync();
+    }
+}
+
+void LineAnnotationDialog::saveWindowGeometry() const
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::line_annotation::GEOMETRY, saveGeometry());
+    settings.sync();
 }

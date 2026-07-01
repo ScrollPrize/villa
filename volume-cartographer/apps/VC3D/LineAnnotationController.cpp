@@ -1343,7 +1343,7 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         materializeGeneratedViews(*session);
     }
     if (!session->deferShowUntilGenerated || !session->optimizedLine.points.empty()) {
-        dialog->showMaximized();
+        dialog->showWithSavedGeometry();
         dialog->raise();
         dialog->activateWindow();
     }
@@ -4589,7 +4589,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         }
     }
     if (session.deferShowUntilGenerated && pane && pane->dialog && !pane->dialog->isVisible()) {
-        pane->dialog->showMaximized();
+        pane->dialog->showWithSavedGeometry();
         pane->dialog->raise();
         pane->dialog->activateWindow();
     }

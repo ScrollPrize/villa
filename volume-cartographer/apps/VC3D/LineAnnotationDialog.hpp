@@ -93,6 +93,7 @@ public:
                                   VolumeSelectorFactory volumeSelectorFactory = {},
                                   QWidget* parent = nullptr);
 
+    void showWithSavedGeometry();
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
                                   const QString& title,
                                   const CChunkedVolumeViewer::CameraState& camera);
@@ -210,6 +211,8 @@ private:
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
     void updateOptimizationOverlayGeometry();
+    void restoreWindowGeometry();
+    void saveWindowGeometry() const;
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
@@ -276,6 +279,7 @@ private:
     bool _generatedOverlayRefreshQueued = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
+    bool _restoredWindowGeometry = false;
     bool _haveInitialCurrentCutCamera = false;
     CChunkedVolumeViewer::CameraState _initialCurrentCutCamera;
     bool _haveInitialSideCutCamera = false;

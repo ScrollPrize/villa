@@ -275,6 +275,10 @@ namespace window {
     constexpr auto STATE_META_APP_VERSION = "mainWin/state_meta/app_version";
 }
 
+namespace line_annotation {
+    constexpr auto GEOMETRY = "lineAnnotation/geometry";
+}
+
 // -----------------------------------------------------------------------------
 // Export Settings
 // -----------------------------------------------------------------------------
