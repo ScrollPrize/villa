@@ -809,6 +809,19 @@ std::optional<nlohmann::json> readCatalogOrigin(const std::filesystem::path& dir
     }
 }
 
+bool originStateAllowsFastOpen(const nlohmann::json& origin)
+{
+    const auto it = origin.find("cache_state");
+    if (it == origin.end()) {
+        return true;
+    }
+    if (!it->is_string()) {
+        return false;
+    }
+    const auto state = lowerCopy(it->get<std::string>());
+    return state.empty() || state == cacheStateName(OpenDataSegmentCacheState::Current);
+}
+
 void writeCatalogOriginState(const std::filesystem::path& dir,
                              OpenDataSegmentCacheState state)
 {
@@ -878,6 +891,10 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
 
     if (!forceRefresh && requiredFilesPresent(segmentDir)) {
         const auto origin = readCatalogOrigin(segmentDir);
+        if (origin && originMatches(*origin, sample, segment, *artifact) &&
+            originStateAllowsFastOpen(*origin)) {
+            return true;
+        }
         if (!origin || originMatches(*origin, sample, segment, *artifact)) {
             normalizeCachedMetadata(url, segment, segmentDir / "meta.json");
             if (origin) {

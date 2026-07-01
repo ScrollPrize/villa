@@ -475,10 +475,7 @@ void OpenDataCatalogWindow::buildUi()
     connect(_inkOnlyCheck, &QCheckBox::toggled, this, &OpenDataCatalogWindow::updateSampleFilter);
     connect(_sampleTable, &QTableWidget::cellDoubleClicked,
             this, [this](int row, int column) {
-                if (column != 0) {
-                    return;
-                }
-                _sampleTable->setCurrentCell(row, 0);
+                _sampleTable->setCurrentCell(row, std::max(column, 0));
                 openSelectedSample();
             });
     connect(_sampleTable->selectionModel(), &QItemSelectionModel::selectionChanged,
