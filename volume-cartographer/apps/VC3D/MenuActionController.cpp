@@ -467,7 +467,7 @@ void MenuActionController::showOpenDataCatalog()
 
     auto* dialog = new vc3d::opendata::OpenDataCatalogWindow(_window);
     dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
-        openOpenDataSample(sample);
+        return openOpenDataSample(sample);
     });
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->show();
@@ -475,10 +475,10 @@ void MenuActionController::showOpenDataCatalog()
     dialog->activateWindow();
 }
 
-void MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)
+bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)
 {
     if (!_window || !_window->_state) {
-        return;
+        return false;
     }
 
     if (_window->_state->vpkg()) {
@@ -493,7 +493,7 @@ void MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         prompt.exec();
 
         if (prompt.clickedButton() != replaceButton) {
-            return;
+            return false;
         }
     }
 
@@ -588,7 +588,7 @@ void MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             QObject::tr("Open Data Sample"),
             QObject::tr("Failed to open sample %1:\n\n%2")
                 .arg(QString::fromStdString(sampleCopy.id), task.error));
-        return;
+        return false;
     }
 
     vc3d::opendata::OpenDataSampleProjectResult result = std::move(task.result);
@@ -600,7 +600,7 @@ void MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             QObject::tr("Open Data Sample"),
             QObject::tr("Failed to create sample project for %1.")
                 .arg(QString::fromStdString(sampleCopy.id)));
-        return;
+        return false;
     }
     _window->_state->setVpkg(pkg);
 
@@ -638,6 +638,8 @@ void MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             QObject::tr("Open Data Sample"),
             details.isEmpty() ? message : message + QObject::tr("\n\n%1").arg(details));
     }
+
+    return true;
 }
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,

@@ -79,7 +79,7 @@ private:
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
-    void openOpenDataSample(const vc3d::opendata::OpenDataSample& sample);
+    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample);
     bool tryResolveRemoteAuth(const QString& url,
                               vc::HttpAuth* authOut,
                               bool allowPrompt,

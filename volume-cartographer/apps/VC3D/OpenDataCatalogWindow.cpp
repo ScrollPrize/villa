@@ -114,7 +114,7 @@ OpenDataCatalogWindow::~OpenDataCatalogWindow()
     }
 }
 
-void OpenDataCatalogWindow::setOpenSampleHandler(std::function<void(const OpenDataSample&)> handler)
+void OpenDataCatalogWindow::setOpenSampleHandler(std::function<bool(const OpenDataSample&)> handler)
 {
     _openSampleHandler = std::move(handler);
     updateActionButtons();
@@ -261,6 +261,14 @@ void OpenDataCatalogWindow::buildUi()
     connect(_segmentsOnlyCheck, &QCheckBox::toggled, this, &OpenDataCatalogWindow::updateSampleFilter);
     connect(_tifxyzOnlyCheck, &QCheckBox::toggled, this, &OpenDataCatalogWindow::updateSampleFilter);
     connect(_inkOnlyCheck, &QCheckBox::toggled, this, &OpenDataCatalogWindow::updateSampleFilter);
+    connect(_sampleTable, &QTableWidget::cellDoubleClicked,
+            this, [this](int row, int column) {
+                if (column != 0) {
+                    return;
+                }
+                _sampleTable->setCurrentCell(row, 0);
+                openSelectedSample();
+            });
     connect(_sampleTable->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &OpenDataCatalogWindow::updateSelectedSample);
     connect(_volumesTable->selectionModel(), &QItemSelectionModel::selectionChanged,
@@ -692,7 +700,9 @@ void OpenDataCatalogWindow::openSelectedSample()
     if (!sample || !_openSampleHandler) {
         return;
     }
-    _openSampleHandler(*sample);
+    if (_openSampleHandler(*sample)) {
+        accept();
+    }
 }
 
 void OpenDataCatalogWindow::copySelectedVolumeUrl()

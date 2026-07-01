@@ -28,7 +28,7 @@ public:
     explicit OpenDataCatalogWindow(QWidget* parent = nullptr);
     ~OpenDataCatalogWindow() override;
 
-    void setOpenSampleHandler(std::function<void(const OpenDataSample&)> handler);
+    void setOpenSampleHandler(std::function<bool(const OpenDataSample&)> handler);
 
 private slots:
     void reloadManifest();
@@ -95,7 +95,7 @@ private:
     std::optional<OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
-    std::function<void(const OpenDataSample&)> _openSampleHandler;
+    std::function<bool(const OpenDataSample&)> _openSampleHandler;
 };
 
 } // namespace vc3d::opendata
