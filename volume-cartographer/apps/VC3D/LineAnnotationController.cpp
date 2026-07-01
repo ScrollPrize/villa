@@ -754,6 +754,27 @@ std::string sanitizedEventName(std::string event)
     return event.empty() ? "event" : event;
 }
 
+std::string sanitizedProjectFiberDirName(const fs::path& projectPath,
+                                         const fs::path& volpkgRoot)
+{
+    std::string name = projectPath.empty()
+        ? volpkgRoot.filename().string()
+        : projectPath.filename().string();
+    for (char& ch : name) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (!std::isalnum(c) && ch != '.' && ch != '-' && ch != '_') {
+            ch = '_';
+        }
+    }
+    while (!name.empty() && name.front() == '_') {
+        name.erase(name.begin());
+    }
+    while (!name.empty() && name.back() == '_') {
+        name.pop_back();
+    }
+    return name.empty() ? "project" : name;
+}
+
 void writeLineDebugJson(const std::string& eventName,
                         const std::vector<vc::lasagna::LineControlPoint>& controls,
                         const nlohmann::json& linePoints,
@@ -1884,7 +1905,7 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         std::error_code relativeEc;
         input.fiberPath = fs::relative(fiberPath(*fiberIt), volpkgRoot, relativeEc);
         if (relativeEc || input.fiberPath.empty()) {
-            input.fiberPath = fs::path("fibers") / fiberIt->fileName;
+            input.fiberPath = relativeFiberPath(*fiberIt);
         }
         input.controlPoints = fiberIt->controlPoints;
         input.linePoints = fiberIt->linePoints;
@@ -3988,10 +4009,6 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
         }
         return snapshot;
     };
-    auto relativeFiberPath = [](const StoredFiber& fiber) {
-        return fs::path("fibers") / fiber.fileName;
-    };
-
     std::map<fs::path, FiberSnapshotWithPath> byPath;
     const fs::path dir = fibersDir();
     std::error_code ec;
@@ -5318,6 +5335,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     ++_nextFiberAlignmentMetricToken;
     ++_fiberMetricsGeneration;
     _fiberMetricsPending = false;
+    _knownFiberTags.clear();
     if (!_state || !_state->vpkg()) {
         emitFiberSummaries();
         return;
@@ -5366,8 +5384,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
     }
     std::sort(_fibers.begin(), _fibers.end(), [](const StoredFiber& a, const StoredFiber& b) {
-        return vc::atlas::atlasFiberPathKey(fs::path("fibers") / a.fileName) <
-               vc::atlas::atlasFiberPathKey(fs::path("fibers") / b.fileName);
+        return a.fileName < b.fileName;
     });
     uint64_t runtimeId = 1;
     for (auto& fiber : _fibers) {
@@ -5388,17 +5405,57 @@ void LineAnnotationController::addKnownFiberTags(const std::vector<std::string>&
     }
 }
 
+fs::path LineAnnotationController::fibersRootDir() const
+{
+    const fs::path root = currentVolpkgRoot();
+    return root.empty() ? fs::path{} : root / "fibers";
+}
+
 fs::path LineAnnotationController::fibersDir() const
 {
     if (!_state || !_state->vpkg()) {
         return {};
     }
+    const fs::path root = currentVolpkgRoot();
+    if (root.empty()) {
+        return {};
+    }
     const auto vpkg = _state->vpkg();
-    const fs::path projectPath = vpkg->path();
-    const fs::path root = projectPath.empty()
-        ? fs::path(vpkg->getVolpkgDirectory())
-        : projectPath.parent_path();
-    return root / "fibers";
+    return root / "fibers" / sanitizedProjectFiberDirName(vpkg->path(), root);
+}
+
+fs::path LineAnnotationController::relativeFiberPath(const StoredFiber& fiber) const
+{
+    const fs::path absolutePath = fiberPath(fiber);
+    const fs::path root = currentVolpkgRoot();
+    if (!absolutePath.empty() && !root.empty()) {
+        std::error_code ec;
+        const fs::path relativePath = fs::relative(absolutePath, root, ec);
+        if (!ec && !relativePath.empty()) {
+            return relativePath;
+        }
+    }
+
+    const fs::path dir = fibersDir();
+    const fs::path rootDir = fibersRootDir();
+    if (!dir.empty() && !rootDir.empty()) {
+        std::error_code ec;
+        const fs::path relativeDir = fs::relative(dir, rootDir.parent_path(), ec);
+        if (!ec && !relativeDir.empty()) {
+            if (!fiber.fileName.empty()) {
+                return relativeDir / fiber.fileName;
+            }
+            if (!fiber.username.empty() && !fiber.startedAt.empty() && fiber.sequence > 0) {
+                return relativeDir / vc3d::line_annotation::fiberFileName(
+                    fiber.username, fiber.startedAt, fiber.sequence);
+            }
+        }
+    }
+
+    if (!fiber.fileName.empty()) {
+        return fs::path("fibers") / fiber.fileName;
+    }
+    return fs::path("fibers") / (std::to_string(fiber.id) + ".json");
 }
 
 fs::path LineAnnotationController::fiberPath(uint64_t fiberId) const
@@ -5452,6 +5509,7 @@ std::vector<std::string> LineAnnotationController::atlasPathKeysForFiber(
     };
 
     if (!fiber.fileName.empty()) {
+        addKey(relativeFiberPath(fiber));
         addKey(fs::path("fibers") / fiber.fileName);
         addKey(fs::path(fiber.fileName));
     }
