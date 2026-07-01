@@ -5,6 +5,7 @@
 #include "OpenDataSampleProject.hpp"
 #include "OpenDataSegmentCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -72,6 +73,15 @@ constexpr const char* kFixture = R"({
             "width": 123,
             "height": 456,
             "created_at": "2026-03-11T00:00:00Z",
+            "creation": {
+              "derived_from": {
+                "type": "volume",
+                "id": "vol1"
+              }
+            },
+            "properties": {
+              "original_volume_downscale": 2
+            },
             "data": [
               {
                 "type": "tifxyz",
@@ -127,6 +137,15 @@ void copyFixtureFile(const std::filesystem::path& source,
         source,
         target,
         std::filesystem::copy_options::overwrite_existing);
+}
+
+cv::Size tifxyzGridSize(const std::filesystem::path& segmentDir)
+{
+    auto surface = load_quad_from_tifxyz(segmentDir.string());
+    REQUIRE(surface != nullptr);
+    const auto* points = surface->rawPointsPtr();
+    REQUIRE(points != nullptr);
+    return points->size();
 }
 
 } // namespace
@@ -256,6 +275,9 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
                     pkg->volumeEntries()[2].tags.end(),
                     "ink-detection-3d") != pkg->volumeEntries()[2].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
+                    pkg->volumeEntries()[0].tags.end(),
+                    "vc-open-data-volume-id:scan-volume") != pkg->volumeEntries()[0].tags.end());
 }
 
 
@@ -304,6 +326,7 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
+    const cv::Size fixtureGridSize = tifxyzGridSize(fixtureSegment);
     writeFile(segmentDir / "meta.json",
               R"({"type":"seg","uuid":"out","name":"seg-a","format":"tifxyz","scale":[1,1]})");
     copyFixtureFile(fixtureSegment / "x.tif", segmentDir / "x.tif");
@@ -343,6 +366,13 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     CHECK(meta.at("vc_open_data_segment_id").get<std::string>() == "20260311000000");
     CHECK(meta.at("vc_open_data_segment_long_id").get<std::string>() == "PHerc0139-20260311000000");
     CHECK(meta.at("vc_open_data_original_volume_id").get<std::string>() == "vol1");
+    CHECK(meta.at("vc_open_data_derived_volume_id").get<std::string>() == "vol1");
+    CHECK(meta.at("vc_open_data_original_volume_downscale").get<double>() == doctest::Approx(2.0));
+    CHECK(meta.at("vc_open_data_coordinates_scaled_to_original_volume").get<double>() == doctest::Approx(2.0));
+
+    const cv::Size cachedGridSize = tifxyzGridSize(segmentDir);
+    CHECK(cachedGridSize.width == fixtureGridSize.width * 2);
+    CHECK(cachedGridSize.height == fixtureGridSize.height * 2);
 
     std::ifstream originIn(segmentDir / "catalog-origin.json", std::ios::binary);
     REQUIRE(originIn.good());

@@ -1,7 +1,9 @@
 #include "OpenDataSegmentCache.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/HttpFetch.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -11,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <cstring>
@@ -389,6 +392,104 @@ void normalizeTiffForMmap(const std::filesystem::path& path)
     writeMmapCompatibleTiff(path, readInfo, pixels);
 }
 
+std::optional<double> jsonNumberLike(const nlohmann::json& obj, const char* key)
+{
+    if (!obj.is_object()) {
+        return std::nullopt;
+    }
+    const auto it = obj.find(key);
+    if (it == obj.end()) {
+        return std::nullopt;
+    }
+    if (it->is_number()) {
+        return it->get<double>();
+    }
+    if (it->is_string()) {
+        try {
+            return std::stod(it->get<std::string>());
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+double originalVolumeDownscale(const OpenDataSegment& segment)
+{
+    for (const auto* key : {"original_volume_downscale",
+                            "originalVolumeDownscale",
+                            "volume_downscale",
+                            "volumeDownscale"}) {
+        if (const auto value = jsonNumberLike(segment.properties, key);
+            value.has_value() && std::isfinite(*value) && *value > 0.0) {
+            return *value;
+        }
+    }
+    return 1.0;
+}
+
+std::string derivedVolumeId(const OpenDataSegment& segment)
+{
+    if (segment.raw.is_object()) {
+        const auto creation = segment.raw.find("creation");
+        if (creation != segment.raw.end() && creation->is_object()) {
+            const auto derived = creation->find("derived_from");
+            if (derived != creation->end() && derived->is_object()) {
+                const auto type = derived->find("type");
+                const auto id = derived->find("id");
+                if (type != derived->end() && type->is_string() &&
+                    id != derived->end() && id->is_string() &&
+                    lowerCopy(type->get<std::string>()) == "volume") {
+                    return id->get<std::string>();
+                }
+            }
+        }
+    }
+    return segment.originalVolumeId;
+}
+
+void applyOpenDataMetadata(nlohmann::json& meta,
+                           const std::string& baseUrl,
+                           const OpenDataSegment& segment)
+{
+    meta["vc_open_data_tifxyz_url"] = baseUrl;
+    meta["vc_open_data_segment_id"] = segment.id;
+    meta["vc_open_data_segment_long_id"] = segment.longId;
+    meta["vc_open_data_original_volume_id"] = segment.originalVolumeId;
+    if (const auto derivedId = derivedVolumeId(segment); !derivedId.empty()) {
+        meta["vc_open_data_derived_volume_id"] = derivedId;
+    }
+    meta["vc_open_data_original_volume_downscale"] = originalVolumeDownscale(segment);
+}
+
+bool coordinatesAlreadyScaled(const nlohmann::json& meta, double)
+{
+    return jsonNumberLike(meta, "vc_open_data_coordinates_scaled_to_original_volume").has_value();
+}
+
+void applyOriginalVolumeDownscale(const std::filesystem::path& segmentDir,
+                                  const OpenDataSegment& segment)
+{
+    const double downscale = originalVolumeDownscale(segment);
+    const auto metaPath = segmentDir / "meta.json";
+    auto meta = nlohmann::json::parse(readTextFile(metaPath));
+    if (!std::isfinite(downscale) || downscale <= 0.0 || downscale == 1.0 ||
+        coordinatesAlreadyScaled(meta, downscale)) {
+        return;
+    }
+
+    auto surface = load_quad_from_tifxyz(segmentDir.string());
+    if (!surface) {
+        throw std::runtime_error("failed to load cached catalog tifxyz segment: " +
+                                 segmentDir.string());
+    }
+
+    vc::core::util::transformSurfacePoints(surface.get(), downscale, std::nullopt, 1.0);
+    vc::core::util::refreshTransformedSurfaceState(surface.get());
+    surface->meta["vc_open_data_coordinates_scaled_to_original_volume"] = downscale;
+    surface->save(segmentDir, true);
+}
+
 void writeCachedMetadata(const std::string& baseUrl,
                          const OpenDataSegment& segment,
                          const std::filesystem::path& target)
@@ -414,10 +515,7 @@ void writeCachedMetadata(const std::string& baseUrl,
     if (!meta.contains("format") || !meta["format"].is_string() || meta["format"].get<std::string>().empty()) {
         meta["format"] = "tifxyz";
     }
-    meta["vc_open_data_tifxyz_url"] = baseUrl;
-    meta["vc_open_data_segment_id"] = segment.id;
-    meta["vc_open_data_segment_long_id"] = segment.longId;
-    meta["vc_open_data_original_volume_id"] = segment.originalVolumeId;
+    applyOpenDataMetadata(meta, baseUrl, segment);
 
     writeStringAtomic(target, meta.dump(2));
 }
@@ -440,11 +538,9 @@ void normalizeCachedMetadata(const std::string& baseUrl,
     if (!meta.contains("format") || !meta["format"].is_string() || meta["format"].get<std::string>().empty()) {
         meta["format"] = "tifxyz";
     }
-    meta["vc_open_data_tifxyz_url"] = baseUrl;
-    meta["vc_open_data_segment_id"] = segment.id;
-    meta["vc_open_data_segment_long_id"] = segment.longId;
-    meta["vc_open_data_original_volume_id"] = segment.originalVolumeId;
+    applyOpenDataMetadata(meta, baseUrl, segment);
     writeStringAtomic(target, meta.dump(2));
+    applyOriginalVolumeDownscale(target.parent_path(), segment);
 }
 
 void writeCachedTifxyzBand(const std::string& baseUrl,
@@ -841,6 +937,7 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
         if (!requiredFilesPresent(tempDir)) {
             throw std::runtime_error("downloaded segment is missing required tifxyz files");
         }
+        normalizeCachedMetadata(url, segment, tempDir / "meta.json");
         writeStringAtomic(tempDir / "catalog-origin.json",
                           catalogOriginJson(sample, segment, *artifact, downloadedFiles).dump(2));
         try {

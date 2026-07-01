@@ -110,6 +110,9 @@ std::vector<std::string> volumeTags(const OpenDataVolume& volume,
         containsInsensitive(artifact.type, "3d")) {
         addUnique("ink-detection-3d");
     }
+    if (!volume.id.empty()) {
+        addUnique("vc-open-data-volume-id:" + volume.id);
+    }
 
     return tags;
 }
@@ -263,14 +266,16 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             }
 
             const auto label = volumeArtifactLabel(volume, artifact);
+            const auto tags = volumeTags(volume, artifact);
             if (hasVolumeEntry(pkg, url)) {
+                pkg.mergeVolumeEntryTags(url, tags);
                 ++result.skippedVolumes;
                 result.messages.push_back("Skipped " + label + ": already attached.");
                 continue;
             }
 
             try {
-                if (pkg.addVolumeEntry(url, volumeTags(volume, artifact))) {
+                if (pkg.addVolumeEntry(url, tags)) {
                     ++result.attachedVolumeEntries;
                 } else {
                     ++result.failedVolumes;
