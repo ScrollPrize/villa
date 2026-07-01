@@ -1716,6 +1716,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _vectorOverlay = std::make_unique<VectorOverlayController>(_state, this);
     _viewerManager->setVectorOverlay(_vectorOverlay.get());
 
+    _inkDetectionOverlay = std::make_unique<InkDetectionOverlayController>(_state, this);
+    _viewerManager->setInkDetectionOverlay(_inkDetectionOverlay.get());
+
     _atlasControlOverlay = std::make_unique<AtlasControlPointsOverlayController>(this);
     _atlasControlOverlay->bindToViewerManager(_viewerManager.get());
 

@@ -144,6 +144,8 @@ set(srcs
     overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
+    overlays/InkDetectionOverlayController.cpp
+    overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
@@ -173,6 +175,8 @@ set(srcs
     viewer_controls/ViewerControlsPanel.hpp
     viewer_controls/panels/ViewerCompositePanel.cpp
     viewer_controls/panels/ViewerCompositePanel.hpp
+    viewer_controls/panels/ViewerInkDetectionPanel.cpp
+    viewer_controls/panels/ViewerInkDetectionPanel.hpp
     viewer_controls/panels/ViewerNavigationPanel.cpp
     viewer_controls/panels/ViewerNavigationPanel.hpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.cpp

@@ -50,6 +50,49 @@ std::string artifactUrl(const OpenDataArtifact& artifact)
                                   : artifact.resolvedUrl);
 }
 
+std::string urlPathWithoutQuery(std::string value)
+{
+    if (const auto pos = value.find('#'); pos != std::string::npos) {
+        value.erase(pos);
+    }
+    if (const auto pos = value.find('?'); pos != std::string::npos) {
+        value.erase(pos);
+    }
+    while (!value.empty() && value.back() == '/') {
+        value.pop_back();
+    }
+    return value;
+}
+
+std::string imageExtensionForUrl(const std::string& url)
+{
+    const std::string path = lowerCopy(urlPathWithoutQuery(url));
+    for (const auto* ext : {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".webp"}) {
+        if (path.size() >= std::strlen(ext) &&
+            path.compare(path.size() - std::strlen(ext), std::strlen(ext), ext) == 0) {
+            return ext;
+        }
+    }
+    return {};
+}
+
+bool isJpegExtension(const std::string& ext)
+{
+    return ext == ".jpg" || ext == ".jpeg";
+}
+
+bool isSupportedInkImageArtifact(const OpenDataArtifact& artifact)
+{
+    const std::string type = lowerCopy(artifact.type);
+    if (type.find("ink") == std::string::npos) {
+        return false;
+    }
+    if (type.find("zarr") != std::string::npos || type.find("3d") != std::string::npos) {
+        return false;
+    }
+    return !imageExtensionForUrl(artifactUrl(artifact)).empty();
+}
+
 std::string safePathComponent(std::string value)
 {
     for (char& c : value) {
@@ -434,6 +477,165 @@ bool cacheOptionalFile(const std::string& baseUrl,
     return false;
 }
 
+std::optional<nlohmann::json> readCatalogOrigin(const std::filesystem::path& dir);
+
+std::string inkDetectionLabel(const OpenDataSegment& segment,
+                              const OpenDataArtifact& artifact,
+                              std::size_t index)
+{
+    std::string label = segment.suffix.empty() ? segmentLabel(segment) : segment.suffix;
+    if (!artifact.type.empty()) {
+        label += " - " + artifact.type;
+    } else {
+        label += " - ink detection";
+    }
+    if (index > 0) {
+        label += " " + std::to_string(index + 1);
+    }
+    return label;
+}
+
+std::vector<nlohmann::json> readInkDetectionRecords(const std::filesystem::path& segmentDir)
+{
+    auto readArrayFile = [&](const std::filesystem::path& path) -> std::vector<nlohmann::json> {
+        if (!std::filesystem::is_regular_file(path)) {
+            return {};
+        }
+        try {
+            auto root = nlohmann::json::parse(readTextFile(path));
+            if (!root.is_array()) {
+                return {};
+            }
+            std::vector<nlohmann::json> out;
+            out.reserve(root.size());
+            for (const auto& item : root) {
+                if (item.is_object()) {
+                    out.push_back(item);
+                }
+            }
+            return out;
+        } catch (...) {
+            return {};
+        }
+    };
+
+    auto records = readArrayFile(segmentDir / "ink-detections.json");
+    if (!records.empty()) {
+        return records;
+    }
+    if (auto origin = readCatalogOrigin(segmentDir)) {
+        const auto it = origin->find("ink_detections");
+        if (it != origin->end() && it->is_array()) {
+            std::vector<nlohmann::json> out;
+            out.reserve(it->size());
+            for (const auto& item : *it) {
+                if (item.is_object()) {
+                    out.push_back(item);
+                }
+            }
+            return out;
+        }
+    }
+    return {};
+}
+
+void writeInkDetectionRecords(const std::filesystem::path& segmentDir,
+                              const std::vector<nlohmann::json>& records)
+{
+    nlohmann::json array = nlohmann::json::array();
+    for (const auto& record : records) {
+        array.push_back(record);
+    }
+    writeStringAtomic(segmentDir / "ink-detections.json", array.dump(2));
+
+    if (auto origin = readCatalogOrigin(segmentDir)) {
+        (*origin)["ink_detections"] = array;
+        writeStringAtomic(segmentDir / "catalog-origin.json", origin->dump(2));
+    }
+}
+
+std::size_t cacheInkDetectionImages(const OpenDataSample& sample,
+                                    const OpenDataSegment& segment,
+                                    const std::filesystem::path& segmentDir)
+{
+    std::vector<nlohmann::json> records = readInkDetectionRecords(segmentDir);
+    std::set<std::string> localFiles;
+    for (const auto& record : records) {
+        const auto it = record.find("local_file");
+        if (it != record.end() && it->is_string()) {
+            localFiles.insert(it->get<std::string>());
+        }
+    }
+
+    std::vector<const OpenDataArtifact*> supportedArtifacts;
+    supportedArtifacts.reserve(segment.artifacts.size());
+    bool hasJpegArtifact = false;
+    for (const auto& artifact : segment.artifacts) {
+        if (!isSupportedInkImageArtifact(artifact)) {
+            continue;
+        }
+        const std::string ext = imageExtensionForUrl(artifactUrl(artifact));
+        if (isJpegExtension(ext)) {
+            hasJpegArtifact = true;
+        }
+        supportedArtifacts.push_back(&artifact);
+    }
+
+    std::size_t supportedIndex = 0;
+    for (const auto* artifactPtr : supportedArtifacts) {
+        const auto& artifact = *artifactPtr;
+        const std::string url = artifactUrl(artifact);
+        const std::string ext = imageExtensionForUrl(url);
+        if (url.empty() || ext.empty()) {
+            continue;
+        }
+        if (hasJpegArtifact && !isJpegExtension(ext)) {
+            continue;
+        }
+
+        std::string baseName = artifact.type.empty() ? "ink_detection" : artifact.type;
+        if (supportedIndex > 0) {
+            baseName += "_" + std::to_string(supportedIndex + 1);
+        }
+        const std::filesystem::path relative = std::filesystem::path("ink-detections") /
+            (safePathComponent(baseName) + ext);
+        const std::filesystem::path target = segmentDir / relative;
+        const std::string relativeString = relative.generic_string();
+
+        bool hasFile = isNonEmptyFile(target);
+        if (!hasFile) {
+            try {
+                auto bytes = vc::httpGetBytes(url);
+                if (!bytes.empty()) {
+                    writeBytesAtomic(target, bytes);
+                    hasFile = true;
+                }
+            } catch (...) {
+                hasFile = false;
+            }
+        }
+
+        if (hasFile && localFiles.insert(relativeString).second) {
+            nlohmann::json record;
+            record["label"] = inkDetectionLabel(segment, artifact, supportedIndex);
+            record["sample_id"] = sample.id;
+            record["segment_id"] = segment.id;
+            record["segment_long_id"] = segment.longId;
+            record["artifact_type"] = artifact.type;
+            record["original_source_uri"] = artifact.sourcePath;
+            record["resolved_http_url"] = artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl;
+            record["local_file"] = relativeString;
+            records.push_back(std::move(record));
+        }
+        ++supportedIndex;
+    }
+
+    if (!records.empty()) {
+        writeInkDetectionRecords(segmentDir, records);
+    }
+    return records.size();
+}
+
 std::string nowUtcIso()
 {
     const auto now = std::chrono::system_clock::now();
@@ -591,6 +793,10 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
                                       *artifact,
                                       {"meta.json", "x.tif", "y.tif", "z.tif"}).dump(2));
             }
+            try {
+                cacheInkDetectionImages(sample, segment, segmentDir);
+            } catch (...) {
+            }
             return true;
         }
     }
@@ -637,6 +843,10 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
         }
         writeStringAtomic(tempDir / "catalog-origin.json",
                           catalogOriginJson(sample, segment, *artifact, downloadedFiles).dump(2));
+        try {
+            cacheInkDetectionImages(sample, segment, tempDir);
+        } catch (...) {
+        }
         publishSegmentDirectory(tempDir, segmentDir);
         return true;
     } catch (const std::exception& e) {
@@ -763,6 +973,50 @@ OpenDataSegmentCacheState cacheStateForSegment(
 bool isOpenDataCatalogSegmentDirectory(const std::filesystem::path& segmentDir)
 {
     return std::filesystem::is_regular_file(segmentDir / "catalog-origin.json");
+}
+
+std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
+    const std::filesystem::path& segmentDir)
+{
+    std::vector<OpenDataInkDetectionEntry> out;
+    if (!std::filesystem::is_directory(segmentDir)) {
+        return out;
+    }
+
+    for (const auto& record : readInkDetectionRecords(segmentDir)) {
+        auto stringField = [&](const char* key) -> std::string {
+            const auto it = record.find(key);
+            return it != record.end() && it->is_string() ? it->get<std::string>() : std::string{};
+        };
+        std::string localFile = stringField("local_file");
+        if (localFile.empty()) {
+            continue;
+        }
+        std::filesystem::path localPath = std::filesystem::path(localFile);
+        if (localPath.is_relative()) {
+            localPath = segmentDir / localPath;
+        }
+        if (!isNonEmptyFile(localPath)) {
+            continue;
+        }
+        OpenDataInkDetectionEntry entry;
+        entry.label = stringField("label");
+        entry.sampleId = stringField("sample_id");
+        entry.segmentId = stringField("segment_id");
+        entry.segmentLongId = stringField("segment_long_id");
+        entry.artifactType = stringField("artifact_type");
+        entry.sourceUrl = stringField("resolved_http_url");
+        if (entry.sourceUrl.empty()) {
+            entry.sourceUrl = stringField("original_source_uri");
+        }
+        entry.localPath = std::move(localPath);
+        if (entry.label.empty()) {
+            entry.label = entry.segmentId.empty() ? entry.localPath.filename().string()
+                                                  : entry.segmentId;
+        }
+        out.push_back(std::move(entry));
+    }
+    return out;
 }
 
 std::filesystem::path defaultEditableCopyPathForCatalogSegment(

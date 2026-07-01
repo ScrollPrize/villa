@@ -10,6 +10,7 @@
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
+#include "overlays/InkDetectionOverlayController.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "CState.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -311,6 +312,12 @@ void ViewerManager::setVolumeOverlay(VolumeOverlayController* overlay)
     if (_volumeOverlay) {
         _volumeOverlay->syncWindowFromManager(_overlayWindowLow, _overlayWindowHigh);
     }
+}
+
+void ViewerManager::setInkDetectionOverlay(InkDetectionOverlayController* overlay)
+{
+    _inkDetectionOverlay = overlay;
+    registerOverlay(overlay);
 }
 
 void ViewerManager::setIntersectionOpacity(float opacity)

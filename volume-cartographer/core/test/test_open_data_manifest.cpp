@@ -3,6 +3,7 @@
 
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
+#include "OpenDataSegmentCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
 #include <algorithm>
@@ -239,6 +240,40 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
                     pkg->volumeEntries()[2].tags.end(),
                     "ink-detection-3d") != pkg->volumeEntries()[2].tags.end());
+}
+
+
+TEST_CASE("OpenDataSegmentCache discovers cached ink detection overlays")
+{
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_ink_detection_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto segmentDir = cacheRoot / "segment";
+    writeFile(segmentDir / "catalog-origin.json",
+              R"({"sample_id":"PHerc0139","segment_id":"20260311000000"})");
+    writeFile(segmentDir / "ink-detections" / "prediction.jpg", "not-empty");
+    writeFile(segmentDir / "ink-detections.json",
+              R"([{
+                "label":"model-a",
+                "sample_id":"PHerc0139",
+                "segment_id":"20260311000000",
+                "segment_long_id":"PHerc0139-20260311000000",
+                "artifact_type":"ink_detection",
+                "resolved_http_url":"https://example.test/prediction.jpg",
+                "local_file":"ink-detections/prediction.jpg"
+              }])");
+
+    const auto detections = cachedInkDetectionsForSegmentDirectory(segmentDir);
+    REQUIRE(detections.size() == 1);
+    CHECK(detections.front().label == "model-a");
+    CHECK(detections.front().sampleId == "PHerc0139");
+    CHECK(detections.front().segmentId == "20260311000000");
+    CHECK(detections.front().segmentLongId == "PHerc0139-20260311000000");
+    CHECK(detections.front().artifactType == "ink_detection");
+    CHECK(detections.front().sourceUrl == "https://example.test/prediction.jpg");
+    CHECK(detections.front().localPath == segmentDir / "ink-detections" / "prediction.jpg");
+
+    std::filesystem::remove_all(cacheRoot);
 }
 
 TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")

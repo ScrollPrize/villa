@@ -44,6 +44,16 @@ struct OpenDataSegmentCacheReconcileResult {
     std::vector<std::string> messages;
 };
 
+struct OpenDataInkDetectionEntry {
+    std::string label;
+    std::string sampleId;
+    std::string segmentId;
+    std::string segmentLongId;
+    std::string artifactType;
+    std::string sourceUrl;
+    std::filesystem::path localPath;
+};
+
 [[nodiscard]] const char* cacheStateName(OpenDataSegmentCacheState state) noexcept;
 
 [[nodiscard]] std::filesystem::path openDataSegmentCacheRoot(
@@ -65,6 +75,9 @@ struct OpenDataSegmentCacheReconcileResult {
     const OpenDataSegment& segment);
 
 [[nodiscard]] bool isOpenDataCatalogSegmentDirectory(
+    const std::filesystem::path& segmentDir);
+
+[[nodiscard]] std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
     const std::filesystem::path& segmentDir);
 
 [[nodiscard]] std::filesystem::path defaultEditableCopyPathForCatalogSegment(
