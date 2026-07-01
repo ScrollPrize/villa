@@ -51,6 +51,10 @@ namespace {
 
 constexpr int kOverviewPhotoMaxHeight = 360;
 constexpr int kOverviewPhotoDefaultWidth = 420;
+constexpr int kCatalogDefaultWidth = 1520;
+constexpr int kCatalogDefaultHeight = 760;
+constexpr int kSampleTableInitialWidth = 940;
+constexpr int kDetailsInitialWidth = 520;
 
 class OverviewPhotoLabel : public QLabel {
 public:
@@ -313,7 +317,7 @@ void OpenDataCatalogWindow::setOpenSampleHandler(std::function<bool(const OpenDa
 void OpenDataCatalogWindow::buildUi()
 {
     setWindowTitle(tr("Open Data Catalog"));
-    resize(1120, 760);
+    resize(kCatalogDefaultWidth, kCatalogDefaultHeight);
 
     auto* mainLayout = new QVBoxLayout(this);
 
@@ -349,6 +353,7 @@ void OpenDataCatalogWindow::buildUi()
     _sampleTable->setSelectionMode(QAbstractItemView::SingleSelection);
     _sampleTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     _sampleTable->setSortingEnabled(true);
+    _sampleTable->setMinimumWidth(kSampleTableInitialWidth);
     _sampleTable->horizontalHeader()->setStretchLastSection(true);
     _sampleTable->verticalHeader()->hide();
 
@@ -448,6 +453,7 @@ void OpenDataCatalogWindow::buildUi()
     splitter->addWidget(_tabs);
     splitter->setStretchFactor(0, 2);
     splitter->setStretchFactor(1, 3);
+    splitter->setSizes({kSampleTableInitialWidth, kDetailsInitialWidth});
     mainLayout->addWidget(splitter, 1);
 
     auto* bottomRow = new QHBoxLayout;
