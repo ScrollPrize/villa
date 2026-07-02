@@ -2387,13 +2387,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             ? qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())
                             : nullptr;
                         if (subWindow) {
-                            QAction* minimizeAction = menu.addAction(tr("Minimize viewer"));
-                            minimizeAction->setEnabled(!subWindow->isMinimized());
-                            connect(minimizeAction, &QAction::triggered, this, [subWindow]() {
-                                if (subWindow)
-                                    subWindow->showMinimized();
-                            });
-
                             QAction* maximizeAction = menu.addAction(
                                 subWindow->isMaximized() ? tr("Restore viewer") : tr("Maximize viewer"));
                             connect(maximizeAction, &QAction::triggered, this, [subWindow]() {
@@ -5411,8 +5404,47 @@ void CWindow::CreateWidgets(void)
     aWidgetLayout->setSpacing(0);
     ui.tabSegment->setLayout(aWidgetLayout);
 
+    auto* resetViewersButton = new QPushButton(tr("Reset viewers"), ui.tabSegment);
+    resetViewersButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    aWidgetLayout->addWidget(resetViewersButton, 0, Qt::AlignLeft);
+
     mdiArea = new QMdiArea(ui.tabSegment);
     aWidgetLayout->addWidget(mdiArea);
+
+    auto ensureDefaultViewer = [this](const std::string& surfaceName,
+                                      const QString& title,
+                                      const std::set<std::string>& intersects) -> VolumeViewerBase* {
+        for (auto* subWindow : mdiArea->subWindowList()) {
+            if (!subWindow)
+                continue;
+            if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
+                if (viewer->surfName() == surfaceName)
+                    return viewer;
+            }
+        }
+
+        auto* viewer = newConnectedViewer(surfaceName, title, mdiArea);
+        if (viewer)
+            viewer->setIntersects(intersects);
+        return viewer;
+    };
+
+    auto resetDefaultViewers = [this, ensureDefaultViewer]() {
+        ensureDefaultViewer("seg xz", tr("Segmentation XZ"), {"segmentation"});
+        ensureDefaultViewer("seg yz", tr("Segmentation YZ"), {"segmentation"});
+        ensureDefaultViewer("xy plane", tr("XY / Slices"), {"segmentation"});
+        ensureDefaultViewer("segmentation", tr("Surface"), {"seg xz", "seg yz"});
+
+        for (auto* subWindow : mdiArea->subWindowList()) {
+            if (!subWindow)
+                continue;
+            subWindow->showNormal();
+            subWindow->show();
+        }
+        mdiArea->tileSubWindows();
+    };
+
+    connect(resetViewersButton, &QPushButton::clicked, this, resetDefaultViewers);
 
     // Ensure the viewer's graphics view gets focus when subwindow is activated
     connect(mdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
@@ -5426,12 +5458,8 @@ void CWindow::CreateWidgets(void)
     });
 
     {
-        newConnectedViewer("seg xz", tr("Segmentation XZ"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("seg yz", tr("Segmentation YZ"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("xy plane", tr("XY / Slices"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("segmentation", tr("Surface"), mdiArea)->setIntersects({"seg xz","seg yz"});
+        resetDefaultViewers();
     }
-    mdiArea->tileSubWindows();
 
     if (_fiberSliceWorkspaceWindow) {
         _fiberSliceMdiArea = new QMdiArea(_fiberSliceWorkspaceWindow);
