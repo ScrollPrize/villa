@@ -952,21 +952,33 @@ void MenuActionController::showSettingsDialog()
     const bool resetViewOnSurfaceChange =
         settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                        vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
+    const bool showPlaneLines =
+        settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
+                       vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
     if (_window->_viewerManager) {
-        _window->_viewerManager->forEachBaseViewer([showDirHints](VolumeViewerBase* viewer) {
+        _window->_viewerManager->forEachBaseViewer([showDirHints, showPlaneLines](VolumeViewerBase* viewer) {
             if (viewer) {
                 viewer->setShowDirectionHints(showDirHints);
-                // Re-read viewer settings (sensitivities, scalebar voxel size, ...)
-                // so changes made in the dialog take effect immediately.
+                viewer->setPlaneIntersectionLinesVisible(showPlaneLines);
+                // Re-read viewer settings (sensitivities, interpolation, scalebar voxel
+                // size, ...) so changes made in the dialog take effect immediately.
                 viewer->reloadPerfSettings();
+                viewer->renderVisible(true);
             }
         });
     }
-    if (_window->ui.chkMoveOnSurfaceChanged) {
-        QSignalBlocker blocker(_window->ui.chkMoveOnSurfaceChanged);
-        _window->ui.chkMoveOnSurfaceChanged->setChecked(resetViewOnSurfaceChange);
-    }
     _window->onMoveOnSurfaceChangedToggled(resetViewOnSurfaceChange);
+
+    if (_window->_viewerManager) {
+        const int intersectionOpacity =
+            settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
+                           vc3d::settings::viewer::INTERSECTION_OPACITY_DEFAULT).toInt();
+        _window->_viewerManager->setIntersectionOpacity(
+            std::clamp(static_cast<float>(intersectionOpacity) / 100.0f, 0.0f, 1.0f));
+    }
+    _window->onAxisOverlayOpacityChanged(
+        settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
+                       vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
 
     dialog->deleteLater();
 }

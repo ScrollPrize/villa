@@ -377,14 +377,14 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         }
     }
     _sliceStepLabel = new QLabel(this);
-    _sliceStepLabel->setText(tr("Step: %1").arg(_viewerManager ? _viewerManager->sliceStepSize() : 1));
-    _sliceStepLabel->setToolTip(tr("Shift+Scroll step size. Use Shift+G / Shift+H to adjust."));
+    _sliceStepLabel->setText(tr("Z sens: %1").arg(_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0, 0, 'f', 1));
+    _sliceStepLabel->setToolTip(tr("Z-scroll sensitivity. Use Shift+G / Shift+H to adjust."));
     _sliceStepLabel->installEventFilter(this);
     buttonLayout->addWidget(_sliceStepLabel);
     if (_viewerManager) {
-        connect(_viewerManager, &ViewerManager::sliceStepSizeChanged, this, [this](int size) {
+        connect(_viewerManager, &ViewerManager::zScrollSensitivityChanged, this, [this](double sensitivity) {
             if (_sliceStepLabel) {
-                _sliceStepLabel->setText(tr("Step: %1").arg(size));
+                _sliceStepLabel->setText(tr("Z sens: %1").arg(sensitivity, 0, 'f', 1));
             }
         });
     }
@@ -1376,7 +1376,9 @@ bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
     if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
         return true;
     }
-    const int sliceStepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
+    const int sliceStepSize = _viewerManager
+        ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
+        : 1;
     const double position = vc3d::line_annotation::shiftedLinePosition(
         _currentLinePosition,
         steps,
@@ -1393,7 +1395,9 @@ bool LineAnnotationDialog::shiftCurrentCutPlaneStraightByScrollSteps(int steps)
         return true;
     }
     auto* plane = _generatedViews.currentCutSurface.get();
-    const int sliceStepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
+    const int sliceStepSize = _viewerManager
+        ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
+        : 1;
     const cv::Vec3f origin = plane->origin();
     const cv::Vec3f normal = plane->normal({0.0f, 0.0f, 0.0f});
     const cv::Vec3f shiftedOrigin =
@@ -1954,7 +1958,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath controlPath;
     QPainterPath seedPath;
     const double lineRadius =
-        std::max(0.5, static_cast<double>(_viewerManager ? _viewerManager->sliceStepSize() : 1) * 0.5);
+        std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = _currentLinePosition - lineRadius;
     const double upper = _currentLinePosition + lineRadius;
     const auto& indices = _generatedControlIndex.sortedControlIndices;
@@ -2316,14 +2320,12 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
     if (_viewerManager &&
         event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers) {
         if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
-            const int newStep = std::max(1, _viewerManager->sliceStepSize() - 1);
-            _viewerManager->setSliceStepSize(newStep);
+            _viewerManager->setZScrollSensitivity(_viewerManager->zScrollSensitivity() - 0.1);
             event->accept();
             return true;
         }
         if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
-            const int newStep = std::min(100, _viewerManager->sliceStepSize() + 1);
-            _viewerManager->setSliceStepSize(newStep);
+            _viewerManager->setZScrollSensitivity(_viewerManager->zScrollSensitivity() + 0.1);
             event->accept();
             return true;
         }

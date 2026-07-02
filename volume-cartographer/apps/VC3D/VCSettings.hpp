@@ -142,7 +142,7 @@ namespace viewer {
     constexpr double DIRECTION_STEP_DEFAULT = 10.0;
     constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
     constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;
-    constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = true;
+    constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = false;
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
@@ -163,7 +163,7 @@ namespace viewer {
 
     constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
 
-    constexpr int INTERSECTION_OPACITY_DEFAULT = 100;
+    constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
     constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
     constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
@@ -172,12 +172,10 @@ namespace viewer {
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
     constexpr auto AXIS_OVERLAY_OPACITY = "viewer/axis_overlay_opacity";
     constexpr auto USE_AXIS_ALIGNED_SLICES = "viewer/use_axis_aligned_slices";
-    constexpr auto SLICE_STEP_SIZE = "viewer/slice_step_size";
 
     constexpr bool SHOW_AXIS_OVERLAYS_DEFAULT = true;
-    constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 100;
+    constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 70;
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
-    constexpr int SLICE_STEP_SIZE_DEFAULT = 1;
 
     // Remote volume chunk cache directory. Resolved through
     // vc3d::remoteCachePath() — see that function for the priority rules.
@@ -236,6 +234,7 @@ namespace perf {
     constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
     constexpr int ITERATION_COUNT_DEFAULT = 1000;
     constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
+    constexpr int INTERPOLATION_METHOD_DEFAULT = 1;  // 0 = Nearest, 1 = Trilinear
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 

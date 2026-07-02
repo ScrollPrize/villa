@@ -252,17 +252,6 @@ void ViewerControlsPanel::setOverlayWindowAvailable(bool available)
     updateOverlayWindowControlsEnabled();
 }
 
-void ViewerControlsPanel::setSliceStepSize(int value)
-{
-    if (!_sliceStepSizeSpin) {
-        return;
-    }
-    QSignalBlocker blocker(_sliceStepSizeSpin);
-    _sliceStepSizeSpin->setValue(std::clamp(value,
-                                            _sliceStepSizeSpin->minimum(),
-                                            _sliceStepSizeSpin->maximum()));
-}
-
 void ViewerControlsPanel::setupViewerControlWiring()
 {
     setupWindowRangeControls();
@@ -275,28 +264,6 @@ void ViewerControlsPanel::setupViewerControlWiring()
         connect(_uiRefs.zoomOutButton, &QPushButton::clicked, this, &ViewerControlsPanel::zoomOutRequested);
     }
 
-    if (auto* spinSliceStep = _uiRefs.sliceStepSizeSpin) {
-        _sliceStepSizeSpin = spinSliceStep;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        int savedStep = settings.value(vc3d::settings::viewer::SLICE_STEP_SIZE,
-                                       vc3d::settings::viewer::SLICE_STEP_SIZE_DEFAULT).toInt();
-        savedStep = std::clamp(savedStep, spinSliceStep->minimum(), spinSliceStep->maximum());
-        {
-            QSignalBlocker blocker(spinSliceStep);
-            spinSliceStep->setValue(savedStep);
-        }
-        if (_viewerManager) {
-            _viewerManager->setSliceStepSize(savedStep);
-        }
-        connect(spinSliceStep, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_viewerManager) {
-                _viewerManager->setSliceStepSize(value);
-            }
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, value);
-            emit sliceStepSizeChanged(value);
-        });
-    }
 }
 
 void ViewerControlsPanel::setupWindowRangeControls()
@@ -377,26 +344,6 @@ void ViewerControlsPanel::setupWindowRangeControls()
 void ViewerControlsPanel::setupIntersectionControls()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-
-    if (auto* spinIntersectionOpacity = _uiRefs.intersectionOpacitySpin) {
-        const int savedOpacity = settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
-                                                spinIntersectionOpacity->value()).toInt();
-        const int boundedOpacity = std::clamp(savedOpacity,
-                                              spinIntersectionOpacity->minimum(),
-                                              spinIntersectionOpacity->maximum());
-        spinIntersectionOpacity->setValue(boundedOpacity);
-        connect(spinIntersectionOpacity, QOverload<int>::of(&QSpinBox::valueChanged),
-                this, [this](int value) {
-                    if (!_viewerManager) {
-                        return;
-                    }
-                    const float normalized = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
-                    _viewerManager->setIntersectionOpacity(normalized);
-                });
-        if (_viewerManager) {
-            _viewerManager->setIntersectionOpacity(spinIntersectionOpacity->value() / 100.0f);
-        }
-    }
 
     if (auto* spinIntersectionThickness = _uiRefs.intersectionThicknessSpin) {
         const double savedThickness = settings.value(vc3d::settings::viewer::INTERSECTION_THICKNESS,

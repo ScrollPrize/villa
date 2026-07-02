@@ -53,11 +53,23 @@ ViewerManager::ViewerManager(CState* state,
     const float normalized = static_cast<float>(savedOpacityPercent) / 100.0f;
     _intersectionOpacity = std::clamp(normalized, 0.0f, 1.0f);
 
-    const float storedBaseLow = settings.value(viewer::BASE_WINDOW_LOW, viewer::BASE_WINDOW_LOW_DEFAULT).toFloat();
-    const float storedBaseHigh = settings.value(viewer::BASE_WINDOW_HIGH, viewer::BASE_WINDOW_HIGH_DEFAULT).toFloat();
+    float storedBaseLow = settings.value(viewer::BASE_WINDOW_LOW, viewer::BASE_WINDOW_LOW_DEFAULT).toFloat();
+    float storedBaseHigh = settings.value(viewer::BASE_WINDOW_HIGH, viewer::BASE_WINDOW_HIGH_DEFAULT).toFloat();
+    // The window is a fixed 0-255 scale. Values persisted on a different scale (e.g. a
+    // legacy 16-bit build) would otherwise clamp to (255, 255) and slam both slider
+    // handles to the far right. Fall back to defaults if the stored pair is out of range
+    // or collapsed so the control is usable again.
+    if (storedBaseLow < 0.0f || storedBaseHigh > 255.0f || (storedBaseHigh - storedBaseLow) < 1.0f) {
+        storedBaseLow = viewer::BASE_WINDOW_LOW_DEFAULT;
+        storedBaseHigh = viewer::BASE_WINDOW_HIGH_DEFAULT;
+    }
     _volumeWindowLow = std::clamp(storedBaseLow, 0.0f, 255.0f);
     const float minHigh = std::min(_volumeWindowLow + 1.0f, 255.0f);
     _volumeWindowHigh = std::clamp(storedBaseHigh, minHigh, 255.0f);
+
+    const double storedZScroll = settings.value(viewer::ZSCROLL_SENSITIVITY,
+                                                 viewer::ZSCROLL_SENSITIVITY_DEFAULT).toDouble();
+    _zScrollSensitivity = std::clamp(storedZScroll, 0.1, 100.0);
 
     _surfacePatchSamplingStride = viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT;
     const float storedThickness = settings.value(viewer::INTERSECTION_THICKNESS, viewer::INTERSECTION_THICKNESS_DEFAULT).toFloat();
@@ -988,14 +1000,24 @@ void ViewerManager::broadcastLinkedCursor(VolumeViewerBase* source,
     });
 }
 
-void ViewerManager::setSliceStepSize(int size)
+void ViewerManager::setZScrollSensitivity(double sensitivity)
 {
-    const int clampedSize = std::max(1, size);
-    if (_sliceStepSize == clampedSize) {
+    const double clamped = std::clamp(sensitivity, 0.1, 100.0);
+    if (std::abs(_zScrollSensitivity - clamped) < 1e-9) {
         return;
     }
-    _sliceStepSize = clampedSize;
-    emit sliceStepSizeChanged(_sliceStepSize);
+    _zScrollSensitivity = clamped;
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::viewer::ZSCROLL_SENSITIVITY, _zScrollSensitivity);
+
+    forEachBaseViewer([](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->reloadPerfSettings();
+        }
+    });
+
+    emit zScrollSensitivityChanged(_zScrollSensitivity);
 }
 
 void ViewerManager::forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const

@@ -1693,12 +1693,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
-    // Slice step size label in status bar
+    // Z-scroll sensitivity label in status bar
     _sliceStepLabel = new QLabel(this);
     _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
-    int initialStepSize = _viewerManager->sliceStepSize();
-    _sliceStepLabel->setText(tr("Step: %1").arg(initialStepSize));
-    _sliceStepLabel->setToolTip(tr("Slice step size: use Shift+G / Shift+H to adjust"));
+    double initialSensitivity = _viewerManager->zScrollSensitivity();
+    _sliceStepLabel->setText(tr("Z sens: %1").arg(initialSensitivity, 0, 'f', 1));
+    _sliceStepLabel->setToolTip(tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sliceStepLabel);
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
@@ -6311,10 +6311,8 @@ void CWindow::CreateWidgets(void)
         .claheTileSize = ui.spinClaheTileSize,
         .zoomInButton = ui.btnZoomIn,
         .zoomOutButton = ui.btnZoomOut,
-        .sliceStepSizeSpin = ui.spinSliceStepSize,
         .volumeWindowContainer = ui.volumeWindowContainer,
         .overlayWindowContainer = ui.overlayWindowContainer,
-        .intersectionOpacitySpin = ui.spinIntersectionOpacity,
         .intersectionThicknessSpin = ui.doubleSpinIntersectionThickness,
     };
     _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
@@ -6324,8 +6322,8 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onZoomIn);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomOutRequested,
             this, &CWindow::onZoomOut);
-    connect(_viewerManager.get(), &ViewerManager::sliceStepSizeChanged,
-            this, &CWindow::onSliceStepSizeChanged);
+    connect(_viewerManager.get(), &ViewerManager::zScrollSensitivityChanged,
+            this, &CWindow::onZScrollSensitivityChanged);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
     if (_viewerControlsPanel) {
@@ -6486,30 +6484,6 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
-    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
-        bool moveOnSurfaceChanged = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
-                                                   vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
-        QSignalBlocker blocker(chkMoveOnSurfaceChanged);
-        chkMoveOnSurfaceChanged->setChecked(moveOnSurfaceChanged);
-        connect(chkMoveOnSurfaceChanged, &QCheckBox::toggled, this, &CWindow::onMoveOnSurfaceChangedToggled);
-    }
-    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
-        bool showPlaneIntersectionLines = settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
-                                                         vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
-        QSignalBlocker blocker(chkPlaneIntersectionLines);
-        chkPlaneIntersectionLines->setChecked(showPlaneIntersectionLines);
-        connect(chkPlaneIntersectionLines, &QCheckBox::toggled,
-                this, &CWindow::onPlaneIntersectionLinesToggled);
-    }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
-                                           spinAxisOverlayOpacity->value()).toInt();
-        storedOpacity = std::clamp(storedOpacity, spinAxisOverlayOpacity->minimum(), spinAxisOverlayOpacity->maximum());
-        QSignalBlocker blocker(spinAxisOverlayOpacity);
-        spinAxisOverlayOpacity->setValue(storedOpacity);
-        connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
-    }
-
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
     }
@@ -6529,18 +6503,12 @@ void CWindow::CreateWidgets(void)
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
     }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        onAxisOverlayOpacityChanged(spinAxisOverlayOpacity->value());
-    }
+    onAxisOverlayOpacityChanged(settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
+                                               vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
-    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
-        onMoveOnSurfaceChangedToggled(chkMoveOnSurfaceChanged->isChecked());
-    }
-    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
-        onPlaneIntersectionLinesToggled(chkPlaneIntersectionLines->isChecked());
-    }
+    onMoveOnSurfaceChangedToggled(moveOnSurfaceChangeEnabled());
 
 }
 
@@ -6633,18 +6601,14 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
-    // Shift+G decreases slice step size, Shift+H increases it
+    // Shift+G decreases Z-scroll sensitivity, Shift+H increases it
     if (event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers && _viewerManager) {
         if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
-            int currentStep = _viewerManager->sliceStepSize();
-            int newStep = std::max(1, currentStep - 1);
-            _viewerManager->setSliceStepSize(newStep);
+            _viewerManager->setZScrollSensitivity(_viewerManager->zScrollSensitivity() - 0.1);
             event->accept();
             return;
         } else if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
-            int currentStep = _viewerManager->sliceStepSize();
-            int newStep = std::min(100, currentStep + 1);
-            _viewerManager->setSliceStepSize(newStep);
+            _viewerManager->setZScrollSensitivity(_viewerManager->zScrollSensitivity() + 0.1);
             event->accept();
             return;
         }
@@ -6857,19 +6821,12 @@ void CWindow::onSegmentationGrowthStatusChanged(bool running)
     }
 }
 
-void CWindow::onSliceStepSizeChanged(int newSize)
+void CWindow::onZScrollSensitivityChanged(double sensitivity)
 {
-    // Update status bar label
+    // Update status bar label. Persistence + viewer refresh happen in
+    // ViewerManager::setZScrollSensitivity (the single source of truth).
     if (_sliceStepLabel) {
-        _sliceStepLabel->setText(tr("Step: %1").arg(newSize));
-    }
-
-    // Save to settings
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, newSize);
-
-    if (_viewerControlsPanel) {
-        _viewerControlsPanel->setSliceStepSize(newSize);
+        _sliceStepLabel->setText(tr("Z sens: %1").arg(sensitivity, 0, 'f', 1));
     }
 }
 
@@ -7882,9 +7839,6 @@ void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->setAxisAlignedEnabled(enabled && _axisAlignedSliceController->isEnabled());
     }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        spinAxisOverlayOpacity->setEnabled(_axisAlignedSliceController->isEnabled() && enabled);
-    }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS, enabled ? "1" : "0");
 }
@@ -7901,7 +7855,7 @@ void CWindow::onAxisOverlayOpacityChanged(int value)
 
 void CWindow::onAxisAlignedSlicesToggled(bool enabled)
 {
-    _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays, ui.spinAxisOverlayOpacity);
+    _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays);
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
 }
