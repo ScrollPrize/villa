@@ -5,16 +5,14 @@
 
 #include <QCheckBox>
 #include <QComboBox>
-#include <QDoubleSpinBox>
 #include <QLabel>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <QSlider>
 #include <QSpinBox>
+#include <QString>
 #include <QVBoxLayout>
 
 #include <algorithm>
-#include <cstdint>
 #include <string>
 
 namespace
@@ -84,13 +82,6 @@ void setWidgetVisible(QWidget* widget, bool visible)
     }
 }
 
-void hideWidget(QWidget* widget)
-{
-    if (widget) {
-        widget->hide();
-    }
-}
-
 } // namespace
 
 ViewerCompositePanel::ViewerCompositePanel(const UiRefs& uiRefs,
@@ -106,6 +97,28 @@ ViewerCompositePanel::ViewerCompositePanel(const UiRefs& uiRefs,
 
     auto* layout = new QVBoxLayout(this);
     moveLayoutItems(_uiRefs.contents ? _uiRefs.contents->layout() : nullptr, layout, this);
+
+    static constexpr const char* kRemovedCompositeControls[] = {
+        "lblMethodScale", "sliderMethodScale", "lblMethodScaleValue",
+        "lblMethodParam", "sliderMethodParam", "lblMethodParamValue",
+        "lblBLExtinction", "spinBLExtinction", "lblBLEmission", "spinBLEmission",
+        "lblBLAmbient", "spinBLAmbient", "chkLightingEnabled", "lblLightAzimuth",
+        "spinLightAzimuth", "lblLightElevation", "spinLightElevation", "lblLightDiffuse",
+        "spinLightDiffuse", "lblLightAmbient", "spinLightAmbient", "chkUseVolumeGradients",
+        "lblShadowSteps", "spinShadowSteps", "chkRakingEnabled", "lblRakingAzimuth",
+        "spinRakingAzimuth", "lblRakingElevation", "spinRakingElevation", "lblRakingStrength",
+        "spinRakingStrength", "lblRakingDepth", "spinRakingDepthScale",
+        "chkPreNormalizeLayers", "chkPreHistEqLayers", "chkPreTfEnabled", "spinPreTfX1",
+        "spinPreTfY1", "lblPreTfKnot2", "spinPreTfX2", "spinPreTfY2",
+        "chkPostTfEnabled", "spinPostTfX1", "spinPostTfY1", "lblPostTfKnot2",
+        "spinPostTfX2", "spinPostTfY2", "lblDvrAmbient", "spinDvrAmbient",
+        "lblPbrRoughness", "spinPbrRoughness", "lblPbrMetallic", "spinPbrMetallic",
+    };
+    for (const char* name : kRemovedCompositeControls) {
+        if (auto* widget = findChild<QWidget*>(QString::fromLatin1(name))) {
+            widget->hide();
+        }
+    }
 
     if (_uiRefs.compositeMode) {
         QSignalBlocker blocker(_uiRefs.compositeMode);
@@ -328,60 +341,6 @@ void ViewerCompositePanel::updateCompositeParamsVisibility()
     setWidgetVisible(_uiRefs.alphaThreshold, isAlpha);
     setWidgetVisible(_uiRefs.materialLabel, isAlpha);
     setWidgetVisible(_uiRefs.material, isAlpha);
-
-    hideWidget(_uiRefs.methodScaleLabel);
-    hideWidget(_uiRefs.methodScale);
-    hideWidget(_uiRefs.methodScaleValue);
-    hideWidget(_uiRefs.methodParamLabel);
-    hideWidget(_uiRefs.methodParam);
-    hideWidget(_uiRefs.methodParamValue);
-    hideWidget(_uiRefs.blExtinctionLabel);
-    hideWidget(_uiRefs.blExtinction);
-    hideWidget(_uiRefs.blEmissionLabel);
-    hideWidget(_uiRefs.blEmission);
-    hideWidget(_uiRefs.blAmbientLabel);
-    hideWidget(_uiRefs.blAmbient);
-    hideWidget(_uiRefs.lightingEnabled);
-    hideWidget(_uiRefs.lightAzimuthLabel);
-    hideWidget(_uiRefs.lightAzimuth);
-    hideWidget(_uiRefs.lightElevationLabel);
-    hideWidget(_uiRefs.lightElevation);
-    hideWidget(_uiRefs.lightDiffuseLabel);
-    hideWidget(_uiRefs.lightDiffuse);
-    hideWidget(_uiRefs.lightAmbientLabel);
-    hideWidget(_uiRefs.lightAmbient);
-    hideWidget(_uiRefs.useVolumeGradients);
-    hideWidget(_uiRefs.shadowStepsLabel);
-    hideWidget(_uiRefs.shadowSteps);
-    hideWidget(_uiRefs.dvrAmbientLabel);
-    hideWidget(_uiRefs.dvrAmbient);
-    hideWidget(_uiRefs.pbrRoughnessLabel);
-    hideWidget(_uiRefs.pbrRoughness);
-    hideWidget(_uiRefs.pbrMetallicLabel);
-    hideWidget(_uiRefs.pbrMetallic);
-    hideWidget(_uiRefs.rakingEnabled);
-    hideWidget(_uiRefs.rakingAzimuthLabel);
-    hideWidget(_uiRefs.rakingAzimuth);
-    hideWidget(_uiRefs.rakingElevationLabel);
-    hideWidget(_uiRefs.rakingElevation);
-    hideWidget(_uiRefs.rakingStrengthLabel);
-    hideWidget(_uiRefs.rakingStrength);
-    hideWidget(_uiRefs.rakingDepthLabel);
-    hideWidget(_uiRefs.rakingDepthScale);
-    hideWidget(_uiRefs.preNormalizeLayers);
-    hideWidget(_uiRefs.preHistEqLayers);
-    hideWidget(_uiRefs.preTfEnabled);
-    hideWidget(_uiRefs.preTfX1);
-    hideWidget(_uiRefs.preTfY1);
-    hideWidget(_uiRefs.preTfKnot2Label);
-    hideWidget(_uiRefs.preTfX2);
-    hideWidget(_uiRefs.preTfY2);
-    hideWidget(_uiRefs.postTfEnabled);
-    hideWidget(_uiRefs.postTfX1);
-    hideWidget(_uiRefs.postTfY1);
-    hideWidget(_uiRefs.postTfKnot2Label);
-    hideWidget(_uiRefs.postTfX2);
-    hideWidget(_uiRefs.postTfY2);
 }
 
 void ViewerCompositePanel::applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply)

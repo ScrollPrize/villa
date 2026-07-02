@@ -174,49 +174,6 @@ TEST_CASE("methodRequiresLayerStorage returns bool for known and unknown methods
     CHECK(true);
 }
 
-TEST_CASE("buildTfLut256 disabled is identity")
-{
-    uint8_t lut[256];
-    buildTfLut256(false, 10, 20, 200, 100, lut);
-    for (int i = 0; i < 256; ++i) {
-        CHECK(int(lut[i]) == i);
-    }
-}
-
-TEST_CASE("buildTfLut256 enabled passes through endpoints (0,0) and (255,255)")
-{
-    uint8_t lut[256];
-    buildTfLut256(true, 85, 85, 170, 170, lut);
-    CHECK(int(lut[0]) == 0);
-    CHECK(int(lut[255]) == 255);
-}
-
-TEST_CASE("buildTfLut256 swaps x1 > x2 internally")
-{
-    uint8_t lutA[256], lutB[256];
-    buildTfLut256(true, 50, 30, 200, 220, lutA);
-    buildTfLut256(true, 200, 220, 50, 30, lutB);
-    for (int i = 0; i < 256; ++i) CHECK(int(lutA[i]) == int(lutB[i]));
-}
-
-TEST_CASE("buildTfLut256 hits the knot values exactly")
-{
-    uint8_t lut[256];
-    buildTfLut256(true, 100, 50, 200, 150, lut);
-    CHECK(int(lut[100]) == 50);
-    CHECK(int(lut[200]) == 150);
-}
-
-TEST_CASE("buildTfLut256 degenerate (x1==x2) does not crash and stays in [0,255]")
-{
-    uint8_t lut[256];
-    buildTfLut256(true, 100, 80, 100, 200, lut);
-    for (int i = 0; i < 256; ++i) {
-        CHECK(int(lut[i]) >= 0);
-        CHECK(int(lut[i]) <= 255);
-    }
-}
-
 TEST_CASE("computeLightingFactor: lighting disabled returns 1")
 {
     CompositeParams p;
