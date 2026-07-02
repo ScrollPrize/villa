@@ -115,7 +115,6 @@ private:
     void initializeExistingViewers();
     void applyInitialSettingsToViewer(VolumeViewerBase* viewer);
     void updateCompositeParamsVisibility();
-    void updateRakingControlsEnabled(bool enabled);
     void applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply);
     void applyToAllViewers(const std::function<void(VolumeViewerBase*)>& apply);
     void applyToPlaneViewers(const std::function<void(VolumeViewerBase*)>& apply);
