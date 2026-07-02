@@ -2021,19 +2021,6 @@
        </property>
       </widget>
      </item>
-     <item row="11" column="0" colspan="4">
-      <widget class="QCheckBox" name="chkMoveOnSurfaceChanged">
-       <property name="toolTip">
-        <string>Move viewers to the selected surface when the active surface changes</string>
-       </property>
-       <property name="text">
-        <string>Move on surface change</string>
-       </property>
-       <property name="checked">
-        <bool>true</bool>
-       </property>
-      </widget>
-     </item>
      <item row="12" column="0">
       <widget class="QCheckBox" name="chkPlaneIntersectionLines">
        <property name="toolTip">

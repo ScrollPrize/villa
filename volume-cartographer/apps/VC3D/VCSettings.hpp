@@ -142,7 +142,7 @@ namespace viewer {
     constexpr double DIRECTION_STEP_DEFAULT = 10.0;
     constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
     constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;
-    constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = true;
+    constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = false;
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;

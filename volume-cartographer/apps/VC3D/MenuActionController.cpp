@@ -758,10 +758,6 @@ void MenuActionController::showSettingsDialog()
             }
         });
     }
-    if (_window->ui.chkMoveOnSurfaceChanged) {
-        QSignalBlocker blocker(_window->ui.chkMoveOnSurfaceChanged);
-        _window->ui.chkMoveOnSurfaceChanged->setChecked(resetViewOnSurfaceChange);
-    }
     _window->onMoveOnSurfaceChangedToggled(resetViewOnSurfaceChange);
 
     dialog->deleteLater();

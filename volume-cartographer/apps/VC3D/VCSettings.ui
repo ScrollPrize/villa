@@ -318,7 +318,7 @@
              <string>Reset view when switching between surfaces</string>
             </property>
             <property name="checked">
-             <bool>true</bool>
+             <bool>false</bool>
             </property>
             <property name="toolTip">
              <string>When enabled, the view will automatically fit and center on each surface when switching between segments</string>
