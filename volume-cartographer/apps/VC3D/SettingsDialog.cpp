@@ -36,6 +36,9 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     chkPlaySoundAfterSegRun->setChecked(settings.value(viewer::PLAY_SOUND_AFTER_SEG_RUN, viewer::PLAY_SOUND_AFTER_SEG_RUN_DEFAULT).toInt() != 0);
     edtUsername->setText(settings.value(viewer::USERNAME, viewer::USERNAME_DEFAULT).toString());
     chkResetViewOnSurfaceChange->setChecked(settings.value(viewer::RESET_VIEW_ON_SURFACE_CHANGE, viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toInt() != 0);
+    if (auto* chk = findChild<QCheckBox*>("chkShowPlaneIntersectionLines")) {
+        chk->setChecked(settings.value(viewer::SHOW_PLANE_INTERSECTION_LINES, viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toInt() != 0);
+    }
     // Show direction hints (flip_x arrows)
     if (findChild<QCheckBox*>("chkShowDirectionHints")) {
         findChild<QCheckBox*>("chkShowDirectionHints")->setChecked(settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toInt() != 0);
@@ -130,6 +133,9 @@ void SettingsDialog::accept()
     settings.setValue(viewer::PLAY_SOUND_AFTER_SEG_RUN, chkPlaySoundAfterSegRun->isChecked() ? "1" : "0");
     settings.setValue(viewer::USERNAME, edtUsername->text());
     settings.setValue(viewer::RESET_VIEW_ON_SURFACE_CHANGE, chkResetViewOnSurfaceChange->isChecked() ? "1" : "0");
+    if (auto* chk = findChild<QCheckBox*>("chkShowPlaneIntersectionLines")) {
+        settings.setValue(viewer::SHOW_PLANE_INTERSECTION_LINES, chk->isChecked() ? "1" : "0");
+    }
     if (findChild<QCheckBox*>("chkShowDirectionHints")) {
         settings.setValue(viewer::SHOW_DIRECTION_HINTS, findChild<QCheckBox*>("chkShowDirectionHints")->isChecked() ? "1" : "0");
     }

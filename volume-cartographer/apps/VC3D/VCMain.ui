@@ -2021,19 +2021,6 @@
        </property>
       </widget>
      </item>
-     <item row="12" column="0">
-      <widget class="QCheckBox" name="chkPlaneIntersectionLines">
-       <property name="toolTip">
-        <string>Show slice-plane intersection lines in the segmentation surface view</string>
-       </property>
-       <property name="text">
-        <string>Show plane lines on segmentation view</string>
-       </property>
-       <property name="checked">
-        <bool>true</bool>
-       </property>
-      </widget>
-     </item>
     </layout>
    </widget>
    </widget>

@@ -6479,14 +6479,6 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
-    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
-        bool showPlaneIntersectionLines = settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
-                                                         vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
-        QSignalBlocker blocker(chkPlaneIntersectionLines);
-        chkPlaneIntersectionLines->setChecked(showPlaneIntersectionLines);
-        connect(chkPlaneIntersectionLines, &QCheckBox::toggled,
-                this, &CWindow::onPlaneIntersectionLinesToggled);
-    }
     if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
         int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                                            spinAxisOverlayOpacity->value()).toInt();
@@ -6522,9 +6514,6 @@ void CWindow::CreateWidgets(void)
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
     onMoveOnSurfaceChangedToggled(moveOnSurfaceChangeEnabled());
-    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
-        onPlaneIntersectionLinesToggled(chkPlaneIntersectionLines->isChecked());
-    }
 
 }
 
