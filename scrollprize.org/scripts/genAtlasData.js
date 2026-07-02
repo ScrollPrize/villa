@@ -418,6 +418,7 @@ function generate() {
       const scrolls = ids.map((id) => {
         const facts = samples[id] ? deriveFacts(samples[id]) : null;
         const curated = curatedFields(overlayScrolls[id], id);
+        const o = overlayScrolls[id] || {};
         const mesh = meshManifest[id] || null;
         const inkSegments = samples[id]
           ? extractInkSegments(samples[id], id, s3ToHttp)
@@ -428,9 +429,10 @@ function generate() {
         // ids without S3 facts (still emit with what's available).
         return {
           id,
-          // factual (S3) — null fields where S3 has no record for this id
-          type: facts ? facts.type : "scroll",
-          desc: facts ? facts.desc : "",
+          // factual (S3) — null fields where S3 has no record for this id;
+          // a curated overlay `type`/`desc` takes precedence when present.
+          type: o.type || (facts ? facts.type : "scroll"),
+          desc: o.desc || (facts ? facts.desc : ""),
           legacy: facts ? facts.legacy : null,
           n_scans: facts ? facts.n_scans : 0,
           n_volumes: facts ? facts.n_volumes : 0,
@@ -503,8 +505,8 @@ function generate() {
       const scrolls = ids
         .map((id) => ({
           id,
-          type: "scroll",
-          desc: "",
+          type: (overlayScrolls[id] && overlayScrolls[id].type) || "scroll",
+          desc: (overlayScrolls[id] && overlayScrolls[id].desc) || "",
           legacy: null,
           n_scans: 0,
           n_volumes: 0,

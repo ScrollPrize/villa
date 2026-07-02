@@ -196,6 +196,7 @@
       "display": "Scroll 3",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "Scroll 3.",
+      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size enabled scanning at extremely high resolution (3.24um).",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/photos/PHerc0332_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0332/",
       "volume": "s3://vesuvius-challenge/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr",
@@ -259,7 +260,7 @@
     },
     "PHerc0172": {
       "display": "Scroll 5",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Bodleian Library, Oxford",
       "note": "Scroll 5. ~70% geometrically unrolled by November 2025.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0172/photos/PHerc0172_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0172/",
@@ -311,7 +312,7 @@
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "Text recovered",
+        "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.6,
@@ -322,8 +323,8 @@
         "segmented": false,
         "unrolled": false,
         "ink": true,
-        "text": true,
-        "furthest": 4,
+        "text": false,
+        "furthest": 3,
         "unrolledPct": 0
       },
       "readings": null
@@ -358,13 +359,13 @@
     "PHerc0139": {
       "display": "PHerc0139",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Title and author attribution recovered: Philodemus, On the Gods, Book 8 — a treatise by the Epicurean philosopher. About 20% virtually unrolled.",
+      "note": "Title and author attribution recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On the Gods, Book 8. About 20% virtually unrolled.",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0139/",
       "content": {
         "work": "Philodemus, On the Gods (Περὶ θεῶν), Book 8",
         "lang": "Greek",
-        "summary": "The scroll's title and author were recovered, identifying it as Philodemus, On the Gods, Book 8 — a work by the Epicurean philosopher. Reading the title of a still-rolled scroll reveals what it contains before any of its body columns are studied.",
+        "summary": "The scroll's title and author were recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On the Gods, Book 8. Reading the title of a still-rolled scroll reveals what it contains before any of its body columns are studied.",
         "caveat": "About 20% is virtually unrolled; the title and author are secure, but the body text is still being recovered."
       },
       "progress": {
@@ -766,6 +767,7 @@
       "readings": null
     },
     "PHerc0500P2": {
+      "type": "fragment",
       "display": "PHerc0500P2",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "",
@@ -775,7 +777,7 @@
       "progress": {
         "segments": 0,
         "patches": null,
-        "textFound": "Text recovered",
+        "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
         "score": 7.8,
@@ -786,8 +788,8 @@
         "segmented": false,
         "unrolled": false,
         "ink": true,
-        "text": true,
-        "furthest": 4,
+        "text": false,
+        "furthest": 3,
         "unrolledPct": 0
       },
       "readings": null
@@ -1205,7 +1207,7 @@
     },
     "PHercMAN5": {
       "display": "PHercMAN5",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMAN5/",
@@ -1232,7 +1234,7 @@
     },
     "PHercMANB": {
       "display": "PHercMANB",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANB/",
@@ -1259,7 +1261,7 @@
     },
     "PHercMANBp": {
       "display": "PHercMANBp",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANBp/",
