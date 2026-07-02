@@ -2237,7 +2237,6 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(ui.dockWidgetSegmentation);
     addDock(ui.dockWidgetDistanceTransform);
     addDock(ui.dockWidgetViewerControls);
-    addDock(ui.dockWidgetPreprocessing);
     addDock(ui.dockWidgetNormalVis);
     addDock(ui.dockWidgetView);
     addDock(ui.dockWidgetOverlay);
@@ -6293,10 +6292,6 @@ void CWindow::CreateWidgets(void)
         .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
         .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
         .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
-        .preprocessingScrollArea = ui.scrollAreaPreprocessing,
-        .preprocessingContents = ui.dockWidgetPreprocessingContents,
-        .isoCutoff = ui.sliderIsoCutoff,
-        .isoCutoffValue = ui.lblIsoCutoffValue,
         .postprocessingScrollArea = ui.scrollAreaPostprocessing,
         .postprocessingContents = ui.dockWidgetPostprocessingContents,
         .baseColormap = ui.baseColormapSelect,

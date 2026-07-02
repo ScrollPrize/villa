@@ -14,7 +14,6 @@ class ViewerManager;
 class WindowRangeWidget;
 class ViewerCompositePanel;
 class ViewerPostprocessingPanel;
-class ViewerPreprocessingPanel;
 class ViewerTransformsPanel;
 
 class ViewerControlsPanel : public QWidget
@@ -117,11 +116,6 @@ public:
         QSlider* normalMaxArrowsSlider{nullptr};
         QLabel* normalMaxArrowsValueLabel{nullptr};
 
-        QScrollArea* preprocessingScrollArea{nullptr};
-        QWidget* preprocessingContents{nullptr};
-        QSlider* isoCutoff{nullptr};
-        QLabel* isoCutoffValue{nullptr};
-
         QScrollArea* postprocessingScrollArea{nullptr};
         QWidget* postprocessingContents{nullptr};
         QComboBox* baseColormap{nullptr};
@@ -173,7 +167,6 @@ private:
     UiRefs _uiRefs;
     ViewerManager* _viewerManager{nullptr};
     ViewerCompositePanel* _compositePanel{nullptr};
-    ViewerPreprocessingPanel* _preprocessingPanel{nullptr};
     ViewerPostprocessingPanel* _postprocessingPanel{nullptr};
     ViewerTransformsPanel* _transformsPanel{nullptr};
     WindowRangeWidget* _volumeWindowWidget{nullptr};

@@ -9,7 +9,6 @@
 #include "viewer_controls/panels/ViewerNavigationPanel.hpp"
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
 #include "viewer_controls/panels/ViewerPostprocessingPanel.hpp"
-#include "viewer_controls/panels/ViewerPreprocessingPanel.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 #include "viewer_controls/panels/ViewerViewExtrasPanel.hpp"
 
@@ -186,18 +185,6 @@ void ViewerControlsPanel::addViewerGroups()
                    normalPanel,
                    viewer::GROUP_NORMAL_VIS_EXPANDED,
                    viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
-
-    ViewerPreprocessingPanel::UiRefs preprocessingUi{
-        .scrollArea = _uiRefs.preprocessingScrollArea,
-        .contents = _uiRefs.preprocessingContents,
-        .isoCutoff = _uiRefs.isoCutoff,
-        .isoCutoffValue = _uiRefs.isoCutoffValue,
-    };
-    _preprocessingPanel = new ViewerPreprocessingPanel(preprocessingUi, _viewerManager, _uiRefs.contents);
-    addViewerGroup(tr("Preprocessing"),
-                   _preprocessingPanel,
-                   viewer::GROUP_PREPROCESSING_EXPANDED,
-                   viewer::GROUP_PREPROCESSING_EXPANDED_DEFAULT);
 
     ViewerPostprocessingPanel::UiRefs postprocessingUi{
         .scrollArea = _uiRefs.postprocessingScrollArea,

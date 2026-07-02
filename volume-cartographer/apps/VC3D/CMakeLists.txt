@@ -183,8 +183,6 @@ set(srcs
     viewer_controls/panels/ViewerNormalVisualizationPanel.hpp
     viewer_controls/panels/ViewerPostprocessingPanel.cpp
     viewer_controls/panels/ViewerPostprocessingPanel.hpp
-    viewer_controls/panels/ViewerPreprocessingPanel.cpp
-    viewer_controls/panels/ViewerPreprocessingPanel.hpp
     viewer_controls/panels/ViewerTransformsPanel.cpp
     viewer_controls/panels/ViewerTransformsPanel.hpp
     viewer_controls/panels/ViewerViewExtrasPanel.cpp

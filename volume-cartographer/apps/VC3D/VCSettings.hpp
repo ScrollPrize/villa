@@ -192,7 +192,6 @@ namespace viewer {
     constexpr auto USERNAME_DEFAULT = "";
 
     // Viewer control group expansion states
-    constexpr auto GROUP_PREPROCESSING_EXPANDED = "viewer/group_preprocessing_expanded";
     constexpr auto GROUP_NORMAL_VIS_EXPANDED = "viewer/group_normal_vis_expanded";
     constexpr auto GROUP_VIEW_EXPANDED = "viewer/group_view_expanded";
     constexpr auto GROUP_OVERLAY_EXPANDED = "viewer/group_overlay_expanded";
@@ -201,7 +200,6 @@ namespace viewer {
     constexpr auto GROUP_POSTPROCESSING_EXPANDED = "viewer/group_postprocessing_expanded";
     constexpr auto GROUP_TRANSFORMS_EXPANDED = "viewer/group_transforms_expanded";
 
-    constexpr bool GROUP_PREPROCESSING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_VIEW_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_OVERLAY_EXPANDED_DEFAULT = true;
