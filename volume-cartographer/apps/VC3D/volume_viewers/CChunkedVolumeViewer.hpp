@@ -4,6 +4,7 @@
 #include <QImage>
 #include <QPointF>
 #include <QPointer>
+#include <QStringList>
 #include <QWidget>
 
 #include <algorithm>
@@ -263,6 +264,7 @@ signals:
     void renderFrameSubmitted(std::uint64_t serial);
     void renderFrameCompleted(std::uint64_t serial, double workerElapsedMs);
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
+    void sharedCacheStatsChanged(const QStringList& items);
 
 private:
     void quiesceForClose();

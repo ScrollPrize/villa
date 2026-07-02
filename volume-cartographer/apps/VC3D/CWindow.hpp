@@ -9,6 +9,7 @@
 #include <QCheckBox>
 #include <QPointer>
 #include <QString>
+#include <QStringList>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -248,6 +249,7 @@ private slots:
     void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
     void onZScrollSensitivityChanged(double sensitivity);
+    void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
     void onNewFiberRequested();
@@ -280,6 +282,7 @@ private:
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
     QLabel* _segmentationGrowthWarning{nullptr};
+    QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _sliceStepLabel{nullptr};
     QString _segmentationGrowthStatusText;
 

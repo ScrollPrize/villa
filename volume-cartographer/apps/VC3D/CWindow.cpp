@@ -2186,6 +2186,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
+    _sharedCacheStatsLabel = new QLabel(this);
+    _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
+    _sharedCacheStatsLabel->setMinimumWidth(320);
+    _sharedCacheStatsLabel->setText(tr("RAM --  disk --  network --"));
+    statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
+
     // Z-scroll sensitivity label in status bar
     _sliceStepLabel = new QLabel(this);
     _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
@@ -2802,6 +2808,11 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
     connect(_state, &CState::volumeChanged, viewer, &CChunkedVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
     connect(_state, &CState::volumeClosing, viewer, &CChunkedVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
+    connect(viewer,
+            &CChunkedVolumeViewer::sharedCacheStatsChanged,
+            this,
+            &CWindow::onSharedCacheStatsChanged,
+            Qt::UniqueConnection);
     if (!annotationViewer) {
         connect(viewer, &CChunkedVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
     } else if (!viewer->property("vc_annotation_focus_bound").toBool()) {
@@ -7437,6 +7448,14 @@ void CWindow::onZScrollSensitivityChanged(double sensitivity)
     if (_sliceStepLabel) {
         _sliceStepLabel->setText(tr("Z sens: %1").arg(sensitivity, 0, 'f', 1));
     }
+}
+
+void CWindow::onSharedCacheStatsChanged(const QStringList& items)
+{
+    if (!_sharedCacheStatsLabel || items.isEmpty()) {
+        return;
+    }
+    _sharedCacheStatsLabel->setText(items.join(QStringLiteral("  ")));
 }
 
 // Open volume package

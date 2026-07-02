@@ -5017,6 +5017,7 @@ void CChunkedVolumeViewer::updateStatusLabel()
         return;
 
     QStringList items;
+    QStringList sharedCacheItems;
     items << QString("L%1").arg(_dsScaleIdx);
     if (const QString viewerLabel = property("vc_viewer_label").toString(); !viewerLabel.isEmpty())
         items << viewerLabel;
@@ -5031,18 +5032,22 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     if (_chunkArray) {
         const auto stats = _chunkArray->stats();
-        items << QString("RAM %1/%2 GB")
+        sharedCacheItems << QString("RAM %1/%2 GB")
             .arg(formatGigabytes(stats.decodedBytes))
             .arg(formatGigabytes(stats.decodedByteCapacity));
         if (stats.persistentCacheEnabled) {
-            items << QString("disk %1%2")
+            sharedCacheItems << QString("disk %1%2")
                 .arg(formatByteSize(stats.persistentCacheBytes))
                 .arg(stats.persistentCacheScanInFlight ? "+" : "");
+        } else {
+            sharedCacheItems << QStringLiteral("disk off");
         }
         if (stats.remoteFetchesInFlight > 0) {
-            items << QString("downloading %1 @ %2")
+            sharedCacheItems << QString("network %1 @ %2")
                 .arg(stats.remoteFetchesInFlight)
                 .arg(formatMegabytesPerSecond(stats.remoteDownloadBytesPerSecond));
+        } else {
+            sharedCacheItems << QStringLiteral("network idle");
         }
     }
 
@@ -5061,4 +5066,5 @@ void CChunkedVolumeViewer::updateStatusLabel()
     }
 
     _statsBar->setItems(items);
+    emit sharedCacheStatsChanged(sharedCacheItems);
 }
