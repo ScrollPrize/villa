@@ -59,7 +59,6 @@
 #include <QSettings>
 #include <QStyle>
 #include <QTemporaryDir>
-#include <QThread>
 #include <QTreeWidget>
 #include <QTimer>
 #include <QTreeWidgetItem>
@@ -556,6 +555,11 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         };
 
     QFutureWatcher<OpenDataOpenTaskResult> watcher;
+    QEventLoop loop;
+    QObject::connect(&watcher,
+                     &QFutureWatcher<OpenDataOpenTaskResult>::finished,
+                     &loop,
+                     &QEventLoop::quit);
     watcher.setFuture(QtConcurrent::run(
         [sampleCopy, cacheDir, progressCallback]() mutable {
             OpenDataOpenTaskResult taskResult;
@@ -572,9 +576,8 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             }
             return taskResult;
         }));
-    while (!watcher.isFinished()) {
-        QApplication::processEvents(QEventLoop::AllEvents, 50);
-        QThread::msleep(10);
+    if (!watcher.isFinished()) {
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
     }
     OpenDataOpenTaskResult task = watcher.result();
     if (progressDialog) {
