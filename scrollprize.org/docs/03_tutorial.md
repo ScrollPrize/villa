@@ -93,7 +93,7 @@ The X-ray photos are combined into a 3D scan volume using [tomographic reconstru
   <figcaption className="mt-0">Artistic visualization of constructing a 3D volume; in reality the object rotates as it is scanned.</figcaption>
 </figure>
 
-We store the 3D scan volume as a directory full of .tif files, where each file represents one horizontal cross-section or "slice" of the object, typically starting at the bottom of the scroll or scroll fragment and moving upwards. We call this a .tif image stack. You can view and explore a 3D scan volume of a scroll in your browser right now in [one click](https://dl.ash2txt.org/view/Scroll1), or with a few lines of code ([Python](https://github.com/ScrollPrize/vesuvius), [C](https://github.com/ScrollPrize/vesuvius-c)).
+We store the 3D scan volume as a directory full of .tif files, where each file represents one horizontal cross-section or "slice" of the object, typically starting at the bottom of the scroll or scroll fragment and moving upwards. We call this a .tif image stack. You can view and explore a 3D scan volume of a scroll in your browser right now in [one click](https://dl.ash2txt.org/view/Scroll1), or with a few lines of code ([Python](https://github.com/ScrollPrize/villa/tree/main/vesuvius), [C](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c)).
 
 Remember that each pixel in the image stack actually represents a cube (voxel) of physical space. If your volume has a 10um voxel size, then 100 slices will be 1mm (1000um) of the object.
 

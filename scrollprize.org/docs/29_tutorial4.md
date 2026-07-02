@@ -48,7 +48,7 @@ For a more technical walkthrough of the pipeline, see this [walkthrough video](h
 For an introduction to one of the core problems in this pipeline where we need your help, check out the [Sheet Stitching Problem Playground](https://github.com/schillij95/graph_problem/tree/main).
 
 Thaumato is one approach but there may be others - for example, volumetric instance segmentation might be useful as an input to later mesh stitching algorithms.
-If interested, check out [this notebook](https://colab.research.google.com/github/ScrollPrize/vesuvius/blob/main/notebooks/example3_cubes_bootstrap.ipynb) providing easy access to volumetric segmentation labels.
+If interested, check out [this notebook](https://colab.research.google.com/github/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/examples/notebooks/example3_cubes_bootstrap.ipynb) providing easy access to volumetric segmentation labels.
 
 ### Walkthrough
 

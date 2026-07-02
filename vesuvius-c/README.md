@@ -41,7 +41,7 @@ https://github.com/user-attachments/assets/e4b90221-744a-46d6-a7c2-cc3f1685fd54
 
 The library fetches scroll data from the Vesuvius Challenge [data server](https://dl.ash2txt.org) in the background. Only the necessary volume chunks are requested, and on-disk caching is used to store downloads between program invocations and avoid re-downloading identical files.
 
-For a similar library in Python, see [vesuvius](https://github.com/ScrollPrize/vesuvius).
+For a similar library in Python, see [vesuvius](https://github.com/ScrollPrize/villa/tree/main/vesuvius).
 
 > ⚠️ `vesuvius-c`  is in beta and the interface may change. Please feel free to reach out with development ideas.
 
