@@ -1571,13 +1571,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     moveExistingDockToSegment(ui.dockWidgetSegmentation, Qt::RightDockWidgetArea);
     moveExistingDockToSegment(ui.dockWidgetDistanceTransform, Qt::RightDockWidgetArea);
     moveExistingDockToSegment(ui.dockWidgetViewerControls, Qt::LeftDockWidgetArea);
-    for (QDockWidget* dock : {ui.dockWidgetPreprocessing,
-                              ui.dockWidgetNormalVis,
+    for (QDockWidget* dock : {ui.dockWidgetNormalVis,
                               ui.dockWidgetView,
                               ui.dockWidgetOverlay,
                               ui.dockWidgetRenderSettings,
-                              ui.dockWidgetComposite,
-                              ui.dockWidgetPostprocessing}) {
+                              ui.dockWidgetComposite}) {
         moveExistingDockToSegment(dock, Qt::LeftDockWidgetArea);
     }
 
@@ -2237,13 +2235,11 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(ui.dockWidgetSegmentation);
     addDock(ui.dockWidgetDistanceTransform);
     addDock(ui.dockWidgetViewerControls);
-    addDock(ui.dockWidgetPreprocessing);
     addDock(ui.dockWidgetNormalVis);
     addDock(ui.dockWidgetView);
     addDock(ui.dockWidgetOverlay);
     addDock(ui.dockWidgetRenderSettings);
     addDock(ui.dockWidgetComposite);
-    addDock(ui.dockWidgetPostprocessing);
     addDock(_lasagnaDock);
     addDock(_atlasOverviewDock);
     addDock(_atlasSearchDock);
@@ -6225,59 +6221,6 @@ void CWindow::CreateWidgets(void)
         .materialLabel = ui.lblMaterial,
         .material = ui.spinMaterial,
         .reverseDirection = ui.chkReverseDirection,
-        .methodScaleLabel = ui.lblMethodScale,
-        .methodScale = ui.sliderMethodScale,
-        .methodScaleValue = ui.lblMethodScaleValue,
-        .methodParamLabel = ui.lblMethodParam,
-        .methodParam = ui.sliderMethodParam,
-        .methodParamValue = ui.lblMethodParamValue,
-        .blExtinctionLabel = ui.lblBLExtinction,
-        .blExtinction = ui.spinBLExtinction,
-        .blEmissionLabel = ui.lblBLEmission,
-        .blEmission = ui.spinBLEmission,
-        .blAmbientLabel = ui.lblBLAmbient,
-        .blAmbient = ui.spinBLAmbient,
-        .lightingEnabled = ui.chkLightingEnabled,
-        .lightAzimuthLabel = ui.lblLightAzimuth,
-        .lightAzimuth = ui.spinLightAzimuth,
-        .lightElevationLabel = ui.lblLightElevation,
-        .lightElevation = ui.spinLightElevation,
-        .lightDiffuseLabel = ui.lblLightDiffuse,
-        .lightDiffuse = ui.spinLightDiffuse,
-        .lightAmbientLabel = ui.lblLightAmbient,
-        .lightAmbient = ui.spinLightAmbient,
-        .useVolumeGradients = ui.chkUseVolumeGradients,
-        .shadowStepsLabel = ui.lblShadowSteps,
-        .shadowSteps = ui.spinShadowSteps,
-        .rakingEnabled = ui.chkRakingEnabled,
-        .rakingAzimuthLabel = ui.lblRakingAzimuth,
-        .rakingAzimuth = ui.spinRakingAzimuth,
-        .rakingElevationLabel = ui.lblRakingElevation,
-        .rakingElevation = ui.spinRakingElevation,
-        .rakingStrengthLabel = ui.lblRakingStrength,
-        .rakingStrength = ui.spinRakingStrength,
-        .rakingDepthLabel = ui.lblRakingDepth,
-        .rakingDepthScale = ui.spinRakingDepthScale,
-        .preNormalizeLayers = ui.chkPreNormalizeLayers,
-        .preHistEqLayers = ui.chkPreHistEqLayers,
-        .preTfEnabled = ui.chkPreTfEnabled,
-        .preTfX1 = ui.spinPreTfX1,
-        .preTfY1 = ui.spinPreTfY1,
-        .preTfKnot2Label = ui.lblPreTfKnot2,
-        .preTfX2 = ui.spinPreTfX2,
-        .preTfY2 = ui.spinPreTfY2,
-        .postTfEnabled = ui.chkPostTfEnabled,
-        .postTfX1 = ui.spinPostTfX1,
-        .postTfY1 = ui.spinPostTfY1,
-        .postTfKnot2Label = ui.lblPostTfKnot2,
-        .postTfX2 = ui.spinPostTfX2,
-        .postTfY2 = ui.spinPostTfY2,
-        .dvrAmbientLabel = ui.lblDvrAmbient,
-        .dvrAmbient = ui.spinDvrAmbient,
-        .pbrRoughnessLabel = ui.lblPbrRoughness,
-        .pbrRoughness = ui.spinPbrRoughness,
-        .pbrMetallicLabel = ui.lblPbrMetallic,
-        .pbrMetallic = ui.spinPbrMetallic,
         .planeCompositeXY = ui.chkPlaneCompositeXY,
         .planeCompositeXZ = ui.chkPlaneCompositeXZ,
         .planeCompositeYZ = ui.chkPlaneCompositeYZ,
@@ -6293,22 +6236,6 @@ void CWindow::CreateWidgets(void)
         .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
         .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
         .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
-        .preprocessingScrollArea = ui.scrollAreaPreprocessing,
-        .preprocessingContents = ui.dockWidgetPreprocessingContents,
-        .isoCutoff = ui.sliderIsoCutoff,
-        .isoCutoffValue = ui.lblIsoCutoffValue,
-        .postprocessingScrollArea = ui.scrollAreaPostprocessing,
-        .postprocessingContents = ui.dockWidgetPostprocessingContents,
-        .baseColormap = ui.baseColormapSelect,
-        .stretchValuesPost = ui.chkStretchValuesPost,
-        .removeSmallComponents = ui.chkRemoveSmallComponents,
-        .minComponentSizeLabel = ui.lblMinComponentSize,
-        .minComponentSize = ui.spinMinComponentSize,
-        .claheEnabled = ui.chkClaheEnabled,
-        .claheClipLimitLabel = ui.lblClaheClipLimit,
-        .claheClipLimit = ui.spinClaheClipLimit,
-        .claheTileSizeLabel = ui.lblClaheTileSize,
-        .claheTileSize = ui.spinClaheTileSize,
         .zoomInButton = ui.btnZoomIn,
         .zoomOutButton = ui.btnZoomOut,
         .volumeWindowContainer = ui.volumeWindowContainer,
@@ -6349,13 +6276,11 @@ void CWindow::CreateWidgets(void)
     _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
 
     auto hideLegacyViewerDocks = [this]() {
-        for (QDockWidget* dock : { ui.dockWidgetPreprocessing,
-                                   ui.dockWidgetNormalVis,
+        for (QDockWidget* dock : { ui.dockWidgetNormalVis,
                                    ui.dockWidgetView,
                                    ui.dockWidgetOverlay,
                                    ui.dockWidgetRenderSettings,
-                                   ui.dockWidgetComposite,
-                                   ui.dockWidgetPostprocessing }) {
+                                   ui.dockWidgetComposite }) {
             if (!dock) {
                 continue;
             }

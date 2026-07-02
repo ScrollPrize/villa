@@ -1486,9 +1486,6 @@ bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
     return !isSupportedStreamingCompositeMethod(_compositeSettings.params.method) ||
            _compositeSettings.params.lightingEnabled ||
            _compositeSettings.params.method == "beerLambert" ||
-           _compositeSettings.postClaheEnabled ||
-           _compositeSettings.postRakingEnabled ||
-           _compositeSettings.postRemoveSmallComponents ||
            _compositeSettings.useVolumeGradients;
 }
 
@@ -1934,9 +1931,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method) ||
                ctx.compositeSettings.params.lightingEnabled ||
                ctx.compositeSettings.params.method == "beerLambert" ||
-               ctx.compositeSettings.postClaheEnabled ||
-               ctx.compositeSettings.postRakingEnabled ||
-               ctx.compositeSettings.postRemoveSmallComponents ||
                ctx.compositeSettings.useVolumeGradients;
     };
 
