@@ -28,7 +28,6 @@ public:
         std::string segmentId;
         std::string segmentLongId;
         std::filesystem::path localPath;
-        bool singleChannel{false};
     };
 
     explicit InkDetectionOverlayController(CState* state, QObject* parent = nullptr);

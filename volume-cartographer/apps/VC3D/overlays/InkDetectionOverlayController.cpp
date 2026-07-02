@@ -242,8 +242,6 @@ void InkDetectionOverlayController::refreshAvailableDetections()
             option.segmentId = entry.segmentId;
             option.segmentLongId = entry.segmentLongId;
             option.localPath = canonical;
-            const cv::Mat probe = cv::imread(canonical.string(), cv::IMREAD_UNCHANGED);
-            option.singleChannel = imageLooksSingleChannel(probe);
             next.push_back(std::move(option));
         }
     }
