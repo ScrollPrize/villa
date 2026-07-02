@@ -58,6 +58,7 @@ constexpr double kFocusPointFilterRadius = 10.0;
 constexpr double kZRangeFilterLowerDefault = 0.0;
 constexpr double kZRangeFilterUpperDefault = 1000000.0;
 constexpr auto kSurfaceColumnSettingsGroup = "surface_panel/columns";
+constexpr auto kCurrentOnlyFilterSettingsKey = "surface_panel/filters/current_only";
 
 bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
 {
@@ -1156,6 +1157,8 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
         _filters.currentOnly->setText(tr("Current Segment Only"));
         _filters.currentOnly->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
         _filters.currentOnly->setMinimumWidth(_filters.currentOnly->sizeHint().width());
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _filters.currentOnly->setChecked(settings.value(kCurrentOnlyFilterSettingsKey, false).toBool());
         _filters.currentOnly->show();
     }
 
@@ -1514,7 +1517,13 @@ void SurfacePanelController::connectFilterSignals()
     connectToggle(_filters.noDefective);
     connectToggle(_filters.hideUnapproved);
     connectToggle(_filters.inspectOnly);
-    connectToggle(_filters.currentOnly);
+    if (_filters.currentOnly) {
+        connect(_filters.currentOnly, &QCheckBox::toggled, this, [this](bool checked) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(kCurrentOnlyFilterSettingsKey, checked);
+            applyFilters();
+        });
+    }
 
     if (_filters.partialReview) {
         connect(_filters.partialReview, &QCheckBox::toggled, this, [this](bool checked) {
