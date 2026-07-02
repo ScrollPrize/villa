@@ -71,8 +71,8 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'firstscroll' },
         { type: 'doc', id: 'grandprize' },
-        { type: 'doc', id: 'firstletters' },
         { type: 'doc', id: 'grand_prize' },
+        { type: 'doc', id: 'firstletters' },
         { type: 'doc', id: 'community_projects' },
       ],
     },
