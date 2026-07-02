@@ -62,6 +62,7 @@ public:
     };
 
     struct TagUiRefs {
+        DropdownChecklistButton* dropdown{nullptr};
         QCheckBox* approved{nullptr};
         QCheckBox* defective{nullptr};
         QCheckBox* reviewed{nullptr};
@@ -176,6 +177,7 @@ private:
     void onTagCheckboxToggled();
     void applyFiltersInternal();
     void updateFilterSummary();
+    void updateTagSummary();
     void updateTagCheckboxStatesForSurface(QuadSurface* surface);
     void setTagCheckboxEnabled(bool enabledApproved,
                                bool enabledDefective,

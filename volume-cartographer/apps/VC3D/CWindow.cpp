@@ -112,6 +112,7 @@
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
+#include "elements/DropdownChecklistButton.hpp"
 #include "MenuActionController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
@@ -6386,11 +6387,13 @@ void CWindow::CreateWidgets(void)
     filterUi.zUpperBound = spinSurfaceZUpperBound;
     _surfacePanel->configureFilters(filterUi, _state->pointCollection());
 
+    auto* tagDropdown = ui.btnTagDropdown;
     SurfacePanelController::TagUiRefs tagUi{
-        .approved = ui.chkApproved,
-        .defective = ui.chkDefective,
-        .reviewed = ui.chkReviewed,
-        .inspect = ui.chkInspect,
+        .dropdown = tagDropdown,
+        .approved = tagDropdown->addOption(tr("Approved"), QStringLiteral("chkApproved")),
+        .defective = tagDropdown->addOption(tr("Defective"), QStringLiteral("chkDefective")),
+        .reviewed = tagDropdown->addOption(tr("Reviewed"), QStringLiteral("chkReviewed")),
+        .inspect = tagDropdown->addOption(tr("Inspect"), QStringLiteral("chkInspect")),
     };
     _surfacePanel->configureTags(tagUi);
 

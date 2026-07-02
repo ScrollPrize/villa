@@ -1166,8 +1166,13 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
 void SurfacePanelController::configureTags(const TagUiRefs& tags)
 {
     _tags = tags;
+    if (_tags.dropdown) {
+        _tags.dropdown->setText(tr("Tags"));
+        _tags.dropdown->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    }
     connectTagSignals();
     resetTagUi();
+    updateTagSummary();
 }
 
 void SurfacePanelController::refreshPointSetFilterOptions()
@@ -1211,6 +1216,7 @@ void SurfacePanelController::resetTagUi()
     resetBox(_tags.defective);
     resetBox(_tags.reviewed);
     resetBox(_tags.inspect);
+    updateTagSummary();
 }
 
 bool SurfacePanelController::isCurrentOnlyFilterEnabled() const
@@ -1727,6 +1733,33 @@ void SurfacePanelController::updateFilterSummary()
         _filters.dropdown->fontMetrics().horizontalAdvance(label) + 32);
 }
 
+void SurfacePanelController::updateTagSummary()
+{
+    if (!_tags.dropdown) {
+        return;
+    }
+
+    int activeTags = 0;
+    const auto countIfChecked = [&activeTags](QCheckBox* box) {
+        if (box && box->isChecked()) {
+            ++activeTags;
+        }
+    };
+
+    countIfChecked(_tags.approved);
+    countIfChecked(_tags.defective);
+    countIfChecked(_tags.reviewed);
+    countIfChecked(_tags.inspect);
+
+    QString label = tr("Tags");
+    if (activeTags > 0) {
+        label += tr(" (%1)").arg(activeTags);
+    }
+    _tags.dropdown->setText(label);
+    _tags.dropdown->setMinimumWidth(
+        _tags.dropdown->fontMetrics().horizontalAdvance(label) + 32);
+}
+
 void SurfacePanelController::onTagCheckboxToggled()
 {
     if (!_ui.treeWidget) {
@@ -1797,6 +1830,7 @@ void SurfacePanelController::onTagCheckboxToggled()
     }
 
     applyFilters();
+    updateTagSummary();
 }
 
 void SurfacePanelController::applyFiltersInternal()
@@ -2083,6 +2117,7 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
 
     if (!surface) {
         setTagCheckboxEnabled(false, false, false, false);
+        updateTagSummary();
         return;
     }
 
@@ -2090,6 +2125,7 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
 
     if (surface->meta.is_null()) {
         setTagCheckboxEnabled(false, false, true, true);
+        updateTagSummary();
         return;
     }
 
@@ -2109,6 +2145,7 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
     applyTag(_tags.defective, "defective");
     applyTag(_tags.reviewed, "reviewed");
     applyTag(_tags.inspect, "inspect");
+    updateTagSummary();
 }
 
 void SurfacePanelController::setTagCheckboxEnabled(bool enabledApproved,
