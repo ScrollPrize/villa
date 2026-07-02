@@ -21,6 +21,7 @@
 #include <QCursor>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QFrame>
 #include <QShowEvent>
 #include <QGraphicsEllipseItem>
 #include <QGraphicsItem>
@@ -736,6 +737,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     , _genSurfaceCache(std::make_shared<GeneratedSurfaceCache>())
 {
     _view = new CVolumeViewerView(this);
+    _view->setFrameShape(QFrame::NoFrame);
     _view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     _view->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     _view->setTransformationAnchor(QGraphicsView::NoAnchor);
@@ -783,6 +785,8 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     reloadPerfSettings();
 
     auto* layout = new QVBoxLayout;
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
     layout->addWidget(_view);
     setLayout(layout);
 

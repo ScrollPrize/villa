@@ -58,9 +58,10 @@
 #include <QVector>
 #include <QLoggingCategory>
 #include <QDebug>
+#include <QFrame>
+#include <QMouseEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <QSplitter>
 #include <QMenu>
 #include <QMainWindow>
 #include <QTabWidget>
@@ -150,9 +151,8 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 namespace
 {
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
-constexpr auto MAIN_VIEWER_OUTER_SPLITTER_SETTING = "mainWin/main_viewer_outer_splitter";
-constexpr auto MAIN_VIEWER_TOP_SPLITTER_SETTING = "mainWin/main_viewer_top_splitter";
-constexpr auto MAIN_VIEWER_BOTTOM_SPLITTER_SETTING = "mainWin/main_viewer_bottom_splitter";
+constexpr auto MAIN_VIEWER_SPLIT_X_SETTING = "mainWin/main_viewer_split_x";
+constexpr auto MAIN_VIEWER_SPLIT_Y_SETTING = "mainWin/main_viewer_split_y";
 constexpr auto ATLAS_INTERNAL_SURFACE_NAME = "__atlas_workspace_base_mesh";
 constexpr int ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS = 0;
 constexpr int ATLAS_SEARCH_MODE_NON_ATLAS_ONLY = 1;
@@ -208,6 +208,224 @@ protected:
 
 private:
     DockMenuBuilder _dockMenuBuilder;
+};
+
+class ViewerSplitGrid : public QWidget
+{
+public:
+    explicit ViewerSplitGrid(QWidget* parent = nullptr)
+        : QWidget(parent)
+    {
+        setContentsMargins(0, 0, 0, 0);
+        _topColumnHandle = makeHandle(Qt::SplitHCursor);
+        _bottomColumnHandle = makeHandle(Qt::SplitHCursor);
+        _leftRowHandle = makeHandle(Qt::SplitVCursor);
+        _rightRowHandle = makeHandle(Qt::SplitVCursor);
+        _centerHandle = makeHandle(Qt::SizeAllCursor);
+    }
+
+    void setViewer(int index, QWidget* widget)
+    {
+        if (index < 0 || index >= 4 || !widget) {
+            return;
+        }
+        _viewers[index] = widget;
+        widget->setParent(this);
+        widget->show();
+        layoutChildren();
+    }
+
+    void resetSplits()
+    {
+        _splitX = 0.5;
+        _splitY = 0.5;
+        layoutChildren();
+        notifySplitChanged();
+    }
+
+    void setSplits(double splitX, double splitY)
+    {
+        _splitX = std::clamp(splitX, 0.1, 0.9);
+        _splitY = std::clamp(splitY, 0.1, 0.9);
+        layoutChildren();
+    }
+
+    double splitX() const { return _splitX; }
+    double splitY() const { return _splitY; }
+
+    std::function<void()> onSplitChanged;
+
+protected:
+    void resizeEvent(QResizeEvent*) override
+    {
+        layoutChildren();
+    }
+
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        auto handle = handleKind(watched);
+        if (handle == HandleKind::None) {
+            return QWidget::eventFilter(watched, event);
+        }
+
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() != Qt::LeftButton) {
+                return false;
+            }
+            _dragging = handle;
+            _dragStartGlobal = mouse->globalPosition().toPoint();
+            _dragStartSplitX = splitXPx();
+            _dragStartSplitY = splitYPx();
+            event->accept();
+            return true;
+        }
+
+        if (event->type() == QEvent::MouseMove && _dragging != HandleKind::None) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            const QPoint delta = mouse->globalPosition().toPoint() - _dragStartGlobal;
+            const int widthPx = std::max(1, width());
+            const int heightPx = std::max(1, height());
+            if (_dragging == HandleKind::Column || _dragging == HandleKind::Both) {
+                _splitX = static_cast<double>(clampSplitPx(_dragStartSplitX + delta.x(), widthPx)) / widthPx;
+            }
+            if (_dragging == HandleKind::Row || _dragging == HandleKind::Both) {
+                _splitY = static_cast<double>(clampSplitPx(_dragStartSplitY + delta.y(), heightPx)) / heightPx;
+            }
+            layoutChildren();
+            notifySplitChanged();
+            event->accept();
+            return true;
+        }
+
+        if (event->type() == QEvent::MouseButtonRelease && _dragging != HandleKind::None) {
+            _dragging = HandleKind::None;
+            notifySplitChanged();
+            event->accept();
+            return true;
+        }
+
+        return QWidget::eventFilter(watched, event);
+    }
+
+private:
+    enum class HandleKind {
+        None,
+        Column,
+        Row,
+        Both,
+    };
+
+    QFrame* makeHandle(Qt::CursorShape cursor)
+    {
+        auto* handle = new QFrame(this);
+        handle->setFrameShape(QFrame::NoFrame);
+        handle->setCursor(cursor);
+        handle->setAutoFillBackground(true);
+        handle->setStyleSheet(QStringLiteral("background: rgba(80, 80, 80, 96);"));
+        handle->installEventFilter(this);
+        handle->show();
+        return handle;
+    }
+
+    HandleKind handleKind(QObject* object) const
+    {
+        if (object == _topColumnHandle || object == _bottomColumnHandle) {
+            return HandleKind::Column;
+        }
+        if (object == _leftRowHandle || object == _rightRowHandle) {
+            return HandleKind::Row;
+        }
+        if (object == _centerHandle) {
+            return HandleKind::Both;
+        }
+        return HandleKind::None;
+    }
+
+    int splitXPx() const
+    {
+        return clampSplitPx(static_cast<int>(std::lround(_splitX * width())), width());
+    }
+
+    int splitYPx() const
+    {
+        return clampSplitPx(static_cast<int>(std::lround(_splitY * height())), height());
+    }
+
+    int clampSplitPx(int value, int extent) const
+    {
+        const int halfHandle = handleWidth() / 2;
+        const int minValue = std::min(std::max(_minPanePx + halfHandle, halfHandle), extent / 2);
+        const int maxValue = std::max(minValue, extent - minValue);
+        return std::clamp(value, minValue, maxValue);
+    }
+
+    int handleWidth() const
+    {
+        return 3;
+    }
+
+    void layoutChildren()
+    {
+        const int w = width();
+        const int h = height();
+        if (w <= 0 || h <= 0) {
+            return;
+        }
+
+        const int handle = handleWidth();
+        const int half = handle / 2;
+        const int splitX = splitXPx();
+        const int splitY = splitYPx();
+
+        setViewerGeometry(0, QRect(0, 0, splitX, splitY));
+        setViewerGeometry(1, QRect(splitX, 0, w - splitX, splitY));
+        setViewerGeometry(2, QRect(0, splitY, splitX, h - splitY));
+        setViewerGeometry(3, QRect(splitX, splitY, w - splitX, h - splitY));
+
+        _topColumnHandle->setGeometry(splitX - half, 0, handle, splitY);
+        _bottomColumnHandle->setGeometry(splitX - half, splitY, handle, h - splitY);
+        _leftRowHandle->setGeometry(0, splitY - half, splitX, handle);
+        _rightRowHandle->setGeometry(splitX, splitY - half, w - splitX, handle);
+        _centerHandle->setGeometry(splitX - half, splitY - half, handle, handle);
+
+        for (auto* handleWidget : {_topColumnHandle,
+                                   _bottomColumnHandle,
+                                   _leftRowHandle,
+                                   _rightRowHandle,
+                                   _centerHandle}) {
+            handleWidget->raise();
+        }
+    }
+
+    void setViewerGeometry(int index, const QRect& rect)
+    {
+        if (index < 0 || index >= 4 || !_viewers[index]) {
+            return;
+        }
+        _viewers[index]->setGeometry(rect.normalized());
+    }
+
+    void notifySplitChanged()
+    {
+        if (onSplitChanged) {
+            onSplitChanged();
+        }
+    }
+
+    QWidget* _viewers[4] = {};
+    QFrame* _topColumnHandle = nullptr;
+    QFrame* _bottomColumnHandle = nullptr;
+    QFrame* _leftRowHandle = nullptr;
+    QFrame* _rightRowHandle = nullptr;
+    QFrame* _centerHandle = nullptr;
+    double _splitX = 0.5;
+    double _splitY = 0.5;
+    static constexpr int _minPanePx = 80;
+    HandleKind _dragging = HandleKind::None;
+    QPoint _dragStartGlobal;
+    int _dragStartSplitX = 0;
+    int _dragStartSplitY = 0;
 };
 
 QString atlasSearchIdListString(const std::vector<uint64_t>& ids)
@@ -2293,14 +2511,8 @@ VolumeViewerBase* CWindow::newConnectedViewerInWidget(std::string surfaceName, Q
         return nullptr;
     }
 
-    if (auto* viewerObject = viewer->asQObject()) {
+    if (auto* viewerObject = viewer->asQObject())
         viewerObject->setProperty("vc_viewer_label", title);
-        connect(viewerObject, &QObject::destroyed, this, [this, viewer]() {
-            if (_activeBaseViewer == viewer) {
-                _activeBaseViewer = nullptr;
-            }
-        });
-    }
 
     if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
         configureChunkedViewerConnections(chunkedViewer);
@@ -2353,13 +2565,21 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     }
 
     if (auto* graphicsView = viewer->graphicsView()) {
-        auto markActiveViewer = [this, viewer]() {
-            _activeBaseViewer = viewer;
-        };
-        connect(graphicsView, &CVolumeViewerView::sendMousePress, this, markActiveViewer, Qt::UniqueConnection);
-        connect(graphicsView, &CVolumeViewerView::sendMouseDoubleClick, this, markActiveViewer, Qt::UniqueConnection);
-        connect(graphicsView, &CVolumeViewerView::sendZoom, this, markActiveViewer, Qt::UniqueConnection);
-        connect(graphicsView, &CVolumeViewerView::sendCursorMove, this, markActiveViewer, Qt::UniqueConnection);
+        if (!viewer->property("vc_active_tracker_bound").toBool()) {
+            auto markActiveViewer = [this, viewer]() {
+                _activeBaseViewer = viewer;
+            };
+            connect(graphicsView, &CVolumeViewerView::sendMousePress, this, markActiveViewer);
+            connect(graphicsView, &CVolumeViewerView::sendMouseDoubleClick, this, markActiveViewer);
+            connect(graphicsView, &CVolumeViewerView::sendZoom, this, markActiveViewer);
+            connect(graphicsView, &CVolumeViewerView::sendCursorMove, this, markActiveViewer);
+            connect(viewer, &QObject::destroyed, this, [this, viewer]() {
+                if (_activeBaseViewer == viewer) {
+                    _activeBaseViewer = nullptr;
+                }
+            });
+            viewer->setProperty("vc_active_tracker_bound", true);
+        }
         if (!viewer->property("vc_annotation_context_bound").toBool()) {
             connect(graphicsView,
                     &CVolumeViewerView::sendAnnotationContextMenuRequested,
@@ -2691,6 +2911,51 @@ VolumeViewerBase* CWindow::activeBaseViewer() const
         return nullptr;
     }
     return baseViewerFromWidget(subWindow->widget());
+}
+
+void CWindow::resetSegmentationViews()
+{
+    auto* viewerGrid = ui.tabSegment ? ui.tabSegment->findChild<ViewerSplitGrid*>(QStringLiteral("mainViewerSplitGrid")) : nullptr;
+    if (!viewerGrid) {
+        return;
+    }
+
+    auto ensureDefaultViewer = [this, viewerGrid](const std::string& surfaceName,
+                                                  const QString& title,
+                                                  const std::set<std::string>& intersects) -> VolumeViewerBase* {
+        if (_viewerManager) {
+            for (auto* viewer : _viewerManager->baseViewers()) {
+                auto* viewerWidget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+                if (viewer && viewerWidget && viewer->surfName() == surfaceName && viewerWidget->parentWidget() == viewerGrid) {
+                    return viewer;
+                }
+            }
+        }
+
+        auto* viewer = newConnectedViewerInWidget(surfaceName, title, viewerGrid);
+        if (viewer) {
+            viewer->setIntersects(intersects);
+        }
+        return viewer;
+    };
+
+    auto* surfaceViewer = ensureDefaultViewer("segmentation", tr("Surface"), {"seg xz", "seg yz"});
+    auto* xyViewer = ensureDefaultViewer("xy plane", tr("XY"), {"segmentation"});
+    auto* xzViewer = ensureDefaultViewer("seg xz", tr("XZ"), {"segmentation"});
+    auto* yzViewer = ensureDefaultViewer("seg yz", tr("YZ"), {"segmentation"});
+
+    viewerGrid->setViewer(0, surfaceViewer ? qobject_cast<QWidget*>(surfaceViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(1, xyViewer ? qobject_cast<QWidget*>(xyViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(2, xzViewer ? qobject_cast<QWidget*>(xzViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(3, yzViewer ? qobject_cast<QWidget*>(yzViewer->asQObject()) : nullptr);
+
+    for (auto* viewer : {surfaceViewer, xzViewer, xyViewer, yzViewer}) {
+        if (auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr) {
+            widget->show();
+        }
+    }
+
+    viewerGrid->resetSplits();
 }
 
 void CWindow::clearSurfaceSelection()
@@ -5451,82 +5716,23 @@ void CWindow::CreateWidgets(void)
     aWidgetLayout->setSpacing(0);
     ui.tabSegment->setLayout(aWidgetLayout);
 
-    auto* resetViewersButton = new QPushButton(tr("Reset viewers"), ui.tabSegment);
-    resetViewersButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
-    aWidgetLayout->addWidget(resetViewersButton, 0, Qt::AlignLeft);
-
     mdiArea = nullptr;
 
-    auto ensureDefaultViewer = [this](const std::string& surfaceName,
-                                      const QString& title,
-                                      const std::set<std::string>& intersects,
-                                      QWidget* parent) -> VolumeViewerBase* {
-        if (_viewerManager) {
-            for (auto* viewer : _viewerManager->baseViewers()) {
-                auto* viewerWidget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
-                if (viewer && viewerWidget && viewer->surfName() == surfaceName && viewerWidget->parentWidget() == parent) {
-                    return viewer;
-                }
-            }
-        }
-
-        auto* viewer = newConnectedViewerInWidget(surfaceName, title, parent);
-        if (viewer)
-            viewer->setIntersects(intersects);
-        return viewer;
-    };
-
-    auto* outerViewerSplitter = new QSplitter(Qt::Vertical, ui.tabSegment);
-    outerViewerSplitter->setObjectName(QStringLiteral("mainViewerOuterSplitter"));
-    outerViewerSplitter->setChildrenCollapsible(false);
-    outerViewerSplitter->setHandleWidth(6);
-    aWidgetLayout->addWidget(outerViewerSplitter, 1);
-
-    auto* topViewerSplitter = new QSplitter(Qt::Horizontal, outerViewerSplitter);
-    topViewerSplitter->setObjectName(QStringLiteral("mainViewerTopSplitter"));
-    topViewerSplitter->setChildrenCollapsible(false);
-    topViewerSplitter->setHandleWidth(6);
-
-    auto* bottomViewerSplitter = new QSplitter(Qt::Horizontal, outerViewerSplitter);
-    bottomViewerSplitter->setObjectName(QStringLiteral("mainViewerBottomSplitter"));
-    bottomViewerSplitter->setChildrenCollapsible(false);
-    bottomViewerSplitter->setHandleWidth(6);
-
-    auto resetDefaultViewers = [this, ensureDefaultViewer, outerViewerSplitter, topViewerSplitter, bottomViewerSplitter]() {
-        auto* xzViewer = ensureDefaultViewer("seg xz", tr("XZ"), {"segmentation"}, topViewerSplitter);
-        auto* yzViewer = ensureDefaultViewer("seg yz", tr("YZ"), {"segmentation"}, topViewerSplitter);
-        auto* xyViewer = ensureDefaultViewer("xy plane", tr("XY"), {"segmentation"}, bottomViewerSplitter);
-        auto* surfaceViewer = ensureDefaultViewer("segmentation", tr("Surface"), {"seg xz", "seg yz"}, bottomViewerSplitter);
-
-        for (auto* viewer : {xzViewer, yzViewer, xyViewer, surfaceViewer}) {
-            if (auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr) {
-                widget->show();
-            }
-        }
-
-        outerViewerSplitter->setSizes({1, 1});
-        topViewerSplitter->setSizes({1, 1});
-        bottomViewerSplitter->setSizes({1, 1});
-    };
-
-    connect(resetViewersButton, &QPushButton::clicked, this, resetDefaultViewers);
+    auto* viewerGrid = new ViewerSplitGrid(ui.tabSegment);
+    viewerGrid->setObjectName(QStringLiteral("mainViewerSplitGrid"));
+    aWidgetLayout->addWidget(viewerGrid, 1);
 
     {
-        resetDefaultViewers();
-        outerViewerSplitter->restoreState(settings.value(MAIN_VIEWER_OUTER_SPLITTER_SETTING).toByteArray());
-        topViewerSplitter->restoreState(settings.value(MAIN_VIEWER_TOP_SPLITTER_SETTING).toByteArray());
-        bottomViewerSplitter->restoreState(settings.value(MAIN_VIEWER_BOTTOM_SPLITTER_SETTING).toByteArray());
+        resetSegmentationViews();
+        viewerGrid->setSplits(settings.value(MAIN_VIEWER_SPLIT_X_SETTING, 0.5).toDouble(),
+                              settings.value(MAIN_VIEWER_SPLIT_Y_SETTING, 0.5).toDouble());
     }
 
-    auto saveMainViewerSplitterState = [outerViewerSplitter, topViewerSplitter, bottomViewerSplitter]() {
+    viewerGrid->onSplitChanged = [viewerGrid]() {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue(MAIN_VIEWER_OUTER_SPLITTER_SETTING, outerViewerSplitter->saveState());
-        settings.setValue(MAIN_VIEWER_TOP_SPLITTER_SETTING, topViewerSplitter->saveState());
-        settings.setValue(MAIN_VIEWER_BOTTOM_SPLITTER_SETTING, bottomViewerSplitter->saveState());
+        settings.setValue(MAIN_VIEWER_SPLIT_X_SETTING, viewerGrid->splitX());
+        settings.setValue(MAIN_VIEWER_SPLIT_Y_SETTING, viewerGrid->splitY());
     };
-    connect(outerViewerSplitter, &QSplitter::splitterMoved, this, saveMainViewerSplitterState);
-    connect(topViewerSplitter, &QSplitter::splitterMoved, this, saveMainViewerSplitterState);
-    connect(bottomViewerSplitter, &QSplitter::splitterMoved, this, saveMainViewerSplitterState);
 
     if (_fiberSliceWorkspaceWindow) {
         _fiberSliceMdiArea = new QMdiArea(_fiberSliceWorkspaceWindow);

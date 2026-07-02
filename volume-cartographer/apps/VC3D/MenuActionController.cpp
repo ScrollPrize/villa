@@ -1047,10 +1047,7 @@ void MenuActionController::resetSegmentationViews()
         return;
     }
 
-    for (auto* sub : _window->mdiArea->subWindowList()) {
-        sub->showNormal();
-    }
-    _window->mdiArea->tileSubWindows();
+    _window->resetSegmentationViews();
 }
 
 void MenuActionController::toggleConsoleOutput()

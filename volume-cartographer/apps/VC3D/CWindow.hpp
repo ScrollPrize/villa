@@ -240,6 +240,7 @@ private slots:
     std::vector<QComboBox*> volumeSelectionControls() const;
     void connectVolumeSelector(QComboBox* selector);
     void clearSurfaceSelection();
+    void resetSegmentationViews();
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
     // Attaches the render-bench recorder once a volume+segment are active (no-op
