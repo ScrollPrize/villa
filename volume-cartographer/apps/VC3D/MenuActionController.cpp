@@ -122,12 +122,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _detachEntryAct = new QAction(QObject::tr("&Detach..."), this);
     connect(_detachEntryAct, &QAction::triggered, this, &MenuActionController::detachEntry);
 
-    _setOutputSegmentsAct = new QAction(QObject::tr("Set Output Segments..."), this);
-    connect(_setOutputSegmentsAct, &QAction::triggered, this, &MenuActionController::setOutputSegments);
-
-    _convertLegacyAct = new QAction(QObject::tr("Convert Legacy Volpkg..."), this);
-    connect(_convertLegacyAct, &QAction::triggered, this, &MenuActionController::convertLegacyVolpkg);
-
     _openAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogOpenButton), QObject::tr("&Open Project..."), this);
     _openAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::OpenVolpkg));
     connect(_openAct, &QAction::triggered, this, &MenuActionController::openVolpkg);
@@ -173,9 +167,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _selectionClearAct = new QAction(QObject::tr("Clear"), this);
     connect(_selectionClearAct, &QAction::triggered, this, &MenuActionController::clearSelection);
 
-    _importObjAct = new QAction(QObject::tr("Import OBJ as Patch..."), this);
-    connect(_importObjAct, &QAction::triggered, this, &MenuActionController::importObjAsPatch);
-
     _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
     connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
 
@@ -187,13 +178,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
-    _recalculateFiberScoresAct = new QAction(QObject::tr("Recalc fiber H/V scores"), this);
-    connect(_recalculateFiberScoresAct, &QAction::triggered, this, [qWindow]() {
-        if (qWindow->_lineAnnotationController) {
-            qWindow->_lineAnnotationController->recalculateAllFiberHvClassifications();
-        }
-    });
-
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
@@ -204,9 +188,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_attachSegmentsAct);
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_detachEntryAct);
-    _fileMenu->addAction(_setOutputSegmentsAct);
-    _fileMenu->addSeparator();
-    _fileMenu->addAction(_convertLegacyAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachRemoteZarrAct);
     _fileMenu->addAction(_openDataCatalogAct);
@@ -219,8 +200,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     _fileMenu->addSeparator();
     _fileMenu->addAction(_settingsAct);
-    _fileMenu->addSeparator();
-    _fileMenu->addAction(_importObjAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_exitAct);
 
@@ -239,7 +218,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
-    _actionsMenu->addAction(_recalculateFiberScoresAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);
@@ -606,6 +584,9 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         return false;
     }
     _window->_state->setVpkg(pkg);
+    if (!pkg->path().empty()) {
+        updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));
+    }
 
     _window->refreshCurrentVolumePackageUi(
         QString::fromStdString(result.preferredVolumeId),
@@ -943,8 +924,13 @@ void MenuActionController::showSettingsDialog()
         return;
     }
 
-    auto* dialog = new SettingsDialog(_window);
+    auto* dialog = new SettingsDialog(
+        _window->_state ? _window->_state->vpkg() : nullptr,
+        _window);
     dialog->exec();
+    if (dialog->outputSegmentsChanged()) {
+        _window->refreshCurrentVolumePackageUi(QString(), true);
+    }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,

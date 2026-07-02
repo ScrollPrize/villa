@@ -2226,30 +2226,39 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
         return;
     }
 
-    auto addDock = [menu](QDockWidget* dock) {
+    auto addDock = [](QMenu* targetMenu, QDockWidget* dock) {
         if (dock) {
-            menu->addAction(dock->toggleViewAction());
+            targetMenu->addAction(dock->toggleViewAction());
         }
     };
 
-    addDock(ui.dockWidgetVolumes);
-    addDock(ui.dockWidgetSegmentation);
-    addDock(ui.dockWidgetDistanceTransform);
-    addDock(ui.dockWidgetViewerControls);
-    addDock(ui.dockWidgetNormalVis);
-    addDock(ui.dockWidgetView);
-    addDock(ui.dockWidgetOverlay);
-    addDock(ui.dockWidgetRenderSettings);
-    addDock(ui.dockWidgetComposite);
-    addDock(_lasagnaDock);
-    addDock(_atlasOverviewDock);
-    addDock(_atlasSearchDock);
-    addDock(_atlasControlDock);
-    addDock(_atlasWorkspaceFiberDock);
-    addDock(_point_collection_widget);
-    addDock(_wrapAnnotationWidget);
-    addDock(_fiberWidget);
-    addDock(_fiberSliceWidget);
+    addDock(menu, ui.dockWidgetVolumes);
+    addDock(menu, ui.dockWidgetSegmentation);
+    addDock(menu, ui.dockWidgetDistanceTransform);
+    addDock(menu, ui.dockWidgetViewerControls);
+    addDock(menu, ui.dockWidgetNormalVis);
+    addDock(menu, ui.dockWidgetView);
+    addDock(menu, ui.dockWidgetOverlay);
+    addDock(menu, ui.dockWidgetRenderSettings);
+    addDock(menu, ui.dockWidgetComposite);
+    addDock(menu, _lasagnaDock);
+
+    if (_atlasOverviewDock || _atlasSearchDock || _atlasControlDock || _atlasWorkspaceFiberDock) {
+        auto* atlasMenu = menu->addMenu(tr("Atlas"));
+        addDock(atlasMenu, _atlasOverviewDock);
+        addDock(atlasMenu, _atlasSearchDock);
+        addDock(atlasMenu, _atlasControlDock);
+        addDock(atlasMenu, _atlasWorkspaceFiberDock);
+    }
+
+    addDock(menu, _point_collection_widget);
+    addDock(menu, _wrapAnnotationWidget);
+
+    if (_fiberWidget || _fiberSliceWidget) {
+        auto* fiberMenu = menu->addMenu(tr("Fibers"));
+        addDock(fiberMenu, _fiberWidget);
+        addDock(fiberMenu, _fiberSliceWidget);
+    }
 }
 
 VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
@@ -5995,6 +6004,7 @@ void CWindow::CreateWidgets(void)
     if (_fiberSliceWorkspaceWindow) {
         _fiberSliceWidget = new CFiberWidget(_fiberSliceWorkspaceWindow);
         _fiberSliceWidget->setObjectName(QStringLiteral("fiberSliceDock"));
+        _fiberSliceWidget->setWindowTitle(tr("Fiber Slice Fibers"));
         _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
     }
 
