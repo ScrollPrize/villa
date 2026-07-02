@@ -2,6 +2,8 @@
 
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
+#include "OpenDataCatalogWindow.hpp"
+#include "OpenDataSampleProject.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -36,17 +38,21 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QMetaObject>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProcess>
+#include <QProgressDialog>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStringList>
@@ -64,6 +70,7 @@
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -72,6 +79,12 @@ namespace
 constexpr int kMaxStoredRemoteUrls = 10;
 QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
+
+struct OpenDataOpenTaskResult {
+    std::shared_ptr<VolumePkg> pkg;
+    vc3d::opendata::OpenDataSampleProjectResult result;
+    QString error;
+};
 
 } // namespace
 
@@ -121,6 +134,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
     connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
+
+    _openDataCatalogAct = new QAction(QObject::tr("Open Data Catalog..."), this);
+    connect(_openDataCatalogAct, &QAction::triggered, this, &MenuActionController::showOpenDataCatalog);
 
     _settingsAct = new QAction(QObject::tr("Settings"), this);
     connect(_settingsAct, &QAction::triggered, this, &MenuActionController::showSettingsDialog);
@@ -193,6 +209,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_convertLegacyAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachRemoteZarrAct);
+    _fileMenu->addAction(_openDataCatalogAct);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent project"), _fileMenu);
     _recentMenu->setEnabled(false);
@@ -439,6 +456,193 @@ void MenuActionController::attachRemoteZarr()
     }
 
     attachRemoteZarrUrl(url.trimmed());
+}
+
+void MenuActionController::showOpenDataCatalog()
+{
+    if (!_window) {
+        return;
+    }
+
+    auto* dialog = new vc3d::opendata::OpenDataCatalogWindow(_window);
+    dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
+        return openOpenDataSample(sample);
+    });
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
+bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)
+{
+    if (!_window || !_window->_state) {
+        return false;
+    }
+
+    if (_window->_state->vpkg()) {
+        QMessageBox prompt(_window);
+        prompt.setWindowTitle(QObject::tr("Open Data Sample"));
+        prompt.setText(QObject::tr("Open sample %1").arg(QString::fromStdString(sample.id)));
+        prompt.setInformativeText(
+            QObject::tr("This will replace the current project."));
+        auto* replaceButton = prompt.addButton(QObject::tr("Replace Project"), QMessageBox::AcceptRole);
+        prompt.addButton(QMessageBox::Cancel);
+        prompt.setDefaultButton(replaceButton);
+        prompt.exec();
+
+        if (prompt.clickedButton() != replaceButton) {
+            return false;
+        }
+    }
+
+    const QString cacheDir = vc3d::remoteCachePath();
+    const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    _window->CloseVolume();
+
+    QPointer<QProgressDialog> progressDialog;
+    if (sampleCopy.tifxyzSegmentCount() > 0) {
+        auto* dialog = new QProgressDialog(
+            QObject::tr("Preparing segment downloads..."),
+            QString(),
+            0,
+            static_cast<int>(sampleCopy.tifxyzSegmentCount()) * 6,
+            _window);
+        dialog->setWindowTitle(QObject::tr("Open Data Sample"));
+        dialog->setCancelButton(nullptr);
+        dialog->setWindowModality(Qt::WindowModal);
+        dialog->setMinimumDuration(0);
+        dialog->setAutoClose(false);
+        dialog->setAutoReset(false);
+        dialog->show();
+        progressDialog = dialog;
+    }
+
+    auto progressCallback =
+        [progressDialog](const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
+            if (!progressDialog) {
+                return;
+            }
+            QMetaObject::invokeMethod(
+                progressDialog.data(),
+                [progressDialog, progress]() {
+                    if (!progressDialog) {
+                        return;
+                    }
+                    const int totalDone = progress.completedSegments + progress.failedSegments;
+                    const QString segment = QString::fromStdString(progress.segmentId);
+                    const QString file = QString::fromStdString(progress.fileName);
+                    QString label = QObject::tr("Downloading segments with %1 worker(s): %2/%3 segments, %4/%5 files.")
+                                        .arg(progress.totalWorkers)
+                                        .arg(totalDone)
+                                        .arg(progress.totalSegments)
+                                        .arg(progress.completedFiles)
+                                        .arg(progress.totalFiles);
+                    if (!segment.isEmpty() && !file.isEmpty()) {
+                        label += QObject::tr("\n%1: %2").arg(segment, file);
+                    } else if (!segment.isEmpty()) {
+                        label += QObject::tr("\n%1").arg(segment);
+                    }
+                    if (progress.failedSegments > 0) {
+                        label += QObject::tr("\nFailures: %1").arg(progress.failedSegments);
+                    }
+                    progressDialog->setMaximum(std::max(progress.totalFiles, 1));
+                    progressDialog->setValue(std::min(progress.completedFiles,
+                                                      std::max(progress.totalFiles, 1)));
+                    progressDialog->setLabelText(label);
+                },
+                Qt::QueuedConnection);
+        };
+
+    QFutureWatcher<OpenDataOpenTaskResult> watcher;
+    QEventLoop loop;
+    QObject::connect(&watcher,
+                     &QFutureWatcher<OpenDataOpenTaskResult>::finished,
+                     &loop,
+                     &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run(
+        [sampleCopy, cacheDir, progressCallback]() mutable {
+            OpenDataOpenTaskResult taskResult;
+            try {
+                taskResult.pkg = vc3d::opendata::createOpenDataSampleProject(
+                    sampleCopy,
+                    cacheDir.toStdString(),
+                    &taskResult.result,
+                    progressCallback);
+            } catch (const std::exception& e) {
+                taskResult.error = QString::fromUtf8(e.what());
+            } catch (...) {
+                taskResult.error = QObject::tr("Unknown error while opening open-data sample.");
+            }
+            return taskResult;
+        }));
+    if (!watcher.isFinished()) {
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+    }
+    OpenDataOpenTaskResult task = watcher.result();
+    if (progressDialog) {
+        progressDialog->close();
+        progressDialog->deleteLater();
+    }
+
+    if (!task.error.isEmpty()) {
+        QMessageBox::warning(
+            _window,
+            QObject::tr("Open Data Sample"),
+            QObject::tr("Failed to open sample %1:\n\n%2")
+                .arg(QString::fromStdString(sampleCopy.id), task.error));
+        return false;
+    }
+
+    vc3d::opendata::OpenDataSampleProjectResult result = std::move(task.result);
+
+    auto pkg = std::move(task.pkg);
+    if (!pkg) {
+        QMessageBox::warning(
+            _window,
+            QObject::tr("Open Data Sample"),
+            QObject::tr("Failed to create sample project for %1.")
+                .arg(QString::fromStdString(sampleCopy.id)));
+        return false;
+    }
+    _window->_state->setVpkg(pkg);
+
+    _window->refreshCurrentVolumePackageUi(
+        QString::fromStdString(result.preferredVolumeId),
+        true);
+    _window->UpdateView();
+
+    QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
+                          .arg(QString::fromStdString(sampleCopy.id))
+                          .arg(result.attachedVolumeEntries)
+                          .arg(result.supportedVolumes);
+    if (sampleCopy.tifxyzSegmentCount() > 0) {
+        message += QObject::tr(" Cached %1 of %2 tifxyz segments; attached %3 segment source(s).")
+                       .arg(result.cachedTifxyzSegments)
+                       .arg(result.supportedTifxyzSegments)
+                       .arg(result.attachedSegmentEntries);
+    }
+    if (_window->statusBar()) {
+        _window->statusBar()->showMessage(message, 7000);
+    }
+
+    if (result.supportedVolumes == 0 ||
+        result.failedVolumes > 0 ||
+        result.failedTifxyzSegments > 0) {
+        QString details;
+        for (const auto& item : result.messages) {
+            if (!details.isEmpty()) {
+                details += QLatin1Char('\n');
+            }
+            details += QString::fromStdString(item);
+        }
+        QMessageBox::information(
+            _window,
+            QObject::tr("Open Data Sample"),
+            details.isEmpty() ? message : message + QObject::tr("\n\n%1").arg(details));
+    }
+
+    return true;
 }
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,

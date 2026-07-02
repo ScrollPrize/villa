@@ -5,6 +5,7 @@
 #include <QMetaObject>
 #include <QPointer>
 
+#include <cstdint>
 #include <memory>
 #include <functional>
 #include <map>
@@ -93,6 +94,7 @@ public:
                                   VolumeSelectorFactory volumeSelectorFactory = {},
                                   QWidget* parent = nullptr);
 
+    void showWithSavedGeometry();
     CChunkedVolumeViewer* addPane(const std::string& surfaceName,
                                   const QString& title,
                                   const CChunkedVolumeViewer::CameraState& camera);
@@ -113,6 +115,7 @@ public:
     ShiftScrollMode shiftScrollMode() const;
     int maxControlPointDistanceVx() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
+    void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
@@ -129,6 +132,10 @@ signals:
     void generatedControlPointDeleteRequested(const std::string& surfaceName,
                                               double linePosition,
                                               cv::Vec3f volumePoint);
+    void generatedControlPointBranchRequested(const std::string& surfaceName,
+                                              size_t controlPointIndex);
+    void generatedControlPointBranchOpenRequested(uint64_t branchFiberId,
+                                                   int branchControlPointIndex);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void showAsMeshRequested();
@@ -210,6 +217,10 @@ private:
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
     void updateOptimizationOverlayGeometry();
+    void restoreWindowGeometry();
+    void saveWindowGeometry() const;
+    void restoreGeneratedViewStateSettings();
+    void saveGeneratedViewStateSettings();
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
@@ -238,6 +249,11 @@ private:
     QList<int> _savedOuterSplitterSizes;
     QList<int> _savedTopSplitterSizes;
     QList<int> _savedStripSplitterSizes;
+    bool _haveSavedCurrentCutZoom = false;
+    float _savedCurrentCutZoom = 1.0f;
+    bool _haveSavedSideCutZoom = false;
+    float _savedSideCutZoom = 1.0f;
+    std::vector<float> _savedStripZooms;
     std::vector<QMetaObject::Connection> _generatedOverlayRefreshConnections;
     std::vector<FastStripOverlayItems> _fastStripOverlayItems;
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
@@ -276,6 +292,7 @@ private:
     bool _generatedOverlayRefreshQueued = false;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _generatedControlIndex;
     QPointer<QVariantAnimation> _controlPointPreviewAnimation;
+    bool _restoredWindowGeometry = false;
     bool _haveInitialCurrentCutCamera = false;
     CChunkedVolumeViewer::CameraState _initialCurrentCutCamera;
     bool _haveInitialSideCutCamera = false;

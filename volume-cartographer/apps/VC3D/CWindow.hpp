@@ -34,6 +34,7 @@
 #include "overlays/PathsOverlayController.hpp"
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
+#include "overlays/InkDetectionOverlayController.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/SurfaceRotationOverlayController.hpp"
 #include "overlays/AtlasOverlayController.hpp"
@@ -338,6 +339,7 @@ private:
     std::unique_ptr<PathsOverlayController> _pathsOverlay;
     std::unique_ptr<BBoxOverlayController> _bboxOverlay;
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
+    std::unique_ptr<InkDetectionOverlayController> _inkDetectionOverlay;
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;

@@ -1716,6 +1716,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _vectorOverlay = std::make_unique<VectorOverlayController>(_state, this);
     _viewerManager->setVectorOverlay(_vectorOverlay.get());
 
+    _inkDetectionOverlay = std::make_unique<InkDetectionOverlayController>(_state, this);
+    _viewerManager->setInkDetectionOverlay(_inkDetectionOverlay.get());
+
     _atlasControlOverlay = std::make_unique<AtlasControlPointsOverlayController>(this);
     _atlasControlOverlay->bindToViewerManager(_viewerManager.get());
 
@@ -2794,6 +2797,9 @@ void CWindow::toggleVolumeOverlayVisibility()
 {
     if (_volumeOverlay) {
         _volumeOverlay->toggleVisibility();
+    }
+    if (_inkDetectionOverlay && _inkDetectionOverlay->hasLoadedSelection()) {
+        _inkDetectionOverlay->toggleVisibility();
     }
 }
 
@@ -6952,6 +6958,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 
     QVector<QPair<QString, QString>> volumeEntries;
+    QVector<QPair<QString, QString>> openDataVolumeIdMap;
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
     QString currentComboId;
@@ -6974,6 +6981,15 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         return false;
     };
 
+    auto openDataVolumeIdMappedToLoadedId = [&](const QString& catalogVolumeId) {
+        for (const auto& mapping : openDataVolumeIdMap) {
+            if (mapping.first == catalogVolumeId) {
+                return mapping.second;
+            }
+        }
+        return QString{};
+    };
+
     QString bestGrowthVolumeId;
     bool preferredVolumeFound = false;
     const auto volumeIds = _state->vpkg()->volumeIDs();
@@ -6986,6 +7002,18 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
+            for (const auto& tag : _state->vpkg()->volumeTags(id)) {
+                constexpr std::string_view prefix = "vc-open-data-volume-id:";
+                if (tag.rfind(prefix, 0) != 0) {
+                    continue;
+                }
+                const QString catalogVolumeId =
+                    QString::fromStdString(tag.substr(prefix.size()));
+                if (!catalogVolumeId.isEmpty() &&
+                    openDataVolumeIdMappedToLoadedId(catalogVolumeId).isEmpty()) {
+                    openDataVolumeIdMap.append({catalogVolumeId, idStr});
+                }
+            }
 
             const QString loweredName = nameStr.toLower();
             const QString loweredId = idStr.toLower();
@@ -7008,7 +7036,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 
     if (!activeCandidate.isEmpty() && !hasVolume(activeCandidate)) {
-        activeCandidate.clear();
+        activeCandidate = openDataVolumeIdMappedToLoadedId(activeCandidate);
     }
     if (activeCandidate.isEmpty() && !currentComboId.isEmpty() && hasVolume(currentComboId)) {
         activeCandidate = currentComboId;
