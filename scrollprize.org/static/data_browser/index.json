@@ -7,11 +7,11 @@
       {
         "big": "45",
         "label": "scrolls & fragments scanned",
-        "sub": "36 scrolls · 9 fragments",
+        "sub": "35 scrolls · 10 fragments",
         "derive": "all"
       },
       {
-        "big": "6",
+        "big": "4",
         "label": "with recovered text",
         "sub": "Greek read; first Latin in progress",
         "derive": "text"
@@ -51,18 +51,18 @@
       {
         "key": "text",
         "label": "Text recovered",
-        "count": 6,
+        "count": 4,
         "desc": "readable Greek/Latin"
       }
     ],
     "totals": {
       "all": 45,
-      "scrolls": 36,
-      "fragments": 9,
+      "scrolls": 35,
+      "fragments": 10,
       "segmented": 12,
       "unrolled": 4,
       "ink": 9,
-      "text": 6,
+      "text": 4,
       "subum": 3
     },
     "marquee": {
@@ -90,7 +90,7 @@
       "date": "2026-03",
       "scroll": "PHerc0139",
       "title": "PHerc 0139 title recovered",
-      "blurb": "Identified as Philodemus, On the Gods, Book 8. ~20% unrolled; 1µm slabs give real legibility gains."
+      "blurb": "Identified as Philodemus, On Gods, Book 8. ~20% unrolled; 1µm slabs give real legibility gains."
     },
     {
       "date": "2026-01",
@@ -1158,7 +1158,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0172/volumes/20241024131839-7.910um-53keV-masked.zarr/",
       "display": "Scroll 5",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Bodleian Library, Oxford",
       "note": "Scroll 5. ~70% geometrically unrolled by November 2025.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0172/photos/PHerc0172_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0172/",
@@ -1910,13 +1910,13 @@
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260319133050-2.403um-0.2m-77keV-masked.zarr/",
       "display": "PHerc0139",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Title and author attribution recovered: Philodemus, On the Gods, Book 8 — a treatise by the Epicurean philosopher. About 20% virtually unrolled.",
+      "note": "Title and author attribution recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On Gods, Book 8. About 20% virtually unrolled.",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0139/",
       "content": {
-        "work": "Philodemus, On the Gods (Περὶ θεῶν), Book 8",
+        "work": "Philodemus, On Gods (Περὶ θεῶν), Book 8",
         "lang": "Greek",
-        "summary": "The scroll's title and author were recovered, identifying it as Philodemus, On the Gods, Book 8 — a work by the Epicurean philosopher. Reading the title of a still-rolled scroll reveals what it contains before any of its body columns are studied.",
+        "summary": "The scroll's title and author were recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On Gods, Book 8. Reading the title of a still-rolled scroll reveals what it contains before any of its body columns are studied.",
         "caveat": "About 20% is virtually unrolled; the title and author are secure, but the body text is still being recovered."
       },
       "progress": {
@@ -2435,210 +2435,6 @@
       "alphaHero": null
     },
     {
-      "id": "PHerc0500P2",
-      "type": "scroll",
-      "desc": "",
-      "legacy": null,
-      "n_scans": 3,
-      "n_volumes": 3,
-      "n_segments": 0,
-      "min_px": 2.215,
-      "energies": [
-        111,
-        113
-      ],
-      "locations": [
-        "ESRF Grenoble"
-      ],
-      "scans": [
-        {
-          "px": 2.215,
-          "energy": 111,
-          "loc": "ESRF Grenoble",
-          "name": "20250508033249-2.215um-0.4m-111keV",
-          "volume": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/"
-        },
-        {
-          "px": 9.362,
-          "energy": 113,
-          "loc": "ESRF Grenoble",
-          "name": "20250720125517-9.362um-1.2m-113keV",
-          "volume": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr/"
-        },
-        {
-          "px": 4.317,
-          "energy": 111,
-          "loc": "ESRF Grenoble",
-          "name": "20250507210011-4.317um-1.2m-111keV",
-          "volume": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250528085330-4.317um-1.2m-111keV-masked.zarr/"
-        }
-      ],
-      "hasS3": true,
-      "licenses": [
-        {
-          "name": "CC BY-NC 4.0",
-          "url": "https://creativecommons.org/licenses/by-nc/4.0/"
-        }
-      ],
-      "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/",
-      "display": "PHerc0500P2",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "",
-      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0500P2/photos/PHerc0500P2_photo.jpg",
-      "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0500P2/",
-      "content": null,
-      "progress": {
-        "segments": 0,
-        "patches": null,
-        "textFound": "Text recovered",
-        "textRank": 0,
-        "unrolledPct": 0,
-        "score": 7.8,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f042010000b000d2f8b6/view"
-      },
-      "stages": {
-        "scanned": true,
-        "segmented": true,
-        "unrolled": false,
-        "ink": true,
-        "text": true,
-        "furthest": 4,
-        "unrolledPct": 0
-      },
-      "readings": null,
-      "volume": null,
-      "mesh": {
-        "file": "PHerc0500P2.ply",
-        "kind": "mesh",
-        "n": 3825,
-        "src": "PHerc0500p2.ply (scaled-meshes-15072026)"
-      },
-      "inkSegments": [],
-      "predictions": [
-        {
-          "purpose": "surface-prediction",
-          "baseVolume": "20250526151718",
-          "px": 2.215,
-          "energy": 111,
-          "model": "20260413222639",
-          "level": 2,
-          "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250526151718-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
-          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/"
-        },
-        {
-          "purpose": "surface-prediction",
-          "baseVolume": "20250820143440",
-          "px": 9.362,
-          "energy": 113,
-          "model": "20260413222639",
-          "level": 0,
-          "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250820143440-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
-          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr/"
-        }
-      ],
-      "hasSurfacePred": true,
-      "hasInk3d": false,
-      "n_predictions": 2,
-      "n_inkSegments": 0,
-      "n_alpha": 0,
-      "alphaHero": null
-    },
-    {
-      "id": "PHerc0009B",
-      "type": "fragment",
-      "desc": "",
-      "legacy": null,
-      "n_scans": 2,
-      "n_volumes": 3,
-      "n_segments": 0,
-      "min_px": 2.401,
-      "energies": [
-        77,
-        116
-      ],
-      "locations": [
-        "ESRF Grenoble"
-      ],
-      "scans": [
-        {
-          "px": 2.401,
-          "energy": 77,
-          "loc": "ESRF Grenoble",
-          "name": "20250718080859-2.401um-0.3m-77keV",
-          "volume": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr/"
-        },
-        {
-          "px": 8.64,
-          "energy": 116,
-          "loc": "ESRF Grenoble",
-          "name": "20250509053741-8.640um-1.2m-116keV",
-          "volume": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr/"
-        }
-      ],
-      "hasS3": true,
-      "licenses": [
-        {
-          "name": "CC BY-NC 4.0",
-          "url": "https://creativecommons.org/licenses/by-nc/4.0/"
-        }
-      ],
-      "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr/",
-      "display": "PHerc0009B",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "",
-      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0009B/photos/PHerc0009B_photo.jpg",
-      "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0009B/",
-      "content": null,
-      "progress": {
-        "segments": 0,
-        "patches": null,
-        "textFound": "Text recovered",
-        "textRank": 0,
-        "unrolledPct": 0,
-        "score": 7.6,
-        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f181010000e800d2f8c7/view"
-      },
-      "stages": {
-        "scanned": true,
-        "segmented": true,
-        "unrolled": false,
-        "ink": true,
-        "text": true,
-        "furthest": 4,
-        "unrolledPct": 0
-      },
-      "readings": null,
-      "volume": null,
-      "mesh": {
-        "file": "PHerc0009B.ply",
-        "kind": "mesh",
-        "n": 11482,
-        "src": "PHerc0009b.ply (scaled-meshes-15072026)"
-      },
-      "inkSegments": [],
-      "predictions": [
-        {
-          "purpose": "surface-prediction",
-          "baseVolume": "20260319104112",
-          "px": 2.401,
-          "energy": 77,
-          "model": "20260413222639",
-          "level": 2,
-          "threshold": 0.2,
-          "zarr": "s3://vesuvius-challenge-open-data/PHerc0009B/representations/predictions/surfaces/20260319104112-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
-          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20260319104112-2.401um-0.3m-77keV-masked.zarr/"
-        }
-      ],
-      "hasSurfacePred": true,
-      "hasInk3d": false,
-      "n_predictions": 1,
-      "n_inkSegments": 0,
-      "n_alpha": 0,
-      "alphaHero": null
-    },
-    {
       "id": "PHerc0814",
       "type": "scroll",
       "desc": "",
@@ -2741,6 +2537,117 @@
           "threshold": 0.2,
           "zarr": "s3://vesuvius-challenge-open-data/PHerc0814/representations/predictions/surfaces/20250804134230-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
           "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr/"
+        }
+      ],
+      "hasSurfacePred": true,
+      "hasInk3d": false,
+      "n_predictions": 2,
+      "n_inkSegments": 0,
+      "n_alpha": 0,
+      "alphaHero": null
+    },
+    {
+      "id": "PHerc0500P2",
+      "type": "fragment",
+      "desc": "",
+      "legacy": null,
+      "n_scans": 3,
+      "n_volumes": 3,
+      "n_segments": 0,
+      "min_px": 2.215,
+      "energies": [
+        111,
+        113
+      ],
+      "locations": [
+        "ESRF Grenoble"
+      ],
+      "scans": [
+        {
+          "px": 2.215,
+          "energy": 111,
+          "loc": "ESRF Grenoble",
+          "name": "20250508033249-2.215um-0.4m-111keV",
+          "volume": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/"
+        },
+        {
+          "px": 9.362,
+          "energy": 113,
+          "loc": "ESRF Grenoble",
+          "name": "20250720125517-9.362um-1.2m-113keV",
+          "volume": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr/"
+        },
+        {
+          "px": 4.317,
+          "energy": 111,
+          "loc": "ESRF Grenoble",
+          "name": "20250507210011-4.317um-1.2m-111keV",
+          "volume": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250528085330-4.317um-1.2m-111keV-masked.zarr/"
+        }
+      ],
+      "hasS3": true,
+      "licenses": [
+        {
+          "name": "CC BY-NC 4.0",
+          "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+        }
+      ],
+      "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/",
+      "display": "PHerc0500P2",
+      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "note": "",
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0500P2/photos/PHerc0500P2_photo.jpg",
+      "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0500P2/",
+      "content": null,
+      "progress": {
+        "segments": 0,
+        "patches": null,
+        "textFound": "Ink detected",
+        "textRank": 0,
+        "unrolledPct": 0,
+        "score": 7.8,
+        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f042010000b000d2f8b6/view"
+      },
+      "stages": {
+        "scanned": true,
+        "segmented": true,
+        "unrolled": false,
+        "ink": true,
+        "text": false,
+        "furthest": 3,
+        "unrolledPct": 0
+      },
+      "readings": null,
+      "volume": null,
+      "mesh": {
+        "file": "PHerc0500P2.ply",
+        "kind": "mesh",
+        "n": 3825,
+        "src": "PHerc0500p2.ply (scaled-meshes-15072026)"
+      },
+      "inkSegments": [],
+      "predictions": [
+        {
+          "purpose": "surface-prediction",
+          "baseVolume": "20250526151718",
+          "px": 2.215,
+          "energy": 111,
+          "model": "20260413222639",
+          "level": 2,
+          "threshold": 0.2,
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250526151718-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/"
+        },
+        {
+          "purpose": "surface-prediction",
+          "baseVolume": "20250820143440",
+          "px": 9.362,
+          "energy": 113,
+          "model": "20260413222639",
+          "level": 0,
+          "threshold": 0.2,
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250820143440-surface-20260413222639-surface-m7-L0-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250820143440-9.362um-1.2m-113keV-masked.zarr/"
         }
       ],
       "hasSurfacePred": true,
@@ -2948,9 +2855,102 @@
       "alphaHero": null
     },
     {
+      "id": "PHerc0009B",
+      "type": "fragment",
+      "desc": "",
+      "legacy": null,
+      "n_scans": 2,
+      "n_volumes": 3,
+      "n_segments": 0,
+      "min_px": 2.401,
+      "energies": [
+        77,
+        116
+      ],
+      "locations": [
+        "ESRF Grenoble"
+      ],
+      "scans": [
+        {
+          "px": 2.401,
+          "energy": 77,
+          "loc": "ESRF Grenoble",
+          "name": "20250718080859-2.401um-0.3m-77keV",
+          "volume": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr/"
+        },
+        {
+          "px": 8.64,
+          "energy": 116,
+          "loc": "ESRF Grenoble",
+          "name": "20250509053741-8.640um-1.2m-116keV",
+          "volume": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr/"
+        }
+      ],
+      "hasS3": true,
+      "licenses": [
+        {
+          "name": "CC BY-NC 4.0",
+          "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+        }
+      ],
+      "volumeZarr": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250521125136-8.640um-1.2m-116keV-masked.zarr/",
+      "display": "PHerc0009B",
+      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "note": "",
+      "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0009B/photos/PHerc0009B_photo.jpg",
+      "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0009B/",
+      "content": null,
+      "progress": {
+        "segments": 0,
+        "patches": null,
+        "textFound": "Ink detected",
+        "textRank": 0,
+        "unrolledPct": 0,
+        "score": 7.6,
+        "wkUrl": "https://wk.aws.ash2txt.org/datasets/6867f181010000e800d2f8c7/view"
+      },
+      "stages": {
+        "scanned": true,
+        "segmented": true,
+        "unrolled": false,
+        "ink": true,
+        "text": false,
+        "furthest": 3,
+        "unrolledPct": 0
+      },
+      "readings": null,
+      "volume": null,
+      "mesh": {
+        "file": "PHerc0009B.ply",
+        "kind": "mesh",
+        "n": 11482,
+        "src": "PHerc0009b.ply (scaled-meshes-15072026)"
+      },
+      "inkSegments": [],
+      "predictions": [
+        {
+          "purpose": "surface-prediction",
+          "baseVolume": "20260319104112",
+          "px": 2.401,
+          "energy": 77,
+          "model": "20260413222639",
+          "level": 2,
+          "threshold": 0.2,
+          "zarr": "s3://vesuvius-challenge-open-data/PHerc0009B/representations/predictions/surfaces/20260319104112-surface-20260413222639-surface-m7-L2-th0.2.zarr/",
+          "baseZarr": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20260319104112-2.401um-0.3m-77keV-masked.zarr/"
+        }
+      ],
+      "hasSurfacePred": true,
+      "hasInk3d": false,
+      "n_predictions": 1,
+      "n_inkSegments": 0,
+      "n_alpha": 0,
+      "alphaHero": null
+    },
+    {
       "id": "PHerc0332",
       "type": "scroll",
-      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is a smaller scroll known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size enabled scanning at extremely high resolution (3.24um).",
+      "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size enabled scanning at extremely high resolution (3.24um).",
       "legacy": "https://dl.ash2txt.org/full-scrolls/Scroll3/PHerc332.volpkg/",
       "n_scans": 4,
       "n_volumes": 4,
@@ -3204,7 +3204,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHercMANBp/volumes/20260427100434-1.129um-0.2m-59keV-masked.zarr/",
       "display": "PHercMANBp",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANBp/",
@@ -3393,7 +3393,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHercMAN5/volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr/",
       "display": "PHercMAN5",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMAN5/",
@@ -3551,7 +3551,7 @@
       ],
       "volumeZarr": "s3://vesuvius-challenge-open-data/PHercMANB/volumes/20260323091048-2.399um-0.2m-78keV-masked.zarr/",
       "display": "PHercMANB",
-      "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "repository": "Museo Archeologico Nazionale di Napoli",
       "note": "",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANB/",

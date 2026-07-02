@@ -319,10 +319,15 @@ export default function ScrollDetailPage(props) {
             </div>
 
             {/* About panel */}
-            {scroll.note ? (
+            {scroll.note || scroll.desc ? (
               <div className="panel">
                 <h2>About this scroll</h2>
-                <p className="txt">{stripMarkdown(scroll.note)}</p>
+                {scroll.note ? (
+                  <p className="txt">{stripMarkdown(scroll.note)}</p>
+                ) : null}
+                {scroll.desc ? (
+                  <p className="txt">{stripMarkdown(scroll.desc)}</p>
+                ) : null}
               </div>
             ) : null}
 
