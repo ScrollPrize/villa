@@ -8,7 +8,6 @@
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
 #include "viewer_controls/panels/ViewerNavigationPanel.hpp"
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
-#include "viewer_controls/panels/ViewerPostprocessingPanel.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 #include "viewer_controls/panels/ViewerViewExtrasPanel.hpp"
 
@@ -185,26 +184,6 @@ void ViewerControlsPanel::addViewerGroups()
                    normalPanel,
                    viewer::GROUP_NORMAL_VIS_EXPANDED,
                    viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
-
-    ViewerPostprocessingPanel::UiRefs postprocessingUi{
-        .scrollArea = _uiRefs.postprocessingScrollArea,
-        .contents = _uiRefs.postprocessingContents,
-        .baseColormap = _uiRefs.baseColormap,
-        .stretchValues = _uiRefs.stretchValuesPost,
-        .removeSmallComponents = _uiRefs.removeSmallComponents,
-        .minComponentSizeLabel = _uiRefs.minComponentSizeLabel,
-        .minComponentSize = _uiRefs.minComponentSize,
-        .claheEnabled = _uiRefs.claheEnabled,
-        .claheClipLimitLabel = _uiRefs.claheClipLimitLabel,
-        .claheClipLimit = _uiRefs.claheClipLimit,
-        .claheTileSizeLabel = _uiRefs.claheTileSizeLabel,
-        .claheTileSize = _uiRefs.claheTileSize,
-    };
-    _postprocessingPanel = new ViewerPostprocessingPanel(postprocessingUi, _viewerManager, _uiRefs.contents);
-    addViewerGroup(tr("Postprocessing"),
-                   _postprocessingPanel,
-                   viewer::GROUP_POSTPROCESSING_EXPANDED,
-                   viewer::GROUP_POSTPROCESSING_EXPANDED_DEFAULT);
 
     _transformsPanel = new ViewerTransformsPanel(_uiRefs.contents);
     addViewerGroup(tr("Transforms"),

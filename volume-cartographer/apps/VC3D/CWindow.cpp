@@ -2242,7 +2242,6 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(ui.dockWidgetOverlay);
     addDock(ui.dockWidgetRenderSettings);
     addDock(ui.dockWidgetComposite);
-    addDock(ui.dockWidgetPostprocessing);
     addDock(_lasagnaDock);
     addDock(_atlasOverviewDock);
     addDock(_atlasSearchDock);
@@ -6292,18 +6291,6 @@ void CWindow::CreateWidgets(void)
         .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
         .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
         .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
-        .postprocessingScrollArea = ui.scrollAreaPostprocessing,
-        .postprocessingContents = ui.dockWidgetPostprocessingContents,
-        .baseColormap = ui.baseColormapSelect,
-        .stretchValuesPost = ui.chkStretchValuesPost,
-        .removeSmallComponents = ui.chkRemoveSmallComponents,
-        .minComponentSizeLabel = ui.lblMinComponentSize,
-        .minComponentSize = ui.spinMinComponentSize,
-        .claheEnabled = ui.chkClaheEnabled,
-        .claheClipLimitLabel = ui.lblClaheClipLimit,
-        .claheClipLimit = ui.spinClaheClipLimit,
-        .claheTileSizeLabel = ui.lblClaheTileSize,
-        .claheTileSize = ui.spinClaheTileSize,
         .zoomInButton = ui.btnZoomIn,
         .zoomOutButton = ui.btnZoomOut,
         .volumeWindowContainer = ui.volumeWindowContainer,

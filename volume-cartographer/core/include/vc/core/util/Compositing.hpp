@@ -124,26 +124,6 @@ struct CompositeRenderSettings {
 
     CompositeParams params;  // method, alpha, BL, lighting, isoCutoff
 
-    // Postprocessing (applied after composite render)
-    bool postStretchValues = false;
-    bool postRemoveSmallComponents = false;
-    int postMinComponentSize = 50;
-
-    // CLAHE (contrast-limited adaptive histogram equalization)
-    bool postClaheEnabled = false;
-    float postClaheClipLimit = 2.0f;
-    int postClaheTileSize = 8;
-
-    // Raking-light post-process: treat the composite gray image as a
-    // heightfield, light it from a low angle. Reveals papyrus surface
-    // texture (crackle, fiber, ink relief) independent of brightness
-    // contrast. Pure 2D pass after CLAHE, before colormap.
-    bool postRakingEnabled = false;
-    float postRakingAzimuth = 30.0f;    // degrees, 0=+x, 90=+y
-    float postRakingElevation = 20.0f;  // degrees above the image plane
-    float postRakingStrength = 0.8f;    // 0..1 blend between unlit and lit
-    float postRakingDepthScale = 4.0f;  // heightfield amplification
-
     bool operator==(const CompositeRenderSettings&) const = default;
 };
 
