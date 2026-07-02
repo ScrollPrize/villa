@@ -107,6 +107,18 @@ class SliceJitterTransform(BasicTransform):
         self.allowed_axes = allowed_axes
         self.mode_seg = mode_seg
 
+    def apply(self, data_dict, **params):
+        # BasicTransform.apply routes 'regression_target' through
+        # _apply_to_segmentation, which resamples with mode_seg ('nearest' by
+        # default) -- correct for discrete label maps but wrong for continuous
+        # regression targets. Peel it off and run it through the bilinear
+        # regression path here, then delegate the remaining keys to the base.
+        regression_target = data_dict.pop('regression_target', None)
+        data_dict = super().apply(data_dict, **params)
+        if regression_target is not None:
+            data_dict['regression_target'] = self._apply_to_regr_target(regression_target, **params)
+        return data_dict
+
     def get_parameters(self, **data_dict) -> dict:
         img = data_dict['image']
         spatial = img.shape[1:]
@@ -235,7 +247,23 @@ if __name__ == '__main__':
     assert dstep < 0.5 and drange > 2.0, "drift must be smooth and low-frequency"
     print(f"[ok] drift-only: max step={dstep:.3f} vox, range={drange:.2f} vox (smooth)")
 
-    # 6) speed
+    # 6) regression targets route through the bilinear path -- NOT the
+    #    nearest-neighbour seg path that BasicTransform.apply would send them to
+    torch.manual_seed(0)
+    tr = SliceJitterTransform(p_jitter=1.0, jitter=(1.5, 1.5),
+                              allowed_axes=(slice_axis,))
+    ramp = torch.linspace(0, 1, shape[sheet_axis], device=dev)
+    reg = ramp.reshape(1, -1, 1, 1).expand(1, *shape).contiguous()  # smooth gradient
+    torch.manual_seed(0)
+    out_r = tr(image=img.clone(), regression_target=reg.clone())['regression_target']
+    torch.manual_seed(0)  # same seed -> same displacement, so only interp mode differs
+    out_s = tr(image=img.clone(), segmentation=reg.clone())['segmentation']
+    assert out_r.shape == reg.shape and torch.isfinite(out_r).all()
+    assert not torch.equal(out_r, out_s), \
+        "regression_target must use bilinear, distinct from the nearest seg path"
+    print("[ok] regression target routed through bilinear path")
+
+    # 7) speed
     for _ in range(3):
         _ = t(image=img.clone(), segmentation=seg.clone())
     if dev == 'cuda':
