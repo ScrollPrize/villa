@@ -89,7 +89,7 @@
       "date": "2026-03",
       "scroll": "PHerc0139",
       "title": "PHerc 0139 title recovered",
-      "blurb": "Identified as Philodemus, On the Gods, Book 8. ~20% unrolled; 1µm slabs give real legibility gains."
+      "blurb": "Identified as Philodemus, On Gods, Book 8. ~20% unrolled; 1µm slabs give real legibility gains."
     },
     {
       "date": "2026-01",
@@ -359,13 +359,13 @@
     "PHerc0139": {
       "display": "PHerc0139",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
-      "note": "Title and author attribution recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On the Gods, Book 8. About 20% virtually unrolled.",
+      "note": "Title and author attribution recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On Gods, Book 8. About 20% virtually unrolled.",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0139/",
       "content": {
-        "work": "Philodemus, On the Gods (Περὶ θεῶν), Book 8",
+        "work": "Philodemus, On Gods (Περὶ θεῶν), Book 8",
         "lang": "Greek",
-        "summary": "The scroll's title and author were recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On the Gods, Book 8. Reading the title of a still-rolled scroll reveals what it contains before any of its body columns are studied.",
+        "summary": "The scroll's title and author were recovered, identifying it as a work by the Epicurean philosopher Philodemus, specifically On Gods, Book 8. Reading the title of a still-rolled scroll reveals what it contains before any of its body columns are studied.",
         "caveat": "About 20% is virtually unrolled; the title and author are secure, but the body text is still being recovered."
       },
       "progress": {
