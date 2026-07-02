@@ -104,6 +104,13 @@ QString surface_column_settings_key(int column)
     return QStringLiteral("%1/column_%2_visible").arg(kSurfaceColumnSettingsGroup).arg(column);
 }
 
+bool surface_column_default_visible(int column)
+{
+    return column != SURFACE_LONG_ID_COLUMN &&
+           column != SURFACE_AVG_COST_COLUMN &&
+           column != SURFACE_OVERLAPS_COLUMN;
+}
+
 void set_surface_tree_item_text(SurfaceTreeWidgetItem* item,
                                 const std::string& id,
                                 QuadSurface* surf)
@@ -1334,7 +1341,10 @@ void SurfacePanelController::restoreSurfaceColumnVisibility()
             _ui.treeWidget->setColumnHidden(column, false);
             continue;
         }
-        const bool visible = settings.value(surface_column_settings_key(column), true).toBool();
+        const QString key = surface_column_settings_key(column);
+        const bool visible = settings.contains(key)
+            ? settings.value(key).toBool()
+            : surface_column_default_visible(column);
         _ui.treeWidget->setColumnHidden(column, !visible);
     }
 }
