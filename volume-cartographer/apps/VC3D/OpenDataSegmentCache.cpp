@@ -496,6 +496,34 @@ void applyOriginalVolumeDownscale(const std::filesystem::path& segmentDir,
     surface->save(segmentDir.string(), segmentStableId(segment), true);
 }
 
+bool cachedMetadataNeedsNormalization(const std::filesystem::path& metaPath,
+                                      const OpenDataSegment& segment,
+                                      bool applyDownscale)
+{
+    try {
+        const auto meta = nlohmann::json::parse(readTextFile(metaPath));
+        if (!meta.is_object()) {
+            return true;
+        }
+        auto stringField = [&](const char* key) -> std::string {
+            const auto it = meta.find(key);
+            return it != meta.end() && it->is_string() ? it->get<std::string>() : std::string{};
+        };
+        if (stringField("uuid") != segmentStableId(segment) ||
+            stringField("type") != "seg" ||
+            stringField("format") != "tifxyz" ||
+            stringField("vc_open_data_segment_id") != segment.id ||
+            stringField("vc_open_data_segment_long_id") != segment.longId) {
+            return true;
+        }
+        return applyDownscale &&
+               originalVolumeDownscale(segment) != 1.0 &&
+               !coordinatesAlreadyScaled(meta, originalVolumeDownscale(segment));
+    } catch (...) {
+        return true;
+    }
+}
+
 void writeCachedMetadata(const std::string& baseUrl,
                          const OpenDataSegment& segment,
                          const std::filesystem::path& target)
@@ -898,17 +926,26 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
         return false;
     }
 
+    const bool applyDownscale = !artifactAlreadyInOriginalVolumeScale(*artifact);
     if (!forceRefresh && requiredFilesPresent(segmentDir)) {
         const auto origin = readCatalogOrigin(segmentDir);
         if (origin && originMatches(*origin, sample, segment, *artifact) &&
             originStateAllowsFastOpen(*origin)) {
+            if (cachedMetadataNeedsNormalization(segmentDir / "meta.json",
+                                                 segment,
+                                                 applyDownscale)) {
+                normalizeCachedMetadata(url,
+                                        segment,
+                                        segmentDir / "meta.json",
+                                        applyDownscale);
+            }
             return true;
         }
         if (!origin || originMatches(*origin, sample, segment, *artifact)) {
             normalizeCachedMetadata(url,
                                     segment,
                                     segmentDir / "meta.json",
-                                    !artifactAlreadyInOriginalVolumeScale(*artifact));
+                                    applyDownscale);
             if (origin) {
                 writeCatalogOriginState(segmentDir, OpenDataSegmentCacheState::Current);
             } else {
@@ -970,7 +1007,7 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
         normalizeCachedMetadata(url,
                                 segment,
                                 tempDir / "meta.json",
-                                !artifactAlreadyInOriginalVolumeScale(*artifact));
+                                applyDownscale);
         writeStringAtomic(tempDir / "catalog-origin.json",
                           catalogOriginJson(sample, segment, *artifact, downloadedFiles).dump(2));
         try {

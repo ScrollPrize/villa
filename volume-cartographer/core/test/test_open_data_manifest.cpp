@@ -418,14 +418,23 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
+    const auto* tifxyz = preferredTifxyzArtifact(sample.segments.front());
+    REQUIRE(tifxyz != nullptr);
     const cv::Size fixtureGridSize = tifxyzGridSize(fixtureSegment);
     writeFile(segmentDir / "meta.json",
-              R"({"type":"seg","uuid":"out","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+              R"({"type":"seg","uuid":"20260311000000.tmp-12345","name":"seg-a","format":"tifxyz","scale":[1,1]})");
     copyFixtureFile(fixtureSegment / "x.tif", segmentDir / "x.tif");
     copyFixtureFile(fixtureSegment / "y.tif", segmentDir / "y.tif");
     copyFixtureFile(fixtureSegment / "z.tif", segmentDir / "z.tif");
     writeFile(segmentDir / "mask.tif", "optional");
     writeFile(segmentDir / "overlapping.json", "{}");
+    writeFile(segmentDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", sample.segments.front().id},
+                  {"resolved_http_url", tifxyz->resolvedUrl},
+                  {"cache_state", "current"}
+              }.dump());
 
     auto pkg = VolumePkg::newEmpty();
     OpenDataSampleProjectResult result;
