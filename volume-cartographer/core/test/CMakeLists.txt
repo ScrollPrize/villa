@@ -103,6 +103,7 @@ vc_add_test(NAME test_ink_detection_overlay
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 
+qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(viewer_manager_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
@@ -113,6 +114,7 @@ vc_add_test(NAME test_viewer_overlay_surface_primitives
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
             test_viewer_manager_stub.cpp
+            ${viewer_overlay_base_surface_primitives_moc}
             ${viewer_manager_overlay_surface_primitives_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
