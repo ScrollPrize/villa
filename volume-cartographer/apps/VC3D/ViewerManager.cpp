@@ -39,6 +39,22 @@ Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
 
 #define VC3D_DEBUG_QCINFO(category) if (!DebugLoggingEnabled()) {} else qCInfo(category)
 
+namespace {
+
+QString compactViewerLabel(const std::string& surfaceName, const QString& title)
+{
+    if (surfaceName == "seg xz")
+        return QStringLiteral("XZ");
+    if (surfaceName == "seg yz")
+        return QStringLiteral("YZ");
+    if (surfaceName == "xy plane")
+        return QStringLiteral("XY");
+    if (title.startsWith(QStringLiteral("Surface ")))
+        return title;
+    return {};
+}
+
+}
 
 ViewerManager::ViewerManager(CState* state,
                              VCCollection* points,
@@ -127,15 +143,12 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     }
 
     auto* chunkedViewer = new CChunkedVolumeViewer(_state, this, mdiArea);
+    chunkedViewer->setProperty("vc_viewer_label", compactViewerLabel(surfaceName, title));
     QWidget* widget = chunkedViewer;
 
     auto* win = mdiArea->addSubWindow(widget);
     win->setWindowTitle(title);
-    win->setWindowFlags(Qt::SubWindow |
-                        Qt::WindowTitleHint |
-                        Qt::WindowSystemMenuHint |
-                        Qt::WindowMinMaxButtonsHint |
-                        Qt::WindowCloseButtonHint);
+    win->setWindowFlags(Qt::SubWindow | Qt::FramelessWindowHint);
     win->setAttribute(Qt::WA_DeleteOnClose);
     win->installEventFilter(widget);
 

@@ -2382,6 +2382,37 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                         }
 
                         QMenu menu(this);
+                        auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
+                        QPointer<QMdiSubWindow> subWindow = viewerWidget
+                            ? qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())
+                            : nullptr;
+                        if (subWindow) {
+                            QAction* minimizeAction = menu.addAction(tr("Minimize viewer"));
+                            minimizeAction->setEnabled(!subWindow->isMinimized());
+                            connect(minimizeAction, &QAction::triggered, this, [subWindow]() {
+                                if (subWindow)
+                                    subWindow->showMinimized();
+                            });
+
+                            QAction* maximizeAction = menu.addAction(
+                                subWindow->isMaximized() ? tr("Restore viewer") : tr("Maximize viewer"));
+                            connect(maximizeAction, &QAction::triggered, this, [subWindow]() {
+                                if (!subWindow)
+                                    return;
+                                if (subWindow->isMaximized())
+                                    subWindow->showNormal();
+                                else
+                                    subWindow->showMaximized();
+                            });
+
+                            QAction* closeAction = menu.addAction(tr("Close viewer"));
+                            connect(closeAction, &QAction::triggered, this, [subWindow]() {
+                                if (subWindow)
+                                    subWindow->close();
+                            });
+                            menu.addSeparator();
+                        }
+
                         auto addLasagnaLaunchAction =
                             [this, lasagnaPanel, &menu, seedX, seedY, seedZ, validVolumePoint,
                              activeSegmentHasLasagnaModel](

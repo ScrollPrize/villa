@@ -5014,6 +5014,8 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     QStringList items;
     items << QString("L%1").arg(_dsScaleIdx);
+    if (const QString viewerLabel = property("vc_viewer_label").toString(); !viewerLabel.isEmpty())
+        items << viewerLabel;
     items << QString("scale %1").arg(_scale, 0, 'f', 2);
     items << QString("%1x%2").arg(_framebuffer.width()).arg(_framebuffer.height());
 
