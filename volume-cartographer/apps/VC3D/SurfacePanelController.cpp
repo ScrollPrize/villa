@@ -32,6 +32,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStyle>
@@ -1085,6 +1086,9 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
         _filters.dropdown->setText(tr("Filters"));
         _filters.dropdown->setPopupMode(QToolButton::DelayedPopup);
         _filters.dropdown->setMenu(nullptr);
+        _filters.dropdown->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        _filters.dropdown->setMinimumWidth(
+            _filters.dropdown->fontMetrics().horizontalAdvance(_filters.dropdown->text()) + 32);
         connect(_filters.dropdown, &QToolButton::clicked,
                 this, &SurfacePanelController::showFilterDialog);
     }
@@ -1141,18 +1145,11 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
     addFilterOption(_filters.showPartialReview, tr("Show Partial Review"), QStringLiteral("chkFilterShowPartialReview"));
     addFilterOption(_filters.inspectOnly, tr("Inspect Only"), QStringLiteral("chkFilterInspectOnly"));
 
-    if (!_filters.currentOnly) {
-        _filters.currentOnly = new QCheckBox(tr("Current Segment Only"),
-                                             _filters.dropdown ? _filters.dropdown->parentWidget() : _ui.treeWidget);
-        _filters.currentOnly->setObjectName(QStringLiteral("chkFilterCurrentOnly"));
-    } else {
+    if (_filters.currentOnly) {
         _filters.currentOnly->setText(tr("Current Segment Only"));
-    }
-    _filters.currentOnly->show();
-    if (_filters.dropdown && _filters.currentOnly->parentWidget() == _filters.dropdown->parentWidget()) {
-        if (auto* grid = qobject_cast<QGridLayout*>(_filters.dropdown->parentWidget()->layout())) {
-            grid->addWidget(_filters.currentOnly, 0, 2);
-        }
+        _filters.currentOnly->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        _filters.currentOnly->setMinimumWidth(_filters.currentOnly->sizeHint().width());
+        _filters.currentOnly->show();
     }
 
     if (_filters.focusPointDistance && _filters.focusPoints) {
@@ -1420,27 +1417,11 @@ void SurfacePanelController::buildFilterDialog()
         form->addRow(tr("Surface ID"), _filters.surfaceIdFilter);
     }
     if (_filters.focusPointDistance) {
-        if (auto* parent = _filters.focusPointDistance->parentWidget()) {
-            const auto labels = parent->findChildren<QLabel*>();
-            for (auto* label : labels) {
-                if (label->text() == tr("Focus radius")) {
-                    label->hide();
-                }
-            }
-        }
         _filters.focusPointDistance->setParent(_filterDialog);
         _filters.focusPointDistance->show();
         form->addRow(tr("Focus radius"), _filters.focusPointDistance);
     }
     if (_filters.zLowerBound && _filters.zUpperBound) {
-        if (auto* parent = _filters.zLowerBound->parentWidget()) {
-            const auto labels = parent->findChildren<QLabel*>();
-            for (auto* label : labels) {
-                if (label->text() == tr("Z range")) {
-                    label->hide();
-                }
-            }
-        }
         auto* zRangeWidget = new QWidget(_filterDialog);
         auto* zRangeLayout = new QHBoxLayout(zRangeWidget);
         zRangeLayout->setContentsMargins(0, 0, 0, 0);
@@ -1742,6 +1723,8 @@ void SurfacePanelController::updateFilterSummary()
         label += tr(" (%1)").arg(activeFilters);
     }
     _filters.dropdown->setText(label);
+    _filters.dropdown->setMinimumWidth(
+        _filters.dropdown->fontMetrics().horizontalAdvance(label) + 32);
 }
 
 void SurfacePanelController::onTagCheckboxToggled()

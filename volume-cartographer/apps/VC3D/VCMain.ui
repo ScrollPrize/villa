@@ -308,25 +308,11 @@
                 </widget>
                </item>
                <item row="0" column="1">
-                <layout class="QHBoxLayout" name="pointSetFilterLayout">
-                 <item>
-                  <widget class="QComboBox" name="cmbPointSetFilter"/>
-                 </item>
-                 <item>
-                  <widget class="QPushButton" name="btnPointSetFilterAll">
-                   <property name="text">
-                    <string>All</string>
-                   </property>
-                  </widget>
-                 </item>
-                 <item>
-                  <widget class="QPushButton" name="btnPointSetFilterNone">
-                   <property name="text">
-                    <string>None</string>
-                   </property>
-                  </widget>
-                 </item>
-                </layout>
+                <widget class="QCheckBox" name="chkFilterCurrentOnly">
+                 <property name="text">
+                  <string>Current Segment Only</string>
+                 </property>
+                </widget>
                </item>
               </layout>
              </item>
@@ -359,105 +345,27 @@
               <number>8</number>
              </property>
              <item row="0" column="0">
-              <widget class="QLabel" name="lblFocusPointFilterDistance">
-               <property name="text">
-                <string>Focus radius</string>
-               </property>
-              </widget>
-             </item>
-             <item row="0" column="1">
-              <widget class="QDoubleSpinBox" name="spinFocusPointFilterDistance">
-               <property name="toolTip">
-                <string>Maximum distance from the focus point for the Focus Point filter.</string>
-               </property>
-               <property name="suffix">
-                <string> vox</string>
-               </property>
-               <property name="decimals">
-                <number>2</number>
-               </property>
-               <property name="maximum">
-                <double>1000000.000000000000000</double>
-               </property>
-               <property name="singleStep">
-                <double>1.000000000000000</double>
-               </property>
-               <property name="value">
-                <double>10.000000000000000</double>
-               </property>
-              </widget>
-             </item>
-             <item row="0" column="2">
-              <widget class="QLabel" name="lblSurfaceZRangeFilter">
-               <property name="text">
-                <string>Z range</string>
-               </property>
-              </widget>
-             </item>
-             <item row="0" column="3">
-              <layout class="QHBoxLayout" name="surfaceZRangeFilterLayout">
-               <property name="spacing">
-                <number>4</number>
-               </property>
-               <item>
-                <widget class="QDoubleSpinBox" name="spinSurfaceZLowerBound">
-                 <property name="toolTip">
-                  <string>Lower Z bound for visible surfaces.</string>
-                 </property>
-                 <property name="decimals">
-                  <number>2</number>
-                 </property>
-                 <property name="maximum">
-                  <double>1000000.000000000000000</double>
-                 </property>
-                 <property name="singleStep">
-                  <double>1.000000000000000</double>
-                 </property>
-                </widget>
-               </item>
-               <item>
-                <widget class="QDoubleSpinBox" name="spinSurfaceZUpperBound">
-                 <property name="toolTip">
-                  <string>Upper Z bound for visible surfaces.</string>
-                 </property>
-                 <property name="decimals">
-                  <number>2</number>
-                 </property>
-                 <property name="maximum">
-                  <double>1000000.000000000000000</double>
-                 </property>
-                 <property name="singleStep">
-                  <double>1.000000000000000</double>
-                 </property>
-                 <property name="value">
-                  <double>1000000.000000000000000</double>
-                 </property>
-                </widget>
-               </item>
-              </layout>
-             </item>
-             <item row="1" column="0">
               <widget class="QCheckBox" name="chkApproved">
                <property name="text">
                 <string>Approved</string>
                </property>
               </widget>
              </item>
-             <item row="1" column="1">
+             <item row="0" column="1">
               <widget class="QCheckBox" name="chkDefective">
                <property name="text">
                 <string>Defective</string>
                </property>
               </widget>
              </item>
-             <item row="1" column="2">
+             <item row="0" column="2">
               <widget class="QCheckBox" name="chkReviewed">
                <property name="text">
                 <string>Reviewed</string>
                </property>
               </widget>
              </item>
-             <item row="1" column="3">
+             <item row="0" column="3">
               <widget class="QCheckBox" name="chkInspect">
                <property name="text">
                 <string>Inspect</string>

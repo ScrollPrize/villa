@@ -6363,24 +6363,27 @@ void CWindow::CreateWidgets(void)
     connectVolumeSelector(volSelect);
 
     auto* filterDropdown = ui.btnFilterDropdown;
-    auto* cmbPointSetFilter = ui.cmbPointSetFilter;
-    auto* btnPointSetFilterAll = ui.btnPointSetFilterAll;
-    auto* btnPointSetFilterNone = ui.btnPointSetFilterNone;
-    auto* cmbPointSetFilterMode = new QComboBox();
+    auto* cmbPointSetFilter = new QComboBox(this);
+    auto* btnPointSetFilterAll = new QPushButton(tr("All"), this);
+    auto* btnPointSetFilterNone = new QPushButton(tr("None"), this);
+    auto* cmbPointSetFilterMode = new QComboBox(this);
+    auto* spinFocusPointFilterDistance = new QDoubleSpinBox(this);
+    auto* spinSurfaceZLowerBound = new QDoubleSpinBox(this);
+    auto* spinSurfaceZUpperBound = new QDoubleSpinBox(this);
     cmbPointSetFilterMode->addItem("Any (OR)");
     cmbPointSetFilterMode->addItem("All (AND)");
-    ui.pointSetFilterLayout->insertWidget(1, cmbPointSetFilterMode);
 
     SurfacePanelController::FilterUiRefs filterUi;
     filterUi.dropdown = filterDropdown;
+    filterUi.currentOnly = ui.chkFilterCurrentOnly;
     filterUi.pointSet = cmbPointSetFilter;
     filterUi.pointSetAll = btnPointSetFilterAll;
     filterUi.pointSetNone = btnPointSetFilterNone;
     filterUi.pointSetMode = cmbPointSetFilterMode;
     filterUi.surfaceIdFilter = ui.lineEditSurfaceFilter;
-    filterUi.focusPointDistance = ui.spinFocusPointFilterDistance;
-    filterUi.zLowerBound = ui.spinSurfaceZLowerBound;
-    filterUi.zUpperBound = ui.spinSurfaceZUpperBound;
+    filterUi.focusPointDistance = spinFocusPointFilterDistance;
+    filterUi.zLowerBound = spinSurfaceZLowerBound;
+    filterUi.zUpperBound = spinSurfaceZUpperBound;
     _surfacePanel->configureFilters(filterUi, _state->pointCollection());
 
     SurfacePanelController::TagUiRefs tagUi{
