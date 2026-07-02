@@ -110,8 +110,8 @@ public:
     void broadcastLinkedCursor(VolumeViewerBase* source,
                                const std::optional<cv::Vec3f>& point);
 
-    void setSliceStepSize(int size);
-    int sliceStepSize() const { return _sliceStepSize; }
+    void setZScrollSensitivity(double sensitivity);
+    double zScrollSensitivity() const { return _zScrollSensitivity; }
 
     void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
@@ -136,7 +136,7 @@ signals:
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
     void samplingStrideChanged(int stride);
-    void sliceStepSizeChanged(int size);
+    void zScrollSensitivityChanged(double sensitivity);
 
 private slots:
     void onGlobalTick();
@@ -202,7 +202,7 @@ private:
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
-    int _sliceStepSize{1};
+    double _zScrollSensitivity{1.0};
     int _surfacePatchSamplingStride{1};
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited

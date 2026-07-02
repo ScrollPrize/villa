@@ -172,12 +172,10 @@ namespace viewer {
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
     constexpr auto AXIS_OVERLAY_OPACITY = "viewer/axis_overlay_opacity";
     constexpr auto USE_AXIS_ALIGNED_SLICES = "viewer/use_axis_aligned_slices";
-    constexpr auto SLICE_STEP_SIZE = "viewer/slice_step_size";
 
     constexpr bool SHOW_AXIS_OVERLAYS_DEFAULT = true;
     constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 100;
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
-    constexpr int SLICE_STEP_SIZE_DEFAULT = 1;
 
     // Remote volume chunk cache directory. Resolved through
     // vc3d::remoteCachePath() — see that function for the priority rules.

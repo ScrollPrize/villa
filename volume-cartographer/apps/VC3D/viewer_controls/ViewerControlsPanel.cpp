@@ -245,17 +245,6 @@ void ViewerControlsPanel::setOverlayWindowAvailable(bool available)
     updateOverlayWindowControlsEnabled();
 }
 
-void ViewerControlsPanel::setSliceStepSize(int value)
-{
-    if (!_sliceStepSizeSpin) {
-        return;
-    }
-    QSignalBlocker blocker(_sliceStepSizeSpin);
-    _sliceStepSizeSpin->setValue(std::clamp(value,
-                                            _sliceStepSizeSpin->minimum(),
-                                            _sliceStepSizeSpin->maximum()));
-}
-
 void ViewerControlsPanel::setupViewerControlWiring()
 {
     setupWindowRangeControls();
@@ -268,28 +257,6 @@ void ViewerControlsPanel::setupViewerControlWiring()
         connect(_uiRefs.zoomOutButton, &QPushButton::clicked, this, &ViewerControlsPanel::zoomOutRequested);
     }
 
-    if (auto* spinSliceStep = _uiRefs.sliceStepSizeSpin) {
-        _sliceStepSizeSpin = spinSliceStep;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        int savedStep = settings.value(vc3d::settings::viewer::SLICE_STEP_SIZE,
-                                       vc3d::settings::viewer::SLICE_STEP_SIZE_DEFAULT).toInt();
-        savedStep = std::clamp(savedStep, spinSliceStep->minimum(), spinSliceStep->maximum());
-        {
-            QSignalBlocker blocker(spinSliceStep);
-            spinSliceStep->setValue(savedStep);
-        }
-        if (_viewerManager) {
-            _viewerManager->setSliceStepSize(savedStep);
-        }
-        connect(spinSliceStep, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_viewerManager) {
-                _viewerManager->setSliceStepSize(value);
-            }
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, value);
-            emit sliceStepSizeChanged(value);
-        });
-    }
 }
 
 void ViewerControlsPanel::setupWindowRangeControls()

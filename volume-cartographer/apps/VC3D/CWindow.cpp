@@ -1693,12 +1693,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
-    // Slice step size label in status bar
+    // Z-scroll sensitivity label in status bar
     _sliceStepLabel = new QLabel(this);
     _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
-    int initialStepSize = _viewerManager->sliceStepSize();
-    _sliceStepLabel->setText(tr("Step: %1").arg(initialStepSize));
-    _sliceStepLabel->setToolTip(tr("Slice step size: use Shift+G / Shift+H to adjust"));
+    double initialSensitivity = _viewerManager->zScrollSensitivity();
+    _sliceStepLabel->setText(tr("Z sens: %1").arg(initialSensitivity, 0, 'f', 1));
+    _sliceStepLabel->setToolTip(tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sliceStepLabel);
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
@@ -6305,7 +6305,6 @@ void CWindow::CreateWidgets(void)
         .claheTileSize = ui.spinClaheTileSize,
         .zoomInButton = ui.btnZoomIn,
         .zoomOutButton = ui.btnZoomOut,
-        .sliceStepSizeSpin = ui.spinSliceStepSize,
         .volumeWindowContainer = ui.volumeWindowContainer,
         .overlayWindowContainer = ui.overlayWindowContainer,
         .intersectionOpacitySpin = ui.spinIntersectionOpacity,
@@ -6318,8 +6317,8 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onZoomIn);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomOutRequested,
             this, &CWindow::onZoomOut);
-    connect(_viewerManager.get(), &ViewerManager::sliceStepSizeChanged,
-            this, &CWindow::onSliceStepSizeChanged);
+    connect(_viewerManager.get(), &ViewerManager::zScrollSensitivityChanged,
+            this, &CWindow::onZScrollSensitivityChanged);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
     if (_viewerControlsPanel) {
@@ -6627,18 +6626,14 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
-    // Shift+G decreases slice step size, Shift+H increases it
+    // Shift+G decreases Z-scroll sensitivity, Shift+H increases it
     if (event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers && _viewerManager) {
         if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
-            int currentStep = _viewerManager->sliceStepSize();
-            int newStep = std::max(1, currentStep - 1);
-            _viewerManager->setSliceStepSize(newStep);
+            _viewerManager->setZScrollSensitivity(_viewerManager->zScrollSensitivity() - 0.1);
             event->accept();
             return;
         } else if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
-            int currentStep = _viewerManager->sliceStepSize();
-            int newStep = std::min(100, currentStep + 1);
-            _viewerManager->setSliceStepSize(newStep);
+            _viewerManager->setZScrollSensitivity(_viewerManager->zScrollSensitivity() + 0.1);
             event->accept();
             return;
         }
@@ -6851,19 +6846,12 @@ void CWindow::onSegmentationGrowthStatusChanged(bool running)
     }
 }
 
-void CWindow::onSliceStepSizeChanged(int newSize)
+void CWindow::onZScrollSensitivityChanged(double sensitivity)
 {
-    // Update status bar label
+    // Update status bar label. Persistence + viewer refresh happen in
+    // ViewerManager::setZScrollSensitivity (the single source of truth).
     if (_sliceStepLabel) {
-        _sliceStepLabel->setText(tr("Step: %1").arg(newSize));
-    }
-
-    // Save to settings
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, newSize);
-
-    if (_viewerControlsPanel) {
-        _viewerControlsPanel->setSliceStepSize(newSize);
+        _sliceStepLabel->setText(tr("Z sens: %1").arg(sensitivity, 0, 'f', 1));
     }
 }
 

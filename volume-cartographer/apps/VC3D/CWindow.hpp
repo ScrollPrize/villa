@@ -244,7 +244,7 @@ private slots:
     // unless --record was passed and the recorder isn't already attached).
     void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
-    void onSliceStepSizeChanged(int newSize);
+    void onZScrollSensitivityChanged(double sensitivity);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
     void onNewFiberRequested();

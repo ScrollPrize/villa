@@ -137,7 +137,6 @@ public:
 
         QPushButton* zoomInButton{nullptr};
         QPushButton* zoomOutButton{nullptr};
-        QSpinBox* sliceStepSizeSpin{nullptr};
         QWidget* volumeWindowContainer{nullptr};
         QWidget* overlayWindowContainer{nullptr};
         QSpinBox* intersectionOpacitySpin{nullptr};
@@ -153,12 +152,10 @@ public:
     void toggleSegmentationComposite();
     void setViewControlsEnabled(bool enabled);
     void setOverlayWindowAvailable(bool available);
-    void setSliceStepSize(int value);
 
 signals:
     void zoomInRequested();
     void zoomOutRequested();
-    void sliceStepSizeChanged(int value);
     void statusMessageRequested(QString text, int timeoutMs);
 
 private:
@@ -182,7 +179,6 @@ private:
     ViewerTransformsPanel* _transformsPanel{nullptr};
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
-    QSpinBox* _sliceStepSizeSpin{nullptr};
     bool _viewControlsEnabled{true};
     bool _overlayWindowAvailable{false};
 };

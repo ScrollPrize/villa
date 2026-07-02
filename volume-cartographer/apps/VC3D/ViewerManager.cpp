@@ -58,6 +58,10 @@ ViewerManager::ViewerManager(CState* state,
     const float minHigh = std::min(_volumeWindowLow + 1.0f, 255.0f);
     _volumeWindowHigh = std::clamp(storedBaseHigh, minHigh, 255.0f);
 
+    const double storedZScroll = settings.value(viewer::ZSCROLL_SENSITIVITY,
+                                                 viewer::ZSCROLL_SENSITIVITY_DEFAULT).toDouble();
+    _zScrollSensitivity = std::clamp(storedZScroll, 0.1, 100.0);
+
     _surfacePatchSamplingStride = viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT;
     const float storedThickness = settings.value(viewer::INTERSECTION_THICKNESS, viewer::INTERSECTION_THICKNESS_DEFAULT).toFloat();
     _intersectionThickness = std::max(0.0f, storedThickness);
@@ -981,14 +985,24 @@ void ViewerManager::broadcastLinkedCursor(VolumeViewerBase* source,
     });
 }
 
-void ViewerManager::setSliceStepSize(int size)
+void ViewerManager::setZScrollSensitivity(double sensitivity)
 {
-    const int clampedSize = std::max(1, size);
-    if (_sliceStepSize == clampedSize) {
+    const double clamped = std::clamp(sensitivity, 0.1, 100.0);
+    if (std::abs(_zScrollSensitivity - clamped) < 1e-9) {
         return;
     }
-    _sliceStepSize = clampedSize;
-    emit sliceStepSizeChanged(_sliceStepSize);
+    _zScrollSensitivity = clamped;
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::viewer::ZSCROLL_SENSITIVITY, _zScrollSensitivity);
+
+    forEachBaseViewer([](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->reloadPerfSettings();
+        }
+    });
+
+    emit zScrollSensitivityChanged(_zScrollSensitivity);
 }
 
 void ViewerManager::forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const
