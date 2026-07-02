@@ -5,7 +5,6 @@
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "elements/LabeledControlRow.hpp"
 
-#include <QComboBox>
 #include <QSettings>
 #include <QSpinBox>
 #include <QVBoxLayout>
@@ -21,28 +20,6 @@ ViewerViewExtrasPanel::ViewerViewExtrasPanel(ViewerManager* viewerManager, QWidg
     layout->setSpacing(8);
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-
-    auto* interpRow = new LabeledControlRow(tr("Interpolation"), this);
-    auto* cmbInterp = new QComboBox(interpRow);
-    cmbInterp->addItem(tr("Nearest"));
-    cmbInterp->addItem(tr("Trilinear"));
-    cmbInterp->setCurrentIndex(std::clamp(settings.value(vc3d::settings::perf::INTERPOLATION_METHOD, 1).toInt(), 0, 1));
-    interpRow->addControl(cmbInterp, 1);
-    layout->addWidget(interpRow);
-
-    connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
-        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-        s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
-        if (_viewerManager) {
-            _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
-                if (!viewer) {
-                    return;
-                }
-                viewer->reloadPerfSettings();
-                viewer->renderVisible(true);
-            });
-        }
-    });
 
     auto* maxResolutionRow = new LabeledControlRow(tr("Max displayed resolution"), this);
     auto* maxResolution = new QSpinBox(maxResolutionRow);

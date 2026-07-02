@@ -39,6 +39,9 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     if (auto* chk = findChild<QCheckBox*>("chkShowPlaneIntersectionLines")) {
         chk->setChecked(settings.value(viewer::SHOW_PLANE_INTERSECTION_LINES, viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toInt() != 0);
     }
+    if (auto* cmb = findChild<QComboBox*>("cmbInterpolation")) {
+        cmb->setCurrentIndex(std::clamp(settings.value(perf::INTERPOLATION_METHOD, perf::INTERPOLATION_METHOD_DEFAULT).toInt(), 0, 1));
+    }
     // Show direction hints (flip_x arrows)
     if (findChild<QCheckBox*>("chkShowDirectionHints")) {
         findChild<QCheckBox*>("chkShowDirectionHints")->setChecked(settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toInt() != 0);
@@ -135,6 +138,9 @@ void SettingsDialog::accept()
     settings.setValue(viewer::RESET_VIEW_ON_SURFACE_CHANGE, chkResetViewOnSurfaceChange->isChecked() ? "1" : "0");
     if (auto* chk = findChild<QCheckBox*>("chkShowPlaneIntersectionLines")) {
         settings.setValue(viewer::SHOW_PLANE_INTERSECTION_LINES, chk->isChecked() ? "1" : "0");
+    }
+    if (auto* cmb = findChild<QComboBox*>("cmbInterpolation")) {
+        settings.setValue(perf::INTERPOLATION_METHOD, cmb->currentIndex());
     }
     if (findChild<QCheckBox*>("chkShowDirectionHints")) {
         settings.setValue(viewer::SHOW_DIRECTION_HINTS, findChild<QCheckBox*>("chkShowDirectionHints")->isChecked() ? "1" : "0");

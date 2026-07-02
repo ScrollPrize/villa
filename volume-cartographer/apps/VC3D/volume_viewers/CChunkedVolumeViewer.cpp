@@ -862,7 +862,7 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
     _voxelSizeOverrideUm = std::max(0.0, s.value(viewer::VOXEL_SIZE_UM, viewer::VOXEL_SIZE_UM_DEFAULT).toDouble());
     updateScalebarScale();   // override may have changed -> refresh the scalebar
-    const int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
+    const int interpIdx = s.value(perf::INTERPOLATION_METHOD, perf::INTERPOLATION_METHOD_DEFAULT).toInt();
     _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
     _maxDisplayedResolution = std::clamp(
         s.value(viewer::MAX_DISPLAYED_RESOLUTION, viewer::MAX_DISPLAYED_RESOLUTION_DEFAULT).toInt(),
