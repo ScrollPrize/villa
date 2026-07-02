@@ -28,6 +28,7 @@ class PathsOverlayController;
 class BBoxOverlayController;
 class VectorOverlayController;
 class VolumeOverlayController;
+class InkDetectionOverlayController;
 class SegmentationModule;
 class ViewerOverlayControllerBase;
 class VolumeViewerBase;
@@ -71,6 +72,8 @@ public:
     void setBBoxOverlay(BBoxOverlayController* overlay);
     void setVectorOverlay(VectorOverlayController* overlay);
     void setVolumeOverlay(VolumeOverlayController* overlay);
+    void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
+    InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
 
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
@@ -208,6 +211,7 @@ private:
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
     VolumeOverlayController* _volumeOverlay{nullptr};
+    InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
     bool _surfacePatchIndexNeedsRebuild{true};
     // Use string IDs for surface tracking to avoid dangling pointers in async operations

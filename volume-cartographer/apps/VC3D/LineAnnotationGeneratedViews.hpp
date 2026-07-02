@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -42,7 +43,16 @@ struct GeneratedOverlay {
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
         double linePosition = std::numeric_limits<double>::quiet_NaN();
+        struct BranchLink {
+            uint64_t fiberId = 0;
+            int controlPointIndex = -1;
+        };
+
+        size_t controlIndex = std::numeric_limits<size_t>::max();
         bool isSeed = false;
+        bool hasBranches = false;
+        std::vector<uint64_t> branchIds;
+        std::vector<BranchLink> branchLinks;
     };
 
     struct PredSnapMarker {
@@ -58,6 +68,7 @@ struct GeneratedOverlay {
     };
 
     std::vector<cv::Vec3f> linePoints;
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
@@ -99,6 +110,7 @@ struct GeneratedViews {
     std::shared_ptr<PlaneSurface> sideCutSurface;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
@@ -703,6 +715,7 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
 {
     GeneratedOverlay overlay;
     overlay.linePoints = views.linePoints;
+    overlay.branchLinePoints = views.branchLinePoints;
     overlay.seedPoint = views.seedPoint;
     overlay.seedLineIndex = views.controlPoints.empty() ? views.seedLineIndex : -1;
     overlay.useSurfaceCenterLine = true;
@@ -717,6 +730,7 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
 {
     GeneratedOverlay overlay;
     overlay.linePoints = views.linePoints;
+    overlay.branchLinePoints = views.branchLinePoints;
     overlay.seedPoint = views.seedPoint;
     overlay.seedLineIndex = views.controlPoints.empty() ? views.seedLineIndex : -1;
     overlay.useSurfaceCenterLine = true;
@@ -747,6 +761,7 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
     std::optional<double> controlLinePositionRadius = std::nullopt)
 {
     GeneratedOverlay overlay;
+    overlay.branchLinePoints = views.branchLinePoints;
     overlay.pointMarker = emphasized && finiteGeneratedPoint(views.focusPoint)
         ? views.focusPoint
         : interpolatedGeneratedLinePoint(views.linePoints, linePosition);
@@ -802,6 +817,8 @@ struct GeneratedControlPointContextMenuOptions {
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
+    std::function<void(size_t)> addBranch;
+    std::function<void(uint64_t, int)> openBranch;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,

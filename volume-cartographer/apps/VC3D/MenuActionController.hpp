@@ -15,6 +15,10 @@ class QMenuBar;
 class CWindow;
 class Volume;
 
+namespace vc3d::opendata {
+struct OpenDataSample;
+}
+
 class MenuActionController : public QObject
 {
     Q_OBJECT
@@ -42,6 +46,7 @@ private slots:
     void openVolpkg();
     void openRecentVolpkg();
     void attachRemoteZarr();
+    void showOpenDataCatalog();
     void showSettingsDialog();
     void showAboutDialog();
     void showKeybindings();
@@ -74,6 +79,7 @@ private:
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
+    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample);
     bool tryResolveRemoteAuth(const QString& url,
                               vc::HttpAuth* authOut,
                               bool allowPrompt,
@@ -113,6 +119,7 @@ private:
     QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
+    QAction* _openDataCatalogAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};

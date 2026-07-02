@@ -97,6 +97,8 @@ struct LineAnnotationController::LineAnnotationSession {
     vc::lasagna::LineOptimizationReport optimizationReport;
     vc::lasagna::LineModel optimizedLine;
     std::vector<vc::lasagna::LineControlPoint> controlPoints;
+    std::vector<LineAnnotationController::FiberBranchRef> branches;
+    bool showLinkedLineOverlays = false;
     double focusedLinePosition = 0.0;
     std::optional<cv::Vec3d> focusedControlPoint;
     cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
@@ -649,18 +651,104 @@ void frameStripLineSpan(CChunkedVolumeViewer* viewer,
 }
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::ControlPointMarker>
-generatedControlMarkers(const std::vector<vc::lasagna::LineControlPoint>& controls)
+generatedControlMarkers(
+    const std::vector<vc::lasagna::LineControlPoint>& controls,
+    const std::vector<LineAnnotationController::FiberBranchRef>& branches = {})
 {
+    struct BranchLinkTarget {
+        uint64_t fiberId = 0;
+        int controlPointIndex = -1;
+    };
+    std::unordered_map<size_t, std::vector<BranchLinkTarget>> branchesByControl;
+    branchesByControl.reserve(branches.size());
+    for (const auto& branch : branches) {
+        if (branch.controlPointIndex < 0 || branch.branchFiberId == 0) {
+            continue;
+        }
+        const size_t controlIndex = static_cast<size_t>(branch.controlPointIndex);
+        if (controlIndex >= controls.size()) {
+            continue;
+        }
+        auto& targets = branchesByControl[controlIndex];
+        const auto duplicate = std::find_if(
+            targets.begin(),
+            targets.end(),
+            [&branch](const BranchLinkTarget& target) {
+                return target.fiberId == branch.branchFiberId &&
+                       target.controlPointIndex == branch.branchControlPointIndex;
+            });
+        if (duplicate == targets.end()) {
+            targets.push_back({branch.branchFiberId, branch.branchControlPointIndex});
+        }
+    }
+
     std::vector<vc3d::line_annotation::GeneratedOverlay::ControlPointMarker> markers;
     markers.reserve(controls.size());
-    for (const auto& control : controls) {
+    for (size_t i = 0; i < controls.size(); ++i) {
+        const auto& control = controls[i];
         vc3d::line_annotation::GeneratedOverlay::ControlPointMarker marker;
         marker.point = toVec3f(control.volumePoint);
         marker.linePosition = control.linePosition;
+        marker.controlIndex = i;
         marker.isSeed = control.isSeed;
-        markers.push_back(marker);
+        if (auto it = branchesByControl.find(i); it != branchesByControl.end()) {
+            std::sort(it->second.begin(),
+                      it->second.end(),
+                      [](const BranchLinkTarget& lhs, const BranchLinkTarget& rhs) {
+                          if (lhs.fiberId != rhs.fiberId) {
+                              return lhs.fiberId < rhs.fiberId;
+                          }
+                          return lhs.controlPointIndex < rhs.controlPointIndex;
+                      });
+            for (const auto& target : it->second) {
+                marker.branchIds.push_back(target.fiberId);
+                marker.branchLinks.push_back({target.fiberId, target.controlPointIndex});
+            }
+            marker.branchIds.erase(std::unique(marker.branchIds.begin(), marker.branchIds.end()),
+                                   marker.branchIds.end());
+            marker.hasBranches = !marker.branchLinks.empty();
+        }
+        markers.push_back(std::move(marker));
     }
     return markers;
+}
+
+void remapBranchControlPointIndices(
+    const std::vector<vc::lasagna::LineControlPoint>& oldControls,
+    const std::vector<vc::lasagna::LineControlPoint>& newControls,
+    std::vector<LineAnnotationController::FiberBranchRef>& branches)
+{
+    if (branches.empty()) {
+        return;
+    }
+
+    constexpr double kMaxMatchDistanceSq = 1.0e-6;
+    for (auto& branch : branches) {
+        if (branch.controlPointIndex < 0 ||
+            static_cast<size_t>(branch.controlPointIndex) >= oldControls.size()) {
+            branch.controlPointIndex = -1;
+            continue;
+        }
+
+        const cv::Vec3d oldPoint = oldControls[static_cast<size_t>(branch.controlPointIndex)].volumePoint;
+        int bestIndex = -1;
+        double bestDistanceSq = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < newControls.size(); ++i) {
+            const cv::Vec3d delta = newControls[i].volumePoint - oldPoint;
+            const double distanceSq = delta.dot(delta);
+            if (distanceSq < bestDistanceSq) {
+                bestDistanceSq = distanceSq;
+                bestIndex = static_cast<int>(i);
+            }
+        }
+        branch.controlPointIndex = bestDistanceSq <= kMaxMatchDistanceSq ? bestIndex : -1;
+    }
+    branches.erase(std::remove_if(branches.begin(),
+                                  branches.end(),
+                                  [](const LineAnnotationController::FiberBranchRef& branch) {
+                                      return branch.controlPointIndex < 0;
+                                  }),
+                   branches.end());
 }
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker>
@@ -752,6 +840,27 @@ std::string sanitizedEventName(std::string event)
         }
     }
     return event.empty() ? "event" : event;
+}
+
+std::string sanitizedProjectFiberDirName(const fs::path& projectPath,
+                                         const fs::path& volpkgRoot)
+{
+    std::string name = projectPath.empty()
+        ? volpkgRoot.filename().string()
+        : projectPath.filename().string();
+    for (char& ch : name) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (!std::isalnum(c) && ch != '.' && ch != '-' && ch != '_') {
+            ch = '_';
+        }
+    }
+    while (!name.empty() && name.front() == '_') {
+        name.erase(name.begin());
+    }
+    while (!name.empty() && name.back() == '_') {
+        name.pop_back();
+    }
+    return name.empty() ? "project" : name;
 }
 
 void writeLineDebugJson(const std::string& eventName,
@@ -1258,6 +1367,18 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                 handleGeneratedControlPointDelete(name, linePosition, volumePoint);
             });
     connect(dialog,
+            &LineAnnotationDialog::generatedControlPointBranchRequested,
+            this,
+            [this](const std::string& name, size_t controlPointIndex) {
+                handleGeneratedControlPointBranch(name, controlPointIndex);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::generatedControlPointBranchOpenRequested,
+            this,
+            [this](uint64_t branchFiberId, int branchControlPointIndex) {
+                openFiberAtControlPoint(branchFiberId, branchControlPointIndex);
+            });
+    connect(dialog,
             &LineAnnotationDialog::generatedPredSnapPointRequested,
             this,
             [this](const std::string& name, cv::Vec3f volumePoint) {
@@ -1322,7 +1443,7 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         materializeGeneratedViews(*session);
     }
     if (!session->deferShowUntilGenerated || !session->optimizedLine.points.empty()) {
-        dialog->showMaximized();
+        dialog->showWithSavedGeometry();
         dialog->raise();
         dialog->activateWindow();
     }
@@ -1378,6 +1499,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberFileName = it->fileName;
     session->fiberManualHvTag = it->manualHvTag;
     session->fiberTags = it->tags;
+    session->branches = it->branches;
     session->disableInitialGeneratedHoverFollow =
         controlPointIndex.has_value() || linePointIndex.has_value() ||
         spanControlIndices.has_value();
@@ -1884,7 +2006,7 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
         std::error_code relativeEc;
         input.fiberPath = fs::relative(fiberPath(*fiberIt), volpkgRoot, relativeEc);
         if (relativeEc || input.fiberPath.empty()) {
-            input.fiberPath = fs::path("fibers") / fiberIt->fileName;
+            input.fiberPath = relativeFiberPath(*fiberIt);
         }
         input.controlPoints = fiberIt->controlPoints;
         input.linePoints = fiberIt->linePoints;
@@ -3023,7 +3145,8 @@ void LineAnnotationController::rebuildIntersectionInspection()
                             vc3d::line_annotation::GeneratedViews views;
                             views.linePoints = generatedLinePoints(linePoints);
                             views.lineUpVectors = lineUpVectors;
-                            views.controlPoints = generatedControlMarkers(session->controlPoints);
+                            views.controlPoints = generatedControlMarkers(session->controlPoints, session->branches);
+                            views.branchLinePoints = generatedBranchLinePointsForSession(*session);
                             views.predSnapPoints =
                                 generatedPredSnapMarkers(session->controlPoints,
                                                          session->predSnapSet);
@@ -3130,7 +3253,8 @@ void LineAnnotationController::rebuildIntersectionInspection()
                 side.triplet.nextLinePosition,
             };
             auto applyGeneratedStripOverlay =
-                [chunkedViewer,
+                [this,
+                 chunkedViewer,
                  key = side.stripSurfaceName,
                  linePoints,
                  lineUpVectors,
@@ -3143,7 +3267,8 @@ void LineAnnotationController::rebuildIntersectionInspection()
                     vc3d::line_annotation::GeneratedViews views;
                     views.linePoints = generatedLinePoints(linePoints);
                     views.lineUpVectors = lineUpVectors;
-                    views.controlPoints = generatedControlMarkers(session->controlPoints);
+                    views.controlPoints = generatedControlMarkers(session->controlPoints, session->branches);
+                    views.branchLinePoints = generatedBranchLinePointsForSession(*session);
                     views.predSnapPoints =
                         generatedPredSnapMarkers(session->controlPoints,
                                                  session->predSnapSet);
@@ -3533,7 +3658,7 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
         options.viewer = viewer;
         options.scenePoint = scenePoint;
         options.globalPos = globalPos;
-        options.controlPoints = generatedControlMarkers(pane->session->controlPoints);
+        options.controlPoints = generatedControlMarkers(pane->session->controlPoints, pane->session->branches);
         options.linePointCount = pane->session->optimizedLine.points.empty()
             ? pane->session->controlPoints.size()
             : pane->session->optimizedLine.points.size();
@@ -3988,10 +4113,6 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
         }
         return snapshot;
     };
-    auto relativeFiberPath = [](const StoredFiber& fiber) {
-        return fs::path("fibers") / fiber.fileName;
-    };
-
     std::map<fs::path, FiberSnapshotWithPath> byPath;
     const fs::path dir = fibersDir();
     std::error_code ec;
@@ -4199,7 +4320,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                            session.controlPoints,
                            linePointsToJson(session.optimizedLine));
         if (pane->dialog) {
-            pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
+            pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints, session.branches));
             pane->dialog->setGeneratedPredSnapPoints(
                 generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
         }
@@ -4211,6 +4332,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     for (const auto& point : session.optimizedLine.points) {
         currentLinePoints.push_back(point.position);
     }
+
+    const std::vector<vc::lasagna::LineControlPoint> branchRemapControls = session.controlPoints;
 
     vc::lasagna::LineControlPointUpdateResult update;
     const std::string updateEventName = editedExistingControl
@@ -4232,6 +4355,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
     session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
     session.controlPoints = update.controlPoints;
+    remapBranchControlPointIndices(branchRemapControls, session.controlPoints, session.branches);
+    syncReciprocalBranchControlPointReferences(session);
     if (update.changedControlIndex >= 0 &&
         update.changedControlIndex < static_cast<int>(session.controlPoints.size())) {
         const auto& changed = session.controlPoints[static_cast<size_t>(update.changedControlIndex)];
@@ -4250,6 +4375,96 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                        session.controlPoints,
                        linePointsToJson(session.optimizedLine));
     startOptimization(session, false, update.activeStart, update.activeEnd);
+}
+
+void LineAnnotationController::handleGeneratedControlPointBranch(const std::string& surfaceName,
+                                                                size_t controlPointIndex)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+
+    auto& parentSession = *pane->session;
+    if (parentSession.taskState == LineAnnotationSession::TaskState::Running) {
+        showError(tr("Line optimization is already running."));
+        return;
+    }
+    if (controlPointIndex >= parentSession.controlPoints.size()) {
+        return;
+    }
+    if (!ensureDatasetForSession(parentSession)) {
+        return;
+    }
+
+    ensureSessionFiberIdentity(parentSession);
+    if (parentSession.fiberId == 0) {
+        parentSession.fiberId = nextFiberId();
+    }
+    const uint64_t parentFiberId = parentSession.fiberId;
+    const std::string parentFileName = parentSession.fiberFileName;
+    const cv::Vec3d branchPoint = parentSession.controlPoints[controlPointIndex].volumePoint;
+    if (!finitePoint(branchPoint)) {
+        return;
+    }
+
+    auto childSession = std::make_shared<LineAnnotationSession>();
+    childSession->fiberId = nextFiberId();
+    childSession->sourceSliceNormal = parentSession.sourceSliceNormal;
+    childSession->initialDirectionMode = parentSession.initialDirectionMode;
+    childSession->selectedDatasetLocation = parentSession.selectedDatasetLocation;
+    childSession->selectedManifestPath = parentSession.selectedManifestPath;
+    childSession->dataset = parentSession.dataset;
+    childSession->normalSampler = parentSession.normalSampler;
+    ensureSessionFiberIdentity(*childSession);
+
+    FiberBranchRef parentToChild;
+    parentToChild.controlPointIndex = static_cast<int>(controlPointIndex);
+    parentToChild.branchFiberId = childSession->fiberId;
+    parentToChild.branchControlPointIndex = 0;
+    parentToChild.branchFileName = childSession->fiberFileName;
+
+    const auto duplicateParentLink = std::find_if(
+        parentSession.branches.begin(),
+        parentSession.branches.end(),
+        [&parentToChild](const FiberBranchRef& branch) {
+            return branch.controlPointIndex == parentToChild.controlPointIndex &&
+                   branch.branchFiberId == parentToChild.branchFiberId &&
+                   branch.branchControlPointIndex == parentToChild.branchControlPointIndex;
+        });
+    if (duplicateParentLink == parentSession.branches.end()) {
+        parentSession.branches.push_back(parentToChild);
+    }
+
+    FiberBranchRef childToParent;
+    childToParent.controlPointIndex = 0;
+    childToParent.branchFiberId = parentFiberId;
+    childToParent.branchControlPointIndex = static_cast<int>(controlPointIndex);
+    childToParent.branchFileName = parentFileName;
+    childSession->branches.push_back(childToParent);
+    childSession->showLinkedLineOverlays = false;
+
+    if (pane->dialog) {
+        pane->dialog->setGeneratedControlPoints(
+            generatedControlMarkers(parentSession.controlPoints, parentSession.branches));
+        pane->dialog->setGeneratedBranchLinePoints(
+            generatedBranchLinePointsForSession(parentSession));
+    }
+
+    const std::string childSurfaceName = nextSurfaceName();
+    CChunkedVolumeViewer::CameraState camera;
+    camera.scale = 1.0f;
+    const cv::Vec3f branchPointf = toVec3f(branchPoint);
+    auto sourcePlane = std::make_shared<PlaneSurface>(branchPointf, toVec3f(parentSession.sourceSliceNormal));
+    launchSession(SourceKind::Plane,
+                  childSurfaceName,
+                  std::move(sourcePlane),
+                  camera,
+                  parentSession.sourceSliceNormal,
+                  childSession,
+                  true);
+    handleLineSeed(childSurfaceName, branchPointf, parentSession.initialDirectionMode);
+    refreshBranchLineViews(parentFiberId);
 }
 
 void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& surfaceName,
@@ -4359,7 +4574,10 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
     const bool deletedSeed = selected->isSeed;
     const int linePointCount = static_cast<int>(session.optimizedLine.points.size());
+    const std::vector<vc::lasagna::LineControlPoint> branchRemapControls = session.controlPoints;
     session.controlPoints.erase(selected);
+    remapBranchControlPointIndices(branchRemapControls, session.controlPoints, session.branches);
+    syncReciprocalBranchControlPointReferences(session);
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     if (session.controlPoints.empty()) {
         return;
@@ -4420,7 +4638,7 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     }
 
     if (pane->dialog) {
-        pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints));
+        pane->dialog->setGeneratedControlPoints(generatedControlMarkers(session.controlPoints, session.branches));
         pane->dialog->setGeneratedPredSnapPoints(
             generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
     }
@@ -4526,7 +4744,10 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     session.selectedManifestPath = task.manifestPath;
     session.optimizationReport = task.result.report;
     session.optimizedLine = std::move(task.result.line);
+    const std::vector<vc::lasagna::LineControlPoint> branchRemapControls = session.controlPoints;
     session.controlPoints = std::move(task.controlPoints);
+    remapBranchControlPointIndices(branchRemapControls, session.controlPoints, session.branches);
+    syncReciprocalBranchControlPointReferences(session);
     for (auto& control : session.controlPoints) {
         double bestDistance = std::numeric_limits<double>::infinity();
         int bestIndex = -1;
@@ -4571,8 +4792,10 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
             return false;
         }
     }
+    refreshBranchLineViews(session.fiberId);
+
     if (session.deferShowUntilGenerated && pane && pane->dialog && !pane->dialog->isVisible()) {
-        pane->dialog->showMaximized();
+        pane->dialog->showWithSavedGeometry();
         pane->dialog->raise();
         pane->dialog->activateWindow();
     }
@@ -4960,22 +5183,15 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineSideSliceTitle = tr("Line Side Slice");
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
+    generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
     generatedViews.seedPoint = seedPoint;
     generatedViews.focusPoint = focusPoint;
     generatedViews.seedLineIndex = static_cast<int>(session.optimizedLine.points.size() / 2);
     generatedViews.initialCurrentCutFollowsStripMouse =
         !session.disableInitialGeneratedHoverFollow;
-    for (const auto& control : session.controlPoints) {
-        LineAnnotationDialog::GeneratedOverlay::ControlPointMarker marker;
-        marker.point = {static_cast<float>(control.volumePoint[0]),
-                        static_cast<float>(control.volumePoint[1]),
-                        static_cast<float>(control.volumePoint[2])};
-        marker.linePosition = std::isfinite(control.linePosition)
-            ? control.linePosition
-            : static_cast<double>(control.optimizedIndex);
-        marker.isSeed = control.isSeed;
-        generatedViews.controlPoints.push_back(marker);
-        if (control.isSeed && std::isfinite(marker.linePosition)) {
+    generatedViews.controlPoints = generatedControlMarkers(session.controlPoints, session.branches);
+    for (const auto& marker : generatedViews.controlPoints) {
+        if (marker.isSeed && std::isfinite(marker.linePosition)) {
             generatedViews.seedLineIndex = static_cast<int>(std::llround(marker.linePosition));
         }
     }
@@ -5331,6 +5547,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     ++_nextFiberAlignmentMetricToken;
     ++_fiberMetricsGeneration;
     _fiberMetricsPending = false;
+    _knownFiberTags.clear();
     if (!_state || !_state->vpkg()) {
         emitFiberSummaries();
         return;
@@ -5379,12 +5596,28 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
     }
     std::sort(_fibers.begin(), _fibers.end(), [](const StoredFiber& a, const StoredFiber& b) {
-        return vc::atlas::atlasFiberPathKey(fs::path("fibers") / a.fileName) <
-               vc::atlas::atlasFiberPathKey(fs::path("fibers") / b.fileName);
+        return a.fileName < b.fileName;
     });
     uint64_t runtimeId = 1;
     for (auto& fiber : _fibers) {
         fiber.id = runtimeId++;
+    }
+    std::unordered_map<std::string, uint64_t> fiberIdByFileName;
+    fiberIdByFileName.reserve(_fibers.size());
+    for (const auto& fiber : _fibers) {
+        if (!fiber.fileName.empty()) {
+            fiberIdByFileName[fiber.fileName] = fiber.id;
+        }
+    }
+    for (auto& fiber : _fibers) {
+        for (auto& branch : fiber.branches) {
+            if (!branch.branchFileName.empty()) {
+                if (auto it = fiberIdByFileName.find(branch.branchFileName);
+                    it != fiberIdByFileName.end()) {
+                    branch.branchFiberId = it->second;
+                }
+            }
+        }
     }
     emitFiberSummaries();
 }
@@ -5401,17 +5634,57 @@ void LineAnnotationController::addKnownFiberTags(const std::vector<std::string>&
     }
 }
 
+fs::path LineAnnotationController::fibersRootDir() const
+{
+    const fs::path root = currentVolpkgRoot();
+    return root.empty() ? fs::path{} : root / "fibers";
+}
+
 fs::path LineAnnotationController::fibersDir() const
 {
     if (!_state || !_state->vpkg()) {
         return {};
     }
+    const fs::path root = currentVolpkgRoot();
+    if (root.empty()) {
+        return {};
+    }
     const auto vpkg = _state->vpkg();
-    const fs::path projectPath = vpkg->path();
-    const fs::path root = projectPath.empty()
-        ? fs::path(vpkg->getVolpkgDirectory())
-        : projectPath.parent_path();
-    return root / "fibers";
+    return root / "fibers" / sanitizedProjectFiberDirName(vpkg->path(), root);
+}
+
+fs::path LineAnnotationController::relativeFiberPath(const StoredFiber& fiber) const
+{
+    const fs::path absolutePath = fiberPath(fiber);
+    const fs::path root = currentVolpkgRoot();
+    if (!absolutePath.empty() && !root.empty()) {
+        std::error_code ec;
+        const fs::path relativePath = fs::relative(absolutePath, root, ec);
+        if (!ec && !relativePath.empty()) {
+            return relativePath;
+        }
+    }
+
+    const fs::path dir = fibersDir();
+    const fs::path rootDir = fibersRootDir();
+    if (!dir.empty() && !rootDir.empty()) {
+        std::error_code ec;
+        const fs::path relativeDir = fs::relative(dir, rootDir.parent_path(), ec);
+        if (!ec && !relativeDir.empty()) {
+            if (!fiber.fileName.empty()) {
+                return relativeDir / fiber.fileName;
+            }
+            if (!fiber.username.empty() && !fiber.startedAt.empty() && fiber.sequence > 0) {
+                return relativeDir / vc3d::line_annotation::fiberFileName(
+                    fiber.username, fiber.startedAt, fiber.sequence);
+            }
+        }
+    }
+
+    if (!fiber.fileName.empty()) {
+        return fs::path("fibers") / fiber.fileName;
+    }
+    return fs::path("fibers") / (std::to_string(fiber.id) + ".json");
 }
 
 fs::path LineAnnotationController::fiberPath(uint64_t fiberId) const
@@ -5465,6 +5738,7 @@ std::vector<std::string> LineAnnotationController::atlasPathKeysForFiber(
     };
 
     if (!fiber.fileName.empty()) {
+        addKey(relativeFiberPath(fiber));
         addKey(fs::path("fibers") / fiber.fileName);
         addKey(fs::path(fiber.fileName));
     }
@@ -5546,6 +5820,11 @@ uint64_t LineAnnotationController::nextFiberId() const
     for (const auto& fiber : _fibers) {
         id = std::max(id, fiber.id + 1);
     }
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->fiberId != 0) {
+            id = std::max(id, pane.session->fiberId + 1);
+        }
+    }
     return id;
 }
 
@@ -5598,6 +5877,103 @@ void LineAnnotationController::ensureSessionFiberIdentity(LineAnnotationSession&
     session.fiberSequence = nextFiberSequenceForUsername(session.fiberUsername);
     session.fiberFileName = vc3d::line_annotation::fiberFileName(
         session.fiberUsername, session.fiberStartedAt, session.fiberSequence);
+}
+
+std::vector<std::vector<cv::Vec3f>>
+LineAnnotationController::generatedBranchLinePointsForSession(
+    const LineAnnotationSession& session) const
+{
+    std::vector<std::vector<cv::Vec3f>> branches;
+    if (!session.showLinkedLineOverlays) {
+        return branches;
+    }
+    std::unordered_set<uint64_t> seenFiberIds;
+
+    auto linePointsForFiber = [this](uint64_t fiberId) -> std::vector<cv::Vec3d> {
+        for (const auto& pane : _panes) {
+            if (!pane.session || pane.session->fiberId != fiberId ||
+                pane.session->optimizedLine.points.empty()) {
+                continue;
+            }
+            std::vector<cv::Vec3d> points;
+            points.reserve(pane.session->optimizedLine.points.size());
+            for (const auto& point : pane.session->optimizedLine.points) {
+                points.push_back(point.position);
+            }
+            return points;
+        }
+        auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+            return fiber.id == fiberId;
+        });
+        return it == _fibers.end() ? std::vector<cv::Vec3d>{} : it->linePoints;
+    };
+
+    for (const auto& branch : session.branches) {
+        if (branch.branchFiberId == 0 || !seenFiberIds.insert(branch.branchFiberId).second) {
+            continue;
+        }
+        std::vector<cv::Vec3d> linePoints = linePointsForFiber(branch.branchFiberId);
+        if (linePoints.size() >= 2) {
+            branches.push_back(generatedLinePoints(linePoints));
+        }
+    }
+    return branches;
+}
+
+void LineAnnotationController::refreshBranchLineViews(uint64_t changedFiberId)
+{
+    for (const auto& pane : _panes) {
+        if (!pane.session || !pane.dialog) {
+            continue;
+        }
+        bool relevant = changedFiberId == 0 || pane.session->fiberId == changedFiberId;
+        if (!relevant) {
+            relevant = std::any_of(pane.session->branches.begin(),
+                                   pane.session->branches.end(),
+                                   [changedFiberId](const FiberBranchRef& branch) {
+                                       return branch.branchFiberId == changedFiberId;
+                                   });
+        }
+        if (!relevant) {
+            continue;
+        }
+        pane.dialog->setGeneratedControlPoints(
+            generatedControlMarkers(pane.session->controlPoints, pane.session->branches));
+        pane.dialog->setGeneratedBranchLinePoints(
+            generatedBranchLinePointsForSession(*pane.session));
+    }
+}
+
+void LineAnnotationController::syncReciprocalBranchControlPointReferences(
+    const LineAnnotationSession& session)
+{
+    if (session.fiberId == 0) {
+        return;
+    }
+
+    auto updateBranches = [&session](std::vector<FiberBranchRef>& targetBranches) {
+        for (auto& targetBranch : targetBranches) {
+            if (targetBranch.branchFiberId != session.fiberId) {
+                continue;
+            }
+            for (const auto& sourceBranch : session.branches) {
+                if (sourceBranch.branchFiberId != 0 &&
+                    targetBranch.controlPointIndex == sourceBranch.branchControlPointIndex &&
+                    targetBranch.branchControlPointIndex != sourceBranch.controlPointIndex) {
+                    targetBranch.branchControlPointIndex = sourceBranch.controlPointIndex;
+                }
+            }
+        }
+    };
+
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session.get() != &session) {
+            updateBranches(pane.session->branches);
+        }
+    }
+    for (auto& fiber : _fibers) {
+        updateBranches(fiber.branches);
+    }
 }
 
 double LineAnnotationController::lineLengthVx(const std::vector<cv::Vec3d>& points)
@@ -5812,6 +6188,7 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberFileName = fiber.fileName;
     session->fiberManualHvTag = fiber.manualHvTag;
     session->fiberTags = fiber.tags;
+    session->branches = fiber.branches;
     session->focusedLinePosition = std::clamp(
         focusLinePosition,
         0.0,
@@ -5901,16 +6278,39 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         fiber.generation = existingIt == _fibers.end()
             ? uint64_t{1}
             : std::max<uint64_t>(uint64_t{1}, existingIt->generation + 1);
-        fiber.controlPoints.reserve(session.controlPoints.size());
-        auto controls = session.controlPoints;
+        struct IndexedControlPoint {
+            size_t originalIndex = 0;
+            vc::lasagna::LineControlPoint control;
+        };
+        std::vector<IndexedControlPoint> controls;
+        controls.reserve(session.controlPoints.size());
+        for (size_t i = 0; i < session.controlPoints.size(); ++i) {
+            controls.push_back({i, session.controlPoints[i]});
+        }
         std::stable_sort(controls.begin(),
                          controls.end(),
-                         [](const vc::lasagna::LineControlPoint& a,
-                            const vc::lasagna::LineControlPoint& b) {
-                             return a.linePosition < b.linePosition;
+                         [](const IndexedControlPoint& a, const IndexedControlPoint& b) {
+                             return a.control.linePosition < b.control.linePosition;
                          });
-        for (const auto& control : controls) {
-            fiber.controlPoints.push_back(control.volumePoint);
+        std::vector<int> storedIndexForSessionIndex(session.controlPoints.size(), -1);
+        fiber.controlPoints.reserve(controls.size());
+        for (size_t storedIndex = 0; storedIndex < controls.size(); ++storedIndex) {
+            const auto& control = controls[storedIndex];
+            storedIndexForSessionIndex[control.originalIndex] = static_cast<int>(storedIndex);
+            fiber.controlPoints.push_back(control.control.volumePoint);
+        }
+        fiber.branches.reserve(session.branches.size());
+        for (const auto& branch : session.branches) {
+            if (branch.controlPointIndex < 0 ||
+                static_cast<size_t>(branch.controlPointIndex) >= storedIndexForSessionIndex.size()) {
+                continue;
+            }
+            FiberBranchRef storedBranch = branch;
+            storedBranch.controlPointIndex =
+                storedIndexForSessionIndex[static_cast<size_t>(branch.controlPointIndex)];
+            if (storedBranch.controlPointIndex >= 0 && storedBranch.branchFiberId != 0) {
+                fiber.branches.push_back(std::move(storedBranch));
+            }
         }
         fiber.linePoints.reserve(session.optimizedLine.points.size());
         for (const auto& point : session.optimizedLine.points) {
@@ -5946,6 +6346,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         invalidateFiberAlignmentMetrics(savedFiberId, true);
         addKnownFiberTags(session.fiberTags);
         emitFiberSummaries();
+        refreshBranchLineViews(savedFiberId);
         emit fiberSaved(savedFiberId, savedGeneration);
     } catch (const std::exception& ex) {
         showError(tr("Could not save fiber: %1").arg(QString::fromStdString(ex.what())));
@@ -5984,6 +6385,38 @@ void LineAnnotationController::saveFiber(const StoredFiber& fiber) const
         {"automatic_certainty", fiber.hvClassification.automaticCertainty},
         {"manual_tag", fiber.manualHvTag},
     };
+    root["branches"] = nlohmann::json::array();
+    auto branchFileNameForId = [this](uint64_t fiberId) -> std::string {
+        for (const auto& fiber : _fibers) {
+            if (fiber.id == fiberId) {
+                return fiber.fileName;
+            }
+        }
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.session->fiberId == fiberId) {
+                return pane.session->fiberFileName;
+            }
+        }
+        return {};
+    };
+    for (const auto& branch : fiber.branches) {
+        if (branch.controlPointIndex < 0 || branch.branchFiberId == 0) {
+            continue;
+        }
+        nlohmann::json branchJson = {
+            {"control_point_index", branch.controlPointIndex},
+            {"branch_fiber_id", branch.branchFiberId},
+            {"branch_control_point_index", branch.branchControlPointIndex},
+        };
+        std::string branchFileName = branchFileNameForId(branch.branchFiberId);
+        if (branchFileName.empty()) {
+            branchFileName = branch.branchFileName;
+        }
+        if (!branchFileName.empty()) {
+            branchJson["branch_file"] = branchFileName;
+        }
+        root["branches"].push_back(std::move(branchJson));
+    }
     root["control_points"] = nlohmann::json::array();
     root["line_points"] = nlohmann::json::array();
     for (const auto& point : fiber.controlPoints) {
@@ -6081,6 +6514,28 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
 
     if (root.contains("tags")) {
         fiber.tags = normalizedFiberTagsFromJson(root.at("tags"));
+    }
+
+    if (root.contains("branches")) {
+        const auto& branches = root.at("branches");
+        if (!branches.is_array()) {
+            throw std::runtime_error("branches must be an array");
+        }
+        for (const auto& branchJson : branches) {
+            if (!branchJson.is_object()) {
+                continue;
+            }
+            FiberBranchRef branch;
+            branch.controlPointIndex = branchJson.value("control_point_index", -1);
+            branch.branchFiberId = branchJson.value("branch_fiber_id", uint64_t{0});
+            branch.branchControlPointIndex = branchJson.value("branch_control_point_index", -1);
+            branch.branchFileName = branchJson.value("branch_file", std::string{});
+            if (branch.controlPointIndex >= 0 &&
+                static_cast<size_t>(branch.controlPointIndex) < fiber.controlPoints.size() &&
+                (branch.branchFiberId != 0 || !branch.branchFileName.empty())) {
+                fiber.branches.push_back(std::move(branch));
+            }
+        }
     }
 
     fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(fiber.controlPoints);

@@ -69,6 +69,7 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& normalGridEntries() const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
+    bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
     bool addSegmentsEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
     bool removeEntry(const std::string& location);

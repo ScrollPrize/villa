@@ -30,14 +30,13 @@ AwsAuth AwsAuth::load(const std::string& profile)
         if (!profileArg.empty())
             cmd += " --profile " + profileArg;
         cmd += " 2>/dev/null";
-        fprintf(stderr, "[AWS] trying: %s\n", cmd.c_str());
         std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (!pipe) { fprintf(stderr, "[AWS]   popen failed\n"); return false; }
+        if (!pipe) return false;
         std::string output;
         char buf[4096];
         while (fgets(buf, sizeof(buf), pipe.get()))
             output += buf;
-        if (output.empty()) { fprintf(stderr, "[AWS]   empty output\n"); return false; }
+        if (output.empty()) return false;
         try {
             auto j = Json::parse(output);
             if (j.contains("AccessKeyId") && j.contains("SecretAccessKey")) {
@@ -45,12 +44,10 @@ AwsAuth AwsAuth::load(const std::string& profile)
                 auth.secret_key = j["SecretAccessKey"].get_string();
                 if (j.contains("SessionToken"))
                     auth.session_token = j["SessionToken"].get_string();
-                fprintf(stderr, "[AWS]   got creds: key=%s...  token=%s\n",
-                    auth.access_key.substr(0, 8).c_str(),
-                    auth.session_token.empty() ? "(none)" : (auth.session_token.substr(0, 20) + "...").c_str());
                 return true;
             }
-        } catch (...) { fprintf(stderr, "[AWS]   JSON parse failed\n"); }
+        } catch (...) {
+        }
         return false;
     };
 
@@ -95,9 +92,6 @@ AwsAuth AwsAuth::load(const std::string& profile)
         auto envProfile = getEnv("AWS_PROFILE");
         bool got = false;
 
-        fprintf(stderr, "[AWS] AwsAuth::load(profile=\"%s\") AWS_PROFILE=\"%s\"\n",
-            profile.c_str(), envProfile.c_str());
-
         // 1. Try explicit profile (env or argument)
         if (!envProfile.empty())
             got = tryExportCreds(envProfile);
@@ -107,9 +101,7 @@ AwsAuth AwsAuth::load(const std::string& profile)
         // 2. Try SSO profiles from ~/.aws/config
         if (!got) {
             auto ssoProfiles = findSsoProfiles();
-            fprintf(stderr, "[AWS] found %zu SSO profiles in config\n", ssoProfiles.size());
             for (auto& p : ssoProfiles) {
-                fprintf(stderr, "[AWS]   SSO profile: %s\n", p.c_str());
                 if (tryExportCreds(p)) {
                     got = true;
                     break;
@@ -120,10 +112,6 @@ AwsAuth AwsAuth::load(const std::string& profile)
         // 3. Try default (no --profile flag)
         if (!got)
             got = tryExportCreds("");
-
-        fprintf(stderr, "[AWS] export-credentials result: %s (key=%s...)\n",
-            got ? "success" : "FAILED",
-            auth.access_key.empty() ? "(empty)" : auth.access_key.substr(0, 8).c_str());
     }
 
     // Method 2: INI files (~/.aws/credentials, ~/.aws/config)
@@ -181,12 +169,6 @@ AwsAuth AwsAuth::load(const std::string& profile)
     if (auth.secret_key.empty())    auth.secret_key = getEnv("AWS_SECRET_ACCESS_KEY");
     if (auth.session_token.empty()) auth.session_token = getEnv("AWS_SESSION_TOKEN");
     if (auth.region.empty())        auth.region = getEnv("AWS_DEFAULT_REGION");
-
-    fprintf(stderr, "[AWS] FINAL: key=%s... secret=%s token=%s region=%s\n",
-        auth.access_key.empty() ? "(empty)" : auth.access_key.substr(0, 8).c_str(),
-        auth.secret_key.empty() ? "(empty)" : "***",
-        auth.session_token.empty() ? "(empty)" : (auth.session_token.substr(0, 20) + "...").c_str(),
-        auth.region.empty() ? "(empty)" : auth.region.c_str());
 
     return auth;
 }

@@ -200,12 +200,22 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
 
     const auto key = "line_annotation_overlay_" + surfaceName;
     std::vector<ViewerOverlayControllerBase::OverlayPrimitive> primitives;
-    primitives.reserve(3 + overlay.controlPoints.size() + overlay.predSnapPoints.size() * 2);
+    size_t branchPointCount = 0;
+    for (const auto& branch : overlay.branchLinePoints) {
+        branchPointCount += branch.size();
+    }
+    primitives.reserve(3 + branchPointCount + overlay.controlPoints.size() +
+                       overlay.predSnapPoints.size() * 2);
 
     ViewerOverlayControllerBase::OverlayStyle lineStyle;
     lineStyle.penColor = QColor(0, 220, 255, 190);
     lineStyle.penWidth = 1.0;
     lineStyle.z = 150.0;
+
+    ViewerOverlayControllerBase::OverlayStyle branchLineStyle;
+    branchLineStyle.penColor = QColor(190, 90, 255, 210);
+    branchLineStyle.penWidth = 1.25;
+    branchLineStyle.z = 149.0;
 
     ViewerOverlayControllerBase::OverlayStyle seedStyle;
     seedStyle.penColor = QColor(255, 230, 0, 220);
@@ -215,6 +225,20 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
 
     ViewerOverlayControllerBase::OverlayStyle controlPointStyle = seedStyle;
     controlPointStyle.z = 160.0;
+
+    ViewerOverlayControllerBase::OverlayStyle branchControlPointStyle = controlPointStyle;
+    branchControlPointStyle.penColor = QColor(210, 95, 255, 245);
+    branchControlPointStyle.brushColor = QColor(210, 95, 255, 175);
+    branchControlPointStyle.penWidth = 2.0;
+    branchControlPointStyle.z = 162.0;
+
+    auto controlStyleForMarker = [&](const GeneratedOverlay::ControlPointMarker& control)
+        -> const ViewerOverlayControllerBase::OverlayStyle& {
+        if (control.hasBranches) {
+            return branchControlPointStyle;
+        }
+        return control.isSeed ? seedStyle : controlPointStyle;
+    };
 
     ViewerOverlayControllerBase::OverlayStyle markerStyle;
     markerStyle.penColor = QColor(0, 220, 255, 210);
@@ -306,9 +330,9 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 if (finiteScenePoint(controlScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                         controlScene,
-                        control.isSeed ? 5.5 : 5.0,
+                        control.hasBranches ? 6.25 : (control.isSeed ? 5.5 : 5.0),
                         true,
-                        control.isSeed ? seedStyle : controlPointStyle});
+                        controlStyleForMarker(control)});
                 }
             }
             for (const auto& predSnap : overlay.predSnapPoints) {
@@ -399,8 +423,33 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         }
         for (const auto& control : overlay.controlPoints) {
             addVolumePointMarker(control.point,
-                                 control.isSeed ? 11.0 : 10.0,
-                                 control.isSeed ? seedStyle : controlPointStyle);
+                                 control.hasBranches ? 12.0 : (control.isSeed ? 11.0 : 10.0),
+                                 controlStyleForMarker(control));
+        }
+    }
+
+    if (!overlay.useSurfaceCenterLine) {
+        for (const auto& branch : overlay.branchLinePoints) {
+            if (branch.size() < 2) {
+                continue;
+            }
+            std::vector<QPointF> branchScene;
+            branchScene.reserve(branch.size());
+            for (const auto& point : branch) {
+                if (!finiteGeneratedPoint(point)) {
+                    continue;
+                }
+                const QPointF scenePoint = viewer->volumeToScene(point);
+                if (finiteScenePoint(scenePoint)) {
+                    branchScene.push_back(scenePoint);
+                }
+            }
+            if (branchScene.size() >= 2) {
+                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                    std::move(branchScene),
+                    false,
+                    branchLineStyle});
+            }
         }
     }
 
@@ -525,7 +574,7 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             previewStyle});
         primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
             targetScene,
-            selectedControl.isSeed ? 6.5 : 6.0,
+            selectedControl.hasBranches ? 7.0 : (selectedControl.isSeed ? 6.5 : 6.0),
             true,
             previewStyle});
         ViewerOverlayControllerBase::applyPrimitives(
@@ -534,11 +583,34 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             std::move(primitives));
     }
 
+    const size_t selectedControlIndex =
+        selectedControl.controlIndex == std::numeric_limits<size_t>::max()
+            ? selectedIndex
+            : selectedControl.controlIndex;
+
     QMenu menu(options.parent);
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
     deleteAction->setEnabled(options.controlPoints.size() > 1);
-    QAction* newLineAnnotationAction = menu.addAction(QWidget::tr("New line annotation"));
-    newLineAnnotationAction->setEnabled(options.viewer->sampleSceneVolume(options.scenePoint).has_value());
+    std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> openBranchActions;
+    if (!selectedControl.branchLinks.empty()) {
+        QMenu* branchMenu = menu.addMenu(QWidget::tr("Go to linked annotation"));
+        for (const auto& branch : selectedControl.branchLinks) {
+            QAction* action = branchMenu->addAction(
+                QWidget::tr("Fiber %1 / CP %2")
+                    .arg(static_cast<qulonglong>(branch.fiberId))
+                    .arg(branch.controlPointIndex));
+            action->setEnabled(static_cast<bool>(options.openBranch));
+            openBranchActions.push_back({action, branch});
+        }
+    }
+    QAction* newLineAnnotationAction = menu.addAction(
+        options.addBranch
+            ? QWidget::tr("New linked line annotation from control point")
+            : QWidget::tr("New line annotation"));
+    newLineAnnotationAction->setEnabled(
+        (static_cast<bool>(options.addBranch) &&
+         selectedControlIndex != std::numeric_limits<size_t>::max()) ||
+        options.viewer->sampleSceneVolume(options.scenePoint).has_value());
     QAction* selected = menu.exec(options.globalPos);
     clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
 
@@ -548,7 +620,17 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         }
         return GeneratedControlPointContextResult::Handled;
     }
+    for (const auto& [action, branch] : openBranchActions) {
+        if (selected == action && action->isEnabled()) {
+            options.openBranch(branch.fiberId, branch.controlPointIndex);
+            return GeneratedControlPointContextResult::Handled;
+        }
+    }
     if (selected == newLineAnnotationAction && newLineAnnotationAction->isEnabled()) {
+        if (options.addBranch && selectedControlIndex != std::numeric_limits<size_t>::max()) {
+            options.addBranch(selectedControlIndex);
+            return GeneratedControlPointContextResult::Handled;
+        }
         return GeneratedControlPointContextResult::NewLineAnnotationRequested;
     }
     return GeneratedControlPointContextResult::Handled;

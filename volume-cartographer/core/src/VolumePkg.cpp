@@ -113,6 +113,7 @@ std::vector<fs::path> immediateSubdirs(const fs::path& dir)
         if (!e.is_directory()) continue;
         const auto name = e.path().filename().string();
         if (name.empty() || name[0] == '.' || name == ".tmp") continue;
+        if (name.find(".tmp-") != std::string::npos || name.ends_with(".previous")) continue;
         out.push_back(e.path());
     }
     std::sort(out.begin(), out.end());
@@ -390,6 +391,34 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
     resolveVolumeEntry(volumes_.back());
     persistProjectState();
     return true;
+}
+
+bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags)
+{
+    if (location.empty() || tags.empty()) return false;
+    for (auto& e : volumes_) {
+        if (e.location != location) continue;
+        bool changed = false;
+        for (const auto& tag : tags) {
+            if (tag.empty()) continue;
+            if (std::find(e.tags.begin(), e.tags.end(), tag) == e.tags.end()) {
+                e.tags.push_back(tag);
+                changed = true;
+            }
+        }
+        if (!changed) return false;
+
+        for (const auto& [id, volume] : loadedVolumes_) {
+            if (!volume) continue;
+            if (volume->isRemote() && volume->remoteUrl() == location) {
+                volumeTagsByID_[id] = e.tags;
+                break;
+            }
+        }
+        persistProjectState();
+        return true;
+    }
+    return false;
 }
 
 bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::string> tags)

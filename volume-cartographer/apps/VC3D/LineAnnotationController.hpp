@@ -104,6 +104,13 @@ public:
         std::vector<std::string> tags;
     };
 
+    struct FiberBranchRef {
+        int controlPointIndex = -1;
+        uint64_t branchFiberId = 0;
+        int branchControlPointIndex = -1;
+        std::string branchFileName;
+    };
+
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
@@ -218,6 +225,7 @@ private:
         uint64_t generation = 1;
         std::vector<cv::Vec3d> controlPoints;
         std::vector<cv::Vec3d> linePoints;
+        std::vector<FiberBranchRef> branches;
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
         std::vector<std::string> tags;
@@ -256,6 +264,8 @@ private:
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);
+    void handleGeneratedControlPointBranch(const std::string& surfaceName,
+                                           size_t controlPointIndex);
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     bool ensureDatasetForSession(LineAnnotationSession& session);
@@ -300,7 +310,9 @@ private:
     void loadFibersForCurrentPackage();
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
+    [[nodiscard]] std::filesystem::path fibersRootDir() const;
     [[nodiscard]] std::filesystem::path fibersDir() const;
+    [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
@@ -316,6 +328,10 @@ private:
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
     void ensureSessionFiberIdentity(LineAnnotationSession& session);
+    [[nodiscard]] std::vector<std::vector<cv::Vec3f>> generatedBranchLinePointsForSession(
+        const LineAnnotationSession& session) const;
+    void refreshBranchLineViews(uint64_t changedFiberId = 0);
+    void syncReciprocalBranchControlPointReferences(const LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
