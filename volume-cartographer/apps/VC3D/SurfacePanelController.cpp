@@ -17,15 +17,22 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDialog>
 #include <QDoubleSpinBox>
+#include <QFormLayout>
+#include <QGridLayout>
+#include <QHeaderView>
+#include <QHBoxLayout>
 #include <QLineEdit>
 #include <QAction>
+#include <QLabel>
 #include <QMenu>
 #include <QMessageBox>
 #include <QModelIndex>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStyle>
@@ -33,6 +40,8 @@
 #include <QString>
 #include <QTreeWidget>
 #include <QTreeWidgetItemIterator>
+#include <QToolButton>
+#include <QVBoxLayout>
 #include <QVector>
 
 #include <iostream>
@@ -48,6 +57,7 @@ namespace {
 constexpr double kFocusPointFilterRadius = 10.0;
 constexpr double kZRangeFilterLowerDefault = 0.0;
 constexpr double kZRangeFilterUpperDefault = 1000000.0;
+constexpr auto kSurfaceColumnSettingsGroup = "surface_panel/columns";
 
 bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
 {
@@ -87,6 +97,11 @@ QString surface_timestamp(QuadSurface* surf)
     }
 
     return QString::fromStdString(surf->meta["date_last_modified"].get_string());
+}
+
+QString surface_column_settings_key(int column)
+{
+    return QStringLiteral("%1/column_%2_visible").arg(kSurfaceColumnSettingsGroup).arg(column);
 }
 
 void set_surface_tree_item_text(SurfaceTreeWidgetItem* item,
@@ -154,6 +169,8 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
 
     if (_ui.treeWidget) {
         _ui.treeWidget->setContextMenuPolicy(Qt::CustomContextMenu);
+        setupSurfaceColumnMenu();
+        restoreSurfaceColumnVisibility();
         connect(_ui.treeWidget, &QTreeWidget::itemSelectionChanged,
                 this, &SurfacePanelController::handleTreeSelectionChanged);
         connect(_ui.treeWidget, &QWidget::customContextMenuRequested,
@@ -735,6 +752,16 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit copySegmentPathRequested(segmentId);
     });
 
+    QMenu* maskMenu = contextMenu.addMenu(tr("Mask"));
+    QAction* generateMaskAction = maskMenu->addAction(tr("Generate Segment Mask"));
+    connect(generateMaskAction, &QAction::triggered, this, [this, segmentId]() {
+        emit generateSegmentMaskRequested(segmentId);
+    });
+    QAction* appendMaskAction = maskMenu->addAction(tr("Append Surface Mask"));
+    connect(appendMaskAction, &QAction::triggered, this, [this, segmentId]() {
+        emit appendSegmentMaskRequested(segmentId);
+    });
+
     contextMenu.addSeparator();
 
     QAction* growSegmentAction = contextMenu.addAction(tr("Run Trace"));
@@ -1057,9 +1084,13 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
     if (_filters.dropdown) {
         _filters.dropdown->clearOptions();
         _filters.dropdown->setText(tr("Filters"));
-        if (auto* menu = _filters.dropdown->menu()) {
-            menu->setObjectName(QStringLiteral("menuFilters"));
-        }
+        _filters.dropdown->setPopupMode(QToolButton::DelayedPopup);
+        _filters.dropdown->setMenu(nullptr);
+        _filters.dropdown->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        _filters.dropdown->setMinimumWidth(
+            _filters.dropdown->fontMetrics().horizontalAdvance(_filters.dropdown->text()) + 32);
+        connect(_filters.dropdown, &QToolButton::clicked,
+                this, &SurfacePanelController::showFilterDialog);
     }
 
     if (_filters.focusPointDistance) {
@@ -1093,24 +1124,9 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
         _filters.zUpperBound->setToolTip(tr("Upper Z bound for visible surfaces."));
     }
 
-    _filters.focusPoints = nullptr;
-    _filters.unreviewed = nullptr;
-    _filters.hideUnapproved = nullptr;
-    _filters.noExpansion = nullptr;
-    _filters.noDefective = nullptr;
-    _filters.partialReview = nullptr;
-    _filters.showPartialReview = nullptr;
-    _filters.inspectOnly = nullptr;
-    _filters.currentOnly = nullptr;
-
-    const auto addFilterOption = [&](QCheckBox*& target, const QString& text, const QString& objectName) {
-        if (_filters.dropdown) {
-            target = _filters.dropdown->addOption(text, objectName);
-            return;
-        }
-
+    const auto addFilterOption = [this](QCheckBox*& target, const QString& text, const QString& objectName) {
         if (!target) {
-            target = new QCheckBox(text);
+            target = new QCheckBox(text, _ui.treeWidget);
             if (!objectName.isEmpty()) {
                 target->setObjectName(objectName);
             }
@@ -1120,29 +1136,27 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
         target->hide();
     };
 
-    const auto addSeparator = [&]() {
-        if (_filters.dropdown) {
-            _filters.dropdown->addSeparator();
-        }
-    };
-
     addFilterOption(_filters.focusPoints, tr("Focus Point"), QStringLiteral("chkFilterFocusPoints"));
-    addSeparator();
     addFilterOption(_filters.unreviewed, tr("Unreviewed"), QStringLiteral("chkFilterUnreviewed"));
     addFilterOption(_filters.hideUnapproved, tr("Hide Unapproved"), QStringLiteral("chkFilterHideUnapproved"));
-    addSeparator();
     addFilterOption(_filters.noExpansion, tr("Hide Expansion"), QStringLiteral("chkFilterNoExpansion"));
     addFilterOption(_filters.noDefective, tr("Hide Defective"), QStringLiteral("chkFilterNoDefective"));
     addFilterOption(_filters.partialReview, tr("Hide Partial Review"), QStringLiteral("chkFilterPartialReview"));
     addFilterOption(_filters.showPartialReview, tr("Show Partial Review"), QStringLiteral("chkFilterShowPartialReview"));
     addFilterOption(_filters.inspectOnly, tr("Inspect Only"), QStringLiteral("chkFilterInspectOnly"));
-    addSeparator();
-    addFilterOption(_filters.currentOnly, tr("Current Segment Only"), QStringLiteral("chkFilterCurrentOnly"));
+
+    if (_filters.currentOnly) {
+        _filters.currentOnly->setText(tr("Current Segment Only"));
+        _filters.currentOnly->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        _filters.currentOnly->setMinimumWidth(_filters.currentOnly->sizeHint().width());
+        _filters.currentOnly->show();
+    }
 
     if (_filters.focusPointDistance && _filters.focusPoints) {
         _filters.focusPointDistance->setEnabled(_filters.focusPoints->isChecked());
     }
 
+    buildFilterDialog();
     connectFilterSignals();
     rebuildPointSetFilterModel();
     applyFilters();
@@ -1152,8 +1166,13 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
 void SurfacePanelController::configureTags(const TagUiRefs& tags)
 {
     _tags = tags;
+    if (_tags.dropdown) {
+        _tags.dropdown->setText(tr("Tags"));
+        _tags.dropdown->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    }
     connectTagSignals();
     resetTagUi();
+    updateTagSummary();
 }
 
 void SurfacePanelController::refreshPointSetFilterOptions()
@@ -1197,6 +1216,7 @@ void SurfacePanelController::resetTagUi()
     resetBox(_tags.defective);
     resetBox(_tags.reviewed);
     resetBox(_tags.inspect);
+    updateTagSummary();
 }
 
 bool SurfacePanelController::isCurrentOnlyFilterEnabled() const
@@ -1288,6 +1308,185 @@ void SurfacePanelController::setSelectionLocked(bool locked)
             }
         }
     }
+}
+
+void SurfacePanelController::setupSurfaceColumnMenu()
+{
+    if (!_ui.treeWidget || !_ui.treeWidget->header()) {
+        return;
+    }
+
+    auto* header = _ui.treeWidget->header();
+    header->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(header, &QWidget::customContextMenuRequested,
+            this, &SurfacePanelController::showSurfaceColumnMenu);
+}
+
+void SurfacePanelController::restoreSurfaceColumnVisibility()
+{
+    if (!_ui.treeWidget) {
+        return;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    for (int column = 0; column < _ui.treeWidget->columnCount(); ++column) {
+        if (column == SURFACE_ID_COLUMN) {
+            _ui.treeWidget->setColumnHidden(column, false);
+            continue;
+        }
+        const bool visible = settings.value(surface_column_settings_key(column), true).toBool();
+        _ui.treeWidget->setColumnHidden(column, !visible);
+    }
+}
+
+void SurfacePanelController::showSurfaceColumnMenu(const QPoint& pos)
+{
+    if (!_ui.treeWidget || !_ui.treeWidget->header()) {
+        return;
+    }
+
+    QMenu menu(_ui.treeWidget);
+    for (int column = 0; column < _ui.treeWidget->columnCount(); ++column) {
+        QString label = _ui.treeWidget->headerItem()
+            ? _ui.treeWidget->headerItem()->text(column)
+            : QString();
+        if (label.isEmpty()) {
+            label = tr("Status");
+        }
+
+        QAction* action = menu.addAction(label);
+        action->setCheckable(true);
+        action->setChecked(!_ui.treeWidget->isColumnHidden(column));
+        action->setEnabled(column != SURFACE_ID_COLUMN);
+        connect(action, &QAction::toggled, this, [this, column](bool checked) {
+            if (!_ui.treeWidget || column == SURFACE_ID_COLUMN) {
+                return;
+            }
+            _ui.treeWidget->setColumnHidden(column, !checked);
+            QSettings columnSettings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            columnSettings.setValue(surface_column_settings_key(column), checked);
+        });
+    }
+
+    menu.exec(_ui.treeWidget->header()->mapToGlobal(pos));
+}
+
+void SurfacePanelController::buildFilterDialog()
+{
+    if (_filterDialog) {
+        return;
+    }
+
+    _filterDialog = new QDialog(_ui.treeWidget);
+    _filterDialog->setObjectName(QStringLiteral("surfaceFilterDialog"));
+    _filterDialog->setWindowTitle(tr("Surface Filters"));
+    _filterDialog->setModal(false);
+
+    auto* mainLayout = new QVBoxLayout(_filterDialog);
+    mainLayout->setContentsMargins(12, 12, 12, 12);
+    mainLayout->setSpacing(10);
+
+    auto* filterGrid = new QGridLayout();
+    filterGrid->setHorizontalSpacing(12);
+    filterGrid->setVerticalSpacing(4);
+    const QList<QCheckBox*> filterBoxes = {
+        _filters.focusPoints,
+        _filters.unreviewed,
+        _filters.hideUnapproved,
+        _filters.noExpansion,
+        _filters.noDefective,
+        _filters.partialReview,
+        _filters.showPartialReview,
+        _filters.inspectOnly,
+    };
+    int row = 0;
+    int col = 0;
+    for (auto* box : filterBoxes) {
+        if (!box) {
+            continue;
+        }
+        box->setParent(_filterDialog);
+        box->show();
+        filterGrid->addWidget(box, row, col);
+        col = (col + 1) % 2;
+        if (col == 0) {
+            ++row;
+        }
+    }
+    mainLayout->addLayout(filterGrid);
+
+    auto* form = new QFormLayout();
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    if (_filters.surfaceIdFilter) {
+        _filters.surfaceIdFilter->setParent(_filterDialog);
+        _filters.surfaceIdFilter->show();
+        form->addRow(tr("Surface ID"), _filters.surfaceIdFilter);
+    }
+    if (_filters.focusPointDistance) {
+        _filters.focusPointDistance->setParent(_filterDialog);
+        _filters.focusPointDistance->show();
+        form->addRow(tr("Focus radius"), _filters.focusPointDistance);
+    }
+    if (_filters.zLowerBound && _filters.zUpperBound) {
+        auto* zRangeWidget = new QWidget(_filterDialog);
+        auto* zRangeLayout = new QHBoxLayout(zRangeWidget);
+        zRangeLayout->setContentsMargins(0, 0, 0, 0);
+        zRangeLayout->setSpacing(4);
+        _filters.zLowerBound->setParent(zRangeWidget);
+        _filters.zUpperBound->setParent(zRangeWidget);
+        _filters.zLowerBound->show();
+        _filters.zUpperBound->show();
+        zRangeLayout->addWidget(_filters.zLowerBound);
+        zRangeLayout->addWidget(_filters.zUpperBound);
+        form->addRow(tr("Z range"), zRangeWidget);
+    }
+    mainLayout->addLayout(form);
+
+    if (_filters.pointSet || _filters.pointSetMode || _filters.pointSetAll || _filters.pointSetNone) {
+        auto* pointSetLayout = new QHBoxLayout();
+        pointSetLayout->setSpacing(4);
+        pointSetLayout->addWidget(new QLabel(tr("Point sets"), _filterDialog));
+        if (_filters.pointSet) {
+            _filters.pointSet->setParent(_filterDialog);
+            _filters.pointSet->show();
+            pointSetLayout->addWidget(_filters.pointSet, 1);
+        }
+        if (_filters.pointSetMode) {
+            _filters.pointSetMode->setParent(_filterDialog);
+            _filters.pointSetMode->show();
+            pointSetLayout->addWidget(_filters.pointSetMode);
+        }
+        if (_filters.pointSetAll) {
+            _filters.pointSetAll->setParent(_filterDialog);
+            _filters.pointSetAll->show();
+            pointSetLayout->addWidget(_filters.pointSetAll);
+        }
+        if (_filters.pointSetNone) {
+            _filters.pointSetNone->setParent(_filterDialog);
+            _filters.pointSetNone->show();
+            pointSetLayout->addWidget(_filters.pointSetNone);
+        }
+        mainLayout->addLayout(pointSetLayout);
+    }
+
+    auto* closeButton = new QPushButton(tr("Close"), _filterDialog);
+    connect(closeButton, &QPushButton::clicked, _filterDialog, &QDialog::hide);
+    auto* buttonLayout = new QHBoxLayout();
+    buttonLayout->addStretch();
+    buttonLayout->addWidget(closeButton);
+    mainLayout->addLayout(buttonLayout);
+}
+
+void SurfacePanelController::showFilterDialog()
+{
+    buildFilterDialog();
+    if (!_filterDialog) {
+        return;
+    }
+
+    _filterDialog->show();
+    _filterDialog->raise();
+    _filterDialog->activateWindow();
 }
 
 void SurfacePanelController::connectFilterSignals()
@@ -1506,8 +1705,23 @@ void SurfacePanelController::updateFilterSummary()
     countIfChecked(_filters.showPartialReview);
     countIfChecked(_filters.inspectOnly);
     countIfChecked(_filters.currentOnly);
+    if (_filters.surfaceIdFilter && !_filters.surfaceIdFilter->text().trimmed().isEmpty()) {
+        ++activeFilters;
+    }
     if (z_range_filter_active(_filters.zLowerBound, _filters.zUpperBound)) {
         ++activeFilters;
+    }
+    if (auto* model = qobject_cast<QStandardItemModel*>(_filters.pointSet ? _filters.pointSet->model() : nullptr)) {
+        bool hasPointSetFilter = false;
+        for (int row = 0; row < model->rowCount(); ++row) {
+            if (model->data(model->index(row, 0), Qt::CheckStateRole) == Qt::Checked) {
+                hasPointSetFilter = true;
+                break;
+            }
+        }
+        if (hasPointSetFilter) {
+            ++activeFilters;
+        }
     }
 
     QString label = tr("Filters");
@@ -1515,6 +1729,35 @@ void SurfacePanelController::updateFilterSummary()
         label += tr(" (%1)").arg(activeFilters);
     }
     _filters.dropdown->setText(label);
+    _filters.dropdown->setMinimumWidth(
+        _filters.dropdown->fontMetrics().horizontalAdvance(label) + 32);
+}
+
+void SurfacePanelController::updateTagSummary()
+{
+    if (!_tags.dropdown) {
+        return;
+    }
+
+    int activeTags = 0;
+    const auto countIfChecked = [&activeTags](QCheckBox* box) {
+        if (box && box->isChecked()) {
+            ++activeTags;
+        }
+    };
+
+    countIfChecked(_tags.approved);
+    countIfChecked(_tags.defective);
+    countIfChecked(_tags.reviewed);
+    countIfChecked(_tags.inspect);
+
+    QString label = tr("Tags");
+    if (activeTags > 0) {
+        label += tr(" (%1)").arg(activeTags);
+    }
+    _tags.dropdown->setText(label);
+    _tags.dropdown->setMinimumWidth(
+        _tags.dropdown->fontMetrics().horizontalAdvance(label) + 32);
 }
 
 void SurfacePanelController::onTagCheckboxToggled()
@@ -1587,6 +1830,7 @@ void SurfacePanelController::onTagCheckboxToggled()
     }
 
     applyFilters();
+    updateTagSummary();
 }
 
 void SurfacePanelController::applyFiltersInternal()
@@ -1873,6 +2117,7 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
 
     if (!surface) {
         setTagCheckboxEnabled(false, false, false, false);
+        updateTagSummary();
         return;
     }
 
@@ -1880,6 +2125,7 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
 
     if (surface->meta.is_null()) {
         setTagCheckboxEnabled(false, false, true, true);
+        updateTagSummary();
         return;
     }
 
@@ -1899,6 +2145,7 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
     applyTag(_tags.defective, "defective");
     applyTag(_tags.reviewed, "reviewed");
     applyTag(_tags.inspect, "inspect");
+    updateTagSummary();
 }
 
 void SurfacePanelController::setTagCheckboxEnabled(bool enabledApproved,

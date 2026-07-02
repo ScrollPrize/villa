@@ -112,6 +112,7 @@
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
+#include "elements/DropdownChecklistButton.hpp"
 #include "MenuActionController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
@@ -5576,6 +5577,10 @@ void CWindow::CreateWidgets(void)
         this, [this](const QStringList& segmentIds) {
             _segmentationCommandHandler->onRasterizeSegments(segmentIds);
         });
+    connect(_surfacePanel.get(), &SurfacePanelController::generateSegmentMaskRequested,
+        this, &CWindow::onEditMaskPressed);
+    connect(_surfacePanel.get(), &SurfacePanelController::appendSegmentMaskRequested,
+        this, &CWindow::onAppendMaskPressed);
     connect(_surfacePanel.get(), &SurfacePanelController::addIgnoreLabelRequested,
         this, [this]() {
             _segmentationCommandHandler->onAddIgnoreLabel();
@@ -6359,31 +6364,36 @@ void CWindow::CreateWidgets(void)
     connectVolumeSelector(volSelect);
 
     auto* filterDropdown = ui.btnFilterDropdown;
-    auto* cmbPointSetFilter = ui.cmbPointSetFilter;
-    auto* btnPointSetFilterAll = ui.btnPointSetFilterAll;
-    auto* btnPointSetFilterNone = ui.btnPointSetFilterNone;
-    auto* cmbPointSetFilterMode = new QComboBox();
+    auto* cmbPointSetFilter = new QComboBox(this);
+    auto* btnPointSetFilterAll = new QPushButton(tr("All"), this);
+    auto* btnPointSetFilterNone = new QPushButton(tr("None"), this);
+    auto* cmbPointSetFilterMode = new QComboBox(this);
+    auto* spinFocusPointFilterDistance = new QDoubleSpinBox(this);
+    auto* spinSurfaceZLowerBound = new QDoubleSpinBox(this);
+    auto* spinSurfaceZUpperBound = new QDoubleSpinBox(this);
     cmbPointSetFilterMode->addItem("Any (OR)");
     cmbPointSetFilterMode->addItem("All (AND)");
-    ui.pointSetFilterLayout->insertWidget(1, cmbPointSetFilterMode);
 
     SurfacePanelController::FilterUiRefs filterUi;
     filterUi.dropdown = filterDropdown;
+    filterUi.currentOnly = ui.chkFilterCurrentOnly;
     filterUi.pointSet = cmbPointSetFilter;
     filterUi.pointSetAll = btnPointSetFilterAll;
     filterUi.pointSetNone = btnPointSetFilterNone;
     filterUi.pointSetMode = cmbPointSetFilterMode;
     filterUi.surfaceIdFilter = ui.lineEditSurfaceFilter;
-    filterUi.focusPointDistance = ui.spinFocusPointFilterDistance;
-    filterUi.zLowerBound = ui.spinSurfaceZLowerBound;
-    filterUi.zUpperBound = ui.spinSurfaceZUpperBound;
+    filterUi.focusPointDistance = spinFocusPointFilterDistance;
+    filterUi.zLowerBound = spinSurfaceZLowerBound;
+    filterUi.zUpperBound = spinSurfaceZUpperBound;
     _surfacePanel->configureFilters(filterUi, _state->pointCollection());
 
+    auto* tagDropdown = ui.btnTagDropdown;
     SurfacePanelController::TagUiRefs tagUi{
-        .approved = ui.chkApproved,
-        .defective = ui.chkDefective,
-        .reviewed = ui.chkReviewed,
-        .inspect = ui.chkInspect,
+        .dropdown = tagDropdown,
+        .approved = tagDropdown->addOption(tr("Approved"), QStringLiteral("chkApproved")),
+        .defective = tagDropdown->addOption(tr("Defective"), QStringLiteral("chkDefective")),
+        .reviewed = tagDropdown->addOption(tr("Reviewed"), QStringLiteral("chkReviewed")),
+        .inspect = tagDropdown->addOption(tr("Inspect"), QStringLiteral("chkInspect")),
     };
     _surfacePanel->configureTags(tagUi);
 
@@ -6421,9 +6431,6 @@ void CWindow::CreateWidgets(void)
         chkAxisAlignedSlices->setChecked(useAxisAligned);
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
     }
-
-    connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
-    connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
 
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
@@ -7402,11 +7409,15 @@ void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> 
     // (the ID remains valid for lookup - will just return nullptr if surface is gone)
 }
 
-void CWindow::onEditMaskPressed(void)
+void CWindow::onEditMaskPressed(const QString& segmentId)
 {
-    auto surf = _state->activeSurface().lock();
-    if (!surf)
+    auto surf = (_state && _state->vpkg())
+        ? _state->vpkg()->getSurface(segmentId.toStdString())
+        : nullptr;
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
         return;
+    }
 
     std::filesystem::path path = surf->path/"mask.tif";
 
@@ -7419,8 +7430,6 @@ void CWindow::onEditMaskPressed(void)
     if (_maskRenderInProgress)
         return;
     _maskRenderInProgress = true;
-    ui.btnEditMask->setEnabled(false);
-    ui.btnAppendMask->setEnabled(false);
     statusBar()->showMessage(tr("Rendering mask..."));
 
     auto* watcher = new QFutureWatcher<void>(this);
@@ -7428,8 +7437,6 @@ void CWindow::onEditMaskPressed(void)
             [this, watcher, surf, path]() {
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
-                ui.btnEditMask->setEnabled(true);
-                ui.btnAppendMask->setEnabled(true);
 
                 statusBar()->showMessage(tr("Mask saved"), 3000);
                 QDesktopServices::openUrl(QUrl::fromLocalFile(
@@ -7447,9 +7454,11 @@ void CWindow::onEditMaskPressed(void)
     }));
 }
 
-void CWindow::onAppendMaskPressed(void)
+void CWindow::onAppendMaskPressed(const QString& segmentId)
 {
-    auto surf = _state->activeSurface().lock();
+    auto surf = (_state && _state->vpkg())
+        ? _state->vpkg()->getSurface(segmentId.toStdString())
+        : nullptr;
     if (!surf || !_state->currentVolume()) {
         if (!surf) {
             QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
@@ -7462,8 +7471,6 @@ void CWindow::onAppendMaskPressed(void)
     if (_maskRenderInProgress)
         return;
     _maskRenderInProgress = true;
-    ui.btnEditMask->setEnabled(false);
-    ui.btnAppendMask->setEnabled(false);
     statusBar()->showMessage(tr("Rendering mask..."));
 
     std::filesystem::path path = surf->path/"mask.tif";
@@ -7474,8 +7481,6 @@ void CWindow::onAppendMaskPressed(void)
             [this, watcher, path]() {
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
-                ui.btnEditMask->setEnabled(true);
-                ui.btnAppendMask->setEnabled(true);
 
                 try {
                     QString msg = watcher->result();

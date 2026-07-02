@@ -217,8 +217,8 @@ private:
 
 private slots:
     void onSegmentationDirChanged(int index);
-    void onEditMaskPressed();
-    void onAppendMaskPressed();
+    void onEditMaskPressed(const QString& segmentId);
+    void onAppendMaskPressed(const QString& segmentId);
     void onManualLocationChanged();
     void onZoomIn();
     void onZoomOut();
