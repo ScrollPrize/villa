@@ -94,6 +94,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <QStringList>
+#include <array>
 
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "viewer_controls/ViewerControlsPanel.hpp"
@@ -153,6 +154,8 @@ namespace
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
 constexpr auto MAIN_VIEWER_SPLIT_X_SETTING = "mainWin/main_viewer_split_x";
 constexpr auto MAIN_VIEWER_SPLIT_Y_SETTING = "mainWin/main_viewer_split_y";
+constexpr auto MAIN_VIEWER_LAYOUT_SURFACES_SETTING = "mainWin/main_viewer_layout_surfaces";
+constexpr auto MAIN_VIEWER_LAYOUT_HIDDEN_SETTING = "mainWin/main_viewer_layout_hidden";
 constexpr auto ATLAS_INTERNAL_SURFACE_NAME = "__atlas_workspace_base_mesh";
 constexpr int ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS = 0;
 constexpr int ATLAS_SEARCH_MODE_NON_ATLAS_ONLY = 1;
@@ -166,6 +169,8 @@ constexpr int ATLAS_CONTROL_SOURCE_INDEX_ROLE = Qt::UserRole + 3;
 constexpr int ATLAS_SURFACE_X_ROLE = Qt::UserRole + 4;
 constexpr int ATLAS_SURFACE_Y_ROLE = Qt::UserRole + 5;
 constexpr double ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD = 0.5;
+
+VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
 
 QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
 {
@@ -226,13 +231,71 @@ public:
 
     void setViewer(int index, QWidget* widget)
     {
-        if (index < 0 || index >= 4 || !widget) {
+        if (index < 0 || index >= 4) {
             return;
         }
+        if (_viewers[index] && _viewers[index] != widget) {
+            _viewers[index]->hide();
+        }
+        if (widget) {
+            for (int i = 0; i < 4; ++i) {
+                if (i != index && _viewers[i] == widget) {
+                    _viewers[i] = nullptr;
+                }
+            }
+            widget->setParent(this);
+            widget->setVisible(!_hidden[index]);
+        }
         _viewers[index] = widget;
-        widget->setParent(this);
-        widget->show();
         layoutChildren();
+    }
+
+    QWidget* viewer(int index) const
+    {
+        return index >= 0 && index < 4 ? _viewers[index] : nullptr;
+    }
+
+    int indexOf(QWidget* widget) const
+    {
+        if (!widget) {
+            return -1;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (_viewers[i] == widget) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    void swapViewers(int first, int second)
+    {
+        if (first < 0 || first >= 4 || second < 0 || second >= 4 || first == second) {
+            return;
+        }
+        std::swap(_viewers[first], _viewers[second]);
+        layoutChildren();
+    }
+
+    void setPaneHidden(int index, bool hidden)
+    {
+        if (index < 0 || index >= 4) {
+            return;
+        }
+        if (hidden && visiblePaneCount() <= 1 && !_hidden[index]) {
+            return;
+        }
+        _hidden[index] = hidden;
+        if (_viewers[index]) {
+            _viewers[index]->setVisible(!hidden);
+        }
+        layoutChildren();
+        notifySplitChanged();
+    }
+
+    bool paneHidden(int index) const
+    {
+        return index >= 0 && index < 4 ? _hidden[index] : false;
     }
 
     void resetSplits()
@@ -378,10 +441,27 @@ private:
         const int splitX = splitXPx();
         const int splitY = splitYPx();
 
-        setViewerGeometry(0, QRect(0, 0, splitX, splitY));
-        setViewerGeometry(1, QRect(splitX, 0, w - splitX, splitY));
-        setViewerGeometry(2, QRect(0, splitY, splitX, h - splitY));
-        setViewerGeometry(3, QRect(splitX, splitY, w - splitX, h - splitY));
+        const bool leftVisible = paneVisible(0) || paneVisible(2);
+        const bool rightVisible = paneVisible(1) || paneVisible(3);
+        const int leftX = 0;
+        const int rightX = leftVisible ? splitX : 0;
+        const int leftW = rightVisible ? splitX : w;
+        const int rightW = leftVisible ? w - splitX : w;
+
+        layoutColumn(0, 2, QRect(leftX, 0, leftW, h), splitY);
+        layoutColumn(1, 3, QRect(rightX, 0, rightW, h), splitY);
+
+        const bool topLeft = paneVisible(0);
+        const bool bottomLeft = paneVisible(2);
+        const bool topRight = paneVisible(1);
+        const bool bottomRight = paneVisible(3);
+        _topColumnHandle->setVisible(leftVisible && rightVisible && (topLeft || topRight));
+        _bottomColumnHandle->setVisible(leftVisible && rightVisible && (bottomLeft || bottomRight));
+        _leftRowHandle->setVisible(topLeft && bottomLeft);
+        _rightRowHandle->setVisible(topRight && bottomRight);
+        _centerHandle->setVisible(leftVisible && rightVisible &&
+                                  (topLeft || topRight) &&
+                                  (bottomLeft || bottomRight));
 
         _topColumnHandle->setGeometry(splitX - half, 0, handle, splitY);
         _bottomColumnHandle->setGeometry(splitX - half, splitY, handle, h - splitY);
@@ -398,12 +478,48 @@ private:
         }
     }
 
+    void layoutColumn(int topIndex, int bottomIndex, const QRect& columnRect, int splitY)
+    {
+        const bool topVisible = paneVisible(topIndex);
+        const bool bottomVisible = paneVisible(bottomIndex);
+        if (topVisible && bottomVisible) {
+            setViewerGeometry(topIndex, QRect(columnRect.x(), 0, columnRect.width(), splitY));
+            setViewerGeometry(bottomIndex, QRect(columnRect.x(), splitY, columnRect.width(), height() - splitY));
+        } else if (topVisible) {
+            setViewerGeometry(topIndex, columnRect);
+        } else if (bottomVisible) {
+            setViewerGeometry(bottomIndex, columnRect);
+        }
+        if (_viewers[topIndex]) {
+            _viewers[topIndex]->setVisible(topVisible);
+        }
+        if (_viewers[bottomIndex]) {
+            _viewers[bottomIndex]->setVisible(bottomVisible);
+        }
+    }
+
     void setViewerGeometry(int index, const QRect& rect)
     {
         if (index < 0 || index >= 4 || !_viewers[index]) {
             return;
         }
         _viewers[index]->setGeometry(rect.normalized());
+    }
+
+    bool paneVisible(int index) const
+    {
+        return index >= 0 && index < 4 && _viewers[index] && !_hidden[index];
+    }
+
+    int visiblePaneCount() const
+    {
+        int count = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (paneVisible(i)) {
+                ++count;
+            }
+        }
+        return count;
     }
 
     void notifySplitChanged()
@@ -414,6 +530,7 @@ private:
     }
 
     QWidget* _viewers[4] = {};
+    bool _hidden[4] = {};
     QFrame* _topColumnHandle = nullptr;
     QFrame* _bottomColumnHandle = nullptr;
     QFrame* _leftRowHandle = nullptr;
@@ -427,6 +544,161 @@ private:
     int _dragStartSplitX = 0;
     int _dragStartSplitY = 0;
 };
+
+struct MainViewerSpec {
+    std::string surfaceName;
+    QString title;
+    std::set<std::string> intersects;
+};
+
+const std::array<const char*, 4> kDefaultMainViewerSurfaces{
+    "segmentation",
+    "xy plane",
+    "seg xz",
+    "seg yz",
+};
+
+const std::array<bool, 4> kDefaultMainViewerHidden{
+    false,
+    false,
+    true,
+    false,
+};
+
+const std::array<const char*, 4> kMainViewerPaneLabels{
+    "Top left",
+    "Top right",
+    "Bottom left",
+    "Bottom right",
+};
+
+std::optional<MainViewerSpec> mainViewerSpecForSurface(const std::string& surfaceName)
+{
+    if (surfaceName == "segmentation") {
+        return MainViewerSpec{surfaceName, QObject::tr("Surface"), {"seg xz", "seg yz"}};
+    }
+    if (surfaceName == "xy plane") {
+        return MainViewerSpec{surfaceName, QObject::tr("XY"), {"segmentation"}};
+    }
+    if (surfaceName == "seg xz") {
+        return MainViewerSpec{surfaceName, QObject::tr("XZ"), {"segmentation"}};
+    }
+    if (surfaceName == "seg yz") {
+        return MainViewerSpec{surfaceName, QObject::tr("YZ"), {"segmentation"}};
+    }
+    return std::nullopt;
+}
+
+QString mainViewerDisplayName(const std::string& surfaceName)
+{
+    if (surfaceName == "segmentation") {
+        return QObject::tr("Surface");
+    }
+    if (surfaceName == "xy plane") {
+        return QObject::tr("XY");
+    }
+    if (surfaceName == "seg xz") {
+        return QObject::tr("XZ");
+    }
+    if (surfaceName == "seg yz") {
+        return QObject::tr("YZ");
+    }
+    return QString::fromStdString(surfaceName);
+}
+
+std::array<std::string, 4> readMainViewerSurfaceLayout()
+{
+    std::array<std::string, 4> layout{};
+    for (int i = 0; i < 4; ++i) {
+        layout[i] = kDefaultMainViewerSurfaces[i];
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QStringList saved = settings.value(MAIN_VIEWER_LAYOUT_SURFACES_SETTING).toStringList();
+    if (saved.size() != 4) {
+        return layout;
+    }
+
+    std::set<std::string> seen;
+    std::array<std::string, 4> candidate{};
+    for (int i = 0; i < 4; ++i) {
+        const std::string name = saved[i].toStdString();
+        if (!mainViewerSpecForSurface(name) || !seen.insert(name).second) {
+            return layout;
+        }
+        candidate[i] = name;
+    }
+    return candidate;
+}
+
+std::array<bool, 4> readMainViewerHiddenLayout()
+{
+    std::array<bool, 4> hidden = kDefaultMainViewerHidden;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QStringList saved = settings.value(MAIN_VIEWER_LAYOUT_HIDDEN_SETTING).toStringList();
+    if (saved.size() != 4) {
+        return hidden;
+    }
+
+    int visibleCount = 0;
+    for (int i = 0; i < 4; ++i) {
+        hidden[i] = saved[i].toInt() != 0;
+        if (!hidden[i]) {
+            ++visibleCount;
+        }
+    }
+    if (visibleCount == 0) {
+        hidden[0] = false;
+    }
+    return hidden;
+}
+
+void persistMainViewerLayout(ViewerSplitGrid* grid)
+{
+    if (!grid) {
+        return;
+    }
+
+    QStringList surfaces;
+    QStringList hidden;
+    for (int i = 0; i < 4; ++i) {
+        std::string surfaceName = kDefaultMainViewerSurfaces[i];
+        if (auto* viewer = baseViewerFromWidget(grid->viewer(i))) {
+            surfaceName = viewer->surfName();
+        }
+        surfaces.push_back(QString::fromStdString(surfaceName));
+        hidden.push_back(grid->paneHidden(i) ? QStringLiteral("1") : QStringLiteral("0"));
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(MAIN_VIEWER_LAYOUT_SURFACES_SETTING, surfaces);
+    settings.setValue(MAIN_VIEWER_LAYOUT_HIDDEN_SETTING, hidden);
+}
+
+void applyMainViewerLayout(ViewerSplitGrid* grid, ViewerManager* manager)
+{
+    if (!grid || !manager) {
+        return;
+    }
+
+    const auto surfaces = readMainViewerSurfaceLayout();
+    const auto hidden = readMainViewerHiddenLayout();
+    for (int pane = 0; pane < 4; ++pane) {
+        QWidget* widget = nullptr;
+        for (auto* viewer : manager->baseViewers()) {
+            if (!viewer || viewer->surfName() != surfaces[pane]) {
+                continue;
+            }
+            widget = qobject_cast<QWidget*>(viewer->asQObject());
+            if (widget && widget->parentWidget() == grid) {
+                break;
+            }
+            widget = nullptr;
+        }
+        grid->setViewer(pane, widget);
+        grid->setPaneHidden(pane, hidden[pane]);
+    }
+}
 
 QString atlasSearchIdListString(const std::vector<uint64_t>& ids)
 {
@@ -2640,6 +2912,59 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         QMenu menu(this);
                         auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
+                        auto* viewerGrid = ui.tabSegment
+                            ? ui.tabSegment->findChild<ViewerSplitGrid*>(QStringLiteral("mainViewerSplitGrid"))
+                            : nullptr;
+                        const int mainViewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
+                        if (viewerGrid && mainViewerPane >= 0) {
+                            QAction* closeAction = menu.addAction(tr("Close viewer"));
+                            closeAction->setEnabled(!viewerGrid->paneHidden(mainViewerPane));
+                            connect(closeAction, &QAction::triggered, this, [viewerGrid, mainViewerPane]() {
+                                viewerGrid->setPaneHidden(mainViewerPane, true);
+                                persistMainViewerLayout(viewerGrid);
+                            });
+
+                            auto* moveMenu = menu.addMenu(tr("Move viewer to"));
+                            for (int pane = 0; pane < 4; ++pane) {
+                                const QString paneLabel = QObject::tr(kMainViewerPaneLabels[pane]);
+                                QAction* paneAction = moveMenu->addAction(paneLabel);
+                                paneAction->setEnabled(pane != mainViewerPane);
+                                connect(paneAction, &QAction::triggered, this,
+                                        [viewerGrid, mainViewerPane, pane]() {
+                                            const bool targetWasHidden = viewerGrid->paneHidden(pane);
+                                            viewerGrid->swapViewers(mainViewerPane, pane);
+                                            if (targetWasHidden) {
+                                                viewerGrid->setPaneHidden(pane, false);
+                                                viewerGrid->setPaneHidden(mainViewerPane, true);
+                                            }
+                                            persistMainViewerLayout(viewerGrid);
+                                        });
+                            }
+
+                            auto* showMenu = menu.addMenu(tr("Show closed viewer here"));
+                            bool hasClosedViewer = false;
+                            for (int pane = 0; pane < 4; ++pane) {
+                                if (!viewerGrid->paneHidden(pane) || !viewerGrid->viewer(pane)) {
+                                    continue;
+                                }
+                                auto* hiddenViewer = baseViewerFromWidget(viewerGrid->viewer(pane));
+                                const QString label = hiddenViewer
+                                    ? mainViewerDisplayName(hiddenViewer->surfName())
+                                    : QObject::tr(kMainViewerPaneLabels[pane]);
+                                QAction* showAction = showMenu->addAction(label);
+                                hasClosedViewer = true;
+                                connect(showAction, &QAction::triggered, this,
+                                        [viewerGrid, mainViewerPane, pane]() {
+                                            viewerGrid->swapViewers(mainViewerPane, pane);
+                                            viewerGrid->setPaneHidden(mainViewerPane, false);
+                                            viewerGrid->setPaneHidden(pane, true);
+                                            persistMainViewerLayout(viewerGrid);
+                                        });
+                            }
+                            showMenu->setEnabled(hasClosedViewer);
+                            menu.addSeparator();
+                        }
+
                         QPointer<QMdiSubWindow> subWindow = viewerWidget
                             ? qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())
                             : nullptr;
@@ -2913,7 +3238,7 @@ VolumeViewerBase* CWindow::activeBaseViewer() const
     return baseViewerFromWidget(subWindow->widget());
 }
 
-void CWindow::resetSegmentationViews()
+void CWindow::resetSegmentationViews(bool persistLayout)
 {
     auto* viewerGrid = ui.tabSegment ? ui.tabSegment->findChild<ViewerSplitGrid*>(QStringLiteral("mainViewerSplitGrid")) : nullptr;
     if (!viewerGrid) {
@@ -2955,7 +3280,14 @@ void CWindow::resetSegmentationViews()
         }
     }
 
+    viewerGrid->setPaneHidden(0, kDefaultMainViewerHidden[0]);
+    viewerGrid->setPaneHidden(1, kDefaultMainViewerHidden[1]);
+    viewerGrid->setPaneHidden(2, kDefaultMainViewerHidden[2]);
+    viewerGrid->setPaneHidden(3, kDefaultMainViewerHidden[3]);
     viewerGrid->resetSplits();
+    if (persistLayout) {
+        persistMainViewerLayout(viewerGrid);
+    }
 }
 
 void CWindow::clearSurfaceSelection()
@@ -5723,7 +6055,8 @@ void CWindow::CreateWidgets(void)
     aWidgetLayout->addWidget(viewerGrid, 1);
 
     {
-        resetSegmentationViews();
+        resetSegmentationViews(false);
+        applyMainViewerLayout(viewerGrid, _viewerManager.get());
         viewerGrid->setSplits(settings.value(MAIN_VIEWER_SPLIT_X_SETTING, 0.5).toDouble(),
                               settings.value(MAIN_VIEWER_SPLIT_Y_SETTING, 0.5).toDouble());
     }
