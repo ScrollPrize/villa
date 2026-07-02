@@ -5376,6 +5376,8 @@ void CWindow::CreateWidgets(void)
 
     // add volume viewer
     auto aWidgetLayout = new QVBoxLayout;
+    aWidgetLayout->setContentsMargins(0, 0, 0, 0);
+    aWidgetLayout->setSpacing(0);
     ui.tabSegment->setLayout(aWidgetLayout);
 
     mdiArea = new QMdiArea(ui.tabSegment);
