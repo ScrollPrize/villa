@@ -1571,13 +1571,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     moveExistingDockToSegment(ui.dockWidgetSegmentation, Qt::RightDockWidgetArea);
     moveExistingDockToSegment(ui.dockWidgetDistanceTransform, Qt::RightDockWidgetArea);
     moveExistingDockToSegment(ui.dockWidgetViewerControls, Qt::LeftDockWidgetArea);
-    for (QDockWidget* dock : {ui.dockWidgetPreprocessing,
-                              ui.dockWidgetNormalVis,
+    for (QDockWidget* dock : {ui.dockWidgetNormalVis,
                               ui.dockWidgetView,
                               ui.dockWidgetOverlay,
                               ui.dockWidgetRenderSettings,
-                              ui.dockWidgetComposite,
-                              ui.dockWidgetPostprocessing}) {
+                              ui.dockWidgetComposite}) {
         moveExistingDockToSegment(dock, Qt::LeftDockWidgetArea);
     }
 
@@ -6278,13 +6276,11 @@ void CWindow::CreateWidgets(void)
     _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
 
     auto hideLegacyViewerDocks = [this]() {
-        for (QDockWidget* dock : { ui.dockWidgetPreprocessing,
-                                   ui.dockWidgetNormalVis,
+        for (QDockWidget* dock : { ui.dockWidgetNormalVis,
                                    ui.dockWidgetView,
                                    ui.dockWidgetOverlay,
                                    ui.dockWidgetRenderSettings,
-                                   ui.dockWidgetComposite,
-                                   ui.dockWidgetPostprocessing }) {
+                                   ui.dockWidgetComposite }) {
             if (!dock) {
                 continue;
             }

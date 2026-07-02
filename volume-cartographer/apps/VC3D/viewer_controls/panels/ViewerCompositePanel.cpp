@@ -9,7 +9,6 @@
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSpinBox>
-#include <QString>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -97,28 +96,6 @@ ViewerCompositePanel::ViewerCompositePanel(const UiRefs& uiRefs,
 
     auto* layout = new QVBoxLayout(this);
     moveLayoutItems(_uiRefs.contents ? _uiRefs.contents->layout() : nullptr, layout, this);
-
-    static constexpr const char* kRemovedCompositeControls[] = {
-        "lblMethodScale", "sliderMethodScale", "lblMethodScaleValue",
-        "lblMethodParam", "sliderMethodParam", "lblMethodParamValue",
-        "lblBLExtinction", "spinBLExtinction", "lblBLEmission", "spinBLEmission",
-        "lblBLAmbient", "spinBLAmbient", "chkLightingEnabled", "lblLightAzimuth",
-        "spinLightAzimuth", "lblLightElevation", "spinLightElevation", "lblLightDiffuse",
-        "spinLightDiffuse", "lblLightAmbient", "spinLightAmbient", "chkUseVolumeGradients",
-        "lblShadowSteps", "spinShadowSteps", "chkRakingEnabled", "lblRakingAzimuth",
-        "spinRakingAzimuth", "lblRakingElevation", "spinRakingElevation", "lblRakingStrength",
-        "spinRakingStrength", "lblRakingDepth", "spinRakingDepthScale",
-        "chkPreNormalizeLayers", "chkPreHistEqLayers", "chkPreTfEnabled", "spinPreTfX1",
-        "spinPreTfY1", "lblPreTfKnot2", "spinPreTfX2", "spinPreTfY2",
-        "chkPostTfEnabled", "spinPostTfX1", "spinPostTfY1", "lblPostTfKnot2",
-        "spinPostTfX2", "spinPostTfY2", "lblDvrAmbient", "spinDvrAmbient",
-        "lblPbrRoughness", "spinPbrRoughness", "lblPbrMetallic", "spinPbrMetallic",
-    };
-    for (const char* name : kRemovedCompositeControls) {
-        if (auto* widget = findChild<QWidget*>(QString::fromLatin1(name))) {
-            widget->hide();
-        }
-    }
 
     if (_uiRefs.compositeMode) {
         QSignalBlocker blocker(_uiRefs.compositeMode);
