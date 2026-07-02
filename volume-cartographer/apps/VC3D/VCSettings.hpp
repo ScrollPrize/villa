@@ -163,7 +163,7 @@ namespace viewer {
 
     constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
 
-    constexpr int INTERSECTION_OPACITY_DEFAULT = 100;
+    constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
     constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
     constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
@@ -174,7 +174,7 @@ namespace viewer {
     constexpr auto USE_AXIS_ALIGNED_SLICES = "viewer/use_axis_aligned_slices";
 
     constexpr bool SHOW_AXIS_OVERLAYS_DEFAULT = true;
-    constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 100;
+    constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 70;
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
 
     // Remote volume chunk cache directory. Resolved through

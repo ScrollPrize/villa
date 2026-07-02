@@ -765,6 +765,17 @@ void MenuActionController::showSettingsDialog()
     }
     _window->onMoveOnSurfaceChangedToggled(resetViewOnSurfaceChange);
 
+    if (_window->_viewerManager) {
+        const int intersectionOpacity =
+            settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
+                           vc3d::settings::viewer::INTERSECTION_OPACITY_DEFAULT).toInt();
+        _window->_viewerManager->setIntersectionOpacity(
+            std::clamp(static_cast<float>(intersectionOpacity) / 100.0f, 0.0f, 1.0f));
+    }
+    _window->onAxisOverlayOpacityChanged(
+        settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
+                       vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
+
     dialog->deleteLater();
 }
 

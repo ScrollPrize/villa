@@ -338,26 +338,6 @@ void ViewerControlsPanel::setupIntersectionControls()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    if (auto* spinIntersectionOpacity = _uiRefs.intersectionOpacitySpin) {
-        const int savedOpacity = settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
-                                                spinIntersectionOpacity->value()).toInt();
-        const int boundedOpacity = std::clamp(savedOpacity,
-                                              spinIntersectionOpacity->minimum(),
-                                              spinIntersectionOpacity->maximum());
-        spinIntersectionOpacity->setValue(boundedOpacity);
-        connect(spinIntersectionOpacity, QOverload<int>::of(&QSpinBox::valueChanged),
-                this, [this](int value) {
-                    if (!_viewerManager) {
-                        return;
-                    }
-                    const float normalized = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
-                    _viewerManager->setIntersectionOpacity(normalized);
-                });
-        if (_viewerManager) {
-            _viewerManager->setIntersectionOpacity(spinIntersectionOpacity->value() / 100.0f);
-        }
-    }
-
     if (auto* spinIntersectionThickness = _uiRefs.intersectionThicknessSpin) {
         const double savedThickness = settings.value(vc3d::settings::viewer::INTERSECTION_THICKNESS,
                                                      spinIntersectionThickness->value()).toDouble();

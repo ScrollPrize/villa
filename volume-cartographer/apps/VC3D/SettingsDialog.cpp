@@ -42,6 +42,12 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     if (auto* cmb = findChild<QComboBox*>("cmbInterpolation")) {
         cmb->setCurrentIndex(std::clamp(settings.value(perf::INTERPOLATION_METHOD, perf::INTERPOLATION_METHOD_DEFAULT).toInt(), 0, 1));
     }
+    if (auto* spin = findChild<QSpinBox*>("spinIntersectionOpacity")) {
+        spin->setValue(std::clamp(settings.value(viewer::INTERSECTION_OPACITY, viewer::INTERSECTION_OPACITY_DEFAULT).toInt(), 0, 100));
+    }
+    if (auto* spin = findChild<QSpinBox*>("spinAxisOverlayOpacity")) {
+        spin->setValue(std::clamp(settings.value(viewer::AXIS_OVERLAY_OPACITY, viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt(), 0, 100));
+    }
     // Show direction hints (flip_x arrows)
     if (findChild<QCheckBox*>("chkShowDirectionHints")) {
         findChild<QCheckBox*>("chkShowDirectionHints")->setChecked(settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toInt() != 0);
@@ -141,6 +147,12 @@ void SettingsDialog::accept()
     }
     if (auto* cmb = findChild<QComboBox*>("cmbInterpolation")) {
         settings.setValue(perf::INTERPOLATION_METHOD, cmb->currentIndex());
+    }
+    if (auto* spin = findChild<QSpinBox*>("spinIntersectionOpacity")) {
+        settings.setValue(viewer::INTERSECTION_OPACITY, spin->value());
+    }
+    if (auto* spin = findChild<QSpinBox*>("spinAxisOverlayOpacity")) {
+        settings.setValue(viewer::AXIS_OVERLAY_OPACITY, spin->value());
     }
     if (findChild<QCheckBox*>("chkShowDirectionHints")) {
         settings.setValue(viewer::SHOW_DIRECTION_HINTS, findChild<QCheckBox*>("chkShowDirectionHints")->isChecked() ? "1" : "0");

@@ -6307,7 +6307,6 @@ void CWindow::CreateWidgets(void)
         .zoomOutButton = ui.btnZoomOut,
         .volumeWindowContainer = ui.volumeWindowContainer,
         .overlayWindowContainer = ui.overlayWindowContainer,
-        .intersectionOpacitySpin = ui.spinIntersectionOpacity,
         .intersectionThicknessSpin = ui.doubleSpinIntersectionThickness,
     };
     _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
@@ -6479,15 +6478,6 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
-                                           spinAxisOverlayOpacity->value()).toInt();
-        storedOpacity = std::clamp(storedOpacity, spinAxisOverlayOpacity->minimum(), spinAxisOverlayOpacity->maximum());
-        QSignalBlocker blocker(spinAxisOverlayOpacity);
-        spinAxisOverlayOpacity->setValue(storedOpacity);
-        connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
-    }
-
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
     }
@@ -6507,9 +6497,8 @@ void CWindow::CreateWidgets(void)
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
     }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        onAxisOverlayOpacityChanged(spinAxisOverlayOpacity->value());
-    }
+    onAxisOverlayOpacityChanged(settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
+                                               vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
@@ -7822,9 +7811,6 @@ void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->setAxisAlignedEnabled(enabled && _axisAlignedSliceController->isEnabled());
     }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        spinAxisOverlayOpacity->setEnabled(_axisAlignedSliceController->isEnabled() && enabled);
-    }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS, enabled ? "1" : "0");
 }
@@ -7841,7 +7827,7 @@ void CWindow::onAxisOverlayOpacityChanged(int value)
 
 void CWindow::onAxisAlignedSlicesToggled(bool enabled)
 {
-    _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays, ui.spinAxisOverlayOpacity);
+    _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays);
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
 }

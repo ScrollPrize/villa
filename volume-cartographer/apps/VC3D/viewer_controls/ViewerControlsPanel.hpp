@@ -139,7 +139,6 @@ public:
         QPushButton* zoomOutButton{nullptr};
         QWidget* volumeWindowContainer{nullptr};
         QWidget* overlayWindowContainer{nullptr};
-        QSpinBox* intersectionOpacitySpin{nullptr};
         QDoubleSpinBox* intersectionThicknessSpin{nullptr};
     };
 
