@@ -113,6 +113,7 @@ std::vector<fs::path> immediateSubdirs(const fs::path& dir)
         if (!e.is_directory()) continue;
         const auto name = e.path().filename().string();
         if (name.empty() || name[0] == '.' || name == ".tmp") continue;
+        if (name.find(".tmp-") != std::string::npos || name.ends_with(".previous")) continue;
         out.push_back(e.path());
     }
     std::sort(out.begin(), out.end());

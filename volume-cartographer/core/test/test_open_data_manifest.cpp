@@ -455,6 +455,7 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     std::ifstream metaIn(segmentDir / "meta.json", std::ios::binary);
     REQUIRE(metaIn.good());
     const auto meta = nlohmann::json::parse(metaIn);
+    CHECK(meta.at("uuid").get<std::string>() == "PHerc0139-20260311000000");
     CHECK(meta.at("vc_open_data_segment_id").get<std::string>() == "20260311000000");
     CHECK(meta.at("vc_open_data_segment_long_id").get<std::string>() == "PHerc0139-20260311000000");
     CHECK(meta.at("vc_open_data_original_volume_id").get<std::string>() == "vol1");

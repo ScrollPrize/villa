@@ -493,7 +493,7 @@ void applyOriginalVolumeDownscale(const std::filesystem::path& segmentDir,
     vc::core::util::transformSurfacePoints(surface.get(), downscale, std::nullopt, 1.0);
     vc::core::util::refreshTransformedSurfaceState(surface.get());
     surface->meta["vc_open_data_coordinates_scaled_to_original_volume"] = downscale;
-    surface->save(segmentDir, true);
+    surface->save(segmentDir.string(), segmentStableId(segment), true);
 }
 
 void writeCachedMetadata(const std::string& baseUrl,

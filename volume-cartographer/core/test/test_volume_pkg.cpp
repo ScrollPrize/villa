@@ -194,6 +194,28 @@ TEST_CASE("VolumePkg: addSegmentsEntry sets outputSegments on first add")
     CHECK_FALSE(p->addSegmentsEntry(""));
 }
 
+TEST_CASE("VolumePkg: segment discovery skips transient cache directories")
+{
+    auto d = tmpDir("seg_transients");
+    auto writeSegMeta = [](const fs::path& segDir, const std::string& uuid) {
+        fs::create_directories(segDir);
+        std::ofstream f(segDir / "meta.json");
+        f << R"({"type":"seg","uuid":")" << uuid << R"(","format":"tifxyz"})";
+    };
+
+    writeSegMeta(d / "stable-seg", "stable-seg");
+    writeSegMeta(d / "stable-seg.tmp-12345", "stable-seg.tmp-12345");
+    writeSegMeta(d / "stable-seg.previous", "stable-seg.previous");
+
+    auto p = VolumePkg::newEmpty();
+    CHECK(p->addSegmentsEntry(d.string()));
+    const auto ids = p->segmentationIDs();
+    REQUIRE(ids.size() == 1);
+    CHECK(ids.front() == "stable-seg");
+
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg: addNormalGridEntry")
 {
     auto p = VolumePkg::newEmpty();
