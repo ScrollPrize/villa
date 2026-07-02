@@ -184,6 +184,7 @@ private:
     bool initializeCommandLineRunner(void);
 
     VolumeViewerBase *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
+    VolumeViewerBase* newConnectedViewerInWidget(std::string surfaceName, QString title, QWidget* parent);
     void closeEvent(QCloseEvent* event) override;
 
     void setWidgetsEnabled(bool state);
@@ -316,6 +317,7 @@ private:
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
     QMdiArea* _intersectionsMdiArea{nullptr};
+    VolumeViewerBase* _activeBaseViewer{nullptr};
 
     bool can_change_volume_();
 

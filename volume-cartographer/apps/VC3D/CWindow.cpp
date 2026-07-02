@@ -60,6 +60,7 @@
 #include <QDebug>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QSplitter>
 #include <QMenu>
 #include <QMainWindow>
 #include <QTabWidget>
@@ -149,6 +150,9 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 namespace
 {
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
+constexpr auto MAIN_VIEWER_OUTER_SPLITTER_SETTING = "mainWin/main_viewer_outer_splitter";
+constexpr auto MAIN_VIEWER_TOP_SPLITTER_SETTING = "mainWin/main_viewer_top_splitter";
+constexpr auto MAIN_VIEWER_BOTTOM_SPLITTER_SETTING = "mainWin/main_viewer_bottom_splitter";
 constexpr auto ATLAS_INTERNAL_SURFACE_NAME = "__atlas_workspace_base_mesh";
 constexpr int ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS = 0;
 constexpr int ATLAS_SEARCH_MODE_NON_ATLAS_ONLY = 1;
@@ -2278,6 +2282,32 @@ VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString t
     return viewer;
 }
 
+VolumeViewerBase* CWindow::newConnectedViewerInWidget(std::string surfaceName, QString title, QWidget* parent)
+{
+    if (!_viewerManager || !parent) {
+        return nullptr;
+    }
+
+    VolumeViewerBase* viewer = _viewerManager->createViewerInWidget(surfaceName, parent);
+    if (!viewer) {
+        return nullptr;
+    }
+
+    if (auto* viewerObject = viewer->asQObject()) {
+        viewerObject->setProperty("vc_viewer_label", title);
+        connect(viewerObject, &QObject::destroyed, this, [this, viewer]() {
+            if (_activeBaseViewer == viewer) {
+                _activeBaseViewer = nullptr;
+            }
+        });
+    }
+
+    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+        configureChunkedViewerConnections(chunkedViewer);
+    }
+    return viewer;
+}
+
 void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 {
     if (!viewer) {
@@ -2323,6 +2353,13 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     }
 
     if (auto* graphicsView = viewer->graphicsView()) {
+        auto markActiveViewer = [this, viewer]() {
+            _activeBaseViewer = viewer;
+        };
+        connect(graphicsView, &CVolumeViewerView::sendMousePress, this, markActiveViewer, Qt::UniqueConnection);
+        connect(graphicsView, &CVolumeViewerView::sendMouseDoubleClick, this, markActiveViewer, Qt::UniqueConnection);
+        connect(graphicsView, &CVolumeViewerView::sendZoom, this, markActiveViewer, Qt::UniqueConnection);
+        connect(graphicsView, &CVolumeViewerView::sendCursorMove, this, markActiveViewer, Qt::UniqueConnection);
         if (!viewer->property("vc_annotation_context_bound").toBool()) {
             connect(graphicsView,
                     &CVolumeViewerView::sendAnnotationContextMenuRequested,
@@ -2637,6 +2674,15 @@ VolumeViewerBase* CWindow::segmentationBaseViewer() const
 
 VolumeViewerBase* CWindow::activeBaseViewer() const
 {
+    if (_activeBaseViewer) {
+        if (auto* activeObject = _activeBaseViewer->asQObject()) {
+            if (!activeObject->parent()) {
+                return nullptr;
+            }
+        }
+        return _activeBaseViewer;
+    }
+
     if (!mdiArea) {
         return nullptr;
     }
@@ -3083,7 +3129,7 @@ bool CWindow::recenterViewersOnCurrentFocus()
 
 bool CWindow::centerFocusOnCursor()
 {
-    if (!_state || !mdiArea) {
+    if (!_state) {
         return false;
     }
 
@@ -3144,7 +3190,8 @@ bool CWindow::centerFocusOnCursor()
 
     // Fall back to the active viewer if the cursor isn't currently over any
     // tiled viewport.
-    if (auto* subWindow = mdiArea->activeSubWindow()) {
+    if (mdiArea && mdiArea->activeSubWindow()) {
+        auto* subWindow = mdiArea->activeSubWindow();
         if (auto* viewer = baseViewerFromWidget(subWindow->widget())) {
             if (tryCenterFromViewer(viewer)) {
                 return true;
@@ -5408,58 +5455,78 @@ void CWindow::CreateWidgets(void)
     resetViewersButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
     aWidgetLayout->addWidget(resetViewersButton, 0, Qt::AlignLeft);
 
-    mdiArea = new QMdiArea(ui.tabSegment);
-    aWidgetLayout->addWidget(mdiArea);
+    mdiArea = nullptr;
 
     auto ensureDefaultViewer = [this](const std::string& surfaceName,
                                       const QString& title,
-                                      const std::set<std::string>& intersects) -> VolumeViewerBase* {
-        for (auto* subWindow : mdiArea->subWindowList()) {
-            if (!subWindow)
-                continue;
-            if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
-                if (viewer->surfName() == surfaceName)
+                                      const std::set<std::string>& intersects,
+                                      QWidget* parent) -> VolumeViewerBase* {
+        if (_viewerManager) {
+            for (auto* viewer : _viewerManager->baseViewers()) {
+                auto* viewerWidget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+                if (viewer && viewerWidget && viewer->surfName() == surfaceName && viewerWidget->parentWidget() == parent) {
                     return viewer;
+                }
             }
         }
 
-        auto* viewer = newConnectedViewer(surfaceName, title, mdiArea);
+        auto* viewer = newConnectedViewerInWidget(surfaceName, title, parent);
         if (viewer)
             viewer->setIntersects(intersects);
         return viewer;
     };
 
-    auto resetDefaultViewers = [this, ensureDefaultViewer]() {
-        ensureDefaultViewer("seg xz", tr("Segmentation XZ"), {"segmentation"});
-        ensureDefaultViewer("seg yz", tr("Segmentation YZ"), {"segmentation"});
-        ensureDefaultViewer("xy plane", tr("XY / Slices"), {"segmentation"});
-        ensureDefaultViewer("segmentation", tr("Surface"), {"seg xz", "seg yz"});
+    auto* outerViewerSplitter = new QSplitter(Qt::Vertical, ui.tabSegment);
+    outerViewerSplitter->setObjectName(QStringLiteral("mainViewerOuterSplitter"));
+    outerViewerSplitter->setChildrenCollapsible(false);
+    outerViewerSplitter->setHandleWidth(6);
+    aWidgetLayout->addWidget(outerViewerSplitter, 1);
 
-        for (auto* subWindow : mdiArea->subWindowList()) {
-            if (!subWindow)
-                continue;
-            subWindow->showNormal();
-            subWindow->show();
+    auto* topViewerSplitter = new QSplitter(Qt::Horizontal, outerViewerSplitter);
+    topViewerSplitter->setObjectName(QStringLiteral("mainViewerTopSplitter"));
+    topViewerSplitter->setChildrenCollapsible(false);
+    topViewerSplitter->setHandleWidth(6);
+
+    auto* bottomViewerSplitter = new QSplitter(Qt::Horizontal, outerViewerSplitter);
+    bottomViewerSplitter->setObjectName(QStringLiteral("mainViewerBottomSplitter"));
+    bottomViewerSplitter->setChildrenCollapsible(false);
+    bottomViewerSplitter->setHandleWidth(6);
+
+    auto resetDefaultViewers = [this, ensureDefaultViewer, outerViewerSplitter, topViewerSplitter, bottomViewerSplitter]() {
+        auto* xzViewer = ensureDefaultViewer("seg xz", tr("XZ"), {"segmentation"}, topViewerSplitter);
+        auto* yzViewer = ensureDefaultViewer("seg yz", tr("YZ"), {"segmentation"}, topViewerSplitter);
+        auto* xyViewer = ensureDefaultViewer("xy plane", tr("XY"), {"segmentation"}, bottomViewerSplitter);
+        auto* surfaceViewer = ensureDefaultViewer("segmentation", tr("Surface"), {"seg xz", "seg yz"}, bottomViewerSplitter);
+
+        for (auto* viewer : {xzViewer, yzViewer, xyViewer, surfaceViewer}) {
+            if (auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr) {
+                widget->show();
+            }
         }
-        mdiArea->tileSubWindows();
+
+        outerViewerSplitter->setSizes({1, 1});
+        topViewerSplitter->setSizes({1, 1});
+        bottomViewerSplitter->setSizes({1, 1});
     };
 
     connect(resetViewersButton, &QPushButton::clicked, this, resetDefaultViewers);
 
-    // Ensure the viewer's graphics view gets focus when subwindow is activated
-    connect(mdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
-        if (subWindow) {
-            if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
-                if (auto* graphicsView = viewer->graphicsView()) {
-                    graphicsView->setFocus();
-                }
-            }
-        }
-    });
-
     {
         resetDefaultViewers();
+        outerViewerSplitter->restoreState(settings.value(MAIN_VIEWER_OUTER_SPLITTER_SETTING).toByteArray());
+        topViewerSplitter->restoreState(settings.value(MAIN_VIEWER_TOP_SPLITTER_SETTING).toByteArray());
+        bottomViewerSplitter->restoreState(settings.value(MAIN_VIEWER_BOTTOM_SPLITTER_SETTING).toByteArray());
     }
+
+    auto saveMainViewerSplitterState = [outerViewerSplitter, topViewerSplitter, bottomViewerSplitter]() {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(MAIN_VIEWER_OUTER_SPLITTER_SETTING, outerViewerSplitter->saveState());
+        settings.setValue(MAIN_VIEWER_TOP_SPLITTER_SETTING, topViewerSplitter->saveState());
+        settings.setValue(MAIN_VIEWER_BOTTOM_SPLITTER_SETTING, bottomViewerSplitter->saveState());
+    };
+    connect(outerViewerSplitter, &QSplitter::splitterMoved, this, saveMainViewerSplitterState);
+    connect(topViewerSplitter, &QSplitter::splitterMoved, this, saveMainViewerSplitterState);
+    connect(bottomViewerSplitter, &QSplitter::splitterMoved, this, saveMainViewerSplitterState);
 
     if (_fiberSliceWorkspaceWindow) {
         _fiberSliceMdiArea = new QMdiArea(_fiberSliceWorkspaceWindow);
@@ -6056,7 +6123,7 @@ void CWindow::CreateWidgets(void)
     // Create fiber annotation controller and dock
     _fiberController = std::make_unique<FiberAnnotationController>(
         _state, _state->pointCollection(), this);
-    _fiberController->setMdiArea(mdiArea);
+    _fiberController->setMdiArea(_fiberSliceMdiArea);
 
     _fiberWidget = new CFiberWidget(this);
     _fiberWidget->setObjectName("fiberDock");
@@ -8387,6 +8454,10 @@ void CWindow::onFiberViewersRequested()
     if (!_fiberController) return;
 
     constexpr int N = FiberAnnotationController::kNumViews;
+    QMdiArea* targetMdiArea = _fiberSliceMdiArea ? _fiberSliceMdiArea : mdiArea;
+    if (!targetMdiArea) {
+        return;
+    }
 
     QMdiSubWindow* subWindows[N] = {};
 
@@ -8394,7 +8465,7 @@ void CWindow::onFiberViewersRequested()
         QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
 
         auto* baseViewer = newConnectedViewer(
-            FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
+            FiberAnnotationController::fiberSurfaceName(i), title, targetMdiArea);
         auto* viewer = baseViewer
             ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())
             : nullptr;
@@ -8422,7 +8493,7 @@ void CWindow::onFiberViewersRequested()
     }
 
     // Layout: 2 columns × 1 row — ref on the left, annotate on the right.
-    QRect area = mdiArea->contentsRect();
+    QRect area = targetMdiArea->contentsRect();
     int colW = area.width() / 2;
     int rowH = area.height();
 
