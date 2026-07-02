@@ -467,6 +467,12 @@ bool coordinatesAlreadyScaled(const nlohmann::json& meta, double)
     return jsonNumberLike(meta, "vc_open_data_coordinates_scaled_to_original_volume").has_value();
 }
 
+bool artifactAlreadyInOriginalVolumeScale(const OpenDataArtifact& artifact)
+{
+    const auto type = lowerCopy(artifact.type);
+    return type.find("transformed") != std::string::npos;
+}
+
 void applyOriginalVolumeDownscale(const std::filesystem::path& segmentDir,
                                   const OpenDataSegment& segment)
 {
@@ -522,7 +528,8 @@ void writeCachedMetadata(const std::string& baseUrl,
 
 void normalizeCachedMetadata(const std::string& baseUrl,
                              const OpenDataSegment& segment,
-                             const std::filesystem::path& target)
+                             const std::filesystem::path& target,
+                             bool applyDownscale)
 {
     auto meta = nlohmann::json::parse(readTextFile(target));
     if (!meta.is_object()) {
@@ -540,7 +547,9 @@ void normalizeCachedMetadata(const std::string& baseUrl,
     }
     applyOpenDataMetadata(meta, baseUrl, segment);
     writeStringAtomic(target, meta.dump(2));
-    applyOriginalVolumeDownscale(target.parent_path(), segment);
+    if (applyDownscale) {
+        applyOriginalVolumeDownscale(target.parent_path(), segment);
+    }
 }
 
 void writeCachedTifxyzBand(const std::string& baseUrl,
@@ -896,7 +905,10 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
             return true;
         }
         if (!origin || originMatches(*origin, sample, segment, *artifact)) {
-            normalizeCachedMetadata(url, segment, segmentDir / "meta.json");
+            normalizeCachedMetadata(url,
+                                    segment,
+                                    segmentDir / "meta.json",
+                                    !artifactAlreadyInOriginalVolumeScale(*artifact));
             if (origin) {
                 writeCatalogOriginState(segmentDir, OpenDataSegmentCacheState::Current);
             } else {
@@ -955,7 +967,10 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
         if (!requiredFilesPresent(tempDir)) {
             throw std::runtime_error("downloaded segment is missing required tifxyz files");
         }
-        normalizeCachedMetadata(url, segment, tempDir / "meta.json");
+        normalizeCachedMetadata(url,
+                                segment,
+                                tempDir / "meta.json",
+                                !artifactAlreadyInOriginalVolumeScale(*artifact));
         writeStringAtomic(tempDir / "catalog-origin.json",
                           catalogOriginJson(sample, segment, *artifact, downloadedFiles).dump(2));
         try {

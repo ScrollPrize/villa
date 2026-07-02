@@ -99,7 +99,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${viewer_overlay_base_ink_moc}
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 

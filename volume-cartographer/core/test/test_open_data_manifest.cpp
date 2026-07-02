@@ -148,6 +148,13 @@ cv::Size tifxyzGridSize(const std::filesystem::path& segmentDir)
     return points->size();
 }
 
+std::string fixtureWithSegmentArtifactType(const char* type)
+{
+    auto fixture = nlohmann::json::parse(kFixture);
+    fixture["metadata"]["samples"]["PHerc0139"]["segments"]["20260311000000"]["data"][0]["type"] = type;
+    return fixture.dump();
+}
+
 } // namespace
 
 TEST_CASE("OpenDataManifest parses samples and computes summary counts")
@@ -465,6 +472,48 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     CHECK(origin.at("cache_state").get<std::string>() == "current");
     CHECK(origin.at("sample_id").get<std::string>() == "PHerc0139");
     CHECK(origin.at("segment_id").get<std::string>() == "20260311000000");
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts")
+{
+    const auto manifest = parseOpenDataManifest(
+        fixtureWithSegmentArtifactType("tifxyz-transformed"));
+    const auto& sample = *manifest.findSample("PHerc0139");
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_transformed_segment_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    const cv::Size fixtureGridSize = tifxyzGridSize(fixtureSegment);
+    writeFile(segmentDir / "meta.json",
+              R"({"type":"seg","uuid":"out","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", segmentDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", segmentDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", segmentDir / "z.tif");
+
+    auto pkg = VolumePkg::newEmpty();
+    OpenDataSampleProjectResult result;
+    attachOpenDataSampleSegments(*pkg, sample, cacheRoot, result);
+
+    CHECK(result.supportedTifxyzSegments == 1);
+    CHECK(result.cachedTifxyzSegments == 1);
+    CHECK(result.attachedSegmentEntries == 1);
+    REQUIRE(pkg->segmentEntries().size() == 1);
+
+    std::ifstream metaIn(segmentDir / "meta.json", std::ios::binary);
+    REQUIRE(metaIn.good());
+    const auto meta = nlohmann::json::parse(metaIn);
+    CHECK(meta.at("vc_open_data_original_volume_downscale").get<double>() == doctest::Approx(2.0));
+    CHECK(!meta.contains("vc_open_data_coordinates_scaled_to_original_volume"));
+
+    const cv::Size cachedGridSize = tifxyzGridSize(segmentDir);
+    CHECK(cachedGridSize.width == fixtureGridSize.width);
+    CHECK(cachedGridSize.height == fixtureGridSize.height);
 
     std::filesystem::remove_all(cacheRoot);
 }
