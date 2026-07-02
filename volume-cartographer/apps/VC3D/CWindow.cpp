@@ -5576,6 +5576,10 @@ void CWindow::CreateWidgets(void)
         this, [this](const QStringList& segmentIds) {
             _segmentationCommandHandler->onRasterizeSegments(segmentIds);
         });
+    connect(_surfacePanel.get(), &SurfacePanelController::generateSegmentMaskRequested,
+        this, &CWindow::onEditMaskPressed);
+    connect(_surfacePanel.get(), &SurfacePanelController::appendSegmentMaskRequested,
+        this, &CWindow::onAppendMaskPressed);
     connect(_surfacePanel.get(), &SurfacePanelController::addIgnoreLabelRequested,
         this, [this]() {
             _segmentationCommandHandler->onAddIgnoreLabel();
@@ -6421,9 +6425,6 @@ void CWindow::CreateWidgets(void)
         chkAxisAlignedSlices->setChecked(useAxisAligned);
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
     }
-
-    connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
-    connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
 
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
@@ -7402,11 +7403,15 @@ void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> 
     // (the ID remains valid for lookup - will just return nullptr if surface is gone)
 }
 
-void CWindow::onEditMaskPressed(void)
+void CWindow::onEditMaskPressed(const QString& segmentId)
 {
-    auto surf = _state->activeSurface().lock();
-    if (!surf)
+    auto surf = (_state && _state->vpkg())
+        ? _state->vpkg()->getSurface(segmentId.toStdString())
+        : nullptr;
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
         return;
+    }
 
     std::filesystem::path path = surf->path/"mask.tif";
 
@@ -7419,8 +7424,6 @@ void CWindow::onEditMaskPressed(void)
     if (_maskRenderInProgress)
         return;
     _maskRenderInProgress = true;
-    ui.btnEditMask->setEnabled(false);
-    ui.btnAppendMask->setEnabled(false);
     statusBar()->showMessage(tr("Rendering mask..."));
 
     auto* watcher = new QFutureWatcher<void>(this);
@@ -7428,8 +7431,6 @@ void CWindow::onEditMaskPressed(void)
             [this, watcher, surf, path]() {
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
-                ui.btnEditMask->setEnabled(true);
-                ui.btnAppendMask->setEnabled(true);
 
                 statusBar()->showMessage(tr("Mask saved"), 3000);
                 QDesktopServices::openUrl(QUrl::fromLocalFile(
@@ -7447,9 +7448,11 @@ void CWindow::onEditMaskPressed(void)
     }));
 }
 
-void CWindow::onAppendMaskPressed(void)
+void CWindow::onAppendMaskPressed(const QString& segmentId)
 {
-    auto surf = _state->activeSurface().lock();
+    auto surf = (_state && _state->vpkg())
+        ? _state->vpkg()->getSurface(segmentId.toStdString())
+        : nullptr;
     if (!surf || !_state->currentVolume()) {
         if (!surf) {
             QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
@@ -7462,8 +7465,6 @@ void CWindow::onAppendMaskPressed(void)
     if (_maskRenderInProgress)
         return;
     _maskRenderInProgress = true;
-    ui.btnEditMask->setEnabled(false);
-    ui.btnAppendMask->setEnabled(false);
     statusBar()->showMessage(tr("Rendering mask..."));
 
     std::filesystem::path path = surf->path/"mask.tif";
@@ -7474,8 +7475,6 @@ void CWindow::onAppendMaskPressed(void)
             [this, watcher, path]() {
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
-                ui.btnEditMask->setEnabled(true);
-                ui.btnAppendMask->setEnabled(true);
 
                 try {
                     QString msg = watcher->result();

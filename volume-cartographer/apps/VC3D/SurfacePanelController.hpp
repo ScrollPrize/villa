@@ -20,6 +20,7 @@ class VCCollection;
 class QTreeWidget;
 class QCheckBox;
 class QComboBox;
+class QDialog;
 class QDoubleSpinBox;
 class QPushButton;
 class QStandardItemModel;
@@ -129,6 +130,8 @@ signals:
     void exportTifxyzChunksRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
+    void generateSegmentMaskRequested(const QString& segmentId);
+    void appendSegmentMaskRequested(const QString& segmentId);
     void mergeTifxyzRequested(const QStringList& segmentIds);
     // Emitted when the user right-clicks two selected segments and picks
     // "Patch tifxyz...". CWindow wires this to
@@ -161,6 +164,11 @@ private:
 
     void connectFilterSignals();
     void connectTagSignals();
+    void setupSurfaceColumnMenu();
+    void restoreSurfaceColumnVisibility();
+    void showSurfaceColumnMenu(const QPoint& pos);
+    void buildFilterDialog();
+    void showFilterDialog();
     void rebuildPointSetFilterModel();
     void handleTreeSelectionChanged();
     void showContextMenu(const QPoint& pos);
@@ -186,6 +194,7 @@ private:
     std::function<void()> _filtersUpdated;
     FilterUiRefs _filters;
     TagUiRefs _tags;
+    QDialog* _filterDialog{nullptr};
     VCCollection* _pointCollection{nullptr};
     std::string _currentSurfaceId;
     QMetaObject::Connection _pointSetModelConnection;
