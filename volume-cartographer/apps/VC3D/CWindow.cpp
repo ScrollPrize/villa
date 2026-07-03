@@ -300,8 +300,53 @@ public:
         return index >= 0 && index < 4 ? _hidden[index] : false;
     }
 
+    bool fullSizeActive() const
+    {
+        return _fullSizePane >= 0;
+    }
+
+    bool fullSizeActiveForPane(int index) const
+    {
+        return _fullSizePane == index;
+    }
+
+    void setFullSizePane(int index)
+    {
+        if (index < 0 || index >= 4 || !_viewers[index]) {
+            return;
+        }
+
+        if (_fullSizePane < 0) {
+            _savedFullSizeHidden = _hidden;
+            _savedFullSizeSplitX = _splitX;
+            _savedFullSizeSplitY = _splitY;
+        }
+
+        _fullSizePane = index;
+        for (int pane = 0; pane < 4; ++pane) {
+            _hidden[pane] = pane != index;
+        }
+        applyVisibility();
+        layoutChildren();
+    }
+
+    void exitFullSize()
+    {
+        if (_fullSizePane < 0) {
+            return;
+        }
+
+        _hidden = _savedFullSizeHidden;
+        _splitX = _savedFullSizeSplitX;
+        _splitY = _savedFullSizeSplitY;
+        _fullSizePane = -1;
+        applyVisibility();
+        layoutChildren();
+    }
+
     void resetSplits()
     {
+        _fullSizePane = -1;
         _splitX = 0.5;
         _splitY = 0.5;
         layoutChildren();
@@ -500,6 +545,15 @@ private:
         }
     }
 
+    void applyVisibility()
+    {
+        for (int i = 0; i < 4; ++i) {
+            if (_viewers[i]) {
+                _viewers[i]->setVisible(!_hidden[i]);
+            }
+        }
+    }
+
     void setViewerGeometry(int index, const QRect& rect)
     {
         if (index < 0 || index >= 4 || !_viewers[index]) {
@@ -532,7 +586,8 @@ private:
     }
 
     QWidget* _viewers[4] = {};
-    bool _hidden[4] = {};
+    std::array<bool, 4> _hidden{};
+    std::array<bool, 4> _savedFullSizeHidden{};
     QFrame* _topColumnHandle = nullptr;
     QFrame* _bottomColumnHandle = nullptr;
     QFrame* _leftRowHandle = nullptr;
@@ -540,6 +595,9 @@ private:
     QFrame* _centerHandle = nullptr;
     double _splitX = 0.5;
     double _splitY = 0.5;
+    double _savedFullSizeSplitX = 0.5;
+    double _savedFullSizeSplitY = 0.5;
+    int _fullSizePane = -1;
     static constexpr int _minPanePx = 80;
     HandleKind _dragging = HandleKind::None;
     QPoint _dragStartGlobal;
@@ -2968,8 +3026,22 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             : nullptr;
                         const int mainViewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
                         if (viewerGrid && mainViewerPane >= 0) {
+                            const bool fullSizeActive = viewerGrid->fullSizeActive();
+                            QAction* fullSizeAction = menu.addAction(
+                                viewerGrid->fullSizeActiveForPane(mainViewerPane)
+                                    ? tr("Exit full size")
+                                    : tr("Full size viewer"));
+                            connect(fullSizeAction, &QAction::triggered, this,
+                                    [viewerGrid, mainViewerPane]() {
+                                        if (viewerGrid->fullSizeActiveForPane(mainViewerPane)) {
+                                            viewerGrid->exitFullSize();
+                                        } else {
+                                            viewerGrid->setFullSizePane(mainViewerPane);
+                                        }
+                                    });
+
                             QAction* closeAction = menu.addAction(tr("Close viewer"));
-                            closeAction->setEnabled(!viewerGrid->paneHidden(mainViewerPane));
+                            closeAction->setEnabled(!fullSizeActive && !viewerGrid->paneHidden(mainViewerPane));
                             connect(closeAction, &QAction::triggered, this, [viewerGrid, mainViewerPane]() {
                                 viewerGrid->setPaneHidden(mainViewerPane, true);
                                 persistMainViewerLayout(viewerGrid);
@@ -2979,7 +3051,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             for (int pane = 0; pane < 4; ++pane) {
                                 const QString paneLabel = QObject::tr(kMainViewerPaneLabels[pane]);
                                 QAction* paneAction = moveMenu->addAction(paneLabel);
-                                paneAction->setEnabled(pane != mainViewerPane);
+                                paneAction->setEnabled(!fullSizeActive && pane != mainViewerPane);
                                 connect(paneAction, &QAction::triggered, this,
                                         [viewerGrid, mainViewerPane, pane]() {
                                             const bool targetWasHidden = viewerGrid->paneHidden(pane);
@@ -3012,7 +3084,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                                             persistMainViewerLayout(viewerGrid);
                                         });
                             }
-                            showMenu->setEnabled(hasClosedViewer);
+                            showMenu->setEnabled(!fullSizeActive && hasClosedViewer);
                             menu.addSeparator();
                         }
 
