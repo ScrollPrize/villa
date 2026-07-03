@@ -10,6 +10,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/AffineTransform.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -37,6 +38,8 @@
 #include <QApplication>
 #include <QGuiApplication>
 #include <QBrush>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
@@ -80,6 +83,7 @@
 #include <QProgressBar>
 #include <QColorDialog>
 #include <QListView>
+#include <QTreeView>
 #include <QPainter>
 #include <QStandardItem>
 #include <QStandardItemModel>
@@ -188,8 +192,151 @@ constexpr int ATLAS_SURFACE_Y_ROLE = Qt::UserRole + 5;
 constexpr int SEGMENT_DIR_NAME_ROLE = Qt::UserRole + 100;
 constexpr int SEGMENT_DIR_COLOR_ROLE = Qt::UserRole + 101;
 constexpr int SEGMENT_DIR_DEFAULT_PALETTE_ROLE = Qt::UserRole + 102;
+constexpr int SURFACE_OVERLAY_KIND_ROLE = Qt::UserRole + 200;
+constexpr int SURFACE_OVERLAY_NAME_ROLE = Qt::UserRole + 201;
+constexpr int SURFACE_OVERLAY_FOLDER_ROLE = Qt::UserRole + 202;
 constexpr double ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD = 0.5;
 constexpr std::string_view OPEN_DATA_VOLUME_ID_TAG_PREFIX = "vc-open-data-volume-id:";
+
+enum class SurfaceOverlayItemKind {
+    Folder,
+    Surface,
+};
+
+SurfaceOverlayItemKind surfaceOverlayItemKind(const QStandardItem* item)
+{
+    return static_cast<SurfaceOverlayItemKind>(
+        item ? item->data(SURFACE_OVERLAY_KIND_ROLE).toInt()
+             : static_cast<int>(SurfaceOverlayItemKind::Surface));
+}
+
+bool isSurfaceOverlayFolder(const QStandardItem* item)
+{
+    return surfaceOverlayItemKind(item) == SurfaceOverlayItemKind::Folder;
+}
+
+bool isSurfaceOverlaySurface(const QStandardItem* item)
+{
+    return surfaceOverlayItemKind(item) == SurfaceOverlayItemKind::Surface;
+}
+
+QStandardItem* findSurfaceOverlayFolder(QStandardItemModel* model, const QString& folderName)
+{
+    if (!model) {
+        return nullptr;
+    }
+    for (int row = 0; row < model->rowCount(); ++row) {
+        QStandardItem* item = model->item(row);
+        if (isSurfaceOverlayFolder(item) &&
+            item->data(SURFACE_OVERLAY_FOLDER_ROLE).toString() == folderName) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
+QList<QStandardItem*> surfaceOverlaySurfaceItems(QStandardItemModel* model)
+{
+    QList<QStandardItem*> items;
+    if (!model) {
+        return items;
+    }
+    for (int folderRow = 0; folderRow < model->rowCount(); ++folderRow) {
+        QStandardItem* folder = model->item(folderRow);
+        if (!isSurfaceOverlayFolder(folder)) {
+            continue;
+        }
+        for (int row = 0; row < folder->rowCount(); ++row) {
+            QStandardItem* child = folder->child(row);
+            if (isSurfaceOverlaySurface(child)) {
+                items.append(child);
+            }
+        }
+    }
+    return items;
+}
+
+QString surfaceOverlayFolderName(const std::string& surfaceName,
+                                 const Surface* surface,
+                                 const QString& currentDir)
+{
+    if (surface && !surface->meta.is_null()) {
+        const auto folder = vc::json::string_or(
+            surface->meta,
+            "vc3d_segment_folder",
+            std::string{});
+        if (!folder.empty()) {
+            return QString::fromStdString(folder);
+        }
+    }
+
+    const QString name = QString::fromStdString(surfaceName);
+    const int slash = name.indexOf(QLatin1Char('/'));
+    if (slash > 0) {
+        return name.left(slash);
+    }
+    if (!currentDir.isEmpty()) {
+        return currentDir;
+    }
+    return QObject::tr("Segments");
+}
+
+QString surfaceOverlayLeafLabel(const std::string& surfaceName, const QString& folderName)
+{
+    const QString name = QString::fromStdString(surfaceName);
+    const QString prefix = folderName + QLatin1Char('/');
+    if (name.startsWith(prefix)) {
+        return name.mid(prefix.size());
+    }
+    return name;
+}
+
+void updateSurfaceOverlayFolderState(QStandardItem* folder)
+{
+    if (!folder || !isSurfaceOverlayFolder(folder)) {
+        return;
+    }
+
+    int checkedCount = 0;
+    int surfaceCount = 0;
+    for (int row = 0; row < folder->rowCount(); ++row) {
+        QStandardItem* child = folder->child(row);
+        if (!isSurfaceOverlaySurface(child)) {
+            continue;
+        }
+        ++surfaceCount;
+        if (child->checkState() == Qt::Checked) {
+            ++checkedCount;
+        }
+    }
+
+    if (checkedCount == 0) {
+        folder->setCheckState(Qt::Unchecked);
+    } else if (checkedCount == surfaceCount && surfaceCount > 0) {
+        folder->setCheckState(Qt::Checked);
+    } else {
+        folder->setCheckState(Qt::PartiallyChecked);
+    }
+}
+
+bool surfaceOverlayItemMatchesFilter(const QStandardItem* item, const QString& filter)
+{
+    if (!item || filter.isEmpty()) {
+        return true;
+    }
+    const QString needle = filter.toCaseFolded();
+    if (item->text().toCaseFolded().contains(needle) ||
+        item->data(SURFACE_OVERLAY_NAME_ROLE).toString().toCaseFolded().contains(needle) ||
+        item->data(SURFACE_OVERLAY_FOLDER_ROLE).toString().toCaseFolded().contains(needle)) {
+        return true;
+    }
+    for (int row = 0; row < item->rowCount(); ++row) {
+        if (surfaceOverlayItemMatchesFilter(item->child(row), filter)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
 
@@ -7654,6 +7801,9 @@ void CWindow::CreateWidgets(void)
         ui.spinOverlapThreshold->setEnabled(checked);
     });
 
+    connect(ui.surfaceOverlaySelect, &QPushButton::clicked,
+            this, &CWindow::showSurfaceOverlaySelectionDialog);
+
     connect(ui.spinOverlapThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double value) {
         if (!_viewerManager) return;
         _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
@@ -7665,7 +7815,7 @@ void CWindow::CreateWidgets(void)
     ui.surfaceOverlaySelect->setEnabled(false);
     ui.spinOverlapThreshold->setEnabled(false);
 
-    // Initialize surface overlay dropdown (will be populated when surfaces load)
+    // Initialize surface overlay selection model (will be populated when surfaces load)
     updateSurfaceOverlayDropdown();
 
     connectVolumeSelector(volSelect);
@@ -9746,138 +9896,268 @@ void CWindow::updateSurfaceOverlayDropdown()
         return;
     }
 
-    // Disconnect previous model's signals if any
+    QSet<QString> previouslyChecked;
     if (_surfaceOverlayModel) {
+        for (auto* item : surfaceOverlaySurfaceItems(_surfaceOverlayModel)) {
+            if (item && item->checkState() == Qt::Checked) {
+                previouslyChecked.insert(item->data(SURFACE_OVERLAY_NAME_ROLE).toString());
+            }
+        }
         disconnect(_surfaceOverlayModel, &QStandardItemModel::dataChanged,
                    this, &CWindow::onSurfaceOverlaySelectionChanged);
+        _surfaceOverlayModel->deleteLater();
     }
 
-    // Create new model
-    _surfaceOverlayModel = new QStandardItemModel(ui.surfaceOverlaySelect);
-    ui.surfaceOverlaySelect->setModel(_surfaceOverlayModel);
+    _surfaceOverlayModel = new QStandardItemModel(this);
+    _surfaceOverlayModel->setHorizontalHeaderLabels({tr("Surface")});
 
-    // Use a QListView to properly show checkboxes
-    auto* listView = new QListView(ui.surfaceOverlaySelect);
-    ui.surfaceOverlaySelect->setView(listView);
-
-    // Get current segmentation directory for filtering
-    std::string currentDir;
+    QString currentDir;
     if (_state->vpkg()) {
-        currentDir = _state->vpkg()->getSegmentationDirectory();
+        currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
     }
-
-    // Add "All" item at the top
-    auto* allItem = new QStandardItem(tr("All"));
-    allItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
-    allItem->setData(Qt::Unchecked, Qt::CheckStateRole);
-    allItem->setData(QStringLiteral("__all__"), Qt::UserRole);
-    _surfaceOverlayModel->appendRow(allItem);
 
     if (_state) {
         const auto names = _state->surfaceNames();
         for (const auto& name : names) {
-            // Only add QuadSurfaces (actual segmentations), skip PlaneSurfaces
             auto surf = _state->surface(name);
             auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get());
             if (!quadSurf) {
                 continue;
             }
 
-            // Filter by current segmentation directory
-            if (!currentDir.empty() && !surf->path.empty()) {
-                std::string surfDir = surf->path.parent_path().filename().string();
-                if (surfDir != currentDir) {
-                    continue;
-                }
+            const QString folderName = surfaceOverlayFolderName(name, surf.get(), currentDir);
+            QStandardItem* folderItem = findSurfaceOverlayFolder(_surfaceOverlayModel, folderName);
+            if (!folderItem) {
+                folderItem = new QStandardItem(folderName);
+                folderItem->setFlags(Qt::ItemIsUserCheckable |
+                                     Qt::ItemIsEnabled |
+                                     Qt::ItemIsSelectable |
+                                     Qt::ItemIsAutoTristate);
+                folderItem->setCheckable(true);
+                folderItem->setCheckState(Qt::Unchecked);
+                folderItem->setData(static_cast<int>(SurfaceOverlayItemKind::Folder),
+                                    SURFACE_OVERLAY_KIND_ROLE);
+                folderItem->setData(folderName, SURFACE_OVERLAY_FOLDER_ROLE);
+                _surfaceOverlayModel->appendRow(folderItem);
             }
 
-            auto* item = new QStandardItem(QString::fromStdString(name));
-            item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
-            item->setData(Qt::Unchecked, Qt::CheckStateRole);
-            item->setData(QString::fromStdString(name), Qt::UserRole);
-
-            // Assign persistent color if not already assigned
             if (_surfaceOverlayColorAssignments.find(name) == _surfaceOverlayColorAssignments.end()) {
                 _surfaceOverlayColorAssignments[name] = _nextSurfaceOverlayColorIndex++;
             }
             size_t colorIdx = _surfaceOverlayColorAssignments[name];
 
-            // Create color swatch icon (16x16 colored square)
+            auto* item = new QStandardItem(surfaceOverlayLeafLabel(name, folderName));
+            item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+            item->setCheckable(true);
+            item->setCheckState(previouslyChecked.contains(QString::fromStdString(name))
+                                    ? Qt::Checked
+                                    : Qt::Unchecked);
+            item->setData(static_cast<int>(SurfaceOverlayItemKind::Surface),
+                          SURFACE_OVERLAY_KIND_ROLE);
+            item->setData(QString::fromStdString(name), SURFACE_OVERLAY_NAME_ROLE);
+            item->setData(folderName, SURFACE_OVERLAY_FOLDER_ROLE);
+
             QPixmap swatch(16, 16);
             swatch.fill(getOverlayColor(colorIdx));
             item->setIcon(QIcon(swatch));
 
-            _surfaceOverlayModel->appendRow(item);
+            folderItem->appendRow(item);
         }
     }
 
-    // Connect model's dataChanged signal for checkbox state changes
+    for (int row = 0; row < _surfaceOverlayModel->rowCount(); ++row) {
+        updateSurfaceOverlayFolderState(_surfaceOverlayModel->item(row));
+    }
+
     connect(_surfaceOverlayModel, &QStandardItemModel::dataChanged,
             this, &CWindow::onSurfaceOverlaySelectionChanged);
+
+    applySurfaceOverlaySelection();
 }
 
 void CWindow::onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft,
-                                                const QModelIndex& /*bottomRight*/,
+                                                const QModelIndex& bottomRight,
                                                 const QVector<int>& roles)
 {
-    if (!roles.contains(Qt::CheckStateRole) || !_surfaceOverlayModel || !_viewerManager) {
+    if ((!roles.isEmpty() && !roles.contains(Qt::CheckStateRole)) ||
+        !_surfaceOverlayModel ||
+        !_viewerManager) {
         return;
     }
 
-    // Check if "All" was toggled (row 0)
-    QStandardItem* changedItem = _surfaceOverlayModel->itemFromIndex(topLeft);
-    if (changedItem && changedItem->data(Qt::UserRole).toString() == QStringLiteral("__all__")) {
-        bool allChecked = changedItem->checkState() == Qt::Checked;
-
-        // Block signals while updating all items
-        {
-            QSignalBlocker blocker(_surfaceOverlayModel);
-            for (int row = 1; row < _surfaceOverlayModel->rowCount(); ++row) {
-                QStandardItem* item = _surfaceOverlayModel->item(row);
-                if (item) {
-                    item->setCheckState(allChecked ? Qt::Checked : Qt::Unchecked);
+    {
+        QSignalBlocker blocker(_surfaceOverlayModel);
+        for (int row = topLeft.row(); row <= bottomRight.row(); ++row) {
+            const QModelIndex idx = topLeft.sibling(row, topLeft.column());
+            QStandardItem* changedItem = _surfaceOverlayModel->itemFromIndex(idx);
+            if (!changedItem) {
+                continue;
+            }
+            if (isSurfaceOverlayFolder(changedItem)) {
+                const Qt::CheckState state = changedItem->checkState() == Qt::Checked
+                    ? Qt::Checked
+                    : Qt::Unchecked;
+                for (int childRow = 0; childRow < changedItem->rowCount(); ++childRow) {
+                    QStandardItem* child = changedItem->child(childRow);
+                    if (isSurfaceOverlaySurface(child)) {
+                        child->setCheckState(state);
+                    }
                 }
+            } else if (isSurfaceOverlaySurface(changedItem) && changedItem->parent()) {
+                updateSurfaceOverlayFolderState(changedItem->parent());
             }
         }
     }
 
-    // Build map of selected surfaces with colors
+    applySurfaceOverlaySelection();
+}
+
+void CWindow::applySurfaceOverlaySelection()
+{
+    if (!_surfaceOverlayModel || !_viewerManager) {
+        updateSurfaceOverlayButtonText();
+        return;
+    }
+
     std::map<std::string, cv::Vec3b> selectedSurfaces;
-    int checkedCount = 0;
-    int totalSurfaces = 0;
-
-    for (int row = 1; row < _surfaceOverlayModel->rowCount(); ++row) {
-        QStandardItem* item = _surfaceOverlayModel->item(row);
-        if (!item) continue;
-
-        totalSurfaces++;
+    for (auto* item : surfaceOverlaySurfaceItems(_surfaceOverlayModel)) {
+        if (!item) {
+            continue;
+        }
         if (item->checkState() == Qt::Checked) {
-            checkedCount++;
-            std::string name = item->data(Qt::UserRole).toString().toStdString();
+            std::string name = item->data(SURFACE_OVERLAY_NAME_ROLE).toString().toStdString();
             size_t colorIdx = _surfaceOverlayColorAssignments[name];
             selectedSurfaces[name] = getOverlayColorBGR(colorIdx);
         }
     }
 
-    // Update "All" checkbox state (partial/full/none) without triggering recursion
-    {
-        QSignalBlocker blocker(_surfaceOverlayModel);
-        QStandardItem* allItem = _surfaceOverlayModel->item(0);
-        if (allItem) {
-            if (checkedCount == 0) {
-                allItem->setCheckState(Qt::Unchecked);
-            } else if (checkedCount == totalSurfaces && totalSurfaces > 0) {
-                allItem->setCheckState(Qt::Checked);
-            } else {
-                allItem->setCheckState(Qt::PartiallyChecked);
+    _viewerManager->forEachBaseViewer([&selectedSurfaces](VolumeViewerBase* viewer) {
+        viewer->setSurfaceOverlays(selectedSurfaces);
+    });
+
+    updateSurfaceOverlayButtonText();
+}
+
+void CWindow::updateSurfaceOverlayButtonText()
+{
+    if (!ui.surfaceOverlaySelect) {
+        return;
+    }
+
+    int checkedCount = 0;
+    int totalCount = 0;
+    if (_surfaceOverlayModel) {
+        for (auto* item : surfaceOverlaySurfaceItems(_surfaceOverlayModel)) {
+            if (!item) {
+                continue;
+            }
+            ++totalCount;
+            if (item->checkState() == Qt::Checked) {
+                ++checkedCount;
             }
         }
     }
 
-    // Propagate to all viewers
-    _viewerManager->forEachBaseViewer([&selectedSurfaces](VolumeViewerBase* viewer) {
-        viewer->setSurfaceOverlays(selectedSurfaces);
+    if (totalCount == 0) {
+        ui.surfaceOverlaySelect->setText(tr("No surfaces"));
+    } else if (checkedCount == 0) {
+        ui.surfaceOverlaySelect->setText(tr("Select..."));
+    } else if (checkedCount == totalCount) {
+        ui.surfaceOverlaySelect->setText(tr("All surfaces (%1)").arg(totalCount));
+    } else {
+        ui.surfaceOverlaySelect->setText(tr("%1 surfaces").arg(checkedCount));
+    }
+}
+
+void CWindow::showSurfaceOverlaySelectionDialog()
+{
+    if (!_surfaceOverlayModel) {
+        updateSurfaceOverlayDropdown();
+    }
+    if (!_surfaceOverlayModel) {
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Select Overlap Surfaces"));
+    dialog.resize(460, 560);
+
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* filterEdit = new QLineEdit(&dialog);
+    filterEdit->setPlaceholderText(tr("Filter surfaces or folders"));
+    layout->addWidget(filterEdit);
+
+    auto* tree = new QTreeView(&dialog);
+    tree->setModel(_surfaceOverlayModel);
+    tree->setHeaderHidden(true);
+    tree->setAlternatingRowColors(true);
+    tree->setSelectionMode(QAbstractItemView::NoSelection);
+    tree->expandAll();
+    layout->addWidget(tree, 1);
+
+    auto* bulkRow = new QHBoxLayout();
+    auto* checkAll = new QPushButton(tr("Check All"), &dialog);
+    auto* deselectAll = new QPushButton(tr("Deselect All"), &dialog);
+    bulkRow->addWidget(checkAll);
+    bulkRow->addWidget(deselectAll);
+    bulkRow->addStretch(1);
+    layout->addLayout(bulkRow);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    const auto refreshFilter = [tree, filterEdit, this]() {
+        const QString filter = filterEdit->text().trimmed();
+        for (int folderRow = 0; folderRow < _surfaceOverlayModel->rowCount(); ++folderRow) {
+            QStandardItem* folder = _surfaceOverlayModel->item(folderRow);
+            const bool folderVisible = surfaceOverlayItemMatchesFilter(folder, filter);
+            tree->setRowHidden(folderRow, QModelIndex(), !folderVisible);
+            for (int row = 0; folder && row < folder->rowCount(); ++row) {
+                QStandardItem* child = folder->child(row);
+                const bool childVisible = filter.isEmpty() ||
+                    surfaceOverlayItemMatchesFilter(child, filter) ||
+                    folder->text().toCaseFolded().contains(filter.toCaseFolded());
+                tree->setRowHidden(row, folder->index(), !childVisible);
+            }
+        }
+        tree->expandAll();
+    };
+
+    const auto setVisibleSurfaces = [tree, this](Qt::CheckState state) {
+        if (!_surfaceOverlayModel) {
+            return;
+        }
+        QSignalBlocker blocker(_surfaceOverlayModel);
+        for (int folderRow = 0; folderRow < _surfaceOverlayModel->rowCount(); ++folderRow) {
+            if (tree->isRowHidden(folderRow, QModelIndex())) {
+                continue;
+            }
+            QStandardItem* folder = _surfaceOverlayModel->item(folderRow);
+            for (int row = 0; folder && row < folder->rowCount(); ++row) {
+                if (tree->isRowHidden(row, folder->index())) {
+                    continue;
+                }
+                QStandardItem* child = folder->child(row);
+                if (isSurfaceOverlaySurface(child)) {
+                    child->setCheckState(state);
+                }
+            }
+            updateSurfaceOverlayFolderState(folder);
+        }
+        applySurfaceOverlaySelection();
+    };
+
+    connect(filterEdit, &QLineEdit::textChanged, &dialog, refreshFilter);
+    connect(checkAll, &QPushButton::clicked, &dialog, [setVisibleSurfaces]() {
+        setVisibleSurfaces(Qt::Checked);
     });
+    connect(deselectAll, &QPushButton::clicked, &dialog, [setVisibleSurfaces]() {
+        setVisibleSurfaces(Qt::Unchecked);
+    });
+
+    refreshFilter();
+    dialog.exec();
 }
 
 QColor CWindow::getOverlayColor(size_t index) const

@@ -222,6 +222,9 @@ private:
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
     void updateSurfaceOverlayDropdown();
     void onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles);
+    void showSurfaceOverlaySelectionDialog();
+    void applySurfaceOverlaySelection();
+    void updateSurfaceOverlayButtonText();
     QColor getOverlayColor(size_t index) const;
     cv::Vec3b getOverlayColorBGR(size_t index) const;
 
