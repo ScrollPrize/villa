@@ -1973,6 +1973,18 @@ void LineAnnotationController::importFibers()
         scaleStoredFiber(*fiber, options->scale);
         importedFibers.push_back(std::move(*fiber));
     };
+    auto bundleEntryPath = [&](const nlohmann::json& item, size_t index) {
+        if (item.is_object()) {
+            const std::string fileName = fs::path(item.value("filename", std::string{}))
+                                             .filename()
+                                             .string();
+            if (!fileName.empty()) {
+                return options->path.parent_path() / fileName;
+            }
+        }
+        return options->path.parent_path() /
+               (options->path.stem().string() + "_" + std::to_string(index) + ".json");
+    };
 
     try {
         std::error_code ec;
@@ -2007,11 +2019,7 @@ void LineAnnotationController::importFibers()
                 size_t index = 0;
                 for (const auto& item : root) {
                     try {
-                        tryAddFiber(loadFiberJson(
-                            item,
-                            options->path.parent_path() /
-                                (options->path.stem().string() + "_" +
-                                 std::to_string(index++) + ".json")));
+                        tryAddFiber(loadFiberJson(item, bundleEntryPath(item, index++)));
                     } catch (const std::exception& ex) {
                         ++skipped;
                         Logger()->warn("Skipping invalid imported fiber entry in {}: {}",
@@ -2036,11 +2044,7 @@ void LineAnnotationController::importFibers()
                 size_t index = 0;
                 for (const auto& item : *entries) {
                     try {
-                        tryAddFiber(loadFiberJson(
-                            item,
-                            options->path.parent_path() /
-                                (options->path.stem().string() + "_" +
-                                 std::to_string(index++) + ".json")));
+                        tryAddFiber(loadFiberJson(item, bundleEntryPath(item, index++)));
                     } catch (const std::exception& ex) {
                         ++skipped;
                         Logger()->warn("Skipping invalid imported fiber entry in {}: {}",
