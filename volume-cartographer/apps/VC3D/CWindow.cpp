@@ -7216,6 +7216,7 @@ void CWindow::CreateWidgets(void)
             .colormapSelect = ui.overlayColormapSelect,
             .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,
+            .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,
         };
         _volumeOverlay->setUi(overlayUi);
         if (_viewerControlsPanel) {

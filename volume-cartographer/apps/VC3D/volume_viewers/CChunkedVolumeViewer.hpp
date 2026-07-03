@@ -135,6 +135,7 @@ public:
     void setOverlayColormap(const std::string& colormapId) override;
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
+    void setOverlayMaxDisplayedResolution(int level) override;
 
     void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
@@ -285,20 +286,6 @@ private:
     void updateContentBounds();
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
-    void prefetchPlaneHalo(const cv::Vec3f& origin,
-                           const cv::Vec3f& vxStep,
-                           const cv::Vec3f& vyStep,
-                           int startLevel,
-                           const vc::render::ChunkedPlaneSampler::Options& options);
-    void prefetchPlaneNormalNeighbors(PlaneSurface& plane,
-                                      int startLevel,
-                                      const vc::render::ChunkedPlaneSampler::Options& options);
-    void prefetchSurfaceHalo(Surface& surf,
-                             int startLevel,
-                             const vc::render::ChunkedPlaneSampler::Options& options,
-                             int fbW,
-                             int fbH);
-    void prefetchVisibleSurfaceChunks(int priorityOffset = 0);
     struct GeneratedSurfaceCache;
     struct PendingRenderJob {
         std::uint64_t requestId = 0;
@@ -310,6 +297,7 @@ private:
         float zOff = 0.0f;
         cv::Vec3f zOffWorldDir{0, 0, 0};
         int startLevel = 0;
+        int overlayStartLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
@@ -350,6 +338,7 @@ private:
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
+    int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
@@ -411,16 +400,6 @@ private:
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
 
-    struct SurfaceChunkPrefetchCache {
-        Surface* surface = nullptr;
-        int level = -1;
-        vc::Sampling sampling = vc::Sampling::Trilinear;
-        bool valid = false;
-        cv::Rect prefetchedCellRect;
-        std::unordered_map<std::uint64_t, std::vector<vc::render::ChunkKey>> tileKeys;
-    };
-    SurfaceChunkPrefetchCache _surfaceChunkPrefetchCache;
-
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;
     float _scale = 1.0f;
@@ -442,6 +421,7 @@ private:
     std::string _overlayColormapId;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
+    int _overlayMaxDisplayedResolution = 0;
 
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
