@@ -141,7 +141,7 @@ public:
 
     void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
-    void setSegmentationCursorMirroring(bool) override {}
+    void setSegmentationCursorMirroring(bool enabled) override;
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
     uint64_t highlightedPointId() const override { return _highlightedPointId; }
@@ -542,6 +542,7 @@ private:
     QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
+    bool _segmentationCursorMirroring = false;
 
     uint64_t _highlightedPointId = 0;
     uint64_t _selectedCollectionId = 0;

@@ -2676,6 +2676,9 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_viewerManager) {
+        _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
+    }
     _sameWrapManualMergePressConsumed = false;
 
     if (_sameWrapAnnotation.enabled() && button == Qt::RightButton &&
@@ -2824,6 +2827,9 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_viewerManager) {
+        _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
+    }
     if (_sameWrapManualMergePressConsumed && button == Qt::RightButton) {
         _sameWrapManualMergePressConsumed = false;
         return;
@@ -2987,6 +2993,14 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
     _cursorCrosshair->show();
 }
 
+void CChunkedVolumeViewer::setSegmentationCursorMirroring(bool enabled)
+{
+    _segmentationCursorMirroring = enabled;
+    if (!enabled && _cursorCrosshair) {
+        _cursorCrosshair->hide();
+    }
+}
+
 void CChunkedVolumeViewer::setLineAnnotationPlacementPreviewEnabled(bool enabled)
 {
     _lineAnnotationPlacementPreviewEnabled = enabled;
@@ -3115,11 +3129,24 @@ std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtSceneP
     return bestHit;
 }
 
-void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&)
+void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point)
 {
-    // The chunked viewer shows the cursor marker at its local mouse position.
-    // Cross-view projection was unreliable for mixed surface/plane views and is
-    // intentionally ignored here.
+    if (!_segmentationCursorMirroring || !point) {
+        if (_cursorCrosshair) {
+            _cursorCrosshair->hide();
+        }
+        return;
+    }
+
+    const QPointF scenePos = volumeToScene(*point);
+    if (!std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        if (_cursorCrosshair) {
+            _cursorCrosshair->hide();
+        }
+        return;
+    }
+
+    updateCursorCrosshair(scenePos);
 }
 
 void CChunkedVolumeViewer::updateFocusMarker(POI* poi)

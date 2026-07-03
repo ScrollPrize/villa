@@ -1010,11 +1010,17 @@ void ViewerManager::setSegmentationCursorMirroring(bool enabled)
 {
     _mirrorCursorToSegmentation = enabled;
     forEachBaseViewer([enabled](VolumeViewerBase* v) { v->setSegmentationCursorMirroring(enabled); });
+    if (!enabled) {
+        broadcastLinkedCursor(nullptr, std::nullopt);
+    }
 }
 
 void ViewerManager::broadcastLinkedCursor(VolumeViewerBase* source,
                                           const std::optional<cv::Vec3f>& point)
 {
+    if (!_mirrorCursorToSegmentation && point.has_value()) {
+        return;
+    }
     forEachBaseViewer([source, &point](VolumeViewerBase* viewer) {
         if (viewer != source) {
             viewer->setLinkedCursorVolumePoint(point);

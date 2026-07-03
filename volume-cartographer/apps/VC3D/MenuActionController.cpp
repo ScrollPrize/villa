@@ -154,7 +154,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _drawBBoxAct->setCheckable(true);
     connect(_drawBBoxAct, &QAction::toggled, this, &MenuActionController::toggleDrawBBox);
 
-    _mirrorCursorAct = new QAction(QObject::tr("Sync cursor to Surface view"), this);
+    _mirrorCursorAct = new QAction(QObject::tr("Sync cursor across views"), this);
     _mirrorCursorAct->setCheckable(true);
     if (qWindow) {
         _mirrorCursorAct->setChecked(qWindow->segmentationCursorMirroringEnabled());

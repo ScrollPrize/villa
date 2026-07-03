@@ -4309,8 +4309,8 @@ void CWindow::setSegmentationCursorMirroring(bool enabled)
     }
 
     if (statusBar()) {
-        showStatusBarMessage(enabled ? tr("Mirroring cursor to Surface view enabled")
-                                         : tr("Mirroring cursor to Surface view disabled"),
+        showStatusBarMessage(enabled ? tr("Syncing cursor across views enabled")
+                                         : tr("Syncing cursor across views disabled"),
                                   2000);
     }
 }
