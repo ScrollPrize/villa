@@ -13,6 +13,7 @@ class QHBoxLayout;
 class QPushButton;
 class QStackedWidget;
 class QToolButton;
+class QTimer;
 class QVBoxLayout;
 
 class StatusDockPanelHost final : public QWidget
@@ -69,6 +70,8 @@ private:
     int itemIndexForButton(const QPushButton* button) const;
     int reorderDropIndexAtGlobalPoint(const QPoint& globalPos) const;
     void moveItem(int from, int to);
+    void setButtonDragArmed(QPushButton* button, bool armed);
+    void resetButtonDragState(bool resetPressedVisual);
     enum class ResizeMode {
         None,
         Width,
@@ -90,7 +93,9 @@ private:
     ResizeMode _resizeMode{ResizeMode::None};
     QPoint _resizeStartGlobal;
     QSize _resizeStartSize;
+    QTimer* _dragArmTimer{nullptr};
     QPointer<QPushButton> _dragButton;
     QPoint _dragStartGlobal;
+    bool _buttonDragArmed{false};
     bool _draggingButton{false};
 };

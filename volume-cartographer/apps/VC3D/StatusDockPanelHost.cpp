@@ -22,6 +22,7 @@
 #include <QStyle>
 #include <QStyleHints>
 #include <QToolButton>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -29,6 +30,7 @@
 
 namespace {
 constexpr int kResizeHitWidth = 10;
+constexpr int kButtonDragHoldMs = 400;
 constexpr auto kPanelSizeSettingsPrefix = "statusDockPanels/sizes";
 constexpr auto kPanelOrderSettingsKey = "statusDockPanels/order";
 
@@ -99,7 +101,21 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
         "QFrame[statusDockPanelHeader=\"true\"] { background: palette(window);"
         " border-bottom: 1px solid palette(mid); }"
         "QPushButton[statusDockPanelButton=\"true\"] { padding: 3px 8px; text-align: left; }"
-        "QPushButton[statusDockPanelButton=\"true\"][active=\"true\"] { font-weight: 600; }"));
+        "QPushButton[statusDockPanelButton=\"true\"][active=\"true\"] { font-weight: 600; }"
+        "QPushButton[statusDockPanelButton=\"true\"][dragArmed=\"true\"] {"
+        " border: 1px solid palette(highlight); background: palette(alternate-base); }"));
+
+    _dragArmTimer = new QTimer(this);
+    _dragArmTimer->setSingleShot(true);
+    _dragArmTimer->setInterval(kButtonDragHoldMs);
+    connect(_dragArmTimer, &QTimer::timeout, this, [this]() {
+        if (!_dragButton) {
+            return;
+        }
+        _buttonDragArmed = true;
+        setButtonDragArmed(_dragButton, true);
+        _dragButton->setCursor(Qt::OpenHandCursor);
+    });
 
     if (qApp) {
         qApp->installEventFilter(this);
@@ -263,7 +279,12 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
                 if (mouse->button() == Qt::LeftButton) {
                     _dragButton = button;
                     _dragStartGlobal = mouse->globalPosition().toPoint();
+                    _buttonDragArmed = false;
                     _draggingButton = false;
+                    setButtonDragArmed(button, false);
+                    if (_dragArmTimer) {
+                        _dragArmTimer->start();
+                    }
                 }
             } else if (event->type() == QEvent::MouseMove && _dragButton == button) {
                 auto* mouse = static_cast<QMouseEvent*>(event);
@@ -271,7 +292,7 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
                 const int dragDistance = qApp && qApp->styleHints()
                     ? qApp->styleHints()->startDragDistance()
                     : QApplication::startDragDistance();
-                if (!_draggingButton &&
+                if (_buttonDragArmed && !_draggingButton &&
                     (globalPos - _dragStartGlobal).manhattanLength() >= dragDistance) {
                     _draggingButton = true;
                     if (_currentIndex >= 0 &&
@@ -291,14 +312,29 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
                     return true;
                 }
             } else if (event->type() == QEvent::MouseButtonRelease && _dragButton == button) {
-                button->unsetCursor();
-                button->setDown(false);
-                _dragButton.clear();
+                const bool wasDragInteraction = _buttonDragArmed || _draggingButton;
                 if (_draggingButton) {
                     saveItemOrder();
-                    _draggingButton = false;
+                }
+                if (wasDragInteraction) {
+                    resetButtonDragState(true);
                     return true;
                 }
+                resetButtonDragState(false);
+            }
+        }
+    }
+
+    if (_dragButton && watched != _dragButton &&
+        (event->type() == QEvent::MouseButtonRelease || event->type() == QEvent::MouseButtonPress)) {
+        auto* mouse = static_cast<QMouseEvent*>(event);
+        if (mouse->button() == Qt::LeftButton) {
+            if (_draggingButton) {
+                saveItemOrder();
+            }
+            resetButtonDragState(_buttonDragArmed || _draggingButton);
+            if (event->type() == QEvent::MouseButtonRelease) {
+                return true;
             }
         }
     }
@@ -856,6 +892,34 @@ void StatusDockPanelHost::moveItem(int from, int to)
     if (_currentIndex >= 0 && _currentIndex < static_cast<int>(_items.size())) {
         positionPanelForItem(_items[static_cast<std::size_t>(_currentIndex)]);
     }
+}
+
+void StatusDockPanelHost::setButtonDragArmed(QPushButton* button, bool armed)
+{
+    if (!button) {
+        return;
+    }
+    button->setProperty("dragArmed", armed);
+    button->style()->unpolish(button);
+    button->style()->polish(button);
+    button->update();
+}
+
+void StatusDockPanelHost::resetButtonDragState(bool resetPressedVisual)
+{
+    if (_dragArmTimer) {
+        _dragArmTimer->stop();
+    }
+    if (_dragButton) {
+        setButtonDragArmed(_dragButton, false);
+        _dragButton->unsetCursor();
+        if (resetPressedVisual) {
+            _dragButton->setDown(false);
+        }
+    }
+    _dragButton.clear();
+    _buttonDragArmed = false;
+    _draggingButton = false;
 }
 
 StatusDockPanelHost::ResizeMode StatusDockPanelHost::resizeModeAtGlobalPoint(const QPoint& globalPos) const
