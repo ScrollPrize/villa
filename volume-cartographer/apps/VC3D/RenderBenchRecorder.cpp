@@ -24,7 +24,9 @@ bool sameCamera(const RenderBenchRecorder::Keyframe& a,
         && close(a.zOffset, b.zOffset, 1e-3f)
         && close(a.zDirX, b.zDirX, 1e-4f)
         && close(a.zDirY, b.zDirY, 1e-4f)
-        && close(a.zDirZ, b.zDirZ, 1e-4f);
+        && close(a.zDirZ, b.zDirZ, 1e-4f)
+        && a.surfaceViewRotationQuarterTurns == b.surfaceViewRotationQuarterTurns
+        && a.surfaceViewFlippedHorizontally == b.surfaceViewFlippedHorizontally;
 }
 }  // namespace
 
@@ -70,6 +72,8 @@ void RenderBenchRecorder::onRender()
     kf.zDirX = cam.zOffsetWorldDir[0];
     kf.zDirY = cam.zOffsetWorldDir[1];
     kf.zDirZ = cam.zOffsetWorldDir[2];
+    kf.surfaceViewRotationQuarterTurns = cam.surfaceViewRotationQuarterTurns;
+    kf.surfaceViewFlippedHorizontally = cam.surfaceViewFlippedHorizontally;
     kf.zSlice = _lastZSlice;
     kf.dsScaleIdx = _viewer->datasetScaleIndex();
 
@@ -111,6 +115,8 @@ bool RenderBenchRecorder::save() const
         dir.append(kf.zDirY);
         dir.append(kf.zDirZ);
         o["zOffsetWorldDir"] = dir;
+        o["surfaceViewRotationQuarterTurns"] = kf.surfaceViewRotationQuarterTurns;
+        o["surfaceViewFlippedHorizontally"] = kf.surfaceViewFlippedHorizontally;
         o["zSlice"] = kf.zSlice;
         o["dsScaleIdx"] = kf.dsScaleIdx;
         keyframes.append(o);

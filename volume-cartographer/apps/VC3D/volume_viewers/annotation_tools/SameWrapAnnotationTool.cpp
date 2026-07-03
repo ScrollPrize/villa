@@ -825,6 +825,7 @@ bool SameWrapAnnotationTool::generatePreview(const QImage& framebuffer,
             return true;
         }
 
+        _state.shortestPathSourceScenePos = volumeToScene(_state.shortestPathSourceVolumePos);
         const int sourceKey = nearestSkeletonPixel(
             skeleton,
             static_cast<int>(std::lround(_state.shortestPathSourceScenePos.x())),
@@ -1211,6 +1212,9 @@ void SameWrapAnnotationTool::refreshOverlay(const VolumeToSceneFn& volumeToScene
                                             const SetOverlayGroupFn& setOverlayGroup,
                                             const ClearOverlayGroupFn& clearOverlayGroup)
 {
+    if (_state.hasShortestPathSource) {
+        _state.shortestPathSourceScenePos = volumeToScene(_state.shortestPathSourceVolumePos);
+    }
     updateOverlay(volumeToScene, setOverlayGroup, clearOverlayGroup);
 }
 
@@ -1259,6 +1263,7 @@ void SameWrapAnnotationTool::updateOverlay(const VolumeToSceneFn& volumeToScene,
 
     if (_state.hasShortestPathSource) {
         const QPointF scenePoint = volumeToScene(_state.shortestPathSourceVolumePos);
+        _state.shortestPathSourceScenePos = scenePoint;
         auto* marker = new QGraphicsEllipseItem(scenePoint.x() - 5.0, scenePoint.y() - 5.0, 10.0, 10.0);
         marker->setPen(QPen(QColor(0, 255, 255, 240), 2.0));
         marker->setBrush(QBrush(QColor(0, 255, 255, 110)));

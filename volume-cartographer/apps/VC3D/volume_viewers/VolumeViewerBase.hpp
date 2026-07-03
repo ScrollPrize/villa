@@ -86,6 +86,9 @@ public:
     virtual void adjustSurfaceOffset(float delta) = 0;
     virtual void resetSurfaceOffsets() = 0;
     virtual void fitSurfaceInView() = 0;
+    virtual bool rotateSurfaceViewClockwise() { return false; }
+    virtual bool flipSurfaceViewHorizontally() { return false; }
+    virtual bool resetSurfaceViewOrientation() { return false; }
 
     // --- Data access ---
     virtual Surface* currentSurface() const = 0;

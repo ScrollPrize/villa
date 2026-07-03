@@ -120,6 +120,8 @@ CChunkedVolumeViewer::CameraState cameraStateFromKeyframe(const RenderBenchRepla
     cs.scale = kf.scale;
     cs.zOffset = kf.zOffset;
     cs.zOffsetWorldDir = {kf.zDirX, kf.zDirY, kf.zDirZ};
+    cs.surfaceViewRotationQuarterTurns = kf.surfaceViewRotationQuarterTurns;
+    cs.surfaceViewFlippedHorizontally = kf.surfaceViewFlippedHorizontally;
     return cs;
 }
 }  // namespace
@@ -168,6 +170,8 @@ bool RenderBenchReplay::load(const QString& path)
             kf.zDirY = static_cast<float>(dir[1].toDouble());
             kf.zDirZ = static_cast<float>(dir[2].toDouble());
         }
+        kf.surfaceViewRotationQuarterTurns = o["surfaceViewRotationQuarterTurns"].toInt();
+        kf.surfaceViewFlippedHorizontally = o["surfaceViewFlippedHorizontally"].toBool();
         kf.dsScaleIdx = o["dsScaleIdx"].toInt();
         _keyframes.push_back(kf);
     }
