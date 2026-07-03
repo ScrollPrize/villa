@@ -9,14 +9,15 @@
 #include <QMainWindow>
 #include <QMenu>
 #include <QMouseEvent>
-#include <QPropertyAnimation>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QStackedWidget>
 #include <QStyle>
 #include <QToolButton>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cstddef>
 
 StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent)
     : QWidget(parent)
@@ -35,7 +36,7 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
     _panelFrame = new QFrame(this);
     _panelFrame->setObjectName(QStringLiteral("statusDockPanelFrame"));
     _panelFrame->setFrameShape(QFrame::StyledPanel);
-    _panelFrame->setMaximumHeight(0);
+    _panelFrame->setWindowFlags(Qt::Widget);
     _panelFrame->hide();
 
     auto* panelLayout = new QVBoxLayout(_panelFrame);
@@ -43,8 +44,20 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
     panelLayout->setSpacing(0);
 
     _stack = new QStackedWidget(_panelFrame);
-    panelLayout->addWidget(_stack);
-    _layout->addWidget(_panelFrame, 0);
+    panelLayout->addWidget(_stack, 1);
+
+    auto* gripRow = new QWidget(_panelFrame);
+    auto* gripLayout = new QHBoxLayout(gripRow);
+    gripLayout->setContentsMargins(0, 0, 2, 2);
+    gripLayout->setSpacing(0);
+    gripLayout->addStretch(1);
+    _resizeHandle = new QWidget(gripRow);
+    _resizeHandle->setObjectName(QStringLiteral("statusDockPanelResizeHandle"));
+    _resizeHandle->setFixedSize(14, 14);
+    _resizeHandle->setCursor(Qt::SizeFDiagCursor);
+    _resizeHandle->installEventFilter(this);
+    gripLayout->addWidget(_resizeHandle, 0, Qt::AlignRight | Qt::AlignBottom);
+    panelLayout->addWidget(gripRow, 0);
 
     _barFrame = new QFrame(this);
     _barFrame->setObjectName(QStringLiteral("statusDockBar"));
@@ -57,13 +70,15 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
 
     setStyleSheet(QStringLiteral(
         "QFrame#statusDockBar { background: palette(window); border-top: 1px solid palette(mid); }"
-        "QFrame#statusDockPanelFrame { background: palette(base); border-top: 1px solid palette(mid); }"
+        "QFrame#statusDockPanelFrame { background: palette(window); border: 1px solid palette(mid); }"
+        "QWidget#statusDockPanelResizeHandle { background: palette(mid); }"
         "QPushButton[statusDockPanelButton=\"true\"] { padding: 3px 8px; text-align: left; }"
         "QPushButton[statusDockPanelButton=\"true\"][active=\"true\"] { font-weight: 600; }"));
 
     if (qApp) {
         qApp->installEventFilter(this);
     }
+    _panelFrame->installEventFilter(this);
 }
 
 StatusDockPanelHost::~StatusDockPanelHost()
@@ -126,6 +141,8 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
 
     content->setParent(page);
     pageLayout->addWidget(content, 1);
+    content->show();
+    page->show();
 
     auto* button = new QPushButton(this);
     button->setProperty("statusDockPanelButton", true);
@@ -173,12 +190,50 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
 
 bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == _resizeHandle) {
+        if (event->type() == QEvent::MouseButtonPress && _currentIndex >= 0 &&
+            _currentIndex < static_cast<int>(_items.size())) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() == Qt::LeftButton) {
+                _resizingPanel = true;
+                _resizeStartGlobal = mouse->globalPosition().toPoint();
+                _resizeStartSize = _panelFrame ? _panelFrame->size() : QSize();
+                return true;
+            }
+        }
+        if (event->type() == QEvent::MouseMove && _resizingPanel && _currentIndex >= 0 &&
+            _currentIndex < static_cast<int>(_items.size())) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            Item& item = _items[static_cast<std::size_t>(_currentIndex)];
+            const QPoint delta = mouse->globalPosition().toPoint() - _resizeStartGlobal;
+            item.panelSize = QSize(_resizeStartSize.width() + delta.x(),
+                                   _resizeStartSize.height() - delta.y());
+            item.userSized = true;
+            positionPanelForItem(item);
+            updateButton(item);
+            return true;
+        }
+        if (event->type() == QEvent::MouseButtonRelease && _resizingPanel) {
+            _resizingPanel = false;
+            return true;
+        }
+    }
+
+    if (watched == _panelFrame && event->type() == QEvent::Resize && _currentIndex >= 0 &&
+        _currentIndex < static_cast<int>(_items.size()) && !_positioningPanel) {
+        Item& item = _items[static_cast<std::size_t>(_currentIndex)];
+        item.panelSize = static_cast<QResizeEvent*>(event)->size();
+        item.userSized = true;
+        updateButton(item);
+        positionPanelForItem(item);
+    }
+
     if (event->type() == QEvent::MouseButtonPress && _currentIndex >= 0) {
         auto* mouse = static_cast<QMouseEvent*>(event);
         if (mouse->button() == Qt::LeftButton &&
             _currentIndex < static_cast<int>(_items.size()) &&
             !_items[static_cast<std::size_t>(_currentIndex)].pinned &&
-            !globalPointInsideHost(mouse->globalPosition().toPoint())) {
+            !globalPointInsidePanelOrBar(mouse->globalPosition().toPoint())) {
             collapseCurrent();
         }
     }
@@ -194,6 +249,16 @@ StatusDockPanelHost::Item* StatusDockPanelHost::itemForDock(QDockWidget* dock)
     return it == _items.end() ? nullptr : &(*it);
 }
 
+int StatusDockPanelHost::itemIndex(const Item& item) const
+{
+    const auto* base = _items.data();
+    const auto* ptr = &item;
+    if (!base || ptr < base || ptr >= base + static_cast<std::ptrdiff_t>(_items.size())) {
+        return -1;
+    }
+    return static_cast<int>(ptr - base);
+}
+
 void StatusDockPanelHost::toggleItem(Item& item)
 {
     if (item.detached) {
@@ -201,7 +266,7 @@ void StatusDockPanelHost::toggleItem(Item& item)
         return;
     }
 
-    const int index = static_cast<int>(&item - _items.data());
+    const int index = itemIndex(item);
     if (_currentIndex == index) {
         collapseCurrent();
     } else {
@@ -216,13 +281,14 @@ void StatusDockPanelHost::expandItem(Item& item)
     }
 
     const int index = _stack->indexOf(item.page);
-    if (index < 0) {
+    const int itemVectorIndex = itemIndex(item);
+    if (index < 0 || itemVectorIndex < 0) {
         return;
     }
 
-    _currentIndex = index;
+    _currentIndex = itemVectorIndex;
     _stack->setCurrentIndex(index);
-    animatePanel(true);
+    showPanelForItem(item);
 
     for (Item& candidate : _items) {
         updateButton(candidate);
@@ -236,7 +302,7 @@ void StatusDockPanelHost::collapseCurrent()
     }
 
     _currentIndex = -1;
-    animatePanel(false);
+    hidePanel();
     for (Item& item : _items) {
         updateButton(item);
     }
@@ -273,6 +339,8 @@ void StatusDockPanelHost::attachItem(Item& item, bool expand)
     item.dock->setWidget(nullptr);
     item.content->setParent(item.page);
     item.page->layout()->addWidget(item.content);
+    item.content->show();
+    item.page->show();
     updateButton(item);
 
     if (expand) {
@@ -290,7 +358,7 @@ void StatusDockPanelHost::showItemMenu(Item& item, const QPoint& globalPos)
     QAction* selected = menu.exec(globalPos);
     if (selected == pin) {
         item.pinned = !item.pinned;
-        if (item.pinned && _currentIndex != _stack->indexOf(item.page)) {
+        if (item.pinned && _currentIndex != itemIndex(item)) {
             expandItem(item);
         }
         updateButton(item);
@@ -314,28 +382,80 @@ void StatusDockPanelHost::updateButton(Item& item)
     const QString pinSuffix = item.pinned ? QStringLiteral(" •") : QString();
     item.button->setText(QStringLiteral("%1 %2%3").arg(prefix, item.dock->windowTitle(), pinSuffix));
     item.button->setProperty("active", active);
+    item.button->setMinimumWidth(0);
     item.button->style()->unpolish(item.button);
     item.button->style()->polish(item.button);
 }
 
-void StatusDockPanelHost::animatePanel(bool expanded)
+void StatusDockPanelHost::showPanelForItem(Item& item)
 {
     if (!_panelFrame) {
         return;
     }
 
+    QWidget* top = window();
+    if (top && _panelFrame->parentWidget() != top) {
+        _panelFrame->setParent(top);
+    }
+    if (item.content) {
+        item.content->show();
+    }
+    if (item.page) {
+        item.page->show();
+    }
+    positionPanelForItem(item);
     _panelFrame->show();
-    auto* animation = new QPropertyAnimation(_panelFrame, "maximumHeight", _panelFrame);
-    animation->setDuration(140);
-    animation->setStartValue(_panelFrame->maximumHeight());
-    animation->setEndValue(expanded ? expandedPanelHeight() : 0);
-    animation->setEasingCurve(QEasingCurve::OutCubic);
-    connect(animation, &QPropertyAnimation::finished, _panelFrame, [this, expanded]() {
-        if (!expanded && _panelFrame) {
-            _panelFrame->hide();
+    _panelFrame->raise();
+    _panelFrame->activateWindow();
+}
+
+void StatusDockPanelHost::positionPanelForItem(Item& item)
+{
+    if (!_panelFrame || !item.button) {
+        return;
+    }
+
+    QWidget* top = window();
+    if (!top) {
+        top = this;
+    }
+
+    const QRect buttonGlobalRect(item.button->mapToGlobal(QPoint(0, 0)), item.button->size());
+    QSize size = item.panelSize;
+    if (!size.isValid() || size.isEmpty()) {
+        QSize contentSize;
+        if (item.page) {
+            contentSize = item.page->sizeHint();
         }
-    });
-    animation->start(QAbstractAnimation::DeleteWhenStopped);
+        if (item.content) {
+            contentSize = contentSize.expandedTo(item.content->sizeHint());
+        }
+        size = contentSize.expandedTo(
+            QSize(std::max(buttonGlobalRect.width(), item.button->sizeHint().width()),
+                  expandedPanelHeight()));
+        item.panelSize = size;
+    }
+
+    const QSize minSize(std::max(80, item.button->minimumSizeHint().width()), 120);
+    const QSize maxSize(std::max(minSize.width(), top->width() - 16),
+                        std::max(minSize.height(), top->height() - 48));
+    size = size.expandedTo(minSize).boundedTo(maxSize);
+    item.panelSize = size;
+
+    QPoint topLeft = top->mapFromGlobal(QPoint(buttonGlobalRect.left(), buttonGlobalRect.top() - size.height()));
+    topLeft.setX(std::clamp(topLeft.x(), 4, std::max(4, top->width() - size.width() - 4)));
+    topLeft.setY(std::clamp(topLeft.y(), 4, std::max(4, top->height() - size.height() - 4)));
+
+    _positioningPanel = true;
+    _panelFrame->setGeometry(QRect(topLeft, size));
+    _positioningPanel = false;
+}
+
+void StatusDockPanelHost::hidePanel()
+{
+    if (_panelFrame) {
+        _panelFrame->hide();
+    }
 }
 
 int StatusDockPanelHost::expandedPanelHeight() const
@@ -345,8 +465,22 @@ int StatusDockPanelHost::expandedPanelHeight() const
     return std::clamp(available / 2, 260, 520);
 }
 
-bool StatusDockPanelHost::globalPointInsideHost(const QPoint& globalPos) const
+bool StatusDockPanelHost::globalPointInsidePanelOrBar(const QPoint& globalPos) const
 {
     const QWidget* widget = QApplication::widgetAt(globalPos);
-    return widget && (widget == this || isAncestorOf(widget));
+    if (!widget) {
+        return false;
+    }
+    if (widget == this || isAncestorOf(widget)) {
+        return true;
+    }
+    if (_panelFrame && (widget == _panelFrame || _panelFrame->isAncestorOf(widget))) {
+        return true;
+    }
+    if (_barFrame && (widget == _barFrame || _barFrame->isAncestorOf(widget))) {
+        return true;
+    }
+    return std::any_of(_items.begin(), _items.end(), [widget](const Item& item) {
+        return item.button && (widget == item.button || item.button->isAncestorOf(widget));
+    });
 }

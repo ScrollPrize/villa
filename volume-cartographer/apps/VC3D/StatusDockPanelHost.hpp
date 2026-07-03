@@ -1,6 +1,8 @@
 #pragma once
 
+#include <QPoint>
 #include <QPointer>
+#include <QSize>
 #include <QWidget>
 
 #include <vector>
@@ -32,11 +34,14 @@ private:
         QPointer<QWidget> content;
         QPointer<QWidget> page;
         QPointer<QPushButton> button;
+        QSize panelSize;
         bool pinned = false;
         bool detached = false;
+        bool userSized = false;
     };
 
     Item* itemForDock(QDockWidget* dock);
+    int itemIndex(const Item& item) const;
     void toggleItem(Item& item);
     void expandItem(Item& item);
     void collapseCurrent();
@@ -44,15 +49,22 @@ private:
     void attachItem(Item& item, bool expand);
     void showItemMenu(Item& item, const QPoint& globalPos);
     void updateButton(Item& item);
-    void animatePanel(bool expanded);
+    void showPanelForItem(Item& item);
+    void positionPanelForItem(Item& item);
+    void hidePanel();
     int expandedPanelHeight() const;
-    bool globalPointInsideHost(const QPoint& globalPos) const;
+    bool globalPointInsidePanelOrBar(const QPoint& globalPos) const;
 
     QVBoxLayout* _layout{nullptr};
     QFrame* _panelFrame{nullptr};
     QStackedWidget* _stack{nullptr};
+    QWidget* _resizeHandle{nullptr};
     QFrame* _barFrame{nullptr};
     QHBoxLayout* _barLayout{nullptr};
     std::vector<Item> _items;
     int _currentIndex{-1};
+    bool _positioningPanel{false};
+    bool _resizingPanel{false};
+    QPoint _resizeStartGlobal;
+    QSize _resizeStartSize;
 };
