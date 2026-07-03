@@ -54,17 +54,25 @@ private:
     void hidePanel();
     int expandedPanelHeight() const;
     bool globalPointInsidePanelOrBar(const QPoint& globalPos) const;
+    enum class ResizeMode {
+        None,
+        Width,
+        Height,
+        Both
+    };
+    ResizeMode resizeModeAtGlobalPoint(const QPoint& globalPos) const;
+    void updateResizeCursor(const QPoint& globalPos);
 
     QVBoxLayout* _layout{nullptr};
     QFrame* _panelFrame{nullptr};
     QStackedWidget* _stack{nullptr};
-    QWidget* _resizeHandle{nullptr};
     QFrame* _barFrame{nullptr};
     QHBoxLayout* _barLayout{nullptr};
     std::vector<Item> _items;
     int _currentIndex{-1};
     bool _positioningPanel{false};
     bool _resizingPanel{false};
+    ResizeMode _resizeMode{ResizeMode::None};
     QPoint _resizeStartGlobal;
     QSize _resizeStartSize;
 };

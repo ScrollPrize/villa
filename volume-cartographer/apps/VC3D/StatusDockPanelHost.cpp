@@ -19,6 +19,10 @@
 #include <algorithm>
 #include <cstddef>
 
+namespace {
+constexpr int kResizeHitWidth = 10;
+}
+
 StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent)
     : QWidget(parent)
 {
@@ -37,6 +41,8 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
     _panelFrame->setObjectName(QStringLiteral("statusDockPanelFrame"));
     _panelFrame->setFrameShape(QFrame::StyledPanel);
     _panelFrame->setWindowFlags(Qt::Widget);
+    _panelFrame->setMouseTracking(true);
+    _panelFrame->setAttribute(Qt::WA_StyledBackground, true);
     _panelFrame->hide();
 
     auto* panelLayout = new QVBoxLayout(_panelFrame);
@@ -45,19 +51,6 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
 
     _stack = new QStackedWidget(_panelFrame);
     panelLayout->addWidget(_stack, 1);
-
-    auto* gripRow = new QWidget(_panelFrame);
-    auto* gripLayout = new QHBoxLayout(gripRow);
-    gripLayout->setContentsMargins(0, 0, 2, 2);
-    gripLayout->setSpacing(0);
-    gripLayout->addStretch(1);
-    _resizeHandle = new QWidget(gripRow);
-    _resizeHandle->setObjectName(QStringLiteral("statusDockPanelResizeHandle"));
-    _resizeHandle->setFixedSize(14, 14);
-    _resizeHandle->setCursor(Qt::SizeFDiagCursor);
-    _resizeHandle->installEventFilter(this);
-    gripLayout->addWidget(_resizeHandle, 0, Qt::AlignRight | Qt::AlignBottom);
-    panelLayout->addWidget(gripRow, 0);
 
     _barFrame = new QFrame(this);
     _barFrame->setObjectName(QStringLiteral("statusDockBar"));
@@ -70,8 +63,12 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
 
     setStyleSheet(QStringLiteral(
         "QFrame#statusDockBar { background: palette(window); border-top: 1px solid palette(mid); }"
-        "QFrame#statusDockPanelFrame { background: palette(window); border: 1px solid palette(mid); }"
-        "QWidget#statusDockPanelResizeHandle { background: palette(mid); }"
+        "QFrame#statusDockPanelFrame { background: palette(window); border-left: 1px solid palette(mid);"
+        " border-bottom: 1px solid palette(mid); border-top: 5px solid palette(mid);"
+        " border-right: 5px solid palette(mid); }"
+        "QWidget[statusDockPanelPage=\"true\"] { background: palette(window); }"
+        "QFrame[statusDockPanelHeader=\"true\"] { background: palette(window);"
+        " border-bottom: 1px solid palette(mid); }"
         "QPushButton[statusDockPanelButton=\"true\"] { padding: 3px 8px; text-align: left; }"
         "QPushButton[statusDockPanelButton=\"true\"][active=\"true\"] { font-weight: 600; }"));
 
@@ -119,11 +116,17 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
 
     auto* page = new QWidget(_stack);
     page->setObjectName(QStringLiteral("statusDockPanelPage_%1").arg(dock->objectName()));
+    page->setProperty("statusDockPanelPage", true);
+    page->setAutoFillBackground(true);
+    page->setAttribute(Qt::WA_StyledBackground, true);
     auto* pageLayout = new QVBoxLayout(page);
     pageLayout->setContentsMargins(0, 0, 0, 0);
     pageLayout->setSpacing(0);
 
     auto* header = new QFrame(page);
+    header->setProperty("statusDockPanelHeader", true);
+    header->setAutoFillBackground(true);
+    header->setAttribute(Qt::WA_StyledBackground, true);
     header->setFrameShape(QFrame::NoFrame);
     auto* headerLayout = new QHBoxLayout(header);
     headerLayout->setContentsMargins(8, 4, 6, 4);
@@ -190,35 +193,6 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
 
 bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 {
-    if (watched == _resizeHandle) {
-        if (event->type() == QEvent::MouseButtonPress && _currentIndex >= 0 &&
-            _currentIndex < static_cast<int>(_items.size())) {
-            auto* mouse = static_cast<QMouseEvent*>(event);
-            if (mouse->button() == Qt::LeftButton) {
-                _resizingPanel = true;
-                _resizeStartGlobal = mouse->globalPosition().toPoint();
-                _resizeStartSize = _panelFrame ? _panelFrame->size() : QSize();
-                return true;
-            }
-        }
-        if (event->type() == QEvent::MouseMove && _resizingPanel && _currentIndex >= 0 &&
-            _currentIndex < static_cast<int>(_items.size())) {
-            auto* mouse = static_cast<QMouseEvent*>(event);
-            Item& item = _items[static_cast<std::size_t>(_currentIndex)];
-            const QPoint delta = mouse->globalPosition().toPoint() - _resizeStartGlobal;
-            item.panelSize = QSize(_resizeStartSize.width() + delta.x(),
-                                   _resizeStartSize.height() - delta.y());
-            item.userSized = true;
-            positionPanelForItem(item);
-            updateButton(item);
-            return true;
-        }
-        if (event->type() == QEvent::MouseButtonRelease && _resizingPanel) {
-            _resizingPanel = false;
-            return true;
-        }
-    }
-
     if (watched == _panelFrame && event->type() == QEvent::Resize && _currentIndex >= 0 &&
         _currentIndex < static_cast<int>(_items.size()) && !_positioningPanel) {
         Item& item = _items[static_cast<std::size_t>(_currentIndex)];
@@ -226,6 +200,54 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
         item.userSized = true;
         updateButton(item);
         positionPanelForItem(item);
+    }
+
+    if ((event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseMove ||
+         event->type() == QEvent::MouseButtonRelease) &&
+        _panelFrame && _panelFrame->isVisible() && _currentIndex >= 0 &&
+        _currentIndex < static_cast<int>(_items.size())) {
+        auto* mouse = static_cast<QMouseEvent*>(event);
+        const QPoint globalPos = mouse->globalPosition().toPoint();
+
+        if (event->type() == QEvent::MouseButtonPress && mouse->button() == Qt::LeftButton) {
+            const ResizeMode mode = resizeModeAtGlobalPoint(globalPos);
+            if (mode != ResizeMode::None) {
+                _resizingPanel = true;
+                _resizeMode = mode;
+                _resizeStartGlobal = globalPos;
+                _resizeStartSize = _panelFrame->size();
+                updateResizeCursor(globalPos);
+                return true;
+            }
+        }
+
+        if (event->type() == QEvent::MouseMove) {
+            if (_resizingPanel) {
+                Item& item = _items[static_cast<std::size_t>(_currentIndex)];
+                const QPoint delta = globalPos - _resizeStartGlobal;
+                QSize nextSize = _resizeStartSize;
+                if (_resizeMode == ResizeMode::Width || _resizeMode == ResizeMode::Both) {
+                    nextSize.setWidth(_resizeStartSize.width() + delta.x());
+                }
+                if (_resizeMode == ResizeMode::Height || _resizeMode == ResizeMode::Both) {
+                    nextSize.setHeight(_resizeStartSize.height() - delta.y());
+                }
+                item.panelSize = nextSize;
+                item.userSized = true;
+                positionPanelForItem(item);
+                updateButton(item);
+                return true;
+            }
+
+            updateResizeCursor(globalPos);
+        }
+
+        if (event->type() == QEvent::MouseButtonRelease && _resizingPanel) {
+            _resizingPanel = false;
+            _resizeMode = ResizeMode::None;
+            updateResizeCursor(globalPos);
+            return true;
+        }
     }
 
     if (event->type() == QEvent::MouseButtonPress && _currentIndex >= 0) {
@@ -483,4 +505,53 @@ bool StatusDockPanelHost::globalPointInsidePanelOrBar(const QPoint& globalPos) c
     return std::any_of(_items.begin(), _items.end(), [widget](const Item& item) {
         return item.button && (widget == item.button || item.button->isAncestorOf(widget));
     });
+}
+
+StatusDockPanelHost::ResizeMode StatusDockPanelHost::resizeModeAtGlobalPoint(const QPoint& globalPos) const
+{
+    if (!_panelFrame || !_panelFrame->isVisible()) {
+        return ResizeMode::None;
+    }
+
+    const QPoint panelPos = _panelFrame->mapFromGlobal(globalPos);
+    const QRect panelRect = _panelFrame->rect();
+    if (!panelRect.contains(panelPos)) {
+        return ResizeMode::None;
+    }
+
+    const bool onTop = panelPos.y() <= kResizeHitWidth;
+    const bool onRight = panelPos.x() >= panelRect.width() - kResizeHitWidth;
+    if (onTop && onRight) {
+        return ResizeMode::Both;
+    }
+    if (onTop) {
+        return ResizeMode::Height;
+    }
+    if (onRight) {
+        return ResizeMode::Width;
+    }
+    return ResizeMode::None;
+}
+
+void StatusDockPanelHost::updateResizeCursor(const QPoint& globalPos)
+{
+    if (!_panelFrame) {
+        return;
+    }
+
+    const ResizeMode mode = _resizingPanel ? _resizeMode : resizeModeAtGlobalPoint(globalPos);
+    switch (mode) {
+    case ResizeMode::Both:
+        _panelFrame->setCursor(Qt::SizeBDiagCursor);
+        break;
+    case ResizeMode::Width:
+        _panelFrame->setCursor(Qt::SizeHorCursor);
+        break;
+    case ResizeMode::Height:
+        _panelFrame->setCursor(Qt::SizeVerCursor);
+        break;
+    case ResizeMode::None:
+        _panelFrame->unsetCursor();
+        break;
+    }
 }
