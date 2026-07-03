@@ -692,10 +692,12 @@ ChunkedPlaneSampler::Stats markKnownMissingPlanePixels(
                     sawTransient = true;
                     break;
                 }
-                if (state == ChunkDependencyState::KnownMissing)
+                if (state == ChunkDependencyState::KnownMissing) {
                     sawKnownMissing = true;
-                else
+                } else {
                     sawReady = true;
+                    break;
+                }
             }
 
             if (!sawTransient && sawKnownMissing && !sawReady) {
@@ -754,10 +756,12 @@ ChunkedPlaneSampler::Stats markKnownMissingCoordsPixels(
                     sawTransient = true;
                     break;
                 }
-                if (state == ChunkDependencyState::KnownMissing)
+                if (state == ChunkDependencyState::KnownMissing) {
                     sawKnownMissing = true;
-                else
+                } else {
                     sawReady = true;
+                    break;
+                }
             }
 
             if (!sawTransient && sawKnownMissing && !sawReady) {
