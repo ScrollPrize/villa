@@ -25,18 +25,11 @@ hide_title: true
 
 <img src="/img/firstletters/composite_thumb.webp" />
 
-<h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">
-  Grand Prize submissions <span style={{
-    background:
-      "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-    WebkitBackgroundClip: "text",
-    WebkitTextFillColor: "transparent",
-    backgroundClip: "text",
-    textFillColor: "transparent",
-  }}>now closed</span>
+<h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">
+  Grand Prize submissions <span className="text-accent">now closed</span>
 </h1>
 
-<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">The 2023 Vesuvius Challenge Grand Prize submission window has closed. Review teams are evaluating entries — stay tuned as we announce results and next stages.</div>
+<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">The 2023 Vesuvius Challenge Grand Prize submission window has closed. Review teams are evaluating entries — stay tuned as we announce results and next stages.</div>
 
 <div className="opacity-60 mb-8 italic">January 1, 2024</div>
 

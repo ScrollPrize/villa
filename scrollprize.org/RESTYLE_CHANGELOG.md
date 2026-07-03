@@ -60,6 +60,19 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Files:** `src/components/Landing.js`, `src/components/landingData.js` (new), `src/css/landing.css`.
 **Verification:** babel/postcss parse clean; all 85 image refs exist; inbound anchors (`#sponsors`, `#educelab-funders`, …) preserved; full `yarn build` green (below).
 
+## C5 — integration: dead-rule sweep, winners cards, dead media, gradient-text zero
+
+**Why:** converge the parallel work packages — remove now-dead legacy CSS, bring the last off-recipe surfaces onto the system, and drop confirmed-dead media.
+**What:**
+- `custom.css` 509 → 475 lines: old `.hero` bg-image rule, orphaned `.pan-horizontal`/`@keyframes pan`, grandprize "PT Sans" font override, two dead `max-width !important` rules removed (each verified covered by chrome/landing.css first). Atlas block untouched.
+- `docs/15_winners.md`: **174** hand-rolled `bg-[#444]` prize-card anchors converted to the `.vc-card` recipe with the single-red amount treatment (all titles/winners/amounts/links/images preserved).
+- Gradient-text count is now **zero site-wide**: grandprize h1 (WP4) + firstletters/submissions_closed/firstscroll h1 spans (orchestrator) → plain `text-accent` emphasis; poster classes (`font-black tracking-tighter`) dropped; firstscroll image-overlay hex arbitraries → `border-line`/`bg-black/65`/`text-white/90`.
+- TOC restored on 4 more docs (data, data_fragments, background, unwrapping); `static/llms.txt` updated to the live `/unwrapping` target.
+- **Dead media deleted (~60MB)** after zero-reference re-verification: `static/vid/graph_solver.mp4` (44MB), `static/img/tutorials/meshlab-segment4.webm` (16MB). Both were unreachable from any page — no press link can exist.
+- Prism dark theme `dracula` → `vsDark` (closer to the Obsidian palette).
+**Files:** `src/css/custom.css`, `src/css/chrome.css` (comment), `docs/{15_winners,26_grandprize,22_firstletters,25_submissions_closed,36_firstscroll,02_data,02_data_fragments,10_background}.md`, `docs/32_unwrapping.mdx`, `static/llms.txt`, `docusaurus.config.js`, 2 static deletions.
+**Verification:** `yarn build` green; residual gradient/shadow/hex-arbitrary sweep clean outside the frozen atlas.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

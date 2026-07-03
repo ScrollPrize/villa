@@ -515,7 +515,7 @@ details.alert > summary {
 
 /* Blocks: --vc-code-bg + hairline + 8px radius, 13.5px/1.6 mono.
    !important is required to beat prism-react-renderer's inline theme styles;
-   token colors stay dracula's (readable on #131518). */
+   syntax token colors come from the prism theme (vsDark) and are readable on #131518. */
 .theme-code-block {
   background: var(--vc-code-bg) !important;
   border: 1px solid var(--vc-line);

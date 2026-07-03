@@ -11,7 +11,7 @@
 ## Open problems & methods
 - [Ink Detection](https://scrollprize.org/ink_detection)
 - [Segmentation](https://scrollprize.org/segmentation)
-- [Representation](https://scrollprize.org/open_problem_rep)
+- [Representation](https://scrollprize.org/unwrapping)
 
 ## Prizes
 - [Open Prizes](https://scrollprize.org/prizes)

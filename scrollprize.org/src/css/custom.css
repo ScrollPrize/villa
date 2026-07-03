@@ -78,12 +78,6 @@ h6 {
   letter-spacing: 0;
 }
 
-.hero {
-  background-image: url("/img/landing/vesuvius.webp");
-  background-size: cover;
-  background-position: center;
-}
-
 figure {
   margin: 0 0 var(--ifm-paragraph-margin-bottom) 0;
 }
@@ -104,7 +98,7 @@ figcaption {
 .theme-doc-toc-mobile,
 .footer {
   background-color: var(--ifm-background-color);
-  border-top: 1px solid var(--vc-line) !important;
+  border-top: 1px solid var(--vc-line);
   z-index: 1;
 }
 
@@ -178,14 +172,6 @@ aside {
   display: none;
 }
 
-main {
-  max-width: 60rem !important;
-}
-
-.docs-doc-id-landing main {
-  max-width: unset !important;
-}
-
 .navbar__toggle {
   margin-right: 12px !important;
 }
@@ -219,25 +205,6 @@ main {
 *::-webkit-media-controls-start-playback-button {
   display: none !important;
   -webkit-appearance: none;
-}
-
-@keyframes pan {
-  from {
-    transform: translateX(0);
-  }
-
-  to {
-    transform: translateX(-100%);
-    /* Adjust this value based on your image's width */
-  }
-}
-
-.pan-horizontal {
-  animation: pan 40s linear infinite;
-}
-
-.docs-doc-id-grandprize article {
-  font: normal 18px/1.65 "PT Sans", "Helvetica", "Arial", sans-serif;
 }
 
 .docs-doc-id-grandprize article figcaption {

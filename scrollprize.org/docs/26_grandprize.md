@@ -26,16 +26,9 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"Vesuvius Challenge 2023 Grand Prize awarded: we can read the scrolls","datePublished":"2024-02-05","dateModified":"2024-02-05","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/social/opengraph.jpg","mainEntityOfPage":"https://scrollprize.org/grandprize"}} />
 
-<h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">Vesuvius Challenge 2023 Grand Prize awarded: <span style={{
-  background:
-    "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-  WebkitBackgroundClip: "text",
-  WebkitTextFillColor: "transparent",
-  backgroundClip: "text",
-  textFillColor: "transparent",
-}}>we can read the first scroll!</span></h1>
+<h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">Vesuvius Challenge 2023 Grand Prize awarded: <span className="text-accent">we can read the first scroll!</span></h1>
 
-<div className="md:text-2xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">The 2000-year-old scroll discusses music, food, and how to enjoy life’s pleasures.</div>
+<div className="md:text-2xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">The 2000-year-old scroll discusses music, food, and how to enjoy life’s pleasures.</div>
 
 <div className="opacity-60 mb-8 italic">February 5th, 2024</div>
 

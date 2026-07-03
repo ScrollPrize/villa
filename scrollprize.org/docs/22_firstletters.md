@@ -28,27 +28,11 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <img src="/img/firstletters/composite_thumb.webp" alt="Composite image of recovered text from inside a Herculaneum scroll." />
 
-<h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">First word discovered in <span style={{
-  background:
-    "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-  WebkitBackgroundClip: "text",
-  WebkitTextFillColor: "transparent",
-  backgroundClip: "text",
-  textFillColor: "transparent",
-}}>unopened Herculaneum scroll</span> by 21yo computer science student</h1>
+<h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">First word discovered in <span className="text-accent">unopened Herculaneum scroll</span> by 21yo computer science student</h1>
 
-<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”</div>
+<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”</div>
 
 <div className="opacity-60 mb-8 italic">October 12th, 2023</div>
-
-<!-- <div className="color-white text-2xl md:text-5xl font-black !mb-2 leading-none tracking-tighter" style={{
-  background:
-    "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-  WebkitBackgroundClip: "text",
-  WebkitTextFillColor: "transparent",
-  backgroundClip: "text",
-  textFillColor: "transparent",
-}}>Vesuvius Challenge \$700,000 Grand Prize “now definitely achievable”</div> -->
 
 
 <figure className="">
