@@ -7,6 +7,7 @@
 #include <QImage>
 #include <chrono>
 #include <array>
+#include <cstddef>
 #include <deque>
 #include <map>
 #include <optional>
@@ -274,7 +275,7 @@ private:
         std::map<std::string, cv::Vec3b> overlays;          // Overlay config when image was built
         float threshold{0.0f};                              // Threshold when image was built
         QuadSurface* surface{nullptr};                      // Current surface when image was built
-        uint64_t surfaceVersion{0};                         // Surface content version
+        std::size_t generationHash{0};                      // Surface/index generations when image was built
     };
     mutable std::map<VolumeViewerBase*, OverlapCache> _overlapCaches;
 
@@ -286,6 +287,7 @@ private:
     QFutureWatcher<QImage>* _overlapWatcher{nullptr};
     PendingOverlapResult _pendingOverlap;
     bool _overlapComputeRunning{false};
+    bool _overlapIndexReadInFlight{false};
     void handleOverlapComputeFinished();
 
     // Deferred refresh timer - fires after throttle window to apply pending state
