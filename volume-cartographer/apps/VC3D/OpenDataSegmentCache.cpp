@@ -519,8 +519,38 @@ std::optional<cv::Matx44d> findVolumeTransformMatrix(const OpenDataSample& sampl
         return std::nullopt;
     }
 
-    const auto it = sample.properties.find("volume_transforms");
-    if (it == sample.properties.end()) {
+    const nlohmann::json* volumeTransforms = nullptr;
+    auto maybeSetTransforms = [&](const nlohmann::json& owner) {
+        if (volumeTransforms || !owner.is_object()) {
+            return;
+        }
+        const auto it = owner.find("volume_transforms");
+        if (it != owner.end()) {
+            volumeTransforms = &*it;
+        }
+    };
+
+    maybeSetTransforms(sample.properties);
+    if (sample.properties.is_object()) {
+        if (const auto nested = sample.properties.find("properties"); nested != sample.properties.end()) {
+            maybeSetTransforms(*nested);
+        }
+    }
+    if (sample.raw.is_object()) {
+        if (const auto sampleIt = sample.raw.find("sample"); sampleIt != sample.raw.end()) {
+            maybeSetTransforms(*sampleIt);
+            if (sampleIt->is_object()) {
+                if (const auto propsIt = sampleIt->find("properties"); propsIt != sampleIt->end()) {
+                    maybeSetTransforms(*propsIt);
+                }
+            }
+        }
+        if (const auto propsIt = sample.raw.find("properties"); propsIt != sample.raw.end()) {
+            maybeSetTransforms(*propsIt);
+        }
+    }
+
+    if (!volumeTransforms) {
         return std::nullopt;
     }
 
@@ -548,8 +578,8 @@ std::optional<cv::Matx44d> findVolumeTransformMatrix(const OpenDataSample& sampl
         return std::nullopt;
     };
 
-    if (it->is_array()) {
-        for (const auto& fromEntry : *it) {
+    if (volumeTransforms->is_array()) {
+        for (const auto& fromEntry : *volumeTransforms) {
             if (!fromEntry.is_object()) {
                 continue;
             }
@@ -568,9 +598,9 @@ std::optional<cv::Matx44d> findVolumeTransformMatrix(const OpenDataSample& sampl
         return std::nullopt;
     }
 
-    if (it->is_object()) {
-        const auto fromIt = it->find(sourceVolumeId);
-        if (fromIt == it->end()) {
+    if (volumeTransforms->is_object()) {
+        const auto fromIt = volumeTransforms->find(sourceVolumeId);
+        if (fromIt == volumeTransforms->end()) {
             return std::nullopt;
         }
         if (fromIt->is_object()) {

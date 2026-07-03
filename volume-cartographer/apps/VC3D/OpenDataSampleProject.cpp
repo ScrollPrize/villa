@@ -201,6 +201,34 @@ bool isNonEmptyFile(const std::filesystem::path& path)
            !ec;
 }
 
+int openDataSegmentEntryCount(const VolumePkg& pkg,
+                              const std::filesystem::path& remoteCacheRoot,
+                              const OpenDataSample& sample)
+{
+    if (remoteCacheRoot.empty() || sample.tifxyzSegmentCount() == 0) {
+        return 0;
+    }
+
+    const auto sourceRoot = openDataSegmentCacheRoot(remoteCacheRoot, sample).string();
+    const auto transformedRoot = (remoteCacheRoot / "open_data" / "transformed_segments" /
+                                  safePathComponent(sample.id.empty() ? "sample" : sample.id))
+                                     .string();
+    int count = 0;
+    for (const auto& entry : pkg.segmentEntries()) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(entry.location, ec) || ec) {
+            continue;
+        }
+        const auto transformedPrefix =
+            transformedRoot + std::string(1, std::filesystem::path::preferred_separator);
+        if (entry.location == sourceRoot ||
+            entry.location.rfind(transformedPrefix, 0) == 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 } // namespace
 
 std::shared_ptr<VolumePkg> createOpenDataSampleProject(
@@ -211,6 +239,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 {
     auto result = OpenDataSampleProjectResult{};
     std::shared_ptr<VolumePkg> pkg;
+    bool loadedCachedProject = false;
     const auto cachedProjectPath = remoteCacheRoot.empty()
         ? std::filesystem::path{}
         : sampleProjectCachePath(remoteCacheRoot, sample);
@@ -222,6 +251,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
             pkg = VolumePkg::load(
                 cachedProjectPath,
                 opts);
+            loadedCachedProject = true;
             result.messages.push_back("Loaded cached sample project: " +
                                       cachedProjectPath.string());
         } catch (const std::exception& e) {
@@ -250,7 +280,16 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     result.messages.insert(result.messages.end(),
                            attachResult.messages.begin(),
                            attachResult.messages.end());
-    attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result, progressCallback);
+    const int cachedSegmentEntryCount =
+        loadedCachedProject ? openDataSegmentEntryCount(*pkg, remoteCacheRoot, sample) : 0;
+    if (cachedSegmentEntryCount > 0) {
+        result.supportedTifxyzSegments = static_cast<int>(sample.tifxyzSegmentCount());
+        result.cachedTifxyzSegments = result.supportedTifxyzSegments;
+        result.attachedSegmentEntries = cachedSegmentEntryCount;
+        result.messages.push_back("Reused cached sample project segment entries.");
+    } else {
+        attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result, progressCallback);
+    }
 
     if (!cachedProjectPath.empty()) {
         try {

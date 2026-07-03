@@ -535,7 +535,7 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     OpenDataVolume targetVolume;
     targetVolume.id = "vol2";
     sample.volumes.push_back(targetVolume);
-    sample.properties["volume_transforms"] = nlohmann::json::array({
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
         {
             {"from_volume_id", "vol1"},
             {"transforms", nlohmann::json::array({
@@ -625,6 +625,72 @@ TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
                       secondResult.messages.end(),
                       [](const std::string& message) {
                           return message.find("Loaded cached sample project") != std::string::npos;
+                      }));
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("OpenDataSampleProject skips segment reconciliation for cached project segment entries")
+{
+    const auto manifest = parseOpenDataManifest(kFixture);
+    const auto& sample = *manifest.findSample("PHerc0139");
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_cached_project_segments_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto segmentDir = openDataSegmentCacheDirectory(
+        cacheRoot,
+        sample,
+        sample.segments.front());
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    const auto* tifxyz = preferredTifxyzArtifact(sample.segments.front());
+    REQUIRE(tifxyz != nullptr);
+    writeFile(segmentDir / "meta.json",
+              R"({"type":"seg","uuid":"20260311000000.tmp-12345","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", segmentDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", segmentDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", segmentDir / "z.tif");
+    writeFile(segmentDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", sample.segments.front().id},
+                  {"resolved_http_url", tifxyz->resolvedUrl},
+                  {"cache_state", "current"}
+              }.dump());
+
+    OpenDataSampleProjectResult firstResult;
+    std::vector<OpenDataSampleDownloadProgress> firstProgressEvents;
+    auto first = createOpenDataSampleProject(
+        sample,
+        cacheRoot,
+        &firstResult,
+        [&](const OpenDataSampleDownloadProgress& progress) {
+            firstProgressEvents.push_back(progress);
+        });
+    REQUIRE(first);
+    CHECK(firstResult.cachedTifxyzSegments == 1);
+    CHECK(firstResult.attachedSegmentEntries == 1);
+    REQUIRE(!firstProgressEvents.empty());
+
+    OpenDataSampleProjectResult secondResult;
+    std::vector<OpenDataSampleDownloadProgress> secondProgressEvents;
+    auto second = createOpenDataSampleProject(
+        sample,
+        cacheRoot,
+        &secondResult,
+        [&](const OpenDataSampleDownloadProgress& progress) {
+            secondProgressEvents.push_back(progress);
+        });
+    REQUIRE(second);
+    CHECK(secondResult.cachedTifxyzSegments == 1);
+    CHECK(secondResult.attachedSegmentEntries == 1);
+    CHECK(secondProgressEvents.empty());
+    CHECK(std::any_of(secondResult.messages.begin(),
+                      secondResult.messages.end(),
+                      [](const std::string& message) {
+                          return message.find("Reused cached sample project segment entries") != std::string::npos;
                       }));
 
     std::filesystem::remove_all(cacheRoot);
