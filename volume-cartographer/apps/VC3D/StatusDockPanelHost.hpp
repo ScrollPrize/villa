@@ -12,6 +12,7 @@ class QFrame;
 class QHBoxLayout;
 class QPushButton;
 class QStackedWidget;
+class QToolButton;
 class QVBoxLayout;
 
 class StatusDockPanelHost final : public QWidget
@@ -34,6 +35,7 @@ private:
         QPointer<QWidget> content;
         QPointer<QWidget> page;
         QPointer<QPushButton> button;
+        QPointer<QToolButton> pinButton;
         QSize panelSize;
         bool pinned = false;
         bool detached = false;
@@ -54,6 +56,9 @@ private:
     void hidePanel();
     int expandedPanelHeight() const;
     bool globalPointInsidePanelOrBar(const QPoint& globalPos) const;
+    QString settingsKeyForItem(const Item& item) const;
+    void loadPanelSize(Item& item);
+    void savePanelSize(const Item& item) const;
     enum class ResizeMode {
         None,
         Width,

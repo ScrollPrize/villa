@@ -1,16 +1,21 @@
 #include "StatusDockPanelHost.hpp"
 
+#include "VCSettings.hpp"
+
 #include <QApplication>
 #include <QDockWidget>
 #include <QEvent>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMouseEvent>
+#include <QPainter>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QSettings>
 #include <QStackedWidget>
 #include <QStyle>
 #include <QToolButton>
@@ -21,6 +26,26 @@
 
 namespace {
 constexpr int kResizeHitWidth = 10;
+constexpr auto kPanelSizeSettingsPrefix = "statusDockPanels/sizes";
+
+QIcon makePinIcon(const QPalette& palette, bool pinned)
+{
+    QPixmap pixmap(16, 16);
+    pixmap.fill(Qt::transparent);
+
+    const QColor color = pinned ? palette.highlight().color() : palette.mid().color();
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(color, 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(pinned ? QBrush(color) : Qt::NoBrush);
+    painter.translate(8.0, 8.0);
+    painter.rotate(35.0);
+    painter.drawRoundedRect(QRectF(-4.0, -6.0, 8.0, 5.0), 1.0, 1.0);
+    painter.drawLine(QPointF(0.0, -1.0), QPointF(0.0, 5.0));
+    painter.drawLine(QPointF(-3.0, 5.0), QPointF(3.0, 5.0));
+    painter.drawLine(QPointF(0.0, 5.0), QPointF(0.0, 7.0));
+    return QIcon(pixmap);
+}
 }
 
 StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent)
@@ -113,6 +138,7 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     Item item;
     item.dock = dock;
     item.content = content;
+    loadPanelSize(item);
 
     auto* page = new QWidget(_stack);
     page->setObjectName(QStringLiteral("statusDockPanelPage_%1").arg(dock->objectName()));
@@ -136,6 +162,13 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     title->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     headerLayout->addWidget(title);
 
+    auto* pin = new QToolButton(header);
+    pin->setCheckable(true);
+    pin->setAutoRaise(true);
+    pin->setIconSize(QSize(16, 16));
+    pin->setToolTip(tr("Pin open"));
+    headerLayout->addWidget(pin);
+
     auto* collapse = new QToolButton(header);
     collapse->setText(QStringLiteral("▼"));
     collapse->setToolTip(tr("Collapse"));
@@ -155,6 +188,7 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
 
     item.page = page;
     item.button = button;
+    item.pinButton = pin;
     _items.push_back(item);
     const int index = static_cast<int>(_items.size() - 1);
     _stack->addWidget(page);
@@ -172,6 +206,13 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     });
     connect(collapse, &QToolButton::clicked, this, [this]() {
         collapseCurrent();
+    });
+    connect(pin, &QToolButton::clicked, this, [this, index](bool checked) {
+        if (index >= 0 && index < static_cast<int>(_items.size())) {
+            Item& item = _items[static_cast<std::size_t>(index)];
+            item.pinned = checked;
+            updateButton(item);
+        }
     });
     connect(dock, &QDockWidget::visibilityChanged, this, [this, dock](bool visible) {
         Item* item = itemForDock(dock);
@@ -243,6 +284,9 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
         }
 
         if (event->type() == QEvent::MouseButtonRelease && _resizingPanel) {
+            if (_currentIndex >= 0 && _currentIndex < static_cast<int>(_items.size())) {
+                savePanelSize(_items[static_cast<std::size_t>(_currentIndex)]);
+            }
             _resizingPanel = false;
             _resizeMode = ResizeMode::None;
             updateResizeCursor(globalPos);
@@ -407,6 +451,12 @@ void StatusDockPanelHost::updateButton(Item& item)
     item.button->setMinimumWidth(0);
     item.button->style()->unpolish(item.button);
     item.button->style()->polish(item.button);
+
+    if (item.pinButton) {
+        item.pinButton->setChecked(item.pinned);
+        item.pinButton->setIcon(makePinIcon(item.pinButton->palette(), item.pinned));
+        item.pinButton->setToolTip(item.pinned ? tr("Unpin") : tr("Pin open"));
+    }
 }
 
 void StatusDockPanelHost::showPanelForItem(Item& item)
@@ -493,9 +543,6 @@ bool StatusDockPanelHost::globalPointInsidePanelOrBar(const QPoint& globalPos) c
     if (!widget) {
         return false;
     }
-    if (widget == this || isAncestorOf(widget)) {
-        return true;
-    }
     if (_panelFrame && (widget == _panelFrame || _panelFrame->isAncestorOf(widget))) {
         return true;
     }
@@ -505,6 +552,44 @@ bool StatusDockPanelHost::globalPointInsidePanelOrBar(const QPoint& globalPos) c
     return std::any_of(_items.begin(), _items.end(), [widget](const Item& item) {
         return item.button && (widget == item.button || item.button->isAncestorOf(widget));
     });
+}
+
+QString StatusDockPanelHost::settingsKeyForItem(const Item& item) const
+{
+    QString id;
+    if (item.dock) {
+        id = item.dock->objectName();
+        if (id.isEmpty()) {
+            id = item.dock->windowTitle();
+        }
+    }
+    if (id.isEmpty()) {
+        const int index = itemIndex(item);
+        id = index >= 0 ? QStringLiteral("panel_%1").arg(index) : QStringLiteral("unknown");
+    }
+    id.replace(QLatin1Char('/'), QLatin1Char('_'));
+    id.replace(QLatin1Char('\\'), QLatin1Char('_'));
+    return QStringLiteral("%1/%2").arg(QString::fromLatin1(kPanelSizeSettingsPrefix), id);
+}
+
+void StatusDockPanelHost::loadPanelSize(Item& item)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QSize size = settings.value(settingsKeyForItem(item)).toSize();
+    if (size.isValid() && !size.isEmpty()) {
+        item.panelSize = size;
+        item.userSized = true;
+    }
+}
+
+void StatusDockPanelHost::savePanelSize(const Item& item) const
+{
+    if (!item.userSized || !item.panelSize.isValid() || item.panelSize.isEmpty()) {
+        return;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(settingsKeyForItem(item), item.panelSize);
 }
 
 StatusDockPanelHost::ResizeMode StatusDockPanelHost::resizeModeAtGlobalPoint(const QPoint& globalPos) const
