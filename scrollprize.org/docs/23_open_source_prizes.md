@@ -1,5 +1,6 @@
 ---
 title: "$12k Open Source Prizes (Dec 31)"
+sidebar_label: "Open Source Prizes (closed)"
 hide_table_of_contents: true
 ---
 

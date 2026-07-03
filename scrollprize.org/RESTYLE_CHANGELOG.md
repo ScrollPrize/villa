@@ -24,6 +24,19 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Verification:** `yarn build` exit 0; old `#1C1A1D` gone from src CSS; `.mdx` purge tripwire class present in emitted bundle; `--vc-*` tokens compiled.
 **Notable mappings:** Infima 7-step red ramp collapsed to the single ember accent; code-line highlight now a raised surface instead of a dark tint; `firstletters` black bg → `--vc-bg`.
 
+## C4 — nav + IA: real navbar, slim sidebar, TOC restoration, orphan pruning with redirects
+
+**Why:** all navigation was crammed into one 35-link sidebar (external socials included) behind a hidden-navbar hack; ~⅓ of entries were closed-prize history advertising stale deadlines; long pages had no table of contents; three orphaned/duplicate docs added clutter.
+**What:**
+- **Real navbar** (was `items: []` + brand faked inside the sidebar): Prizes · Data · Tutorials · Milestones · Community ▾ (Discord/𝕏/Substack/Donate/Jobs) · right-aligned "Get Started" CTA (`vc-navbar-cta`). Brand-in-sidebar HTML hack deleted; desktop navbar-height-0 hack removed from custom.css (navbar height now 56px); leftover brand 50%-opacity dimming removed.
+- **Sidebar** 15 → 8 top-level entries, zero external links; Milestones/Scrolls/Archive collapsed (`sidebarCollapsible` flipped to true); `ink_detection` + `grand_prize` moved into Archive (both closed 2023 prizes). Stale nav labels cleaned via `sidebar_label` (e.g. "$700k/$100k/$50k Grand Prize (Dec 31)" → "2023 Grand Prize (closed)").
+- **TOC restored** on 16 long-form docs (`hide_table_of_contents` removed): master_plan, faq, all tutorials, winners, prizes, segmentation, livestream, grandprize, firstscroll, firstletters, community_projects. FAQ's hand-rolled `<TOCInline>` red-link index removed (the real TOC replaces it).
+- **Orphans deleted WITH redirects** (no URL dies): `06_tutorial_thaumato.md` + `29_tutorial4.md` (duplicate "Segmentation - a different approach") → `/segmentation`; `open_problem_rep.md` → `/unwrapping`. 3 inbound links that pointed at `tutorial4` while talking about ink detection now point at the actual Ink Detection tutorial (`tutorial5`) — a pre-existing mislink, fixed.
+- **Footer**: 3-column sitemap → one dense band (© + CC BY-NC · Discord/GitHub/Substack/𝕏/Jobs). GitHub link → `github.com/ScrollPrize`.
+**Files:** `docusaurus.config.js`, `sidebars.js`, `src/css/custom.css` (navbar hack removal only), `docs/*` (frontmatter/labels, FAQ index, 2 link fixes, 3 deletions).
+**Verification:** `yarn build` green under strict `onBrokenLinks: throw`; all 7 redirect routes generate; Discord URL verified against repo (`discord.gg/V4fJhvtaQn`).
+**Known follow-ups:** `static/llms.txt` still references `/open_problem_rep` (URL stays alive via redirect; text updated in C5); grandprize page still carries its inline gradient h1 (P2 polish, iteration round).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

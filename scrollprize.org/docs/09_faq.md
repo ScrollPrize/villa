@@ -1,6 +1,5 @@
 ---
 title: "FAQ"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -35,14 +34,6 @@ hide_table_of_contents: true
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
-
-import TOCInline from '@theme/TOCInline';
-
-<TOCInline
-  toc={toc}
-/>
-
----
 
 ### What is Vesuvius Challenge?
 

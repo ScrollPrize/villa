@@ -1,5 +1,6 @@
 ---
 title: "$1000 Private Progress Pics Prize (Dec 15th)"
+sidebar_label: "Progress Prize (closed)"
 hide_table_of_contents: true
 ---
 

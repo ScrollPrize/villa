@@ -34,7 +34,7 @@
   --ifm-navbar-link-color: white; */
 
   --ifm-navbar-padding-vertical: 0px;
-  --ifm-navbar-height: 45px;
+  --ifm-navbar-height: 56px;
 
   /* Docs heading sizes (spec §2 type scale) */
   --ifm-h1-font-size: 2.5rem;   /* docs h1 */
@@ -113,14 +113,6 @@ figcaption {
 }
 
 @media (min-width: 997px) {
-  :root {
-    --ifm-navbar-height: 0;
-  }
-
-  .navbar--fixed-top {
-    display: none;
-  }
-
   .docs-doc-id-landing .container {
     padding: 0 32px;
   }
@@ -204,35 +196,19 @@ main {
   vertical-align: -5px !important;
 }
 
-.custom-top-header .navbar__logo img {
-  vertical-align: -1px !important;
-}
-
 .navbar__title {
   font-weight: 600;
   letter-spacing: -0.01em;
   font-size: 18px;
 }
 
-.custom-top-header .navbar__title {
-  margin-bottom: 10px;
-}
-
-@media (max-width: 996px) {
-  .custom-top-header {
-    display: none;
-  }
-}
-
 .navbar__brand {
   margin-left: 8px;
-  opacity: .5;
 }
 
 @media (max-width: 996px) {
   .navbar__brand {
     margin-left: 0;
-    opacity: 1;
   }
 
   .hash-link {

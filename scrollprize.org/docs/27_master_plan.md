@@ -1,6 +1,5 @@
 ---
 title: "Master Plan"
-hide_table_of_contents: true
 ---
 
 <head>

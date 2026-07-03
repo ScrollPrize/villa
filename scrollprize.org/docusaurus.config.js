@@ -131,7 +131,7 @@ const config = {
         docs: {
           routeBasePath: "/",
           sidebarPath: require.resolve("./sidebars.js"),
-          sidebarCollapsible: false,
+          sidebarCollapsible: true,
           breadcrumbs: false,
           editUrl:
               "https://github.com/ScrollPrize/villa/tree/main/scrollprize.org",
@@ -173,48 +173,55 @@ const config = {
             alt: "Vesuvius Challenge Logo",
             src: "img/social/favicon-64x64.png",
           },
-          items: [],
+          items: [
+            { to: "/prizes", label: "Prizes", position: "left" },
+            { to: "/data", label: "Data", position: "left" },
+            { to: "/tutorial", label: "Tutorials", position: "left" },
+            { to: "/winners", label: "Milestones", position: "left" },
+            {
+              type: "dropdown",
+              label: "Community",
+              position: "left",
+              items: [
+                { label: "Discord", href: "https://discord.gg/V4fJhvtaQn" },
+                { label: "𝕏", href: "https://x.com/scrollprize" },
+                { label: "Substack", href: "https://scrollprize.substack.com" },
+                {
+                  label: "Donate",
+                  href: "https://donate.stripe.com/aEUg101vt9eN8gM144",
+                },
+                { label: "Jobs", to: "/jobs" },
+              ],
+            },
+            {
+              to: "/get_started",
+              label: "Get Started",
+              position: "right",
+              className: "vc-navbar-cta",
+            },
+          ],
         },
         footer: {
           style: "dark",
           links: [
             {
-              title: "Overview",
-              items: [
-                {
-                  label: "Getting Started",
-                  to: "/get_started",
-                },
-                {
-                  label: "Master Plan",
-                  to: "/master_plan",
-                },
-              ],
-            },
-            {
-              title: "Community",
               items: [
                 {
                   label: "Discord",
                   href: "https://discord.gg/V4fJhvtaQn",
                 },
                 {
-                  label: "Substack",
-                  href: "https://scrollprize.substack.com",
+                  label: "GitHub",
+                  href: "https://github.com/ScrollPrize",
                 },
                 {
-                  label: "GitHub",
-                  href: "https://github.com/ScrollPrize/villa",
+                  label: "Substack",
+                  href: "https://scrollprize.substack.com",
                 },
                 {
                   label: "𝕏",
                   href: "https://x.com/scrollprize",
                 },
-              ],
-            },
-            {
-              title: "More",
-              items: [
                 {
                   label: "Jobs",
                   to: "/jobs",
@@ -222,7 +229,7 @@ const config = {
               ],
             },
           ],
-          copyright: `Copyright © ${new Date().getFullYear()} Vesuvius Challenge.`,
+          copyright: `Copyright © ${new Date().getFullYear()} Vesuvius Challenge · Content licensed CC BY-NC 4.0`,
         },
         image: '/img/social/opengraph.jpg',
         metadata: [
@@ -317,6 +324,20 @@ const config = {
           {
             to: "https://dl.ash2txt.org/LICENSE.txt",
             from: "/license",
+          },
+          // Orphan docs removed in the "Obsidian Minimal" restyle. Journals and
+          // Discord threads have linked these for years — keep the URLs alive.
+          {
+            to: "/segmentation",
+            from: "/tutorial_thaumato",
+          },
+          {
+            to: "/segmentation",
+            from: "/tutorial4",
+          },
+          {
+            to: "/unwrapping",
+            from: "/open_problem_rep",
           },
         ],
       },

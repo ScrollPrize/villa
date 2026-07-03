@@ -1,7 +1,6 @@
 ---
 title: "Tutorial: Segmentation"
 sidebar_label: "Segmentation"
-hide_table_of_contents: true
 ---
 
 <head>

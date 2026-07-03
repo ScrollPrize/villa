@@ -1,5 +1,6 @@
 ---
 title: "2024 Grand Prize Submission Instructions"
+sidebar_label: "2024 GP Instructions (closed)"
 hide_table_of_contents: true
 slug: "2024_gp_submissions"
 ---

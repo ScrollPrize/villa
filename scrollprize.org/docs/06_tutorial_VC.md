@@ -1,6 +1,5 @@
 ---
 title: "Volume Cartographer (Segmentation)"
-hide_table_of_contents: true
 ---
 
 <head>

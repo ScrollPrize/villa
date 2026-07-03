@@ -1,7 +1,6 @@
 ---
 title: "First word discovered in unopened Herculaneum scroll by 21yo computer science student"
 sidebar_label: "First word discovered (Oct 2023)"
-hide_table_of_contents: true
 hide_title: true
 ---
 
@@ -108,7 +107,7 @@ His team also scanned and photographed detached scroll fragments bearing visible
   <figcaption className="mt-0">Training a machine learning model on the ground truth data from the detached fragments. From Stephen Parsons’ <a href="https://uknowledge.uky.edu/cs_etds/138/">PhD dissertation</a>.</figcaption>
 </figure>
 
-Professor Seales’ graduate student, Stephen Parsons, worked on detecting ink from the CT-scans using machine learning models and <a href="tutorial4">found success with the detached fragments</a>. That success caught the eye of tech entrepreneurs Nat Friedman and Daniel Gross, who started Vesuvius Challenge to accelerate this progress. They launched an open competition March of 2023, and — alongside a \$700,000 Grand Prize — awarded several smaller prizes for the development of open source tools and techniques.
+Professor Seales’ graduate student, Stephen Parsons, worked on detecting ink from the CT-scans using machine learning models and <a href="tutorial5">found success with the detached fragments</a>. That success caught the eye of tech entrepreneurs Nat Friedman and Daniel Gross, who started Vesuvius Challenge to accelerate this progress. They launched an open competition March of 2023, and — alongside a \$700,000 Grand Prize — awarded several smaller prizes for the development of open source tools and techniques.
 
 Early in the summer, a small team of annotators (the “segmentation team”) joined our effort. They began <a href="tutorial3">mapping the 3D structure of the scroll</a> using tools initially built by EduceLab and improved by our community. By July we had segmented and “virtually flattened” hundreds of cm2 of papyrus.
 
@@ -121,7 +120,7 @@ Early in the summer, a small team of annotators (the “segmentation team”) jo
 
 In early August, contestant Casey Handmer, an ex-JPL startup founder and polymath, wrote a <a href="https://caseyhandmer.wordpress.com/2023/08/05/reading-ancient-scrolls/">blog post</a> about his discovery of a “crackle pattern” that looks like ink.
 
-Casey found the pattern by staring at the segmented CT scans for hours on end. This was a major and surprising discovery. Stephen Parsons had seen <a href="tutorial4">direct evidence of ink</a> in detached fragments before, but not yet in the scrolls.
+Casey found the pattern by staring at the segmented CT scans for hours on end. This was a major and surprising discovery. Stephen Parsons had seen <a href="tutorial5">direct evidence of ink</a> in detached fragments before, but not yet in the scrolls.
 
 Casey was the first person in 2,000 years to find ink — and a letter — inside an unopened scroll.
 

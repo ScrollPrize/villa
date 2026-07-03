@@ -1,5 +1,6 @@
 ---
 title: "$700k/$100k/$50k Grand Prize (Dec 31)"
+sidebar_label: "2023 Grand Prize (closed)"
 hide_table_of_contents: true
 ---
 

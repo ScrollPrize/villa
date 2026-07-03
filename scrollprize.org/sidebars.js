@@ -11,21 +11,19 @@
 
 // @ts-check
 
-const brandHeader = {
-  type: 'html',
-  value:
-    '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>',
-};
-
 /** @type {import('@docusaurus/plugin-content-docs').SidebarsConfig} */
 const sidebars = {
   // Single, unified menu used across the whole site so every important page is
-  // reachable from one coherent navigation surface.
+  // reachable from one coherent navigation surface. External links (Discord,
+  // Substack, X, Donate) live in the navbar Community dropdown + footer, not
+  // here. Requires `sidebarCollapsible: true` in the docs preset so the
+  // `collapsed: true` categories below actually start collapsed.
   overviewSidebar: [
-    brandHeader,
     {
       type: 'category',
       label: 'Overview',
+      collapsible: true,
+      collapsed: false,
       link: { type: 'doc', id: 'landing' },
       items: [
         { type: 'doc', id: 'get_started' },
@@ -59,7 +57,6 @@ const sidebars = {
         { type: 'doc', id: 'tutorial3' },
         { type: 'doc', id: 'tutorial5' },
         { type: 'doc', id: 'segmentation' },
-        { type: 'doc', id: 'ink_detection' },
         { type: 'doc', id: 'tutorial_VC' },
       ],
     },
@@ -67,11 +64,12 @@ const sidebars = {
     {
       type: 'category',
       label: 'Milestones & Results',
+      collapsible: true,
+      collapsed: true,
       link: { type: 'doc', id: 'winners' },
       items: [
         { type: 'doc', id: 'firstscroll' },
         { type: 'doc', id: 'grandprize' },
-        { type: 'doc', id: 'grand_prize' },
         { type: 'doc', id: 'firstletters' },
         { type: 'doc', id: 'community_projects' },
       ],
@@ -79,6 +77,8 @@ const sidebars = {
     {
       type: 'category',
       label: 'The Scrolls',
+      collapsible: true,
+      collapsed: true,
       link: { type: 'doc', id: 'background' },
       items: [
         { type: 'doc', id: 'villa_model' },
@@ -86,39 +86,21 @@ const sidebars = {
       ],
     },
     {
-      type: 'link',
-      label: 'Discord',
-      href: 'https://discord.gg/V4fJhvtaQn',
-    },
-    {
-      type: 'link',
-      label: 'Mailing list',
-      href: 'https://scrollprize.substack.com/',
-    },
-    {
-      type: 'link',
-      label: '𝕏',
-      href: 'https://x.com/scrollprize',
-    },
-    {
-      type: 'link',
-      label: 'Donate',
-      href: 'https://donate.stripe.com/aEUg101vt9eN8gM144',
-    },
-    { type: 'doc', id: 'jobs' },
-    {
       type: 'category',
       label: 'Archive',
       collapsible: true,
       collapsed: true,
       items: [
-        { type: 'doc', id: '28_2024_prizes' },
-        { type: 'doc', id: '30_2024_gp_submissions' },
+        { type: 'doc', id: 'grand_prize' },
+        { type: 'doc', id: 'ink_detection' },
         { type: 'doc', id: 'open_source_prizes' },
         { type: 'doc', id: 'private_prizes' },
+        { type: 'doc', id: '28_2024_prizes' },
+        { type: 'doc', id: '30_2024_gp_submissions' },
         { type: 'doc', id: 'submissions_closed' },
       ],
     },
+    { type: 'doc', id: 'jobs' },
   ],
 };
 

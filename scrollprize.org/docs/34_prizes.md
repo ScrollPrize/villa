@@ -2,7 +2,6 @@
 id: prizes
 title: "Open Prizes"
 sidebar_label: "Open Prizes"
-hide_table_of_contents: true
 ---
 
 <head>

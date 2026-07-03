@@ -1,7 +1,6 @@
 ---
 title: "Tutorial: Representation"
 sidebar_label: "Representation"
-hide_table_of_contents: true
 ---
 
 <head>

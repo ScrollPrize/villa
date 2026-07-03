@@ -1,6 +1,6 @@
 ---
 title: "Grand Prize submissions now closed"
-sidebar_label: "Announcement: Submissions now closed!"
+sidebar_label: "2024 Submissions Closed"
 hide_table_of_contents: true
 hide_title: true
 ---

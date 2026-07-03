@@ -1,6 +1,5 @@
 ---
 title: "Winners"
-hide_table_of_contents: true
 ---
 
 import PrizeCard from '@site/src/components/PrizeCard';

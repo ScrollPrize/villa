@@ -1,5 +1,6 @@
 ---
 title: "$100,000 Ink Detection (June 14th)"
+sidebar_label: "Kaggle Ink Detection 2023 (closed)"
 hide_table_of_contents: true
 ---
 
