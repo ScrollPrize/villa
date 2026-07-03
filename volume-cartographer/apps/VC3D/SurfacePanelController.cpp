@@ -36,6 +36,7 @@
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStyle>
+#include <QBrush>
 #include <QWidget>
 #include <QString>
 #include <QTreeWidget>
@@ -454,6 +455,7 @@ void SurfacePanelController::populateSurfaceTree()
         if (surf) {
             set_surface_tree_item_text(item, id, surf.get());
             updateTreeItemIcon(item);
+            applyTransformWarningStyle(item);
         } else {
             delete item;
         }
@@ -557,6 +559,7 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
             set_surface_tree_item_text(item, segId, surf.get());
             updateTreeItemIcon(item);
+            applyTransformWarningStyle(item);
         }
     } catch (const std::exception& e) {
         std::cout << "Failed to add segmentation " << segId << ": " << e.what() << std::endl;
@@ -1316,6 +1319,44 @@ void SurfacePanelController::setSelectionLocked(bool locked)
             if (!id.isEmpty()) {
                 _lockedSelectionIds.append(id);
             }
+        }
+    }
+}
+
+void SurfacePanelController::setTransformWarning(const QString& warningText)
+{
+    _transformWarningText = warningText;
+    if (!_ui.treeWidget) {
+        return;
+    }
+
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if (auto* item = dynamic_cast<SurfaceTreeWidgetItem*>(*it)) {
+            applyTransformWarningStyle(item);
+        }
+        ++it;
+    }
+}
+
+void SurfacePanelController::applyTransformWarningStyle(SurfaceTreeWidgetItem* item)
+{
+    if (!item) {
+        return;
+    }
+
+    const bool warning = !_transformWarningText.isEmpty();
+    const QBrush foreground = warning ? QBrush(QColor(QStringLiteral("#c62828"))) : QBrush();
+    for (int column = SURFACE_ID_COLUMN; column <= TIMESTAMP_COLUMN; ++column) {
+        item->setForeground(column, foreground);
+        if (warning) {
+            item->setToolTip(column, _transformWarningText);
+        } else if (column == SURFACE_ID_COLUMN) {
+            item->setToolTip(column, item->text(column));
+        } else if (column == SURFACE_LONG_ID_COLUMN) {
+            item->setToolTip(column, item->text(column));
+        } else {
+            item->setToolTip(column, QString());
         }
     }
 }

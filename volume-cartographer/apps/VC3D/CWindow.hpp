@@ -255,6 +255,7 @@ private slots:
     std::optional<cv::Matx44d> openDataVolumeTransformForSwitch(
         const std::string& fromLoadedVolumeId,
         const std::string& toLoadedVolumeId) const;
+    void updateOpenDataSegmentTransformState(bool showDialog = true);
     void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
@@ -298,12 +299,15 @@ private:
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
     QLabel* _segmentationGrowthWarning{nullptr};
+    QLabel* _segmentTransformWarning{nullptr};
     QLabel* _statusMessageLabel{nullptr};
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _sliceStepLabel{nullptr};
     QTimer* _statusMessageTimer{nullptr};
     QString _segmentationGrowthStatusText;
+    QString _lastSegmentTransformWarningVolumeId;
     bool _relayingNativeStatusMessage{false};
+    bool _resetNextSurfaceViewForVolumeShapeChange{false};
 
 
     Ui_VCMainWindow ui;

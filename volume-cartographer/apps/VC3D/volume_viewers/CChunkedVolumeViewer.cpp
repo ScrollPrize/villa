@@ -524,6 +524,18 @@ float scaleForCoarsestSegmentationRenderLevel(int numLevels)
     return std::clamp(0.75f / (dsScale * kSegmentationResolutionLodZoomBias), kMinScale, kMaxScale);
 }
 
+float fitScaleForExtent(float extentU, float extentV, int viewportW, int viewportH)
+{
+    constexpr float kFitPadding = 0.88f;
+    if (!(extentU > 0.0f) || !(extentV > 0.0f) || viewportW <= 0 || viewportH <= 0) {
+        return 1.0f;
+    }
+
+    const float scaleU = static_cast<float>(viewportW) / extentU;
+    const float scaleV = static_cast<float>(viewportH) / extentV;
+    return std::clamp(std::min(scaleU, scaleV) * kFitPadding, kMinScale, kMaxScale);
+}
+
 std::filesystem::path remoteCacheRootForState(const CState* state)
 {
     // Suggestion order: per-volpkg setting first (so projects with an
@@ -2281,6 +2293,76 @@ void CChunkedVolumeViewer::fitSurfaceInView()
     recalcPyramidLevel();
     _genCacheDirty = true;
     submitRender("fit surface in view");
+}
+
+void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
+{
+    if (_closing || !_view) {
+        return;
+    }
+
+    auto surf = _surfWeak.lock();
+    if (!_volume || !surf) {
+        return;
+    }
+
+    resizeFramebuffer();
+    const QSize viewportSize = _view->viewport()->size();
+    float minU = 0.0f;
+    float maxU = 0.0f;
+    float minV = 0.0f;
+    float maxV = 0.0f;
+    bool haveBounds = false;
+
+    if (dynamic_cast<PlaneSurface*>(surf.get())) {
+        updateContentBounds();
+        if (_contentMaxU > _contentMinU && _contentMaxV > _contentMinV) {
+            minU = _contentMinU;
+            maxU = _contentMaxU;
+            minV = _contentMinV;
+            maxV = _contentMaxV;
+            haveBounds = true;
+        }
+    } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+        try {
+            quad->ensureLoaded();
+            if (const cv::Mat_<cv::Vec3f>* points = quad->rawPointsPtr();
+                points && !points->empty()) {
+                const cv::Vec3f center = quad->center();
+                const cv::Vec2f gridScale = quad->scale();
+                minU = -center[0] * gridScale[0];
+                minV = -center[1] * gridScale[1];
+                maxU = static_cast<float>(points->cols - 1) - center[0] * gridScale[0];
+                maxV = static_cast<float>(points->rows - 1) - center[1] * gridScale[1];
+                haveBounds = maxU > minU && maxV > minV;
+            }
+        } catch (const std::exception& e) {
+            qWarning() << "Could not fit surface view:" << e.what();
+        }
+    }
+
+    if (!haveBounds) {
+        return;
+    }
+
+    _surfacePtrX = (minU + maxU) * 0.5f;
+    _surfacePtrY = (minV + maxV) * 0.5f;
+    _scale = fitScaleForExtent(maxU - minU,
+                               maxV - minV,
+                               viewportSize.width(),
+                               viewportSize.height());
+    _zOff = 0.0f;
+    _zOffWorldDir = {0, 0, 0};
+    recalcPyramidLevel();
+    _genCacheDirty = true;
+    updateFocusMarker();
+    if (forceRender) {
+        renderVisible(true, "reset view for current content");
+    } else {
+        submitRender("reset view for current content");
+    }
+    refreshSameWrapAnnotationOverlay();
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forceRender)

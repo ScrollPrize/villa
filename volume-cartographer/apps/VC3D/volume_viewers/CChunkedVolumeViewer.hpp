@@ -91,6 +91,7 @@ public:
     void adjustSurfaceOffset(float delta) override;
     void resetSurfaceOffsets() override;
     void fitSurfaceInView() override;
+    void resetViewForCurrentContent(bool forceRender = false) override;
     void notifyInteractiveViewChange(double motionPx);
 
     std::string surfName() const override { return _surfName; }
