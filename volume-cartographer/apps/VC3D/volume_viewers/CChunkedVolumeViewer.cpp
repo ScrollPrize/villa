@@ -763,6 +763,10 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
     _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
+    _linkedCursorViewTolerance = std::max(
+        0.0f,
+        s.value(viewer::POINT_COLLECTION_VIEW_TOLERANCE,
+                viewer::POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT).toFloat());
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, perf::INTERPOLATION_METHOD_DEFAULT).toInt();
     _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
     _maxDisplayedResolution = std::clamp(
@@ -3131,18 +3135,34 @@ std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtSceneP
 
 void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point)
 {
-    if (!_segmentationCursorMirroring || !point) {
+    auto hideCrosshair = [this]() {
         if (_cursorCrosshair) {
             _cursorCrosshair->hide();
         }
+    };
+
+    if (!_segmentationCursorMirroring || !point) {
+        hideCrosshair();
         return;
     }
 
-    const QPointF scenePos = volumeToScene(*point);
-    if (!std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
-        if (_cursorCrosshair) {
-            _cursorCrosshair->hide();
+    QPointF scenePos;
+    if (auto* plane = dynamic_cast<PlaneSurface*>(currentSurface())) {
+        const cv::Vec3f projected = plane->project(*point, 1.0f, 1.0f);
+        if (!std::isfinite(projected[0]) ||
+            !std::isfinite(projected[1]) ||
+            !std::isfinite(projected[2]) ||
+            std::abs(projected[2] - _zOff) > _linkedCursorViewTolerance) {
+            hideCrosshair();
+            return;
         }
+        scenePos = surfaceToScene(projected[0], projected[1]);
+    } else {
+        scenePos = volumeToScene(*point);
+    }
+
+    if (!std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        hideCrosshair();
         return;
     }
 
