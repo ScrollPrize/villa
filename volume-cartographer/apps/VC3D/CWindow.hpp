@@ -301,6 +301,8 @@ private:
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
+    QDockWidget* _inkDetectionDock{nullptr};
+    QDockWidget* _transformsDock{nullptr};
     AtlasControlPointsDock* _atlasControlDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceFiberDock{nullptr};

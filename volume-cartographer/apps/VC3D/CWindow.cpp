@@ -19,6 +19,7 @@
 
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
+#include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
 #include <QGridLayout>
 #include <QAction>
 #include <QVBoxLayout>
@@ -2385,6 +2386,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                ui.dockWidgetDistanceTransform,
                                _atlasOverviewDock,
                                _atlasSearchDock,
+                               ui.dockWidgetOverlay,
+                               _inkDetectionDock,
+                               _transformsDock,
                                static_cast<QDockWidget*>(_atlasControlDock),
                                _atlasWorkspaceOverviewDock,
                                _atlasWorkspaceSearchDock,
@@ -2415,6 +2419,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                ui.dockWidgetVolumes,
                                ui.dockWidgetViewerControls,
+                               ui.dockWidgetOverlay,
+                               _inkDetectionDock,
+                               _transformsDock,
                                _atlasOverviewDock,
                                _atlasSearchDock,
                                static_cast<QDockWidget*>(_atlasControlDock),
@@ -2451,6 +2458,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
+                                   ui.dockWidgetOverlay,
+                                   _inkDetectionDock,
+                                   _transformsDock,
                                    _atlasOverviewDock,
                                    _atlasSearchDock,
                                    static_cast<QDockWidget*>(_atlasControlDock),
@@ -2468,6 +2478,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     if (_statusDockPanelHost) {
         for (QDockWidget* dock : {ui.dockWidgetVolumes,
                                   ui.dockWidgetViewerControls,
+                                  ui.dockWidgetOverlay,
+                                  _inkDetectionDock,
+                                  _transformsDock,
                                   ui.dockWidgetSegmentation,
                                   _lasagnaDock,
                                   ui.dockWidgetDistanceTransform,
@@ -2764,6 +2777,8 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, ui.dockWidgetNormalVis);
     addDock(menu, ui.dockWidgetView);
     addDock(menu, ui.dockWidgetOverlay);
+    addDock(menu, _inkDetectionDock);
+    addDock(menu, _transformsDock);
     addDock(menu, ui.dockWidgetRenderSettings);
     addDock(menu, ui.dockWidgetComposite);
     addDock(menu, _lasagnaDock);
@@ -6966,6 +6981,20 @@ void CWindow::CreateWidgets(void)
     _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
                                                                  _viewerManager.get(),
                                                                  ui.dockWidgetViewerControlsContents);
+    _inkDetectionDock = new QDockWidget(tr("Ink Detection"), this);
+    _inkDetectionDock->setObjectName(QStringLiteral("dockWidgetInkDetection"));
+    attachScrollAreaToDock(_inkDetectionDock,
+                           new ViewerInkDetectionPanel(_viewerManager.get(), _inkDetectionDock),
+                           QStringLiteral("dockWidgetInkDetectionContent"));
+
+    _transformsDock = new QDockWidget(tr("Transforms"), this);
+    _transformsDock->setObjectName(QStringLiteral("dockWidgetTransforms"));
+    auto* transformsPanel = new ViewerTransformsPanel(_transformsDock);
+    attachScrollAreaToDock(_transformsDock,
+                           transformsPanel,
+                           QStringLiteral("dockWidgetTransformsContent"));
+    _viewerControlsPanel->setTransformsPanel(transformsPanel);
+
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomInRequested,
             this, &CWindow::onZoomIn);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomOutRequested,
@@ -6995,11 +7024,16 @@ void CWindow::CreateWidgets(void)
 
     _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
     _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetOverlay);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _inkDetectionDock);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _transformsDock);
+    _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetViewerControls, ui.dockWidgetOverlay, Qt::Vertical);
+    _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetOverlay, _inkDetectionDock, Qt::Vertical);
+    _segmentWorkspaceWindow->splitDockWidget(_inkDetectionDock, _transformsDock, Qt::Vertical);
 
     auto hideLegacyViewerDocks = [this]() {
         for (QDockWidget* dock : { ui.dockWidgetNormalVis,
                                    ui.dockWidgetView,
-                                   ui.dockWidgetOverlay,
                                    ui.dockWidgetRenderSettings,
                                    ui.dockWidgetComposite }) {
             if (!dock) {

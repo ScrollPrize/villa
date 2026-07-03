@@ -5,10 +5,8 @@
 #include "WindowRangeWidget.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
-#include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
 #include "viewer_controls/panels/ViewerNavigationPanel.hpp"
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
-#include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 #include "viewer_controls/panels/ViewerViewExtrasPanel.hpp"
 
 #include <QDoubleSpinBox>
@@ -72,16 +70,6 @@ void ViewerControlsPanel::addViewerGroups()
                    "viewer_controls/group_navigation_expanded",
                    true);
 
-    addViewerGroup(tr("Overlay"),
-                   detachScrollContents(_uiRefs.overlayScrollArea, _uiRefs.overlayContents),
-                   viewer::GROUP_OVERLAY_EXPANDED,
-                   viewer::GROUP_OVERLAY_EXPANDED_DEFAULT);
-
-    addViewerGroup(tr("Ink Detection"),
-                   new ViewerInkDetectionPanel(_viewerManager, _uiRefs.contents),
-                   "viewer_controls/group_ink_detection_expanded",
-                   true);
-
     ViewerCompositePanel::UiRefs compositeUi{
         .scrollArea = _uiRefs.compositeScrollArea,
         .contents = _uiRefs.compositeContents,
@@ -131,12 +119,6 @@ void ViewerControlsPanel::addViewerGroups()
                    normalPanel,
                    viewer::GROUP_NORMAL_VIS_EXPANDED,
                    viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
-
-    _transformsPanel = new ViewerTransformsPanel(_uiRefs.contents);
-    addViewerGroup(tr("Transforms"),
-                   _transformsPanel,
-                   viewer::GROUP_TRANSFORMS_EXPANDED,
-                   viewer::GROUP_TRANSFORMS_EXPANDED_DEFAULT);
 
     if (auto* layout = qobject_cast<QVBoxLayout*>(_uiRefs.contents->layout())) {
         layout->addStretch(1);

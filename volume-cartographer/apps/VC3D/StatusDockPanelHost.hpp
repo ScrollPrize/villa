@@ -61,8 +61,11 @@ private:
     int expandedPanelHeight() const;
     bool globalPointInsidePanelOrBar(const QPoint& globalPos) const;
     QString settingsKeyForItem(const Item& item) const;
+    QString visibilitySettingsKeyForItem(const Item& item) const;
     void loadPanelSize(Item& item);
     void savePanelSize(const Item& item) const;
+    bool loadItemVisibleInBar(const Item& item) const;
+    void saveItemVisibleInBar(const Item& item) const;
     QString itemSettingsId(const Item& item) const;
     void loadItemOrder();
     void saveItemOrder() const;
@@ -80,6 +83,7 @@ private:
     };
     ResizeMode resizeModeAtGlobalPoint(const QPoint& globalPos) const;
     void updateResizeCursor(const QPoint& globalPos);
+    void setResizeFeedback(ResizeMode mode);
 
     QVBoxLayout* _layout{nullptr};
     QFrame* _panelFrame{nullptr};
@@ -98,4 +102,6 @@ private:
     QPoint _dragStartGlobal;
     bool _buttonDragArmed{false};
     bool _draggingButton{false};
+    ResizeMode _resizeFeedbackMode{ResizeMode::None};
+    bool _resizeCursorOverridden{false};
 };

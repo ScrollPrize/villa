@@ -4,6 +4,7 @@
 
 #include <QApplication>
 #include <QAction>
+#include <QCursor>
 #include <QDockWidget>
 #include <QEvent>
 #include <QFrame>
@@ -30,8 +31,11 @@
 
 namespace {
 constexpr int kResizeHitWidth = 10;
+constexpr int kDefaultPanelWidth = 360;
+constexpr int kMinimumPanelWidth = 320;
 constexpr int kButtonDragHoldMs = 400;
 constexpr auto kPanelSizeSettingsPrefix = "statusDockPanels/sizes";
+constexpr auto kPanelVisibleSettingsPrefix = "statusDockPanels/visible";
 constexpr auto kPanelOrderSettingsKey = "statusDockPanels/order";
 
 QIcon makePinIcon(const QPalette& palette, bool pinned)
@@ -97,6 +101,8 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
         "QFrame#statusDockPanelFrame { background: palette(window); border-left: 1px solid palette(mid);"
         " border-bottom: 1px solid palette(mid); border-top: 5px solid palette(mid);"
         " border-right: 5px solid palette(mid); }"
+        "QFrame#statusDockPanelFrame[resizeHandleActive=\"true\"] {"
+        " border-top: 5px solid palette(highlight); border-right: 5px solid palette(highlight); }"
         "QWidget[statusDockPanelPage=\"true\"] { background: palette(window); }"
         "QFrame[statusDockPanelHeader=\"true\"] { background: palette(window);"
         " border-bottom: 1px solid palette(mid); }"
@@ -159,6 +165,7 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     item.dock = dock;
     item.content = content;
     loadPanelSize(item);
+    item.visibleInBar = loadItemVisibleInBar(item);
 
     auto* page = new QWidget(_stack);
     page->setObjectName(QStringLiteral("statusDockPanelPage_%1").arg(dock->objectName()));
@@ -213,12 +220,13 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     _items.push_back(item);
     _stack->addWidget(page);
     _barLayout->insertWidget(std::max(0, _barLayout->count() - 1), button);
+    button->setVisible(item.visibleInBar);
 
     if (QAction* action = dock->toggleViewAction()) {
         action->disconnect(dock);
         dock->disconnect(action);
         action->setCheckable(true);
-        action->setChecked(true);
+        action->setChecked(item.visibleInBar);
         connect(action, &QAction::toggled, this, [this, dock](bool checked) {
             if (Item* actionItem = itemForDock(dock)) {
                 setItemVisibleInBar(*actionItem, checked);
@@ -285,6 +293,12 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
                     if (_dragArmTimer) {
                         _dragArmTimer->start();
                     }
+                    const int buttonIndex = itemIndexForButton(button);
+                    if (buttonIndex >= 0 && buttonIndex < static_cast<int>(_items.size())) {
+                        toggleItem(_items[static_cast<std::size_t>(buttonIndex)]);
+                    }
+                    button->setDown(true);
+                    return true;
                 }
             } else if (event->type() == QEvent::MouseMove && _dragButton == button) {
                 auto* mouse = static_cast<QMouseEvent*>(event);
@@ -312,7 +326,7 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
                     return true;
                 }
             } else if (event->type() == QEvent::MouseButtonRelease && _dragButton == button) {
-                const bool wasDragInteraction = _buttonDragArmed || _draggingButton;
+                const bool wasDragInteraction = _draggingButton;
                 if (_draggingButton) {
                     saveItemOrder();
                 }
@@ -321,6 +335,8 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
                     return true;
                 }
                 resetButtonDragState(false);
+                button->setDown(false);
+                return true;
             }
         }
     }
@@ -541,6 +557,7 @@ void StatusDockPanelHost::setItemVisibleInBar(Item& item, bool visible)
     }
 
     item.visibleInBar = visible;
+    saveItemVisibleInBar(item);
     if (item.button) {
         item.button->setVisible(visible);
     }
@@ -656,12 +673,12 @@ void StatusDockPanelHost::positionPanelForItem(Item& item)
             contentSize = contentSize.expandedTo(item.content->sizeHint());
         }
         size = contentSize.expandedTo(
-            QSize(std::max(buttonGlobalRect.width(), item.button->sizeHint().width()),
+            QSize(std::max({kDefaultPanelWidth, buttonGlobalRect.width(), item.button->sizeHint().width()}),
                   expandedPanelHeight()));
         item.panelSize = size;
     }
 
-    const QSize minSize(std::max(80, item.button->minimumSizeHint().width()), 120);
+    const QSize minSize(std::max(kMinimumPanelWidth, item.button->minimumSizeHint().width()), 120);
     const QSize maxSize(std::max(minSize.width(), top->width() - 16),
                         std::max(minSize.height(), top->height() - 48));
     size = size.expandedTo(minSize).boundedTo(maxSize);
@@ -681,6 +698,7 @@ void StatusDockPanelHost::hidePanel()
     if (_panelFrame) {
         _panelFrame->hide();
     }
+    setResizeFeedback(ResizeMode::None);
 }
 
 int StatusDockPanelHost::expandedPanelHeight() const
@@ -719,6 +737,11 @@ QString StatusDockPanelHost::settingsKeyForItem(const Item& item) const
     return QStringLiteral("%1/%2").arg(QString::fromLatin1(kPanelSizeSettingsPrefix), itemSettingsId(item));
 }
 
+QString StatusDockPanelHost::visibilitySettingsKeyForItem(const Item& item) const
+{
+    return QStringLiteral("%1/%2").arg(QString::fromLatin1(kPanelVisibleSettingsPrefix), itemSettingsId(item));
+}
+
 void StatusDockPanelHost::loadPanelSize(Item& item)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -737,6 +760,18 @@ void StatusDockPanelHost::savePanelSize(const Item& item) const
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(settingsKeyForItem(item), item.panelSize);
+}
+
+bool StatusDockPanelHost::loadItemVisibleInBar(const Item& item) const
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(visibilitySettingsKeyForItem(item), true).toBool();
+}
+
+void StatusDockPanelHost::saveItemVisibleInBar(const Item& item) const
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(visibilitySettingsKeyForItem(item), item.visibleInBar);
 }
 
 QString StatusDockPanelHost::itemSettingsId(const Item& item) const
@@ -955,18 +990,45 @@ void StatusDockPanelHost::updateResizeCursor(const QPoint& globalPos)
     }
 
     const ResizeMode mode = _resizingPanel ? _resizeMode : resizeModeAtGlobalPoint(globalPos);
+    setResizeFeedback(mode);
+}
+
+void StatusDockPanelHost::setResizeFeedback(ResizeMode mode)
+{
+    if (!_panelFrame) {
+        return;
+    }
+    if (_resizeFeedbackMode == mode &&
+        _resizeCursorOverridden == (mode != ResizeMode::None)) {
+        return;
+    }
+
+    const bool shouldOverrideCursor = mode != ResizeMode::None;
+    if (_resizeCursorOverridden && (!shouldOverrideCursor || _resizeFeedbackMode != mode)) {
+        QApplication::restoreOverrideCursor();
+        _resizeCursorOverridden = false;
+    }
+
     switch (mode) {
     case ResizeMode::Both:
-        _panelFrame->setCursor(Qt::SizeBDiagCursor);
+        QApplication::setOverrideCursor(QCursor(Qt::SizeBDiagCursor));
+        _resizeCursorOverridden = true;
         break;
     case ResizeMode::Width:
-        _panelFrame->setCursor(Qt::SizeHorCursor);
+        QApplication::setOverrideCursor(QCursor(Qt::SizeHorCursor));
+        _resizeCursorOverridden = true;
         break;
     case ResizeMode::Height:
-        _panelFrame->setCursor(Qt::SizeVerCursor);
+        QApplication::setOverrideCursor(QCursor(Qt::SizeVerCursor));
+        _resizeCursorOverridden = true;
         break;
     case ResizeMode::None:
-        _panelFrame->unsetCursor();
         break;
     }
+
+    _resizeFeedbackMode = mode;
+    _panelFrame->setProperty("resizeHandleActive", shouldOverrideCursor);
+    _panelFrame->style()->unpolish(_panelFrame);
+    _panelFrame->style()->polish(_panelFrame);
+    _panelFrame->update();
 }

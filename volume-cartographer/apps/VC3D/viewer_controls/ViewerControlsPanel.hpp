@@ -75,6 +75,7 @@ public:
 
     ViewerTransformsPanel* transformsPanel() const { return _transformsPanel; }
     ViewerCompositePanel* compositePanel() const { return _compositePanel; }
+    void setTransformsPanel(ViewerTransformsPanel* panel) { _transformsPanel = panel; }
     void toggleSegmentationComposite();
     void setViewControlsEnabled(bool enabled);
     void setOverlayWindowAvailable(bool available);
