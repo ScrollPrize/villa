@@ -108,6 +108,18 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Files:** `src/components/Landing.js`, `src/css/{landing,chrome}.css`, `sidebars.js`, `docusaurus.config.js`, 11 docs edited, 3 docs deleted.
 **Verification:** build green (strict link check); redirect stubs serve 200 for all three removed slugs (no URL dies); harness on /, /data, /faq, /jobs + /get_started: 30/30 combos with 0 console errors, 0 overflow, 0 small tap targets; 773 local media refs across 87 pages all resolve.
 
+## C8 — owner requests round 2: hero CTAs, clickable stats, story trim, team layout
+
+**Why:** direct instructions from Giorgio during local validation.
+**What:**
+1. "Join Discord" outline button added next to the filled Get Started in the hero CTA row.
+2. The "35 scrolls scanned" and "1 scroll fully read" hero stats are now links opening the data browser (`/data_browser`); hover shows the ember accent.
+3. Story: the "2024 AD — New frontiers" chapter deleted (its two images stay on disk); timeline is now backstory-expander → 2023 → 2026.
+4. The 2026 chapter shows the unwrapped PHerc. 1667 banner (`banner-strip.webp` from the firstscroll post, 256KB, displayed as a 200px pannable strip linking to `/firstscroll`) and no longer mentions the Master Plan.
+5. Team layout: "Vesuvius Challenge Team" and the renamed "Vesuvius Challenge Papyrology Team" sit side by side; "EduceLab Team" is now collapsible and sits beside "Advisors & Alumni"; Papyrology Advisors unchanged below. Dead `.vc-story__pair` CSS removed.
+**Files:** `src/components/Landing.js`, `src/css/landing.css`.
+**Verification:** build green; landing capture at 5 viewports: 0 overflow, 0 small tap targets, 0 console errors; desktop height now 6,447px; layout screenshot-verified.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

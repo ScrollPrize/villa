@@ -419,19 +419,22 @@
   width: auto;
   max-width: none;
 }
-/* 2024 keeps its two-result pair. */
-.vc-landing .vc-story__pair {
-  display: flex;
-  gap: 12px;
-  max-width: 720px;
+/* Panorama as a link (2026 banner): block-level, pannable, click-through. */
+.vc-landing a.vc-panorama {
+  display: block;
   margin-top: 8px;
 }
-.vc-landing .vc-story__pair .vc-media {
-  width: calc(50% - 6px);
-  min-width: 0;
-  height: 200px;
-  object-fit: cover;
-  margin-top: 0;
+
+/* Clickable hero stats (scrolls scanned / read → data browser). */
+.vc-landing a.vc-stat {
+  text-decoration: none;
+  color: inherit;
+}
+.vc-landing a.vc-stat:hover .vc-stat__value {
+  color: var(--vc-accent);
+}
+.vc-landing a.vc-stat:hover .vc-stat__label {
+  color: var(--vc-text);
 }
 
 /* 2026 chapter: two flat open-prize stat cards. */
@@ -872,8 +875,7 @@
   }
   .vc-landing img.vc-story__media,
   .vc-landing video.vc-story__media,
-  .vc-landing .vc-panorama img,
-  .vc-landing .vc-story__pair .vc-media {
+  .vc-landing .vc-panorama img {
     height: 200px;
   }
   .vc-landing .vc-team {
@@ -888,12 +890,6 @@
 @media (max-width: 560px) {
   .vc-landing .vc-open-prizes {
     grid-template-columns: minmax(0, 1fr);
-  }
-  .vc-landing .vc-story__pair {
-    flex-direction: column;
-  }
-  .vc-landing .vc-story__pair .vc-media {
-    width: 100%;
   }
   .vc-landing a.vc-prize-row {
     grid-template-columns: minmax(0, 1fr) auto;

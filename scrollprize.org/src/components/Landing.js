@@ -27,8 +27,7 @@ const usd = new Intl.NumberFormat("en-US", {
 
 /* ---------------------------------------------------------------------------
    Story content (JSX-heavy, so it stays here; pure data lives in
-   landingData.js). One media element per chapter — except 2024, which keeps
-   its two-result pair (per audit §4).
+   landingData.js). One media element per chapter.
 --------------------------------------------------------------------------- */
 
 const storyImage = (src, alt) => (
@@ -145,36 +144,6 @@ const stories = ({ unrollVideo }) => [
             alt="Herculaneum scroll panorama"
             loading="lazy"
             decoding="async"
-          />
-        </div>
-      </>
-    ),
-  },
-  {
-    date: "2024 AD",
-    text: "New frontiers.",
-    description: (
-      <>
-        <p>
-          A widespread community effort builds on the success of the first
-          scroll, automating and refining the components of the virtual
-          unwrapping pipeline. Efforts to scan and read multiple scrolls are
-          underway. New text is revealed from another scroll.
-        </p>
-        <div className="vc-story__pair">
-          <img
-            src="/img/landing/patches.webp"
-            alt="Automatically segmented papyrus surface patches"
-            loading="lazy"
-            decoding="async"
-            className="vc-media"
-          />
-          <img
-            src="/img/landing/scroll5.webp"
-            alt="New text revealed from another scroll"
-            loading="lazy"
-            decoding="async"
-            className="vc-media"
           />
         </div>
       </>
@@ -546,18 +515,24 @@ export function Landing() {
                 <span className="vc-stat__value">$1,800,500</span>
                 <span className="vc-stat__label">awarded in prizes</span>
               </div>
-              <div className="vc-stat">
+              <a className="vc-stat vc-stat--link" href="/data_browser">
                 <span className="vc-stat__value">35</span>
                 <span className="vc-stat__label">scrolls scanned</span>
-              </div>
-              <div className="vc-stat">
+              </a>
+              <a className="vc-stat vc-stat--link" href="/data_browser">
                 <span className="vc-stat__value">1</span>
                 <span className="vc-stat__label">scroll fully read</span>
-              </div>
+              </a>
             </div>
             <div className="vc-hero__ctas">
               <a className="vc-btn" href="/get_started">
                 Get Started
+              </a>
+              <a
+                className="vc-btn-outline"
+                href="https://discord.gg/V4fJhvtaQn"
+              >
+                Join Discord
               </a>
               <a className="vc-cta" href="/firstscroll">
                 Read the breaking announcement
@@ -707,7 +682,7 @@ export function Landing() {
         </section>
 
         {/* ------------------------------------------------------------------
-            Our story — six beats on one hairline timeline. The 2026 chapter
+            Our story — five beats on one hairline timeline. The 2026 chapter
             carries the open prizes (merged per audit §4).
         ------------------------------------------------------------------ */}
         <section className="vc-section" aria-labelledby="our-story">
@@ -772,10 +747,20 @@ export function Landing() {
                     since the eruption in 79 AD — became the first Herculaneum
                     scroll to be virtually unwrapped and read end to end.
                     Vesuvius Challenge now moves onto its next stage: reading
-                    multiple entire scrolls. Read more about the prizes below,
-                    and how they contribute towards{" "}
-                    <a href="/master_plan">The Master Plan</a>.
+                    multiple entire scrolls. Read more about the prizes below.
                   </p>
+                  <a
+                    href="/firstscroll"
+                    className="vc-media vc-panorama"
+                    aria-label="The unwrapped writing surface of PHerc. 1667 — read the announcement"
+                  >
+                    <img
+                      src="/img/firstscroll/banner-strip.webp"
+                      alt="The unwrapped writing surface of PHerc. 1667, showing columns of ancient Greek text"
+                      loading="lazy"
+                      decoding="async"
+                    />
+                  </a>
                   <div className="vc-open-prizes">
                     {openPrizes.map((p) => (
                       <OpenPrize prize={p} key={p.title} />
@@ -873,9 +858,12 @@ export function Landing() {
             </p>
             <div className="vc-team">
               <TeamGroup title="Vesuvius Challenge Team" list={team.challenge} />
-              <TeamGroup title="EduceLab Team" list={team.educe} />
+              <TeamGroup
+                title="Vesuvius Challenge Papyrology Team"
+                list={team.papyrology}
+              />
+              <TeamGroup title="EduceLab Team" list={team.educe} collapsible />
               <TeamGroup title="Advisors & Alumni" list={team.alumni} collapsible />
-              <TeamGroup title="Papyrology Team" list={team.papyrology} />
               <TeamGroup
                 title="Papyrology Advisors"
                 list={team.papyrologyAdvisors}
