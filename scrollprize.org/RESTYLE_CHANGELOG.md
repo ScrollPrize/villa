@@ -37,6 +37,17 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Verification:** `yarn build` green under strict `onBrokenLinks: throw`; all 7 redirect routes generate; Discord URL verified against repo (`discord.gg/V4fJhvtaQn`).
 **Known follow-ups:** `static/llms.txt` still references `/open_problem_rep` (URL stays alive via redirect; text updated in C5); grandprize page still carries its inline gradient h1 (P2 polish, iteration round).
 
+## C3 — components + chrome: one card recipe, docs-page skin, tap targets
+
+**Why:** five shared components each carried their own visual system (6-layer shadows, rounded-2xl, three reds per card); docs pages had no coherent chrome (115-char lines, red link walls, six admonition hues, sub-44px tap targets).
+**What:**
+- `LatestPosts.js`: 4 shadowed cards → dense "Updates" strip (title 15px/600 + date, tabular numerals; 4-up → 2-up → single column responsive). Fetch/fallback logic untouched.
+- `TopCard.js` → flat `.vc-card` (now unused but kept); `PrizeCard.js` → flat card, $ amount is the single red; `BeforeAfter.js` → 2px ember divider + 24px round handle (drag/touch logic byte-identical); `TutorialsTop.js` → hairline-framed pipeline thumbs, ember active state (autoplay behavior kept).
+- `chrome.css` (15 sections): 56px navbar skin (blur, hairline, filled `vc-navbar-cta` button, 44px hamburger, safe-area), sidebar skin (uppercase faint category labels, ember active rule, no filled blocks), TOC skin, body-link discipline (neutral text + ember-tinted underline — un-reds FAQ/data/master_plan), ONE admonition recipe (covers `<Admonition>` and `<details>`), table skin (surface header, row hairlines, overflow-x scroll), code blocks 13.5px mono on #131518, framed content images (lightbox verified unaffected), dense footer band with 44px targets, visible heading anchors (incl. touch), focus-visible ember rings, docs content measure 720px.
+**Files:** `src/components/{LatestPosts,TopCard,PrizeCard,BeforeAfter,TutorialsTop}.js`, `src/css/chrome.css`.
+**Verification:** full `yarn build` exit 0 on the combined tree (C4 + C3 + WP1-in-flight).
+**Routed follow-ups:** `docs/15_winners.md` has ~15 hand-rolled `bg-[#444]` prize-card clones → convert in integration pass; optional prism theme swap dracula→vsDark (config) left for the iteration round.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

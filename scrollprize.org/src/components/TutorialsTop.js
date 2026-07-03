@@ -1,15 +1,18 @@
 import React from "react";
 
+// Pipeline thumbnail: quiet by default, framed media (hairline + 8px radius).
+// The current step (highlight) reads as active nav: surface row + ember label.
+// No shadows, no translate — hover is a surface tint only.
 function Thumb({ href, highlight, label, videoSrc, poster, imgSrc }) {
   return (
     <a
       href={href}
-      className={`mb-2 flex flex-col items-center w-[100px] sm:w-[150px] relative box-content p-2 sm:p-4 sm:pb-2 hover:bg-[#fefefe26] rounded-xl ${
-        highlight ? "bg-[#fffefc30] hover:bg-[#fefefe45]" : ""
+      className={`mb-2 flex flex-col items-center w-[100px] sm:w-[150px] relative box-content p-2 sm:p-4 sm:pb-2 rounded-lg border border-solid hover:bg-surface hover:no-underline ${
+        highlight ? "bg-surface border-line" : "border-transparent"
       }`}
     >
       {/* square media box */}
-      <div className="relative w-full aspect-square rounded-xl overflow-hidden mb-2">
+      <div className="relative w-full aspect-square rounded-lg overflow-hidden border border-solid border-line mb-2">
         {videoSrc ? (
           <video
             autoPlay
@@ -31,7 +34,13 @@ function Thumb({ href, highlight, label, videoSrc, poster, imgSrc }) {
           />
         )}
       </div>
-      <div className="text-sm">{label}</div>
+      <div
+        className={`text-sm ${
+          highlight ? "text-accent font-semibold" : "text-dim"
+        }`}
+      >
+        {label}
+      </div>
     </a>
   );
 }
@@ -48,7 +57,7 @@ export function TutorialsTop({ highlightId } = {}) {
       />
 
       <div className="hidden sm:flex mx-2 mb-2 flex-col items-center">
-        <div className="relative leading-[150px] py-4 w-[16px] text-center">→</div>
+        <div className="relative leading-[150px] py-4 w-[16px] text-center text-faint">→</div>
         <div className="text-sm">&nbsp;</div>
       </div>
 
@@ -61,7 +70,7 @@ export function TutorialsTop({ highlightId } = {}) {
       />
 
       <div className="hidden sm:flex mx-2 mb-2 flex-col items-center">
-        <div className="relative leading-[150px] py-4 w-[16px] text-center">→</div>
+        <div className="relative leading-[150px] py-4 w-[16px] text-center text-faint">→</div>
         <div className="text-sm">&nbsp;</div>
       </div>
 
@@ -74,7 +83,7 @@ export function TutorialsTop({ highlightId } = {}) {
       />
 
       <div className="hidden sm:flex mx-2 mb-2 flex-col items-center">
-        <div className="relative leading-[150px] py-4 w-[16px] text-center">→</div>
+        <div className="relative leading-[150px] py-4 w-[16px] text-center text-faint">→</div>
         <div className="text-sm">&nbsp;</div>
       </div>
 

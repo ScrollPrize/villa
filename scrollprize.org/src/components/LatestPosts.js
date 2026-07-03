@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from "react";
-import TopCard from "./TopCard";
 
-// Displays 4 TopCards: 1 permanent "Get Started" + 3 latest Substack posts
+// Dense "Updates" strip: 1 permanent "Get Started" entry + 3 latest Substack
+// posts, one compact row per entry (title 15px/600 + date 12px faint).
+// Layout/skin lives in chrome.css (.vc-updates): 4-up >=1280px, 2-up >=480px,
+// single column below 480px, hairline separators, no shadows.
 // Fetches posts from /data/latestPosts.json (generated at build time by fetchLatestPosts.js)
 // RSS feed is fetched from https://scrollprize.substack.com/feed during build
 
@@ -63,20 +65,21 @@ const LatestPosts = () => {
   }, []);
 
   return (
-    <div className="grid grid-cols-2 xl:grid-cols-4 gap-4 max-w-9xl pb-3">
-      <TopCard
-        title="Get Started"
-        href="/get_started"
-        subtext="$1.8M+ already awarded"
-        useArrow={true}
-      />
+    <div className="vc-updates mb-3" role="list">
+      <a className="vc-updates__item" href="/get_started" role="listitem">
+        <span className="vc-updates__title">Get Started</span>
+        <span className="vc-updates__meta">$1.8M+ already awarded</span>
+      </a>
       {posts.map((post, index) => (
-        <TopCard
+        <a
           key={index}
-          title={post.title}
+          className="vc-updates__item"
           href={post.href}
-          subtext={post.subtext}
-        />
+          role="listitem"
+        >
+          <span className="vc-updates__title">{post.title}</span>
+          <span className="vc-updates__meta">{post.subtext}</span>
+        </a>
       ))}
     </div>
   );

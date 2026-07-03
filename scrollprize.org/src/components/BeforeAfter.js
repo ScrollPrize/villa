@@ -43,7 +43,7 @@ const BeforeAfter = ({
   return (
     <div
       ref={containerRef}
-      className="h-80 rounded-xl relative inline-block overflow-hidden cursor-col-resize w-full max-w-4xl select-none"
+      className="h-80 rounded-lg border border-solid border-line relative inline-block overflow-hidden cursor-col-resize w-full max-w-4xl select-none"
       onMouseDown={handleMouseDown}
       onTouchStart={handleMouseDown}
       style={{
@@ -69,16 +69,12 @@ const BeforeAfter = ({
         }}
       />
 
+      {/* 2px ember divider + 24px round handle with hairline ring (spec §3) */}
       <div
-        className="absolute top-0 bottom-0 w-1 bg-orange-700"
+        className="absolute top-0 bottom-0 w-0.5 bg-accent"
         style={{ left: `${sliderPosition}%`, cursor: "col-resize" }}
       >
-        <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 w-6 h-6 bg-black rounded-full flex items-center justify-center">
-          <div className="flex items-center gap-1">
-            <div className="w-1 h-4 bg-orange-700"></div>
-            <div className="w-1 h-4 bg-orange-700"></div>
-          </div>
-        </div>
+        <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 w-6 h-6 bg-bg border border-solid border-line rounded-full"></div>
       </div>
     </div>
   );
