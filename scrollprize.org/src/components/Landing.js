@@ -600,11 +600,14 @@ export function Landing() {
                 }
               >
                 <p>
-                  A better image representation alone does not an unrolled
-                  scroll make. We need methods to better map the surfaces,
-                  stitch them where necessary, and extract them into readable
-                  sheets of papyrus. For a primer on current autosegmentation
-                  methods and their progress, read the{" "}
+                  Reading a scroll means tracing its wound layers through the
+                  CT scan, stitching them together, and flattening them into
+                  readable sheets of papyrus — this is how PHerc. 1667 was
+                  read end to end. Doing it for the whole library demands
+                  faster, more automated methods: today only 12 of the 45
+                  scrolls and fragments we have scanned are even in
+                  segmentation. For a primer on current methods and their
+                  progress, read the{" "}
                   <a href="/unwrapping">Virtual Unwrapping document</a>.
                 </p>
               </ChallengeBox>
@@ -627,10 +630,12 @@ export function Landing() {
                 }
               >
                 <p>
-                  We've so far recovered text from just four of the 35 scrolls
-                  we have scanned. Is the ink fundamentally different in the
-                  others? Is the papyrus surface? We're not yet sure. We are
-                  certain though that if it ever existed, it can be detected.
+                  The carbon ink is nearly invisible in the scans. Machine
+                  learning models have surfaced ink on 9 of the 45 scrolls and
+                  fragments we have scanned, and text has been recovered from
+                  just 4. Is the ink fundamentally different in the others? Is
+                  the papyrus surface? We're not yet sure — but we are certain
+                  that if it ever existed, it can be detected.
                 </p>
               </ChallengeBox>
             </div>

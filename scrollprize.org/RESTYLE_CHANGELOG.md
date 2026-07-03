@@ -134,6 +134,13 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Files:** `src/components/Landing.js`, `src/css/landing.css`.
 **Verification:** build green; landing capture ×5 viewports clean (0 overflow / 0 small taps / 0 console errors); desktop height now 5,867px; screenshot-verified.
 
+## C11 — owner requests round 5: open-problem captions grounded in dashboard data, "Extra" category
+
+1. Both open-problem captions rewritten to be internally consistent and current, grounded in the data browser dashboard (updated 2026-06-15: 45 scanned = 35 scrolls + 10 fragments, 12 in segmentation, 9 with ink results, 4 with recovered text): **Virtual Unwrapping** no longer opens with a dangling reference to the removed Representation card, uses "unwrapped" terminology, cites PHerc. 1667 end-to-end and the 12-of-45 segmentation gap; **Ink Detection** now says ink surfaced on 9 of 45 and text recovered from 4 (was "four of the 35"), keeping the "if it ever existed, it can be detected" close.
+2. Sidebar category "The Scrolls" renamed to **"Extra"** (still holds Villa Model + Livestreams).
+**Files:** `src/components/Landing.js`, `sidebars.js`.
+**Verification:** build green; captions confirmed in served HTML; capture ×2 routes ×5 viewports clean.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

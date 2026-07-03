@@ -74,7 +74,7 @@ const sidebars = {
     },
     {
       type: 'category',
-      label: 'The Scrolls',
+      label: 'Extra',
       collapsible: true,
       collapsed: true,
       items: [
