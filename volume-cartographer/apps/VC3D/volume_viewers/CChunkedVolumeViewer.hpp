@@ -96,6 +96,7 @@ public:
     std::string surfName() const override { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const override { return _volume; }
     float getCurrentScale() const override { return _scale; }
+    static float clampCameraScale(float scale);
     float dsScale() const override { return _dsScale; }
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;

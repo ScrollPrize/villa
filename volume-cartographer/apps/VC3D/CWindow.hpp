@@ -27,6 +27,7 @@
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
+#include "OpenDataManifest.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -249,6 +250,11 @@ private slots:
     QString lastVolumeSettingKeyForCurrentPackage() const;
     QString rememberedVolumeIdForCurrentPackage() const;
     void rememberCurrentVolumeForPackage(const QString& volumeId) const;
+    const vc3d::opendata::OpenDataManifest* cachedOpenDataManifest() const;
+    std::string openDataVolumeIdForLoadedVolumeId(const std::string& volumeId) const;
+    std::optional<cv::Matx44d> openDataVolumeTransformForSwitch(
+        const std::string& fromLoadedVolumeId,
+        const std::string& toLoadedVolumeId) const;
     void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
@@ -272,6 +278,8 @@ private:
     QComboBox* volSelect{nullptr};
     std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
     QComboBox* cmbSegmentationDir;
+    mutable bool _openDataManifestLoadAttempted{false};
+    mutable std::optional<vc3d::opendata::OpenDataManifest> _openDataManifestCache;
 
 
     SeedingWidget* _seedingWidget;

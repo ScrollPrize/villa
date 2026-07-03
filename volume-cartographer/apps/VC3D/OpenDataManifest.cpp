@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
 
@@ -122,6 +123,119 @@ nlohmann::json objectOrEmpty(const nlohmann::json& obj, const char* key)
         return *it;
     }
     return nlohmann::json::object();
+}
+
+std::optional<cv::Matx44d> matrixValue(const nlohmann::json& obj,
+                                       std::initializer_list<std::string_view> keys)
+{
+    if (!obj.is_object()) {
+        return std::nullopt;
+    }
+    const nlohmann::json* matrixJson = nullptr;
+    for (const auto key : keys) {
+        const auto it = obj.find(std::string(key));
+        if (it != obj.end() && it->is_array()) {
+            matrixJson = &*it;
+            break;
+        }
+    }
+    if (!matrixJson || (matrixJson->size() != 3 && matrixJson->size() != 4)) {
+        return std::nullopt;
+    }
+
+    cv::Matx44d matrix = cv::Matx44d::eye();
+    for (std::size_t r = 0; r < matrixJson->size(); ++r) {
+        const auto& row = matrixJson->at(r);
+        if (!row.is_array() || row.size() != 4) {
+            return std::nullopt;
+        }
+        for (std::size_t c = 0; c < 4; ++c) {
+            if (!row.at(c).is_number()) {
+                return std::nullopt;
+            }
+            const double value = row.at(c).get<double>();
+            if (!std::isfinite(value)) {
+                return std::nullopt;
+            }
+            matrix(static_cast<int>(r), static_cast<int>(c)) = value;
+        }
+    }
+
+    if (matrixJson->size() == 4) {
+        constexpr double eps = 1e-12;
+        if (std::abs(matrix(3, 0)) > eps ||
+            std::abs(matrix(3, 1)) > eps ||
+            std::abs(matrix(3, 2)) > eps ||
+            std::abs(matrix(3, 3) - 1.0) > eps) {
+            return std::nullopt;
+        }
+    }
+
+    return matrix;
+}
+
+std::vector<OpenDataVolumeTransformGroup> parseVolumeTransforms(const nlohmann::json& propertiesJson)
+{
+    std::vector<OpenDataVolumeTransformGroup> groups;
+    if (!propertiesJson.is_object()) {
+        return groups;
+    }
+    auto groupsIt = propertiesJson.find("volume_transforms");
+    const nlohmann::json* groupsJson =
+        (groupsIt != propertiesJson.end() && groupsIt->is_array()) ? &*groupsIt : nullptr;
+    if (!groupsJson) {
+        const auto nestedPropertiesIt = propertiesJson.find("properties");
+        if (nestedPropertiesIt != propertiesJson.end() && nestedPropertiesIt->is_object()) {
+            groupsIt = nestedPropertiesIt->find("volume_transforms");
+            if (groupsIt != nestedPropertiesIt->end() && groupsIt->is_array()) {
+                groupsJson = &*groupsIt;
+            }
+        }
+    }
+    if (!groupsJson) {
+        return groups;
+    }
+
+    groups.reserve(groupsJson->size());
+    for (const auto& groupJson : *groupsJson) {
+        if (!groupJson.is_object()) {
+            continue;
+        }
+        OpenDataVolumeTransformGroup group;
+        group.raw = groupJson;
+        group.fromVolumeId = stringValue(groupJson, {"from_volume_id", "fromVolumeId"}).value_or("");
+        const auto transformsIt = groupJson.find("transforms");
+        if (group.fromVolumeId.empty() ||
+            transformsIt == groupJson.end() ||
+            !transformsIt->is_array()) {
+            continue;
+        }
+
+        group.transforms.reserve(transformsIt->size());
+        for (const auto& transformJson : *transformsIt) {
+            if (!transformJson.is_object()) {
+                continue;
+            }
+            auto matrix = matrixValue(transformJson, {"matrix", "transformation_matrix"});
+            if (!matrix) {
+                continue;
+            }
+            OpenDataVolumeTransform transform;
+            transform.raw = transformJson;
+            transform.toVolumeId = stringValue(transformJson, {"to_volume_id", "toVolumeId"}).value_or("");
+            transform.derivationPath = stringValue(transformJson, {"derivation_path", "derivationPath"}).value_or("");
+            transform.matrix = *matrix;
+            if (!transform.toVolumeId.empty()) {
+                group.transforms.push_back(std::move(transform));
+            }
+        }
+
+        if (!group.transforms.empty()) {
+            groups.push_back(std::move(group));
+        }
+    }
+
+    return groups;
 }
 
 bool startsWith(std::string_view value, std::string_view prefix)
@@ -298,6 +412,7 @@ OpenDataSample parseSample(std::string id, const nlohmann::json& sampleJson)
     if (sample.properties.empty()) {
         sample.properties = objectOrEmpty(sampleJson, "properties");
     }
+    sample.volumeTransforms = parseVolumeTransforms(sample.properties);
     if (sampleJson.is_object()) {
         if (const auto sampleIt = sampleJson.find("sample"); sampleIt != sampleJson.end()) {
             sample.artifacts = parseArtifacts(*sampleIt);
@@ -588,6 +703,29 @@ const OpenDataArtifact* preferredPhotoArtifact(const OpenDataSample& sample) noe
                    type.find("thumbnail") != std::string::npos;
         });
     return it == sample.artifacts.end() ? nullptr : &*it;
+}
+
+std::optional<cv::Matx44d> findSampleVolumeTransform(
+    const OpenDataSample& sample,
+    std::string_view fromVolumeId,
+    std::string_view toVolumeId) noexcept
+{
+    if (fromVolumeId.empty() || toVolumeId.empty()) {
+        return std::nullopt;
+    }
+
+    for (const auto& group : sample.volumeTransforms) {
+        if (group.fromVolumeId != fromVolumeId) {
+            continue;
+        }
+        for (const auto& transform : group.transforms) {
+            if (transform.toVolumeId == toVolumeId) {
+                return transform.matrix;
+            }
+        }
+    }
+
+    return std::nullopt;
 }
 
 } // namespace vc3d::opendata

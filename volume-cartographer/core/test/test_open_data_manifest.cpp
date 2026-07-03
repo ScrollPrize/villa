@@ -219,6 +219,62 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     CHECK(segment.hasLayersZarr());
 }
 
+TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "metadata": {
+        "samples": {
+          "sample-a": {
+            "sample": {
+              "properties": {
+                "volume_transforms": [
+                  {
+                    "from_volume_id": "vol-a",
+                    "transforms": [
+                      {
+                        "to_volume_id": "vol-b",
+                        "matrix": [
+                          [0.5, 0.0, 0.0, 10.0],
+                          [0.0, 0.5, 0.0, 20.0],
+                          [0.0, 0.0, 0.5, 30.0]
+                        ],
+                        "derivation_path": "vol-a-vol-b"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "volumes": {
+              "vol-a": {"data_format": "zarr"},
+              "vol-b": {"data_format": "zarr"}
+            }
+          }
+        }
+      }
+    })");
+
+    const auto* sample = manifest.findSample("sample-a");
+    REQUIRE(sample != nullptr);
+    REQUIRE(sample->volumeTransforms.size() == 1);
+    CHECK(sample->volumeTransforms.front().fromVolumeId == "vol-a");
+    REQUIRE(sample->volumeTransforms.front().transforms.size() == 1);
+    CHECK(sample->volumeTransforms.front().transforms.front().toVolumeId == "vol-b");
+    CHECK(sample->volumeTransforms.front().transforms.front().derivationPath == "vol-a-vol-b");
+
+    const auto forward = findSampleVolumeTransform(*sample, "vol-a", "vol-b");
+    REQUIRE(forward.has_value());
+    CHECK((*forward)(0, 0) == doctest::Approx(0.5));
+    CHECK((*forward)(0, 3) == doctest::Approx(10.0));
+    CHECK((*forward)(1, 3) == doctest::Approx(20.0));
+    CHECK((*forward)(2, 3) == doctest::Approx(30.0));
+    CHECK((*forward)(3, 3) == doctest::Approx(1.0));
+
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "vol-b", "vol-a").has_value());
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "vol-a", "vol-c").has_value());
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "", "vol-b").has_value());
+}
+
 TEST_CASE("OpenDataManifest resolves public origins with the website rewrite table")
 {
     CHECK(resolveOpenDataUrl("s3://vesuvius-challenge-open-data/a/b") ==

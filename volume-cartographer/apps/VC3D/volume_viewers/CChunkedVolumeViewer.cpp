@@ -789,6 +789,11 @@ CChunkedVolumeViewer::CameraState CChunkedVolumeViewer::cameraState() const
     return state;
 }
 
+float CChunkedVolumeViewer::clampCameraScale(float scale)
+{
+    return std::clamp(scale, kMinScale, kMaxScale);
+}
+
 void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool forceRender)
 {
     if (_closing) {

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <opencv2/core/mat.hpp>
 
 namespace vc3d::opendata {
 
@@ -41,6 +42,19 @@ struct OpenDataArtifact {
     std::string accessUsage;
 
     [[nodiscard]] bool hasResolvedUrl() const noexcept;
+};
+
+struct OpenDataVolumeTransform {
+    std::string toVolumeId;
+    cv::Matx44d matrix = cv::Matx44d::eye();
+    std::string derivationPath;
+    nlohmann::json raw = nlohmann::json::object();
+};
+
+struct OpenDataVolumeTransformGroup {
+    std::string fromVolumeId;
+    std::vector<OpenDataVolumeTransform> transforms;
+    nlohmann::json raw = nlohmann::json::object();
 };
 
 struct OpenDataScan {
@@ -93,6 +107,7 @@ struct OpenDataSample {
     std::vector<OpenDataScan> scans;
     std::vector<OpenDataVolume> volumes;
     std::vector<OpenDataSegment> segments;
+    std::vector<OpenDataVolumeTransformGroup> volumeTransforms;
     nlohmann::json raw = nlohmann::json::object();
 
     [[nodiscard]] std::size_t scanCount() const noexcept;
@@ -143,5 +158,10 @@ struct OpenDataManifest {
 
 [[nodiscard]] const OpenDataArtifact* preferredPhotoArtifact(
     const OpenDataSample& sample) noexcept;
+
+[[nodiscard]] std::optional<cv::Matx44d> findSampleVolumeTransform(
+    const OpenDataSample& sample,
+    std::string_view fromVolumeId,
+    std::string_view toVolumeId) noexcept;
 
 } // namespace vc3d::opendata
