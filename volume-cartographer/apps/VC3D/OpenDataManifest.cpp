@@ -342,6 +342,7 @@ OpenDataScan parseScan(std::string id, const nlohmann::json& scanJson)
     scan.id = nestedStringValue(scanJson, {"id"}).value_or(std::move(id));
     scan.suffix = nestedStringValue(scanJson, {"suffix"}).value_or("");
     scan.createdAt = nestedStringValue(scanJson, {"created_at", "createdAt", "created"}).value_or("");
+    scan.pixelSizeUm = numberValue(scanJson, {"pixel_size_um", "pixelSizeUm", "resolution_um"});
     scan.properties = objectOrEmpty(scanJson, "properties");
     scan.artifacts = parseArtifacts(scanJson);
     scan.raw = scanJson.is_object() ? scanJson : nlohmann::json::object();
@@ -423,6 +424,23 @@ OpenDataSample parseSample(std::string id, const nlohmann::json& sampleJson)
     }
     sample.scans = parseObjectMap(sampleJson, "scans", parseScan);
     sample.volumes = parseObjectMap(sampleJson, "volumes", parseVolume);
+    for (auto& volume : sample.volumes) {
+        if (volume.pixelSizeUm && *volume.pixelSizeUm > 0.0) {
+            continue;
+        }
+        if (volume.scanId.empty()) {
+            continue;
+        }
+        const auto scanIt = std::find_if(
+            sample.scans.begin(), sample.scans.end(), [&](const OpenDataScan& scan) {
+                return scan.id == volume.scanId;
+            });
+        if (scanIt != sample.scans.end() &&
+            scanIt->pixelSizeUm &&
+            *scanIt->pixelSizeUm > 0.0) {
+            volume.pixelSizeUm = scanIt->pixelSizeUm;
+        }
+    }
     sample.segments = parseObjectMap(sampleJson, "segments", parseSegment);
     sample.raw = sampleJson.is_object() ? sampleJson : nlohmann::json::object();
     return sample;

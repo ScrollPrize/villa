@@ -61,6 +61,7 @@ struct OpenDataScan {
     std::string id;
     std::string suffix;
     std::string createdAt;
+    std::optional<double> pixelSizeUm;
     nlohmann::json properties = nlohmann::json::object();
     std::vector<OpenDataArtifact> artifacts;
     nlohmann::json raw = nlohmann::json::object();

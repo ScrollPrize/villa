@@ -219,6 +219,93 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     CHECK(segment.hasLayersZarr());
 }
 
+TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "samples": {
+        "sample-a": {
+          "scans": {
+            "scan-a": {
+              "properties": {
+                "pixel_size_um": 2.403,
+                "detector_distance_mm": 220.0
+              }
+            }
+          },
+          "volumes": {
+            "volume-with-properties": {
+              "scan_id": "scan-a",
+              "properties": {
+                "pixel_size_um": 7.91,
+                "detector_distance_mm": 12.5
+              },
+              "data": [{
+                "type": "ome-zarr",
+                "origins": [{
+                  "path": "sample-a/volumes/volume-with-properties.zarr",
+                  "access_roots": [{
+                    "type": "s3",
+                    "url": "s3://vesuvius-challenge-open-data/",
+                    "usage": "public-read"
+                  }]
+                }]
+              }]
+            },
+            "volume-from-scan": {
+              "scan_id": "scan-a",
+              "data": [{
+                "type": "ome-zarr",
+                "origins": [{
+                  "path": "sample-a/volumes/volume-from-scan.zarr",
+                  "access_roots": [{
+                    "type": "s3",
+                    "url": "s3://vesuvius-challenge-open-data/",
+                    "usage": "public-read"
+                  }]
+                }]
+              }]
+            }
+          }
+        }
+      }
+    })");
+
+    const auto* sample = manifest.findSample("sample-a");
+    REQUIRE(sample != nullptr);
+    REQUIRE(sample->scans.size() == 1);
+    REQUIRE(sample->scans.front().pixelSizeUm.has_value());
+    CHECK(*sample->scans.front().pixelSizeUm == doctest::Approx(2.403));
+    REQUIRE(sample->volumes.size() == 2);
+
+    const auto byId = [&](const std::string& id) -> const OpenDataVolume* {
+        const auto it = std::find_if(
+            sample->volumes.begin(), sample->volumes.end(), [&](const OpenDataVolume& volume) {
+                return volume.id == id;
+            });
+        return it == sample->volumes.end() ? nullptr : &*it;
+    };
+
+    const auto* volumeWithProperties = byId("volume-with-properties");
+    REQUIRE(volumeWithProperties != nullptr);
+    REQUIRE(volumeWithProperties->pixelSizeUm.has_value());
+    CHECK(*volumeWithProperties->pixelSizeUm == doctest::Approx(7.91));
+    const auto* volumeFromScan = byId("volume-from-scan");
+    REQUIRE(volumeFromScan != nullptr);
+    REQUIRE(volumeFromScan->pixelSizeUm.has_value());
+    CHECK(*volumeFromScan->pixelSizeUm == doctest::Approx(2.403));
+
+    auto pkg = VolumePkg::newEmpty();
+    const auto result = attachOpenDataSampleVolumes(*pkg, *sample);
+    CHECK(result.supportedVolumes == 2);
+    REQUIRE(pkg->volumeEntries().size() == 2);
+
+    const auto hasTag = [](const vc::project::Entry& entry, const std::string& tag) {
+        return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
+    };
+    CHECK(hasTag(pkg->volumeEntries()[0], "vc-open-data-voxel-size-um:7.910000"));
+    CHECK(hasTag(pkg->volumeEntries()[1], "vc-open-data-voxel-size-um:2.403000"));
+}
+
 TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
 {
     const auto manifest = parseOpenDataManifest(R"({
