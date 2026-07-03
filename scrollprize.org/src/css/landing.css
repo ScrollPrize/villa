@@ -419,10 +419,21 @@
   width: auto;
   max-width: none;
 }
-/* Panorama as a link (2026 banner): block-level, pannable, click-through. */
-.vc-landing a.vc-panorama {
+/* 2026 banner (PHerc. 1667): fixed crop of the middle-right region of the
+   4000×308 strip — object-position picks the visible window; click-through
+   to /firstscroll for the full pannable banner. */
+.vc-landing a.vc-banner-1667 {
   display: block;
+  height: 200px;
+  overflow: hidden;
   margin-top: 8px;
+}
+.vc-landing a.vc-banner-1667 img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 70% 50%;
+  max-width: none;
 }
 
 /* Clickable hero stats (scrolls scanned / read → data browser). */

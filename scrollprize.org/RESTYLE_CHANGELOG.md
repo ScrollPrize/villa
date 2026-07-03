@@ -120,6 +120,13 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Files:** `src/components/Landing.js`, `src/css/landing.css`.
 **Verification:** build green; landing capture at 5 viewports: 0 overflow, 0 small tap targets, 0 console errors; desktop height now 6,447px; layout screenshot-verified.
 
+## C9 — owner requests round 3: navbar Discord button, banner crop, Senators fold
+
+1. "Join Discord" is now also a navbar button (outline style, right side, next to the filled Get Started — the one-filled-element rule holds; drawer clone styled to match; auto external-link icon hidden for the button look). `docusaurus.config.js` + `chrome.css`.
+2. The 2026 PHerc. 1667 banner is a fixed crop of the middle-right region (`object-fit: cover; object-position: 70% 50%`) instead of a left-edge pannable strip — the sparse left edge looked poor; full banner remains one click away on `/firstscroll`. `Landing.js` + `landing.css`.
+3. The "Senators" sponsor tier is collapsible like Citizens. `Landing.js`.
+**Verification:** build green; landing capture ×5 viewports: 0 overflow / 0 small taps / 0 console errors; screenshot-verified.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

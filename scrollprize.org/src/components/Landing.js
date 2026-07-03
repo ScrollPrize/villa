@@ -751,7 +751,7 @@ export function Landing() {
                   </p>
                   <a
                     href="/firstscroll"
-                    className="vc-media vc-panorama"
+                    className="vc-media vc-banner-1667"
                     aria-label="The unwrapped writing surface of PHerc. 1667 — read the announcement"
                   >
                     <img
@@ -818,6 +818,7 @@ export function Landing() {
               list={sponsors.filter(
                 (s) => s.amount >= 50000 && s.amount < 200000
               )}
+              collapsible
             />
             <SponsorTier
               label="Up to $50,000"

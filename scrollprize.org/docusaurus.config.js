@@ -194,6 +194,12 @@ const config = {
               ],
             },
             {
+              href: "https://discord.gg/V4fJhvtaQn",
+              label: "Join Discord",
+              position: "right",
+              className: "vc-navbar-discord",
+            },
+            {
               to: "/get_started",
               label: "Get Started",
               position: "right",

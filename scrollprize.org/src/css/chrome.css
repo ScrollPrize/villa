@@ -207,6 +207,38 @@ h1, h2, h3, h4, h5, h6 {
   margin-top: 8px;
 }
 
+/* "Join Discord" navbar button — outline sibling of the filled CTA
+   (the spec's one-filled-element rule stays intact). */
+.navbar .vc-navbar-discord {
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+  padding: 7px 14px; /* 1px less than the CTA to offset the border */
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.2;
+  margin-left: 8px;
+}
+.navbar .vc-navbar-discord:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
+  text-decoration: none;
+}
+/* Button look: drop the auto external-link icon in the top bar. */
+.navbar .vc-navbar-discord svg {
+  display: none;
+}
+/* Drawer clone: centered outline row above the filled Get Started. */
+.menu__link.vc-navbar-discord,
+.menu__link.vc-navbar-discord:hover {
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+  justify-content: center;
+  font-weight: 650;
+  margin-top: 8px;
+}
+
 /* Hamburger: hidden >=997px (Infima default — do NOT force it visible
    globally, or it shows next to the full desktop navbar); >=44x44 hit area
    under 997px where the drawer lives (Gate 8; baseline was 30x30). */
