@@ -302,8 +302,21 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     const auto hasTag = [](const vc::project::Entry& entry, const std::string& tag) {
         return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
     };
-    CHECK(hasTag(pkg->volumeEntries()[0], "vc-open-data-voxel-size-um:7.910000"));
-    CHECK(hasTag(pkg->volumeEntries()[1], "vc-open-data-voxel-size-um:2.403000"));
+    const auto entryForVolumeId = [&](const std::string& id) -> const vc::project::Entry* {
+        const auto tag = "vc-open-data-volume-id:" + id;
+        const auto it = std::find_if(
+            pkg->volumeEntries().begin(), pkg->volumeEntries().end(), [&](const vc::project::Entry& entry) {
+                return hasTag(entry, tag);
+            });
+        return it == pkg->volumeEntries().end() ? nullptr : &*it;
+    };
+
+    const auto* volumeWithPropertiesEntry = entryForVolumeId("volume-with-properties");
+    REQUIRE(volumeWithPropertiesEntry != nullptr);
+    CHECK(hasTag(*volumeWithPropertiesEntry, "vc-open-data-voxel-size-um:7.910000"));
+    const auto* volumeFromScanEntry = entryForVolumeId("volume-from-scan");
+    REQUIRE(volumeFromScanEntry != nullptr);
+    CHECK(hasTag(*volumeFromScanEntry, "vc-open-data-voxel-size-um:2.403000"));
 }
 
 TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
