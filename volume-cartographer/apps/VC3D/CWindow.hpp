@@ -242,6 +242,9 @@ private slots:
     std::vector<QComboBox*> volumeSelectionControls() const;
     void connectVolumeSelector(QComboBox* selector);
     void clearSurfaceSelection();
+    QString lastVolumeSettingKeyForCurrentPackage() const;
+    QString rememberedVolumeIdForCurrentPackage() const;
+    void rememberCurrentVolumeForPackage(const QString& volumeId) const;
     void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);

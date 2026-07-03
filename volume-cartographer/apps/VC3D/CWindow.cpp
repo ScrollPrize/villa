@@ -3360,6 +3360,9 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
     _state->setCurrentVolume(newvol);
+    if (_state->currentVolume() && !_state->currentVolumeId().empty()) {
+        rememberCurrentVolumeForPackage(QString::fromStdString(_state->currentVolumeId()));
+    }
 
     const bool growthVolumeValid = _state->hasVpkg() && !_state->segmentationGrowthVolumeId().empty() &&
                                    _state->vpkg()->hasVolume(_state->segmentationGrowthVolumeId());
@@ -7567,6 +7570,58 @@ void CWindow::connectVolumeSelector(QComboBox* selector)
             });
 }
 
+QString CWindow::lastVolumeSettingKeyForCurrentPackage() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+
+    QString projectPath = QString::fromStdString(_state->vpkg()->path().string());
+    if (projectPath.isEmpty()) {
+        return {};
+    }
+
+    const QFileInfo info(projectPath);
+    QString stablePath = info.canonicalFilePath();
+    if (stablePath.isEmpty()) {
+        stablePath = info.absoluteFilePath();
+    }
+    if (stablePath.isEmpty()) {
+        stablePath = projectPath;
+    }
+
+    return QStringLiteral("%1%2").arg(
+        QString::fromLatin1(vc3d::settings::project::LAST_VOLUME_PREFIX),
+        QString::fromLatin1(QUrl::toPercentEncoding(stablePath)));
+}
+
+QString CWindow::rememberedVolumeIdForCurrentPackage() const
+{
+    const QString key = lastVolumeSettingKeyForCurrentPackage();
+    if (key.isEmpty()) {
+        return {};
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(key).toString();
+}
+
+void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
+{
+    if (volumeId.isEmpty() || !_state || !_state->vpkg() ||
+        !_state->vpkg()->hasVolume(volumeId.toStdString())) {
+        return;
+    }
+
+    const QString key = lastVolumeSettingKeyForCurrentPackage();
+    if (key.isEmpty()) {
+        return;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(key, volumeId);
+}
+
 QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)
 {
     auto* volumeSelector = new VolumeSelector(parent);
@@ -7614,6 +7669,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     QVector<QPair<QString, QString>> openDataVolumeIdMap;
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
+    const bool hasExplicitPreferredVolume = !activeCandidate.isEmpty();
     QString currentComboId;
     for (QComboBox* selector : selectors) {
         if (selector && selector->currentIndex() >= 0) {
@@ -7690,6 +7746,12 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
     if (!activeCandidate.isEmpty() && !hasVolume(activeCandidate)) {
         activeCandidate = openDataVolumeIdMappedToLoadedId(activeCandidate);
+    }
+    if (activeCandidate.isEmpty() && !hasExplicitPreferredVolume) {
+        const QString rememberedVolumeId = rememberedVolumeIdForCurrentPackage();
+        if (!rememberedVolumeId.isEmpty() && hasVolume(rememberedVolumeId)) {
+            activeCandidate = rememberedVolumeId;
+        }
     }
     if (activeCandidate.isEmpty() && !currentComboId.isEmpty() && hasVolume(currentComboId)) {
         activeCandidate = currentComboId;

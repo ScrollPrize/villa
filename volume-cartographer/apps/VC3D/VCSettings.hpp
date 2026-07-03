@@ -88,6 +88,7 @@ namespace project {
     constexpr auto DEFAULT_PATH = "project/default_path";
     constexpr auto AUTO_OPEN = "project/auto_open";
     constexpr auto RECENT = "project/recent";
+    constexpr auto LAST_VOLUME_PREFIX = "project/last_volume/";
 
     constexpr bool AUTO_OPEN_DEFAULT = true;
 }
