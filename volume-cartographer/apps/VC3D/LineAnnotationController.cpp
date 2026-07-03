@@ -33,7 +33,11 @@
 #include <QFutureWatcher>
 #include <QButtonGroup>
 #include <QColor>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QEvent>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -187,6 +191,166 @@ constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
 constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 using Clock = std::chrono::steady_clock;
+
+struct FiberJsonPathOptions {
+    fs::path path;
+    double scale = 1.0;
+};
+
+std::optional<FiberJsonPathOptions> showFiberJsonPathDialog(QWidget* parent,
+                                                            bool importMode,
+                                                            const fs::path& defaultDir)
+{
+    QDialog dialog(parent);
+    dialog.setWindowTitle(importMode
+                              ? QObject::tr("Import Fibers")
+                              : QObject::tr("Export Fibers"));
+
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* form = new QFormLayout();
+
+    auto* pathRow = new QWidget(&dialog);
+    auto* pathLayout = new QHBoxLayout(pathRow);
+    pathLayout->setContentsMargins(0, 0, 0, 0);
+    auto* pathEdit = new QLineEdit(pathRow);
+    pathEdit->setPlaceholderText(importMode
+                                     ? QObject::tr("Folder or .json path")
+                                     : QObject::tr(".json path"));
+    pathLayout->addWidget(pathEdit, 1);
+
+    auto defaultDirectory = QString::fromStdString(defaultDir.string());
+    if (importMode) {
+        auto* browseFileButton = new QPushButton(QObject::tr("File"), pathRow);
+        auto* browseFolderButton = new QPushButton(QObject::tr("Folder"), pathRow);
+        pathLayout->addWidget(browseFileButton);
+        pathLayout->addWidget(browseFolderButton);
+        QObject::connect(browseFileButton, &QPushButton::clicked, &dialog, [&]() {
+            const QString path = QFileDialog::getOpenFileName(
+                &dialog,
+                QObject::tr("Import fiber JSON"),
+                defaultDirectory,
+                QObject::tr("JSON files (*.json);;All files (*)"));
+            if (!path.isEmpty()) {
+                pathEdit->setText(path);
+            }
+        });
+        QObject::connect(browseFolderButton, &QPushButton::clicked, &dialog, [&]() {
+            const QString path = QFileDialog::getExistingDirectory(
+                &dialog,
+                QObject::tr("Import fiber JSON folder"),
+                defaultDirectory);
+            if (!path.isEmpty()) {
+                pathEdit->setText(path);
+            }
+        });
+    } else {
+        auto* browseButton = new QPushButton(QObject::tr("Browse"), pathRow);
+        pathLayout->addWidget(browseButton);
+        QObject::connect(browseButton, &QPushButton::clicked, &dialog, [&]() {
+            QString path = QFileDialog::getSaveFileName(
+                &dialog,
+                QObject::tr("Export fiber JSON"),
+                defaultDirectory,
+                QObject::tr("JSON files (*.json);;All files (*)"));
+            if (!path.isEmpty()) {
+                if (!path.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)) {
+                    path += QStringLiteral(".json");
+                }
+                pathEdit->setText(path);
+            }
+        });
+    }
+
+    auto* scaleSpin = new QDoubleSpinBox(&dialog);
+    scaleSpin->setRange(-1000000000.0, 1000000000.0);
+    scaleSpin->setDecimals(6);
+    scaleSpin->setSingleStep(0.25);
+    scaleSpin->setValue(1.0);
+
+    form->addRow(QObject::tr("Path:"), pathRow);
+    form->addRow(QObject::tr("Scale:"), scaleSpin);
+    layout->addLayout(form);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                                         &dialog);
+    layout->addWidget(buttons);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, [&]() {
+        const QString text = pathEdit->text().trimmed();
+        if (text.isEmpty()) {
+            QMessageBox::warning(&dialog,
+                                 dialog.windowTitle(),
+                                 QObject::tr("Enter a path."));
+            return;
+        }
+
+        const fs::path path(text.toStdString());
+        std::error_code ec;
+        const bool isDirectory = fs::is_directory(path, ec);
+        if (importMode) {
+            ec.clear();
+            const bool isRegularFile = fs::is_regular_file(path, ec);
+            if (!isDirectory && !isRegularFile) {
+                QMessageBox::warning(&dialog,
+                                     dialog.windowTitle(),
+                                     QObject::tr("Import path must be an existing folder or JSON file."));
+                return;
+            }
+            if (!isDirectory && path.extension() != ".json") {
+                QMessageBox::warning(&dialog,
+                                     dialog.windowTitle(),
+                                     QObject::tr("Import file must end in .json."));
+                return;
+            }
+        } else if (path.extension() != ".json") {
+            QMessageBox::warning(&dialog,
+                                 dialog.windowTitle(),
+                                 QObject::tr("Export path must end in .json."));
+            return;
+        }
+
+        if (!std::isfinite(scaleSpin->value())) {
+            QMessageBox::warning(&dialog,
+                                 dialog.windowTitle(),
+                                 QObject::tr("Scale must be a finite number."));
+            return;
+        }
+        dialog.accept();
+    });
+
+    if (dialog.exec() != QDialog::Accepted) {
+        return std::nullopt;
+    }
+
+    return FiberJsonPathOptions{fs::path(pathEdit->text().trimmed().toStdString()),
+                                scaleSpin->value()};
+}
+
+void writeJsonAtomic(const fs::path& finalPath, const nlohmann::json& root)
+{
+    std::error_code ec;
+    const fs::path parent = finalPath.parent_path();
+    if (!parent.empty()) {
+        fs::create_directories(parent, ec);
+        if (ec) {
+            throw std::runtime_error("Failed to create " + parent.string() + ": " + ec.message());
+        }
+    }
+
+    const fs::path tempPath = finalPath.string() + ".tmp";
+    {
+        std::ofstream out(tempPath);
+        if (!out) {
+            throw std::runtime_error("Failed to open " + tempPath.string());
+        }
+        out << root.dump(2) << '\n';
+    }
+    fs::rename(tempPath, finalPath, ec);
+    if (ec) {
+        fs::remove(tempPath);
+        throw std::runtime_error("Failed to replace " + finalPath.string() + ": " + ec.message());
+    }
+}
 
 bool atlasDebugEnabled()
 {
@@ -1783,6 +1947,183 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
         }
     }
     emitFiberSummaries();
+}
+
+void LineAnnotationController::importFibers()
+{
+    const fs::path dir = fibersDir();
+    if (dir.empty()) {
+        showError(tr("No volume package is loaded."));
+        return;
+    }
+
+    const auto options = showFiberJsonPathDialog(_parentWidget.data(), true, dir);
+    if (!options) {
+        return;
+    }
+
+    std::vector<StoredFiber> importedFibers;
+    int skipped = 0;
+
+    auto tryAddFiber = [&](std::optional<StoredFiber> fiber) {
+        if (!fiber) {
+            ++skipped;
+            return;
+        }
+        scaleStoredFiber(*fiber, options->scale);
+        importedFibers.push_back(std::move(*fiber));
+    };
+
+    try {
+        std::error_code ec;
+        if (fs::is_directory(options->path, ec)) {
+            std::vector<fs::path> fiberFiles;
+            for (const auto& entry : fs::directory_iterator(options->path, ec)) {
+                if (ec) {
+                    break;
+                }
+                if (entry.is_regular_file() && entry.path().extension() == ".json") {
+                    fiberFiles.push_back(entry.path());
+                }
+            }
+            std::sort(fiberFiles.begin(), fiberFiles.end());
+            for (const auto& path : fiberFiles) {
+                try {
+                    tryAddFiber(loadFiberFile(path));
+                } catch (const std::exception& ex) {
+                    ++skipped;
+                    Logger()->warn("Skipping invalid imported fiber JSON {}: {}",
+                                   path.string(),
+                                   ex.what());
+                }
+            }
+        } else {
+            std::ifstream in(options->path);
+            if (!in) {
+                throw std::runtime_error("Failed to open " + options->path.string());
+            }
+            const nlohmann::json root = nlohmann::json::parse(in);
+            if (root.is_array()) {
+                size_t index = 0;
+                for (const auto& item : root) {
+                    try {
+                        tryAddFiber(loadFiberJson(
+                            item,
+                            options->path.parent_path() /
+                                (options->path.stem().string() + "_" +
+                                 std::to_string(index++) + ".json")));
+                    } catch (const std::exception& ex) {
+                        ++skipped;
+                        Logger()->warn("Skipping invalid imported fiber entry in {}: {}",
+                                       options->path.string(),
+                                       ex.what());
+                    }
+                }
+            } else if (root.is_object() && root.value("type", std::string{}) == "vc3d_fiber") {
+                tryAddFiber(loadFiberJson(root, options->path));
+            } else {
+                const nlohmann::json* entries = nullptr;
+                if (root.is_object() && root.contains("point_collections")) {
+                    entries = &root.at("point_collections");
+                } else if (root.is_object() && root.contains("fibers")) {
+                    entries = &root.at("fibers");
+                }
+                if (!entries || !entries->is_array()) {
+                    throw std::runtime_error(
+                        "Import JSON must be a vc3d_fiber, an array of vc3d_fiber objects, "
+                        "or a bundle with point_collections/fibers");
+                }
+                size_t index = 0;
+                for (const auto& item : *entries) {
+                    try {
+                        tryAddFiber(loadFiberJson(
+                            item,
+                            options->path.parent_path() /
+                                (options->path.stem().string() + "_" +
+                                 std::to_string(index++) + ".json")));
+                    } catch (const std::exception& ex) {
+                        ++skipped;
+                        Logger()->warn("Skipping invalid imported fiber entry in {}: {}",
+                                       options->path.string(),
+                                       ex.what());
+                    }
+                }
+            }
+        }
+
+        if (importedFibers.empty()) {
+            showError(skipped > 0
+                          ? tr("No valid fibers were found. Skipped %1 invalid JSON item(s).")
+                                .arg(skipped)
+                          : tr("No fibers were found."));
+            return;
+        }
+
+        uint64_t nextSequence = nextFiberSequenceForUsername(currentFiberUsername());
+        std::unordered_set<std::string> reservedNames;
+        reservedNames.reserve(importedFibers.size());
+        for (auto& fiber : importedFibers) {
+            fiber.id = 0;
+            fiber.generation = std::max<uint64_t>(uint64_t{1}, fiber.generation);
+            if (fiber.username.empty()) {
+                fiber.username = currentFiberUsername();
+            }
+            if (fiber.startedAt.empty()) {
+                fiber.startedAt = currentFiberDateTimeString();
+            }
+            if (fiber.sequence == 0) {
+                fiber.sequence = nextSequence++;
+            }
+            fiber.fileName = uniqueImportedFiberFileName(fiber, reservedNames, nextSequence);
+            fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(fiber.controlPoints);
+            saveFiber(fiber);
+        }
+
+        loadFibersForCurrentPackage();
+        QMessageBox::information(_parentWidget.data(),
+                                 tr("Import Fibers"),
+                                 skipped > 0
+                                     ? tr("Imported %1 fiber(s). Skipped %2 invalid JSON item(s).")
+                                           .arg(importedFibers.size())
+                                           .arg(skipped)
+                                     : tr("Imported %1 fiber(s).").arg(importedFibers.size()));
+    } catch (const std::exception& ex) {
+        showError(tr("Could not import fibers: %1").arg(QString::fromStdString(ex.what())));
+    }
+}
+
+void LineAnnotationController::exportFibers()
+{
+    if (_fibers.empty()) {
+        showError(tr("There are no fibers to export."));
+        return;
+    }
+
+    const fs::path defaultDir = currentVolpkgRoot().empty() ? fibersDir() : currentVolpkgRoot();
+    const auto options = showFiberJsonPathDialog(_parentWidget.data(), false, defaultDir);
+    if (!options) {
+        return;
+    }
+
+    try {
+        nlohmann::json root = nlohmann::json::object();
+        root["type"] = "vc3d_fiber_collection";
+        root["version"] = 1;
+        root["scale"] = options->scale;
+        root["point_collections"] = nlohmann::json::array();
+        for (const auto& fiber : _fibers) {
+            root["point_collections"].push_back(fiberToJson(fiber, options->scale));
+        }
+
+        writeJsonAtomic(options->path, root);
+        QMessageBox::information(_parentWidget.data(),
+                                 tr("Export Fibers"),
+                                 tr("Exported %1 fiber(s) to %2.")
+                                     .arg(_fibers.size())
+                                     .arg(QString::fromStdString(options->path.string())));
+    } catch (const std::exception& ex) {
+        showError(tr("Could not export fibers: %1").arg(QString::fromStdString(ex.what())));
+    }
 }
 
 void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QString& tag)
@@ -5981,6 +6322,20 @@ double LineAnnotationController::lineLengthVx(const std::vector<cv::Vec3d>& poin
     return vc3d::line_annotation::fiberLineLengthVx(points);
 }
 
+void LineAnnotationController::scaleStoredFiber(StoredFiber& fiber, double scale)
+{
+    if (!std::isfinite(scale) || approximatelyEqual(scale, 1.0)) {
+        return;
+    }
+    for (auto& point : fiber.controlPoints) {
+        point = point * scale;
+    }
+    for (auto& point : fiber.linePoints) {
+        point = point * scale;
+    }
+    fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(fiber.controlPoints);
+}
+
 LineAnnotationController::CachedFiberAlignmentMetrics
 LineAnnotationController::calculateAlignmentMetricsForFiber(
     const StoredFiber& fiber,
@@ -6353,37 +6708,28 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
     }
 }
 
-void LineAnnotationController::saveFiber(const StoredFiber& fiber) const
+nlohmann::json LineAnnotationController::fiberToJson(const StoredFiber& fiber, double scale) const
 {
-    const fs::path dir = fibersDir();
-    if (dir.empty()) {
-        throw std::runtime_error("No volume package is loaded");
-    }
-
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) {
-        throw std::runtime_error("Failed to create fibers directory " +
-                                 dir.string() + ": " + ec.message());
-    }
+    StoredFiber serialized = fiber;
+    scaleStoredFiber(serialized, scale);
 
     nlohmann::json root = nlohmann::json::object();
     root["type"] = "vc3d_fiber";
     root["version"] = 1;
-    root["username"] = fiber.username;
-    root["started_at"] = fiber.startedAt;
-    root["sequence"] = fiber.sequence;
-    root["filename"] = fiber.fileName;
-    root["generation"] = fiber.generation;
-    root["tags"] = fiber.tags;
+    root["username"] = serialized.username;
+    root["started_at"] = serialized.startedAt;
+    root["sequence"] = serialized.sequence;
+    root["filename"] = serialized.fileName;
+    root["generation"] = serialized.generation;
+    root["tags"] = serialized.tags;
     root["hv_classification"] = {
-        {"z_distance", fiber.hvClassification.zDistance},
-        {"control_point_length", fiber.hvClassification.fiberLength},
-        {"horizontal_score", fiber.hvClassification.horizontalScore},
-        {"vertical_score", fiber.hvClassification.verticalScore},
-        {"automatic_tag", vc3d::line_annotation::fiberHvTagToString(fiber.hvClassification.automaticTag)},
-        {"automatic_certainty", fiber.hvClassification.automaticCertainty},
-        {"manual_tag", fiber.manualHvTag},
+        {"z_distance", serialized.hvClassification.zDistance},
+        {"control_point_length", serialized.hvClassification.fiberLength},
+        {"horizontal_score", serialized.hvClassification.horizontalScore},
+        {"vertical_score", serialized.hvClassification.verticalScore},
+        {"automatic_tag", vc3d::line_annotation::fiberHvTagToString(serialized.hvClassification.automaticTag)},
+        {"automatic_certainty", serialized.hvClassification.automaticCertainty},
+        {"manual_tag", serialized.manualHvTag},
     };
     root["branches"] = nlohmann::json::array();
     auto branchFileNameForId = [this](uint64_t fiberId) -> std::string {
@@ -6399,7 +6745,7 @@ void LineAnnotationController::saveFiber(const StoredFiber& fiber) const
         }
         return {};
     };
-    for (const auto& branch : fiber.branches) {
+    for (const auto& branch : serialized.branches) {
         if (branch.controlPointIndex < 0 || branch.branchFiberId == 0) {
             continue;
         }
@@ -6419,30 +6765,27 @@ void LineAnnotationController::saveFiber(const StoredFiber& fiber) const
     }
     root["control_points"] = nlohmann::json::array();
     root["line_points"] = nlohmann::json::array();
-    for (const auto& point : fiber.controlPoints) {
+    for (const auto& point : serialized.controlPoints) {
         root["control_points"].push_back(pointToJson(point));
     }
-    for (const auto& point : fiber.linePoints) {
+    for (const auto& point : serialized.linePoints) {
         root["line_points"].push_back(pointToJson(point));
     }
-
-    const fs::path finalPath = fiberPath(fiber);
-    const fs::path tempPath = finalPath.string() + ".tmp";
-    {
-        std::ofstream out(tempPath);
-        if (!out) {
-            throw std::runtime_error("Failed to open " + tempPath.string());
-        }
-        out << root.dump(2) << '\n';
-    }
-    fs::rename(tempPath, finalPath, ec);
-    if (ec) {
-        fs::remove(tempPath);
-        throw std::runtime_error("Failed to replace " + finalPath.string() + ": " + ec.message());
-    }
+    return root;
 }
 
-std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::loadFiberFile(
+void LineAnnotationController::saveFiber(const StoredFiber& fiber) const
+{
+    const fs::path dir = fibersDir();
+    if (dir.empty()) {
+        throw std::runtime_error("No volume package is loaded");
+    }
+
+    writeJsonAtomic(fiberPath(fiber), fiberToJson(fiber));
+}
+
+std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::loadFiberJson(
+    const nlohmann::json& root,
     const fs::path& path) const
 {
     std::string stem = path.stem().string();
@@ -6455,11 +6798,6 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
             return ch >= '0' && ch <= '9';
         });
 
-    std::ifstream in(path);
-    if (!in) {
-        throw std::runtime_error("Failed to open fiber file");
-    }
-    const nlohmann::json root = nlohmann::json::parse(in);
     const std::string type = root.value("type", std::string{});
     if (type != "vc3d_fiber") {
         return std::nullopt;
@@ -6577,6 +6915,66 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
         fiber.needsSave = true;
     }
     return fiber;
+}
+
+std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::loadFiberFile(
+    const fs::path& path) const
+{
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Failed to open fiber file");
+    }
+    const nlohmann::json root = nlohmann::json::parse(in);
+    return loadFiberJson(root, path);
+}
+
+std::string LineAnnotationController::uniqueImportedFiberFileName(
+    const StoredFiber& fiber,
+    std::unordered_set<std::string>& reserved,
+    uint64_t& nextSequence) const
+{
+    std::string requested = fs::path(fiber.fileName).filename().string();
+    if (requested.empty()) {
+        const std::string username = fiber.username.empty() ? currentFiberUsername() : fiber.username;
+        const std::string startedAt = fiber.startedAt.empty()
+            ? currentFiberDateTimeString()
+            : fiber.startedAt;
+        const uint64_t sequence = fiber.sequence == 0 ? nextSequence++ : fiber.sequence;
+        requested = vc3d::line_annotation::fiberFileName(username, startedAt, sequence);
+    }
+
+    if (fs::path(requested).extension() != ".json") {
+        requested += ".json";
+    }
+
+    const fs::path dir = fibersDir();
+    const std::string stem = fs::path(requested).stem().string();
+    const std::string extension = fs::path(requested).extension().string().empty()
+        ? ".json"
+        : fs::path(requested).extension().string();
+
+    auto available = [&](const std::string& candidate) {
+        if (candidate.empty() || reserved.count(candidate) != 0) {
+            return false;
+        }
+        std::error_code ec;
+        return !fs::exists(dir / candidate, ec);
+    };
+
+    if (available(requested)) {
+        reserved.insert(requested);
+        return requested;
+    }
+
+    for (uint64_t suffix = 1; suffix < std::numeric_limits<uint64_t>::max(); ++suffix) {
+        const std::string candidate = stem + "_import" + std::to_string(suffix) + extension;
+        if (available(candidate)) {
+            reserved.insert(candidate);
+            return candidate;
+        }
+    }
+
+    throw std::runtime_error("Could not find an available imported fiber file name");
 }
 
 void LineAnnotationController::showError(const QString& message) const

@@ -6974,6 +6974,14 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::renameFiberFile);
             connect(widget,
+                    &CFiberWidget::importFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::importFibers);
+            connect(widget,
+                    &CFiberWidget::exportFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::exportFibers);
+            connect(widget,
                     &CFiberWidget::metricsCalculationRequested,
                     _lineAnnotationController.get(),
                     [this](std::vector<uint64_t> orderedFiberIds) {

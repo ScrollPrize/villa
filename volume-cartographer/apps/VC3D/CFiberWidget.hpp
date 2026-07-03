@@ -93,6 +93,8 @@ signals:
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
+    void importFibersRequested();
+    void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
 
 private slots:
@@ -149,5 +151,7 @@ private:
     QPushButton* _manualVButton;
     QPushButton* _manualResetButton;
     QPushButton* _recalculateScoreButton;
+    QPushButton* _importButton;
+    QPushButton* _exportButton;
     QPushButton* _deleteButton;
 };
