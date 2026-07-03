@@ -1314,6 +1314,7 @@ void CChunkedVolumeViewer::syncCameraTransform()
     _camSurfY = _surfacePtrY;
     _camScale = _scale;
     updateDisplayedFramebufferMapping();
+    updateIntersectionPreviewTransform();
     updateFocusMarker();
     requestDirectPaint();
 }
