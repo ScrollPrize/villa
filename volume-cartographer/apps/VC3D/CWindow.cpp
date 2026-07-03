@@ -214,6 +214,28 @@ bool isOpenDataSegmentsEntry(const vc::project::Entry& entry)
     });
 }
 
+bool isAvailableOpenDataSegmentsEntry(const VolumePkg& pkg,
+                                      const vc::project::Entry& entry)
+{
+    if (!isOpenDataSegmentsEntry(entry)) {
+        return false;
+    }
+    if (vc::project::isLocationRemote(entry.location)) {
+        return true;
+    }
+
+    std::error_code ec;
+    const auto path = vc::project::resolveLocalPath(
+        entry.location,
+        pkg.path().parent_path());
+    if (!std::filesystem::is_directory(path, ec) || ec) {
+        return false;
+    }
+    return vc::project::validateLocation(
+        vc::project::Category::Segments,
+        path.string()).empty();
+}
+
 std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
                                                        const std::string& loadedVolumeId)
 {
@@ -251,7 +273,7 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
     const vc::project::Entry* sourceMatch = nullptr;
 
     for (const auto& entry : pkg.segmentEntries()) {
-        if (!isOpenDataSegmentsEntry(entry)) {
+        if (!isAvailableOpenDataSegmentsEntry(pkg, entry)) {
             continue;
         }
         if (std::find(entry.tags.begin(), entry.tags.end(), targetTag) != entry.tags.end()) {
@@ -284,7 +306,7 @@ const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumeP
 bool packageHasOpenDataSegments(const VolumePkg& pkg)
 {
     for (const auto& entry : pkg.segmentEntries()) {
-        if (isOpenDataSegmentsEntry(entry)) {
+        if (isAvailableOpenDataSegmentsEntry(pkg, entry)) {
             return true;
         }
     }
