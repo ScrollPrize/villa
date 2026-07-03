@@ -473,46 +473,67 @@ public:
     }
 
 protected:
-    void mousePressEvent(QMouseEvent* event) override
+    void showEvent(QShowEvent* event) override
     {
-        if (event && event->button() == Qt::LeftButton) {
-            const QModelIndex index = indexAt(event->pos());
+        // QComboBox's popup container filters viewport mouse events and closes
+        // the popup / selects the hovered row on release. Installing this
+        // filter on every show keeps it ahead of the container's, so clicks on
+        // the checkbox or palette controls can be consumed before the combo
+        // reacts to them.
+        viewport()->removeEventFilter(this);
+        viewport()->installEventFilter(this);
+        QListView::showEvent(event);
+    }
+
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (watched != viewport()) {
+            return QListView::eventFilter(watched, event);
+        }
+
+        switch (event->type()) {
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonDblClick: {
+            const auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() != Qt::LeftButton) {
+                break;
+            }
+            const QModelIndex index = indexAt(mouse->pos());
             const SegmentFolderControl control =
-                index.isValid() ? segmentFolderControlAt(visualRect(index), event->pos())
+                index.isValid() ? segmentFolderControlAt(visualRect(index), mouse->pos())
                                 : SegmentFolderControl::None;
             if (control != SegmentFolderControl::None) {
                 _pressedIndex = QPersistentModelIndex(index);
                 _pressedControl = control;
-                event->accept();
-                return;
+                return true;
             }
+            break;
         }
-
-        _pressedIndex = QPersistentModelIndex();
-        _pressedControl = SegmentFolderControl::None;
-        QListView::mousePressEvent(event);
-    }
-
-    void mouseReleaseEvent(QMouseEvent* event) override
-    {
-        if (event && event->button() == Qt::LeftButton && _pressedIndex.isValid()) {
-            const QModelIndex index = indexAt(event->pos());
+        case QEvent::MouseButtonRelease: {
+            const auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() != Qt::LeftButton || !_pressedIndex.isValid()) {
+                break;
+            }
+            const QModelIndex index = indexAt(mouse->pos());
             const SegmentFolderControl control =
                 index == QModelIndex(_pressedIndex)
-                    ? segmentFolderControlAt(visualRect(index), event->pos())
+                    ? segmentFolderControlAt(visualRect(index), mouse->pos())
                     : SegmentFolderControl::None;
-            if (control == _pressedControl) {
-                activateControl(QModelIndex(_pressedIndex), control);
-            }
+            const QModelIndex pressed(_pressedIndex);
+            const bool activate = control == _pressedControl;
             _pressedIndex = QPersistentModelIndex();
             _pressedControl = SegmentFolderControl::None;
-            event->accept();
-            return;
+            if (activate) {
+                activateControl(pressed, control);
+            }
+            // Swallow the release even on a cancelled press so the combo
+            // neither switches rows nor closes the popup.
+            return true;
         }
-
-        _pressedIndex = QPersistentModelIndex();
-        _pressedControl = SegmentFolderControl::None;
-        QListView::mouseReleaseEvent(event);
+        default:
+            break;
+        }
+        return QListView::eventFilter(watched, event);
     }
 
 private:
@@ -531,7 +552,10 @@ private:
         }
 
         if (control == SegmentFolderControl::Palette && _paletteCallback) {
-            _paletteCallback(index.row());
+            // Defer so the menu's nested event loop does not run inside this
+            // event filter while the popup is still dispatching the release.
+            const int row = index.row();
+            QTimer::singleShot(0, this, [this, row]() { _paletteCallback(row); });
         }
     }
 
