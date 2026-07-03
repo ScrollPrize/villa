@@ -1221,25 +1221,15 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
 
 void CChunkedVolumeViewer::updateScalebarScale()
 {
-    // The scalebar overlay (CVolumeViewerView::drawForeground) needs µm per scene
-    // pixel, where one scene pixel == one rendered framebuffer pixel (the framebuffer
-    // is blitted 1:1, so the view transform m11 ~= 1 and does NOT carry the zoom).
-    // The zoom + LOD live in the FRAMEBUFFER render, not the view transform:
-    //   - 1 framebuffer px = 1/_scale render-LOD voxels (gen steps gridScale/_scale).
-    //   - 1 render-LOD voxel = _dsScale level-0 voxels = _dsScale * voxelSize µm.
-    // => µm/px = voxelSize * _dsScale / _scale. Must be recomputed on every zoom AND
-    // LOD change (both happen here) -- the old code set it once at volume-load with
-    // the wrong formula (voxelSize/_dsScale, zoom ignored), so the bar was wrong at
-    // every zoom level.
+    // Scene pixels are framebuffer pixels. `_scale` is the camera zoom in
+    // framebuffer pixels per level-0 voxel-space unit; render LOD changes which
+    // zarr level is sampled, not the physical size of the view.
     if (!_view || !_volume)
         return;
-    // Voxel size (µm per level-0 voxel) comes from the selected volume's metadata.
-    // Catalog volumes normalize their per-volume metadata.json into Volume::voxelSize().
     double voxel = _volume->voxelSize();
     if (!(voxel > 0.0) || !(_scale > 0.0f))
         return;
-    const double umPerScenePx =
-        voxel * static_cast<double>(_dsScale) / static_cast<double>(_scale);
+    const double umPerScenePx = voxel / static_cast<double>(_scale);
     _view->setVoxelSize(umPerScenePx, umPerScenePx);
 }
 
