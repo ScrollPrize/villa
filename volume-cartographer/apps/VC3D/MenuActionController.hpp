@@ -17,6 +17,7 @@ class Volume;
 
 namespace vc3d::opendata {
 struct OpenDataSample;
+class OpenDataCatalogWindow;
 }
 
 class MenuActionController : public QObject
@@ -33,6 +34,8 @@ public:
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
+    void showOpenDataCatalog();
+    bool isOpenDataCatalogVisible() const;
 
 private slots:
     void newProject();
@@ -46,7 +49,6 @@ private slots:
     void openVolpkg();
     void openRecentVolpkg();
     void attachRemoteZarr();
-    void showOpenDataCatalog();
     void showSettingsDialog();
     void showAboutDialog();
     void showKeybindings();
@@ -69,6 +71,7 @@ signals:
     // wires this to SegmentationCommandHandler::onMergePatch with an
     // empty seed list so the dialog opens with empty combo boxes.
     void mergePatchFromMenuRequested();
+    void openDataCatalogVisibilityChanged(bool visible);
 
 private:
     QStringList loadRecentPaths() const;
@@ -138,4 +141,5 @@ private:
     QAction* _recalculateFiberScoresAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
+    QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
 };

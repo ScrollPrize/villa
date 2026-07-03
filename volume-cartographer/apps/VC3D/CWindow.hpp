@@ -106,6 +106,8 @@ class ViewerTransformsPanel;
 class LineAnnotationController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
+class StatusDockPanelHost;
+class ViewerCompositePanel;
 
 class CWindow : public QMainWindow
 {
@@ -179,6 +181,9 @@ private:
 
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);
+    void updateVolumePackageEmptyState();
+    void showStatusBarMessage(const QString& text, int timeout = 0);
+    void clearStatusBarMessage();
 
 
     // Helper method for command line tools
@@ -241,6 +246,9 @@ private slots:
     std::vector<QComboBox*> volumeSelectionControls() const;
     void connectVolumeSelector(QComboBox* selector);
     void clearSurfaceSelection();
+    QString lastVolumeSettingKeyForCurrentPackage() const;
+    QString rememberedVolumeIdForCurrentPackage() const;
+    void rememberCurrentVolumeForPackage(const QString& volumeId) const;
     void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
@@ -282,20 +290,26 @@ private:
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
     QLabel* _segmentationGrowthWarning{nullptr};
+    QLabel* _statusMessageLabel{nullptr};
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _sliceStepLabel{nullptr};
+    QTimer* _statusMessageTimer{nullptr};
     QString _segmentationGrowthStatusText;
+    bool _relayingNativeStatusMessage{false};
 
 
     Ui_VCMainWindow ui;
     QTabWidget* _workspaceTabs{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
+    StatusDockPanelHost* _statusDockPanelHost{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
+    QDockWidget* _inkDetectionDock{nullptr};
+    QDockWidget* _transformsDock{nullptr};
     AtlasControlPointsDock* _atlasControlDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceFiberDock{nullptr};
@@ -330,6 +344,7 @@ private:
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
     std::unique_ptr<ViewerControlsPanel> _viewerControlsPanel;
+    ViewerCompositePanel* _viewerCompositePanel{nullptr};
     bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 

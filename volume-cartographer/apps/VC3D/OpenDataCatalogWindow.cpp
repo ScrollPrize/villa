@@ -28,6 +28,7 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSaveFile>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSplitter>
@@ -516,8 +517,14 @@ void OpenDataCatalogWindow::buildUi()
     _statusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     _syncSampleCacheButton = new QPushButton(tr("Sync Local Data"), this);
     _openSampleButton = new QPushButton(tr("Open Sample"), this);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    _doNotShowOnNextOpenCheck = new QCheckBox(tr("Do not show on next open"), this);
+    _doNotShowOnNextOpenCheck->setChecked(
+        !settings.value(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
+                        vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT).toBool());
     auto* closeButton = new QPushButton(tr("Close"), this);
     bottomRow->addWidget(_statusLabel, 1);
+    bottomRow->addWidget(_doNotShowOnNextOpenCheck);
     bottomRow->addWidget(_syncSampleCacheButton);
     bottomRow->addWidget(_openSampleButton);
     bottomRow->addWidget(closeButton);
@@ -546,6 +553,11 @@ void OpenDataCatalogWindow::buildUi()
     connect(_openSegmentCacheFolderButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentCacheFolder);
     connect(_syncSampleCacheButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::syncSelectedSampleCache);
     connect(_openSampleButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSample);
+    connect(_doNotShowOnNextOpenCheck, &QCheckBox::toggled, this, [](bool checked) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
+                          checked ? QStringLiteral("0") : QStringLiteral("1"));
+    });
     connect(closeButton, &QPushButton::clicked, this, &QDialog::accept);
 
     clearDetails();

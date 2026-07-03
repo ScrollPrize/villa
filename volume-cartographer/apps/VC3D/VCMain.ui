@@ -144,6 +144,13 @@
      <item>
       <layout class="QVBoxLayout" name="verticalLayout">
        <item>
+        <widget class="QPushButton" name="btnOpenDataCatalog">
+         <property name="text">
+          <string>Open Data Catalog</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QGroupBox" name="grpVolManager">
          <property name="minimumSize">
           <size>

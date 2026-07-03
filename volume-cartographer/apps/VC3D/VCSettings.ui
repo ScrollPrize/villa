@@ -41,7 +41,7 @@
             <string>Auto open last used *.volpkg upon app start</string>
            </property>
            <property name="checked">
-            <bool>true</bool>
+            <bool>false</bool>
            </property>
           </widget>
          </item>
