@@ -533,14 +533,23 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
                     const int totalDone = progress.completedSegments + progress.failedSegments;
                     const QString segment = QString::fromStdString(progress.segmentId);
                     const QString file = QString::fromStdString(progress.fileName);
-                    QString label = QObject::tr("Downloading segments with %1 worker(s): %2/%3 segments, %4/%5 files.")
-                                        .arg(progress.totalWorkers)
-                                        .arg(totalDone)
-                                        .arg(progress.totalSegments)
-                                        .arg(progress.completedFiles)
-                                        .arg(progress.totalFiles);
+                    const QString status = QString::fromStdString(progress.status);
+                    const bool transforming = status.startsWith(QStringLiteral("transform-"));
+                    QString label = transforming
+                        ? QObject::tr("Transforming segments with %1 worker(s): %2/%3 transforms.")
+                              .arg(progress.totalWorkers)
+                              .arg(totalDone)
+                              .arg(progress.totalSegments)
+                        : QObject::tr("Downloading segments with %1 worker(s): %2/%3 segments, %4/%5 files.")
+                              .arg(progress.totalWorkers)
+                              .arg(totalDone)
+                              .arg(progress.totalSegments)
+                              .arg(progress.completedFiles)
+                              .arg(progress.totalFiles);
                     if (!segment.isEmpty() && !file.isEmpty()) {
-                        label += QObject::tr("\n%1: %2").arg(segment, file);
+                        label += transforming
+                            ? QObject::tr("\n%1 -> %2").arg(segment, file)
+                            : QObject::tr("\n%1: %2").arg(segment, file);
                     } else if (!segment.isEmpty()) {
                         label += QObject::tr("\n%1").arg(segment);
                     }

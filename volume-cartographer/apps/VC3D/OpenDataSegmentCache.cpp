@@ -1710,7 +1710,11 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     std::map<std::string, int> transformedByTarget;
     if (!transformTasks.empty()) {
         std::atomic_size_t nextTransform{0};
+        std::atomic_int completedTransforms{0};
+        std::atomic_int failedTransforms{0};
+        std::atomic_int activeTransformWorkers{0};
         std::mutex transformResultMutex;
+        std::mutex transformProgressMutex;
         const auto hardware = std::thread::hardware_concurrency();
         const std::size_t desiredWorkers = hardware == 0 ? 4 : hardware;
         const std::size_t transformWorkerCount = std::min<std::size_t>(
@@ -1719,6 +1723,25 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
                 ? 1
                 : std::max<std::size_t>(2, std::min<std::size_t>(desiredWorkers, 8)));
 
+        auto emitTransformProgress = [&](const TransformTask* task, std::string status) {
+            OpenDataSampleDownloadProgress progress;
+            progress.totalSegments = static_cast<int>(transformTasks.size());
+            progress.completedSegments = completedTransforms.load(std::memory_order_relaxed);
+            progress.failedSegments = failedTransforms.load(std::memory_order_relaxed);
+            progress.totalFiles = static_cast<int>(transformTasks.size());
+            progress.completedFiles = progress.completedSegments + progress.failedSegments;
+            progress.activeWorkers = activeTransformWorkers.load(std::memory_order_relaxed);
+            progress.totalWorkers = static_cast<int>(transformWorkerCount);
+            if (task && task->segment) {
+                progress.segmentId = segmentLabel(*task->segment);
+                progress.fileName = task->targetVolumeId;
+            }
+            progress.status = std::move(status);
+            std::lock_guard<std::mutex> lk(transformProgressMutex);
+            reportProgress(progressCallback, progress);
+        };
+        emitTransformProgress(nullptr, "transform-starting");
+
         auto transformWorker = [&]() {
             for (;;) {
                 const std::size_t idx = nextTransform.fetch_add(1);
@@ -1726,6 +1749,8 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
                     return;
                 }
                 const auto& task = transformTasks[idx];
+                activeTransformWorkers.fetch_add(1, std::memory_order_relaxed);
+                emitTransformProgress(&task, "transform-segment-start");
                 const auto sourceSegmentDir = openDataSegmentCacheDirectory(
                     remoteCacheRoot, sample, *task.segment);
                 const auto targetSegmentDir = openDataTransformedSegmentCacheDirectory(
@@ -1737,14 +1762,19 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
                                                                        targetSegmentDir,
                                                                        task.targetVolumeId,
                                                                        &error);
+                activeTransformWorkers.fetch_sub(1, std::memory_order_relaxed);
                 std::lock_guard<std::mutex> lk(transformResultMutex);
                 if (transformed) {
                     ++result.transformedTifxyzSegments;
                     ++transformedByTarget[task.targetVolumeId];
+                    completedTransforms.fetch_add(1, std::memory_order_relaxed);
+                    emitTransformProgress(&task, "transform-segment-done");
                 } else {
                     ++result.failedTransformedTifxyzSegments;
+                    failedTransforms.fetch_add(1, std::memory_order_relaxed);
                     result.messages.push_back("Failed to transform " + segmentLabel(*task.segment) +
                                               " to " + task.targetVolumeId + ": " + error);
+                    emitTransformProgress(&task, "transform-segment-failed");
                 }
             }
         };
@@ -1757,6 +1787,7 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         for (auto& t : transformWorkers) {
             t.join();
         }
+        emitTransformProgress(nullptr, "transform-finished");
     }
 
     for (const auto& [targetVolumeId, transformedForTarget] : transformedByTarget) {
