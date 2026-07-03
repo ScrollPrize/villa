@@ -36,7 +36,7 @@ const sidebars = {
       type: 'category',
       label: 'Data',
       collapsible: true,
-      collapsed: true,
+      collapsed: false,
       link: { type: 'doc', id: 'data' },
       items: [
         { type: 'doc', id: 'data_browser', label: 'Data Browser' },

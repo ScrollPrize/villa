@@ -141,6 +141,11 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Files:** `src/components/Landing.js`, `sidebars.js`.
 **Verification:** build green; captions confirmed in served HTML; capture ×2 routes ×5 viewports clean.
 
+## C12 — owner requests round 6: sidebar default-expansion policy
+
+Sidebar now opens with only **Overview** and **Data** expanded by default; Tutorials, Milestones & Results, Extra, and Archive start collapsed and auto-expand only when the visited page lives inside them (Docusaurus native active-path expansion). Change: `Data` category `collapsed: true → false` in `sidebars.js` (Overview was already expanded; the rest already collapsed).
+**Verification:** screenshots — `/get_started` shows Overview+Data open, others closed; `/tutorial1` additionally shows Tutorials auto-expanded with the active item highlighted.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
