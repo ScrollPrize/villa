@@ -3,6 +3,7 @@
 #include "VCSettings.hpp"
 
 #include <QApplication>
+#include <QAction>
 #include <QDockWidget>
 #include <QEvent>
 #include <QFrame>
@@ -16,6 +17,7 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QStyle>
 #include <QToolButton>
@@ -194,6 +196,18 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     _stack->addWidget(page);
     _barLayout->insertWidget(std::max(0, _barLayout->count() - 1), button);
 
+    if (QAction* action = dock->toggleViewAction()) {
+        action->disconnect(dock);
+        dock->disconnect(action);
+        action->setCheckable(true);
+        action->setChecked(true);
+        connect(action, &QAction::toggled, this, [this, index](bool checked) {
+            if (index >= 0 && index < static_cast<int>(_items.size())) {
+                setItemVisibleInBar(_items[static_cast<std::size_t>(index)], checked);
+            }
+        });
+    }
+
     connect(button, &QPushButton::clicked, this, [this, index]() {
         if (index >= 0 && index < static_cast<int>(_items.size())) {
             toggleItem(_items[static_cast<std::size_t>(index)]);
@@ -230,6 +244,7 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     });
 
     updateButton(_items.back());
+    syncViewAction(_items.back());
 }
 
 bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
@@ -327,6 +342,10 @@ int StatusDockPanelHost::itemIndex(const Item& item) const
 
 void StatusDockPanelHost::toggleItem(Item& item)
 {
+    if (!item.visibleInBar) {
+        return;
+    }
+
     if (item.detached) {
         attachItem(item, true);
         return;
@@ -342,7 +361,7 @@ void StatusDockPanelHost::toggleItem(Item& item)
 
 void StatusDockPanelHost::expandItem(Item& item)
 {
-    if (!item.page) {
+    if (!item.visibleInBar || !item.page) {
         return;
     }
 
@@ -376,7 +395,7 @@ void StatusDockPanelHost::collapseCurrent()
 
 void StatusDockPanelHost::detachItem(Item& item)
 {
-    if (!item.dock || !item.content || !item.page || item.detached) {
+    if (!item.visibleInBar || !item.dock || !item.content || !item.page || item.detached) {
         return;
     }
 
@@ -414,12 +433,54 @@ void StatusDockPanelHost::attachItem(Item& item, bool expand)
     }
 }
 
+void StatusDockPanelHost::setItemVisibleInBar(Item& item, bool visible)
+{
+    if (item.visibleInBar == visible) {
+        syncViewAction(item);
+        return;
+    }
+
+    if (!visible) {
+        if (item.detached) {
+            attachItem(item, false);
+        }
+        if (_currentIndex == itemIndex(item)) {
+            collapseCurrent();
+        }
+        item.pinned = false;
+    }
+
+    item.visibleInBar = visible;
+    if (item.button) {
+        item.button->setVisible(visible);
+    }
+    if (item.dock && !item.detached) {
+        item.dock->hide();
+    }
+    updateButton(item);
+    syncViewAction(item);
+}
+
+void StatusDockPanelHost::syncViewAction(Item& item)
+{
+    if (!item.dock) {
+        return;
+    }
+
+    if (QAction* action = item.dock->toggleViewAction()) {
+        const QSignalBlocker blocker(action);
+        action->setCheckable(true);
+        action->setChecked(item.visibleInBar);
+    }
+}
+
 void StatusDockPanelHost::showItemMenu(Item& item, const QPoint& globalPos)
 {
     QMenu menu(this);
     QAction* pin = menu.addAction(item.pinned ? tr("Unpin") : tr("Pin open"));
     pin->setEnabled(!item.detached);
     QAction* detach = menu.addAction(item.detached ? tr("Attach to status bar") : tr("Detach"));
+    QAction* close = menu.addAction(tr("Close"));
 
     QAction* selected = menu.exec(globalPos);
     if (selected == pin) {
@@ -434,6 +495,8 @@ void StatusDockPanelHost::showItemMenu(Item& item, const QPoint& globalPos)
         } else {
             detachItem(item);
         }
+    } else if (selected == close) {
+        setItemVisibleInBar(item, false);
     }
 }
 

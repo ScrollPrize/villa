@@ -37,6 +37,7 @@ private:
         QPointer<QPushButton> button;
         QPointer<QToolButton> pinButton;
         QSize panelSize;
+        bool visibleInBar = true;
         bool pinned = false;
         bool detached = false;
         bool userSized = false;
@@ -49,6 +50,8 @@ private:
     void collapseCurrent();
     void detachItem(Item& item);
     void attachItem(Item& item, bool expand);
+    void setItemVisibleInBar(Item& item, bool visible);
+    void syncViewAction(Item& item);
     void showItemMenu(Item& item, const QPoint& globalPos);
     void updateButton(Item& item);
     void showPanelForItem(Item& item);
