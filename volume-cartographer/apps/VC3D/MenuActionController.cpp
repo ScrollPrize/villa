@@ -627,7 +627,7 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
                        .arg(result.attachedSegmentEntries);
     }
     if (_window->statusBar()) {
-        _window->statusBar()->showMessage(message, 7000);
+        _window->showStatusBarMessage(message, 7000);
     }
 
     if (result.supportedVolumes == 0 ||
@@ -810,7 +810,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
         _attachRemoteZarrAct->setEnabled(false);
     }
     if (_window->statusBar()) {
-        _window->statusBar()->showMessage(QObject::tr("Attaching remote zarr..."));
+        _window->showStatusBarMessage(QObject::tr("Attaching remote zarr..."));
     }
 
     auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
@@ -850,7 +850,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                         _window->_state->vpkg()->addVolumeEntry(url.trimmed().toStdString());
 
                         if (_window->statusBar()) {
-                            _window->statusBar()->showMessage(
+                            _window->showStatusBarMessage(
                                 QObject::tr("Attached remote zarr: %1")
                                     .arg(QString::fromStdString(volume->id())),
                                 5000);
@@ -1097,7 +1097,7 @@ void MenuActionController::toggleDrawBBox(bool enabled)
         if (viewer && viewer->surfName() == "segmentation") {
             viewer->setBBoxMode(enabled);
             if (_window->statusBar()) {
-                _window->statusBar()->showMessage(enabled ? QObject::tr("BBox mode active: drag on Surface view")
+                _window->showStatusBarMessage(enabled ? QObject::tr("BBox mode active: drag on Surface view")
                                                          : QObject::tr("BBox mode off"),
                                                   3000);
             }
@@ -1122,18 +1122,18 @@ void MenuActionController::surfaceFromSelection()
     VolumeViewerBase* segViewer = _window->segmentationBaseViewer();
 
     if (!segViewer) {
-        _window->statusBar()->showMessage(QObject::tr("No Surface viewer found"), 3000);
+        _window->showStatusBarMessage(QObject::tr("No Surface viewer found"), 3000);
         return;
     }
 
     auto sels = segViewer->selections();
     if (sels.empty()) {
-        _window->statusBar()->showMessage(QObject::tr("No selections to convert"), 3000);
+        _window->showStatusBarMessage(QObject::tr("No selections to convert"), 3000);
         return;
     }
 
     if (_window->_state->activeSurfaceId().empty() || !_window->_state->vpkg()->getSurface(_window->_state->activeSurfaceId())) {
-        _window->statusBar()->showMessage(QObject::tr("Select a segmentation first"), 3000);
+        _window->showStatusBarMessage(QObject::tr("Select a segmentation first"), 3000);
         return;
     }
 
@@ -1157,7 +1157,7 @@ void MenuActionController::surfaceFromSelection()
             filtered->save(outDir.string(), newId);
             created++;
         } catch (const std::exception& e) {
-            _window->statusBar()->showMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);
+            _window->showStatusBarMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);
         }
     }
 
@@ -1165,12 +1165,12 @@ void MenuActionController::surfaceFromSelection()
         if (_window->_surfacePanel) {
             _window->_surfacePanel->reloadSurfacesFromDisk();
         }
-        _window->statusBar()->showMessage(QObject::tr("Created %1 surface(s) from selection").arg(created), 5000);
+        _window->showStatusBarMessage(QObject::tr("Created %1 surface(s) from selection").arg(created), 5000);
     } else {
         if (_window->_surfacePanel) {
             _window->_surfacePanel->refreshFiltersOnly();
         }
-        _window->statusBar()->showMessage(QObject::tr("No surfaces created from selection"), 3000);
+        _window->showStatusBarMessage(QObject::tr("No surfaces created from selection"), 3000);
     }
 }
 
@@ -1182,12 +1182,12 @@ void MenuActionController::clearSelection()
 
     VolumeViewerBase* segViewer = _window->segmentationBaseViewer();
     if (!segViewer) {
-        _window->statusBar()->showMessage(QObject::tr("No Surface viewer found"), 3000);
+        _window->showStatusBarMessage(QObject::tr("No Surface viewer found"), 3000);
         return;
     }
 
     segViewer->clearSelections();
-    _window->statusBar()->showMessage(QObject::tr("Selections cleared"), 2000);
+    _window->showStatusBarMessage(QObject::tr("Selections cleared"), 2000);
 }
 
 void MenuActionController::importObjAsPatch()
@@ -1292,7 +1292,7 @@ void MenuActionController::beginRotateSurfaceTransform()
 
     _window->_surfaceRotationOverlay->beginRotate();
     if (_window->statusBar()) {
-        _window->statusBar()->showMessage(QObject::tr("Surface rotation active"), 3000);
+        _window->showStatusBarMessage(QObject::tr("Surface rotation active"), 3000);
     }
 }
 

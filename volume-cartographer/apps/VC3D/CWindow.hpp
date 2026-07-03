@@ -295,6 +295,7 @@ private:
     QLabel* _sliceStepLabel{nullptr};
     QTimer* _statusMessageTimer{nullptr};
     QString _segmentationGrowthStatusText;
+    bool _relayingNativeStatusMessage{false};
 
 
     Ui_VCMainWindow ui;

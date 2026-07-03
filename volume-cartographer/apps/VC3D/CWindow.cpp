@@ -55,6 +55,7 @@
 #include <QLineEdit>
 #include <QDoubleSpinBox>
 #include <QSpinBox>
+#include <QStatusBar>
 #include <QSizePolicy>
 #include <QTimer>
 #include <QSize>
@@ -2317,7 +2318,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     if (_statusDockPanelHost) {
         if (auto* statusDockBar = _statusDockPanelHost->takeBarWidget()) {
             statusDockBar->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
-            statusBar()->insertWidget(0, statusDockBar, 1);
+            statusBar()->insertWidget(0, statusDockBar, 0);
         }
     }
 
@@ -2333,6 +2334,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _statusMessageTimer = new QTimer(this);
     _statusMessageTimer->setSingleShot(true);
     connect(_statusMessageTimer, &QTimer::timeout, this, &CWindow::clearStatusBarMessage);
+    connect(statusBar(), &QStatusBar::messageChanged, this, [this](const QString& message) {
+        if (_relayingNativeStatusMessage || message.isEmpty()) {
+            return;
+        }
+
+        _relayingNativeStatusMessage = true;
+        showStatusBarMessage(message, 0);
+        statusBar()->clearMessage();
+        _relayingNativeStatusMessage = false;
+    });
 
     // create UI widgets
     CreateWidgets();
