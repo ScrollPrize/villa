@@ -558,12 +558,15 @@ void SurfacePanelController::populateSurfaceTree()
 
     std::vector<std::string> ids;
     if (!_visibleSegmentFolders.empty() && _state) {
+        // Surfaces from other checked folders stay loaded for viewer overlaps
+        // but are not listed in the tree.
         ids = _state->surfaceNames();
-        ids.erase(std::remove_if(ids.begin(), ids.end(), [](const std::string& id) {
+        ids.erase(std::remove_if(ids.begin(), ids.end(), [this](const std::string& id) {
             return id == "segmentation" ||
                    id == "xy plane" ||
                    id == "seg xz" ||
-                   id == "seg yz";
+                   id == "seg yz" ||
+                   _multiFolderSurfaceIds.count(id) > 0;
         }), ids.end());
         std::sort(ids.begin(), ids.end());
     } else {
