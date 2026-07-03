@@ -141,7 +141,11 @@ const config = {
         blog: false,
         theme: {
           customCss: [
+            require.resolve("./src/css/tokens.css"),
+            require.resolve("./src/css/utilities.css"),
             require.resolve("./src/css/custom.css"),
+            require.resolve("./src/css/chrome.css"),
+            require.resolve("./src/css/landing.css"),
             require.resolve("./src/css/imageZoom.css"),
           ],
         },

@@ -13,24 +13,34 @@
 @tailwind components;
 @tailwind utilities;
 
-/* You can override the default Infima variables here. */
+/* Infima bridge — Obsidian tokens (from tokens.css) drive the Infima ramp.
+   The site is dark-only, so the light-mode :root ramp points at the same
+   tokens (values killed per spec §1). One accent token collapses the old
+   7-step red ramp — hover feedback in the new design is border/bg, not shade. */
 :root {
-  /* From https://colorbox.io/?c0=%26p%24s%24%3D7%26p%24h%24st%24%3D10%26p%24h%24e%24%3D0%26p%24h%24c%24%3Deqo%26p%24sa%24st%24%3D0.3%26p%24sa%24e%24%3D1%26p%24sa%24r%24%3D1%26p%24sa%24c%24%3Deqo%26p%24b%24st%24%3D1%26p%24b%24e%24%3D0.33%26p%24b%24c%24%3Deqti%26o%24n%24%3DRed%26o%24ms%24%3D%5B%5D%26o%24ro%24%3Dccw */
-  --ifm-color-primary-lightest: #ffbfb3;
-  --ifm-color-primary-lighter: #fe8a7a;
-  --ifm-color-primary-light: #fb564a;
-  --ifm-color-primary: #f42f27;
-  --ifm-color-primary-dark: #e41511;
-  --ifm-color-primary-darker: #a80504;
-  --ifm-color-primary-darkest: #540000;
+  --ifm-color-primary-lightest: var(--vc-accent);
+  --ifm-color-primary-lighter: var(--vc-accent);
+  --ifm-color-primary-light: var(--vc-accent);
+  --ifm-color-primary: var(--vc-accent);
+  --ifm-color-primary-dark: var(--vc-accent);
+  --ifm-color-primary-darker: var(--vc-accent);
+  --ifm-color-primary-darkest: var(--vc-accent);
+  --ifm-background-color: var(--vc-bg);
+  --ifm-font-family-base: var(--vc-font);
   --ifm-code-font-size: 95%;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
-  --doc-sidebar-width: 230px !important;
+  --docusaurus-highlighted-code-line-bg: var(--vc-raised);
+  --doc-sidebar-width: 260px !important;
   /* --ifm-navbar-background-color: white;
   --ifm-navbar-link-color: white; */
 
   --ifm-navbar-padding-vertical: 0px;
   --ifm-navbar-height: 45px;
+
+  /* Docs heading sizes (spec §2 type scale) */
+  --ifm-h1-font-size: 2.5rem;   /* docs h1 */
+  --ifm-h2-font-size: 1.75rem;  /* docs h2 */
+  --ifm-h3-font-size: 1.375rem; /* h3 */
+  --ifm-h4-font-size: 1.125rem; /* h4 */
 }
 
 /* Native smooth scrolling for anchor jumps, back-to-top, and scroll-to-top on
@@ -42,26 +52,30 @@
 
 /* For readability concerns, you should choose a lighter palette in dark mode. */
 [data-theme='dark'] {
-  --ifm-color-primary-lightest: #ffbfb3;
-  --ifm-color-primary-lighter: #fe8a7a;
-  --ifm-color-primary-light: #fb564a;
-  --ifm-color-primary: #e5502b;
-  --ifm-color-primary-dark: #e41511;
-  --ifm-color-primary-darker: #a80504;
-  --ifm-color-primary-darkest: #540000;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
-  --ifm-background-color: #1C1A1D !important;
+  --ifm-color-primary-lightest: var(--vc-accent);
+  --ifm-color-primary-lighter: var(--vc-accent);
+  --ifm-color-primary-light: var(--vc-accent);
+  --ifm-color-primary: var(--vc-accent);
+  --ifm-color-primary-dark: var(--vc-accent);
+  --ifm-color-primary-darker: var(--vc-accent);
+  --ifm-color-primary-darkest: var(--vc-accent);
+  --docusaurus-highlighted-code-line-bg: var(--vc-raised);
+  --ifm-background-color: var(--vc-bg) !important;
 }
 
-/* Make headings match homepage */
+/* Global type reset (spec §2): retire the 900/-0.05em poster weight. */
 h1,
-h2,
+h2 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
 h3,
 h4,
 h5,
 h6 {
-  font-weight: 900;
-  letter-spacing: -0.05em;
+  font-weight: 650;
+  letter-spacing: 0;
 }
 
 .hero {
@@ -81,7 +95,7 @@ figcaption {
 }
 
 .markdown h2 {
-  --ifm-h2-font-size: 2rem;
+  --ifm-h2-font-size: 1.75rem;
   margin-bottom: calc(var(--ifm-heading-vertical-rhythm-bottom) * var(--ifm-leading));
   margin-top: calc(var(--ifm-h2-vertical-rhythm-top) * var(--ifm-leading));
 }
@@ -90,7 +104,7 @@ figcaption {
 .theme-doc-toc-mobile,
 .footer {
   background-color: var(--ifm-background-color);
-  border-top: 1px solid #2F3237 !important;
+  border-top: 1px solid var(--vc-line) !important;
   z-index: 1;
 }
 
@@ -148,7 +162,7 @@ figcaption {
 }
 
 .docs-doc-id-firstletters {
-  background: black;
+  background: var(--vc-bg);
   /* --ifm-color-primary: rgb(188, 134, 249); */
 }
 
@@ -161,7 +175,7 @@ figcaption {
 }
 
 .theme-doc-sidebar-container {
-  border-right: 1px solid #2F3237 !important;
+  border-right: 1px solid var(--vc-line) !important;
 }
 
 aside {
@@ -195,8 +209,8 @@ main {
 }
 
 .navbar__title {
-  font-weight: 900;
-  letter-spacing: -0.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   font-size: 18px;
 }
 
@@ -268,7 +282,7 @@ main {
 .docs-doc-id-grandprize article b,
 .docs-doc-id-grandprize article h2,
 .docs-doc-id-grandprize article h3 {
-  color: white;
+  color: var(--vc-text);
 }
 
 .docs-doc-id-grandprize article h2,
@@ -287,7 +301,7 @@ main {
 
 /* --- Design tokens (scoped) --- */
 .atlas {
-  --card: #1c2127; --line: rgba(255, 255, 255, 0.1); --ink: var(--ifm-font-color-base); --dim: #aeb9c4; --faint: #8a939d; --accent: #c9a24b;
+  --card: var(--vc-surface); --line: var(--vc-line); --ink: var(--ifm-font-color-base); --dim: #aeb9c4; --faint: #8a939d; --accent: #c9a24b;
   --s1: #5b6b7a; --s2: #5a8fb0; --s3: #5aa98a; --s4: #c08a4a; --s5: #c9a24b;
   font-size: 15px;
   line-height: 1.5;
