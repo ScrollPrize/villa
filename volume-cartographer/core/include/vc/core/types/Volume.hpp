@@ -85,7 +85,7 @@ public:
         const std::string& url,
         const std::filesystem::path& cacheRoot = {},
         const vc::HttpAuth& auth = {},
-        const std::string& metadataUrl = {});
+        const utils::Json& metadata = {});
 
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;

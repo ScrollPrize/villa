@@ -71,8 +71,7 @@ std::string deriveRemoteVolumeName(const std::string& url)
 }
 
 std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
-                                                    const vc::HttpAuth& auth,
-                                                    const std::string& explicitMetadataUrl = {})
+                                                    const vc::HttpAuth& auth)
 {
     const auto numberFromObject = [](const utils::Json& obj,
                                      std::initializer_list<const char*> keys) -> std::optional<double> {
@@ -150,9 +149,6 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
         return normalize(utils::Json::parse(body), url);
     };
 
-    if (!explicitMetadataUrl.empty()) {
-        return loadUrl(explicitMetadataUrl);
-    }
     if (auto meta = loadUrl(remoteUrl + "/" + METADATA_FILE.string())) {
         return meta;
     }
@@ -1281,7 +1277,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
     const std::filesystem::path& cacheRoot,
     const vc::HttpAuth& authIn,
-    const std::string& metadataUrl)
+    const utils::Json& metadata)
 {
     // Resolve s3:// URLs to https:// and detect AWS credentials
     auto resolved = vc::resolveRemoteUrl(url);
@@ -1363,7 +1359,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->metadata_["max"] = double{};
 
     try {
-        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth, metadataUrl)) {
+        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth)) {
             vol->metadata_.update(*remoteMeta);
             vol->metadata_["width"] = vol->_width;
             vol->metadata_["height"] = vol->_height;
@@ -1371,6 +1367,13 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         }
     } catch (const std::exception& e) {
         Logger()->warn("Failed to load remote volume metadata for '{}': {}", remoteUrl, e.what());
+    }
+
+    if (metadata.is_object()) {
+        vol->metadata_.update(metadata);
+        vol->metadata_["width"] = vol->_width;
+        vol->metadata_["height"] = vol->_height;
+        vol->metadata_["slices"] = vol->_slices;
     }
 
     return vol;

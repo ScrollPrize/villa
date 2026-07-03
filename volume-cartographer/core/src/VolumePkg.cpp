@@ -116,6 +116,22 @@ std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string
     return {};
 }
 
+utils::Json metadataFromVolumeEntryTags(const std::vector<std::string>& tags)
+{
+    auto metadata = utils::Json::object();
+    const auto voxelSizeTag = tagValueWithPrefix(tags, "vc-open-data-voxel-size-um:");
+    if (!voxelSizeTag.empty()) {
+        try {
+            const double voxelSize = std::stod(voxelSizeTag);
+            if (voxelSize > 0.0) {
+                metadata["voxelsize"] = voxelSize;
+            }
+        } catch (...) {
+        }
+    }
+    return metadata;
+}
+
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
 {
     std::vector<fs::path> out;
@@ -424,10 +440,10 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
             const auto& volume = it->second;
             if (!volume) continue;
             if (volume->isRemote() && volume->remoteUrl() == location) {
-                const auto metadataUrl = tagValueWithPrefix(e.tags, "vc-open-data-metadata-url:");
-                if (!metadataUrl.empty()) {
+                auto metadata = metadataFromVolumeEntryTags(e.tags);
+                if (!metadata.empty()) {
                     try {
-                        auto refreshed = Volume::NewFromUrl(location, opts_.remoteCacheRoot, {}, metadataUrl);
+                        auto refreshed = Volume::NewFromUrl(location, opts_.remoteCacheRoot, {}, metadata);
                         const auto refreshedId = refreshed->id();
                         if (refreshedId != id && loadedVolumes_.count(refreshedId) == 0) {
                             loadedVolumes_.erase(it);
@@ -445,7 +461,7 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
                             volumeTagsByID_[id] = e.tags;
                         }
                     } catch (const std::exception& ex) {
-                        Logger()->warn("Failed to refresh remote volume metadata '{}': {}", location, ex.what());
+                        Logger()->warn("Failed to refresh remote volume manifest metadata '{}': {}", location, ex.what());
                         volumeTagsByID_[id] = e.tags;
                     }
                 } else {
@@ -938,7 +954,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
                 e.location,
                 opts_.remoteCacheRoot,
                 {},
-                tagValueWithPrefix(e.tags, "vc-open-data-metadata-url:"));
+                metadataFromVolumeEntryTags(e.tags));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);

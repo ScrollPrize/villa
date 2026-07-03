@@ -42,31 +42,6 @@ std::string artifactUrl(const OpenDataArtifact& artifact)
                                   : artifact.resolvedUrl);
 }
 
-std::string metadataUrlForVolume(const OpenDataVolume& volume)
-{
-    for (const auto& artifact : volume.artifacts) {
-        const std::string type = lowerCopy(artifact.type);
-        const std::string url = artifactUrl(artifact);
-        if (url.empty()) {
-            continue;
-        }
-        const std::string loweredUrl = lowerCopy(url);
-        const bool isJson = loweredUrl.size() >= 5 &&
-                            loweredUrl.substr(loweredUrl.size() - 5) == ".json";
-        const bool isMetadataJson = loweredUrl.size() >= 14 &&
-                                    loweredUrl.substr(loweredUrl.size() - 14) == "/metadata.json";
-        if (type == "metadata" ||
-            type == "metadata.json" ||
-            type == "volume_metadata" ||
-            type == "volume-metadata" ||
-            (type.find("metadata") != std::string::npos && isJson) ||
-            isMetadataJson) {
-            return url;
-        }
-    }
-    return {};
-}
-
 bool isSupportedRemoteZarr(const OpenDataVolume& volume,
                            const OpenDataArtifact& artifact,
                            const std::string& url)
@@ -139,8 +114,8 @@ std::vector<std::string> volumeTags(const OpenDataVolume& volume,
     if (!volume.id.empty()) {
         addUnique("vc-open-data-volume-id:" + volume.id);
     }
-    if (const std::string metadataUrl = metadataUrlForVolume(volume); !metadataUrl.empty()) {
-        addUnique("vc-open-data-metadata-url:" + metadataUrl);
+    if (volume.pixelSizeUm && *volume.pixelSizeUm > 0.0) {
+        addUnique("vc-open-data-voxel-size-um:" + std::to_string(*volume.pixelSizeUm));
     }
 
     return tags;
