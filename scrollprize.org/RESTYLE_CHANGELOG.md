@@ -48,6 +48,18 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Verification:** full `yarn build` exit 0 on the combined tree (C4 + C3 + WP1-in-flight).
 **Routed follow-ups:** `docs/15_winners.md` has ~15 hand-rolled `bg-[#444]` prize-card clones → convert in integration pass; optional prism theme swap dracula→vsDark (config) left for the iteration round.
 
+## C2 — landing: rewrite to Obsidian, slim-down, decorative machinery deleted
+
+**Why:** the landing was a 2,110-line, ~10,800px-tall, 15.2MB movie-splash page: fullscreen autoplay volcano video with gradient text over live lava, six copies of a radial-gradient text treatment, 6-layer shadows, scroll-linked fixed background layers, three sponsor-tier accent hues, and three screens of poster-card walls.
+**What:**
+- `Landing.js` 2,110 → 866 lines; data arrays extracted to new `landingData.js`. Deleted: StoryBackground fixed layers + scroll-opacity JS, all gradient-text copies, all multi-layer shadows, mix-blend-exclusion, tier colors, hover-translates, sepia filters, the 40s auto-pan (panorama now a static, manually scrollable strip).
+- Hero: navbar-aware `min(calc(100vh - navbar), 860px)`; video demoted to 0.35-opacity backdrop (0.25 mobile) behind solid→transparent media scrims, poster-first, reduced-motion → poster only; plain h1 + one ember line; stat strip `$1,800,500 · 5 scrolls · 2 read`; filled Get Started + text CTA; Breaking card in the hero fold.
+- Story: all 6 beats kept at reading scale (mono ember kickers, 2rem titles, 96px gaps, one 720px framed media per chapter, 1px timeline rule). Open prizes merged into the 2026 chapter. Awarded prizes: 6 poster cards → one flush card with dense rows (title / 20px avatar stack / tabular $). Created By → one credit line. Sponsors: every donor kept, neutral tier headings, 24px-avatar rows, Citizens dense 2-col. Team kept (scale fix). Partners → one grayscale row.
+- Sidebar hidden on landing (`landing.css`); est. height ~10,800 → ~7,100–7,400px (−33%; remaining levers noted for iteration).
+- Pre-existing bugs fixed: `prizes#…` anchors missing leading `/`, Sergei Pnev URL missing protocol, Neil Parikh avatar `.webp`→`.jpg` (file was jpg), hero video src missing leading `/`, real alt text on partner logos.
+**Files:** `src/components/Landing.js`, `src/components/landingData.js` (new), `src/css/landing.css`.
+**Verification:** babel/postcss parse clean; all 85 image refs exist; inbound anchors (`#sponsors`, `#educelab-funders`, …) preserved; full `yarn build` green (below).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

@@ -1,1 +1,823 @@
-/* landing.css — landing page skin (hero, story timeline, prize/sponsor grids, slim-down). OWNED BY WP1. Loaded after custom.css so it overrides legacy rules. */
+/* ==========================================================================
+   landing.css — landing page skin (OWNED BY WP1).
+   Loaded after custom.css so it overrides legacy rules.
+   Consumes tokens (--vc-*) and utility recipes (.vc-card, .vc-cta, …); no raw
+   color values beyond var() references and the transparent keyword (used only
+   in solid→transparent overlays ON MEDIA, which spec §1 allows for masking).
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Landing chrome: no doc sidebar, full-width main.
+   -------------------------------------------------------------------------- */
+.docs-doc-id-landing .theme-doc-sidebar-container {
+  display: none;
+}
+.docs-doc-id-landing main {
+  max-width: none !important;
+}
+
+/* --------------------------------------------------------------------------
+   Base scope
+   -------------------------------------------------------------------------- */
+.vc-landing {
+  color: var(--vc-text);
+}
+.vc-landing .container {
+  max-width: 1152px;
+}
+.vc-landing img {
+  max-width: 100%;
+}
+
+/* Section rhythm: 96px desktop / 64px under 768px. */
+.vc-landing .vc-section {
+  padding-top: var(--vc-section-pad);
+}
+.vc-landing .vc-section--tight {
+  padding-top: 48px;
+}
+.vc-landing .vc-section--last {
+  padding-bottom: var(--vc-section-pad);
+}
+
+/* Landing section heading (spec §2: 2.25rem / 700). Scoped above .markdown h2. */
+.vc-landing .vc-h2 {
+  font-size: 2.25rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  color: var(--vc-text);
+  margin: 0 0 24px;
+}
+.vc-landing .vc-section__intro {
+  max-width: 640px;
+  font-size: 1rem;
+  line-height: 1.65;
+  color: var(--vc-text-dim);
+  margin: -8px 0 32px;
+}
+
+/* Body-link grammar inside landing prose (spec §3). */
+.vc-landing .vc-hero__intro a,
+.vc-landing .vc-section__intro a,
+.vc-landing .vc-story__body > p a,
+.vc-landing .vc-credit a,
+.vc-landing .vc-team__credit a {
+  color: var(--vc-text);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: var(--vc-accent-underline);
+  text-underline-offset: 2px;
+}
+.vc-landing .vc-hero__intro a:hover,
+.vc-landing .vc-section__intro a:hover,
+.vc-landing .vc-story__body > p a:hover,
+.vc-landing .vc-credit a:hover,
+.vc-landing .vc-team__credit a:hover {
+  color: var(--vc-accent);
+}
+
+/* Kickers are block-level in this layout. */
+.vc-landing .vc-kicker {
+  display: block;
+  margin: 0 0 6px;
+}
+
+/* CTAs / buttons: ≥44px tap targets on the landing page. */
+.vc-landing .vc-cta {
+  min-height: 44px;
+  align-items: center;
+}
+.vc-landing .vc-btn,
+.vc-landing .vc-btn-outline {
+  min-height: 44px;
+  padding: 10px 20px;
+  font-size: 0.875rem;
+}
+
+/* --------------------------------------------------------------------------
+   Hero — static --vc-bg base, demoted video backdrop, navbar-aware height.
+   -------------------------------------------------------------------------- */
+.vc-landing .vc-hero {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  /* navbar-aware, capped so the fold stays dense on tall screens */
+  min-height: min(calc(100vh - var(--ifm-navbar-height, 56px)), 860px);
+  padding-top: 48px;
+  padding-bottom: 48px;
+  /* full-bleed section: respect notches */
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  overflow: hidden;
+  background: var(--vc-bg);
+}
+.vc-landing .vc-hero__backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+.vc-landing .vc-hero__video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 72% center;
+  opacity: 0.35; /* demoted backdrop, spec cap ≤40% */
+}
+/* Solid→transparent overlay ON MEDIA (allowed masking gradient): the text
+   zone left is solid page bg; the volcano only breathes on the right edge,
+   and fades out at the bottom into the page. */
+.vc-landing .vc-hero__scrim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, var(--vc-bg) 32%, transparent 78%),
+    linear-gradient(0deg, var(--vc-bg) 4%, transparent 36%);
+}
+.vc-landing .vc-hero__content {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+}
+.vc-landing .vc-hero__title {
+  font-size: clamp(2.4rem, 6vw, 4.5rem);
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  line-height: 1.05;
+  color: var(--vc-text);
+  max-width: 18ch;
+  margin: 0 0 16px;
+}
+.vc-landing .vc-hero__tagline {
+  font-size: clamp(1.375rem, 2.6vw, 2rem);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  color: var(--vc-accent);
+  margin: 0 0 24px;
+}
+.vc-landing .vc-hero__intro {
+  max-width: 60ch;
+  font-size: 1.125rem;
+  line-height: 1.6;
+  color: var(--vc-text-dim);
+  margin: 0 0 32px;
+}
+.vc-landing .vc-hero__stats {
+  margin: 0 0 32px;
+  row-gap: 12px;
+}
+.vc-landing .vc-hero__stats .vc-stat__value {
+  font-family: var(--vc-mono);
+}
+.vc-landing .vc-hero__ctas {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 28px;
+}
+
+/* Breaking card — .vc-card--hero, one red (the kicker). */
+.vc-landing a.vc-breaking {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  margin-top: 48px;
+  max-width: 960px;
+  color: var(--vc-text);
+  text-decoration: none;
+}
+.vc-landing .vc-breaking__text {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.vc-landing .vc-breaking__title {
+  display: block;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  color: var(--vc-text);
+}
+.vc-landing .vc-breaking__desc {
+  display: block;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  color: var(--vc-text-dim);
+}
+.vc-landing .vc-breaking__img {
+  width: 38%;
+  max-width: 340px;
+  height: 116px;
+  object-fit: cover;
+  flex: 0 0 auto;
+}
+
+/* --------------------------------------------------------------------------
+   Open problems — the one card recipe, chips, single .vc-cta grammar.
+   -------------------------------------------------------------------------- */
+.vc-landing .vc-problems {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.vc-landing .vc-problem {
+  display: grid;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  gap: 24px;
+  align-items: stretch;
+}
+.vc-landing .vc-problem__text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+.vc-landing .vc-problem__title {
+  font-size: 1.375rem;
+  font-weight: 650;
+  letter-spacing: 0;
+  color: var(--vc-text);
+  margin: 0 0 12px;
+}
+.vc-landing .vc-problem__body {
+  font-size: 1rem;
+  line-height: 1.65;
+  color: var(--vc-text-dim);
+  flex: 1 1 auto;
+}
+.vc-landing .vc-problem__body p {
+  margin: 0 0 12px;
+}
+.vc-landing .vc-problem__body a {
+  color: var(--vc-text);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: var(--vc-accent-underline);
+  text-underline-offset: 2px;
+}
+.vc-landing .vc-problem__body a:hover {
+  color: var(--vc-accent);
+}
+.vc-landing .vc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+.vc-landing .vc-chip {
+  font-size: 0.75rem;
+  line-height: 1;
+  padding: 5px 8px;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text-faint);
+  white-space: nowrap;
+}
+.vc-landing .vc-problem__media {
+  min-width: 0;
+  align-self: center;
+}
+/* Rein in the slider height (BeforeAfter root; WP2 restyles its internals). */
+.vc-landing .vc-problem__media > div {
+  height: 260px;
+  max-width: none;
+}
+
+/* Targets strip — merged "What We're Building Towards", hairline-divided. */
+.vc-landing .vc-targets {
+  margin-top: 40px;
+  border-top: 1px solid var(--vc-line);
+  padding-top: 24px;
+}
+.vc-landing .vc-targets__label {
+  margin: 0 0 16px;
+}
+.vc-landing .vc-targets__grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.vc-landing .vc-target {
+  padding: 0 20px;
+  border-left: 1px solid var(--vc-line);
+}
+.vc-landing .vc-target:first-child {
+  border-left: 0;
+  padding-left: 0;
+}
+.vc-landing .vc-target__title {
+  display: block;
+  font-size: 0.9375rem;
+  font-weight: 650;
+  color: var(--vc-text);
+  margin-bottom: 4px;
+}
+.vc-landing .vc-target__desc {
+  display: block;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--vc-text-faint);
+}
+
+/* --------------------------------------------------------------------------
+   Our story — hairline timeline, reading-scale chapters, uniform media.
+   -------------------------------------------------------------------------- */
+.vc-landing .vc-timeline {
+  position: relative;
+  max-width: 768px;
+}
+.vc-landing .vc-timeline::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 1px;
+  background: var(--vc-line);
+}
+.vc-landing .vc-story {
+  position: relative;
+  padding-left: 40px;
+}
+.vc-landing .vc-story + .vc-story {
+  margin-top: 96px;
+}
+/* Chapter marker on the rule — neutral, not another ember. */
+.vc-landing .vc-story::before {
+  content: "";
+  position: absolute;
+  left: -3px;
+  top: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--vc-r-full);
+  background: var(--vc-bg);
+  border: 1px solid var(--vc-line-strong);
+}
+.vc-landing .vc-story__kicker {
+  margin-bottom: 8px;
+}
+.vc-landing .vc-story__title {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  color: var(--vc-text);
+  margin: 0 0 16px;
+}
+.vc-landing .vc-story__body {
+  max-width: 640px;
+  font-size: 1rem;
+  line-height: 1.65;
+  color: var(--vc-text-dim);
+}
+.vc-landing .vc-story__body p {
+  margin: 0 0 16px;
+}
+/* Uniform chapter media: 720px frame, cropped to a calm banner height. */
+.vc-landing .vc-story__body .vc-media {
+  width: 100%;
+  max-width: 720px;
+  margin-top: 8px;
+}
+.vc-landing img.vc-story__media,
+.vc-landing video.vc-story__media {
+  height: 240px;
+  object-fit: cover;
+}
+/* 2023 panorama: static, manually pannable strip (the 40s auto-pan is gone). */
+.vc-landing .vc-panorama {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  background: var(--vc-surface);
+}
+.vc-landing .vc-panorama img {
+  display: block;
+  height: 240px;
+  width: auto;
+  max-width: none;
+}
+/* 2024 keeps its two-result pair. */
+.vc-landing .vc-story__pair {
+  display: flex;
+  gap: 12px;
+  max-width: 720px;
+  margin-top: 8px;
+}
+.vc-landing .vc-story__pair .vc-media {
+  width: calc(50% - 6px);
+  min-width: 0;
+  height: 240px;
+  object-fit: cover;
+  margin-top: 0;
+}
+
+/* 2026 chapter: two flat open-prize stat cards. */
+.vc-landing .vc-open-prizes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 24px 0;
+}
+.vc-landing a.vc-open-prize {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--vc-text);
+  text-decoration: none;
+}
+.vc-landing .vc-open-prize__amount {
+  font-size: 1.375rem;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--vc-text);
+}
+.vc-landing .vc-open-prize__title {
+  font-size: 0.9375rem;
+  font-weight: 650;
+  color: var(--vc-text);
+}
+.vc-landing .vc-open-prize__desc {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--vc-text-faint);
+}
+
+/* --------------------------------------------------------------------------
+   Awarded prizes — dense rows in one flush card.
+   -------------------------------------------------------------------------- */
+.vc-landing .vc-prize-table {
+  max-width: 960px;
+}
+.vc-landing a.vc-prize-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(96px, auto);
+  align-items: center;
+  gap: 8px 24px;
+  padding: 14px 20px;
+  color: var(--vc-text);
+  text-decoration: none;
+  border-top: 1px solid var(--vc-line);
+  transition: background-color 0.15s;
+}
+.vc-landing a.vc-prize-row:first-child {
+  border-top: 0;
+}
+.vc-landing a.vc-prize-row:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
+  text-decoration: none;
+}
+.vc-landing .vc-prize-row__title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+.vc-landing .vc-prize-row__winners {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end;
+}
+.vc-landing .vc-prize-row__label {
+  font-size: 0.8125rem;
+  color: var(--vc-text-faint);
+  white-space: nowrap;
+}
+.vc-landing .vc-prize-row__amount {
+  font-size: 0.9375rem;
+  font-weight: 650;
+  text-align: right;
+}
+.vc-landing .vc-prize-table__cta {
+  margin-top: 12px;
+}
+
+/* Overlapping avatar stacks (winners 20px; sponsors 24px, monochrome). */
+.vc-landing .vc-avatars {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.vc-landing .vc-avatars img {
+  width: 20px;
+  height: 20px;
+  border-radius: var(--vc-r-full);
+  border: 2px solid var(--vc-bg);
+  object-fit: cover;
+  position: relative;
+  margin-left: -7px;
+}
+.vc-landing .vc-avatars img:first-child {
+  margin-left: 0;
+}
+.vc-landing .vc-avatars--mono img {
+  filter: saturate(0);
+}
+
+/* --------------------------------------------------------------------------
+   Sponsors — neutral tier headings, rows in a 3–4 col grid, dense Citizens.
+   -------------------------------------------------------------------------- */
+.vc-landing .vc-tier {
+  margin-top: 40px;
+}
+.vc-landing .vc-tier:first-of-type {
+  margin-top: 0;
+}
+.vc-landing .vc-tier__label {
+  margin: 0 0 2px;
+}
+.vc-landing .vc-tier__title {
+  font-size: 1.25rem;
+  font-weight: 650;
+  letter-spacing: 0;
+  color: var(--vc-text);
+  margin: 0 0 12px;
+}
+.vc-landing .vc-tier__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px 24px;
+}
+.vc-landing .vc-tier__grid--dense {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-width: 768px;
+}
+.vc-landing a.vc-sponsor {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  margin: 0 -10px;
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+  text-decoration: none;
+  transition: background-color 0.15s;
+}
+.vc-landing a.vc-sponsor:hover {
+  background: var(--vc-surface);
+  color: var(--vc-text);
+  text-decoration: none;
+}
+.vc-landing .vc-sponsor__avatar {
+  width: auto;
+  min-width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+}
+.vc-landing .vc-sponsor .vc-avatars img {
+  width: 24px;
+  height: 24px;
+}
+.vc-landing .vc-sponsor__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vc-landing .vc-sponsor__amount {
+  font-size: 0.875rem;
+  color: var(--vc-text);
+}
+.vc-landing a.vc-sponsor--dense {
+  padding: 5px 10px;
+}
+.vc-landing .vc-sponsors__cta {
+  margin-top: 32px;
+}
+
+/* --------------------------------------------------------------------------
+   Team — credit line + plain dense lists.
+   -------------------------------------------------------------------------- */
+.vc-landing .vc-credit {
+  max-width: 640px;
+  font-size: 1rem;
+  line-height: 1.65;
+  color: var(--vc-text-dim);
+  margin: -8px 0 40px;
+}
+.vc-landing .vc-team {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 48px;
+}
+.vc-landing .vc-team__group h3 {
+  font-size: 1.375rem;
+  font-weight: 650;
+  letter-spacing: 0;
+  color: var(--vc-text);
+  margin: 0 0 12px;
+}
+.vc-landing .vc-person {
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  padding: 3px 0;
+}
+.vc-landing a.vc-person__name {
+  color: var(--vc-text);
+  font-weight: 500;
+  text-decoration: none;
+}
+.vc-landing a.vc-person__name:hover {
+  color: var(--vc-accent);
+  text-decoration: underline;
+  text-decoration-color: var(--vc-accent-underline);
+  text-underline-offset: 2px;
+}
+.vc-landing span.vc-person__name {
+  color: var(--vc-text);
+  font-weight: 500;
+}
+.vc-landing .vc-person__role {
+  color: var(--vc-text-faint);
+  margin-left: 8px;
+}
+.vc-landing .vc-team__credit {
+  margin-top: 32px;
+}
+
+/* --------------------------------------------------------------------------
+   Partners — one monochrome logo row + funders list.
+   -------------------------------------------------------------------------- */
+.vc-landing .vc-partners {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 32px 48px;
+  margin-bottom: 48px;
+}
+.vc-landing .vc-partners__img {
+  display: block;
+  height: 40px;
+  width: auto;
+  filter: grayscale(1);
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+.vc-landing .vc-partners__img--tall {
+  height: 80px;
+}
+.vc-landing .vc-partners__link:hover .vc-partners__img {
+  opacity: 1;
+}
+.vc-landing .vc-funders__title {
+  font-size: 1.375rem;
+  font-weight: 650;
+  letter-spacing: 0;
+  color: var(--vc-text);
+  margin: 0 0 12px;
+}
+
+/* Focus visibility for the row/name links introduced here. */
+.vc-landing a.vc-prize-row:focus-visible,
+.vc-landing a.vc-sponsor:focus-visible,
+.vc-landing a.vc-open-prize:focus-visible,
+.vc-landing a.vc-person__name:focus-visible,
+.vc-landing .vc-partners__link:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+
+/* --------------------------------------------------------------------------
+   Responsive (Gate 8: no horizontal overflow 360–768px, single column <480px,
+   fluid type via clamp, media max-width 100%).
+   -------------------------------------------------------------------------- */
+@media (max-width: 996px) {
+  .vc-landing .vc-tier__grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 768px) {
+  .vc-landing .vc-section {
+    padding-top: 64px;
+  }
+  .vc-landing .vc-section--tight {
+    padding-top: 40px;
+  }
+  .vc-landing .vc-section--last {
+    padding-bottom: 64px;
+  }
+  .vc-landing .vc-h2 {
+    font-size: 1.75rem;
+  }
+  .vc-landing .vc-hero {
+    min-height: 0; /* content-driven on small screens */
+    padding-top: 32px;
+    padding-bottom: 32px;
+  }
+  /* Text spans the full width on phones: quieter video, heavier mask. */
+  .vc-landing .vc-hero__video {
+    opacity: 0.25;
+  }
+  .vc-landing .vc-hero__scrim {
+    background: linear-gradient(0deg, var(--vc-bg) 12%, transparent 64%),
+      linear-gradient(90deg, var(--vc-bg) 8%, transparent 92%);
+  }
+  .vc-landing .vc-hero__intro {
+    font-size: 1rem;
+  }
+  .vc-landing a.vc-breaking {
+    flex-direction: column-reverse;
+    align-items: stretch;
+    gap: 16px;
+  }
+  .vc-landing .vc-breaking__img {
+    width: 100%;
+    max-width: none;
+    height: 96px;
+  }
+  .vc-landing .vc-breaking__title {
+    font-size: 1.25rem;
+  }
+  /* Problems stack; slider above text. */
+  .vc-landing .vc-problem {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vc-landing .vc-problem__media {
+    order: -1;
+  }
+  .vc-landing .vc-problem__media > div {
+    height: 220px;
+  }
+  .vc-landing .vc-targets__grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 20px;
+  }
+  .vc-landing .vc-target:nth-child(odd) {
+    border-left: 0;
+    padding-left: 0;
+  }
+  /* Story timeline tightens. */
+  .vc-landing .vc-story {
+    padding-left: 24px;
+  }
+  .vc-landing .vc-story + .vc-story {
+    margin-top: 64px;
+  }
+  .vc-landing .vc-story__title {
+    font-size: 1.5rem;
+  }
+  .vc-landing img.vc-story__media,
+  .vc-landing video.vc-story__media,
+  .vc-landing .vc-panorama img,
+  .vc-landing .vc-story__pair .vc-media {
+    height: 200px;
+  }
+  .vc-landing .vc-team {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 40px;
+  }
+  .vc-landing .vc-stat {
+    padding: 0 16px;
+  }
+}
+
+@media (max-width: 560px) {
+  .vc-landing .vc-open-prizes {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vc-landing .vc-story__pair {
+    flex-direction: column;
+  }
+  .vc-landing .vc-story__pair .vc-media {
+    width: 100%;
+  }
+  .vc-landing a.vc-prize-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .vc-landing .vc-prize-row__winners {
+    grid-column: 1;
+    grid-row: 2;
+    justify-self: start;
+  }
+  .vc-landing .vc-prize-row__amount {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}
+
+@media (max-width: 480px) {
+  /* News teasers single column (defensive; LatestPosts internals are WP2's). */
+  .vc-landing section[aria-label="Latest updates"] .grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vc-landing .vc-targets__grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .vc-landing .vc-target {
+    border-left: 0;
+    padding: 0;
+  }
+  .vc-landing .vc-tier__grid,
+  .vc-landing .vc-tier__grid--dense {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
