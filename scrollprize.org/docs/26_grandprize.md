@@ -318,7 +318,7 @@ Machine learning models are infamous for “hallucinating”: making up text or 
 These scrolls were scanned at Diamond Light Source, a particle accelerator near Oxford, England. The facility produces a parallel beam of X-rays at high flux, allowing for fast, accurate, and high-resolution imaging. The X-ray photos are turned into a 3D volume of voxels using tomographic reconstruction algorithms, resulting in a stack of slice images.
 
 <figure>
-  <video autoPlay playsInline loop muted className="w-[100%] max-w-[600px]" poster="/img/grandprize/.webp">
+  <video autoPlay playsInline loop muted className="w-[100%] max-w-[600px]">
     <source src="/img/grandprize/scroll1.webm" type="video/webm"/>
   </video>
   <figcaption className="mt-[-6px]">Scrubbing through the slice images of the scroll.</figcaption>
