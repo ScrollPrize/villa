@@ -509,6 +509,12 @@ def save_overlay_and_print_satisfaction(
     total_count = satisfied_patches.numel()
     satisfied_ratio = satisfied_count / max(total_count, 1)
     print(f'satisfied_patches = {satisfied_count}/{total_count} ({satisfied_ratio * 100:.1f}%)')
+    # Same binary satisfied/not per patch, but weight the overall fraction by patch area
+    # so a few large satisfied patches count more than many tiny ones.
+    all_patches_area = float(total_areas.sum().item())
+    satisfied_patches_area = float(total_areas[satisfied_patches].sum().item())
+    area_weighted_satisfied_ratio = satisfied_patches_area / max(all_patches_area, 1e-9)
+    print(f'satisfied_patches_area_weighted = {satisfied_patches_area:.1f}/{all_patches_area:.1f} ({area_weighted_satisfied_ratio * 100:.1f}%)')
     boundary_satisfied_ratio = boundary_satisfied_count / max(total_count, 1)
     print(f'boundary_satisfied_patches = {boundary_satisfied_count}/{total_count} ({boundary_satisfied_ratio * 100:.1f}%)')
     satisfied_area = float(satisfied_areas.sum().item())
