@@ -133,6 +133,7 @@ h1, h2, h3, h4, h5, h6 {
 .navbar__brand {
   opacity: 1; /* custom.css dims it to .5 */
   color: var(--vc-text);
+  min-height: 44px; /* Gate 8: >=44px-tall hit area within the 56px bar */
 }
 .navbar__brand:hover {
   color: var(--vc-text);
@@ -206,31 +207,73 @@ h1, h2, h3, h4, h5, h6 {
   margin-top: 8px;
 }
 
-/* Hamburger: >=44x44 hit area (Gate 8; baseline was 30x30). */
+/* Hamburger: hidden >=997px (Infima default — do NOT force it visible
+   globally, or it shows next to the full desktop navbar); >=44x44 hit area
+   under 997px where the drawer lives (Gate 8; baseline was 30x30). */
 .navbar__toggle {
-  width: 44px;
-  height: 44px;
-  min-width: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
   border-radius: var(--vc-r-btn);
   color: var(--vc-text);
 }
 .navbar__toggle:hover {
   background: var(--vc-raised);
 }
+@media (max-width: 996px) {
+  .navbar__toggle {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
 
 /* ==========================================================================
    §3 Mobile drawer (Docusaurus navbar-sidebar)
+
+   The navbar's backdrop-filter (§2) establishes a containing block for its
+   fixed-position descendants, so the drawer + backdrop (children of .navbar)
+   collapse to the 56px navbar height instead of the viewport — the panel then
+   clips all menu content ("empty transparent drawer"). Viewport-relative
+   heights (dvh) escape the trapped containing block and restore full height.
    ========================================================================== */
+.navbar-sidebar,
+.navbar-sidebar__backdrop {
+  height: 100vh;
+  height: 100dvh;
+}
 .navbar-sidebar {
   background: var(--vc-bg);
+  border-right: 1px solid var(--vc-line);
   padding-left: env(safe-area-inset-left);
+  overflow-y: auto;
+}
+/* Items panel fills below the brand bar and scrolls long doc sidebars. */
+.navbar-sidebar__items {
+  height: calc(100dvh - var(--ifm-navbar-height));
+}
+.navbar-sidebar__item {
+  overflow-y: auto;
 }
 .navbar-sidebar__brand {
   border-bottom: 1px solid var(--vc-line);
   box-shadow: none;
+}
+/* "Back to main menu" — custom.css hid this, which stranded users in the
+   secondary (doc-sidebar) panel with no way to reach the primary site nav.
+   Restore it as a quiet hairline row with a >=44px tap target. */
+.navbar-sidebar__back {
+  display: block;
+  background: var(--vc-surface);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text-dim);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  min-height: 44px;
+}
+.navbar-sidebar__back:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
 }
 .navbar-sidebar__close {
   width: 44px;
@@ -307,6 +350,12 @@ h1, h2, h3, h4, h5, h6 {
   border-radius: var(--vc-r-btn);
 }
 .menu__list-item-collapsible:hover {
+  background: transparent;
+}
+/* Active category row carries no filled block either (matches the item rule). */
+.menu__list-item-collapsible--active,
+.menu__list-item-collapsible .menu__link--active,
+.menu__link--sublist.menu__link--active {
   background: transparent;
 }
 .menu__caret {
@@ -462,9 +511,13 @@ html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   text-decoration-color: var(--vc-accent);
 }
 
-/* <details> collapsibles (e.g. prizes "Submission criteria"). */
+/* <details> collapsibles (e.g. prizes "Submission criteria"). Keep the surface
+   + label treatment, but drop the ember left edge — a collapsible is not an
+   accent element, so it reads as a plain hairline card (accent = CTA/active). */
 details.alert {
   --docusaurus-details-decoration-color: var(--vc-text-faint);
+  border: 1px solid var(--vc-line);
+  border-left: 1px solid var(--vc-line);
 }
 details.alert > summary {
   font-weight: 600;
@@ -631,15 +684,33 @@ a.theme-edit-this-page:hover {
   --ifm-footer-title-color: var(--vc-text-faint);
   background: var(--vc-bg);
   border-top: 1px solid var(--vc-line);
-  padding: 24px 0 max(24px, env(safe-area-inset-bottom));
+  padding: 12px 0 max(12px, env(safe-area-inset-bottom));
+}
+/* Collapse the sitemap shape into a single band. Under 768px it stacks
+   (links row + copyright), both centered and compact. */
+.footer .container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
 }
 .footer__title {
-  font-size: 0.75rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--vc-text-faint);
-  margin-bottom: 4px;
+  display: none; /* single untitled link group — no column heading */
+}
+.footer__links {
+  margin: 0;
+  width: auto;
+}
+.footer .footer__col {
+  margin: 0;
+  padding: 0;
+}
+.footer__items {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0 4px;
 }
 .footer__item {
   padding: 0;
@@ -648,20 +719,36 @@ a.theme-edit-this-page:hover {
 .footer__link-item {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
-  min-height: 44px; /* Gate 8: baseline links were 29-35 x 32px */
+  min-width: 44px; /* Gate 8: 𝕏 (28px) / Jobs (31px) reach a >=44px hit area */
+  min-height: 44px; /* baseline links were 29-35 x 32px */
+  padding: 0 12px;
   color: var(--vc-text-dim);
 }
 .footer__link-item:hover {
   color: var(--vc-text);
   text-decoration: none;
 }
-.footer__links {
-  margin-bottom: 8px;
-}
 .footer__copyright {
   font-size: 0.8125rem;
   color: var(--vc-text-faint);
+  text-align: center;
+}
+
+/* >=768px: one row — copyright left, links inline right. row-reverse puts the
+   links group (first in DOM) on the right and the copyright on the left. */
+@media (min-width: 768px) {
+  .footer .container {
+    flex-direction: row-reverse;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px 24px;
+  }
+  .footer__copyright {
+    text-align: left;
+  }
 }
 
 /* ==========================================================================

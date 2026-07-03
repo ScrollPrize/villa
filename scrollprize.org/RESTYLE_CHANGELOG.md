@@ -82,6 +82,18 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Verification:** ffprobe duration/dimension checks + frame-diff spot checks per asset; zero stale references (grep); `yarn build` green.
 **Skipped/flagged:** `desktop-scan.gif` (7.5MB) is unreferenced — left untouched; next-heaviest in-use asset is `tutorials/second_seg_run.webm` (7.5MB) + four 3–4MB progress files — follow-up candidates.
 
+## C6 — qa fixes: mobile drawer, footer band, landing height, polish
+
+**Why:** the visual sign-off found one blocker (empty mobile drawer) plus prioritized polish; Gate 3 traced 10 console 404s to a pre-existing broken poster ref.
+**What:**
+- **Mobile drawer fixed** (the blocker): the navbar's `backdrop-filter` established a containing block that trapped the fixed-position drawer at 56px height, clipping all content. Fixed with `100dvh` viewport-relative heights; drawer panels get solid `--vc-bg` + hairline; the "Back to main menu" affordance (hidden by legacy CSS, stranding users in the docs panel) restored as a 44px row. Hamburger no longer forced visible on desktop.
+- **Footer** as the spec's dense band: one row ≥768px (© left, links right), 44px-wide tap targets on narrow labels, navbar brand hit-area ≥44px. Verified: **0 small tap targets** (baseline ~10/page, after-1 3/page).
+- **Landing height**: values pass (media 200px, tighter credits rhythm, hero cap) + folding of bulk lists behind expanders with counts — Citizens sponsors (28), Advisors & Alumni (17), Papyrology Advisors (6), and the three pre-2023 story beats under a "The backstory" expander (all content preserved, expandable in place). Desktop height now **7,270px** (baseline ~10,800, −33%).
+- `/tutorial` console 404 fixed: `TutorialsTop.js` referenced a poster (`top-prediction-small3.webp`) that never existed — now points at the real file. Pre-existing bug (present on main).
+- Polish: `<details>` skin hairline (ember reserve), date suffixes dropped from milestone sidebar labels, `/prizes` blockquote → standard `:::warning` admonition, landing heading anchors hidden. Firstscroll page content refresh (hero video webm+poster, og image) included.
+**Files:** `src/css/{chrome,landing}.css`, `src/components/{Landing,TutorialsTop}.js`, `docs/{22_firstletters,26_grandprize,34_prizes,36_firstscroll}.md`.
+**Verification:** build green; targeted capture: drawer populated on solid bg (screenshot-verified), no desktop hamburger, 0 overflow / 0 small taps / 0 console errors on `/` and `/get_started` × 5 viewports; landing single-tile (<8,000px).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

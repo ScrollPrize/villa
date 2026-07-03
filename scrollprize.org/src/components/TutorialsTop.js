@@ -91,7 +91,7 @@ export function TutorialsTop({ highlightId } = {}) {
         href="/tutorial5"
         label="Ink Detection"
         videoSrc="/img/tutorial-thumbs/top-prediction-small.webm"
-        poster="/img/tutorial-thumbs/top-prediction-small3.webp"
+        poster="/img/tutorial-thumbs/top-prediction-small.webp"
         highlight={highlightId == 5}
       />
     </div>

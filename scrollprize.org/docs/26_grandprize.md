@@ -1,6 +1,6 @@
 ---
 title: "Vesuvius Challenge 2023 Grand Prize awarded: we can read the scrolls!"
-sidebar_label: "2023 Grand Prize (Feb 2024)"
+sidebar_label: "2023 Grand Prize"
 hide_title: true
 ---
 

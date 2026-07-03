@@ -1,6 +1,6 @@
 ---
 title: "An entire Herculaneum scroll has been read for the first time"
-sidebar_label: "First scroll read (Jun 2026)"
+sidebar_label: "First scroll read"
 hide_title: true
 ---
 

@@ -92,7 +92,9 @@ Just as with the Grand Prize, please **do not** make your discovery public until
 
 ***
 
-> ⚠️ The previous prizes are too ambitious? You can still contribute!
+:::warning
+The previous prizes are too ambitious? You can still contribute!
+:::
 
 ## Progress Prizes
 

@@ -15,6 +15,11 @@
 .docs-doc-id-landing main {
   max-width: none !important;
 }
+/* Marketing headings don't need permanent "#" anchor affordances (noise next
+   to "Our story" etc., especially on touch). Docs keep theirs (spec §5). */
+.docs-doc-id-landing .hash-link {
+  display: none !important;
+}
 
 /* --------------------------------------------------------------------------
    Base scope
@@ -38,6 +43,17 @@
 }
 .vc-landing .vc-section--last {
   padding-bottom: var(--vc-section-pad);
+}
+/* Credits half (Awarded prizes → Partners) rides a tighter 64px rhythm — the
+   list-dense lower page doesn't need the full 96px section gap (height pass). */
+.vc-landing section[aria-labelledby="awarded-prizes"],
+.vc-landing section[aria-labelledby="sponsors"],
+.vc-landing section[aria-labelledby="team"],
+.vc-landing section[aria-labelledby="partners"] {
+  padding-top: 64px;
+}
+.vc-landing section[aria-labelledby="partners"] {
+  padding-bottom: 64px;
 }
 
 /* Landing section heading (spec §2: 2.25rem / 700). Scoped above .markdown h2. */
@@ -104,7 +120,7 @@
   flex-direction: column;
   justify-content: center;
   /* navbar-aware, capped so the fold stays dense on tall screens */
-  min-height: min(calc(100vh - var(--ifm-navbar-height, 56px)), 860px);
+  min-height: min(calc(100vh - var(--ifm-navbar-height, 56px)), 780px);
   padding-top: 48px;
   padding-bottom: 48px;
   /* full-bleed section: respect notches */
@@ -346,7 +362,7 @@
   padding-left: 40px;
 }
 .vc-landing .vc-story + .vc-story {
-  margin-top: 96px;
+  margin-top: 64px;
 }
 /* Chapter marker on the rule — neutral, not another ember. */
 .vc-landing .vc-story::before {
@@ -388,7 +404,7 @@
 }
 .vc-landing img.vc-story__media,
 .vc-landing video.vc-story__media {
-  height: 240px;
+  height: 200px;
   object-fit: cover;
 }
 /* 2023 panorama: static, manually pannable strip (the 40s auto-pan is gone). */
@@ -399,7 +415,7 @@
 }
 .vc-landing .vc-panorama img {
   display: block;
-  height: 240px;
+  height: 200px;
   width: auto;
   max-width: none;
 }
@@ -413,7 +429,7 @@
 .vc-landing .vc-story__pair .vc-media {
   width: calc(50% - 6px);
   min-width: 0;
-  height: 240px;
+  height: 200px;
   object-fit: cover;
   margin-top: 0;
 }
@@ -551,7 +567,7 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 10px;
+  padding: 4px 10px;
   margin: 0 -10px;
   border-radius: var(--vc-r-btn);
   color: var(--vc-text);
@@ -587,10 +603,107 @@
   color: var(--vc-text);
 }
 .vc-landing a.vc-sponsor--dense {
-  padding: 5px 10px;
+  padding: 3px 10px;
 }
 .vc-landing .vc-sponsors__cta {
   margin-top: 32px;
+}
+
+/* --------------------------------------------------------------------------
+   Collapsible sections (secondary donors, advisors/alumni, story backstory).
+   Native <details>; content preserved, folded away by default to keep the
+   page short. One quiet hairline summary row with a rotating caret.
+   -------------------------------------------------------------------------- */
+.vc-landing .vc-collapse {
+  border-top: 1px solid var(--vc-line);
+}
+.vc-landing .vc-collapse > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 0;
+}
+.vc-landing .vc-collapse > summary::-webkit-details-marker {
+  display: none;
+}
+.vc-landing .vc-collapse__heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.vc-landing .vc-collapse__title {
+  font-size: 1.25rem;
+  font-weight: 650;
+  letter-spacing: 0;
+  color: var(--vc-text);
+  margin: 0;
+}
+.vc-landing .vc-collapse__count {
+  color: var(--vc-text-faint);
+  font-weight: 400;
+}
+.vc-landing .vc-collapse__hint {
+  font-size: 0.8125rem;
+  color: var(--vc-text-faint);
+}
+.vc-landing .vc-collapse__arrow {
+  flex: 0 0 auto;
+  color: var(--vc-text-faint);
+  font-size: 0.75rem;
+  transition: transform 0.15s ease;
+}
+.vc-landing .vc-collapse[open] > summary .vc-collapse__arrow {
+  transform: rotate(180deg);
+}
+.vc-landing .vc-collapse > summary:hover .vc-collapse__title,
+.vc-landing .vc-collapse > summary:hover .vc-collapse__arrow {
+  color: var(--vc-text);
+}
+.vc-landing .vc-collapse > summary:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+.vc-landing .vc-collapse__body {
+  padding-top: 8px;
+  padding-bottom: 16px;
+}
+
+/* Sponsor tier as a collapsible: the tier label sits above the title in the
+   summary; drop the standalone top margin the plain tier carries. */
+.vc-landing .vc-tier.vc-collapse {
+  margin-top: 40px;
+}
+.vc-landing .vc-tier.vc-collapse > summary .vc-tier__label,
+.vc-landing .vc-tier.vc-collapse > summary .vc-tier__title {
+  margin: 0;
+}
+
+/* Team group as a collapsible: match the group heading scale, stay in-grid. */
+.vc-landing .vc-team__group.vc-collapse {
+  border-top: 1px solid var(--vc-line);
+}
+.vc-landing .vc-team__group-title {
+  font-size: 1.375rem;
+}
+
+/* Story backstory expander: aligns with the timeline; its revealed chapters
+   keep their own markers on the rule. */
+.vc-landing .vc-story-history {
+  border-top: 0;
+  margin-bottom: 64px;
+}
+.vc-landing .vc-story-history > summary {
+  padding-left: 40px;
+}
+.vc-landing .vc-story-history .vc-collapse__body {
+  padding-top: 24px;
+}
+.vc-landing .vc-story-history .vc-story:first-child {
+  margin-top: 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -618,7 +731,7 @@
 .vc-landing .vc-person {
   font-size: 0.9375rem;
   line-height: 1.5;
-  padding: 3px 0;
+  padding: 2px 0;
 }
 .vc-landing a.vc-person__name {
   color: var(--vc-text);

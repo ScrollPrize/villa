@@ -1,6 +1,6 @@
 ---
 title: "First word discovered in unopened Herculaneum scroll by 21yo computer science student"
-sidebar_label: "First word discovered (Oct 2023)"
+sidebar_label: "First word discovered"
 hide_title: true
 ---
 

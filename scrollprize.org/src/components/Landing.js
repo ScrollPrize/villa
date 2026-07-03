@@ -277,17 +277,67 @@ const SponsorRow = ({ sponsor, dense }) => (
   </a>
 );
 
-const SponsorTier = ({ label, title, list, dense }) => (
-  <div className="vc-tier">
-    <p className="vc-label vc-tier__label">{label}</p>
-    <h3 className="vc-tier__title">{title}</h3>
+const SponsorTier = ({ label, title, list, dense, collapsible }) => {
+  const grid = (
     <div className={`vc-tier__grid${dense ? " vc-tier__grid--dense" : ""}`}>
       {list.map((s, i) => (
         <SponsorRow sponsor={s} dense={dense} key={i} />
       ))}
     </div>
-  </div>
-);
+  );
+  if (collapsible) {
+    return (
+      <details className="vc-tier vc-collapse">
+        <summary className="vc-collapse__summary">
+          <span className="vc-collapse__heading">
+            <span className="vc-label vc-tier__label">{label}</span>
+            <span className="vc-tier__title vc-collapse__title">
+              {title}
+              <span className="vc-collapse__count"> ({list.length})</span>
+            </span>
+          </span>
+          <span className="vc-collapse__arrow" aria-hidden="true">▾</span>
+        </summary>
+        <div className="vc-collapse__body">{grid}</div>
+      </details>
+    );
+  }
+  return (
+    <div className="vc-tier">
+      <p className="vc-label vc-tier__label">{label}</p>
+      <h3 className="vc-tier__title">{title}</h3>
+      {grid}
+    </div>
+  );
+};
+
+/* Team group — plain by default; `collapsible` folds advisor/alumni lists
+   behind an expander so the lower page stays short (content preserved). */
+const TeamGroup = ({ title, list, collapsible }) => {
+  const people = list.map((t, i) => <PersonLink link={t} key={i} />);
+  if (collapsible) {
+    return (
+      <details className="vc-team__group vc-collapse">
+        <summary className="vc-collapse__summary">
+          <span className="vc-collapse__heading">
+            <span className="vc-collapse__title vc-team__group-title">
+              {title}
+              <span className="vc-collapse__count"> ({list.length})</span>
+            </span>
+          </span>
+          <span className="vc-collapse__arrow" aria-hidden="true">▾</span>
+        </summary>
+        <div className="vc-collapse__body">{people}</div>
+      </details>
+    );
+  }
+  return (
+    <div className="vc-team__group">
+      <h3>{title}</h3>
+      {people}
+    </div>
+  );
+};
 
 const PersonLink = ({ link }) => (
   <div className="vc-person">
@@ -333,7 +383,7 @@ const targets = [
   {
     title: "Generalizable Ink Detection",
     description:
-      "Ink has been found in two scrolls, but remains elusive in our other scrolls.",
+      "Ink has been found in a handful of scrolls, but remains elusive in most of them.",
   },
   {
     title: "High Quality Annotations",
@@ -490,7 +540,7 @@ export function Landing() {
               geometry competition that is <a href="/grandprize">reading</a>{" "}
               the carbonized Herculaneum scrolls — without opening them. Our
               current challenge: <a href="/get_started">join the community</a>{" "}
-              and grow from a few passages to entire scrolls.
+              and read entire scrolls.
             </p>
             <div className="vc-stat-strip vc-hero__stats">
               <div className="vc-stat">
@@ -498,12 +548,12 @@ export function Landing() {
                 <span className="vc-stat__label">awarded in prizes</span>
               </div>
               <div className="vc-stat">
-                <span className="vc-stat__value">5</span>
+                <span className="vc-stat__value">35</span>
                 <span className="vc-stat__label">scrolls scanned</span>
               </div>
               <div className="vc-stat">
-                <span className="vc-stat__value">2</span>
-                <span className="vc-stat__label">scrolls read</span>
+                <span className="vc-stat__value">1</span>
+                <span className="vc-stat__label">scroll fully read</span>
               </div>
             </div>
             <div className="vc-hero__ctas">
@@ -667,9 +717,43 @@ export function Landing() {
               Our story
             </Heading>
             <div className="vc-timeline">
-              {stories({ unrollVideo }).map((s, index) => (
-                <Story story={s} key={s.date} index={index} />
-              ))}
+              {(() => {
+                const allStories = stories({ unrollVideo });
+                const EARLY_COUNT = 3; // 79 AD, 1750, 2015 — the pre-Challenge backstory
+                const early = allStories.slice(0, EARLY_COUNT);
+                const recent = allStories.slice(EARLY_COUNT);
+                return (
+                  <>
+                    <details className="vc-collapse vc-story-history">
+                      <summary className="vc-collapse__summary">
+                        <span className="vc-collapse__heading">
+                          <span className="vc-collapse__title">
+                            The backstory
+                          </span>
+                          <span className="vc-collapse__hint">
+                            79 AD – 2015 AD · how we got here
+                          </span>
+                        </span>
+                        <span className="vc-collapse__arrow" aria-hidden="true">
+                          ▾
+                        </span>
+                      </summary>
+                      <div className="vc-collapse__body">
+                        {early.map((s, index) => (
+                          <Story story={s} key={s.date} index={index} />
+                        ))}
+                      </div>
+                    </details>
+                    {recent.map((s, index) => (
+                      <Story
+                        story={s}
+                        key={s.date}
+                        index={index + EARLY_COUNT}
+                      />
+                    ))}
+                  </>
+                );
+              })()}
 
               <article
                 className="vc-story"
@@ -681,13 +765,16 @@ export function Landing() {
                   id="the-challenge-continues"
                   className="vc-story__title"
                 >
-                  The challenge continues.
+                  The first scroll is read.
                 </Heading>
                 <div className="vc-story__body">
                   <p>
-                    Vesuvius Challenge moves onto its next stage of reading
+                    In 2026, <a href="/firstscroll">PHerc. 1667</a> — sealed
+                    since the eruption in 79 AD — became the first Herculaneum
+                    scroll to be virtually unwrapped and read end to end.
+                    Vesuvius Challenge now moves onto its next stage: reading
                     multiple entire scrolls. Read more about the prizes below,
-                    and on how they contribute towards{" "}
+                    and how they contribute towards{" "}
                     <a href="/master_plan">The Master Plan</a>.
                   </p>
                   <div className="vc-open-prizes">
@@ -753,6 +840,7 @@ export function Landing() {
               title="Citizens"
               list={sponsors.filter((s) => s.amount < 50000)}
               dense
+              collapsible
             />
             <div className="vc-sponsors__cta">
               <a
@@ -785,36 +873,15 @@ export function Landing() {
               .
             </p>
             <div className="vc-team">
-              <div className="vc-team__group">
-                <h3>Vesuvius Challenge Team</h3>
-                {team.challenge.map((t, i) => (
-                  <PersonLink link={t} key={i} />
-                ))}
-              </div>
-              <div className="vc-team__group">
-                <h3>EduceLab Team</h3>
-                {team.educe.map((t, i) => (
-                  <PersonLink link={t} key={i} />
-                ))}
-              </div>
-              <div className="vc-team__group">
-                <h3>Advisors & Alumni</h3>
-                {team.alumni.map((t, i) => (
-                  <PersonLink link={t} key={i} />
-                ))}
-              </div>
-              <div className="vc-team__group">
-                <h3>Papyrology Team</h3>
-                {team.papyrology.map((t, i) => (
-                  <PersonLink link={t} key={i} />
-                ))}
-              </div>
-              <div className="vc-team__group">
-                <h3>Papyrology Advisors</h3>
-                {team.papyrologyAdvisors.map((t, i) => (
-                  <PersonLink link={t} key={i} />
-                ))}
-              </div>
+              <TeamGroup title="Vesuvius Challenge Team" list={team.challenge} />
+              <TeamGroup title="EduceLab Team" list={team.educe} />
+              <TeamGroup title="Advisors & Alumni" list={team.alumni} collapsible />
+              <TeamGroup title="Papyrology Team" list={team.papyrology} />
+              <TeamGroup
+                title="Papyrology Advisors"
+                list={team.papyrologyAdvisors}
+                collapsible
+              />
             </div>
             <p className="vc-caption vc-team__credit">
               Villa dei Papiri art by{" "}
