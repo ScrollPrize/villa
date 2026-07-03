@@ -190,6 +190,55 @@ QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
     return QStringLiteral("%1 x %2 vx").arg(formatValue(size.width), formatValue(size.height));
 }
 
+QString openDataCatalogVolumeIdForLoadedVolume(const VolumePkg& pkg, const std::string& loadedVolumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-volume-id:";
+    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
+        if (tag.rfind(prefix, 0) == 0) {
+            return QString::fromStdString(tag.substr(prefix.size()));
+        }
+    }
+    return {};
+}
+
+const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pkg,
+                                                             const QString& catalogVolumeId)
+{
+    if (catalogVolumeId.isEmpty()) {
+        return nullptr;
+    }
+
+    const std::string targetTag = "vc-open-data-target-volume-id:" + catalogVolumeId.toStdString();
+    const std::string sourceTag = "vc-open-data-source-volume-id:" + catalogVolumeId.toStdString();
+    const vc::project::Entry* sourceMatch = nullptr;
+
+    for (const auto& entry : pkg.segmentEntries()) {
+        const bool openData = std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end();
+        if (!openData) {
+            continue;
+        }
+        if (std::find(entry.tags.begin(), entry.tags.end(), targetTag) != entry.tags.end()) {
+            return &entry;
+        }
+        if (!sourceMatch &&
+            std::find(entry.tags.begin(), entry.tags.end(), sourceTag) != entry.tags.end()) {
+            sourceMatch = &entry;
+        }
+    }
+
+    return sourceMatch;
+}
+
+bool packageHasOpenDataSegments(const VolumePkg& pkg)
+{
+    for (const auto& entry : pkg.segmentEntries()) {
+        if (std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 class DockMenuMainWindow : public QMainWindow
 {
 public:
@@ -3545,6 +3594,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
     syncVolumeSelectionControls();
+    updateOpenDataSegmentTransformState(true);
 }
 
 bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
@@ -3620,6 +3670,7 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
     if (_surfaceAffineTransforms) {
         _surfaceAffineTransforms->refresh();
     }
+    updateOpenDataSegmentTransformState(false);
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -7836,6 +7887,90 @@ void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(key, volumeId);
+}
+
+void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
+{
+    if (!_state || !_state->vpkg()) {
+        return;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::string loadedVolumeId = _state->currentVolumeId();
+    const QString catalogVolumeId = openDataCatalogVolumeIdForLoadedVolume(*vpkg, loadedVolumeId);
+    const bool hasOpenDataSegments = packageHasOpenDataSegments(*vpkg);
+    const auto* matchingEntry = findOpenDataSegmentsEntryForVolume(*vpkg, catalogVolumeId);
+
+    auto setWarning = [&](bool enabled) {
+        const QString warningText = tr("Current segments have no available transforms to selected volume.");
+        if (!_segmentTransformWarning && statusBar()) {
+            _segmentTransformWarning = new QLabel(statusBar());
+            _segmentTransformWarning->setObjectName(QStringLiteral("segmentTransformWarning"));
+            _segmentTransformWarning->setStyleSheet(QStringLiteral("color: #c62828; font-weight: 600;"));
+            _segmentTransformWarning->setContentsMargins(8, 0, 8, 0);
+            _segmentTransformWarning->setAlignment(Qt::AlignCenter);
+            _segmentTransformWarning->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            _segmentTransformWarning->setMinimumWidth(320);
+            _segmentTransformWarning->hide();
+            statusBar()->addPermanentWidget(_segmentTransformWarning, 1);
+        }
+
+        if (_surfacePanel) {
+            _surfacePanel->setTransformWarning(enabled ? warningText : QString());
+        }
+        if (_segmentTransformWarning) {
+            _segmentTransformWarning->setText(enabled ? warningText : QString());
+            _segmentTransformWarning->setVisible(enabled);
+        }
+        if (enabled) {
+            showStatusBarMessage(warningText, 0);
+        } else if (_statusMessageLabel && _statusMessageLabel->text() == warningText) {
+            clearStatusBarMessage();
+        }
+    };
+
+    if (!hasOpenDataSegments || catalogVolumeId.isEmpty()) {
+        setWarning(false);
+        _lastSegmentTransformWarningVolumeId.clear();
+        return;
+    }
+
+    if (matchingEntry) {
+        const auto currentPath = vpkg->outputSegmentsPath().lexically_normal();
+        const auto targetPath = vc::project::resolveLocalPath(
+            matchingEntry->location,
+            vpkg->path().parent_path()).lexically_normal();
+        if (currentPath != targetPath) {
+            clearSurfaceSelection();
+            vpkg->setOutputSegments(matchingEntry->location);
+            vpkg->refreshSegmentations();
+            if (cmbSegmentationDir) {
+                const QSignalBlocker blocker(cmbSegmentationDir);
+                const QString targetName = QString::fromStdString(targetPath.filename().string());
+                const int index = cmbSegmentationDir->findText(targetName);
+                if (index >= 0) {
+                    cmbSegmentationDir->setCurrentIndex(index);
+                }
+            }
+            if (_surfacePanel) {
+                _surfacePanel->setVolumePkg(vpkg);
+                _surfacePanel->loadSurfaces(true);
+                _surfacePanel->refreshPointSetFilterOptions();
+            }
+        }
+        setWarning(false);
+        _lastSegmentTransformWarningVolumeId.clear();
+        return;
+    }
+
+    setWarning(true);
+    if (showDialog && _lastSegmentTransformWarningVolumeId != catalogVolumeId) {
+        _lastSegmentTransformWarningVolumeId = catalogVolumeId;
+        QMessageBox::information(
+            this,
+            tr("Segments unavailable"),
+            tr("Current segments have no available transforms to selected volume."));
+    }
 }
 
 QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)

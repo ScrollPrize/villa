@@ -19,6 +19,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -125,6 +126,8 @@ std::string segmentStableId(const OpenDataSegment& segment)
     }
     return safePathComponent(segment.suffix);
 }
+
+std::string sourceVolumeIdForSegment(const OpenDataSegment& segment);
 
 bool hasSegmentEntry(const VolumePkg& pkg, const std::string& location)
 {
@@ -448,6 +451,12 @@ std::string derivedVolumeId(const OpenDataSegment& segment)
     return segment.originalVolumeId;
 }
 
+std::string sourceVolumeIdForSegment(const OpenDataSegment& segment)
+{
+    const auto derived = derivedVolumeId(segment);
+    return derived.empty() ? segment.originalVolumeId : derived;
+}
+
 void applyOpenDataMetadata(nlohmann::json& meta,
                            const std::string& baseUrl,
                            const OpenDataSegment& segment)
@@ -471,6 +480,145 @@ bool artifactAlreadyInOriginalVolumeScale(const OpenDataArtifact& artifact)
 {
     const auto type = lowerCopy(artifact.type);
     return type.find("transformed") != std::string::npos;
+}
+
+std::optional<cv::Matx44d> parseOpenDataMatrix(const nlohmann::json& matrixJson)
+{
+    if (!matrixJson.is_array() || (matrixJson.size() != 3 && matrixJson.size() != 4)) {
+        return std::nullopt;
+    }
+
+    cv::Matx44d matrix = cv::Matx44d::eye();
+    for (int row = 0; row < static_cast<int>(matrixJson.size()); ++row) {
+        const auto& rowJson = matrixJson.at(static_cast<std::size_t>(row));
+        if (!rowJson.is_array() || rowJson.size() != 4) {
+            return std::nullopt;
+        }
+        for (int col = 0; col < 4; ++col) {
+            if (!rowJson.at(static_cast<std::size_t>(col)).is_number()) {
+                return std::nullopt;
+            }
+            matrix(row, col) = rowJson.at(static_cast<std::size_t>(col)).get<double>();
+        }
+    }
+    if (matrixJson.size() == 4 &&
+        (std::abs(matrix(3, 0)) > 1e-12 ||
+         std::abs(matrix(3, 1)) > 1e-12 ||
+         std::abs(matrix(3, 2)) > 1e-12 ||
+         std::abs(matrix(3, 3) - 1.0) > 1e-12)) {
+        return std::nullopt;
+    }
+    return matrix;
+}
+
+std::optional<cv::Matx44d> findVolumeTransformMatrix(const OpenDataSample& sample,
+                                                     const std::string& sourceVolumeId,
+                                                     const std::string& targetVolumeId)
+{
+    if (sourceVolumeId.empty() || targetVolumeId.empty() || sourceVolumeId == targetVolumeId) {
+        return std::nullopt;
+    }
+
+    const auto it = sample.properties.find("volume_transforms");
+    if (it == sample.properties.end()) {
+        return std::nullopt;
+    }
+
+    auto inspectTransformList = [&](const nlohmann::json& transforms) -> std::optional<cv::Matx44d> {
+        if (!transforms.is_array()) {
+            return std::nullopt;
+        }
+        for (const auto& transform : transforms) {
+            if (!transform.is_object()) {
+                continue;
+            }
+            const auto toIt = transform.find("to_volume_id");
+            if (toIt == transform.end() || !toIt->is_string() ||
+                toIt->get<std::string>() != targetVolumeId) {
+                continue;
+            }
+            const auto matrixIt = transform.find("matrix");
+            if (matrixIt == transform.end()) {
+                continue;
+            }
+            if (auto matrix = parseOpenDataMatrix(*matrixIt)) {
+                return matrix;
+            }
+        }
+        return std::nullopt;
+    };
+
+    if (it->is_array()) {
+        for (const auto& fromEntry : *it) {
+            if (!fromEntry.is_object()) {
+                continue;
+            }
+            const auto fromIt = fromEntry.find("from_volume_id");
+            if (fromIt == fromEntry.end() || !fromIt->is_string() ||
+                fromIt->get<std::string>() != sourceVolumeId) {
+                continue;
+            }
+            const auto transformsIt = fromEntry.find("transforms");
+            if (transformsIt != fromEntry.end()) {
+                if (auto matrix = inspectTransformList(*transformsIt)) {
+                    return matrix;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    if (it->is_object()) {
+        const auto fromIt = it->find(sourceVolumeId);
+        if (fromIt == it->end()) {
+            return std::nullopt;
+        }
+        if (fromIt->is_object()) {
+            const auto transformsIt = fromIt->find("transforms");
+            if (transformsIt != fromIt->end()) {
+                if (auto matrix = inspectTransformList(*transformsIt)) {
+                    return matrix;
+                }
+            }
+            const auto targetIt = fromIt->find(targetVolumeId);
+            if (targetIt != fromIt->end()) {
+                if (targetIt->is_object()) {
+                    if (const auto matrixIt = targetIt->find("matrix"); matrixIt != targetIt->end()) {
+                        return parseOpenDataMatrix(*matrixIt);
+                    }
+                }
+                return parseOpenDataMatrix(*targetIt);
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+nlohmann::json matrixToJson(const cv::Matx44d& matrix)
+{
+    nlohmann::json out = nlohmann::json::array();
+    for (int row = 0; row < 3; ++row) {
+        nlohmann::json rowJson = nlohmann::json::array();
+        for (int col = 0; col < 4; ++col) {
+            rowJson.push_back(matrix(row, col));
+        }
+        out.push_back(std::move(rowJson));
+    }
+    return out;
+}
+
+utils::Json matrixToUtilsJson(const cv::Matx44d& matrix)
+{
+    auto out = utils::Json::array();
+    for (int row = 0; row < 3; ++row) {
+        auto rowJson = utils::Json::array();
+        for (int col = 0; col < 4; ++col) {
+            rowJson.push_back(matrix(row, col));
+        }
+        out.push_back(std::move(rowJson));
+    }
+    return out;
 }
 
 void applyOriginalVolumeDownscale(const std::filesystem::path& segmentDir,
@@ -833,6 +981,42 @@ bool originMatches(const nlohmann::json& origin,
            (actualUrl.empty() || expectedUrl.empty() || actualUrl == expectedUrl);
 }
 
+bool transformedOriginMatches(const nlohmann::json& origin,
+                              const OpenDataSample& sample,
+                              const OpenDataSegment& segment,
+                              const std::string& sourceVolumeId,
+                              const std::string& targetVolumeId,
+                              const cv::Matx44d& matrix)
+{
+    if (!origin.is_object()) {
+        return false;
+    }
+    auto stringField = [&](const char* key) -> std::string {
+        const auto it = origin.find(key);
+        return it != origin.end() && it->is_string() ? it->get<std::string>() : std::string{};
+    };
+    if (stringField("sample_id") != sample.id ||
+        stringField("segment_id") != segment.id ||
+        stringField("source_volume_id") != sourceVolumeId ||
+        stringField("target_volume_id") != targetVolumeId) {
+        return false;
+    }
+    const auto matrixIt = origin.find("matrix");
+    const auto cachedMatrix = matrixIt == origin.end() ? std::optional<cv::Matx44d>{}
+                                                       : parseOpenDataMatrix(*matrixIt);
+    if (!cachedMatrix) {
+        return false;
+    }
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            if (std::abs((*cachedMatrix)(row, col) - matrix(row, col)) > 1e-12) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 std::optional<nlohmann::json> readCatalogOrigin(const std::filesystem::path& dir)
 {
     const auto path = dir / "catalog-origin.json";
@@ -1026,6 +1210,74 @@ bool cacheTifxyzSegment(const OpenDataSample& sample,
     return false;
 }
 
+bool cacheTransformedTifxyzSegment(const OpenDataSample& sample,
+                                   const OpenDataSegment& segment,
+                                   const std::filesystem::path& sourceSegmentDir,
+                                   const std::filesystem::path& targetSegmentDir,
+                                   const std::string& targetVolumeId,
+                                   std::string* errorOut)
+{
+    if (!requiredFilesPresent(sourceSegmentDir)) {
+        if (errorOut) *errorOut = "source cached segment is incomplete.";
+        return false;
+    }
+
+    const std::string sourceVolumeId = sourceVolumeIdForSegment(segment);
+    const auto matrix = findVolumeTransformMatrix(sample, sourceVolumeId, targetVolumeId);
+    if (!matrix) {
+        if (errorOut) *errorOut = "no transform from " + sourceVolumeId + " to " + targetVolumeId + ".";
+        return false;
+    }
+
+    if (requiredFilesPresent(targetSegmentDir)) {
+        const auto origin = readCatalogOrigin(targetSegmentDir);
+        if (origin && transformedOriginMatches(*origin, sample, segment, sourceVolumeId, targetVolumeId, *matrix)) {
+            return true;
+        }
+    }
+
+    const auto tempDir = makeTempSegmentDir(targetSegmentDir);
+    std::error_code ec;
+    std::filesystem::remove_all(tempDir, ec);
+    std::filesystem::create_directories(tempDir);
+
+    try {
+        auto surface = load_quad_from_tifxyz(sourceSegmentDir.string());
+        if (!surface) {
+            throw std::runtime_error("failed to load source cached tifxyz segment");
+        }
+
+        vc::core::util::transformSurfacePoints(surface.get(), 1.0, *matrix, 1.0);
+        vc::core::util::refreshTransformedSurfaceState(surface.get());
+        surface->meta["vc_open_data_transform_source_volume_id"] = sourceVolumeId;
+        surface->meta["vc_open_data_transform_target_volume_id"] = targetVolumeId;
+        surface->meta["vc_open_data_volume_transform_matrix"] = matrixToUtilsJson(*matrix);
+        surface->save(tempDir.string(), segmentStableId(segment), true);
+
+        nlohmann::json origin;
+        origin["manifest_url"] = std::string(kDefaultManifestUrl);
+        origin["sample_id"] = sample.id;
+        origin["segment_id"] = segment.id;
+        origin["segment_long_id"] = segment.longId;
+        origin["source_volume_id"] = sourceVolumeId;
+        origin["target_volume_id"] = targetVolumeId;
+        origin["matrix"] = matrixToJson(*matrix);
+        origin["transformed_at_utc"] = nowUtcIso();
+        origin["cache_state"] = cacheStateName(OpenDataSegmentCacheState::Current);
+        writeStringAtomic(tempDir / "catalog-origin.json", origin.dump(2));
+
+        publishSegmentDirectory(tempDir, targetSegmentDir);
+        return true;
+    } catch (const std::exception& e) {
+        std::filesystem::remove_all(tempDir, ec);
+        if (errorOut) *errorOut = e.what();
+    } catch (...) {
+        std::filesystem::remove_all(tempDir, ec);
+        if (errorOut) *errorOut = "unknown error.";
+    }
+    return false;
+}
+
 void markOrphanedEntries(const std::filesystem::path& segmentsRoot,
                          const std::set<std::string>& expectedDirNames)
 {
@@ -1090,6 +1342,26 @@ std::filesystem::path openDataSegmentCacheDirectory(
     const OpenDataSegment& segment)
 {
     return openDataSegmentCacheRoot(remoteCacheRoot, sample) /
+           safePathComponent(segment.id);
+}
+
+std::filesystem::path openDataTransformedSegmentCacheRoot(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const std::string& targetVolumeId)
+{
+    return remoteCacheRoot / "open_data" / "segments" /
+           (safePathComponent(sample.id.empty() ? "sample" : sample.id) +
+            "__to_" + safePathComponent(targetVolumeId.empty() ? "volume" : targetVolumeId));
+}
+
+std::filesystem::path openDataTransformedSegmentCacheDirectory(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment,
+    const std::string& targetVolumeId)
+{
+    return openDataTransformedSegmentCacheRoot(remoteCacheRoot, sample, targetVolumeId) /
            safePathComponent(segment.id);
 }
 
@@ -1381,8 +1653,19 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     }
 
     const auto location = segmentsRoot.string();
+    std::set<std::string> sourceVolumeIds;
+    for (const auto* segment : tifxyzSegments) {
+        const auto sourceVolumeId = sourceVolumeIdForSegment(*segment);
+        if (!sourceVolumeId.empty()) {
+            sourceVolumeIds.insert(sourceVolumeId);
+        }
+    }
+    std::vector<std::string> sourceTags = {"open-data", "immutable"};
+    for (const auto& sourceVolumeId : sourceVolumeIds) {
+        sourceTags.push_back("vc-open-data-source-volume-id:" + sourceVolumeId);
+    }
     try {
-        if (pkg.addSegmentsEntry(location, {"open-data", "immutable"})) {
+        if (pkg.addSegmentsEntry(location, sourceTags)) {
             ++result.attachedSegmentEntries;
         } else if (hasSegmentEntry(pkg, location)) {
             pkg.refreshSegmentations();
@@ -1396,6 +1679,116 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     } catch (...) {
         ++result.failedTifxyzSegments;
         result.messages.push_back("Failed to attach cached tifxyz segment directory: unknown error.");
+    }
+
+    std::set<std::string> targetVolumeIds;
+    for (const auto& volume : sample.volumes) {
+        if (!volume.id.empty()) {
+            targetVolumeIds.insert(volume.id);
+        }
+    }
+    for (const auto& sourceVolumeId : sourceVolumeIds) {
+        targetVolumeIds.erase(sourceVolumeId);
+    }
+
+    struct TransformTask {
+        const OpenDataSegment* segment = nullptr;
+        std::string targetVolumeId;
+    };
+    std::vector<TransformTask> transformTasks;
+    for (const auto& targetVolumeId : targetVolumeIds) {
+        for (const auto* segment : tifxyzSegments) {
+            const auto sourceVolumeId = sourceVolumeIdForSegment(*segment);
+            if (sourceVolumeId.empty() || sourceVolumeId == targetVolumeId ||
+                !findVolumeTransformMatrix(sample, sourceVolumeId, targetVolumeId)) {
+                continue;
+            }
+            transformTasks.push_back({segment, targetVolumeId});
+        }
+    }
+
+    std::map<std::string, int> transformedByTarget;
+    if (!transformTasks.empty()) {
+        std::atomic_size_t nextTransform{0};
+        std::mutex transformResultMutex;
+        const auto hardware = std::thread::hardware_concurrency();
+        const std::size_t desiredWorkers = hardware == 0 ? 4 : hardware;
+        const std::size_t transformWorkerCount = std::min<std::size_t>(
+            transformTasks.size(),
+            transformTasks.size() <= 1
+                ? 1
+                : std::max<std::size_t>(2, std::min<std::size_t>(desiredWorkers, 4)));
+
+        auto transformWorker = [&]() {
+            for (;;) {
+                const std::size_t idx = nextTransform.fetch_add(1);
+                if (idx >= transformTasks.size()) {
+                    return;
+                }
+                const auto& task = transformTasks[idx];
+                const auto sourceSegmentDir = openDataSegmentCacheDirectory(
+                    remoteCacheRoot, sample, *task.segment);
+                const auto targetSegmentDir = openDataTransformedSegmentCacheDirectory(
+                    remoteCacheRoot, sample, *task.segment, task.targetVolumeId);
+                std::string error;
+                const bool transformed = cacheTransformedTifxyzSegment(sample,
+                                                                       *task.segment,
+                                                                       sourceSegmentDir,
+                                                                       targetSegmentDir,
+                                                                       task.targetVolumeId,
+                                                                       &error);
+                std::lock_guard<std::mutex> lk(transformResultMutex);
+                if (transformed) {
+                    ++result.transformedTifxyzSegments;
+                    ++transformedByTarget[task.targetVolumeId];
+                } else {
+                    ++result.failedTransformedTifxyzSegments;
+                    result.messages.push_back("Failed to transform " + segmentLabel(*task.segment) +
+                                              " to " + task.targetVolumeId + ": " + error);
+                }
+            }
+        };
+
+        std::vector<std::thread> transformWorkers;
+        transformWorkers.reserve(transformWorkerCount);
+        for (std::size_t i = 0; i < transformWorkerCount; ++i) {
+            transformWorkers.emplace_back(transformWorker);
+        }
+        for (auto& t : transformWorkers) {
+            t.join();
+        }
+    }
+
+    for (const auto& [targetVolumeId, transformedForTarget] : transformedByTarget) {
+        if (transformedForTarget <= 0) {
+            continue;
+        }
+
+        const auto transformedRoot = openDataTransformedSegmentCacheRoot(
+            remoteCacheRoot, sample, targetVolumeId);
+        const auto transformedLocation = transformedRoot.string();
+        try {
+            if (pkg.addSegmentsEntry(transformedLocation,
+                                     {"open-data",
+                                      "immutable",
+                                      "open-data-transformed",
+                                      "vc-open-data-target-volume-id:" + targetVolumeId})) {
+                ++result.attachedSegmentEntries;
+            } else if (hasSegmentEntry(pkg, transformedLocation)) {
+                pkg.refreshSegmentations();
+            } else {
+                result.messages.push_back("Failed to attach transformed tifxyz segment directory for " +
+                                          targetVolumeId + ".");
+            }
+        } catch (const std::exception& e) {
+            ++result.failedTransformedTifxyzSegments;
+            result.messages.push_back("Failed to attach transformed tifxyz segment directory for " +
+                                      targetVolumeId + ": " + e.what());
+        } catch (...) {
+            ++result.failedTransformedTifxyzSegments;
+            result.messages.push_back("Failed to attach transformed tifxyz segment directory for " +
+                                      targetVolumeId + ": unknown error.");
+        }
     }
 
     return result;

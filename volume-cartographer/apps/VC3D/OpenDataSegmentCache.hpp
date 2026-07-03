@@ -41,6 +41,8 @@ struct OpenDataSegmentCacheReconcileResult {
     int attachedSegmentEntries = 0;
     int skippedTifxyzSegments = 0;
     int failedTifxyzSegments = 0;
+    int transformedTifxyzSegments = 0;
+    int failedTransformedTifxyzSegments = 0;
     std::vector<std::string> messages;
 };
 
@@ -64,6 +66,17 @@ struct OpenDataInkDetectionEntry {
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,
     const OpenDataSegment& segment);
+
+[[nodiscard]] std::filesystem::path openDataTransformedSegmentCacheRoot(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const std::string& targetVolumeId);
+
+[[nodiscard]] std::filesystem::path openDataTransformedSegmentCacheDirectory(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment,
+    const std::string& targetVolumeId);
 
 [[nodiscard]] std::filesystem::path openDataEditableSegmentRoot(
     const std::filesystem::path& remoteCacheRoot,

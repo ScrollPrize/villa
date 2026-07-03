@@ -23,6 +23,8 @@ struct OpenDataSampleProjectResult {
     int attachedSegmentEntries = 0;
     int skippedTifxyzSegments = 0;
     int failedTifxyzSegments = 0;
+    int transformedTifxyzSegments = 0;
+    int failedTransformedTifxyzSegments = 0;
     std::string preferredVolumeId;
     std::vector<std::string> messages;
 };

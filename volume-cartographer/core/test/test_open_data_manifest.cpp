@@ -528,6 +528,77 @@ TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts"
     std::filesystem::remove_all(cacheRoot);
 }
 
+TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
+{
+    auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    sample.volumes.push_back(targetVolume);
+    sample.properties["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_volume_transform_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto sourceDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    const auto transformedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front(), "vol2");
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    writeFile(sourceDir / "meta.json",
+              R"({"type":"seg","uuid":"20260311000000.tmp-12345","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", sourceDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", sourceDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", sourceDir / "z.tif");
+    writeFile(sourceDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", sample.segments.front().id},
+                  {"resolved_http_url", preferredTifxyzArtifact(sample.segments.front())->resolvedUrl},
+                  {"cache_state", "current"}
+              }.dump());
+
+    auto pkg = VolumePkg::newEmpty();
+    OpenDataSampleProjectResult result;
+    attachOpenDataSampleSegments(*pkg, sample, cacheRoot, result);
+
+    CHECK(result.cachedTifxyzSegments == 1);
+    CHECK(result.transformedTifxyzSegments == 1);
+    REQUIRE(std::filesystem::is_regular_file(transformedDir / "meta.json"));
+    REQUIRE(pkg->segmentEntries().size() == 2);
+    CHECK(std::any_of(pkg->segmentEntries().begin(),
+                      pkg->segmentEntries().end(),
+                      [](const vc::project::Entry& entry) {
+                          return std::find(entry.tags.begin(),
+                                           entry.tags.end(),
+                                           "vc-open-data-target-volume-id:vol2") != entry.tags.end();
+                      }));
+
+    std::ifstream metaIn(transformedDir / "meta.json", std::ios::binary);
+    REQUIRE(metaIn.good());
+    const auto meta = nlohmann::json::parse(metaIn);
+    CHECK(meta.at("vc_open_data_transform_source_volume_id").get<std::string>() == "vol1");
+    CHECK(meta.at("vc_open_data_transform_target_volume_id").get<std::string>() == "vol2");
+    CHECK(meta.at("vc_open_data_volume_transform_matrix")[0][3].get<double>() == doctest::Approx(10.0));
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
 {
     OpenDataSample sample;

@@ -357,6 +357,8 @@ void attachOpenDataSampleSegments(
     result.attachedSegmentEntries += cacheResult.attachedSegmentEntries;
     result.skippedTifxyzSegments += cacheResult.skippedTifxyzSegments;
     result.failedTifxyzSegments += cacheResult.failedTifxyzSegments;
+    result.transformedTifxyzSegments += cacheResult.transformedTifxyzSegments;
+    result.failedTransformedTifxyzSegments += cacheResult.failedTransformedTifxyzSegments;
     result.messages.insert(result.messages.end(),
                            cacheResult.messages.begin(),
                            cacheResult.messages.end());
