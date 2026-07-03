@@ -62,6 +62,13 @@ private:
     QString settingsKeyForItem(const Item& item) const;
     void loadPanelSize(Item& item);
     void savePanelSize(const Item& item) const;
+    QString itemSettingsId(const Item& item) const;
+    void loadItemOrder();
+    void saveItemOrder() const;
+    void rebuildBarLayout();
+    int itemIndexForButton(const QPushButton* button) const;
+    int reorderDropIndexAtGlobalPoint(const QPoint& globalPos) const;
+    void moveItem(int from, int to);
     enum class ResizeMode {
         None,
         Width,
@@ -83,4 +90,7 @@ private:
     ResizeMode _resizeMode{ResizeMode::None};
     QPoint _resizeStartGlobal;
     QSize _resizeStartSize;
+    QPointer<QPushButton> _dragButton;
+    QPoint _dragStartGlobal;
+    bool _draggingButton{false};
 };

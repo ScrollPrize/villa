@@ -20,6 +20,7 @@
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QStyle>
+#include <QStyleHints>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -29,6 +30,7 @@
 namespace {
 constexpr int kResizeHitWidth = 10;
 constexpr auto kPanelSizeSettingsPrefix = "statusDockPanels/sizes";
+constexpr auto kPanelOrderSettingsKey = "statusDockPanels/order";
 
 QIcon makePinIcon(const QPalette& palette, bool pinned)
 {
@@ -187,12 +189,12 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     button->setContextMenuPolicy(Qt::CustomContextMenu);
     button->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
     button->setToolTip(tr("Left-click to expand. Right-click for pin and detach options."));
+    button->installEventFilter(this);
 
     item.page = page;
     item.button = button;
     item.pinButton = pin;
     _items.push_back(item);
-    const int index = static_cast<int>(_items.size() - 1);
     _stack->addWidget(page);
     _barLayout->insertWidget(std::max(0, _barLayout->count() - 1), button);
 
@@ -201,31 +203,33 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
         dock->disconnect(action);
         action->setCheckable(true);
         action->setChecked(true);
-        connect(action, &QAction::toggled, this, [this, index](bool checked) {
-            if (index >= 0 && index < static_cast<int>(_items.size())) {
-                setItemVisibleInBar(_items[static_cast<std::size_t>(index)], checked);
+        connect(action, &QAction::toggled, this, [this, dock](bool checked) {
+            if (Item* actionItem = itemForDock(dock)) {
+                setItemVisibleInBar(*actionItem, checked);
             }
         });
     }
 
-    connect(button, &QPushButton::clicked, this, [this, index]() {
-        if (index >= 0 && index < static_cast<int>(_items.size())) {
-            toggleItem(_items[static_cast<std::size_t>(index)]);
+    connect(button, &QPushButton::clicked, this, [this, dock]() {
+        if (_draggingButton) {
+            return;
+        }
+        if (Item* clickedItem = itemForDock(dock)) {
+            toggleItem(*clickedItem);
         }
     });
-    connect(button, &QPushButton::customContextMenuRequested, this, [this, index, button](const QPoint& pos) {
-        if (index >= 0 && index < static_cast<int>(_items.size())) {
-            showItemMenu(_items[static_cast<std::size_t>(index)], button->mapToGlobal(pos));
+    connect(button, &QPushButton::customContextMenuRequested, this, [this, dock, button](const QPoint& pos) {
+        if (Item* menuItem = itemForDock(dock)) {
+            showItemMenu(*menuItem, button->mapToGlobal(pos));
         }
     });
     connect(collapse, &QToolButton::clicked, this, [this]() {
         collapseCurrent();
     });
-    connect(pin, &QToolButton::clicked, this, [this, index](bool checked) {
-        if (index >= 0 && index < static_cast<int>(_items.size())) {
-            Item& item = _items[static_cast<std::size_t>(index)];
-            item.pinned = checked;
-            updateButton(item);
+    connect(pin, &QToolButton::clicked, this, [this, dock](bool checked) {
+        if (Item* pinItem = itemForDock(dock)) {
+            pinItem->pinned = checked;
+            updateButton(*pinItem);
         }
     });
     connect(dock, &QDockWidget::visibilityChanged, this, [this, dock](bool visible) {
@@ -237,18 +241,68 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     });
 
     page->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(page, &QWidget::customContextMenuRequested, this, [this, index, page](const QPoint& pos) {
-        if (index >= 0 && index < static_cast<int>(_items.size())) {
-            showItemMenu(_items[static_cast<std::size_t>(index)], page->mapToGlobal(pos));
+    connect(page, &QWidget::customContextMenuRequested, this, [this, dock, page](const QPoint& pos) {
+        if (Item* menuItem = itemForDock(dock)) {
+            showItemMenu(*menuItem, page->mapToGlobal(pos));
         }
     });
 
-    updateButton(_items.back());
-    syncViewAction(_items.back());
+    loadItemOrder();
+    if (Item* addedItem = itemForDock(dock)) {
+        updateButton(*addedItem);
+        syncViewAction(*addedItem);
+    }
 }
 
 bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 {
+    if (auto* button = qobject_cast<QPushButton*>(watched)) {
+        if (itemIndexForButton(button) >= 0) {
+            if (event->type() == QEvent::MouseButtonPress) {
+                auto* mouse = static_cast<QMouseEvent*>(event);
+                if (mouse->button() == Qt::LeftButton) {
+                    _dragButton = button;
+                    _dragStartGlobal = mouse->globalPosition().toPoint();
+                    _draggingButton = false;
+                }
+            } else if (event->type() == QEvent::MouseMove && _dragButton == button) {
+                auto* mouse = static_cast<QMouseEvent*>(event);
+                const QPoint globalPos = mouse->globalPosition().toPoint();
+                const int dragDistance = qApp && qApp->styleHints()
+                    ? qApp->styleHints()->startDragDistance()
+                    : QApplication::startDragDistance();
+                if (!_draggingButton &&
+                    (globalPos - _dragStartGlobal).manhattanLength() >= dragDistance) {
+                    _draggingButton = true;
+                    if (_currentIndex >= 0 &&
+                        _currentIndex < static_cast<int>(_items.size())) {
+                        Item& current = _items[static_cast<std::size_t>(_currentIndex)];
+                        if (!current.pinned) {
+                            collapseCurrent();
+                        }
+                    }
+                    button->setDown(true);
+                    button->setCursor(Qt::ClosedHandCursor);
+                }
+                if (_draggingButton) {
+                    const int from = itemIndexForButton(button);
+                    const int to = reorderDropIndexAtGlobalPoint(globalPos);
+                    moveItem(from, to);
+                    return true;
+                }
+            } else if (event->type() == QEvent::MouseButtonRelease && _dragButton == button) {
+                button->unsetCursor();
+                button->setDown(false);
+                _dragButton.clear();
+                if (_draggingButton) {
+                    saveItemOrder();
+                    _draggingButton = false;
+                    return true;
+                }
+            }
+        }
+    }
+
     if (watched == _panelFrame && event->type() == QEvent::Resize && _currentIndex >= 0 &&
         _currentIndex < static_cast<int>(_items.size()) && !_positioningPanel) {
         Item& item = _items[static_cast<std::size_t>(_currentIndex)];
@@ -626,20 +680,7 @@ bool StatusDockPanelHost::globalPointInsidePanelOrBar(const QPoint& globalPos) c
 
 QString StatusDockPanelHost::settingsKeyForItem(const Item& item) const
 {
-    QString id;
-    if (item.dock) {
-        id = item.dock->objectName();
-        if (id.isEmpty()) {
-            id = item.dock->windowTitle();
-        }
-    }
-    if (id.isEmpty()) {
-        const int index = itemIndex(item);
-        id = index >= 0 ? QStringLiteral("panel_%1").arg(index) : QStringLiteral("unknown");
-    }
-    id.replace(QLatin1Char('/'), QLatin1Char('_'));
-    id.replace(QLatin1Char('\\'), QLatin1Char('_'));
-    return QStringLiteral("%1/%2").arg(QString::fromLatin1(kPanelSizeSettingsPrefix), id);
+    return QStringLiteral("%1/%2").arg(QString::fromLatin1(kPanelSizeSettingsPrefix), itemSettingsId(item));
 }
 
 void StatusDockPanelHost::loadPanelSize(Item& item)
@@ -660,6 +701,161 @@ void StatusDockPanelHost::savePanelSize(const Item& item) const
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(settingsKeyForItem(item), item.panelSize);
+}
+
+QString StatusDockPanelHost::itemSettingsId(const Item& item) const
+{
+    QString id;
+    if (item.dock) {
+        id = item.dock->objectName();
+        if (id.isEmpty()) {
+            id = item.dock->windowTitle();
+        }
+    }
+    if (id.isEmpty()) {
+        const int index = itemIndex(item);
+        id = index >= 0 ? QStringLiteral("panel_%1").arg(index) : QStringLiteral("unknown");
+    }
+    id.replace(QLatin1Char('/'), QLatin1Char('_'));
+    id.replace(QLatin1Char('\\'), QLatin1Char('_'));
+    return id;
+}
+
+void StatusDockPanelHost::loadItemOrder()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QStringList order = settings.value(QString::fromLatin1(kPanelOrderSettingsKey)).toStringList();
+    if (order.isEmpty() || _items.size() < 2) {
+        rebuildBarLayout();
+        return;
+    }
+
+    QWidget* currentPage = nullptr;
+    if (_currentIndex >= 0 && _currentIndex < static_cast<int>(_items.size())) {
+        currentPage = _items[static_cast<std::size_t>(_currentIndex)].page;
+    }
+
+    std::stable_sort(_items.begin(), _items.end(), [this, &order](const Item& lhs, const Item& rhs) {
+        const int lhsIndex = order.indexOf(itemSettingsId(lhs));
+        const int rhsIndex = order.indexOf(itemSettingsId(rhs));
+        const bool lhsKnown = lhsIndex >= 0;
+        const bool rhsKnown = rhsIndex >= 0;
+        if (lhsKnown != rhsKnown) {
+            return lhsKnown;
+        }
+        if (!lhsKnown) {
+            return false;
+        }
+        return lhsIndex < rhsIndex;
+    });
+
+    _currentIndex = -1;
+    if (currentPage) {
+        for (int i = 0; i < static_cast<int>(_items.size()); ++i) {
+            if (_items[static_cast<std::size_t>(i)].page == currentPage) {
+                _currentIndex = i;
+                break;
+            }
+        }
+    }
+    rebuildBarLayout();
+}
+
+void StatusDockPanelHost::saveItemOrder() const
+{
+    QStringList order;
+    order.reserve(static_cast<int>(_items.size()));
+    for (const Item& item : _items) {
+        order.push_back(itemSettingsId(item));
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(QString::fromLatin1(kPanelOrderSettingsKey), order);
+}
+
+void StatusDockPanelHost::rebuildBarLayout()
+{
+    if (!_barLayout) {
+        return;
+    }
+
+    for (const Item& item : _items) {
+        if (item.button) {
+            _barLayout->removeWidget(item.button);
+        }
+    }
+    for (const Item& item : _items) {
+        if (item.button) {
+            _barLayout->insertWidget(std::max(0, _barLayout->count() - 1), item.button);
+        }
+    }
+}
+
+int StatusDockPanelHost::itemIndexForButton(const QPushButton* button) const
+{
+    if (!button) {
+        return -1;
+    }
+    for (int i = 0; i < static_cast<int>(_items.size()); ++i) {
+        if (_items[static_cast<std::size_t>(i)].button == button) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int StatusDockPanelHost::reorderDropIndexAtGlobalPoint(const QPoint& globalPos) const
+{
+    if (_items.empty()) {
+        return -1;
+    }
+
+    for (int i = 0; i < static_cast<int>(_items.size()); ++i) {
+        const Item& item = _items[static_cast<std::size_t>(i)];
+        if (!item.button || !item.button->isVisible()) {
+            continue;
+        }
+        const QRect rect(item.button->mapToGlobal(QPoint(0, 0)), item.button->size());
+        if (globalPos.x() < rect.center().x()) {
+            return i;
+        }
+    }
+
+    return static_cast<int>(_items.size()) - 1;
+}
+
+void StatusDockPanelHost::moveItem(int from, int to)
+{
+    if (from < 0 || to < 0 ||
+        from >= static_cast<int>(_items.size()) ||
+        to >= static_cast<int>(_items.size()) ||
+        from == to) {
+        return;
+    }
+
+    QWidget* currentPage = nullptr;
+    if (_currentIndex >= 0 && _currentIndex < static_cast<int>(_items.size())) {
+        currentPage = _items[static_cast<std::size_t>(_currentIndex)].page;
+    }
+
+    Item item = std::move(_items[static_cast<std::size_t>(from)]);
+    _items.erase(_items.begin() + from);
+    _items.insert(_items.begin() + to, std::move(item));
+
+    _currentIndex = -1;
+    if (currentPage) {
+        for (int i = 0; i < static_cast<int>(_items.size()); ++i) {
+            if (_items[static_cast<std::size_t>(i)].page == currentPage) {
+                _currentIndex = i;
+                break;
+            }
+        }
+    }
+
+    rebuildBarLayout();
+    if (_currentIndex >= 0 && _currentIndex < static_cast<int>(_items.size())) {
+        positionPanelForItem(_items[static_cast<std::size_t>(_currentIndex)]);
+    }
 }
 
 StatusDockPanelHost::ResizeMode StatusDockPanelHost::resizeModeAtGlobalPoint(const QPoint& globalPos) const
