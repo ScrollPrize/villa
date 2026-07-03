@@ -642,10 +642,20 @@ details.alert > summary {
    into an overlay outside .markdown, so it is unaffected. */
 html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   .markdown
-  img:not([class*="object-cover"]) {
+  img:not([class*="object-cover"]):not([class*="max-w-none"]) {
   max-width: 100%;
   border-radius: var(--vc-r-card);
   border: 1px solid var(--vc-line);
+}
+/* Pannable full-width strips (e.g. the PHerc 1667 banner on /firstscroll):
+   the image keeps its natural width and scrolls inside its own
+   overflow-x-auto container — forcing max-width:100% distorts it. The frame
+   lives on the outer container, so the image itself stays unframed. */
+.markdown .overflow-x-auto img,
+.markdown img[class*="max-w-none"] {
+  max-width: none;
+  border: 0;
+  border-radius: 0;
 }
 
 /* Typography only — custom.css keeps its legacy negative margin-top, which

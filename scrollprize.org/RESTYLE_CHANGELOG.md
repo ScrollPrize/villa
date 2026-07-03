@@ -146,6 +146,12 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 Sidebar now opens with only **Overview** and **Data** expanded by default; Tutorials, Milestones & Results, Extra, and Archive start collapsed and auto-expand only when the visited page lives inside them (Docusaurus native active-path expansion). Change: `Data` category `collapsed: true → false` in `sidebars.js` (Overview was already expanded; the rest already collapsed).
 **Verification:** screenshots — `/get_started` shows Overview+Data open, others closed; `/tutorial1` additionally shows Tutorials auto-expanded with the active item highlighted.
 
+## C13 — fix: firstscroll banner distortion (chrome image rule vs pannable strip)
+
+The docs-chrome rule framing content images (`max-width:100%` + border) was crushing the 4000px-wide PHerc. 1667 banner on `/firstscroll` into the 720px column while its height stayed pinned — visible distortion. Images marked `max-w-none` or living inside an `overflow-x-auto` strip are now exempt (natural width, panning restored, no doubled frame — the frame belongs to the outer container).
+**Files:** `src/css/chrome.css`.
+**Verification:** build green; `/firstscroll` screenshot shows the strip at natural proportions with scale-bar/credit overlays and sideways panning.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
