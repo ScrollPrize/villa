@@ -31,13 +31,13 @@
    </property>
    <layout class="QVBoxLayout" name="verticalLayout_10">
     <property name="leftMargin">
-     <number>4</number>
+     <number>0</number>
     </property>
     <property name="topMargin">
-     <number>10</number>
+     <number>0</number>
     </property>
     <property name="rightMargin">
-     <number>4</number>
+     <number>0</number>
     </property>
     <property name="bottomMargin">
      <number>0</number>
@@ -45,30 +45,40 @@
     <item>
      <widget class="QWidget" name="central" native="true">
       <layout class="QVBoxLayout" name="verticalLayout_15">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
        <property name="bottomMargin">
         <number>0</number>
        </property>
        <item>
         <layout class="QVBoxLayout" name="viewerLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
          <item>
-          <widget class="QTabWidget" name="tabWidget">
-           <property name="currentIndex">
-            <number>0</number>
+          <widget class="QWidget" name="tabSegment" native="true">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
            </property>
-           <widget class="QWidget" name="tabSegment">
-            <property name="sizePolicy">
-             <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-              <horstretch>0</horstretch>
-              <verstretch>0</verstretch>
-             </sizepolicy>
-            </property>
-            <attribute name="icon">
-             <iconset theme="image-x-generic"/>
-            </attribute>
-            <attribute name="title">
-             <string>Segment</string>
-            </attribute>
-           </widget>
           </widget>
          </item>
         </layout>

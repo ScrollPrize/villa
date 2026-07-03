@@ -1,19 +1,26 @@
 #include "SettingsDialog.hpp"
 
 #include "VCSettings.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
 #include <thread>
+#include <utility>
+#include <QComboBox>
 #include <QDir>
 #include <QFileDialog>
+#include <QGridLayout>
+#include <QLabel>
 #include <QSettings>
 #include <QMessageBox>
 #include <QToolTip>
 
 
 
-SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
+SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage, QWidget *parent)
+    : QDialog(parent)
+    , _volumePackage(std::move(volumePackage))
 {
     setupUi(this);
 
@@ -22,6 +29,7 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
 
     edtDefaultPathVolpkg->setText(settings.value(project::DEFAULT_PATH).toString());
     chkAutoOpenVolpkg->setChecked(settings.value(project::AUTO_OPEN, project::AUTO_OPEN_DEFAULT).toInt() != 0);
+    setupOutputSegmentsControl();
 
     spinFwdBackStepMs->setValue(settings.value(viewer::FWD_BACK_STEP_MS, viewer::FWD_BACK_STEP_MS_DEFAULT).toInt());
     chkCenterOnZoom->setChecked(settings.value(viewer::CENTER_ON_ZOOM, viewer::CENTER_ON_ZOOM_DEFAULT).toInt() != 0);
@@ -120,6 +128,47 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     connect(btnHelpRamCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpRamCacheSize->toolTip()); });
 }
 
+void SettingsDialog::setupOutputSegmentsControl()
+{
+    auto* layout = qobject_cast<QGridLayout*>(gridLayout);
+    if (!layout) {
+        return;
+    }
+
+    auto* label = new QLabel(tr("Output segments"), groupBox_2);
+    _outputSegmentsCombo = new QComboBox(groupBox_2);
+    _outputSegmentsCombo->setObjectName(QStringLiteral("cmbOutputSegments"));
+
+    layout->addWidget(label, 2, 0);
+    layout->addWidget(_outputSegmentsCombo, 2, 1);
+
+    if (!_volumePackage) {
+        _outputSegmentsCombo->addItem(tr("Open or create a project first"), QString());
+        _outputSegmentsCombo->setEnabled(false);
+        return;
+    }
+
+    const auto& entries = _volumePackage->segmentEntries();
+    if (entries.empty()) {
+        _outputSegmentsCombo->addItem(tr("Attach a segments source first"), QString());
+        _outputSegmentsCombo->setEnabled(false);
+        return;
+    }
+
+    int currentIdx = 0;
+    const QString current = _volumePackage->hasOutputSegments()
+        ? QString::fromStdString(_volumePackage->outputSegmentsPath().string())
+        : QString();
+    for (const auto& entry : entries) {
+        const QString location = QString::fromStdString(entry.location);
+        _outputSegmentsCombo->addItem(location, location);
+        if (!current.isEmpty() && location == current) {
+            currentIdx = _outputSegmentsCombo->count() - 1;
+        }
+    }
+    _outputSegmentsCombo->setCurrentIndex(currentIdx);
+}
+
 void SettingsDialog::accept()
 {
     // Store the settings
@@ -128,6 +177,18 @@ void SettingsDialog::accept()
 
     settings.setValue(project::DEFAULT_PATH, edtDefaultPathVolpkg->text());
     settings.setValue(project::AUTO_OPEN, chkAutoOpenVolpkg->isChecked() ? "1" : "0");
+    if (_volumePackage && _outputSegmentsCombo && _outputSegmentsCombo->isEnabled()) {
+        const QString chosen = _outputSegmentsCombo->currentData().toString();
+        if (!chosen.isEmpty()) {
+            const QString current = _volumePackage->hasOutputSegments()
+                ? QString::fromStdString(_volumePackage->outputSegmentsPath().string())
+                : QString();
+            if (chosen != current) {
+                _volumePackage->setOutputSegments(chosen.toStdString());
+                _outputSegmentsChanged = true;
+            }
+        }
+    }
 
     settings.setValue(viewer::FWD_BACK_STEP_MS, spinFwdBackStepMs->value());
     settings.setValue(viewer::CENTER_ON_ZOOM, chkCenterOnZoom->isChecked() ? "1" : "0");
@@ -189,7 +250,7 @@ void SettingsDialog::accept()
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 
-    close();
+    QDialog::accept();
 }
 
 // Expand string that contains a range definition from the user settings into an integer vector
@@ -220,4 +281,3 @@ std::vector<int> SettingsDialog::expandSettingToIntRange(const QString& setting)
 
     return res;
 }
-

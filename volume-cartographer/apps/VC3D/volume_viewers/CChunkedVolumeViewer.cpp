@@ -21,6 +21,7 @@
 #include <QCursor>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QFrame>
 #include <QShowEvent>
 #include <QGraphicsEllipseItem>
 #include <QGraphicsItem>
@@ -736,6 +737,7 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     , _genSurfaceCache(std::make_shared<GeneratedSurfaceCache>())
 {
     _view = new CVolumeViewerView(this);
+    _view->setFrameShape(QFrame::NoFrame);
     _view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     _view->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     _view->setTransformationAnchor(QGraphicsView::NoAnchor);
@@ -783,6 +785,8 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     reloadPerfSettings();
 
     auto* layout = new QVBoxLayout;
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
     layout->addWidget(_view);
     setLayout(layout);
 
@@ -5013,7 +5017,10 @@ void CChunkedVolumeViewer::updateStatusLabel()
         return;
 
     QStringList items;
+    QStringList sharedCacheItems;
     items << QString("L%1").arg(_dsScaleIdx);
+    if (const QString viewerLabel = property("vc_viewer_label").toString(); !viewerLabel.isEmpty())
+        items << viewerLabel;
     items << QString("scale %1").arg(_scale, 0, 'f', 2);
     items << QString("%1x%2").arg(_framebuffer.width()).arg(_framebuffer.height());
 
@@ -5025,18 +5032,22 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     if (_chunkArray) {
         const auto stats = _chunkArray->stats();
-        items << QString("RAM %1/%2 GB")
+        sharedCacheItems << QString("RAM %1/%2 GB")
             .arg(formatGigabytes(stats.decodedBytes))
             .arg(formatGigabytes(stats.decodedByteCapacity));
         if (stats.persistentCacheEnabled) {
-            items << QString("disk %1%2")
+            sharedCacheItems << QString("disk %1%2")
                 .arg(formatByteSize(stats.persistentCacheBytes))
                 .arg(stats.persistentCacheScanInFlight ? "+" : "");
+        } else {
+            sharedCacheItems << QStringLiteral("disk off");
         }
         if (stats.remoteFetchesInFlight > 0) {
-            items << QString("downloading %1 @ %2")
+            sharedCacheItems << QString("network %1 @ %2")
                 .arg(stats.remoteFetchesInFlight)
                 .arg(formatMegabytesPerSecond(stats.remoteDownloadBytesPerSecond));
+        } else {
+            sharedCacheItems << QStringLiteral("network idle");
         }
     }
 
@@ -5055,4 +5066,5 @@ void CChunkedVolumeViewer::updateStatusLabel()
     }
 
     _statsBar->setItems(items);
+    emit sharedCacheStatsChanged(sharedCacheItems);
 }

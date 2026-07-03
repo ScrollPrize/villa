@@ -9,6 +9,7 @@
 #include <QCheckBox>
 #include <QPointer>
 #include <QString>
+#include <QStringList>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -184,6 +185,7 @@ private:
     bool initializeCommandLineRunner(void);
 
     VolumeViewerBase *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
+    VolumeViewerBase* newConnectedViewerInWidget(std::string surfaceName, QString title, QWidget* parent);
     void closeEvent(QCloseEvent* event) override;
 
     void setWidgetsEnabled(bool state);
@@ -239,6 +241,7 @@ private slots:
     std::vector<QComboBox*> volumeSelectionControls() const;
     void connectVolumeSelector(QComboBox* selector);
     void clearSurfaceSelection();
+    void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
     // Attaches the render-bench recorder once a volume+segment are active (no-op
@@ -246,6 +249,7 @@ private slots:
     void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
     void onZScrollSensitivityChanged(double sensitivity);
+    void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
     void onNewFiberRequested();
@@ -278,6 +282,7 @@ private:
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
     QLabel* _segmentationGrowthWarning{nullptr};
+    QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _sliceStepLabel{nullptr};
     QString _segmentationGrowthStatusText;
 
@@ -316,6 +321,7 @@ private:
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
     QMdiArea* _intersectionsMdiArea{nullptr};
+    VolumeViewerBase* _activeBaseViewer{nullptr};
 
     bool can_change_volume_();
 
