@@ -110,4 +110,9 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     const OpenDataSampleProgressCallback& progressCallback = {},
     bool forceRefresh = false);
 
+OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
+    VolumePkg& pkg,
+    const OpenDataSample& sample,
+    const std::filesystem::path& remoteCacheRoot);
+
 } // namespace vc3d::opendata

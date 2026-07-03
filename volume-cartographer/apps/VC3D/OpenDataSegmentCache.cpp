@@ -1384,11 +1384,8 @@ std::filesystem::path openDataTransformedSegmentCacheRoot(
     const std::string& sourceVolumeId,
     const std::string& targetVolumeId)
 {
-    const auto sampleComponent = safePathComponent(sample.id.empty() ? "sample" : sample.id);
-    return remoteCacheRoot / "open_data" / "segments" /
-           sampleComponent /
-           (safePathComponent(sourceVolumeId.empty() ? "volume" : sourceVolumeId) +
-            "__to_" + safePathComponent(targetVolumeId.empty() ? "volume" : targetVolumeId));
+    (void)sourceVolumeId;
+    return openDataSegmentCacheRoot(remoteCacheRoot, sample, targetVolumeId);
 }
 
 std::filesystem::path openDataTransformedSegmentCacheDirectory(
@@ -1444,6 +1441,129 @@ OpenDataSegmentCacheState cacheStateForSegment(
         if (state == "incomplete") return OpenDataSegmentCacheState::Incomplete;
     }
     return OpenDataSegmentCacheState::Current;
+}
+
+OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
+    VolumePkg& pkg,
+    const OpenDataSample& sample,
+    const std::filesystem::path& remoteCacheRoot)
+{
+    OpenDataSegmentCacheReconcileResult result;
+    if (sample.tifxyzSegmentCount() == 0) {
+        return result;
+    }
+
+    result.supportedTifxyzSegments = static_cast<int>(sample.tifxyzSegmentCount());
+    if (remoteCacheRoot.empty()) {
+        result.skippedTifxyzSegments = result.supportedTifxyzSegments;
+        result.messages.push_back("Skipped cached tifxyz segment discovery: no remote cache directory configured.");
+        return result;
+    }
+
+    std::vector<const OpenDataSegment*> tifxyzSegments;
+    tifxyzSegments.reserve(sample.segments.size());
+    for (const auto& segment : sample.segments) {
+        if (segment.hasTifxyz()) {
+            tifxyzSegments.push_back(&segment);
+        }
+    }
+
+    std::map<std::string, int> cachedSegmentsBySource;
+    for (const auto* segment : tifxyzSegments) {
+        const auto sourceVolumeId = sourceVolumeIdForSegment(*segment);
+        if (cacheStateForSegment(remoteCacheRoot, sample, *segment) ==
+            OpenDataSegmentCacheState::Current) {
+            ++result.cachedTifxyzSegments;
+            ++cachedSegmentsBySource[sourceVolumeId];
+        }
+    }
+
+    auto attachEntry = [&](const std::string& location,
+                           std::vector<std::string> tags,
+                           const std::string& label) {
+        try {
+            if (pkg.addSegmentsEntry(location, std::move(tags))) {
+                ++result.attachedSegmentEntries;
+            } else if (hasSegmentEntry(pkg, location)) {
+                pkg.refreshSegmentations();
+            } else {
+                result.messages.push_back("Failed to attach cached tifxyz segment directory for " +
+                                          label + ".");
+            }
+        } catch (const std::exception& e) {
+            ++result.failedTifxyzSegments;
+            result.messages.push_back("Failed to attach cached tifxyz segment directory for " +
+                                      label + ": " + e.what());
+        } catch (...) {
+            ++result.failedTifxyzSegments;
+            result.messages.push_back("Failed to attach cached tifxyz segment directory for " +
+                                      label + ": unknown error.");
+        }
+    };
+
+    for (const auto& [sourceVolumeId, cachedCount] : cachedSegmentsBySource) {
+        if (cachedCount <= 0) {
+            continue;
+        }
+        std::vector<std::string> tags = {"open-data", "immutable"};
+        if (!sourceVolumeId.empty()) {
+            tags.push_back("vc-open-data-source-volume-id:" + sourceVolumeId);
+        }
+        attachEntry(openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId).string(),
+                    std::move(tags),
+                    sourceVolumeId.empty() ? std::string("source volume") : sourceVolumeId);
+    }
+
+    std::set<std::string> targetVolumeIds;
+    for (const auto& volume : sample.volumes) {
+        if (!volume.id.empty()) {
+            targetVolumeIds.insert(volume.id);
+        }
+    }
+
+    std::map<std::pair<std::string, std::string>, int> transformedByRoute;
+    for (const auto& targetVolumeId : targetVolumeIds) {
+        for (const auto* segment : tifxyzSegments) {
+            const auto sourceVolumeId = sourceVolumeIdForSegment(*segment);
+            if (sourceVolumeId.empty() || sourceVolumeId == targetVolumeId) {
+                continue;
+            }
+            const auto matrix = findVolumeTransformMatrix(sample, sourceVolumeId, targetVolumeId);
+            if (!matrix) {
+                continue;
+            }
+            const auto transformedDir = openDataTransformedSegmentCacheDirectory(
+                remoteCacheRoot, sample, *segment, targetVolumeId);
+            if (!requiredFilesPresent(transformedDir)) {
+                continue;
+            }
+            const auto origin = readCatalogOrigin(transformedDir);
+            if (origin && !transformedOriginMatches(
+                              *origin, sample, *segment, sourceVolumeId, targetVolumeId, *matrix)) {
+                continue;
+            }
+            ++result.transformedTifxyzSegments;
+            ++transformedByRoute[{sourceVolumeId, targetVolumeId}];
+        }
+    }
+
+    for (const auto& [route, transformedCount] : transformedByRoute) {
+        if (transformedCount <= 0) {
+            continue;
+        }
+        const auto& sourceVolumeId = route.first;
+        const auto& targetVolumeId = route.second;
+        attachEntry(openDataTransformedSegmentCacheRoot(
+                        remoteCacheRoot, sample, sourceVolumeId, targetVolumeId).string(),
+                    {"open-data",
+                     "immutable",
+                     "open-data-transformed",
+                     "vc-open-data-source-volume-id:" + sourceVolumeId,
+                     "vc-open-data-target-volume-id:" + targetVolumeId},
+                    sourceVolumeId + " to " + targetVolumeId);
+    }
+
+    return result;
 }
 
 bool isOpenDataCatalogSegmentDirectory(const std::filesystem::path& segmentDir)

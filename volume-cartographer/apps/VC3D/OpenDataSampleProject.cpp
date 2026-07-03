@@ -287,12 +287,20 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     result.messages.insert(result.messages.end(),
                            attachResult.messages.begin(),
                            attachResult.messages.end());
-    const int cachedSegmentEntryCount =
-        loadedCachedProject ? openDataSegmentEntryCount(*pkg, remoteCacheRoot, sample) : 0;
-    if (cachedSegmentEntryCount > 0) {
-        result.supportedTifxyzSegments = static_cast<int>(sample.tifxyzSegmentCount());
-        result.cachedTifxyzSegments = result.supportedTifxyzSegments;
-        result.attachedSegmentEntries = cachedSegmentEntryCount;
+    if (loadedCachedProject &&
+        openDataSegmentEntryCount(*pkg, remoteCacheRoot, sample) > 0) {
+        const auto cacheAttachResult =
+            attachExistingOpenDataSegmentCaches(*pkg, sample, remoteCacheRoot);
+        result.supportedTifxyzSegments += cacheAttachResult.supportedTifxyzSegments;
+        result.cachedTifxyzSegments += cacheAttachResult.cachedTifxyzSegments;
+        result.attachedSegmentEntries += cacheAttachResult.attachedSegmentEntries;
+        result.skippedTifxyzSegments += cacheAttachResult.skippedTifxyzSegments;
+        result.failedTifxyzSegments += cacheAttachResult.failedTifxyzSegments;
+        result.transformedTifxyzSegments += cacheAttachResult.transformedTifxyzSegments;
+        result.failedTransformedTifxyzSegments += cacheAttachResult.failedTransformedTifxyzSegments;
+        result.messages.insert(result.messages.end(),
+                               cacheAttachResult.messages.begin(),
+                               cacheAttachResult.messages.end());
         result.messages.push_back("Reused cached sample project segment entries.");
     } else {
         attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result, progressCallback);

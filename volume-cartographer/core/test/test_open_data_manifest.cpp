@@ -564,7 +564,7 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
         cacheRoot, sample, sample.segments.front(), "vol2");
     CHECK(sourceDir.parent_path().filename() == "vol1");
     CHECK(sourceDir.parent_path().parent_path().filename() == "PHerc0139");
-    CHECK(transformedDir.parent_path().filename() == "vol1__to_vol2");
+    CHECK(transformedDir.parent_path().filename() == "vol2");
     CHECK(transformedDir.parent_path().parent_path().filename() == "PHerc0139");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
@@ -638,10 +638,10 @@ TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
     std::filesystem::remove_all(cacheRoot);
 }
 
-TEST_CASE("OpenDataSampleProject skips segment reconciliation for cached project segment entries")
+TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cached transforms")
 {
     const auto manifest = parseOpenDataManifest(kFixture);
-    const auto& sample = *manifest.findSample("PHerc0139");
+    auto sample = *manifest.findSample("PHerc0139");
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
                            ("vc_open_data_cached_project_segments_test_" + std::to_string(getpid()));
@@ -682,6 +682,40 @@ TEST_CASE("OpenDataSampleProject skips segment reconciliation for cached project
     CHECK(firstResult.attachedSegmentEntries == 1);
     REQUIRE(!firstProgressEvents.empty());
 
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    targetVolume.dataFormat = "zarr";
+    OpenDataArtifact targetArtifact;
+    targetArtifact.type = "zarr";
+    targetArtifact.resolvedUrl = "http://127.0.0.1:9/vol2.zarr";
+    targetVolume.artifacts.push_back(std::move(targetArtifact));
+    sample.volumes.push_back(std::move(targetVolume));
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+    const auto transformedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot,
+        sample,
+        sample.segments.front(),
+        "vol2");
+    writeFile(transformedDir / "meta.json",
+              R"({"type":"seg","uuid":"PHerc0139-20260311000000","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", transformedDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", transformedDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", transformedDir / "z.tif");
+
     OpenDataSampleProjectResult secondResult;
     std::vector<OpenDataSampleDownloadProgress> secondProgressEvents;
     auto second = createOpenDataSampleProject(
@@ -690,11 +724,20 @@ TEST_CASE("OpenDataSampleProject skips segment reconciliation for cached project
         &secondResult,
         [&](const OpenDataSampleDownloadProgress& progress) {
             secondProgressEvents.push_back(progress);
-        });
+    });
     REQUIRE(second);
     CHECK(secondResult.cachedTifxyzSegments == 1);
+    CHECK(secondResult.transformedTifxyzSegments == 1);
     CHECK(secondResult.attachedSegmentEntries == 1);
     CHECK(secondProgressEvents.empty());
+    REQUIRE(second->segmentEntries().size() == 2);
+    CHECK(std::any_of(second->segmentEntries().begin(),
+                      second->segmentEntries().end(),
+                      [](const vc::project::Entry& entry) {
+                          return std::find(entry.tags.begin(),
+                                           entry.tags.end(),
+                                           "vc-open-data-target-volume-id:vol2") != entry.tags.end();
+                      }));
     CHECK(std::any_of(secondResult.messages.begin(),
                       secondResult.messages.end(),
                       [](const std::string& message) {
