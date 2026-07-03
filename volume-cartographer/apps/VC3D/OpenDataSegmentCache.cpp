@@ -1480,24 +1480,26 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
 
     auto attachEntry = [&](const std::string& location,
                            std::vector<std::string> tags,
-                           const std::string& label) {
+                           const std::string& label,
+                           const std::string& cacheDescription,
+                           int& failedCount) {
+        const std::string failurePrefix =
+            "Failed to attach " + cacheDescription + " for " + label;
         try {
             if (pkg.addSegmentsEntry(location, std::move(tags))) {
                 ++result.attachedSegmentEntries;
             } else if (hasSegmentEntry(pkg, location)) {
                 pkg.refreshSegmentations();
             } else {
-                result.messages.push_back("Failed to attach cached tifxyz segment directory for " +
-                                          label + ".");
+                ++failedCount;
+                result.messages.push_back(failurePrefix + ".");
             }
         } catch (const std::exception& e) {
-            ++result.failedTifxyzSegments;
-            result.messages.push_back("Failed to attach cached tifxyz segment directory for " +
-                                      label + ": " + e.what());
+            ++failedCount;
+            result.messages.push_back(failurePrefix + ": " + e.what());
         } catch (...) {
-            ++result.failedTifxyzSegments;
-            result.messages.push_back("Failed to attach cached tifxyz segment directory for " +
-                                      label + ": unknown error.");
+            ++failedCount;
+            result.messages.push_back(failurePrefix + ": unknown error.");
         }
     };
 
@@ -1511,7 +1513,9 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
         }
         attachEntry(openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId).string(),
                     std::move(tags),
-                    sourceVolumeId.empty() ? std::string("source volume") : sourceVolumeId);
+                    sourceVolumeId.empty() ? std::string("source volume") : sourceVolumeId,
+                    "cached tifxyz segment directory",
+                    result.failedTifxyzSegments);
     }
 
     std::set<std::string> targetVolumeIds;
@@ -1560,7 +1564,9 @@ OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
                      "open-data-transformed",
                      "vc-open-data-source-volume-id:" + sourceVolumeId,
                      "vc-open-data-target-volume-id:" + targetVolumeId},
-                    sourceVolumeId + " to " + targetVolumeId);
+                    sourceVolumeId + " to " + targetVolumeId,
+                    "transformed tifxyz segment directory",
+                    result.failedTransformedTifxyzSegments);
     }
 
     return result;
