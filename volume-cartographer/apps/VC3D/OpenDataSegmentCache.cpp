@@ -1562,7 +1562,7 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         tifxyzSegments.size(),
         tifxyzSegments.size() <= 1
             ? 1
-            : std::max<std::size_t>(2, std::min<std::size_t>(desiredWorkers, 4)));
+            : std::max<std::size_t>(2, std::min<std::size_t>(desiredWorkers, 8)));
     constexpr int kProgressFilesPerSegment = 6;
     const int totalFiles =
         static_cast<int>(tifxyzSegments.size()) * kProgressFilesPerSegment;
@@ -1717,7 +1717,7 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
             transformTasks.size(),
             transformTasks.size() <= 1
                 ? 1
-                : std::max<std::size_t>(2, std::min<std::size_t>(desiredWorkers, 4)));
+                : std::max<std::size_t>(2, std::min<std::size_t>(desiredWorkers, 8)));
 
         auto transformWorker = [&]() {
             for (;;) {
