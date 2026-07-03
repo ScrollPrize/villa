@@ -33,6 +33,7 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
+#include <QBrush>
 #include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
@@ -201,6 +202,43 @@ QString openDataCatalogVolumeIdForLoadedVolume(const VolumePkg& pkg, const std::
     return {};
 }
 
+bool isOpenDataSegmentsEntry(const vc::project::Entry& entry)
+{
+    if (std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end()) {
+        return true;
+    }
+    return std::any_of(entry.tags.begin(), entry.tags.end(), [](const std::string& tag) {
+        constexpr std::string_view sourcePrefix = "vc-open-data-source-volume-id:";
+        constexpr std::string_view targetPrefix = "vc-open-data-target-volume-id:";
+        return tag.rfind(sourcePrefix, 0) == 0 || tag.rfind(targetPrefix, 0) == 0;
+    });
+}
+
+std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
+                                                       const std::string& loadedVolumeId)
+{
+    std::vector<QString> candidates;
+    constexpr std::string_view prefix = "vc-open-data-volume-id:";
+
+    auto addCandidate = [&candidates](QString candidate) {
+        if (candidate.isEmpty()) {
+            return;
+        }
+        if (std::find(candidates.begin(), candidates.end(), candidate) == candidates.end()) {
+            candidates.push_back(std::move(candidate));
+        }
+    };
+
+    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
+        if (tag.rfind(prefix, 0) == 0) {
+            addCandidate(QString::fromStdString(tag.substr(prefix.size())));
+        }
+    }
+    addCandidate(QString::fromStdString(loadedVolumeId));
+
+    return candidates;
+}
+
 const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pkg,
                                                              const QString& catalogVolumeId)
 {
@@ -213,8 +251,7 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
     const vc::project::Entry* sourceMatch = nullptr;
 
     for (const auto& entry : pkg.segmentEntries()) {
-        const bool openData = std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end();
-        if (!openData) {
+        if (!isOpenDataSegmentsEntry(entry)) {
             continue;
         }
         if (std::find(entry.tags.begin(), entry.tags.end(), targetTag) != entry.tags.end()) {
@@ -229,14 +266,34 @@ const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pk
     return sourceMatch;
 }
 
+const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumePkg& pkg,
+                                                                   const std::string& loadedVolumeId,
+                                                                   QString* matchedCatalogVolumeId = nullptr)
+{
+    for (const QString& candidate : openDataCatalogVolumeIdCandidates(pkg, loadedVolumeId)) {
+        if (const auto* entry = findOpenDataSegmentsEntryForVolume(pkg, candidate)) {
+            if (matchedCatalogVolumeId) {
+                *matchedCatalogVolumeId = candidate;
+            }
+            return entry;
+        }
+    }
+    return nullptr;
+}
+
 bool packageHasOpenDataSegments(const VolumePkg& pkg)
 {
     for (const auto& entry : pkg.segmentEntries()) {
-        if (std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end()) {
+        if (isOpenDataSegmentsEntry(entry)) {
             return true;
         }
     }
     return false;
+}
+
+bool volumeHasOpenDataSegmentsEntry(const VolumePkg& pkg, const std::string& loadedVolumeId)
+{
+    return findOpenDataSegmentsEntryForLoadedVolume(pkg, loadedVolumeId) != nullptr;
 }
 
 class DockMenuMainWindow : public QMainWindow
@@ -7897,9 +7954,12 @@ void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
 
     auto vpkg = _state->vpkg();
     const std::string loadedVolumeId = _state->currentVolumeId();
-    const QString catalogVolumeId = openDataCatalogVolumeIdForLoadedVolume(*vpkg, loadedVolumeId);
+    QString catalogVolumeId = openDataCatalogVolumeIdForLoadedVolume(*vpkg, loadedVolumeId);
     const bool hasOpenDataSegments = packageHasOpenDataSegments(*vpkg);
-    const auto* matchingEntry = findOpenDataSegmentsEntryForVolume(*vpkg, catalogVolumeId);
+    const auto* matchingEntry = findOpenDataSegmentsEntryForLoadedVolume(
+        *vpkg,
+        loadedVolumeId,
+        &catalogVolumeId);
 
     auto setWarning = [&](bool enabled) {
         const QString warningText = tr("Current segments have no available transforms to selected volume.");
@@ -7929,7 +7989,7 @@ void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
         }
     };
 
-    if (!hasOpenDataSegments || catalogVolumeId.isEmpty()) {
+    if (!hasOpenDataSegments || loadedVolumeId.empty()) {
         setWarning(false);
         _lastSegmentTransformWarningVolumeId.clear();
         return;
@@ -7964,8 +8024,11 @@ void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
     }
 
     setWarning(true);
-    if (showDialog && _lastSegmentTransformWarningVolumeId != catalogVolumeId) {
-        _lastSegmentTransformWarningVolumeId = catalogVolumeId;
+    const QString warningVolumeId = catalogVolumeId.isEmpty()
+        ? QString::fromStdString(loadedVolumeId)
+        : catalogVolumeId;
+    if (showDialog && _lastSegmentTransformWarningVolumeId != warningVolumeId) {
+        _lastSegmentTransformWarningVolumeId = warningVolumeId;
         QMessageBox::information(
             this,
             tr("Segments unavailable"),
@@ -8018,6 +8081,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
     QVector<QPair<QString, QString>> volumeEntries;
     QVector<QPair<QString, QString>> openDataVolumeIdMap;
+    std::set<QString> openDataVolumesWithoutSegments;
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
     const bool hasExplicitPreferredVolume = !activeCandidate.isEmpty();
@@ -8052,6 +8116,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
     QString bestGrowthVolumeId;
     bool preferredVolumeFound = false;
+    const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
     const auto volumeIds = _state->vpkg()->volumeIDs();
     for (const auto& id : volumeIds) {
         try {
@@ -8062,6 +8127,9 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
+            if (hasOpenDataSegments && !volumeHasOpenDataSegmentsEntry(*_state->vpkg(), id)) {
+                openDataVolumesWithoutSegments.insert(idStr);
+            }
             for (const auto& tag : _state->vpkg()->volumeTags(id)) {
                 constexpr std::string_view prefix = "vc-open-data-volume-id:";
                 if (tag.rfind(prefix, 0) != 0) {
@@ -8122,6 +8190,13 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         selector->clear();
         for (const auto& [id, label] : volumeEntries) {
             selector->addItem(label, QVariant(id));
+            const int row = selector->count() - 1;
+            if (openDataVolumesWithoutSegments.find(id) != openDataVolumesWithoutSegments.end()) {
+                selector->setItemData(row, QBrush(QColor(245, 124, 0)), Qt::ForegroundRole);
+                selector->setItemData(row,
+                                      tr("No segment transform is available for this volume."),
+                                      Qt::ToolTipRole);
+            }
         }
         if (activeCandidate.isEmpty()) {
             if (selector->count() > 0) {

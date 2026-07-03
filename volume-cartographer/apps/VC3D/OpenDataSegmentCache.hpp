@@ -60,7 +60,8 @@ struct OpenDataInkDetectionEntry {
 
 [[nodiscard]] std::filesystem::path openDataSegmentCacheRoot(
     const std::filesystem::path& remoteCacheRoot,
-    const OpenDataSample& sample);
+    const OpenDataSample& sample,
+    const std::string& sourceVolumeId);
 
 [[nodiscard]] std::filesystem::path openDataSegmentCacheDirectory(
     const std::filesystem::path& remoteCacheRoot,
@@ -70,6 +71,7 @@ struct OpenDataInkDetectionEntry {
 [[nodiscard]] std::filesystem::path openDataTransformedSegmentCacheRoot(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,
+    const std::string& sourceVolumeId,
     const std::string& targetVolumeId);
 
 [[nodiscard]] std::filesystem::path openDataTransformedSegmentCacheDirectory(

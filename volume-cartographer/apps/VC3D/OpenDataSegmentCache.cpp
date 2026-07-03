@@ -1360,10 +1360,13 @@ const char* cacheStateName(OpenDataSegmentCacheState state) noexcept
 
 std::filesystem::path openDataSegmentCacheRoot(
     const std::filesystem::path& remoteCacheRoot,
-    const OpenDataSample& sample)
+    const OpenDataSample& sample,
+    const std::string& sourceVolumeId)
 {
+    const auto sampleComponent = safePathComponent(sample.id.empty() ? "sample" : sample.id);
+    const auto sourceComponent = safePathComponent(sourceVolumeId.empty() ? "volume" : sourceVolumeId);
     return remoteCacheRoot / "open_data" / "segments" /
-           safePathComponent(sample.id.empty() ? "sample" : sample.id);
+           sampleComponent / sourceComponent;
 }
 
 std::filesystem::path openDataSegmentCacheDirectory(
@@ -1371,17 +1374,20 @@ std::filesystem::path openDataSegmentCacheDirectory(
     const OpenDataSample& sample,
     const OpenDataSegment& segment)
 {
-    return openDataSegmentCacheRoot(remoteCacheRoot, sample) /
+    return openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeIdForSegment(segment)) /
            safePathComponent(segment.id);
 }
 
 std::filesystem::path openDataTransformedSegmentCacheRoot(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,
+    const std::string& sourceVolumeId,
     const std::string& targetVolumeId)
 {
+    const auto sampleComponent = safePathComponent(sample.id.empty() ? "sample" : sample.id);
     return remoteCacheRoot / "open_data" / "segments" /
-           (safePathComponent(sample.id.empty() ? "sample" : sample.id) +
+           sampleComponent /
+           (safePathComponent(sourceVolumeId.empty() ? "volume" : sourceVolumeId) +
             "__to_" + safePathComponent(targetVolumeId.empty() ? "volume" : targetVolumeId));
 }
 
@@ -1391,7 +1397,8 @@ std::filesystem::path openDataTransformedSegmentCacheDirectory(
     const OpenDataSegment& segment,
     const std::string& targetVolumeId)
 {
-    return openDataTransformedSegmentCacheRoot(remoteCacheRoot, sample, targetVolumeId) /
+    return openDataTransformedSegmentCacheRoot(
+               remoteCacheRoot, sample, sourceVolumeIdForSegment(segment), targetVolumeId) /
            safePathComponent(segment.id);
 }
 
@@ -1567,16 +1574,15 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         return result;
     }
 
-    const auto segmentsRoot = openDataSegmentCacheRoot(remoteCacheRoot, sample);
     std::vector<const OpenDataSegment*> tifxyzSegments;
     tifxyzSegments.reserve(sample.segments.size());
-    std::set<std::string> expectedDirNames;
+    std::map<std::string, std::set<std::string>> expectedDirNamesBySource;
     for (const auto& segment : sample.segments) {
         if (!segment.hasTifxyz()) {
             continue;
         }
         tifxyzSegments.push_back(&segment);
-        expectedDirNames.insert(safePathComponent(segment.id));
+        expectedDirNamesBySource[sourceVolumeIdForSegment(segment)].insert(safePathComponent(segment.id));
     }
 
     std::atomic_size_t next{0};
@@ -1674,7 +1680,11 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     for (auto& t : workers) {
         t.join();
     }
-    markOrphanedEntries(segmentsRoot, expectedDirNames);
+    for (const auto& [sourceVolumeId, expectedDirNames] : expectedDirNamesBySource) {
+        markOrphanedEntries(
+            openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId),
+            expectedDirNames);
+    }
     emitProgress(nullptr, nullptr, "finished");
 
     const int prepared = result.cachedTifxyzSegments;
@@ -1682,33 +1692,39 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         return result;
     }
 
-    const auto location = segmentsRoot.string();
-    std::set<std::string> sourceVolumeIds;
+    std::map<std::string, int> cachedSegmentsBySource;
     for (const auto* segment : tifxyzSegments) {
         const auto sourceVolumeId = sourceVolumeIdForSegment(*segment);
+        const auto sourceRoot = openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId);
+        if (requiredFilesPresent(sourceRoot / safePathComponent(segment->id))) {
+            ++cachedSegmentsBySource[sourceVolumeId];
+        }
+    }
+    for (const auto& [sourceVolumeId, cachedCount] : cachedSegmentsBySource) {
+        if (cachedCount <= 0) {
+            continue;
+        }
+        const auto location = openDataSegmentCacheRoot(remoteCacheRoot, sample, sourceVolumeId).string();
+        std::vector<std::string> sourceTags = {"open-data", "immutable"};
         if (!sourceVolumeId.empty()) {
-            sourceVolumeIds.insert(sourceVolumeId);
+            sourceTags.push_back("vc-open-data-source-volume-id:" + sourceVolumeId);
         }
-    }
-    std::vector<std::string> sourceTags = {"open-data", "immutable"};
-    for (const auto& sourceVolumeId : sourceVolumeIds) {
-        sourceTags.push_back("vc-open-data-source-volume-id:" + sourceVolumeId);
-    }
-    try {
-        if (pkg.addSegmentsEntry(location, sourceTags)) {
-            ++result.attachedSegmentEntries;
-        } else if (hasSegmentEntry(pkg, location)) {
-            pkg.refreshSegmentations();
-        } else {
-            result.messages.push_back("Failed to attach cached tifxyz segment directory.");
+        try {
+            if (pkg.addSegmentsEntry(location, sourceTags)) {
+                ++result.attachedSegmentEntries;
+            } else if (hasSegmentEntry(pkg, location)) {
+                pkg.refreshSegmentations();
+            } else {
+                result.messages.push_back("Failed to attach cached tifxyz segment directory.");
+            }
+        } catch (const std::exception& e) {
+            ++result.failedTifxyzSegments;
+            result.messages.push_back("Failed to attach cached tifxyz segment directory: " +
+                                      std::string(e.what()));
+        } catch (...) {
+            ++result.failedTifxyzSegments;
+            result.messages.push_back("Failed to attach cached tifxyz segment directory: unknown error.");
         }
-    } catch (const std::exception& e) {
-        ++result.failedTifxyzSegments;
-        result.messages.push_back("Failed to attach cached tifxyz segment directory: " +
-                                  std::string(e.what()));
-    } catch (...) {
-        ++result.failedTifxyzSegments;
-        result.messages.push_back("Failed to attach cached tifxyz segment directory: unknown error.");
     }
 
     std::set<std::string> targetVolumeIds;
@@ -1717,7 +1733,8 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
             targetVolumeIds.insert(volume.id);
         }
     }
-    for (const auto& sourceVolumeId : sourceVolumeIds) {
+    for (const auto& [sourceVolumeId, cachedCount] : cachedSegmentsBySource) {
+        (void)cachedCount;
         targetVolumeIds.erase(sourceVolumeId);
     }
 
@@ -1737,7 +1754,7 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         }
     }
 
-    std::map<std::string, int> transformedByTarget;
+    std::map<std::pair<std::string, std::string>, int> transformedByRoute;
     if (!transformTasks.empty()) {
         std::atomic_size_t nextTransform{0};
         std::atomic_int completedTransforms{0};
@@ -1796,7 +1813,8 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
                 std::lock_guard<std::mutex> lk(transformResultMutex);
                 if (transformed) {
                     ++result.transformedTifxyzSegments;
-                    ++transformedByTarget[task.targetVolumeId];
+                    ++transformedByRoute[
+                        {sourceVolumeIdForSegment(*task.segment), task.targetVolumeId}];
                     completedTransforms.fetch_add(1, std::memory_order_relaxed);
                     emitTransformProgress(&task, "transform-segment-done");
                 } else {
@@ -1820,19 +1838,22 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
         emitTransformProgress(nullptr, "transform-finished");
     }
 
-    for (const auto& [targetVolumeId, transformedForTarget] : transformedByTarget) {
+    for (const auto& [route, transformedForTarget] : transformedByRoute) {
         if (transformedForTarget <= 0) {
             continue;
         }
+        const auto& sourceVolumeId = route.first;
+        const auto& targetVolumeId = route.second;
 
         const auto transformedRoot = openDataTransformedSegmentCacheRoot(
-            remoteCacheRoot, sample, targetVolumeId);
+            remoteCacheRoot, sample, sourceVolumeId, targetVolumeId);
         const auto transformedLocation = transformedRoot.string();
         try {
             if (pkg.addSegmentsEntry(transformedLocation,
                                      {"open-data",
                                       "immutable",
                                       "open-data-transformed",
+                                      "vc-open-data-source-volume-id:" + sourceVolumeId,
                                       "vc-open-data-target-volume-id:" + targetVolumeId})) {
                 ++result.attachedSegmentEntries;
             } else if (hasSegmentEntry(pkg, transformedLocation)) {

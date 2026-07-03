@@ -415,7 +415,9 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
                            ("vc_open_data_sample_project_test_" + std::to_string(getpid()));
     std::filesystem::remove_all(cacheRoot);
 
-    const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
+    const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    CHECK(segmentDir.parent_path().filename() == "vol1");
+    CHECK(segmentDir.parent_path().parent_path().filename() == "PHerc0139");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     const auto* tifxyz = preferredTifxyzArtifact(sample.segments.front());
@@ -496,7 +498,9 @@ TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts"
                            ("vc_open_data_transformed_segment_test_" + std::to_string(getpid()));
     std::filesystem::remove_all(cacheRoot);
 
-    const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
+    const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    CHECK(segmentDir.parent_path().filename() == "vol1");
+    CHECK(segmentDir.parent_path().parent_path().filename() == "PHerc0139");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     const cv::Size fixtureGridSize = tifxyzGridSize(fixtureSegment);
@@ -558,6 +562,10 @@ TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
     const auto sourceDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
     const auto transformedDir = openDataTransformedSegmentCacheDirectory(
         cacheRoot, sample, sample.segments.front(), "vol2");
+    CHECK(sourceDir.parent_path().filename() == "vol1");
+    CHECK(sourceDir.parent_path().parent_path().filename() == "PHerc0139");
+    CHECK(transformedDir.parent_path().filename() == "vol1__to_vol2");
+    CHECK(transformedDir.parent_path().parent_path().filename() == "PHerc0139");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     writeFile(sourceDir / "meta.json",

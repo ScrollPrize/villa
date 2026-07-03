@@ -209,20 +209,27 @@ int openDataSegmentEntryCount(const VolumePkg& pkg,
         return 0;
     }
 
-    const auto sourceRoot = openDataSegmentCacheRoot(remoteCacheRoot, sample).string();
-    const auto transformedRoot = (remoteCacheRoot / "open_data" / "transformed_segments" /
-                                  safePathComponent(sample.id.empty() ? "sample" : sample.id))
-                                     .string();
+    const auto sampleSegmentsRoot = remoteCacheRoot / "open_data" / "segments" /
+                                    safePathComponent(sample.id.empty() ? "sample" : sample.id);
+    const auto sampleSegmentsRootString = sampleSegmentsRoot.string();
+    const auto sampleSegmentsPrefix =
+        sampleSegmentsRootString + std::string(1, std::filesystem::path::preferred_separator);
     int count = 0;
     for (const auto& entry : pkg.segmentEntries()) {
         std::error_code ec;
         if (!std::filesystem::is_directory(entry.location, ec) || ec) {
             continue;
         }
-        const auto transformedPrefix =
-            transformedRoot + std::string(1, std::filesystem::path::preferred_separator);
-        if (entry.location == sourceRoot ||
-            entry.location.rfind(transformedPrefix, 0) == 0) {
+        const bool openDataSegmentEntry =
+            std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end() &&
+            std::any_of(entry.tags.begin(), entry.tags.end(), [](const std::string& tag) {
+                return tag.rfind("vc-open-data-source-volume-id:", 0) == 0 ||
+                       tag.rfind("vc-open-data-target-volume-id:", 0) == 0;
+            });
+        if (openDataSegmentEntry &&
+            entry.location.rfind(sampleSegmentsPrefix, 0) == 0 &&
+            entry.location.find(std::string(1, std::filesystem::path::preferred_separator),
+                                sampleSegmentsPrefix.size()) == std::string::npos) {
             ++count;
         }
     }
