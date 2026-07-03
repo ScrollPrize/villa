@@ -89,6 +89,7 @@
 #include <QStandardItemModel>
 #include <QStyledItemDelegate>
 #include <QStyleOptionButton>
+#include <QPersistentModelIndex>
 #include <QSet>
 #include <QPushButton>
 #include <QItemSelectionModel>
@@ -340,6 +341,33 @@ bool surfaceOverlayItemMatchesFilter(const QStandardItem* item, const QString& f
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
 
+QRect segmentFolderCheckRect(const QRect& row)
+{
+    return QRect(row.left() + 4, row.top() + (row.height() - 18) / 2, 18, 18);
+}
+
+QRect segmentFolderPaletteRect(const QRect& row)
+{
+    return QRect(row.right() - 26, row.top() + (row.height() - 20) / 2, 20, 20);
+}
+
+enum class SegmentFolderControl {
+    None,
+    CheckBox,
+    Palette,
+};
+
+SegmentFolderControl segmentFolderControlAt(const QRect& row, const QPoint& pos)
+{
+    if (segmentFolderCheckRect(row).contains(pos)) {
+        return SegmentFolderControl::CheckBox;
+    }
+    if (segmentFolderPaletteRect(row).contains(pos)) {
+        return SegmentFolderControl::Palette;
+    }
+    return SegmentFolderControl::None;
+}
+
 class SegmentFolderDelegate final : public QStyledItemDelegate
 {
 public:
@@ -368,10 +396,10 @@ public:
         check.state |= index.data(Qt::CheckStateRole).toInt() == Qt::Checked
             ? QStyle::State_On
             : QStyle::State_Off;
-        check.rect = checkRect(option.rect);
+        check.rect = segmentFolderCheckRect(option.rect);
         style->drawPrimitive(QStyle::PE_IndicatorCheckBox, &check, painter, opt.widget);
 
-        const QRect icon = paletteRect(option.rect);
+        const QRect icon = segmentFolderPaletteRect(option.rect);
         const bool defaultPalette = index.data(SEGMENT_DIR_DEFAULT_PALETTE_ROLE).toBool();
         const QColor color = index.data(SEGMENT_DIR_COLOR_ROLE).value<QColor>();
         if (defaultPalette) {
@@ -415,12 +443,12 @@ public:
             return QStyledItemDelegate::editorEvent(event, model, option, index);
         }
         const auto* mouse = static_cast<QMouseEvent*>(event);
-        if (checkRect(option.rect).contains(mouse->pos())) {
+        if (segmentFolderCheckRect(option.rect).contains(mouse->pos())) {
             const bool checked = index.data(Qt::CheckStateRole).toInt() == Qt::Checked;
             model->setData(index, checked ? Qt::Unchecked : Qt::Checked, Qt::CheckStateRole);
             return true;
         }
-        if (paletteRect(option.rect).contains(mouse->pos())) {
+        if (segmentFolderPaletteRect(option.rect).contains(mouse->pos())) {
             if (_paletteCallback) {
                 _paletteCallback(index.row());
             }
@@ -430,17 +458,86 @@ public:
     }
 
 private:
-    static QRect checkRect(const QRect& row)
+    PaletteCallback _paletteCallback;
+};
+
+class SegmentFolderListView final : public QListView
+{
+public:
+    using PaletteCallback = std::function<void(int)>;
+
+    explicit SegmentFolderListView(PaletteCallback paletteCallback, QWidget* parent = nullptr)
+        : QListView(parent)
+        , _paletteCallback(std::move(paletteCallback))
     {
-        return QRect(row.left() + 4, row.top() + (row.height() - 18) / 2, 18, 18);
     }
 
-    static QRect paletteRect(const QRect& row)
+protected:
+    void mousePressEvent(QMouseEvent* event) override
     {
-        return QRect(row.right() - 26, row.top() + (row.height() - 20) / 2, 20, 20);
+        if (event && event->button() == Qt::LeftButton) {
+            const QModelIndex index = indexAt(event->pos());
+            const SegmentFolderControl control =
+                index.isValid() ? segmentFolderControlAt(visualRect(index), event->pos())
+                                : SegmentFolderControl::None;
+            if (control != SegmentFolderControl::None) {
+                _pressedIndex = QPersistentModelIndex(index);
+                _pressedControl = control;
+                event->accept();
+                return;
+            }
+        }
+
+        _pressedIndex = QPersistentModelIndex();
+        _pressedControl = SegmentFolderControl::None;
+        QListView::mousePressEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override
+    {
+        if (event && event->button() == Qt::LeftButton && _pressedIndex.isValid()) {
+            const QModelIndex index = indexAt(event->pos());
+            const SegmentFolderControl control =
+                index == QModelIndex(_pressedIndex)
+                    ? segmentFolderControlAt(visualRect(index), event->pos())
+                    : SegmentFolderControl::None;
+            if (control == _pressedControl) {
+                activateControl(QModelIndex(_pressedIndex), control);
+            }
+            _pressedIndex = QPersistentModelIndex();
+            _pressedControl = SegmentFolderControl::None;
+            event->accept();
+            return;
+        }
+
+        _pressedIndex = QPersistentModelIndex();
+        _pressedControl = SegmentFolderControl::None;
+        QListView::mouseReleaseEvent(event);
+    }
+
+private:
+    void activateControl(const QModelIndex& index, SegmentFolderControl control)
+    {
+        if (!index.isValid()) {
+            return;
+        }
+
+        if (control == SegmentFolderControl::CheckBox) {
+            if (QAbstractItemModel* itemModel = model()) {
+                const bool checked = index.data(Qt::CheckStateRole).toInt() == Qt::Checked;
+                itemModel->setData(index, checked ? Qt::Unchecked : Qt::Checked, Qt::CheckStateRole);
+            }
+            return;
+        }
+
+        if (control == SegmentFolderControl::Palette && _paletteCallback) {
+            _paletteCallback(index.row());
+        }
     }
 
     PaletteCallback _paletteCallback;
+    QPersistentModelIndex _pressedIndex;
+    SegmentFolderControl _pressedControl{SegmentFolderControl::None};
 };
 
 bool finiteVec3(const cv::Vec3f& p)
@@ -7857,7 +7954,9 @@ void CWindow::CreateWidgets(void)
     cmbSegmentationDir = ui.cmbSegmentationDir;
     _segmentDirModel = new QStandardItemModel(cmbSegmentationDir);
     cmbSegmentationDir->setModel(_segmentDirModel);
-    cmbSegmentationDir->setView(new QListView(cmbSegmentationDir));
+    cmbSegmentationDir->setView(
+        new SegmentFolderListView([this](int row) { showSegmentFolderPaletteMenu(row); },
+                                  cmbSegmentationDir));
     cmbSegmentationDir->view()->setItemDelegate(
         new SegmentFolderDelegate([this](int row) { showSegmentFolderPaletteMenu(row); },
                                   cmbSegmentationDir->view()));
