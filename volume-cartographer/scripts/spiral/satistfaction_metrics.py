@@ -17,8 +17,8 @@ from visualization import save_overlay
 
 # Thresholds defining the patch-satisfaction metrics.
 metrics_config = {
-    'satisfaction_radius_tolerance': 0.5,  # spiral-space, in units of dr_per_winding
-    'satisfaction_distance_tolerance': 16.0,  # absolute scan-space distance, in voxels
+    'satisfaction_radius_tolerance': 0.45,  # spiral-space, in units of dr_per_winding
+    'satisfaction_distance_tolerance': 6.0,  # absolute scan-space distance, in voxels
     'satisfied_patch_quad_fraction': 0.95,  # min fraction of valid quads satisfied for a patch to count as satisfied
     'boundary_satisfied_patch_quad_fraction': 0.90,  # min fraction of boundary quads satisfied for the boundary metric
 }
