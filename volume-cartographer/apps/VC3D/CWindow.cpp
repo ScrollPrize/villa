@@ -425,7 +425,7 @@ private:
 
     int handleWidth() const
     {
-        return 3;
+        return 5;
     }
 
     void layoutChildren()
