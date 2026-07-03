@@ -969,8 +969,7 @@ void MenuActionController::showSettingsDialog()
             if (viewer) {
                 viewer->setShowDirectionHints(showDirHints);
                 viewer->setPlaneIntersectionLinesVisible(showPlaneLines);
-                // Re-read viewer settings (sensitivities, interpolation, scalebar voxel
-                // size, ...) so changes made in the dialog take effect immediately.
+                // Re-read viewer settings so changes made in the dialog take effect immediately.
                 viewer->reloadPerfSettings();
                 viewer->renderVisible(true);
             }

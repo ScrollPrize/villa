@@ -259,6 +259,7 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     volume.artifacts.push_back(artifact("ome-zarr", "http://127.0.0.1:9/base.zarr"));
     volume.artifacts.push_back(artifact("surface-prediction-zarr", "http://127.0.0.1:9/surface.zarr"));
     volume.artifacts.push_back(artifact("ink-detection-3d-zarr", "http://127.0.0.1:9/ink.zarr"));
+    volume.artifacts.push_back(artifact("metadata", "http://127.0.0.1:9/metadata.json"));
     volume.artifacts.push_back(artifact("obj", "http://127.0.0.1:9/mesh.obj"));
     sample.volumes.push_back(std::move(volume));
 
@@ -285,6 +286,9 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
                     pkg->volumeEntries()[0].tags.end(),
                     "vc-open-data-volume-id:scan-volume") != pkg->volumeEntries()[0].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
+                    pkg->volumeEntries()[0].tags.end(),
+                    "vc-open-data-metadata-url:http://127.0.0.1:9/metadata.json") != pkg->volumeEntries()[0].tags.end());
 }
 
 TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")

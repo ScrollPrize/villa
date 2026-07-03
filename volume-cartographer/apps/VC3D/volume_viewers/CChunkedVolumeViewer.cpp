@@ -751,8 +751,6 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
     _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
-    _voxelSizeOverrideUm = std::max(0.0, s.value(viewer::VOXEL_SIZE_UM, viewer::VOXEL_SIZE_UM_DEFAULT).toDouble());
-    updateScalebarScale();   // override may have changed -> refresh the scalebar
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, perf::INTERPOLATION_METHOD_DEFAULT).toInt();
     _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
     _maxDisplayedResolution = std::clamp(
@@ -1218,14 +1216,9 @@ void CChunkedVolumeViewer::updateScalebarScale()
     // every zoom level.
     if (!_view || !_volume)
         return;
-    // Voxel size (µm per level-0 voxel): prefer the volume's own metadata, but many
-    // .vca archives don't carry one (voxelSize()==0). Fall back to the user-set
-    // override (viewer/voxel_size_um in settings) so the scalebar still shows real
-    // units. If neither is available the bar can't be physical -> leave the view's
-    // default and the overlay shows nothing meaningful.
+    // Voxel size (µm per level-0 voxel) comes from the selected volume's metadata.
+    // Catalog volumes normalize their per-volume metadata.json into Volume::voxelSize().
     double voxel = _volume->voxelSize();
-    if (!(voxel > 0.0))
-        voxel = _voxelSizeOverrideUm;                 // 0 if unset
     if (!(voxel > 0.0) || !(_scale > 0.0f))
         return;
     const double umPerScenePx =
