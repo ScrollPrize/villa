@@ -77,8 +77,7 @@
 .vc-landing .vc-hero__intro a,
 .vc-landing .vc-section__intro a,
 .vc-landing .vc-story__body > p a,
-.vc-landing .vc-credit a,
-.vc-landing .vc-team__credit a {
+.vc-landing .vc-credit a {
   color: var(--vc-text);
   font-weight: 500;
   text-decoration: underline;
@@ -88,8 +87,7 @@
 .vc-landing .vc-hero__intro a:hover,
 .vc-landing .vc-section__intro a:hover,
 .vc-landing .vc-story__body > p a:hover,
-.vc-landing .vc-credit a:hover,
-.vc-landing .vc-team__credit a:hover {
+.vc-landing .vc-credit a:hover {
   color: var(--vc-accent);
 }
 
@@ -765,9 +763,6 @@
 .vc-landing .vc-person__role {
   color: var(--vc-text-faint);
   margin-left: 8px;
-}
-.vc-landing .vc-team__credit {
-  margin-top: 32px;
 }
 
 /* --------------------------------------------------------------------------

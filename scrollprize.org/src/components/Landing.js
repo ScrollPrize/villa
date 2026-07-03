@@ -58,10 +58,6 @@ const stories = ({ unrollVideo }) => [
           text exposed to the air decays and disappears, the library of the
           Villa of the Papyri waits underground, intact.
         </p>
-        {storyImage(
-          "/img/landing/rocio-espin-pinar-villa-papyri-small.webp",
-          "Villa of the Papyri illustration"
-        )}
       </>
     ),
   },
@@ -576,8 +572,9 @@ export function Landing() {
         </section>
 
         {/* ------------------------------------------------------------------
-            Open problems — three before/after sliders + "Targets" strip
-            (the merged "What We're Building Towards").
+            Open problems — two before/after sliders (Virtual Unwrapping,
+            Ink Detection) + "Targets" strip (the merged "What We're
+            Building Towards").
         ------------------------------------------------------------------ */}
         <section className="vc-section" aria-labelledby="open-problems">
           <div className="container mx-auto">
@@ -586,34 +583,7 @@ export function Landing() {
             </Heading>
             <div className="vc-problems">
               <ChallengeBox
-                title="Representation"
-                linkText="Scan the Surface"
-                href="/unwrapping"
-                skills={[
-                  "image annotation",
-                  "computer vision",
-                  "machine learning",
-                  "medical imaging",
-                ]}
-                media={
-                  <BeforeAfter
-                    beforeImage="/img/data/rep_raw_10037.png"
-                    afterImage="/img/data/rep_norms_10037.png"
-                  />
-                }
-              >
-                <p>
-                  Carbonized and crushed under pyroclastic flow and debris, the
-                  scrolls are in rough shape. Tracing the 3D sheets through
-                  these damaged scrolls is nearly impossible in the raw scan
-                  data. More structured representations, like those obtained
-                  with semantic segmentation, simplify downstream tasks
-                  significantly.
-                </p>
-              </ChallengeBox>
-
-              <ChallengeBox
-                title="Geometric Reconstruction"
+                title="Virtual Unwrapping"
                 linkText="Chart the Path"
                 href="/segmentation"
                 skills={[
@@ -871,10 +841,6 @@ export function Landing() {
                 collapsible
               />
             </div>
-            <p className="vc-caption vc-team__credit">
-              Villa dei Papiri art by{" "}
-              <a href="https://www.artstation.com/rocioespin">Rocío Espín</a>
-            </p>
           </div>
         </section>
 

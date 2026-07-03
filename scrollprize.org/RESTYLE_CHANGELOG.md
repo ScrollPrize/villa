@@ -127,6 +127,13 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 3. The "Senators" sponsor tier is collapsible like Citizens. `Landing.js`.
 **Verification:** build green; landing capture ×5 viewports: 0 overflow / 0 small taps / 0 console errors; screenshot-verified.
 
+## C10 — owner requests round 4: open problems restructure, Rocío art removal
+
+1. Open problems section reduced to two clearly separate cards: **Virtual Unwrapping** (renamed from "Geometric Reconstruction"; same slider, links, skills) and **Ink Detection**. The "Representation" card removed (its `/unwrapping` destination remains reachable via the Virtual Unwrapping card; slider images stay on disk).
+2. The Villa dei Papiri illustration by Rocío Espín removed from the 79 AD story beat, along with the artist-credit caption above Partners; dead `.vc-team__credit` CSS removed. (Asset stays on disk per hotlink policy.)
+**Files:** `src/components/Landing.js`, `src/css/landing.css`.
+**Verification:** build green; landing capture ×5 viewports clean (0 overflow / 0 small taps / 0 console errors); desktop height now 5,867px; screenshot-verified.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
