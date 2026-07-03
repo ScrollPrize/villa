@@ -675,6 +675,14 @@ void persistMainViewerLayout(ViewerSplitGrid* grid)
     settings.setValue(MAIN_VIEWER_LAYOUT_HIDDEN_SETTING, hidden);
 }
 
+ViewerSplitGrid* mainViewerSplitGrid(QWidget* parent)
+{
+    auto* widget = parent
+        ? parent->findChild<QWidget*>(QStringLiteral("mainViewerSplitGrid"))
+        : nullptr;
+    return dynamic_cast<ViewerSplitGrid*>(widget);
+}
+
 void applyMainViewerLayout(ViewerSplitGrid* grid, ViewerManager* manager)
 {
     if (!grid || !manager) {
@@ -2923,9 +2931,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         QMenu menu(this);
                         auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
-                        auto* viewerGrid = ui.tabSegment
-                            ? ui.tabSegment->findChild<ViewerSplitGrid*>(QStringLiteral("mainViewerSplitGrid"))
-                            : nullptr;
+                        auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
                         const int mainViewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
                         if (viewerGrid && mainViewerPane >= 0) {
                             QAction* closeAction = menu.addAction(tr("Close viewer"));
@@ -3251,7 +3257,7 @@ VolumeViewerBase* CWindow::activeBaseViewer() const
 
 void CWindow::resetSegmentationViews(bool persistLayout)
 {
-    auto* viewerGrid = ui.tabSegment ? ui.tabSegment->findChild<ViewerSplitGrid*>(QStringLiteral("mainViewerSplitGrid")) : nullptr;
+    auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
     if (!viewerGrid) {
         return;
     }
