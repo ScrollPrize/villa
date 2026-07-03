@@ -19,6 +19,7 @@
 
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
+#include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
 #include <QGridLayout>
 #include <QAction>
@@ -2535,6 +2536,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
                                    ui.dockWidgetOverlay,
+                                   ui.dockWidgetComposite,
                                    _inkDetectionDock,
                                    _transformsDock,
                                    _atlasOverviewDock,
@@ -2554,6 +2556,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     if (_statusDockPanelHost) {
         for (QDockWidget* dock : {ui.dockWidgetVolumes,
                                   ui.dockWidgetViewerControls,
+                                  ui.dockWidgetComposite,
                                   ui.dockWidgetOverlay,
                                   _inkDetectionDock,
                                   _transformsDock,
@@ -2610,8 +2613,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
-        if (_viewerControlsPanel) {
-            _viewerControlsPanel->toggleSegmentationComposite();
+        if (_viewerCompositePanel) {
+            _viewerCompositePanel->toggleSegmentationComposite();
         }
     });
 
@@ -7044,26 +7047,6 @@ void CWindow::CreateWidgets(void)
         .viewContents = ui.dockWidgetViewContents,
         .overlayScrollArea = ui.scrollAreaOverlay,
         .overlayContents = ui.dockWidgetOverlayContents,
-        .compositeScrollArea = ui.scrollAreaComposite,
-        .compositeContents = ui.dockWidgetCompositeContents,
-        .compositeEnabled = ui.chkCompositeEnabled,
-        .compositeMode = ui.cmbCompositeMode,
-        .layersInFront = ui.spinLayersInFront,
-        .layersBehind = ui.spinLayersBehind,
-        .alphaMinLabel = ui.lblAlphaMin,
-        .alphaMin = ui.spinAlphaMin,
-        .alphaMaxLabel = ui.lblAlphaMax,
-        .alphaMax = ui.spinAlphaMax,
-        .alphaThresholdLabel = ui.lblAlphaThreshold,
-        .alphaThreshold = ui.spinAlphaThreshold,
-        .materialLabel = ui.lblMaterial,
-        .material = ui.spinMaterial,
-        .reverseDirection = ui.chkReverseDirection,
-        .planeCompositeXY = ui.chkPlaneCompositeXY,
-        .planeCompositeXZ = ui.chkPlaneCompositeXZ,
-        .planeCompositeYZ = ui.chkPlaneCompositeYZ,
-        .planeLayersFront = ui.spinPlaneLayersFront,
-        .planeLayersBehind = ui.spinPlaneLayersBehind,
         .renderSettingsScrollArea = ui.scrollAreaRenderSettings,
         .renderSettingsContents = ui.dockWidgetRenderSettingsContents,
         .normalVisualizationContents = ui.dockWidgetNormalVisContents,
@@ -7083,6 +7066,33 @@ void CWindow::CreateWidgets(void)
     _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
                                                                  _viewerManager.get(),
                                                                  ui.dockWidgetViewerControlsContents);
+    ViewerCompositePanel::UiRefs compositeUi{
+        .scrollArea = ui.scrollAreaComposite,
+        .contents = ui.dockWidgetCompositeContents,
+        .compositeEnabled = ui.chkCompositeEnabled,
+        .compositeMode = ui.cmbCompositeMode,
+        .layersInFront = ui.spinLayersInFront,
+        .layersBehind = ui.spinLayersBehind,
+        .alphaMinLabel = ui.lblAlphaMin,
+        .alphaMin = ui.spinAlphaMin,
+        .alphaMaxLabel = ui.lblAlphaMax,
+        .alphaMax = ui.spinAlphaMax,
+        .alphaThresholdLabel = ui.lblAlphaThreshold,
+        .alphaThreshold = ui.spinAlphaThreshold,
+        .materialLabel = ui.lblMaterial,
+        .material = ui.spinMaterial,
+        .reverseDirection = ui.chkReverseDirection,
+        .planeCompositeXY = ui.chkPlaneCompositeXY,
+        .planeCompositeXZ = ui.chkPlaneCompositeXZ,
+        .planeCompositeYZ = ui.chkPlaneCompositeYZ,
+        .planeLayersFront = ui.spinPlaneLayersFront,
+        .planeLayersBehind = ui.spinPlaneLayersBehind,
+    };
+    _viewerCompositePanel = new ViewerCompositePanel(compositeUi, _viewerManager.get(), ui.dockWidgetComposite);
+    attachScrollAreaToDock(ui.dockWidgetComposite,
+                           _viewerCompositePanel,
+                           QStringLiteral("dockWidgetCompositeContent"));
+
     _inkDetectionDock = new QDockWidget(tr("Ink Detection"), this);
     _inkDetectionDock->setObjectName(QStringLiteral("dockWidgetInkDetection"));
     attachScrollAreaToDock(_inkDetectionDock,

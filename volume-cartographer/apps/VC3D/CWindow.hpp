@@ -107,6 +107,7 @@ class LineAnnotationController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
+class ViewerCompositePanel;
 
 class CWindow : public QMainWindow
 {
@@ -338,6 +339,7 @@ private:
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
     std::unique_ptr<ViewerControlsPanel> _viewerControlsPanel;
+    ViewerCompositePanel* _viewerCompositePanel{nullptr};
     bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 

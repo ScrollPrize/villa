@@ -4,7 +4,6 @@
 #include "ViewerManager.hpp"
 #include "WindowRangeWidget.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
-#include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerNavigationPanel.hpp"
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
 #include "viewer_controls/panels/ViewerViewExtrasPanel.hpp"
@@ -70,33 +69,6 @@ void ViewerControlsPanel::addViewerGroups()
                    "viewer_controls/group_navigation_expanded",
                    true);
 
-    ViewerCompositePanel::UiRefs compositeUi{
-        .scrollArea = _uiRefs.compositeScrollArea,
-        .contents = _uiRefs.compositeContents,
-        .compositeEnabled = _uiRefs.compositeEnabled,
-        .compositeMode = _uiRefs.compositeMode,
-        .layersInFront = _uiRefs.layersInFront,
-        .layersBehind = _uiRefs.layersBehind,
-        .alphaMinLabel = _uiRefs.alphaMinLabel,
-        .alphaMin = _uiRefs.alphaMin,
-        .alphaMaxLabel = _uiRefs.alphaMaxLabel,
-        .alphaMax = _uiRefs.alphaMax,
-        .alphaThresholdLabel = _uiRefs.alphaThresholdLabel,
-        .alphaThreshold = _uiRefs.alphaThreshold,
-        .materialLabel = _uiRefs.materialLabel,
-        .material = _uiRefs.material,
-        .reverseDirection = _uiRefs.reverseDirection,
-        .planeCompositeXY = _uiRefs.planeCompositeXY,
-        .planeCompositeXZ = _uiRefs.planeCompositeXZ,
-        .planeCompositeYZ = _uiRefs.planeCompositeYZ,
-        .planeLayersFront = _uiRefs.planeLayersFront,
-        .planeLayersBehind = _uiRefs.planeLayersBehind,
-    };
-    _compositePanel = new ViewerCompositePanel(compositeUi, _viewerManager, _uiRefs.contents);
-    addViewerGroup(tr("Composite View"),
-                   _compositePanel,
-                   viewer::GROUP_COMPOSITE_EXPANDED,
-                   viewer::GROUP_COMPOSITE_EXPANDED_DEFAULT);
     addViewerGroup(tr("Render Settings"),
                    detachScrollContents(_uiRefs.renderSettingsScrollArea, _uiRefs.renderSettingsContents),
                    viewer::GROUP_RENDER_SETTINGS_EXPANDED,
@@ -132,13 +104,6 @@ void ViewerControlsPanel::setViewControlsEnabled(bool enabled)
         _volumeWindowWidget->setControlsEnabled(enabled);
     }
     updateOverlayWindowControlsEnabled();
-}
-
-void ViewerControlsPanel::toggleSegmentationComposite()
-{
-    if (_compositePanel) {
-        _compositePanel->toggleSegmentationComposite();
-    }
 }
 
 void ViewerControlsPanel::setOverlayWindowAvailable(bool available)
