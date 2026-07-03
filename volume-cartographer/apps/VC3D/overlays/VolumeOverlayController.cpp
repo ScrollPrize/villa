@@ -111,6 +111,12 @@ void VolumeOverlayController::setUi(const UiRefs& ui)
         _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
     }
 
+    if (_ui.maxDisplayedResolutionSpin) {
+        _ui.maxDisplayedResolutionSpin->setRange(0, 5);
+        QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
+        _ui.maxDisplayedResolutionSpin->setValue(std::clamp(_overlayMaxDisplayedResolution, 0, 5));
+    }
+
     populateColormapOptions();
     refreshVolumeOptions();
     updateUiEnabled();
@@ -133,6 +139,13 @@ void VolumeOverlayController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg
     setColormap(_overlayColormapName);
     setOpacity(_overlayOpacity);
     setWindowBounds(_overlayWindowLow, _overlayWindowHigh);
+    if (_ui.maxDisplayedResolutionSpin) {
+        const QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
+        _ui.maxDisplayedResolutionSpin->setValue(std::clamp(_overlayMaxDisplayedResolution, 0, 5));
+    }
+    if (_viewerManager) {
+        _viewerManager->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
+    }
     updateUiEnabled();
     _suspendPersistence = false;
 }
@@ -169,6 +182,7 @@ void VolumeOverlayController::clearVolumePkg()
     _overlayOpacityBeforeToggle = _overlayOpacity;
     _overlayWindowLow = 0.0f;
     _overlayWindowHigh = 255.0f;
+    _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
     if (_ui.opacitySpin) {
         const QSignalBlocker blocker(_ui.opacitySpin);
         _ui.opacitySpin->setValue(percentValueFromOpacity(_overlayOpacity));
@@ -177,11 +191,16 @@ void VolumeOverlayController::clearVolumePkg()
         const QSignalBlocker blocker(_ui.thresholdSpin);
         _ui.thresholdSpin->setValue(spinValueFromWindow(_overlayWindowLow));
     }
+    if (_ui.maxDisplayedResolutionSpin) {
+        const QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
+        _ui.maxDisplayedResolutionSpin->setValue(_overlayMaxDisplayedResolution);
+    }
 
     if (_viewerManager) {
         _viewerManager->setOverlayOpacity(_overlayOpacity);
         _viewerManager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
         _viewerManager->setOverlayColormap(std::string());
+        _viewerManager->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     }
 
     updateUiEnabled();
@@ -354,6 +373,12 @@ void VolumeOverlayController::connectUiSignals()
             _ui.thresholdSpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int value) { handleThresholdChanged(value); }));
     }
+
+    if (_ui.maxDisplayedResolutionSpin) {
+        _connections.push_back(QObject::connect(
+            _ui.maxDisplayedResolutionSpin, qOverload<int>(&QSpinBox::valueChanged),
+            this, [this](int value) { handleMaxDisplayedResolutionChanged(value); }));
+    }
 }
 
 void VolumeOverlayController::disconnectUiSignals()
@@ -439,6 +464,9 @@ void VolumeOverlayController::updateUiEnabled()
     if (_ui.thresholdSpin) {
         _ui.thresholdSpin->setEnabled(hasOverlay);
     }
+    if (_ui.maxDisplayedResolutionSpin) {
+        _ui.maxDisplayedResolutionSpin->setEnabled(hasOverlay);
+    }
     if (_ui.colormapSelect) {
         const bool hasColormaps = _ui.colormapSelect->count() > 0;
         _ui.colormapSelect->setEnabled(hasOverlay && hasColormaps);
@@ -474,6 +502,7 @@ void VolumeOverlayController::loadState()
     _overlayWindowLow = 0.0f;
     _overlayWindowHigh = 255.0f;
     _overlayColormapName.clear();
+    _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
 
     if (_volpkgPath.isEmpty()) {
         return;
@@ -522,6 +551,12 @@ void VolumeOverlayController::loadState()
         _overlayColormapName = storedColormap.toStdString();
     }
 
+    _overlayMaxDisplayedResolution = std::clamp(
+        settings.value(volume_overlay::MAX_DISPLAYED_RESOLUTION,
+                       volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT).toInt(),
+        0,
+        5);
+
     settings.endGroup();
     settings.endGroup();
 }
@@ -548,6 +583,7 @@ void VolumeOverlayController::saveState() const
     settings.setValue(volume_overlay::WINDOW_HIGH, _overlayWindowHigh);
     settings.setValue(volume_overlay::THRESHOLD, _overlayWindowLow); // legacy compatibility
     settings.setValue(volume_overlay::COLORMAP, QString::fromStdString(_overlayColormapName));
+    settings.setValue(volume_overlay::MAX_DISPLAYED_RESOLUTION, _overlayMaxDisplayedResolution);
     settings.endGroup();
     settings.endGroup();
 }
@@ -646,6 +682,28 @@ void VolumeOverlayController::setWindowBounds(float low, float high)
 
     if (_viewerManager) {
         _viewerManager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
+    }
+}
+
+void VolumeOverlayController::handleMaxDisplayedResolutionChanged(int value)
+{
+    const int clamped = std::clamp(value, 0, 5);
+    if (_overlayMaxDisplayedResolution == clamped) {
+        return;
+    }
+
+    _overlayMaxDisplayedResolution = clamped;
+    if (_ui.maxDisplayedResolutionSpin && _ui.maxDisplayedResolutionSpin->value() != clamped) {
+        const QSignalBlocker blocker(_ui.maxDisplayedResolutionSpin);
+        _ui.maxDisplayedResolutionSpin->setValue(clamped);
+    }
+
+    if (_viewerManager) {
+        _viewerManager->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
+    }
+
+    if (!_suspendPersistence) {
+        saveState();
     }
 }
 

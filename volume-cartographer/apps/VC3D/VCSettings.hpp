@@ -445,6 +445,9 @@ namespace volume_overlay {
     constexpr auto WINDOW_HIGH = "window_high";
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
+
+    constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
 }
 
 } // namespace settings

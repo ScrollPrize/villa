@@ -93,6 +93,8 @@ public:
     void setOverlayWindow(float low, float high);
     float overlayWindowLow() const { return _overlayWindowLow; }
     float overlayWindowHigh() const { return _overlayWindowHigh; }
+    void setOverlayMaxDisplayedResolution(int level);
+    int overlayMaxDisplayedResolution() const { return _overlayMaxDisplayedResolution; }
 
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _volumeWindowLow; }
@@ -202,6 +204,7 @@ private:
     std::string _overlayColormapId;
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
+    int _overlayMaxDisplayedResolution{0};
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};

@@ -108,6 +108,7 @@ public:
     void setOverlayColormap(const std::string&) override {}
     void setOverlayThreshold(float) override {}
     void setOverlayWindow(float, float) override {}
+    void setOverlayMaxDisplayedResolution(int) override {}
     void reloadPerfSettings() override {}
 
     uint64_t highlightedPointId() const override { return 0; }

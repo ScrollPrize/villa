@@ -238,6 +238,7 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayOpacity(_overlayOpacity);
     baseViewer->setOverlayColormap(_overlayColormapId);
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
+    baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);
@@ -426,6 +427,14 @@ void ViewerManager::setOverlayWindow(float low, float high)
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh); });
 
     emit overlayWindowChanged(_overlayWindowLow, _overlayWindowHigh);
+}
+
+void ViewerManager::setOverlayMaxDisplayedResolution(int level)
+{
+    _overlayMaxDisplayedResolution = std::clamp(level, 0, 5);
+    forEachBaseViewer([this](VolumeViewerBase* v) {
+        v->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
+    });
 }
 
 void ViewerManager::setVolumeWindow(float low, float high)

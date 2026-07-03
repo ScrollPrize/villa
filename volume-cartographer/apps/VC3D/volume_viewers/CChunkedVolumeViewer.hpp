@@ -135,6 +135,7 @@ public:
     void setOverlayColormap(const std::string& colormapId) override;
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
+    void setOverlayMaxDisplayedResolution(int level) override;
 
     void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
@@ -289,12 +290,15 @@ private:
                            const cv::Vec3f& vxStep,
                            const cv::Vec3f& vyStep,
                            int startLevel,
+                           int overlayStartLevel,
                            const vc::render::ChunkedPlaneSampler::Options& options);
     void prefetchPlaneNormalNeighbors(PlaneSurface& plane,
                                       int startLevel,
+                                      int overlayStartLevel,
                                       const vc::render::ChunkedPlaneSampler::Options& options);
     void prefetchSurfaceHalo(Surface& surf,
                              int startLevel,
+                             int overlayStartLevel,
                              const vc::render::ChunkedPlaneSampler::Options& options,
                              int fbW,
                              int fbH);
@@ -310,6 +314,7 @@ private:
         float zOff = 0.0f;
         cv::Vec3f zOffWorldDir{0, 0, 0};
         int startLevel = 0;
+        int overlayStartLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
@@ -350,6 +355,7 @@ private:
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
+    int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
@@ -442,6 +448,7 @@ private:
     std::string _overlayColormapId;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
+    int _overlayMaxDisplayedResolution = 0;
 
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;

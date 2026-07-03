@@ -26,6 +26,7 @@ public:
         QPointer<QComboBox> colormapSelect;
         QPointer<QSpinBox> opacitySpin;
         QPointer<QSpinBox> thresholdSpin;
+        QPointer<QSpinBox> maxDisplayedResolutionSpin;
     };
 
     explicit VolumeOverlayController(ViewerManager* manager, QObject* parent = nullptr);
@@ -58,6 +59,7 @@ private:
     void handleColormapChanged(int index);
     void handleOpacityChanged(int value);
     void handleThresholdChanged(int value);
+    void handleMaxDisplayedResolutionChanged(int value);
 
     ViewerManager* _viewerManager{nullptr};
     UiRefs _ui;
@@ -72,6 +74,7 @@ private:
     float _overlayOpacityBeforeToggle{0.5f};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
+    int _overlayMaxDisplayedResolution{0};
     bool _overlayVisible{false};
 
     std::vector<QMetaObject::Connection> _connections;

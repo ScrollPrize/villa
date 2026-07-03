@@ -1479,6 +1479,20 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     return std::clamp(level, 0, _chunkArray->numLevels() - 1);
 }
 
+int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) const
+{
+    if (!_overlayChunkArray) {
+        return 0;
+    }
+
+    int level = _dsScaleIdx;
+    if (preferSurfaceResolution && level < _overlayChunkArray->numLevels() - 1) {
+        level -= kSurfaceResolutionLevelBias;
+    }
+    level = std::max(level, _overlayMaxDisplayedResolution);
+    return std::clamp(level, 0, _overlayChunkArray->numLevels() - 1);
+}
+
 void CChunkedVolumeViewer::markInteractiveMotion(double)
 {
     // Interactions schedule a normal full-quality render directly (scheduleRender in
@@ -1498,6 +1512,7 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
     const cv::Vec3f& vxStep,
     const cv::Vec3f& vyStep,
     int startLevel,
+    int overlayStartLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
     const bool prefetchBase = shouldPrefetchRemoteVolumeHalo(_volume);
@@ -1515,6 +1530,7 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
     const int expandedW = fbW + 2 * halo;
     std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniqueKeys;
     auto collect = [&](vc::render::IChunkedArray& array,
+                       int level,
                        const cv::Vec3f& stripOrigin,
                        int stripW,
                        int stripH) {
@@ -1522,18 +1538,18 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
             return;
         cv::Mat_<uint8_t> stripCoverage(stripH, stripW, uint8_t(0));
         auto keys = vc::render::ChunkedPlaneSampler::collectPlaneDependencies(
-            array, startLevel, stripOrigin, vxStep, vyStep, stripCoverage, options);
+            array, level, stripOrigin, vxStep, vyStep, stripCoverage, options);
         uniqueKeys.insert(keys.begin(), keys.end());
     };
 
     std::vector<vc::render::ChunkKey> keys;
     if (prefetchBase && _chunkArray) {
-        collect(*_chunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
+        collect(*_chunkArray, startLevel, origin - vxStep * float(halo) - vyStep * float(halo),
                 expandedW, halo);
-        collect(*_chunkArray, origin - vxStep * float(halo) + vyStep * float(fbH),
+        collect(*_chunkArray, startLevel, origin - vxStep * float(halo) + vyStep * float(fbH),
                 expandedW, halo);
-        collect(*_chunkArray, origin - vxStep * float(halo), halo, fbH);
-        collect(*_chunkArray, origin + vxStep * float(fbW), halo, fbH);
+        collect(*_chunkArray, startLevel, origin - vxStep * float(halo), halo, fbH);
+        collect(*_chunkArray, startLevel, origin + vxStep * float(fbW), halo, fbH);
 
         keys.reserve(uniqueKeys.size());
         for (const auto& key : uniqueKeys)
@@ -1541,15 +1557,17 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
         _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
     }
 
-    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f ||
+        _overlayChunkArray->numLevels() <= 0)
         return;
+    overlayStartLevel = std::clamp(overlayStartLevel, 0, _overlayChunkArray->numLevels() - 1);
     uniqueKeys.clear();
-    collect(*_overlayChunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
+    collect(*_overlayChunkArray, overlayStartLevel, origin - vxStep * float(halo) - vyStep * float(halo),
             expandedW, halo);
-    collect(*_overlayChunkArray, origin - vxStep * float(halo) + vyStep * float(fbH),
+    collect(*_overlayChunkArray, overlayStartLevel, origin - vxStep * float(halo) + vyStep * float(fbH),
             expandedW, halo);
-    collect(*_overlayChunkArray, origin - vxStep * float(halo), halo, fbH);
-    collect(*_overlayChunkArray, origin + vxStep * float(fbW), halo, fbH);
+    collect(*_overlayChunkArray, overlayStartLevel, origin - vxStep * float(halo), halo, fbH);
+    collect(*_overlayChunkArray, overlayStartLevel, origin + vxStep * float(fbW), halo, fbH);
     keys.clear();
     keys.reserve(uniqueKeys.size());
     for (const auto& key : uniqueKeys)
@@ -1560,6 +1578,7 @@ void CChunkedVolumeViewer::prefetchPlaneHalo(
 void CChunkedVolumeViewer::prefetchPlaneNormalNeighbors(
     PlaneSurface& plane,
     int startLevel,
+    int overlayStartLevel,
     const vc::render::ChunkedPlaneSampler::Options& options)
 {
     const bool prefetchBase = shouldSpeculativelyPrefetchVolume(_volume);
@@ -1642,17 +1661,19 @@ void CChunkedVolumeViewer::prefetchPlaneNormalNeighbors(
         collect(*_chunkArray, startLevel, chunkDistance(*_chunkArray, startLevel));
     }
 
-    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f ||
+        _overlayChunkArray->numLevels() <= 0)
         return;
     if (_overlayChunkArray->numLevels() <= 0)
         return;
-    const int overlayLevel = std::clamp(startLevel, 0, _overlayChunkArray->numLevels() - 1);
+    const int overlayLevel = std::clamp(overlayStartLevel, 0, _overlayChunkArray->numLevels() - 1);
     collect(*_overlayChunkArray, overlayLevel, chunkDistance(*_overlayChunkArray, overlayLevel));
 }
 
 void CChunkedVolumeViewer::prefetchSurfaceHalo(
     Surface& surf,
     int startLevel,
+    int overlayStartLevel,
     const vc::render::ChunkedPlaneSampler::Options& options,
     int fbW,
     int fbH)
@@ -1670,6 +1691,7 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
     std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniqueKeys;
 
     auto collect = [&](vc::render::IChunkedArray& array,
+                       int level,
                        int sceneX,
                        int sceneY,
                        int stripW,
@@ -1687,16 +1709,16 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
 
         cv::Mat_<uint8_t> coverage(stripH, stripW, uint8_t(0));
         auto keys = vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
-            array, startLevel, coords, coverage, options);
+            array, level, coords, coverage, options);
         uniqueKeys.insert(keys.begin(), keys.end());
     };
 
     std::vector<vc::render::ChunkKey> keys;
     if (prefetchBase && _chunkArray) {
-        collect(*_chunkArray, -halo, -halo, fbW + 2 * halo, halo);
-        collect(*_chunkArray, -halo, fbH, fbW + 2 * halo, halo);
-        collect(*_chunkArray, -halo, 0, halo, fbH);
-        collect(*_chunkArray, fbW, 0, halo, fbH);
+        collect(*_chunkArray, startLevel, -halo, -halo, fbW + 2 * halo, halo);
+        collect(*_chunkArray, startLevel, -halo, fbH, fbW + 2 * halo, halo);
+        collect(*_chunkArray, startLevel, -halo, 0, halo, fbH);
+        collect(*_chunkArray, startLevel, fbW, 0, halo, fbH);
 
         keys.reserve(uniqueKeys.size());
         for (const auto& key : uniqueKeys)
@@ -1704,13 +1726,15 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
         _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
     }
 
-    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f)
+    if (!prefetchOverlay || !_overlayChunkArray || _overlayOpacity <= 0.0f ||
+        _overlayChunkArray->numLevels() <= 0)
         return;
+    overlayStartLevel = std::clamp(overlayStartLevel, 0, _overlayChunkArray->numLevels() - 1);
     uniqueKeys.clear();
-    collect(*_overlayChunkArray, -halo, -halo, fbW + 2 * halo, halo);
-    collect(*_overlayChunkArray, -halo, fbH, fbW + 2 * halo, halo);
-    collect(*_overlayChunkArray, -halo, 0, halo, fbH);
-    collect(*_overlayChunkArray, fbW, 0, halo, fbH);
+    collect(*_overlayChunkArray, overlayStartLevel, -halo, -halo, fbW + 2 * halo, halo);
+    collect(*_overlayChunkArray, overlayStartLevel, -halo, fbH, fbW + 2 * halo, halo);
+    collect(*_overlayChunkArray, overlayStartLevel, -halo, 0, halo, fbH);
+    collect(*_overlayChunkArray, overlayStartLevel, fbW, 0, halo, fbH);
     keys.clear();
     keys.reserve(uniqueKeys.size());
     for (const auto& key : uniqueKeys)
@@ -1848,6 +1872,7 @@ struct CChunkedVolumeViewer::RenderContext {
     float zOff = 0.0f;
     cv::Vec3f zOffWorldDir{0, 0, 0};
     int startLevel = 0;
+    int overlayStartLevel = 0;
     vc::Sampling samplingMethod = vc::Sampling::Trilinear;
     CompositeRenderSettings compositeSettings;
     float windowLow = 0.0f;
@@ -1891,10 +1916,10 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     bool phaseGenCached = false;
     QElapsedTimer phaseTimer;
     if (ProfileLoggingEnabled()) {
-        Logger()->info("[vc3d-profile] renderFrame begin reason='{}' caller='{}' serial={} surf='{}' size={}x{} level={} overlay={} composite={} planeComposite={}",
+        Logger()->info("[vc3d-profile] renderFrame begin reason='{}' caller='{}' serial={} surf='{}' size={}x{} level={} overlay_level={} overlay={} composite={} planeComposite={}",
                        ctx.profileReason, ctx.profileCaller, ctx.serial,
                        ctx.surf ? ctx.surf->id : std::string(""),
-                       ctx.fbW, ctx.fbH, ctx.startLevel,
+                       ctx.fbW, ctx.fbH, ctx.startLevel, ctx.overlayStartLevel,
                        bool(ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f),
                        ctx.compositeSettings.enabled, ctx.compositeSettings.planeEnabled);
     }
@@ -2083,7 +2108,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             overlayCoverage.create(ctx.fbH, ctx.fbW);
             overlayValues.setTo(0);
             overlayCoverage.setTo(0);
-            const int level = std::clamp(ctx.startLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
+            const int level = std::clamp(ctx.overlayStartLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
             vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
                 overlayValues, overlayCoverage, options);
@@ -2155,7 +2180,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 overlayCoverage.create(ctx.fbH, ctx.fbW);
                 overlayValues.setTo(0);
                 overlayCoverage.setTo(0);
-                const int level = std::clamp(ctx.startLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
+                const int level = std::clamp(ctx.overlayStartLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
                 vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
                     *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
             }
@@ -2216,7 +2241,9 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.scale = _scale;
     job.zOff = _zOff;
     job.zOffWorldDir = _zOffWorldDir;
-    job.startLevel = renderStartLevel(dynamic_cast<PlaneSurface*>(surf.get()) == nullptr);
+    const bool preferSurfaceResolution = dynamic_cast<PlaneSurface*>(surf.get()) == nullptr;
+    job.startLevel = renderStartLevel(preferSurfaceResolution);
+    job.overlayStartLevel = overlayRenderStartLevel(preferSurfaceResolution);
     job.samplingMethod = _samplingMethod;
     job.compositeSettings = _compositeSettings;
     job.windowLow = _windowLow;
@@ -2257,6 +2284,7 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
            a.zOff == b.zOff &&
            vecEqual(a.zOffWorldDir, b.zOffWorldDir) &&
            a.startLevel == b.startLevel &&
+           a.overlayStartLevel == b.overlayStartLevel &&
            a.samplingMethod == b.samplingMethod &&
            a.compositeSettings == b.compositeSettings &&
            a.windowLow == b.windowLow &&
@@ -2332,6 +2360,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.zOff = job.zOff;
     ctx.zOffWorldDir = job.zOffWorldDir;
     ctx.startLevel = job.startLevel;
+    ctx.overlayStartLevel = job.overlayStartLevel;
     ctx.samplingMethod = job.samplingMethod;
     ctx.compositeSettings = job.compositeSettings;
     ctx.windowLow = job.windowLow;
@@ -2496,6 +2525,7 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
         const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
             const int startLevel = renderStartLevel(false);
+            const int overlayStartLevel = overlayRenderStartLevel(false);
             const cv::Vec3f vx = plane->basisX();
             const cv::Vec3f vy = plane->basisY();
             const cv::Vec3f n = plane->normal({0, 0, 0});
@@ -2505,10 +2535,10 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
                                    + vy * (_surfacePtrY - halfH)
                                    + plane->origin()
                                    + n * _zOff;
-            prefetchPlaneHalo(origin, vx / _scale, vy / _scale, startLevel, options);
-            prefetchPlaneNormalNeighbors(*plane, startLevel, options);
+            prefetchPlaneHalo(origin, vx / _scale, vy / _scale, startLevel, overlayStartLevel, options);
+            prefetchPlaneNormalNeighbors(*plane, startLevel, overlayStartLevel, options);
         } else {
-            prefetchSurfaceHalo(*surf, renderStartLevel(true), options,
+            prefetchSurfaceHalo(*surf, renderStartLevel(true), overlayRenderStartLevel(true), options,
                                 _framebuffer.width(), _framebuffer.height());
         }
     }
@@ -2657,6 +2687,21 @@ void CChunkedVolumeViewer::setOverlayWindow(float low, float high)
     _overlayWindowLow = std::clamp(low, 0.0f, 255.0f);
     _overlayWindowHigh = std::clamp(high, _overlayWindowLow + 1.0f, 255.0f);
     submitRender("overlay window changed");
+}
+
+void CChunkedVolumeViewer::setOverlayMaxDisplayedResolution(int level)
+{
+    if (_closing) {
+        return;
+    }
+
+    const int clamped = std::clamp(level, 0, 5);
+    if (_overlayMaxDisplayedResolution == clamped) {
+        return;
+    }
+
+    _overlayMaxDisplayedResolution = clamped;
+    submitRender("overlay max displayed resolution changed");
 }
 
 void CChunkedVolumeViewer::panByF(float dx, float dy)
