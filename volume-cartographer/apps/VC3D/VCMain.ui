@@ -1351,7 +1351,7 @@
       </size>
      </property>
      <property name="windowTitle">
-      <string>Render Settings</string>
+      <string>Segment Overlaps</string>
      </property>
      <attribute name="dockWidgetArea">
       <number>1</number>

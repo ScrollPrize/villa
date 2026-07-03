@@ -28,9 +28,6 @@ public:
         QScrollArea* overlayScrollArea{nullptr};
         QWidget* overlayContents{nullptr};
 
-        QScrollArea* renderSettingsScrollArea{nullptr};
-        QWidget* renderSettingsContents{nullptr};
-
         QWidget* normalVisualizationContents{nullptr};
         QCheckBox* showSurfaceNormals{nullptr};
         QLabel* normalArrowLengthLabel{nullptr};
