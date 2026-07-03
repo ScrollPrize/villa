@@ -401,13 +401,17 @@ void OpenDataCatalogWindow::buildUi()
         tr("Segments"),
         tr("Ink"),
         tr("Local TIFXYZ"),
-        tr("Sync")
+        tr("Sync Status")
     });
     _sampleTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     _sampleTable->setSelectionMode(QAbstractItemView::SingleSelection);
     _sampleTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     _sampleTable->setSortingEnabled(true);
     _sampleTable->setMinimumWidth(kSampleTableInitialWidth);
+    _sampleTable->horizontalHeader()->setSectionsClickable(true);
+    _sampleTable->horizontalHeader()->setSortIndicatorShown(true);
+    _sampleTable->horizontalHeader()->setSortIndicator(0, Qt::AscendingOrder);
+    _sampleTable->horizontalHeader()->setToolTip(tr("Click a column header to sort."));
     _sampleTable->horizontalHeader()->setStretchLastSection(true);
     _sampleTable->verticalHeader()->hide();
 
