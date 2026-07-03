@@ -182,6 +182,8 @@ private:
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);
     void updateVolumePackageEmptyState();
+    void showStatusBarMessage(const QString& text, int timeout = 0);
+    void clearStatusBarMessage();
 
 
     // Helper method for command line tools
@@ -288,8 +290,10 @@ private:
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
     QLabel* _segmentationGrowthWarning{nullptr};
+    QLabel* _statusMessageLabel{nullptr};
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _sliceStepLabel{nullptr};
+    QTimer* _statusMessageTimer{nullptr};
     QString _segmentationGrowthStatusText;
 
 

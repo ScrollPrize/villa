@@ -2309,17 +2309,30 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_volumeOverlay.get(), &VolumeOverlayController::requestStatusMessage, this,
             [this](const QString& message, int timeout) {
                 if (statusBar()) {
-                    statusBar()->showMessage(message, timeout);
+                    showStatusBarMessage(message, timeout);
                 }
             });
     _viewerManager->setVolumeOverlay(_volumeOverlay.get());
 
     if (_statusDockPanelHost) {
         if (auto* statusDockBar = _statusDockPanelHost->takeBarWidget()) {
-            statusDockBar->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            statusDockBar->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
             statusBar()->insertWidget(0, statusDockBar, 1);
         }
     }
+
+    _statusMessageLabel = new QLabel(this);
+    _statusMessageLabel->setObjectName(QStringLiteral("statusMessageLabel"));
+    _statusMessageLabel->setContentsMargins(8, 0, 8, 0);
+    _statusMessageLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _statusMessageLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    _statusMessageLabel->setMinimumWidth(160);
+    _statusMessageLabel->setWordWrap(false);
+    statusBar()->addWidget(_statusMessageLabel, 1);
+
+    _statusMessageTimer = new QTimer(this);
+    _statusMessageTimer->setSingleShot(true);
+    connect(_statusMessageTimer, &QTimer::timeout, this, &CWindow::clearStatusBarMessage);
 
     // create UI widgets
     CreateWidgets();
@@ -2652,7 +2665,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 }
             });
         }
-        statusBar()->showMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
+        showStatusBarMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
     });
 
     fAxisAlignedSlicesShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::AxisAlignedSlices), this);
@@ -2670,7 +2683,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (_rawPointsOverlay) {
             bool newEnabled = !_rawPointsOverlay->isEnabled();
             _rawPointsOverlay->setEnabled(newEnabled);
-            statusBar()->showMessage(
+            showStatusBarMessage(
                 newEnabled ? tr("Raw points overlay enabled") : tr("Raw points overlay disabled"),
                 2000);
         }
@@ -2771,7 +2784,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(fApplyApprovedTagShortcut, &QShortcut::activated, [this]() {
         if (_surfacePanel &&
             _surfacePanel->setTagChecked(SurfacePanelController::Tag::Approved, true)) {
-            statusBar()->showMessage(tr("Applied Approved tag"), 2000);
+            showStatusBarMessage(tr("Applied Approved tag"), 2000);
         }
     });
 
@@ -2780,7 +2793,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(fApplyDefectiveTagShortcut, &QShortcut::activated, [this]() {
         if (_surfacePanel &&
             _surfacePanel->setTagChecked(SurfacePanelController::Tag::Defective, true)) {
-            statusBar()->showMessage(tr("Applied Defective tag"), 2000);
+            showStatusBarMessage(tr("Applied Defective tag"), 2000);
         }
     });
 
@@ -3559,7 +3572,7 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
     refreshVolumeSelectionUi(preferredVolumeId);
     if (!_state->vpkg()->hasVolumes()) {
         Logger()->info("Opened volpkg '{}' with no volumes", _state->vpkgPath().toStdString());
-        statusBar()->showMessage(tr("Opened volume package with no volumes."), 5000);
+        showStatusBarMessage(tr("Opened volume package with no volumes."), 5000);
     }
 
     if (_volumeOverlay) {
@@ -3650,7 +3663,7 @@ void CWindow::toggleFocusedView()
         }
         _savedDockStates.clear();
         _focusedViewActive = false;
-        statusBar()->showMessage(tr("Restored full view"), 2000);
+        showStatusBarMessage(tr("Restored full view"), 2000);
     } else {
         _savedDockStates.clear();
         const QList<QDockWidget*> docks = findChildren<QDockWidget*>();
@@ -3665,7 +3678,7 @@ void CWindow::toggleFocusedView()
             dock->hide();
         }
         _focusedViewActive = true;
-        statusBar()->showMessage(tr("Focused view (Shift+Ctrl+F to restore)"), 2000);
+        showStatusBarMessage(tr("Focused view (Shift+Ctrl+F to restore)"), 2000);
     }
 }
 
@@ -3979,7 +3992,7 @@ void CWindow::setSegmentationCursorMirroring(bool enabled)
     }
 
     if (statusBar()) {
-        statusBar()->showMessage(enabled ? tr("Mirroring cursor to Surface view enabled")
+        showStatusBarMessage(enabled ? tr("Mirroring cursor to Surface view enabled")
                                          : tr("Mirroring cursor to Surface view disabled"),
                                   2000);
     }
@@ -4656,7 +4669,7 @@ void CWindow::remapCurrentAtlas()
         : vpkg->path().parent_path();
 
     if (statusBar()) {
-        statusBar()->showMessage(tr("Remapping atlas fibers..."), 3000);
+        showStatusBarMessage(tr("Remapping atlas fibers..."), 3000);
     }
     for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
         if (!dock || !dock->widget()) {
@@ -4682,7 +4695,7 @@ void CWindow::remapCurrentAtlas()
             const QString summary = watcher->result();
             displayAtlasFromDirectory(atlasDir);
             if (statusBar()) {
-                statusBar()->showMessage(tr("Remapped atlas fibers. %1").arg(summary), 7000);
+                showStatusBarMessage(tr("Remapped atlas fibers. %1").arg(summary), 7000);
             }
         } catch (const std::exception& ex) {
             refreshAtlasOverviewDocks();
@@ -4765,7 +4778,7 @@ void CWindow::optimizeAtlasSnapCandidates()
         ? manifestPath.filename().generic_string()
         : manifestPath.string();
     if (statusBar()) {
-        statusBar()->showMessage(tr("Preparing atlas snap candidates..."), 3000);
+        showStatusBarMessage(tr("Preparing atlas snap candidates..."), 3000);
     }
     auto setRankButtonsEnabled = [this](bool enabled) {
         for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
@@ -4789,7 +4802,7 @@ void CWindow::optimizeAtlasSnapCandidates()
             return;
         }
         if (statusBar()) {
-            statusBar()->showMessage(tr("Applying atlas snap candidate ranking..."), 3000);
+            showStatusBarMessage(tr("Applying atlas snap candidate ranking..."), 3000);
         }
         auto* finishWatcher = new QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>(this);
         connect(finishWatcher,
@@ -4803,7 +4816,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                 refreshAtlasOverviewDocks();
                 displayAtlasFromDirectory(atlasDir);
                 if (statusBar()) {
-                    statusBar()->showMessage(
+                    showStatusBarMessage(
                         tr("Ranked snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 queued, %7 cached.")
                             .arg(report.controls)
                             .arg(report.successfulPairTerms)
@@ -4878,7 +4891,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                       << std::endl;
             QJsonObject qtRequest = toQtJsonObject(serviceRequest);
             if (statusBar()) {
-                statusBar()->showMessage(tr("Ranking atlas snap candidates..."), 3000);
+                showStatusBarMessage(tr("Ranking atlas snap candidates..."), 3000);
             }
             LasagnaServiceManager::instance().rankLaplaceSnapPairs(
                 qtRequest,
@@ -5339,7 +5352,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
                             : tr("Atlas object search found %1 signed result(s); skipped %2 result(s)")
                                   .arg(static_cast<int>(workerResult.results.size()))
                                   .arg(static_cast<int>(workerResult.skippedSigningCount));
-                        statusBar()->showMessage(message, 3000);
+                        showStatusBarMessage(message, 3000);
                     }
                 } else {
                     qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 finishing_results start total=1")
@@ -5359,7 +5372,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
                         }
                     }
                     if (statusBar()) {
-                        statusBar()->showMessage(tr("Atlas object search canceled"), 3000);
+                        showStatusBarMessage(tr("Atlas object search canceled"), 3000);
                     }
                 }
                 const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -6140,7 +6153,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
             _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
         }
         if (statusBar()) {
-            statusBar()->showMessage(tr("Displayed atlas %1")
+            showStatusBarMessage(tr("Displayed atlas %1")
                                          .arg(QString::fromStdString(atlas.metadata.name)),
                                      3000);
         }
@@ -6305,7 +6318,7 @@ void CWindow::CreateWidgets(void)
                 }
                 const QString path = absoluteSegmentPathForClipboard(surf->path, _state->vpkg());
                 QApplication::clipboard()->setText(path);
-                statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
+                showStatusBarMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::renderSegmentRequested,
             this, [this](const QString& segmentId) {
@@ -6449,7 +6462,7 @@ void CWindow::CreateWidgets(void)
                     }
                 }
                 if (okCount > 0) {
-                    statusBar()->showMessage(
+                    showStatusBarMessage(
                         tr("Recalculated area for %1 segment(s).").arg(okCount), 5000);
                 }
                 if (failCount > 0) {
@@ -6459,7 +6472,7 @@ void CWindow::CreateWidgets(void)
             });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
-                statusBar()->showMessage(message, timeoutMs);
+                showStatusBarMessage(message, timeoutMs);
             });
 
     const auto attachScrollAreaToDock = [](QDockWidget* dock, QWidget* content, const QString& objectName) {
@@ -6587,7 +6600,7 @@ void CWindow::CreateWidgets(void)
     SegmentationGrower::UiCallbacks growerCallbacks{
         [this](const QString& text, int timeout) {
             if (statusBar()) {
-                statusBar()->showMessage(text, timeout);
+                showStatusBarMessage(text, timeout);
             }
         },
         [this](QuadSurface* surface) {
@@ -6633,7 +6646,7 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onCopyWithNtRequested);
     connect(_segmentationWidget, &SegmentationWidget::volumeSelectionChanged, this, [this](const QString& volumeId) {
         if (!_state->vpkg()) {
-            statusBar()->showMessage(tr("No volume package loaded."), 4000);
+            showStatusBarMessage(tr("No volume package loaded."), 4000);
             if (_segmentationWidget) {
                 const QString fallbackId = QString::fromStdString(!_state->segmentationGrowthVolumeId().empty()
                                                                    ? _state->segmentationGrowthVolumeId()
@@ -6651,9 +6664,9 @@ void CWindow::CreateWidgets(void)
             if (_segmentationWidget && vol) {
                 _segmentationWidget->setVolumeZarrPath(QString::fromStdString(vol->path().string()));
             }
-            statusBar()->showMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
+            showStatusBarMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
         } catch (const std::out_of_range&) {
-            statusBar()->showMessage(tr("Volume '%1' not found in this package.").arg(volumeId), 4000);
+            showStatusBarMessage(tr("Volume '%1' not found in this package.").arg(volumeId), 4000);
             if (_segmentationWidget) {
                 const QString fallbackId = QString::fromStdString(!_state->currentVolumeId().empty()
                                                                    ? _state->currentVolumeId()
@@ -6682,7 +6695,7 @@ void CWindow::CreateWidgets(void)
 
     connect(_segmentationWidget, &SegmentationWidget::lasagnaStopRequested, this, [this]() {
         LasagnaServiceManager::instance().stopOptimization();
-        statusBar()->showMessage(tr("Lasagna optimization stop requested."), 3000);
+        showStatusBarMessage(tr("Lasagna optimization stop requested."), 3000);
     });
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::serviceStarted,
             this, &CWindow::updateAtlasFiberDocks);
@@ -6692,7 +6705,7 @@ void CWindow::CreateWidgets(void)
     // Add only the segments placed by lasagna instead of rescanning every surface.
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::resultsPlaced,
             this, [this](const QString& outputDir, const QStringList& segmentNames) {
-        statusBar()->showMessage(
+        showStatusBarMessage(
             tr("Lasagna optimization finished. Added %1 segment(s) from %2")
                 .arg(segmentNames.size())
                 .arg(outputDir), 5000);
@@ -7586,7 +7599,40 @@ void CWindow::UpdateVolpkgLabel(int filterCounter)
 
 void CWindow::onShowStatusMessage(QString text, int timeout)
 {
-    statusBar()->showMessage(text, timeout);
+    showStatusBarMessage(text, timeout);
+}
+
+void CWindow::showStatusBarMessage(const QString& text, int timeout)
+{
+    if (!_statusMessageLabel) {
+        if (statusBar()) {
+            statusBar()->showMessage(text, timeout);
+        }
+        return;
+    }
+
+    _statusMessageLabel->setText(text);
+    _statusMessageLabel->setToolTip(text);
+
+    if (_statusMessageTimer) {
+        _statusMessageTimer->stop();
+        if (timeout > 0) {
+            _statusMessageTimer->start(timeout);
+        }
+    }
+}
+
+void CWindow::clearStatusBarMessage()
+{
+    if (_statusMessageTimer) {
+        _statusMessageTimer->stop();
+    }
+    if (_statusMessageLabel) {
+        _statusMessageLabel->clear();
+        _statusMessageLabel->setToolTip(QString());
+    } else if (statusBar()) {
+        statusBar()->clearMessage();
+    }
 }
 
 void CWindow::onSegmentationGrowthStatusChanged(bool running)
@@ -7614,12 +7660,14 @@ void CWindow::onSegmentationGrowthStatusChanged(bool running)
         _segmentationGrowthStatusText = tr("Surface growth in progress - surface selection locked");
         _segmentationGrowthWarning->setText(_segmentationGrowthStatusText);
         _segmentationGrowthWarning->setVisible(true);
-        statusBar()->showMessage(_segmentationGrowthStatusText, 0);
+        showStatusBarMessage(_segmentationGrowthStatusText, 0);
     } else if (_segmentationGrowthWarning) {
         _segmentationGrowthWarning->clear();
         _segmentationGrowthWarning->setVisible(false);
-        if (statusBar()->currentMessage() == _segmentationGrowthStatusText) {
-            statusBar()->clearMessage();
+        if (_statusMessageLabel && _statusMessageLabel->text() == _segmentationGrowthStatusText) {
+            clearStatusBarMessage();
+        } else if (statusBar()->currentMessage() == _segmentationGrowthStatusText) {
+            clearStatusBarMessage();
         }
         _segmentationGrowthStatusText.clear();
     }
@@ -8369,7 +8417,7 @@ void CWindow::onEditMaskPressed(const QString& segmentId)
     if (_maskRenderInProgress)
         return;
     _maskRenderInProgress = true;
-    statusBar()->showMessage(tr("Rendering mask..."));
+    showStatusBarMessage(tr("Rendering mask..."));
 
     auto* watcher = new QFutureWatcher<void>(this);
     connect(watcher, &QFutureWatcher<void>::finished, this,
@@ -8377,7 +8425,7 @@ void CWindow::onEditMaskPressed(const QString& segmentId)
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
 
-                statusBar()->showMessage(tr("Mask saved"), 3000);
+                showStatusBarMessage(tr("Mask saved"), 3000);
                 QDesktopServices::openUrl(QUrl::fromLocalFile(
                     QString::fromStdString(path.string())));
             });
@@ -8410,7 +8458,7 @@ void CWindow::onAppendMaskPressed(const QString& segmentId)
     if (_maskRenderInProgress)
         return;
     _maskRenderInProgress = true;
-    statusBar()->showMessage(tr("Rendering mask..."));
+    showStatusBarMessage(tr("Rendering mask..."));
 
     std::filesystem::path path = surf->path/"mask.tif";
     auto volume = _state->currentVolume();
@@ -8423,13 +8471,13 @@ void CWindow::onAppendMaskPressed(const QString& segmentId)
 
                 try {
                     QString msg = watcher->result();
-                    statusBar()->showMessage(msg, 3000);
+                    showStatusBarMessage(msg, 3000);
                     QDesktopServices::openUrl(QUrl::fromLocalFile(
                         QString::fromStdString(path.string())));
                 } catch (const std::exception& e) {
                     QMessageBox::critical(this, tr("Error"),
                                          tr("Failed to render surface: %1").arg(e.what()));
-                    statusBar()->clearMessage();
+                    clearStatusBarMessage();
                 }
             });
 
@@ -8530,7 +8578,7 @@ void CWindow::onSegmentationDirChanged(int index)
         }
 
         // Update the status bar to show the change
-        statusBar()->showMessage(tr("Switched to %1 directory").arg(QString::fromStdString(newDir)), 3000);
+        showStatusBarMessage(tr("Switched to %1 directory").arg(QString::fromStdString(newDir)), 3000);
     }
 }
 
@@ -8642,7 +8690,7 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
 {
     auto point_opt = _state->pointCollection()->getPoint(pointId);
     if (!point_opt) {
-        statusBar()->showMessage(tr("Point not found"), 2000);
+        showStatusBarMessage(tr("Point not found"), 2000);
         return;
     }
 
@@ -8650,7 +8698,7 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     auto seg_surface = _state->surface("segmentation");
     auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface.get());
     if (!quad_surface) {
-        statusBar()->showMessage(tr("No active segmentation surface for anchor conversion"), 3000);
+        showStatusBarMessage(tr("No active segmentation surface for anchor conversion"), 3000);
         return;
     }
 
@@ -8660,7 +8708,7 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     float dist = quad_surface->pointTo(ptr, point_opt->p, 4.0, 1000, patchIndex);
 
     if (dist > 10.0) {
-        statusBar()->showMessage(tr("Point is too far from surface (distance: %1)").arg(dist), 3000);
+        showStatusBarMessage(tr("Point is too far from surface (distance: %1)").arg(dist), 3000);
         return;
     }
 
@@ -8674,7 +8722,7 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     // Remove the point (it's now represented by the anchor)
     _state->pointCollection()->removePoint(pointId);
 
-    statusBar()->showMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
+    showStatusBarMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
 }
 
 void CWindow::onZoomOut()
@@ -8689,7 +8737,7 @@ void CWindow::onCopyCoordinates()
     QString coords = lblLocFocus->text().trimmed();
     if (!coords.isEmpty()) {
         QApplication::clipboard()->setText(coords);
-        statusBar()->showMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
+        showStatusBarMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
     }
 }
 
@@ -8700,7 +8748,7 @@ void CWindow::onResetAxisAlignedRotations()
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->refreshAll();
     }
-    statusBar()->showMessage(tr("All plane rotations reset"), 2000);
+    showStatusBarMessage(tr("All plane rotations reset"), 2000);
 }
 
 void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
@@ -8811,7 +8859,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         auto activeSurfaceShared = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
 
         if (!_segmentationModule->beginEditingSession(activeSurfaceShared)) {
-            statusBar()->showMessage(tr("Unable to start segmentation editing"), 3000);
+            showStatusBarMessage(tr("Unable to start segmentation editing"), 3000);
             if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
                 QSignalBlocker blocker(_segmentationWidget);
                 _segmentationWidget->setEditingEnabled(false);
@@ -8838,7 +8886,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
     const QString message = enabled
         ? tr("Segmentation editing enabled")
         : tr("Segmentation editing disabled");
-    statusBar()->showMessage(message, 2000);
+    showStatusBarMessage(message, 2000);
     if (_surfaceAffineTransforms) {
         _surfaceAffineTransforms->refresh();
     }
@@ -8851,7 +8899,7 @@ void CWindow::onSegmentationStopToolsRequested()
     }
     if (_cmdRunner) {
         _cmdRunner->cancel();
-        statusBar()->showMessage(tr("Cancelling running tools..."), 3000);
+        showStatusBarMessage(tr("Cancelling running tools..."), 3000);
     }
 }
 
@@ -8861,7 +8909,7 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                         bool inpaintOnly)
 {
     if (!_segmentationGrower) {
-        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
+        showStatusBarMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
     }
 
@@ -9055,7 +9103,7 @@ cv::Vec3b CWindow::getOverlayColorBGR(size_t index) const
 void CWindow::onCopyWithNtRequested()
 {
     if (!_segmentationGrower) {
-        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
+        showStatusBarMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
     }
 
@@ -9228,7 +9276,7 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         _planeSlicingOverlay->refreshAll();
     }
 
-    statusBar()->showMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
+    showStatusBarMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
 }
 
 // ---- Fiber annotation slots -------------------------------------------------
