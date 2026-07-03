@@ -29,7 +29,6 @@ const sidebars = {
         { type: 'doc', id: 'get_started' },
         { type: 'doc', id: 'prizes' },
         { type: 'doc', id: 'unwrapping' },
-        { type: 'doc', id: 'master_plan' },
       ],
     },
     {
@@ -88,6 +87,7 @@ const sidebars = {
       collapsible: true,
       collapsed: true,
       items: [
+        { type: 'doc', id: 'master_plan' },
         { type: 'doc', id: 'grand_prize' },
         { type: 'doc', id: 'ink_detection' },
         { type: 'doc', id: 'open_source_prizes' },

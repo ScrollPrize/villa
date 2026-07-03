@@ -152,6 +152,12 @@ The docs-chrome rule framing content images (`max-width:100%` + border) was crus
 **Files:** `src/css/chrome.css`.
 **Verification:** build green; `/firstscroll` screenshot shows the strip at natural proportions with scale-bar/credit overlays and sideways panning.
 
+## C14 — owner request: archive the Master Plan
+
+Master Plan moved from the Overview sidebar category into Archive (first entry). URL `/master_plan` unchanged — no redirect needed; inbound links unaffected (the landing already stopped referencing it in C8).
+**Files:** `sidebars.js`.
+**Verification:** sidebars.js loads clean via node; doc id resolves (full build rides with the in-flight prizes/sticker round, which the strict checker covers).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
