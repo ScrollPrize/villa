@@ -86,6 +86,21 @@ constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
 constexpr float kApprovalPlaneIntersectionScale = 1.5f;
 constexpr float kFocusProjectionThreshold = 4.0f;
 
+std::optional<QColor> segmentFolderColorOverride(const QuadSurface* surface)
+{
+    if (!surface || surface->meta.is_null() || !surface->meta.contains("vc3d_segment_folder_color")) {
+        return std::nullopt;
+    }
+    const auto& color = surface->meta["vc3d_segment_folder_color"];
+    if (!color.is_array() || color.size() < 3) {
+        return std::nullopt;
+    }
+    auto channel = [&](size_t index) {
+        return std::clamp(static_cast<int>(std::lround(color.at(index).get_double())), 0, 255);
+    };
+    return QColor(channel(0), channel(1), channel(2));
+}
+
 struct IntersectionStyle {
     QRgb color = 0;
     int z = kIntersectionZ;
@@ -4492,6 +4507,8 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         } else if (_highlightedSurfaceIds.count(target->id)) {
             baseColor = QColor(0, 220, 255);
             zValue = kHighlightedIntersectionZ;
+        } else if (auto folderColor = segmentFolderColorOverride(target.get())) {
+            baseColor = *folderColor;
         } else {
             const auto& id = target->id;
             auto it = _surfaceColorAssignments.find(id);

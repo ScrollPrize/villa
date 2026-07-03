@@ -1,11 +1,13 @@
 #pragma once
 
 #include <QObject>
+#include <QColor>
 #include <QPointF>
 #include <QString>
 #include <QStringList>
 
 #include <functional>
+#include <filesystem>
 #include <memory>
 #include <unordered_set>
 #include <vector>
@@ -76,6 +78,14 @@ public:
         Inspect,
     };
 
+    struct SegmentFolderSelection {
+        std::string dirName;
+        std::filesystem::path path;
+        bool currentFolder{false};
+        bool defaultPalette{false};
+        QColor color;
+    };
+
     SurfacePanelController(const UiRefs& ui,
                            CState* state,
                            ViewerManager* viewerManager,
@@ -109,6 +119,7 @@ public:
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
     void setTransformWarning(const QString& warningText);
+    void setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
     bool cycleToNextVisibleSegment();
@@ -208,4 +219,6 @@ private:
     bool _selectionLockNotified{false};
     QString _transformWarningText;
     std::unordered_set<std::string> _highlightedSurfaceIds;
+    std::vector<SegmentFolderSelection> _visibleSegmentFolders;
+    std::unordered_set<std::string> _multiFolderSurfaceIds;
 };

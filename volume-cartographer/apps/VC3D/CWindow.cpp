@@ -78,6 +78,14 @@
 #include <QHeaderView>
 #include <QFormLayout>
 #include <QProgressBar>
+#include <QColorDialog>
+#include <QListView>
+#include <QPainter>
+#include <QStandardItem>
+#include <QStandardItemModel>
+#include <QStyledItemDelegate>
+#include <QStyleOptionButton>
+#include <QSet>
 #include <QPushButton>
 #include <QItemSelectionModel>
 #include <QItemSelection>
@@ -177,10 +185,116 @@ constexpr int ATLAS_CONTROL_INDEX_ROLE = Qt::UserRole + 2;
 constexpr int ATLAS_CONTROL_SOURCE_INDEX_ROLE = Qt::UserRole + 3;
 constexpr int ATLAS_SURFACE_X_ROLE = Qt::UserRole + 4;
 constexpr int ATLAS_SURFACE_Y_ROLE = Qt::UserRole + 5;
+constexpr int SEGMENT_DIR_NAME_ROLE = Qt::UserRole + 100;
+constexpr int SEGMENT_DIR_COLOR_ROLE = Qt::UserRole + 101;
+constexpr int SEGMENT_DIR_DEFAULT_PALETTE_ROLE = Qt::UserRole + 102;
 constexpr double ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD = 0.5;
 constexpr std::string_view OPEN_DATA_VOLUME_ID_TAG_PREFIX = "vc-open-data-volume-id:";
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
+
+class SegmentFolderDelegate final : public QStyledItemDelegate
+{
+public:
+    using PaletteCallback = std::function<void(int)>;
+
+    explicit SegmentFolderDelegate(PaletteCallback paletteCallback, QObject* parent = nullptr)
+        : QStyledItemDelegate(parent)
+        , _paletteCallback(std::move(paletteCallback))
+    {
+    }
+
+    void paint(QPainter* painter,
+               const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override
+    {
+        painter->save();
+
+        QStyleOptionViewItem opt(option);
+        initStyleOption(&opt, index);
+        opt.text.clear();
+        QStyle* style = opt.widget ? opt.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
+
+        QStyleOptionButton check;
+        check.state = QStyle::State_Enabled;
+        check.state |= index.data(Qt::CheckStateRole).toInt() == Qt::Checked
+            ? QStyle::State_On
+            : QStyle::State_Off;
+        check.rect = checkRect(option.rect);
+        style->drawPrimitive(QStyle::PE_IndicatorCheckBox, &check, painter, opt.widget);
+
+        const QRect icon = paletteRect(option.rect);
+        const bool defaultPalette = index.data(SEGMENT_DIR_DEFAULT_PALETTE_ROLE).toBool();
+        const QColor color = index.data(SEGMENT_DIR_COLOR_ROLE).value<QColor>();
+        if (defaultPalette) {
+            const std::array<QColor, 4> colors = {
+                QColor(255, 120, 120),
+                QColor(120, 200, 255),
+                QColor(120, 255, 140),
+                QColor(255, 220, 100),
+            };
+            const int w = icon.width() / 2;
+            const int h = icon.height() / 2;
+            for (int i = 0; i < 4; ++i) {
+                painter->fillRect(QRect(icon.left() + (i % 2) * w,
+                                        icon.top() + (i / 2) * h,
+                                        w,
+                                        h),
+                                  colors[i]);
+            }
+            painter->setPen(option.palette.mid().color());
+            painter->drawRect(icon.adjusted(0, 0, -1, -1));
+        } else {
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            painter->setPen(option.palette.mid().color());
+            painter->setBrush(color.isValid() ? color : QColor(120, 200, 255));
+            painter->drawEllipse(icon.adjusted(2, 2, -2, -2));
+        }
+
+        QRect text = option.rect.adjusted(check.rect.width() + 10, 0, -(icon.width() + 10), 0);
+        painter->setPen(option.palette.text().color());
+        painter->drawText(text, Qt::AlignVCenter | Qt::AlignLeft, index.data(Qt::DisplayRole).toString());
+
+        painter->restore();
+    }
+
+    bool editorEvent(QEvent* event,
+                     QAbstractItemModel* model,
+                     const QStyleOptionViewItem& option,
+                     const QModelIndex& index) override
+    {
+        if (!event || !model || !index.isValid() || event->type() != QEvent::MouseButtonRelease) {
+            return QStyledItemDelegate::editorEvent(event, model, option, index);
+        }
+        const auto* mouse = static_cast<QMouseEvent*>(event);
+        if (checkRect(option.rect).contains(mouse->pos())) {
+            const bool checked = index.data(Qt::CheckStateRole).toInt() == Qt::Checked;
+            model->setData(index, checked ? Qt::Unchecked : Qt::Checked, Qt::CheckStateRole);
+            return true;
+        }
+        if (paletteRect(option.rect).contains(mouse->pos())) {
+            if (_paletteCallback) {
+                _paletteCallback(index.row());
+            }
+            return true;
+        }
+        return QStyledItemDelegate::editorEvent(event, model, option, index);
+    }
+
+private:
+    static QRect checkRect(const QRect& row)
+    {
+        return QRect(row.left() + 4, row.top() + (row.height() - 18) / 2, 18, 18);
+    }
+
+    static QRect paletteRect(const QRect& row)
+    {
+        return QRect(row.right() - 26, row.top() + (row.height() - 20) / 2, 20, 20);
+    }
+
+    PaletteCallback _paletteCallback;
+};
 
 bool finiteVec3(const cv::Vec3f& p)
 {
@@ -3895,21 +4009,7 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
         _volumeOverlay->setVolumePkg(_state->vpkg(), _state->vpkgPath());
     }
 
-    {
-        const QSignalBlocker blocker{cmbSegmentationDir};
-        cmbSegmentationDir->clear();
-
-        auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
-        for (const auto& dirName : availableDirs) {
-            cmbSegmentationDir->addItem(QString::fromStdString(dirName));
-        }
-
-        int currentIndex = cmbSegmentationDir->findText(
-            QString::fromStdString(_state->vpkg()->getSegmentationDirectory()));
-        if (currentIndex >= 0) {
-            cmbSegmentationDir->setCurrentIndex(currentIndex);
-        }
-    }
+    refreshSegmentationDirectoryDropdown();
 
     if (_surfacePanel) {
         _surfacePanel->setVolumePkg(_state->vpkg());
@@ -6629,7 +6729,10 @@ void CWindow::CreateWidgets(void)
                 if (!_state->vpkg()) {
                     return;
                 }
-                auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(segmentId.toStdString()));
+                if (!surf) {
+                    surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                }
                 if (!surf) {
                     return;
                 }
@@ -6695,7 +6798,10 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::focusSurfaceRequested,
             this, [this](const QString& segmentId) {
                 if (!_state || !_state->vpkg()) return;
-                auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(segmentId.toStdString()));
+                if (!surf) {
+                    surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                }
                 auto* quad = dynamic_cast<QuadSurface*>(surf.get());
                 if (!quad) return;
                 const auto focusPoint = findSegmentFocusPoint(*quad);
@@ -7599,6 +7705,21 @@ void CWindow::CreateWidgets(void)
     _surfacePanel->configureTags(tagUi);
 
     cmbSegmentationDir = ui.cmbSegmentationDir;
+    _segmentDirModel = new QStandardItemModel(cmbSegmentationDir);
+    cmbSegmentationDir->setModel(_segmentDirModel);
+    cmbSegmentationDir->setView(new QListView(cmbSegmentationDir));
+    cmbSegmentationDir->view()->setItemDelegate(
+        new SegmentFolderDelegate([this](int row) { showSegmentFolderPaletteMenu(row); },
+                                  cmbSegmentationDir->view()));
+    connect(_segmentDirModel, &QStandardItemModel::dataChanged,
+            this, [this](const QModelIndex&, const QModelIndex&, const QVector<int>& roles) {
+        if (_updatingSegmentDirUi) {
+            return;
+        }
+        if (roles.isEmpty() || roles.contains(Qt::CheckStateRole)) {
+            applySegmentFolderSelection(true);
+        }
+    });
     connect(cmbSegmentationDir, &QComboBox::currentIndexChanged, this, &CWindow::onSegmentationDirChanged);
 
     // Location input element (single QLineEdit for comma-separated values)
@@ -8282,14 +8403,7 @@ void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
             clearSurfaceSelection();
             vpkg->setOutputSegments(matchingEntry->location);
             vpkg->refreshSegmentations();
-            if (cmbSegmentationDir) {
-                const QSignalBlocker blocker(cmbSegmentationDir);
-                const QString targetName = QString::fromStdString(targetPath.filename().string());
-                const int index = cmbSegmentationDir->findText(targetName);
-                if (index >= 0) {
-                    cmbSegmentationDir->setCurrentIndex(index);
-                }
-            }
+            refreshSegmentationDirectoryDropdown();
             if (_surfacePanel) {
                 _surfacePanel->setVolumePkg(vpkg);
                 _surfacePanel->loadSurfaces(true);
@@ -8639,9 +8753,14 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
     const std::string previousSurfId = _state->activeSurfaceId();
     const std::string newSurfId = surfaceId.toStdString();
 
-    // Look up the shared_ptr by ID
-    if (_state->vpkg() && !newSurfId.empty()) {
-        _state->setActiveSurface(newSurfId, _state->vpkg()->getSurface(newSurfId));
+    // Look up the shared_ptr by display ID. Multi-folder entries are keyed only
+    // in CState, while current-folder entries are still owned by VolumePkg.
+    if (_state && !newSurfId.empty()) {
+        auto stateSurface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(newSurfId));
+        if (!stateSurface && _state->vpkg()) {
+            stateSurface = _state->vpkg()->getSurface(newSurfId);
+        }
+        _state->setActiveSurface(newSurfId, stateSurface);
     } else {
         _state->clearActiveSurface();
     }
@@ -8789,8 +8908,12 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
     const std::string previousSurfId = _state->activeSurfaceId();
     const std::string newSurfId = surfaceId.toStdString();
 
-    if (_state->vpkg() && !newSurfId.empty()) {
-        _state->setActiveSurface(newSurfId, _state->vpkg()->getSurface(newSurfId));
+    if (_state && !newSurfId.empty()) {
+        auto stateSurface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(newSurfId));
+        if (!stateSurface && _state->vpkg()) {
+            stateSurface = _state->vpkg()->getSurface(newSurfId);
+        }
+        _state->setActiveSurface(newSurfId, stateSurface);
     } else {
         _state->clearActiveSurface();
     }
@@ -9045,13 +9168,193 @@ QString CWindow::getCurrentVolumePath() const
     return QString::fromStdString(volume->path().string());
 }
 
+QColor CWindow::defaultSegmentFolderColor(const QString& dirName) const
+{
+    static const std::array<QColor, 10> colors = {
+        QColor(0, 180, 255),
+        QColor(255, 170, 0),
+        QColor(120, 220, 120),
+        QColor(255, 100, 150),
+        QColor(180, 120, 255),
+        QColor(70, 210, 190),
+        QColor(255, 230, 90),
+        QColor(240, 120, 70),
+        QColor(150, 210, 255),
+        QColor(210, 210, 210),
+    };
+    return colors[static_cast<size_t>(qHash(dirName)) % colors.size()];
+}
+
+QColor segmentFolderSolidColorOr(const std::map<QString, QColor>& colors,
+                                 const QString& dirName,
+                                 const QColor& fallback)
+{
+    auto it = colors.find(dirName);
+    return it != colors.end() ? it->second : fallback;
+}
+
+void CWindow::refreshSegmentationDirectoryDropdown()
+{
+    if (!_state || !_state->vpkg() || !cmbSegmentationDir || !_segmentDirModel) {
+        return;
+    }
+
+    QSet<QString> previouslyChecked;
+    for (int row = 0; row < _segmentDirModel->rowCount(); ++row) {
+        auto* item = _segmentDirModel->item(row);
+        if (item && item->checkState() == Qt::Checked) {
+            previouslyChecked.insert(item->data(SEGMENT_DIR_NAME_ROLE).toString());
+        }
+    }
+
+    const QString currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
+    if (!currentDir.isEmpty()) {
+        previouslyChecked.insert(currentDir);
+    }
+
+    const QSignalBlocker blocker{cmbSegmentationDir};
+    _updatingSegmentDirUi = true;
+    _segmentDirModel->clear();
+
+    const auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
+    int currentIndex = -1;
+    for (const auto& dirNameStd : availableDirs) {
+        const QString dirName = QString::fromStdString(dirNameStd);
+        auto* item = new QStandardItem(dirName);
+        item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsUserCheckable);
+        item->setCheckable(true);
+        item->setCheckState(previouslyChecked.contains(dirName) ? Qt::Checked : Qt::Unchecked);
+        item->setData(dirName, SEGMENT_DIR_NAME_ROLE);
+        item->setData(segmentFolderSolidColorOr(_segmentFolderSolidColors, dirName, QColor()),
+                      SEGMENT_DIR_COLOR_ROLE);
+        item->setData(!_segmentFolderSolidColors.contains(dirName) && dirName == currentDir,
+                      SEGMENT_DIR_DEFAULT_PALETTE_ROLE);
+        _segmentDirModel->appendRow(item);
+        if (dirName == currentDir) {
+            currentIndex = _segmentDirModel->rowCount() - 1;
+        }
+    }
+
+    if (currentIndex >= 0) {
+        cmbSegmentationDir->setCurrentIndex(currentIndex);
+    }
+    _updatingSegmentDirUi = false;
+
+    applySegmentFolderSelection(false);
+}
+
+void CWindow::applySegmentFolderSelection(bool reloadSurfaces)
+{
+    if (!_state || !_state->vpkg() || !_surfacePanel || !_segmentDirModel) {
+        return;
+    }
+
+    const QString currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
+    std::vector<SurfacePanelController::SegmentFolderSelection> folders;
+    folders.reserve(static_cast<size_t>(_segmentDirModel->rowCount()));
+
+    _updatingSegmentDirUi = true;
+    for (int row = 0; row < _segmentDirModel->rowCount(); ++row) {
+        auto* item = _segmentDirModel->item(row);
+        if (!item) {
+            continue;
+        }
+        const QString dirName = item->data(SEGMENT_DIR_NAME_ROLE).toString();
+        if (dirName == currentDir && item->checkState() != Qt::Checked) {
+            item->setCheckState(Qt::Checked);
+        }
+        const bool checked = item->checkState() == Qt::Checked;
+        const bool isCurrent = dirName == currentDir;
+        const bool defaultPalette = isCurrent && !_segmentFolderSolidColors.contains(dirName);
+        const QColor color = defaultPalette
+            ? QColor()
+            : segmentFolderSolidColorOr(_segmentFolderSolidColors,
+                                        dirName,
+                                        defaultSegmentFolderColor(dirName));
+        item->setData(color, SEGMENT_DIR_COLOR_ROLE);
+        item->setData(defaultPalette, SEGMENT_DIR_DEFAULT_PALETTE_ROLE);
+        if (!checked) {
+            continue;
+        }
+        folders.push_back(SurfacePanelController::SegmentFolderSelection{
+            dirName.toStdString(),
+            _state->vpkg()->findSegmentPathByName(dirName.toStdString()),
+            isCurrent,
+            defaultPalette,
+            color,
+        });
+    }
+    _updatingSegmentDirUi = false;
+
+    _surfacePanel->setVisibleSegmentFolders(std::move(folders));
+    if (reloadSurfaces) {
+        _state->setSurface("segmentation", nullptr, true);
+        _state->clearActiveSurface();
+        if (treeWidgetSurfaces) {
+            treeWidgetSurfaces->clearSelection();
+        }
+        _surfacePanel->resetTagUi();
+        _surfacePanel->loadSurfaces(true);
+    }
+}
+
+void CWindow::showSegmentFolderPaletteMenu(int row)
+{
+    if (!_segmentDirModel || row < 0 || row >= _segmentDirModel->rowCount()) {
+        return;
+    }
+    auto* item = _segmentDirModel->item(row);
+    if (!item) {
+        return;
+    }
+    const QString dirName = item->data(SEGMENT_DIR_NAME_ROLE).toString();
+    const QString currentDir = _state && _state->vpkg()
+        ? QString::fromStdString(_state->vpkg()->getSegmentationDirectory())
+        : QString();
+
+    QMenu menu(cmbSegmentationDir);
+    if (dirName == currentDir) {
+        QAction* defaultAction = menu.addAction(tr("Default palette"));
+        connect(defaultAction, &QAction::triggered, this, [this, dirName]() {
+            _segmentFolderSolidColors.erase(dirName);
+            applySegmentFolderSelection(true);
+            if (cmbSegmentationDir) {
+                cmbSegmentationDir->view()->viewport()->update();
+            }
+        });
+        menu.addSeparator();
+    }
+
+    QAction* chooseAction = menu.addAction(tr("Solid color..."));
+    connect(chooseAction, &QAction::triggered, this, [this, dirName]() {
+        const QColor initial = segmentFolderSolidColorOr(_segmentFolderSolidColors,
+                                                        dirName,
+                                                        defaultSegmentFolderColor(dirName));
+        const QColor chosen = QColorDialog::getColor(initial, this, tr("Segment Folder Color"));
+        if (!chosen.isValid()) {
+            return;
+        }
+        _segmentFolderSolidColors[dirName] = chosen;
+        applySegmentFolderSelection(true);
+        if (cmbSegmentationDir) {
+            cmbSegmentationDir->view()->viewport()->update();
+        }
+    });
+    menu.exec(QCursor::pos());
+}
+
 void CWindow::onSegmentationDirChanged(int index)
 {
     if (!_state->vpkg() || index < 0 || !cmbSegmentationDir) {
         return;
     }
 
-    std::string newDir = cmbSegmentationDir->itemText(index).toStdString();
+    std::string newDir;
+    if (_segmentDirModel && index < _segmentDirModel->rowCount()) {
+        newDir = _segmentDirModel->item(index)->data(SEGMENT_DIR_NAME_ROLE).toString().toStdString();
+    } else {
+        newDir = cmbSegmentationDir->itemText(index).toStdString();
+    }
 
     // Only reload if the directory actually changed
     if (newDir != _state->vpkg()->getSegmentationDirectory()) {
@@ -9068,11 +9371,13 @@ void CWindow::onSegmentationDirChanged(int index)
 
         // Set the new directory in the VolumePkg
         _state->vpkg()->setSegmentationDirectory(newDir);
+        _state->vpkg()->refreshSegmentations();
 
         // Reset stride user override for the new directory.
         if (_viewerManager) {
             _viewerManager->resetStrideUserOverride();
         }
+        applySegmentFolderSelection(false);
         if (_surfacePanel) {
             _surfacePanel->loadSurfaces(true);
         }
