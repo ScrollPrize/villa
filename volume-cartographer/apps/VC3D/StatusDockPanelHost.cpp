@@ -131,6 +131,9 @@ StatusDockPanelHost::StatusDockPanelHost(QWidget* centralWidget, QWidget* parent
 
 StatusDockPanelHost::~StatusDockPanelHost()
 {
+    setResizeFeedback(ResizeMode::None);
+    resetButtonDragState(true);
+
     if (qApp) {
         qApp->removeEventFilter(this);
     }
