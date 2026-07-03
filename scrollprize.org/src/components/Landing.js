@@ -474,7 +474,7 @@ export function Landing() {
               ref={heroVideo}
             >
               <source
-                data-src="/img/landing/vesuvius-flipped-min.webm"
+                data-src="/img/landing/vesuvius-flipped-960.webm"
                 type="video/webm"
               />
             </video>

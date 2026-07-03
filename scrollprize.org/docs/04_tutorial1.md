@@ -48,7 +48,9 @@ To get a basic understanding of the kind of data we’re working with, it’s us
 
 <div className="flex flex-wrap items-start">
   <figure className="sm:w-[48.4%]">
-    <img src="/img/tutorials/en-gedi-word-soup.gif"/>
+    <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/en-gedi-word-soup-poster.webp">
+      <source src="/img/tutorials/en-gedi-word-soup.webm" type="video/webm"/>
+    </video>
     <figcaption className="mt-0">Word soup in a simulated scroll <a href="https://www.youtube.com/watch?v=tL7rhIFNtQg">(source)</a></figcaption>
   </figure>
   <figure className="sm:w-[50%]">
@@ -231,7 +233,7 @@ Here is a video showing the whole process:
 
 <figure>
   <video controls playsInline muted className="w-[100%] rounded-xl" poster="/img/tutorials/imagej-word-soup2.webp">
-    <source src="/img/tutorials/imagej-word-soup2.webm" type="video/webm"/>
+    <source src="/img/tutorials/imagej-word-soup2-c.webm" type="video/webm"/>
   </video>
 </figure>
 

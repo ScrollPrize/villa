@@ -73,6 +73,15 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Files:** `src/css/custom.css`, `src/css/chrome.css` (comment), `docs/{15_winners,26_grandprize,22_firstletters,25_submissions_closed,36_firstscroll,02_data,02_data_fragments,10_background}.md`, `docs/32_unwrapping.mdx`, `static/llms.txt`, `docusaurus.config.js`, 2 static deletions.
 **Verification:** `yarn build` green; residual gradient/shadow/hex-arbitrary sweep clean outside the frozen atlas.
 
+## C5b — media: 17 heavy assets re-encoded, −106MB on referenced pages
+
+**Why:** the site cannot feel lean at 15.2MB landing weight; the worst in-use assets were multi-MB GIFs and uncompressed PNGs (a 17MB image link target, a 12.9MB reaction GIF).
+**What:** 17 conversions, **129.8MB → 23.5MB (−81.9%)**, every output ≤3MB (Gate 4 cap). Highlights: hero backdrop webm 2.81MB → 0.17MB (960px CRF40 — displayed at 0.35 opacity); `youssef_text_wbb` 17.5MB PNG → 2.57MB high-quality webp (text readability preserved); `luke-reaction.gif` 12.9MB → 2.0MB animated webp; 9 progress-report GIF/webm files → compact VP9. Markup semantics preserved: markdown images stay images (animated webp); `<img>`→`<video>` swaps only where sibling media on the same page already used that pattern.
+**Rule honored:** all 17 originals stay on disk — externally hotlinked asset URLs keep working; only page references changed (11 files).
+**Files:** `src/components/Landing.js`, `docs/{02_data_segments,04_tutorial1,15_winners,22_firstletters,26_grandprize}.md`, `docs/32_unwrapping.mdx`, 17 new files under `static/`.
+**Verification:** ffprobe duration/dimension checks + frame-diff spot checks per asset; zero stale references (grep); `yarn build` green.
+**Skipped/flagged:** `desktop-scan.gif` (7.5MB) is unreferenced — left untouched; next-heaviest in-use asset is `tutorials/second_seg_run.webm` (7.5MB) + four 3–4MB progress files — follow-up candidates.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

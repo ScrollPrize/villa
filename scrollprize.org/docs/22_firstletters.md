@@ -162,7 +162,7 @@ If you’re trying to find these letters in the image, keep in mind that our mod
 Luke’s First Letters Prize submission is available now on <a href="https://github.com/lukeboi/scroll-first-letters">GitHub</a>.
 
 <figure>
-  <img className="max-w-[300px]" src="/img/firstletters/luke-reaction.gif" alt="Animated reaction of Luke celebrating when told he won the prize." />
+  <img className="max-w-[300px]" src="/img/firstletters/luke-reaction.webp" alt="Animated reaction of Luke celebrating when told he won the prize." />
   <figcaption className="mt-0">Luke’s reaction when we told him he won the prize a few days ago.</figcaption>
 </figure>
 

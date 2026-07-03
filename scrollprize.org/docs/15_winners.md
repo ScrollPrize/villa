@@ -291,7 +291,9 @@ This page lists all the prizes awarded so far:
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://discord.com/channels/1079907749569237093/1079907750265499772/1323439459018211338">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Supervoxel-based segmentation methods</span>: Forrest McDonald / @verditelabs</div>
-    <img alt="Supervoxel-based segmentation methods by Forrest McDonald" src="/img/progress/202412/super.gif"/>
+    <video autoPlay playsInline muted loop className="w-[100%]">
+      <source src="/img/progress/202412/super.webm" type="video/webm"/>
+    </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/WillStevens/scrollreading/blob/main/report4.pdf">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Segmentation tools</span>: William Stevens / @Will Stevens</div>
@@ -311,7 +313,9 @@ This page lists all the prizes awarded so far:
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://discord.com/channels/1079907749569237093/1312615268270342184/1312615268270342184">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$10,000</div><span className="font-semibold">vesuvius-c library</span>: Forrest McDonald / @verditelabs</div>
-    <img alt="vesuvius-c library by Forrest McDonald" src="/img/progress/202411/christmas.gif"/>
+    <video autoPlay playsInline muted loop className="w-[100%]">
+      <source src="/img/progress/202411/christmas.webm" type="video/webm"/>
+    </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/tomhsiao1260/field-based-visualization?tab=readme-ov-file">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,500</div><span className="font-semibold">Electric potential scroll flattening</span>: Yao Hsiao / @Yao Hsiao, Dalufishe / @Dalufish</div>
@@ -515,7 +519,9 @@ This page lists all the prizes awarded so far:
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/tomhsiao1260/wj-wt-ftt/">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Web volume annotator</span>: Yao Hsiao / @Yao Hsiao, Dalufishe / @Dalufish</div>
-    <img alt="Web volume annotator by Yao Hsiao and Dalufishe" src="/img/progress/202407/yao.gif"/>
+    <video autoPlay playsInline muted loop className="w-[100%]">
+      <source src="/img/progress/202407/yao.webm" type="video/webm"/>
+    </video>
   </a>
 </div>
 
@@ -572,7 +578,7 @@ This page lists all the prizes awarded so far:
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/KhartesViewer/khartes">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$10,000</div><span className="font-semibold">Khartes improvements</span>: Chuck / @khartes_chuck</div>
     <video autoPlay playsInline muted loop className="w-[100%]">
-      <source src="/img/progress/202405/layer_offset_mini_demo.webm" type="video/webm"/>
+      <source src="/img/progress/202405/layer_offset_mini_demo-c.webm" type="video/webm"/>
     </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://discord.com/channels/1079907749569237093/1079907750265499772/1245553260362858577">
@@ -581,7 +587,9 @@ This page lists all the prizes awarded so far:
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/jrudolph/vesuvius-gui">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,500</div><span className="font-semibold">vesuvius-gui</span>: Johannes Rudolph / @jrudolph</div>
-    <img alt="vesuvius-gui by Johannes Rudolph" src="/img/progress/202405/vesuvius-gui.gif"/>
+    <video autoPlay playsInline muted loop className="w-[100%]">
+      <source src="/img/progress/202405/vesuvius-gui.webm" type="video/webm"/>
+    </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/OliverDaubney/vesuvius_basic_compression">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Scroll compression and masking</span>: Oliver Daubney / @O_D</div>
@@ -645,7 +653,9 @@ This page lists all the prizes awarded so far:
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://discord.com/channels/1079907749569237093/1232307086952501313">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Meshing and chunking</span>: Santiago Pelufo / @spelufo</div>
-    <img alt="Meshing and chunking by Santiago Pelufo" src="/img/progress/202404/chunk.gif"/>
+    <video autoPlay playsInline muted loop className="w-[100%]">
+      <source src="/img/progress/202404/chunk.webm" type="video/webm"/>
+    </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/tomhsiao1260/pipeline-visualize">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Pipeline Visualize</span>: Yao Hsiao / @Yao Hsiao</div>
@@ -671,7 +681,9 @@ This page lists all the prizes awarded so far:
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://discord.com/channels/1079907749569237093/1204133327083147264">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,500</div><span className="font-semibold">Volumetric ink detection</span>: Jorge Villaescusa / @mojonero</div>
-    <img alt="Volumetric ink detection by Jorge Villaescusa" src="/img/progress/os-mar24/volumetric.gif"/>
+    <video autoPlay playsInline muted loop className="w-[100%]">
+      <source src="/img/progress/os-mar24/volumetric.webm" type="video/webm"/>
+    </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/tspersonalgithub/march_2024_progress_submission">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$2,500</div><span className="font-semibold">Volumetric segmentation labels</span>: Tim Skinner / @Tim S</div>
@@ -687,7 +699,9 @@ This page lists all the prizes awarded so far:
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://discord.com/channels/1079907749569237093/1162822294415097907/threads/1167722091781554290">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Cell viewer and segmentation comparison</span>: Yao Hsiao / @Yao Hsiao</div>
-    <img alt="Cell viewer and segmentation comparison by Yao Hsiao" src="/img/progress/os-mar24/cell.gif"/>
+    <video autoPlay playsInline muted loop className="w-[100%]">
+      <source src="/img/progress/os-mar24/cell.webm" type="video/webm"/>
+    </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://discord.com/channels/1079907749569237093/1221902373887279226">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$1,000</div><span className="font-semibold">Superpixels and cells</span>: Santiago Pelufo / @spelufo</div>
@@ -843,7 +857,7 @@ This page lists all the prizes awarded so far:
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/KhartesViewer/khartes">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$10,000</div><span className="font-semibold">Khartes</span> by Chuck / @khartes_chuck</div>
     <video autoPlay playsInline muted loop className="w-[100%]">
-      <source src="/img/progress/khartes.webm" type="video/webm"/>
+      <source src="/img/progress/khartes-c.webm" type="video/webm"/>
     </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://discord.com/channels/1079907749569237093/1079907750265499772/1150930251824779424">
@@ -907,7 +921,7 @@ This page lists all the prizes awarded so far:
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://github.com/KhartesViewer/khartes">
     <div className="mb-4"><div className="text-sm font-semibold text-accent vc-nums">\$10,000</div><span className="font-semibold"> Khartes</span> by Chuck / @khartes_chuck</div>
     <video autoPlay playsInline muted loop className="w-[100%]">
-      <source src="/img/progress/khartes.webm" type="video/webm"/>
+      <source src="/img/progress/khartes-c.webm" type="video/webm"/>
     </video>
   </a>
   <a className="vc-card max-w-[200px] mr-4 mb-4 flex flex-col justify-between hover:no-underline" href="https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes_masked/20230205180739/">
