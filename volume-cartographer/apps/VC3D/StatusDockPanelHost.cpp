@@ -602,6 +602,13 @@ int StatusDockPanelHost::expandedPanelHeight() const
 
 bool StatusDockPanelHost::globalPointInsidePanelOrBar(const QPoint& globalPos) const
 {
+    if (QWidget* popup = QApplication::activePopupWidget()) {
+        const QRect popupRect(popup->mapToGlobal(QPoint(0, 0)), popup->size());
+        if (popup->isVisible() && popupRect.contains(globalPos)) {
+            return true;
+        }
+    }
+
     const QWidget* widget = QApplication::widgetAt(globalPos);
     if (!widget) {
         return false;
