@@ -947,7 +947,12 @@ void OpenDataCatalogWindow::onOverviewPhotoFinished(QFutureWatcher<PhotoLoadResu
     _photoWatchers.erase(
         std::remove(_photoWatchers.begin(), _photoWatchers.end(), watcher),
         _photoWatchers.end());
-    const PhotoLoadResult result = watcher->result();
+    const auto future = watcher->future();
+    if (future.resultCount() == 0) {
+        watcher->deleteLater();
+        return;
+    }
+    const PhotoLoadResult result = future.result();
     watcher->deleteLater();
 
     if (result.sampleId != _pendingPhotoSampleId) {
