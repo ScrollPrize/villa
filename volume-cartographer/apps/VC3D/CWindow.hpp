@@ -307,7 +307,6 @@ private:
     QString _segmentationGrowthStatusText;
     QString _lastSegmentTransformWarningVolumeId;
     bool _relayingNativeStatusMessage{false};
-    bool _resetNextSurfaceViewForVolumeShapeChange{false};
 
 
     Ui_VCMainWindow ui;

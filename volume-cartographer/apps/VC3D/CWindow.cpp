@@ -8649,8 +8649,6 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
     auto surf = _state->activeSurface().lock();
 
     _state->setSurface("segmentation", surf, false, false);
-    const bool resetSurfaceViewForVolumeShapeChange =
-        _resetNextSurfaceViewForVolumeShapeChange;
 
     if (newSurfId != previousSurfId) {
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
@@ -8690,13 +8688,6 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             } else {
                 _atlasControlDock->clearResults();
             }
-        }
-    }
-
-    if (resetSurfaceViewForVolumeShapeChange && surf) {
-        _resetNextSurfaceViewForVolumeShapeChange = false;
-        if (auto* viewer = segmentationViewer()) {
-            viewer->resetViewForCurrentContent();
         }
     }
 
