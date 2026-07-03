@@ -106,6 +106,7 @@ class ViewerTransformsPanel;
 class LineAnnotationController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
+class StatusDockPanelHost;
 
 class CWindow : public QMainWindow
 {
@@ -290,6 +291,7 @@ private:
     Ui_VCMainWindow ui;
     QTabWidget* _workspaceTabs{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
+    StatusDockPanelHost* _statusDockPanelHost{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};

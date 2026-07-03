@@ -2,6 +2,7 @@
 
 #include "RenderBenchRecorder.hpp"
 #include "RenderBenchReplay.hpp"
+#include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -2053,7 +2054,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _segmentWorkspaceWindow = segmentWorkspaceWindow;
     _segmentWorkspaceWindow->setObjectName(QStringLiteral("segmentWorkspaceWindow"));
     _segmentWorkspaceWindow->setDockOptions(dockOptions());
-    _segmentWorkspaceWindow->setCentralWidget(segmentCentralWidget);
+    _statusDockPanelHost = new StatusDockPanelHost(segmentCentralWidget, _segmentWorkspaceWindow);
+    _segmentWorkspaceWindow->setCentralWidget(_statusDockPanelHost);
 
     auto moveExistingDockToSegment = [this](QDockWidget* dock, Qt::DockWidgetArea area) {
         if (!dock || !_segmentWorkspaceWindow) {
@@ -2243,6 +2245,13 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 }
             });
     _viewerManager->setVolumeOverlay(_volumeOverlay.get());
+
+    if (_statusDockPanelHost) {
+        if (auto* statusDockBar = _statusDockPanelHost->takeBarWidget()) {
+            statusDockBar->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            statusBar()->insertWidget(0, statusDockBar, 1);
+        }
+    }
 
     // create UI widgets
     CreateWidgets();
@@ -2453,6 +2462,22 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             if (!dock) continue;
             connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
             connect(dock, &QDockWidget::dockLocationChanged, this, fixGrab);
+        }
+    }
+
+    if (_statusDockPanelHost) {
+        for (QDockWidget* dock : {ui.dockWidgetVolumes,
+                                  ui.dockWidgetViewerControls,
+                                  ui.dockWidgetSegmentation,
+                                  _lasagnaDock,
+                                  ui.dockWidgetDistanceTransform,
+                                  static_cast<QDockWidget*>(_point_collection_widget),
+                                  static_cast<QDockWidget*>(_wrapAnnotationWidget),
+                                  _atlasOverviewDock,
+                                  _atlasSearchDock,
+                                  static_cast<QDockWidget*>(_atlasControlDock),
+                                  static_cast<QDockWidget*>(_fiberWidget)}) {
+            _statusDockPanelHost->addDock(dock);
         }
     }
 
