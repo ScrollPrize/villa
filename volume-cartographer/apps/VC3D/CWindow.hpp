@@ -180,6 +180,7 @@ private:
 
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);
+    void updateVolumePackageEmptyState();
 
 
     // Helper method for command line tools

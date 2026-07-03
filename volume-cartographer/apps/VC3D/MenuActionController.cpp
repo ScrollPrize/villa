@@ -442,14 +442,37 @@ void MenuActionController::showOpenDataCatalog()
         return;
     }
 
+    if (_openDataCatalogDialog) {
+        _openDataCatalogDialog->show();
+        _openDataCatalogDialog->raise();
+        _openDataCatalogDialog->activateWindow();
+        emit openDataCatalogVisibilityChanged(true);
+        return;
+    }
+
     auto* dialog = new vc3d::opendata::OpenDataCatalogWindow(_window);
+    _openDataCatalogDialog = dialog;
     dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });
     dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dialog, &QDialog::finished, this, [this]() {
+        emit openDataCatalogVisibilityChanged(false);
+    });
+    connect(dialog, &QDialog::finished, dialog, &QObject::deleteLater);
+    connect(dialog, &QObject::destroyed, this, [this]() {
+        _openDataCatalogDialog = nullptr;
+        emit openDataCatalogVisibilityChanged(false);
+    });
     dialog->show();
     dialog->raise();
     dialog->activateWindow();
+    emit openDataCatalogVisibilityChanged(true);
+}
+
+bool MenuActionController::isOpenDataCatalogVisible() const
+{
+    return _openDataCatalogDialog && _openDataCatalogDialog->isVisible();
 }
 
 bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)

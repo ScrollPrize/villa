@@ -2337,6 +2337,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this, [this]() {
                 _segmentationCommandHandler->onMergePatch(QStringList{});
             });
+    connect(_menuController.get(), &MenuActionController::openDataCatalogVisibilityChanged,
+            this, [this](bool) {
+                updateVolumePackageEmptyState();
+            });
+    connect(ui.btnOpenDataCatalog, &QPushButton::clicked, this, [this]() {
+        if (_menuController) {
+            _menuController->showOpenDataCatalog();
+            updateVolumePackageEmptyState();
+        }
+    });
 
     if (isDarkMode()) {
         applyDarkPalette();
@@ -2567,6 +2577,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                std::max(height(), minWindowSize.height()));
     }
 
+    bool scheduledStartupAction = false;
+
     // If enabled, auto open the last used local volume package.
     if (settings.value(vc3d::settings::project::AUTO_OPEN, vc3d::settings::project::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
@@ -2574,12 +2586,24 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
         if (!files.empty() && !files.at(0).isEmpty()) {
             QString path = files[0];
+            scheduledStartupAction = true;
             QTimer::singleShot(0, this, [this, path]() {
                 if (_menuController) {
                     _menuController->openVolpkgAt(path);
                 }
             });
         }
+    }
+
+    if (!scheduledStartupAction &&
+        settings.value(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
+                       vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT).toBool()) {
+        QTimer::singleShot(0, this, [this]() {
+            if (_menuController && !_state->hasVpkg()) {
+                _menuController->showOpenDataCatalog();
+                updateVolumePackageEmptyState();
+            }
+        });
     }
 
     // Create application-wide keyboard shortcuts
@@ -7469,6 +7493,7 @@ void CWindow::closeEvent(QCloseEvent* event)
 void CWindow::setWidgetsEnabled(bool state)
 {
     ui.grpVolManager->setEnabled(state);
+    ui.btnOpenDataCatalog->setEnabled(!state);
     if (_viewerControlsPanel) {
         _viewerControlsPanel->setViewControlsEnabled(state);
         _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay && _volumeOverlay->hasOverlaySelection());
@@ -7516,10 +7541,12 @@ void CWindow::UpdateView(void)
     if (!_state->hasVpkg() && _state->currentVolume() == nullptr) {
         setWidgetsEnabled(false);  // Disable Widgets for User
         ui.lblVpkgName->setText("[ No Volume Package Loaded ]");
+        updateVolumePackageEmptyState();
         return;
     }
 
     setWidgetsEnabled(true);  // Enable Widgets for User
+    updateVolumePackageEmptyState();
 
     // show volume package name
     UpdateVolpkgLabel(0);
@@ -7527,6 +7554,13 @@ void CWindow::UpdateView(void)
     syncVolumeSelectionControls();
 
     update();
+}
+
+void CWindow::updateVolumePackageEmptyState()
+{
+    const bool hasOpenPackage = _state && (_state->hasVpkg() || _state->currentVolume() != nullptr);
+    const bool catalogVisible = _menuController && _menuController->isOpenDataCatalogVisible();
+    ui.btnOpenDataCatalog->setVisible(!hasOpenPackage && !catalogVisible);
 }
 
 void CWindow::UpdateVolpkgLabel(int filterCounter)
