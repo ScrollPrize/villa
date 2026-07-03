@@ -15,7 +15,9 @@
 
 #include <iostream>
 
+#include <array>
 #include <functional>
+#include <optional>
 
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
@@ -3627,7 +3629,13 @@ void CWindow::clearSurfaceSelection()
 
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
-    const bool hadVolume = static_cast<bool>(_state->currentVolume());
+    auto previousVolume = _state->currentVolume();
+    const bool hadVolume = static_cast<bool>(previousVolume);
+    const std::optional<std::array<int, 3>> previousShape =
+        previousVolume ? std::optional<std::array<int, 3>>(previousVolume->shapeXyz()) : std::nullopt;
+    const std::optional<std::array<int, 3>> nextShape =
+        newvol ? std::optional<std::array<int, 3>>(newvol->shapeXyz()) : std::nullopt;
+    const bool volumeShapeChanged = previousShape && nextShape && *previousShape != *nextShape;
     POI* existingFocusPoi = _state ? _state->poi("focus") : nullptr;
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
@@ -3659,7 +3667,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
             poi->n = cv::Vec3f(0, 0, 1);
         }
 
-        if (createdPoi || !hadVolume) {
+        if (createdPoi || !hadVolume || volumeShapeChanged) {
             poi->p = cv::Vec3f((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, (z0 + z1) * 0.5f);
         } else {
             poi->p[0] = std::clamp(poi->p[0], x0, x1);
@@ -3672,6 +3680,14 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     }
 
     _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
+    if (volumeShapeChanged && _viewerManager) {
+        _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
+            if (viewer) {
+                viewer->resetViewForCurrentContent();
+            }
+        });
+    }
+    _resetNextSurfaceViewForVolumeShapeChange = volumeShapeChanged;
     syncVolumeSelectionControls();
     updateOpenDataSegmentTransformState(true);
 }
@@ -8393,6 +8409,8 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
     auto surf = _state->activeSurface().lock();
 
     _state->setSurface("segmentation", surf, false, false);
+    const bool resetSurfaceViewForVolumeShapeChange =
+        _resetNextSurfaceViewForVolumeShapeChange;
 
     if (newSurfId != previousSurfId) {
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
@@ -8432,6 +8450,13 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             } else {
                 _atlasControlDock->clearResults();
             }
+        }
+    }
+
+    if (resetSurfaceViewForVolumeShapeChange && surf) {
+        _resetNextSurfaceViewForVolumeShapeChange = false;
+        if (auto* viewer = segmentationViewer()) {
+            viewer->resetViewForCurrentContent();
         }
     }
 
