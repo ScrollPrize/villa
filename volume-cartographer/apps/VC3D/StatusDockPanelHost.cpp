@@ -417,7 +417,7 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 
     if (event->type() == QEvent::MouseButtonPress && _currentIndex >= 0) {
         auto* mouse = static_cast<QMouseEvent*>(event);
-        if (mouse->button() == Qt::LeftButton &&
+        if ((mouse->button() == Qt::LeftButton || mouse->button() == Qt::RightButton) &&
             _currentIndex < static_cast<int>(_items.size()) &&
             !_items[static_cast<std::size_t>(_currentIndex)].pinned &&
             !globalPointInsidePanelOrBar(mouse->globalPosition().toPoint())) {
