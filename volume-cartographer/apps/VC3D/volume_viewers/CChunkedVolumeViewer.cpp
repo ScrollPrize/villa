@@ -763,8 +763,10 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
     _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
-    _voxelSizeOverrideUm = std::max(0.0, s.value(viewer::VOXEL_SIZE_UM, viewer::VOXEL_SIZE_UM_DEFAULT).toDouble());
-    updateScalebarScale();   // override may have changed -> refresh the scalebar
+    _linkedCursorViewTolerance = std::max(
+        0.0f,
+        s.value(viewer::POINT_COLLECTION_VIEW_TOLERANCE,
+                viewer::POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT).toFloat());
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, perf::INTERPOLATION_METHOD_DEFAULT).toInt();
     _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
     _maxDisplayedResolution = std::clamp(
@@ -801,6 +803,11 @@ CChunkedVolumeViewer::CameraState CChunkedVolumeViewer::cameraState() const
     state.zOffset = _zOff;
     state.zOffsetWorldDir = _zOffWorldDir;
     return state;
+}
+
+float CChunkedVolumeViewer::clampCameraScale(float scale)
+{
+    return std::clamp(scale, kMinScale, kMaxScale);
 }
 
 void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool forceRender)
@@ -1218,30 +1225,15 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
 
 void CChunkedVolumeViewer::updateScalebarScale()
 {
-    // The scalebar overlay (CVolumeViewerView::drawForeground) needs µm per scene
-    // pixel, where one scene pixel == one rendered framebuffer pixel (the framebuffer
-    // is blitted 1:1, so the view transform m11 ~= 1 and does NOT carry the zoom).
-    // The zoom + LOD live in the FRAMEBUFFER render, not the view transform:
-    //   - 1 framebuffer px = 1/_scale render-LOD voxels (gen steps gridScale/_scale).
-    //   - 1 render-LOD voxel = _dsScale level-0 voxels = _dsScale * voxelSize µm.
-    // => µm/px = voxelSize * _dsScale / _scale. Must be recomputed on every zoom AND
-    // LOD change (both happen here) -- the old code set it once at volume-load with
-    // the wrong formula (voxelSize/_dsScale, zoom ignored), so the bar was wrong at
-    // every zoom level.
+    // Scene pixels are framebuffer pixels. `_scale` is the camera zoom in
+    // framebuffer pixels per level-0 voxel-space unit; render LOD changes which
+    // zarr level is sampled, not the physical size of the view.
     if (!_view || !_volume)
         return;
-    // Voxel size (µm per level-0 voxel): prefer the volume's own metadata, but many
-    // .vca archives don't carry one (voxelSize()==0). Fall back to the user-set
-    // override (viewer/voxel_size_um in settings) so the scalebar still shows real
-    // units. If neither is available the bar can't be physical -> leave the view's
-    // default and the overlay shows nothing meaningful.
     double voxel = _volume->voxelSize();
-    if (!(voxel > 0.0))
-        voxel = _voxelSizeOverrideUm;                 // 0 if unset
     if (!(voxel > 0.0) || !(_scale > 0.0f))
         return;
-    const double umPerScenePx =
-        voxel * static_cast<double>(_dsScale) / static_cast<double>(_scale);
+    const double umPerScenePx = voxel / static_cast<double>(_scale);
     _view->setVoxelSize(umPerScenePx, umPerScenePx);
 }
 
@@ -1326,6 +1318,7 @@ void CChunkedVolumeViewer::syncCameraTransform()
     _camSurfY = _surfacePtrY;
     _camScale = _scale;
     updateDisplayedFramebufferMapping();
+    updateIntersectionPreviewTransform();
     updateFocusMarker();
     requestDirectPaint();
 }
@@ -2687,6 +2680,9 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_viewerManager) {
+        _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
+    }
     _sameWrapManualMergePressConsumed = false;
 
     if (_sameWrapAnnotation.enabled() && button == Qt::RightButton &&
@@ -2835,6 +2831,9 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
     updateStatusLabel();
+    if (_viewerManager) {
+        _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
+    }
     if (_sameWrapManualMergePressConsumed && button == Qt::RightButton) {
         _sameWrapManualMergePressConsumed = false;
         return;
@@ -2998,6 +2997,14 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
     _cursorCrosshair->show();
 }
 
+void CChunkedVolumeViewer::setSegmentationCursorMirroring(bool enabled)
+{
+    _segmentationCursorMirroring = enabled;
+    if (!enabled && _cursorCrosshair) {
+        _cursorCrosshair->hide();
+    }
+}
+
 void CChunkedVolumeViewer::setLineAnnotationPlacementPreviewEnabled(bool enabled)
 {
     _lineAnnotationPlacementPreviewEnabled = enabled;
@@ -3126,11 +3133,40 @@ std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtSceneP
     return bestHit;
 }
 
-void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&)
+void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point)
 {
-    // The chunked viewer shows the cursor marker at its local mouse position.
-    // Cross-view projection was unreliable for mixed surface/plane views and is
-    // intentionally ignored here.
+    auto hideCrosshair = [this]() {
+        if (_cursorCrosshair) {
+            _cursorCrosshair->hide();
+        }
+    };
+
+    if (!_segmentationCursorMirroring || !point) {
+        hideCrosshair();
+        return;
+    }
+
+    QPointF scenePos;
+    if (auto* plane = dynamic_cast<PlaneSurface*>(currentSurface())) {
+        const cv::Vec3f projected = plane->project(*point, 1.0f, 1.0f);
+        if (!std::isfinite(projected[0]) ||
+            !std::isfinite(projected[1]) ||
+            !std::isfinite(projected[2]) ||
+            std::abs(projected[2] - _zOff) > _linkedCursorViewTolerance) {
+            hideCrosshair();
+            return;
+        }
+        scenePos = surfaceToScene(projected[0], projected[1]);
+    } else {
+        scenePos = volumeToScene(*point);
+    }
+
+    if (!std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        hideCrosshair();
+        return;
+    }
+
+    updateCursorCrosshair(scenePos);
 }
 
 void CChunkedVolumeViewer::updateFocusMarker(POI* poi)

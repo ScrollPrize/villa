@@ -125,6 +125,13 @@ vc_add_test(NAME test_line_annotation_context_menu
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_scale_bar_units
+    SOURCES test_scale_bar_units.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.hpp
+    LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
 vc_add_test(NAME test_fiber_widget
     SOURCES test_fiber_widget.cpp

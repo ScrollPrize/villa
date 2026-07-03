@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <opencv2/core/mat.hpp>
 
 #include "LineAnnotationFiberClassification.hpp"
@@ -140,6 +141,8 @@ public:
     void deleteFiber(uint64_t fiberId);
     void deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
+    void importFibers();
+    void exportFibers();
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
     void recalculateFiberHvClassification(uint64_t fiberId);
@@ -333,14 +336,21 @@ private:
     void refreshBranchLineViews(uint64_t changedFiberId = 0);
     void syncReciprocalBranchControlPointReferences(const LineAnnotationSession& session);
     [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
+    static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
         const vc::lasagna::NormalSampler* normalSampler);
     [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
         const std::vector<cv::Vec3d>& points);
     void saveSessionAsFiber(LineAnnotationSession& session);
+    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
     void saveFiber(const StoredFiber& fiber) const;
+    [[nodiscard]] std::optional<StoredFiber> loadFiberJson(const nlohmann::json& root,
+                                                           const std::filesystem::path& path) const;
     [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
+    [[nodiscard]] std::string uniqueImportedFiberFileName(const StoredFiber& fiber,
+                                                          std::unordered_set<std::string>& reserved,
+                                                          uint64_t& nextSequence) const;
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForFiber(

@@ -219,6 +219,162 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     CHECK(segment.hasLayersZarr());
 }
 
+TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "samples": {
+        "sample-a": {
+          "scans": {
+            "scan-a": {
+              "properties": {
+                "pixel_size_um": 2.403,
+                "detector_distance_mm": 220.0
+              }
+            }
+          },
+          "volumes": {
+            "volume-with-properties": {
+              "scan_id": "scan-a",
+              "properties": {
+                "pixel_size_um": 7.91,
+                "detector_distance_mm": 12.5
+              },
+              "data": [{
+                "type": "ome-zarr",
+                "origins": [{
+                  "path": "sample-a/volumes/volume-with-properties.zarr",
+                  "access_roots": [{
+                    "type": "s3",
+                    "url": "s3://vesuvius-challenge-open-data/",
+                    "usage": "public-read"
+                  }]
+                }]
+              }]
+            },
+            "volume-from-scan": {
+              "scan_id": "scan-a",
+              "data": [{
+                "type": "ome-zarr",
+                "origins": [{
+                  "path": "sample-a/volumes/volume-from-scan.zarr",
+                  "access_roots": [{
+                    "type": "s3",
+                    "url": "s3://vesuvius-challenge-open-data/",
+                    "usage": "public-read"
+                  }]
+                }]
+              }]
+            }
+          }
+        }
+      }
+    })");
+
+    const auto* sample = manifest.findSample("sample-a");
+    REQUIRE(sample != nullptr);
+    REQUIRE(sample->scans.size() == 1);
+    REQUIRE(sample->scans.front().pixelSizeUm.has_value());
+    CHECK(*sample->scans.front().pixelSizeUm == doctest::Approx(2.403));
+    REQUIRE(sample->volumes.size() == 2);
+
+    const auto byId = [&](const std::string& id) -> const OpenDataVolume* {
+        const auto it = std::find_if(
+            sample->volumes.begin(), sample->volumes.end(), [&](const OpenDataVolume& volume) {
+                return volume.id == id;
+            });
+        return it == sample->volumes.end() ? nullptr : &*it;
+    };
+
+    const auto* volumeWithProperties = byId("volume-with-properties");
+    REQUIRE(volumeWithProperties != nullptr);
+    REQUIRE(volumeWithProperties->pixelSizeUm.has_value());
+    CHECK(*volumeWithProperties->pixelSizeUm == doctest::Approx(7.91));
+    const auto* volumeFromScan = byId("volume-from-scan");
+    REQUIRE(volumeFromScan != nullptr);
+    REQUIRE(volumeFromScan->pixelSizeUm.has_value());
+    CHECK(*volumeFromScan->pixelSizeUm == doctest::Approx(2.403));
+
+    auto pkg = VolumePkg::newEmpty();
+    const auto result = attachOpenDataSampleVolumes(*pkg, *sample);
+    CHECK(result.supportedVolumes == 2);
+    REQUIRE(pkg->volumeEntries().size() == 2);
+
+    const auto hasTag = [](const vc::project::Entry& entry, const std::string& tag) {
+        return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
+    };
+    const auto entryForVolumeId = [&](const std::string& id) -> const vc::project::Entry* {
+        const auto tag = "vc-open-data-volume-id:" + id;
+        const auto it = std::find_if(
+            pkg->volumeEntries().begin(), pkg->volumeEntries().end(), [&](const vc::project::Entry& entry) {
+                return hasTag(entry, tag);
+            });
+        return it == pkg->volumeEntries().end() ? nullptr : &*it;
+    };
+
+    const auto* volumeWithPropertiesEntry = entryForVolumeId("volume-with-properties");
+    REQUIRE(volumeWithPropertiesEntry != nullptr);
+    CHECK(hasTag(*volumeWithPropertiesEntry, "vc-open-data-voxel-size-um:7.910000"));
+    const auto* volumeFromScanEntry = entryForVolumeId("volume-from-scan");
+    REQUIRE(volumeFromScanEntry != nullptr);
+    CHECK(hasTag(*volumeFromScanEntry, "vc-open-data-voxel-size-um:2.403000"));
+}
+
+TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "metadata": {
+        "samples": {
+          "sample-a": {
+            "sample": {
+              "properties": {
+                "volume_transforms": [
+                  {
+                    "from_volume_id": "vol-a",
+                    "transforms": [
+                      {
+                        "to_volume_id": "vol-b",
+                        "matrix": [
+                          [0.5, 0.0, 0.0, 10.0],
+                          [0.0, 0.5, 0.0, 20.0],
+                          [0.0, 0.0, 0.5, 30.0]
+                        ],
+                        "derivation_path": "vol-a-vol-b"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "volumes": {
+              "vol-a": {"data_format": "zarr"},
+              "vol-b": {"data_format": "zarr"}
+            }
+          }
+        }
+      }
+    })");
+
+    const auto* sample = manifest.findSample("sample-a");
+    REQUIRE(sample != nullptr);
+    REQUIRE(sample->volumeTransforms.size() == 1);
+    CHECK(sample->volumeTransforms.front().fromVolumeId == "vol-a");
+    REQUIRE(sample->volumeTransforms.front().transforms.size() == 1);
+    CHECK(sample->volumeTransforms.front().transforms.front().toVolumeId == "vol-b");
+    CHECK(sample->volumeTransforms.front().transforms.front().derivationPath == "vol-a-vol-b");
+
+    const auto forward = findSampleVolumeTransform(*sample, "vol-a", "vol-b");
+    REQUIRE(forward.has_value());
+    CHECK((*forward)(0, 0) == doctest::Approx(0.5));
+    CHECK((*forward)(0, 3) == doctest::Approx(10.0));
+    CHECK((*forward)(1, 3) == doctest::Approx(20.0));
+    CHECK((*forward)(2, 3) == doctest::Approx(30.0));
+    CHECK((*forward)(3, 3) == doctest::Approx(1.0));
+
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "vol-b", "vol-a").has_value());
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "vol-a", "vol-c").has_value());
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "", "vol-b").has_value());
+}
+
 TEST_CASE("OpenDataManifest resolves public origins with the website rewrite table")
 {
     CHECK(resolveOpenDataUrl("s3://vesuvius-challenge-open-data/a/b") ==
@@ -248,6 +404,7 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     OpenDataVolume volume;
     volume.id = "scan-volume";
     volume.dataFormat = "zarr";
+    volume.pixelSizeUm = 7.91;
 
     auto artifact = [](std::string type, std::string url) {
         OpenDataArtifact out;
@@ -285,6 +442,9 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
                     pkg->volumeEntries()[0].tags.end(),
                     "vc-open-data-volume-id:scan-volume") != pkg->volumeEntries()[0].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
+                    pkg->volumeEntries()[0].tags.end(),
+                    "vc-open-data-voxel-size-um:7.910000") != pkg->volumeEntries()[0].tags.end());
 }
 
 TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")

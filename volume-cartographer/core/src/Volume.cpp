@@ -73,32 +73,86 @@ std::string deriveRemoteVolumeName(const std::string& url)
 std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
                                                     const vc::HttpAuth& auth)
 {
-    const auto load = [&](const std::string& name) -> std::optional<utils::Json> {
-        const auto url = remoteUrl + "/" + name;
-        const auto body = vc::httpGetString(url, auth);
-        if (body.empty()) {
+    const auto numberFromObject = [](const utils::Json& obj,
+                                     std::initializer_list<const char*> keys) -> std::optional<double> {
+        if (!obj.is_object()) {
             return std::nullopt;
         }
-        auto json = utils::Json::parse(body);
-        if (name == METADATA_FILE_ALT.string()) {
-            if (!json.contains("scan")) {
-                throw std::runtime_error("metadata.json missing 'scan' key: " + url);
+        for (const char* key : keys) {
+            if (!obj.contains(key)) {
+                continue;
             }
-            json.update(json["scan"]);
-            if (!json.contains("format")) {
-                json["format"] = "zarr";
+            const auto& value = obj[key];
+            if (value.is_number()) {
+                return value.get_double();
+            }
+            if (value.is_string()) {
+                try {
+                    return std::stod(value.get_string());
+                } catch (...) {
+                }
             }
         }
+        return std::nullopt;
+    };
+
+    const auto voxelSizeFromMetadata = [&](const utils::Json& obj) -> std::optional<double> {
+        const auto keys = {
+            "voxelsize",
+            "voxel_size_um",
+            "voxelSizeUm",
+            "pixel_size_um",
+            "pixelSizeUm",
+            "resolution_um",
+        };
+        if (auto value = numberFromObject(obj, keys)) {
+            return value;
+        }
+        for (const char* key : {"scan", "volume", "properties", "metadata"}) {
+            if (obj.is_object() && obj.contains(key)) {
+                if (auto value = numberFromObject(obj[key], keys)) {
+                    return value;
+                }
+            }
+        }
+        return std::nullopt;
+    };
+
+    const auto normalize = [&](utils::Json json, const std::string& url) -> utils::Json {
         if (!json.is_object()) {
             throw std::runtime_error("remote volume metadata is not an object: " + url);
+        }
+        if (json.contains("scan") && json["scan"].is_object()) {
+            json.update(json["scan"]);
+        }
+        if (!json.contains("format")) {
+            json["format"] = "zarr";
+        }
+
+        bool hasVoxelSize = false;
+        if (json.contains("voxelsize") && json["voxelsize"].is_number()) {
+            hasVoxelSize = json["voxelsize"].get_double() > 0.0;
+        }
+        if (!hasVoxelSize) {
+            if (auto voxelSize = voxelSizeFromMetadata(json); voxelSize && *voxelSize > 0.0) {
+                json["voxelsize"] = *voxelSize;
+            }
         }
         return json;
     };
 
-    if (auto meta = load(METADATA_FILE.string())) {
+    const auto loadUrl = [&](const std::string& url) -> std::optional<utils::Json> {
+        const auto body = vc::httpGetString(url, auth);
+        if (body.empty()) {
+            return std::nullopt;
+        }
+        return normalize(utils::Json::parse(body), url);
+    };
+
+    if (auto meta = loadUrl(remoteUrl + "/" + METADATA_FILE.string())) {
         return meta;
     }
-    return load(METADATA_FILE_ALT.string());
+    return loadUrl(remoteUrl + "/" + METADATA_FILE_ALT.string());
 }
 
 std::string deriveRemoteVolumeId(const std::string& url)
@@ -1222,7 +1276,8 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
     const std::filesystem::path& cacheRoot,
-    const vc::HttpAuth& authIn)
+    const vc::HttpAuth& authIn,
+    const utils::Json& metadata)
 {
     // Resolve s3:// URLs to https:// and detect AWS credentials
     auto resolved = vc::resolveRemoteUrl(url);
@@ -1312,6 +1367,13 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         }
     } catch (const std::exception& e) {
         Logger()->warn("Failed to load remote volume metadata for '{}': {}", remoteUrl, e.what());
+    }
+
+    if (metadata.is_object()) {
+        vol->metadata_.update(metadata);
+        vol->metadata_["width"] = vol->_width;
+        vol->metadata_["height"] = vol->_height;
+        vol->metadata_["slices"] = vol->_slices;
     }
 
     return vol;

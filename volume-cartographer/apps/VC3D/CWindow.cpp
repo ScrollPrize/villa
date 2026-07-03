@@ -9,6 +9,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/AffineTransform.hpp"
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -69,6 +70,7 @@
 #include <QMouseEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
 #include <QTabWidget>
@@ -176,8 +178,78 @@ constexpr int ATLAS_CONTROL_SOURCE_INDEX_ROLE = Qt::UserRole + 3;
 constexpr int ATLAS_SURFACE_X_ROLE = Qt::UserRole + 4;
 constexpr int ATLAS_SURFACE_Y_ROLE = Qt::UserRole + 5;
 constexpr double ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD = 0.5;
+constexpr std::string_view OPEN_DATA_VOLUME_ID_TAG_PREFIX = "vc-open-data-volume-id:";
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
+
+bool finiteVec3(const cv::Vec3f& p)
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+std::optional<cv::Vec3f> transformPoint(const cv::Vec3f& point, const cv::Matx44d& matrix)
+{
+    cv::Vec3d transformed;
+    if (!vc::core::util::applyAffineTransform(cv::Vec3d(point), matrix, transformed)) {
+        return std::nullopt;
+    }
+    const cv::Vec3f out(static_cast<float>(transformed[0]),
+                        static_cast<float>(transformed[1]),
+                        static_cast<float>(transformed[2]));
+    return finiteVec3(out) ? std::optional<cv::Vec3f>(out) : std::nullopt;
+}
+
+cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return point;
+    }
+    const auto [w, h, d] = volume->shapeXyz();
+    point[0] = std::clamp(point[0], 0.0f, static_cast<float>(std::max(1, w) - 1));
+    point[1] = std::clamp(point[1], 0.0f, static_cast<float>(std::max(1, h) - 1));
+    point[2] = std::clamp(point[2], 0.0f, static_cast<float>(std::max(1, d) - 1));
+    return point;
+}
+
+std::filesystem::path openDataCatalogManifestCachePath()
+{
+    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    if (base.isEmpty()) {
+        base = QDir::home().filePath(QStringLiteral(".VC3D"));
+    }
+    return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
+}
+
+std::optional<double> relativeAffineDistanceScale(const cv::Matx44d& matrix)
+{
+    cv::Mat linear(3, 3, CV_64F);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            linear.at<double>(row, col) = matrix(row, col);
+        }
+    }
+
+    cv::SVD svd(linear, cv::SVD::NO_UV);
+    if (svd.w.rows < 3) {
+        return std::nullopt;
+    }
+    const double s0 = svd.w.at<double>(0, 0);
+    const double s1 = svd.w.at<double>(1, 0);
+    const double s2 = svd.w.at<double>(2, 0);
+    if (!(std::isfinite(s0) && std::isfinite(s1) && std::isfinite(s2)) ||
+        s0 <= 0.0 || s1 <= 0.0 || s2 <= 0.0) {
+        return std::nullopt;
+    }
+
+    const double mean = (s0 + s1 + s2) / 3.0;
+    const double maxDeviation =
+        std::max({std::abs(s0 - mean), std::abs(s1 - mean), std::abs(s2 - mean)});
+    const double relativeDeviation = maxDeviation / mean;
+    if (!std::isfinite(relativeDeviation) || relativeDeviation > 0.02) {
+        return std::nullopt;
+    }
+    return mean;
+}
 
 QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
 {
@@ -3629,14 +3701,75 @@ void CWindow::clearSurfaceSelection()
 
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
-    auto previousVolume = _state->currentVolume();
-    const bool hadVolume = static_cast<bool>(previousVolume);
-    const std::optional<std::array<int, 3>> previousShape =
-        previousVolume ? std::optional<std::array<int, 3>>(previousVolume->shapeXyz()) : std::nullopt;
-    const std::optional<std::array<int, 3>> nextShape =
-        newvol ? std::optional<std::array<int, 3>>(newvol->shapeXyz()) : std::nullopt;
-    const bool volumeShapeChanged = previousShape && nextShape && *previousShape != *nextShape;
+    const bool hadVolume = static_cast<bool>(_state->currentVolume());
     POI* existingFocusPoi = _state ? _state->poi("focus") : nullptr;
+    const std::string previousVolumeId = _state ? _state->currentVolumeId() : std::string{};
+    std::string targetVolumeId;
+    if (_state && _state->vpkg() && newvol) {
+        for (const auto& id : _state->vpkg()->volumeIDs()) {
+            if (_state->vpkg()->volume(id) == newvol) {
+                targetVolumeId = id;
+                break;
+            }
+        }
+    }
+    if (targetVolumeId.empty() && newvol) {
+        targetVolumeId = newvol->id();
+    }
+
+    struct CapturedViewerNavigation {
+        QPointer<CChunkedVolumeViewer> viewer;
+        CChunkedVolumeViewer::CameraState camera;
+        cv::Vec3f center{0, 0, 0};
+        bool hasCenter{false};
+    };
+
+    const auto navigationTransform =
+        (hadVolume && newvol && previousVolumeId != targetVolumeId)
+            ? openDataVolumeTransformForSwitch(previousVolumeId, targetVolumeId)
+            : std::optional<cv::Matx44d>{};
+    const auto navigationScale =
+        navigationTransform ? relativeAffineDistanceScale(*navigationTransform)
+                            : std::optional<double>{};
+    std::optional<cv::Vec3f> transformedFocusPoint;
+    std::optional<cv::Vec3f> transformedFocusNormal;
+    std::vector<CapturedViewerNavigation> capturedViewers;
+
+    if (navigationTransform) {
+        if (existingFocusPoi && finiteVec3(existingFocusPoi->p)) {
+            transformedFocusPoint = transformPoint(existingFocusPoi->p, *navigationTransform);
+            if (cv::norm(existingFocusPoi->n) > 0.0f) {
+                const cv::Vec3f normal =
+                    vc::core::util::transformNormal(existingFocusPoi->n, *navigationTransform);
+                if (finiteVec3(normal)) {
+                    transformedFocusNormal = normal;
+                }
+            }
+        }
+
+        if (_viewerManager) {
+            _viewerManager->forEachBaseViewer([&](VolumeViewerBase* baseViewer) {
+                auto* viewer = dynamic_cast<CChunkedVolumeViewer*>(baseViewer);
+                if (!viewer || !viewer->graphicsView()) {
+                    return;
+                }
+                CapturedViewerNavigation captured;
+                captured.viewer = viewer;
+                captured.camera = viewer->cameraState();
+                const QSize viewportSize = viewer->graphicsView()->viewport()->size();
+                const QPointF centerScene(
+                    static_cast<qreal>(std::max(1, viewportSize.width())) * 0.5,
+                    static_cast<qreal>(std::max(1, viewportSize.height())) * 0.5);
+                if (const auto sample = viewer->sampleSceneVolume(centerScene)) {
+                    if (finiteVec3(sample->position)) {
+                        captured.center = sample->position;
+                        captured.hasCenter = true;
+                    }
+                }
+                capturedViewers.push_back(std::move(captured));
+            });
+        }
+    }
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
     _state->setCurrentVolume(newvol);
@@ -3667,7 +3800,12 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
             poi->n = cv::Vec3f(0, 0, 1);
         }
 
-        if (createdPoi || !hadVolume || volumeShapeChanged) {
+        if (transformedFocusPoint) {
+            poi->p = clampToVolumeBounds(*transformedFocusPoint, _state->currentVolume());
+            if (transformedFocusNormal) {
+                poi->n = *transformedFocusNormal;
+            }
+        } else if (createdPoi || !hadVolume) {
             poi->p = cv::Vec3f((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, (z0 + z1) * 0.5f);
         } else {
             poi->p[0] = std::clamp(poi->p[0], x0, x1);
@@ -3679,15 +3817,37 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
         _state->setPOI("focus", poi);
     }
 
-    _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
-    if (volumeShapeChanged && _viewerManager) {
-        _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
-            if (viewer) {
-                viewer->resetViewForCurrentContent();
+    if (navigationTransform && _state->currentVolume()) {
+        for (const auto& captured : capturedViewers) {
+            CChunkedVolumeViewer* viewer = captured.viewer.data();
+            if (!viewer || viewer->currentVolume() != _state->currentVolume()) {
+                continue;
             }
-        });
+
+            std::optional<cv::Vec3f> transformedCenter;
+            if (captured.hasCenter) {
+                transformedCenter = transformPoint(captured.center, *navigationTransform);
+            }
+            if (!transformedCenter) {
+                continue;
+            }
+
+            viewer->centerOnVolumePoint(
+                clampToVolumeBounds(*transformedCenter, _state->currentVolume()),
+                false);
+            auto camera = viewer->cameraState();
+            camera.scale = captured.camera.scale;
+            if (navigationScale) {
+                camera.scale = CChunkedVolumeViewer::clampCameraScale(
+                    static_cast<float>(static_cast<double>(captured.camera.scale) / *navigationScale));
+            }
+            camera.zOffset = captured.camera.zOffset;
+            camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
+            viewer->applyCameraState(camera, false);
+        }
     }
-    _resetNextSurfaceViewForVolumeShapeChange = volumeShapeChanged;
+
+    _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
     syncVolumeSelectionControls();
     updateOpenDataSegmentTransformState(true);
 }
@@ -4149,8 +4309,8 @@ void CWindow::setSegmentationCursorMirroring(bool enabled)
     }
 
     if (statusBar()) {
-        showStatusBarMessage(enabled ? tr("Mirroring cursor to Surface view enabled")
-                                         : tr("Mirroring cursor to Surface view disabled"),
+        showStatusBarMessage(enabled ? tr("Syncing cursor across views enabled")
+                                         : tr("Syncing cursor across views disabled"),
                                   2000);
     }
 }
@@ -7120,6 +7280,14 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::renameFiberFile);
             connect(widget,
+                    &CFiberWidget::importFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::importFibers);
+            connect(widget,
+                    &CFiberWidget::exportFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::exportFibers);
+            connect(widget,
                     &CFiberWidget::metricsCalculationRequested,
                     _lineAnnotationController.get(),
                     [this](std::vector<uint64_t> orderedFiberIds) {
@@ -7984,6 +8152,78 @@ void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
     settings.setValue(key, volumeId);
 }
 
+const vc3d::opendata::OpenDataManifest* CWindow::cachedOpenDataManifest() const
+{
+    if (_openDataManifestCache) {
+        return &*_openDataManifestCache;
+    }
+    if (_openDataManifestLoadAttempted) {
+        return nullptr;
+    }
+    _openDataManifestLoadAttempted = true;
+
+    const auto manifestPath = openDataCatalogManifestCachePath();
+    if (manifestPath.empty() || !std::filesystem::is_regular_file(manifestPath)) {
+        return nullptr;
+    }
+
+    try {
+        _openDataManifestCache = vc3d::opendata::loadOpenDataManifestFile(
+            manifestPath,
+            std::string(vc3d::opendata::kDefaultManifestUrl));
+        return &*_openDataManifestCache;
+    } catch (const std::exception& ex) {
+        Logger()->warn("Failed to load cached open-data manifest '{}': {}",
+                       manifestPath.string(), ex.what());
+    } catch (...) {
+        Logger()->warn("Failed to load cached open-data manifest '{}': unknown error",
+                       manifestPath.string());
+    }
+
+    return nullptr;
+}
+
+std::string CWindow::openDataVolumeIdForLoadedVolumeId(const std::string& volumeId) const
+{
+    if (volumeId.empty() || !_state || !_state->vpkg()) {
+        return {};
+    }
+
+    for (const auto& tag : _state->vpkg()->volumeTags(volumeId)) {
+        if (tag.rfind(OPEN_DATA_VOLUME_ID_TAG_PREFIX, 0) != 0) {
+            continue;
+        }
+        return tag.substr(OPEN_DATA_VOLUME_ID_TAG_PREFIX.size());
+    }
+
+    return {};
+}
+
+std::optional<cv::Matx44d> CWindow::openDataVolumeTransformForSwitch(
+    const std::string& fromLoadedVolumeId,
+    const std::string& toLoadedVolumeId) const
+{
+    const std::string fromCatalogId = openDataVolumeIdForLoadedVolumeId(fromLoadedVolumeId);
+    const std::string toCatalogId = openDataVolumeIdForLoadedVolumeId(toLoadedVolumeId);
+    if (fromCatalogId.empty() || toCatalogId.empty() || fromCatalogId == toCatalogId) {
+        return std::nullopt;
+    }
+
+    const auto* manifest = cachedOpenDataManifest();
+    if (!manifest) {
+        return std::nullopt;
+    }
+
+    for (const auto& sample : manifest->samples) {
+        if (auto matrix = vc3d::opendata::findSampleVolumeTransform(
+                sample, fromCatalogId, toCatalogId)) {
+            return matrix;
+        }
+    }
+
+    return std::nullopt;
+}
+
 void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
 {
     if (!_state || !_state->vpkg()) {
@@ -8409,8 +8649,6 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
     auto surf = _state->activeSurface().lock();
 
     _state->setSurface("segmentation", surf, false, false);
-    const bool resetSurfaceViewForVolumeShapeChange =
-        _resetNextSurfaceViewForVolumeShapeChange;
 
     if (newSurfId != previousSurfId) {
         if (_segmentationModule && _segmentationModule->editingEnabled()) {
@@ -8450,13 +8688,6 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             } else {
                 _atlasControlDock->clearResults();
             }
-        }
-    }
-
-    if (resetSurfaceViewForVolumeShapeChange && surf) {
-        _resetNextSurfaceViewForVolumeShapeChange = false;
-        if (auto* viewer = segmentationViewer()) {
-            viewer->resetViewForCurrentContent();
         }
     }
 

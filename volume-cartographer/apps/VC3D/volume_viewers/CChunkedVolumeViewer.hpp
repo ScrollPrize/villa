@@ -97,6 +97,7 @@ public:
     std::string surfName() const override { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const override { return _volume; }
     float getCurrentScale() const override { return _scale; }
+    static float clampCameraScale(float scale);
     float dsScale() const override { return _dsScale; }
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
@@ -140,7 +141,7 @@ public:
 
     void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
-    void setSegmentationCursorMirroring(bool) override {}
+    void setSegmentationCursorMirroring(bool enabled) override;
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
     uint64_t highlightedPointId() const override { return _highlightedPointId; }
@@ -430,7 +431,7 @@ private:
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
-    double _voxelSizeOverrideUm = 0.0;   // scalebar fallback when volume metadata lacks voxelsize
+    float _linkedCursorViewTolerance = 10.0f;
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     int _maxDisplayedResolution = 0;
     bool _showDirectionHints = true;
@@ -542,6 +543,7 @@ private:
     QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
+    bool _segmentationCursorMirroring = false;
 
     uint64_t _highlightedPointId = 0;
     uint64_t _selectedCollectionId = 0;

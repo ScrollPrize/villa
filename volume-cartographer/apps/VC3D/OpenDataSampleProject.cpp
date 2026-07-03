@@ -114,6 +114,9 @@ std::vector<std::string> volumeTags(const OpenDataVolume& volume,
     if (!volume.id.empty()) {
         addUnique("vc-open-data-volume-id:" + volume.id);
     }
+    if (volume.pixelSizeUm && *volume.pixelSizeUm > 0.0) {
+        addUnique("vc-open-data-voxel-size-um:" + std::to_string(*volume.pixelSizeUm));
+    }
 
     return tags;
 }
