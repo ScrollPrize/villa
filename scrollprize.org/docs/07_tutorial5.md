@@ -152,4 +152,4 @@ So how can a machine learning model detect ink? In the electron microscope image
 
 Now let’s create a model! This part of the tutorial is over [on Kaggle as a notebook](https://www.kaggle.com/code/jpposma/vesuvius-challenge-ink-detection-tutorial).
 
-To run more advanced models on the [scroll segments](data_segments), check out the winning code from the [First Letters Prize](firstletters) and the [2023 Grand Prize](grandprize).
+To run more advanced models on the [scroll segments](data), check out the winning code from the [First Letters Prize](firstletters) and the [2023 Grand Prize](grandprize).

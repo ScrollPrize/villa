@@ -11,7 +11,6 @@ import {
   sponsors,
   team,
   partners,
-  educelabFunders,
 } from "./landingData";
 
 /* ==========================================================================
@@ -419,7 +418,7 @@ export function Landing() {
   const SHOW_BREAKING = true;
 
   useBrokenLinks().collectAnchor("sponsors");
-  useBrokenLinks().collectAnchor("educelab-funders");
+  useBrokenLinks().collectAnchor("partners");
   useBrokenLinks().collectAnchor("our-story");
 
   // siteUrl is used by the OpenGraph/Twitter tags below. Sitewide JSON-LD
@@ -683,10 +682,10 @@ export function Landing() {
                 }
               >
                 <p>
-                  We've so far recovered text from just two of our five
-                  scrolls. Is the ink fundamentally different in others? Is the
-                  papyrus surface? We're not yet sure. We are certain though
-                  that if it ever existed, it can be detected.
+                  We've so far recovered text from just four of the 35 scrolls
+                  we have scanned. Is the ink fundamentally different in the
+                  others? Is the papyrus surface? We're not yet sure. We are
+                  certain though that if it ever existed, it can be detected.
                 </p>
               </ChallengeBox>
             </div>
@@ -914,14 +913,6 @@ export function Landing() {
                     }`}
                   />
                 </a>
-              ))}
-            </div>
-            <h3 className="vc-funders__title" id="educelab-funders">
-              EduceLab funders
-            </h3>
-            <div className="vc-funders">
-              {educelabFunders.map((t, i) => (
-                <PersonLink link={t} key={i} />
               ))}
             </div>
           </div>

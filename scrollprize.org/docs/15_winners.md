@@ -842,7 +842,7 @@ This page lists all the prizes awarded so far:
 
 ### \$45,000 Segmentation Tooling 2 (October 3, 2023)
 
-**Goal:** Help the [segmentation team](data_segments) do larger and harder areas.<br/>
+**Goal:** Help the [segmentation team](segmentation) do larger and harder areas.<br/>
 **Announcement:** <a href="https://scrollprize.substack.com/p/segmentation-tooling-2-winners">Blog post</a>
 
 <div className="flex flex-row flex-wrap">
@@ -908,7 +908,7 @@ This page lists all the prizes awarded so far:
 
 ### \$45,000 Segmentation Tooling (June 27, 2023)
 
-**Goal:** Help the [segmentation team](data_segments) do larger and harder areas.<br/>
+**Goal:** Help the [segmentation team](segmentation) do larger and harder areas.<br/>
 **Announcement:** <a href="https://scrollprize.substack.com/p/ink-detection-followup-prize-winners">Blog post</a>
 
 <div className="flex flex-row flex-wrap">

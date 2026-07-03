@@ -40,9 +40,7 @@ const sidebars = {
       link: { type: 'doc', id: 'data' },
       items: [
         { type: 'doc', id: 'data_browser', label: 'Data Browser' },
-        { type: 'doc', id: 'data_segments' },
         { type: 'doc', id: 'data_datasets' },
-        { type: 'doc', id: 'data_fragments' },
       ],
     },
     {
@@ -79,7 +77,6 @@ const sidebars = {
       label: 'The Scrolls',
       collapsible: true,
       collapsed: true,
-      link: { type: 'doc', id: 'background' },
       items: [
         { type: 'doc', id: 'villa_model' },
         { type: 'doc', id: 'livestream' },

@@ -213,7 +213,7 @@ There were many contributions from different people in the critical path for the
 * Luke’s search for crackle was directly inspired by Casey’s work.
 * Casey was able to look through many sheets of papyrus because our segmentation team had mapped out hundreds of cm2.
 * The segmentation team was able to map out a lot of papyrus because of tooling built by contestants who worked on “Segmentation Tooling Prizes” (work by Julian Schilliger, Chuck, Yao Hsiao, and many others).
-* The segmentation tooling advances were possible because contestants built on top of existing open source tools by professor Seales’ team (work by Seth Parker, Stephen Parsons, and many others). And of course, the contest itself wouldn’t have been possible without the foundation that Dr. Seales and his team, along with their [funders](/#educelab-funders), have laid out and continue to support.
+* The segmentation tooling advances were possible because contestants built on top of existing open source tools by professor Seales’ team (work by Seth Parker, Stephen Parsons, and many others). And of course, the contest itself wouldn’t have been possible without the foundation that Dr. Seales and his team, along with their [funders](/#partners), have laid out and continue to support.
 
 Looking back at what got us to this point, it seems that almost every single thing we did in running this contest so far has been load-bearing. We’re not quite sure what to make of this! Perhaps that progress is more fragile and success is more contingent than it often seems in retrospect.
 

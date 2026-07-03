@@ -68,7 +68,7 @@ We host the dataset in **two repositories** (with the **same folder layout**):
 
 An overview of the dataset can be found in the [Data Browser](data_browser).
 The browser is the unified sample index for both scrolls and fragments.
-For deeper exploration, use [Segments](data_segments) when you want mapped surface data, and [Curated Datasets](data_datasets) for ready-to-use bundles built for specific research tasks.
+For deeper exploration, use [Curated Datasets](data_datasets) for ready-to-use bundles built for specific research tasks.
 
 ## What's included
 
@@ -117,7 +117,6 @@ You will typically browse by **sample ID** (e.g., a specific scroll or fragment)
 ➡️ **Browse all samples:** [Data Browser](data_browser)
 
 Looking for scroll-only or fragment-only views? Use the same browser row-by-row and apply the relevant filters.
-- [Segments](data_segments) for mapped surface exports and segment artifacts
 
 
 ## Documentation and references

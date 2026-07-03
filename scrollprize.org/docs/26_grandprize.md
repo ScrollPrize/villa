@@ -430,7 +430,7 @@ After that, we will scan and read every scroll. We estimate that the scrolls we 
 
 And as if the prospect of reading hundreds of scrolls isn’t good enough, there might be an even bigger payoff at the end of all of this (as Nat said on the [Dwarkesh podcast](https://youtu.be/qcvMjoJdck4?t=646): <em>“there is gold in this mud”</em>).
 
-<div>Dr. Garrett Ryan (<a href="https://www.youtube.com/@toldinstone">toldinstone</a>) writes it best on our <a href="background">History page</a>:</div>
+<div>Dr. Garrett Ryan (<a href="https://www.youtube.com/@toldinstone">toldinstone</a>) writes it best:</div>
 
 <div className="italic ml-8 mb-4">“The scrolls we have now may be just the beginning. When part of the Villa of the Papyri was cleared in the 1990s, archaeologists realized that the building was much larger than previously thought, with two unexcavated levels. At the very least, these floors likely contain more papyri in cabinets and carrying cases. And it’s probable that they conceal a far greater treasure.</div>
 

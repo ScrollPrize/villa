@@ -757,14 +757,13 @@
 }
 
 /* --------------------------------------------------------------------------
-   Partners — one monochrome logo row + funders list.
+   Partners — one monochrome logo row.
    -------------------------------------------------------------------------- */
 .vc-landing .vc-partners {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 32px 48px;
-  margin-bottom: 48px;
 }
 .vc-landing .vc-partners__img {
   display: block;
@@ -779,13 +778,6 @@
 }
 .vc-landing .vc-partners__link:hover .vc-partners__img {
   opacity: 1;
-}
-.vc-landing .vc-funders__title {
-  font-size: 1.375rem;
-  font-weight: 650;
-  letter-spacing: 0;
-  color: var(--vc-text);
-  margin: 0 0 12px;
 }
 
 /* Focus visibility for the row/name links introduced here. */

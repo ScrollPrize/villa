@@ -42,6 +42,8 @@ import JsonLd from '@site/src/components/JsonLd';
 
 # Curated Datasets
 
+<div className="opacity-60 mb-8 italic">July 2025</div>
+
 The data available through Vesuvius Challenge is large, frequently updated, and can be overwhelming to navigate.
 
 Here are some organized datasets suited for particular tasks or subproblems.

@@ -339,6 +339,19 @@ const config = {
             to: "/unwrapping",
             from: "/open_problem_rep",
           },
+          // Pages retired in the C6 fix round — keep the URLs alive.
+          {
+            to: "/data",
+            from: "/data_segments",
+          },
+          {
+            to: "/data",
+            from: "/data_fragments",
+          },
+          {
+            to: "/",
+            from: "/background",
+          },
         ],
       },
     ],

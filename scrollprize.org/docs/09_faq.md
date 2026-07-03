@@ -54,7 +54,7 @@ The [2024 prize](2024_prizes) deadlines closed on **December 31, 2024**, and we 
 
 ### What's the historical background of Herculaneum and the scrolls?
 
-We have a [background page](background) for that!
+The story of the villa and its scrolls is told in [Our story](/#our-story) on the landing page!
 
 ### Where can I read the texts Vesuvius Challenge has uncovered?
 

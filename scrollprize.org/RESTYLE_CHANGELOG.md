@@ -94,6 +94,20 @@ Pipeline: multi-agent (design audit from full-page screenshots → token foundat
 **Files:** `src/css/{chrome,landing}.css`, `src/components/{Landing,TutorialsTop}.js`, `docs/{22_firstletters,26_grandprize,34_prizes,36_firstscroll}.md`.
 **Verification:** build green; targeted capture: drawer populated on solid bg (screenshot-verified), no desktop hamburger, 0 overflow / 0 small taps / 0 console errors on `/` and `/get_started` × 5 viewports; landing single-tile (<8,000px).
 
+## C7 — owner requests: real stats, PHerc 1667, deeper IA pruning, landing folds
+
+**Why:** direct instructions from Giorgio during the iteration round (given to the fix agent mid-run).
+**What (all seven requests):**
+1. Hero stat strip now uses real counts — `$1,800,500 awarded · 35 scrolls scanned · 1 scroll fully read` (35 sourced from the atlas dashboard totals); stale copy fixed; 2026 story chapter retitled "The first scroll is read." featuring PHerc. 1667 → `/firstscroll`.
+2. Landing folds (all content preserved behind native `<details>` expanders with counts): Citizens sponsors (28), Advisors & Alumni (17), Papyrology Advisors (6), and the 79 AD–2015 "backstory" story beats. Final landing height **6,971px desktop** (baseline ~10,800, −35%) / 10,265px mobile (from 14,226).
+3. Segments + Fragments data pages deleted; redirects `/data_segments→/data`, `/data_fragments→/data`; 6 inbound refs fixed; Data sidebar slimmed.
+4. Curated Datasets page gains the standard date line (July 2025) under its h1.
+5. History page (`/background`) deleted with redirect → `/` (the landing's "Our story" covers it); "The Scrolls" sidebar category kept holding Villa model + Livestreams; FAQ/grandprize refs repointed.
+6. Jobs page gains a "start as a contributor" note (open prizes + Discord path).
+7. EduceLab funders block removed from the landing (partners row stays; firstletters anchor repointed to `/#partners`).
+**Files:** `src/components/Landing.js`, `src/css/{landing,chrome}.css`, `sidebars.js`, `docusaurus.config.js`, 11 docs edited, 3 docs deleted.
+**Verification:** build green (strict link check); redirect stubs serve 200 for all three removed slugs (no URL dies); harness on /, /data, /faq, /jobs + /get_started: 30/30 combos with 0 console errors, 0 overflow, 0 small tap targets; 773 local media refs across 87 pages all resolve.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
