@@ -1198,11 +1198,19 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
         oneSegmentSample,
         remoteRoot,
         [this](const OpenDataSampleDownloadProgress& progress) {
+            const QString status = qstr(progress.status);
+            const bool transforming = status.startsWith(QStringLiteral("transform-"));
             if (!progress.segmentId.empty()) {
-                const QString message = tr("Syncing %1: %2/%3 files")
-                    .arg(qstr(progress.segmentId))
-                    .arg(progress.completedFiles)
-                    .arg(progress.totalFiles);
+                const QString message = transforming
+                    ? tr("Transforming %1 -> %2: %3/%4 transforms")
+                          .arg(qstr(progress.segmentId))
+                          .arg(qstr(progress.fileName))
+                          .arg(progress.completedSegments + progress.failedSegments)
+                          .arg(progress.totalSegments)
+                    : tr("Syncing %1: %2/%3 files")
+                          .arg(qstr(progress.segmentId))
+                          .arg(progress.completedFiles)
+                          .arg(progress.totalFiles);
                 QMetaObject::invokeMethod(this, [this, message]() {
                     setStatus(message);
                 }, Qt::QueuedConnection);
@@ -1242,15 +1250,27 @@ void OpenDataCatalogWindow::syncSelectedSampleCache()
         remoteRoot,
         [this](const OpenDataSampleDownloadProgress& progress) {
             QString message;
+            const QString status = qstr(progress.status);
+            const bool transforming = status.startsWith(QStringLiteral("transform-"));
             if (!progress.segmentId.empty()) {
-                message = tr("Syncing %1: %2/%3 files")
-                    .arg(qstr(progress.segmentId))
-                    .arg(progress.completedFiles)
-                    .arg(progress.totalFiles);
+                message = transforming
+                    ? tr("Transforming %1 -> %2: %3/%4 transforms")
+                          .arg(qstr(progress.segmentId))
+                          .arg(qstr(progress.fileName))
+                          .arg(progress.completedSegments + progress.failedSegments)
+                          .arg(progress.totalSegments)
+                    : tr("Syncing %1: %2/%3 files")
+                          .arg(qstr(progress.segmentId))
+                          .arg(progress.completedFiles)
+                          .arg(progress.totalFiles);
             } else {
-                message = tr("Syncing local data: %1/%2 files")
-                    .arg(progress.completedFiles)
-                    .arg(progress.totalFiles);
+                message = transforming
+                    ? tr("Transforming segments: %1/%2 transforms")
+                          .arg(progress.completedSegments + progress.failedSegments)
+                          .arg(progress.totalSegments)
+                    : tr("Syncing local data: %1/%2 files")
+                          .arg(progress.completedFiles)
+                          .arg(progress.totalFiles);
             }
             QMetaObject::invokeMethod(this, [this, message]() {
                 setStatus(message);

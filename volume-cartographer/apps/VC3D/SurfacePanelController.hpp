@@ -108,6 +108,7 @@ public:
     void reloadSurfacesFromDisk();
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
+    void setTransformWarning(const QString& warningText);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
     bool cycleToNextVisibleSegment();
@@ -185,6 +186,7 @@ private:
                                bool enabledInspect);
     void logSurfaceLoadSummary() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
+    void applyTransformWarningStyle(SurfaceTreeWidgetItem* item);
     bool cycleVisibleSegment(int direction);
     std::shared_ptr<QuadSurface> getSurfaceById(const std::string& id) const;
 
@@ -204,5 +206,6 @@ private:
     bool _selectionLocked{false};
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};
+    QString _transformWarningText;
     std::unordered_set<std::string> _highlightedSurfaceIds;
 };

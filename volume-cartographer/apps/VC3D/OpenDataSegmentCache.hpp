@@ -41,6 +41,8 @@ struct OpenDataSegmentCacheReconcileResult {
     int attachedSegmentEntries = 0;
     int skippedTifxyzSegments = 0;
     int failedTifxyzSegments = 0;
+    int transformedTifxyzSegments = 0;
+    int failedTransformedTifxyzSegments = 0;
     std::vector<std::string> messages;
 };
 
@@ -58,12 +60,25 @@ struct OpenDataInkDetectionEntry {
 
 [[nodiscard]] std::filesystem::path openDataSegmentCacheRoot(
     const std::filesystem::path& remoteCacheRoot,
-    const OpenDataSample& sample);
+    const OpenDataSample& sample,
+    const std::string& sourceVolumeId);
 
 [[nodiscard]] std::filesystem::path openDataSegmentCacheDirectory(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSample& sample,
     const OpenDataSegment& segment);
+
+[[nodiscard]] std::filesystem::path openDataTransformedSegmentCacheRoot(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const std::string& sourceVolumeId,
+    const std::string& targetVolumeId);
+
+[[nodiscard]] std::filesystem::path openDataTransformedSegmentCacheDirectory(
+    const std::filesystem::path& remoteCacheRoot,
+    const OpenDataSample& sample,
+    const OpenDataSegment& segment,
+    const std::string& targetVolumeId);
 
 [[nodiscard]] std::filesystem::path openDataEditableSegmentRoot(
     const std::filesystem::path& remoteCacheRoot,
@@ -94,5 +109,10 @@ OpenDataSegmentCacheReconcileResult reconcileOpenDataSampleSegments(
     const std::filesystem::path& remoteCacheRoot,
     const OpenDataSampleProgressCallback& progressCallback = {},
     bool forceRefresh = false);
+
+OpenDataSegmentCacheReconcileResult attachExistingOpenDataSegmentCaches(
+    VolumePkg& pkg,
+    const OpenDataSample& sample,
+    const std::filesystem::path& remoteCacheRoot);
 
 } // namespace vc3d::opendata

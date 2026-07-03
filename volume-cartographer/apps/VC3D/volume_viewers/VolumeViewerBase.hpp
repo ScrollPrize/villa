@@ -86,6 +86,7 @@ public:
     virtual void adjustSurfaceOffset(float delta) = 0;
     virtual void resetSurfaceOffsets() = 0;
     virtual void fitSurfaceInView() = 0;
+    virtual void resetViewForCurrentContent(bool forceRender = false) { (void)forceRender; }
 
     // --- Data access ---
     virtual Surface* currentSurface() const = 0;

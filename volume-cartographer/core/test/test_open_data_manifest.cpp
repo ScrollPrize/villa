@@ -415,7 +415,9 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
                            ("vc_open_data_sample_project_test_" + std::to_string(getpid()));
     std::filesystem::remove_all(cacheRoot);
 
-    const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
+    const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    CHECK(segmentDir.parent_path().filename() == "vol1");
+    CHECK(segmentDir.parent_path().parent_path().filename() == "PHerc0139");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     const auto* tifxyz = preferredTifxyzArtifact(sample.segments.front());
@@ -496,7 +498,9 @@ TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts"
                            ("vc_open_data_transformed_segment_test_" + std::to_string(getpid()));
     std::filesystem::remove_all(cacheRoot);
 
-    const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
+    const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    CHECK(segmentDir.parent_path().filename() == "vol1");
+    CHECK(segmentDir.parent_path().parent_path().filename() == "PHerc0139");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     const cv::Size fixtureGridSize = tifxyzGridSize(fixtureSegment);
@@ -528,6 +532,81 @@ TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts"
     std::filesystem::remove_all(cacheRoot);
 }
 
+TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
+{
+    auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    sample.volumes.push_back(targetVolume);
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_volume_transform_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto sourceDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    const auto transformedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front(), "vol2");
+    CHECK(sourceDir.parent_path().filename() == "vol1");
+    CHECK(sourceDir.parent_path().parent_path().filename() == "PHerc0139");
+    CHECK(transformedDir.parent_path().filename() == "vol2");
+    CHECK(transformedDir.parent_path().parent_path().filename() == "PHerc0139");
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    writeFile(sourceDir / "meta.json",
+              R"({"type":"seg","uuid":"20260311000000.tmp-12345","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", sourceDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", sourceDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", sourceDir / "z.tif");
+    writeFile(sourceDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", sample.segments.front().id},
+                  {"resolved_http_url", preferredTifxyzArtifact(sample.segments.front())->resolvedUrl},
+                  {"cache_state", "current"}
+              }.dump());
+
+    auto pkg = VolumePkg::newEmpty();
+    OpenDataSampleProjectResult result;
+    attachOpenDataSampleSegments(*pkg, sample, cacheRoot, result);
+
+    CHECK(result.cachedTifxyzSegments == 1);
+    CHECK(result.transformedTifxyzSegments == 1);
+    REQUIRE(std::filesystem::is_regular_file(transformedDir / "meta.json"));
+    REQUIRE(pkg->segmentEntries().size() == 2);
+    CHECK(std::any_of(pkg->segmentEntries().begin(),
+                      pkg->segmentEntries().end(),
+                      [](const vc::project::Entry& entry) {
+                          return std::find(entry.tags.begin(),
+                                           entry.tags.end(),
+                                           "vc-open-data-target-volume-id:vol2") != entry.tags.end();
+                      }));
+
+    std::ifstream metaIn(transformedDir / "meta.json", std::ios::binary);
+    REQUIRE(metaIn.good());
+    const auto meta = nlohmann::json::parse(metaIn);
+    CHECK(meta.at("vc_open_data_transform_source_volume_id").get<std::string>() == "vol1");
+    CHECK(meta.at("vc_open_data_transform_target_volume_id").get<std::string>() == "vol2");
+    CHECK(meta.at("vc_open_data_volume_transform_matrix")[0][3].get<double>() == doctest::Approx(10.0));
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
 {
     OpenDataSample sample;
@@ -554,6 +633,115 @@ TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
                       secondResult.messages.end(),
                       [](const std::string& message) {
                           return message.find("Loaded cached sample project") != std::string::npos;
+                      }));
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cached transforms")
+{
+    const auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_cached_project_segments_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto segmentDir = openDataSegmentCacheDirectory(
+        cacheRoot,
+        sample,
+        sample.segments.front());
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    const auto* tifxyz = preferredTifxyzArtifact(sample.segments.front());
+    REQUIRE(tifxyz != nullptr);
+    writeFile(segmentDir / "meta.json",
+              R"({"type":"seg","uuid":"20260311000000.tmp-12345","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", segmentDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", segmentDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", segmentDir / "z.tif");
+    writeFile(segmentDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", sample.segments.front().id},
+                  {"resolved_http_url", tifxyz->resolvedUrl},
+                  {"cache_state", "current"}
+              }.dump());
+
+    OpenDataSampleProjectResult firstResult;
+    std::vector<OpenDataSampleDownloadProgress> firstProgressEvents;
+    auto first = createOpenDataSampleProject(
+        sample,
+        cacheRoot,
+        &firstResult,
+        [&](const OpenDataSampleDownloadProgress& progress) {
+            firstProgressEvents.push_back(progress);
+        });
+    REQUIRE(first);
+    CHECK(firstResult.cachedTifxyzSegments == 1);
+    CHECK(firstResult.attachedSegmentEntries == 1);
+    REQUIRE(!firstProgressEvents.empty());
+
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    targetVolume.dataFormat = "zarr";
+    OpenDataArtifact targetArtifact;
+    targetArtifact.type = "zarr";
+    targetArtifact.resolvedUrl = "http://127.0.0.1:9/vol2.zarr";
+    targetVolume.artifacts.push_back(std::move(targetArtifact));
+    sample.volumes.push_back(std::move(targetVolume));
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+    const auto transformedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot,
+        sample,
+        sample.segments.front(),
+        "vol2");
+    writeFile(transformedDir / "meta.json",
+              R"({"type":"seg","uuid":"PHerc0139-20260311000000","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", transformedDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", transformedDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", transformedDir / "z.tif");
+
+    OpenDataSampleProjectResult secondResult;
+    std::vector<OpenDataSampleDownloadProgress> secondProgressEvents;
+    auto second = createOpenDataSampleProject(
+        sample,
+        cacheRoot,
+        &secondResult,
+        [&](const OpenDataSampleDownloadProgress& progress) {
+            secondProgressEvents.push_back(progress);
+    });
+    REQUIRE(second);
+    CHECK(secondResult.cachedTifxyzSegments == 1);
+    CHECK(secondResult.transformedTifxyzSegments == 1);
+    CHECK(secondResult.attachedSegmentEntries == 1);
+    CHECK(secondProgressEvents.empty());
+    REQUIRE(second->segmentEntries().size() == 2);
+    CHECK(std::any_of(second->segmentEntries().begin(),
+                      second->segmentEntries().end(),
+                      [](const vc::project::Entry& entry) {
+                          return std::find(entry.tags.begin(),
+                                           entry.tags.end(),
+                                           "vc-open-data-target-volume-id:vol2") != entry.tags.end();
+                      }));
+    CHECK(std::any_of(secondResult.messages.begin(),
+                      secondResult.messages.end(),
+                      [](const std::string& message) {
+                          return message.find("Reused cached sample project segment entries") != std::string::npos;
                       }));
 
     std::filesystem::remove_all(cacheRoot);
