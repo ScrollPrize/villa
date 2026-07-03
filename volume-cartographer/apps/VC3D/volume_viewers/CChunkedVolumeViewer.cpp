@@ -437,6 +437,14 @@ std::uint64_t surfaceCellTileKey(int col, int row)
     return surfaceTileKey(tx, ty);
 }
 
+bool rectContains(const cv::Rect& outer, const cv::Rect& inner)
+{
+    return inner.x >= outer.x &&
+           inner.y >= outer.y &&
+           inner.x + inner.width <= outer.x + outer.width &&
+           inner.y + inner.height <= outer.y + outer.height;
+}
+
 QString formatVec3(const cv::Vec3f& v)
 {
     return QString("(%1, %2, %3)")
