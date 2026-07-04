@@ -75,6 +75,7 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    RemoteVolumeCachePaths.cpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp

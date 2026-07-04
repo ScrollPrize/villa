@@ -480,6 +480,8 @@ vc_add_test(NAME test_volume_static_read)
 
 vc_add_test(NAME test_volume_pyramid)
 
+vc_add_test(NAME test_cache_compression)
+
 vc_add_test(NAME test_chunk_cache_persist)
 
 vc_add_test(NAME test_zarr_chunk_fetcher)

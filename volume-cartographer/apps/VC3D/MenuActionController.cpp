@@ -11,6 +11,7 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
+#include "RemoteVolumeCachePaths.hpp"
 #include "SettingsDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
@@ -956,8 +957,29 @@ void MenuActionController::showSettingsDialog()
         return;
     }
 
+    CState* state = _window->_state;
+    const auto cacheDir = state
+        ? vc3d::persistentCacheDirForVolume(state->currentVolume(), state)
+        : std::filesystem::path{};
+
+    // Chunk geometry drives the delta-zyx filter used when compacting the
+    // current volume's disk cache from the dialog.
+    CacheChunkLayout chunkLayout;
+    if (!cacheDir.empty()) {
+        if (auto volume = state->currentVolume()) {
+            if (auto* chunked = volume->chunkedCache()) {
+                chunkLayout.elemSize =
+                    chunked->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
+                for (int level = 0; level < chunked->numLevels(); ++level)
+                    chunkLayout.levelChunkShapes.push_back(chunked->chunkShape(level));
+            }
+        }
+    }
+
     auto* dialog = new SettingsDialog(
-        _window->_state ? _window->_state->vpkg() : nullptr,
+        state ? state->vpkg() : nullptr,
+        cacheDir,
+        std::move(chunkLayout),
         _window);
     dialog->exec();
     if (dialog->outputSegmentsChanged()) {

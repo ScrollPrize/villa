@@ -233,12 +233,12 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
-    // When true the disk cache stores c3d-compressed sharded zarr (smaller,
-    // lossy).  When false it stores source chunk bytes unchanged at the
-    // volume's native chunk size (larger, lossless).  Both modes use
-    // independent directories so they can coexist.  Requires restart.
-    constexpr auto DISK_CACHE_COMPRESSED = "perf/disk_cache_compressed";
-    constexpr bool DISK_CACHE_COMPRESSED_DEFAULT = true;
+    // When true, raw chunks downloaded from remote volumes are stored in the
+    // persistent disk cache zstd-compressed (lossless, fast). Reading
+    // understands both formats regardless of this flag; it only controls the
+    // write format. Requires restart.
+    constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
+    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = false;
 
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:

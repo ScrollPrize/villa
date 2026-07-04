@@ -2,6 +2,7 @@
 
 #include <utils/thread_pool.hpp>
 
+#include "vc/core/util/CacheCompression.hpp"
 #include "vc/core/util/Logging.hpp"
 
 #include <algorithm>
@@ -105,8 +106,24 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
                 throw std::invalid_argument("ChunkCache chunk shape must be positive");
         }
     }
+    state_->options_.compressPersistentCache =
+        state_->options_.compressPersistentCache || persistentCompressionDefault();
     if (state_->options_.persistentCachePath)
         startPersistentCacheSizeScan(state_);
+}
+
+namespace {
+std::atomic_bool g_persistentCompressionDefault{false};
+}
+
+void ChunkCache::setPersistentCompressionDefault(bool enabled)
+{
+    g_persistentCompressionDefault.store(enabled, std::memory_order_relaxed);
+}
+
+bool ChunkCache::persistentCompressionDefault()
+{
+    return g_persistentCompressionDefault.load(std::memory_order_relaxed);
 }
 
 ChunkCache::~ChunkCache()
@@ -509,12 +526,10 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
     enforceCapacityLocked(state);
 }
 
-std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& state, const ChunkKey& key)
-{
-    if (!state.options_.persistentCachePath)
-        return std::nullopt;
+namespace {
 
-    const auto path = persistentPath(state, key);
+std::optional<std::vector<std::byte>> readFileBytes(const std::filesystem::path& path)
+{
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file)
         return std::nullopt;
@@ -528,9 +543,34 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& st
     file.read(reinterpret_cast<char*>(bytes.data()), size);
     if (!file)
         return std::nullopt;
-    if (state.fetchers_.at(static_cast<std::size_t>(key.level))
-            ->persistentCacheExtension(key) == ".bin" &&
-        bytes.size() != expectedChunkBytes(state, key))
+    return bytes;
+}
+
+} // namespace
+
+std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& state, const ChunkKey& key)
+{
+    if (!state.options_.persistentCachePath)
+        return std::nullopt;
+
+    const bool rawEntry = persistentEntryIsRaw(state, key);
+    if (rawEntry) {
+        // Compressed variant wins when both formats exist: compaction and
+        // compressed writes leave ".zst" as the authoritative copy.
+        if (auto compressed = readFileBytes(persistentCompressedPath(state, key))) {
+            auto decompressed = vc::cacheDecompress(
+                std::span<const std::byte>(compressed->data(), compressed->size()),
+                expectedChunkBytes(state, key));
+            if (decompressed)
+                return decompressed;
+            // Corrupt compressed entry — fall through to ".bin"/refetch.
+        }
+    }
+
+    auto bytes = readFileBytes(persistentPath(state, key));
+    if (!bytes)
+        return std::nullopt;
+    if (rawEntry && bytes->size() != expectedChunkBytes(state, key))
         return std::nullopt;
     return bytes;
 }
@@ -549,8 +589,7 @@ bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
 {
     if (!state || !state->options_.persistentCachePath || !bytes)
         return false;
-    if (state->fetchers_.at(static_cast<std::size_t>(key.level))
-            ->persistentCacheExtension(key) == ".bin" &&
+    if (persistentEntryIsRaw(*state, key) &&
         bytes->size() != expectedChunkBytes(*state, key))
         return false;
 
@@ -576,12 +615,28 @@ void ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
 {
     if (!state.options_.persistentCachePath)
         return;
-    if (state.fetchers_.at(static_cast<std::size_t>(key.level))
-            ->persistentCacheExtension(key) == ".bin" &&
-        bytes.size() != expectedChunkBytes(state, key))
+    const bool rawEntry = persistentEntryIsRaw(state, key);
+    if (rawEntry && bytes.size() != expectedChunkBytes(state, key))
         return;
 
-    const auto path = persistentPath(state, key);
+    const bool compress = rawEntry && state.options_.compressPersistentCache;
+    const std::vector<std::byte>* payload = &bytes;
+    std::vector<std::byte> compressed;
+    if (compress) {
+        try {
+            compressed = vc::cacheCompress(
+                std::span<const std::byte>(bytes.data(), bytes.size()),
+                state.levels_[static_cast<std::size_t>(key.level)].chunkShape,
+                dtypeSize(state.dtype_));
+        } catch (const std::exception& e) {
+            Logger()->warn("ChunkCache persistent-cache compression failed: {}", e.what());
+            return;
+        }
+        payload = &compressed;
+    }
+
+    const auto path = compress ? persistentCompressedPath(state, key)
+                               : persistentPath(state, key);
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec)
@@ -592,8 +647,8 @@ void ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
         std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
         if (!file)
             return;
-        file.write(reinterpret_cast<const char*>(bytes.data()),
-                   static_cast<std::streamsize>(bytes.size()));
+        file.write(reinterpret_cast<const char*>(payload->data()),
+                   static_cast<std::streamsize>(payload->size()));
         if (!file)
             return;
     }
@@ -607,10 +662,23 @@ void ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
         std::filesystem::remove(tmp, ec);
         return;
     }
-    const auto newSize = regularFileSize(path).value_or(bytes.size());
+    std::int64_t removedCounterpart = 0;
+    if (rawEntry) {
+        // Drop the other-format copy so the freshly written file is
+        // authoritative (reads prefer ".zst" over ".bin").
+        const auto counterpart = compress ? persistentPath(state, key)
+                                          : persistentCompressedPath(state, key);
+        if (const auto size = regularFileSize(counterpart)) {
+            std::error_code removeEc;
+            if (std::filesystem::remove(counterpart, removeEc) && !removeEc)
+                removedCounterpart = static_cast<std::int64_t>(*size);
+        }
+    }
+    const auto newSize = regularFileSize(path).value_or(payload->size());
     addPersistentCacheBytesDelta(
         state,
-        static_cast<std::int64_t>(newSize) - static_cast<std::int64_t>(oldSize));
+        static_cast<std::int64_t>(newSize) - static_cast<std::int64_t>(oldSize) -
+            removedCounterpart);
 }
 
 void ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
@@ -658,6 +726,21 @@ std::filesystem::path ChunkCache::persistentPath(const State& state, const Chunk
            (std::to_string(key.ix) +
             state.fetchers_.at(static_cast<std::size_t>(key.level))
                 ->persistentCacheExtension(key));
+}
+
+std::filesystem::path ChunkCache::persistentCompressedPath(const State& state, const ChunkKey& key)
+{
+    return *state.options_.persistentCachePath /
+           ("level_" + std::to_string(key.level)) /
+           std::to_string(key.iz) /
+           std::to_string(key.iy) /
+           (std::to_string(key.ix) + vc::kCompressedCacheExtension);
+}
+
+bool ChunkCache::persistentEntryIsRaw(const State& state, const ChunkKey& key)
+{
+    return state.fetchers_.at(static_cast<std::size_t>(key.level))
+               ->persistentCacheExtension(key) == ".bin";
 }
 
 std::filesystem::path ChunkCache::persistentEmptyPath(const State& state, const ChunkKey& key)

@@ -2,6 +2,7 @@
 
 #include "CState.hpp"
 #include "elements/ViewerStatsBar.hpp"
+#include "RemoteVolumeCachePaths.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -145,38 +146,6 @@ int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
             return -1;
     }
     return axis;
-}
-
-std::string stableHexHash(const std::string& value)
-{
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (unsigned char c : value) {
-        hash ^= static_cast<std::uint64_t>(c);
-        hash *= 1099511628211ULL;
-    }
-    std::ostringstream out;
-    out << std::hex << hash;
-    return out.str();
-}
-
-std::string normalizedVolumeCacheIdentity(const std::shared_ptr<Volume>& volume)
-{
-    if (!volume)
-        return {};
-    if (volume->isRemote()) {
-        return "remote|" + volume->remoteUrl() +
-               "|base=" + std::to_string(volume->baseScaleLevel()) +
-               "|id=" + volume->id() +
-               "|cache_schema=remote_sharded_ranges_v1";
-    }
-
-    std::error_code ec;
-    auto path = std::filesystem::weakly_canonical(volume->path(), ec);
-    if (ec)
-        path = std::filesystem::absolute(volume->path(), ec);
-    if (ec)
-        path = volume->path();
-    return "local|" + path.string() + "|id=" + volume->id();
 }
 
 uint32_t alphaBlendArgb(uint32_t base, uint32_t overlay, float alpha)
@@ -551,24 +520,6 @@ float fitScaleForExtent(float extentU, float extentV, int viewportW, int viewpor
     return std::clamp(std::min(scaleU, scaleV) * kFitPadding, kMinScale, kMaxScale);
 }
 
-std::filesystem::path remoteCacheRootForState(const CState* state)
-{
-    // Suggestion order: per-volpkg setting first (so projects with an
-    // explicit cache stay co-located when no host mount is present), then
-    // the user's persisted setting. remoteCachePath() ignores both when
-    // /volpkgs or /ephemeral is mounted.
-    QString suggestion;
-    if (state && state->vpkg()) {
-        suggestion = QString::fromStdString(state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
-    }
-    if (suggestion.isEmpty()) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        suggestion =
-            settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR).toString();
-    }
-    return vc3d::remoteCachePath(suggestion).toStdString();
-}
-
 std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
                                                                 std::size_t decodedByteCapacity,
                                                                 const CState* state)
@@ -583,8 +534,7 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
     options.maxConcurrentReads = 16;
     options.detectAllFillChunks = volume->isRemote();
     if (volume->isRemote()) {
-        const auto cacheRoot = remoteCacheRootForState(state);
-        options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
+        options.persistentCachePath = vc3d::persistentCacheDirForVolume(volume, state);
     }
 
     return volume->createChunkCache(std::move(options));
@@ -600,9 +550,9 @@ std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::sha
     const std::size_t capacity = decodedByteCapacity > 0
         ? decodedByteCapacity
         : streamingCacheCapacityBytes(nullptr);
-    const std::string key = normalizedVolumeCacheIdentity(volume) +
+    const std::string key = vc3d::normalizedVolumeCacheIdentity(volume) +
                             "|decoded=" + std::to_string(capacity) +
-                            "|cache=" + (volume->isRemote() ? remoteCacheRootForState(state).string() : std::string{});
+                            "|cache=" + (volume->isRemote() ? vc3d::remoteCacheRootForState(state).string() : std::string{});
 
     static std::mutex cacheMutex;
     static std::unordered_map<std::string, std::weak_ptr<vc::render::ChunkCache>> caches;
