@@ -1264,10 +1264,13 @@ struct SurfacePatchIndex::Impl {
     // Sub-iterates at triStride to find the closest sub-quad, returning a
     // PatchHit with u,v expressed in tile-local source-mesh-cell units
     // (range [0, tileStride], not bary over the full tile).
+    // earlyOutDistSq >= 0 returns as soon as any sub-quad hit is at least that
+    // close — for callers that only need "within tolerance", not the minimum.
     static PatchHit evaluatePatch(const PatchRecord& rec,
                                   int tileStride,
                                   int triStride,
-                                  const cv::Vec3f& point) {
+                                  const cv::Vec3f& point,
+                                  float earlyOutDistSq = -1.0f) {
         PatchHit best;
         triStride = std::max(1, triStride);
         tileStride = std::max(triStride, tileStride);
@@ -1304,6 +1307,11 @@ struct SurfacePatchIndex::Impl {
                     float u = clamp01(tri.bary[0] + tri.bary[1]);
                     float v = clamp01(tri.bary[1] + tri.bary[2]);
                     recordHit(u, v, tri.distSq);
+                }
+
+                if (earlyOutDistSq >= 0.0f && best.valid &&
+                    best.distSq <= earlyOutDistSq) {
+                    return best;
                 }
             }
         }
@@ -2151,6 +2159,107 @@ SurfacePatchIndex::locate(const PointQuery& pointQuery) const
     }
     best.distance = std::sqrt(bestDistSq);
     return best;
+}
+
+std::optional<SurfacePatchIndex::LookupResult>
+SurfacePatchIndex::locateAny(const PointQuery& pointQuery) const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
+        !isFinitePoint(pointQuery.worldPoint)) {
+        return std::nullopt;
+    }
+
+    const float tol = std::max(pointQuery.tolerance, 0.0f);
+    Impl::Point3 min_pt(pointQuery.worldPoint[0] - tol,
+                        pointQuery.worldPoint[1] - tol,
+                        pointQuery.worldPoint[2] - tol);
+    Impl::Point3 max_pt(pointQuery.worldPoint[0] + tol,
+                        pointQuery.worldPoint[1] + tol,
+                        pointQuery.worldPoint[2] + tol);
+    Impl::Box3 query(min_pt, max_pt);
+
+    const float toleranceSq = tol * tol;
+
+    // Filter directly against the caller's sets. makeRawSurfaceFilter copies
+    // the include/exclude sets per call, which is prohibitive when this runs
+    // per sample point with thousands of included surfaces.
+    const SurfaceFilter& filter = pointQuery.surfaces;
+    QuadSurface* const only = filter.only ? filter.only.get() : nullptr;
+    if ((filter.includeRaw && filter.includeRaw->empty()) ||
+        (!filter.includeRaw && filter.include && filter.include->empty())) {
+        return std::nullopt;
+    }
+    // Non-owning aliasing key for lookups in shared_ptr-keyed sets.
+    const auto sharedKey = [](QuadSurface* s) {
+        return std::shared_ptr<QuadSurface>(std::shared_ptr<QuadSurface>(), s);
+    };
+    const auto accepts = [&](QuadSurface* s) -> bool {
+        if (!s || (only && s != only)) {
+            return false;
+        }
+        if (filter.includeRaw) {
+            if (filter.includeRaw->find(s) == filter.includeRaw->end()) {
+                return false;
+            }
+        } else if (filter.include) {
+            if (filter.include->find(sharedKey(s)) == filter.include->end()) {
+                return false;
+            }
+        }
+        if (filter.excludeRaw &&
+            filter.excludeRaw->find(s) != filter.excludeRaw->end()) {
+            return false;
+        }
+        if (filter.exclude &&
+            filter.exclude->find(sharedKey(s)) != filter.exclude->end()) {
+            return false;
+        }
+        return true;
+    };
+
+    try {
+        for (auto it = impl_->tree->qbegin(bgi::intersects(query));
+             it != impl_->tree->qend(); ++it) {
+            const Impl::PatchRecord& rec = it->second;
+            if (!accepts(rec.surface)) {
+                continue;
+            }
+
+            Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
+                                                     impl_->samplingStride,
+                                                     pointQuery.worldPoint,
+                                                     toleranceSq);
+            if (!hit.valid || hit.distSq > toleranceSq) {
+                continue;
+            }
+
+            SurfacePatchIndex::LookupResult result;
+            const cv::Vec3f center = rec.surface->center();
+            const cv::Vec2f scale = rec.surface->scale();
+            const float absX = static_cast<float>(rec.i) + hit.u;
+            const float absY = static_cast<float>(rec.j) + hit.v;
+            result.ptr = {
+                absX - center[0] * scale[0],
+                absY - center[1] * scale[1],
+                0.0f
+            };
+            if (auto srIt = impl_->surfaceRecords.find(rec.surface);
+                srIt != impl_->surfaceRecords.end()) {
+                result.surface = srIt->second.surface;
+            }
+            result.distance = std::sqrt(hit.distSq);
+            return result;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] locateAny query failed: " << e.what() << std::endl;
+        return std::nullopt;
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] locateAny query failed: unknown exception" << std::endl;
+        return std::nullopt;
+    }
+
+    return std::nullopt;
 }
 
 std::vector<SurfacePatchIndex::LookupResult>

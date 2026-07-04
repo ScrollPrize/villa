@@ -104,6 +104,12 @@ public:
     bool containsSurface(const SurfacePtr& surface) const;
 
     std::optional<LookupResult> locate(const PointQuery& query) const;
+    // Cheap overlap-style variant of locate(): returns the first accepted hit
+    // within tolerance instead of scanning every candidate for the nearest,
+    // and filters against the caller's include/exclude sets without copying
+    // them (locate() copies the sets per call). Safe to call concurrently
+    // from many threads while queries hold the shared lock.
+    std::optional<LookupResult> locateAny(const PointQuery& query) const;
     std::vector<LookupResult> locateAll(const PointQuery& query) const;
     std::vector<SurfacePtr> locateSurfaces(const PointQuery& query) const;
 
