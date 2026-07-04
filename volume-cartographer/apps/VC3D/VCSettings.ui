@@ -674,79 +674,24 @@
             </property>
            </widget>
           </item>
-          <item row="2" column="0" colspan="3">
-           <widget class="QCheckBox" name="chkVideoRecompress">
+          <item row="2" column="0" colspan="2">
+           <widget class="QCheckBox" name="chkCompressRemoteCache">
             <property name="text">
-             <string>Compress disk cache (c3d)</string>
+             <string>Compress remote volume disk cache (zstd, lossless)</string>
             </property>
             <property name="toolTip">
-             <string>When enabled, chunks fetched from remote volumes are re-encoded with the c3d codec before storing to the disk cache. Reduces disk usage but is lossy. When disabled, source chunk bytes are stored unchanged at the source volume's native chunk size. Both modes use separate directories. Requires restart.</string>
+             <string>When enabled, chunks downloaded from remote volumes are stored zstd-compressed in the disk cache. Lossless and fast; typically shrinks the cache severalfold. Existing cache entries stay readable either way. Requires restart.</string>
             </property>
            </widget>
           </item>
-          <item row="3" column="0">
-           <widget class="QLabel" name="labelVideoCodecType">
+          <item row="2" column="2">
+           <widget class="QPushButton" name="btnCompressExistingCache">
             <property name="text">
-             <string>Video codec</string>
+             <string>Compress existing cache...</string>
             </property>
-           </widget>
-          </item>
-          <item row="3" column="1">
-           <widget class="QComboBox" name="cmbVideoCodecType">
-            <item>
-             <property name="text">
-              <string>H.265</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>C3D (3D DCT)</string>
-             </property>
-            </item>
-           </widget>
-          </item>
-          <item row="4" column="0">
-           <widget class="QLabel" name="labelVideoQualityPreset">
-            <property name="text">
-             <string>Compression level</string>
-            </property>
-           </widget>
-          </item>
-          <item row="4" column="1">
-           <widget class="QComboBox" name="cmbVideoQualityPreset">
             <property name="toolTip">
-             <string>Controls quality vs compression ratio. Higher compression = more disk savings but lower fidelity.</string>
+             <string>Compress the already-downloaded, uncompressed chunks in the disk cache of the currently shown volume (zstd, lossless). Runs with multiple workers and can be cancelled.</string>
             </property>
-            <item>
-             <property name="text">
-              <string>Lossless (1x)</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/2 lossless size</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/4 lossless size</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/8 lossless size</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/16 lossless size</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>1/32 lossless size</string>
-             </property>
-            </item>
            </widget>
           </item>
           <item row="6" column="0">

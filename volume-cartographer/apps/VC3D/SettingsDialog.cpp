@@ -2,25 +2,37 @@
 
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/CacheCompression.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <fstream>
+#include <future>
 #include <thread>
 #include <utility>
+#include <vector>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileDialog>
 #include <QGridLayout>
 #include <QLabel>
+#include <QProgressDialog>
 #include <QSettings>
 #include <QMessageBox>
 #include <QToolTip>
 
 
 
-SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage, QWidget *parent)
+SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
+                               std::filesystem::path currentVolumeCacheDir,
+                               QWidget *parent)
     : QDialog(parent)
     , _volumePackage(std::move(volumePackage))
+    , _currentVolumeCacheDir(std::move(currentVolumeCacheDir))
 {
     setupUi(this);
 
@@ -98,17 +110,17 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage, QWidget
     if (auto* lbl = findChild<QLabel*>("labelIOThreads")) lbl->hide();
     if (spinIOThreads) spinIOThreads->hide();
 
-    // Disk-cache compression toggle (repurposed from old recompression UI)
-    chkVideoRecompress->setChecked(
-        settings.value(perf::DISK_CACHE_COMPRESSED, perf::DISK_CACHE_COMPRESSED_DEFAULT).toBool());
+    chkCompressRemoteCache->setChecked(
+        settings.value(perf::REMOTE_CACHE_COMPRESSION, perf::REMOTE_CACHE_COMPRESSION_DEFAULT).toBool());
 
-    // Codec-type and quality-preset combos are unused — keep hidden.
-    cmbVideoQualityPreset->hide();
-    cmbVideoCodecType->hide();
-    if (auto* label = findChild<QLabel*>("labelVideoQualityPreset"))
-        label->hide();
-    if (auto* label = findChild<QLabel*>("labelVideoCodecType"))
-        label->hide();
+    // Compacting an existing cache needs a currently shown remote volume.
+    btnCompressExistingCache->setEnabled(!_currentVolumeCacheDir.empty());
+    if (_currentVolumeCacheDir.empty()) {
+        btnCompressExistingCache->setToolTip(
+            tr("Open a remote volume first — compression applies to the disk cache of the currently shown volume."));
+    }
+    connect(btnCompressExistingCache, &QPushButton::clicked, this,
+            &SettingsDialog::compressExistingCache);
 
     connect(btnBrowseRemoteCachePath, &QPushButton::clicked, this, [this]{
         QString dir = QFileDialog::getExistingDirectory(this, tr("Select Remote Cache Directory"),
@@ -231,7 +243,7 @@ void SettingsDialog::accept()
     // Cache settings
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
-    settings.setValue(perf::DISK_CACHE_COMPRESSED, chkVideoRecompress->isChecked());
+    settings.setValue(perf::REMOTE_CACHE_COMPRESSION, chkCompressRemoteCache->isChecked());
 
     // Per-segment backup count: persist and apply live (no restart needed).
     if (spinSegmentBackupCount) {
@@ -245,6 +257,170 @@ void SettingsDialog::accept()
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 
     QDialog::accept();
+}
+
+namespace {
+
+// Compress one raw cache chunk in place: <name>.bin -> <name>.zst
+// (atomic tmp+rename, source removed on success). Returns false on failure;
+// the original file is left untouched in that case.
+bool compressCacheFile(const std::filesystem::path& binPath,
+                       std::uint64_t& bytesIn,
+                       std::uint64_t& bytesOut)
+{
+    namespace fs = std::filesystem;
+
+    std::vector<std::byte> input;
+    {
+        std::ifstream file(binPath, std::ios::binary | std::ios::ate);
+        if (!file)
+            return false;
+        const auto size = file.tellg();
+        if (size < 0)
+            return false;
+        input.resize(static_cast<std::size_t>(size));
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(input.data()), size);
+        if (!file)
+            return false;
+    }
+
+    std::vector<std::byte> compressed;
+    try {
+        compressed = vc::cacheCompress(std::span<const std::byte>(input.data(), input.size()));
+    } catch (const std::exception&) {
+        return false;
+    }
+
+    fs::path zstPath = binPath;
+    zstPath.replace_extension(vc::kCompressedCacheExtension);
+    const fs::path tmpPath = zstPath.string() + ".tmp";
+    {
+        std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!file)
+            return false;
+        file.write(reinterpret_cast<const char*>(compressed.data()),
+                   static_cast<std::streamsize>(compressed.size()));
+        if (!file) {
+            std::error_code ec;
+            fs::remove(tmpPath, ec);
+            return false;
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmpPath, zstPath, ec);
+    if (ec) {
+        fs::remove(zstPath, ec);
+        ec.clear();
+        fs::rename(tmpPath, zstPath, ec);
+    }
+    if (ec) {
+        fs::remove(tmpPath, ec);
+        return false;
+    }
+    fs::remove(binPath, ec);
+
+    bytesIn += input.size();
+    bytesOut += compressed.size();
+    return true;
+}
+
+} // namespace
+
+void SettingsDialog::compressExistingCache()
+{
+    namespace fs = std::filesystem;
+
+    const fs::path cacheDir = _currentVolumeCacheDir;
+    std::error_code ec;
+    if (cacheDir.empty() || !fs::is_directory(cacheDir, ec)) {
+        QMessageBox::information(this, tr("Compress cache"),
+            tr("No disk cache found for the currently shown volume."));
+        return;
+    }
+
+    // Uncompressed chunks are stored as ".bin"; ".zst" is already
+    // compressed and ".c3d"/".empty" entries have nothing to gain.
+    std::vector<fs::path> files;
+    for (auto it = fs::recursive_directory_iterator(
+             cacheDir, fs::directory_options::skip_permission_denied, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec)
+            break;
+        if (it->is_regular_file(ec) && it->path().extension() == ".bin")
+            files.push_back(it->path());
+    }
+    if (files.empty()) {
+        QMessageBox::information(this, tr("Compress cache"),
+            tr("The cache for the currently shown volume has no uncompressed chunks."));
+        return;
+    }
+
+    QProgressDialog progress(
+        tr("Compressing %1 cached chunks...").arg(files.size()),
+        tr("Cancel"), 0, static_cast<int>(files.size()), this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setValue(0);
+
+    std::atomic<std::size_t> nextIndex{0};
+    std::atomic<std::size_t> done{0};
+    std::atomic<std::size_t> failures{0};
+    std::atomic<std::uint64_t> totalIn{0};
+    std::atomic<std::uint64_t> totalOut{0};
+    std::atomic<bool> cancelled{false};
+
+    // std::async workers: VC3D pins OpenMP/cv::parallel_for_ to one thread,
+    // so explicit fan-out is the supported parallelism route here.
+    const std::size_t workerCount = std::min<std::size_t>(
+        files.size(),
+        std::max<std::size_t>(2, std::thread::hardware_concurrency() / 2));
+    std::vector<std::future<void>> workers;
+    workers.reserve(workerCount);
+    for (std::size_t w = 0; w < workerCount; ++w) {
+        workers.push_back(std::async(std::launch::async, [&]{
+            std::uint64_t bytesIn = 0;
+            std::uint64_t bytesOut = 0;
+            std::size_t localFailures = 0;
+            while (!cancelled.load(std::memory_order_relaxed)) {
+                const auto i = nextIndex.fetch_add(1, std::memory_order_relaxed);
+                if (i >= files.size())
+                    break;
+                if (!compressCacheFile(files[i], bytesIn, bytesOut))
+                    ++localFailures;
+                done.fetch_add(1, std::memory_order_relaxed);
+            }
+            totalIn += bytesIn;
+            totalOut += bytesOut;
+            failures += localFailures;
+        }));
+    }
+
+    while (done.load() < files.size() && !progress.wasCanceled()) {
+        progress.setValue(static_cast<int>(done.load()));
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    cancelled = progress.wasCanceled();
+    for (auto& worker : workers)
+        worker.wait();
+    progress.setValue(static_cast<int>(files.size()));
+
+    const auto gib = [](std::uint64_t bytes) {
+        return QString::number(static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), 'f', 2);
+    };
+    const std::size_t compressed = done.load() - failures.load();
+    QString summary =
+        tr("Compressed %1 of %2 chunks: %3 GiB -> %4 GiB.")
+            .arg(compressed)
+            .arg(files.size())
+            .arg(gib(totalIn.load()))
+            .arg(gib(totalOut.load()));
+    if (cancelled)
+        summary += tr("\nCancelled — the remaining chunks are unchanged and can be compressed later.");
+    if (failures.load() > 0)
+        summary += tr("\n%1 chunks could not be compressed and were left as-is.").arg(failures.load());
+    QMessageBox::information(this, tr("Compress cache"), summary);
 }
 
 // Expand string that contains a range definition from the user settings into an integer vector

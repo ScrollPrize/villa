@@ -12,6 +12,7 @@
 #include "VCSettings.hpp"
 #include "vc/core/Version.hpp"
 #include <QSettings>
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/CrashHandler.hpp"
@@ -293,6 +294,13 @@ auto main(int argc, char* argv[]) -> int
         // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
         QuadSurface::setBackupCount(
             settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
+
+        // Remote-volume disk-cache compression (zstd, lossless). Applied as a
+        // process-wide default so every ChunkCache picks it up, including the
+        // core-created ones used by blocking readers.
+        vc::render::ChunkCache::setPersistentCompressionDefault(
+            settings.value(perf::REMOTE_CACHE_COMPRESSION,
+                           perf::REMOTE_CACHE_COMPRESSION_DEFAULT).toBool());
     }
     if (parser.isSet(cacheSizeOption)) {
         bool ok = false;

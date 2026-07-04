@@ -38,6 +38,12 @@ public:
         std::size_t maxConcurrentReads = 16;
         bool detectAllFillChunks = true;
         std::optional<std::filesystem::path> persistentCachePath;
+        // Store raw (".bin") persistent-cache chunks zstd-compressed
+        // (".zst"). Reading handles both formats regardless of this flag;
+        // it only selects the write format. Combined (OR) with the
+        // process-wide default below at construction. Chunks whose source
+        // encoding is already compact (".c3d") are never recompressed.
+        bool compressPersistentCache = false;
     };
 
     struct Stats {
@@ -78,6 +84,12 @@ public:
     Stats stats() const;
     void invalidate();
     void beginViewRequest();
+
+    // Process-wide default for Options::compressPersistentCache, OR-ed into
+    // every cache built afterwards. Lets an application apply a user setting
+    // without threading it through each construction site.
+    static void setPersistentCompressionDefault(bool enabled);
+    static bool persistentCompressionDefault();
 
 private:
     enum class EntryStatus {
@@ -159,7 +171,9 @@ private:
     static void writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
     static void writePersistentEmpty(State& state, const ChunkKey& key);
     static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
+    static std::filesystem::path persistentCompressedPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
+    static bool persistentEntryIsRaw(const State& state, const ChunkKey& key);
     static void startPersistentCacheSizeScan(const std::shared_ptr<State>& state);
     static std::size_t persistentCacheBytes(
         const std::filesystem::path& path,

@@ -11,6 +11,7 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
+#include "RemoteVolumeCachePaths.hpp"
 #include "SettingsDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
@@ -956,8 +957,11 @@ void MenuActionController::showSettingsDialog()
         return;
     }
 
+    CState* state = _window->_state;
     auto* dialog = new SettingsDialog(
-        _window->_state ? _window->_state->vpkg() : nullptr,
+        state ? state->vpkg() : nullptr,
+        state ? vc3d::persistentCacheDirForVolume(state->currentVolume(), state)
+              : std::filesystem::path{},
         _window);
     dialog->exec();
     if (dialog->outputSegmentsChanged()) {
