@@ -281,6 +281,7 @@ private slots:
     void applySegmentFolderSelection(bool reloadSurfaces);
     void showSegmentFolderPaletteMenu(int row);
     QColor defaultSegmentFolderColor(const QString& dirName) const;
+    QString effectiveDefaultSegmentFolderDir() const;
 
 private:
     CState* _state;
@@ -291,6 +292,7 @@ private:
     QStandardItemModel* _segmentDirModel{nullptr};
     bool _updatingSegmentDirUi{false};
     std::map<QString, QColor> _segmentFolderSolidColors;
+    QString _segmentFolderDefaultPaletteDir;
     mutable bool _openDataManifestLoadAttempted{false};
     mutable std::optional<vc3d::opendata::OpenDataManifest> _openDataManifestCache;
 

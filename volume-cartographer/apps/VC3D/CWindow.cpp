@@ -9467,6 +9467,30 @@ QColor segmentFolderSolidColorOr(const std::map<QString, QColor>& colors,
     return it != colors.end() ? it->second : fallback;
 }
 
+QString CWindow::effectiveDefaultSegmentFolderDir() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+
+    const QString currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
+    const auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
+    const auto containsDir = [&availableDirs](const QString& dirName) {
+        return std::any_of(availableDirs.begin(), availableDirs.end(), [&dirName](const std::string& available) {
+            return QString::fromStdString(available) == dirName;
+        });
+    };
+
+    if (!_segmentFolderDefaultPaletteDir.isEmpty() && containsDir(_segmentFolderDefaultPaletteDir)) {
+        return _segmentFolderDefaultPaletteDir;
+    }
+
+    if (!currentDir.isEmpty() && !_segmentFolderSolidColors.contains(currentDir)) {
+        return currentDir;
+    }
+    return {};
+}
+
 void CWindow::refreshSegmentationDirectoryDropdown()
 {
     if (!_state || !_state->vpkg() || !cmbSegmentationDir || !_segmentDirModel) {
@@ -9491,6 +9515,7 @@ void CWindow::refreshSegmentationDirectoryDropdown()
     _segmentDirModel->clear();
 
     const auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
+    const QString defaultPaletteDir = effectiveDefaultSegmentFolderDir();
     int currentIndex = -1;
     for (const auto& dirNameStd : availableDirs) {
         const QString dirName = QString::fromStdString(dirNameStd);
@@ -9501,8 +9526,7 @@ void CWindow::refreshSegmentationDirectoryDropdown()
         item->setData(dirName, SEGMENT_DIR_NAME_ROLE);
         item->setData(segmentFolderSolidColorOr(_segmentFolderSolidColors, dirName, QColor()),
                       SEGMENT_DIR_COLOR_ROLE);
-        item->setData(!_segmentFolderSolidColors.contains(dirName) && dirName == currentDir,
-                      SEGMENT_DIR_DEFAULT_PALETTE_ROLE);
+        item->setData(dirName == defaultPaletteDir, SEGMENT_DIR_DEFAULT_PALETTE_ROLE);
         _segmentDirModel->appendRow(item);
         if (dirName == currentDir) {
             currentIndex = _segmentDirModel->rowCount() - 1;
@@ -9524,6 +9548,7 @@ void CWindow::applySegmentFolderSelection(bool reloadSurfaces)
     }
 
     const QString currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
+    const QString defaultPaletteDir = effectiveDefaultSegmentFolderDir();
     std::vector<SurfacePanelController::SegmentFolderSelection> folders;
     folders.reserve(static_cast<size_t>(_segmentDirModel->rowCount()));
 
@@ -9539,7 +9564,7 @@ void CWindow::applySegmentFolderSelection(bool reloadSurfaces)
         }
         const bool checked = item->checkState() == Qt::Checked;
         const bool isCurrent = dirName == currentDir;
-        const bool defaultPalette = isCurrent && !_segmentFolderSolidColors.contains(dirName);
+        const bool defaultPalette = dirName == defaultPaletteDir;
         const QColor color = defaultPalette
             ? QColor()
             : segmentFolderSolidColorOr(_segmentFolderSolidColors,
@@ -9582,22 +9607,25 @@ void CWindow::showSegmentFolderPaletteMenu(int row)
         return;
     }
     const QString dirName = item->data(SEGMENT_DIR_NAME_ROLE).toString();
-    const QString currentDir = _state && _state->vpkg()
-        ? QString::fromStdString(_state->vpkg()->getSegmentationDirectory())
-        : QString();
+    const QString previousDefaultDir = effectiveDefaultSegmentFolderDir();
 
     QMenu menu(cmbSegmentationDir);
-    if (dirName == currentDir) {
-        QAction* defaultAction = menu.addAction(tr("Default palette"));
-        connect(defaultAction, &QAction::triggered, this, [this, dirName]() {
-            _segmentFolderSolidColors.erase(dirName);
-            applySegmentFolderSelection(true);
-            if (cmbSegmentationDir) {
-                cmbSegmentationDir->view()->viewport()->update();
-            }
-        });
-        menu.addSeparator();
-    }
+    QAction* defaultAction = menu.addAction(tr("Default palette"));
+    defaultAction->setCheckable(true);
+    defaultAction->setChecked(dirName == previousDefaultDir);
+    connect(defaultAction, &QAction::triggered, this, [this, dirName, previousDefaultDir]() {
+        if (!previousDefaultDir.isEmpty() && previousDefaultDir != dirName &&
+            !_segmentFolderSolidColors.contains(previousDefaultDir)) {
+            _segmentFolderSolidColors[previousDefaultDir] = defaultSegmentFolderColor(previousDefaultDir);
+        }
+        _segmentFolderSolidColors.erase(dirName);
+        _segmentFolderDefaultPaletteDir = dirName;
+        applySegmentFolderSelection(true);
+        if (cmbSegmentationDir) {
+            cmbSegmentationDir->view()->viewport()->update();
+        }
+    });
+    menu.addSeparator();
 
     QAction* chooseAction = menu.addAction(tr("Solid color..."));
     connect(chooseAction, &QAction::triggered, this, [this, dirName]() {
@@ -9609,6 +9637,9 @@ void CWindow::showSegmentFolderPaletteMenu(int row)
             return;
         }
         _segmentFolderSolidColors[dirName] = chosen;
+        if (effectiveDefaultSegmentFolderDir() == dirName) {
+            _segmentFolderDefaultPaletteDir.clear();
+        }
         applySegmentFolderSelection(true);
         if (cmbSegmentationDir) {
             cmbSegmentationDir->view()->viewport()->update();
