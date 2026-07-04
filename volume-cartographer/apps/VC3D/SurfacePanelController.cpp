@@ -2107,6 +2107,12 @@ void SurfacePanelController::applyFiltersInternal()
             }
             ++visIt;
         }
+        for (const auto& id : _multiFolderSurfaceIds) {
+            auto surf = getSurfaceById(id);
+            if (surf) {
+                out.insert(id);
+            }
+        }
     };
 
     if (!hasActiveFilters) {
@@ -2296,10 +2302,15 @@ void SurfacePanelController::applyFiltersInternal()
     intersects.clear();
     intersects.insert("segmentation");
     if (currentOnly) {
-        // Only show the current segment's intersection line.
-        // If no segment is selected, just show "segmentation" alone.
+        // Limit the current segmentation folder to the selected segment while
+        // preserving checked comparison folders.
         if (!_currentSurfaceId.empty() && getSurfaceById(_currentSurfaceId)) {
             intersects.insert(_currentSurfaceId);
+        }
+        for (const auto& id : _multiFolderSurfaceIds) {
+            if (getSurfaceById(id)) {
+                intersects.insert(id);
+            }
         }
     } else {
         collectVisibleSurfaces(intersects);
