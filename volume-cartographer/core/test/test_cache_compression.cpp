@@ -1,5 +1,5 @@
-// CacheCompression coverage: VCZ1 delta-zyx+zstd roundtrips, legacy plain
-// zstd fallback (both directions), and corrupt/mismatched payload handling.
+// CacheCompression coverage: VCZ1 delta-zyx+zstd roundtrips and
+// corrupt/mismatched payload handling.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -12,6 +12,7 @@
 #include <cstring>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include <zstd.h>
@@ -95,39 +96,36 @@ TEST_CASE("Filter reduces compressed size on correlated data")
     const std::array<int, 3> shape{32, 32, 32};
     const auto input = smoothVolume(shape, 1);
     const auto filtered = vc::cacheCompress(asSpan(input), shape, 1);
-    const auto legacy = vc::cacheCompress(asSpan(input), {0, 0, 0}, 1);
-    CHECK(filtered.size() < legacy.size());
-}
 
-TEST_CASE("Mismatched shape falls back to a decodable legacy frame")
-{
-    const std::array<int, 3> shape{4, 4, 4};
-    const auto input = smoothVolume(shape, 1);
-    // Wrong element count and unsupported element size both take the
-    // legacy path; the result must still decode.
-    for (const auto compressed :
-         {vc::cacheCompress(asSpan(input), {4, 4, 5}, 1),
-          vc::cacheCompress(asSpan(input), shape, 4)}) {
-        CHECK_FALSE(static_cast<char>(compressed[0]) == 'V');
-        const auto decoded = vc::cacheDecompress(asSpan(compressed), input.size());
-        REQUIRE(decoded.has_value());
-        CHECK(*decoded == input);
-    }
-}
-
-TEST_CASE("Legacy plain zstd frames from older caches still decode")
-{
-    const std::array<int, 3> shape{4, 4, 4};
-    const auto input = smoothVolume(shape, 1);
-    std::vector<std::byte> legacy(ZSTD_compressBound(input.size()));
+    std::vector<std::byte> unfiltered(ZSTD_compressBound(input.size()));
     const auto rc = ZSTD_compress(
-        legacy.data(), legacy.size(), input.data(), input.size(), 3);
+        unfiltered.data(), unfiltered.size(), input.data(), input.size(), 3);
     REQUIRE_FALSE(ZSTD_isError(rc));
-    legacy.resize(rc);
+    CHECK(filtered.size() < rc);
+}
 
-    const auto decoded = vc::cacheDecompress(asSpan(legacy), input.size());
-    REQUIRE(decoded.has_value());
-    CHECK(*decoded == input);
+TEST_CASE("Mismatched shape or element size throws")
+{
+    const std::array<int, 3> shape{4, 4, 4};
+    const auto input = smoothVolume(shape, 1);
+    CHECK_THROWS_AS(vc::cacheCompress(asSpan(input), {4, 4, 5}, 1),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(vc::cacheCompress(asSpan(input), shape, 4),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(vc::cacheCompress(asSpan(input), {0, 0, 0}, 1),
+                    std::invalid_argument);
+}
+
+TEST_CASE("Plain zstd frames without a VCZ1 header are rejected")
+{
+    const std::array<int, 3> shape{4, 4, 4};
+    const auto input = smoothVolume(shape, 1);
+    std::vector<std::byte> frame(ZSTD_compressBound(input.size()));
+    const auto rc = ZSTD_compress(
+        frame.data(), frame.size(), input.data(), input.size(), 3);
+    REQUIRE_FALSE(ZSTD_isError(rc));
+    frame.resize(rc);
+    CHECK_FALSE(vc::cacheDecompress(asSpan(frame), input.size()).has_value());
 }
 
 TEST_CASE("Corrupt and mismatched payloads return nullopt")

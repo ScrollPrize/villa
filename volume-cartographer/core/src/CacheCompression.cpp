@@ -112,8 +112,8 @@ std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
                 static_cast<std::size_t>(shapeZYX[2]) * elemSize ==
             input.size();
     if (!shapeValid) {
-        // Legacy plain zstd frame; cacheDecompress handles both formats.
-        return zstdCompressFrame(input, level, 0);
+        throw std::invalid_argument(
+            "cacheCompress: chunk shape/element size does not match payload");
     }
 
     const auto z = static_cast<std::size_t>(shapeZYX[0]);
@@ -145,15 +145,8 @@ std::optional<std::vector<std::byte>> cacheDecompress(
     std::span<const std::byte> input,
     std::size_t expectedSize)
 {
-    if (!hasVcz1Header(input)) {
-        // Legacy format: a single plain zstd frame of the raw payload.
-        std::vector<std::byte> output(expectedSize);
-        const std::size_t rc = ZSTD_decompress(
-            output.data(), output.size(), input.data(), input.size());
-        if (ZSTD_isError(rc) || rc != expectedSize)
-            return std::nullopt;
-        return output;
-    }
+    if (!hasVcz1Header(input))
+        return std::nullopt;
 
     const auto elemSize = static_cast<std::size_t>(input[5]);
     const std::size_t z = readU32(input.data() + 8);

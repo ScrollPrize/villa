@@ -266,10 +266,9 @@ void SettingsDialog::accept()
 namespace {
 
 // Compress one raw cache chunk in place: <name>.bin -> <name>.zst
-// (atomic tmp+rename, source removed on success). Returns false on failure;
-// the original file is left untouched in that case. shapeZYX/elemSize enable
-// the delta-zyx filter; a mismatched or unknown shape falls back to a plain
-// zstd frame inside cacheCompress.
+// (atomic tmp+rename, source removed on success). Returns false on failure —
+// including a mismatched or unknown chunk shape, which cacheCompress rejects —
+// and the original file is left untouched in that case.
 bool compressCacheFile(const std::filesystem::path& binPath,
                        std::array<int, 3> shapeZYX,
                        std::size_t elemSize,

@@ -37,17 +37,16 @@ inline constexpr const char* kCompressedCacheExtension = ".zst";
 inline constexpr const char* kDeltaZstdCodecName = "vc_delta_zstd";
 
 // Compresses one decoded chunk of shapeZYX elements of elemSize bytes.
-// input.size() must equal z*y*x*elemSize and elemSize must be 1 or 2;
-// otherwise the payload is stored as a legacy plain zstd frame (no filter).
+// Throws std::invalid_argument unless input.size() equals z*y*x*elemSize
+// with elemSize 1 or 2.
 std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
                                      std::array<int, 3> shapeZYX,
                                      std::size_t elemSize,
                                      int level = kCacheCompressionLevel);
 
-// Decompresses a VCZ1 payload or a legacy plain zstd frame (the format
-// written before the delta filter existed). The decoded size must equal
-// expectedSize. Returns std::nullopt on any error or size mismatch
-// (treated by callers as a corrupt cache entry).
+// Decompresses a VCZ1 payload whose decoded size must equal expectedSize.
+// Returns std::nullopt on any error or size mismatch (treated by callers
+// as a corrupt cache entry).
 std::optional<std::vector<std::byte>> cacheDecompress(
     std::span<const std::byte> input,
     std::size_t expectedSize);
