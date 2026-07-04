@@ -625,7 +625,9 @@ void ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     if (compress) {
         try {
             compressed = vc::cacheCompress(
-                std::span<const std::byte>(bytes.data(), bytes.size()));
+                std::span<const std::byte>(bytes.data(), bytes.size()),
+                state.levels_[static_cast<std::size_t>(key.level)].chunkShape,
+                dtypeSize(state.dtype_));
         } catch (const std::exception& e) {
             Logger()->warn("ChunkCache persistent-cache compression failed: {}", e.what());
             return;

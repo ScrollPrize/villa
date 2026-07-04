@@ -958,10 +958,28 @@ void MenuActionController::showSettingsDialog()
     }
 
     CState* state = _window->_state;
+    const auto cacheDir = state
+        ? vc3d::persistentCacheDirForVolume(state->currentVolume(), state)
+        : std::filesystem::path{};
+
+    // Chunk geometry drives the delta-zyx filter used when compacting the
+    // current volume's disk cache from the dialog.
+    CacheChunkLayout chunkLayout;
+    if (!cacheDir.empty()) {
+        if (auto volume = state->currentVolume()) {
+            if (auto* chunked = volume->chunkedCache()) {
+                chunkLayout.elemSize =
+                    chunked->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
+                for (int level = 0; level < chunked->numLevels(); ++level)
+                    chunkLayout.levelChunkShapes.push_back(chunked->chunkShape(level));
+            }
+        }
+    }
+
     auto* dialog = new SettingsDialog(
         state ? state->vpkg() : nullptr,
-        state ? vc3d::persistentCacheDirForVolume(state->currentVolume(), state)
-              : std::filesystem::path{},
+        cacheDir,
+        std::move(chunkLayout),
         _window);
     dialog->exec();
     if (dialog->outputSegmentsChanged()) {

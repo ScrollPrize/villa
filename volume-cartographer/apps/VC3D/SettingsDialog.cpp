@@ -9,8 +9,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <future>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -29,10 +31,12 @@
 
 SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
                                std::filesystem::path currentVolumeCacheDir,
+                               CacheChunkLayout currentVolumeChunkLayout,
                                QWidget *parent)
     : QDialog(parent)
     , _volumePackage(std::move(volumePackage))
     , _currentVolumeCacheDir(std::move(currentVolumeCacheDir))
+    , _currentVolumeChunkLayout(std::move(currentVolumeChunkLayout))
 {
     setupUi(this);
 
@@ -263,8 +267,12 @@ namespace {
 
 // Compress one raw cache chunk in place: <name>.bin -> <name>.zst
 // (atomic tmp+rename, source removed on success). Returns false on failure;
-// the original file is left untouched in that case.
+// the original file is left untouched in that case. shapeZYX/elemSize enable
+// the delta-zyx filter; a mismatched or unknown shape falls back to a plain
+// zstd frame inside cacheCompress.
 bool compressCacheFile(const std::filesystem::path& binPath,
+                       std::array<int, 3> shapeZYX,
+                       std::size_t elemSize,
                        std::uint64_t& bytesIn,
                        std::uint64_t& bytesOut)
 {
@@ -287,7 +295,10 @@ bool compressCacheFile(const std::filesystem::path& binPath,
 
     std::vector<std::byte> compressed;
     try {
-        compressed = vc::cacheCompress(std::span<const std::byte>(input.data(), input.size()));
+        compressed = vc::cacheCompress(
+            std::span<const std::byte>(input.data(), input.size()),
+            shapeZYX,
+            elemSize);
     } catch (const std::exception&) {
         return false;
     }
@@ -341,14 +352,31 @@ void SettingsDialog::compressExistingCache()
 
     // Uncompressed chunks are stored as ".bin"; ".zst" is already
     // compressed and ".c3d"/".empty" entries have nothing to gain.
-    std::vector<fs::path> files;
+    // Each file's pyramid level ("level_N" path component) selects the
+    // chunk shape used by the delta-zyx compression filter.
+    const auto& layout = _currentVolumeChunkLayout;
+    auto shapeForFile = [&](const fs::path& path) -> std::array<int, 3> {
+        const auto rel = fs::relative(path, cacheDir, ec);
+        if (ec || rel.empty())
+            return {0, 0, 0};
+        const std::string top = rel.begin()->string();
+        constexpr std::string_view prefix{"level_"};
+        if (top.rfind(prefix, 0) != 0)
+            return {0, 0, 0};
+        const std::size_t level = std::strtoul(top.c_str() + prefix.size(), nullptr, 10);
+        if (level >= layout.levelChunkShapes.size())
+            return {0, 0, 0};
+        return layout.levelChunkShapes[level];
+    };
+
+    std::vector<std::pair<fs::path, std::array<int, 3>>> files;
     for (auto it = fs::recursive_directory_iterator(
              cacheDir, fs::directory_options::skip_permission_denied, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (ec)
             break;
         if (it->is_regular_file(ec) && it->path().extension() == ".bin")
-            files.push_back(it->path());
+            files.emplace_back(it->path(), shapeForFile(it->path()));
     }
     if (files.empty()) {
         QMessageBox::information(this, tr("Compress cache"),
@@ -386,7 +414,8 @@ void SettingsDialog::compressExistingCache()
                 const auto i = nextIndex.fetch_add(1, std::memory_order_relaxed);
                 if (i >= files.size())
                     break;
-                if (!compressCacheFile(files[i], bytesIn, bytesOut))
+                if (!compressCacheFile(files[i].first, files[i].second,
+                                       layout.elemSize, bytesIn, bytesOut))
                     ++localFailures;
                 done.fetch_add(1, std::memory_order_relaxed);
             }

@@ -5,12 +5,16 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/util/CacheCompression.hpp"
 #include "utils/zarr.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -177,5 +181,38 @@ TEST_CASE("readChunkOrFill: present chunk returns true; output mirrors written d
     std::vector<uint8_t> out(payload.size(), 0);
     CHECK(ds->readChunkOrFill(0, 0, 0, out.data()));
     CHECK(out[0] == 0x77);
+    fs::remove_all(d);
+}
+
+TEST_CASE("ZarrArray reads a v2 array stored with the vc_delta_zstd codec")
+{
+    // Mirrors what scripts/recompress_zarr.py produces: VCZ1 chunk payloads
+    // plus a .zarray whose compressor id is "vc_delta_zstd".
+    auto d = tmpDir("vcdeltazstd_read");
+    const std::array<int, 3> shape{4, 4, 4};
+    std::vector<std::byte> voxels(64);
+    for (std::size_t i = 0; i < voxels.size(); ++i)
+        voxels[i] = static_cast<std::byte>((i * 7 + 3) & 0xFF);
+    const auto encoded = vc::cacheCompress(
+        std::span<const std::byte>(voxels.data(), voxels.size()), shape, 1);
+
+    {
+        std::ofstream meta(d / ".zarray");
+        meta << R"({"zarr_format":2,"shape":[4,4,4],"chunks":[4,4,4],)"
+             << R"("dtype":"|u1","order":"C","fill_value":0,"filters":null,)"
+             << R"("compressor":{"id":"vc_delta_zstd","level":3}})";
+    }
+    {
+        std::ofstream chunk(d / "0.0.0", std::ios::binary);
+        chunk.write(reinterpret_cast<const char*>(encoded.data()),
+                    static_cast<std::streamsize>(encoded.size()));
+    }
+
+    auto array = utils::ZarrArray::open(d, vc::buildZarrCodecRegistry(1));
+    const std::array<std::size_t, 3> indices{0, 0, 0};
+    auto bytes = array.read_chunk(indices);
+    REQUIRE(bytes.has_value());
+    REQUIRE(bytes->size() == voxels.size());
+    CHECK(std::memcmp(bytes->data(), voxels.data(), voxels.size()) == 0);
     fs::remove_all(d);
 }

@@ -7,6 +7,8 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
 
+#include <zstd.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -512,5 +514,36 @@ TEST_CASE("Corrupt .zst entry falls back to a remote fetch")
     REQUIRE(r.bytes);
     CHECK(*r.bytes == fr.bytes);
     CHECK(f->fetchCalls.load() == 1);
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Legacy plain-zstd .zst entry (pre-filter format) is loaded")
+{
+    auto persist = tmpDir("compress_legacy");
+    const auto expected = variedBytes(64);
+
+    // Write the format produced before the delta-zyx filter existed: a
+    // bare zstd frame with no VCZ1 header.
+    std::vector<std::byte> frame(ZSTD_compressBound(expected.size()));
+    const auto rc = ZSTD_compress(
+        frame.data(), frame.size(), expected.data(), expected.size(), 3);
+    REQUIRE_FALSE(ZSTD_isError(rc));
+    frame.resize(rc);
+    const auto target = persist / "level_0" / "0" / "0";
+    fs::create_directories(target);
+    {
+        std::ofstream file(target / "0.zst", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(frame.data()),
+                   static_cast<std::streamsize>(frame.size()));
+        REQUIRE(file.good());
+    }
+
+    auto f = std::make_shared<CountingFetcher>();
+    auto c = makeCache(f, persist, /*compress=*/true);
+    auto r = waitForResolved(*c, 0, 0, 0, 0);
+    REQUIRE(r.status == ChunkStatus::Data);
+    REQUIRE(r.bytes);
+    CHECK(*r.bytes == expected);
+    CHECK(f->fetchCalls.load() == 0);
     fs::remove_all(persist);
 }
