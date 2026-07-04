@@ -50,6 +50,11 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("this script requires numcodecs (pip install numcodecs)")
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
+
 CODEC_ID = "vc_delta_zstd"
 MAGIC = b"VCZ1"
 HEADER = struct.Struct("<4sBBHIII")  # magic, version, elemsize, reserved, z, y, x
@@ -206,13 +211,22 @@ def recompress_array(array_dir: Path, out_dir: Path, level: int, workers: int) -
     else:
         pool = ProcessPoolExecutor(max_workers=workers)
         results = pool.map(_process_chunk, jobs, chunksize=8)
+    progress = tqdm(total=len(jobs), unit="chunk", desc=f"  {array_dir.name}",
+                    smoothing=0.05) if tqdm else None
     for i, (_path, n_in, n_out, was_converted) in enumerate(results, 1):
         total_in += n_in
         total_out += n_out
         converted += was_converted
-        if i % 500 == 0 or i == len(jobs):
+        if progress:
+            progress.set_postfix_str(
+                f"{total_in/1e9:.2f}->{total_out/1e9:.2f} GB "
+                f"({total_out/max(total_in,1):.3f})", refresh=False)
+            progress.update(1)
+        elif i % 500 == 0 or i == len(jobs):
             print(f"  {i}/{len(jobs)}  {total_in/1e9:.2f} GB -> {total_out/1e9:.2f} GB "
                   f"({total_out/max(total_in,1):.3f})", flush=True)
+    if progress:
+        progress.close()
     if workers > 1:
         pool.shutdown()
 
