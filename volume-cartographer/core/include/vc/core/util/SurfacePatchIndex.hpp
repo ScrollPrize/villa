@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -157,6 +158,13 @@ public:
     // Generation tracking for undo/redo detection
     uint64_t generation(const SurfacePtr& surface) const;
 
+    // Index-wide generation: bumped by every successful mutation (rebuild,
+    // cache load, surface update/remove, flush, stride change, move-assign).
+    // Lets callers detect "anything changed" with one O(1) probe instead of
+    // querying generation() per surface, at the cost of over-invalidating
+    // when a non-observed surface changes.
+    uint64_t globalGeneration() const;
+
 private:
     struct NoPatchFilter {
         template <typename Box>
@@ -172,4 +180,5 @@ private:
     struct Impl;
     mutable std::shared_mutex mutex_;
     std::unique_ptr<Impl> impl_;
+    std::atomic<uint64_t> globalGeneration_{1};
 };

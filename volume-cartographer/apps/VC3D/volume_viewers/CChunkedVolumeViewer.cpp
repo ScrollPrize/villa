@@ -3495,6 +3495,7 @@ void CChunkedVolumeViewer::setIntersects(const std::set<std::string>& names)
         return;
     }
     _intersectTgts = names;
+    _resolvedIntersectTargets = {};
     invalidateIntersect();
     renderIntersections("setIntersects");
 }
@@ -4135,33 +4136,47 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
 
-    std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
-    auto addTarget = [&](const std::string& name) {
-        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name))) {
-            if (activeSeg && quad != activeSeg && !activeSeg->id.empty() &&
-                quad->id == activeSeg->id) {
-                // During editing, named/highlighted surface lookups may resolve
-                // to the saved surface object while the live geometry is in the
-                // active segmentation preview. Target the preview instead of
-                // dropping the surface for this frame.
-                targets.insert(activeSeg);
-                return;
+    const std::uint64_t surfacesVersion = _state->surfacesVersion();
+    if (!_resolvedIntersectTargets.valid ||
+        _resolvedIntersectTargets.activeSeg != activeSeg.get() ||
+        _resolvedIntersectTargets.surfacesVersion != surfacesVersion) {
+        auto& resolved = _resolvedIntersectTargets;
+        resolved.targets.clear();
+        auto addTarget = [&](const std::string& name) {
+            if (auto quad = std::dynamic_pointer_cast<QuadSurface>(_state->surface(name))) {
+                if (activeSeg && quad != activeSeg && !activeSeg->id.empty() &&
+                    quad->id == activeSeg->id) {
+                    // During editing, named/highlighted surface lookups may resolve
+                    // to the saved surface object while the live geometry is in the
+                    // active segmentation preview. Target the preview instead of
+                    // dropping the surface for this frame.
+                    resolved.targets.insert(activeSeg);
+                    return;
+                }
+                resolved.targets.insert(std::move(quad));
             }
-            targets.insert(std::move(quad));
-        }
-    };
-    for (const auto& name : _intersectTgts) {
-        if (name == "visible_segmentation") {
-            if (_highlightedSurfaceIds.empty()) {
-                addTarget("segmentation");
+        };
+        for (const auto& name : _intersectTgts) {
+            if (name == "visible_segmentation") {
+                if (_highlightedSurfaceIds.empty()) {
+                    addTarget("segmentation");
+                } else {
+                    for (const auto& id : _highlightedSurfaceIds)
+                        addTarget(id);
+                }
             } else {
-                for (const auto& id : _highlightedSurfaceIds)
-                    addTarget(id);
+                addTarget(name);
             }
-        } else {
-            addTarget(name);
         }
+        std::size_t th = 0;
+        for (const auto& t : resolved.targets)
+            th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
+        resolved.targetHash = th;
+        resolved.activeSeg = activeSeg.get();
+        resolved.surfacesVersion = surfacesVersion;
+        resolved.valid = true;
     }
+    const auto& targets = _resolvedIntersectTargets.targets;
     if (targets.empty()) {
         invalidateIntersect();
         _lastIntersectFp = {};
@@ -4171,12 +4186,10 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
 
     const bool useEditIndexForActive = _segmentationEditActive && editPatchIndex && !editPatchIndex->empty() &&
         activeSeg && targets.find(activeSeg) != targets.end();
-    auto globalTargets = targets;
-    std::unordered_set<SurfacePatchIndex::SurfacePtr> editTargets;
     if (useEditIndexForActive) {
+        // Flush before the fingerprint below so it observes the post-flush
+        // edit-index generation.
         editPatchIndex->flushPendingUpdates(activeSeg);
-        globalTargets.erase(activeSeg);
-        editTargets.insert(activeSeg);
     }
     auto* primaryPatchIndex = patchIndex ? patchIndex : editPatchIndex;
 
@@ -4230,17 +4243,16 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                     (useEditIndexForActive ? editPatchIndex->patchCount() : 0);
     fp.surfaceCount = (patchIndex ? patchIndex->surfaceCount() : 0) +
                       (useEditIndexForActive ? editPatchIndex->surfaceCount() : 0);
-    size_t th = 0;
-    size_t gh = 0;
-    for (const auto& t : targets) {
-        auto* generationIndex = (useEditIndexForActive && t == activeSeg) ? editPatchIndex : patchIndex;
-        const uint64_t generation = generationIndex ? generationIndex->generation(t) : 0;
-        th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
-        gh ^= std::hash<const void*>{}(t.get()) ^
-              (std::hash<uint64_t>{}(generation) + 0x9e3779b9u);
-    }
-    fp.targetHash = th;
-    fp.targetGenerationHash = gh;
+    fp.targetHash = _resolvedIntersectTargets.targetHash;
+    // One O(1) probe per index instead of a mutex-guarded generation()
+    // lookup per target (~100k per tick on large sessions). Slightly
+    // over-invalidates — an update to a non-target surface also bumps the
+    // global generation and forces a recompute — but non-target updates are
+    // rare compared to render ticks.
+    fp.targetGenerationHash =
+        std::hash<uint64_t>{}(patchIndex ? patchIndex->globalGeneration() : 0) ^
+        (std::hash<uint64_t>{}(useEditIndexForActive ? editPatchIndex->globalGeneration() : 0) +
+         0x9e3779b9u);
     fp.activeSegHash = activeSeg ? std::hash<const void*>{}(activeSeg.get()) : 0;
     size_t hh = 0;
     for (const auto& id : _highlightedSurfaceIds)
@@ -4338,16 +4350,17 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             _intersectionGeometryCache.surfaceCount = fp.surfaceCount;
             _intersectionGeometryCache.targetHash = fp.targetHash;
             _intersectionGeometryCache.targetGenerationHash = fp.targetGenerationHash;
+            auto globalTargets = targets;
+            globalTargets.erase(activeSeg);
             if (patchIndex && !globalTargets.empty()) {
                 _intersectionGeometryCache.intersections =
                     patchIndex->computePlaneIntersections(*plane, cacheRoi, globalTargets);
             }
-            if (!editTargets.empty()) {
-                auto editIntersections = editPatchIndex->computePlaneIntersections(*plane, cacheRoi, editTargets);
-                for (auto& [surface, segments] : editIntersections) {
-                    auto& out = _intersectionGeometryCache.intersections[surface];
-                    out.insert(out.end(), segments.begin(), segments.end());
-                }
+            const std::unordered_set<SurfacePatchIndex::SurfacePtr> editTargets{activeSeg};
+            auto editIntersections = editPatchIndex->computePlaneIntersections(*plane, cacheRoi, editTargets);
+            for (auto& [surface, segments] : editIntersections) {
+                auto& out = _intersectionGeometryCache.intersections[surface];
+                out.insert(out.end(), segments.begin(), segments.end());
             }
             _intersectionGeometryCache.valid = true;
         } else {
@@ -4653,6 +4666,7 @@ void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::strin
     }
     _highlightedSurfaceIds.clear();
     _highlightedSurfaceIds = std::move(next);
+    _resolvedIntersectTargets = {};
     renderIntersections("highlighted surface ids changed");
 }
 
