@@ -56,7 +56,7 @@ constexpr qreal kManualAddIntersectionZ = 121.0;
 constexpr float kManualAddIntersectionOpacityScale = 1.2f;
 constexpr float kManualAddIntersectionWidthScale = 1.3f;
 constexpr float kManualAddIntersectionMinWidthDelta = 0.75f;
-constexpr int kSurfaceOverlapSampleStride = 2;
+constexpr int kSurfaceOverlapSampleStride = 4;
 
 // Full opacity for mask pixels - the slider controls overall opacity via QGraphicsPixmapItem::setOpacity
 constexpr int kApprovalMaskAlpha = 255;
