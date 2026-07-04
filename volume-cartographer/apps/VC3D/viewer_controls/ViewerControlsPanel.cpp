@@ -69,11 +69,6 @@ void ViewerControlsPanel::addViewerGroups()
                    "viewer_controls/group_navigation_expanded",
                    true);
 
-    addViewerGroup(tr("Render Settings"),
-                   detachScrollContents(_uiRefs.renderSettingsScrollArea, _uiRefs.renderSettingsContents),
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED,
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT);
-
     ViewerNormalVisualizationPanel::UiRefs normalUi{
         .contents = _uiRefs.normalVisualizationContents,
         .showSurfaceNormals = _uiRefs.showSurfaceNormals,

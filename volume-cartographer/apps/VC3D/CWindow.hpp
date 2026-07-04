@@ -7,6 +7,7 @@
 #include <opencv2/core/mat.hpp>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QColor>
 #include <QPointer>
 #include <QString>
 #include <QStringList>
@@ -57,6 +58,7 @@ class QuadSurface;
 class RenderBenchRecorder;
 class RenderBenchReplay;
 class QTreeWidget;
+class QStandardItemModel;
 
 // Render-bench profiling modes (see RenderBenchRecorder/RenderBenchReplay).
 struct RenderBenchOptions {
@@ -220,6 +222,9 @@ private:
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
     void updateSurfaceOverlayDropdown();
     void onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles);
+    void showSurfaceOverlaySelectionDialog();
+    void applySurfaceOverlaySelection();
+    void updateSurfaceOverlayButtonText();
     QColor getOverlayColor(size_t index) const;
     cv::Vec3b getOverlayColorBGR(size_t index) const;
 
@@ -272,6 +277,11 @@ private slots:
     void onFiberViewersRequested();
     void onFiberAnnotationFinished(uint64_t fiberId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
+    void refreshSegmentationDirectoryDropdown();
+    void applySegmentFolderSelection(bool reloadSurfaces);
+    void showSegmentFolderPaletteMenu(int row);
+    QColor defaultSegmentFolderColor(const QString& dirName) const;
+    QString effectiveDefaultSegmentFolderDir() const;
 
 private:
     CState* _state;
@@ -279,6 +289,10 @@ private:
     QComboBox* volSelect{nullptr};
     std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
     QComboBox* cmbSegmentationDir;
+    QStandardItemModel* _segmentDirModel{nullptr};
+    bool _updatingSegmentDirUi{false};
+    std::map<QString, QColor> _segmentFolderSolidColors;
+    QString _segmentFolderDefaultPaletteDir;
     mutable bool _openDataManifestLoadAttempted{false};
     mutable std::optional<vc3d::opendata::OpenDataManifest> _openDataManifestCache;
 

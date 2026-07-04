@@ -447,6 +447,22 @@ private:
     int _surfacePatchSamplingStride = 2;
     std::set<std::string> _intersectTgts;
     std::unordered_set<std::string> _highlightedSurfaceIds;
+
+    // Resolved intersection targets, cached across render ticks. With very
+    // large sessions (~100k visible surfaces) re-resolving every name via
+    // CState per renderIntersections call costs tens of milliseconds on the
+    // main thread even when the fingerprint would hit. Invalidated when the
+    // target names / highlight set change and (via CState::surfacesVersion)
+    // when the surface map itself changes.
+    struct ResolvedIntersectTargets {
+        std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
+        std::size_t targetHash = 0;
+        QuadSurface* activeSeg = nullptr;
+        std::uint64_t surfacesVersion = 0;
+        bool valid = false;
+    };
+    ResolvedIntersectTargets _resolvedIntersectTargets;
+
     std::vector<QGraphicsItem*> _intersectionItems;
     float _intersectionItemsCamSurfX = 0.0f;
     float _intersectionItemsCamSurfY = 0.0f;
