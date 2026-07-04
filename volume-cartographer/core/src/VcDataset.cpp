@@ -456,7 +456,7 @@ static utils::ZarrArray::Codec codecFromConfig(const CompressorConfig& cfg)
     codec.decompress = [cfg](std::span<const std::byte> data, std::size_t outSize) {
         return decompressBytes(cfg, data, outSize);
     };
-    if (cfg.id != CompressorId::C3d) {
+    if (cfg.id != CompressorId::C3d && cfg.id != CompressorId::VcDeltaZstd) {
         codec.decompress_into = [cfg](std::span<const std::byte> data,
                                       std::span<std::byte> out) {
             decompressBytesInto(cfg, data, out);
@@ -659,6 +659,12 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
         }
 
         case CompressorId::C3d: {
+            const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
+            std::memcpy(output, bytes.data(), outBytes);
+            break;
+        }
+
+        case CompressorId::VcDeltaZstd: {
             const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
             std::memcpy(output, bytes.data(), outBytes);
             break;

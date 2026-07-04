@@ -74,6 +74,43 @@ TEST_CASE("VcDataset::decompress: too-short input throws for 'none' compressor")
     fs::remove_all(d);
 }
 
+TEST_CASE("ZarrArray::read_chunk_into decodes vc_delta_zstd chunks")
+{
+    auto d = tmpDir("vcz_read_into");
+    const std::array<int, 3> shape{2, 3, 4};
+    const auto n = static_cast<size_t>(shape[0] * shape[1] * shape[2]);
+
+    std::vector<std::byte> payload(n);
+    for (size_t i = 0; i < payload.size(); ++i)
+        payload[i] = static_cast<std::byte>((i * 17 + 3) & 0xFF);
+
+    const auto encoded = vc::cacheCompress(
+        std::span<const std::byte>(payload.data(), payload.size()), shape, 1);
+
+    std::ofstream(d / ".zarray") << R"({
+        "zarr_format": 2,
+        "shape": [2, 3, 4],
+        "chunks": [2, 3, 4],
+        "dtype": "|u1",
+        "compressor": {"id": "vc_delta_zstd", "level": 3},
+        "fill_value": 0,
+        "order": "C",
+        "filters": null,
+        "dimension_separator": "."
+    })";
+    std::ofstream chunk(d / "0.0.0", std::ios::binary);
+    chunk.write(reinterpret_cast<const char*>(encoded.data()),
+                static_cast<std::streamsize>(encoded.size()));
+    chunk.close();
+
+    auto array = utils::ZarrArray::open(d, vc::buildZarrCodecRegistry(1));
+    std::vector<std::byte> out(payload.size(), std::byte{0xCC});
+    const std::array<size_t, 3> index{0, 0, 0};
+    CHECK(array.read_chunk_into(index, out));
+    CHECK(out == payload);
+    fs::remove_all(d);
+}
+
 TEST_CASE("VcDataset::readChunk on out-of-range chunk returns false (or throws)")
 {
     auto d = tmpDir("oor_read");
