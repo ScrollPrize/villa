@@ -240,14 +240,13 @@ namespace perf {
     constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
     constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
 
-    // Near-lossless quantization bin width for compressed disk-cache writes
+    // Quantization bin width for compressed disk-cache writes
     // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
     // Only affects newly written chunks; reading is unaffected. Requires
     // restart, except for the explicit "recompress existing cache" action.
-    // Default +-2: bounded below the CT noise floor and visually
-    // indistinguishable, for a smaller cache than lossless.
+    // Default lossless: compression saves space without changing voxels.
     constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
-    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 5;
+    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
 
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:

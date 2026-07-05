@@ -707,7 +707,7 @@
           <item row="3" column="1">
            <widget class="QComboBox" name="cmbCacheQuantization">
             <property name="toolTip">
-             <string>Accuracy of compressed disk-cache chunks. Near-lossless modes bound the per-voxel error (±1 or ±2 gray levels — below the CT noise floor, visually indistinguishable) and shrink the cache substantially. Affects newly written chunks and the "Compress existing cache" action; requires restart for new downloads.</string>
+             <string>Accuracy of compressed disk-cache chunks. Lossless preserves exact voxel values. Near-lossless modes bound the per-voxel error (±1 or ±2 gray levels) and shrink the cache further. Affects newly written chunks and the "Compress existing cache" action; requires restart for new downloads.</string>
             </property>
            </widget>
           </item>
