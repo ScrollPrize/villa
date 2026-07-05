@@ -283,11 +283,12 @@ enum class RecompressResult { Done, Skipped, Failed };
 
 // Recompress one cache chunk in place with the requested quantization
 // (atomic tmp+rename; a replaced ".bin" source is removed on success).
-// Raw ".bin" chunks are always encoded; ".zst" chunks are re-encoded only
-// when their recorded quantization width is below the requested one
-// (re-quantizing at the same width would be a lossless no-op, and a payload
-// quantized more coarsely has nothing left to recover). Returns Failed on
-// any error — including a mismatched or unknown chunk shape, which
+// Raw ".bin" chunks are always encoded; ".zst" chunks are re-encoded when
+// their recorded quantization width is below the requested one or when they
+// carry an outdated entropy codec (re-quantizing at or below the recorded
+// width is a lossless no-op, so a codec upgrade never loses data; the
+// recorded width is kept when it exceeds the requested one). Returns Failed
+// on any error — including a mismatched or unknown chunk shape, which
 // cacheCompress rejects — and the original file is left untouched then.
 RecompressResult compressCacheFile(const std::filesystem::path& srcPath,
                                    std::array<int, 3> shapeZYX,
@@ -318,12 +319,14 @@ RecompressResult compressCacheFile(const std::filesystem::path& srcPath,
     std::vector<std::byte> raw;
     std::span<const std::byte> rawSpan(input.data(), input.size());
     if (alreadyCompressed) {
-        const auto existingWidth =
-            vc::cacheQuantBinWidth(std::span<const std::byte>(input.data(), input.size()));
+        const std::span<const std::byte> inputSpan(input.data(), input.size());
+        const auto existingWidth = vc::cacheQuantBinWidth(inputSpan);
         if (!existingWidth)
             return RecompressResult::Failed;
-        if (*existingWidth >= quantBinWidth)
+        if (*existingWidth >= quantBinWidth &&
+            vc::cacheCodec(inputSpan) == vc::kCacheDefaultCodec)
             return RecompressResult::Skipped;
+        quantBinWidth = std::max(quantBinWidth, *existingWidth);
         const std::size_t expectedSize =
             static_cast<std::size_t>(shapeZYX[0]) * shapeZYX[1] * shapeZYX[2] *
             elemSize;

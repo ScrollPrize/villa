@@ -14,16 +14,29 @@ namespace vc {
 // Chunks cached from remote volumes with a raw/uncompressed source are stored
 // as plain decoded bytes (".bin"). cacheCompress() converts such payloads to
 // the self-describing "VCZ1" format (".zst" cache files): a small header
-// followed by a zstd frame of the delta-zyx-filtered voxels. The filter
-// stores each element as the difference from its predecessor along z, then y,
-// then x (mod 2^8/2^16), which roughly halves the compressed size of scroll
-// CT data compared to zstd on raw bytes while the filter itself runs at
-// memory bandwidth. Level 1 both compresses better and runs ~2x faster than
-// level 3 on this data: the delta residuals are noise-like, so the greedy
-// match search at levels 2-12 emits statistically-coincidental short matches
-// whose offsets cost more than huffman-coded literals; level 1 finds almost
-// no matches and lands near the order-0 entropy of the residuals (verified
-// per-chunk across regions and pyramid levels).
+// followed by an entropy-coded frame of the delta-zyx-filtered voxels. The
+// filter stores each element as the difference from its predecessor along z,
+// then y, then x (mod 2^8/2^16), which roughly halves the compressed size of
+// scroll CT data compared to zstd on raw bytes while the filter itself runs
+// at memory bandwidth.
+//
+// Two entropy codecs exist, recorded in header byte 7:
+//   Zstd (0): a plain zstd frame. Level 1 both compresses better and runs
+//     ~2x faster than level 3 on this data: the delta residuals are
+//     noise-like, so the greedy match search at levels 2-12 emits
+//     statistically-coincidental short matches whose offsets cost more than
+//     huffman-coded literals; level 1 finds almost no matches and lands near
+//     the order-0 entropy of the residuals. This is the codec the
+//     "vc_delta_zstd" zarr arrays use (Python tooling decodes it with plain
+//     numcodecs zstd), and what all payloads written before the rANS codec
+//     existed carry.
+//   Rans (1): order-0 rANS (12-bit tables, eight interleaved 64-bit states,
+//     32-bit renormalization). zstd's huffman-coded literals cannot spend
+//     fractional bits per symbol, which costs ~19% on the sharply peaked
+//     residual distributions that quantization produces; rANS codes them at
+//     the order-0 entropy floor (~18% smaller chunks at width 3 on dense
+//     scroll data, ~9-10% across mixed pyramid levels) with encode faster
+//     than and decode comparable to the zstd path. Default for cache writes.
 //
 // Optionally the voxels are quantized before filtering (near-lossless mode):
 // each value is snapped to the nearest multiple of quantBinWidth, so the
@@ -38,11 +51,18 @@ namespace vc {
 //   4      format version (1)
 //   5      element size in bytes (1 or 2)
 //   6      quantization bin width (0 and 1 both mean lossless)
-//   7      reserved (0)
+//   7      entropy codec id (0 zstd, 1 rANS; pre-codec payloads carry 0)
 //   8..19  chunk dims as three uint32: z, y, x (element counts)
-//   20..   zstd frame of the filtered payload (z*y*x*elemSize bytes)
+//   20..   codec 0: zstd frame of the filtered payload
+//          codec 1: 256 uint16 symbol frequencies summing to 4096, then
+//                   eight uint64 initial rANS states, then the rANS byte
+//                   stream (decoded back to front by construction)
 inline constexpr int kCacheCompressionLevel = 1;
 inline constexpr const char* kCompressedCacheExtension = ".zst";
+
+// Entropy codec for the filtered payload (VCZ1 header byte 7).
+enum class CacheCodec : unsigned char { Zstd = 0, Rans = 1 };
+inline constexpr CacheCodec kCacheDefaultCodec = CacheCodec::Rans;
 
 // Codec name used when a zarr array stores chunks in this format directly
 // (v2 "compressor" id / v3 codec name).
@@ -56,13 +76,15 @@ inline constexpr int kCacheQuantMaxErr2 = 5;
 
 // Compresses one decoded chunk of shapeZYX elements of elemSize bytes.
 // quantBinWidth 1 is lossless; larger widths quantize first (see above).
+// `level` only applies to the Zstd codec and is ignored for Rans.
 // Throws std::invalid_argument unless input.size() equals z*y*x*elemSize
 // with elemSize 1 or 2, and quantBinWidth is in [1, 255].
 std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
                                      std::array<int, 3> shapeZYX,
                                      std::size_t elemSize,
                                      int level = kCacheCompressionLevel,
-                                     int quantBinWidth = kCacheQuantLossless);
+                                     int quantBinWidth = kCacheQuantLossless,
+                                     CacheCodec codec = kCacheDefaultCodec);
 
 // In-place near-lossless quantization as applied by cacheCompress: snaps
 // each element to the nearest multiple of quantBinWidth (clamped to the
@@ -76,6 +98,10 @@ void cacheQuantize(std::span<std::byte> data,
 // if input is not a VCZ1 payload. Payloads written before quantization
 // existed report 1 (lossless).
 std::optional<int> cacheQuantBinWidth(std::span<const std::byte> input);
+
+// Entropy codec recorded in a VCZ1 payload, or std::nullopt if input is not
+// a VCZ1 payload or names an unknown codec.
+std::optional<CacheCodec> cacheCodec(std::span<const std::byte> input);
 
 // Decompresses a VCZ1 payload whose decoded size must equal expectedSize.
 // Returns std::nullopt on any error or size mismatch (treated by callers

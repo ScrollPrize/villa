@@ -189,6 +189,93 @@ TEST_CASE("Quantization width is reported for all payload generations")
         std::invalid_argument);
 }
 
+TEST_CASE("Codec id is recorded and both codecs roundtrip identically")
+{
+    const std::array<int, 3> shape{8, 6, 10};
+    for (const std::size_t elemSize : {std::size_t{1}, std::size_t{2}}) {
+        const auto input = smoothVolume(shape, elemSize);
+        const auto rans = vc::cacheCompress(asSpan(input), shape, elemSize,
+                                            vc::kCacheCompressionLevel,
+                                            vc::kCacheQuantLossless,
+                                            vc::CacheCodec::Rans);
+        const auto zstd = vc::cacheCompress(asSpan(input), shape, elemSize,
+                                            vc::kCacheCompressionLevel,
+                                            vc::kCacheQuantLossless,
+                                            vc::CacheCodec::Zstd);
+        CHECK(vc::cacheCodec(asSpan(rans)) == vc::CacheCodec::Rans);
+        CHECK(vc::cacheCodec(asSpan(zstd)) == vc::CacheCodec::Zstd);
+        CHECK(static_cast<int>(rans[7]) == 1);
+        CHECK(static_cast<int>(zstd[7]) == 0);
+
+        const auto fromRans = vc::cacheDecompress(asSpan(rans), input.size());
+        const auto fromZstd = vc::cacheDecompress(asSpan(zstd), input.size());
+        REQUIRE(fromRans.has_value());
+        REQUIRE(fromZstd.has_value());
+        CHECK(*fromRans == input);
+        CHECK(*fromZstd == input);
+    }
+
+    // Default codec for new payloads is rANS.
+    const auto input = smoothVolume(shape, 1);
+    const auto def = vc::cacheCompress(asSpan(input), shape, 1);
+    CHECK(vc::cacheCodec(asSpan(def)) == vc::kCacheDefaultCodec);
+    CHECK(vc::kCacheDefaultCodec == vc::CacheCodec::Rans);
+}
+
+TEST_CASE("rANS handles degenerate and incompressible payloads")
+{
+    // Constant chunk: a single symbol owns the whole frequency table.
+    const std::array<int, 3> shape{16, 16, 16};
+    std::vector<std::byte> zeros(16 * 16 * 16, std::byte{0});
+    const auto czero = vc::cacheCompress(asSpan(zeros), shape, 1);
+    const auto dzero = vc::cacheDecompress(asSpan(czero), zeros.size());
+    REQUIRE(dzero.has_value());
+    CHECK(*dzero == zeros);
+
+    // Uniform random bytes: near-incompressible, exercises the worst-case
+    // output bound and full 256-symbol tables.
+    std::vector<std::byte> noise(16 * 16 * 16);
+    std::mt19937 rng(99);
+    for (auto& b : noise) b = static_cast<std::byte>(rng() & 0xFF);
+    const auto cnoise = vc::cacheCompress(asSpan(noise), shape, 1);
+    const auto dnoise = vc::cacheDecompress(asSpan(cnoise), noise.size());
+    REQUIRE(dnoise.has_value());
+    CHECK(*dnoise == noise);
+}
+
+TEST_CASE("Corrupt rANS payloads and unknown codec ids return nullopt")
+{
+    const std::array<int, 3> shape{8, 8, 8};
+    const auto input = smoothVolume(shape, 1);
+    const auto good = vc::cacheCompress(asSpan(input), shape, 1,
+                                        vc::kCacheCompressionLevel,
+                                        vc::kCacheQuantLossless,
+                                        vc::CacheCodec::Rans);
+    REQUIRE(vc::cacheDecompress(asSpan(good), input.size()).has_value());
+
+    // Truncated stream.
+    std::vector<std::byte> truncated(good.begin(),
+                                     good.begin() + good.size() - 5);
+    CHECK_FALSE(vc::cacheDecompress(asSpan(truncated), input.size()).has_value());
+
+    // Trailing garbage: the stream must be consumed exactly.
+    auto padded = good;
+    padded.insert(padded.end(), 8, std::byte{0x55});
+    CHECK_FALSE(vc::cacheDecompress(asSpan(padded), input.size()).has_value());
+
+    // Frequency table not summing to 4096.
+    auto badTable = good;
+    badTable[20] = static_cast<std::byte>(
+        static_cast<unsigned char>(badTable[20]) ^ 0x01);
+    CHECK_FALSE(vc::cacheDecompress(asSpan(badTable), input.size()).has_value());
+
+    // Unknown codec id.
+    auto badCodec = good;
+    badCodec[7] = std::byte{0x7E};
+    CHECK_FALSE(vc::cacheCodec(asSpan(badCodec)).has_value());
+    CHECK_FALSE(vc::cacheDecompress(asSpan(badCodec), input.size()).has_value());
+}
+
 TEST_CASE("Corrupt and mismatched payloads return nullopt")
 {
     const std::array<int, 3> shape{4, 4, 4};

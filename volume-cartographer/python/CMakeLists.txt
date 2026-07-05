@@ -43,6 +43,19 @@ set_target_properties(vc_volume PROPERTIES
 target_link_libraries(vc_volume PRIVATE vc_core)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
+nanobind_add_module(vc_cache_codec
+    NOMINSIZE
+    vc/cache_codec.cpp
+)
+set_target_properties(vc_cache_codec PROPERTIES
+    OUTPUT_NAME cache_codec
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
+    # See vc_volume above: libs are one dir up in site-packages root.
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+)
+target_link_libraries(vc_cache_codec PRIVATE vc_core)
+target_compile_features(vc_cache_codec PRIVATE cxx_std_23)
+
 nanobind_add_module(vc_surface_index
     vc/surface_index.cpp
 )
@@ -66,7 +79,7 @@ install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index
+install(TARGETS vc_volume vc_surface_index vc_cache_codec
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )
