@@ -1,6 +1,7 @@
 #include "vc/core/util/CacheCompression.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -17,46 +18,119 @@ constexpr std::size_t kHeaderSize = 20;
 constexpr unsigned char kMagic[4] = {'V', 'C', 'Z', '1'};
 constexpr unsigned char kFormatVersion = 1;
 
-// In-place backward difference along z, then y, then x. Iterating each pass
-// from the end keeps every subtraction reading not-yet-filtered values; the
-// element-wise arithmetic wraps mod 2^8/2^16, so the inverse is exact.
+// Delta-axis masks: bit 0 differences along x, bit 1 along y, bit 2 along z.
+// kDeltaMaskZyx (all three passes) is what every payload used before
+// per-chunk selection and what non-selected payloads still use.
+constexpr unsigned kDeltaMaskZyx = 7;
+
+// In-place backward difference along each axis in `mask`, z then y then x.
+// Iterating each pass from the end keeps every subtraction reading
+// not-yet-filtered values; the element-wise arithmetic wraps mod 2^8/2^16,
+// so the inverse is exact. The passes commute, so the order is only a
+// convention shared with deltaUnfilter.
 template <typename T>
-void deltaZyxFilter(T* data, std::size_t z, std::size_t y, std::size_t x)
+void deltaFilter(T* data, std::size_t z, std::size_t y, std::size_t x,
+                 unsigned mask)
 {
     const std::size_t slice = y * x;
     const std::size_t n = z * slice;
-    for (std::size_t i = n; i-- > slice;)
-        data[i] = static_cast<T>(data[i] - data[i - slice]);
-    for (std::size_t s = 0; s < z; ++s) {
-        T* p = data + s * slice;
-        for (std::size_t i = slice; i-- > x;)
-            p[i] = static_cast<T>(p[i] - p[i - x]);
-    }
-    for (std::size_t r = 0; r < z * y; ++r) {
-        T* p = data + r * x;
-        for (std::size_t i = x; i-- > 1;)
-            p[i] = static_cast<T>(p[i] - p[i - 1]);
-    }
+    if (mask & 4)
+        for (std::size_t i = n; i-- > slice;)
+            data[i] = static_cast<T>(data[i] - data[i - slice]);
+    if (mask & 2)
+        for (std::size_t s = 0; s < z; ++s) {
+            T* p = data + s * slice;
+            for (std::size_t i = slice; i-- > x;)
+                p[i] = static_cast<T>(p[i] - p[i - x]);
+        }
+    if (mask & 1)
+        for (std::size_t r = 0; r < z * y; ++r) {
+            T* p = data + r * x;
+            for (std::size_t i = x; i-- > 1;)
+                p[i] = static_cast<T>(p[i] - p[i - 1]);
+        }
 }
 
 // Inverse: forward prefix sums along x, then y, then z.
 template <typename T>
-void deltaZyxUnfilter(T* data, std::size_t z, std::size_t y, std::size_t x)
+void deltaUnfilter(T* data, std::size_t z, std::size_t y, std::size_t x,
+                   unsigned mask)
 {
     const std::size_t slice = y * x;
     const std::size_t n = z * slice;
-    for (std::size_t r = 0; r < z * y; ++r) {
-        T* p = data + r * x;
-        for (std::size_t i = 1; i < x; ++i)
-            p[i] = static_cast<T>(p[i] + p[i - 1]);
+    if (mask & 1)
+        for (std::size_t r = 0; r < z * y; ++r) {
+            T* p = data + r * x;
+            for (std::size_t i = 1; i < x; ++i)
+                p[i] = static_cast<T>(p[i] + p[i - 1]);
+        }
+    if (mask & 2)
+        for (std::size_t s = 0; s < z; ++s) {
+            T* p = data + s * slice;
+            for (std::size_t i = x; i < slice; ++i)
+                p[i] = static_cast<T>(p[i] + p[i - x]);
+        }
+    if (mask & 4)
+        for (std::size_t i = slice; i < n; ++i)
+            data[i] = static_cast<T>(data[i] + data[i - slice]);
+}
+
+// Picks the delta-axis mask with the lowest order-0 residual entropy. Each
+// difference pass cancels smooth structure but doubles white-noise variance,
+// so on noise-dominated chunks fewer passes often beat the full cascade; the
+// winner varies chunk to chunk, hence measuring instead of guessing. One
+// pass over every 4th z-slice histograms all eight subsets at once via the
+// Lorenzo-corner identity (the residual of any axis subset is the
+// alternating sum over the corresponding neighbor corners); entropy of the
+// subsampled histogram tracks the full-chunk rANS size closely enough that
+// this recovers nearly all of the exhaustive gain. Requires all dims >= 2.
+unsigned selectDeltaMask(const std::uint8_t* q,
+                         std::size_t z,
+                         std::size_t y,
+                         std::size_t x)
+{
+    std::uint64_t h[8][256] = {};
+    std::uint64_t n = 0;
+    const std::size_t slice = y * x;
+    for (std::size_t zz = 1; zz < z; zz += 4) {
+        for (std::size_t yy = 1; yy < y; ++yy) {
+            const std::uint8_t* p = q + zz * slice + yy * x;
+            const std::uint8_t* py = p - x;
+            const std::uint8_t* pz = p - slice;
+            const std::uint8_t* pyz = pz - x;
+            for (std::size_t xx = 1; xx < x; ++xx) {
+                const int v = p[xx];
+                const int vx = p[xx - 1], vy = py[xx], vz = pz[xx];
+                const int vxy = py[xx - 1], vxz = pz[xx - 1], vyz = pyz[xx];
+                const int vxyz = pyz[xx - 1];
+                h[0][v]++;
+                h[1][static_cast<std::uint8_t>(v - vx)]++;
+                h[2][static_cast<std::uint8_t>(v - vy)]++;
+                h[3][static_cast<std::uint8_t>(v - vx - vy + vxy)]++;
+                h[4][static_cast<std::uint8_t>(v - vz)]++;
+                h[5][static_cast<std::uint8_t>(v - vx - vz + vxz)]++;
+                h[6][static_cast<std::uint8_t>(v - vy - vz + vyz)]++;
+                h[7][static_cast<std::uint8_t>(v - vx - vy - vz + vxy +
+                                               vxz + vyz - vxyz)]++;
+                ++n;
+            }
+        }
     }
-    for (std::size_t s = 0; s < z; ++s) {
-        T* p = data + s * slice;
-        for (std::size_t i = x; i < slice; ++i)
-            p[i] = static_cast<T>(p[i] + p[i - x]);
+    unsigned best = kDeltaMaskZyx;
+    double bestBits = std::numeric_limits<double>::max();
+    for (unsigned m = 0; m < 8; ++m) {
+        double bits = 0;
+        for (int s = 0; s < 256; ++s)
+            if (h[m][s]) {
+                const double p = static_cast<double>(h[m][s]) / n;
+                bits -= p * std::log2(p);
+            }
+        if (bits < bestBits) {
+            bestBits = bits;
+            best = m;
+        }
     }
-    for (std::size_t i = slice; i < n; ++i)
-        data[i] = static_cast<T>(data[i] + data[i - slice]);
+    return best;
 }
 
 // Snap to the nearest multiple of `width` (bins centered on multiples, so 0
@@ -333,6 +407,35 @@ bool hasVcz1Header(std::span<const std::byte> input)
            static_cast<unsigned char>(input[4]) == kFormatVersion;
 }
 
+// Header byte 7: bits 0-3 codec id; bit 7 set means bits 4-6 carry the
+// delta-axis mask. Payloads from before per-chunk selection have bits 4-7
+// clear and imply full zyx; a clear flag with nonzero mask bits is invalid.
+struct CodecByte {
+    CacheCodec codec;
+    unsigned mask;
+    bool hasMask;
+};
+
+std::optional<CodecByte> parseCodecByte(unsigned char b)
+{
+    const bool hasMask = (b & 0x80) != 0;
+    if (!hasMask && (b & 0x70) != 0)
+        return std::nullopt;
+    CodecByte out;
+    out.hasMask = hasMask;
+    out.mask = hasMask ? (b >> 4) & 7u : kDeltaMaskZyx;
+    switch (b & 0x0F) {
+    case static_cast<unsigned char>(CacheCodec::Zstd):
+        out.codec = CacheCodec::Zstd;
+        return out;
+    case static_cast<unsigned char>(CacheCodec::Rans):
+        out.codec = CacheCodec::Rans;
+        return out;
+    default:
+        return std::nullopt;
+    }
+}
+
 std::vector<std::byte> zstdCompressFrame(std::span<const std::byte> input,
                                          int level,
                                          std::size_t headerReserve)
@@ -381,10 +484,23 @@ std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
 
     std::vector<std::byte> filtered(input.begin(), input.end());
     cacheQuantize({filtered.data(), filtered.size()}, elemSize, quantBinWidth);
+
+    // Per-chunk filter selection is limited to rANS uint8 payloads: the zstd
+    // codec keeps fixed zyx so pure-Python "vc_delta_zstd" readers stay
+    // valid, and the uint16 probe isn't implemented (16-bit volumes are rare
+    // in the streaming path). Degenerate dims skip the probe; the extra
+    // passes are no-ops there anyway.
+    unsigned mask = kDeltaMaskZyx;
+    if (codec == CacheCodec::Rans && elemSize == 1 && z >= 2 && y >= 2 &&
+        x >= 2)
+        mask = selectDeltaMask(
+            reinterpret_cast<const std::uint8_t*>(filtered.data()), z, y, x);
     if (elemSize == 1)
-        deltaZyxFilter(reinterpret_cast<std::uint8_t*>(filtered.data()), z, y, x);
+        deltaFilter(reinterpret_cast<std::uint8_t*>(filtered.data()), z, y, x,
+                    mask);
     else
-        deltaZyxFilter(reinterpret_cast<std::uint16_t*>(filtered.data()), z, y, x);
+        deltaFilter(reinterpret_cast<std::uint16_t*>(filtered.data()), z, y, x,
+                    mask);
 
     const std::span<const std::byte> filteredSpan(filtered.data(),
                                                   filtered.size());
@@ -395,7 +511,10 @@ std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
     output[4] = static_cast<std::byte>(kFormatVersion);
     output[5] = static_cast<std::byte>(elemSize);
     output[6] = static_cast<std::byte>(quantBinWidth);
-    output[7] = static_cast<std::byte>(codec);
+    output[7] = codec == CacheCodec::Rans
+        ? static_cast<std::byte>(0x80u | (mask << 4) |
+                                 static_cast<unsigned>(codec))
+        : static_cast<std::byte>(codec);
     writeU32(output.data() + 8, static_cast<std::uint32_t>(z));
     writeU32(output.data() + 12, static_cast<std::uint32_t>(y));
     writeU32(output.data() + 16, static_cast<std::uint32_t>(x));
@@ -427,14 +546,20 @@ std::optional<CacheCodec> cacheCodec(std::span<const std::byte> input)
 {
     if (!hasVcz1Header(input))
         return std::nullopt;
-    switch (static_cast<unsigned char>(input[7])) {
-    case static_cast<unsigned char>(CacheCodec::Zstd):
-        return CacheCodec::Zstd;
-    case static_cast<unsigned char>(CacheCodec::Rans):
-        return CacheCodec::Rans;
-    default:
+    const auto parsed = parseCodecByte(static_cast<unsigned char>(input[7]));
+    if (!parsed)
         return std::nullopt;
-    }
+    return parsed->codec;
+}
+
+std::optional<int> cacheDeltaMask(std::span<const std::byte> input)
+{
+    if (!hasVcz1Header(input))
+        return std::nullopt;
+    const auto parsed = parseCodecByte(static_cast<unsigned char>(input[7]));
+    if (!parsed || !parsed->hasMask)
+        return std::nullopt;
+    return static_cast<int>(parsed->mask);
 }
 
 std::optional<std::vector<std::byte>> cacheDecompress(
@@ -451,12 +576,12 @@ std::optional<std::vector<std::byte>> cacheDecompress(
     if ((elemSize != 1 && elemSize != 2) || z == 0 || y == 0 || x == 0 ||
         z * y * x * elemSize != expectedSize)
         return std::nullopt;
-    const auto codec = cacheCodec(input);
-    if (!codec)
+    const auto parsed = parseCodecByte(static_cast<unsigned char>(input[7]));
+    if (!parsed)
         return std::nullopt;
 
     std::vector<std::byte> output(expectedSize);
-    if (*codec == CacheCodec::Rans) {
+    if (parsed->codec == CacheCodec::Rans) {
         if (!ransDecompressFrame(input.subspan(kHeaderSize), output.data(),
                                  expectedSize))
             return std::nullopt;
@@ -469,9 +594,11 @@ std::optional<std::vector<std::byte>> cacheDecompress(
     }
 
     if (elemSize == 1)
-        deltaZyxUnfilter(reinterpret_cast<std::uint8_t*>(output.data()), z, y, x);
+        deltaUnfilter(reinterpret_cast<std::uint8_t*>(output.data()), z, y, x,
+                      parsed->mask);
     else
-        deltaZyxUnfilter(reinterpret_cast<std::uint16_t*>(output.data()), z, y, x);
+        deltaUnfilter(reinterpret_cast<std::uint16_t*>(output.data()), z, y, x,
+                      parsed->mask);
     return output;
 }
 

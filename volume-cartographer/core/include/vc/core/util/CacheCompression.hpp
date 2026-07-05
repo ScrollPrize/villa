@@ -14,11 +14,21 @@ namespace vc {
 // Chunks cached from remote volumes with a raw/uncompressed source are stored
 // as plain decoded bytes (".bin"). cacheCompress() converts such payloads to
 // the self-describing "VCZ1" format (".zst" cache files): a small header
-// followed by an entropy-coded frame of the delta-zyx-filtered voxels. The
-// filter stores each element as the difference from its predecessor along z,
-// then y, then x (mod 2^8/2^16), which roughly halves the compressed size of
-// scroll CT data compared to zstd on raw bytes while the filter itself runs
-// at memory bandwidth.
+// followed by an entropy-coded frame of the delta-filtered voxels. The
+// filter stores each element as the difference from its predecessor along a
+// per-chunk subset of the z, y, x axes (mod 2^8/2^16), which roughly halves
+// the compressed size of scroll CT data compared to zstd on raw bytes while
+// the filter itself runs at memory bandwidth.
+//
+// Which axes to difference is chosen per chunk (rANS uint8 payloads only;
+// everything else stays full zyx): each pass cancels smooth structure along
+// its axis but doubles white-noise variance, so on noise-dominated level-0
+// scroll data the third pass usually costs more than it saves and a two-axis
+// filter wins (occasionally one axis, on sparse or very clean chunks). The
+// encoder probes all eight subsets with order-0 histograms of the Lorenzo
+// corner residuals over every 4th z-slice, keeps the lowest-entropy one, and
+// records it in the header (~14% smaller level-0 chunks than fixed zyx at
+// identical fidelity).
 //
 // Two entropy codecs exist, recorded in header byte 7:
 //   Zstd (0): a plain zstd frame. Level 1 both compresses better and runs
@@ -51,7 +61,12 @@ namespace vc {
 //   4      format version (1)
 //   5      element size in bytes (1 or 2)
 //   6      quantization bin width (0 and 1 both mean lossless)
-//   7      entropy codec id (0 zstd, 1 rANS; pre-codec payloads carry 0)
+//   7      bits 0-3: entropy codec id (0 zstd, 1 rANS; pre-codec payloads
+//          carry 0). Bit 7 set means bits 4-6 record the delta-axis mask
+//          (bit 4 x, bit 5 y, bit 6 z). Payloads written before per-chunk
+//          filter selection have bits 4-7 clear and are always full zyx;
+//          zstd-codec payloads stay full zyx so the pure-Python
+//          "vc_delta_zstd" decoder keeps working.
 //   8..19  chunk dims as three uint32: z, y, x (element counts)
 //   20..   codec 0: zstd frame of the filtered payload
 //          codec 1: 256 uint16 symbol frequencies summing to 4096, then
@@ -102,6 +117,12 @@ std::optional<int> cacheQuantBinWidth(std::span<const std::byte> input);
 // Entropy codec recorded in a VCZ1 payload, or std::nullopt if input is not
 // a VCZ1 payload or names an unknown codec.
 std::optional<CacheCodec> cacheCodec(std::span<const std::byte> input);
+
+// Delta-axis mask recorded in a VCZ1 payload (bit 0 x, bit 1 y, bit 2 z), or
+// std::nullopt if input is not a VCZ1 payload or predates per-chunk filter
+// selection (such payloads are always full zyx). Recompression uses this to
+// tell whether re-encoding a payload could still shrink it.
+std::optional<int> cacheDeltaMask(std::span<const std::byte> input);
 
 // Decompresses a VCZ1 payload whose decoded size must equal expectedSize.
 // Returns std::nullopt on any error or size mismatch (treated by callers

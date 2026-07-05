@@ -677,10 +677,13 @@
           <item row="2" column="0" colspan="2">
            <widget class="QCheckBox" name="chkCompressRemoteCache">
             <property name="text">
-             <string>Compress remote volume disk cache (zstd, lossless)</string>
+             <string>Compress remote volume disk cache</string>
             </property>
             <property name="toolTip">
-             <string>When enabled, chunks downloaded from remote volumes are stored zstd-compressed in the disk cache. Lossless and fast; typically shrinks the cache severalfold. Existing cache entries stay readable either way. Requires restart.</string>
+             <string>When enabled, chunks downloaded from remote volumes are stored compressed in the disk cache using the selected accuracy below. Existing cache entries stay readable either way. Requires restart.</string>
+            </property>
+            <property name="checked">
+             <bool>true</bool>
             </property>
            </widget>
           </item>

@@ -26,7 +26,8 @@ VCZ1 layout (little-endian):
   4      format version (1)
   5      element size in bytes (1 or 2)
   6      quantization bin width (0 and 1 both mean lossless)
-  7      entropy codec id (0 zstd, 1 rANS)
+  7      bits 0-3: entropy codec id (0 zstd, 1 rANS); bit 7 set means bits
+         4-6 record a per-chunk delta-axis mask (rANS payloads only)
   8..19  chunk dims as three uint32: z, y, x (element counts)
   20..   codec 0: zstd frame of the filtered payload
          codec 1: rANS frequency table, states, and byte stream
@@ -139,7 +140,10 @@ def decode_chunk(buf: bytes) -> np.ndarray:
     if elemsize not in (1, 2):
         raise ValueError(f"unsupported element size {elemsize}")
     dtype = np.uint8 if elemsize == 1 else np.uint16
-    codec = meta >> 8
+    # High byte: bits 0-3 codec id; bit 7 set means bits 4-6 carry a
+    # per-chunk delta-axis mask (rANS payloads only — the compiled codec
+    # handles it; zstd payloads are always full zyx).
+    codec = (meta >> 8) & 0x0F
     if codec == CODEC_IDS["rans"]:
         raw = _vc_cache_codec().decompress(bytes(buf), z * y * x * elemsize)
         return np.frombuffer(raw, dtype=dtype).reshape(z, y, x)
@@ -260,7 +264,16 @@ def _recorded_quant(buf: bytes) -> int:
 
 
 def _recorded_codec(buf: bytes) -> int:
-    return buf[7]
+    return buf[7] & 0x0F
+
+
+def _up_to_date(buf: bytes, quant: int, codec: str) -> bool:
+    """True when a payload already carries the requested quant/codec and,
+    for rANS, a per-chunk delta mask (mask-less payloads predate filter
+    selection and re-encode losslessly to a smaller frame)."""
+    return (buf[:4] == MAGIC and _recorded_quant(buf) >= quant
+            and _recorded_codec(buf) == CODEC_IDS[codec]
+            and (codec == "zstd" or bool(buf[7] & 0x80)))
 
 
 def _process_chunk(args: tuple) -> tuple[str, int, int, bool]:
@@ -271,10 +284,9 @@ def _process_chunk(args: tuple) -> tuple[str, int, int, bool]:
     buf = path.read_bytes()
 
     # Already converted (resume / idempotence) — unless a coarser
-    # quantization or a different entropy codec was requested than the
-    # payload carries.
-    if buf[:4] == MAGIC and _recorded_quant(buf) >= quant \
-            and _recorded_codec(buf) == CODEC_IDS[codec]:
+    # quantization, a different entropy codec, or a filter upgrade was
+    # requested than the payload carries.
+    if _up_to_date(buf, quant, codec):
         if out_path != path:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(buf)
@@ -393,9 +405,7 @@ def _rechunk_jobs(array_dir: Path, out_dir: Path, meta: dict,
                             out_path = chunk_key_path(out_dir, idx, sep)
                             if out_path.exists():
                                 head = out_path.read_bytes()[:HEADER.size]
-                                if head[:4] == MAGIC and \
-                                        _recorded_quant(head) >= quant and \
-                                        _recorded_codec(head) == CODEC_IDS[codec]:
+                                if _up_to_date(head, quant, codec):
                                     continue
                             dst_entries.append(
                                 ((iz * new_chunks[0], iy * new_chunks[1],

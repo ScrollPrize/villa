@@ -204,8 +204,13 @@ TEST_CASE("Codec id is recorded and both codecs roundtrip identically")
                                             vc::CacheCodec::Zstd);
         CHECK(vc::cacheCodec(asSpan(rans)) == vc::CacheCodec::Rans);
         CHECK(vc::cacheCodec(asSpan(zstd)) == vc::CacheCodec::Zstd);
-        CHECK(static_cast<int>(rans[7]) == 1);
+        // rANS payloads record their delta-axis mask (flag bit 7); zstd
+        // payloads keep the plain codec byte for Python compatibility.
+        CHECK((static_cast<int>(rans[7]) & 0x0F) == 1);
+        CHECK((static_cast<int>(rans[7]) & 0x80) == 0x80);
         CHECK(static_cast<int>(zstd[7]) == 0);
+        CHECK(vc::cacheDeltaMask(asSpan(rans)).has_value());
+        CHECK_FALSE(vc::cacheDeltaMask(asSpan(zstd)).has_value());
 
         const auto fromRans = vc::cacheDecompress(asSpan(rans), input.size());
         const auto fromZstd = vc::cacheDecompress(asSpan(zstd), input.size());
@@ -220,6 +225,64 @@ TEST_CASE("Codec id is recorded and both codecs roundtrip identically")
     const auto def = vc::cacheCompress(asSpan(input), shape, 1);
     CHECK(vc::cacheCodec(asSpan(def)) == vc::kCacheDefaultCodec);
     CHECK(vc::kCacheDefaultCodec == vc::CacheCodec::Rans);
+}
+
+TEST_CASE("Per-chunk delta mask roundtrips on directional data")
+{
+    // Patterns whose lowest-entropy filter differs (smooth along one axis,
+    // noisy along the others, pure noise, near-constant): whatever mask the
+    // probe picks, decode must reproduce the input exactly and the payload
+    // must record a mask.
+    const std::array<int, 3> shape{16, 12, 14};
+    const std::size_t n = 16 * 12 * 14;
+    std::mt19937 rng(7);
+    for (int pattern = 0; pattern < 4; ++pattern) {
+        std::vector<std::byte> input(n);
+        std::size_t i = 0;
+        for (int z = 0; z < shape[0]; ++z)
+            for (int y = 0; y < shape[1]; ++y)
+                for (int x = 0; x < shape[2]; ++x) {
+                    int v = 0;
+                    switch (pattern) {
+                    case 0: v = 16 * z + static_cast<int>(rng() % 3); break;
+                    case 1: v = 16 * x + static_cast<int>(rng() % 3); break;
+                    case 2: v = static_cast<int>(rng() % 256); break;
+                    case 3: v = 100; break;
+                    }
+                    input[i++] = static_cast<std::byte>(v & 0xFF);
+                }
+        const auto compressed = vc::cacheCompress(asSpan(input), shape, 1);
+        const auto mask = vc::cacheDeltaMask(asSpan(compressed));
+        REQUIRE(mask.has_value());
+        CHECK(*mask >= 0);
+        CHECK(*mask <= 7);
+        const auto decoded = vc::cacheDecompress(asSpan(compressed), n);
+        REQUIRE(decoded.has_value());
+        CHECK(*decoded == input);
+    }
+}
+
+TEST_CASE("Legacy rANS payloads without a mask decode as full zyx")
+{
+    // uint16 payloads never probe, so their filter is exactly the legacy
+    // zyx cascade; clearing the header's mask bits reconstructs a payload
+    // written before per-chunk selection existed and it must still decode.
+    const std::array<int, 3> shape{6, 5, 7};
+    const auto input = smoothVolume(shape, 2);
+    auto compressed = vc::cacheCompress(asSpan(input), shape, 2);
+    REQUIRE(vc::cacheDeltaMask(asSpan(compressed)) == 7);
+
+    compressed[7] = std::byte{1};
+    CHECK_FALSE(vc::cacheDeltaMask(asSpan(compressed)).has_value());
+    CHECK(vc::cacheCodec(asSpan(compressed)) == vc::CacheCodec::Rans);
+    const auto decoded = vc::cacheDecompress(asSpan(compressed), input.size());
+    REQUIRE(decoded.has_value());
+    CHECK(*decoded == input);
+
+    // Mask bits without the flag bit are not a valid codec byte.
+    compressed[7] = std::byte{0x51};
+    CHECK_FALSE(vc::cacheCodec(asSpan(compressed)).has_value());
+    CHECK_FALSE(vc::cacheDecompress(asSpan(compressed), input.size()).has_value());
 }
 
 TEST_CASE("rANS handles degenerate and incompressible payloads")
