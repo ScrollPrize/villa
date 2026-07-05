@@ -117,6 +117,18 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
     chkCompressRemoteCache->setChecked(
         settings.value(perf::REMOTE_CACHE_COMPRESSION, perf::REMOTE_CACHE_COMPRESSION_DEFAULT).toBool());
 
+    cmbCacheQuantization->addItem(tr("Lossless"), vc::kCacheQuantLossless);
+    cmbCacheQuantization->addItem(tr("Near-lossless (max error ±1)"),
+                                  vc::kCacheQuantMaxErr1);
+    cmbCacheQuantization->addItem(tr("Near-lossless (max error ±2)"),
+                                  vc::kCacheQuantMaxErr2);
+    {
+        const int width = settings.value(perf::REMOTE_CACHE_QUANTIZATION,
+                                         perf::REMOTE_CACHE_QUANTIZATION_DEFAULT).toInt();
+        const int idx = cmbCacheQuantization->findData(width);
+        cmbCacheQuantization->setCurrentIndex(idx >= 0 ? idx : 0);
+    }
+
     // Compacting an existing cache needs a currently shown remote volume.
     btnCompressExistingCache->setEnabled(!_currentVolumeCacheDir.empty());
     if (_currentVolumeCacheDir.empty()) {
@@ -248,6 +260,8 @@ void SettingsDialog::accept()
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
     settings.setValue(perf::REMOTE_CACHE_COMPRESSION, chkCompressRemoteCache->isChecked());
+    settings.setValue(perf::REMOTE_CACHE_QUANTIZATION,
+                      cmbCacheQuantization->currentData().toInt());
 
     // Per-segment backup count: persist and apply live (no restart needed).
     if (spinSegmentBackupCount) {
@@ -265,56 +279,83 @@ void SettingsDialog::accept()
 
 namespace {
 
-// Compress one raw cache chunk in place: <name>.bin -> <name>.zst
-// (atomic tmp+rename, source removed on success). Returns false on failure —
-// including a mismatched or unknown chunk shape, which cacheCompress rejects —
-// and the original file is left untouched in that case.
-bool compressCacheFile(const std::filesystem::path& binPath,
-                       std::array<int, 3> shapeZYX,
-                       std::size_t elemSize,
-                       std::uint64_t& bytesIn,
-                       std::uint64_t& bytesOut)
+enum class RecompressResult { Done, Skipped, Failed };
+
+// Recompress one cache chunk in place with the requested quantization
+// (atomic tmp+rename; a replaced ".bin" source is removed on success).
+// Raw ".bin" chunks are always encoded; ".zst" chunks are re-encoded only
+// when their recorded quantization width is below the requested one
+// (re-quantizing at the same width would be a lossless no-op, and a payload
+// quantized more coarsely has nothing left to recover). Returns Failed on
+// any error — including a mismatched or unknown chunk shape, which
+// cacheCompress rejects — and the original file is left untouched then.
+RecompressResult compressCacheFile(const std::filesystem::path& srcPath,
+                                   std::array<int, 3> shapeZYX,
+                                   std::size_t elemSize,
+                                   int quantBinWidth,
+                                   std::uint64_t& bytesIn,
+                                   std::uint64_t& bytesOut)
 {
     namespace fs = std::filesystem;
 
     std::vector<std::byte> input;
     {
-        std::ifstream file(binPath, std::ios::binary | std::ios::ate);
+        std::ifstream file(srcPath, std::ios::binary | std::ios::ate);
         if (!file)
-            return false;
+            return RecompressResult::Failed;
         const auto size = file.tellg();
         if (size < 0)
-            return false;
+            return RecompressResult::Failed;
         input.resize(static_cast<std::size_t>(size));
         file.seekg(0);
         file.read(reinterpret_cast<char*>(input.data()), size);
         if (!file)
-            return false;
+            return RecompressResult::Failed;
+    }
+
+    const bool alreadyCompressed =
+        srcPath.extension() == vc::kCompressedCacheExtension;
+    std::vector<std::byte> raw;
+    std::span<const std::byte> rawSpan(input.data(), input.size());
+    if (alreadyCompressed) {
+        const auto existingWidth =
+            vc::cacheQuantBinWidth(std::span<const std::byte>(input.data(), input.size()));
+        if (!existingWidth)
+            return RecompressResult::Failed;
+        if (*existingWidth >= quantBinWidth)
+            return RecompressResult::Skipped;
+        const std::size_t expectedSize =
+            static_cast<std::size_t>(shapeZYX[0]) * shapeZYX[1] * shapeZYX[2] *
+            elemSize;
+        auto decoded = vc::cacheDecompress(
+            std::span<const std::byte>(input.data(), input.size()), expectedSize);
+        if (!decoded)
+            return RecompressResult::Failed;
+        raw = std::move(*decoded);
+        rawSpan = {raw.data(), raw.size()};
     }
 
     std::vector<std::byte> compressed;
     try {
-        compressed = vc::cacheCompress(
-            std::span<const std::byte>(input.data(), input.size()),
-            shapeZYX,
-            elemSize);
+        compressed = vc::cacheCompress(rawSpan, shapeZYX, elemSize,
+                                       vc::kCacheCompressionLevel, quantBinWidth);
     } catch (const std::exception&) {
-        return false;
+        return RecompressResult::Failed;
     }
 
-    fs::path zstPath = binPath;
+    fs::path zstPath = srcPath;
     zstPath.replace_extension(vc::kCompressedCacheExtension);
     const fs::path tmpPath = zstPath.string() + ".tmp";
     {
         std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
         if (!file)
-            return false;
+            return RecompressResult::Failed;
         file.write(reinterpret_cast<const char*>(compressed.data()),
                    static_cast<std::streamsize>(compressed.size()));
         if (!file) {
             std::error_code ec;
             fs::remove(tmpPath, ec);
-            return false;
+            return RecompressResult::Failed;
         }
     }
     std::error_code ec;
@@ -326,13 +367,14 @@ bool compressCacheFile(const std::filesystem::path& binPath,
     }
     if (ec) {
         fs::remove(tmpPath, ec);
-        return false;
+        return RecompressResult::Failed;
     }
-    fs::remove(binPath, ec);
+    if (!alreadyCompressed)
+        fs::remove(srcPath, ec);
 
     bytesIn += input.size();
     bytesOut += compressed.size();
-    return true;
+    return RecompressResult::Done;
 }
 
 } // namespace
@@ -349,10 +391,13 @@ void SettingsDialog::compressExistingCache()
         return;
     }
 
-    // Uncompressed chunks are stored as ".bin"; ".zst" is already
-    // compressed and ".c3d"/".empty" entries have nothing to gain.
-    // Each file's pyramid level ("level_N" path component) selects the
-    // chunk shape used by the delta-zyx compression filter.
+    // Uncompressed chunks are stored as ".bin". When a near-lossless mode
+    // is selected, already-compressed ".zst" chunks are candidates too —
+    // the worker re-encodes only those recorded with a narrower
+    // quantization than requested. ".c3d"/".empty" entries have nothing to
+    // gain. Each file's pyramid level ("level_N" path component) selects
+    // the chunk shape used by the delta-zyx compression filter.
+    const int quantBinWidth = cmbCacheQuantization->currentData().toInt();
     const auto& layout = _currentVolumeChunkLayout;
     auto shapeForFile = [&](const fs::path& path) -> std::array<int, 3> {
         const auto rel = fs::relative(path, cacheDir, ec);
@@ -374,12 +419,17 @@ void SettingsDialog::compressExistingCache()
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (ec)
             break;
-        if (it->is_regular_file(ec) && it->path().extension() == ".bin")
+        if (!it->is_regular_file(ec))
+            continue;
+        const auto ext = it->path().extension();
+        if (ext == ".bin" ||
+            (quantBinWidth > vc::kCacheQuantLossless &&
+             ext == vc::kCompressedCacheExtension))
             files.emplace_back(it->path(), shapeForFile(it->path()));
     }
     if (files.empty()) {
         QMessageBox::information(this, tr("Compress cache"),
-            tr("The cache for the currently shown volume has no uncompressed chunks."));
+            tr("The cache for the currently shown volume has no chunks to compress."));
         return;
     }
 
@@ -393,6 +443,7 @@ void SettingsDialog::compressExistingCache()
     std::atomic<std::size_t> nextIndex{0};
     std::atomic<std::size_t> done{0};
     std::atomic<std::size_t> failures{0};
+    std::atomic<std::size_t> skipped{0};
     std::atomic<std::uint64_t> totalIn{0};
     std::atomic<std::uint64_t> totalOut{0};
     std::atomic<bool> cancelled{false};
@@ -409,18 +460,24 @@ void SettingsDialog::compressExistingCache()
             std::uint64_t bytesIn = 0;
             std::uint64_t bytesOut = 0;
             std::size_t localFailures = 0;
+            std::size_t localSkipped = 0;
             while (!cancelled.load(std::memory_order_relaxed)) {
                 const auto i = nextIndex.fetch_add(1, std::memory_order_relaxed);
                 if (i >= files.size())
                     break;
-                if (!compressCacheFile(files[i].first, files[i].second,
-                                       layout.elemSize, bytesIn, bytesOut))
-                    ++localFailures;
+                switch (compressCacheFile(files[i].first, files[i].second,
+                                          layout.elemSize, quantBinWidth,
+                                          bytesIn, bytesOut)) {
+                case RecompressResult::Failed: ++localFailures; break;
+                case RecompressResult::Skipped: ++localSkipped; break;
+                case RecompressResult::Done: break;
+                }
                 done.fetch_add(1, std::memory_order_relaxed);
             }
             totalIn += bytesIn;
             totalOut += bytesOut;
             failures += localFailures;
+            skipped += localSkipped;
         }));
     }
 
@@ -437,7 +494,8 @@ void SettingsDialog::compressExistingCache()
     const auto gib = [](std::uint64_t bytes) {
         return QString::number(static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), 'f', 2);
     };
-    const std::size_t compressed = done.load() - failures.load();
+    const std::size_t compressed =
+        done.load() - failures.load() - skipped.load();
     QString summary =
         tr("Compressed %1 of %2 chunks: %3 GiB -> %4 GiB.")
             .arg(compressed)
@@ -446,6 +504,8 @@ void SettingsDialog::compressExistingCache()
             .arg(gib(totalOut.load()));
     if (cancelled)
         summary += tr("\nCancelled — the remaining chunks are unchanged and can be compressed later.");
+    if (skipped.load() > 0)
+        summary += tr("\n%1 chunks already matched the selected accuracy and were left as-is.").arg(skipped.load());
     if (failures.load() > 0)
         summary += tr("\n%1 chunks could not be compressed and were left as-is.").arg(failures.load());
     QMessageBox::information(this, tr("Compress cache"), summary);

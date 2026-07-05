@@ -301,6 +301,9 @@ auto main(int argc, char* argv[]) -> int
         vc::render::ChunkCache::setPersistentCompressionDefault(
             settings.value(perf::REMOTE_CACHE_COMPRESSION,
                            perf::REMOTE_CACHE_COMPRESSION_DEFAULT).toBool());
+        vc::render::ChunkCache::setPersistentQuantizationDefault(
+            settings.value(perf::REMOTE_CACHE_QUANTIZATION,
+                           perf::REMOTE_CACHE_QUANTIZATION_DEFAULT).toInt());
     }
     if (parser.isSet(cacheSizeOption)) {
         bool ok = false;

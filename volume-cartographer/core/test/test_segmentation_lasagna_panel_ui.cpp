@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>

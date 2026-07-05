@@ -44,6 +44,11 @@ public:
         // process-wide default below at construction. Chunks whose source
         // encoding is already compact (".c3d") are never recompressed.
         bool compressPersistentCache = false;
+        // Near-lossless quantization bin width for compressed persistent
+        // writes (1 = lossless, 3 = max error +-1, 5 = +-2; see
+        // CacheCompression.hpp). Combined (max) with the process-wide
+        // default below at construction.
+        int cacheQuantBinWidth = 1;
     };
 
     struct Stats {
@@ -90,6 +95,11 @@ public:
     // without threading it through each construction site.
     static void setPersistentCompressionDefault(bool enabled);
     static bool persistentCompressionDefault();
+
+    // Process-wide default for Options::cacheQuantBinWidth (same pattern as
+    // the compression default above; the larger of the two values wins).
+    static void setPersistentQuantizationDefault(int binWidth);
+    static int persistentQuantizationDefault();
 
 private:
     enum class EntryStatus {

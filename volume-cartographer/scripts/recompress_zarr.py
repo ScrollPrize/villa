@@ -18,7 +18,8 @@ VCZ1 layout (little-endian):
   0..3   magic 'V' 'C' 'Z' '1'
   4      format version (1)
   5      element size in bytes (1 or 2)
-  6..7   reserved (0)
+  6      quantization bin width (0 and 1 both mean lossless)
+  7      reserved (0)
   8..19  chunk dims as three uint32: z, y, x (element counts)
   20..   zstd frame of the filtered payload
 
@@ -64,15 +65,29 @@ except ImportError:  # pragma: no cover
 CODEC_ID = "vc_delta_zstd"
 MAGIC = b"VCZ1"
 HEADER = struct.Struct("<4sBBHIII")  # magic, version, elemsize, reserved, z, y, x
-DEFAULT_ZSTD_LEVEL = 3
+DEFAULT_ZSTD_LEVEL = 1
+DEFAULT_QUANT = 1  # near-lossless bin width: 1=lossless, 3=max err +-1, 5=+-2
 
 
-def encode_chunk(a: np.ndarray, level: int = DEFAULT_ZSTD_LEVEL) -> bytes:
+def quantize(a: np.ndarray, quant: int) -> np.ndarray:
+    """Snap to the nearest multiple of `quant` (0 stays 0; error <= quant//2).
+    Idempotent, so re-encoding already-quantized data is lossless."""
+    if quant <= 1:
+        return a
+    maxval = np.iinfo(a.dtype).max
+    return np.minimum(((a.astype(np.int32) + quant // 2) // quant) * quant,
+                      maxval).astype(a.dtype)
+
+
+def encode_chunk(a: np.ndarray, level: int = DEFAULT_ZSTD_LEVEL,
+                 quant: int = DEFAULT_QUANT) -> bytes:
     if a.ndim != 3:
         raise ValueError("vc_delta_zstd expects 3D chunks")
     if a.dtype not in (np.uint8, np.uint16):
         raise ValueError("vc_delta_zstd supports uint8/uint16 only")
-    a = np.ascontiguousarray(a)
+    if not 1 <= quant <= 255:
+        raise ValueError("quant bin width must be in [1, 255]")
+    a = np.ascontiguousarray(quantize(a, quant))
     d = a.copy()
     d[1:, :, :] -= a[:-1, :, :]
     e = d.copy()
@@ -80,7 +95,7 @@ def encode_chunk(a: np.ndarray, level: int = DEFAULT_ZSTD_LEVEL) -> bytes:
     f = e.copy()
     f[:, :, 1:] -= e[:, :, :-1]
     z, y, x = a.shape
-    header = HEADER.pack(MAGIC, 1, a.dtype.itemsize, 0, z, y, x)
+    header = HEADER.pack(MAGIC, 1, a.dtype.itemsize, quant, z, y, x)
     zstd = numcodecs.Zstd(level=level)
     return header + zstd.encode(f.tobytes())
 
@@ -200,25 +215,31 @@ def _decode_source(buf: bytes, meta: dict) -> np.ndarray:
     return np.frombuffer(raw, dtype=dtype).reshape(meta["chunks"])[:]
 
 
+def _recorded_quant(buf: bytes) -> int:
+    return max(1, buf[6])
+
+
 def _process_chunk(args: tuple) -> tuple[str, int, int, bool]:
     """Worker: returns (path, in_bytes, out_bytes, converted)."""
-    path_s, meta, out_path_s, level = args
+    path_s, meta, out_path_s, level, quant = args
     path = Path(path_s)
     out_path = Path(out_path_s)
     buf = path.read_bytes()
 
-    if buf[:4] == MAGIC:  # already converted (resume / idempotence)
+    # Already converted (resume / idempotence) — unless a coarser
+    # quantization was requested than the payload carries.
+    if buf[:4] == MAGIC and _recorded_quant(buf) >= quant:
         if out_path != path:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(buf)
         return (path_s, len(buf), len(buf), False)
 
     original = _decode_source(buf, meta)
-    encoded = encode_chunk(original, level)
+    encoded = encode_chunk(original, level, quant)
 
     # Verify before anything replaces the source.
     roundtrip = decode_chunk(encoded)
-    if not np.array_equal(roundtrip, original):
+    if not np.array_equal(roundtrip, quantize(original, quant)):
         raise RuntimeError(f"{path}: verification failed, aborting")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,7 +256,7 @@ def _process_tile(args: tuple) -> tuple[int, int, int]:
     dst_entries: [(voxel_offset_in_tile, out_path)] chunks to emit.
     Returns (in_bytes, out_bytes, written).
     """
-    meta, src_entries, dst_entries, tile_shape, new_chunks, level = args
+    meta, src_entries, dst_entries, tile_shape, new_chunks, level, quant = args
     dtype = np.dtype(meta["dtype"])
     fill = int(meta.get("fill_value") or 0)
 
@@ -252,8 +273,8 @@ def _process_tile(args: tuple) -> tuple[int, int, int]:
     nz, ny, nx = new_chunks
     for (oz, oy, ox), out_path_s in dst_entries:
         sub = np.ascontiguousarray(tile[oz:oz + nz, oy:oy + ny, ox:ox + nx])
-        encoded = encode_chunk(sub, level)
-        if not np.array_equal(decode_chunk(encoded), sub):
+        encoded = encode_chunk(sub, level, quant)
+        if not np.array_equal(decode_chunk(encoded), quantize(sub, quant)):
             raise RuntimeError(f"{out_path_s}: verification failed, aborting")
         out_path = Path(out_path_s)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,7 +287,8 @@ def _process_tile(args: tuple) -> tuple[int, int, int]:
 
 
 def _rechunk_jobs(array_dir: Path, out_dir: Path, meta: dict,
-                  new_chunks: list[int], level: int) -> list[tuple]:
+                  new_chunks: list[int], level: int,
+                  quant: int) -> list[tuple]:
     """One job per supertile: max(old, new) voxels per axis, so power-of-two
     alignment lets each job read whole source chunks and write whole output
     chunks with no cross-tile overlap."""
@@ -316,26 +338,29 @@ def _rechunk_jobs(array_dir: Path, out_dir: Path, meta: dict,
                                    zip(idx, new_chunks, shape)):
                                 continue
                             out_path = chunk_key_path(out_dir, idx, sep)
-                            if out_path.exists() and \
-                                    out_path.read_bytes()[:4] == MAGIC:
-                                continue
+                            if out_path.exists():
+                                head = out_path.read_bytes()[:HEADER.size]
+                                if head[:4] == MAGIC and \
+                                        _recorded_quant(head) >= quant:
+                                    continue
                             dst_entries.append(
                                 ((iz * new_chunks[0], iy * new_chunks[1],
                                   ix * new_chunks[2]), str(out_path)))
                 if src_entries and dst_entries:
                     jobs.append((meta, src_entries, dst_entries,
-                                 tuple(tile), tuple(new_chunks), level))
+                                 tuple(tile), tuple(new_chunks), level, quant))
     return jobs
 
 
 def recompress_array(array_dir: Path, out_dir: Path, level: int, workers: int,
-                     chunk_size: list[int] | None = None) -> None:
+                     chunk_size: list[int] | None = None,
+                     quant: int = DEFAULT_QUANT) -> None:
     meta = load_meta(array_dir)
 
     if chunk_size is not None and list(chunk_size) != list(meta["chunks"]):
         validate_pow2_chunks(meta["chunks"], chunk_size, str(array_dir))
         recompress_array_rechunk(array_dir, out_dir, meta, chunk_size,
-                                 level, workers)
+                                 level, workers, quant)
         return
 
     files = chunk_files(array_dir)
@@ -343,7 +368,8 @@ def recompress_array(array_dir: Path, out_dir: Path, level: int, workers: int,
           f"({meta['dtype']}, chunks={meta['chunks']}, "
           f"compressor={meta.get('compressor')})")
 
-    jobs = [(str(p), meta, str(out_dir / p.relative_to(array_dir)), level)
+    jobs = [(str(p), meta, str(out_dir / p.relative_to(array_dir)), level,
+             quant)
             for p in files]
     total_in = total_out = converted = 0
     if workers <= 1:
@@ -392,8 +418,8 @@ def _write_array_meta(array_dir: Path, out_dir: Path, meta: dict,
 
 def recompress_array_rechunk(array_dir: Path, out_dir: Path, meta: dict,
                              new_chunks: list[int], level: int,
-                             workers: int) -> None:
-    jobs = _rechunk_jobs(array_dir, out_dir, meta, new_chunks, level)
+                             workers: int, quant: int = DEFAULT_QUANT) -> None:
+    jobs = _rechunk_jobs(array_dir, out_dir, meta, new_chunks, level, quant)
     n_out = sum(len(j[2]) for j in jobs)
     print(f"{array_dir}: rechunk {meta['chunks']} -> {list(new_chunks)}, "
           f"{len(jobs)} tiles / {n_out} output chunks "
@@ -438,7 +464,11 @@ def main() -> None:
     group.add_argument("--in-place", action="store_true",
                        help="replace chunks in the source tree (resumable)")
     ap.add_argument("--level", type=int, default=DEFAULT_ZSTD_LEVEL,
-                    help="zstd level (default 3)")
+                    help=f"zstd level (default {DEFAULT_ZSTD_LEVEL})")
+    ap.add_argument("--max-error", type=int, default=0, choices=(0, 1, 2),
+                    help="near-lossless: bound the per-voxel error (0 = "
+                         "lossless; 1 or 2 gray levels, below the CT noise "
+                         "floor). Irreversible for the affected low bits.")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2),
                     help="parallel worker processes")
     ap.add_argument("--chunk-size", type=str, default=None,
@@ -470,7 +500,7 @@ def main() -> None:
         out_dir = array_dir if args.in_place \
             else args.out / array_dir.relative_to(root)
         recompress_array(array_dir, out_dir, args.level, args.workers,
-                         chunk_size)
+                         chunk_size, quant=2 * args.max_error + 1)
 
     if not args.in_place:
         # Copy group-level metadata (.zgroup/.zattrs/.zmetadata) for OME-Zarr.

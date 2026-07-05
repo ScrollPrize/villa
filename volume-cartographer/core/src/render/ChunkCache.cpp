@@ -108,12 +108,15 @@ ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
     }
     state_->options_.compressPersistentCache =
         state_->options_.compressPersistentCache || persistentCompressionDefault();
+    state_->options_.cacheQuantBinWidth = std::max(
+        state_->options_.cacheQuantBinWidth, persistentQuantizationDefault());
     if (state_->options_.persistentCachePath)
         startPersistentCacheSizeScan(state_);
 }
 
 namespace {
 std::atomic_bool g_persistentCompressionDefault{false};
+std::atomic_int g_persistentQuantizationDefault{1};
 }
 
 void ChunkCache::setPersistentCompressionDefault(bool enabled)
@@ -124,6 +127,17 @@ void ChunkCache::setPersistentCompressionDefault(bool enabled)
 bool ChunkCache::persistentCompressionDefault()
 {
     return g_persistentCompressionDefault.load(std::memory_order_relaxed);
+}
+
+void ChunkCache::setPersistentQuantizationDefault(int binWidth)
+{
+    g_persistentQuantizationDefault.store(std::clamp(binWidth, 1, 255),
+                                          std::memory_order_relaxed);
+}
+
+int ChunkCache::persistentQuantizationDefault()
+{
+    return g_persistentQuantizationDefault.load(std::memory_order_relaxed);
 }
 
 ChunkCache::~ChunkCache()
@@ -627,7 +641,9 @@ void ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
             compressed = vc::cacheCompress(
                 std::span<const std::byte>(bytes.data(), bytes.size()),
                 state.levels_[static_cast<std::size_t>(key.level)].chunkShape,
-                dtypeSize(state.dtype_));
+                dtypeSize(state.dtype_),
+                vc::kCacheCompressionLevel,
+                state.options_.cacheQuantBinWidth);
         } catch (const std::exception& e) {
             Logger()->warn("ChunkCache persistent-cache compression failed: {}", e.what());
             return;

@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <span>
@@ -126,6 +127,66 @@ TEST_CASE("Plain zstd frames without a VCZ1 header are rejected")
     REQUIRE_FALSE(ZSTD_isError(rc));
     frame.resize(rc);
     CHECK_FALSE(vc::cacheDecompress(asSpan(frame), input.size()).has_value());
+}
+
+TEST_CASE("Near-lossless quantization bounds the per-voxel error")
+{
+    const std::array<int, 3> shape{8, 6, 10};
+    for (const std::size_t elemSize : {std::size_t{1}, std::size_t{2}}) {
+        const auto input = smoothVolume(shape, elemSize);
+        for (const int width : {vc::kCacheQuantMaxErr1, vc::kCacheQuantMaxErr2}) {
+            const auto compressed =
+                vc::cacheCompress(asSpan(input), shape, elemSize,
+                                  vc::kCacheCompressionLevel, width);
+            CHECK(vc::cacheQuantBinWidth(asSpan(compressed)) == width);
+
+            const auto decoded = vc::cacheDecompress(asSpan(compressed), input.size());
+            REQUIRE(decoded.has_value());
+            const int maxErr = width / 2;
+            for (std::size_t i = 0; i < input.size(); i += elemSize) {
+                int orig = 0, got = 0;
+                std::memcpy(&orig, input.data() + i, elemSize);
+                std::memcpy(&got, decoded->data() + i, elemSize);
+                CHECK(std::abs(orig - got) <= maxErr);
+                if (orig == 0)
+                    CHECK(got == 0); // masked background must stay exact
+            }
+
+            // Idempotent: re-encoding the quantized voxels at the same
+            // width must reproduce them exactly.
+            const auto again =
+                vc::cacheCompress(asSpan(*decoded), shape, elemSize,
+                                  vc::kCacheCompressionLevel, width);
+            const auto decodedAgain = vc::cacheDecompress(asSpan(again), input.size());
+            REQUIRE(decodedAgain.has_value());
+            CHECK(*decodedAgain == *decoded);
+        }
+    }
+}
+
+TEST_CASE("Quantization width is reported for all payload generations")
+{
+    const std::array<int, 3> shape{4, 4, 4};
+    const auto input = smoothVolume(shape, 1);
+
+    auto lossless = vc::cacheCompress(asSpan(input), shape, 1);
+    CHECK(vc::cacheQuantBinWidth(asSpan(lossless)) == vc::kCacheQuantLossless);
+
+    // Payloads written before quantization existed carry 0 in byte 6 and
+    // must read back as lossless.
+    lossless[6] = std::byte{0};
+    CHECK(vc::cacheQuantBinWidth(asSpan(lossless)) == vc::kCacheQuantLossless);
+    CHECK(vc::cacheDecompress(asSpan(lossless), input.size()).has_value());
+
+    const std::vector<std::byte> garbage(64, std::byte{0xAB});
+    CHECK_FALSE(vc::cacheQuantBinWidth(asSpan(garbage)).has_value());
+
+    CHECK_THROWS_AS(
+        vc::cacheCompress(asSpan(input), shape, 1, vc::kCacheCompressionLevel, 0),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        vc::cacheCompress(asSpan(input), shape, 1, vc::kCacheCompressionLevel, 256),
+        std::invalid_argument);
 }
 
 TEST_CASE("Corrupt and mismatched payloads return nullopt")

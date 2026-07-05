@@ -1,7 +1,9 @@
 #include "vc/core/util/CacheCompression.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -57,6 +59,27 @@ void deltaZyxUnfilter(T* data, std::size_t z, std::size_t y, std::size_t x)
         data[i] = static_cast<T>(data[i] + data[i - slice]);
 }
 
+// Snap to the nearest multiple of `width` (bins centered on multiples, so 0
+// stays exactly 0 and masked background survives untouched). Idempotent:
+// bin centers map to themselves.
+template <typename T>
+void quantizeValues(T* data, std::size_t n, int width)
+{
+    constexpr int maxVal = std::numeric_limits<T>::max();
+    const int half = width / 2;
+    if constexpr (sizeof(T) == 1) {
+        T lut[256];
+        for (int v = 0; v < 256; ++v)
+            lut[v] = static_cast<T>(std::min((v + half) / width * width, maxVal));
+        for (std::size_t i = 0; i < n; ++i)
+            data[i] = lut[data[i]];
+    } else {
+        for (std::size_t i = 0; i < n; ++i)
+            data[i] = static_cast<T>(
+                std::min((data[i] + half) / width * width, maxVal));
+    }
+}
+
 void writeU32(std::byte* out, std::uint32_t value)
 {
     out[0] = static_cast<std::byte>(value & 0xFF);
@@ -102,7 +125,8 @@ std::vector<std::byte> zstdCompressFrame(std::span<const std::byte> input,
 std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
                                      std::array<int, 3> shapeZYX,
                                      std::size_t elemSize,
-                                     int level)
+                                     int level,
+                                     int quantBinWidth)
 {
     const bool shapeValid =
         (elemSize == 1 || elemSize == 2) &&
@@ -115,12 +139,17 @@ std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
         throw std::invalid_argument(
             "cacheCompress: chunk shape/element size does not match payload");
     }
+    if (quantBinWidth < 1 || quantBinWidth > 255) {
+        throw std::invalid_argument(
+            "cacheCompress: quantization bin width must be in [1, 255]");
+    }
 
     const auto z = static_cast<std::size_t>(shapeZYX[0]);
     const auto y = static_cast<std::size_t>(shapeZYX[1]);
     const auto x = static_cast<std::size_t>(shapeZYX[2]);
 
     std::vector<std::byte> filtered(input.begin(), input.end());
+    cacheQuantize({filtered.data(), filtered.size()}, elemSize, quantBinWidth);
     if (elemSize == 1)
         deltaZyxFilter(reinterpret_cast<std::uint8_t*>(filtered.data()), z, y, x);
     else
@@ -133,12 +162,33 @@ std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
     std::memcpy(output.data(), kMagic, sizeof(kMagic));
     output[4] = static_cast<std::byte>(kFormatVersion);
     output[5] = static_cast<std::byte>(elemSize);
-    output[6] = std::byte{0};
+    output[6] = static_cast<std::byte>(quantBinWidth);
     output[7] = std::byte{0};
     writeU32(output.data() + 8, static_cast<std::uint32_t>(z));
     writeU32(output.data() + 12, static_cast<std::uint32_t>(y));
     writeU32(output.data() + 16, static_cast<std::uint32_t>(x));
     return output;
+}
+
+void cacheQuantize(std::span<std::byte> data,
+                   std::size_t elemSize,
+                   int quantBinWidth)
+{
+    if (quantBinWidth <= 1)
+        return;
+    if (elemSize == 1)
+        quantizeValues(reinterpret_cast<std::uint8_t*>(data.data()),
+                       data.size(), quantBinWidth);
+    else
+        quantizeValues(reinterpret_cast<std::uint16_t*>(data.data()),
+                       data.size() / 2, quantBinWidth);
+}
+
+std::optional<int> cacheQuantBinWidth(std::span<const std::byte> input)
+{
+    if (!hasVcz1Header(input))
+        return std::nullopt;
+    return std::max(1, static_cast<int>(input[6]));
 }
 
 std::optional<std::vector<std::byte>> cacheDecompress(

@@ -690,7 +690,21 @@
              <string>Compress existing cache...</string>
             </property>
             <property name="toolTip">
-             <string>Compress the already-downloaded, uncompressed chunks in the disk cache of the currently shown volume (zstd, lossless). Runs with multiple workers and can be cancelled.</string>
+             <string>Compress the already-downloaded chunks in the disk cache of the currently shown volume using the compression accuracy selected below. Runs with multiple workers and can be cancelled.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="labelCacheQuantization">
+            <property name="text">
+             <string>Cache compression accuracy</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QComboBox" name="cmbCacheQuantization">
+            <property name="toolTip">
+             <string>Accuracy of compressed disk-cache chunks. Near-lossless modes bound the per-voxel error (±1 or ±2 gray levels — below the CT noise floor, visually indistinguishable) and shrink the cache substantially. Affects newly written chunks and the "Compress existing cache" action; requires restart for new downloads.</string>
             </property>
            </widget>
           </item>
