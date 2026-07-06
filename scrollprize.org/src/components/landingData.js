@@ -1,6 +1,11 @@
 // landingData.js — pure data arrays for the landing page (OWNED BY WP1).
 // Content (names, amounts, links) is preserved verbatim from Landing.js;
 // only presentation lives in Landing.js / landing.css.
+//
+// NOTE: this array now carries AWARDED prizes only. The open-prize board on
+// the landing is sourced at build time from docs/34_prizes.md frontmatter via
+// plugins/prizes-data.js (usePluginData("prizes-data") in Landing.js), so the
+// landing updates automatically when the prizes page changes.
 
 export const prizes = [
   {
@@ -131,35 +136,24 @@ export const prizes = [
     ],
     href: "/winners",
   },
-  {
-    title: "First Letters / First Title Prizes",
-    prizeMoney: "7 x $60,000",
-    description: "Find the first letters or the title of a scroll",
-    requirement: "",
-    href: "/prizes#first-letters-and-title-prizes",
-  },
-  {
-    title: "Monthly Progress Prizes",
-    prizeMoney: "$350,000",
-    description: "Open ended prizes from $1,000-20,000",
-    requirement: "",
-    href: "/prizes#progress-prizes",
-  },
 ];
 
 export const creators = [
   {
     name: "Nat Friedman",
+    role: "Instigator, Director & Founding Sponsor",
     image: "/img/landing/nat.webp",
     href: "https://nat.org/",
   },
   {
     name: "Daniel Gross",
+    role: "Founding Sponsor",
     image: "/img/landing/daniel.webp",
     href: "https://dcgross.com/",
   },
   {
     name: "Dr. Brent Seales",
+    role: "Principal Advisor",
     image: "/img/landing/brent.webp",
     href: "https://educelab.engr.uky.edu/w-brent-seales",
   },
@@ -443,32 +437,18 @@ export const sponsors = [
   },
 ];
 
+export const projectLead = {
+  name: "Giorgio Angelotti",
+  title: "Project & Tech Team Lead, PhD",
+  href: "https://thegiorgio.org/",
+};
+
 export const team = {
   challenge: [
-    {
-      name: "Nat Friedman",
-      title: "Instigator & Founding Sponsor",
-      href: "https://nat.org/",
-    },
-    {
-      name: "Daniel Gross",
-      title: "Founding Sponsor",
-      href: "https://dcgross.com/",
-    },
-    {
-      name: "Giorgio Angelotti",
-      title: "Research Project Lead, PhD",
-      href: "https://thegiorgio.org/",
-    },
     {
       name: "Sean Johnson",
       title: "Research Assistant",
       href: "https://github.com/bruniss",
-    },
-    {
-      name: "Youssef Nader",
-      title: "Machine Learning Researcher",
-      href: "https://youssefnader.com/",
     },
     {
       name: "Hendrik Schilling",
@@ -482,7 +462,7 @@ export const team = {
     },
     {
       name: "Elian Rafael Dal Prá",
-      title: "ML Intern & Annotation Specialist",
+      title: "ML Intern",
       href: "https://twitter.com/elianrafaeldp",
     },
     {
@@ -490,9 +470,11 @@ export const team = {
       title: "Platform Engineer",
       href: "https://blog.virtual-void.net/",
     },
+  ],
+  annotation: [
     {
       name: "David Josey",
-      title: "ML Annotation Team Lead, PhD",
+      title: "Team Lead, PhD",
       href: "https://www.linkedin.com/in/davidsjosey/",
     },
     {
@@ -558,6 +540,11 @@ export const team = {
       name: "Stephen Parsons",
       title: "Project Lead, PhD",
       href: "https://www2.cs.uky.edu/dri/stephen-parsons/",
+    },
+    {
+      name: "Youssef Nader",
+      title: "Machine Learning Researcher",
+      href: "https://youssefnader.com/",
     },
     {
       name: "Ben Kyles",
@@ -637,15 +624,15 @@ export const team = {
   ],
   papyrology: [
     {
-      name: "Federica Nicolardi (Lead Papyrologist)",
+      name: "Federica Nicolardi",
       title:
-        "Assistant Professor of Papyrology, University of Naples Federico II",
+        "Team Lead and Assistant Professor, University of Naples Federico II",
       href: "https://www.docenti.unina.it/federica.nicolardi",
     },
     {
       name: "Marzia D'Angelo",
       title:
-        "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
+        "Postdoctoral Fellow, University of Naples Federico II",
       href: "https://unina.academia.edu/MDAngelo",
     },
     {
@@ -656,7 +643,7 @@ export const team = {
     {
       name: "Alessia Lavorante",
       title:
-        "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
+        "Postdoctoral Fellow, University of Naples Federico II",
       href: "https://unina.academia.edu/AlessiaLavorante",
     },
     {
@@ -667,18 +654,18 @@ export const team = {
     {
       name: "Maria Chiara Robustelli",
       title:
-        "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
+        "Postdoctoral Fellow, University of Naples Federico II",
       href: "https://unina.academia.edu/mrobustelli",
     },
     {
       name: "Claudio Vergara",
       title:
-        "Postdoctoral Fellow in Papyrology, University of Naples Federico II",
+        "Postdoctoral Fellow, University of Naples Federico II",
       href: "https://unina.academia.edu/ClaudioVergara",
     },
     {
       name: "Rossella Villa",
-      title: "Research Assistant in Papyrology, University of Salerno",
+      title: "Research Assistant, University of Salerno",
       href: "https://salerno.academia.edu/RossellaVilla",
     },
   ],
@@ -705,12 +692,6 @@ export const team = {
       title:
         "Fellow of the American Academy of Arts and Sciences; Professor of Classics, University of Michigan",
       href: "https://lsa.umich.edu/classics/people/departmental-faculty/rjanko.html",
-    },
-    {
-      name: "Federica Nicolardi",
-      title:
-        "Assistant Professor of Papyrology, University of Naples Federico II",
-      href: "https://www.docenti.unina.it/federica.nicolardi",
     },
     {
       name: "Tobias Reinhardt",

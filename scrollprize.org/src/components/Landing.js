@@ -1,13 +1,14 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import useBrokenLinks from "@docusaurus/useBrokenLinks";
 import Head from "@docusaurus/Head";
 import Heading from "@theme/Heading";
 import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
+import { usePluginData } from "@docusaurus/useGlobalData";
 import BeforeAfter from "./BeforeAfter";
 import LatestPosts from "./LatestPosts";
 import {
-  prizes,
   creators,
+  projectLead,
   sponsors,
   team,
   partners,
@@ -123,16 +124,11 @@ const stories = ({ unrollVideo }) => [
     description: (
       <>
         <p>
-          Vesuvius Challenge was launched in March 2023 to bring the world
-          together to read the Herculaneum scrolls. Along with smaller progress
-          prizes, a Grand Prize was issued for the first team to recover 4
-          passages of 140 characters from a Herculaneum scroll.
-        </p>
-        <p>
-          Following a year of remarkable progress,{" "}
-          <a href="/grandprize">the prize was claimed</a>. After 275 years, the
-          ancient puzzle of the Herculaneum Papyri has been cracked open. But
-          the quest to uncover the secrets of the scrolls is just beginning.
+          Vesuvius Challenge launched in March 2023 with a Grand Prize for
+          the first team to recover four passages of 140 characters from a
+          Herculaneum scroll. Within a year,{" "}
+          <a href="/grandprize">the prize was claimed</a> — after 275 years,
+          the puzzle was cracked open. The quest was just beginning.
         </p>
         <div className="vc-media vc-panorama">
           <img
@@ -169,41 +165,181 @@ const Story = ({ story, index }) => (
   </article>
 );
 
-const Winners = ({ winners }) => (
-  <span className="vc-avatars">
-    {winners.map((winner, i) => (
-      <img
-        key={i}
-        src={winner.image}
-        alt={winner.name}
-        loading="lazy"
-        decoding="async"
-        style={{ zIndex: 10 - i }}
-      />
-    ))}
-  </span>
-);
-
-const OpenPrize = ({ prize }) => (
-  <a href={prize.href} className="vc-card vc-open-prize">
-    <span className="vc-open-prize__amount vc-nums">{prize.prizeMoney}</span>
-    <span className="vc-open-prize__title">{prize.title}</span>
-    <span className="vc-open-prize__desc">{prize.description}</span>
-  </a>
-);
-
-const AwardedPrizeRow = ({ prize }) => (
-  <a href={prize.href} className="vc-prize-row">
-    <span className="vc-prize-row__title">{prize.title}</span>
-    <span className="vc-prize-row__winners">
-      <Winners winners={prize.winners} />
-      <span className="vc-prize-row__label">
-        {prize.winnersLabel || `${prize.winners.length} Winners`}
-      </span>
+/* Open-prize board — data-driven from docs/34_prizes.md frontmatter via
+   plugins/prizes-data.js. Dense competition-platform rows: ember amount,
+   title + hook, cadence. Whole row links into /prizes. */
+const OpenPrizeRow = ({ prize }) => (
+  <a
+    href={prize.href}
+    className={`vc-open-row${prize.featured ? " vc-open-row--featured" : ""}`}
+  >
+    <span className="vc-open-row__amount vc-nums">
+      {usd.format(prize.amount)}
+      {prize.unit && (
+        <span className="vc-open-row__unit">{prize.unit}</span>
+      )}
     </span>
-    <span className="vc-prize-row__amount vc-nums">{prize.prizeMoney}</span>
+    <span className="vc-open-row__body">
+      <span className="vc-open-row__title">{prize.title}</span>
+      <span className="vc-open-row__hook">{prize.hook}</span>
+      {prize.tiers && (
+        <span className="vc-open-row__tiers" aria-label="Prize tiers">
+          {prize.tiers.map((tier) => (
+            <span className="vc-chip vc-open-row__tier" key={tier.name}>
+              {tier.name}{" "}
+              <span className="vc-nums vc-open-row__tier-amt">
+                {usd.format(tier.amount)}
+              </span>
+            </span>
+          ))}
+        </span>
+      )}
+    </span>
+    <span className="vc-open-row__meta">{prize.cadence}</span>
   </a>
 );
+
+const OpenPrizeBoard = ({ prizes }) => {
+  if (!prizes.length) return null;
+  const total = prizes.reduce((sum, p) => sum + p.amount, 0);
+  return (
+    <div className="vc-card vc-card--flush vc-open-board">
+      <div className="vc-open-board__head">
+        <span className="vc-label">Currently open</span>
+        <span className="vc-open-board__total vc-nums">
+          {usd.format(total)} prize pool
+        </span>
+      </div>
+      {prizes.map((p) => (
+        <OpenPrizeRow prize={p} key={p.id || p.title} />
+      ))}
+    </div>
+  );
+};
+
+/* --------------------------------------------------------------------------
+   2027 Grand Prize sticker — $1,000,000 announcement, landing page only.
+   Advertises the TOTAL open prize pool (bigger number than any single
+   prize), computed from the prizes-page frontmatter; the whole card links
+   to /prizes. Enters after a small scroll (or a short delay on desktop,
+   where the bottom-center pill can't collide with the hero CTAs); steps
+   aside while the footer or the Open Prizes board is on screen; dismissible
+   with a 44px close button, persisted in localStorage (SSR-safe: window
+   access only inside effects). Toggle with SHOW_PRIZE_STICKER.
+-------------------------------------------------------------------------- */
+const SHOW_PRIZE_STICKER = true;
+const PRIZE_STICKER_DISMISS_KEY = "vcPrizePoolDismissed";
+
+function PrizePoolSticker({ total }) {
+  const [shown, setShown] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const [yielding, setYielding] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    try {
+      if (window.localStorage.getItem(PRIZE_STICKER_DISMISS_KEY) === "1") {
+        setDismissed(true);
+        return undefined;
+      }
+    } catch (e) {
+      // Storage unavailable (privacy mode) — still show; dismissal just
+      // won't persist across visits.
+    }
+    let revealed = false;
+    let timer = null;
+    const onScroll = () => {
+      if (window.scrollY > 240) reveal();
+    };
+    const reveal = () => {
+      if (revealed) return;
+      revealed = true;
+      window.removeEventListener("scroll", onScroll);
+      if (timer) window.clearTimeout(timer);
+      setShown(true);
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    // Desktop-only delay fallback: on phones the sticker waits for a scroll
+    // so it can never pop over the hero CTAs at the bottom of the first view.
+    if (window.matchMedia("(min-width: 769px)").matches) {
+      timer = window.setTimeout(reveal, 3000);
+    }
+    onScroll(); // already scrolled (deep link / restored position)
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      if (timer) window.clearTimeout(timer);
+    };
+  }, []);
+
+  // Step aside while a footer is visible (links stay uncovered) or while
+  // the Open Prizes board is on screen (no point advertising the $1M row
+  // the visitor is already looking at — and on phones the bar would cover
+  // that very row).
+  useEffect(() => {
+    if (
+      typeof window === "undefined" ||
+      typeof IntersectionObserver === "undefined"
+    )
+      return undefined;
+    const watched = Array.from(document.querySelectorAll("footer")).concat(
+      Array.from(
+        document.querySelectorAll('section[aria-labelledby="open-prizes"]')
+      )
+    );
+    if (!watched.length) return undefined;
+    const onScreen = new Set();
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) onScreen.add(entry.target);
+        else onScreen.delete(entry.target);
+      });
+      setYielding(onScreen.size > 0);
+    });
+    watched.forEach((el) => observer.observe(el));
+    return () => observer.disconnect();
+  }, []);
+
+  if (!SHOW_PRIZE_STICKER || dismissed) return null;
+  const interactive = shown && !yielding;
+  return (
+    <div
+      className={`vc-gp2027${shown ? " vc-gp2027--in" : ""}${
+        yielding ? " vc-gp2027--yield" : ""
+      }`}
+      role="complementary"
+      aria-label="Open prize pool announcement"
+      aria-hidden={!interactive}
+    >
+      <a
+        href="/prizes"
+        className="vc-gp2027__card"
+        tabIndex={interactive ? 0 : -1}
+      >
+        <span className="vc-label vc-gp2027__kicker">Open prize pool</span>
+        <span className="vc-gp2027__amount vc-nums">{usd.format(total)}</span>
+        <span className="vc-gp2027__hint">
+          From monthly awards to the $1,000,000 Grand Prize&nbsp;→
+        </span>
+      </a>
+      <button
+        type="button"
+        className="vc-gp2027__close"
+        aria-label="Dismiss the open prize pool announcement"
+        tabIndex={interactive ? 0 : -1}
+        onClick={() => {
+          setDismissed(true);
+          try {
+            window.localStorage.setItem(PRIZE_STICKER_DISMISS_KEY, "1");
+          } catch (e) {
+            // Best effort — session-only dismissal.
+          }
+        }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
 
 const SponsorAvatar = ({ sponsor }) => {
   if (!sponsor.image) {
@@ -316,7 +452,15 @@ const PersonLink = ({ link }) => (
   </div>
 );
 
-const ChallengeBox = ({ title, children, skills, linkText, href, media }) => (
+const ChallengeBox = ({
+  title,
+  children,
+  skills,
+  linkText,
+  href,
+  media,
+  bounty,
+}) => (
   <div className="vc-card vc-problem">
     <div className="vc-problem__text">
       <h3 className="vc-problem__title">{title}</h3>
@@ -329,6 +473,12 @@ const ChallengeBox = ({ title, children, skills, linkText, href, media }) => (
             </span>
           ))}
         </div>
+      )}
+      {bounty && (
+        <a href={bounty.href} className="vc-problem__bounty">
+          <span className="vc-label">Solve it, win</span>
+          <span className="vc-problem__bounty-text">{bounty.text}</span>
+        </a>
       )}
       <a href={href} className="vc-cta">
         {linkText}
@@ -415,8 +565,15 @@ export function Landing() {
     autoPlay(unrollVideo);
   }, []);
 
-  const openPrizes = prizes.filter((p) => !p.winners);
-  const awardedPrizes = prizes.filter((p) => p.winners);
+  // Open prizes are sourced from docs/34_prizes.md frontmatter at build time
+  // (plugins/prizes-data.js) — the landing updates with the prizes page.
+  const { prizes: openPrizes = [] } = usePluginData("prizes-data") || {};
+  const openPrizeTotal = openPrizes.reduce((sum, p) => sum + p.amount, 0);
+  const openById = Object.fromEntries(openPrizes.map((p) => [p.id, p]));
+  const grandPrize2027 = openById["grand-prize-2027"];
+  const firstLetters = openById["first-letters"];
+  const firstTitle = openById["first-title"];
+  const progressPrizes = openById["progress-prizes"];
 
   return (
     <>
@@ -507,10 +664,18 @@ export function Landing() {
               and read entire scrolls.
             </p>
             <div className="vc-stat-strip vc-hero__stats">
-              <div className="vc-stat">
+              {openPrizes.length > 0 && (
+                <a className="vc-stat vc-stat--link" href="/prizes">
+                  <span className="vc-stat__value">
+                    {usd.format(openPrizeTotal)}
+                  </span>
+                  <span className="vc-stat__label">open prize pool</span>
+                </a>
+              )}
+              <a className="vc-stat vc-stat--link" href="/winners">
                 <span className="vc-stat__value">$1,800,500</span>
-                <span className="vc-stat__label">awarded in prizes</span>
-              </div>
+                <span className="vc-stat__label">already awarded</span>
+              </a>
               <a className="vc-stat vc-stat--link" href="/data_browser">
                 <span className="vc-stat__value">35</span>
                 <span className="vc-stat__label">scrolls scanned</span>
@@ -572,6 +737,23 @@ export function Landing() {
         </section>
 
         {/* ------------------------------------------------------------------
+            Open prizes — dense board fed by the prizes page frontmatter
+            (plugins/prizes-data.js). Sits directly above Open problems:
+            the money first, then the problems it pays for.
+        ------------------------------------------------------------------ */}
+        <section className="vc-section" aria-labelledby="open-prizes">
+          <div className="container mx-auto">
+            <Heading as="h2" id="open-prizes" className="vc-h2">
+              Open prizes
+            </Heading>
+            <OpenPrizeBoard prizes={openPrizes} />
+            <a href="/prizes" className="vc-cta">
+              Rules and details
+            </a>
+          </div>
+        </section>
+
+        {/* ------------------------------------------------------------------
             Open problems — two before/after sliders (Virtual Unwrapping,
             Ink Detection) + "Targets" strip (the merged "What We're
             Building Towards").
@@ -586,11 +768,38 @@ export function Landing() {
                 title="Virtual Unwrapping"
                 linkText="Chart the Path"
                 href="/segmentation"
+                bounty={
+                  (grandPrize2027 || progressPrizes) && {
+                    href: (grandPrize2027 || progressPrizes).href,
+                    text: (
+                      <>
+                        {grandPrize2027 && (
+                          <>
+                            <strong className="vc-nums">
+                              {usd.format(grandPrize2027.amount)}
+                            </strong>{" "}
+                            {grandPrize2027.title}
+                          </>
+                        )}
+                        {grandPrize2027 && progressPrizes && " · "}
+                        {progressPrizes && (
+                          <>
+                            <strong className="vc-nums">
+                              {usd.format(progressPrizes.amount)}
+                            </strong>{" "}
+                            {progressPrizes.unit} in {progressPrizes.title}
+                          </>
+                        )}
+                        &nbsp;→
+                      </>
+                    ),
+                  }
+                }
                 skills={[
                   "geometry processing",
-                  "computer vision",
-                  "machine learning",
+                  "3D computer vision",
                   "optimization",
+                  "C++",
                 ]}
                 media={
                   <BeforeAfter
@@ -600,15 +809,11 @@ export function Landing() {
                 }
               >
                 <p>
-                  Reading a scroll means tracing its wound layers through the
-                  CT scan, stitching them together, and flattening them into
-                  readable sheets of papyrus — this is how PHerc. 1667 was
-                  read end to end. Doing it for the whole library demands
-                  faster, more automated methods: today only 12 of the 45
-                  scrolls and fragments we have scanned are even in
-                  segmentation. For a primer on current methods and their
-                  progress, read the{" "}
-                  <a href="/unwrapping">Virtual Unwrapping document</a>.
+                  A CT scan yields voxels, not pages: the writing surface
+                  must be segmented, meshed, and flattened. The pipeline
+                  fails where adjacent sheets are densely packed, or tear.
+                  Tracing remains semi-automated. Fully automating it is an
+                  open problem.
                 </p>
               </ChallengeBox>
 
@@ -616,11 +821,28 @@ export function Landing() {
                 title="Ink Detection"
                 linkText="Find a Letter"
                 href="/tutorial5"
+                bounty={
+                  firstLetters &&
+                  firstTitle && {
+                    href: firstLetters.href,
+                    text: (
+                      <>
+                        <strong className="vc-nums">
+                          {usd.format(firstLetters.amount)}
+                        </strong>{" "}
+                        {firstLetters.title} ·{" "}
+                        <strong className="vc-nums">
+                          {usd.format(firstTitle.amount)}
+                        </strong>{" "}
+                        {firstTitle.title}&nbsp;→
+                      </>
+                    ),
+                  }
+                }
                 skills={[
-                  "image annotation",
-                  "computer vision",
                   "machine learning",
-                  "pattern recognition",
+                  "computer vision",
+                  "domain generalization",
                 ]}
                 media={
                   <BeforeAfter
@@ -630,12 +852,12 @@ export function Landing() {
                 }
               >
                 <p>
-                  The carbon ink is nearly invisible in the scans. Machine
-                  learning models have surfaced ink on 9 of the 45 scrolls and
-                  fragments we have scanned, and text has been recovered from
-                  just 4. Is the ink fundamentally different in the others? Is
-                  the papyrus surface? We're not yet sure — but we are certain
-                  that if it ever existed, it can be detected.
+                  Carbon ink is nearly indistinguishable from papyrus in
+                  X-ray CT. Models train on fragments with visible ink and
+                  infer it inside sealed scrolls; iterative pseudo-labeling
+                  bootstraps legibility. Ink has surfaced on 9 of 45 scanned
+                  scrolls, not always legibly. Generalization is the open
+                  problem.
                 </p>
               </ChallengeBox>
             </div>
@@ -646,10 +868,15 @@ export function Landing() {
               </p>
               <div className="vc-targets__grid">
                 {targets.map((t) => (
-                  <div className="vc-target" key={t.title}>
+                  <a
+                    className="vc-target"
+                    href="https://github.com/ScrollPrize/villa"
+                    key={t.title}
+                    title="Build it with us — the ScrollPrize villa monorepo on GitHub"
+                  >
                     <span className="vc-target__title">{t.title}</span>
                     <span className="vc-target__desc">{t.description}</span>
-                  </div>
+                  </a>
                 ))}
               </div>
             </div>
@@ -722,7 +949,7 @@ export function Landing() {
                     since the eruption in 79 AD — became the first Herculaneum
                     scroll to be virtually unwrapped and read end to end.
                     Vesuvius Challenge now moves onto its next stage: reading
-                    multiple entire scrolls. Read more about the prizes below.
+                    multiple entire scrolls.
                   </p>
                   <a
                     href="/firstscroll"
@@ -736,41 +963,12 @@ export function Landing() {
                       decoding="async"
                     />
                   </a>
-                  <div className="vc-open-prizes">
-                    {openPrizes.map((p) => (
-                      <OpenPrize prize={p} key={p.title} />
-                    ))}
-                  </div>
                   <a href="/prizes" className="vc-cta">
                     See all open prizes
                   </a>
                 </div>
               </article>
             </div>
-          </div>
-        </section>
-
-        {/* ------------------------------------------------------------------
-            Awarded prizes — dense rows: name / winners / $ (tabular).
-        ------------------------------------------------------------------ */}
-        <section className="vc-section" aria-labelledby="awarded-prizes">
-          <div className="container mx-auto">
-            <Heading as="h2" id="awarded-prizes" className="vc-h2">
-              Awarded prizes
-            </Heading>
-            <p className="vc-section__intro">
-              Incredible teams of engineers are helping us unlock these
-              secrets, providing unprecedented access to scrolls that have not
-              been read in two millennia.
-            </p>
-            <div className="vc-card vc-card--flush vc-prize-table">
-              {awardedPrizes.map((p) => (
-                <AwardedPrizeRow prize={p} key={p.title} />
-              ))}
-            </div>
-            <a href="/winners" className="vc-cta vc-prize-table__cta">
-              All winners
-            </a>
           </div>
         </section>
 
@@ -787,21 +985,25 @@ export function Landing() {
               title="Caesars"
               list={sponsors.filter((s) => s.amount >= 200000)}
             />
-            <SponsorTier
-              label="$50,000 – $200,000"
-              title="Senators"
-              list={sponsors.filter(
-                (s) => s.amount >= 50000 && s.amount < 200000
-              )}
-              collapsible
-            />
-            <SponsorTier
-              label="Up to $50,000"
-              title="Citizens"
-              list={sponsors.filter((s) => s.amount < 50000)}
-              dense
-              collapsible
-            />
+            {/* Senators + Citizens expanders sit side by side on desktop
+                (vertical-space save); they stack on phones. */}
+            <div className="vc-tier-row">
+              <SponsorTier
+                label="$50,000 – $200,000"
+                title="Senators"
+                list={sponsors.filter(
+                  (s) => s.amount >= 50000 && s.amount < 200000
+                )}
+                collapsible
+              />
+              <SponsorTier
+                label="Up to $50,000"
+                title="Citizens"
+                list={sponsors.filter((s) => s.amount < 50000)}
+                dense
+                collapsible
+              />
+            </div>
             <div className="vc-sponsors__cta">
               <a
                 href="https://donate.stripe.com/aEUg101vt9eN8gM144"
@@ -822,23 +1024,39 @@ export function Landing() {
             <Heading as="h2" id="team" className="vc-h2">
               Team
             </Heading>
-            <p className="vc-credit">
-              Created by{" "}
-              {creators.map((c, i) => (
-                <React.Fragment key={c.name}>
-                  {i > 0 && (i === creators.length - 1 ? ", and " : ", ")}
-                  <a href={c.href}>{c.name}</a>
-                </React.Fragment>
-              ))}
-              .
-            </p>
+            <div className="vc-credits">
+              <div className="vc-credits__group">
+                <p className="vc-label vc-credits__label">Created by</p>
+                {creators.map((c) => (
+                  <div className="vc-person" key={c.name}>
+                    <a href={c.href} className="vc-person__name">
+                      {c.name}
+                    </a>
+                    {c.role && (
+                      <span className="vc-person__role">{c.role}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="vc-credits__group">
+                <p className="vc-label vc-credits__label">Led by</p>
+                <div className="vc-person">
+                  <a href={projectLead.href} className="vc-person__name">
+                    {projectLead.name}
+                  </a>
+                  <span className="vc-person__role">{projectLead.title}</span>
+                </div>
+              </div>
+            </div>
             <div className="vc-team">
-              <TeamGroup title="Vesuvius Challenge Team" list={team.challenge} />
+              <TeamGroup title="Tech Team" list={team.challenge} />
+              <TeamGroup title="Papyrology Team" list={team.papyrology} />
+              <TeamGroup title="Annotation Team" list={team.annotation} />
               <TeamGroup
-                title="Vesuvius Challenge Papyrology Team"
-                list={team.papyrology}
+                title="EduceLab Team (Partners)"
+                list={team.educe}
+                collapsible
               />
-              <TeamGroup title="EduceLab Team" list={team.educe} collapsible />
               <TeamGroup title="Advisors & Alumni" list={team.alumni} collapsible />
               <TeamGroup
                 title="Papyrology Advisors"
@@ -877,6 +1095,9 @@ export function Landing() {
             </div>
           </div>
         </section>
+
+        {/* $1,000,000 · 2027 Grand Prize floating teaser (landing only). */}
+        <PrizePoolSticker total={openPrizeTotal} />
       </div>
     </>
   );
