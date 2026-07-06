@@ -42,6 +42,13 @@ import TabItem from '@theme/TabItem';
 
 <TutorialsTop highlightId={3} />
 
+:::warning[OUTDATED CONTENT]
+
+This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
+
+
 The micro-CT scan converts the scroll into a volumetric grid of density measurements, providing a mathematical description with integer coordinates and average material densities in small adjacent cubes known as voxels.
 
 <div className="flex max-w-[400px]">

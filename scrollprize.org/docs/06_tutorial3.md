@@ -40,7 +40,14 @@ import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-<TutorialsTop highlightId={3} />
+<TutorialsTop highlightId={4} />
+
+:::warning[OUTDATED CONTENT]
+
+This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
+
 
 This tutorial walks through a slice-based approach to segmentation, which is helpful background for learning about the task.
 This was used to generate the 2023 [Grand Prize results](grandprize).

@@ -42,6 +42,13 @@ import TabItem from '@theme/TabItem';
 
 <TutorialsTop highlightId={2} />
 
+:::warning[OUTDATED CONTENT]
+
+This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
+
+
 ### Campfire scroll
 
 To get a basic understanding of the kind of data we’re working with, it’s useful to look at it directly. Our goal will be to look at a scroll in two ways: 1) a “word soup” of floating letters, and 2) a mesh representation:

@@ -44,6 +44,12 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <div className="opacity-60 mb-8 italic">July 2025</div>
 
+:::warning[OUTDATED CONTENT]
+
+This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
+
 The data available through Vesuvius Challenge is large, frequently updated, and can be overwhelming to navigate.
 
 Here are some organized datasets suited for particular tasks or subproblems.

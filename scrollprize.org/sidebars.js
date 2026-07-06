@@ -52,9 +52,8 @@ const sidebars = {
         { type: 'doc', id: 'tutorial1' },
         { type: 'doc', id: 'tutorial2' },
         { type: 'doc', id: 'tutorial3' },
-        { type: 'doc', id: 'tutorial5' },
         { type: 'doc', id: 'segmentation' },
-        { type: 'doc', id: 'tutorial_VC' },
+        { type: 'doc', id: 'tutorial5' },
       ],
     },
     { type: 'doc', id: 'faq' },
@@ -88,6 +87,7 @@ const sidebars = {
       collapsed: true,
       items: [
         { type: 'doc', id: 'master_plan' },
+        { type: 'doc', id: 'tutorial_VC' },
         { type: 'doc', id: 'grand_prize' },
         { type: 'doc', id: 'ink_detection' },
         { type: 'doc', id: 'open_source_prizes' },

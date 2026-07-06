@@ -46,6 +46,13 @@ There are five steps in our process for reading a carbonized scroll:
 
 <TutorialsTop/>
 
+:::warning[OUTDATED CONTENT]
+
+This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
+
+
 1. <b>Scan:</b> use X-ray tomography to create a 3D scan of a scroll or fragment. The digital twin is a volumetric image where each voxel (3D pixel) represents the average density of the material at the scan resolution.
 2. <b>Representation:</b> choosing a digital or mathematical representation for data manipulation. Scanning outputs voxels in a 3D grid, but other options like point clouds exist. Switching between representations is possible if no important information is lost.
 3. <b>Segmentation:</b> mapping and transforming the written surface into a flat, 2D projection and sampling nearby voxels to create a flattened volume that contains all surface features.

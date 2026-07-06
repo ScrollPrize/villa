@@ -41,6 +41,12 @@ import { TutorialsTop } from '@site/src/components/TutorialsTop';
 
 <TutorialsTop highlightId={4} />
 
+:::warning[OUTDATED CONTENT]
+
+This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
+
 *Last updated: February 20, 2025*
 
 

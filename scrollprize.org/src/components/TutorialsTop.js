@@ -7,7 +7,7 @@ function Thumb({ href, highlight, label, videoSrc, poster, imgSrc }) {
   return (
     <a
       href={href}
-      className={`mb-2 flex flex-col items-center w-[100px] sm:w-[150px] relative box-content p-2 sm:p-4 sm:pb-2 rounded-lg border border-solid hover:bg-surface hover:no-underline ${
+      className={`mb-2 flex flex-col items-center w-[100px] sm:w-[150px] min-w-0 relative box-content p-2 sm:p-4 sm:pb-2 rounded-lg border border-solid hover:bg-surface hover:no-underline ${
         highlight ? "bg-surface border-line" : "border-transparent"
       }`}
     >
@@ -47,7 +47,9 @@ function Thumb({ href, highlight, label, videoSrc, poster, imgSrc }) {
 
 export function TutorialsTop({ highlightId } = {}) {
   return (
-    <div className="mx-[-16px] sm:mx-0 flex flex-wrap items-start mb-4 text-center justify-center sm:justify-start">
+    // One row on ≥sm: thumbs shrink (min-w-0) instead of wrapping; the
+    // arrows are fixed-width. Phones keep the centered wrap.
+    <div className="mx-[-16px] sm:mx-0 flex flex-wrap sm:flex-nowrap items-start mb-4 text-center justify-center sm:justify-start">
       <Thumb
         href="/tutorial1"
         label="Scanning"

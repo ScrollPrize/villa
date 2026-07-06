@@ -40,6 +40,13 @@ import { TutorialsTop } from '@site/src/components/TutorialsTop';
 
 <TutorialsTop highlightId={5} />
 
+:::warning[OUTDATED CONTENT]
+
+This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
+
+
 This tutorial gives a high-level overview on ink detection methods.
 Since this tutorial was written, ink detection has successfully recovered text from inside the rolled scrolls.
 The technical principles remain the same as what is described here.

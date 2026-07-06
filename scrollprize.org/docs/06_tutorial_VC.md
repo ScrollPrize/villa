@@ -38,6 +38,12 @@ title: "Volume Cartographer (Segmentation)"
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
+:::warning[OUTDATED CONTENT]
+
+This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
+
 Volume Cartographer was used to generate the 2023 [Grand Prize results](grandprize). This guide was made by @bruniss with feedback and help from @hari_seldon and @djosey of the segmentation team.
 
 :::tip
