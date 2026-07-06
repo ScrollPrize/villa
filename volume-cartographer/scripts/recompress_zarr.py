@@ -22,9 +22,9 @@ import math
 import os
 import shutil
 import sys
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 try:
     import zarr
@@ -126,9 +126,113 @@ def chunk_slice_for_index(
     )
 
 
+def chunk_grid_shape(shape: tuple[int, ...], chunks: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(math.ceil(s / c) for s, c in zip(shape, chunks))
+
+
+def chunk_grid_size(shape: tuple[int, ...], chunks: tuple[int, ...]) -> int:
+    return math.prod(chunk_grid_shape(shape, chunks))
+
+
 def chunk_indices(shape: tuple[int, ...], chunks: tuple[int, ...]) -> Iterable[tuple[int, ...]]:
-    grid_shape = tuple(math.ceil(s / c) for s, c in zip(shape, chunks))
-    yield from np.ndindex(*grid_shape)
+    yield from np.ndindex(*chunk_grid_shape(shape, chunks))
+
+
+def copy_jobs(
+    src_path: str,
+    dst_path: Path,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+) -> Iterable[tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int, ...]]]:
+    for idx in chunk_indices(shape, chunks):
+        yield (src_path, str(dst_path), idx, shape, chunks)
+
+
+def downsample_jobs(
+    src_path: Path,
+    dst_path: Path,
+    dst_shape: tuple[int, ...],
+    dst_chunks: tuple[int, ...],
+    src_shape: tuple[int, ...],
+    downsample_type: str,
+) -> Iterable[tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], str]]:
+    for idx in chunk_indices(dst_shape, dst_chunks):
+        yield (str(src_path), str(dst_path), idx, dst_shape, dst_chunks, src_shape, downsample_type)
+
+
+CopyJob = tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+DownsampleJob = tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], str]
+ChunkJob = CopyJob | DownsampleJob
+ChunkFunc = Callable[[Any], int]
+
+
+def batched(iterable: Iterable[ChunkJob], size: int) -> Iterable[tuple[ChunkJob, ...]]:
+    batch: list[ChunkJob] = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) == size:
+            yield tuple(batch)
+            batch.clear()
+    if batch:
+        yield tuple(batch)
+
+
+def run_chunk_batch(func: ChunkFunc, batch: tuple[ChunkJob, ...]) -> int:
+    for job in batch:
+        func(job)
+    return len(batch)
+
+
+def run_chunk_jobs(
+    func: ChunkFunc,
+    jobs: Iterable[ChunkJob],
+    *,
+    total_jobs: int,
+    workers: int,
+    desc: str,
+    batch_size: int = 8,
+) -> None:
+    completed = 0
+
+    def update_progress(delta: int) -> None:
+        nonlocal completed
+        completed += delta
+        if progress is not None:
+            progress.update(delta)
+        elif completed % 100 == 0 or completed == total_jobs:
+            print(f"  {completed}/{total_jobs} chunks", flush=True)
+
+    progress = tqdm(total=total_jobs, unit="chunk", desc=desc) if tqdm is not None else None
+    try:
+        if workers <= 1:
+            for job in jobs:
+                func(job)
+                update_progress(1)
+        else:
+            max_pending = max(1, workers * 4)
+            batches = batched(jobs, batch_size)
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                pending: set[Future[int]] = set()
+                exhausted = False
+                while pending or not exhausted:
+                    while not exhausted and len(pending) < max_pending:
+                        try:
+                            batch = next(batches)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        pending.add(pool.submit(run_chunk_batch, func, batch))
+
+                    if not pending:
+                        continue
+
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        update_progress(future.result())
+    finally:
+        if progress is not None:
+            progress.close()
+    print(f"  done: {completed} chunks")
 
 
 def copy_chunk(job: tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int, ...]]) -> int:
@@ -208,7 +312,7 @@ def array_dirs(root: Path) -> list[Path]:
 def copy_group_metadata(src_root: Path, dst_root: Path, arrays: list[Path]) -> None:
     array_meta = {".zarray"}
     for path in src_root.rglob("*"):
-        if not path.is_file() or path.name not in {".zattrs", ".zgroup"}:
+        if not path.is_file() or path.name not in {".zattrs", ".zgroup", ".zmetadata"}:
             continue
         if path.name in array_meta:
             continue
@@ -236,7 +340,7 @@ def s3_array_paths(root: str) -> list[str]:
 def copy_s3_group_metadata(src_root: str, dst_root: Path) -> None:
     store = open_s3_store(src_root)
     for key in store.keys():
-        if not key.endswith((".zattrs", ".zgroup")):
+        if not key.endswith((".zattrs", ".zgroup", ".zmetadata")):
             continue
         dst = dst_root / key
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -267,23 +371,10 @@ def recompress_array(src_path: str | Path, dst_path: Path, codec: Vcz1, workers:
     print(f"  shape={src.shape} chunks={src.chunks} dtype={src.dtype} codec={codec.get_config()}")
     shape = tuple(src.shape)
     chunks = tuple(src.chunks)
-    jobs = [
-        (src_path_str, str(dst_path), idx, shape, chunks)
-        for idx in chunk_indices(shape, chunks)
-    ]
-    if workers <= 1:
-        results = map(copy_chunk, jobs)
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            results = pool.map(copy_chunk, jobs, chunksize=8)
-    if tqdm is not None:
-        src_name = Path(src_path_str.rstrip("/")).name if not is_s3_path(src_path_str) else src_path_str.rstrip("/").rsplit("/", 1)[-1]
-        results = tqdm(results, total=len(jobs), unit="chunk", desc=f"  {src_name}")
-    n = 0
-    for n, _voxels in enumerate(results, 1):
-        if tqdm is None and (n % 100 == 0 or n == len(jobs)):
-            print(f"  {n}/{len(jobs)} chunks", flush=True)
-    print(f"  done: {n} chunks")
+    total_jobs = chunk_grid_size(shape, chunks)
+    jobs = copy_jobs(src_path_str, dst_path, shape, chunks)
+    src_name = Path(src_path_str.rstrip("/")).name if not is_s3_path(src_path_str) else src_path_str.rstrip("/").rsplit("/", 1)[-1]
+    run_chunk_jobs(copy_chunk, jobs, total_jobs=total_jobs, workers=workers, desc=f"  {src_name}")
 
 
 def write_ome_zattrs(
@@ -369,22 +460,9 @@ def recompress_flat_array_as_ome(
         )
         print(f"{prev_path} -> {level_path}")
         print(f"  shape={shape} chunks={level_chunks} dtype={src.dtype} downsample={downsample_type}2x")
-        jobs = [
-            (str(prev_path), str(level_path), idx, shape, level_chunks, prev_shape, downsample_type)
-            for idx in chunk_indices(shape, level_chunks)
-        ]
-        if workers <= 1:
-            results = map(downsample_chunk, jobs)
-        else:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                results = pool.map(downsample_chunk, jobs, chunksize=8)
-        if tqdm is not None:
-            results = tqdm(results, total=len(jobs), unit="chunk", desc=f"  level {level}")
-        n = 0
-        for n, _voxels in enumerate(results, 1):
-            if tqdm is None and (n % 100 == 0 or n == len(jobs)):
-                print(f"  {n}/{len(jobs)} chunks", flush=True)
-        print(f"  done: {n} chunks")
+        total_jobs = chunk_grid_size(shape, level_chunks)
+        jobs = downsample_jobs(prev_path, level_path, shape, level_chunks, prev_shape, downsample_type)
+        run_chunk_jobs(downsample_chunk, jobs, total_jobs=total_jobs, workers=workers, desc=f"  level {level}")
         prev_path = level_path
         prev_shape = shape
 

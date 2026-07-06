@@ -65,3 +65,6 @@ def _vcz1_shape(payload) -> tuple[int, int, int]:
         int.from_bytes(payload[12:16], "little"),
         int.from_bytes(payload[16:20], "little"),
     )
+
+
+register()
