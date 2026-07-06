@@ -485,11 +485,10 @@ std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
     std::vector<std::byte> filtered(input.begin(), input.end());
     cacheQuantize({filtered.data(), filtered.size()}, elemSize, quantBinWidth);
 
-    // Per-chunk filter selection is limited to rANS uint8 payloads: the zstd
-    // codec keeps fixed zyx so pure-Python "vc_delta_zstd" readers stay
-    // valid, and the uint16 probe isn't implemented (16-bit volumes are rare
-    // in the streaming path). Degenerate dims skip the probe; the extra
-    // passes are no-ops there anyway.
+    // Per-chunk filter selection is limited to rANS uint8 payloads; the
+    // uint16 probe isn't implemented (16-bit volumes are rare in the
+    // streaming path). Degenerate dims skip the probe; the extra passes are
+    // no-ops there anyway.
     unsigned mask = kDeltaMaskZyx;
     if (codec == CacheCodec::Rans && elemSize == 1 && z >= 2 && y >= 2 &&
         x >= 2)

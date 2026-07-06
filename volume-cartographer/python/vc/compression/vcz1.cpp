@@ -1,6 +1,5 @@
-// Python bindings for the VCZ1 cache-chunk codec (quantize + delta-zyx +
-// zstd/rANS). Used by scripts/recompress_zarr.py to read and write
-// rANS-coded (codec 1) payloads, which have no pure-Python decoder.
+// Python bindings for the VCZ1 zarr/chunk codec (quantize + delta-zyx +
+// zstd/rANS).
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
@@ -14,7 +13,7 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
-NB_MODULE(cache_codec, m)
+NB_MODULE(vcz1, m)
 {
     m.doc() = "VCZ1 cache-chunk codec (quantize + delta-zyx + zstd/rANS)";
 

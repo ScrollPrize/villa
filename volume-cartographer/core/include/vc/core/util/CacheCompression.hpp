@@ -8,8 +8,8 @@
 
 namespace vc {
 
-// Lossless compression for persistent chunk-cache payloads and
-// "vc_delta_zstd"-coded zarr chunks.
+// Lossless compression for persistent chunk-cache payloads and "vcz1"-coded
+// zarr chunks.
 //
 // Chunks cached from remote volumes with a raw/uncompressed source are stored
 // as plain decoded bytes (".bin"). cacheCompress() converts such payloads to
@@ -36,10 +36,7 @@ namespace vc {
 //     noise-like, so the greedy match search at levels 2-12 emits
 //     statistically-coincidental short matches whose offsets cost more than
 //     huffman-coded literals; level 1 finds almost no matches and lands near
-//     the order-0 entropy of the residuals. This is the codec the
-//     "vc_delta_zstd" zarr arrays use (Python tooling decodes it with plain
-//     numcodecs zstd), and what all payloads written before the rANS codec
-//     existed carry.
+//     the order-0 entropy of the residuals.
 //   Rans (1): order-0 rANS (12-bit tables, eight interleaved 64-bit states,
 //     32-bit renormalization). zstd's huffman-coded literals cannot spend
 //     fractional bits per symbol, which costs ~19% on the sharply peaked
@@ -64,9 +61,7 @@ namespace vc {
 //   7      bits 0-3: entropy codec id (0 zstd, 1 rANS; pre-codec payloads
 //          carry 0). Bit 7 set means bits 4-6 record the delta-axis mask
 //          (bit 4 x, bit 5 y, bit 6 z). Payloads written before per-chunk
-//          filter selection have bits 4-7 clear and are always full zyx;
-//          zstd-codec payloads stay full zyx so the pure-Python
-//          "vc_delta_zstd" decoder keeps working.
+//          filter selection have bits 4-7 clear and are always full zyx.
 //   8..19  chunk dims as three uint32: z, y, x (element counts)
 //   20..   codec 0: zstd frame of the filtered payload
 //          codec 1: 256 uint16 symbol frequencies summing to 4096, then
@@ -81,7 +76,7 @@ inline constexpr CacheCodec kCacheDefaultCodec = CacheCodec::Rans;
 
 // Codec name used when a zarr array stores chunks in this format directly
 // (v2 "compressor" id / v3 codec name).
-inline constexpr const char* kDeltaZstdCodecName = "vc_delta_zstd";
+inline constexpr const char* kVcz1CodecName = "vcz1";
 
 // Near-lossless quantization bin widths offered in UIs. Width 1 is
 // lossless; width 2k+1 bounds the per-voxel error by +-k.

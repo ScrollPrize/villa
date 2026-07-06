@@ -294,7 +294,7 @@ std::vector<std::byte> decompressBytes(const CompressorConfig& cfg,
         auto decoded = vc::cacheDecompress(input, outputSize);
         if (!decoded) {
             throw std::runtime_error(
-                "vc_delta_zstd chunk failed to decode or has mismatched size");
+                "vcz1 chunk failed to decode or has mismatched size");
         }
         return std::move(*decoded);
     }
@@ -357,7 +357,7 @@ std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
         // does not have. Volumes are written in this format by
         // scripts/recompress_zarr.py (or the chunk-cache writer).
         throw std::runtime_error(
-            "writing vc_delta_zstd zarr chunks is not supported here");
+            "writing vcz1 zarr chunks is not supported here");
     }
 
     throw std::runtime_error("unsupported zarr compressor");
@@ -402,7 +402,7 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
             cfg.level = meta.compression_level > 0 ? meta.compression_level : 5;
         } else if (meta.compressor_id == "c3d") {
             cfg.id = CompressorId::C3d;
-        } else if (meta.compressor_id == vc::kDeltaZstdCodecName) {
+        } else if (meta.compressor_id == vc::kVcz1CodecName) {
             cfg.id = CompressorId::VcDeltaZstd;
         } else {
             throw std::runtime_error("Unsupported zarr compressor: " + meta.compressor_id);
@@ -430,7 +430,7 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
                 }
                 return true;
             }
-            if (cc.name == vc::kDeltaZstdCodecName) {
+            if (cc.name == vc::kVcz1CodecName) {
                 cfg.id = CompressorId::VcDeltaZstd; return true;
             }
         }
@@ -469,13 +469,14 @@ utils::ZarrArray::CodecRegistry buildZarrCodecRegistry(int dtypeSize)
 {
     utils::ZarrArray::CodecRegistry reg;
     for (const char* name :
-         {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d", vc::kDeltaZstdCodecName}) {
+         {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d",
+          vc::kVcz1CodecName}) {
         CompressorConfig cfg;
         if      (std::string(name) == "blosc") cfg.id = CompressorId::Blosc;
         else if (std::string(name) == "zstd")  cfg.id = CompressorId::Zstd;
         else if (std::string(name) == "lz4")   cfg.id = CompressorId::Lz4;
         else if (std::string(name) == "c3d")   cfg.id = CompressorId::C3d;
-        else if (std::string(name) == vc::kDeltaZstdCodecName)
+        else if (std::string(name) == vc::kVcz1CodecName)
             cfg.id = CompressorId::VcDeltaZstd;
         else                                   cfg.id = CompressorId::Gzip;
         cfg.blosc_typesize = dtypeSize;

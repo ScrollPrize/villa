@@ -1,596 +1,208 @@
 #!/usr/bin/env python3
-"""Recompress an OME-Zarr (zarr v2) volume into the vc_delta_zstd format.
+"""Recompress a local zarr array/tree with the VCZ1 rANS codec.
 
-Each stored chunk is decoded with its current compressor, filtered with a
-delta along z, then y, then x (mod-2^8/2^16 backward differences), and
-re-encoded as a self-describing "VCZ1" payload: a 20-byte header followed by
-an entropy-coded frame of the filtered voxels. The array's .zarray metadata
-is updated to `{"id": "vc_delta_zstd"}` so readers pick the right codec. On
-scroll CT data this roughly halves the size that plain zstd achieves,
-losslessly, while both encode and decode stay near zstd speed.
+This is intentionally a small zarr-python example:
 
-Two entropy codecs exist (VCZ1 header byte 7):
-  zstd (0): plain zstd frame; encoded and decoded in pure Python here.
-  rans (1): order-0 rANS, ~9-18% smaller on quantized chunks and the default
-    for VC3D's local cache. Reading or writing it from Python requires the
-    compiled vc bindings (`vc.cache_codec`); there is no pure-Python rANS.
+    python scripts/recompress_zarr.py \
+        /home/sean/Desktop/paris4_level5only.zarr \
+        /home/sean/Desktop/paris4_level5only.vcz1.zarr
 
-Readers:
-  - VC3D / volume-cartographer (codec registered as "vc_delta_zstd";
-    reads both entropy codecs)
-  - Python: import this file (registers a numcodecs codec) and open the
-    volume with zarr as usual (rans chunks additionally need vc.cache_codec).
-
-VCZ1 layout (little-endian):
-  0..3   magic 'V' 'C' 'Z' '1'
-  4      format version (1)
-  5      element size in bytes (1 or 2)
-  6      quantization bin width (0 and 1 both mean lossless)
-  7      bits 0-3: entropy codec id (0 zstd, 1 rANS); bit 7 set means bits
-         4-6 record a per-chunk delta-axis mask (rANS payloads only)
-  8..19  chunk dims as three uint32: z, y, x (element counts)
-  20..   codec 0: zstd frame of the filtered payload
-         codec 1: rANS frequency table, states, and byte stream
-
-Usage:
-  # Recompress into a new directory tree (metadata + all chunks):
-  python recompress_zarr.py /path/to/volume.zarr --out /path/to/out.zarr
-
-  # Recompress in place (resumable; VCZ1 chunks are detected and skipped):
-  python recompress_zarr.py /path/to/volume.zarr --in-place
-
-  # Recompress and rechunk (each axis must stay a power-of-two factor of
-  # the source chunk size, so tile boundaries align and every source chunk
-  # is read exactly once; requires --out):
-  python recompress_zarr.py /path/to/volume.zarr --out out.zarr --chunk-size 256
-  python recompress_zarr.py /path/to/volume.zarr --out out.zarr --chunk-size 64,128,128
-
-Every chunk is verified (decode(new) == decode(old)) before it replaces or
-lands next to the original; a failed verification aborts the run.
+The output is zarr v2 metadata with compressor id "vcz1".  The chunks are
+self-describing VCZ1 payloads written by vc.compression.vcz1, using rANS by
+default.
+zarr-python 2.x and 3.x both use the numcodecs registration below for v2
+arrays; under zarr-python 3.x the script passes zarr_format=2 explicitly.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
-import struct
+import math
+import shutil
 import sys
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 
 try:
     import numcodecs
-except ImportError:  # pragma: no cover
-    sys.exit("this script requires numcodecs (pip install numcodecs)")
+    import zarr
+except ImportError as e:  # pragma: no cover
+    raise SystemExit("install zarr and numcodecs: python -m pip install zarr") from e
 
 try:
-    from tqdm import tqdm
-except ImportError:  # pragma: no cover
-    tqdm = None
-
-CODEC_ID = "vc_delta_zstd"
-MAGIC = b"VCZ1"
-# magic, version, elemsize, (quant | entropy-codec << 8), z, y, x
-HEADER = struct.Struct("<4sBBHIII")
-DEFAULT_ZSTD_LEVEL = 1
-DEFAULT_QUANT = 1  # near-lossless bin width: 1=lossless, 3=max err +-1, 5=+-2
-DEFAULT_CODEC = "zstd"  # entropy codec: "zstd" (pure Python) or "rans"
-CODEC_IDS = {"zstd": 0, "rans": 1}
+    from vc.compression import vcz1
+except ImportError as e:  # pragma: no cover
+    raise SystemExit(
+        "install the volume-cartographer Python bindings so "
+        "`from vc.compression import vcz1` works"
+    ) from e
 
 
-def _vc_cache_codec():
-    """The compiled vc.cache_codec module, required for rANS payloads."""
-    try:
-        from vc import cache_codec
-    except ImportError as e:
-        raise RuntimeError(
-            "this payload/codec needs the compiled vc python bindings "
-            "(vc.cache_codec); install them or use --codec zstd. If the "
-            "bindings are installed but fail to load libvc_core.so, set "
-            "LD_LIBRARY_PATH to the directory containing it") from e
-    return cache_codec
+CODEC_ID = "vcz1"
 
 
-def quantize(a: np.ndarray, quant: int) -> np.ndarray:
-    """Snap to the nearest multiple of `quant` (0 stays 0; error <= quant//2).
-    Idempotent, so re-encoding already-quantized data is lossless."""
-    if quant <= 1:
-        return a
-    maxval = np.iinfo(a.dtype).max
-    return np.minimum(((a.astype(np.int32) + quant // 2) // quant) * quant,
-                      maxval).astype(a.dtype)
-
-
-def encode_chunk(a: np.ndarray, level: int = DEFAULT_ZSTD_LEVEL,
-                 quant: int = DEFAULT_QUANT,
-                 codec: str = DEFAULT_CODEC) -> bytes:
-    if a.ndim != 3:
-        raise ValueError("vc_delta_zstd expects 3D chunks")
-    if a.dtype not in (np.uint8, np.uint16):
-        raise ValueError("vc_delta_zstd supports uint8/uint16 only")
-    if not 1 <= quant <= 255:
-        raise ValueError("quant bin width must be in [1, 255]")
-    if codec not in CODEC_IDS:
-        raise ValueError("codec must be 'zstd' or 'rans'")
-    a = np.ascontiguousarray(a)
-    if codec == "rans":
-        z, y, x = a.shape
-        return _vc_cache_codec().compress(a.tobytes(), z, y, x,
-                                          a.dtype.itemsize, quant, "rans")
-    a = np.ascontiguousarray(quantize(a, quant))
-    d = a.copy()
-    d[1:, :, :] -= a[:-1, :, :]
-    e = d.copy()
-    e[:, 1:, :] -= d[:, :-1, :]
-    f = e.copy()
-    f[:, :, 1:] -= e[:, :, :-1]
-    z, y, x = a.shape
-    header = HEADER.pack(MAGIC, 1, a.dtype.itemsize, quant, z, y, x)
-    zstd = numcodecs.Zstd(level=level)
-    return header + zstd.encode(f.tobytes())
-
-
-def decode_chunk(buf: bytes) -> np.ndarray:
-    magic, version, elemsize, meta, z, y, x = HEADER.unpack_from(buf, 0)
-    if magic != MAGIC or version != 1:
-        raise ValueError("not a VCZ1 payload")
-    if elemsize not in (1, 2):
-        raise ValueError(f"unsupported element size {elemsize}")
-    dtype = np.uint8 if elemsize == 1 else np.uint16
-    # High byte: bits 0-3 codec id; bit 7 set means bits 4-6 carry a
-    # per-chunk delta-axis mask (rANS payloads only — the compiled codec
-    # handles it; zstd payloads are always full zyx).
-    codec = (meta >> 8) & 0x0F
-    if codec == CODEC_IDS["rans"]:
-        raw = _vc_cache_codec().decompress(bytes(buf), z * y * x * elemsize)
-        return np.frombuffer(raw, dtype=dtype).reshape(z, y, x)
-    if codec != CODEC_IDS["zstd"]:
-        raise ValueError(f"unknown VCZ1 entropy codec {codec}")
-    raw = numcodecs.Zstd().decode(bytes(buf[HEADER.size:]))
-    f = np.frombuffer(raw, dtype=dtype).reshape(z, y, x)
-    e = np.cumsum(f, axis=2, dtype=dtype)
-    d = np.cumsum(e, axis=1, dtype=dtype)
-    return np.cumsum(d, axis=0, dtype=dtype)
-
-
-class VcDeltaZstd(numcodecs.abc.Codec):
-    """numcodecs codec so Python zarr readers can open recompressed volumes."""
+class Vcz1(numcodecs.abc.Codec):
+    """numcodecs wrapper for the C++ VCZ1 chunk codec."""
 
     codec_id = CODEC_ID
 
-    def __init__(self, level: int = DEFAULT_ZSTD_LEVEL,
-                 codec: str = DEFAULT_CODEC):
-        self.level = level
+    def __init__(self, codec: str = "rans", quant: int = 1):
+        if codec not in {"rans", "zstd"}:
+            raise ValueError("codec must be 'rans' or 'zstd'")
+        if not 1 <= int(quant) <= 255:
+            raise ValueError("quant must be in [1, 255]")
         self.codec = codec
+        self.quant = int(quant)
 
     def encode(self, buf):
-        return encode_chunk(np.asarray(buf), self.level, codec=self.codec)
+        a = np.ascontiguousarray(buf)
+        if a.ndim != 3:
+            raise ValueError("vcz1 expects 3D chunks")
+        if a.dtype not in (np.uint8, np.uint16):
+            raise ValueError("vcz1 supports uint8 and uint16 chunks")
+        z, y, x = a.shape
+        return vcz1.compress(
+            a.tobytes(), z, y, x, a.dtype.itemsize, self.quant, self.codec
+        )
 
     def decode(self, buf, out=None):
-        decoded = decode_chunk(bytes(buf))
+        payload = bytes(memoryview(buf))
+        z, y, x = _vcz1_shape(payload)
+        elem_size = payload[5]
+        raw = vcz1.decompress(payload, z * y * x * elem_size)
         if out is not None:
-            np.copyto(np.frombuffer(out, dtype=decoded.dtype).reshape(decoded.shape),
-                      decoded)
+            np.frombuffer(out, dtype=np.uint8)[:] = np.frombuffer(raw, dtype=np.uint8)
             return out
-        return decoded
+        return raw
 
     def get_config(self):
-        return {"id": self.codec_id, "level": self.level, "codec": self.codec}
+        return {"id": self.codec_id, "codec": self.codec, "quant": self.quant}
 
 
-numcodecs.register_codec(VcDeltaZstd)
+numcodecs.register_codec(Vcz1)
 
 
-# ---------------------------------------------------------------------------
-# zarr v2 directory walking (no zarr-python dependency)
-# ---------------------------------------------------------------------------
+def _vcz1_shape(payload: bytes) -> tuple[int, int, int]:
+    if len(payload) < 20 or payload[:4] != b"VCZ1":
+        raise ValueError("not a VCZ1 payload")
+    return (
+        int.from_bytes(payload[8:12], "little"),
+        int.from_bytes(payload[12:16], "little"),
+        int.from_bytes(payload[16:20], "little"),
+    )
 
-def find_arrays(root: Path) -> list[Path]:
-    """Directories containing a .zarray, e.g. OME-Zarr pyramid levels."""
+
+def zarr_major() -> int:
+    return int(zarr.__version__.split(".", 1)[0])
+
+
+def create_array(path: Path, src, *, codec: Vcz1):
+    kwargs = dict(
+        shape=src.shape,
+        chunks=src.chunks,
+        dtype=src.dtype,
+        compressor=codec,
+        fill_value=getattr(src, "fill_value", None),
+        overwrite=True,
+    )
+    if zarr_major() >= 3:
+        kwargs["zarr_format"] = 2
+    return zarr.create(store=str(path), **kwargs)
+
+
+def chunk_slices(shape: tuple[int, ...], chunks: tuple[int, ...]) -> Iterable[tuple[slice, ...]]:
+    grid = [range(math.ceil(s / c)) for s, c in zip(shape, chunks)]
+    for idx in np.ndindex(*(len(g) for g in grid)):
+        yield tuple(
+            slice(i * c, min((i + 1) * c, s))
+            for i, c, s in zip(idx, chunks, shape)
+        )
+
+
+def array_dirs(root: Path) -> list[Path]:
+    if (root / ".zarray").exists():
+        return [root]
     return sorted(p.parent for p in root.rglob(".zarray"))
 
 
-def load_meta(array_dir: Path) -> dict:
-    meta = json.loads((array_dir / ".zarray").read_text())
-    if meta.get("zarr_format") != 2:
-        raise SystemExit(f"{array_dir}: only zarr v2 arrays are supported")
-    if meta.get("order", "C") != "C":
-        raise SystemExit(f"{array_dir}: only C-order arrays are supported")
-    if meta.get("filters"):
-        raise SystemExit(f"{array_dir}: v2 filters are not supported")
-    if len(meta["shape"]) != 3:
-        raise SystemExit(f"{array_dir}: only 3D arrays are supported")
-    dtype = np.dtype(meta["dtype"])
-    if dtype.byteorder == ">":
-        raise SystemExit(f"{array_dir}: big-endian dtypes are not supported")
-    if dtype.itemsize not in (1, 2) or dtype.kind != "u":
-        raise SystemExit(f"{array_dir}: only uint8/uint16 arrays are supported "
-                         f"(got {meta['dtype']})")
-    comp = meta.get("compressor")
-    if comp and comp.get("id") == "c3d":
-        raise SystemExit(f"{array_dir}: c3d-coded volumes cannot be recompressed here")
-    return meta
+def copy_group_metadata(src_root: Path, dst_root: Path, arrays: list[Path]) -> None:
+    array_meta = {".zarray"}
+    for path in src_root.rglob("*"):
+        if not path.is_file() or path.name not in {".zattrs", ".zgroup", ".zmetadata"}:
+            continue
+        if path.name in array_meta:
+            continue
+        rel = path.relative_to(src_root)
+        dst = dst_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dst)
 
 
-def chunk_files(array_dir: Path) -> list[Path]:
-    skip = {".zarray", ".zattrs", ".zgroup", ".zmetadata"}
-    return [p for p in array_dir.rglob("*")
-            if p.is_file() and p.name not in skip and not p.name.endswith(".tmp")]
+def recompress_array(src_path: Path, dst_path: Path, codec: Vcz1) -> None:
+    src = zarr.open(str(src_path), mode="r")
+    if len(src.shape) != 3:
+        raise SystemExit(f"{src_path}: expected a 3D array, got shape {src.shape}")
+    if np.dtype(src.dtype) not in (np.dtype("uint8"), np.dtype("uint16")):
+        raise SystemExit(f"{src_path}: expected uint8 or uint16, got {src.dtype}")
 
-
-def chunk_key_path(array_dir: Path, idx: tuple[int, int, int], sep: str) -> Path:
-    if sep == "/":
-        return array_dir / str(idx[0]) / str(idx[1]) / str(idx[2])
-    return array_dir / f"{idx[0]}.{idx[1]}.{idx[2]}"
-
-
-def parse_chunk_index(array_dir: Path, path: Path, sep: str) -> tuple[int, int, int] | None:
-    parts = path.relative_to(array_dir).parts if sep == "/" \
-        else tuple(path.name.split("."))
-    if len(parts) != 3:
-        return None
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    dst = create_array(dst_path, src, codec=codec)
     try:
-        return tuple(int(p) for p in parts)  # type: ignore[return-value]
-    except ValueError:
-        return None
+        dst.attrs.update(dict(src.attrs))
+    except Exception:
+        pass
 
-
-def validate_pow2_chunks(old: list[int], new: list[int], where: str) -> None:
-    for axis, (o, n) in enumerate(zip(old, new)):
-        big, small = max(o, n), min(o, n)
-        if n <= 0 or big % small != 0 or ((big // small) & (big // small - 1)) != 0:
-            raise SystemExit(
-                f"{where}: new chunk size {n} on axis {axis} is not a "
-                f"power-of-two factor of the current chunk size {o}")
-
-
-def _decode_source(buf: bytes, meta: dict) -> np.ndarray:
-    dtype = np.dtype(meta["dtype"])
-    comp = meta.get("compressor")
-    if buf[:4] == MAGIC:
-        return decode_chunk(buf)
-    if comp is None:
-        raw = buf
-    else:
-        raw = numcodecs.get_codec(dict(comp)).decode(buf)
-    return np.frombuffer(raw, dtype=dtype).reshape(meta["chunks"])[:]
-
-
-def _recorded_quant(buf: bytes) -> int:
-    return max(1, buf[6])
-
-
-def _recorded_codec(buf: bytes) -> int:
-    return buf[7] & 0x0F
-
-
-def _up_to_date(buf: bytes, quant: int, codec: str) -> bool:
-    """True when a payload already carries the requested quant/codec and,
-    for rANS, a per-chunk delta mask (mask-less payloads predate filter
-    selection and re-encode losslessly to a smaller frame)."""
-    if buf[:4] != MAGIC or len(buf) < HEADER.size:
-        return False
-    return (_recorded_quant(buf) >= quant
-            and _recorded_codec(buf) == CODEC_IDS[codec]
-            and (codec == "zstd" or bool(buf[7] & 0x80)))
-
-
-def _process_chunk(args: tuple) -> tuple[str, int, int, bool]:
-    """Worker: returns (path, in_bytes, out_bytes, converted)."""
-    path_s, meta, out_path_s, level, quant, codec = args
-    path = Path(path_s)
-    out_path = Path(out_path_s)
-    buf = path.read_bytes()
-
-    # Already converted (resume / idempotence) — unless a coarser
-    # quantization, a different entropy codec, or a filter upgrade was
-    # requested than the payload carries.
-    if _up_to_date(buf, quant, codec):
-        if out_path != path:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_bytes(buf)
-        return (path_s, len(buf), len(buf), False)
-
-    # A codec swap must not sharpen the recorded quantization: re-encoding
-    # at or above the recorded width is a lossless no-op, below it would lie
-    # about what the voxels already lost.
-    if buf[:4] == MAGIC:
-        quant = max(quant, _recorded_quant(buf))
-
-    original = _decode_source(buf, meta)
-    encoded = encode_chunk(original, level, quant, codec)
-
-    # Verify before anything replaces the source.
-    roundtrip = decode_chunk(encoded)
-    if not np.array_equal(roundtrip, quantize(original, quant)):
-        raise RuntimeError(f"{path}: verification failed, aborting")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_name(out_path.name + ".tmp")
-    tmp.write_bytes(encoded)
-    os.replace(tmp, out_path)
-    return (path_s, len(buf), len(encoded), True)
-
-
-def _process_tile(args: tuple) -> tuple[int, int, int]:
-    """Rechunking worker for one supertile of max(old, new) chunks per axis.
-
-    src_entries: [(voxel_offset_in_tile, path)] source chunks to decode.
-    dst_entries: [(voxel_offset_in_tile, out_path)] chunks to emit.
-    Returns (in_bytes, out_bytes, written).
-    """
-    meta, src_entries, dst_entries, tile_shape, new_chunks, level, quant, \
-        codec = args
-    dtype = np.dtype(meta["dtype"])
-    fill = int(meta.get("fill_value") or 0)
-
-    tile = np.full(tile_shape, fill, dtype=dtype)
-    bytes_in = 0
-    for (oz, oy, ox), path_s in src_entries:
-        buf = Path(path_s).read_bytes()
-        bytes_in += len(buf)
-        a = _decode_source(buf, meta)
-        tile[oz:oz + a.shape[0], oy:oy + a.shape[1], ox:ox + a.shape[2]] = a
-
-    bytes_out = 0
-    written = 0
-    nz, ny, nx = new_chunks
-    for (oz, oy, ox), out_path_s in dst_entries:
-        sub = np.ascontiguousarray(tile[oz:oz + nz, oy:oy + ny, ox:ox + nx])
-        encoded = encode_chunk(sub, level, quant, codec)
-        if not np.array_equal(decode_chunk(encoded), quantize(sub, quant)):
-            raise RuntimeError(f"{out_path_s}: verification failed, aborting")
-        out_path = Path(out_path_s)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out_path.with_name(out_path.name + ".tmp")
-        tmp.write_bytes(encoded)
-        os.replace(tmp, out_path)
-        bytes_out += len(encoded)
-        written += 1
-    return (bytes_in, bytes_out, written)
-
-
-def _rechunk_jobs(array_dir: Path, out_dir: Path, meta: dict,
-                  new_chunks: list[int], level: int,
-                  quant: int, codec: str) -> list[tuple]:
-    """One job per supertile: max(old, new) voxels per axis, so power-of-two
-    alignment lets each job read whole source chunks and write whole output
-    chunks with no cross-tile overlap."""
-    sep = meta.get("dimension_separator", ".")
-    old = meta["chunks"]
-    shape = meta["shape"]
-    tile = [max(o, n) for o, n in zip(old, new_chunks)]
-
-    by_index: dict[tuple[int, int, int], Path] = {}
-    for p in chunk_files(array_dir):
-        idx = parse_chunk_index(array_dir, p, sep)
-        if idx is None:
-            raise SystemExit(f"{array_dir}: unrecognized chunk file {p}")
-        by_index[idx] = p
-
-    def grid(span: list[int]) -> list[int]:
-        return [(s + t - 1) // t for s, t in zip(shape, span)]
-
-    jobs = []
-    tz, ty, tx = grid(tile)
-    for gz in range(tz):
-        for gy in range(ty):
-            for gx in range(tx):
-                origin = (gz * tile[0], gy * tile[1], gx * tile[2])
-                src_entries = []
-                for iz in range(tile[0] // old[0]):
-                    for iy in range(tile[1] // old[1]):
-                        for ix in range(tile[2] // old[2]):
-                            idx = (origin[0] // old[0] + iz,
-                                   origin[1] // old[1] + iy,
-                                   origin[2] // old[2] + ix)
-                            path = by_index.get(idx)
-                            if path is not None:
-                                src_entries.append(
-                                    ((iz * old[0], iy * old[1], ix * old[2]),
-                                     str(path)))
-                dst_entries = []
-                for iz in range(tile[0] // new_chunks[0]):
-                    for iy in range(tile[1] // new_chunks[1]):
-                        for ix in range(tile[2] // new_chunks[2]):
-                            idx = (origin[0] // new_chunks[0] + iz,
-                                   origin[1] // new_chunks[1] + iy,
-                                   origin[2] // new_chunks[2] + ix)
-                            # Skip chunks entirely past the array bounds and,
-                            # for resume, ones already written.
-                            if any(i * n >= s for i, n, s in
-                                   zip(idx, new_chunks, shape)):
-                                continue
-                            out_path = chunk_key_path(out_dir, idx, sep)
-                            if out_path.exists():
-                                head = out_path.read_bytes()[:HEADER.size]
-                                if _up_to_date(head, quant, codec):
-                                    continue
-                            dst_entries.append(
-                                ((iz * new_chunks[0], iy * new_chunks[1],
-                                  ix * new_chunks[2]), str(out_path)))
-                if src_entries and dst_entries:
-                    jobs.append((meta, src_entries, dst_entries,
-                                 tuple(tile), tuple(new_chunks), level, quant,
-                                 codec))
-    return jobs
-
-
-def recompress_array(array_dir: Path, out_dir: Path, level: int, workers: int,
-                     chunk_size: list[int] | None = None,
-                     quant: int = DEFAULT_QUANT,
-                     codec: str = DEFAULT_CODEC) -> None:
-    meta = load_meta(array_dir)
-
-    if chunk_size is not None and list(chunk_size) != list(meta["chunks"]):
-        validate_pow2_chunks(meta["chunks"], chunk_size, str(array_dir))
-        recompress_array_rechunk(array_dir, out_dir, meta, chunk_size,
-                                 level, workers, quant, codec)
-        return
-
-    files = chunk_files(array_dir)
-    print(f"{array_dir}: {len(files)} chunks "
-          f"({meta['dtype']}, chunks={meta['chunks']}, "
-          f"compressor={meta.get('compressor')})")
-
-    jobs = [(str(p), meta, str(out_dir / p.relative_to(array_dir)), level,
-             quant, codec)
-            for p in files]
-    total_in = total_out = converted = 0
-    if workers <= 1:
-        results = map(_process_chunk, jobs)
-    else:
-        pool = ProcessPoolExecutor(max_workers=workers)
-        results = pool.map(_process_chunk, jobs, chunksize=8)
-    progress = tqdm(total=len(jobs), unit="chunk", desc=f"  {array_dir.name}",
-                    smoothing=0.05) if tqdm else None
-    for i, (_path, n_in, n_out, was_converted) in enumerate(results, 1):
-        total_in += n_in
-        total_out += n_out
-        converted += was_converted
-        if progress:
-            progress.set_postfix_str(
-                f"{total_in/1e9:.2f}->{total_out/1e9:.2f} GB "
-                f"({total_out/max(total_in,1):.3f})", refresh=False)
-            progress.update(1)
-        elif i % 500 == 0 or i == len(jobs):
-            print(f"  {i}/{len(jobs)}  {total_in/1e9:.2f} GB -> {total_out/1e9:.2f} GB "
-                  f"({total_out/max(total_in,1):.3f})", flush=True)
-    if progress:
-        progress.close()
-    if workers > 1:
-        pool.shutdown()
-
-    # Metadata last: an interrupted in-place run keeps the old compressor id,
-    # and the resume path recognizes converted chunks by their VCZ1 magic.
-    _write_array_meta(array_dir, out_dir, meta, meta["chunks"], level, codec)
-    print(f"  done: {converted} converted, ratio "
-          f"{total_out/max(total_in,1):.3f} vs source encoding")
-
-
-def _write_array_meta(array_dir: Path, out_dir: Path, meta: dict,
-                      chunks: list[int], level: int,
-                      codec: str = DEFAULT_CODEC) -> None:
-    new_meta = dict(meta)
-    new_meta["chunks"] = list(chunks)
-    new_meta["compressor"] = {"id": CODEC_ID, "level": level, "codec": codec}
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / ".zarray").write_text(json.dumps(new_meta, indent=4))
-    for extra in (".zattrs",):
-        src = array_dir / extra
-        if src.exists() and not (out_dir / extra).exists():
-            (out_dir / extra).write_text(src.read_text())
-
-
-def recompress_array_rechunk(array_dir: Path, out_dir: Path, meta: dict,
-                             new_chunks: list[int], level: int,
-                             workers: int, quant: int = DEFAULT_QUANT,
-                             codec: str = DEFAULT_CODEC) -> None:
-    jobs = _rechunk_jobs(array_dir, out_dir, meta, new_chunks, level, quant,
-                         codec)
-    n_out = sum(len(j[2]) for j in jobs)
-    print(f"{array_dir}: rechunk {meta['chunks']} -> {list(new_chunks)}, "
-          f"{len(jobs)} tiles / {n_out} output chunks "
-          f"({meta['dtype']}, compressor={meta.get('compressor')})")
-
-    total_in = total_out = written = 0
-    if workers <= 1:
-        results = map(_process_tile, jobs)
-    else:
-        pool = ProcessPoolExecutor(max_workers=workers)
-        results = pool.map(_process_tile, jobs, chunksize=2)
-    progress = tqdm(total=len(jobs), unit="tile", desc=f"  {array_dir.name}",
-                    smoothing=0.05) if tqdm else None
-    for i, (n_in, n_out_bytes, n_written) in enumerate(results, 1):
-        total_in += n_in
-        total_out += n_out_bytes
-        written += n_written
-        if progress:
-            progress.set_postfix_str(
-                f"{total_in/1e9:.2f}->{total_out/1e9:.2f} GB "
-                f"({total_out/max(total_in,1):.3f})", refresh=False)
-            progress.update(1)
-        elif i % 100 == 0 or i == len(jobs):
-            print(f"  {i}/{len(jobs)} tiles  {total_in/1e9:.2f} GB -> "
-                  f"{total_out/1e9:.2f} GB", flush=True)
-    if progress:
-        progress.close()
-    if workers > 1:
-        pool.shutdown()
-
-    _write_array_meta(array_dir, out_dir, meta, new_chunks, level, codec)
-    print(f"  done: {written} chunks written, ratio "
-          f"{total_out/max(total_in,1):.3f} vs source encoding")
+    print(f"{src_path} -> {dst_path}")
+    print(f"  shape={src.shape} chunks={src.chunks} dtype={src.dtype} codec={codec.get_config()}")
+    for n, slc in enumerate(chunk_slices(tuple(src.shape), tuple(src.chunks)), 1):
+        dst[slc] = src[slc]
+        if n % 100 == 0:
+            print(f"  {n} chunks", flush=True)
+    print(f"  done: {n} chunks")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Recompress an OME-Zarr volume into vc_delta_zstd (VCZ1) chunks.")
-    ap.add_argument("volume", type=Path, help="zarr root (contains levels or a .zarray)")
-    group = ap.add_mutually_exclusive_group(required=True)
-    group.add_argument("--out", type=Path, help="write the recompressed tree here")
-    group.add_argument("--in-place", action="store_true",
-                       help="replace chunks in the source tree (resumable)")
-    ap.add_argument("--level", type=int, default=DEFAULT_ZSTD_LEVEL,
-                    help=f"zstd level (default {DEFAULT_ZSTD_LEVEL}; "
-                         "ignored with --codec rans)")
-    ap.add_argument("--codec", choices=("zstd", "rans"), default=DEFAULT_CODEC,
-                    help="entropy codec for the filtered voxels. rans is "
-                         "~9-18%% smaller (most on quantized chunks) and what "
-                         "VC3D's cache writes, but reading it from Python "
-                         "requires the compiled vc bindings; zstd (default) "
-                         "stays pure-Python readable")
-    ap.add_argument("--max-error", type=int, default=0, choices=(0, 1, 2),
-                    help="near-lossless: bound the per-voxel error (0 = "
-                         "lossless; 1 or 2 gray levels, below the CT noise "
-                         "floor). Irreversible for the affected low bits.")
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2),
-                    help="parallel worker processes")
-    ap.add_argument("--chunk-size", type=str, default=None,
-                    help="output chunk size: one value or z,y,x; each axis "
-                         "must be a power-of-two factor of the source chunk "
-                         "size (requires --out)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=Path, help="input zarr array or group")
+    parser.add_argument("output", type=Path, help="output zarr array or group")
+    parser.add_argument("--codec", choices=("rans", "zstd"), default="rans")
+    parser.add_argument(
+        "--quant",
+        type=int,
+        default=1,
+        help="VCZ1 quantization bin width; 1 is lossless",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="delete the output path first if it already exists",
+    )
+    args = parser.parse_args()
 
-    chunk_size = None
-    if args.chunk_size:
-        parts = [int(v) for v in args.chunk_size.split(",")]
-        if len(parts) == 1:
-            parts *= 3
-        if len(parts) != 3:
-            sys.exit("--chunk-size takes one value or z,y,x")
-        chunk_size = parts
-        if args.in_place:
-            sys.exit("--chunk-size requires --out (old and new chunk keys "
-                     "would collide in the source tree)")
+    if not args.input.exists():
+        raise SystemExit(f"{args.input}: does not exist")
+    if args.output.exists():
+        if not args.overwrite:
+            raise SystemExit(f"{args.output}: already exists; pass --overwrite")
+        shutil.rmtree(args.output)
 
-    root = args.volume
-    if not root.is_dir():
-        sys.exit(f"{root}: not a directory")
-    arrays = find_arrays(root)
+    arrays = array_dirs(args.input)
     if not arrays:
-        sys.exit(f"{root}: no .zarray found")
+        raise SystemExit(f"{args.input}: no .zarray found")
 
-    for array_dir in arrays:
-        out_dir = array_dir if args.in_place \
-            else args.out / array_dir.relative_to(root)
-        recompress_array(array_dir, out_dir, args.level, args.workers,
-                         chunk_size, quant=2 * args.max_error + 1,
-                         codec=args.codec)
-
-    if not args.in_place:
-        # Copy group-level metadata (.zgroup/.zattrs/.zmetadata) for OME-Zarr.
-        for extra in root.rglob("*"):
-            if extra.is_file() and extra.name in {".zgroup", ".zattrs", ".zmetadata"} \
-                    and not any(a in extra.parents for a in arrays):
-                dest = args.out / extra.relative_to(root)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                if not dest.exists():
-                    dest.write_text(extra.read_text())
-    print("all arrays done")
+    codec = Vcz1(codec=args.codec, quant=args.quant)
+    if arrays == [args.input]:
+        recompress_array(args.input, args.output, codec)
+    else:
+        copy_group_metadata(args.input, args.output, arrays)
+        for src_array in arrays:
+            recompress_array(
+                src_array,
+                args.output / src_array.relative_to(args.input),
+                codec,
+            )
 
 
 if __name__ == "__main__":
