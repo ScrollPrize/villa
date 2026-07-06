@@ -23,7 +23,7 @@ import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 try:
     import zarr
@@ -40,8 +40,45 @@ except ImportError as e:  # pragma: no cover
         "`from vc.compression.vcz1_numcodecs import Vcz1` works"
     ) from e
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
+
+
 def zarr_major() -> int:
     return int(zarr.__version__.split(".", 1)[0])
+
+
+def is_s3_path(path: str) -> bool:
+    return path.startswith("s3://")
+
+
+def normalize_s3_path(path: str) -> str:
+    if not path.startswith("s3://") or ".s3." not in path:
+        return path
+
+    prefix = "s3://"
+    rest = path[len(prefix):]
+    host, sep, key = rest.partition("/")
+    bucket = host.split(".s3.", 1)[0]
+    return f"{prefix}{bucket}{sep}{key}" if sep else f"{prefix}{bucket}"
+
+
+def open_s3_store(path: str, *, check: bool = False):
+    try:
+        import s3fs
+    except ImportError as e:  # pragma: no cover
+        raise SystemExit("install s3fs to read s3:// inputs: python -m pip install s3fs") from e
+
+    fs = s3fs.S3FileSystem(anon=True)
+    return s3fs.S3Map(root=normalize_s3_path(path).rstrip("/"), s3=fs, check=check)
+
+
+def open_zarr(path: str, mode: str = "r"):
+    if is_s3_path(path):
+        return zarr.open(open_s3_store(path), mode=mode)
+    return zarr.open(path, mode=mode)
 
 
 def create_array(path: Path, src, *, codec: Vcz1):
@@ -76,7 +113,7 @@ def chunk_indices(shape: tuple[int, ...], chunks: tuple[int, ...]) -> Iterable[t
 
 def copy_chunk(job: tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int, ...]]) -> int:
     src_path, dst_path, idx, shape, chunks = job
-    src = zarr.open(src_path, mode="r")
+    src = open_zarr(src_path, mode="r")
     dst = zarr.open(dst_path, mode="a")
     slc = chunk_slice_for_index(idx, shape, chunks)
     dst[slc] = src[slc]
@@ -102,8 +139,39 @@ def copy_group_metadata(src_root: Path, dst_root: Path, arrays: list[Path]) -> N
         shutil.copy2(path, dst)
 
 
-def recompress_array(src_path: Path, dst_path: Path, codec: Vcz1, workers: int) -> None:
-    src = zarr.open(str(src_path), mode="r")
+def s3_array_paths(root: str) -> list[str]:
+    opened = open_zarr(root, mode="r")
+    if not isinstance(opened, zarr.Group):
+        return [root]
+
+    arrays: list[str] = []
+
+    def visit(path: str, node: Any) -> None:
+        if isinstance(node, zarr.Array):
+            arrays.append(path)
+
+    opened.visititems(visit)
+    return [f"{root.rstrip('/')}/{path}" for path in sorted(arrays)]
+
+
+def copy_s3_group_metadata(src_root: str, dst_root: Path) -> None:
+    store = open_s3_store(src_root)
+    for key in store.keys():
+        if not key.endswith((".zattrs", ".zgroup", ".zmetadata")):
+            continue
+        dst = dst_root / key
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(store[key])
+
+
+def relative_s3_array_path(src_root: str, src_array: str) -> Path:
+    rel = src_array.removeprefix(src_root.rstrip("/")).lstrip("/")
+    return Path(rel)
+
+
+def recompress_array(src_path: str | Path, dst_path: Path, codec: Vcz1, workers: int) -> None:
+    src_path_str = str(src_path)
+    src = open_zarr(src_path_str, mode="r")
     if len(src.shape) != 3:
         raise SystemExit(f"{src_path}: expected a 3D array, got shape {src.shape}")
     if np.dtype(src.dtype) not in (np.dtype("uint8"), np.dtype("uint16")):
@@ -121,7 +189,7 @@ def recompress_array(src_path: Path, dst_path: Path, codec: Vcz1, workers: int) 
     shape = tuple(src.shape)
     chunks = tuple(src.chunks)
     jobs = [
-        (str(src_path), str(dst_path), idx, shape, chunks)
+        (src_path_str, str(dst_path), idx, shape, chunks)
         for idx in chunk_indices(shape, chunks)
     ]
     if workers <= 1:
@@ -130,7 +198,8 @@ def recompress_array(src_path: Path, dst_path: Path, codec: Vcz1, workers: int) 
         with ProcessPoolExecutor(max_workers=workers) as pool:
             results = pool.map(copy_chunk, jobs, chunksize=8)
     if tqdm is not None:
-        results = tqdm(results, total=len(jobs), unit="chunk", desc=f"  {src_path.name}")
+        src_name = Path(src_path_str.rstrip("/")).name if not is_s3_path(src_path_str) else src_path_str.rstrip("/").rsplit("/", 1)[-1]
+        results = tqdm(results, total=len(jobs), unit="chunk", desc=f"  {src_name}")
     n = 0
     for n, _voxels in enumerate(results, 1):
         if tqdm is None and (n % 100 == 0 or n == len(jobs)):
@@ -140,7 +209,7 @@ def recompress_array(src_path: Path, dst_path: Path, codec: Vcz1, workers: int) 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="input zarr array or group")
+    parser.add_argument("input", type=str, help="input zarr array or group; local path or s3:// URI")
     parser.add_argument("output", type=Path, help="output zarr array or group")
     parser.add_argument("--codec", choices=("rans", "zstd"), default="rans")
     parser.add_argument(
@@ -162,26 +231,40 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.input.exists():
-        raise SystemExit(f"{args.input}: does not exist")
+    input_path = normalize_s3_path(args.input)
+    input_is_s3 = is_s3_path(input_path)
+
+    if input_is_s3:
+        input_store = open_s3_store(input_path, check=False)
+        if ".zarray" not in input_store and ".zgroup" not in input_store:
+            raise SystemExit(f"{input_path}: no .zarray or .zgroup found")
+    else:
+        input_path = str(Path(input_path))
+        if not Path(input_path).exists():
+            raise SystemExit(f"{input_path}: does not exist")
     if args.output.exists():
         if not args.overwrite:
             raise SystemExit(f"{args.output}: already exists; pass --overwrite")
         shutil.rmtree(args.output)
 
-    arrays = array_dirs(args.input)
+    arrays = s3_array_paths(input_path) if input_is_s3 else array_dirs(Path(input_path))
     if not arrays:
-        raise SystemExit(f"{args.input}: no .zarray found")
+        raise SystemExit(f"{input_path}: no .zarray found")
 
     codec = Vcz1(codec=args.codec, quant=args.quant)
-    if arrays == [args.input]:
-        recompress_array(args.input, args.output, codec, args.workers)
+    is_single_array = arrays == [input_path] if input_is_s3 else arrays == [Path(input_path)]
+    if is_single_array:
+        recompress_array(input_path, args.output, codec, args.workers)
     else:
-        copy_group_metadata(args.input, args.output, arrays)
+        if input_is_s3:
+            copy_s3_group_metadata(input_path, args.output)
+        else:
+            copy_group_metadata(Path(input_path), args.output, arrays)
         for src_array in arrays:
+            dst_rel = relative_s3_array_path(input_path, src_array) if input_is_s3 else src_array.relative_to(input_path)
             recompress_array(
                 src_array,
-                args.output / src_array.relative_to(args.input),
+                args.output / dst_rel,
                 codec,
                 args.workers,
             )
