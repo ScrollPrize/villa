@@ -330,8 +330,13 @@ bool decompressBytesInto(const CompressorConfig& cfg,
         gzipDecompressInto(input, output);
         return true;
     case CompressorId::C3d:
-    case CompressorId::VcDeltaZstd:
         return false;
+    case CompressorId::VcDeltaZstd:
+        if (!vc::cacheDecompressInto(input, output)) {
+            throw std::runtime_error(
+                "vcz1 chunk failed to decode or has mismatched size");
+        }
+        return true;
     }
     return false;
 }
@@ -456,7 +461,7 @@ static utils::ZarrArray::Codec codecFromConfig(const CompressorConfig& cfg)
     codec.decompress = [cfg](std::span<const std::byte> data, std::size_t outSize) {
         return decompressBytes(cfg, data, outSize);
     };
-    if (cfg.id != CompressorId::C3d && cfg.id != CompressorId::VcDeltaZstd) {
+    if (cfg.id != CompressorId::C3d) {
         codec.decompress_into = [cfg](std::span<const std::byte> data,
                                       std::span<std::byte> out) {
             decompressBytesInto(cfg, data, out);
@@ -647,15 +652,11 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
             break;
         }
 
-        case CompressorId::Lz4: {
-            const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
-            std::memcpy(output, bytes.data(), outBytes);
-            break;
-        }
-
+        case CompressorId::Lz4:
         case CompressorId::Gzip: {
-            const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
-            std::memcpy(output, bytes.data(), outBytes);
+            auto out = std::span<std::byte>(
+                reinterpret_cast<std::byte*>(output), outBytes);
+            decompressBytesInto(impl_->compressor_, input, out);
             break;
         }
 
@@ -666,8 +667,9 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
         }
 
         case CompressorId::VcDeltaZstd: {
-            const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
-            std::memcpy(output, bytes.data(), outBytes);
+            auto out = std::span<std::byte>(
+                reinterpret_cast<std::byte*>(output), outBytes);
+            decompressBytesInto(impl_->compressor_, input, out);
             break;
         }
 

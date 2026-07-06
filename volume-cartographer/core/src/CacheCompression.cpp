@@ -561,35 +561,33 @@ std::optional<int> cacheDeltaMask(std::span<const std::byte> input)
     return static_cast<int>(parsed->mask);
 }
 
-std::optional<std::vector<std::byte>> cacheDecompress(
-    std::span<const std::byte> input,
-    std::size_t expectedSize)
+bool cacheDecompressInto(std::span<const std::byte> input,
+                         std::span<std::byte> output)
 {
     if (!hasVcz1Header(input))
-        return std::nullopt;
+        return false;
 
     const auto elemSize = static_cast<std::size_t>(input[5]);
     const std::size_t z = readU32(input.data() + 8);
     const std::size_t y = readU32(input.data() + 12);
     const std::size_t x = readU32(input.data() + 16);
     if ((elemSize != 1 && elemSize != 2) || z == 0 || y == 0 || x == 0 ||
-        z * y * x * elemSize != expectedSize)
-        return std::nullopt;
+        z * y * x * elemSize != output.size())
+        return false;
     const auto parsed = parseCodecByte(static_cast<unsigned char>(input[7]));
     if (!parsed)
-        return std::nullopt;
+        return false;
 
-    std::vector<std::byte> output(expectedSize);
     if (parsed->codec == CacheCodec::Rans) {
         if (!ransDecompressFrame(input.subspan(kHeaderSize), output.data(),
-                                 expectedSize))
-            return std::nullopt;
+                                 output.size()))
+            return false;
     } else {
         const std::size_t rc = ZSTD_decompress(
             output.data(), output.size(),
             input.data() + kHeaderSize, input.size() - kHeaderSize);
-        if (ZSTD_isError(rc) || rc != expectedSize)
-            return std::nullopt;
+        if (ZSTD_isError(rc) || rc != output.size())
+            return false;
     }
 
     if (elemSize == 1)
@@ -598,6 +596,16 @@ std::optional<std::vector<std::byte>> cacheDecompress(
     else
         deltaUnfilter(reinterpret_cast<std::uint16_t*>(output.data()), z, y, x,
                       parsed->mask);
+    return true;
+}
+
+std::optional<std::vector<std::byte>> cacheDecompress(
+    std::span<const std::byte> input,
+    std::size_t expectedSize)
+{
+    std::vector<std::byte> output(expectedSize);
+    if (!cacheDecompressInto(input, output))
+        return std::nullopt;
     return output;
 }
 

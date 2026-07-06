@@ -22,25 +22,30 @@ class Vcz1(numcodecs.abc.Codec):
         self.quant = int(quant)
 
     def encode(self, buf):
-        a = np.ascontiguousarray(buf)
+        a = np.asarray(buf)
         if a.ndim != 3:
             raise ValueError("vcz1 expects 3D chunks")
         if a.dtype not in (np.uint8, np.uint16):
             raise ValueError("vcz1 supports uint8 and uint16 chunks")
-        z, y, x = a.shape
-        return vcz1.compress(
-            a.tobytes(), z, y, x, a.dtype.itemsize, self.quant, self.codec
-        )
+        if a.flags.c_contiguous:
+            return vcz1.compress_array(a, self.quant, self.codec)
+        a = np.ascontiguousarray(a)
+        return vcz1.compress_array(a, self.quant, self.codec)
 
     def decode(self, buf, out=None):
-        payload = bytes(memoryview(buf))
+        payload = buf if isinstance(buf, bytes) else bytes(memoryview(buf))
         z, y, x = _vcz1_shape(payload)
         elem_size = payload[5]
-        raw = vcz1.decompress(payload, z * y * x * elem_size)
+        expected_size = z * y * x * elem_size
         if out is not None:
-            np.frombuffer(out, dtype=np.uint8)[:] = np.frombuffer(raw, dtype=np.uint8)
+            out_bytes = np.frombuffer(out, dtype=np.uint8)
+            if out_bytes.size != expected_size:
+                raise ValueError(
+                    f"output buffer has {out_bytes.size} bytes, expected {expected_size}"
+                )
+            vcz1.decompress_into(payload, out_bytes)
             return out
-        return raw
+        return vcz1.decompress(payload, expected_size)
 
     def get_config(self):
         return {"id": self.codec_id, "codec": self.codec, "quant": self.quant}
@@ -52,7 +57,7 @@ def register() -> None:
     numcodecs.register_codec(Vcz1)
 
 
-def _vcz1_shape(payload: bytes) -> tuple[int, int, int]:
+def _vcz1_shape(payload) -> tuple[int, int, int]:
     if len(payload) < 20 or payload[:4] != b"VCZ1":
         raise ValueError("not a VCZ1 payload")
     return (

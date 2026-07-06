@@ -126,4 +126,9 @@ std::optional<std::vector<std::byte>> cacheDecompress(
     std::span<const std::byte> input,
     std::size_t expectedSize);
 
+// Decompresses directly into caller-owned output storage. Returns false on
+// invalid input or size mismatch.
+bool cacheDecompressInto(std::span<const std::byte> input,
+                         std::span<std::byte> output);
+
 } // namespace vc
