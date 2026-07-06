@@ -158,6 +158,46 @@ Master Plan moved from the Overview sidebar category into Archive (first entry).
 **Files:** `sidebars.js`.
 **Verification:** sidebars.js loads clean via node; doc id resolves (full build rides with the in-flight prizes/sticker round, which the strict checker covers).
 
+## C15 — prizes: 2027 Grand Prize + restructured prize suite + dynamic prizes plugin
+
+**Why:** announce the 2027 Grand Prize and rebuild the whole prize offering around it (owner-directed, July 4–6 sessions).
+**What:**
+- **2027 Grand Prize** section (from the owner's spec document): \$800k/\$100k/\$50k/\$50k = \$1M pool, 23 eligible PHerc volumes (each linking to its Data Browser page + neuroglancer), June 25th 2027 deadline; "Eligible scroll volumes" and "Submission criteria and requirements" as collapsibles; updated rules (70%-per-column letter-by-letter legibility, concurrent-submission ranking, merged skip-patches clause, multi-scroll-dataset requirement dropped).
+- **First Letters** restructured: \$50k per scroll across the GP volume set (\$40k first + \$10k second team per scroll), max 10 scrolls = up to \$500k; 2023-rubric features restored (purpose statement, "rather be slow than wrong", per-letter dimensions, 3D orientation, rows/fiber-overlay soft criteria, held-out validation, stay-open clause). Split into its own section.
+- **PHerc. Paris 4's Title Prize** (renamed from First Title — titles were already found in PHerc. 172/139): \$50k, any scan including 2.4µm, framed with Data Browser facts; own section + criteria collapsible.
+- **Progress Prizes**: \$20,000 guaranteed monthly best-submission award added (pool math now \$590k/yr).
+- **NEW `plugins/prizes-data.js`**: reads the prizes list from `docs/34_prizes.md` frontmatter at build time and exposes it as global data — the landing's prize surfaces update automatically with the prizes page. Total open pool: **\$2,140,000**.
+- Entity rename in prize T&C: Curious Cases, Inc. → Scroll Prize, Inc.
+**Files:** `docs/34_prizes.md`, `plugins/prizes-data.js` (new), `docusaurus.config.js` (plugin registration).
+
+## C16 — landing: prize-pool sticker, open-prizes board, hero stats, team overhaul
+
+- **Floating sticker** (bottom-center pill on desktop, bottom bar on phones): dynamic **\$2,140,000 open prize pool**, clickable → /prizes; scroll-triggered entrance, yields while the Open Prizes board or footer is on screen, dismissible (localStorage), reduced-motion aware, `SHOW_PRIZE_STICKER` toggle.
+- **Open prizes board** ("\$2,140,000 prize pool") in its own section directly above Open Problems, fed by the plugin; per-prize rows with ember amounts, hooks, tier chips, deadlines.
+- **Hero stat strip**: dynamic open-pool stat leads; `$1,800,500 already awarded` → links to /winners; scroll stats → Data Browser. **Awarded Prizes section removed** (winners page replaces it).
+- **Open problems**: owner-dictated concise scientific captions; prize tie-in lines; tags cleaned; targets strip tiles link to the villa monorepo.
+- **Story**: 2023 chapter condensed to one paragraph.
+- **Team**: two-column credits (Created by list with roles — Nat Friedman Instigator, Director & Founding Sponsor; Daniel Gross Founding Sponsor; Dr. Brent Seales Principal Advisor | Led by Giorgio Angelotti, Project & Tech Team Lead, PhD); masonry team columns; Tech Team (renamed) + new Annotation Team; Papyrology Team renamed + titles de-duplicated; EduceLab Team (Partners); Youssef Nader → Advisors & Alumni; Daniel Gross and duplicate Federica Nicolardi entries removed; Senators+Citizens sponsor expanders side-by-side.
+**Files:** `src/components/Landing.js`, `src/components/landingData.js`, `src/css/landing.css`.
+
+## C17 — atlas: human-readable PHerc labels
+
+Scrolls display as "PHerc. 172" / "PHerc. Paris 4" instead of raw ids ("PHerc0172"): `label` derived at generation time (`phercLabel()` in `scripts/genAtlasData.js`), rendered in cards, detail pages, tab titles, JSON-LD, alt/aria texts; search matches both spellings. **URLs unchanged** (no-dead-links rule).
+**Files:** `scripts/genAtlasData.js`, `src/components/atlas/{ScrollCard,ScrollDetailPage,AtlasBrowser}.js`.
+
+## C18 — tutorials & IA: outdated banners, VC archive, pipeline strip fix
+
+- **[OUTDATED CONTENT] admonition** on all tutorials (hub + Scanning/Representation/Seg-and-Flattening/Ink Detection/Segmentation/VC), Virtual Unwrapping, and Curated Datasets.
+- **Volume Cartographer tutorial archived** (sidebar → Archive; URL unchanged); sidebar tutorial order matches the pipeline strip (Ink Detection last); tutorial3 highlights the correct strip step.
+- **Pipeline strip renders in one row** (thumbs shrink instead of wrapping — 4×150px+arrows exceeded the 720px measure).
+**Files:** `docs/{03_tutorial,04_tutorial1,05_tutorial2,06_tutorial3,06_tutorial_VC,07_tutorial5,35_segmentation}.md`, `docs/32_unwrapping.mdx`, `docs/02_data_datasets.md`, `sidebars.js`, `src/components/TutorialsTop.js`.
+
+## C19 — get started & FAQ: brought current (July 2026)
+
+- **Get Started**: 2026 PHerc. 1667 hook; "Dive in" leads with the 2027 Grand Prize; Ink Detection before Segmentation; Data Browser as the see-a-scroll destination; Discord invite unified (`discord.gg/V4fJhvtaQn`); `vesuvius` Python + VC3D recommended (C library mentions removed); \$20k/month noted in Open Source box.
+- **FAQ**: OUTDATED banner on top; intro + dates answers rewritten around the 2026 milestone and 2027 deadlines; publications list adds the 2026 PHerc. 1667 preprint and **Angelotti et al., Scientific Reports 2026** (nature.com + arXiv); texts answer points at Data Browser readings (172 *On Vices*, 139 *On Gods*); software answer → VC3D + `vesuvius`; scan-parameter claims reframed as history (7.91µm-era vs 2.4µm/1.1µm today); slice-orientation section marked as tif-stack-era; Discord unified; Scroll Prize, Inc. rename.
+**Files:** `docs/01_get_started.md`, `docs/09_faq.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
