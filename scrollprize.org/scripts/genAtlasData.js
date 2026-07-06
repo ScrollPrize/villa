@@ -318,6 +318,21 @@ function normalizeStages(stages) {
   return stages;
 }
 
+// Human-readable inventory label: "PHerc0172" -> "PHerc. 172",
+// "PHerc0175A" -> "PHerc. 175A", "PHercParis4" -> "PHerc. Paris 4".
+// Non-PHerc ids pass through unchanged; routes/URLs keep the raw id.
+function phercLabel(id) {
+  const m = /^PHerc(.+)$/.exec(id || "");
+  if (!m) return id;
+  const rest = m[1];
+  const letters = /^([A-Za-z]+)(.*)$/.exec(rest);
+  if (letters) {
+    const tail = letters[2] ? ` ${letters[2].replace(/^0+(?=\d)/, "")}` : "";
+    return `PHerc. ${letters[1]}${tail}`;
+  }
+  return `PHerc. ${rest.replace(/^0+(?=\d)/, "")}`;
+}
+
 function curatedFields(overlayScroll, id) {
   const o = overlayScroll || {};
   let readings = o.readings ?? null;
@@ -328,6 +343,7 @@ function curatedFields(overlayScroll, id) {
   }
   return {
     display: o.display ?? id,
+    label: phercLabel(id),
     repository: o.repository ?? null,
     note: o.note ?? "",
     photo: o.photo ?? null,

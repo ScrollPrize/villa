@@ -85,8 +85,9 @@ export default function ScrollDetailPage(props) {
   const canonical = `${SITE}/data_browser/${scroll.id}`;
   const metaDesc = metaDescription(scroll);
   // Identify scrolls by their PHerc inventory name; keep "Scroll N" as a tag.
+  const label = scroll.label || scroll.id;
   const nick = scroll.display && scroll.display !== scroll.id ? scroll.display : null;
-  const pageTitle = `${scroll.id}${nick ? ` (${nick})` : ""} — Vesuvius Challenge`;
+  const pageTitle = `${label}${nick ? ` (${nick})` : ""} — Vesuvius Challenge`;
 
   // og:image: scroll photo, else the first readings image if present.
   const firstReading =
@@ -124,7 +125,7 @@ export default function ScrollDetailPage(props) {
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "Dataset",
-    name: scroll.id,
+    name: label,
     alternateName: scroll.display,
     description: metaDesc,
     url: canonical,
@@ -155,7 +156,7 @@ export default function ScrollDetailPage(props) {
             ← all scrolls
           </Link>
           <h1>
-            {scroll.id}
+            {label}
             {nick ? <span className="nick">{nick}</span> : null}
             <span
               className={`type ${scroll.type === "scroll" ? "" : "fragment"}`}
@@ -190,7 +191,7 @@ export default function ScrollDetailPage(props) {
                 <div className="fragview">
                   <img
                     src={photoThumb(photo, 1400)}
-                    alt={`Photograph of ${scroll.id}`}
+                    alt={`Photograph of ${label}`}
                     loading="lazy"
                     onError={(e) => {
                       e.currentTarget.src = photo;
