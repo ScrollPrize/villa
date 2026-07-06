@@ -13,8 +13,12 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "numpy",
+    "numcodecs>=0.16.5,<0.17",
 ]
 license = { file = "LICENSE" }
+
+[project.entry-points."numcodecs.codecs"]
+vcz1 = "vc.compression.vcz1_numcodecs:Vcz1"
 
 [tool.scikit-build]
 cmake.version = ">=3.22"

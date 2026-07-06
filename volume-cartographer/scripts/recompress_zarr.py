@@ -18,81 +18,27 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Iterable
+
+try:
+    import zarr
+except ImportError as e:  # pragma: no cover
+    raise SystemExit("install zarr: python -m pip install zarr") from e
 
 import numpy as np
 
 try:
-    import numcodecs
-    import zarr
-except ImportError as e:  # pragma: no cover
-    raise SystemExit("install zarr and numcodecs: python -m pip install zarr") from e
-
-try:
-    from vc.compression import vcz1
+    from vc.compression.vcz1_numcodecs import Vcz1
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
         "install the volume-cartographer Python bindings so "
-        "`from vc.compression import vcz1` works"
+        "`from vc.compression.vcz1_numcodecs import Vcz1` works"
     ) from e
-
-
-CODEC_ID = "vcz1"
-
-
-class Vcz1(numcodecs.abc.Codec):
-    """numcodecs wrapper for the C++ VCZ1 chunk codec."""
-
-    codec_id = CODEC_ID
-
-    def __init__(self, codec: str = "rans", quant: int = 1):
-        if codec not in {"rans", "zstd"}:
-            raise ValueError("codec must be 'rans' or 'zstd'")
-        if not 1 <= int(quant) <= 255:
-            raise ValueError("quant must be in [1, 255]")
-        self.codec = codec
-        self.quant = int(quant)
-
-    def encode(self, buf):
-        a = np.ascontiguousarray(buf)
-        if a.ndim != 3:
-            raise ValueError("vcz1 expects 3D chunks")
-        if a.dtype not in (np.uint8, np.uint16):
-            raise ValueError("vcz1 supports uint8 and uint16 chunks")
-        z, y, x = a.shape
-        return vcz1.compress(
-            a.tobytes(), z, y, x, a.dtype.itemsize, self.quant, self.codec
-        )
-
-    def decode(self, buf, out=None):
-        payload = bytes(memoryview(buf))
-        z, y, x = _vcz1_shape(payload)
-        elem_size = payload[5]
-        raw = vcz1.decompress(payload, z * y * x * elem_size)
-        if out is not None:
-            np.frombuffer(out, dtype=np.uint8)[:] = np.frombuffer(raw, dtype=np.uint8)
-            return out
-        return raw
-
-    def get_config(self):
-        return {"id": self.codec_id, "codec": self.codec, "quant": self.quant}
-
-
-numcodecs.register_codec(Vcz1)
-
-
-def _vcz1_shape(payload: bytes) -> tuple[int, int, int]:
-    if len(payload) < 20 or payload[:4] != b"VCZ1":
-        raise ValueError("not a VCZ1 payload")
-    return (
-        int.from_bytes(payload[8:12], "little"),
-        int.from_bytes(payload[12:16], "little"),
-        int.from_bytes(payload[16:20], "little"),
-    )
-
 
 def zarr_major() -> int:
     return int(zarr.__version__.split(".", 1)[0])
@@ -112,13 +58,29 @@ def create_array(path: Path, src, *, codec: Vcz1):
     return zarr.create(store=str(path), **kwargs)
 
 
-def chunk_slices(shape: tuple[int, ...], chunks: tuple[int, ...]) -> Iterable[tuple[slice, ...]]:
-    grid = [range(math.ceil(s / c)) for s, c in zip(shape, chunks)]
-    for idx in np.ndindex(*(len(g) for g in grid)):
-        yield tuple(
-            slice(i * c, min((i + 1) * c, s))
-            for i, c, s in zip(idx, chunks, shape)
-        )
+def chunk_slice_for_index(
+    idx: tuple[int, ...],
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+) -> tuple[slice, ...]:
+    return tuple(
+        slice(i * c, min((i + 1) * c, s))
+        for i, c, s in zip(idx, chunks, shape)
+    )
+
+
+def chunk_indices(shape: tuple[int, ...], chunks: tuple[int, ...]) -> Iterable[tuple[int, ...]]:
+    grid_shape = tuple(math.ceil(s / c) for s, c in zip(shape, chunks))
+    yield from np.ndindex(*grid_shape)
+
+
+def copy_chunk(job: tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int, ...]]) -> int:
+    src_path, dst_path, idx, shape, chunks = job
+    src = zarr.open(src_path, mode="r")
+    dst = zarr.open(dst_path, mode="a")
+    slc = chunk_slice_for_index(idx, shape, chunks)
+    dst[slc] = src[slc]
+    return int(np.prod([s.stop - s.start for s in slc]))
 
 
 def array_dirs(root: Path) -> list[Path]:
@@ -140,7 +102,7 @@ def copy_group_metadata(src_root: Path, dst_root: Path, arrays: list[Path]) -> N
         shutil.copy2(path, dst)
 
 
-def recompress_array(src_path: Path, dst_path: Path, codec: Vcz1) -> None:
+def recompress_array(src_path: Path, dst_path: Path, codec: Vcz1, workers: int) -> None:
     src = zarr.open(str(src_path), mode="r")
     if len(src.shape) != 3:
         raise SystemExit(f"{src_path}: expected a 3D array, got shape {src.shape}")
@@ -156,10 +118,23 @@ def recompress_array(src_path: Path, dst_path: Path, codec: Vcz1) -> None:
 
     print(f"{src_path} -> {dst_path}")
     print(f"  shape={src.shape} chunks={src.chunks} dtype={src.dtype} codec={codec.get_config()}")
-    for n, slc in enumerate(chunk_slices(tuple(src.shape), tuple(src.chunks)), 1):
-        dst[slc] = src[slc]
-        if n % 100 == 0:
-            print(f"  {n} chunks", flush=True)
+    shape = tuple(src.shape)
+    chunks = tuple(src.chunks)
+    jobs = [
+        (str(src_path), str(dst_path), idx, shape, chunks)
+        for idx in chunk_indices(shape, chunks)
+    ]
+    if workers <= 1:
+        results = map(copy_chunk, jobs)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            results = pool.map(copy_chunk, jobs, chunksize=8)
+    if tqdm is not None:
+        results = tqdm(results, total=len(jobs), unit="chunk", desc=f"  {src_path.name}")
+    n = 0
+    for n, _voxels in enumerate(results, 1):
+        if tqdm is None and (n % 100 == 0 or n == len(jobs)):
+            print(f"  {n}/{len(jobs)} chunks", flush=True)
     print(f"  done: {n} chunks")
 
 
@@ -179,6 +154,12 @@ def main() -> None:
         action="store_true",
         help="delete the output path first if it already exists",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 2) - 1),
+        help="parallel worker processes for chunkwise copy/compression",
+    )
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -194,7 +175,7 @@ def main() -> None:
 
     codec = Vcz1(codec=args.codec, quant=args.quant)
     if arrays == [args.input]:
-        recompress_array(args.input, args.output, codec)
+        recompress_array(args.input, args.output, codec, args.workers)
     else:
         copy_group_metadata(args.input, args.output, arrays)
         for src_array in arrays:
@@ -202,6 +183,7 @@ def main() -> None:
                 src_array,
                 args.output / src_array.relative_to(args.input),
                 codec,
+                args.workers,
             )
 
 

@@ -21,6 +21,10 @@ configure_file(vc/compression/__init__.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/__init__.py"
     COPYONLY
 )
+configure_file(vc/compression/vcz1_numcodecs.py
+    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1_numcodecs.py"
+    COPYONLY
+)
 
 nanobind_add_module(vc_lasagna_amgx
     NOMINSIZE
@@ -98,3 +102,4 @@ install(TARGETS vc_compression_vcz1
 )
 install(FILES vc/__init__.py DESTINATION vc)
 install(FILES vc/compression/__init__.py DESTINATION vc/compression)
+install(FILES vc/compression/vcz1_numcodecs.py DESTINATION vc/compression)
