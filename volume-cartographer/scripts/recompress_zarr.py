@@ -17,6 +17,7 @@ arrays; under zarr-python 3.x the script passes zarr_format=2 explicitly.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import shutil
@@ -81,18 +82,37 @@ def open_zarr(path: str, mode: str = "r"):
     return zarr.open(path, mode=mode)
 
 
-def create_array(path: Path, src, *, codec: Vcz1):
+def create_array_for_spec(
+    path: Path,
+    *,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    dtype,
+    fill_value,
+    codec: Vcz1,
+):
     kwargs = dict(
-        shape=src.shape,
-        chunks=src.chunks,
-        dtype=src.dtype,
+        shape=shape,
+        chunks=chunks,
+        dtype=dtype,
         compressor=codec,
-        fill_value=getattr(src, "fill_value", None),
+        fill_value=fill_value,
         overwrite=True,
     )
     if zarr_major() >= 3:
         kwargs["zarr_format"] = 2
     return zarr.create(store=str(path), **kwargs)
+
+
+def create_array(path: Path, src, *, codec: Vcz1):
+    return create_array_for_spec(
+        path,
+        shape=tuple(src.shape),
+        chunks=tuple(src.chunks),
+        dtype=src.dtype,
+        fill_value=getattr(src, "fill_value", None),
+        codec=codec,
+    )
 
 
 def chunk_slice_for_index(
@@ -120,6 +140,65 @@ def copy_chunk(job: tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int,
     return int(np.prod([s.stop - s.start for s in slc]))
 
 
+def downsample_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(max(1, math.ceil(s / 2)) for s in shape)
+
+
+def downsample_chunks(chunks: tuple[int, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(min(c, s) for c, s in zip(chunks, shape))
+
+
+def downsample_nearest_2x(src: np.ndarray) -> np.ndarray:
+    return src[::2, ::2, ::2]
+
+
+def downsample_mean_2x(src: np.ndarray, out_shape: tuple[int, ...]) -> np.ndarray:
+    original_shape = tuple(src.shape)
+    pad_width = [(0, out_shape[dim] * 2 - original_shape[dim]) for dim in range(3)]
+    if any(after for _before, after in pad_width):
+        src = np.pad(src, pad_width, mode="constant", constant_values=0)
+
+    sums = src.reshape(
+        out_shape[0], 2,
+        out_shape[1], 2,
+        out_shape[2], 2,
+    ).sum(axis=(1, 3, 5), dtype=np.uint64)
+    counts_1d = [
+        np.minimum(
+            2,
+            original_shape[dim] - 2 * np.arange(out_shape[dim], dtype=np.uint64),
+        )
+        for dim in range(3)
+    ]
+    counts = (
+        counts_1d[0][:, None, None]
+        * counts_1d[1][None, :, None]
+        * counts_1d[2][None, None, :]
+    )
+    return ((sums + counts // 2) // counts).astype(src.dtype, copy=False)
+
+
+def downsample_chunk(
+    job: tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], str],
+) -> int:
+    src_path, dst_path, idx, dst_shape, dst_chunks, src_shape, downsample_type = job
+    src = zarr.open(src_path, mode="r")
+    dst = zarr.open(dst_path, mode="a")
+    dst_slc = chunk_slice_for_index(idx, dst_shape, dst_chunks)
+    src_slc = tuple(
+        slice(s.start * 2, min(s.stop * 2, src_shape[dim]))
+        for dim, s in enumerate(dst_slc)
+    )
+    block = np.asarray(src[src_slc])
+    out_shape = tuple(s.stop - s.start for s in dst_slc)
+    if downsample_type == "nearest":
+        downsampled = downsample_nearest_2x(block)
+    else:
+        downsampled = downsample_mean_2x(block, out_shape)
+    dst[dst_slc] = downsampled
+    return int(np.prod(out_shape))
+
+
 def array_dirs(root: Path) -> list[Path]:
     if (root / ".zarray").exists():
         return [root]
@@ -129,7 +208,7 @@ def array_dirs(root: Path) -> list[Path]:
 def copy_group_metadata(src_root: Path, dst_root: Path, arrays: list[Path]) -> None:
     array_meta = {".zarray"}
     for path in src_root.rglob("*"):
-        if not path.is_file() or path.name not in {".zattrs", ".zgroup", ".zmetadata"}:
+        if not path.is_file() or path.name not in {".zattrs", ".zgroup"}:
             continue
         if path.name in array_meta:
             continue
@@ -157,7 +236,7 @@ def s3_array_paths(root: str) -> list[str]:
 def copy_s3_group_metadata(src_root: str, dst_root: Path) -> None:
     store = open_s3_store(src_root)
     for key in store.keys():
-        if not key.endswith((".zattrs", ".zgroup", ".zmetadata")):
+        if not key.endswith((".zattrs", ".zgroup")):
             continue
         dst = dst_root / key
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +286,109 @@ def recompress_array(src_path: str | Path, dst_path: Path, codec: Vcz1, workers:
     print(f"  done: {n} chunks")
 
 
+def write_ome_zattrs(
+    dst_root: Path,
+    *,
+    name: str,
+    downsample_type: str,
+    levels: int = 6,
+) -> None:
+    datasets = []
+    for level in range(levels):
+        scale = float(2 ** level)
+        datasets.append({
+            "path": str(level),
+            "coordinateTransformations": [
+                {"type": "scale", "scale": [scale, scale, scale]},
+            ],
+        })
+
+    attrs = {
+        "note_axes_order": "ZYX (slice, row, col)",
+        "pyramid": True,
+        "pyramid_levels": levels - 1,
+        "multiscales": [{
+            "version": "0.4",
+            "name": name,
+            "axes": [
+                {"name": "z", "type": "space"},
+                {"name": "y", "type": "space"},
+                {"name": "x", "type": "space"},
+            ],
+            "datasets": datasets,
+            "metadata": {"downsampling_method": downsample_type},
+        }],
+    }
+    (dst_root / ".zattrs").write_text(json.dumps(attrs, indent=2) + "\n")
+
+
+def create_ome_root(dst_root: Path, *, name: str, downsample_type: str) -> None:
+    kwargs = {"mode": "w"}
+    if zarr_major() >= 3:
+        kwargs["zarr_format"] = 2
+    zarr.open_group(str(dst_root), **kwargs)
+    write_ome_zattrs(dst_root, name=name, downsample_type=downsample_type)
+
+
+def recompress_flat_array_as_ome(
+    src_path: str | Path,
+    dst_root: Path,
+    codec: Vcz1,
+    workers: int,
+    downsample_type: str = "mean",
+) -> None:
+    src_path_str = str(src_path)
+    src = open_zarr(src_path_str, mode="r")
+    if len(src.shape) != 3:
+        raise SystemExit(f"{src_path}: expected a 3D array, got shape {src.shape}")
+    if np.dtype(src.dtype) not in (np.dtype("uint8"), np.dtype("uint16")):
+        raise SystemExit(f"{src_path}: expected uint8 or uint16, got {src.dtype}")
+
+    create_ome_root(
+        dst_root,
+        name=Path(src_path_str.rstrip("/")).name or "/",
+        downsample_type=downsample_type,
+    )
+    recompress_array(src_path, dst_root / "0", codec, workers)
+
+    prev_path = dst_root / "0"
+    prev_shape = tuple(src.shape)
+    chunks = tuple(src.chunks)
+    fill_value = getattr(src, "fill_value", None)
+    for level in range(1, 6):
+        shape = downsample_shape(prev_shape)
+        level_path = dst_root / str(level)
+        level_chunks = downsample_chunks(chunks, shape)
+        create_array_for_spec(
+            level_path,
+            shape=shape,
+            chunks=level_chunks,
+            dtype=src.dtype,
+            fill_value=fill_value,
+            codec=codec,
+        )
+        print(f"{prev_path} -> {level_path}")
+        print(f"  shape={shape} chunks={level_chunks} dtype={src.dtype} downsample={downsample_type}2x")
+        jobs = [
+            (str(prev_path), str(level_path), idx, shape, level_chunks, prev_shape, downsample_type)
+            for idx in chunk_indices(shape, level_chunks)
+        ]
+        if workers <= 1:
+            results = map(downsample_chunk, jobs)
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                results = pool.map(downsample_chunk, jobs, chunksize=8)
+        if tqdm is not None:
+            results = tqdm(results, total=len(jobs), unit="chunk", desc=f"  level {level}")
+        n = 0
+        for n, _voxels in enumerate(results, 1):
+            if tqdm is None and (n % 100 == 0 or n == len(jobs)):
+                print(f"  {n}/{len(jobs)} chunks", flush=True)
+        print(f"  done: {n} chunks")
+        prev_path = level_path
+        prev_shape = shape
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=str, help="input zarr array or group; local path or s3:// URI")
@@ -228,6 +410,17 @@ def main() -> None:
         type=int,
         default=max(1, (os.cpu_count() or 2) - 1),
         help="parallel worker processes for chunkwise copy/compression",
+    )
+    parser.add_argument(
+        "--output-ome",
+        action="store_true",
+        help="write a flat input array as an OME-Zarr pyramid at output/{0..5}",
+    )
+    parser.add_argument(
+        "--downsample-type",
+        choices=("mean", "nearest"),
+        default="mean",
+        help="2x reduction for --output-ome pyramid levels",
     )
     args = parser.parse_args()
 
@@ -253,7 +446,17 @@ def main() -> None:
 
     codec = Vcz1(codec=args.codec, quant=args.quant)
     is_single_array = arrays == [input_path] if input_is_s3 else arrays == [Path(input_path)]
-    if is_single_array:
+    if args.output_ome:
+        if not is_single_array:
+            raise SystemExit("--output-ome requires the input to be a single root-level zarr array")
+        recompress_flat_array_as_ome(
+            input_path,
+            args.output,
+            codec,
+            args.workers,
+            args.downsample_type,
+        )
+    elif is_single_array:
         recompress_array(input_path, args.output, codec, args.workers)
     else:
         if input_is_s3:
