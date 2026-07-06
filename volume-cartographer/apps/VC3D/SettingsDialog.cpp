@@ -15,6 +15,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -683,6 +684,12 @@ void SettingsDialog::compressExistingCache()
         std::array<int, 3> shapeZYX;
     };
     std::vector<RecompressFile> files;
+    auto keyLess = [](const vc::render::ChunkKey& a,
+                      const vc::render::ChunkKey& b) {
+        return std::tie(a.level, a.iz, a.iy, a.ix) <
+               std::tie(b.level, b.iz, b.iy, b.ix);
+    };
+    std::map<vc::render::ChunkKey, std::size_t, decltype(keyLess)> fileByKey(keyLess);
     for (auto it = fs::recursive_directory_iterator(
              cacheDir, fs::directory_options::skip_permission_denied, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
@@ -694,8 +701,14 @@ void SettingsDialog::compressExistingCache()
         if (ext == ".bin" ||
             (quantBinWidth > vc::kCacheQuantLossless &&
              ext == vc::kCompressedCacheExtension)) {
-            if (auto entry = cacheFileEntryForPath(cacheDir, it->path(), layout))
-                files.push_back({it->path(), entry->shapeZYX});
+            if (auto entry = cacheFileEntryForPath(cacheDir, it->path(), layout)) {
+                if (auto [pos, inserted] = fileByKey.emplace(entry->key, files.size());
+                    inserted) {
+                    files.push_back({it->path(), entry->shapeZYX});
+                } else if (ext == ".bin") {
+                    files[pos->second] = {it->path(), entry->shapeZYX};
+                }
+            }
         }
     }
     if (files.empty()) {

@@ -271,7 +271,9 @@ def _up_to_date(buf: bytes, quant: int, codec: str) -> bool:
     """True when a payload already carries the requested quant/codec and,
     for rANS, a per-chunk delta mask (mask-less payloads predate filter
     selection and re-encode losslessly to a smaller frame)."""
-    return (buf[:4] == MAGIC and _recorded_quant(buf) >= quant
+    if buf[:4] != MAGIC or len(buf) < HEADER.size:
+        return False
+    return (_recorded_quant(buf) >= quant
             and _recorded_codec(buf) == CODEC_IDS[codec]
             and (codec == "zstd" or bool(buf[7] & 0x80)))
 
