@@ -198,6 +198,16 @@ Scrolls display as "PHerc. 172" / "PHerc. Paris 4" instead of raw ids ("PHerc017
 - **FAQ**: OUTDATED banner on top; intro + dates answers rewritten around the 2026 milestone and 2027 deadlines; publications list adds the 2026 PHerc. 1667 preprint and **Angelotti et al., Scientific Reports 2026** (nature.com + arXiv); texts answer points at Data Browser readings (172 *On Vices*, 139 *On Gods*); software answer → VC3D + `vesuvius`; scan-parameter claims reframed as history (7.91µm-era vs 2.4µm/1.1µm today); slice-orientation section marked as tif-stack-era; Discord unified; Scroll Prize, Inc. rename.
 **Files:** `docs/01_get_started.md`, `docs/09_faq.md`.
 
+## C20 — First Letters flattened to \$50k first-team-only
+
+The \$40k/\$10k first/second-team split is removed: **\$50,000 per scroll to the first team** (10 letters in 4 cm², open-source to accept). Max 10 scrolls / \$500k total unchanged; tier chips removed from the landing board row.
+**Files:** `docs/34_prizes.md` (headline + frontmatter).
+
+## C21 — open-prize-pool banner atop the Prizes page
+
+New `PrizePoolBanner` component at the top of /prizes: ember-bordered card showing the plugin-computed total ("Open prize pool · \$2,140,000 · Grand Prize deadline June 25th, 2027 →"), linking to the 2027 Grand Prize section. Same data source as the landing sticker/board — one value everywhere.
+**Files:** `src/components/PrizePoolBanner.js` (new), `docs/34_prizes.md` (import + placement).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

@@ -29,11 +29,6 @@ prizes:
     cadence: "Max 10 scrolls · Deadline June 25th, 2027"
     href: "/prizes#first-letters-prizes"
     hook: "$50,000 per scroll across the 2027 Grand Prize volumes: uncover 10 letters within a single 4 cm² area."
-    tiers:
-      - name: "1st per scroll"
-        amount: 40000
-      - name: "2nd per scroll"
-        amount: 10000
   - id: first-title
     title: "PHerc. Paris 4's Title"
     amount: 50000
@@ -94,8 +89,11 @@ prizes:
 </head>
 
 import TOCInline from '@theme/TOCInline';
+import PrizePoolBanner from '@site/src/components/PrizePoolBanner';
 
 Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us make history!
+
+<PrizePoolBanner />
 
 ***
 
@@ -211,7 +209,7 @@ One of the frontiers of Vesuvius Challenge is finding techniques that work acros
 While we’ve discovered text in some of our scrolls, others have not yet produced legible findings.
 These prizes bridge ink detection on fragments to the much harder problem of reading intact scrolls: we want to prove that ink detection works on scrolls where nothing has been read yet. The review bar is deliberately high — we’d rather be slow than wrong.
 
-**First Letters: \$50,000 in prizes per scroll, for any of the [scroll volumes eligible for the 2027 Grand Prize](#2027-grand-prize).** \$40,000 to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize) — and \$10,000 to the second team to reach the same milestone. First Letters prizes will be awarded for a maximum of 10 scrolls — up to \$500,000 in total.
+**First Letters: \$50,000 per scroll, for any of the [scroll volumes eligible for the 2027 Grand Prize](#2027-grand-prize).** \$50,000 to the first team that uncovers 10 letters within a single 4 cm² area of that scroll — and open sources their methods and results (after winning the prize). First Letters prizes will be awarded for a maximum of 10 scrolls — up to \$500,000 in total.
 
 **Deadline: June 25th, 2027 (11:59pm Pacific)**
 
