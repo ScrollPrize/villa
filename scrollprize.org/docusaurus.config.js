@@ -311,6 +311,7 @@ const config = {
     },
     './plugins/fetch-substack-posts',
     './plugins/atlas-data',
+    './plugins/prizes-data',
     [
       "@docusaurus/plugin-client-redirects",
       {
