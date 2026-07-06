@@ -538,7 +538,10 @@ endif()
 # (static/interface/PCH helper targets are skipped — they aren't needed at
 # runtime). The vc_runtime component keeps this isolated from unrelated
 # dependency install rules (e.g. libigl's CMake config exports).
-set(_vc_install_dirs apps apps/VC3D core utils libs/c3d)
+set(_vc_install_dirs core utils libs/c3d)
+if(VC_BUILD_APPS)
+    list(APPEND _vc_install_dirs apps apps/VC3D)
+endif()
 if(VC_BUILD_FLATBOI)
     list(APPEND _vc_install_dirs libs/flatboi)
 endif()
