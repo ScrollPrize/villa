@@ -7906,6 +7906,10 @@ void CWindow::CreateWidgets(void)
             .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,
             .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,
+            .compositeEnabledCheck = ui.chkOverlayComposite,
+            .compositeMethodSelect = ui.cmbOverlayCompositeMethod,
+            .compositeLayersFrontSpin = ui.spinOverlayCompositeLayersFront,
+            .compositeLayersBehindSpin = ui.spinOverlayCompositeLayersBehind,
         };
         _volumeOverlay->setUi(overlayUi);
         if (_viewerControlsPanel) {

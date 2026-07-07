@@ -450,8 +450,16 @@ namespace volume_overlay {
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
+    constexpr auto COMPOSITE_ENABLED = "composite_enabled";
+    constexpr auto COMPOSITE_METHOD = "composite_method";
+    constexpr auto COMPOSITE_LAYERS_FRONT = "composite_layers_front";
+    constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
 
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
+    constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
+    constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;
+    constexpr int COMPOSITE_LAYERS_BEHIND_DEFAULT = 0;
 }
 
 } // namespace settings

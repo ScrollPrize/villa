@@ -1327,6 +1327,66 @@
       </widget>
      </item>
      <item row="6" column="0" colspan="3">
+      <widget class="QCheckBox" name="chkOverlayComposite">
+       <property name="text">
+        <string>Composite (surface view)</string>
+       </property>
+       <property name="toolTip">
+        <string>Composite the overlay volume across multiple layers along the surface normal. Applies to the surface view only; plane views always show a single slice.</string>
+       </property>
+      </widget>
+     </item>
+     <item row="7" column="0">
+      <widget class="QLabel" name="labelOverlayCompositeMethod">
+       <property name="text">
+        <string>Composite method</string>
+       </property>
+      </widget>
+     </item>
+     <item row="7" column="1" colspan="2">
+      <widget class="QComboBox" name="cmbOverlayCompositeMethod"/>
+     </item>
+     <item row="8" column="0">
+      <widget class="QLabel" name="labelOverlayCompositeLayersFront">
+       <property name="text">
+        <string>Layers in front</string>
+       </property>
+      </widget>
+     </item>
+     <item row="8" column="1">
+      <widget class="QSpinBox" name="spinOverlayCompositeLayersFront">
+       <property name="minimum">
+        <number>0</number>
+       </property>
+       <property name="maximum">
+        <number>64</number>
+       </property>
+       <property name="value">
+        <number>8</number>
+       </property>
+      </widget>
+     </item>
+     <item row="9" column="0">
+      <widget class="QLabel" name="labelOverlayCompositeLayersBehind">
+       <property name="text">
+        <string>Layers behind</string>
+       </property>
+      </widget>
+     </item>
+     <item row="9" column="1">
+      <widget class="QSpinBox" name="spinOverlayCompositeLayersBehind">
+       <property name="minimum">
+        <number>0</number>
+       </property>
+       <property name="maximum">
+        <number>64</number>
+       </property>
+       <property name="value">
+        <number>0</number>
+       </property>
+      </widget>
+     </item>
+     <item row="10" column="0" colspan="3">
       <spacer name="verticalSpacerOverlay">
        <property name="orientation">
         <enum>Qt::Vertical</enum>

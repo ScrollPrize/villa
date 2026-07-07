@@ -95,6 +95,18 @@ struct CompositeRenderSettings {
     bool operator==(const CompositeRenderSettings&) const = default;
 };
 
+// Composite settings for the overlay volume, independent of the primary
+// volume's CompositeRenderSettings. Only max/mean/min are supported; applies
+// to generated-surface views only (plane views stay single-slice).
+struct OverlayCompositeSettings {
+    bool enabled = false;
+    std::string method = "max";  // "max" | "mean" | "min"
+    int layersFront = 8;
+    int layersBehind = 0;
+
+    bool operator==(const OverlayCompositeSettings&) const = default;
+};
+
 // Layer values for a single pixel across all layers
 // Used by compositing methods to process per-pixel data
 struct LayerStack {

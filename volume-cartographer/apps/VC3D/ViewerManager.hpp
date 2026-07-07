@@ -13,6 +13,7 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
@@ -95,6 +96,8 @@ public:
     float overlayWindowHigh() const { return _overlayWindowHigh; }
     void setOverlayMaxDisplayedResolution(int level);
     int overlayMaxDisplayedResolution() const { return _overlayMaxDisplayedResolution; }
+    void setOverlayComposite(const OverlayCompositeSettings& settings);
+    const OverlayCompositeSettings& overlayComposite() const { return _overlayComposite; }
 
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _volumeWindowLow; }
@@ -205,6 +208,7 @@ private:
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
     int _overlayMaxDisplayedResolution{0};
+    OverlayCompositeSettings _overlayComposite;
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
