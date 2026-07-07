@@ -362,16 +362,20 @@ public:
     // because gen() can be called from concurrent OMP threads.
     mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
-    // gen() scratch buffers reused across render ticks. At 1920×1080 each
-    // coords/normals Mat is ~170 MiB of cv::Vec3f; submitRender fires every
-    // 16-33 ms so fresh allocations burn GB/sec through the allocator and
-    // page-fault every frame. cv::warpAffine writes these as dst: OpenCV's
-    // Mat::create reuses the buffer when size+type match the existing alloc,
-    // so these stay at one buffer per surface after steady state is reached.
-    // mutable because gen() is const.
-    mutable cv::Mat_<cv::Vec3f> _genCoordsScratch;
-    mutable cv::Mat_<cv::Vec3f> _genNormalsScratch;
-    mutable cv::Mat_<uint8_t> _genValidScratch;
+    // Guards the lazy one-time build of the shared derived caches
+    // (_normalCache, _validMaskCache) so concurrent gen()/validMask() calls
+    // from the batch renderer's OMP tile loop don't race on construction.
+    // The caches are read-only once built (until unloadCaches() on surface
+    // switch), so reads after the build run lock-free.
+    mutable std::mutex _cacheMutex;
+    // NOTE: gen()'s per-call coords/normals/valid scratch buffers used to live
+    // here as members and were reused across render ticks to avoid per-frame
+    // reallocation (at 1920×1080 each coords/normals Mat is ~170 MiB of
+    // cv::Vec3f). But gen() is called concurrently per-tile from the renderer's
+    // OMP loop, and sharing those buffers (plus returning views into them)
+    // raced -> SIGSEGV. They are now thread_local inside gen(): each thread
+    // keeps its own buffers, so the per-frame reuse is preserved per-thread
+    // while staying race-free.
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
