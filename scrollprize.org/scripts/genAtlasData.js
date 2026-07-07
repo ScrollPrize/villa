@@ -342,6 +342,10 @@ function curatedFields(overlayScroll, id) {
     // License name -> which of this scroll's data that license covers
     // (annotates the License row in the Data & access panel).
     licenseScope: o.licenseScope ?? null,
+    // Curated license list override — for items whose S3 metadata carries no
+    // per-volume license (e.g. the legacy DLS fragment volpkgs, which are
+    // EduceLab-licensed but volume-less in metadata.json).
+    ...(o.licenses ? { licenses: o.licenses } : {}),
     // DEPRECATED: surface-prediction Neuroglancer links now derive from
     // scroll.predictions (see extractPredictions); kept for backward-compat only.
     volume: o.volume ?? null,

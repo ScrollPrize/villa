@@ -183,6 +183,9 @@
     "PHercParis3": {
       "display": "Scroll 2",
       "repository": "Institut de France, Paris",
+      "licenseScope": {
+        "CC BY-NC 4.0": "all data"
+      },
       "note": "Scroll 2. Rescanned at ESRF at 2.4µm.",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis3/",
@@ -211,6 +214,10 @@
       "display": "Scroll 3",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "Scroll 3.",
+      "licenseScope": {
+        "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
       "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size enabled scanning at extremely high resolution (3.24um).",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/photos/PHerc0332_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0332/",
@@ -244,6 +251,10 @@
     "PHerc1667": {
       "display": "Scroll 4",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "licenseScope": {
+        "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
       "note": "Scroll 4 — the first Herculaneum scroll virtually unwrapped and read in full, end to end, without ever being physically opened. Scanned and read at 2.4µm.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667/photos/PHerc1667_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1667/",
@@ -1303,6 +1314,12 @@
     },
     "PHercParis1Fr34": {
       "display": "PHercParis1Fr34",
+      "licenses": [
+        { "name": "EduceLab Data License", "url": "https://dl.ash2txt.org/LICENSE.txt" }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis1Fr34/photos/PHercParis1Fr34_photo.jpg",
@@ -1330,6 +1347,12 @@
     },
     "PHercParis1Fr39": {
       "display": "PHercParis1Fr39",
+      "licenses": [
+        { "name": "EduceLab Data License", "url": "https://dl.ash2txt.org/LICENSE.txt" }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis1Fr39/photos/PHercParis1Fr39_photo.jpg",
@@ -1357,6 +1380,12 @@
     },
     "PHercParis2Fr143": {
       "display": "PHercParis2Fr143",
+      "licenses": [
+        { "name": "EduceLab Data License", "url": "https://dl.ash2txt.org/LICENSE.txt" }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis2Fr143/photos/PHercParis2Fr143_photo.jpg",
@@ -1384,6 +1413,12 @@
     },
     "PHercParis2Fr47": {
       "display": "PHercParis2Fr47",
+      "licenses": [
+        { "name": "EduceLab Data License", "url": "https://dl.ash2txt.org/LICENSE.txt" }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis2Fr47/photos/PHercParis2Fr47_photo.jpg",
