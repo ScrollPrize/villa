@@ -336,6 +336,9 @@ function curatedFields(overlayScroll, id) {
     progress: o.progress ?? null,
     stages: normalizeStages(o.stages ? { ...o.stages } : null),
     readings,
+    // Per-scroll legal/access terms (e.g. the PHerc. Paris 4 publication
+    // reservation) rendered as a notice panel on the detail page.
+    legalNotice: o.legalNotice ?? null,
     // DEPRECATED: surface-prediction Neuroglancer links now derive from
     // scroll.predictions (see extractPredictions); kept for backward-compat only.
     volume: o.volume ?? null,

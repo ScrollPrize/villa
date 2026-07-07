@@ -136,7 +136,11 @@ export default function ScrollDetailPage(props) {
     },
     ...(ogImage ? { image: ogImage } : {}),
     ...(scroll.repository ? { provider: { "@type": "Organization", name: scroll.repository } } : {}),
+    ...(scroll.legalNotice
+      ? { usageInfo: `${canonical}#publication-notice` }
+      : {}),
   };
+  const legalNotice = scroll.legalNotice || null;
 
   return (
     <Layout title={pageTitle} description={metaDesc}>
@@ -166,6 +170,32 @@ export default function ScrollDetailPage(props) {
           <div className="repo">📍 {scroll.repository || ""}</div>
 
           <div className="grid">
+            {/* Legal/access terms (e.g. the publication-reservation period
+                that conditioned the imaging of this scroll). Rendered first —
+                readers must see it before any data link. */}
+            {legalNotice ? (
+              <div
+                className="panel full"
+                id="publication-notice"
+                style={{ borderColor: "var(--accent)" }}
+              >
+                <h2>⚖️ {legalNotice.title || "Data access notice"}</h2>
+                {(legalNotice.paragraphs || []).map((p, i) => (
+                  <p className="txt" key={i}>
+                    {p}
+                  </p>
+                ))}
+                {legalNotice.licenseLine ? (
+                  <p
+                    className="txt"
+                    style={{ color: "var(--dim)", fontSize: "13px" }}
+                  >
+                    {legalNotice.licenseLine}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
             {/* Recovered-text panel */}
             {content && content.summary ? (
               <div className="panel full textpanel">

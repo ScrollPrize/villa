@@ -120,6 +120,17 @@
     "PHercParis4": {
       "display": "Scroll 1",
       "repository": "Institut de France, Paris",
+      "legalNotice": {
+        "title": "Data access and publication notice",
+        "added": "07/07/2026",
+        "until": "07/07/2027",
+        "licenseLine": "These terms are a modification of the CC BY-NC 4.0 license (additional terms) under which these materials are provided. Notice added on 07/07/2026; the one-year publication-reservation period runs until 07/07/2027.",
+        "paragraphs": [
+          "The raw scan data, virtually unwrapped segments, ink-enhanced data, ink identifications, and related derived materials for this ancient scroll are being made available to support open examination, study, verification, and technical experimentation. Access to these materials is provided on the express condition that they are not used for scholarly publication during the temporary publication-reservation period.",
+          "For one year from the public release of these data, scholarly publication rights are reserved for the research team designated by the custodial holder of the physical scroll. That team has been granted the right to prepare the first scholarly analysis because it was designated by the institution or holder responsible for the original material. This publication reservation was a condition of the imaging of the scroll and must be respected by all users.",
+          "During this period, users may examine, study, test, and analyze the data, but may not publish scholarly claims, transcriptions, translations, editions, interpretations, or formal analyses based on the data without permission from the custodial holder or the designated scholarly team. After the one-year restriction has expired and the designated team has published its analysis, the data will be released from this publication restriction and will be available for unrestricted scholarly use."
+        ]
+      },
       "note": "Scroll 1. The first scroll from which substantial continuous Greek text was recovered (2023 Vesuvius Challenge Grand Prize) — Epicurean philosophy attributed to Philodemus. Rescanned at ESRF at 2.4µm in 2026.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/photos/PHercParis4_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis4/",
