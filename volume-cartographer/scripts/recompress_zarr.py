@@ -7,6 +7,9 @@ This is intentionally a small zarr-python example:
         /home/sean/Desktop/paris4_level5only.zarr \
         /home/sean/Desktop/paris4_level5only.vcz1.zarr
 
+    python scripts/recompress_zarr.py --in-place \
+        /home/sean/Desktop/paris4_level5only.zarr
+
 The output is zarr v2 metadata with compressor id "vcz1".  The chunks are
 self-describing VCZ1 payloads written by vc.compression.vcz1, using rANS by
 default.
@@ -22,6 +25,7 @@ import math
 import os
 import shutil
 import sys
+import tempfile
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -244,6 +248,138 @@ def copy_chunk(job: tuple[str, str, tuple[int, ...], tuple[int, ...], tuple[int,
     return int(np.prod([s.stop - s.start for s in slc]))
 
 
+def load_zarray_metadata(path: Path) -> dict[str, Any]:
+    return json.loads((path / ".zarray").read_text())
+
+
+def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(value, f, indent=4, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def in_place_state_path(path: Path) -> Path:
+    return path / ".recompress_zarr_in_place.json"
+
+
+def write_in_place_state(path: Path, original_meta: dict[str, Any], target_meta: dict[str, Any]) -> None:
+    write_json_atomic(
+        in_place_state_path(path),
+        {
+            "version": 1,
+            "original_meta": original_meta,
+            "target_meta": target_meta,
+        },
+    )
+
+
+def load_in_place_state(path: Path) -> dict[str, Any] | None:
+    state_path = in_place_state_path(path)
+    if not state_path.exists():
+        return None
+    state = json.loads(state_path.read_text())
+    if state.get("version") != 1:
+        raise SystemExit(f"{state_path}: unsupported in-place recovery state")
+    if not isinstance(state.get("original_meta"), dict) or not isinstance(state.get("target_meta"), dict):
+        raise SystemExit(f"{state_path}: invalid in-place recovery state")
+    return state
+
+
+def validate_in_place_metadata(path: Path, meta: dict[str, Any]) -> None:
+    if meta.get("zarr_format") != 2:
+        raise SystemExit(f"{path}: --in-place only supports zarr v2 arrays")
+    if meta.get("filters") not in (None, []):
+        raise SystemExit(f"{path}: --in-place does not support arrays with filters")
+    if meta.get("order", "C") != "C":
+        raise SystemExit(f"{path}: --in-place only supports C-order arrays")
+
+
+def chunk_storage_path(array_path: Path, meta: dict[str, Any], idx: tuple[int, ...]) -> Path:
+    separator = meta.get("dimension_separator", ".")
+    if separator == "/":
+        return array_path.joinpath(*(str(i) for i in idx))
+    if separator == ".":
+        return array_path / ".".join(str(i) for i in idx)
+    raise SystemExit(f"{array_path}: unsupported dimension_separator {separator!r}")
+
+
+def write_chunk_payload_atomic(path: Path, payload: bytes | bytearray | memoryview) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def chunk_has_vcz1_payload(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            return f.read(4) == b"VCZ1"
+    except FileNotFoundError:
+        return False
+
+
+def remove_consolidated_metadata(root: Path) -> None:
+    for path in root.rglob(".zmetadata"):
+        path.unlink()
+        print(f"  removed stale consolidated metadata: {path}")
+
+
+InPlaceJob = tuple[
+    str,
+    dict[str, Any],
+    dict[str, Any],
+    bool,
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+]
+
+
+def in_place_jobs(
+    src_path: Path,
+    original_meta: dict[str, Any],
+    codec_config: dict[str, Any],
+    skip_existing_vcz1: bool,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+) -> Iterable[InPlaceJob]:
+    for idx in chunk_indices(shape, chunks):
+        yield (str(src_path), original_meta, codec_config, skip_existing_vcz1, idx, shape, chunks)
+
+
+def recompress_chunk_in_place(job: InPlaceJob) -> int:
+    src_path_str, original_meta, codec_config, skip_existing_vcz1, idx, shape, chunks = job
+    src_path = Path(src_path_str)
+    slc = chunk_slice_for_index(idx, shape, chunks)
+    chunk_path = chunk_storage_path(src_path, original_meta, idx)
+    if skip_existing_vcz1 and chunk_has_vcz1_payload(chunk_path):
+        return int(np.prod([s.stop - s.start for s in slc]))
+
+    src = zarr.open(src_path_str, mode="r")
+    block = np.ascontiguousarray(src[slc])
+    codec = Vcz1(**{k: v for k, v in codec_config.items() if k != "id"})
+    payload = codec.encode(block)
+    write_chunk_payload_atomic(chunk_path, payload)
+    return int(np.prod([s.stop - s.start for s in slc]))
+
+
 def downsample_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(max(1, math.ceil(s / 2)) for s in shape)
 
@@ -377,6 +513,58 @@ def recompress_array(src_path: str | Path, dst_path: Path, codec: Vcz1, workers:
     run_chunk_jobs(copy_chunk, jobs, total_jobs=total_jobs, workers=workers, desc=f"  {src_name}")
 
 
+def recompress_array_in_place(src_path: Path, codec: Vcz1, workers: int) -> None:
+    state = load_in_place_state(src_path)
+    if state is not None:
+        requested_target_meta: dict[str, Any] = dict(state["target_meta"])
+        requested_target_meta["compressor"] = codec.get_config()
+        if requested_target_meta != state["target_meta"]:
+            raise SystemExit(
+                f"{in_place_state_path(src_path)}: unfinished in-place run uses a different codec; "
+                "rerun with the same --codec/--quant to recover"
+            )
+        write_json_atomic(src_path / ".zarray", state["original_meta"])
+        print(f"{src_path}: resuming interrupted in-place recompression")
+
+    src = zarr.open(str(src_path), mode="r")
+    if len(src.shape) != 3:
+        raise SystemExit(f"{src_path}: expected a 3D array, got shape {src.shape}")
+    if np.dtype(src.dtype) not in (np.dtype("uint8"), np.dtype("uint16")):
+        raise SystemExit(f"{src_path}: expected uint8 or uint16, got {src.dtype}")
+
+    original_meta = state["original_meta"] if state is not None else load_zarray_metadata(src_path)
+    validate_in_place_metadata(src_path, original_meta)
+
+    codec_config = codec.get_config()
+    new_meta = dict(original_meta)
+    new_meta["compressor"] = codec_config
+    if state is None:
+        write_in_place_state(src_path, original_meta, new_meta)
+
+    shape = tuple(src.shape)
+    chunks = tuple(src.chunks)
+    total_jobs = chunk_grid_size(shape, chunks)
+    print(f"{src_path} -> {src_path} (in-place)")
+    print(f"  shape={src.shape} chunks={src.chunks} dtype={src.dtype} codec={codec_config}")
+    print("  recovery: rerun the same --in-place command to continue an interrupted conversion")
+    original_compressor = original_meta.get("compressor")
+    skip_existing_vcz1 = not (
+        isinstance(original_compressor, dict)
+        and original_compressor.get("id") == "vcz1"
+        and original_compressor != codec_config
+    )
+    jobs = in_place_jobs(src_path, original_meta, codec_config, skip_existing_vcz1, shape, chunks)
+    run_chunk_jobs(
+        recompress_chunk_in_place,
+        jobs,
+        total_jobs=total_jobs,
+        workers=workers,
+        desc=f"  {src_path.name}",
+    )
+    write_json_atomic(src_path / ".zarray", new_meta)
+    in_place_state_path(src_path).unlink(missing_ok=True)
+
+
 def write_ome_zattrs(
     dst_root: Path,
     *,
@@ -470,7 +658,7 @@ def recompress_flat_array_as_ome(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=str, help="input zarr array or group; local path or s3:// URI")
-    parser.add_argument("output", type=Path, help="output zarr array or group")
+    parser.add_argument("output", nargs="?", type=Path, help="output zarr array or group")
     parser.add_argument("--codec", choices=("rans", "zstd"), default="rans")
     parser.add_argument(
         "--quant",
@@ -482,6 +670,11 @@ def main() -> None:
         "--overwrite",
         action="store_true",
         help="delete the output path first if it already exists",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="rewrite local input chunks in place; output must be omitted",
     )
     parser.add_argument(
         "--workers",
@@ -505,6 +698,18 @@ def main() -> None:
     input_path = normalize_s3_path(args.input)
     input_is_s3 = is_s3_path(input_path)
 
+    if args.in_place:
+        if args.output is not None:
+            raise SystemExit("--in-place rewrites the input path; omit output")
+        if args.overwrite:
+            raise SystemExit("--overwrite is only valid when writing a separate output")
+        if args.output_ome:
+            raise SystemExit("--output-ome requires a separate output path")
+        if input_is_s3:
+            raise SystemExit("--in-place only supports local zarr paths")
+    elif args.output is None:
+        raise SystemExit("output is required unless --in-place is used")
+
     if input_is_s3:
         input_store = open_s3_store(input_path, check=False)
         if ".zarray" not in input_store and ".zgroup" not in input_store:
@@ -513,7 +718,7 @@ def main() -> None:
         input_path = str(Path(input_path))
         if not Path(input_path).exists():
             raise SystemExit(f"{input_path}: does not exist")
-    if args.output.exists():
+    if args.output is not None and args.output.exists():
         if not args.overwrite:
             raise SystemExit(f"{args.output}: already exists; pass --overwrite")
         shutil.rmtree(args.output)
@@ -524,7 +729,11 @@ def main() -> None:
 
     codec = Vcz1(codec=args.codec, quant=args.quant)
     is_single_array = arrays == [input_path] if input_is_s3 else arrays == [Path(input_path)]
-    if args.output_ome:
+    if args.in_place:
+        for src_array in arrays:
+            recompress_array_in_place(src_array, codec, args.workers)
+        remove_consolidated_metadata(Path(input_path))
+    elif args.output_ome:
         if not is_single_array:
             raise SystemExit("--output-ome requires the input to be a single root-level zarr array")
         recompress_flat_array_as_ome(

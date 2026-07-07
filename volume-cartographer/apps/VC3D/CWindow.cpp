@@ -76,6 +76,7 @@
 #include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
 #include <QHeaderView>
@@ -130,6 +131,7 @@
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
@@ -2746,13 +2748,28 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
+    _workspaceTabs->setTabsClosable(true);
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
     _workspaceTabs->addTab(_atlasWorkspaceWindow, tr("Atlas"));
     _workspaceTabs->addTab(_fiberSliceWorkspaceWindow, tr("Fiber Slice"));
     _workspaceTabs->addTab(_intersectionsWorkspaceWindow, tr("Intersections"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) {
+        for (int i = 0; i < _workspaceTabs->count(); ++i) {
+            tabBar->setTabButton(i, QTabBar::RightSide, nullptr);
+        }
+    }
     setCentralWidget(_workspaceTabs);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
+        if (!_workspaceTabs) {
+            return;
+        }
+        auto* dialog = qobject_cast<LineAnnotationDialog*>(_workspaceTabs->widget(index));
+        if (dialog) {
+            dialog->close();
+        }
+    });
     auto* lasagnaEscapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), _lasagnaWorkspaceWindow);
     lasagnaEscapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(lasagnaEscapeShortcut, &QShortcut::activated, this, &CWindow::switchToMainWorkspace);
@@ -2816,6 +2833,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             &LineAnnotationController::atlasCreated,
             this,
             &CWindow::displayAtlasFromDirectory);
+    connect(_lineAnnotationController.get(),
+            &LineAnnotationController::lineAnnotationWorkspaceRequested,
+            this,
+            &CWindow::openLineAnnotationWorkspace);
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fiberSaved,
             this,
@@ -3189,6 +3210,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     if (width() < minWindowSize.width() || height() < minWindowSize.height()) {
         resize(std::max(width(), minWindowSize.width()),
                std::max(height(), minWindowSize.height()));
+    }
+    if (!restoredGeometry) {
+        setWindowState(windowState() | Qt::WindowMaximized);
     }
 
     bool scheduledStartupAction = false;
@@ -4084,6 +4108,91 @@ void CWindow::clearSurfaceSelection()
     }
 }
 
+bool CWindow::restoreActiveSurfaceAfterSurfaceReload(const std::string& surfaceId)
+{
+    if (!_state || surfaceId.empty()) {
+        return false;
+    }
+
+    auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(surfaceId));
+    if (!surf && _state->vpkg()) {
+        surf = _state->vpkg()->getSurface(surfaceId);
+    }
+    if (!surf) {
+        return false;
+    }
+
+    std::vector<std::pair<VolumeViewerBase*, bool>> resetDefaults;
+    if (_viewerManager) {
+        _viewerManager->forEachBaseViewer([this, &resetDefaults](VolumeViewerBase* viewer) {
+            if (!viewer || viewer->surfName() != "segmentation") {
+                return;
+            }
+            const bool defaultReset = _viewerManager->resetDefaultFor(viewer);
+            resetDefaults.emplace_back(viewer, defaultReset);
+            viewer->setResetViewOnSurfaceChange(false);
+        });
+    }
+
+    _state->setActiveSurface(surfaceId, surf);
+    _state->setSurface("segmentation", surf, false, true);
+
+    for (auto& entry : resetDefaults) {
+        auto* viewer = entry.first;
+        if (viewer) {
+            viewer->setResetViewOnSurfaceChange(entry.second);
+        }
+    }
+
+    if (_surfacePanel) {
+        _surfacePanel->selectSurfaceById(surfaceId);
+    }
+
+    if (_segmentationModule) {
+        try {
+            _segmentationModule->onActiveSegmentChanged(surf.get());
+        } catch (const std::exception& e) {
+            qWarning() << "Failed to reactivate segment"
+                       << QString::fromStdString(surfaceId)
+                       << "after reloading surfaces:"
+                       << e.what();
+            return false;
+        }
+    }
+
+    if (_point_collection_widget) {
+        if (!surf->path.empty()) {
+            _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+        } else {
+            _point_collection_widget->clearCorrPointsResults();
+        }
+    }
+    if (_atlasControlDock) {
+        if (!surf->path.empty()) {
+            _atlasControlDock->loadResults(surf->path / "atlas_control_points_results.json");
+        } else {
+            _atlasControlDock->clearResults();
+        }
+    }
+
+    if (_viewerManager) {
+        _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
+            if (!viewer) {
+                return;
+            }
+            viewer->invalidateIntersect("segmentation");
+            viewer->renderIntersections("active segment restored after surface reload");
+            viewer->requestRender("active segment restored after surface reload");
+        });
+    }
+
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
+    maybeAttachBenchRecorder();
+    return true;
+}
+
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
     const bool hadVolume = static_cast<bool>(_state->currentVolume());
@@ -4407,6 +4516,41 @@ void CWindow::switchToFiberSliceWorkspace()
         _fiberSliceWorkspaceWindow->raise();
         _fiberSliceWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
     }
+}
+
+void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title)
+{
+    if (!_workspaceTabs || !dialog) {
+        return;
+    }
+
+    dialog->setWorkspaceEmbedded(true);
+
+    int index = _workspaceTabs->indexOf(dialog);
+    if (index < 0) {
+        index = _workspaceTabs->addTab(dialog, title.isEmpty() ? tr("Line Annotation") : title);
+        auto* escapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), dialog);
+        escapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+        connect(escapeShortcut, &QShortcut::activated, dialog, &QWidget::close);
+        QWidget* tabWidget = dialog;
+        connect(dialog, &QObject::destroyed, this, [this, tabWidget]() {
+            if (!_workspaceTabs) {
+                return;
+            }
+            for (int i = 0; i < _workspaceTabs->count(); ++i) {
+                if (_workspaceTabs->widget(i) == tabWidget) {
+                    _workspaceTabs->removeTab(i);
+                    switchToMainWorkspace();
+                    break;
+                }
+            }
+        });
+    }
+
+    _workspaceTabs->setCurrentIndex(index);
+    dialog->show();
+    dialog->raise();
+    dialog->setFocus(Qt::ShortcutFocusReason);
 }
 
 void CWindow::repeatLastLasagnaAction()
@@ -7906,6 +8050,10 @@ void CWindow::CreateWidgets(void)
             .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,
             .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,
+            .compositeEnabledCheck = ui.chkOverlayComposite,
+            .compositeMethodSelect = ui.cmbOverlayCompositeMethod,
+            .compositeLayersFrontSpin = ui.spinOverlayCompositeLayersFront,
+            .compositeLayersBehindSpin = ui.spinOverlayCompositeLayersBehind,
         };
         _volumeOverlay->setUi(overlayUi);
         if (_viewerControlsPanel) {
@@ -8674,7 +8822,7 @@ void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
             matchingEntry->location,
             vpkg->path().parent_path()).lexically_normal();
         if (currentPath != targetPath) {
-            clearSurfaceSelection();
+            const std::string previousActiveSurfaceId = _state->activeSurfaceId();
             vpkg->setOutputSegments(matchingEntry->location);
             vpkg->refreshSegmentations();
             refreshSegmentationDirectoryDropdown();
@@ -8682,6 +8830,10 @@ void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
                 _surfacePanel->setVolumePkg(vpkg);
                 _surfacePanel->loadSurfaces(true);
                 _surfacePanel->refreshPointSetFilterOptions();
+            }
+            if (!restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId)) {
+                clearSurfaceSelection();
+                _state->setSurface("segmentation", nullptr, true);
             }
         }
         setWarning(false);
@@ -9587,13 +9739,10 @@ void CWindow::applySegmentFolderSelection(bool reloadSurfaces)
 
     _surfacePanel->setVisibleSegmentFolders(std::move(folders));
     if (reloadSurfaces) {
-        _state->setSurface("segmentation", nullptr, true);
-        _state->clearActiveSurface();
-        if (treeWidgetSurfaces) {
-            treeWidgetSurfaces->clearSelection();
-        }
+        const std::string previousActiveSurfaceId = _state->activeSurfaceId();
         _surfacePanel->resetTagUi();
         _surfacePanel->loadSurfaces(true);
+        restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId);
     }
 }
 
@@ -9663,16 +9812,7 @@ void CWindow::onSegmentationDirChanged(int index)
 
     // Only reload if the directory actually changed
     if (newDir != _state->vpkg()->getSegmentationDirectory()) {
-        // Clear the current segmentation surface first to ensure viewers update
-        _state->setSurface("segmentation", nullptr, true);
-
-        // Clear current surface selection
-        _state->clearActiveSurface();
-        treeWidgetSurfaces->clearSelection();
-
-        if (_surfacePanel) {
-            _surfacePanel->resetTagUi();
-        }
+        const std::string previousActiveSurfaceId = _state->activeSurfaceId();
 
         // Set the new directory in the VolumePkg
         _state->vpkg()->setSegmentationDirectory(newDir);
@@ -9685,6 +9825,20 @@ void CWindow::onSegmentationDirChanged(int index)
         applySegmentFolderSelection(false);
         if (_surfacePanel) {
             _surfacePanel->loadSurfaces(true);
+        }
+
+        const bool restoredActiveSurface =
+            restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId);
+
+        if (!restoredActiveSurface) {
+            _state->clearActiveSurface();
+            _state->setSurface("segmentation", nullptr, true);
+            if (treeWidgetSurfaces) {
+                treeWidgetSurfaces->clearSelection();
+            }
+            if (_surfacePanel) {
+                _surfacePanel->resetTagUi();
+            }
         }
 
         // Update the status bar to show the change

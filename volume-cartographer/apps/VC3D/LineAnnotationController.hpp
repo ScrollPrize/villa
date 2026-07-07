@@ -177,6 +177,7 @@ public:
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
 signals:
+    void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
     void fiberAlignmentMetricsReset(bool pending);
     void fiberAlignmentMetricsUpdated(

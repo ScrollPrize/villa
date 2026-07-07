@@ -138,6 +138,7 @@ public:
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
     void setOverlayMaxDisplayedResolution(int level) override;
+    void setOverlayComposite(const OverlayCompositeSettings& settings) override;
 
     void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
@@ -314,6 +315,7 @@ private:
         std::string overlayColormapId;
         float overlayWindowLow = 0.0f;
         float overlayWindowHigh = 255.0f;
+        OverlayCompositeSettings overlayComposite;
         std::uint64_t chunkContentEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
@@ -424,6 +426,7 @@ private:
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
     int _overlayMaxDisplayedResolution = 0;
+    OverlayCompositeSettings _overlayComposite;
 
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;

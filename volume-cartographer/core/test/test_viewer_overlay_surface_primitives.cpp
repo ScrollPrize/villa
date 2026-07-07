@@ -109,6 +109,7 @@ public:
     void setOverlayThreshold(float) override {}
     void setOverlayWindow(float, float) override {}
     void setOverlayMaxDisplayedResolution(int) override {}
+    void setOverlayComposite(const OverlayCompositeSettings&) override {}
     void reloadPerfSettings() override {}
 
     uint64_t highlightedPointId() const override { return 0; }

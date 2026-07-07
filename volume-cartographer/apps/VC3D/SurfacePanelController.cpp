@@ -62,6 +62,16 @@ constexpr double kZRangeFilterUpperDefault = 1000000.0;
 constexpr auto kSurfaceColumnSettingsGroup = "surface_panel/columns";
 constexpr auto kCurrentOnlyFilterSettingsKey = "surface_panel/filters/current_only";
 
+bool preserveSurfaceDuringSegmentReload(const std::string& name)
+{
+    return name == "segmentation" ||
+           name == "xy plane" ||
+           name == "xz plane" ||
+           name == "yz plane" ||
+           name == "seg xz" ||
+           name == "seg yz";
+}
+
 bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
 {
     if (!lower || !upper) {
@@ -247,7 +257,31 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
 
 void SurfacePanelController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
 {
+    if (pkg != _volumePkg) {
+        _overlaySegmentations.clear();
+        if (_viewerManager) {
+            _viewerManager->clearSurfacePatchIndexCache();
+        }
+    }
     _volumePkg = pkg;
+}
+
+// Identifies the current folder selection (volpkg + checked folders, with the
+// active folder marked) for the ViewerManager's surface index cache.
+QString SurfacePanelController::folderSelectionCacheKey() const
+{
+    QStringList parts;
+    for (const auto& folder : _visibleSegmentFolders) {
+        parts << QString::fromStdString(folder.dirName) +
+                     (folder.currentFolder ? QStringLiteral("*") : QString());
+    }
+    if (parts.isEmpty() && _volumePkg) {
+        parts << QString::fromStdString(_volumePkg->getSegmentationDirectory());
+    }
+    parts.sort();
+    const QString volpkgDir =
+        _volumePkg ? QString::fromStdString(_volumePkg->getVolpkgDirectory()) : QString();
+    return volpkgDir + QLatin1Char('|') + parts.join(QLatin1Char(','));
 }
 
 void SurfacePanelController::clear()
@@ -270,14 +304,24 @@ void SurfacePanelController::loadSurfaces(bool reload)
     }
 
     if (!_visibleSegmentFolders.empty()) {
+        // Stash the live surface index under the outgoing folder selection
+        // BEFORE unbinding its surfaces, so switching back can reuse it.
+        if (_viewerManager) {
+            _viewerManager->setSurfacePatchIndexCacheKey(folderSelectionCacheKey());
+        }
         if (reload) {
             if (_state) {
                 auto names = _state->surfaceNames();
                 for (const auto& name : names) {
+                    if (preserveSurfaceDuringSegmentReload(name)) {
+                        continue;
+                    }
                     _state->setSurface(name, nullptr, true, false);
                 }
             }
-            _volumePkg->unloadAllSurfaces();
+            // Surfaces stay loaded in the VolumePkg's per-folder retention so
+            // returning to a previously visited folder is fast; they are only
+            // rebound to the state below.
             _multiFolderSurfaceIds.clear();
         }
 
@@ -299,7 +343,14 @@ void SurfacePanelController::loadSurfaces(bool reload)
 
             for (const auto& segPath : segment_dirs_under(folder.path)) {
                 try {
-                    auto seg = Segmentation::New(segPath);
+                    std::shared_ptr<Segmentation> seg;
+                    if (auto retained = _overlaySegmentations.find(segPath.string());
+                        retained != _overlaySegmentations.end()) {
+                        seg = retained->second;
+                    } else {
+                        seg = Segmentation::New(segPath);
+                        _overlaySegmentations.emplace(segPath.string(), seg);
+                    }
                     auto surf = seg->loadSurface();
                     if (!surf) {
                         continue;
@@ -329,11 +380,17 @@ void SurfacePanelController::loadSurfaces(bool reload)
         return;
     }
 
+    if (_viewerManager) {
+        _viewerManager->setSurfacePatchIndexCacheKey(folderSelectionCacheKey());
+    }
     if (reload) {
         // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
         if (_state) {
             auto names = _state->surfaceNames();
             for (const auto& name : names) {
+                if (preserveSurfaceDuringSegmentReload(name)) {
+                    continue;
+                }
                 _state->setSurface(name, nullptr, true, false);
             }
         }
@@ -379,6 +436,9 @@ void SurfacePanelController::loadSurfacesIncremental()
     }
 
     std::cout << "Starting incremental surface load..." << std::endl;
+    // Explicit disk refresh: also forget retained overlay-folder segmentations
+    // so the next full load re-reads them from disk.
+    _overlaySegmentations.clear();
     _volumePkg->refreshSegmentations();
     auto changes = detectSurfaceChanges();
 
@@ -1361,6 +1421,46 @@ void SurfacePanelController::syncSelectionUi(const std::string& surfaceId, QuadS
     if (isCurrentOnlyFilterEnabled()) {
         applyFilters();
     }
+}
+
+bool SurfacePanelController::selectSurfaceById(const std::string& surfaceId)
+{
+    if (!_ui.treeWidget || surfaceId.empty()) {
+        return false;
+    }
+
+    const QString idQString = QString::fromStdString(surfaceId);
+    QTreeWidgetItem* targetItem = nullptr;
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
+            targetItem = *it;
+            break;
+        }
+        ++it;
+    }
+
+    auto surface = getSurfaceById(surfaceId);
+    if (!targetItem || !surface) {
+        return false;
+    }
+
+    {
+        const QSignalBlocker blocker{_ui.treeWidget};
+        _ui.treeWidget->clearSelection();
+        targetItem->setSelected(true);
+        _ui.treeWidget->scrollToItem(targetItem);
+    }
+
+    syncSelectionUi(surfaceId, surface.get());
+
+    if (_segmentationViewerProvider) {
+        if (auto* viewer = _segmentationViewerProvider()) {
+            viewer->setWindowTitle(tr("Surface %1").arg(idQString));
+        }
+    }
+
+    return true;
 }
 
 void SurfacePanelController::resetTagUi()

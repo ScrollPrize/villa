@@ -1600,6 +1600,8 @@ void LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         cleanupSurfaceName(surfaceName);
     });
 
+    emit lineAnnotationWorkspaceRequested(dialog, tr("Line Annotation"));
+
     refreshSessionOptimizationStatus(*session);
     if (!session->optimizedLine.points.empty()) {
         session->taskState = LineAnnotationSession::TaskState::Succeeded;
