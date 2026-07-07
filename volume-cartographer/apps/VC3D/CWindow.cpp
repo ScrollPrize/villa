@@ -4452,6 +4452,7 @@ void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QS
             for (int i = 0; i < _workspaceTabs->count(); ++i) {
                 if (_workspaceTabs->widget(i) == tabWidget) {
                     _workspaceTabs->removeTab(i);
+                    switchToMainWorkspace();
                     break;
                 }
             }
