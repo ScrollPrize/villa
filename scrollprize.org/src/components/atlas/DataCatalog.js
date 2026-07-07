@@ -57,6 +57,9 @@ export default function DataCatalog({ scroll }) {
     ? neuroglancerUrl(scroll.volumeZarr, `${scroll.display} CT`)
     : null;
   const licenses = scroll.licenses || [];
+  // Optional per-license scope annotations curated in atlasOverlay.json
+  // (license name -> which of this scroll's data it covers).
+  const licenseScope = scroll.licenseScope || null;
 
   // Volume-level predictions are listed in their own Predictions table; here we
   // only summarize the count in the metadata list.
@@ -180,6 +183,12 @@ export default function DataCatalog({ scroll }) {
                 <a href={l.url} target="_blank" rel="noopener noreferrer">
                   {l.name}
                 </a>
+                {licenseScope && licenseScope[l.name] ? (
+                  <span style={{ color: "var(--dim)" }}>
+                    {" "}
+                    ({licenseScope[l.name]})
+                  </span>
+                ) : null}
               </React.Fragment>
             ))
           ) : (

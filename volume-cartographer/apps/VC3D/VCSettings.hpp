@@ -87,9 +87,12 @@ namespace settings {
 namespace project {
     constexpr auto DEFAULT_PATH = "project/default_path";
     constexpr auto AUTO_OPEN = "project/auto_open";
+    constexpr auto SHOW_OPEN_DATA_CATALOG_ON_STARTUP = "project/show_open_data_catalog_on_startup";
     constexpr auto RECENT = "project/recent";
+    constexpr auto LAST_VOLUME_PREFIX = "project/last_volume/";
 
-    constexpr bool AUTO_OPEN_DEFAULT = true;
+    constexpr bool AUTO_OPEN_DEFAULT = false;
+    constexpr bool SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -105,9 +108,6 @@ namespace viewer {
     constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
     constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
     constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
-    // Fallback voxel size (µm per level-0 voxel) for the scalebar when the loaded
-    // volume's metadata has none (e.g. .vca archives). 0 = unset (no fallback).
-    constexpr auto VOXEL_SIZE_UM = "viewer/voxel_size_um";
 
     constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
     constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
@@ -115,7 +115,6 @@ namespace viewer {
     constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
-    constexpr double VOXEL_SIZE_UM_DEFAULT = 0.0;   // unset; scalebar falls back to volume metadata only
     constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
     constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 
@@ -234,12 +233,20 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
-    // When true the disk cache stores c3d-compressed sharded zarr (smaller,
-    // lossy).  When false it stores source chunk bytes unchanged at the
-    // volume's native chunk size (larger, lossless).  Both modes use
-    // independent directories so they can coexist.  Requires restart.
-    constexpr auto DISK_CACHE_COMPRESSED = "perf/disk_cache_compressed";
-    constexpr bool DISK_CACHE_COMPRESSED_DEFAULT = true;
+    // When true, raw chunks downloaded from remote volumes are stored in the
+    // persistent disk cache compressed at the configured quantization width.
+    // Reading understands both formats regardless of this flag; it only
+    // controls the write format. Requires restart.
+    constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
+    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
+
+    // Quantization bin width for compressed disk-cache writes
+    // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
+    // Only affects newly written chunks; reading is unaffected. Requires
+    // restart, except for the explicit "recompress existing cache" action.
+    // Default lossless: compression saves space without changing voxels.
+    constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
+    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
 
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:
@@ -442,6 +449,17 @@ namespace volume_overlay {
     constexpr auto WINDOW_HIGH = "window_high";
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
+    constexpr auto COMPOSITE_ENABLED = "composite_enabled";
+    constexpr auto COMPOSITE_METHOD = "composite_method";
+    constexpr auto COMPOSITE_LAYERS_FRONT = "composite_layers_front";
+    constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
+
+    constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
+    constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
+    constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;
+    constexpr int COMPOSITE_LAYERS_BEHIND_DEFAULT = 0;
 }
 
 } // namespace settings

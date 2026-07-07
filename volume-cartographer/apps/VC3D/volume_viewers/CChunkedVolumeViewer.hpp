@@ -4,6 +4,7 @@
 #include <QImage>
 #include <QPointF>
 #include <QPointer>
+#include <QStringList>
 #include <QWidget>
 
 #include <algorithm>
@@ -90,11 +91,13 @@ public:
     void adjustSurfaceOffset(float delta) override;
     void resetSurfaceOffsets() override;
     void fitSurfaceInView() override;
+    void resetViewForCurrentContent(bool forceRender = false) override;
     void notifyInteractiveViewChange(double motionPx);
 
     std::string surfName() const override { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const override { return _volume; }
     float getCurrentScale() const override { return _scale; }
+    static float clampCameraScale(float scale);
     float dsScale() const override { return _dsScale; }
     float normalOffset() const override { return _zOff; }
     CameraState cameraState() const;
@@ -134,10 +137,12 @@ public:
     void setOverlayColormap(const std::string& colormapId) override;
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
+    void setOverlayMaxDisplayedResolution(int level) override;
+    void setOverlayComposite(const OverlayCompositeSettings& settings) override;
 
     void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
-    void setSegmentationCursorMirroring(bool) override {}
+    void setSegmentationCursorMirroring(bool enabled) override;
     const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
     uint64_t highlightedPointId() const override { return _highlightedPointId; }
@@ -263,6 +268,7 @@ signals:
     void renderFrameSubmitted(std::uint64_t serial);
     void renderFrameCompleted(std::uint64_t serial, double workerElapsedMs);
     void sendSegmentationRadiusWheel(int steps, QPointF scenePoint, cv::Vec3f worldPos);
+    void sharedCacheStatsChanged(const QStringList& items);
 
 private:
     void quiesceForClose();
@@ -283,20 +289,6 @@ private:
     void updateContentBounds();
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
-    void prefetchPlaneHalo(const cv::Vec3f& origin,
-                           const cv::Vec3f& vxStep,
-                           const cv::Vec3f& vyStep,
-                           int startLevel,
-                           const vc::render::ChunkedPlaneSampler::Options& options);
-    void prefetchPlaneNormalNeighbors(PlaneSurface& plane,
-                                      int startLevel,
-                                      const vc::render::ChunkedPlaneSampler::Options& options);
-    void prefetchSurfaceHalo(Surface& surf,
-                             int startLevel,
-                             const vc::render::ChunkedPlaneSampler::Options& options,
-                             int fbW,
-                             int fbH);
-    void prefetchVisibleSurfaceChunks(int priorityOffset = 0);
     struct GeneratedSurfaceCache;
     struct PendingRenderJob {
         std::uint64_t requestId = 0;
@@ -308,6 +300,7 @@ private:
         float zOff = 0.0f;
         cv::Vec3f zOffWorldDir{0, 0, 0};
         int startLevel = 0;
+        int overlayStartLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
@@ -322,6 +315,7 @@ private:
         std::string overlayColormapId;
         float overlayWindowLow = 0.0f;
         float overlayWindowHigh = 255.0f;
+        OverlayCompositeSettings overlayComposite;
         std::uint64_t chunkContentEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
@@ -348,6 +342,7 @@ private:
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
+    int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
@@ -409,16 +404,6 @@ private:
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
 
-    struct SurfaceChunkPrefetchCache {
-        Surface* surface = nullptr;
-        int level = -1;
-        vc::Sampling sampling = vc::Sampling::Trilinear;
-        bool valid = false;
-        cv::Rect prefetchedCellRect;
-        std::unordered_map<std::uint64_t, std::vector<vc::render::ChunkKey>> tileKeys;
-    };
-    SurfaceChunkPrefetchCache _surfaceChunkPrefetchCache;
-
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;
     float _scale = 1.0f;
@@ -440,6 +425,8 @@ private:
     std::string _overlayColormapId;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
+    int _overlayMaxDisplayedResolution = 0;
+    OverlayCompositeSettings _overlayComposite;
 
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
@@ -447,7 +434,7 @@ private:
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
-    double _voxelSizeOverrideUm = 0.0;   // scalebar fallback when volume metadata lacks voxelsize
+    float _linkedCursorViewTolerance = 10.0f;
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     int _maxDisplayedResolution = 0;
     bool _showDirectionHints = true;
@@ -463,6 +450,22 @@ private:
     int _surfacePatchSamplingStride = 2;
     std::set<std::string> _intersectTgts;
     std::unordered_set<std::string> _highlightedSurfaceIds;
+
+    // Resolved intersection targets, cached across render ticks. With very
+    // large sessions (~100k visible surfaces) re-resolving every name via
+    // CState per renderIntersections call costs tens of milliseconds on the
+    // main thread even when the fingerprint would hit. Invalidated when the
+    // target names / highlight set change and (via CState::surfacesVersion)
+    // when the surface map itself changes.
+    struct ResolvedIntersectTargets {
+        std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
+        std::size_t targetHash = 0;
+        QuadSurface* activeSeg = nullptr;
+        std::uint64_t surfacesVersion = 0;
+        bool valid = false;
+    };
+    ResolvedIntersectTargets _resolvedIntersectTargets;
+
     std::vector<QGraphicsItem*> _intersectionItems;
     float _intersectionItemsCamSurfX = 0.0f;
     float _intersectionItemsCamSurfY = 0.0f;
@@ -559,6 +562,7 @@ private:
     QGraphicsEllipseItem* _lineAnnotationPlacementMarker = nullptr;
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
+    bool _segmentationCursorMirroring = false;
 
     uint64_t _highlightedPointId = 0;
     uint64_t _selectedCollectionId = 0;

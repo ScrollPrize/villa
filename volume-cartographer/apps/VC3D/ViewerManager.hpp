@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -13,6 +14,7 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
@@ -93,6 +95,10 @@ public:
     void setOverlayWindow(float low, float high);
     float overlayWindowLow() const { return _overlayWindowLow; }
     float overlayWindowHigh() const { return _overlayWindowHigh; }
+    void setOverlayMaxDisplayedResolution(int level);
+    int overlayMaxDisplayedResolution() const { return _overlayMaxDisplayedResolution; }
+    void setOverlayComposite(const OverlayCompositeSettings& settings);
+    const OverlayCompositeSettings& overlayComposite() const { return _overlayComposite; }
 
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _volumeWindowLow; }
@@ -104,6 +110,13 @@ public:
     int intersectionMaxSurfaces() const { return _intersectionMaxSurfaces; }
     void primeSurfacePatchIndicesAsync();
     void resetStrideUserOverride() {}
+
+    // Folder-selection keyed retention of built surface patch indexes. The
+    // surface panel sets the key before rebinding surfaces on a folder
+    // switch; the live index is stashed under the outgoing key and swapped
+    // back in (if still valid) when the user returns to that selection.
+    void setSurfacePatchIndexCacheKey(const QString& key);
+    void clearSurfacePatchIndexCache();
 
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
@@ -202,6 +215,8 @@ private:
     std::string _overlayColormapId;
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
+    int _overlayMaxDisplayedResolution{0};
+    OverlayCompositeSettings _overlayComposite;
     float _volumeWindowLow{0.0f};
     float _volumeWindowHigh{255.0f};
     bool _mirrorCursorToSegmentation{false};
@@ -213,6 +228,16 @@ private:
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
+    struct CachedSurfacePatchIndex {
+        SurfacePatchIndex index;
+        std::unordered_set<std::string> ids;
+    };
+    // Indexes stashed on folder-selection switches, keyed by the selection
+    // they were built for. Entries are validated against the current surface
+    // instances (and stride) before being swapped back in.
+    std::map<QString, CachedSurfacePatchIndex> _surfacePatchIndexCache;
+    QString _surfacePatchIndexCacheKey;
+    void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;

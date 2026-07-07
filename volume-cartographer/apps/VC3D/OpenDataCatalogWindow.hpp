@@ -106,6 +106,7 @@ private:
     QPushButton* _cacheSegmentButton{nullptr};
     QPushButton* _openSegmentCacheFolderButton{nullptr};
     QPushButton* _syncSampleCacheButton{nullptr};
+    QCheckBox* _doNotShowOnNextOpenCheck{nullptr};
 
     std::optional<OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;

@@ -40,6 +40,9 @@ option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on c
 option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
 option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
+option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
+    "Avoid network update checks for vendored libbacktrace during ordinary builds"
+    ON)
 option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
 option(VC_ENABLE_ECL_MAXFLOW "Build CUDA ECL-MaxFlow integration for Lasagna maxflow" OFF)
@@ -487,6 +490,7 @@ if(NOT VC_LIBBACKTRACE)
         GIT_REPOSITORY https://github.com/ianlancetaylor/libbacktrace.git
         GIT_TAG master
         GIT_SHALLOW TRUE
+        UPDATE_DISCONNECTED ${VC_LIBBACKTRACE_UPDATE_DISCONNECTED}
         PREFIX ${CMAKE_BINARY_DIR}/_deps/libbacktrace
         CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${_libbt_install} --enable-static --disable-shared --with-pic
         BUILD_COMMAND make -j${_nproc}
@@ -534,7 +538,10 @@ endif()
 # (static/interface/PCH helper targets are skipped — they aren't needed at
 # runtime). The vc_runtime component keeps this isolated from unrelated
 # dependency install rules (e.g. libigl's CMake config exports).
-set(_vc_install_dirs apps apps/VC3D core utils libs/c3d)
+set(_vc_install_dirs core utils libs/c3d)
+if(VC_BUILD_APPS)
+    list(APPEND _vc_install_dirs apps apps/VC3D)
+endif()
 if(VC_BUILD_FLATBOI)
     list(APPEND _vc_install_dirs libs/flatboi)
 endif()

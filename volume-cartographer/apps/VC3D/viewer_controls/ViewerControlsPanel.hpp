@@ -12,7 +12,6 @@ class QSlider;
 class QSpinBox;
 class ViewerManager;
 class WindowRangeWidget;
-class ViewerCompositePanel;
 class ViewerTransformsPanel;
 
 class ViewerControlsPanel : public QWidget
@@ -28,30 +27,6 @@ public:
 
         QScrollArea* overlayScrollArea{nullptr};
         QWidget* overlayContents{nullptr};
-
-        QScrollArea* compositeScrollArea{nullptr};
-        QWidget* compositeContents{nullptr};
-        QCheckBox* compositeEnabled{nullptr};
-        QComboBox* compositeMode{nullptr};
-        QSpinBox* layersInFront{nullptr};
-        QSpinBox* layersBehind{nullptr};
-        QLabel* alphaMinLabel{nullptr};
-        QSpinBox* alphaMin{nullptr};
-        QLabel* alphaMaxLabel{nullptr};
-        QSpinBox* alphaMax{nullptr};
-        QLabel* alphaThresholdLabel{nullptr};
-        QSpinBox* alphaThreshold{nullptr};
-        QLabel* materialLabel{nullptr};
-        QSpinBox* material{nullptr};
-        QCheckBox* reverseDirection{nullptr};
-        QCheckBox* planeCompositeXY{nullptr};
-        QCheckBox* planeCompositeXZ{nullptr};
-        QCheckBox* planeCompositeYZ{nullptr};
-        QSpinBox* planeLayersFront{nullptr};
-        QSpinBox* planeLayersBehind{nullptr};
-
-        QScrollArea* renderSettingsScrollArea{nullptr};
-        QWidget* renderSettingsContents{nullptr};
 
         QWidget* normalVisualizationContents{nullptr};
         QCheckBox* showSurfaceNormals{nullptr};
@@ -74,8 +49,7 @@ public:
                                  QWidget* parent = nullptr);
 
     ViewerTransformsPanel* transformsPanel() const { return _transformsPanel; }
-    ViewerCompositePanel* compositePanel() const { return _compositePanel; }
-    void toggleSegmentationComposite();
+    void setTransformsPanel(ViewerTransformsPanel* panel) { _transformsPanel = panel; }
     void setViewControlsEnabled(bool enabled);
     void setOverlayWindowAvailable(bool available);
 
@@ -99,7 +73,6 @@ private:
 
     UiRefs _uiRefs;
     ViewerManager* _viewerManager{nullptr};
-    ViewerCompositePanel* _compositePanel{nullptr};
     ViewerTransformsPanel* _transformsPanel{nullptr};
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};

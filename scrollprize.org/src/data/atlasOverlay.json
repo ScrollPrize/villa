@@ -120,6 +120,21 @@
     "PHercParis4": {
       "display": "Scroll 1",
       "repository": "Institut de France, Paris",
+      "licenseScope": {
+        "EduceLab Data License": "the 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
+      "legalNotice": {
+        "title": "Data access and publication notice",
+        "added": "07/07/2026",
+        "until": "25/06/2027",
+        "licenseLine": "These terms are a modification of the CC BY-NC 4.0 license (additional terms) under which these materials are provided. The publication-reservation period runs until 25/06/2027.",
+        "paragraphs": [
+          "The raw scan data, virtually unwrapped segments, ink-enhanced data, ink identifications, and related derived materials for this ancient scroll are being made available to support open examination, study, verification, and technical experimentation. Access to these materials is provided on the express condition that they are not used for scholarly publication during the temporary publication-reservation period.",
+          "For one year from the public release of these data, scholarly publication rights are reserved for the research teams designated by the Vesuvius Challenge or by the custodial institution holding the physical scroll. Those teams have been granted the right to prepare the first scholarly analyses because they were designated by the Vesuvius Challenge or by the institution responsible for the original material. This publication reservation was a condition of the imaging of the scroll and must be respected by all users.",
+          "During this period, users may examine, study, test, and analyze the data, but may not publish scholarly claims, transcriptions, translations, editions, interpretations, or formal analyses based on the data without permission from the Vesuvius Challenge, the custodial institution, or the designated scholarly teams. After the one-year restriction has expired and the designated teams have published their analyses, the data will be released from this publication restriction and will be available for unrestricted scholarly use."
+        ]
+      },
       "note": "Scroll 1. The first scroll from which substantial continuous Greek text was recovered (2023 Vesuvius Challenge Grand Prize) — Epicurean philosophy attributed to Philodemus. Rescanned at ESRF at 2.4µm in 2026.",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/photos/PHercParis4_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis4/",
@@ -168,6 +183,9 @@
     "PHercParis3": {
       "display": "Scroll 2",
       "repository": "Institut de France, Paris",
+      "licenseScope": {
+        "CC BY-NC 4.0": "all data"
+      },
       "note": "Scroll 2. Rescanned at ESRF at 2.4µm.",
       "photo": null,
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis3/",
@@ -196,6 +214,10 @@
       "display": "Scroll 3",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
       "note": "Scroll 3.",
+      "licenseScope": {
+        "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
       "desc": "PHerc. 332 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is the innermost part of a scroll, known as a *midollo* (marrow), a remnant from physical unwrapping of the larger original. Its small size enabled scanning at extremely high resolution (3.24um).",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/photos/PHerc0332_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0332/",
@@ -229,7 +251,12 @@
     "PHerc1667": {
       "display": "Scroll 4",
       "repository": "Biblioteca Nazionale di Napoli ‘Vittorio Emanuele III’ (Officina dei Papiri Ercolanesi)",
+      "licenseScope": {
+        "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
       "note": "Scroll 4 — the first Herculaneum scroll virtually unwrapped and read in full, end to end, without ever being physically opened. Scanned and read at 2.4µm.",
+      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and later rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025) — the scan from which it was virtually unwrapped and read in full.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1667/photos/PHerc1667_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1667/",
       "content": {
@@ -1288,6 +1315,12 @@
     },
     "PHercParis1Fr34": {
       "display": "PHercParis1Fr34",
+      "licenses": [
+        { "name": "EduceLab Data License", "url": "https://dl.ash2txt.org/LICENSE.txt" }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis1Fr34/photos/PHercParis1Fr34_photo.jpg",
@@ -1315,6 +1348,12 @@
     },
     "PHercParis1Fr39": {
       "display": "PHercParis1Fr39",
+      "licenses": [
+        { "name": "EduceLab Data License", "url": "https://dl.ash2txt.org/LICENSE.txt" }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis1Fr39/photos/PHercParis1Fr39_photo.jpg",
@@ -1342,6 +1381,12 @@
     },
     "PHercParis2Fr143": {
       "display": "PHercParis2Fr143",
+      "licenses": [
+        { "name": "EduceLab Data License", "url": "https://dl.ash2txt.org/LICENSE.txt" }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis2Fr143/photos/PHercParis2Fr143_photo.jpg",
@@ -1369,6 +1414,12 @@
     },
     "PHercParis2Fr47": {
       "display": "PHercParis2Fr47",
+      "licenses": [
+        { "name": "EduceLab Data License", "url": "https://dl.ash2txt.org/LICENSE.txt" }
+      ],
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "repository": "Institut de France, Paris",
       "note": "",
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis2Fr47/photos/PHercParis2Fr47_photo.jpg",

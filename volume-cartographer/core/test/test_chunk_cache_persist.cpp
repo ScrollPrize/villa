@@ -64,13 +64,15 @@ fs::path tmpDir(const std::string& tag)
 }
 
 std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
-                                       std::optional<fs::path> persist = {})
+                                       std::optional<fs::path> persist = {},
+                                       bool compress = false)
 {
     std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
     opts.maxConcurrentReads = 4;
     opts.detectAllFillChunks = true;
     if (persist) opts.persistentCachePath = *persist;
+    opts.compressPersistentCache = compress;
     return std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{f},
@@ -421,4 +423,94 @@ TEST_CASE("Many concurrent tryGetChunk calls converge on the same Entry")
     // The fetcher should have been called at most a small number of times
     // (cache coalesces in-flight requests).
     CHECK(f->fetchCalls.load() <= 4);
+}
+
+namespace {
+
+bool waitForFile(const fs::path& path,
+                 std::chrono::milliseconds timeout = std::chrono::seconds{2})
+{
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (fs::exists(path)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return fs::exists(path);
+}
+
+std::vector<std::byte> variedBytes(std::size_t n)
+{
+    std::vector<std::byte> bytes(n);
+    for (std::size_t i = 0; i < n; ++i)
+        bytes[i] = std::byte{static_cast<unsigned char>(i * 7 + 3)};
+    return bytes;
+}
+
+} // namespace
+
+TEST_CASE("compressPersistentCache stores .zst instead of .bin")
+{
+    auto persist = tmpDir("compress_write");
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fr;
+    fr.status = ChunkFetchStatus::Found;
+    fr.bytes = variedBytes(64);
+    f->setCanned({0, 0, 0, 0}, fr);
+
+    auto c = makeCache(f, persist, /*compress=*/true);
+    auto r = waitForResolved(*c, 0, 0, 0, 0);
+    REQUIRE(r.status == ChunkStatus::Data);
+
+    const auto zst = persist / "level_0" / "0" / "0" / "0.zst";
+    CHECK(waitForFile(zst));
+    CHECK_FALSE(fs::exists(persist / "level_0" / "0" / "0" / "0.bin"));
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Reopen cache: compressed .zst entry is loaded without a fetch")
+{
+    auto persist = tmpDir("compress_reload");
+    const auto expected = variedBytes(64);
+
+    {
+        auto f = std::make_shared<CountingFetcher>();
+        ChunkFetchResult fr;
+        fr.status = ChunkFetchStatus::Found;
+        fr.bytes = expected;
+        f->setCanned({0, 0, 0, 0}, fr);
+        auto c = makeCache(f, persist, /*compress=*/true);
+        REQUIRE(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
+        REQUIRE(waitForFile(persist / "level_0" / "0" / "0" / "0.zst"));
+    }
+
+    // Compression off: the reader must still understand the .zst entry.
+    auto f = std::make_shared<CountingFetcher>();
+    auto c = makeCache(f, persist, /*compress=*/false);
+    auto r = waitForResolved(*c, 0, 0, 0, 0);
+    REQUIRE(r.status == ChunkStatus::Data);
+    REQUIRE(r.bytes);
+    CHECK(*r.bytes == expected);
+    CHECK(f->fetchCalls.load() == 0);
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Corrupt .zst entry falls back to a remote fetch")
+{
+    auto persist = tmpDir("compress_corrupt");
+    const auto target = persist / "level_0" / "0" / "0";
+    writeSizedFile(target / "0.zst", 16, 0xAB); // not a valid zstd frame
+
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fr;
+    fr.status = ChunkFetchStatus::Found;
+    fr.bytes = variedBytes(64);
+    f->setCanned({0, 0, 0, 0}, fr);
+
+    auto c = makeCache(f, persist, /*compress=*/true);
+    auto r = waitForResolved(*c, 0, 0, 0, 0);
+    REQUIRE(r.status == ChunkStatus::Data);
+    REQUIRE(r.bytes);
+    CHECK(*r.bytes == fr.bytes);
+    CHECK(f->fetchCalls.load() == 1);
+    fs::remove_all(persist);
 }

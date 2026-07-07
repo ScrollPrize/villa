@@ -28,6 +28,7 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSaveFile>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSplitter>
@@ -400,13 +401,17 @@ void OpenDataCatalogWindow::buildUi()
         tr("Segments"),
         tr("Ink"),
         tr("Local TIFXYZ"),
-        tr("Sync")
+        tr("Sync Status")
     });
     _sampleTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     _sampleTable->setSelectionMode(QAbstractItemView::SingleSelection);
     _sampleTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     _sampleTable->setSortingEnabled(true);
     _sampleTable->setMinimumWidth(kSampleTableInitialWidth);
+    _sampleTable->horizontalHeader()->setSectionsClickable(true);
+    _sampleTable->horizontalHeader()->setSortIndicatorShown(true);
+    _sampleTable->horizontalHeader()->setSortIndicator(0, Qt::AscendingOrder);
+    _sampleTable->horizontalHeader()->setToolTip(tr("Click a column header to sort."));
     _sampleTable->horizontalHeader()->setStretchLastSection(true);
     _sampleTable->verticalHeader()->hide();
 
@@ -516,8 +521,14 @@ void OpenDataCatalogWindow::buildUi()
     _statusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     _syncSampleCacheButton = new QPushButton(tr("Sync Local Data"), this);
     _openSampleButton = new QPushButton(tr("Open Sample"), this);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    _doNotShowOnNextOpenCheck = new QCheckBox(tr("Do not show on next open"), this);
+    _doNotShowOnNextOpenCheck->setChecked(
+        !settings.value(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
+                        vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT).toBool());
     auto* closeButton = new QPushButton(tr("Close"), this);
     bottomRow->addWidget(_statusLabel, 1);
+    bottomRow->addWidget(_doNotShowOnNextOpenCheck);
     bottomRow->addWidget(_syncSampleCacheButton);
     bottomRow->addWidget(_openSampleButton);
     bottomRow->addWidget(closeButton);
@@ -546,6 +557,11 @@ void OpenDataCatalogWindow::buildUi()
     connect(_openSegmentCacheFolderButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentCacheFolder);
     connect(_syncSampleCacheButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::syncSelectedSampleCache);
     connect(_openSampleButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSample);
+    connect(_doNotShowOnNextOpenCheck, &QCheckBox::toggled, this, [](bool checked) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
+                          checked ? QStringLiteral("0") : QStringLiteral("1"));
+    });
     connect(closeButton, &QPushButton::clicked, this, &QDialog::accept);
 
     clearDetails();
@@ -931,7 +947,12 @@ void OpenDataCatalogWindow::onOverviewPhotoFinished(QFutureWatcher<PhotoLoadResu
     _photoWatchers.erase(
         std::remove(_photoWatchers.begin(), _photoWatchers.end(), watcher),
         _photoWatchers.end());
-    const PhotoLoadResult result = watcher->result();
+    const auto future = watcher->future();
+    if (future.resultCount() == 0) {
+        watcher->deleteLater();
+        return;
+    }
+    const PhotoLoadResult result = future.result();
     watcher->deleteLater();
 
     if (result.sampleId != _pendingPhotoSampleId) {
@@ -1186,11 +1207,19 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
         oneSegmentSample,
         remoteRoot,
         [this](const OpenDataSampleDownloadProgress& progress) {
+            const QString status = qstr(progress.status);
+            const bool transforming = status.startsWith(QStringLiteral("transform-"));
             if (!progress.segmentId.empty()) {
-                const QString message = tr("Syncing %1: %2/%3 files")
-                    .arg(qstr(progress.segmentId))
-                    .arg(progress.completedFiles)
-                    .arg(progress.totalFiles);
+                const QString message = transforming
+                    ? tr("Transforming %1 -> %2: %3/%4 transforms")
+                          .arg(qstr(progress.segmentId))
+                          .arg(qstr(progress.fileName))
+                          .arg(progress.completedSegments + progress.failedSegments)
+                          .arg(progress.totalSegments)
+                    : tr("Syncing %1: %2/%3 files")
+                          .arg(qstr(progress.segmentId))
+                          .arg(progress.completedFiles)
+                          .arg(progress.totalFiles);
                 QMetaObject::invokeMethod(this, [this, message]() {
                     setStatus(message);
                 }, Qt::QueuedConnection);
@@ -1230,15 +1259,27 @@ void OpenDataCatalogWindow::syncSelectedSampleCache()
         remoteRoot,
         [this](const OpenDataSampleDownloadProgress& progress) {
             QString message;
+            const QString status = qstr(progress.status);
+            const bool transforming = status.startsWith(QStringLiteral("transform-"));
             if (!progress.segmentId.empty()) {
-                message = tr("Syncing %1: %2/%3 files")
-                    .arg(qstr(progress.segmentId))
-                    .arg(progress.completedFiles)
-                    .arg(progress.totalFiles);
+                message = transforming
+                    ? tr("Transforming %1 -> %2: %3/%4 transforms")
+                          .arg(qstr(progress.segmentId))
+                          .arg(qstr(progress.fileName))
+                          .arg(progress.completedSegments + progress.failedSegments)
+                          .arg(progress.totalSegments)
+                    : tr("Syncing %1: %2/%3 files")
+                          .arg(qstr(progress.segmentId))
+                          .arg(progress.completedFiles)
+                          .arg(progress.totalFiles);
             } else {
-                message = tr("Syncing local data: %1/%2 files")
-                    .arg(progress.completedFiles)
-                    .arg(progress.totalFiles);
+                message = transforming
+                    ? tr("Transforming segments: %1/%2 transforms")
+                          .arg(progress.completedSegments + progress.failedSegments)
+                          .arg(progress.totalSegments)
+                    : tr("Syncing local data: %1/%2 files")
+                          .arg(progress.completedFiles)
+                          .arg(progress.totalFiles);
             }
             QMetaObject::invokeMethod(this, [this, message]() {
                 setStatus(message);

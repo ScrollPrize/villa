@@ -65,7 +65,7 @@ from spiral_helpers import (
     patch_intersects_z_roi
 )
 import sample_spiral
-from satistfaction_metrics import (
+from satisfaction_metrics import (
     get_patch_satisfied_areas as _get_patch_satisfied_areas,
     get_unattached_pcl_satisfied_counts as _get_unattached_pcl_satisfied_counts,
     metrics_config,

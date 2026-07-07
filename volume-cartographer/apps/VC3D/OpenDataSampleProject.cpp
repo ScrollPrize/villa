@@ -114,6 +114,9 @@ std::vector<std::string> volumeTags(const OpenDataVolume& volume,
     if (!volume.id.empty()) {
         addUnique("vc-open-data-volume-id:" + volume.id);
     }
+    if (volume.pixelSizeUm && *volume.pixelSizeUm > 0.0) {
+        addUnique("vc-open-data-voxel-size-um:" + std::to_string(*volume.pixelSizeUm));
+    }
 
     return tags;
 }
@@ -201,6 +204,41 @@ bool isNonEmptyFile(const std::filesystem::path& path)
            !ec;
 }
 
+int openDataSegmentEntryCount(const VolumePkg& pkg,
+                              const std::filesystem::path& remoteCacheRoot,
+                              const OpenDataSample& sample)
+{
+    if (remoteCacheRoot.empty() || sample.tifxyzSegmentCount() == 0) {
+        return 0;
+    }
+
+    const auto sampleSegmentsRoot = remoteCacheRoot / "open_data" / "segments" /
+                                    safePathComponent(sample.id.empty() ? "sample" : sample.id);
+    const auto sampleSegmentsRootString = sampleSegmentsRoot.string();
+    const auto sampleSegmentsPrefix =
+        sampleSegmentsRootString + std::string(1, std::filesystem::path::preferred_separator);
+    int count = 0;
+    for (const auto& entry : pkg.segmentEntries()) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(entry.location, ec) || ec) {
+            continue;
+        }
+        const bool openDataSegmentEntry =
+            std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end() &&
+            std::any_of(entry.tags.begin(), entry.tags.end(), [](const std::string& tag) {
+                return tag.rfind("vc-open-data-source-volume-id:", 0) == 0 ||
+                       tag.rfind("vc-open-data-target-volume-id:", 0) == 0;
+            });
+        if (openDataSegmentEntry &&
+            entry.location.rfind(sampleSegmentsPrefix, 0) == 0 &&
+            entry.location.find(std::string(1, std::filesystem::path::preferred_separator),
+                                sampleSegmentsPrefix.size()) == std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 } // namespace
 
 std::shared_ptr<VolumePkg> createOpenDataSampleProject(
@@ -211,6 +249,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 {
     auto result = OpenDataSampleProjectResult{};
     std::shared_ptr<VolumePkg> pkg;
+    bool loadedCachedProject = false;
     const auto cachedProjectPath = remoteCacheRoot.empty()
         ? std::filesystem::path{}
         : sampleProjectCachePath(remoteCacheRoot, sample);
@@ -222,6 +261,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
             pkg = VolumePkg::load(
                 cachedProjectPath,
                 opts);
+            loadedCachedProject = true;
             result.messages.push_back("Loaded cached sample project: " +
                                       cachedProjectPath.string());
         } catch (const std::exception& e) {
@@ -250,7 +290,24 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     result.messages.insert(result.messages.end(),
                            attachResult.messages.begin(),
                            attachResult.messages.end());
-    attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result, progressCallback);
+    if (loadedCachedProject &&
+        openDataSegmentEntryCount(*pkg, remoteCacheRoot, sample) > 0) {
+        const auto cacheAttachResult =
+            attachExistingOpenDataSegmentCaches(*pkg, sample, remoteCacheRoot);
+        result.supportedTifxyzSegments += cacheAttachResult.supportedTifxyzSegments;
+        result.cachedTifxyzSegments += cacheAttachResult.cachedTifxyzSegments;
+        result.attachedSegmentEntries += cacheAttachResult.attachedSegmentEntries;
+        result.skippedTifxyzSegments += cacheAttachResult.skippedTifxyzSegments;
+        result.failedTifxyzSegments += cacheAttachResult.failedTifxyzSegments;
+        result.transformedTifxyzSegments += cacheAttachResult.transformedTifxyzSegments;
+        result.failedTransformedTifxyzSegments += cacheAttachResult.failedTransformedTifxyzSegments;
+        result.messages.insert(result.messages.end(),
+                               cacheAttachResult.messages.begin(),
+                               cacheAttachResult.messages.end());
+        result.messages.push_back("Reused cached sample project segment entries.");
+    } else {
+        attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result, progressCallback);
+    }
 
     if (!cachedProjectPath.empty()) {
         try {
@@ -357,6 +414,8 @@ void attachOpenDataSampleSegments(
     result.attachedSegmentEntries += cacheResult.attachedSegmentEntries;
     result.skippedTifxyzSegments += cacheResult.skippedTifxyzSegments;
     result.failedTifxyzSegments += cacheResult.failedTifxyzSegments;
+    result.transformedTifxyzSegments += cacheResult.transformedTifxyzSegments;
+    result.failedTransformedTifxyzSegments += cacheResult.failedTransformedTifxyzSegments;
     result.messages.insert(result.messages.end(),
                            cacheResult.messages.begin(),
                            cacheResult.messages.end());

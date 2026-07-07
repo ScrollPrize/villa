@@ -219,6 +219,162 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     CHECK(segment.hasLayersZarr());
 }
 
+TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "samples": {
+        "sample-a": {
+          "scans": {
+            "scan-a": {
+              "properties": {
+                "pixel_size_um": 2.403,
+                "detector_distance_mm": 220.0
+              }
+            }
+          },
+          "volumes": {
+            "volume-with-properties": {
+              "scan_id": "scan-a",
+              "properties": {
+                "pixel_size_um": 7.91,
+                "detector_distance_mm": 12.5
+              },
+              "data": [{
+                "type": "ome-zarr",
+                "origins": [{
+                  "path": "sample-a/volumes/volume-with-properties.zarr",
+                  "access_roots": [{
+                    "type": "s3",
+                    "url": "s3://vesuvius-challenge-open-data/",
+                    "usage": "public-read"
+                  }]
+                }]
+              }]
+            },
+            "volume-from-scan": {
+              "scan_id": "scan-a",
+              "data": [{
+                "type": "ome-zarr",
+                "origins": [{
+                  "path": "sample-a/volumes/volume-from-scan.zarr",
+                  "access_roots": [{
+                    "type": "s3",
+                    "url": "s3://vesuvius-challenge-open-data/",
+                    "usage": "public-read"
+                  }]
+                }]
+              }]
+            }
+          }
+        }
+      }
+    })");
+
+    const auto* sample = manifest.findSample("sample-a");
+    REQUIRE(sample != nullptr);
+    REQUIRE(sample->scans.size() == 1);
+    REQUIRE(sample->scans.front().pixelSizeUm.has_value());
+    CHECK(*sample->scans.front().pixelSizeUm == doctest::Approx(2.403));
+    REQUIRE(sample->volumes.size() == 2);
+
+    const auto byId = [&](const std::string& id) -> const OpenDataVolume* {
+        const auto it = std::find_if(
+            sample->volumes.begin(), sample->volumes.end(), [&](const OpenDataVolume& volume) {
+                return volume.id == id;
+            });
+        return it == sample->volumes.end() ? nullptr : &*it;
+    };
+
+    const auto* volumeWithProperties = byId("volume-with-properties");
+    REQUIRE(volumeWithProperties != nullptr);
+    REQUIRE(volumeWithProperties->pixelSizeUm.has_value());
+    CHECK(*volumeWithProperties->pixelSizeUm == doctest::Approx(7.91));
+    const auto* volumeFromScan = byId("volume-from-scan");
+    REQUIRE(volumeFromScan != nullptr);
+    REQUIRE(volumeFromScan->pixelSizeUm.has_value());
+    CHECK(*volumeFromScan->pixelSizeUm == doctest::Approx(2.403));
+
+    auto pkg = VolumePkg::newEmpty();
+    const auto result = attachOpenDataSampleVolumes(*pkg, *sample);
+    CHECK(result.supportedVolumes == 2);
+    REQUIRE(pkg->volumeEntries().size() == 2);
+
+    const auto hasTag = [](const vc::project::Entry& entry, const std::string& tag) {
+        return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
+    };
+    const auto entryForVolumeId = [&](const std::string& id) -> const vc::project::Entry* {
+        const auto tag = "vc-open-data-volume-id:" + id;
+        const auto it = std::find_if(
+            pkg->volumeEntries().begin(), pkg->volumeEntries().end(), [&](const vc::project::Entry& entry) {
+                return hasTag(entry, tag);
+            });
+        return it == pkg->volumeEntries().end() ? nullptr : &*it;
+    };
+
+    const auto* volumeWithPropertiesEntry = entryForVolumeId("volume-with-properties");
+    REQUIRE(volumeWithPropertiesEntry != nullptr);
+    CHECK(hasTag(*volumeWithPropertiesEntry, "vc-open-data-voxel-size-um:7.910000"));
+    const auto* volumeFromScanEntry = entryForVolumeId("volume-from-scan");
+    REQUIRE(volumeFromScanEntry != nullptr);
+    CHECK(hasTag(*volumeFromScanEntry, "vc-open-data-voxel-size-um:2.403000"));
+}
+
+TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "metadata": {
+        "samples": {
+          "sample-a": {
+            "sample": {
+              "properties": {
+                "volume_transforms": [
+                  {
+                    "from_volume_id": "vol-a",
+                    "transforms": [
+                      {
+                        "to_volume_id": "vol-b",
+                        "matrix": [
+                          [0.5, 0.0, 0.0, 10.0],
+                          [0.0, 0.5, 0.0, 20.0],
+                          [0.0, 0.0, 0.5, 30.0]
+                        ],
+                        "derivation_path": "vol-a-vol-b"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "volumes": {
+              "vol-a": {"data_format": "zarr"},
+              "vol-b": {"data_format": "zarr"}
+            }
+          }
+        }
+      }
+    })");
+
+    const auto* sample = manifest.findSample("sample-a");
+    REQUIRE(sample != nullptr);
+    REQUIRE(sample->volumeTransforms.size() == 1);
+    CHECK(sample->volumeTransforms.front().fromVolumeId == "vol-a");
+    REQUIRE(sample->volumeTransforms.front().transforms.size() == 1);
+    CHECK(sample->volumeTransforms.front().transforms.front().toVolumeId == "vol-b");
+    CHECK(sample->volumeTransforms.front().transforms.front().derivationPath == "vol-a-vol-b");
+
+    const auto forward = findSampleVolumeTransform(*sample, "vol-a", "vol-b");
+    REQUIRE(forward.has_value());
+    CHECK((*forward)(0, 0) == doctest::Approx(0.5));
+    CHECK((*forward)(0, 3) == doctest::Approx(10.0));
+    CHECK((*forward)(1, 3) == doctest::Approx(20.0));
+    CHECK((*forward)(2, 3) == doctest::Approx(30.0));
+    CHECK((*forward)(3, 3) == doctest::Approx(1.0));
+
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "vol-b", "vol-a").has_value());
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "vol-a", "vol-c").has_value());
+    CHECK_FALSE(findSampleVolumeTransform(*sample, "", "vol-b").has_value());
+}
+
 TEST_CASE("OpenDataManifest resolves public origins with the website rewrite table")
 {
     CHECK(resolveOpenDataUrl("s3://vesuvius-challenge-open-data/a/b") ==
@@ -248,6 +404,7 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     OpenDataVolume volume;
     volume.id = "scan-volume";
     volume.dataFormat = "zarr";
+    volume.pixelSizeUm = 7.91;
 
     auto artifact = [](std::string type, std::string url) {
         OpenDataArtifact out;
@@ -285,6 +442,9 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
                     pkg->volumeEntries()[0].tags.end(),
                     "vc-open-data-volume-id:scan-volume") != pkg->volumeEntries()[0].tags.end());
+    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
+                    pkg->volumeEntries()[0].tags.end(),
+                    "vc-open-data-voxel-size-um:7.910000") != pkg->volumeEntries()[0].tags.end());
 }
 
 TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
@@ -415,7 +575,9 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
                            ("vc_open_data_sample_project_test_" + std::to_string(getpid()));
     std::filesystem::remove_all(cacheRoot);
 
-    const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
+    const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    CHECK(segmentDir.parent_path().filename() == "vol1");
+    CHECK(segmentDir.parent_path().parent_path().filename() == "PHerc0139");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     const auto* tifxyz = preferredTifxyzArtifact(sample.segments.front());
@@ -496,7 +658,9 @@ TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts"
                            ("vc_open_data_transformed_segment_test_" + std::to_string(getpid()));
     std::filesystem::remove_all(cacheRoot);
 
-    const auto segmentDir = cacheRoot / "open_data" / "segments" / "PHerc0139" / "20260311000000";
+    const auto segmentDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    CHECK(segmentDir.parent_path().filename() == "vol1");
+    CHECK(segmentDir.parent_path().parent_path().filename() == "PHerc0139");
     const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
                                 "segments" / "20241113070770";
     const cv::Size fixtureGridSize = tifxyzGridSize(fixtureSegment);
@@ -528,6 +692,81 @@ TEST_CASE("OpenDataSegmentCache does not downscale transformed tifxyz artifacts"
     std::filesystem::remove_all(cacheRoot);
 }
 
+TEST_CASE("OpenDataSegmentCache writes per-volume transformed segment caches")
+{
+    auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    sample.volumes.push_back(targetVolume);
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_volume_transform_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto sourceDir = openDataSegmentCacheDirectory(cacheRoot, sample, sample.segments.front());
+    const auto transformedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot, sample, sample.segments.front(), "vol2");
+    CHECK(sourceDir.parent_path().filename() == "vol1");
+    CHECK(sourceDir.parent_path().parent_path().filename() == "PHerc0139");
+    CHECK(transformedDir.parent_path().filename() == "vol2");
+    CHECK(transformedDir.parent_path().parent_path().filename() == "PHerc0139");
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    writeFile(sourceDir / "meta.json",
+              R"({"type":"seg","uuid":"20260311000000.tmp-12345","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", sourceDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", sourceDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", sourceDir / "z.tif");
+    writeFile(sourceDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", sample.segments.front().id},
+                  {"resolved_http_url", preferredTifxyzArtifact(sample.segments.front())->resolvedUrl},
+                  {"cache_state", "current"}
+              }.dump());
+
+    auto pkg = VolumePkg::newEmpty();
+    OpenDataSampleProjectResult result;
+    attachOpenDataSampleSegments(*pkg, sample, cacheRoot, result);
+
+    CHECK(result.cachedTifxyzSegments == 1);
+    CHECK(result.transformedTifxyzSegments == 1);
+    REQUIRE(std::filesystem::is_regular_file(transformedDir / "meta.json"));
+    REQUIRE(pkg->segmentEntries().size() == 2);
+    CHECK(std::any_of(pkg->segmentEntries().begin(),
+                      pkg->segmentEntries().end(),
+                      [](const vc::project::Entry& entry) {
+                          return std::find(entry.tags.begin(),
+                                           entry.tags.end(),
+                                           "vc-open-data-target-volume-id:vol2") != entry.tags.end();
+                      }));
+
+    std::ifstream metaIn(transformedDir / "meta.json", std::ios::binary);
+    REQUIRE(metaIn.good());
+    const auto meta = nlohmann::json::parse(metaIn);
+    CHECK(meta.at("vc_open_data_transform_source_volume_id").get<std::string>() == "vol1");
+    CHECK(meta.at("vc_open_data_transform_target_volume_id").get<std::string>() == "vol2");
+    CHECK(meta.at("vc_open_data_volume_transform_matrix")[0][3].get<double>() == doctest::Approx(10.0));
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
 {
     OpenDataSample sample;
@@ -554,6 +793,115 @@ TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
                       secondResult.messages.end(),
                       [](const std::string& message) {
                           return message.find("Loaded cached sample project") != std::string::npos;
+                      }));
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
+TEST_CASE("OpenDataSampleProject reuses cached project and attaches existing cached transforms")
+{
+    const auto manifest = parseOpenDataManifest(kFixture);
+    auto sample = *manifest.findSample("PHerc0139");
+
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_cached_project_segments_test_" + std::to_string(getpid()));
+    std::filesystem::remove_all(cacheRoot);
+
+    const auto segmentDir = openDataSegmentCacheDirectory(
+        cacheRoot,
+        sample,
+        sample.segments.front());
+    const auto fixtureSegment = std::filesystem::path(VC_TEST_FIXTURES_DIR) /
+                                "segments" / "20241113070770";
+    const auto* tifxyz = preferredTifxyzArtifact(sample.segments.front());
+    REQUIRE(tifxyz != nullptr);
+    writeFile(segmentDir / "meta.json",
+              R"({"type":"seg","uuid":"20260311000000.tmp-12345","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", segmentDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", segmentDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", segmentDir / "z.tif");
+    writeFile(segmentDir / "catalog-origin.json",
+              nlohmann::json{
+                  {"sample_id", sample.id},
+                  {"segment_id", sample.segments.front().id},
+                  {"resolved_http_url", tifxyz->resolvedUrl},
+                  {"cache_state", "current"}
+              }.dump());
+
+    OpenDataSampleProjectResult firstResult;
+    std::vector<OpenDataSampleDownloadProgress> firstProgressEvents;
+    auto first = createOpenDataSampleProject(
+        sample,
+        cacheRoot,
+        &firstResult,
+        [&](const OpenDataSampleDownloadProgress& progress) {
+            firstProgressEvents.push_back(progress);
+        });
+    REQUIRE(first);
+    CHECK(firstResult.cachedTifxyzSegments == 1);
+    CHECK(firstResult.attachedSegmentEntries == 1);
+    REQUIRE(!firstProgressEvents.empty());
+
+    OpenDataVolume targetVolume;
+    targetVolume.id = "vol2";
+    targetVolume.dataFormat = "zarr";
+    OpenDataArtifact targetArtifact;
+    targetArtifact.type = "zarr";
+    targetArtifact.resolvedUrl = "http://127.0.0.1:9/vol2.zarr";
+    targetVolume.artifacts.push_back(std::move(targetArtifact));
+    sample.volumes.push_back(std::move(targetVolume));
+    sample.properties["properties"]["volume_transforms"] = nlohmann::json::array({
+        {
+            {"from_volume_id", "vol1"},
+            {"transforms", nlohmann::json::array({
+                {
+                    {"to_volume_id", "vol2"},
+                    {"matrix", nlohmann::json::array({
+                        nlohmann::json::array({1.0, 0.0, 0.0, 10.0}),
+                        nlohmann::json::array({0.0, 1.0, 0.0, 20.0}),
+                        nlohmann::json::array({0.0, 0.0, 1.0, 30.0})
+                    })}
+                }
+            })}
+        }
+    });
+    const auto transformedDir = openDataTransformedSegmentCacheDirectory(
+        cacheRoot,
+        sample,
+        sample.segments.front(),
+        "vol2");
+    writeFile(transformedDir / "meta.json",
+              R"({"type":"seg","uuid":"PHerc0139-20260311000000","name":"seg-a","format":"tifxyz","scale":[1,1]})");
+    copyFixtureFile(fixtureSegment / "x.tif", transformedDir / "x.tif");
+    copyFixtureFile(fixtureSegment / "y.tif", transformedDir / "y.tif");
+    copyFixtureFile(fixtureSegment / "z.tif", transformedDir / "z.tif");
+
+    OpenDataSampleProjectResult secondResult;
+    std::vector<OpenDataSampleDownloadProgress> secondProgressEvents;
+    auto second = createOpenDataSampleProject(
+        sample,
+        cacheRoot,
+        &secondResult,
+        [&](const OpenDataSampleDownloadProgress& progress) {
+            secondProgressEvents.push_back(progress);
+    });
+    REQUIRE(second);
+    CHECK(secondResult.cachedTifxyzSegments == 1);
+    CHECK(secondResult.transformedTifxyzSegments == 1);
+    CHECK(secondResult.attachedSegmentEntries == 1);
+    CHECK(secondProgressEvents.empty());
+    REQUIRE(second->segmentEntries().size() == 2);
+    CHECK(std::any_of(second->segmentEntries().begin(),
+                      second->segmentEntries().end(),
+                      [](const vc::project::Entry& entry) {
+                          return std::find(entry.tags.begin(),
+                                           entry.tags.end(),
+                                           "vc-open-data-target-volume-id:vol2") != entry.tags.end();
+                      }));
+    CHECK(std::any_of(secondResult.messages.begin(),
+                      secondResult.messages.end(),
+                      [](const std::string& message) {
+                          return message.find("Reused cached sample project segment entries") != std::string::npos;
                       }));
 
     std::filesystem::remove_all(cacheRoot);

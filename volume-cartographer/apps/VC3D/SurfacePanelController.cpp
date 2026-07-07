@@ -8,6 +8,7 @@
 #include "VCSettings.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/DateTime.hpp"
@@ -36,6 +37,7 @@
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStyle>
+#include <QBrush>
 #include <QWidget>
 #include <QString>
 #include <QTreeWidget>
@@ -58,6 +60,17 @@ constexpr double kFocusPointFilterRadius = 10.0;
 constexpr double kZRangeFilterLowerDefault = 0.0;
 constexpr double kZRangeFilterUpperDefault = 1000000.0;
 constexpr auto kSurfaceColumnSettingsGroup = "surface_panel/columns";
+constexpr auto kCurrentOnlyFilterSettingsKey = "surface_panel/filters/current_only";
+
+bool preserveSurfaceDuringSegmentReload(const std::string& name)
+{
+    return name == "segmentation" ||
+           name == "xy plane" ||
+           name == "xz plane" ||
+           name == "yz plane" ||
+           name == "seg xz" ||
+           name == "seg yz";
+}
 
 bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
 {
@@ -99,9 +112,65 @@ QString surface_timestamp(QuadSurface* surf)
     return QString::fromStdString(surf->meta["date_last_modified"].get_string());
 }
 
+std::string segment_display_id(const std::string& dirName, const std::string& segmentId, bool currentFolder)
+{
+    if (currentFolder) {
+        return segmentId;
+    }
+    return dirName + "/" + segmentId;
+}
+
+void apply_folder_metadata(QuadSurface* surf,
+                           const SurfacePanelController::SegmentFolderSelection& folder,
+                           const std::string& displayId)
+{
+    if (!surf) {
+        return;
+    }
+    surf->id = displayId;
+    surf->meta["vc3d_segment_folder"] = folder.dirName;
+    surf->meta["vc3d_segment_display_id"] = displayId;
+    surf->meta["vc3d_segment_folder_default_palette"] = folder.defaultPalette;
+    if (!folder.defaultPalette && folder.color.isValid()) {
+        utils::Json color = utils::Json::array();
+        color.push_back(static_cast<double>(folder.color.red()));
+        color.push_back(static_cast<double>(folder.color.green()));
+        color.push_back(static_cast<double>(folder.color.blue()));
+        surf->meta["vc3d_segment_folder_color"] = std::move(color);
+    } else if (surf->meta.contains("vc3d_segment_folder_color")) {
+        surf->meta.erase("vc3d_segment_folder_color");
+    }
+}
+
+std::vector<std::filesystem::path> segment_dirs_under(const std::filesystem::path& root)
+{
+    std::vector<std::filesystem::path> out;
+    if (root.empty() || !std::filesystem::exists(root)) {
+        return out;
+    }
+    if (Segmentation::checkDir(root)) {
+        out.push_back(root);
+        return out;
+    }
+    for (const auto& child : std::filesystem::directory_iterator(root)) {
+        if (child.is_directory() && Segmentation::checkDir(child.path())) {
+            out.push_back(child.path());
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 QString surface_column_settings_key(int column)
 {
     return QStringLiteral("%1/column_%2_visible").arg(kSurfaceColumnSettingsGroup).arg(column);
+}
+
+bool surface_column_default_visible(int column)
+{
+    return column != SURFACE_LONG_ID_COLUMN &&
+           column != SURFACE_AVG_COST_COLUMN &&
+           column != SURFACE_OVERLAPS_COLUMN;
 }
 
 void set_surface_tree_item_text(SurfaceTreeWidgetItem* item,
@@ -188,7 +257,31 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
 
 void SurfacePanelController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
 {
+    if (pkg != _volumePkg) {
+        _overlaySegmentations.clear();
+        if (_viewerManager) {
+            _viewerManager->clearSurfacePatchIndexCache();
+        }
+    }
     _volumePkg = pkg;
+}
+
+// Identifies the current folder selection (volpkg + checked folders, with the
+// active folder marked) for the ViewerManager's surface index cache.
+QString SurfacePanelController::folderSelectionCacheKey() const
+{
+    QStringList parts;
+    for (const auto& folder : _visibleSegmentFolders) {
+        parts << QString::fromStdString(folder.dirName) +
+                     (folder.currentFolder ? QStringLiteral("*") : QString());
+    }
+    if (parts.isEmpty() && _volumePkg) {
+        parts << QString::fromStdString(_volumePkg->getSegmentationDirectory());
+    }
+    parts.sort();
+    const QString volpkgDir =
+        _volumePkg ? QString::fromStdString(_volumePkg->getVolpkgDirectory()) : QString();
+    return volpkgDir + QLatin1Char('|') + parts.join(QLatin1Char(','));
 }
 
 void SurfacePanelController::clear()
@@ -210,11 +303,94 @@ void SurfacePanelController::loadSurfaces(bool reload)
         return;
     }
 
+    if (!_visibleSegmentFolders.empty()) {
+        // Stash the live surface index under the outgoing folder selection
+        // BEFORE unbinding its surfaces, so switching back can reuse it.
+        if (_viewerManager) {
+            _viewerManager->setSurfacePatchIndexCacheKey(folderSelectionCacheKey());
+        }
+        if (reload) {
+            if (_state) {
+                auto names = _state->surfaceNames();
+                for (const auto& name : names) {
+                    if (preserveSurfaceDuringSegmentReload(name)) {
+                        continue;
+                    }
+                    _state->setSurface(name, nullptr, true, false);
+                }
+            }
+            // Surfaces stay loaded in the VolumePkg's per-folder retention so
+            // returning to a previously visited folder is fast; they are only
+            // rebound to the state below.
+            _multiFolderSurfaceIds.clear();
+        }
+
+        for (const auto& folder : _visibleSegmentFolders) {
+            if (folder.currentFolder) {
+                auto segIds = _volumePkg->segmentationIDs();
+                _volumePkg->loadSurfacesBatch(segIds);
+                if (_state) {
+                    for (const auto& id : segIds) {
+                        auto surf = _volumePkg->getSurface(id);
+                        if (surf) {
+                            apply_folder_metadata(surf.get(), folder, id);
+                            _state->setSurface(id, surf, true, false);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            for (const auto& segPath : segment_dirs_under(folder.path)) {
+                try {
+                    std::shared_ptr<Segmentation> seg;
+                    if (auto retained = _overlaySegmentations.find(segPath.string());
+                        retained != _overlaySegmentations.end()) {
+                        seg = retained->second;
+                    } else {
+                        seg = Segmentation::New(segPath);
+                        _overlaySegmentations.emplace(segPath.string(), seg);
+                    }
+                    auto surf = seg->loadSurface();
+                    if (!surf) {
+                        continue;
+                    }
+                    const std::string displayId = segment_display_id(folder.dirName, seg->id(), folder.currentFolder);
+                    apply_folder_metadata(surf.get(), folder, displayId);
+                    _multiFolderSurfaceIds.insert(displayId);
+                    if (_state) {
+                        _state->setSurface(displayId, surf, true, false);
+                    }
+                } catch (const std::exception& ex) {
+                    std::cout << "Failed to load segment from " << segPath << ": " << ex.what() << std::endl;
+                }
+            }
+        }
+
+        populateSurfaceTree();
+        applyFilters();
+        logSurfaceLoadSummary();
+        if (_filtersUpdated) {
+            _filtersUpdated();
+        }
+        if (_viewerManager) {
+            _viewerManager->primeSurfacePatchIndicesAsync();
+        }
+        emit surfacesLoaded();
+        return;
+    }
+
+    if (_viewerManager) {
+        _viewerManager->setSurfacePatchIndexCacheKey(folderSelectionCacheKey());
+    }
     if (reload) {
         // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
         if (_state) {
             auto names = _state->surfaceNames();
             for (const auto& name : names) {
+                if (preserveSurfaceDuringSegmentReload(name)) {
+                    continue;
+                }
                 _state->setSurface(name, nullptr, true, false);
             }
         }
@@ -260,6 +436,9 @@ void SurfacePanelController::loadSurfacesIncremental()
     }
 
     std::cout << "Starting incremental surface load..." << std::endl;
+    // Explicit disk refresh: also forget retained overlay-folder segmentations
+    // so the next full load re-reads them from disk.
+    _overlaySegmentations.clear();
     _volumePkg->refreshSegmentations();
     auto changes = detectSurfaceChanges();
 
@@ -437,8 +616,25 @@ void SurfacePanelController::populateSurfaceTree()
     const QSignalBlocker blocker{_ui.treeWidget};
     _ui.treeWidget->clear();
 
-    for (const auto& id : _volumePkg->segmentationIDs()) {
-        auto surf = _volumePkg->getSurface(id);
+    std::vector<std::string> ids;
+    if (!_visibleSegmentFolders.empty() && _state) {
+        // Surfaces from other checked folders stay loaded for viewer overlaps
+        // but are not listed in the tree.
+        ids = _state->surfaceNames();
+        ids.erase(std::remove_if(ids.begin(), ids.end(), [this](const std::string& id) {
+            return id == "segmentation" ||
+                   id == "xy plane" ||
+                   id == "seg xz" ||
+                   id == "seg yz" ||
+                   _multiFolderSurfaceIds.count(id) > 0;
+        }), ids.end());
+        std::sort(ids.begin(), ids.end());
+    } else {
+        ids = _volumePkg->segmentationIDs();
+    }
+
+    for (const auto& id : ids) {
+        auto surf = getSurfaceById(id);
 
         auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
@@ -446,6 +642,7 @@ void SurfacePanelController::populateSurfaceTree()
         if (surf) {
             set_surface_tree_item_text(item, id, surf.get());
             updateTreeItemIcon(item);
+            applyTransformWarningStyle(item);
         } else {
             delete item;
         }
@@ -549,6 +746,7 @@ void SurfacePanelController::addSingleSegmentation(const std::string& segId)
             item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
             set_surface_tree_item_text(item, segId, surf.get());
             updateTreeItemIcon(item);
+            applyTransformWarningStyle(item);
         }
     } catch (const std::exception& e) {
         std::cout << "Failed to add segmentation " << segId << ": " << e.what() << std::endl;
@@ -716,9 +914,18 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     const QString segmentId = selectedSegmentIds.isEmpty() ?
         item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() :
         selectedSegmentIds.front();
+    const std::string segmentIdStd = segmentId.toStdString();
+    const bool isCurrentFolderSegment = _volumePkg && _volumePkg->getSurface(segmentIdStd) != nullptr;
+    const bool allSelectedCurrentFolder = selectedSegmentIds.isEmpty()
+        ? isCurrentFolderSegment
+        : std::all_of(selectedSegmentIds.begin(),
+                      selectedSegmentIds.end(),
+                      [this](const QString& id) {
+                          return _volumePkg && _volumePkg->getSurface(id.toStdString()) != nullptr;
+                      });
 
     QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
-    const bool isLocal = (_volumePkg != nullptr);
+    const bool isLocal = isCurrentFolderSegment;
 
     if (isLocal) {
         std::string currentDir = _volumePkg->getSegmentationDirectory();
@@ -753,6 +960,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     QMenu* maskMenu = contextMenu.addMenu(tr("Mask"));
+    maskMenu->setEnabled(isCurrentFolderSegment);
     QAction* generateMaskAction = maskMenu->addAction(tr("Generate Segment Mask"));
     connect(generateMaskAction, &QAction::triggered, this, [this, segmentId]() {
         emit generateSegmentMaskRequested(segmentId);
@@ -765,11 +973,12 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     contextMenu.addSeparator();
 
     QAction* growSegmentAction = contextMenu.addAction(tr("Run Trace"));
+    growSegmentAction->setEnabled(isCurrentFolderSegment);
     connect(growSegmentAction, &QAction::triggered, this, [this, segmentId]() {
         emit growSegmentRequested(segmentId);
     });
 
-    if (_volumePkg) {
+    if (_volumePkg && isCurrentFolderSegment) {
         QMenu* copySurfaceMenu = contextMenu.addMenu(tr("Copy Surface"));
         if (selectedSegmentIds.size() == 1) {
             QAction* copySurfaceAction = copySurfaceMenu->addAction(tr("Copy Surface..."));
@@ -848,24 +1057,29 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     contextMenu.addSeparator();
 
     QAction* renderAction = contextMenu.addAction(tr("Render segment"));
+    renderAction->setEnabled(isCurrentFolderSegment);
     connect(renderAction, &QAction::triggered, this, [this, segmentId]() {
         emit renderSegmentRequested(segmentId);
     });
 
     QAction* convertToObjAction = contextMenu.addAction(tr("Convert to OBJ"));
+    convertToObjAction->setEnabled(isCurrentFolderSegment);
     connect(convertToObjAction, &QAction::triggered, this, [this, segmentId]() {
         emit convertToObjRequested(segmentId);
     });
     QAction* visObjAction = contextMenu.addAction(tr("Lasagna Vis as OBJ"));
+    visObjAction->setEnabled(isCurrentFolderSegment);
     connect(visObjAction, &QAction::triggered, this, [this, segmentId]() {
         emit visLasagnaObjRequested(segmentId);
     });
     QAction* cropBoundsAction = contextMenu.addAction(tr("Crop bounds to valid region"));
+    cropBoundsAction->setEnabled(isCurrentFolderSegment);
     connect(cropBoundsAction, &QAction::triggered, this, [this, segmentId]() {
         emit cropBoundsRequested(segmentId);
     });
 
     QMenu* flipMenu = contextMenu.addMenu(tr("Flip Surface"));
+    flipMenu->setEnabled(isCurrentFolderSegment);
     QAction* flipUAction = flipMenu->addAction(tr("V Flip"));
     connect(flipUAction, &QAction::triggered, this, [this, segmentId]() {
         emit flipURequested(segmentId);
@@ -880,26 +1094,31 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     QAction* rotateAction = contextMenu.addAction(tr("Rotate Surface 90° CW"));
+    rotateAction->setEnabled(isCurrentFolderSegment);
     connect(rotateAction, &QAction::triggered, this, [this, segmentId]() {
         emit rotateSurfaceRequested(segmentId);
     });
 
     QAction* refineAlphaCompAction = contextMenu.addAction(tr("Refine (Alpha-comp)"));
+    refineAlphaCompAction->setEnabled(isCurrentFolderSegment);
     connect(refineAlphaCompAction, &QAction::triggered, this, [this, segmentId]() {
         emit alphaCompRefineRequested(segmentId);
     });
 
     QAction* slimFlattenAction = contextMenu.addAction(tr("SLIM-flatten"));
+    slimFlattenAction->setEnabled(isCurrentFolderSegment);
     connect(slimFlattenAction, &QAction::triggered, this, [this, segmentId]() {
         emit slimFlattenRequested(segmentId);
     });
 
     QAction* straightenAction = contextMenu.addAction(tr("Straighten (vc_straighten)"));
+    straightenAction->setEnabled(isCurrentFolderSegment);
     connect(straightenAction, &QAction::triggered, this, [this, segmentId]() {
         emit straightenRequested(segmentId);
     });
 
     QAction* abfFlattenAction = contextMenu.addAction(tr("ABF++ flatten"));
+    abfFlattenAction->setEnabled(isCurrentFolderSegment);
     connect(abfFlattenAction, &QAction::triggered, this, [this, segmentId]() {
         emit abfFlattenRequested(segmentId);
     });
@@ -907,11 +1126,13 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     contextMenu.addSeparator();
 
     QAction* exportChunksAction = contextMenu.addAction(tr("Export width-chunks (40k px)"));
+    exportChunksAction->setEnabled(isCurrentFolderSegment);
     connect(exportChunksAction, &QAction::triggered, this, [this, segmentId]() {
         emit exportTifxyzChunksRequested(segmentId);
     });
 
     QAction* rasterizeAction = contextMenu.addAction(tr("Rasterize"));
+    rasterizeAction->setEnabled(allSelectedCurrentFolder);
     connect(rasterizeAction, &QAction::triggered, this, [this, selectedSegmentIds, segmentId]() {
         QStringList rasterizeTargets = selectedSegmentIds;
         if (rasterizeTargets.isEmpty()) {
@@ -922,7 +1143,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
 
     // Merge tifxyz only makes sense for >=2 surfaces; gate on selection
     // so it doesn't appear when the user right-clicks a single segment.
-    if (selectedSegmentIds.size() >= 2) {
+    if (selectedSegmentIds.size() >= 2 && allSelectedCurrentFolder) {
         QAction* mergeAction = contextMenu.addAction(tr("Merge tifxyz..."));
         connect(mergeAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
             emit mergeTifxyzRequested(selectedSegmentIds);
@@ -931,7 +1152,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     // Patch tifxyz is exactly-2-input; gate to exactly 2 selected segments
     // so the dialog opens with both pickers pre-filled and the user can
     // dial in border / blend without picking inputs.
-    if (selectedSegmentIds.size() == 2) {
+    if (selectedSegmentIds.size() == 2 && allSelectedCurrentFolder) {
         QAction* patchAction = contextMenu.addAction(tr("Patch tifxyz..."));
         connect(patchAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
             emit mergePatchRequested(selectedSegmentIds);
@@ -939,6 +1160,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     }
 
     QAction* addIgnoreLabelAction = contextMenu.addAction(tr("Add ignore label"));
+    addIgnoreLabelAction->setEnabled(isCurrentFolderSegment);
     connect(addIgnoreLabelAction, &QAction::triggered, this, [this]() {
         emit addIgnoreLabelRequested();
     });
@@ -951,6 +1173,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     contextMenu.addSeparator();
 
     QAction* recalcAreaAction = contextMenu.addAction(tr("Recalculate Area from Mask"));
+    recalcAreaAction->setEnabled(allSelectedCurrentFolder);
     connect(recalcAreaAction, &QAction::triggered, this, [this, recalcTargets]() {
         emit recalcAreaRequested(recalcTargets);
     });
@@ -972,7 +1195,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
 
     contextMenu.addSeparator();
 
-    const std::string segmentIdStd = segmentId.toStdString();
     QAction* highlightAction = contextMenu.addAction(tr("Highlight in slice views"));
     highlightAction->setCheckable(true);
     highlightAction->setChecked(_highlightedSurfaceIds.count(segmentIdStd) > 0);
@@ -1149,6 +1371,8 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
         _filters.currentOnly->setText(tr("Current Segment Only"));
         _filters.currentOnly->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
         _filters.currentOnly->setMinimumWidth(_filters.currentOnly->sizeHint().width());
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _filters.currentOnly->setChecked(settings.value(kCurrentOnlyFilterSettingsKey, false).toBool());
         _filters.currentOnly->show();
     }
 
@@ -1197,6 +1421,46 @@ void SurfacePanelController::syncSelectionUi(const std::string& surfaceId, QuadS
     if (isCurrentOnlyFilterEnabled()) {
         applyFilters();
     }
+}
+
+bool SurfacePanelController::selectSurfaceById(const std::string& surfaceId)
+{
+    if (!_ui.treeWidget || surfaceId.empty()) {
+        return false;
+    }
+
+    const QString idQString = QString::fromStdString(surfaceId);
+    QTreeWidgetItem* targetItem = nullptr;
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
+            targetItem = *it;
+            break;
+        }
+        ++it;
+    }
+
+    auto surface = getSurfaceById(surfaceId);
+    if (!targetItem || !surface) {
+        return false;
+    }
+
+    {
+        const QSignalBlocker blocker{_ui.treeWidget};
+        _ui.treeWidget->clearSelection();
+        targetItem->setSelected(true);
+        _ui.treeWidget->scrollToItem(targetItem);
+    }
+
+    syncSelectionUi(surfaceId, surface.get());
+
+    if (_segmentationViewerProvider) {
+        if (auto* viewer = _segmentationViewerProvider()) {
+            viewer->setWindowTitle(tr("Surface %1").arg(idQString));
+        }
+    }
+
+    return true;
 }
 
 void SurfacePanelController::resetTagUi()
@@ -1310,6 +1574,49 @@ void SurfacePanelController::setSelectionLocked(bool locked)
     }
 }
 
+void SurfacePanelController::setTransformWarning(const QString& warningText)
+{
+    _transformWarningText = warningText;
+    if (!_ui.treeWidget) {
+        return;
+    }
+
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if (auto* item = dynamic_cast<SurfaceTreeWidgetItem*>(*it)) {
+            applyTransformWarningStyle(item);
+        }
+        ++it;
+    }
+}
+
+void SurfacePanelController::setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders)
+{
+    _visibleSegmentFolders = std::move(folders);
+}
+
+void SurfacePanelController::applyTransformWarningStyle(SurfaceTreeWidgetItem* item)
+{
+    if (!item) {
+        return;
+    }
+
+    const bool warning = !_transformWarningText.isEmpty();
+    const QBrush foreground = warning ? QBrush(QColor(QStringLiteral("#c62828"))) : QBrush();
+    for (int column = SURFACE_ID_COLUMN; column <= TIMESTAMP_COLUMN; ++column) {
+        item->setForeground(column, foreground);
+        if (warning) {
+            item->setToolTip(column, _transformWarningText);
+        } else if (column == SURFACE_ID_COLUMN) {
+            item->setToolTip(column, item->text(column));
+        } else if (column == SURFACE_LONG_ID_COLUMN) {
+            item->setToolTip(column, item->text(column));
+        } else {
+            item->setToolTip(column, QString());
+        }
+    }
+}
+
 void SurfacePanelController::setupSurfaceColumnMenu()
 {
     if (!_ui.treeWidget || !_ui.treeWidget->header()) {
@@ -1334,7 +1641,10 @@ void SurfacePanelController::restoreSurfaceColumnVisibility()
             _ui.treeWidget->setColumnHidden(column, false);
             continue;
         }
-        const bool visible = settings.value(surface_column_settings_key(column), true).toBool();
+        const QString key = surface_column_settings_key(column);
+        const bool visible = settings.contains(key)
+            ? settings.value(key).toBool()
+            : surface_column_default_visible(column);
         _ui.treeWidget->setColumnHidden(column, !visible);
     }
 }
@@ -1504,7 +1814,13 @@ void SurfacePanelController::connectFilterSignals()
     connectToggle(_filters.noDefective);
     connectToggle(_filters.hideUnapproved);
     connectToggle(_filters.inspectOnly);
-    connectToggle(_filters.currentOnly);
+    if (_filters.currentOnly) {
+        connect(_filters.currentOnly, &QCheckBox::toggled, this, [this](bool checked) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(kCurrentOnlyFilterSettingsKey, checked);
+            applyFilters();
+        });
+    }
 
     if (_filters.partialReview) {
         connect(_filters.partialReview, &QCheckBox::toggled, this, [this](bool checked) {
@@ -1891,6 +2207,12 @@ void SurfacePanelController::applyFiltersInternal()
             }
             ++visIt;
         }
+        for (const auto& id : _multiFolderSurfaceIds) {
+            auto surf = getSurfaceById(id);
+            if (surf) {
+                out.insert(id);
+            }
+        }
     };
 
     if (!hasActiveFilters) {
@@ -2080,10 +2402,15 @@ void SurfacePanelController::applyFiltersInternal()
     intersects.clear();
     intersects.insert("segmentation");
     if (currentOnly) {
-        // Only show the current segment's intersection line.
-        // If no segment is selected, just show "segmentation" alone.
+        // Limit the current segmentation folder to the selected segment while
+        // preserving checked comparison folders.
         if (!_currentSurfaceId.empty() && getSurfaceById(_currentSurfaceId)) {
             intersects.insert(_currentSurfaceId);
+        }
+        for (const auto& id : _multiFolderSurfaceIds) {
+            if (getSurfaceById(id)) {
+                intersects.insert(id);
+            }
         }
     } else {
         collectVisibleSurfaces(intersects);
@@ -2239,18 +2566,18 @@ void SurfacePanelController::applyHighlightSelection(const std::string& id, bool
 
 std::shared_ptr<QuadSurface> SurfacePanelController::getSurfaceById(const std::string& id) const
 {
-    // Try volumePkg first (local mode)
-    if (_volumePkg) {
-        auto surf = _volumePkg->getSurface(id);
-        if (surf) {
-            return surf;
-        }
-    }
-    // Fall back to CState (remote mode)
+    // Multi-folder display IDs live only in CState. Prefer it so folder-qualified
+    // entries such as "paths/foo" resolve before falling back to VolumePkg.
     if (_state) {
         auto surf = _state->surface(id);
         if (surf) {
             return std::dynamic_pointer_cast<QuadSurface>(surf);
+        }
+    }
+    if (_volumePkg) {
+        auto surf = _volumePkg->getSurface(id);
+        if (surf) {
+            return surf;
         }
     }
     return nullptr;

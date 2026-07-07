@@ -252,6 +252,11 @@ The 1.1 µm vs 2.4 µm ink-comparison caption rendered as "AT 1.1 ΜM: ]ΟΥ̓Δ
 The six callouts showed the default tip lightbulb; the post's own convention is the 🙋 raising-hand ("look for the 🙋 callouts"). The `:::tip` blocks are now `<Admonition type="tip" icon="🙋" title="How you can help">` (import added). Icon renders monochrome like every admonition emoji site-wide (intentional chrome.css treatment).
 **Files:** `docs/37_tech_blogpost.md`.
 
+## C29 — merge main into website-restyle
+
+Brings the branch current with main: the data page rewrite (dataset naming, deprecated samples endpoint, 2026 pre-print reference, EduceLab "scanned at DLS before 2025" scoping), the PHerc. Paris 4 publication notice + per-scroll license scopes (PR #1117), and the PHerc. 1667 DLS→ESRF scan-history correction (PR #1118). One conflict in `docs/02_data.md` (a "scroll-only or fragment-only views" sentence main had deleted — deletion kept). The atlas auto-merge preserved both sides: restyle's `phercLabel` display labels + segment folder/copy-S3 links, and main's `legalNotice`/`licenseScope`/curated-licenses pipeline.
+**Files:** merge commit (docs/02_data.md resolved by hand; genAtlasData.js, ScrollDetailPage.js, DataCatalog.js, atlasOverlay.json auto-merged).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

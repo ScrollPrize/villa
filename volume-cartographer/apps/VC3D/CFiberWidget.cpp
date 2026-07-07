@@ -545,6 +545,12 @@ void CFiberWidget::setupUi()
             this, &CFiberWidget::onRecalculateHvScoreClicked);
 
     auto* buttonLayout = new QHBoxLayout();
+    _importButton = new QPushButton(tr("Import"), mainWidget);
+    _importButton->setObjectName(QStringLiteral("fiberImportButton"));
+    buttonLayout->addWidget(_importButton);
+    _exportButton = new QPushButton(tr("Export"), mainWidget);
+    _exportButton->setObjectName(QStringLiteral("fiberExportButton"));
+    buttonLayout->addWidget(_exportButton);
     _deleteButton = new QPushButton(tr("Delete"), mainWidget);
     _deleteButton->setObjectName(QStringLiteral("fiberDeleteButton"));
     _deleteButton->setEnabled(false);
@@ -552,6 +558,12 @@ void CFiberWidget::setupUi()
     buttonLayout->addStretch(1);
     layout->addLayout(buttonLayout);
 
+    connect(_importButton, &QPushButton::clicked, this, [this]() {
+        emit importFibersRequested();
+    });
+    connect(_exportButton, &QPushButton::clicked, this, [this]() {
+        emit exportFibersRequested();
+    });
     connect(_deleteButton, &QPushButton::clicked, this, &CFiberWidget::onDeleteClicked);
 
     updateClassificationUi();

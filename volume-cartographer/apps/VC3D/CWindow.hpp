@@ -7,8 +7,10 @@
 #include <opencv2/core/mat.hpp>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QColor>
 #include <QPointer>
 #include <QString>
+#include <QStringList>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -26,6 +28,7 @@
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
+#include "OpenDataManifest.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -55,6 +58,7 @@ class QuadSurface;
 class RenderBenchRecorder;
 class RenderBenchReplay;
 class QTreeWidget;
+class QStandardItemModel;
 
 // Render-bench profiling modes (see RenderBenchRecorder/RenderBenchReplay).
 struct RenderBenchOptions {
@@ -105,6 +109,9 @@ class ViewerTransformsPanel;
 class LineAnnotationController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
+class StatusDockPanelHost;
+class ViewerCompositePanel;
+class LineAnnotationDialog;
 
 class CWindow : public QMainWindow
 {
@@ -173,17 +180,22 @@ private:
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void switchToFiberSliceWorkspace();
+    void openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title);
     void repeatLastLasagnaAction();
     void selectLasagnaOutputSegment(const QString& outputName);
 
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);
+    void updateVolumePackageEmptyState();
+    void showStatusBarMessage(const QString& text, int timeout = 0);
+    void clearStatusBarMessage();
 
 
     // Helper method for command line tools
     bool initializeCommandLineRunner(void);
 
     VolumeViewerBase *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
+    VolumeViewerBase* newConnectedViewerInWidget(std::string surfaceName, QString title, QWidget* parent);
     void closeEvent(QCloseEvent* event) override;
 
     void setWidgetsEnabled(bool state);
@@ -212,6 +224,9 @@ private:
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
     void updateSurfaceOverlayDropdown();
     void onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles);
+    void showSurfaceOverlaySelectionDialog();
+    void applySurfaceOverlaySelection();
+    void updateSurfaceOverlayButtonText();
     QColor getOverlayColor(size_t index) const;
     cv::Vec3b getOverlayColorBGR(size_t index) const;
 
@@ -239,13 +254,25 @@ private slots:
     std::vector<QComboBox*> volumeSelectionControls() const;
     void connectVolumeSelector(QComboBox* selector);
     void clearSurfaceSelection();
+    QString lastVolumeSettingKeyForCurrentPackage() const;
+    QString rememberedVolumeIdForCurrentPackage() const;
+    void rememberCurrentVolumeForPackage(const QString& volumeId) const;
+    const vc3d::opendata::OpenDataManifest* cachedOpenDataManifest() const;
+    std::string openDataVolumeIdForLoadedVolumeId(const std::string& volumeId) const;
+    std::optional<cv::Matx44d> openDataVolumeTransformForSwitch(
+        const std::string& fromLoadedVolumeId,
+        const std::string& toLoadedVolumeId) const;
+    void updateOpenDataSegmentTransformState(bool showDialog = true);
+    void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
+    bool restoreActiveSurfaceAfterSurfaceReload(const std::string& surfaceId);
     // Attaches the render-bench recorder once a volume+segment are active (no-op
     // unless --record was passed and the recorder isn't already attached).
     void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
     void onZScrollSensitivityChanged(double sensitivity);
+    void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
     void onNewFiberRequested();
@@ -253,6 +280,11 @@ private slots:
     void onFiberViewersRequested();
     void onFiberAnnotationFinished(uint64_t fiberId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
+    void refreshSegmentationDirectoryDropdown();
+    void applySegmentFolderSelection(bool reloadSurfaces);
+    void showSegmentFolderPaletteMenu(int row);
+    QColor defaultSegmentFolderColor(const QString& dirName) const;
+    QString effectiveDefaultSegmentFolderDir() const;
 
 private:
     CState* _state;
@@ -260,6 +292,12 @@ private:
     QComboBox* volSelect{nullptr};
     std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
     QComboBox* cmbSegmentationDir;
+    QStandardItemModel* _segmentDirModel{nullptr};
+    bool _updatingSegmentDirUi{false};
+    std::map<QString, QColor> _segmentFolderSolidColors;
+    QString _segmentFolderDefaultPaletteDir;
+    mutable bool _openDataManifestLoadAttempted{false};
+    mutable std::optional<vc3d::opendata::OpenDataManifest> _openDataManifestCache;
 
 
     SeedingWidget* _seedingWidget;
@@ -278,19 +316,28 @@ private:
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
     QLabel* _segmentationGrowthWarning{nullptr};
+    QLabel* _segmentTransformWarning{nullptr};
+    QLabel* _statusMessageLabel{nullptr};
+    QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _sliceStepLabel{nullptr};
+    QTimer* _statusMessageTimer{nullptr};
     QString _segmentationGrowthStatusText;
+    QString _lastSegmentTransformWarningVolumeId;
+    bool _relayingNativeStatusMessage{false};
 
 
     Ui_VCMainWindow ui;
     QTabWidget* _workspaceTabs{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
+    StatusDockPanelHost* _statusDockPanelHost{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
+    QDockWidget* _inkDetectionDock{nullptr};
+    QDockWidget* _transformsDock{nullptr};
     AtlasControlPointsDock* _atlasControlDock{nullptr};
     QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
     QDockWidget* _atlasWorkspaceFiberDock{nullptr};
@@ -316,6 +363,7 @@ private:
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
     QMdiArea* _intersectionsMdiArea{nullptr};
+    VolumeViewerBase* _activeBaseViewer{nullptr};
 
     bool can_change_volume_();
 
@@ -324,6 +372,7 @@ private:
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
     std::unique_ptr<ViewerControlsPanel> _viewerControlsPanel;
+    ViewerCompositePanel* _viewerCompositePanel{nullptr};
     bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 

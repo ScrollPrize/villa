@@ -348,6 +348,11 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 
     _surfs[name] = surf;
+    if (!sameSurface) {
+        // Edit updates re-set the same pointer every frame; only a mapping
+        // change should invalidate cached views of the surface map.
+        ++_surfacesVersion;
+    }
 
     if (!noSignalSend || surf == nullptr) {
         emit surfaceChanged(name, surf, isEditUpdate);

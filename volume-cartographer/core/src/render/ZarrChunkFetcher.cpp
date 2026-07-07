@@ -1,5 +1,6 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/util/CacheCompression.hpp"
 
 #include <utils/http_fetch.hpp>
 #include <utils/zarr.hpp>
@@ -138,8 +139,13 @@ class ZarrChunkFetcher final : public IChunkFetcher {
 public:
     explicit ZarrChunkFetcher(utils::ZarrArray array)
         : array_(std::make_unique<utils::ZarrArray>(std::move(array)))
-        , persistEncodedC3d_(array_->stores_chunks_with_codec("c3d"))
     {
+        // Source encodings already compact enough to persist verbatim,
+        // avoiding a decode+re-encode round trip on the cache writer.
+        if (array_->stores_chunks_with_codec("c3d"))
+            persistEncodedExtension_ = ".c3d";
+        else if (array_->stores_chunks_with_codec(vc::kVcz1CodecName))
+            persistEncodedExtension_ = vc::kCompressedCacheExtension;
     }
 
     ChunkFetchResult fetch(const ChunkKey& key) override
@@ -151,7 +157,7 @@ public:
             static_cast<std::size_t>(key.ix)};
 
         try {
-            if (persistEncodedC3d_) {
+            if (!persistEncodedExtension_.empty()) {
                 auto encoded = array_->read_chunk_encoded(indices);
                 if (!encoded) {
                     result.status = ChunkFetchStatus::Missing;
@@ -190,7 +196,7 @@ public:
 
     std::string persistentCacheExtension(const ChunkKey&) const override
     {
-        return persistEncodedC3d_ ? ".c3d" : ".bin";
+        return persistEncodedExtension_.empty() ? ".bin" : persistEncodedExtension_;
     }
 
     ChunkFetchResult decodePersistentBytes(
@@ -200,7 +206,7 @@ public:
         ChunkFetchResult result;
         try {
             result.status = ChunkFetchStatus::Found;
-            if (persistEncodedC3d_) {
+            if (!persistEncodedExtension_.empty()) {
                 result.hasPersistentBytes = true;
                 result.persistentBytes = std::move(bytes);
                 result.bytes = array_->decode_chunk_payload(
@@ -218,7 +224,7 @@ public:
 
 private:
     std::unique_ptr<utils::ZarrArray> array_;
-    bool persistEncodedC3d_ = false;
+    std::string persistEncodedExtension_;
 };
 
 std::array<int, 3> toArray3(const std::vector<std::size_t>& values, const char* name)

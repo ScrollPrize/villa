@@ -1,16 +1,20 @@
 #pragma once
 
 #include <QObject>
+#include <QColor>
 #include <QPointF>
 #include <QString>
 #include <QStringList>
 
 #include <functional>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <unordered_set>
 #include <vector>
 
 class CState;
+class Segmentation;
 class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
@@ -76,6 +80,14 @@ public:
         Inspect,
     };
 
+    struct SegmentFolderSelection {
+        std::string dirName;
+        std::filesystem::path path;
+        bool currentFolder{false};
+        bool defaultPalette{false};
+        QColor color;
+    };
+
     SurfacePanelController(const UiRefs& ui,
                            CState* state,
                            ViewerManager* viewerManager,
@@ -100,6 +112,7 @@ public:
     void applyFilters();
 
     void syncSelectionUi(const std::string& surfaceId, QuadSurface* surface);
+    bool selectSurfaceById(const std::string& surfaceId);
     void resetTagUi();
 
     bool isCurrentOnlyFilterEnabled() const;
@@ -108,6 +121,8 @@ public:
     void reloadSurfacesFromDisk();
     void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
+    void setTransformWarning(const QString& warningText);
+    void setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
     bool cycleToNextVisibleSegment();
@@ -184,7 +199,9 @@ private:
                                bool enabledReviewed,
                                bool enabledInspect);
     void logSurfaceLoadSummary() const;
+    QString folderSelectionCacheKey() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
+    void applyTransformWarningStyle(SurfaceTreeWidgetItem* item);
     bool cycleVisibleSegment(int direction);
     std::shared_ptr<QuadSurface> getSurfaceById(const std::string& id) const;
 
@@ -204,5 +221,12 @@ private:
     bool _selectionLocked{false};
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};
+    QString _transformWarningText;
     std::unordered_set<std::string> _highlightedSurfaceIds;
+    std::vector<SegmentFolderSelection> _visibleSegmentFolders;
+    std::unordered_set<std::string> _multiFolderSurfaceIds;
+    // Segmentations loaded for non-current overlay folders, keyed by segment
+    // path. Retained so re-checking a folder (or switching back to a selection
+    // that includes it) reuses the already-loaded surfaces.
+    std::map<std::string, std::shared_ptr<Segmentation>> _overlaySegmentations;
 };

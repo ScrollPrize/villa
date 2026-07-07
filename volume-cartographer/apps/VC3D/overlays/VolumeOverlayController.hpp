@@ -12,9 +12,11 @@
 class ViewerManager;
 class VolumePkg;
 class Volume;
+class QCheckBox;
 class QComboBox;
 class QSpinBox;
 class QString;
+struct OverlayCompositeSettings;
 
 class VolumeOverlayController : public QObject
 {
@@ -26,6 +28,11 @@ public:
         QPointer<QComboBox> colormapSelect;
         QPointer<QSpinBox> opacitySpin;
         QPointer<QSpinBox> thresholdSpin;
+        QPointer<QSpinBox> maxDisplayedResolutionSpin;
+        QPointer<QCheckBox> compositeEnabledCheck;
+        QPointer<QComboBox> compositeMethodSelect;
+        QPointer<QSpinBox> compositeLayersFrontSpin;
+        QPointer<QSpinBox> compositeLayersBehindSpin;
     };
 
     explicit VolumeOverlayController(ViewerManager* manager, QObject* parent = nullptr);
@@ -53,11 +60,19 @@ private:
     void setOpacity(float value);
     void setThreshold(float value);
     void setWindowBounds(float low, float high);
+    OverlayCompositeSettings currentCompositeSettings() const;
+    void syncCompositeUi();
+    void pushCompositeToManager();
 
     void handleVolumeComboChanged(int index);
     void handleColormapChanged(int index);
     void handleOpacityChanged(int value);
     void handleThresholdChanged(int value);
+    void handleMaxDisplayedResolutionChanged(int value);
+    void handleCompositeEnabledChanged(bool enabled);
+    void handleCompositeMethodChanged(int index);
+    void handleCompositeLayersFrontChanged(int value);
+    void handleCompositeLayersBehindChanged(int value);
 
     ViewerManager* _viewerManager{nullptr};
     UiRefs _ui;
@@ -72,6 +87,11 @@ private:
     float _overlayOpacityBeforeToggle{0.5f};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
+    int _overlayMaxDisplayedResolution{0};
+    bool _compositeEnabled{false};
+    std::string _compositeMethod{"max"};
+    int _compositeLayersFront{8};
+    int _compositeLayersBehind{0};
     bool _overlayVisible{false};
 
     std::vector<QMetaObject::Connection> _connections;
