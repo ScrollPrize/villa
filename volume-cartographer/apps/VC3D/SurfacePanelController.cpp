@@ -62,6 +62,16 @@ constexpr double kZRangeFilterUpperDefault = 1000000.0;
 constexpr auto kSurfaceColumnSettingsGroup = "surface_panel/columns";
 constexpr auto kCurrentOnlyFilterSettingsKey = "surface_panel/filters/current_only";
 
+bool preserveSurfaceDuringSegmentReload(const std::string& name)
+{
+    return name == "segmentation" ||
+           name == "xy plane" ||
+           name == "xz plane" ||
+           name == "yz plane" ||
+           name == "seg xz" ||
+           name == "seg yz";
+}
+
 bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
 {
     if (!lower || !upper) {
@@ -274,6 +284,9 @@ void SurfacePanelController::loadSurfaces(bool reload)
             if (_state) {
                 auto names = _state->surfaceNames();
                 for (const auto& name : names) {
+                    if (preserveSurfaceDuringSegmentReload(name)) {
+                        continue;
+                    }
                     _state->setSurface(name, nullptr, true, false);
                 }
             }
@@ -334,6 +347,9 @@ void SurfacePanelController::loadSurfaces(bool reload)
         if (_state) {
             auto names = _state->surfaceNames();
             for (const auto& name : names) {
+                if (preserveSurfaceDuringSegmentReload(name)) {
+                    continue;
+                }
                 _state->setSurface(name, nullptr, true, false);
             }
         }

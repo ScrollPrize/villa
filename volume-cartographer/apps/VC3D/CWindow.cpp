@@ -4108,6 +4108,91 @@ void CWindow::clearSurfaceSelection()
     }
 }
 
+bool CWindow::restoreActiveSurfaceAfterSurfaceReload(const std::string& surfaceId)
+{
+    if (!_state || surfaceId.empty()) {
+        return false;
+    }
+
+    auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(surfaceId));
+    if (!surf && _state->vpkg()) {
+        surf = _state->vpkg()->getSurface(surfaceId);
+    }
+    if (!surf) {
+        return false;
+    }
+
+    std::vector<std::pair<VolumeViewerBase*, bool>> resetDefaults;
+    if (_viewerManager) {
+        _viewerManager->forEachBaseViewer([this, &resetDefaults](VolumeViewerBase* viewer) {
+            if (!viewer || viewer->surfName() != "segmentation") {
+                return;
+            }
+            const bool defaultReset = _viewerManager->resetDefaultFor(viewer);
+            resetDefaults.emplace_back(viewer, defaultReset);
+            viewer->setResetViewOnSurfaceChange(false);
+        });
+    }
+
+    _state->setActiveSurface(surfaceId, surf);
+    _state->setSurface("segmentation", surf, false, true);
+
+    for (auto& entry : resetDefaults) {
+        auto* viewer = entry.first;
+        if (viewer) {
+            viewer->setResetViewOnSurfaceChange(entry.second);
+        }
+    }
+
+    if (_surfacePanel) {
+        _surfacePanel->selectSurfaceById(surfaceId);
+    }
+
+    if (_segmentationModule) {
+        try {
+            _segmentationModule->onActiveSegmentChanged(surf.get());
+        } catch (const std::exception& e) {
+            qWarning() << "Failed to reactivate segment"
+                       << QString::fromStdString(surfaceId)
+                       << "after reloading surfaces:"
+                       << e.what();
+            return false;
+        }
+    }
+
+    if (_point_collection_widget) {
+        if (!surf->path.empty()) {
+            _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+        } else {
+            _point_collection_widget->clearCorrPointsResults();
+        }
+    }
+    if (_atlasControlDock) {
+        if (!surf->path.empty()) {
+            _atlasControlDock->loadResults(surf->path / "atlas_control_points_results.json");
+        } else {
+            _atlasControlDock->clearResults();
+        }
+    }
+
+    if (_viewerManager) {
+        _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
+            if (!viewer) {
+                return;
+            }
+            viewer->invalidateIntersect("segmentation");
+            viewer->renderIntersections("active segment restored after surface reload");
+            viewer->requestRender("active segment restored after surface reload");
+        });
+    }
+
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
+    maybeAttachBenchRecorder();
+    return true;
+}
+
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
     const bool hadVolume = static_cast<bool>(_state->currentVolume());
@@ -8737,7 +8822,7 @@ void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
             matchingEntry->location,
             vpkg->path().parent_path()).lexically_normal();
         if (currentPath != targetPath) {
-            clearSurfaceSelection();
+            const std::string previousActiveSurfaceId = _state->activeSurfaceId();
             vpkg->setOutputSegments(matchingEntry->location);
             vpkg->refreshSegmentations();
             refreshSegmentationDirectoryDropdown();
@@ -8745,6 +8830,10 @@ void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
                 _surfacePanel->setVolumePkg(vpkg);
                 _surfacePanel->loadSurfaces(true);
                 _surfacePanel->refreshPointSetFilterOptions();
+            }
+            if (!restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId)) {
+                clearSurfaceSelection();
+                _state->setSurface("segmentation", nullptr, true);
             }
         }
         setWarning(false);
@@ -9650,13 +9739,10 @@ void CWindow::applySegmentFolderSelection(bool reloadSurfaces)
 
     _surfacePanel->setVisibleSegmentFolders(std::move(folders));
     if (reloadSurfaces) {
-        _state->setSurface("segmentation", nullptr, true);
-        _state->clearActiveSurface();
-        if (treeWidgetSurfaces) {
-            treeWidgetSurfaces->clearSelection();
-        }
+        const std::string previousActiveSurfaceId = _state->activeSurfaceId();
         _surfacePanel->resetTagUi();
         _surfacePanel->loadSurfaces(true);
+        restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId);
     }
 }
 
@@ -9741,56 +9827,8 @@ void CWindow::onSegmentationDirChanged(int index)
             _surfacePanel->loadSurfaces(true);
         }
 
-        bool restoredActiveSurface = false;
-        if (!previousActiveSurfaceId.empty()) {
-            auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(previousActiveSurfaceId));
-            if (!surf && _state->vpkg()) {
-                surf = _state->vpkg()->getSurface(previousActiveSurfaceId);
-            }
-
-            if (surf) {
-                std::vector<std::pair<VolumeViewerBase*, bool>> resetDefaults;
-                if (_viewerManager) {
-                    _viewerManager->forEachBaseViewer([this, &resetDefaults](VolumeViewerBase* viewer) {
-                        if (!viewer || viewer->surfName() != "segmentation") {
-                            return;
-                        }
-                        const bool defaultReset = _viewerManager->resetDefaultFor(viewer);
-                        resetDefaults.emplace_back(viewer, defaultReset);
-                        viewer->setResetViewOnSurfaceChange(false);
-                    });
-                }
-
-                _state->setActiveSurface(previousActiveSurfaceId, surf);
-                _state->setSurface("segmentation", surf, false, true);
-
-                if (!resetDefaults.empty()) {
-                    const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
-                    for (auto& entry : resetDefaults) {
-                        auto* viewer = entry.first;
-                        if (!viewer) {
-                            continue;
-                        }
-                        viewer->setResetViewOnSurfaceChange(editingActive ? false : entry.second);
-                    }
-                }
-
-                if (_surfacePanel) {
-                    _surfacePanel->selectSurfaceById(previousActiveSurfaceId);
-                }
-                if (_segmentationModule) {
-                    try {
-                        _segmentationModule->onActiveSegmentChanged(surf.get());
-                    } catch (const std::exception& e) {
-                        qWarning() << "Failed to reactivate segment"
-                                   << QString::fromStdString(previousActiveSurfaceId)
-                                   << "after switching segmentation directory:"
-                                   << e.what();
-                    }
-                }
-                restoredActiveSurface = true;
-            }
-        }
+        const bool restoredActiveSurface =
+            restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId);
 
         if (!restoredActiveSurface) {
             _state->clearActiveSurface();

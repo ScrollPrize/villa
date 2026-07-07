@@ -266,6 +266,7 @@ private slots:
     void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
+    bool restoreActiveSurfaceAfterSurfaceReload(const std::string& surfaceId);
     // Attaches the render-bench recorder once a volume+segment are active (no-op
     // unless --record was passed and the recorder isn't already attached).
     void maybeAttachBenchRecorder();
