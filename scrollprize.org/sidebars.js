@@ -28,6 +28,7 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'get_started' },
         { type: 'doc', id: 'prizes' },
+        { type: 'doc', id: 'from_ash_to_text' },
         { type: 'doc', id: 'unwrapping' },
       ],
     },

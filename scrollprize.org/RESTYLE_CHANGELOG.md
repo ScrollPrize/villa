@@ -213,6 +213,16 @@ New `PrizePoolBanner` component at the top of /prizes: ember-bordered card showi
 Per Sean (bruniss) and Forrest's feedback: the per-segment "mesh ↗" .obj link (no current tool consumes .obj, and the linked obj was wrong) is replaced by **"files ↗"** — the segment's root folder (containing the tifxyz, surface volumes, and predictions) in the S3 file browser — plus a **"copy s3"** button that puts the rclone-able `s3://…/segments/<id>/` path on the clipboard. The folder is derived at generation time from any of the segment's data URLs.
 **Files:** `scripts/genAtlasData.js`, `src/components/atlas/InkSegmentsGallery.js`.
 
+## C23 — technical blogpost: "From Ash to Text" (July 2026)
+
+New page `/from_ash_to_text` converted from the team's Google Doc — a technical map of the whole scanning → unwrapping → ink-detection pipeline and where the community can help.
+
+- **Full image quality preserved**: the 26 figures come from the docx export's original media (up to 2048px wide, 23MB total), not the ~624px versions the markdown export embeds; built assets verified byte-identical to the originals.
+- Six "🙋 How you can help" callouts converted to `:::tip[How you can help]` admonitions; editorial placeholders stripped; all `$` KaTeX-escaped; og/twitter meta set.
+- **Placements**: sidebar Overview, directly above the outdated Virtual Unwrapping page; Get Started 2027-Grand-Prize box ("Starting point: From Ash to Text — the state of the pipeline") and Segmentation box (replaces the Virtual Unwrapping link); landing Virtual Unwrapping open-problem card CTA now "Chart the Path" → `/from_ash_to_text` (was /segmentation).
+- Verified: build green, zero horizontal overflow at 390px, no console errors, admonitions and tables render.
+**Files:** `docs/37_from_ash_to_text.md` (new), `static/img/ash2text/` (26 new images), `sidebars.js`, `docs/01_get_started.md`, `src/components/Landing.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
