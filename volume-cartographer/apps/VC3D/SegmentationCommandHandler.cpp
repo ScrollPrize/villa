@@ -2004,8 +2004,8 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     }
     outputDirPath = outDir.absolutePath();
 
-    QString normalGridPath;
-    if (_state && _state->vpkg()) {
+    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
+    if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
         const auto paths = _state->vpkg()->normalGridPaths();
         if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
     }
@@ -2184,8 +2184,8 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
     }
     outputDirPath = outDir.absolutePath();
 
-    QString normalGridPath;
-    if (_state && _state->vpkg()) {
+    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
+    if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
         const auto paths = _state->vpkg()->normalGridPaths();
         if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
     }

@@ -1,5 +1,6 @@
 #include "OpenDataCatalogWindow.hpp"
 
+#include "OpenDataNormalGrids.hpp"
 #include "OpenDataSegmentCache.hpp"
 #include "VCSettings.hpp"
 
@@ -25,6 +26,8 @@
 #include <QLineEdit>
 #include <QMetaObject>
 #include <QPixmap>
+#include <QPointer>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSaveFile>
@@ -43,8 +46,10 @@
 #include <QtConcurrent>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cmath>
+#include <memory>
 #include <exception>
 #include <limits>
 #include <utility>
@@ -149,6 +154,38 @@ QString optionalInt(std::optional<int> value)
 QString yesNo(bool value)
 {
     return value ? QStringLiteral("Yes") : QStringLiteral("No");
+}
+
+QString formatByteSize(std::uint64_t bytes)
+{
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    constexpr double kMiB = 1024.0 * 1024.0;
+    if (bytes >= static_cast<std::uint64_t>(kGiB)) {
+        return QStringLiteral("%1 GB").arg(bytes / kGiB, 0, 'f', 1);
+    }
+    if (bytes >= static_cast<std::uint64_t>(kMiB)) {
+        return QStringLiteral("%1 MB").arg(bytes / kMiB, 0, 'f', 1);
+    }
+    return QStringLiteral("%1 KB").arg(bytes / 1024.0, 0, 'f', 1);
+}
+
+QString normalGridsStatusDisplay(const std::filesystem::path& remoteRoot,
+                                 const std::string& sampleId,
+                                 const OpenDataVolume& volume)
+{
+    const auto state = normalGridsCacheState(remoteRoot, sampleId, volume);
+    if (!state.hasArtifact) {
+        return QStringLiteral("—");
+    }
+    if (state.complete) {
+        return QObject::tr("All (%1)").arg(formatByteSize(state.totalBytes));
+    }
+    if (state.cachedFiles > 0) {
+        return QObject::tr("%1 cached (%2 files)")
+            .arg(formatByteSize(state.cachedBytes))
+            .arg(state.cachedFiles);
+    }
+    return QObject::tr("Not cached");
 }
 
 QString cacheStateDisplay(OpenDataSegmentCacheState state)
@@ -448,7 +485,7 @@ void OpenDataCatalogWindow::buildUi()
     auto* volumesPage = new QWidget(_tabs);
     auto* volumesLayout = new QVBoxLayout(volumesPage);
     _volumesTable = new QTableWidget(volumesPage);
-    _volumesTable->setColumnCount(8);
+    _volumesTable->setColumnCount(9);
     _volumesTable->setHorizontalHeaderLabels({
         tr("Volume ID"),
         tr("Scan ID"),
@@ -457,6 +494,7 @@ void OpenDataCatalogWindow::buildUi()
         tr("Energy"),
         tr("Detector distance"),
         tr("Format"),
+        tr("Normal grids"),
         tr("Created")
     });
     _volumesTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -465,9 +503,14 @@ void OpenDataCatalogWindow::buildUi()
     _volumesTable->horizontalHeader()->setStretchLastSection(true);
     _volumesTable->verticalHeader()->hide();
     auto* volumeActions = new QHBoxLayout;
+    _downloadNormalGridsButton = new QPushButton(tr("Download Normal Grids"), volumesPage);
+    _downloadNormalGridsButton->setToolTip(
+        tr("Download the volume's full normal-grid store into the remote cache. "
+           "Not required: normal grids stream on demand as they are used."));
     _copyVolumeUrlButton = new QPushButton(tr("Copy URL"), volumesPage);
     _openVolumeUrlButton = new QPushButton(tr("Open URL"), volumesPage);
     volumeActions->addStretch(1);
+    volumeActions->addWidget(_downloadNormalGridsButton);
     volumeActions->addWidget(_copyVolumeUrlButton);
     volumeActions->addWidget(_openVolumeUrlButton);
     volumesLayout->addWidget(_volumesTable, 1);
@@ -551,6 +594,8 @@ void OpenDataCatalogWindow::buildUi()
             this, &OpenDataCatalogWindow::updateActionButtons);
     connect(_copyVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedVolumeUrl);
     connect(_openVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedVolumeUrl);
+    connect(_downloadNormalGridsButton, &QPushButton::clicked,
+            this, &OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids);
     connect(_copySegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedSegmentUrl);
     connect(_openSegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentUrl);
     connect(_cacheSegmentButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::cacheSelectedSegment);
@@ -808,7 +853,9 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
         _volumesTable->setItem(row, 4, item(optionalNumber(volume.energyKeV, 'f', 1)));
         _volumesTable->setItem(row, 5, item(optionalNumber(volume.detectorDistanceMm, 'f', 1)));
         _volumesTable->setItem(row, 6, item(qstr(volume.dataFormat)));
-        _volumesTable->setItem(row, 7, item(qstr(volume.createdAt)));
+        _volumesTable->setItem(row, 7,
+                               item(normalGridsStatusDisplay(remoteRoot, sample->id, volume)));
+        _volumesTable->setItem(row, 8, item(qstr(volume.createdAt)));
     }
     _volumesTable->resizeColumnsToContents();
 
@@ -1103,6 +1150,21 @@ void OpenDataCatalogWindow::updateActionButtons()
             ? tr("Re-sync Local Data")
             : tr("Sync Local Data"));
     }
+    if (_downloadNormalGridsButton) {
+        const auto* volume = selectedVolume();
+        bool canDownload = false;
+        QString text = tr("Download Normal Grids");
+        if (sample && volume) {
+            const auto gridsState = normalGridsCacheState(remoteRoot, sample->id, *volume);
+            if (gridsState.complete) {
+                text = tr("Normal Grids Downloaded");
+            } else {
+                canDownload = gridsState.hasArtifact;
+            }
+        }
+        _downloadNormalGridsButton->setEnabled(canDownload);
+        _downloadNormalGridsButton->setText(text);
+    }
     if (_copyVolumeUrlButton) {
         _copyVolumeUrlButton->setEnabled(hasVolumeUrl);
     }
@@ -1161,6 +1223,123 @@ void OpenDataCatalogWindow::openSelectedVolumeUrl()
     if (!url.isEmpty()) {
         QDesktopServices::openUrl(QUrl(url));
     }
+}
+
+void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()
+{
+    const auto* sample = selectedSample();
+    const auto* volume = selectedVolume();
+    if (!sample || !volume) {
+        return;
+    }
+
+    OpenDataNormalGridsInfo info;
+    info.sampleId = sample->id;
+    info.volumeId = volume->id;
+    info.url = normalGridsArtifactUrl(*volume);
+    if (info.url.empty()) {
+        return;
+    }
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const QString volumeLabel = qstr(volume->id);
+    const int volumeRow = _volumesTable ? _volumesTable->currentRow() : -1;
+
+    auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
+    auto* dialog = new QProgressDialog(
+        tr("Listing normal grid files for volume %1...").arg(volumeLabel),
+        tr("Cancel"), 0, 0, this);
+    dialog->setWindowTitle(tr("Downloading Normal Grids"));
+    dialog->setWindowModality(Qt::WindowModal);
+    dialog->setMinimumDuration(0);
+    dialog->setAutoClose(false);
+    dialog->setAutoReset(false);
+    dialog->show();
+    QPointer<QProgressDialog> dialogGuard(dialog);
+    connect(dialog, &QProgressDialog::canceled, this, [cancelFlag]() {
+        cancelFlag->store(true, std::memory_order_release);
+    });
+
+    auto progressCallback =
+        [dialogGuard, volumeLabel](const NormalGridsDownloadProgress& progress) {
+            if (!dialogGuard) {
+                return;
+            }
+            QMetaObject::invokeMethod(
+                dialogGuard.data(),
+                [dialogGuard, volumeLabel, progress]() {
+                    if (!dialogGuard) {
+                        return;
+                    }
+                    if (progress.totalFiles <= 0) {
+                        dialogGuard->setLabelText(
+                            tr("Listing normal grid files for volume %1...").arg(volumeLabel));
+                        return;
+                    }
+                    const int done = progress.completedFiles + progress.failedFiles;
+                    QString label =
+                        tr("Downloading normal grids for volume %1 with %2 worker(s): "
+                           "%3/%4 files (%5 / %6).")
+                            .arg(volumeLabel)
+                            .arg(kNormalGridsDownloadWorkers)
+                            .arg(done)
+                            .arg(progress.totalFiles)
+                            .arg(formatByteSize(progress.completedBytes),
+                                 formatByteSize(progress.totalBytes));
+                    if (progress.failedFiles > 0) {
+                        label += tr("\nFailures: %1").arg(progress.failedFiles);
+                    }
+                    dialogGuard->setMaximum(progress.totalFiles);
+                    dialogGuard->setValue(std::min(done, progress.totalFiles));
+                    dialogGuard->setLabelText(label);
+                },
+                Qt::QueuedConnection);
+        };
+
+    struct DownloadResult {
+        std::filesystem::path dir;
+        std::string error;
+    };
+
+    QFutureWatcher<DownloadResult> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<DownloadResult>::finished, &loop, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([info, remoteRoot, progressCallback, cancelFlag]() {
+        DownloadResult result;
+        result.dir = downloadOpenDataNormalGrids(
+            info,
+            remoteRoot,
+            kNormalGridsDownloadWorkers,
+            progressCallback,
+            cancelFlag.get(),
+            &result.error);
+        return result;
+    }));
+    if (!watcher.isFinished()) {
+        loop.exec();
+    }
+    const DownloadResult result = watcher.result();
+    if (dialogGuard) {
+        dialogGuard->close();
+        dialogGuard->deleteLater();
+    }
+
+    if (result.dir.empty()) {
+        setStatus(cancelFlag->load(std::memory_order_acquire)
+                      ? tr("Normal grid download for %1 cancelled.").arg(volumeLabel)
+                      : tr("Normal grid download for %1 failed: %2")
+                            .arg(volumeLabel, qstr(result.error)));
+    } else {
+        setStatus(tr("Normal grids for %1 downloaded to %2.")
+                      .arg(volumeLabel, qstr(result.dir.string())));
+    }
+
+    // Refresh the volume's status cell and the button state.
+    if (_volumesTable && volumeRow >= 0 && volumeRow < _volumesTable->rowCount() &&
+        selectedSample() == sample) {
+        _volumesTable->setItem(
+            volumeRow, 7, item(normalGridsStatusDisplay(remoteRoot, sample->id, *volume)));
+    }
+    updateActionButtons();
 }
 
 void OpenDataCatalogWindow::copySelectedSegmentUrl()

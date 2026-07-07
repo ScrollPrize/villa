@@ -79,6 +79,12 @@ public:
     void setNormal3dZarrPathGetter(std::function<QString()> fn) { _normal3dZarrPathGetter = std::move(fn); }
 
     /**
+     * Callback that returns the normal grid path paired with the current
+     * volume. If not set, falls back to the project's first normal grid entry.
+     */
+    void setNormalGridPathGetter(std::function<QString()> fn) { _normalGridPathGetter = std::move(fn); }
+
+    /**
      * Callback for checking if editing is in progress (from SegmentationModule).
      * Used by onRenameSurface and onCopySurfaceRequested to block during edits.
      */
@@ -188,6 +194,7 @@ private:
 
     // Callbacks for CWindow-specific operations
     std::function<QString()> _normal3dZarrPathGetter;
+    std::function<QString()> _normalGridPathGetter;
     std::function<bool()> _isEditingCheck;
     std::function<void()> _clearSelectionCallback;
     std::function<void(const std::string&)> _restoreSelectionCallback;

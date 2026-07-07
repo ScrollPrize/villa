@@ -1,5 +1,6 @@
 #include "OpenDataSampleProject.hpp"
 
+#include "OpenDataNormalGrids.hpp"
 #include "OpenDataSegmentCache.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
@@ -79,7 +80,8 @@ bool jsonStringEqualsInsensitive(const nlohmann::json& obj,
     return lowerCopy(it->get<std::string>()) == expected;
 }
 
-std::vector<std::string> volumeTags(const OpenDataVolume& volume,
+std::vector<std::string> volumeTags(const OpenDataSample& sample,
+                                    const OpenDataVolume& volume,
                                     const OpenDataArtifact& artifact)
 {
     std::vector<std::string> tags;
@@ -113,6 +115,12 @@ std::vector<std::string> volumeTags(const OpenDataVolume& volume,
     }
     if (!volume.id.empty()) {
         addUnique("vc-open-data-volume-id:" + volume.id);
+    }
+    if (!sample.id.empty()) {
+        addUnique(std::string(kOpenDataSampleIdTagPrefix) + sample.id);
+    }
+    if (const auto normalGridsUrl = normalGridsArtifactUrl(volume); !normalGridsUrl.empty()) {
+        addUnique(std::string(kOpenDataNormalGridsTagPrefix) + normalGridsUrl);
     }
     if (volume.pixelSizeUm && *volume.pixelSizeUm > 0.0) {
         addUnique("vc-open-data-voxel-size-um:" + std::to_string(*volume.pixelSizeUm));
@@ -281,6 +289,15 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
         pkg->setRemoteCacheRoot(remoteCacheRoot);
     }
 
+    if (!remoteCacheRoot.empty()) {
+        const int attachedNormalGrids =
+            attachOpenDataNormalGrids(*pkg, sample, remoteCacheRoot);
+        if (attachedNormalGrids > 0) {
+            result.messages.push_back("Attached " + std::to_string(attachedNormalGrids) +
+                                      " streaming normal grid store(s).");
+        }
+    }
+
     auto attachResult = attachOpenDataSampleVolumes(*pkg, sample);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;
@@ -358,7 +375,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             }
 
             const auto label = volumeArtifactLabel(volume, artifact);
-            const auto tags = volumeTags(volume, artifact);
+            const auto tags = volumeTags(sample, volume, artifact);
             if (hasVolumeEntry(pkg, url)) {
                 pkg.mergeVolumeEntryTags(url, tags);
                 ++result.skippedVolumes;
