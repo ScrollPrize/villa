@@ -382,8 +382,10 @@ We have evidence that working on 1.1 µm data yields cleaner results than 2.4 µ
 
 ![](/img/ash2text/image22.png)
 
-| At 1.1 µm:                 \]οὐδὲ γὰρ                 \]τὰ μέλλοντα τελεῖϲθαι πρ\[ | At 2.4 µm: τὰ μέλλοντα |
-| :---- | :---- |
+<div className="flex flex-wrap gap-4 italic mb-4">
+  <div className="flex-1 min-w-[240px]">At 1.1 µm:<br/>\]οὐδὲ γὰρ<br/>\]τὰ μέλλοντα τελεῖϲθαι πρ\[</div>
+  <div className="flex-1 min-w-[240px]">At 2.4 µm: τὰ μέλλοντα</div>
+</div>
 
 The square brackets follow classics and papyrology's standard "Leiden Convention" for transcribing damaged text: they mark text that is missing or illegible at that point in the original, not a typo or a transcriber giving up. An open bracket with nothing closing it, as in "πρ\[", means the word is simply cut off there by damage.
 

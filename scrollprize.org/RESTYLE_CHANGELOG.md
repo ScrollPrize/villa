@@ -242,6 +242,11 @@ The C23 page moves from `/from_ash_to_text` to **`/tech_blogpost`** (doc file, s
 - Verified: build green (anchor checker), click-test lands headings just below the fixed navbar.
 **Files:** `docs/37_tech_blogpost.md`.
 
+## C27 — blogpost: Greek transcription caption un-mangled
+
+The 1.1 µm vs 2.4 µm ink-comparison caption rendered as "AT 1.1 ΜM: ]ΟΥ̓ΔῈ ΓᾺΡ…" — the Google-Docs export emitted the two-column caption as a one-row markdown table, whose only row becomes a `<th>` header, and the site's table styling uppercases headers (µ → Μ, Greek capitalized). Replaced with a flex two-column italic caption (line breaks of the transcription restored), aligned under the two image panels; stacks on mobile. The doc's two real tables (scan parameters, bottlenecks) keep their intended uppercase headers.
+**Files:** `docs/37_tech_blogpost.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
