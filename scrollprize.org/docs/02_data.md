@@ -137,7 +137,7 @@ Use this citation for newer scans released directly by Vesuvius Challenge:
 
 ### EduceLab-Scrolls
 
-Scrolls 1-4 and Fragments 1-6 belong to the legacy EduceLab-Scrolls dataset.
+Scrolls 1-4 and Fragments 1-6 scanned at DLS before 2025 belong to the legacy EduceLab-Scrolls dataset.
 
 - In any published abstract, cite `EduceLab-Scrolls` as the source of the data.
 - In any published manuscripts using data from EduceLab-Scrolls, reference: Parsons, S., Parker, C. S., Chapman, C., Hayashida, M., & Seales, W. B. (2023). *EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT*. ArXiv [Cs.CV]. https://doi.org/10.48550/arXiv.2304.02084.
