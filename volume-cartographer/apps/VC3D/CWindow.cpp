@@ -3211,6 +3211,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         resize(std::max(width(), minWindowSize.width()),
                std::max(height(), minWindowSize.height()));
     }
+    if (!restoredGeometry) {
+        setWindowState(windowState() | Qt::WindowMaximized);
+    }
 
     bool scheduledStartupAction = false;
 
