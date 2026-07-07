@@ -223,6 +223,11 @@ New page `/from_ash_to_text` converted from the team's Google Doc — a technica
 - Verified: build green, zero horizontal overflow at 390px, no console errors, admonitions and tables render.
 **Files:** `docs/37_from_ash_to_text.md` (new), `static/img/ash2text/` (26 new images), `sidebars.js`, `docs/01_get_started.md`, `src/components/Landing.js`.
 
+## C24 — blogpost route renamed to /tech_blogpost
+
+The C23 page moves from `/from_ash_to_text` to **`/tech_blogpost`** (doc file, sidebar id, Get Started links, landing CTA, og/twitter URLs). A client redirect keeps `/from_ash_to_text` alive (it existed on preview builds). Title and sidebar label ("From Ash to Text") unchanged.
+**Files:** `docs/37_tech_blogpost.md` (renamed from `37_from_ash_to_text.md`), `sidebars.js`, `docs/01_get_started.md`, `src/components/Landing.js`, `docusaurus.config.js` (redirect).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

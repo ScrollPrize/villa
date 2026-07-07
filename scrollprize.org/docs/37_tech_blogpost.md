@@ -12,7 +12,7 @@ sidebar_label: "From Ash to Text"
   />
 
   <meta property="og:type" content="article" />
-  <meta property="og:url" content="https://scrollprize.org/from_ash_to_text" />
+  <meta property="og:url" content="https://scrollprize.org/tech_blogpost" />
   <meta property="og:title" content="From Ash to Text: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
   <meta
     property="og:description"
@@ -21,7 +21,7 @@ sidebar_label: "From Ash to Text"
   <meta property="og:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
 
   <meta property="twitter:card" content="summary_large_image" />
-  <meta property="twitter:url" content="https://scrollprize.org/from_ash_to_text" />
+  <meta property="twitter:url" content="https://scrollprize.org/tech_blogpost" />
   <meta property="twitter:title" content="From Ash to Text: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
   <meta
     property="twitter:description"

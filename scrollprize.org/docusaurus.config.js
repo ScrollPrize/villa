@@ -359,6 +359,11 @@ const config = {
             to: "/",
             from: "/background",
           },
+          // The blogpost briefly lived at /from_ash_to_text on preview builds.
+          {
+            to: "/tech_blogpost",
+            from: "/from_ash_to_text",
+          },
         ],
       },
     ],
