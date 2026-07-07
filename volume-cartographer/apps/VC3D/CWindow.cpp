@@ -76,6 +76,7 @@
 #include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
 #include <QHeaderView>
@@ -130,6 +131,7 @@
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
@@ -2746,13 +2748,28 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
+    _workspaceTabs->setTabsClosable(true);
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
     _workspaceTabs->addTab(_atlasWorkspaceWindow, tr("Atlas"));
     _workspaceTabs->addTab(_fiberSliceWorkspaceWindow, tr("Fiber Slice"));
     _workspaceTabs->addTab(_intersectionsWorkspaceWindow, tr("Intersections"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) {
+        for (int i = 0; i < _workspaceTabs->count(); ++i) {
+            tabBar->setTabButton(i, QTabBar::RightSide, nullptr);
+        }
+    }
     setCentralWidget(_workspaceTabs);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
+        if (!_workspaceTabs) {
+            return;
+        }
+        auto* dialog = qobject_cast<LineAnnotationDialog*>(_workspaceTabs->widget(index));
+        if (dialog) {
+            dialog->close();
+        }
+    });
     auto* lasagnaEscapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), _lasagnaWorkspaceWindow);
     lasagnaEscapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(lasagnaEscapeShortcut, &QShortcut::activated, this, &CWindow::switchToMainWorkspace);
@@ -2816,6 +2833,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             &LineAnnotationController::atlasCreated,
             this,
             &CWindow::displayAtlasFromDirectory);
+    connect(_lineAnnotationController.get(),
+            &LineAnnotationController::lineAnnotationWorkspaceRequested,
+            this,
+            &CWindow::openLineAnnotationWorkspace);
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fiberSaved,
             this,
@@ -4407,6 +4428,40 @@ void CWindow::switchToFiberSliceWorkspace()
         _fiberSliceWorkspaceWindow->raise();
         _fiberSliceWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
     }
+}
+
+void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title)
+{
+    if (!_workspaceTabs || !dialog) {
+        return;
+    }
+
+    dialog->setWorkspaceEmbedded(true);
+
+    int index = _workspaceTabs->indexOf(dialog);
+    if (index < 0) {
+        index = _workspaceTabs->addTab(dialog, title.isEmpty() ? tr("Line Annotation") : title);
+        auto* escapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), dialog);
+        escapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+        connect(escapeShortcut, &QShortcut::activated, dialog, &QWidget::close);
+        QWidget* tabWidget = dialog;
+        connect(dialog, &QObject::destroyed, this, [this, tabWidget]() {
+            if (!_workspaceTabs) {
+                return;
+            }
+            for (int i = 0; i < _workspaceTabs->count(); ++i) {
+                if (_workspaceTabs->widget(i) == tabWidget) {
+                    _workspaceTabs->removeTab(i);
+                    break;
+                }
+            }
+        });
+    }
+
+    _workspaceTabs->setCurrentIndex(index);
+    dialog->show();
+    dialog->raise();
+    dialog->setFocus(Qt::ShortcutFocusReason);
 }
 
 void CWindow::repeatLastLasagnaAction()

@@ -111,6 +111,7 @@ class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
 class ViewerCompositePanel;
+class LineAnnotationDialog;
 
 class CWindow : public QMainWindow
 {
@@ -179,6 +180,7 @@ private:
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void switchToFiberSliceWorkspace();
+    void openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title);
     void repeatLastLasagnaAction();
     void selectLasagnaOutputSegment(const QString& outputName);
 
