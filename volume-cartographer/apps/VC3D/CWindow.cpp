@@ -3779,6 +3779,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             menu.addSeparator();
                         }
 
+                        if (viewer->measurementSupported()) {
+                            QAction* measureAction = menu.addAction(tr("Measure"));
+                            connect(measureAction, &QAction::triggered, this, [viewer]() {
+                                viewer->startMeasurementMode();
+                            });
+                            menu.addSeparator();
+                        }
+
                         auto addLasagnaLaunchAction =
                             [this, lasagnaPanel, &menu, seedX, seedY, seedZ, validVolumePoint,
                              activeSegmentHasLasagnaModel](

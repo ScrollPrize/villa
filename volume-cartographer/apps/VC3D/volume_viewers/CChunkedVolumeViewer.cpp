@@ -28,6 +28,7 @@
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
+#include <QGraphicsSimpleTextItem>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
@@ -78,6 +79,7 @@ constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(180, 200, 255), qRgb(255, 140, 180), qRgb(160, 255, 180),
 };
 constexpr int kIntersectionZ = 100;
+constexpr const char* kMeasurementOverlayKey = "segmentation_measurement";
 
 constexpr int kHighlightedIntersectionZ = 110;
 constexpr int kActiveIntersectionZ = 120;
@@ -199,6 +201,17 @@ float distance3(const cv::Vec3f& a, const cv::Vec3f& b)
 {
     const cv::Vec3f d = a - b;
     return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+}
+
+double volumeDistanceMicrometers(const cv::Vec3f& a, const cv::Vec3f& b, double voxelSizeUm)
+{
+    if (!(voxelSizeUm > 0.0)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const cv::Vec3d d(static_cast<double>(a[0]) - static_cast<double>(b[0]),
+                      static_cast<double>(a[1]) - static_cast<double>(b[1]),
+                      static_cast<double>(a[2]) - static_cast<double>(b[2]));
+    return std::sqrt(d.dot(d)) * voxelSizeUm;
 }
 
 struct SafeFocusProjection {
@@ -745,6 +758,9 @@ void CChunkedVolumeViewer::setSurface(const std::string& name)
     if (_closing) {
         return;
     }
+    if (_measurement.active || _measurement.first || _measurement.second) {
+        clearMeasurement();
+    }
     _surfName = name;
     if (_state)
         onSurfaceChanged(name, _state->surface(name));
@@ -792,6 +808,7 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     } else {
         submitRender("annotation camera state applied");
     }
+    refreshMeasurementOverlay();
     emit overlaysUpdated();
 }
 
@@ -808,6 +825,7 @@ void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& s
     recalcPyramidLevel();
     _genCacheDirty = true;
     syncCameraTransform();
+    refreshMeasurementOverlay();
     emit overlaysUpdated();
 }
 
@@ -981,6 +999,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     invalidateIntersect(name);
     if (!surf) {
         clearIntersectionItems();
+        _measurement = {};
         _scene->clear();
         _overlayGroups.clear();
         _cursorCrosshair = nullptr;
@@ -1284,6 +1303,7 @@ void CChunkedVolumeViewer::syncCameraTransform()
     _camScale = _scale;
     updateDisplayedFramebufferMapping();
     updateIntersectionPreviewTransform();
+    refreshMeasurementOverlay();
     updateFocusMarker();
     requestDirectPaint();
 }
@@ -2226,6 +2246,7 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
     }
     submitRender("pan");
     refreshSameWrapAnnotationOverlay();
+    refreshMeasurementOverlay();
     emit overlaysUpdated();
 }
 
@@ -2257,6 +2278,7 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     resizeFramebuffer();
     submitRender("zoom");
     refreshSameWrapAnnotationOverlay();
+    refreshMeasurementOverlay();
     emit overlaysUpdated();
 }
 
@@ -2480,6 +2502,7 @@ void CChunkedVolumeViewer::onResized()
     resizeFramebuffer();
     _genCacheDirty = true;
     submitRender("resized");
+    refreshMeasurementOverlay();
     _view->viewport()->update();
 }
 
@@ -2705,6 +2728,10 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
     }
     _sameWrapManualMergePressConsumed = false;
 
+    if (handleMeasurementClick(scenePos, button, modifiers)) {
+        return;
+    }
+
     if (_sameWrapAnnotation.enabled() && button == Qt::RightButton &&
         modifiers.testFlag(Qt::ShiftModifier)) {
         if (const auto hit = pointAtScenePosition(scenePos)) {
@@ -2904,6 +2931,11 @@ void CChunkedVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBas
 
 void CChunkedVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers)
 {
+    if (key == Qt::Key_Escape && isMeasurementActive()) {
+        clearMeasurement();
+        return;
+    }
+
     constexpr float kPanPx = 64.0f;
     switch (key) {
         case Qt::Key_Left: panByF(kPanPx, 0); break;
@@ -3075,6 +3107,171 @@ void CChunkedVolumeViewer::clearLineAnnotationPlacementMarker()
 {
     if (_lineAnnotationPlacementMarker) {
         _lineAnnotationPlacementMarker->hide();
+    }
+}
+
+void CChunkedVolumeViewer::startMeasurementMode()
+{
+    if (!measurementSupported()) {
+        return;
+    }
+    _measurement = {};
+    _measurement.active = true;
+    clearOverlayGroup(kMeasurementOverlayKey);
+    if (_view) {
+        _view->setFocus(Qt::MouseFocusReason);
+        _view->setCursor(Qt::CrossCursor);
+    }
+}
+
+bool CChunkedVolumeViewer::measurementSupported() const
+{
+    auto surf = _surfWeak.lock();
+    if (!surf) {
+        return false;
+    }
+    return _surfName == "segmentation" ||
+           dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
+}
+
+bool CChunkedVolumeViewer::isMeasurementActive() const
+{
+    return _measurement.active;
+}
+
+void CChunkedVolumeViewer::clearMeasurement()
+{
+    _measurement = {};
+    clearOverlayGroup(kMeasurementOverlayKey);
+    if (_view) {
+        _view->unsetCursor();
+        _view->viewport()->update();
+    }
+}
+
+bool CChunkedVolumeViewer::handleMeasurementClick(const QPointF& scenePos,
+                                                  Qt::MouseButton button,
+                                                  Qt::KeyboardModifiers modifiers)
+{
+    if (!_measurement.active || !measurementSupported()) {
+        return false;
+    }
+    if (button != Qt::LeftButton || modifiers != Qt::NoModifier) {
+        return true;
+    }
+
+    const cv::Vec3f volumePos = _lastCursorVolumePos ? *_lastCursorVolumePos : sceneToVolume(scenePos);
+    if (!std::isfinite(volumePos[0]) ||
+        !std::isfinite(volumePos[1]) ||
+        !std::isfinite(volumePos[2])) {
+        return true;
+    }
+
+    MeasurementPoint point;
+    point.surface = sceneToSurface(scenePos);
+    point.volume = volumePos;
+    if (!_measurement.first || _measurement.second) {
+        _measurement.first = point;
+        _measurement.second.reset();
+    } else {
+        _measurement.second = point;
+    }
+    refreshMeasurementOverlay();
+    return true;
+}
+
+void CChunkedVolumeViewer::refreshMeasurementOverlay()
+{
+    if (!_measurement.active && !_measurement.first && !_measurement.second) {
+        clearOverlayGroup(kMeasurementOverlayKey);
+        return;
+    }
+
+    std::vector<QGraphicsItem*> items;
+    auto makeMarker = [](const QPointF& pos) {
+        auto* marker = new QGraphicsEllipseItem(-4.0, -4.0, 8.0, 8.0);
+        QPen pen(QColor(255, 230, 80), 1.5);
+        pen.setCosmetic(true);
+        marker->setPen(pen);
+        marker->setBrush(QBrush(QColor(255, 230, 80, 90)));
+        marker->setPos(pos);
+        marker->setZValue(145.0);
+        marker->setAcceptedMouseButtons(Qt::NoButton);
+        return marker;
+    };
+
+    std::optional<QPointF> firstScene;
+    std::optional<QPointF> secondScene;
+    if (_measurement.first) {
+        firstScene = surfaceToScene(_measurement.first->surface[0], _measurement.first->surface[1]);
+        if (std::isfinite(firstScene->x()) && std::isfinite(firstScene->y())) {
+            items.push_back(makeMarker(*firstScene));
+        }
+    }
+    if (_measurement.second) {
+        secondScene = surfaceToScene(_measurement.second->surface[0], _measurement.second->surface[1]);
+        if (std::isfinite(secondScene->x()) && std::isfinite(secondScene->y())) {
+            items.push_back(makeMarker(*secondScene));
+        }
+    }
+
+    if (firstScene && secondScene &&
+        std::isfinite(firstScene->x()) && std::isfinite(firstScene->y()) &&
+        std::isfinite(secondScene->x()) && std::isfinite(secondScene->y())) {
+        QPainterPath path;
+        path.moveTo(*firstScene);
+        path.lineTo(*secondScene);
+        auto* line = new QGraphicsPathItem(path);
+        QPen pen(QColor(255, 230, 80), 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+        pen.setCosmetic(true);
+        line->setPen(pen);
+        line->setBrush(Qt::NoBrush);
+        line->setZValue(144.0);
+        line->setAcceptedMouseButtons(Qt::NoButton);
+        items.push_back(line);
+
+        const double um = _volume
+            ? volumeDistanceMicrometers(_measurement.first->volume,
+                                        _measurement.second->volume,
+                                        _volume->voxelSize())
+            : std::numeric_limits<double>::quiet_NaN();
+        if (std::isfinite(um)) {
+            const QPointF mid = (*firstScene + *secondScene) * 0.5;
+            const QPointF delta = *secondScene - *firstScene;
+            const double len = std::hypot(delta.x(), delta.y());
+            QPointF offset(0.0, -16.0);
+            if (len > 1.0) {
+                offset = QPointF(-delta.y() / len * 16.0, delta.x() / len * 16.0);
+                if (offset.y() > 0.0) {
+                    offset = -offset;
+                }
+            }
+            const QString label = CVolumeViewerView::formatScaleBarLength(um).text;
+            QFont font;
+            font.setPointSize(12);
+            font.setBold(true);
+
+            auto* shadow = new QGraphicsSimpleTextItem(label);
+            shadow->setFont(font);
+            shadow->setBrush(QBrush(Qt::black));
+            shadow->setPos(mid + offset + QPointF(1.0, 1.0));
+            shadow->setZValue(145.0);
+            shadow->setAcceptedMouseButtons(Qt::NoButton);
+            items.push_back(shadow);
+
+            auto* text = new QGraphicsSimpleTextItem(label);
+            text->setFont(font);
+            text->setBrush(QBrush(Qt::white));
+            text->setPos(mid + offset);
+            text->setZValue(146.0);
+            text->setAcceptedMouseButtons(Qt::NoButton);
+            items.push_back(text);
+        }
+    }
+
+    setOverlayGroup(kMeasurementOverlayKey, items);
+    if (_view) {
+        _view->viewport()->update();
     }
 }
 
