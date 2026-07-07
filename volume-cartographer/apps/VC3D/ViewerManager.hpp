@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -109,6 +110,13 @@ public:
     int intersectionMaxSurfaces() const { return _intersectionMaxSurfaces; }
     void primeSurfacePatchIndicesAsync();
     void resetStrideUserOverride() {}
+
+    // Folder-selection keyed retention of built surface patch indexes. The
+    // surface panel sets the key before rebinding surfaces on a folder
+    // switch; the live index is stashed under the outgoing key and swapped
+    // back in (if still valid) when the user returns to that selection.
+    void setSurfacePatchIndexCacheKey(const QString& key);
+    void clearSurfacePatchIndexCache();
 
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
@@ -220,6 +228,16 @@ private:
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
+    struct CachedSurfacePatchIndex {
+        SurfacePatchIndex index;
+        std::unordered_set<std::string> ids;
+    };
+    // Indexes stashed on folder-selection switches, keyed by the selection
+    // they were built for. Entries are validated against the current surface
+    // instances (and stride) before being swapped back in.
+    std::map<QString, CachedSurfacePatchIndex> _surfacePatchIndexCache;
+    QString _surfacePatchIndexCacheKey;
+    void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;

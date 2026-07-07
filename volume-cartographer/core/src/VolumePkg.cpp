@@ -833,8 +833,14 @@ void VolumePkg::unloadAllSurfaces()
         std::lock_guard<std::mutex> lk(segmentsMutex_);
         snapshot.reserve(loadedSegmentations_.size());
         for (auto& [id, seg] : loadedSegmentations_) snapshot.push_back(seg);
+        // Also drop surfaces retained for other segmentation directories.
+        for (auto& [location, segs] : segmentationsByLocation_) {
+            for (auto& [id, seg] : segs) snapshot.push_back(seg);
+        }
     }
-    for (auto& seg : snapshot) seg->unloadSurface();
+    for (auto& seg : snapshot) {
+        if (seg) seg->unloadSurface();
+    }
 }
 
 void VolumePkg::loadSurfacesBatch(const std::vector<std::string>& ids)
@@ -914,6 +920,8 @@ void VolumePkg::resolveAll()
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
         loadedSegmentations_.clear();
+        segmentationsByLocation_.clear();
+        activeSegmentsLocation_.clear();
         segmentationTagsByID_.clear();
     }
     resolvedNormalGridPaths_.clear();
@@ -937,6 +945,9 @@ void VolumePkg::resolveAll()
     if (selectedSegments) {
         outputSegments_ = selectedSegments->location;
         resolveSegmentsEntry(*selectedSegments);
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        activeSegmentsLocation_ = selectedSegments->location;
+        segmentationsByLocation_[activeSegmentsLocation_] = loadedSegmentations_;
     }
     for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
 }
@@ -1008,9 +1019,28 @@ void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e)
         Logger()->warn("Skipping segments '{}': path does not exist", e.location);
         return;
     }
+    // Reuse Segmentation objects retained from an earlier visit to this entry
+    // so surfaces they already loaded stay available. The directory is still
+    // rescanned, so segments added or removed on disk are picked up.
+    std::map<std::string, std::shared_ptr<Segmentation>> retainedByPath;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = segmentationsByLocation_.find(e.location);
+        if (it != segmentationsByLocation_.end()) {
+            for (const auto& [id, seg] : it->second) {
+                if (seg) retainedByPath[seg->path().string()] = seg;
+            }
+        }
+    }
     auto loadOne = [&](const fs::path& sp) {
         try {
-            auto s = Segmentation::New(sp);
+            std::shared_ptr<Segmentation> s;
+            if (auto retained = retainedByPath.find(sp.string());
+                retained != retainedByPath.end()) {
+                s = retained->second;
+            } else {
+                s = Segmentation::New(sp);
+            }
             const auto id = s->id();
             std::lock_guard<std::mutex> lk(segmentsMutex_);
             if (loadedSegmentations_.count(id) > 0) {
@@ -1172,6 +1202,12 @@ void VolumePkg::refreshSegmentations()
 {
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
+        // Retain the outgoing directory's segmentations so switching back to
+        // it reuses them (and their loaded surfaces) without hitting disk.
+        if (!activeSegmentsLocation_.empty()) {
+            segmentationsByLocation_[activeSegmentsLocation_] = loadedSegmentations_;
+        }
+        activeSegmentsLocation_.clear();
         loadedSegmentations_.clear();
         segmentationTagsByID_.clear();
     }
@@ -1194,6 +1230,9 @@ void VolumePkg::refreshSegmentations()
     if (selectedSegments) {
         outputSegments_ = selectedSegments->location;
         resolveSegmentsEntry(*selectedSegments);
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        activeSegmentsLocation_ = selectedSegments->location;
+        segmentationsByLocation_[activeSegmentsLocation_] = loadedSegmentations_;
     }
 }
 

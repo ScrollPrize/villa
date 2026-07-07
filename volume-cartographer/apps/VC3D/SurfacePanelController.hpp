@@ -8,11 +8,13 @@
 
 #include <functional>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <unordered_set>
 #include <vector>
 
 class CState;
+class Segmentation;
 class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
@@ -197,6 +199,7 @@ private:
                                bool enabledReviewed,
                                bool enabledInspect);
     void logSurfaceLoadSummary() const;
+    QString folderSelectionCacheKey() const;
     void applyHighlightSelection(const std::string& id, bool enabled);
     void applyTransformWarningStyle(SurfaceTreeWidgetItem* item);
     bool cycleVisibleSegment(int direction);
@@ -222,4 +225,8 @@ private:
     std::unordered_set<std::string> _highlightedSurfaceIds;
     std::vector<SegmentFolderSelection> _visibleSegmentFolders;
     std::unordered_set<std::string> _multiFolderSurfaceIds;
+    // Segmentations loaded for non-current overlay folders, keyed by segment
+    // path. Retained so re-checking a folder (or switching back to a selection
+    // that includes it) reuses the already-loaded surfaces.
+    std::map<std::string, std::shared_ptr<Segmentation>> _overlaySegmentations;
 };

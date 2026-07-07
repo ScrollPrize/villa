@@ -151,6 +151,13 @@ private:
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;
     std::map<std::string, std::shared_ptr<Segmentation>> loadedSegmentations_;
+    // Segmentations previously resolved for a segments entry, keyed by entry
+    // location. Retained across setSegmentationDirectory() switches so
+    // returning to a directory reuses the same Segmentation objects (and any
+    // surfaces they have loaded) instead of redoing that work from disk.
+    std::map<std::string, std::map<std::string, std::shared_ptr<Segmentation>>>
+        segmentationsByLocation_;
+    std::string activeSegmentsLocation_;
     std::map<std::string, std::vector<std::string>> segmentationTagsByID_;
     std::vector<std::filesystem::path> resolvedNormalGridPaths_;
 

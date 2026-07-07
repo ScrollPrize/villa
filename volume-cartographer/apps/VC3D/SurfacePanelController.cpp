@@ -257,7 +257,31 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
 
 void SurfacePanelController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
 {
+    if (pkg != _volumePkg) {
+        _overlaySegmentations.clear();
+        if (_viewerManager) {
+            _viewerManager->clearSurfacePatchIndexCache();
+        }
+    }
     _volumePkg = pkg;
+}
+
+// Identifies the current folder selection (volpkg + checked folders, with the
+// active folder marked) for the ViewerManager's surface index cache.
+QString SurfacePanelController::folderSelectionCacheKey() const
+{
+    QStringList parts;
+    for (const auto& folder : _visibleSegmentFolders) {
+        parts << QString::fromStdString(folder.dirName) +
+                     (folder.currentFolder ? QStringLiteral("*") : QString());
+    }
+    if (parts.isEmpty() && _volumePkg) {
+        parts << QString::fromStdString(_volumePkg->getSegmentationDirectory());
+    }
+    parts.sort();
+    const QString volpkgDir =
+        _volumePkg ? QString::fromStdString(_volumePkg->getVolpkgDirectory()) : QString();
+    return volpkgDir + QLatin1Char('|') + parts.join(QLatin1Char(','));
 }
 
 void SurfacePanelController::clear()
@@ -280,6 +304,11 @@ void SurfacePanelController::loadSurfaces(bool reload)
     }
 
     if (!_visibleSegmentFolders.empty()) {
+        // Stash the live surface index under the outgoing folder selection
+        // BEFORE unbinding its surfaces, so switching back can reuse it.
+        if (_viewerManager) {
+            _viewerManager->setSurfacePatchIndexCacheKey(folderSelectionCacheKey());
+        }
         if (reload) {
             if (_state) {
                 auto names = _state->surfaceNames();
@@ -290,7 +319,9 @@ void SurfacePanelController::loadSurfaces(bool reload)
                     _state->setSurface(name, nullptr, true, false);
                 }
             }
-            _volumePkg->unloadAllSurfaces();
+            // Surfaces stay loaded in the VolumePkg's per-folder retention so
+            // returning to a previously visited folder is fast; they are only
+            // rebound to the state below.
             _multiFolderSurfaceIds.clear();
         }
 
@@ -312,7 +343,14 @@ void SurfacePanelController::loadSurfaces(bool reload)
 
             for (const auto& segPath : segment_dirs_under(folder.path)) {
                 try {
-                    auto seg = Segmentation::New(segPath);
+                    std::shared_ptr<Segmentation> seg;
+                    if (auto retained = _overlaySegmentations.find(segPath.string());
+                        retained != _overlaySegmentations.end()) {
+                        seg = retained->second;
+                    } else {
+                        seg = Segmentation::New(segPath);
+                        _overlaySegmentations.emplace(segPath.string(), seg);
+                    }
                     auto surf = seg->loadSurface();
                     if (!surf) {
                         continue;
@@ -342,6 +380,9 @@ void SurfacePanelController::loadSurfaces(bool reload)
         return;
     }
 
+    if (_viewerManager) {
+        _viewerManager->setSurfacePatchIndexCacheKey(folderSelectionCacheKey());
+    }
     if (reload) {
         // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
         if (_state) {
@@ -395,6 +436,9 @@ void SurfacePanelController::loadSurfacesIncremental()
     }
 
     std::cout << "Starting incremental surface load..." << std::endl;
+    // Explicit disk refresh: also forget retained overlay-folder segmentations
+    // so the next full load re-reads them from disk.
+    _overlaySegmentations.clear();
     _volumePkg->refreshSegmentations();
     auto changes = detectSurfaceChanges();
 
