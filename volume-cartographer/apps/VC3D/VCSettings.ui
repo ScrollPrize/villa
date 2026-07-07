@@ -315,13 +315,13 @@
           <item row="9" column="0" colspan="2">
            <widget class="QCheckBox" name="chkResetViewOnSurfaceChange">
             <property name="text">
-             <string>Reset view when switching between surfaces</string>
+             <string>Automatically rotate planes to align with segmentation</string>
             </property>
             <property name="checked">
              <bool>false</bool>
             </property>
             <property name="toolTip">
-             <string>When enabled, the view will automatically fit and center on each surface when switching between segments</string>
+             <string>When enabled, switching segments automatically rotates the slicing planes to align with the segmentation surface</string>
             </property>
            </widget>
           </item>
