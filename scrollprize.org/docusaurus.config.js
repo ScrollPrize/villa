@@ -175,6 +175,7 @@ const config = {
           },
           items: [
             { to: "/prizes", label: "Prizes", position: "left" },
+            { to: "/tech_blogpost", label: "Technical Blogpost", position: "left" },
             { to: "/data", label: "Data", position: "left" },
             { to: "/tutorial", label: "Tutorials", position: "left" },
             { to: "/winners", label: "Milestones", position: "left" },

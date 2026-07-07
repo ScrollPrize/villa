@@ -1,6 +1,6 @@
 ---
-title: "From Ash to Text: Why Reading Every Herculaneum Scroll Is Still a Challenge"
-sidebar_label: "From Ash to Text"
+title: "Technical Blogpost: Why Reading Every Herculaneum Scroll Is Still a Challenge"
+sidebar_label: "Technical Blogpost"
 ---
 
 <head>
@@ -13,7 +13,7 @@ sidebar_label: "From Ash to Text"
 
   <meta property="og:type" content="article" />
   <meta property="og:url" content="https://scrollprize.org/tech_blogpost" />
-  <meta property="og:title" content="From Ash to Text: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
+  <meta property="og:title" content="Technical Blogpost: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
   <meta
     property="og:description"
     content="Why reading every Herculaneum scroll is still a challenge: how scanning, virtual unwrapping, and ink detection work today — and where you can help."
@@ -22,7 +22,7 @@ sidebar_label: "From Ash to Text"
 
   <meta property="twitter:card" content="summary_large_image" />
   <meta property="twitter:url" content="https://scrollprize.org/tech_blogpost" />
-  <meta property="twitter:title" content="From Ash to Text: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
+  <meta property="twitter:title" content="Technical Blogpost: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
   <meta
     property="twitter:description"
     content="Why reading every Herculaneum scroll is still a challenge: how scanning, virtual unwrapping, and ink detection work today — and where you can help."

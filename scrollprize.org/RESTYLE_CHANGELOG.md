@@ -228,6 +228,13 @@ New page `/from_ash_to_text` converted from the team's Google Doc — a technica
 The C23 page moves from `/from_ash_to_text` to **`/tech_blogpost`** (doc file, sidebar id, Get Started links, landing CTA, og/twitter URLs). A client redirect keeps `/from_ash_to_text` alive (it existed on preview builds). Title and sidebar label ("From Ash to Text") unchanged.
 **Files:** `docs/37_tech_blogpost.md` (renamed from `37_from_ash_to_text.md`), `sidebars.js`, `docs/01_get_started.md`, `src/components/Landing.js`, `docusaurus.config.js` (redirect).
 
+## C25 — blogpost named "Technical Blogpost" + navbar entry
+
+- Page title → **"Technical Blogpost: Why Reading Every Herculaneum Scroll Is Still a Challenge"**; sidebar label and Get Started link texts → "Technical Blogpost"; og/twitter titles updated. Route stays `/tech_blogpost`.
+- **New top-navbar item "Technical Blogpost"** between Prizes and Data.
+- Navbar links get `white-space: nowrap` + tighter item padding in the 997–1220px band so the two-word label doesn't wrap just above the hamburger cutoff (verified single-line at 997/1024/1150/1440, zero overflow).
+**Files:** `docs/37_tech_blogpost.md`, `docs/01_get_started.md`, `docusaurus.config.js` (navbar item), `src/css/chrome.css`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

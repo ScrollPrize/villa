@@ -147,6 +147,15 @@ h1, h2, h3, h4, h5, h6 {
   font-size: 0.875rem;
   font-weight: 500;
   color: var(--vc-text-dim);
+  white-space: nowrap; /* multi-word items ("Technical Blogpost") stay on one line */
+}
+/* Just above the 996px hamburger cutoff there isn't room for every item at
+   full padding — tighten instead of letting labels wrap to two lines. */
+@media (min-width: 997px) and (max-width: 1220px) {
+  .navbar__item {
+    padding-left: 0.5rem;
+    padding-right: 0.5rem;
+  }
 }
 .navbar__link:hover {
   color: var(--vc-text);
