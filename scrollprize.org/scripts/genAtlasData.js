@@ -339,6 +339,9 @@ function curatedFields(overlayScroll, id) {
     // Per-scroll legal/access terms (e.g. the PHerc. Paris 4 publication
     // reservation) rendered as a notice panel on the detail page.
     legalNotice: o.legalNotice ?? null,
+    // License name -> which of this scroll's data that license covers
+    // (annotates the License row in the Data & access panel).
+    licenseScope: o.licenseScope ?? null,
     // DEPRECATED: surface-prediction Neuroglancer links now derive from
     // scroll.predictions (see extractPredictions); kept for backward-compat only.
     volume: o.volume ?? null,

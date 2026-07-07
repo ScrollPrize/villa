@@ -120,6 +120,10 @@
     "PHercParis4": {
       "display": "Scroll 1",
       "repository": "Institut de France, Paris",
+      "licenseScope": {
+        "EduceLab Data License": "the 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
       "legalNotice": {
         "title": "Data access and publication notice",
         "added": "07/07/2026",
