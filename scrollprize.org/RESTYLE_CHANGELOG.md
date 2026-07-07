@@ -235,6 +235,13 @@ The C23 page moves from `/from_ash_to_text` to **`/tech_blogpost`** (doc file, s
 - Navbar links get `white-space: nowrap` + tighter item padding in the 997–1220px band so the two-word label doesn't wrap just above the hamburger cutoff (verified single-line at 997/1024/1150/1440, zero overflow).
 **Files:** `docs/37_tech_blogpost.md`, `docs/01_get_started.md`, `docusaurus.config.js` (navbar item), `src/css/chrome.css`.
 
+## C26 — blogpost: clickable cross-references
+
+- All textual cross-references in `/tech_blogpost` now link to their targets: three "(see References)" → `#references-and-implementation-links`; "Sections 2–4" / "Sections 2 and 3" → the numbered section anchors; "the previous section" (trail metaphor) → Meshes; the five recap bullets' quoted section names → their sections. The recap's stale name "Why approximate supervision is a bottleneck" corrected to the real heading "Label quality: the main unwrapping bottleneck".
+- **Content headings demoted one level** (`#`→`##`, `##`→`###`) — the doc keeps a single h1 (the title), the major sections finally get anchor ids (content-level h1s got none, which the strict `onBrokenAnchors` build caught), and the TOC now shows the proper section→subsection hierarchy.
+- Verified: build green (anchor checker), click-test lands headings just below the fixed navbar.
+**Files:** `docs/37_tech_blogpost.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
