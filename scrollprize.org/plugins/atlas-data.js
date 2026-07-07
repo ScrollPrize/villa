@@ -30,8 +30,14 @@ module.exports = function atlasDataPlugin(context, options) {
     },
 
     async contentLoaded({ content, actions }) {
-      const { createData, addRoute } = actions;
+      const { createData, addRoute, setGlobalData } = actions;
       const { scrolls = [], _general = '' } = content || {};
+
+      // The set of scroll ids that got a static detail route this build. The
+      // index grid (AtlasBrowser) uses it to hide any live-only scroll that
+      // appears in the fresher metadata.min.json but has no page here yet, so a
+      // card never links to a 404. New scrolls surface at the next build.
+      setGlobalData({ routedIds: scrolls.map((s) => s.id) });
 
       await Promise.all(
         scrolls.map(async (scroll) => {
