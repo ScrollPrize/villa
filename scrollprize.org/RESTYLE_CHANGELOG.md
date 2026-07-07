@@ -247,6 +247,11 @@ The C23 page moves from `/from_ash_to_text` to **`/tech_blogpost`** (doc file, s
 The 1.1 µm vs 2.4 µm ink-comparison caption rendered as "AT 1.1 ΜM: ]ΟΥ̓ΔῈ ΓᾺΡ…" — the Google-Docs export emitted the two-column caption as a one-row markdown table, whose only row becomes a `<th>` header, and the site's table styling uppercases headers (µ → Μ, Greek capitalized). Replaced with a flex two-column italic caption (line breaks of the transcription restored), aligned under the two image panels; stacks on mobile. The doc's two real tables (scan parameters, bottlenecks) keep their intended uppercase headers.
 **Files:** `docs/37_tech_blogpost.md`.
 
+## C28 — blogpost: 🙋 icon on the "How you can help" boxes
+
+The six callouts showed the default tip lightbulb; the post's own convention is the 🙋 raising-hand ("look for the 🙋 callouts"). The `:::tip` blocks are now `<Admonition type="tip" icon="🙋" title="How you can help">` (import added). Icon renders monochrome like every admonition emoji site-wide (intentional chrome.css treatment).
+**Files:** `docs/37_tech_blogpost.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

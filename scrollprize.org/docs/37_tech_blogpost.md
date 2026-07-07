@@ -30,6 +30,8 @@ sidebar_label: "Technical Blogpost"
   <meta property="twitter:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
 </head>
 
+import Admonition from '@theme/Admonition';
+
 <div className="opacity-60 mb-8 italic">July 2026</div>
 
 In 2026, **PHerc. 1667** **was virtually unwrapped and read without physically opening the scroll** (see [References](#references-and-implementation-links)). 
@@ -154,11 +156,11 @@ Here's the winning recipe condensed to a single sentence: take an off-the-shelf 
 
 ![](/img/ash2text/image7.png)
 
-:::tip[How you can help]
+<Admonition type="tip" icon="🙋" title="How you can help">
 
 Create datasets with labels better localized on the papyrus’ recto or train ML models that can better preserve the sheets’ topology in the predictions. The open question is reaching a high level of topologic accuracy in densely packed regions, regions affected by high curvature or in spots where the papyrus is damaged. Different representations are also worth investigating, like using a Distance Transform rather than a Binary Segmentation (e.g. [https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/5th-place-solution](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/5th-place-solution))
 
-:::
+</Admonition>
 
 Surface predictions are useful, but they are not usable as the final geometry for unwrapping. Dense predictions often contain holes, local deviations, false positives, or accidental mergers between nearby layers. In a normal 2D image segmentation task, a small local error may be tolerable. Here, a small local error can send a traced mesh onto the wrong wrap entirely, with no easy way to recover.
 
@@ -181,11 +183,11 @@ The areas we most often see this type of problem are:
 
 These are not abstract errors. They determine whether a flattened rendering shows a coherent writing surface or a geometrically corrupted one. The community has since built automatic tools that specifically target this failure list:
 
-:::tip[How you can help]
+<Admonition type="tip" icon="🙋" title="How you can help">
 
 If you know classical geometry, optimization, or C++, this is one of the highest-leverage places to contribute. Many errors in the surface predictions can be fixed during or mitigated during the meshing step with either subsequent optimization or post-processing algorithms. Community contributions building alternative, scalable meshing algorithms that attack the current failure modes are encouraged (e.g. [github.com/Hob3rMallow/scrollfiesta\_public](https://github.com/Hob3rMallow/scrollfiesta_public))
 
-:::
+</Admonition>
 ### Surface mesh representations
 The unwrapping software used by our team, [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer), uses a custom format called 'tifxyz,' an alternative to widely-used 3D formats such as .obj or .stl. Its key benefit is that it enforces grid topology on the surface mesh — meaning, again, a single flat sheet. The flat coordinate system on the surface is carried explicitly exploiting a 2D grid structure. Indeed, the surface mesh (QuadSurface in the C++ code; Tifxyz in Python, via vesuvius.tifxyz.Tifxyz/read\_tifxyz()) is represented by a 2D array of 3D vertex coordinates: the array's shape determines the mesh's grid structure, and the vertices define its actual shape in space. That grid of coordinates is saved as three separate TIFF images, one each for x, y, and z coordinates (as float32). The format can also mark a given cell as missing, either by setting each coordinate to \-1 or via an optional sidecar mask image. Converter scripts move between tifxyz and .obj in both directions ([vc\_tifxyz2obj](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_tifxyz2obj.cpp), [vc\_obj2tifxyz](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz.cpp)); going from .obj to tifxyz requires an accompanying .griduv sidecar file specifying the intended grid structure (a [legacy converter](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_obj2tifxyz_legacy.cpp) without this requirement also exists, but is not recommended for new work). The core representation itself lives in [QuadSurface.cpp](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/core/src/QuadSurface.cpp).
 
@@ -281,11 +283,11 @@ For every training crop, the dataset finds foreground patches using the old anno
 
 The main problem is obtaining, either through direct tracing or through semantic/instance segmentation, a way to identify and separate long fibers with the right connectivity. The same problem is shared in **connectomics** — the field that reconstructs a brain's wiring diagram by tracing individual axons and dendrites through teravoxel-scale 3D electron-microscopy volumes.
 
-:::tip[How you can help]
+<Admonition type="tip" icon="🙋" title="How you can help">
 
 If you know classical computer vision or fiber/curve-following techniques, conservative fiber tracing is exactly this kind of problem. The goal should be reliable connections — a tracer that confidently follows fewer fibers correctly is more useful than one that follows more fibers with a higher error rate.
 
-:::
+</Admonition>
 ### Spiral fit: a global prior
 Local tracing can drift. Fibers can help, but they are also local or semi-local. There is another source of information: the scroll was originally a spiral.
 
@@ -301,11 +303,11 @@ One way to represent the deformation is through a **stationary velocity field**.
 
 A global prior can organize and regularize geometry, allowing a single consistent result to be produced from disconnected annotations, bridging small gaps and interpolating windings. But where annotations are sparse or the volume is highly ambiguous, spiral fitting is still under-constrained, and won't necessarily follow the true sheet surfaces.
 
-:::tip[How you can help]
+<Admonition type="tip" icon="🙋" title="How you can help">
 
 Devise better evaluation suites and loss functions to fit the spiral. Increase its expressivity and reduce the number of needed annotations. Most importantly, relative winding number annotations seem to have a great impact on the spiral fit. Automating these procedures will boost scalability by a great extent\!
 
-:::
+</Admonition>
 ### Label quality: the main unwrapping bottleneck
 Machine learning needs labels. For surface models, those labels often come from human-generated meshes or annotations — enormously valuable, but approximate. They may wiggle. They may drift slightly off the true surface. They may avoid the most ambiguous regions. This is also valid for manually or semi-automatically traced fibers. They may represent the best usable tracing rather than exact truth.
 
@@ -321,11 +323,11 @@ Why did we move forward with these datasets instead of fixing them first? The la
 
 A useful direction is **label snapping**: using the raw CT signal and local geometry to move approximate labels back onto the most plausible papyrus surface / fiber. Another direction is **active learning**, where the model identifies the most uncertain or valuable regions and asks humans to correct only those.
 
-:::tip[How you can help]
+<Admonition type="tip" icon="🙋" title="How you can help">
 
 If you have experience with 3D annotation, active learning, or data-quality workflows, this is a place where careful, small-scale work can matter more than scale. The next major gains in unrolling may come from better labels rather than simply larger models — a smaller set of precise labels in hard regions may be more useful than a larger set of approximate labels in easy regions.
 
-:::
+</Admonition>
 ***
 ## 3\. Ink recovery: detecting what is written
 Once the surface is traced and flattened, the next question is: where is the ink?
@@ -459,11 +461,11 @@ The checkpoint behind panel (d) in the previous image, [ink\_3d\_dino\_guided](h
 
 Careful\! The 3D UNet segmentation model for ink segmentation was not only DINO guided, but it also used **self-distillation** from another 3D ink detection model (not discussed here) to clean up the DINO embedding during UNet training.
 
-:::tip[How you can help]
+<Admonition type="tip" icon="🙋" title="How you can help">
 
 If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected fragment labels otherwise introduce, giving the model a direct target instead of an indirect one.
 
-:::
+</Admonition>
 ### Self-distillation without ground truth
 Not every fiber- and ink-modeling effort in this pipeline starts from labels at all. A trainer at [scripts/fiber\_5class/](https://github.com/ScrollPrize/villa/tree/main/scripts/fiber_5class), specifically its [label\_generator.py](https://github.com/ScrollPrize/villa/blob/main/scripts/fiber_5class/label_generator.py), trains a 3D U-Net for 4-class semantic segmentation — background, vertical fiber, horizontal/angular fiber, and ink — directly on raw CT, with no ground-truth labels of any kind (in PHerc. Paris 4).
 
