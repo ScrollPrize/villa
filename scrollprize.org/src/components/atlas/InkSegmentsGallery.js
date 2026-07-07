@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { thumbnailUrls, neuroglancerUrl, toHttp } from "./dataAccess";
+import { thumbnailUrls, neuroglancerUrl } from "./dataAccess";
 
 // InkSegmentsGallery — the per-segment listing the old atlas had: every segment
 // with an ink prediction, as a lazy-loaded grid of small Thumbor thumbnails.
@@ -12,7 +12,37 @@ import { thumbnailUrls, neuroglancerUrl, toHttp } from "./dataAccess";
 // Clicking a thumbnail opens an in-page lightbox (a Thumbor-resized view of the
 // .jpg — the raw downsampled files can be tens of MB); ← / → (or the ‹ ›
 // buttons) step through the segments. Where available each card also links its
-// surface layers in Neuroglancer and its mesh.
+// surface layers in Neuroglancer and its segment folder (tifxyz etc.) with a
+// copy-for-rclone S3 path button.
+
+// s3://bucket/prefix → the bucket's index.html#prefix file-browser page.
+const browseUrl = (s3uri) => {
+  const m = String(s3uri || "").match(/^s3:\/\/([^/]+)\/(.*)$/);
+  return m ? `https://${m[1]}.s3.amazonaws.com/index.html#${m[2]}` : s3uri;
+};
+
+// Tiny copy-to-clipboard button for a segment's s3:// folder path (rclone-able).
+function CopyS3({ uri }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = () => {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard.writeText(uri).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      });
+    }
+  };
+  return (
+    <button
+      className="copybtn"
+      type="button"
+      title={`copy S3 path (rclone-able): ${uri}`}
+      onClick={onCopy}
+    >
+      {copied ? "✓" : "copy s3"}
+    </button>
+  );
+}
 
 export default function InkSegmentsGallery({ segments, display }) {
   const all = segments || [];
@@ -172,11 +202,17 @@ export default function InkSegmentsGallery({ segments, display }) {
                     3D ↗
                   </a>
                 ) : null}
-                {s.mesh ? (
-                  <a href={toHttp(s.mesh)} target="_blank" rel="noopener noreferrer">
-                    mesh ↗
+                {s.folder ? (
+                  <a
+                    href={browseUrl(s.folder)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="segment folder (tifxyz, surface volumes, predictions) in the file browser"
+                  >
+                    files ↗
                   </a>
                 ) : null}
+                {s.folder ? <CopyS3 uri={s.folder} /> : null}
               </span>
             </div>
           );

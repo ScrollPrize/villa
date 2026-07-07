@@ -208,6 +208,11 @@ The \$40k/\$10k first/second-team split is removed: **\$50,000 per scroll to the
 New `PrizePoolBanner` component at the top of /prizes: ember-bordered card showing the plugin-computed total ("Open prize pool · \$2,140,000 · Grand Prize deadline June 25th, 2027 →"), linking to the 2027 Grand Prize section. Same data source as the landing sticker/board — one value everywhere.
 **Files:** `src/components/PrizePoolBanner.js` (new), `docs/34_prizes.md` (import + placement).
 
+## C22 — data browser: segment folder links + copy-S3 buttons (community feedback)
+
+Per Sean (bruniss) and Forrest's feedback: the per-segment "mesh ↗" .obj link (no current tool consumes .obj, and the linked obj was wrong) is replaced by **"files ↗"** — the segment's root folder (containing the tifxyz, surface volumes, and predictions) in the S3 file browser — plus a **"copy s3"** button that puts the rclone-able `s3://…/segments/<id>/` path on the clipboard. The folder is derived at generation time from any of the segment's data URLs.
+**Files:** `scripts/genAtlasData.js`, `src/components/atlas/InkSegmentsGallery.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
