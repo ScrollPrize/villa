@@ -9,7 +9,10 @@
 #include <vector>
 
 class QComboBox;
+class QPushButton;
+class QSpinBox;
 class VolumePkg;
+class Volume;
 
 
 // Chunk geometry of the currently shown volume, needed to apply the
@@ -26,6 +29,7 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
 
     public:
         SettingsDialog(std::shared_ptr<VolumePkg> volumePackage = {},
+                       std::shared_ptr<Volume> currentVolume = {},
                        std::filesystem::path currentVolumeCacheDir = {},
                        CacheChunkLayout currentVolumeChunkLayout = {},
                        QWidget* parent = nullptr);
@@ -38,11 +42,16 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
 
     private:
         void setupOutputSegmentsControl();
+        void setupCacheActionControls();
         void compressExistingCache();
+        void redownloadExistingCache();
 
         std::shared_ptr<VolumePkg> _volumePackage;
+        std::shared_ptr<Volume> _currentVolume;
         std::filesystem::path _currentVolumeCacheDir;
         CacheChunkLayout _currentVolumeChunkLayout;
         QComboBox* _outputSegmentsCombo{nullptr};
+        QPushButton* _redownloadCacheButton{nullptr};
+        QSpinBox* _cacheActionWorkersSpin{nullptr};
         bool _outputSegmentsChanged{false};
 };

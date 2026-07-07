@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 import math
 import numpy as np
-import open3d as o3d
 import os
+import trimesh
 import zarr
 import logging
 from glob import glob
@@ -43,27 +43,37 @@ _DOWNSAMPLE_DATASETS = {}
 logger = logging.getLogger(__name__)
 
 
-def _apply_affine_to_mesh(mesh, matrix4, perm, inv_transpose):
-    vertices = np.asarray(mesh.vertices)
-    if vertices.size:
-        transformed_vertices = apply_affine_to_points(vertices, matrix4, perm)
-        mesh.vertices = o3d.utility.Vector3dVector(transformed_vertices)
+def _load_mesh(mesh_path):
+    mesh = trimesh.load_mesh(
+        str(mesh_path),
+        process=False,
+        maintain_order=True,
+    )
+    if isinstance(mesh, trimesh.Scene):
+        geometries = tuple(mesh.geometry.values())
+        if not geometries:
+            raise ValueError(f"Mesh file '{mesh_path}' does not contain geometry.")
+        mesh = trimesh.util.concatenate(geometries)
 
-    linear = matrix4[:3, :3]
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise ValueError(f"Mesh file '{mesh_path}' did not load as a triangle mesh.")
 
-    if mesh.has_vertex_normals() and len(mesh.vertex_normals) == len(mesh.vertices):
-        v_normals = np.asarray(mesh.vertex_normals)
-        transformed_normals = transform_normals(
-            v_normals, linear, perm=perm, inv_transpose=inv_transpose
-        )
-        mesh.vertex_normals = o3d.utility.Vector3dVector(transformed_normals)
+    return mesh
 
-    if mesh.has_triangle_normals() and len(mesh.triangle_normals) == len(mesh.triangles):
-        t_normals = np.asarray(mesh.triangle_normals)
-        transformed_t_normals = transform_normals(
-            t_normals, linear, perm=perm, inv_transpose=inv_transpose
-        )
-        mesh.triangle_normals = o3d.utility.Vector3dVector(transformed_t_normals)
+
+def _mesh_triangle_uvs(mesh, triangles):
+    visual = getattr(mesh, "visual", None)
+    uv = getattr(visual, "uv", None)
+    if uv is None:
+        return None
+
+    uv = np.asarray(uv, dtype=np.float32)
+    expected_rows = len(triangles) * 3
+    if uv.shape[0] == expected_rows:
+        return uv.reshape(len(triangles), 3, 2)
+    if uv.shape[0] == len(mesh.vertices):
+        return uv[triangles]
+    return None
 
 
 def _set_slice_state(state):
@@ -930,18 +940,15 @@ def process_mesh(
     We assign mesh_index+1 as the label.
     """
     print(f"Processing mesh: {mesh_path}")
-    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
-
-    if transform_info is not None:
-        _apply_affine_to_mesh(
-            mesh,
-            transform_info["matrix"],
-            transform_info["perm"],
-            transform_info.get("inv_transpose"),
-        )
+    mesh = _load_mesh(mesh_path)
 
     vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    triangles = np.asarray(mesh.triangles, dtype=np.int32)
+    triangles = np.asarray(mesh.faces, dtype=np.int32)
+
+    if transform_info is not None:
+        vertices = apply_affine_to_points(
+            vertices, transform_info["matrix"], transform_info["perm"]
+        ).astype(np.float32, copy=False)
 
     # Every triangle in this mesh gets the same label: mesh_index+1
     labels = np.full(len(triangles), mesh_index + 1, dtype=label_dtype)
@@ -953,37 +960,27 @@ def process_mesh(
     use_vertex_normals = False
 
     if need_normals:
-        if mesh.has_vertex_normals() and len(mesh.vertex_normals) == len(mesh.vertices):
-            vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
-            use_vertex_normals = True
-        else:
-            mesh.compute_vertex_normals()
-            if len(mesh.vertex_normals) == len(mesh.vertices):
-                vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
-                use_vertex_normals = True
+        vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
+        triangle_normals = np.asarray(mesh.face_normals, dtype=np.float32)
 
-        if mesh.has_triangle_normals() and len(mesh.triangle_normals) == len(mesh.triangles):
-            triangle_normals = np.asarray(mesh.triangle_normals, dtype=np.float32)
-        else:
-            mesh.compute_triangle_normals()
-            if len(mesh.triangle_normals) == len(mesh.triangles):
-                triangle_normals = np.asarray(mesh.triangle_normals, dtype=np.float32)
-
-        if triangle_normals.shape[0] == 0:
-            mesh.compute_triangle_normals()
-            triangle_normals = np.asarray(mesh.triangle_normals, dtype=np.float32)
+        if transform_info is not None:
+            linear = transform_info["matrix"][:3, :3]
+            perm = transform_info["perm"]
+            inv_transpose = transform_info.get("inv_transpose")
+            vertex_normals = transform_normals(
+                vertex_normals, linear, perm=perm, inv_transpose=inv_transpose
+            ).astype(np.float32, copy=False)
+            triangle_normals = transform_normals(
+                triangle_normals, linear, perm=perm, inv_transpose=inv_transpose
+            ).astype(np.float32, copy=False)
 
         if vertex_normals.shape[0] != len(vertices):
-            mesh.compute_vertex_normals()
-            if len(mesh.vertex_normals) == len(mesh.vertices):
-                vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
-                use_vertex_normals = True
-
-        if vertex_normals.shape[0] == 0:
             raise ValueError("Unable to compute vertex normals required for surface processing.")
 
-        if triangle_normals.shape[0] == 0:
+        if triangle_normals.shape[0] != len(triangles):
             raise ValueError("Unable to compute triangle normals required for surface processing.")
+
+        use_vertex_normals = True
 
     vertex_tangents = np.zeros((0, 3), dtype=np.float32)
     vertex_bitangents = np.zeros((0, 3), dtype=np.float32)
@@ -992,15 +989,9 @@ def process_mesh(
     use_vertex_tangents = False
 
     if include_surface_frame:
-        if not mesh.has_triangle_uvs():
+        triangle_uvs = _mesh_triangle_uvs(mesh, triangles)
+        if triangle_uvs is None:
             raise ValueError("Mesh does not provide triangle UVs required for surface frame export.")
-
-        triangle_uvs = np.asarray(mesh.triangle_uvs, dtype=np.float32)
-        expected_uv_rows = len(triangles) * 3
-        if triangle_uvs.shape[0] != expected_uv_rows:
-            raise ValueError("Triangle UV array size does not match triangle count.")
-
-        triangle_uvs = triangle_uvs.reshape(len(triangles), 3, 2)
 
         vertex_tangents = np.zeros((len(vertices), 3), dtype=np.float32)
         vertex_bitangents = np.zeros((len(vertices), 3), dtype=np.float32)

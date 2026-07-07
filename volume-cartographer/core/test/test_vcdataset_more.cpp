@@ -74,7 +74,7 @@ TEST_CASE("VcDataset::decompress: too-short input throws for 'none' compressor")
     fs::remove_all(d);
 }
 
-TEST_CASE("ZarrArray::read_chunk_into decodes vc_delta_zstd chunks")
+TEST_CASE("ZarrArray::read_chunk_into decodes vcz1 chunks")
 {
     auto d = tmpDir("vcz_read_into");
     const std::array<int, 3> shape{2, 3, 4};
@@ -92,7 +92,7 @@ TEST_CASE("ZarrArray::read_chunk_into decodes vc_delta_zstd chunks")
         "shape": [2, 3, 4],
         "chunks": [2, 3, 4],
         "dtype": "|u1",
-        "compressor": {"id": "vc_delta_zstd", "level": 3},
+        "compressor": {"id": "vcz1"},
         "fill_value": 0,
         "order": "C",
         "filters": null,
@@ -221,10 +221,10 @@ TEST_CASE("readChunkOrFill: present chunk returns true; output mirrors written d
     fs::remove_all(d);
 }
 
-TEST_CASE("ZarrArray reads a v2 array stored with the vc_delta_zstd codec")
+TEST_CASE("ZarrArray reads a v2 array stored with the vcz1 codec")
 {
     // Mirrors what scripts/recompress_zarr.py produces: VCZ1 chunk payloads
-    // plus a .zarray whose compressor id is "vc_delta_zstd".
+    // plus a .zarray whose compressor id is "vcz1".
     auto d = tmpDir("vcdeltazstd_read");
     const std::array<int, 3> shape{4, 4, 4};
     std::vector<std::byte> voxels(64);
@@ -237,7 +237,7 @@ TEST_CASE("ZarrArray reads a v2 array stored with the vc_delta_zstd codec")
         std::ofstream meta(d / ".zarray");
         meta << R"({"zarr_format":2,"shape":[4,4,4],"chunks":[4,4,4],)"
              << R"("dtype":"|u1","order":"C","fill_value":0,"filters":null,)"
-             << R"("compressor":{"id":"vc_delta_zstd","level":3}})";
+             << R"("compressor":{"id":"vcz1"}})";
     }
     {
         std::ofstream chunk(d / "0.0.0", std::ios::binary);
