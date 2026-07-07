@@ -1363,6 +1363,46 @@ void SurfacePanelController::syncSelectionUi(const std::string& surfaceId, QuadS
     }
 }
 
+bool SurfacePanelController::selectSurfaceById(const std::string& surfaceId)
+{
+    if (!_ui.treeWidget || surfaceId.empty()) {
+        return false;
+    }
+
+    const QString idQString = QString::fromStdString(surfaceId);
+    QTreeWidgetItem* targetItem = nullptr;
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
+            targetItem = *it;
+            break;
+        }
+        ++it;
+    }
+
+    auto surface = getSurfaceById(surfaceId);
+    if (!targetItem || !surface) {
+        return false;
+    }
+
+    {
+        const QSignalBlocker blocker{_ui.treeWidget};
+        _ui.treeWidget->clearSelection();
+        targetItem->setSelected(true);
+        _ui.treeWidget->scrollToItem(targetItem);
+    }
+
+    syncSelectionUi(surfaceId, surface.get());
+
+    if (_segmentationViewerProvider) {
+        if (auto* viewer = _segmentationViewerProvider()) {
+            viewer->setWindowTitle(tr("Surface %1").arg(idQString));
+        }
+    }
+
+    return true;
+}
+
 void SurfacePanelController::resetTagUi()
 {
     _currentSurfaceId.clear();

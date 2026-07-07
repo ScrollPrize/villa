@@ -9667,16 +9667,7 @@ void CWindow::onSegmentationDirChanged(int index)
 
     // Only reload if the directory actually changed
     if (newDir != _state->vpkg()->getSegmentationDirectory()) {
-        // Clear the current segmentation surface first to ensure viewers update
-        _state->setSurface("segmentation", nullptr, true);
-
-        // Clear current surface selection
-        _state->clearActiveSurface();
-        treeWidgetSurfaces->clearSelection();
-
-        if (_surfacePanel) {
-            _surfacePanel->resetTagUi();
-        }
+        const std::string previousActiveSurfaceId = _state->activeSurfaceId();
 
         // Set the new directory in the VolumePkg
         _state->vpkg()->setSegmentationDirectory(newDir);
@@ -9689,6 +9680,68 @@ void CWindow::onSegmentationDirChanged(int index)
         applySegmentFolderSelection(false);
         if (_surfacePanel) {
             _surfacePanel->loadSurfaces(true);
+        }
+
+        bool restoredActiveSurface = false;
+        if (!previousActiveSurfaceId.empty()) {
+            auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(previousActiveSurfaceId));
+            if (!surf && _state->vpkg()) {
+                surf = _state->vpkg()->getSurface(previousActiveSurfaceId);
+            }
+
+            if (surf) {
+                std::vector<std::pair<VolumeViewerBase*, bool>> resetDefaults;
+                if (_viewerManager) {
+                    _viewerManager->forEachBaseViewer([this, &resetDefaults](VolumeViewerBase* viewer) {
+                        if (!viewer || viewer->surfName() != "segmentation") {
+                            return;
+                        }
+                        const bool defaultReset = _viewerManager->resetDefaultFor(viewer);
+                        resetDefaults.emplace_back(viewer, defaultReset);
+                        viewer->setResetViewOnSurfaceChange(false);
+                    });
+                }
+
+                _state->setActiveSurface(previousActiveSurfaceId, surf);
+                _state->setSurface("segmentation", surf, false, true);
+
+                if (!resetDefaults.empty()) {
+                    const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
+                    for (auto& entry : resetDefaults) {
+                        auto* viewer = entry.first;
+                        if (!viewer) {
+                            continue;
+                        }
+                        viewer->setResetViewOnSurfaceChange(editingActive ? false : entry.second);
+                    }
+                }
+
+                if (_surfacePanel) {
+                    _surfacePanel->selectSurfaceById(previousActiveSurfaceId);
+                }
+                if (_segmentationModule) {
+                    try {
+                        _segmentationModule->onActiveSegmentChanged(surf.get());
+                    } catch (const std::exception& e) {
+                        qWarning() << "Failed to reactivate segment"
+                                   << QString::fromStdString(previousActiveSurfaceId)
+                                   << "after switching segmentation directory:"
+                                   << e.what();
+                    }
+                }
+                restoredActiveSurface = true;
+            }
+        }
+
+        if (!restoredActiveSurface) {
+            _state->clearActiveSurface();
+            _state->setSurface("segmentation", nullptr, true);
+            if (treeWidgetSurfaces) {
+                treeWidgetSurfaces->clearSelection();
+            }
+            if (_surfacePanel) {
+                _surfacePanel->resetTagUi();
+            }
         }
 
         // Update the status bar to show the change

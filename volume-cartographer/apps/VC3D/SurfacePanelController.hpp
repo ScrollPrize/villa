@@ -110,6 +110,7 @@ public:
     void applyFilters();
 
     void syncSelectionUi(const std::string& surfaceId, QuadSurface* surface);
+    bool selectSurfaceById(const std::string& surfaceId);
     void resetTagUi();
 
     bool isCurrentOnlyFilterEnabled() const;
