@@ -315,13 +315,13 @@
           <item row="9" column="0" colspan="2">
            <widget class="QCheckBox" name="chkResetViewOnSurfaceChange">
             <property name="text">
-             <string>Reset view when switching between surfaces</string>
+             <string>Automatically rotate planes to align with segmentation</string>
             </property>
             <property name="checked">
              <bool>false</bool>
             </property>
             <property name="toolTip">
-             <string>When enabled, the view will automatically fit and center on each surface when switching between segments</string>
+             <string>When enabled, switching segments automatically rotates the slicing planes to align with the segmentation surface</string>
             </property>
            </widget>
           </item>
@@ -677,10 +677,13 @@
           <item row="2" column="0" colspan="2">
            <widget class="QCheckBox" name="chkCompressRemoteCache">
             <property name="text">
-             <string>Compress remote volume disk cache (zstd, lossless)</string>
+             <string>Compress remote volume disk cache</string>
             </property>
             <property name="toolTip">
-             <string>When enabled, chunks downloaded from remote volumes are stored zstd-compressed in the disk cache. Lossless and fast; typically shrinks the cache severalfold. Existing cache entries stay readable either way. Requires restart.</string>
+             <string>When enabled, chunks downloaded from remote volumes are stored compressed in the disk cache using the selected accuracy below. Existing cache entries stay readable either way. Requires restart.</string>
+            </property>
+            <property name="checked">
+             <bool>true</bool>
             </property>
            </widget>
           </item>
@@ -690,7 +693,21 @@
              <string>Compress existing cache...</string>
             </property>
             <property name="toolTip">
-             <string>Compress the already-downloaded, uncompressed chunks in the disk cache of the currently shown volume (zstd, lossless). Runs with multiple workers and can be cancelled.</string>
+             <string>Compress the already-downloaded chunks in the disk cache of the currently shown volume using the compression accuracy selected below. Runs with multiple workers and can be cancelled.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="labelCacheQuantization">
+            <property name="text">
+             <string>Cache compression accuracy</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QComboBox" name="cmbCacheQuantization">
+            <property name="toolTip">
+             <string>Accuracy of compressed disk-cache chunks. Lossless preserves exact voxel values. Near-lossless modes bound the per-voxel error (±1 or ±2 gray levels) and shrink the cache further. Affects newly written chunks and the "Compress existing cache" action; requires restart for new downloads.</string>
             </property>
            </widget>
           </item>

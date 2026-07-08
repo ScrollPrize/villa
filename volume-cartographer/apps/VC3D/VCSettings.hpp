@@ -234,11 +234,19 @@ namespace perf {
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
     // When true, raw chunks downloaded from remote volumes are stored in the
-    // persistent disk cache zstd-compressed (lossless, fast). Reading
-    // understands both formats regardless of this flag; it only controls the
-    // write format. Requires restart.
+    // persistent disk cache compressed at the configured quantization width.
+    // Reading understands both formats regardless of this flag; it only
+    // controls the write format. Requires restart.
     constexpr auto REMOTE_CACHE_COMPRESSION = "perf/remote_cache_compression";
-    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = false;
+    constexpr bool REMOTE_CACHE_COMPRESSION_DEFAULT = true;
+
+    // Quantization bin width for compressed disk-cache writes
+    // (1 = lossless, 3 = max error +-1, 5 = +-2; see CacheCompression.hpp).
+    // Only affects newly written chunks; reading is unaffected. Requires
+    // restart, except for the explicit "recompress existing cache" action.
+    // Default lossless: compression saves space without changing voxels.
+    constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
+    constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
 
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:
@@ -442,8 +450,16 @@ namespace volume_overlay {
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
+    constexpr auto COMPOSITE_ENABLED = "composite_enabled";
+    constexpr auto COMPOSITE_METHOD = "composite_method";
+    constexpr auto COMPOSITE_LAYERS_FRONT = "composite_layers_front";
+    constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
 
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
+    constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
+    constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;
+    constexpr int COMPOSITE_LAYERS_BEHIND_DEFAULT = 0;
 }
 
 } // namespace settings

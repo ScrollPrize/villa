@@ -122,6 +122,8 @@ public:
     void setOptimizationBusy(bool busy);
     void setOptimizationStatus(bool optimized);
     void setCloseAfterFinalizationAllowed(bool allowed);
+    void setWorkspaceEmbedded(bool embedded);
+    bool workspaceEmbedded() const { return _workspaceEmbedded; }
 
 signals:
     void paneClosed(const std::string& surfaceName);
@@ -238,6 +240,7 @@ private:
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
     bool _closeAfterFinalizationAllowed = false;
+    bool _workspaceEmbedded = false;
 
     QWidget* _generatedTopWidget = nullptr;
     std::vector<QPointer<QWidget>> _generatedContainers;

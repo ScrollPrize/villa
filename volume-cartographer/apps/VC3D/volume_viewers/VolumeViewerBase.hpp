@@ -129,6 +129,7 @@ public:
     virtual void setOverlayThreshold(float threshold) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
     virtual void setOverlayMaxDisplayedResolution(int level) = 0;
+    virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
     virtual void reloadPerfSettings() = 0;
 
     // --- Interaction state ---

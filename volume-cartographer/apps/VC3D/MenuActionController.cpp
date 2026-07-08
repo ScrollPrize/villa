@@ -978,6 +978,7 @@ void MenuActionController::showSettingsDialog()
 
     auto* dialog = new SettingsDialog(
         state ? state->vpkg() : nullptr,
+        state ? state->currentVolume() : nullptr,
         cacheDir,
         std::move(chunkLayout),
         _window);

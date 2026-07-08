@@ -426,6 +426,10 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
 
 void LineAnnotationDialog::showWithSavedGeometry()
 {
+    if (_workspaceEmbedded) {
+        show();
+        return;
+    }
     if (_restoredWindowGeometry) {
         show();
     } else {
@@ -549,11 +553,18 @@ void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
     _closeAfterFinalizationAllowed = allowed;
 }
 
+void LineAnnotationDialog::setWorkspaceEmbedded(bool embedded)
+{
+    _workspaceEmbedded = embedded;
+}
+
 void LineAnnotationDialog::closeEvent(QCloseEvent* event)
 {
     if (_closeAfterFinalizationAllowed) {
         saveGeneratedViewStateSettings();
-        saveWindowGeometry();
+        if (!_workspaceEmbedded) {
+            saveWindowGeometry();
+        }
         QMainWindow::closeEvent(event);
         return;
     }

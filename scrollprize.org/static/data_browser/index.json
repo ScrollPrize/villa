@@ -239,6 +239,21 @@
           }
         ]
       },
+      "legalNotice": {
+        "title": "Data access and publication notice",
+        "added": "07/07/2026",
+        "until": "25/06/2027",
+        "licenseLine": "These terms are a modification of the CC BY-NC 4.0 license (additional terms) under which these materials are provided. The publication-reservation period runs until 25/06/2027.",
+        "paragraphs": [
+          "The raw scan data, virtually unwrapped segments, ink-enhanced data, ink identifications, and related derived materials for this ancient scroll are being made available to support open examination, study, verification, and technical experimentation. Access to these materials is provided on the express condition that they are not used for scholarly publication during the temporary publication-reservation period.",
+          "For one year from the public release of these data, scholarly publication rights are reserved for the research teams designated by the Vesuvius Challenge or by the custodial institution holding the physical scroll. Those teams have been granted the right to prepare the first scholarly analyses because they were designated by the Vesuvius Challenge or by the institution responsible for the original material. This publication reservation was a condition of the imaging of the scroll and must be respected by all users.",
+          "During this period, users may examine, study, test, and analyze the data, but may not publish scholarly claims, transcriptions, translations, editions, interpretations, or formal analyses based on the data without permission from the Vesuvius Challenge, the custodial institution, or the designated scholarly teams. After the one-year restriction has expired and the designated teams have published their analyses, the data will be released from this publication restriction and will be available for unrestricted scholarly use."
+        ]
+      },
+      "licenseScope": {
+        "EduceLab Data License": "the 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
       "volume": null,
       "mesh": {
         "file": "PHercParis4.ply",
@@ -1253,7 +1268,7 @@
     {
       "id": "PHerc1667",
       "type": "scroll",
-      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
+      "desc": "PHerc. 1667 is a rolled Herculaneum papyrus from the [Biblioteca Nazionale di Napoli](https://www.bnnonline.it/it/121/officina-dei-papiri-ercolanesi), carbonized during the eruption of Mount Vesuvius in 79 AD. It was first scanned at the [Diamond Light Source](https://www.diamond.ac.uk) in Oxfordshire, UK (2023, at 3.24 µm and 7.91 µm), and later rescanned at 2.4 µm at the [ESRF](https://www.esrf.fr) in Grenoble, France (2025) — the scan from which it was virtually unwrapped and read in full.\n\nIt is similar in size to PHerc. 332 (Scroll 3).",
       "legacy": "https://dl.ash2txt.org/full-scrolls/Scroll4/PHerc1667.volpkg/",
       "n_scans": 3,
       "n_volumes": 3,
@@ -1332,6 +1347,11 @@
         "unrolledPct": 100
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": {
+        "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
       "volume": null,
       "mesh": {
         "file": "PHerc1667.ply",
@@ -1650,6 +1670,8 @@
           }
         ]
       },
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0172.ply",
@@ -2388,6 +2410,8 @@
         "unrolledPct": 20
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0139.ply",
@@ -2956,6 +2980,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": "s3://vesuvius-challenge/PHerc0814/representations/predictions/surfaces/20260309142202-surface-20260413222639-surface-m7-L2-th0.2.zarr",
       "mesh": {
         "file": "PHerc0814.ply",
@@ -3211,6 +3237,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0500P2.ply",
@@ -3314,6 +3342,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0343P.ply",
@@ -3406,6 +3436,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0841.ply",
@@ -3509,6 +3541,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0009B.ply",
@@ -3626,6 +3660,11 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": {
+        "EduceLab Data License": "the 3.24 µm and 7.91 µm DLS scans",
+        "CC BY-NC 4.0": "all other data"
+      },
       "volume": "s3://vesuvius-challenge/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr",
       "mesh": {
         "file": "PHerc0332.ply",
@@ -3723,6 +3762,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc1451.ply",
@@ -3815,6 +3856,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHercMANBp.ply",
@@ -3907,6 +3950,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0846A.ply",
@@ -4002,6 +4047,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHercMAN5.ply",
@@ -4086,6 +4133,10 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": {
+        "CC BY-NC 4.0": "all data"
+      },
       "volume": null,
       "mesh": {
         "file": "PHercParis3.ply",
@@ -4158,6 +4209,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHercMANB.ply",
@@ -4242,6 +4295,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc1299.ply",
@@ -4334,6 +4389,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc1203.ply",
@@ -4429,6 +4486,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0175A.ply",
@@ -4513,6 +4572,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0343.ply",
@@ -4597,6 +4658,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0483B.ply",
@@ -4681,6 +4744,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0490A.ply",
@@ -4765,6 +4830,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0306B.ply",
@@ -4849,6 +4916,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc1218.ply",
@@ -4933,6 +5002,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0175B.ply",
@@ -5017,6 +5088,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0800.ply",
@@ -5101,6 +5174,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0490B.ply",
@@ -5185,6 +5260,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0483A.ply",
@@ -5269,6 +5346,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0268.ply",
@@ -5353,6 +5432,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc1447.ply",
@@ -5437,6 +5518,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0826.ply",
@@ -5521,6 +5604,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0211.ply",
@@ -5605,6 +5690,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0813.ply",
@@ -5689,6 +5776,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0125.ply",
@@ -5773,6 +5862,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0846B.ply",
@@ -5857,6 +5948,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0358.ply",
@@ -5941,6 +6034,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0191.ply",
@@ -6025,6 +6120,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc0257.ply",
@@ -6109,6 +6206,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": {
         "file": "PHerc1545.ply",
@@ -6150,7 +6249,12 @@
       "locations": [],
       "scans": [],
       "hasS3": true,
-      "licenses": [],
+      "licenses": [
+        {
+          "name": "EduceLab Data License",
+          "url": "https://dl.ash2txt.org/LICENSE.txt"
+        }
+      ],
       "volumeZarr": null,
       "display": "PHercParis1Fr39",
       "repository": "Institut de France, Paris",
@@ -6176,6 +6280,10 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "volume": null,
       "mesh": null,
       "inkSegments": [],
@@ -6226,6 +6334,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": null,
       "inkSegments": [],
@@ -6276,6 +6386,8 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": null,
       "volume": null,
       "mesh": null,
       "inkSegments": [],
@@ -6300,7 +6412,12 @@
       "locations": [],
       "scans": [],
       "hasS3": true,
-      "licenses": [],
+      "licenses": [
+        {
+          "name": "EduceLab Data License",
+          "url": "https://dl.ash2txt.org/LICENSE.txt"
+        }
+      ],
       "volumeZarr": null,
       "display": "PHercParis1Fr34",
       "repository": "Institut de France, Paris",
@@ -6326,6 +6443,10 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "volume": null,
       "mesh": null,
       "inkSegments": [],
@@ -6350,7 +6471,12 @@
       "locations": [],
       "scans": [],
       "hasS3": true,
-      "licenses": [],
+      "licenses": [
+        {
+          "name": "EduceLab Data License",
+          "url": "https://dl.ash2txt.org/LICENSE.txt"
+        }
+      ],
       "volumeZarr": null,
       "display": "PHercParis2Fr47",
       "repository": "Institut de France, Paris",
@@ -6376,6 +6502,10 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "volume": null,
       "mesh": null,
       "inkSegments": [],
@@ -6400,7 +6530,12 @@
       "locations": [],
       "scans": [],
       "hasS3": true,
-      "licenses": [],
+      "licenses": [
+        {
+          "name": "EduceLab Data License",
+          "url": "https://dl.ash2txt.org/LICENSE.txt"
+        }
+      ],
       "volumeZarr": null,
       "display": "PHercParis2Fr143",
       "repository": "Institut de France, Paris",
@@ -6426,6 +6561,10 @@
         "unrolledPct": 0
       },
       "readings": null,
+      "legalNotice": null,
+      "licenseScope": {
+        "EduceLab Data License": "all data — the DLS scans"
+      },
       "volume": null,
       "mesh": null,
       "inkSegments": [],

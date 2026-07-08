@@ -8,6 +8,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCryptographicHash>
 #include <QDir>
@@ -87,6 +88,14 @@ int spinValueFromWindow(float value)
     const float clamped = std::clamp(value, 0.0f, 255.0f);
     return static_cast<int>(std::round(clamped));
 }
+
+std::string sanitizedCompositeMethod(const std::string& method)
+{
+    if (method == "max" || method == "mean" || method == "min") {
+        return method;
+    }
+    return vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
+}
 } // namespace
 
 VolumeOverlayController::VolumeOverlayController(ViewerManager* manager, QObject* parent)
@@ -117,6 +126,21 @@ void VolumeOverlayController::setUi(const UiRefs& ui)
         _ui.maxDisplayedResolutionSpin->setValue(std::clamp(_overlayMaxDisplayedResolution, 0, 5));
     }
 
+    if (_ui.compositeMethodSelect) {
+        const QSignalBlocker blocker(_ui.compositeMethodSelect);
+        _ui.compositeMethodSelect->clear();
+        _ui.compositeMethodSelect->addItem(tr("Maximum"), QStringLiteral("max"));
+        _ui.compositeMethodSelect->addItem(tr("Mean"), QStringLiteral("mean"));
+        _ui.compositeMethodSelect->addItem(tr("Minimum"), QStringLiteral("min"));
+    }
+    if (_ui.compositeLayersFrontSpin) {
+        _ui.compositeLayersFrontSpin->setRange(0, 64);
+    }
+    if (_ui.compositeLayersBehindSpin) {
+        _ui.compositeLayersBehindSpin->setRange(0, 64);
+    }
+    syncCompositeUi();
+
     populateColormapOptions();
     refreshVolumeOptions();
     updateUiEnabled();
@@ -146,6 +170,8 @@ void VolumeOverlayController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg
     if (_viewerManager) {
         _viewerManager->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     }
+    syncCompositeUi();
+    pushCompositeToManager();
     updateUiEnabled();
     _suspendPersistence = false;
 }
@@ -183,6 +209,11 @@ void VolumeOverlayController::clearVolumePkg()
     _overlayWindowLow = 0.0f;
     _overlayWindowHigh = 255.0f;
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
+    _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
+    _compositeMethod = vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
+    _compositeLayersFront = vc3d::settings::volume_overlay::COMPOSITE_LAYERS_FRONT_DEFAULT;
+    _compositeLayersBehind = vc3d::settings::volume_overlay::COMPOSITE_LAYERS_BEHIND_DEFAULT;
+    syncCompositeUi();
     if (_ui.opacitySpin) {
         const QSignalBlocker blocker(_ui.opacitySpin);
         _ui.opacitySpin->setValue(percentValueFromOpacity(_overlayOpacity));
@@ -201,6 +232,7 @@ void VolumeOverlayController::clearVolumePkg()
         _viewerManager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
         _viewerManager->setOverlayColormap(std::string());
         _viewerManager->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
+        _viewerManager->setOverlayComposite(currentCompositeSettings());
     }
 
     updateUiEnabled();
@@ -379,6 +411,30 @@ void VolumeOverlayController::connectUiSignals()
             _ui.maxDisplayedResolutionSpin, qOverload<int>(&QSpinBox::valueChanged),
             this, [this](int value) { handleMaxDisplayedResolutionChanged(value); }));
     }
+
+    if (_ui.compositeEnabledCheck) {
+        _connections.push_back(QObject::connect(
+            _ui.compositeEnabledCheck, &QCheckBox::toggled,
+            this, [this](bool checked) { handleCompositeEnabledChanged(checked); }));
+    }
+
+    if (_ui.compositeMethodSelect) {
+        _connections.push_back(QObject::connect(
+            _ui.compositeMethodSelect, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int index) { handleCompositeMethodChanged(index); }));
+    }
+
+    if (_ui.compositeLayersFrontSpin) {
+        _connections.push_back(QObject::connect(
+            _ui.compositeLayersFrontSpin, qOverload<int>(&QSpinBox::valueChanged),
+            this, [this](int value) { handleCompositeLayersFrontChanged(value); }));
+    }
+
+    if (_ui.compositeLayersBehindSpin) {
+        _connections.push_back(QObject::connect(
+            _ui.compositeLayersBehindSpin, qOverload<int>(&QSpinBox::valueChanged),
+            this, [this](int value) { handleCompositeLayersBehindChanged(value); }));
+    }
 }
 
 void VolumeOverlayController::disconnectUiSignals()
@@ -471,6 +527,19 @@ void VolumeOverlayController::updateUiEnabled()
         const bool hasColormaps = _ui.colormapSelect->count() > 0;
         _ui.colormapSelect->setEnabled(hasOverlay && hasColormaps);
     }
+    if (_ui.compositeEnabledCheck) {
+        _ui.compositeEnabledCheck->setEnabled(hasOverlay);
+    }
+    const bool compositeControlsEnabled = hasOverlay && _compositeEnabled;
+    if (_ui.compositeMethodSelect) {
+        _ui.compositeMethodSelect->setEnabled(compositeControlsEnabled);
+    }
+    if (_ui.compositeLayersFrontSpin) {
+        _ui.compositeLayersFrontSpin->setEnabled(compositeControlsEnabled);
+    }
+    if (_ui.compositeLayersBehindSpin) {
+        _ui.compositeLayersBehindSpin->setEnabled(compositeControlsEnabled);
+    }
 }
 
 void VolumeOverlayController::syncWindowFromManager(float low, float high)
@@ -503,6 +572,10 @@ void VolumeOverlayController::loadState()
     _overlayWindowHigh = 255.0f;
     _overlayColormapName.clear();
     _overlayMaxDisplayedResolution = vc3d::settings::volume_overlay::MAX_DISPLAYED_RESOLUTION_DEFAULT;
+    _compositeEnabled = vc3d::settings::volume_overlay::COMPOSITE_ENABLED_DEFAULT;
+    _compositeMethod = vc3d::settings::volume_overlay::COMPOSITE_METHOD_DEFAULT;
+    _compositeLayersFront = vc3d::settings::volume_overlay::COMPOSITE_LAYERS_FRONT_DEFAULT;
+    _compositeLayersBehind = vc3d::settings::volume_overlay::COMPOSITE_LAYERS_BEHIND_DEFAULT;
 
     if (_volpkgPath.isEmpty()) {
         return;
@@ -557,6 +630,23 @@ void VolumeOverlayController::loadState()
         0,
         5);
 
+    _compositeEnabled = settings.value(volume_overlay::COMPOSITE_ENABLED,
+                                       volume_overlay::COMPOSITE_ENABLED_DEFAULT).toBool();
+    _compositeMethod = sanitizedCompositeMethod(
+        settings.value(volume_overlay::COMPOSITE_METHOD,
+                       QString::fromLatin1(volume_overlay::COMPOSITE_METHOD_DEFAULT))
+            .toString().toStdString());
+    _compositeLayersFront = std::clamp(
+        settings.value(volume_overlay::COMPOSITE_LAYERS_FRONT,
+                       volume_overlay::COMPOSITE_LAYERS_FRONT_DEFAULT).toInt(),
+        0,
+        64);
+    _compositeLayersBehind = std::clamp(
+        settings.value(volume_overlay::COMPOSITE_LAYERS_BEHIND,
+                       volume_overlay::COMPOSITE_LAYERS_BEHIND_DEFAULT).toInt(),
+        0,
+        64);
+
     settings.endGroup();
     settings.endGroup();
 }
@@ -584,6 +674,10 @@ void VolumeOverlayController::saveState() const
     settings.setValue(volume_overlay::THRESHOLD, _overlayWindowLow); // legacy compatibility
     settings.setValue(volume_overlay::COLORMAP, QString::fromStdString(_overlayColormapName));
     settings.setValue(volume_overlay::MAX_DISPLAYED_RESOLUTION, _overlayMaxDisplayedResolution);
+    settings.setValue(volume_overlay::COMPOSITE_ENABLED, _compositeEnabled);
+    settings.setValue(volume_overlay::COMPOSITE_METHOD, QString::fromStdString(_compositeMethod));
+    settings.setValue(volume_overlay::COMPOSITE_LAYERS_FRONT, _compositeLayersFront);
+    settings.setValue(volume_overlay::COMPOSITE_LAYERS_BEHIND, _compositeLayersBehind);
     settings.endGroup();
     settings.endGroup();
 }
@@ -682,6 +776,116 @@ void VolumeOverlayController::setWindowBounds(float low, float high)
 
     if (_viewerManager) {
         _viewerManager->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
+    }
+}
+
+OverlayCompositeSettings VolumeOverlayController::currentCompositeSettings() const
+{
+    OverlayCompositeSettings settings;
+    settings.enabled = _compositeEnabled;
+    settings.method = sanitizedCompositeMethod(_compositeMethod);
+    settings.layersFront = std::clamp(_compositeLayersFront, 0, 64);
+    settings.layersBehind = std::clamp(_compositeLayersBehind, 0, 64);
+    return settings;
+}
+
+void VolumeOverlayController::syncCompositeUi()
+{
+    if (_ui.compositeEnabledCheck) {
+        const QSignalBlocker blocker(_ui.compositeEnabledCheck);
+        _ui.compositeEnabledCheck->setChecked(_compositeEnabled);
+    }
+    if (_ui.compositeMethodSelect) {
+        const QSignalBlocker blocker(_ui.compositeMethodSelect);
+        const int index = _ui.compositeMethodSelect->findData(
+            QString::fromStdString(sanitizedCompositeMethod(_compositeMethod)));
+        if (index >= 0) {
+            _ui.compositeMethodSelect->setCurrentIndex(index);
+        }
+    }
+    if (_ui.compositeLayersFrontSpin) {
+        const QSignalBlocker blocker(_ui.compositeLayersFrontSpin);
+        _ui.compositeLayersFrontSpin->setValue(std::clamp(_compositeLayersFront, 0, 64));
+    }
+    if (_ui.compositeLayersBehindSpin) {
+        const QSignalBlocker blocker(_ui.compositeLayersBehindSpin);
+        _ui.compositeLayersBehindSpin->setValue(std::clamp(_compositeLayersBehind, 0, 64));
+    }
+}
+
+void VolumeOverlayController::pushCompositeToManager()
+{
+    if (_viewerManager) {
+        _viewerManager->setOverlayComposite(currentCompositeSettings());
+    }
+}
+
+void VolumeOverlayController::handleCompositeEnabledChanged(bool enabled)
+{
+    if (_compositeEnabled == enabled) {
+        return;
+    }
+
+    _compositeEnabled = enabled;
+    pushCompositeToManager();
+    updateUiEnabled();
+
+    if (!_suspendPersistence) {
+        saveState();
+    }
+}
+
+void VolumeOverlayController::handleCompositeMethodChanged(int index)
+{
+    if (!_ui.compositeMethodSelect || index < 0) {
+        return;
+    }
+
+    const QVariant data = _ui.compositeMethodSelect->itemData(index);
+    if (!data.isValid()) {
+        return;
+    }
+
+    const std::string method = sanitizedCompositeMethod(data.toString().toStdString());
+    if (_compositeMethod == method) {
+        return;
+    }
+
+    _compositeMethod = method;
+    pushCompositeToManager();
+
+    if (!_suspendPersistence) {
+        saveState();
+    }
+}
+
+void VolumeOverlayController::handleCompositeLayersFrontChanged(int value)
+{
+    const int clamped = std::clamp(value, 0, 64);
+    if (_compositeLayersFront == clamped) {
+        return;
+    }
+
+    _compositeLayersFront = clamped;
+    pushCompositeToManager();
+
+    if (!_suspendPersistence) {
+        saveState();
+    }
+}
+
+void VolumeOverlayController::handleCompositeLayersBehindChanged(int value)
+{
+    const int clamped = std::clamp(value, 0, 64);
+    if (_compositeLayersBehind == clamped) {
+        return;
+    }
+
+    _compositeLayersBehind = clamped;
+    pushCompositeToManager();
+
+    if (!_suspendPersistence) {
+        saveState();
     }
 }
 
