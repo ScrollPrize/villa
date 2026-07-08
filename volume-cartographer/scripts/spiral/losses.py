@@ -128,6 +128,13 @@ def _progressive_dt_active_mask(snapped_winding, dr_per_winding, dt_max_winding)
     return winding_idx <= dt_max_winding
 
 
+def _weighted_line_choice(totals):
+    """Pick a line index with probability proportional to its valid length (F5 area-uniform)."""
+    total = float(totals.sum())
+    if total <= 0:
+        return np.random.randint(len(totals))
+    return int(np.searchsorted(np.cumsum(totals), np.random.random() * total, side='right'))
+
 
 def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, patch_indices, extra_zyxs=None, num_points_per_patch=None):
     if len(patch_indices) == 0:
@@ -150,6 +157,7 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     vertical_ijs_by_patch = np.empty([N, P, 2], dtype=np.float32)
     rand = np.random.random
     randint = np.random.randint
+    within_row_uniform = cfg['patch_within_sampling'] == 'row_run'
     fixed_jitters_h = rand(N).astype(np.float32)
     fixed_jitters_v = rand(N).astype(np.float32)
     var_jitters_h = rand((N, P)).astype(np.float32)
@@ -160,7 +168,7 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
         # Horizontal: pick a row uniformly from rows-with-valid-quads, then pick a run
         # within that row weighted by length (matches original `np.random.choice(flatnonzero)`).
         rows_h = patch._sampling_valid_quad_rows
-        k = randint(rows_h.shape[0])
+        k = randint(rows_h.shape[0]) if within_row_uniform else _weighted_line_choice(patch._h_row_totals)
         row_idx = rows_h[k]
         cum_h = patch._h_runs_cum[k]
         total_h = cum_h[-1]
@@ -177,7 +185,7 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
 
         # Vertical: same but with rows/cols swapped (fixed-coord is the column).
         cols_v = patch._sampling_valid_quad_cols
-        k = randint(cols_v.shape[0])
+        k = randint(cols_v.shape[0]) if within_row_uniform else _weighted_line_choice(patch._v_col_totals)
         col_idx = cols_v[k]
         cum_v = patch._v_runs_cum[k]
         total_v = cum_v[-1]

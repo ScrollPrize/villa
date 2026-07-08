@@ -73,6 +73,7 @@ from satistfaction_metrics import (
 )
 from visualization import overlay_patches_on_slices
 from transforms import SpiralAndTransform
+import adaptive_sampling as adasamp
 
 
 configure_torch_threads_from_env()
@@ -214,6 +215,74 @@ default_config = {
     'shell_table_smooth_sigma_z': 4.0,
     'shell_table_smooth_sigma_theta': 1.0,
     'shell_min_confidence': 0.25,
+
+    # --- adaptive annotation sampling (see adaptive_sampling.py); ALL defaults reproduce baseline ---
+    # F1 patch area exponent (was hardcoded sqrt = 0.5)
+    'patch_area_sampling_alpha': 0.5,
+    # F2 spatial density-equalization (tau=0 / enable=False => no-op)
+    'density_equalize_enable': False,
+    'density_equalize_tau': 0.0,
+    'density_equalize_mode': 'reweight',
+    'density_measure': 'count',
+    'density_bin_scheme': 'voxel',
+    'density_voxel_size': 256.0,
+    'density_num_z_slabs': 16,
+    'density_num_radial_rings': 12,
+    'density_num_angular_sectors': 8,
+    'density_multi_stratum': 'centroid',
+    'density_apply_patches': True,
+    'density_apply_unverified': True,
+    'density_apply_rel_winding': True,
+    'density_apply_abs_winding': True,
+    'density_apply_unattached': True,
+    'density_apply_tracks': True,
+    'density_spiral_recompute_interval': 0,
+    # F3 residual-adaptive / hard-example (beta=0 / enable=False => no-op)
+    'residual_adaptive_enable': False,
+    'residual_ema_beta': 0.0,
+    'residual_ema_decay': 0.9,
+    'residual_ema_eps': 1.e-6,
+    'residual_ema_warmup_steps': 2000,
+    'residual_apply_patches': True,
+    'residual_apply_unverified': False,
+    'residual_apply_unattached': True,
+    'residual_apply_tracks': True,
+    'residual_apply_rel_winding': False,
+    'residual_apply_abs_winding': False,
+    # curriculum (anneal tau/beta over training; enable=False => static)
+    'curriculum_enable': False,
+    'curriculum_schedule': 'linear',
+    'curriculum_warmup_frac': 0.0,
+    'curriculum_density_end_frac': 1.0,
+    'curriculum_hard_start_frac': 0.5,
+    'curriculum_tau_final': 0.0,
+    'curriculum_beta_final': 0.0,
+    # F4 coverage / blue-noise (enable=False => no-op)
+    'bluenoise_enable': False,
+    'bluenoise_method': 'fps',
+    'bluenoise_oversample': 2.0,
+    'bluenoise_min_dist': 0.0,
+    'bluenoise_space': 'scan',
+    'bluenoise_apply_patches': False,
+    'bluenoise_apply_unattached': False,
+    'bluenoise_apply_tracks': False,
+    # F5 within-patch anchor sampling ('row_run' = original; 'area_uniform' = length-weighted)
+    'patch_within_sampling': 'row_run',
+    # F6 satisfaction-frontier (metric-aware) patch sampling: periodically re-measure each
+    # patch's satisfied-quad fraction and upweight those just below the satisfaction threshold
+    # (one nudge from flipping). enable=False => no probe, no reweight => baseline bit-identical.
+    'frontier_enable': False,
+    'frontier_probe_interval': 1000,   # steps between satisfaction probes
+    'frontier_start_frac': 0.8,        # only probe/reweight after this fraction of training (DT phase)
+    'frontier_peak': 0.9,              # satisfied-fraction the weight peaks at (just below threshold)
+    'frontier_width': 0.12,            # Gaussian scale of the frontier band
+    'frontier_floor': 0.05,            # min weight (keeps satisfied/hopeless patches sampled)
+    'frontier_hopeless': 0.35,         # below this satisfied-fraction, treat as hopeless (floor only)
+    'frontier_ema_decay': 0.6,         # EMA on the per-patch frontier weight (stability/hysteresis)
+    # F7 two-sided / hysteresis term: weight for patches JUST ABOVE threshold so freshly-satisfied
+    # patches keep being sampled and don't regress (anti-oscillation). retain=0 => one-sided F6.
+    'frontier_retain': 0.0,
+    'frontier_retain_width': 0.04,     # Gaussian scale (above threshold) of the retention band
 }
 
 
@@ -791,7 +860,7 @@ def main(load_only_patches_and_point_collections=False):
     # patch cache / atlas construction
     # ==========================================================================
 
-    def prepare_patch_sampling_cache(patches):
+    def prepare_patch_sampling_cache(patches, alpha=0.5):
         patch_areas = np.empty(len(patches), dtype=np.float32)
         for patch_idx, patch in enumerate(patches):
             # Use the quad-valid mask so bilinear interpolation at (row_idx+di, j+dj)
@@ -847,13 +916,47 @@ def main(load_only_patches_and_point_collections=False):
                 in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
             )
 
+            patch._h_row_totals = np.array([c[-1] if c.shape[0] else 0.0 for c in patch._h_runs_cum], dtype=np.float64)
+            patch._v_col_totals = np.array([c[-1] if c.shape[0] else 0.0 for c in patch._v_runs_cum], dtype=np.float64)
             patch_areas[patch_idx] = float(patch.area)
 
-        inv_weights = patch_areas ** 0.5
+        inv_weights = patch_areas ** alpha
         return inv_weights / inv_weights.sum()
 
+    def _compute_patch_strata_density(patches):
+        """Per-patch scan-space stratum density for F2 density-equalization, or None if
+        disabled. Representative coord = mean of the patch's in-ROI valid-quad centers.
+        Computed once in static scan space (the spiral transform drifts during training)."""
+        if not cfg['density_equalize_enable']:
+            return None
+        n = len(patches)
+        reps = np.empty((n, 3), dtype=np.float64)
+        areas = np.empty(n, dtype=np.float64)
+        for i, patch in enumerate(patches):
+            zyxs_np = patch.zyxs.detach().cpu().numpy().astype(np.float64)
+            qc = (zyxs_np[:-1, :-1] + zyxs_np[1:, :-1] + zyxs_np[:-1, 1:] + zyxs_np[1:, 1:]) / 4.0
+            m = patch._sampling_valid_quad_mask_np
+            sel = qc[m]
+            reps[i] = sel.mean(axis=0) if sel.shape[0] else zyxs_np.reshape(-1, 3).mean(axis=0)
+            areas[i] = float(patch.area)
+        sid = adasamp.compute_stratum_ids(
+            reps,
+            bin_scheme=cfg['density_bin_scheme'],
+            voxel_size=cfg['density_voxel_size'],
+            num_z_slabs=cfg['density_num_z_slabs'],
+            num_radial_rings=cfg['density_num_radial_rings'],
+            num_angular_sectors=cfg['density_num_angular_sectors'],
+            z_to_umbilicus_yx=umbilicus,
+            z_begin=z_begin, z_end=z_end,
+        )
+        measure = areas if cfg['density_measure'] == 'area' else None
+        return adasamp.stratum_density_per_unit(sid, measure=measure)
+
     verified_patches_list = list(verified_patches.values())
-    patch_sampling_probabilities = prepare_patch_sampling_cache(verified_patches_list)
+    patch_sampling_probabilities = prepare_patch_sampling_cache(verified_patches_list, alpha=cfg['patch_area_sampling_alpha'])
+    patch_density = _compute_patch_strata_density(verified_patches_list)
+    patch_resid_ema = adasamp.ResidualEMA(len(verified_patches_list), decay=cfg['residual_ema_decay']) if (cfg['residual_adaptive_enable'] and cfg['residual_apply_patches']) else None
+    patch_frontier_w = None  # F6: per-patch satisfaction-frontier weight (set by periodic probe)
     num_verified_patches = len(verified_patches_list)
     print(f'fitting {num_verified_patches} patches')
 
@@ -891,6 +994,7 @@ def main(load_only_patches_and_point_collections=False):
 
     unverified_patches_list = []
     unverified_patch_sampling_probabilities = None
+    unverified_patch_density = None
     unverified_patch_atlas = None
     using_tracks = (
         (cfg['loss_weight_track_radius'] > 0 or cfg['loss_weight_track_dt'] > 0)
@@ -1050,7 +1154,8 @@ def main(load_only_patches_and_point_collections=False):
 
     if unverified_patches:
         unverified_patches_list = list(unverified_patches.values())
-        unverified_patch_sampling_probabilities = prepare_patch_sampling_cache(unverified_patches_list)
+        unverified_patch_sampling_probabilities = prepare_patch_sampling_cache(unverified_patches_list, alpha=cfg['patch_area_sampling_alpha'])
+        unverified_patch_density = _compute_patch_strata_density(unverified_patches_list)
         unverified_patch_atlas = PatchGpuAtlas(unverified_patches, device='cuda')
 
     # ==========================================================================
@@ -1306,6 +1411,64 @@ def main(load_only_patches_and_point_collections=False):
             'flow_field_high_res_lr_scale': spiral_and_transform.flow_field.flow_scales[1],
         }
 
+        # F6 satisfaction-frontier probe: periodically re-measure per-patch satisfied-quad fraction
+        # and build a weight peaked just below the satisfaction threshold (metric-aware sampling).
+        # Off by default (no probe, no cost). Active only in the configured (late/DT) phase.
+        if cfg['frontier_enable'] and iteration >= int(cfg['frontier_start_frac'] * num_training_steps) \
+                and (patch_frontier_w is None or iteration % max(1, int(cfg['frontier_probe_interval'])) == 0):
+            with torch.no_grad():
+                _f_sat, _f_sa, _f_ta, _f_qm, _f_bsat, _f_twi = _get_patch_satisfied_areas(
+                    slice_to_spiral_transform, dr_per_winding, verified_patches_list, z_begin, z_end)
+            _f_frac = (_f_sa / _f_ta.clamp(min=1e-9)).cpu().numpy()
+            _f_w = adasamp.frontier_weight(
+                _f_frac, threshold=metrics_config['satisfied_patch_quad_fraction'],
+                peak=cfg['frontier_peak'], width=cfg['frontier_width'],
+                floor=cfg['frontier_floor'], hopeless=cfg['frontier_hopeless'],
+                retain=cfg['frontier_retain'], retain_width=cfg['frontier_retain_width'])
+            if patch_frontier_w is None:
+                patch_frontier_w = _f_w
+            else:
+                _d = float(cfg['frontier_ema_decay'])
+                patch_frontier_w = _d * patch_frontier_w + (1.0 - _d) * _f_w
+            log_metrics['frontier_probe_satisfied_frac'] = float(
+                (_f_frac >= metrics_config['satisfied_patch_quad_fraction']).mean())
+
+        # Adaptive sampling: F1 area-exponent is baked into *_sampling_probabilities; F2 density and
+        # F3 residual reweighting are applied here per-step. When both are off, combine returns the
+        # base array unchanged so the patch draws stay bit-identical to baseline.
+        if cfg['density_equalize_enable'] or cfg['residual_adaptive_enable']:
+            tau_now, beta_now = adasamp.resolve_tau_beta(cfg, iteration, num_training_steps)
+            resid_on = cfg['residual_adaptive_enable'] and iteration >= cfg['residual_ema_warmup_steps']
+            eff_patch_probs = adasamp.combine_sampling_weights(
+                patch_sampling_probabilities,
+                density=patch_density if cfg['density_apply_patches'] else None,
+                residual_ema=patch_resid_ema.values() if (resid_on and patch_resid_ema is not None) else None,
+                tau=tau_now if cfg['density_apply_patches'] else 0.0,
+                beta=beta_now if (resid_on and patch_resid_ema is not None) else 0.0,
+                eps=cfg['residual_ema_eps'],
+            )
+            if unverified_patch_sampling_probabilities is not None:
+                eff_unverified_probs = adasamp.combine_sampling_weights(
+                    unverified_patch_sampling_probabilities,
+                    density=unverified_patch_density if cfg['density_apply_unverified'] else None,
+                    tau=tau_now if cfg['density_apply_unverified'] else 0.0,
+                    beta=0.0,
+                    eps=cfg['residual_ema_eps'],
+                )
+            else:
+                eff_unverified_probs = unverified_patch_sampling_probabilities
+        else:
+            eff_patch_probs = patch_sampling_probabilities
+            eff_unverified_probs = unverified_patch_sampling_probabilities
+
+        # F6: fold in the satisfaction-frontier weight (no-op while disabled or before the first probe;
+        # multiplication makes a new array, so the cached base probabilities are never mutated).
+        if cfg['frontier_enable'] and patch_frontier_w is not None:
+            eff_patch_probs = eff_patch_probs * patch_frontier_w
+            _fs = eff_patch_probs.sum()
+            if _fs > 0:
+                eff_patch_probs = eff_patch_probs / _fs
+
         compute_patch_dt = iteration > cfg['loss_start_patch_dt']
         track_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_track_dt'] is None else cfg['loss_start_track_dt']
         compute_track_dt = iteration > track_dt_start
@@ -1331,7 +1494,7 @@ def main(load_only_patches_and_point_collections=False):
             cfg['num_patches_per_step_for_dt'],
             verified_patches_list,
             patch_atlas,
-            patch_sampling_probabilities,
+            eff_patch_probs,
             umbilicus_zyx,
             compute_dt=compute_patch_dt,
             shell_valid_zyxs=shell_valid_zyxs_gpu,
@@ -1354,7 +1517,7 @@ def main(load_only_patches_and_point_collections=False):
                 cfg['unverified_num_patches_per_step_for_dt'],
                 unverified_patches_list,
                 unverified_patch_atlas,
-                unverified_patch_sampling_probabilities,
+                eff_unverified_probs,
                 compute_dt=compute_unverified_patch_dt,
                 dt_max_winding=unverified_patch_dt_max_winding,
             )
