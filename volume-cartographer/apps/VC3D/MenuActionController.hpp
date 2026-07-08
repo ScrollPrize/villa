@@ -1,12 +1,15 @@
 #pragma once
 
 #include <QObject>
+#include <QFutureWatcher>
 #include <QPointer>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <string>
 
 #include "vc/core/util/RemoteAuth.hpp"
+#include "OpenDataVolumePrefill.hpp"
 
 class QAction;
 class QDialog;
@@ -28,6 +31,7 @@ public:
     static constexpr int kMaxRecentVolpkg = 10;
 
     explicit MenuActionController(CWindow* window);
+    ~MenuActionController() override;
 
     void populateMenus(QMenuBar* menuBar);
     void updateRecentVolpkgList(const QString& path);
@@ -83,6 +87,8 @@ private:
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
     bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample);
+    void startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume);
+    void cancelOpenDataVolumePrefills();
     bool tryResolveRemoteAuth(const QString& url,
                               vc::HttpAuth* authOut,
                               bool allowPrompt,
@@ -142,4 +148,6 @@ private:
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
+    std::vector<QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>*> _openDataPrefillWatchers;
+    std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
 };

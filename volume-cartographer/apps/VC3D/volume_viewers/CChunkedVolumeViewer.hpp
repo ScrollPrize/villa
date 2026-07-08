@@ -341,6 +341,12 @@ private:
     void updateDisplayedFramebufferMapping();
     static bool renderJobsEquivalentForDisplay(const PendingRenderJob& a,
                                                const PendingRenderJob& b);
+    // Everything of renderJobsEquivalentForDisplay except the chunk-content
+    // epoch and gen-cache dirtiness: true when two jobs sample the same
+    // pixels from the same source, so one frame's data can stand in for
+    // missing chunks in the other.
+    static bool renderJobsSameGeometry(const PendingRenderJob& a,
+                                       const PendingRenderJob& b);
     struct RenderContext;
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
@@ -402,6 +408,10 @@ private:
     std::optional<PendingRenderJob> _activeRenderJob;
     std::optional<PendingRenderJob> _pendingRenderJob;
     std::optional<PendingRenderJob> _displayedRenderJob;
+    // Last presented render (sample values + coverage). The next render of
+    // the same geometry reuses its pixels where chunks are missing so a
+    // transient cache miss never blanks an already-shown region.
+    std::shared_ptr<RenderResult> _lastRenderResult;
     bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
     std::uint64_t _chunkContentEpoch = 0;

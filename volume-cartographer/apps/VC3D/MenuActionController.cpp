@@ -4,6 +4,7 @@
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
 #include "OpenDataSampleProject.hpp"
+#include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -94,6 +95,11 @@ MenuActionController::MenuActionController(CWindow* window)
     , _window(window)
 {
     _recentActs.fill(nullptr);
+}
+
+MenuActionController::~MenuActionController()
+{
+    cancelOpenDataVolumePrefills();
 }
 
 void MenuActionController::populateMenus(QMenuBar* menuBar)
@@ -500,6 +506,7 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
 
     const QString cacheDir = vc3d::remoteCachePath();
     const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    cancelOpenDataVolumePrefills();
     _window->CloseVolume();
 
     QPointer<QProgressDialog> progressDialog;
@@ -625,6 +632,7 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         QString::fromStdString(result.preferredVolumeId),
         true);
     _window->UpdateView();
+    startOpenDataVolumePrefill(_window->_state ? _window->_state->currentVolume() : nullptr);
 
     QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
                           .arg(QString::fromStdString(sampleCopy.id))
@@ -657,6 +665,135 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
     }
 
     return true;
+}
+
+void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume)
+{
+    if (!volume || !volume->isRemote() || !volume->hasScaleLevel(vc3d::opendata::kOpenDataVolumePrefillLevel)) {
+        return;
+    }
+    if (volume->remotePersistentCachePath().empty()) {
+        return;
+    }
+    if (vc3d::opendata::openDataVolumePrefillMarkerMatches(
+            volume->remotePersistentCachePath(),
+            *volume,
+            vc3d::opendata::kOpenDataVolumePrefillLevel)) {
+        Logger()->info(
+            "Open-data volume {} level {} already prefetched",
+            volume->id(),
+            vc3d::opendata::kOpenDataVolumePrefillLevel);
+        return;
+    }
+
+    auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
+    _openDataPrefillCancelFlag = cancelFlag;
+    auto* watcher = new QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>(this);
+    _openDataPrefillWatchers.push_back(watcher);
+
+    const QString volumeId = QString::fromStdString(volume->id());
+    if (_window) {
+        _window->showStatusBarMessage(
+            QObject::tr("Caching remote volume %1 level /%2 in background...")
+                .arg(volumeId)
+                .arg(vc3d::opendata::kOpenDataVolumePrefillLevel),
+            7000);
+    }
+
+    connect(watcher,
+            &QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>::finished,
+            this,
+            [this, watcher, volumeId]() {
+                vc3d::opendata::OpenDataVolumePrefillResult result;
+                try {
+                    result = watcher->result();
+                } catch (const std::exception& e) {
+                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                    result.volumeId = volumeId.toStdString();
+                    result.message = e.what();
+                } catch (...) {
+                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                    result.volumeId = volumeId.toStdString();
+                    result.message = "unknown error";
+                }
+
+                _openDataPrefillWatchers.erase(
+                    std::remove(_openDataPrefillWatchers.begin(),
+                                _openDataPrefillWatchers.end(),
+                                watcher),
+                    _openDataPrefillWatchers.end());
+                watcher->deleteLater();
+
+                if (!_window) {
+                    return;
+                }
+
+                using Status = vc3d::opendata::OpenDataVolumePrefillResult::Status;
+                switch (result.status) {
+                case Status::Completed:
+                    _window->showStatusBarMessage(
+                        QObject::tr("Cached remote volume %1 level /%2: %3 chunks.")
+                            .arg(QString::fromStdString(result.volumeId))
+                            .arg(result.level)
+                            .arg(result.totalChunks),
+                        7000);
+                    Logger()->info(
+                        "Open-data volume prefill completed for {} level {}: {} chunks (data={}, empty={})",
+                        result.volumeId,
+                        result.level,
+                        result.totalChunks,
+                        result.dataChunks,
+                        result.emptyChunks);
+                    break;
+                case Status::Failed:
+                    _window->showStatusBarMessage(
+                        QObject::tr("Remote volume %1 level /%2 cache failed: %3")
+                            .arg(QString::fromStdString(result.volumeId))
+                            .arg(result.level)
+                            .arg(QString::fromStdString(result.message)),
+                        9000);
+                    Logger()->warn(
+                        "Open-data volume prefill failed for {} level {}: {}",
+                        result.volumeId,
+                        result.level,
+                        result.message);
+                    break;
+                case Status::Cancelled:
+                    Logger()->info(
+                        "Open-data volume prefill cancelled for {} level {} after {}/{} chunks",
+                        result.volumeId,
+                        result.level,
+                        result.resolvedChunks,
+                        result.totalChunks);
+                    break;
+                case Status::Skipped:
+                    Logger()->info(
+                        "Open-data volume prefill skipped for {} level {}: {}",
+                        result.volumeId,
+                        result.level,
+                        result.message);
+                    break;
+                }
+            });
+
+    watcher->setFuture(QtConcurrent::run([volume, cancelFlag]() {
+        return vc3d::opendata::prefillOpenDataVolumeLevel(
+            volume,
+            vc3d::opendata::kOpenDataVolumePrefillLevel,
+            cancelFlag.get());
+    }));
+}
+
+void MenuActionController::cancelOpenDataVolumePrefills()
+{
+    if (_openDataPrefillCancelFlag) {
+        _openDataPrefillCancelFlag->store(true, std::memory_order_release);
+    }
+    for (auto* watcher : _openDataPrefillWatchers) {
+        if (watcher) {
+            watcher->cancel();
+        }
+    }
 }
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
