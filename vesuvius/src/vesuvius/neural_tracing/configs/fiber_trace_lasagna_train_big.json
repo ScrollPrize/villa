@@ -1,0 +1,57 @@
+{
+  "seed": 0,
+  "device": "cuda",
+  "num_steps": 1000000000,
+  "sample_limit_": 100,
+  "log_every": 1000,
+  "test_every": 10000,
+  "test_sample_count": 16,
+  "test_start_iteration": 1,
+  "sample_visualization_every": 10,
+  "test_visualization_every": 100,
+  "run_path": "runs/fiber_trace",
+  "run_name": "fiber_trace_train_staticsheep",
+  "tensorboard_enabled": true,
+  "batch_size": 16,
+  "random_negative_pool_size": 10000,
+  "crop_size": [128, 128, 128],
+  "augmentation_crop_size": [128, 128, 128],
+  "image_normalization": "zscore",
+  "positive_direction_jitter_degrees": 30.0,
+  "control_point_margin_voxels": 10,
+  "normal_plane_jitter_voxels": 10.0,
+  "normal_perpendicular_jitter_voxels": 4.0,
+  "positive_along_fiber_limit_voxels": 20.0,
+  "negative_cone_distance_voxels": 20.0,
+  "random_valid_max_attempts": 256,
+  "volume_cache_dir": "/ephemeral/hendrik/vesuvius_fiber_trace_zarr_cache",
+  "debug_sampling": false,
+  "debug_cache": true,
+  "datasets": [
+    {
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 1,
+      "lasagna_manifest_path": "/ephemeral/hendrik/las_008.lasagna.json",
+      "fiber_glob": "/home/hendrik/fibers/fibers_2026-06-16/*.json",
+      "test_fiber_glob": "/home/hendrik/fibers/fibers_test_2026-06-22/*.json"
+    }
+  ],
+  "model": {
+    "input_channels": 1,
+    "unet_base_channels": 16,
+    "unet_depth": 6,
+    "conditioned_feature_channels": 64,
+    "embedding_dim": 32,
+    "head_channels": 64,
+    "_decoder_upsample_mode": "pixelshuffle"
+  },
+  "optimizer": {
+    "learning_rate": 0.01,
+    "weight_decay": 0.0001
+  },
+  "loss": {
+    "temperature": 0.1,
+    "contrastive_weight": 1.0,
+    "max_contrastive_samples": 1048576
+  }
+}
