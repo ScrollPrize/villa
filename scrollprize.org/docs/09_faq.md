@@ -35,6 +35,8 @@ title: "FAQ"
   />
 </head>
 
+import AwardedTotal from '@site/src/components/AwardedTotal';
+
 :::info[WORK IN PROGRESS]
 
 This page is being revised (July 8, 2026). Most answers are current; a few still describe earlier tooling or data layouts and are being updated.
@@ -50,7 +52,7 @@ After their discovery in the 1750s, some were opened physically, mostly destroyi
 A few hundred scrolls were excavated that were never opened, and remain rolled up with their contents sealed away.
 Our community is building methods to read these scrolls using micro-CT and an algorithmic pipeline using machine learning and computer vision.
 
-We've awarded \$1,800,500 in prizes and broken through twice: in 2023 the first passages of Greek were revealed inside a closed scroll, and in 2026 [PHerc. 1667](firstscroll) became the first scroll ever read from beginning to end.
+We've awarded <AwardedTotal /> in prizes and broken through twice: in 2023 the first passages of Greek were revealed inside a closed scroll, and in 2026 [PHerc. 1667](firstscroll) became the first scroll ever read from beginning to end.
 Now we want to read them all — starting with the [2027 Grand Prize](prizes#2027-grand-prize).
 Join us to win prizes and be a part of history!
 

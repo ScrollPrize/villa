@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import AwardedTotal from "./AwardedTotal";
 
 // Dense "Updates" strip: 1 permanent "Get Started" entry + 3 latest Substack
 // posts, one compact row per entry (title 15px/600 + date 12px faint).
@@ -68,7 +69,9 @@ const LatestPosts = () => {
     <div className="vc-updates mb-3" role="list">
       <a className="vc-updates__item" href="/get_started" role="listitem">
         <span className="vc-updates__title">Get Started</span>
-        <span className="vc-updates__meta">$1.8M+ already awarded</span>
+        <span className="vc-updates__meta">
+          <AwardedTotal compact /> already awarded
+        </span>
       </a>
       {posts.map((post, index) => (
         <a

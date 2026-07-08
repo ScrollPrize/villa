@@ -3,6 +3,7 @@ title: "Winners"
 ---
 
 import PrizeCard from '@site/src/components/PrizeCard';
+import AwardedTotal from '@site/src/components/AwardedTotal';
 
 <head>
   <html data-theme="dark" />
@@ -37,7 +38,7 @@ import PrizeCard from '@site/src/components/PrizeCard';
   />
 </head>
 
-Vesuvius Challenge has awarded **\$1,800,500** in prizes!
+Vesuvius Challenge has awarded **<AwardedTotal />** in prizes!
 
 This page lists all the prizes awarded so far:
 

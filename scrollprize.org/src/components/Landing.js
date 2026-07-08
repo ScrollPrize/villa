@@ -580,6 +580,8 @@ export function Landing() {
   // Open prizes are sourced from docs/34_prizes.md frontmatter at build time
   // (plugins/prizes-data.js) — the landing updates with the prizes page.
   const { prizes: openPrizes = [] } = usePluginData("prizes-data") || {};
+  const { awardedTotal = 0 } = usePluginData("winners-data") || {};
+  const { counts = {} } = usePluginData("atlas-data") || {};
   const openPrizeTotal = openPrizes.reduce((sum, p) => sum + p.amount, 0);
   const openById = Object.fromEntries(openPrizes.map((p) => [p.id, p]));
   const grandPrize2027 = openById["grand-prize-2027"];
@@ -684,12 +686,20 @@ export function Landing() {
                   <span className="vc-stat__label">open prize pool</span>
                 </a>
               )}
-              <a className="vc-stat vc-stat--link" href="/winners">
-                <span className="vc-stat__value">$1,800,500</span>
-                <span className="vc-stat__label">already awarded</span>
+              {awardedTotal > 0 && (
+                <a className="vc-stat vc-stat--link" href="/winners">
+                  <span className="vc-stat__value">
+                    {usd.format(awardedTotal)}
+                  </span>
+                  <span className="vc-stat__label">already awarded</span>
+                </a>
+              )}
+              <a className="vc-stat vc-stat--link" href="/data_browser">
+                <span className="vc-stat__value">{counts.fragments ?? 10}</span>
+                <span className="vc-stat__label">fragments scanned</span>
               </a>
               <a className="vc-stat vc-stat--link" href="/data_browser">
-                <span className="vc-stat__value">35</span>
+                <span className="vc-stat__value">{counts.scrolls ?? 35}</span>
                 <span className="vc-stat__label">scrolls scanned</span>
               </a>
               <a className="vc-stat vc-stat--link" href="/data_browser">

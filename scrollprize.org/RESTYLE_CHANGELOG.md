@@ -289,6 +289,13 @@ The pipeline strip on /2026_open_problems now reads Scanning → Unwrapping → 
 - **Site-wide fixes (sweep findings)**: prizes monthly deadline June 30 → July 31, 2026 and "most-read scroll" framing corrected; old Discord invites → discord.gg/V4fJhvtaQn (livestream, submissions_closed, grandprize); closed/historical banners added to /ink_detection, /2024_gp_submissions, /firstletters; 2024_prizes banner past-tensed; KaTeX display equations scroll in-container (mobile); /unwrapping fixed-600px iframe made responsive (226px mobile overflow → 0); landing ink card "9 of 45 scanned scrolls" → "scrolls and fragments"; tutorial link text matches its target, deprecated C library dropped, invalid webm poster removed; tutorial2/segmentation/grand_prize/community_projects typos; vesuvius-c marked deprecated + VC3D added to community tools; EduceLab paper dated 2023 on /data; winners' automated-segmentation heading dated (December, 2024); villa 3D viewer min-height on phones; data browser: Paris 4 work "attributed to Philodemus (title not yet identified)", stale segments=20 now falls back to the live S3 count, "— keV" empty-energies fixed, fragment pages say "About this fragment".
 **Files:** 24 files (docs/, src/components/, src/css/chrome.css, src/data/atlasOverlay.json).
 
+## C35 — awarded total + sample counts go dynamic; fragments stat on the hero
+
+- **New `plugins/winners-data.js`**: sums every money heading on docs/15_winners.md (29 sections = \$1,800,500 exactly) and exposes it as global data; fails the build loudly if the parse looks wrong (floor \$1,800,500, ≥20 sections). Adding a new winner section now updates every "awarded" figure site-wide.
+- Consumers: landing hero stat, LatestPosts teaser ("\$1.8M+" via a new `<AwardedTotal compact />` component), the winners page's own headline, the FAQ figure, and docusaurus.config.js (tagline, default meta description, org JSON-LD) via the exported `computeAwardedTotal()`.
+- **`plugins/atlas-data.js` now exposes live sample counts** (scrolls/fragments/samples from the build-time index). Hero stat strip: "10 fragments scanned" added before "35 scrolls scanned", and both counts are now dynamic instead of hardcoded.
+**Files:** `plugins/winners-data.js` (new), `src/components/AwardedTotal.js` (new), `plugins/atlas-data.js`, `src/components/Landing.js`, `src/components/LatestPosts.js`, `docs/15_winners.md`, `docs/09_faq.md`, `docusaurus.config.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

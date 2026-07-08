@@ -6,6 +6,11 @@ const darkCodeTheme = require("prism-react-renderer").themes.vsDark;
 const rehypeKatex = require("rehype-katex").default; // Extract default export for rehype-katex
 const remarkMath = require("remark-math").default; // Extract default export for remark-math
 const rehypeImageDimensions = require("./plugins/rehype-image-dimensions");
+const { computeAwardedTotal } = require("./plugins/winners-data");
+
+// Total $ awarded, summed from the winners page's money headings at config
+// load — keeps the tagline/meta descriptions in sync with docs/15_winners.md.
+const AWARDED = computeAwardedTotal(__dirname).total.toLocaleString("en-US");
 
 // Sitewide structured data. Injected via headTags (below) so it is present in
 // the server-rendered static HTML — react-helmet (<Head>) drops <script>
@@ -20,7 +25,7 @@ const orgJsonLd = {
   url: SITE_URL,
   logo: SITE_URL + "img/social/opengraph.jpg",
   description:
-    "Vesuvius Challenge is a machine learning, computer vision, and geometry competition reading the carbonized Herculaneum scrolls — papyri buried by the eruption of Mount Vesuvius in 79 AD — using X-ray CT scanning and AI. Over $1,800,500 in prizes has been awarded.",
+    `Vesuvius Challenge is a machine learning, computer vision, and geometry competition reading the carbonized Herculaneum scrolls — papyri buried by the eruption of Mount Vesuvius in 79 AD — using X-ray CT scanning and AI. Over $${AWARDED} in prizes has been awarded.`,
   foundingDate: "2023",
   founder: [
     { "@type": "Person", name: "Nat Friedman" },
@@ -70,7 +75,7 @@ const SITEMAP_LASTMOD = gitLastmodSupported() ? "date" : null;
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: "Vesuvius Challenge",
-  tagline: "A machine learning and computer vision competition with $1,800,500 awarded in prizes",
+  tagline: `A machine learning and computer vision competition with $${AWARDED} awarded in prizes`,
   url: "https://scrollprize.org",
   baseUrl: "/",
   onBrokenAnchors: "throw",
@@ -242,8 +247,7 @@ const config = {
         metadata: [
           {
             name: "description",
-            content:
-                "A machine learning and computer vision competition with $1,800,500 awarded in prizes",
+            content: `A machine learning and computer vision competition with $${AWARDED} awarded in prizes`,
           },
           {
             property: "og:type",
@@ -313,6 +317,7 @@ const config = {
     './plugins/fetch-substack-posts',
     './plugins/atlas-data',
     './plugins/prizes-data',
+    './plugins/winners-data',
     [
       "@docusaurus/plugin-client-redirects",
       {

@@ -33,6 +33,16 @@ module.exports = function atlasDataPlugin(context, options) {
       const { createData, addRoute } = actions;
       const { scrolls = [], _general = '' } = content || {};
 
+      // Live sample counts for the landing hero stats (regenerated every
+      // build from the open-data metadata via scripts/genAtlasData.js).
+      actions.setGlobalData({
+        counts: {
+          scrolls: scrolls.filter((s) => s.type === 'scroll').length,
+          fragments: scrolls.filter((s) => s.type === 'fragment').length,
+          samples: scrolls.length,
+        },
+      });
+
       await Promise.all(
         scrolls.map(async (scroll) => {
           // Each detail route gets its own code-split JSON module (props.scroll).
