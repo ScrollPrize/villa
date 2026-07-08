@@ -42,19 +42,78 @@ import JsonLd from '@site/src/components/JsonLd';
 
 # Curated Datasets
 
-<div className="opacity-60 mb-8 italic">July 2025</div>
-
-:::warning[OUTDATED CONTENT]
-
-This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
-
-:::
+<div className="opacity-60 mb-8 italic">July 2026</div>
 
 The data available through Vesuvius Challenge is large, frequently updated, and can be overwhelming to navigate.
 
 Here are some organized datasets suited for particular tasks or subproblems.
 Largely, these curate the segmentation efforts of our team and community.
 Click one of the datasets to find a download along with more information.
+
+## `spiral-input` (2026-07)
+
+A collection of same-winding and multi-winding annotations, in the form of: surface patches, line annotations, and point collections.
+
+This dataset contains manual annotations of the scroll wraps, recording which parts of the surface belong to the same wrap (*winding*) of the sheet for use as ground-truth inputs when fitting a global winding solution. It is organized by scroll. Each scroll below provides some combination of: verified and unverified surface patches (grid-topology quad meshes sampled on the papyrus surface), line annotations (curves traced across the surface), point collections, same-/relative-/absolute-winding annotations, and the fitted umbilicus.
+
+### Paris4
+
+{/* Paris4 = Scroll 1 / PHercParis4. */}
+Spiral annotations for scroll PHercParis4 (Scroll 1). Contents include ~27,000 verified and ~204,000 unverified surface patches, traced tracks, and point collections, together with `same_windings` / `relative_windings` / `abs_winding` graphs, the fitted `umbilicus`, fiber and outer-shell geometry, and the volume inputs used by the fitting pipeline (~49.6 GB total).
+
+<div className="flex flex-wrap items-start gap-4 mb-4">
+  <div className="mb-2">
+    <img src="/img/data/datasets/spiral-input-multiwinding.webp" className="h-[240px] w-auto"/>
+    <figcaption className="mt-[-6px]">Multi-winding annotations.</figcaption>
+  </div>
+  <div className="mb-2">
+    <img src="/img/data/datasets/spiral-input-fiber.webp" className="h-[240px] w-auto"/>
+    <figcaption className="mt-[-6px]">Same-winding fiber annotation.</figcaption>
+  </div>
+</div>
+
+- [README](pathname:///data/datasets/spiral-input-PHercParis4-README.md)
+- [Browse on Hugging Face](https://huggingface.co/buckets/scrollprize/datasets/tree/spiral/PHercParis4)
+
+{/* TODO: add more scroll subsections here later, e.g. "### Scroll5", each following the Paris4 pattern above. */}
+
+## `surface-labels` (2026-07)
+
+Labeled papyrus surfaces: voxelized, recto (inside) sheet surfaces within the scroll volume.
+
+<div className="mb-4">
+  <img src="/img/data/datasets/surface-labels-kaggle.webp" className="w-[70%]"/>
+  <figcaption className="mt-[-6px]">3D sub-volumes paired with surface label masks.</figcaption>
+</div>
+
+Voxelized surface segmentation that identifies the volumetric part of the papyrus we want to map. This dataset provides labels of the recto surfaces of the papyrus sheet, paired with the corresponding scroll volume data so they can be used directly as training inputs for machine-learning models.
+
+- [README](pathname:///data/datasets/surface-labels-README.md)
+- [Browse on Hugging Face](https://huggingface.co/buckets/scrollprize/datasets/tree/surfaces)
+
+## `ink-labels` (2026-07)
+
+Binary ink masks aligned to surface volumes (2D) and scroll volumes (3D).
+
+<div className="mb-4">
+  <img src="/img/firstletters/ink-label.webp" className="w-[55%]"/>
+  <figcaption className="mt-[-6px]">Texture image (left) and the corresponding binary ink label (right).</figcaption>
+</div>
+
+Ink labels are binary images marking the location of ink on a papyrus surface. No infrared ground truth exists in scrolls — labels begin as hand-annotated ink strokes and are refined through iterative pseudo-labeling. Models trained on these labels can then detect ink elsewhere in the scrolls.
+
+- [README](pathname:///data/datasets/ink-labels-README.md)
+- [Browse on Hugging Face](https://huggingface.co/buckets/scrollprize/datasets/tree/ink)
+
+<hr className="mt-16 mb-10 border-t-2 border-solid opacity-20" />
+
+<div className="uppercase tracking-widest text-sm opacity-50 mb-4">Archived datasets</div>
+
+:::warning[OUTDATED CONTENT]
+
+The datasets below describe an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+
+:::
 
 ## `fiber-skeletons` (2025-07)
 
