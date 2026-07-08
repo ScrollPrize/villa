@@ -56,7 +56,7 @@ Our goal is to read the entire library:
 
 <Admonition type="tip" icon="🏆" title="2027 Grand Prize">
 * Prize: \$1,000,000 to [fully unroll and read one of 23 sealed scrolls](prizes#2027-grand-prize) — deadline June 25th, 2027
-* Starting point: [Technical Blogpost](tech_blogpost) (the state of the pipeline), [Data](data), [Tutorials](tutorial)
+* Starting point: [Open Problems](2026_open_problems) (the state of the pipeline), [Data](data), [Tutorials](tutorial)
 </Admonition>
 
 Or contribute to its two primary subproblems:
@@ -68,7 +68,7 @@ Or contribute to its two primary subproblems:
 
 <Admonition type="info" icon="⚙️" title="Segmentation">
 * Prizes: [2027 Grand Prize](prizes#2027-grand-prize) and [Progress Prizes](prizes#progress-prizes)
-* Starting point: [Technical Blogpost](tech_blogpost), [Segmentation tutorial](segmentation)
+* Starting point: [Open Problems](2026_open_problems), [Segmentation tutorial](segmentation)
 </Admonition>
 
 Curious how far the field has come? See the \$200,000 [Kaggle Surface Detection winners](winners#surface-detection-kaggle-winners).

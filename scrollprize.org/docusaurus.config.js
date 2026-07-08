@@ -175,7 +175,7 @@ const config = {
           },
           items: [
             { to: "/prizes", label: "Prizes", position: "left" },
-            { to: "/tech_blogpost", label: "Technical Blogpost", position: "left" },
+            { to: "/2026_open_problems", label: "Open Problems", position: "left" },
             { to: "/data", label: "Data", position: "left" },
             { to: "/tutorial", label: "Tutorials", position: "left" },
             { to: "/winners", label: "Milestones", position: "left" },
@@ -360,10 +360,15 @@ const config = {
             to: "/",
             from: "/background",
           },
-          // The blogpost briefly lived at /from_ash_to_text on preview builds.
+          // The blogpost briefly lived at /from_ash_to_text and /tech_blogpost
+          // on preview builds.
           {
-            to: "/tech_blogpost",
+            to: "/2026_open_problems",
             from: "/from_ash_to_text",
+          },
+          {
+            to: "/2026_open_problems",
+            from: "/tech_blogpost",
           },
         ],
       },

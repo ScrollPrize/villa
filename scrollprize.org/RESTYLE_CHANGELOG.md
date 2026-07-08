@@ -257,6 +257,13 @@ The six callouts showed the default tip lightbulb; the post's own convention is 
 Brings the branch current with main: the data page rewrite (dataset naming, deprecated samples endpoint, 2026 pre-print reference, EduceLab "scanned at DLS before 2025" scoping), the PHerc. Paris 4 publication notice + per-scroll license scopes (PR #1117), and the PHerc. 1667 DLS→ESRF scan-history correction (PR #1118). One conflict in `docs/02_data.md` (a "scroll-only or fragment-only views" sentence main had deleted — deletion kept). The atlas auto-merge preserved both sides: restyle's `phercLabel` display labels + segment folder/copy-S3 links, and main's `legalNotice`/`licenseScope`/curated-licenses pipeline.
 **Files:** merge commit (docs/02_data.md resolved by hand; genAtlasData.js, ScrollDetailPage.js, DataCatalog.js, atlasOverlay.json auto-merged).
 
+## C30 — blogpost is now "Open Problems" at /2026_open_problems; Virtual Unwrapping archived
+
+- **Virtual Unwrapping archived**: moved from the Overview sidebar category into Archive (after Master Plan). URL `/unwrapping` unchanged — still resolves.
+- **Blogpost renamed "Open Problems"** everywhere it's displayed: navbar item (between Prizes and Data), sidebar label, page title ("Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge"), og/twitter titles, and the two Get Started starting-point links.
+- **Route moved to `/2026_open_problems`**: file renamed to `docs/37_2026_open_problems.md` with an explicit frontmatter `id` (the default number-prefix parser won't strip `37_` when the rest starts with a digit — same reason `28_2024_prizes` keeps its full id). Redirects updated so `/tech_blogpost` and `/from_ash_to_text` both point directly at the new route (no chained hops). Landing "Chart the Path" CTA updated.
+**Files:** `docs/37_2026_open_problems.md` (renamed from `37_tech_blogpost.md`), `sidebars.js`, `docusaurus.config.js` (navbar + redirects), `docs/01_get_started.md`, `src/components/Landing.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

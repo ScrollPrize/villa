@@ -767,7 +767,7 @@ export function Landing() {
               <ChallengeBox
                 title="Virtual Unwrapping"
                 linkText="Chart the Path"
-                href="/tech_blogpost"
+                href="/2026_open_problems"
                 bounty={
                   (grandPrize2027 || progressPrizes) && {
                     href: (grandPrize2027 || progressPrizes).href,

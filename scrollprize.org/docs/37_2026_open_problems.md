@@ -1,6 +1,7 @@
 ---
-title: "Technical Blogpost: Why Reading Every Herculaneum Scroll Is Still a Challenge"
-sidebar_label: "Technical Blogpost"
+id: 2026_open_problems
+title: "Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge"
+sidebar_label: "Open Problems"
 ---
 
 <head>
@@ -12,8 +13,8 @@ sidebar_label: "Technical Blogpost"
   />
 
   <meta property="og:type" content="article" />
-  <meta property="og:url" content="https://scrollprize.org/tech_blogpost" />
-  <meta property="og:title" content="Technical Blogpost: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
+  <meta property="og:url" content="https://scrollprize.org/2026_open_problems" />
+  <meta property="og:title" content="Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
   <meta
     property="og:description"
     content="Why reading every Herculaneum scroll is still a challenge: how scanning, virtual unwrapping, and ink detection work today — and where you can help."
@@ -21,8 +22,8 @@ sidebar_label: "Technical Blogpost"
   <meta property="og:image" content="https://scrollprize.org/img/social/opengraph.jpg" />
 
   <meta property="twitter:card" content="summary_large_image" />
-  <meta property="twitter:url" content="https://scrollprize.org/tech_blogpost" />
-  <meta property="twitter:title" content="Technical Blogpost: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
+  <meta property="twitter:url" content="https://scrollprize.org/2026_open_problems" />
+  <meta property="twitter:title" content="Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge" />
   <meta
     property="twitter:description"
     content="Why reading every Herculaneum scroll is still a challenge: how scanning, virtual unwrapping, and ink detection work today — and where you can help."

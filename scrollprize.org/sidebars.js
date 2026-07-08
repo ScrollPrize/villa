@@ -28,8 +28,7 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'get_started' },
         { type: 'doc', id: 'prizes' },
-        { type: 'doc', id: 'tech_blogpost' },
-        { type: 'doc', id: 'unwrapping' },
+        { type: 'doc', id: '2026_open_problems' },
       ],
     },
     {
@@ -88,6 +87,7 @@ const sidebars = {
       collapsed: true,
       items: [
         { type: 'doc', id: 'master_plan' },
+        { type: 'doc', id: 'unwrapping' },
         { type: 'doc', id: 'tutorial_VC' },
         { type: 'doc', id: 'grand_prize' },
         { type: 'doc', id: 'ink_detection' },
