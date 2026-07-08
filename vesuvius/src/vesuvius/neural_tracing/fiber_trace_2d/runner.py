@@ -5,6 +5,12 @@ from pathlib import Path
 
 import numpy as np
 
+from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
+    limit_augmentation_rows,
+    overlay_line_rgb,
+    random_combined_augmentation,
+    resolve_torch_device,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DLoader, load_config
 
 
@@ -12,35 +18,57 @@ def _to_u8_image(image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     arr = np.asarray(image, dtype=np.float32)
     valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(arr)
     out = np.zeros(arr.shape, dtype=np.uint8)
-    if not bool(valid.any()):
-        return out
-    values = arr[valid]
-    lo, hi = np.percentile(values, [1.0, 99.0])
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo = float(values.min())
-        hi = float(values.max())
-    if hi <= lo:
-        out[valid] = 127
-        return out
-    scaled = (arr - lo) * (255.0 / (hi - lo))
-    out[valid] = np.clip(scaled[valid], 0.0, 255.0).astype(np.uint8)
+    out[valid] = np.clip(arr[valid], 0.0, 255.0).astype(np.uint8)
     return out
 
 
 def _write_jpg(path: Path, image_u8: np.ndarray) -> None:
     from PIL import Image
 
-    Image.fromarray(np.asarray(image_u8, dtype=np.uint8), mode="L").save(path, quality=95)
+    image = np.asarray(image_u8, dtype=np.uint8)
+    mode = "RGB" if image.ndim == 3 and image.shape[-1] == 3 else "L"
+    Image.fromarray(image, mode=mode).save(path, quality=95)
 
 
-def _write_contact_sheet(path: Path, images: list[np.ndarray], *, columns: int = 8) -> None:
+def _draw_label(image: np.ndarray, label: str) -> np.ndarray:
+    from PIL import Image, ImageDraw, ImageFont
+
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=-1)
+    pil = Image.fromarray(arr, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    text = str(label)
+    font = ImageFont.load_default()
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = int(bbox[2] - bbox[0])
+        text_h = int(bbox[3] - bbox[1])
+    except AttributeError:
+        text_w, text_h = draw.textsize(text, font=font)
+    pad = 2
+    draw.rectangle((0, 0, min(arr.shape[1], text_w + 2 * pad), text_h + 2 * pad), fill=(0, 0, 0, 160))
+    draw.text((pad, pad), text, fill=(255, 255, 255, 255), font=font)
+    return np.asarray(pil, dtype=np.uint8)
+
+
+def _write_contact_sheet(
+    path: Path, images: list[np.ndarray], *, columns: int = 8, labels: list[str] | None = None
+) -> None:
     if not images:
         return
-    h, w = images[0].shape
+    if labels is not None and len(labels) != len(images):
+        raise ValueError("labels length must match images length")
+    h, w = images[0].shape[:2]
+    prepared = [
+        _draw_label(image, labels[i]) if labels is not None else np.asarray(image, dtype=np.uint8)
+        for i, image in enumerate(images)
+    ]
+    channels = () if prepared[0].ndim == 2 else (prepared[0].shape[2],)
     cols = max(1, min(columns, len(images)))
     rows = (len(images) + cols - 1) // cols
-    sheet = np.zeros((rows * h, cols * w), dtype=np.uint8)
-    for i, image in enumerate(images):
+    sheet = np.zeros((rows * h, cols * w, *channels), dtype=np.uint8)
+    for i, image in enumerate(prepared):
         row = i // cols
         col = i % cols
         sheet[row * h : (row + 1) * h, col * w : (col + 1) * w] = image
@@ -130,6 +158,54 @@ def _export_batch(batch, output_dir: str | Path) -> None:
     )
 
 
+def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int, output_dir: str | Path) -> None:
+    out = Path(output_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    device = resolve_torch_device(loader.config.augment.device)
+
+    lower_entries, upper_entries = limit_augmentation_rows(loader.config.augment, sample_index)
+    combined_entries = [
+        (f"combined_{i:02d}", random_combined_augmentation(loader.config.augment, sample_index, i))
+        for i in range(len(lower_entries))
+    ]
+    entries = lower_entries + upper_entries + combined_entries
+
+    contact_images: list[np.ndarray] = []
+    contact_labels: list[str] = []
+    first_sample = None
+    summary_lines = [
+        f"sample_index={sample_index}",
+        f"device={device}",
+        "layout=row 1: lower limits; row 2: upper limits; row 3: random combined training-style augmentations",
+    ]
+    for name, params in entries:
+        sample, aug_image, aug_valid, line = loader.build_augmented_center_strip_patch(
+            sample_index,
+            params,
+            device=device,
+        )
+        if first_sample is None:
+            first_sample = sample
+        image_u8 = _to_u8_image(aug_image, aug_valid)
+        overlay = overlay_line_rgb(image_u8, line, opacity=0.5)
+        contact_images.append(overlay)
+        contact_labels.append(name)
+        summary_lines.append(f"{name}: {params}")
+    if first_sample is not None:
+        summary_lines.insert(2, f"fiber_path={first_sample.fiber_path}")
+        summary_lines.insert(3, f"control_point_index={first_sample.control_point_index}")
+        summary_lines.insert(4, f"strip_z_offset={first_sample.strip_z_offset}")
+
+    _write_contact_sheet(
+        out / "augment_contact_sheet.jpg",
+        contact_images,
+        columns=len(lower_entries),
+        labels=contact_labels,
+    )
+    (out / "augment_summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    print(f"exported augment_contact_sheet.jpg and augment_summary.txt to {out}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Load or prefetch 2D fiber-strip batches.")
     parser.add_argument("config", help="Path to Vesuvius-style JSON loader config")
@@ -139,6 +215,7 @@ def main() -> None:
     parser.add_argument("--prefetch-samples", type=int, default=None)
     parser.add_argument("--skip-prefetch", action="store_true")
     parser.add_argument("--export-dir", default=None)
+    parser.add_argument("--augment-vis", action="store_true")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -154,6 +231,12 @@ def main() -> None:
             f"downloaded={summary['downloaded']} bytes={summary['bytes']} "
             f"errors={summary['errors']} workers={summary['workers']}"
         )
+        return
+
+    if args.augment_vis:
+        if args.export_dir is None:
+            raise SystemExit("--augment-vis requires --export-dir")
+        _export_augment_contact_sheet(loader, args.sample_index, args.export_dir)
         return
 
     if not args.skip_prefetch:

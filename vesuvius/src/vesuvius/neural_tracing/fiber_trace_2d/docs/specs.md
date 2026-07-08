@@ -18,6 +18,15 @@
 - Each strip-z patch is sampled independently.
 - Dataset and loader settings are specified in Vesuvius-style JSON.
 - Config keys include `datasets`, `batch_size`, `patch_shape_hw`, `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `prefetch_workers`, and optional cache settings.
+- Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
+- Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
+- Geometric strip augmentations operate on strip coordinates before image sampling.
+- Geometric augmentation builds an oversized strip-coordinate source area, maps output patch pixels into that source, and samples the volume once at the final augmented coordinates to avoid edge and image reinterpolation artifacts.
+- Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
+- Augment visualization uses raw clipped image values and must not apply percentile or per-cell normalization.
+- The augment visualization mode renders a three-row JPG contact sheet: lower-limit examples, upper-limit examples, and random combined training-style examples.
+- Augment contact sheets draw the fiber line at 50 percent opacity, transformed consistently with geometric augmentations.
+- Augment contact-sheet cells include a small top label naming the shown augmentation.
 - Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.
 - Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.
 - Normal batch loading samples random control points deterministically from the configured seed.
@@ -26,4 +35,5 @@
 - Prefetch deduplicates chunk requests, skips cached chunks, and fetches missing chunks into the configured cache.
 - Prefetch parallelism is capped at 16 workers.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
+- Augment contact sheets are exported with `--augment-vis --export-dir <dir>`.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
