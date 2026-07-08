@@ -126,6 +126,10 @@ default_config = {
     'flow_rtol': 1.e-5,  # adaptive-solver relative tolerance (ignored for fixed solvers)
     'flow_atol': 1.e-6,  # adaptive-solver absolute tolerance
     'num_flow_timesteps': 1,
+    # Number of independent stationary flow fields composed sequentially,
+    # phi = exp(v_N) o ... o exp(v_1) (each stage keeps the fast inline-rk4 + sparse-grad
+    # path when num_flow_timesteps == 1 and the solver is rk4). 1 == original behaviour.
+    'num_flow_stages': 1,
     'flow_bounds_z_margin': 160,
     'flow_bounds_radius': 3200,
     'flow_voxel_resolution': 16,
@@ -1313,7 +1317,9 @@ def main(load_only_patches_and_point_collections=False):
     # Optimizer and checkpoint helpers
     # ==========================================================================
 
-    flow_field_params = list(spiral_and_transform.flow_field.parameters())
+    # All flow stages' parameters go into the flow param group (stage 0 == .flow_field,
+    # plus any extra_flow_fields when num_flow_stages > 1).
+    flow_field_params = [p for flow_field in spiral_and_transform.flow_fields for p in flow_field.parameters()]
     gap_expander_params = list(spiral_and_transform.gap_expander_params.parameters())
     linear_params = [spiral_and_transform.linear_logits]
     grouped_ids = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
@@ -1408,7 +1414,9 @@ def main(load_only_patches_and_point_collections=False):
 
     for iteration in tqdm(range(start_iteration, num_training_steps), disable=not is_main_process()):
         step_timer.start('fwd')
-        spiral_and_transform.flow_field.flow_scales[1] = get_flow_field_high_res_lr_scale(iteration)
+        flow_field_high_res_lr_scale = get_flow_field_high_res_lr_scale(iteration)
+        for flow_field in spiral_and_transform.flow_fields:
+            flow_field.flow_scales[1] = flow_field_high_res_lr_scale
 
         slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
         dr_per_winding = spiral_and_transform.get_dr_per_winding()
@@ -1617,9 +1625,11 @@ def main(load_only_patches_and_point_collections=False):
         step_timer.stop('fwd')
         step_timer.start('bwd')
         loss.backward()
-        apply_accumulated_field_grad = getattr(spiral_and_transform.flow_field, 'apply_accumulated_field_grad', None)
-        if apply_accumulated_field_grad is not None:
-            apply_accumulated_field_grad()
+        # Flush every stage's sparse-accumulated field gradient into its parameters.
+        for flow_field in spiral_and_transform.flow_fields:
+            apply_accumulated_field_grad = getattr(flow_field, 'apply_accumulated_field_grad', None)
+            if apply_accumulated_field_grad is not None:
+                apply_accumulated_field_grad()
         step_timer.stop('bwd')
         step_timer.start('comm')
         allreduce_grads_(dist_grad_params)
