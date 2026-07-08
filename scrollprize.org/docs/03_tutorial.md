@@ -149,7 +149,7 @@ The goal of segmentation is to map and capture information near the written surf
 
 The output of this process is a flattened 3D volume of the voxels around the mapped surface, which we call a “surface volume”. This is again a .tif image stack, just like our original volume. However, it is much smaller than the original volume and more consistent since the papyrus always sits roughly in the middle of the volume.
 
-In ["Tutorial: Segmentation"](segmentation) we’ll dive deeper into segmentation and virtual unwrapping.
+In ["Tutorial: Segmentation"](segmentation) we’ll dive deeper into segmentation and virtual unwrapping, and in ["Tutorial: Spiral Fitting"](tutorial_spiral) we show how to combine many small segments into a single coherent surface covering a whole scroll.
 
 ### 4. Ink detection
 

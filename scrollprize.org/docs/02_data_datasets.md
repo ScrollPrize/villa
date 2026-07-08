@@ -74,6 +74,7 @@ Spiral annotations for scroll PHercParis4 (Scroll 1). Contents include ~27,000 v
 
 - [README](pathname:///data/datasets/spiral-input-PHercParis4-README.md)
 - [Browse on Hugging Face](https://huggingface.co/buckets/scrollprize/datasets/tree/spiral/PHercParis4)
+- [Tutorial: Spiral Fitting](tutorial_spiral) — how to fit a whole-scroll surface to these annotations
 
 {/* TODO: add more scroll subsections here later, e.g. "### Scroll5", each following the Paris4 pattern above. */}
 

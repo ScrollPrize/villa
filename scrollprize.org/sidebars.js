@@ -54,6 +54,7 @@ const sidebars = {
         { type: 'doc', id: 'tutorial3' },
         { type: 'doc', id: 'segmentation' },
         { type: 'doc', id: 'tutorial5' },
+        { type: 'doc', id: 'tutorial_spiral' },
       ],
     },
     { type: 'doc', id: 'faq' },
