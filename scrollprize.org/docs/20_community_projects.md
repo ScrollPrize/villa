@@ -152,10 +152,10 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [segmata](https://github.com/sgoutteb/segmata) by Stephane Gouttebroze:
     - Improve the segmentation process by sharpening the layers rendering, this is based on optimizing the layer 32, a further objective is to link this optimization on a inference loop (optimizing on the detected ink instead of only layers)
 
-- [Synthetic instance labels and volume generation](https://lcparker/synthetic-pages) by lcparker
+- [Synthetic instance labels and volume generation](https://github.com/lcparker/synthetic-pages) by lcparker
     - Generate artificial 3D volumes with corresponding instance labels for use in pretraining instance segmentation networks
 
-- [Mask3D for instance segmentation on scroll volumes](https://lcparker/Mask3D) by lcparker
+- [Mask3D for instance segmentation on scroll volumes](https://github.com/lcparker/Mask3D) by lcparker
     - SOTA instance segmentation network, configured to work with scroll volumes
     - [Effects of pretraining on synthetically generated data](https://github.com/lcparker/pretraining-advantage), plus pretrained and finetuned weights for the Mask3D network
 - [Affinity Prediction with Unet](https://discordapp.com/channels/1079907749569237093/1407379961417039953) by Ayush Mishra
@@ -168,24 +168,23 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 #### 🌟 Highlighted
 
-- [Sheet instance annotation of cubes for Deep Learning models](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/seg-volumetric-labels/finished_cubes/) (work in progress)
-    - [More cubes to annotate, help us!](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/seg-volumetric-labels/cubes/)
+- [Sheet instance annotation of cubes for Deep Learning models](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/) - includes `instance-labels/` (manually annotated cubes), the recommended `instance-labels-harmonized/` (consistent instance IDs across cube boundaries), and `semantic-labels/`
 
 - [Denoised and contrast enhanced volumes](https://discord.com/channels/1079907749569237093/1249316301273436320), download [here](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes_denoised_ce/), same path pattern for other scrolls.
 
 #### Scroll Surface Predictions
-- [Scroll 1, and 3 Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/p2_submission/) by Sean Johnson
-- [Scroll 4 Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/Fiber-and-Surface-Models/Predictions/s4/) by Sean Johnson
+- [Scroll 1, and 3 Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s1/surfaces/) by Sean Johnson (also see [Scroll 3](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s3/surfaces/))
+- [Scroll 4 Surface Predictions](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s4/fiber_surfaces/) by Sean Johnson
 - [Scroll Surface Prediction Repository and Writeup](https://github.com/bruniss/VC-Surface-Models) by Sean Johnson 
 
 #### 📜 Segments
--[Large Autosegmentation of Scroll5](https://dl.ash2txt.org/community-uploads/bruniss/p2_submission/s5_initial_trace/) by Hendrik Schilling and Sean Johnson -- Unsupervised, many switches -- check readme.md
+-[Large Autosegmentation of Scroll5](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/s5/autogens/s5_initial_trace/) by Hendrik Schilling and Sean Johnson -- Unsupervised, many switches -- check readme.md
 
 - [Scroll 2 segments](https://discord.com/channels/1079907749569237093/1079907750265499772/1245553260362858577) by Sean Johnson
 
 - [New segments](https://discord.com/channels/1079907749569237093/1234969334535946303) by Sean Johnson
 
-- [Large segments](http://dl.ash2txt.org/bruniss-uploads/) by Sean Johnson
+- [Large segments](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/) by Sean Johnson (uploads reorganized into per-scroll folders)
 
 - [Rescaled to 7.91um fragment surfaces and labels](https://dl.ash2txt.org/community-uploads/jrudolph/rescaled-fragments/) by Johannes Rudolph
 
@@ -239,7 +238,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 #### 🌟 Highlighted
 
 - [3D (volumetric) Ink detection model](https://github.com/ryanchesler/3d-ink-detection) by Ryan Chesler. Ink detection model that works on full scroll data in 3D, without segmentation nor flattening.
-- [Volumetric Ink Detection for Scroll 1, 2, 3, 4](https://dl.ash2txt.org/community-uploads/bruniss/3d%20Ink%20/) by Sean Johnson
+- [Volumetric Ink Detection for Scroll 1, 2, 3, 4](https://dl.ash2txt.org/community-uploads/bruniss/scrolls/) by Sean Johnson (each scroll folder now has its own `3d_ink/` subfolder)
 
 #### ⚙️ Tools
 
