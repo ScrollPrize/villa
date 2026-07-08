@@ -46,7 +46,10 @@ This post doubles as a technical map of the whole pipeline and an onboarding doc
 
 ### 📊 **Where is the data**
 
-Data is available at [https://scrollprize.org/data\_browser](https://scrollprize.org/data_browser), each scroll item will link to a page containing the available scanned CT volumes and the virtually unwrapped papyrus “segments” produced by the Vesuvius Challenge team, together with useful representations (to be defined later in this blog post) and ink detection predictions. A more direct link to access data is: [https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html)
+- **Data Browser** — [https://scrollprize.org/data\_browser](https://scrollprize.org/data_browser): each scroll links to a page containing the available scanned CT volumes and the virtually unwrapped papyrus “segments” produced by the Vesuvius Challenge team, together with useful representations (to be defined later in this blog post) and ink detection predictions.
+- **Direct access (S3 bucket)** — [https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html)
+- **Curated datasets (ink and spiral)** — hosted on Hugging Face: [https://huggingface.co/buckets/scrollprize/datasets](https://huggingface.co/buckets/scrollprize/datasets)
+- **Model checkpoints** — hosted on Hugging Face: [https://huggingface.co/scrollprize](https://huggingface.co/scrollprize)
 
 ### 🧑‍💻 **Where is the code**
 
@@ -121,7 +124,7 @@ Scanning is controlled by several parameters, but three are especially important
 
 To understand why the third parameter matters, we must explain **phase contrast**.
 
-X-rays behave like waves. Passing through a material doesn't just absorb them; it also shifts their phase. As the wave-front travels away from the sample and towards the detector, it interferes with itself, generating interference fringes at the detector corresponding to the position where the accumulation of shift in phase started or ended: interface boundaries. The fringes act as a natural “edge enhancement”, and this effect is known as phase contrast. In objects with very little attenuation contrast – like carbonized scrolls – this can be especially useful. A computational step called **phase retrieval** can turn those phase-contrast fringes into a higher-contrast reconstruction; the Paganin algorithm is one commonly used method for it.
+X-rays behave like waves. Passing through a material doesn't just absorb them; it also shifts their phase. As the wave-front travels away from the sample and towards the detector, it interferes with itself, generating interference fringes at the detector corresponding to the position where the accumulation of shift in phase started or ended: interface boundaries. The fringes act as a natural “edge enhancement”, and this effect is known as phase contrast. In objects with very little attenuation contrast – like carbonized scrolls – this can be especially useful. A computational step called **phase retrieval** can turn those phase-contrast fringes into a higher-contrast reconstruction; the [Paganin algorithm](https://pubmed.ncbi.nlm.nih.gov/12000561/) is one commonly used method for it.
 
 But more phase contrast isn't always better. Push propagation distance too far and the same effect can turn against you, blurring the volume and reducing clarity rather than contributing to it. 
 
@@ -162,11 +165,11 @@ A common starting point for  surface localization is **semantic segmentation**: 
 
 In papyrus terminology, two sides of a sheet are often distinguished. The **recto** is the written surface, its fibers running horizontally, and it's always rolled facing inward, toward the center of the scroll. The **verso** is the back of the papyrus, where the fibers run vertically instead.
 
-The architecture usually chosen for this job is a **3D U-Net**. The model learns local and contextual patterns in the CT data and produces a voxelwise surface probability.
+The architecture usually chosen for this job is a **[3D U-Net](https://arxiv.org/abs/1606.06650)**. The model learns local and contextual patterns in the CT data and produces a voxelwise surface probability.
 
 Two checkpoints built on this idea anchor the current pipeline: [surface\_recto\_3dunet](https://huggingface.co/scrollprize/surface_recto_3dunet), a checkpoint for the recto-surface predictor (recto — the papyrus's written surface, defined below) used in the pipeline behind the project's technical paper (see [References](#references-and-implementation-links)); and [surface\_m7\_nnunet](https://huggingface.co/scrollprize/surface_m7_nnunet), the nnU-Net ("m7") component — nnU-Net is defined just below — of the [1st-place solution](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/1st-place-solution-for-the-vesuvius-challenge-su) to the Kaggle competition described below.
 
-Surface prediction was the subject of a dedicated Kaggle competition, "Vesuvius Challenge – Surface Detection," with a \$200,000 prize pool in November 2025\. The competition's scoring metric was deliberately topology-aware rather than voxel-accuracy-based: it rewarded connected, gap-free predictions and penalized exactly the failure modes described later in this section — holes, mergers, and sheet switches — rather than treating them as small per-voxel errors. The winning approaches converged on **nnU-Net**, a self-configuring 3D U-Net framework that automatically adapts its own architecture and training pipeline to a given dataset's geometry and voxel spacing, instead of requiring a human to hand-tune it.
+Surface prediction was the subject of a dedicated Kaggle competition, "Vesuvius Challenge – Surface Detection," with a \$200,000 prize pool in November 2025\. The competition's scoring metric was deliberately topology-aware rather than voxel-accuracy-based: it rewarded connected, gap-free predictions and penalized exactly the failure modes described later in this section — holes, mergers, and sheet switches — rather than treating them as small per-voxel errors. The winning approaches converged on **[nnU-Net](https://doi.org/10.1038/s41592-020-01008-z)**, a self-configuring 3D U-Net framework that automatically adapts its own architecture and training pipeline to a given dataset's geometry and voxel spacing, instead of requiring a human to hand-tune it.
 
 Here's the winning recipe condensed to a single sentence: take an off-the-shelf nnU-Net model configured for a couple of patch sizes, train it for a very long time (*well over the default 1,000 epochs)*, and average their predictions together (a process known as ensembling).
 
@@ -259,7 +262,7 @@ The lasagna can (optionally) optimize several stacked sheets at the same time, s
 
 The lasagna needs richer prediction volumes than a plain recto surface prediction can offer: a dense normal volume predicted by a U-Net, and a surface density (called 'gradient magnitude') volume that represents how closely spaced the papyrus windings are. The second one works like this: a second U-Net predicts a **fractional winding position** field for every voxel — essentially "how much further out in the scroll do we get, moving from one side of this voxel to the other point, expressed as a fraction of one full winding." That field is built from distance transforms to sheet skeletons, then normalized into a monotone field via iterative weighted averaging. Gradient magnitude is just the spatial gradient of that field: how fast winding position changes as you move through space. Integrate it along a short strip between two points and you get the number of windings crossed to go from one to the other — which is why it doubles as a proxy for winding spacing. High gradient magnitude means sheets are packed tightly together locally; low means they're far apart.
 
-Technically, the lasagna can do a global optimization of the entire local surface (or surfaces) via gradient-based optimization (Adam), implemented using PyTorch. Note that this is a different sense of "gradient" from the gradient-magnitude volume above: this is the gradient of a loss function with respect to the surface's own coordinates, computed during optimization, not a measure of image edge strength. GrowPatch, by contrast, uses Ceres — a classical nonlinear least-squares solver of the kind widely used in robotics and computer vision — inside an iterative growth loop that adds quads progressively and repeatedly re-optimizes an outer fringe.
+Technically, the lasagna can do a global optimization of the entire local surface (or surfaces) via gradient-based optimization ([Adam](https://arxiv.org/abs/1412.6980)), implemented using PyTorch. Note that this is a different sense of "gradient" from the gradient-magnitude volume above: this is the gradient of a loss function with respect to the surface's own coordinates, computed during optimization, not a measure of image edge strength. GrowPatch, by contrast, uses [Ceres](http://ceres-solver.org) — a classical nonlinear least-squares solver of the kind widely used in robotics and computer vision — inside an iterative growth loop that adds quads progressively and repeatedly re-optimizes an outer fringe.
 
 The predicted volumes (normals, etc.) that are used as input to the main lasagna surface optimization can also be used to trace fibers, i.e. to semi-automatically follow the lines of papyrus fibers through the 3D volume, given sparse human-specified keypoints.
 
@@ -274,7 +277,7 @@ Flattening takes each point on the 3D mesh and assigns it a 2D coordinate. The s
 
 *VC3D preview of 3D ink recovery on a segment before and after flattening. Flattening aims for a low-distortion parametrization.*
 
-VC3D's current production flattening tool is [flatboi](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/libs/flatboi/flatboi.cpp), which uses  **SLIM (Scalable Locally Injective Mappings)**, minimizing the Symmetric Dirichlet Energy (which is small the lower the isometric distortion induced by the map).
+VC3D's current production flattening tool is [flatboi](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/libs/flatboi/flatboi.cpp), which uses **[SLIM](https://igl.ethz.ch/projects/slim/) (Scalable Locally Injective Mappings)**, minimizing the Symmetric Dirichlet Energy (which is small the lower the isometric distortion induced by the map).
 
 ### Fibers as connectivity clues
 Papyrus is made of fibers. These fibers are not just texture; they carry geometric information.
@@ -287,7 +290,7 @@ If we can manage to trace the fibers, we can directly obtain oriented axes in th
 
 In VC3D we have a fiber tracer tool, which is part of the Lasagna optimization ecosystem. It is not fully automated, and the line annotation widget inside VC3D is what drives it. Once fibers are annotated, [atlas.py](https://github.com/ScrollPrize/villa/blob/main/lasagna/atlas.py) can pair fibers / skeleton annotations and optimize a “patch” through them.
 
-This is not the only way to trace fibers. Some of the project's most valuable fiber-skeleton labels were traced by hand years ago in **WebKnossos** (a web-based tool for tracing and annotating skeleton-like structures voxel by voxel in large volumetric datasets), against older EduceLab-era scans taken at Diamond Light Source, a synchrotron facility distinct from ESRF — the facility behind the more recent scans discussed throughout this post.
+This is not the only way to trace fibers. Some of the project's most valuable fiber-skeleton labels were traced by hand years ago in **[WebKnossos](https://doi.org/10.1038/nmeth.4331)** (a web-based tool for tracing and annotating skeleton-like structures voxel by voxel in large volumetric datasets), against older [EduceLab](https://arxiv.org/abs/2304.02084)-era scans taken at Diamond Light Source, a synchrotron facility distinct from ESRF — the facility behind the more recent scans discussed throughout this post.
 
 These annotations were voxelized and used to train a semantic segmentation model for fibers. We provide a checkpoint named [fiber\_hz\_vt](https://huggingface.co/scrollprize/fiber_hz_vt) — weights of an nnUNet model trained on "horizontal/vertical" fibers manually traced by annotators on the older 7.81 µm old scans.
 
@@ -392,7 +395,7 @@ A pseudo-label is a provisional label created from model output and human review
 
 ![](/img/ash2text/image21.png)
 
-A concrete record of this loop exists in the six PHerc.1667-iteration-0 through \-5 checkpoints released alongside the project. Each of the six shares an identical architecture (a ResNet3D-50 backbone initialized from Kinetics-700 weights, feeding a 2D U-Net decoder) and an identical training budget (12,396 optimizer steps), differing only in how much pseudo-labeled data it was fine-tuned on — from a cross-segment baseline at iteration 0 up to the densest available label set, 33,061 tiles, at iteration 5\. Kinetics-700 is, on its face, an odd source for this: it's a video-action-recognition dataset, built for recognizing human activities in video clips, with nothing obviously to do with CT scans or ancient papyrus. The connection is architectural rather than topical — a video clip and a CT volume are both fundamentally 3D data (two spatial axes plus a third axis, time for one and depth for the other), so a 3D-convolutional network pretrained on one transfers surprisingly well to the other. All six checkpoints are released on Hugging Face: [iteration-0](https://huggingface.co/scrollprize/PHerc.1667-iteration-0), [iteration-1](https://huggingface.co/scrollprize/PHerc.1667-iteration-1), [iteration-2](https://huggingface.co/scrollprize/PHerc.1667-iteration-2), [iteration-3](https://huggingface.co/scrollprize/PHerc.1667-iteration-3), [iteration-4](https://huggingface.co/scrollprize/PHerc.1667-iteration-4), and [iteration-5](https://huggingface.co/scrollprize/PHerc.1667-iteration-5).
+A concrete record of this loop exists in the six PHerc.1667-iteration-0 through \-5 checkpoints released alongside the project. Each of the six shares an identical architecture (a [ResNet3D-50](https://arxiv.org/abs/1711.09577) backbone initialized from [Kinetics-700](https://arxiv.org/abs/1907.06987) weights, feeding a 2D U-Net decoder) and an identical training budget (12,396 optimizer steps), differing only in how much pseudo-labeled data it was fine-tuned on — from a cross-segment baseline at iteration 0 up to the densest available label set, 33,061 tiles, at iteration 5\. Kinetics-700 is, on its face, an odd source for this: it's a video-action-recognition dataset, built for recognizing human activities in video clips, with nothing obviously to do with CT scans or ancient papyrus. The connection is architectural rather than topical — a video clip and a CT volume are both fundamentally 3D data (two spatial axes plus a third axis, time for one and depth for the other), so a 3D-convolutional network pretrained on one transfers surprisingly well to the other. All six checkpoints are released on Hugging Face: [iteration-0](https://huggingface.co/scrollprize/PHerc.1667-iteration-0), [iteration-1](https://huggingface.co/scrollprize/PHerc.1667-iteration-1), [iteration-2](https://huggingface.co/scrollprize/PHerc.1667-iteration-2), [iteration-3](https://huggingface.co/scrollprize/PHerc.1667-iteration-3), [iteration-4](https://huggingface.co/scrollprize/PHerc.1667-iteration-4), and [iteration-5](https://huggingface.co/scrollprize/PHerc.1667-iteration-5).
 
 This process helped recover readable text in PHerc. 1667\. But it is not guaranteed to work everywhere. In some scrolls, predictions improve and then plateau. In others, current models show little or no convincing ink. The current ink detection model, which works on 2.4 µm data, is [https://huggingface.co/scrollprize/ink\_canonical\_2um](https://huggingface.co/scrollprize/ink_canonical_2um), inference code: [https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized\_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)
 
@@ -421,7 +424,7 @@ What happens if the models don’t generalize? The right conclusion here is neit
 ## 4\. Data scale: the infrastructure bottleneck
 A full-resolution scroll volume is huge — too huge to just download to a laptop and work with as a local folder. So the project increasingly depends on chunked, cloud-friendly formats instead.
 
-One important format is **OME-Zarr**, which stores large multidimensional arrays in chunks and often at multiple resolutions, letting software read only the region it needs rather than loading an entire scroll.
+One important format is **[OME-Zarr](https://doi.org/10.1038/s41592-021-01326-w)**, which stores large multidimensional arrays in chunks and often at multiple resolutions, letting software read only the region it needs rather than loading an entire scroll.
 
 Getting the data format right turns out to matter as much as the algorithms built on top of it, because it determines what research is practical at all. A model that requires copying tens of terabytes locally shuts most contributors out before they start. An interface that can't stream small regions interactively leaves annotators waiting instead of working. And predictions that aren't saved in formats VC3D can inspect are hard to validate.
 
@@ -446,7 +449,7 @@ A major direction is **self-supervised learning**.
 
 In supervised learning, a model learns from direct supervision, which usually is provided via human annotated labels. In self-supervised learning, a model learns structure from raw data without needing a human label for every voxel/pixel. It is given a training objective that forces it to build useful internal representations.
 
-DINO is one family of self-supervised methods. A 3D DINO-style model can be trained on CT chunks so that similar 3D structures have similar internal embeddings.
+[DINO](https://arxiv.org/abs/2104.14294) is one family of self-supervised methods. A 3D DINO-style model can be trained on CT chunks so that similar 3D structures have similar internal embeddings.
 
 An **embedding** is a vector representation learned by the model. If ink-like voxels form a recognizable cluster in embedding space, a small number of expert-selected examples may help generate many candidate labels.
 
@@ -525,7 +528,7 @@ The pipeline works, but not without a person checking its output at almost every
 | Cross-scroll generalization | Ink models may work on one scroll but not another. | Fragment training plus scroll-specific pseudo-labeling. | Multi-scroll training, better labels, stronger diagnostics. |
 | Data scale | Scroll volumes are too large for ordinary local workflows. | OME-Zarr, chunked processing, cloud storage. | Reproducible streaming pipelines and cheaper compute/storage paths. |
 
-One step forward on cross-scroll generalization came from an unusual source: an autonomous agent swarm, inspired by the open-source karpathy/autoresearch project (released March 2026\) and adapted internally for ink-detection model architectures [https://github.com/ScrollPrize/AutoInk/tree/main](https://github.com/ScrollPrize/AutoInk/tree/main). Running several agents continuously, the system found a configuration that nearly doubled the validation Dice score on PHerc. 1667 while training only on PHerc. 139 data — a genuine cross-scroll generalization improvement.
+One step forward on cross-scroll generalization came from an unusual source: an autonomous agent swarm, inspired by the open-source karpathy/autoresearch project (released March 2026\) and adapted internally for ink-detection model architectures. Running several agents continuously, the system found a configuration that nearly doubled the validation Dice score on PHerc. 1667 while training only on PHerc. 139 data — a genuine cross-scroll generalization improvement.
 
 ***
 ## 6\. What’s next?
@@ -553,7 +556,7 @@ Not every method in the [villa monorepository](https://github.com/ScrollPrize/vi
 ## Appendix B: Surface morphology and ink signal
 An optical profilometer can image a fragment in a way that resembles a photograph, but instead of recording color, each pixel records surface height. The result is a heightmap: a high-resolution map of the fragment’s topography.
 
-Studies on opened Herculaneum fragments show that this surface shape alone carries usable information for telling inked regions from uninked ones. The finding comes from training machine learning models on three-dimensional optical profilometry of mechanically opened fragments (Angelotti, Nicolardi, Henderson & Seales — see [References](#references-and-implementation-links)), which also measured how detection quality degrades as the lateral resolution of the height-map is coarsened: a direct, empirical link between spatial resolution and how much of the morphological ink signal survives. But ink doesn't always show up as simple raised relief — the signal is more subtle and heterogeneous, and may depend on fine texture, local roughness, cracks, deposits, deformation, or other small-scale surface changes.
+Studies on opened Herculaneum fragments show that this surface shape alone carries usable information for telling inked regions from uninked ones. The finding comes from training machine learning models on three-dimensional optical profilometry of mechanically opened fragments ([Angelotti, Nicolardi, Henderson & Seales, 2026](https://www.nature.com/articles/s41598-026-58467-1) — see [References](#references-and-implementation-links)), which also measured how detection quality degrades as the lateral resolution of the height-map is coarsened: a direct, empirical link between spatial resolution and how much of the morphological ink signal survives. But ink doesn't always show up as simple raised relief — the signal is more subtle and heterogeneous, and may depend on fine texture, local roughness, cracks, deposits, deformation, or other small-scale surface changes.
 
 ![](/img/ash2text/image26.jpg)
 
@@ -563,22 +566,55 @@ High effective resolution matters here too: some ink information may live at ver
 
 ***
 ## References and implementation links
-* Vesuvius Challenge website: [https://scrollprize.org/](https://scrollprize.org/)   
-* Vesuvius Challenge public data: [https://scrollprize.org/data](https://scrollprize.org/data)   
-* Vesuvius Challenge S3 Open Data Bucket: [https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html)  
-* HuggingFace Vesuvius Challenge organization: [https://huggingface.co/scrollprize](https://huggingface.co/scrollprize)  
-* GitHub ScrollPrize organization: [https://github.com/ScrollPrize](https://github.com/ScrollPrize)  
-* Vesuvius Challenge Substack: [https://scrollprize.substack.com/](https://scrollprize.substack.com/)   
-* Technical release on PHerc. 1667, PHerc. Paris 4, surface tracing, ink recovery, and 3D DINO-guided ink segmentation: [https://arxiv.org/html/2606.29085v1](https://arxiv.org/html/2606.29085v1)   
-* Surface-topography work on ink signal in opened Herculaneum fragments: [https://www.nature.com/articles/s41598-026-58467-1](https://www.nature.com/articles/s41598-026-58467-1) (open-access preprint, no cookie wall: [https://arxiv.org/abs/2603.27698](https://arxiv.org/abs/2603.27698))    
-* Ink detection inference code: [https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized\_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)  
-* Spiral fit code: [https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/sc ripts/spiral/fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py)   
-* lasagna code: [https://github.com/ScrollPrize/villa/tree/main/lasagna](https://github.com/ScrollPrize/villa/tree/main/lasagna)   
-* VC3D / Volume Cartographer app code: [https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/apps/src](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/apps/src)   
-* lasagna fiber tracer: [https://github.com/ScrollPrize/villa/blob/main/lasagna/atlas.py](https://github.com/ScrollPrize/villa/blob/main/lasagna/atlas.py)   
-* Neural tracing inference service (heatmap / dense-displacement / copy modes): [https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural\_tracing/trace\_service.py](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/trace_service.py)   
-* Neural mesh autoregression (MVP): [https://github.com/ScrollPrize/villa/tree/main/vesuvius/src/vesuvius/neural\_tracing/autoreg\_mesh](https://github.com/ScrollPrize/villa/tree/main/vesuvius/src/vesuvius/neural_tracing/autoreg_mesh)   
-* Vesuvius Challenge – Surface Detection (Kaggle competition): [https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/overview](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/overview)   
-* ScrollFiesta, community automatic mesher: [https://github.com/Hob3rMallow/scrollfiesta\_public](https://github.com/Hob3rMallow/scrollfiesta_public)   
-* Additional released checkpoints not otherwise linked above: [ink\_detection\_pipeline](https://huggingface.co/scrollprize/ink_detection_pipeline)   
-* Vesuvius Challenge Substack posts cited in this piece: [“Finally—letters in Scroll 4\!”](https://scrollprize.substack.com/p/finallyletters-in-scroll-4), [“\~70% of PHerc. 172 is now digitally unwrapped”](https://scrollprize.substack.com/p/70-of-pherc-172-is-now-digitally), [“We are cooking”](https://scrollprize.substack.com/p/we-are-cooking), [“Unveiling the Mystery of Compressed Regions”](https://scrollprize.substack.com/p/unveiling-the-mystery-of-compressed), [“Back to the Challenge: \$100K Kaggle Surface Detection”](https://scrollprize.substack.com/p/back-to-the-challenge-100k-kaggle), [“Summer haze comes with ink”](https://scrollprize.substack.com/p/summer-haze-comes-with-ink), [“May Progress Prizes and Updates to Tooling”](https://scrollprize.substack.com/p/may-progress-prizes-and-updates-to)
+
+### Publications
+
+* G. Angelotti, S. Parsons, F. Nicolardi, Y. Nader, S. Johnson, D. Josey, P. Henderson, H. Schilling, J. Rudolph, F. McDonald, E. R. Dal Prá, P. Tafforeau, A. Mirone, C. S. Parker, J. P. Posma, B. Kyles, C. Vergara, A. Lavorante, R. Villa, M. C. Robustelli, M. D'Angelo, G. Del Mastro, M. McOsker, K. Fleischer, C. Chapman, N. Friedman, and W. B. Seales, "Complete virtual unwrapping and reading of a rolled Herculaneum papyrus," arXiv:2606.29085, 2026. [https://arxiv.org/abs/2606.29085](https://arxiv.org/abs/2606.29085)
+* G. Angelotti, F. Nicolardi, P. Henderson, and W. B. Seales, "Ink Detection from Surface Topography of the Herculaneum Papyri," *Scientific Reports*, 2026. [https://www.nature.com/articles/s41598-026-58467-1](https://www.nature.com/articles/s41598-026-58467-1) (open-access preprint, no cookie wall: [arXiv:2603.27698](https://arxiv.org/abs/2603.27698))
+* S. Parsons, C. S. Parker, C. Chapman, M. Hayashida, and W. B. Seales, "EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT," arXiv:2304.02084, 2023. [https://arxiv.org/abs/2304.02084](https://arxiv.org/abs/2304.02084)
+
+### Methods cited
+
+* **nnU-Net** — F. Isensee, P. F. Jaeger, S. A. A. Kohl, J. Petersen, and K. H. Maier-Hein, "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation," *Nature Methods* 18:203-211, 2021. [https://doi.org/10.1038/s41592-020-01008-z](https://doi.org/10.1038/s41592-020-01008-z) (preprint: [arXiv:1809.10486](https://arxiv.org/abs/1809.10486))
+* **U-Net** — O. Ronneberger, P. Fischer, and T. Brox, "U-Net: Convolutional Networks for Biomedical Image Segmentation," MICCAI 2015. [https://arxiv.org/abs/1505.04597](https://arxiv.org/abs/1505.04597)
+* **3D U-Net** — Ö. Çiçek, A. Abdulkadir, S. S. Lienkamp, T. Brox, and O. Ronneberger, "3D U-Net: Learning Dense Volumetric Segmentation from Sparse Annotation," MICCAI 2016. [https://arxiv.org/abs/1606.06650](https://arxiv.org/abs/1606.06650)
+* **ResNet3D pretraining** — K. Hara, H. Kataoka, and Y. Satoh, "Can Spatiotemporal 3D CNNs Retrace the History of 2D CNNs and ImageNet?," CVPR 2018. [https://arxiv.org/abs/1711.09577](https://arxiv.org/abs/1711.09577)
+* **Kinetics-700** — J. Carreira, E. Noland, C. Hillier, and A. Zisserman, "A Short Note on the Kinetics-700 Human Action Dataset," arXiv:1907.06987, 2019. [https://arxiv.org/abs/1907.06987](https://arxiv.org/abs/1907.06987)
+* **DINO** — M. Caron, H. Touvron, I. Misra, H. Jégou, J. Mairal, P. Bojanowski, and A. Joulin, "Emerging Properties in Self-Supervised Vision Transformers," ICCV 2021. [https://arxiv.org/abs/2104.14294](https://arxiv.org/abs/2104.14294)
+* **Adam optimizer** — D. P. Kingma and J. Ba, "Adam: A Method for Stochastic Optimization," ICLR 2015. [https://arxiv.org/abs/1412.6980](https://arxiv.org/abs/1412.6980)
+* **Ceres Solver** — S. Agarwal, K. Mierle, and the Ceres Solver Team, "Ceres Solver" (software), 2023. [http://ceres-solver.org](http://ceres-solver.org)
+* **SLIM (Scalable Locally Injective Mappings)** — M. Rabinovich, R. Poranne, D. Panozzo, and O. Sorkine-Hornung, "Scalable Locally Injective Mappings," *ACM Transactions on Graphics* 36(2), 2017. [https://igl.ethz.ch/projects/slim/](https://igl.ethz.ch/projects/slim/)
+* **Phase retrieval (Paganin method)** — D. Paganin, S. C. Mayo, T. E. Gureyev, P. R. Miller, and S. W. Wilkins, "Simultaneous phase and amplitude extraction from a single defocused image of a homogeneous object," *Journal of Microscopy* 206(1):33-40, 2002. [https://pubmed.ncbi.nlm.nih.gov/12000561/](https://pubmed.ncbi.nlm.nih.gov/12000561/)
+* **WebKnossos** — K. M. Boergens, M. Berning, T. Bocklisch, et al., "webKnossos: efficient online 3D data annotation for connectomics," *Nature Methods* 14:691-694, 2017. [https://doi.org/10.1038/nmeth.4331](https://doi.org/10.1038/nmeth.4331)
+* **OME-Zarr / OME-NGFF** — J. Moore, C. Allan, S. Besson, et al., "OME-NGFF: a next-generation file format for expanding bioimaging data-access strategies," *Nature Methods* 18:1496-1498, 2021. [https://doi.org/10.1038/s41592-021-01326-w](https://doi.org/10.1038/s41592-021-01326-w) (spec: [https://ngff.openmicroscopy.org/](https://ngff.openmicroscopy.org/))
+
+### Competition
+
+* Vesuvius Challenge – Surface Detection (Kaggle competition): [overview](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/overview) · [1st-place writeup](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/1st-place-solution-for-the-vesuvius-challenge-su) · [5th-place writeup](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection/writeups/5th-place-solution)
+
+### Code
+
+* villa monorepository (VC3D / Volume Cartographer, lasagna, neural tracing, dinovol): [https://github.com/ScrollPrize/villa](https://github.com/ScrollPrize/villa)
+* VC3D / Volume Cartographer app code: [https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/apps/src](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/apps/src)
+* lasagna code: [https://github.com/ScrollPrize/villa/tree/main/lasagna](https://github.com/ScrollPrize/villa/tree/main/lasagna) · lasagna fiber tracer: [atlas.py](https://github.com/ScrollPrize/villa/blob/main/lasagna/atlas.py)
+* Spiral fit code: [fit_spiral.py](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py)
+* Ink detection inference code: [ink-detection/optimized_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)
+* Neural tracing inference service (heatmap / dense-displacement / copy modes): [trace_service.py](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/trace_service.py)
+* Neural mesh autoregression (MVP): [neural_tracing/autoreg_mesh](https://github.com/ScrollPrize/villa/tree/main/vesuvius/src/vesuvius/neural_tracing/autoreg_mesh)
+* 3D DINO implementation: [https://github.com/ScrollPrize/dinovol](https://github.com/ScrollPrize/dinovol)
+* ScrollFiesta, community automatic mesher: [https://github.com/Hob3rMallow/scrollfiesta_public](https://github.com/Hob3rMallow/scrollfiesta_public)
+
+### Model checkpoints (Hugging Face)
+
+* All released checkpoints: [https://huggingface.co/scrollprize](https://huggingface.co/scrollprize) — including the recto-surface predictor [surface_recto_3dunet](https://huggingface.co/scrollprize/surface_recto_3dunet), the Kaggle-winning [surface_m7_nnunet](https://huggingface.co/scrollprize/surface_m7_nnunet), the neural copy-tracer [copy_displacement_latest](https://huggingface.co/scrollprize/copy_displacement_latest) and baseline [ps256_copy_baseline](https://huggingface.co/scrollprize/ps256_copy_baseline), fiber models [fiber_hz_vt](https://huggingface.co/scrollprize/fiber_hz_vt) / [fiber_dinoguided_2class_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000) / [fiber_ink_4class_selfdistill](https://huggingface.co/scrollprize/fiber_ink_4class_selfdistill) / [fiber_selftrain_teacher_epoch30](https://huggingface.co/scrollprize/fiber_selftrain_teacher_epoch30), the PHerc. 1667 pseudo-labeling series [iteration-0](https://huggingface.co/scrollprize/PHerc.1667-iteration-0)–[iteration-5](https://huggingface.co/scrollprize/PHerc.1667-iteration-5), the current 2 µm ink model [ink_canonical_2um](https://huggingface.co/scrollprize/ink_canonical_2um) and the PHerc. Paris 4 3D model [ink_3d_dino_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided), the DINO checkpoints [dinovol_v2_ps8_with_paris4_352500](https://huggingface.co/scrollprize/dinovol_v2_ps8_with_paris4_352500) / [dinovol_v2_ps6_step032350](https://huggingface.co/scrollprize/dinovol_v2_ps6_step032350) / [dinovol_v2_ps8_supcon3class_step362500](https://huggingface.co/scrollprize/dinovol_v2_ps8_supcon3class_step362500), and the [ink_detection_pipeline](https://huggingface.co/scrollprize/ink_detection_pipeline) reference pipeline.
+
+### Data
+
+* Vesuvius Challenge public data: [https://scrollprize.org/data](https://scrollprize.org/data) · Data Browser: [https://scrollprize.org/data_browser](https://scrollprize.org/data_browser)
+* S3 Open Data Bucket (AWS Open Data Program): [https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html)
+* Curated datasets (ink and spiral) on Hugging Face: [https://huggingface.co/buckets/scrollprize/datasets](https://huggingface.co/buckets/scrollprize/datasets)
+
+### Project & further reading
+
+* Vesuvius Challenge website: [https://scrollprize.org/](https://scrollprize.org/) · GitHub org: [https://github.com/ScrollPrize](https://github.com/ScrollPrize) · Hugging Face org: [https://huggingface.co/scrollprize](https://huggingface.co/scrollprize)
+* Vesuvius Challenge Substack: [https://scrollprize.substack.com/](https://scrollprize.substack.com/) — posts cited in this piece: ["Finally—letters in Scroll 4!"](https://scrollprize.substack.com/p/finallyletters-in-scroll-4), ["~70% of PHerc. 172 is now digitally unwrapped"](https://scrollprize.substack.com/p/70-of-pherc-172-is-now-digitally), ["We are cooking"](https://scrollprize.substack.com/p/we-are-cooking), ["Unveiling the Mystery of Compressed Regions"](https://scrollprize.substack.com/p/unveiling-the-mystery-of-compressed), ["Back to the Challenge: $100K Kaggle Surface Detection"](https://scrollprize.substack.com/p/back-to-the-challenge-100k-kaggle), ["Summer haze comes with ink"](https://scrollprize.substack.com/p/summer-haze-comes-with-ink), ["May Progress Prizes and Updates to Tooling"](https://scrollprize.substack.com/p/may-progress-prizes-and-updates-to)

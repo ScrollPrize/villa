@@ -71,8 +71,6 @@ Or contribute to its two primary subproblems:
 * Starting point: [Open Problems](2026_open_problems), [Segmentation tutorial](segmentation)
 </Admonition>
 
-Curious how far the field has come? See the \$200,000 [Kaggle Surface Detection winners](winners#surface-detection-kaggle-winners).
-
 ### 4. Utilize resources
 
 Find more information about our datasets ([data page](data)) and what to do with them ([tutorials](tutorial)).

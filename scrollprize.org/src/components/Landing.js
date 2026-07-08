@@ -454,6 +454,7 @@ const PersonLink = ({ link }) => (
 
 const ChallengeBox = ({
   title,
+  titleHref,
   children,
   skills,
   linkText,
@@ -463,7 +464,18 @@ const ChallengeBox = ({
 }) => (
   <div className="vc-card vc-problem">
     <div className="vc-problem__text">
-      <h3 className="vc-problem__title">{title}</h3>
+      <h3 className="vc-problem__title">
+        {titleHref ? (
+          <a
+            href={titleHref}
+            className="text-inherit hover:underline hover:text-inherit"
+          >
+            {title}
+          </a>
+        ) : (
+          title
+        )}
+      </h3>
       <div className="vc-problem__body">{children}</div>
       {skills && (
         <div className="vc-chips" aria-label="Related skills">
@@ -766,6 +778,7 @@ export function Landing() {
             <div className="vc-problems">
               <ChallengeBox
                 title="Virtual Unwrapping"
+                titleHref="/2026_open_problems#2-unwrapping-turning-disconnected-voxels-into-a-surface"
                 linkText="Chart the Path"
                 href="/2026_open_problems"
                 bounty={
@@ -819,6 +832,7 @@ export function Landing() {
 
               <ChallengeBox
                 title="Ink Detection"
+                titleHref="/2026_open_problems#3-ink-recovery-detecting-what-is-written"
                 linkText="Find a Letter"
                 href="/tutorial5"
                 bounty={

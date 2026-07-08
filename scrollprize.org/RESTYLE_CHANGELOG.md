@@ -274,6 +274,14 @@ The Tutorials pipeline strip (Scanning → Representation → Segmentation and F
 The pipeline strip on /2026_open_problems now reads Scanning → Unwrapping → Flattening → Ink recovery (was Representation / Segmentation and Flattening / Ink Detection), via a `labels` override prop on `TutorialsTop` mirroring the `links` one. Tutorial pages keep their original labels.
 **Files:** `src/components/TutorialsTop.js`, `docs/37_2026_open_problems.md`.
 
+## C33 — feedback round: Get Started trim, data list, landing links, academic references
+
+- **Get Started**: removed the "Curious how far the field has come? … Kaggle Surface Detection winners" line.
+- **Open Problems "Where is the data"** is now a list: Data Browser, direct S3 bucket, curated datasets (ink and spiral) at huggingface.co/buckets/scrollprize/datasets, model checkpoints at huggingface.co/scrollprize.
+- **Landing Open-problems cards**: titles now link to the matching Open Problems sections (Virtual Unwrapping → §2, Ink Detection → §3) via a `titleHref` prop on ChallengeBox.
+- **Open Problems references overhauled** (agent-audited, every URL curl-verified 200): the flat link list is now structured (Publications / Methods cited / Competition / Code / Model checkpoints / Data / Project) with academic citations — Angelotti et al. arXiv:2606.29085 (canonical /abs/ replaces the /html/ render), Angelotti et al. Scientific Reports 2026, EduceLab-Scrolls, nnU-Net (Isensee et al. 2021), U-Net, 3D U-Net, ResNet3D, Kinetics-700, DINO, Adam, Ceres, SLIM, Paganin 2002, WebKnossos, OME-NGFF. Thirteen in-text terms now link to their canonical sources. Fixed: dead AutoInk link (404 — removed), malformed "sc ripts" link text.
+**Files:** `docs/01_get_started.md`, `docs/37_2026_open_problems.md`, `src/components/Landing.js`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
