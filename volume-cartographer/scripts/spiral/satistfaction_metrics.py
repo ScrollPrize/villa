@@ -23,6 +23,16 @@ metrics_config = {
     'boundary_satisfied_patch_quad_fraction': 0.90,  # min fraction of boundary quads satisfied for the boundary metric
 }
 
+# Optional env override so experiments can sweep metric strictness WITHOUT touching the loss
+# (eval-only ⇒ cannot be gamed by the optimizer). Mirrors fit_spiral.get_env_config_overrides.
+_metrics_overrides_json = os.environ.get('FIT_SPIRAL_METRICS_CONFIG_OVERRIDES')
+if _metrics_overrides_json:
+    _metrics_overrides = json.loads(_metrics_overrides_json)
+    _unknown_metric_keys = sorted(set(_metrics_overrides) - set(metrics_config))
+    if _unknown_metric_keys:
+        raise KeyError(f'unknown FIT_SPIRAL_METRICS_CONFIG_OVERRIDES keys: {_unknown_metric_keys}')
+    metrics_config.update(_metrics_overrides)
+
 
 def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches, z_begin, z_end, verbose=False):
     """Per-patch satisfaction metrics.

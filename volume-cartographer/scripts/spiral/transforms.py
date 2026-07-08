@@ -12,19 +12,25 @@ from flow_fields import CartesianFlowField, CylindricalFlowField
 from geom_utils import expm_2x2, interp1d
 from sample_spiral import get_bounding_windings, get_theta_and_radii
 
+# Error-controlled adaptive ODE solvers (variable step count); fixed solvers ('rk4', 'euler', ...)
+# integrate on a fixed grid instead.
+_ADAPTIVE_SOLVERS = {'dopri5', 'dopri8', 'bosh3', 'adaptive_heun', 'fehlberg2'}
+
 
 class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
 
     domain = pyro.distributions.constraints.real_vector
     codomain = domain
 
-    def __init__(self, flow_field, flow_min_corner_zyx, flow_max_corner_zyx, num_steps, solver, truncate_at_step=None, event_dim=0, cache_size=0):
+    def __init__(self, flow_field, flow_min_corner_zyx, flow_max_corner_zyx, num_steps, solver, truncate_at_step=None, rtol=1e-5, atol=1e-6, event_dim=0, cache_size=0):
         super().__init__(cache_size=cache_size)
         self.flow_field = flow_field
         self.flow_min_corner_zyx = flow_min_corner_zyx
         self.flow_max_corner_zyx = flow_max_corner_zyx
         self.num_steps = num_steps
         self.solver = solver
+        self.rtol = rtol
+        self.atol = atol
         self.truncate_at_step = truncate_at_step
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
@@ -36,6 +42,12 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
 
     def _velocity(self, t_int, current_zyx_scaled):
         # t_int is a scalar in [0, 1]; flow_field expects t in [-1, 1]
+        if self.num_flow_timesteps == 1:
+            # stationary field: cache the sampler (get_sampler rebuilds the LR->HR field otherwise,
+            # which would be paid on every adaptive sub-step)
+            if self._cached_sampler is None:
+                self._cached_sampler = self.flow_field.get_sampler(0.0)
+            return self._cached_sampler(current_zyx_scaled)
         t_flow = t_int * 2 - 1
         return self.flow_field.get_sampler(t_flow)(current_zyx_scaled)
 
@@ -46,10 +58,9 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         n_steps = self.num_steps if self.truncate_at_step is None else self.truncate_at_step
         t_span = n_steps / self.num_steps
         h = (-t_span if inverse else t_span) / n_steps
-        if self.num_flow_timesteps == 1:
-            # Time-invariant flow: build the sampler once and inline a manual rk4 loop to skip
-            # torchdiffeq's per-step dispatch overhead.
-            assert self.solver == 'rk4'
+        if self.num_flow_timesteps == 1 and self.solver == 'rk4':
+            # Time-invariant rk4 fast path: build the sampler once and inline a manual rk4 loop to
+            # skip torchdiffeq's per-step dispatch overhead.
             if self._cached_sampler is None:
                 self._cached_sampler = self.flow_field.get_sampler(0.0)
             sampler = self._cached_sampler
@@ -59,7 +70,16 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
                 k3 = sampler(y + (h / 2) * k2)
                 k4 = sampler(y + h * k3)
                 y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+        elif self.solver in _ADAPTIVE_SOLVERS:
+            # Adaptive (error-controlled) integrator: integrate over [t0, t_end] and let the solver
+            # pick its own step count from rtol/atol. Direct backprop (composes with the flow field's
+            # sparse-gradient accumulation, like the fixed odeint path).
+            t0 = 1. if inverse else 0.
+            t_end = t0 + (-t_span if inverse else t_span)
+            ts = torch.tensor([t0, t_end], device=y.device, dtype=y.dtype)
+            y = odeint(self._velocity, y, ts, method=self.solver, rtol=self.rtol, atol=self.atol)[-1]
         else:
+            # Fixed-step non-rk4, or a time-varying (num_flow_timesteps>1) field: fixed grid.
             t0 = 1. if inverse else 0.
             ts = torch.linspace(t0, t0 + h * n_steps, n_steps + 1, device=y.device)
             y = odeint(self._velocity, y, ts, method=self.solver)[-1]
@@ -265,7 +285,7 @@ class SpiralAndTransform(nn.Module):
 
     def get_slice_to_spiral_transform(self, truncate_at_step=None):
         truncate_frac = None if truncate_at_step is None else truncate_at_step / (self.flow_integration_steps - 1)
-        diffeomorphism = IntegratedFlowDiffeomorphism(self.flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
+        diffeomorphism = IntegratedFlowDiffeomorphism(self.flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step, rtol=self.cfg.get('flow_rtol', 1e-5), atol=self.cfg.get('flow_atol', 1e-6))
         gap_expander = GapExpandingTransform(
             self.gap_expander_params,
             self.get_dr_per_winding(),

@@ -107,6 +107,11 @@ render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' i
 
 default_config = {
     'random_seed': 1,
+    # Optimisation z-range (full-resolution voxel slices). Defaults reproduce the module-level
+    # z_begin/z_end above; overriding these (slab experiments) rebinds the module globals in
+    # __main__ BEFORE scale_counts_for_z_range / configure_losses / main() consume them.
+    'z_begin': 7000,
+    'z_end': 17000,
     # Multi-GPU batch policy (only relevant under torchrun, world size > 1):
     #   True  -> split per-step object-sample counts by world_size so the effective
     #            per-step batch matches single-GPU while each rank does less work.
@@ -117,7 +122,9 @@ default_config = {
     'lr_final_factor': 0.3,
     'num_training_steps': 30_000,
     'num_flow_integration_steps': 3,
-    'flow_integration_solver': 'rk4',
+    'flow_integration_solver': 'rk4',  # 'rk4' (fixed) | 'dopri5'/'bosh3'/'adaptive_heun' (adaptive)
+    'flow_rtol': 1.e-5,  # adaptive-solver relative tolerance (ignored for fixed solvers)
+    'flow_atol': 1.e-6,  # adaptive-solver absolute tolerance
     'num_flow_timesteps': 1,
     'flow_bounds_z_margin': 160,
     'flow_bounds_radius': 3200,
@@ -1702,6 +1709,12 @@ if __name__ == '__main__':
     try:
         config = dict(default_config)
         config.update(get_env_config_overrides())
+        # Rebind the module-level z-range globals from config (module scope, so plain
+        # assignment rebinds them for every function that reads them later).
+        z_begin, z_end = int(config['z_begin']), int(config['z_end'])
+        assert z_begin < z_end, f'z_begin {z_begin} must be < z_end {z_end}'
+        if (z_begin, z_end) != (default_config['z_begin'], default_config['z_end']):
+            print(f'z-range overridden via config: [{z_begin}, {z_end}) ({z_end - z_begin} slices)')
         reference_z_range_num_slices = 9500
         z_range_scaled_count_keys = (
             'num_patches_per_step',
