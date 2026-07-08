@@ -430,8 +430,8 @@ public:
             order_.push_back(key);
             first = order_.size() == 1;
         }
-        started_.count_down();
         if (first) {
+            started_.count_down();
             std::unique_lock<std::mutex> lk(m_);
             cv_.wait(lk, [&] { return released_; });
         }
