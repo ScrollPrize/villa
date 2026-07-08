@@ -376,10 +376,10 @@ uv run python -m koine_machines.inference.infer \
 A first model trained on a small dataset will reveal some letters clearly, others faintly, and miss some entirely. The way to make it better is the same loop that scaled ink detection to entire scrolls:
 
 1. **Run inference** on your training segments (and new, unlabeled ones).
-2. **Inspect the predictions.** Look for regions where letter strokes are clearly and unambiguously visible.
+2. **Inspect the predictions.** Look for regions where letter strokes are clearly visible.
 3. **Extend the labels.** In those regions, paint the visible strokes white in the ink label image, and extend the supervision mask to cover the region — both the strokes *and* the clean background around them, since the background pixels are the negative examples the model learns from.
 4. **Retrain** on the enlarged labels, starting fresh or from your last checkpoint (add `"checkpoint": "runs/ink_tutorial/ckpt_019000.pth"` and `"weights_only": true` to the config).
-5. **Repeat** until the model stops improving.
+5. **Repeat.**
 
 Labels are ordinary image files, so you can edit them in any image editor that handles large images (e.g. GIMP or Photoshop). If you edit or create labels as TIFF/PNG files, convert them to the `.zarr` format the trainer expects with:
 
