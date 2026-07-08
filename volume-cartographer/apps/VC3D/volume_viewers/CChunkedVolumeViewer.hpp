@@ -350,6 +350,7 @@ private:
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
+    void refreshCursorPositionAt(const QPointF& scenePos);
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
     void clearLineAnnotationPlacementMarker();

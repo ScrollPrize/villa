@@ -2461,6 +2461,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
         return;
     if (modifiers & Qt::ShiftModifier) {
         if (_shiftScrollOverride && _shiftScrollOverride(steps, scenePoint, modifiers)) {
+            refreshCursorPositionAt(scenePoint);
             return;
         }
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
@@ -2487,6 +2488,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
             _genCacheDirty = true;
             submitRender("z offset mouse wheel");
         }
+        refreshCursorPositionAt(scenePoint);
     } else if (modifiers & Qt::ControlModifier) {
         emit sendSegmentationRadiusWheel(steps, scenePoint, sceneToVolume(scenePoint));
     } else {
@@ -3291,6 +3293,17 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
             p += n * _zOff;
     }
     return p;
+}
+
+void CChunkedVolumeViewer::refreshCursorPositionAt(const QPointF& scenePos)
+{
+    _lastScenePos = scenePos;
+    _lastCursorVolumePos = cursorVolumePosition(scenePos);
+    updateCursorCrosshair(scenePos);
+    updateStatusLabel();
+    if (_viewerManager) {
+        _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
+    }
 }
 
 std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtScenePosition(const QPointF& scenePos)
