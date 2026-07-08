@@ -264,6 +264,11 @@ Brings the branch current with main: the data page rewrite (dataset naming, depr
 - **Route moved to `/2026_open_problems`**: file renamed to `docs/37_2026_open_problems.md` with an explicit frontmatter `id` (the default number-prefix parser won't strip `37_` when the rest starts with a digit — same reason `28_2024_prizes` keeps its full id). Redirects updated so `/tech_blogpost` and `/from_ash_to_text` both point directly at the new route (no chained hops). Landing "Chart the Path" CTA updated.
 **Files:** `docs/37_2026_open_problems.md` (renamed from `37_tech_blogpost.md`), `sidebars.js`, `docusaurus.config.js` (navbar + redirects), `docs/01_get_started.md`, `src/components/Landing.js`.
 
+## C31 — Open Problems: pipeline gif strip as visual TOC
+
+The Tutorials pipeline strip (Scanning → Representation → Segmentation and Flattening → Ink Detection) now also sits in the Open Problems post's "The pipeline" section, directly under the three-step list. On this page the four thumbs deep-link to the post's own section anchors (§1 Scanning, §2 Unwrapping ×2, §3 Ink recovery) — a visual table of contents — via a new optional `links` prop on `TutorialsTop` (tutorial pages keep their default destinations). Verified: thumbs land sections below the fixed navbar; mobile wraps 3+1 with zero overflow.
+**Files:** `src/components/TutorialsTop.js`, `docs/37_2026_open_problems.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

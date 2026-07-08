@@ -32,6 +32,7 @@ sidebar_label: "Open Problems"
 </head>
 
 import Admonition from '@theme/Admonition';
+import { TutorialsTop } from '@site/src/components/TutorialsTop';
 
 <div className="opacity-60 mb-8 italic">July 2026</div>
 
@@ -57,6 +58,15 @@ Reading a scroll is a chain of complex problems:
 1. **Scanning**: producing a 3D X-ray volume that preserves the relevant physical signal.    
 2. **Unrolling**: inferring the hidden papyrus sheets from that 3D volume and flattening them.    
 3. **Ink recovery**: detecting or segmenting the ink signal on, or near, the recovered writing surface.
+
+<TutorialsTop
+  links={{
+    scanning: '#1-scanning-preserving-the-signal-before-algorithms-see-it',
+    representation: '#2-unwrapping-turning-disconnected-voxels-into-a-surface',
+    segmentation: '#2d-parameterization-and-flattening-the-easier-problem-after-the-hard-one',
+    ink: '#3-ink-recovery-detecting-what-is-written',
+  }}
+/>
 
 The most important thing to understand is what we actually get after scanning. We do not get sheets. We do not get a mesh, a graph, or a map of which layer connects to which. We get a **3D grid of voxels**.
 
