@@ -242,7 +242,7 @@ _Widget for creating initial segmentations which can be used for traces or later
 
 
 
-### Creating an inital segmentation 
+### Creating an initial segmentation 
 
 For all growth or editing actions, you'll need an initial mesh to start from. This can be done either through the GUI or the CLI. 
 
@@ -278,7 +278,7 @@ An existing segmentation can be semi-automatically grown utlizing the tracer opt
 
 ### Correcting errors in a segmentation
 
-There are a few ways to fix errors which occured during segmentation. All parameters controlling these actions are in the `segmentation` widget , and have tooltips which will appear on mouse hover.
+There are a few ways to fix errors which occurred during segmentation. All parameters controlling these actions are in the `segmentation` widget , and have tooltips which will appear on mouse hover.
 
 *Deforming/manipulating the mesh manually by left-clicking or dragging near it* 
 

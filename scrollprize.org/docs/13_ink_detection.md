@@ -37,6 +37,12 @@ hide_table_of_contents: true
   />
 </head>
 
+:::warning[COMPETITION CLOSED]
+
+This 2023 Kaggle competition has concluded. See the [Winners page](winners) for the results and [Prizes](prizes) for what is currently open.
+
+:::
+
 As you will learn in the [tutorials](/tutorial), one of the big challenges of reading the Herculaneum Papyri is detecting the ink in the 3D X-ray scans.
 
 <figure>

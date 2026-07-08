@@ -92,7 +92,9 @@ The scrolls are scanned using **synchrotron X-ray micro-computed tomography**, o
 
 There is, however, still a signal to be found. Ink may affect the scan in more subtle ways. Texture, morphology, density, and phase effects. Frequently, in some combination of all of them. Teasing out these subtle differences is difficult, and is the primary reason we scan at such high resolutions, and why we continue to invest time and money into ensuring our scans are as good as we can reasonably achieve. 
 
-![](/img/ash2text/image1.png)￼
+![](/img/ash2text/image1.png)
+
+*A micro-CT cross-section of a carbonized Herculaneum scroll: hundreds of tightly wound, deformed papyrus windings packed into a few centimeters (scale bar: 5 cm). The subtle differences that distinguish ink from papyrus must be teased out of data like this.*
 
 ### The compressed-region problem
 For as long as we’ve been working on these scans, it’s been apparent that some regions of a scroll look worse than the resolution used to scan them would suggest. These patches come out blurred, foggy, "compressed" — papyrus layers that should be cleanly separable become hard to tell apart. When panning through layers, the sheets could almost be seen “behind” this fog. Recent scanning experiments conducted at very high resolutions have finally given us an answer to the question of why these areas exist. 
@@ -105,9 +107,15 @@ The working explanation starts at the fiber level. Carbonized papyrus fibers con
 
 ![](/img/ash2text/image4.png)
 
+*A visual analogy for the compressed-region problem: the same view of Naples and Mount Vesuvius on a clear day and shrouded in haze. In compressed regions of a scan, papyrus sheets can almost be seen "behind" this kind of fog.*
+
 ![](/img/ash2text/image5.jpg)
 
+*A compressed region of PHerc. Paris 4, scanned at DLS at 7.91 µm with a suboptimal protocol: layer boundaries blur into haze and adjacent sheets become hard to tell apart.*
+
 ![](/img/ash2text/image6.jpg)
+
+*The same compressed region of PHerc. Paris 4, rescanned at ESRF at 2.4 µm with a more optimized protocol: individual windings become far easier to separate.*
 
  The difficulty of unwrapping scrolls begins here. Blur the boundaries in the scan, and every downstream step gets harder: surface localization (finding the writing surface within the volume) turns noisier, mesh tracing turns less stable, and ink recovery may miss information it needs.
 
@@ -174,6 +182,8 @@ Surface prediction was the subject of a dedicated Kaggle competition, "Vesuvius 
 Here's the winning recipe condensed to a single sentence: take an off-the-shelf nnU-Net model configured for a couple of patch sizes, train it for a very long time (*well over the default 1,000 epochs)*, and average their predictions together (a process known as ensembling).
 
 ![](/img/ash2text/image7.png)
+
+*A recto-surface prediction (red) overlaid on a CT cross-section: the binarized model output marks the written side of each papyrus wrap — the mask that downstream mesh tracing consumes (scale bar: 0.5 cm).*
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
@@ -288,11 +298,13 @@ If we can manage to trace the fibers, we can directly obtain oriented axes in th
 
 ![](/img/ash2text/image15.png)
 
+*A 3D rendering of individually segmented papyrus fibers, each color a separate instance. The crossing horizontal and vertical bundles physically define the row-and-column (U and V) axes that can parameterize the sheet’s surface.*
+
 In VC3D we have a fiber tracer tool, which is part of the Lasagna optimization ecosystem. It is not fully automated, and the line annotation widget inside VC3D is what drives it. Once fibers are annotated, [atlas.py](https://github.com/ScrollPrize/villa/blob/main/lasagna/atlas.py) can pair fibers / skeleton annotations and optimize a “patch” through them.
 
 This is not the only way to trace fibers. Some of the project's most valuable fiber-skeleton labels were traced by hand years ago in **[WebKnossos](https://doi.org/10.1038/nmeth.4331)** (a web-based tool for tracing and annotating skeleton-like structures voxel by voxel in large volumetric datasets), against older [EduceLab](https://arxiv.org/abs/2304.02084)-era scans taken at Diamond Light Source, a synchrotron facility distinct from ESRF — the facility behind the more recent scans discussed throughout this post.
 
-These annotations were voxelized and used to train a semantic segmentation model for fibers. We provide a checkpoint named [fiber\_hz\_vt](https://huggingface.co/scrollprize/fiber_hz_vt) — weights of an nnUNet model trained on "horizontal/vertical" fibers manually traced by annotators on the older 7.81 µm old scans.
+These annotations were voxelized and used to train a semantic segmentation model for fibers. We provide a checkpoint named [fiber\_hz\_vt](https://huggingface.co/scrollprize/fiber_hz_vt) — weights of an nnUNet model trained on "horizontal/vertical" fibers manually traced by annotators on the older 7.91 µm scans.
 
 Since we rescanned some of the old scrolls with the new protocol at ESRF, it can be important to match both labels and predictions.
 
@@ -318,6 +330,8 @@ Each of these sources of information provides a hard (verified) or soft (unverif
 
 ![](/img/ash2text/image16.png)
 
+*The spiral prior, illustrated: an idealized rolled scroll (left) is related to the damaged, deformed scroll observed in the scan (right) by a smooth spatial deformation — the transformation the spiral fit estimates.*
+
 One way to represent the deformation is through a **stationary velocity field**. In simple terms, this is a smooth 3D field that tells points how to move from the ideal spiral toward the observed scroll. If the transformation is smooth and does not tear or fold the coordinate system onto itself, it preserves the global structure of the spiral while still adapting to damage. The fitting process itself is implemented in [fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py).
 
 A global prior can organize and regularize geometry, allowing a single consistent result to be produced from disconnected annotations, bridging small gaps and interpolating windings. But where annotations are sparse or the volume is highly ambiguous, spiral fitting is still under-constrained, and won't necessarily follow the true sheet surfaces.
@@ -338,7 +352,7 @@ Why did we move forward with these datasets instead of fixing them first? The la
 
 ![](/img/ash2text/image18.jpg)
 
-*Two real examples of label imprecision on a traced segment: the red line marking the recto surface runs visibly offset from the true fiber boundary in places (left pair), and drifts across fiber layers rather than tracking one sheet (right pair).*
+*Two real examples of label imprecision on a traced segment: the red line marking the recto surface runs visibly offset from the true fiber boundary in places (first pair, z=120), and drifts across fiber layers rather than tracking one sheet (second pair, z=200).*
 
 A useful direction is **label snapping**: using the raw CT signal and local geometry to move approximate labels back onto the most plausible papyrus surface / fiber. Another direction is **active learning**, where the model identifies the most uncertain or valuable regions and asks humans to correct only those.
 
@@ -370,11 +384,15 @@ That creates a training pair:
 
 ![](/img/ash2text/image19.png)
 
+*The two halves of a fragment training pair: (a) a max-projection composite of the fragment’s CT data, where the ink is not apparent, and (b) the aligned infrared photograph of the same fragment, where the ink is clearly visible (scale bars: 5 mm).*
+
 The model learns from fragments and is then applied to sealed scrolls. Generalization is not straightforward\!
 
 Working on surface-conditioned renders of the fragments’ outer sheet, the model receives a local 3D neighborhood and predicts a 2D ink probability map on the flattened surface.
 
 ![](/img/ash2text/image20.png)
+
+*How a fragment becomes a training pair: the fragment (a) is photographed in infrared (e) and CT-scanned (b); a mesh of its exposed surface (c) extracts a flattened surface volume used as the model input (d), while the aligned IR photograph provides the 2D ink labels (f, g).*
 
 This design makes sense because fragment labels are 2D: the photograph tells us where ink appears on the exposed surface, but not exactly where the ink signal sits in depth inside the CT volume.
 
@@ -394,6 +412,8 @@ A pseudo-label is a provisional label created from model output and human review
 10. Repeat.
 
 ![](/img/ash2text/image21.png)
+
+*The pseudo-labeling loop in action on PHerc. 1667: six models (iterations 0–5) trained with progressively denser pseudo-label coverage, from a cross-segment baseline up to 33,061 tiles. Row (a) shows the training labels, row (b) predictions on a training segment (magenta = training label), and row (c) predictions on a held-out segment, which grow steadily cleaner and more legible.*
 
 A concrete record of this loop exists in the six PHerc.1667-iteration-0 through \-5 checkpoints released alongside the project. Each of the six shares an identical architecture (a [ResNet3D-50](https://arxiv.org/abs/1711.09577) backbone initialized from [Kinetics-700](https://arxiv.org/abs/1907.06987) weights, feeding a 2D U-Net decoder) and an identical training budget (12,396 optimizer steps), differing only in how much pseudo-labeled data it was fine-tuned on — from a cross-segment baseline at iteration 0 up to the densest available label set, 33,061 tiles, at iteration 5\. Kinetics-700 is, on its face, an odd source for this: it's a video-action-recognition dataset, built for recognizing human activities in video clips, with nothing obviously to do with CT scans or ancient papyrus. The connection is architectural rather than topical — a video clip and a CT volume are both fundamentally 3D data (two spatial axes plus a third axis, time for one and depth for the other), so a 3D-convolutional network pretrained on one transfers surprisingly well to the other. All six checkpoints are released on Hugging Face: [iteration-0](https://huggingface.co/scrollprize/PHerc.1667-iteration-0), [iteration-1](https://huggingface.co/scrollprize/PHerc.1667-iteration-1), [iteration-2](https://huggingface.co/scrollprize/PHerc.1667-iteration-2), [iteration-3](https://huggingface.co/scrollprize/PHerc.1667-iteration-3), [iteration-4](https://huggingface.co/scrollprize/PHerc.1667-iteration-4), and [iteration-5](https://huggingface.co/scrollprize/PHerc.1667-iteration-5).
 
@@ -472,7 +492,7 @@ In recent high-resolution scans of PHerc. Paris 4, ink-bearing deposits become v
 
 ![](/img/ash2text/image24.png)
 
-1) *XY slice of PHerc. Paris 4, 2.4 µm scan . b) Ink segmented in 3D. c) Virtually unwrapped PI (no ink detection, the letter is directly visible). d): the flattened region with the recovered ink overlaid in red on the actual papyrus surface — multiple full lines of clearly legible Greek letters running the width of the sheet, not an isolated word or two.*
+*a) XY slice of PHerc. Paris 4, 2.4 µm scan. b) Ink segmented in 3D. c) Virtually unwrapped PI (no ink detection, the letter is directly visible). d): the flattened region with the recovered ink overlaid in red on the actual papyrus surface — multiple full lines of clearly legible Greek letters running the width of the sheet, not an isolated word or two.*
 
 Not every scroll will behave like PHerc. Paris 4 — but direct 3D ink segmentation is possible under favorable scan and preservation conditions, and it gives us a cleaner target for future models.
 

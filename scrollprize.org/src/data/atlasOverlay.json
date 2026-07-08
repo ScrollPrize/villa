@@ -139,13 +139,13 @@
       "photo": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/photos/PHercParis4_photo.jpg",
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis4/",
       "content": {
-        "work": "Epicurean prose (author/title not yet identified)",
+        "work": "Epicurean prose, attributed to Philodemus (title not yet identified)",
         "lang": "Greek",
         "summary": "Scroll 1 — the flagship. Substantial continuous Greek text recovered from the banner and body; site of the 2023 First Letters and Grand Prize.",
         "caveat": "The title region shows no detectable ink (possibly a different ink; the top rows are physically missing)."
       },
       "progress": {
-        "segments": 20,
+        "segments": null,
         "patches": 49936,
         "textFound": "Substantial text",
         "textRank": 4,

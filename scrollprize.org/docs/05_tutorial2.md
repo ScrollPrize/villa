@@ -117,7 +117,7 @@ For this tutorial, we'll be using a library/framework known as [nnUNetv2](https:
 
 nnUNet is a well regarded and highly performant machine learning library with a focus on volumetric data within the medical domain, which has many parallels to our imaging modalities (namely xray tomography), and provides us with a fantastic baseline and starting point for experimentation.
 
-This is a simplified guide, it is highly recommended to visit [the repository](https://github.com/MIC-DKFZ/nnUNet)and read further after following this!
+This is a simplified guide, it is highly recommended to visit [the repository](https://github.com/MIC-DKFZ/nnUNet) and read further after following this!
 
 ### Installing nnUNet and its Dependencies
 **Requirements**
@@ -148,7 +148,7 @@ Install PyTorch
 ```bash
 pip install torch torchvision
 ```
-Install nnUNetv2. if you wish to extend nnUNet, you can install in editable mode by following [these instructions](https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/installation_instructions.md#installation-instructions)
+Install nnUNetv2. If you wish to extend nnUNet, you can install in editable mode by following [these instructions](https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/installation_instructions.md#installation-instructions)
 ```bash
 pip install nnunetv2
 ```

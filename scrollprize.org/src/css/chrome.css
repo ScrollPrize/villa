@@ -472,6 +472,29 @@ h1, h2, h3, h4, h5, h6 {
   }
 }
 
+/* KaTeX display equations scroll inside their own box instead of forcing the
+   page wide on phones (e.g. the /unwrapping objectives at 390px). */
+.markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+}
+
+/* Open Problems (/2026_open_problems): an italic paragraph directly after an
+   image reads as a bound figure caption — centered, dimmed, narrower measure,
+   tight to its image and separated from the following prose. */
+html.docs-doc-id-2026_open_problems
+  .markdown
+  p:has(> img)
+  + p:has(> em:only-child) {
+  text-align: center;
+  font-size: 0.875rem;
+  line-height: 1.55;
+  opacity: 0.7;
+  max-width: 65ch;
+  margin: 0.5rem auto 2rem;
+}
+
 /* ==========================================================================
    §6 Body-link discipline (docs content only)
    Text-colored links with a soft ember underline; hover goes full ember.

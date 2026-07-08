@@ -122,7 +122,7 @@ You will typically browse by **sample ID** (e.g., a specific scroll or fragment)
 - For information on the updated scans (2026), read the [technical pre-print](https://arxiv.org/abs/2606.29085).
 - [Scan at ESRF Draft Info Sheet (2025)](https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing) draft regarding the 2025 scans.
 - [EduceLab Data Sheet (2023)](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing): technical description of the 2023 scans.
-- [EduceLab-Scrolls (2019)](https://arxiv.org/abs/2304.02084): technical paper describing the original dataset work from 2019.
+- [EduceLab-Scrolls (2023)](https://arxiv.org/abs/2304.02084): technical paper describing the original dataset work.
 
 ## How to Cite
 

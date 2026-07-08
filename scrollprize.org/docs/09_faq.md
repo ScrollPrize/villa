@@ -35,9 +35,9 @@ title: "FAQ"
   />
 </head>
 
-:::warning[OUTDATED CONTENT]
+:::info[WORK IN PROGRESS]
 
-This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+This page is being revised (July 8, 2026). Most answers are current; a few still describe earlier tooling or data layouts and are being updated.
 
 :::
 
@@ -98,6 +98,7 @@ Most are by Philodemus. This is a list of English translations we have found so 
 
 #### Academic papers
 
+* For the current end-to-end technical overview of the pipeline — and where you can help — see [Open Problems: Why Reading Every Herculaneum Scroll Is Still a Challenge](2026_open_problems).
 * Data papers:
   * 2019: [EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT](https://arxiv.org/abs/2304.02084)
   * 2023: [EduceLab Herculaneum Scroll Data (2023) Info Sheet](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing)
@@ -222,7 +223,7 @@ There are two ways you can write on papyrus: horizontally (“volumen”) or [ve
 
 ### How big are the letters, and where can we expect to find text?
 
-Letter sizes vary, and of course we don’t know what’s inside the unopened scrolls, but we expect the opened fragments to be fairly representative. You can measure how big the letters are by looking at the aligned surface images, which have a voxel resolution of approximately 3.24µm, like the original CT data (though there can be some local variation due to the registration / flattening process). So you could open, for example, <code>fragments/Frag1.volpkg/working/54keV_exposed_surface/ir.png</code>, measure a letter size in pixels, and multiply by 3.24µm.
+Letter sizes vary, and of course we don’t know what’s inside the unopened scrolls, but we expect the opened fragments to be fairly representative. You can measure how big the letters are by looking at the aligned surface images, which have a voxel resolution of approximately 3.24µm, like the original CT data (though there can be some local variation due to the registration / flattening process). For example, open a fragment page in the [Data Browser](data_browser) — say [PHerc. Paris 2 Fr 47](data_browser/PHercParis2Fr47) — measure a letter size in pixels on its surface image, and multiply by the pixel size.
 
 There are also some measurements in [this paper by Richard Janko](http://www-personal.umich.edu/~rjanko/how-to-read-and-reconstruct-a-herculaneum-papyrus.pdf), though it’s a little hard to infer actual letter sizing from it. If someone wants to do a more thorough review of the range of letter sizes found in all the Herculaneum papyri, we’d happily include your results here!
 
@@ -331,7 +332,7 @@ For more information about the reconstruction method, check out:
 
 * Appendix A.1 of ["EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT"](https://arxiv.org/abs/2304.02084)
 * ["Data processing methods and data acquisition for samples larger than the field of view in parallel-beam tomography"](https://opg.optica.org/oe/fulltext.cfm?uri=oe-29-12-17849&id=451366)
-* The [algotom](ttps://github.com/algotom/algotom) reconstruction package
+* The [algotom](https://github.com/algotom/algotom) reconstruction package
 
 Reconstruction methods are out of scope for Vesuvius Challenge, which focuses on processing the reconstructed images.
 That said, if you have specific ideas you would like to share with us, please do so by reaching out to team@scrollprize.org!
@@ -356,10 +357,10 @@ The ensuing discussion is also informative and can be found [on our Discord](htt
 
 Based on this, the raw reconstruction values for a scan do not have units or physical interpretations attached to them.
 These 32-bit float values are typically in the range [-0.1, 0.1] or smaller.
-For more recent scans, we are releasing .hdf files that contain these original reconstruction output float values, so you can experiment with your own intensity windowing.
+Some earlier scan releases also included .hdf files with the original reconstruction float values, so you can experiment with your own intensity windowing; current volumes are released as cloud-optimized OME-Zarr (see each scroll’s [Data Browser](data_browser) page for available formats).
 For the 16-bit integer .tif slices that we release, we map the float range to [0, 2^16-1] by choosing a minimum and maximum in the raw float range and scaling accordingly.
-The fragments and all more recent scans use the 0.01 percentile and 99.99 percentile as the window min and max.
-Scroll 1 and Scroll 2 use 0.1 and 99.9, to achieve visually comparable output since they have so much more papyrus in the field of view.
+For those tif releases, the fragments and later scans used the 0.01 percentile and 99.99 percentile as the window min and max.
+Scroll 1 and Scroll 2 used 0.1 and 99.9, to achieve visually comparable output since they have so much more papyrus in the field of view.
 
 Reconstruction outputs should be nonnegative by the principles of backprojection (there can't be negative X-ray attenuation).
 But noise and other processes lead to some negative values in the reconstructions.
@@ -395,17 +396,15 @@ It could be worthwhile to try to reverse engineer what machine learning models a
 
 ### Does segmenting and flattening need to happen before ink detection?
 
-This ordering is largely historical and due to the way we’ve constructed label sets, which relies on doing the segmentation and flattening first. But this can’t be the only way to do it, and we’d love to see the pipeline get shaken up.
+This ordering is largely historical and due to the way our label sets were constructed, which relied on doing the segmentation and flattening first. It is no longer the only way: alongside surface-conditioned ink detection, **direct 3D ink segmentation** is now in use — on PHerc. Paris 4, ink is segmented directly in the 3D volume. See [Ink recovery](2026_open_problems#3-ink-recovery-detecting-what-is-written) and [Direct 3D ink segmentation](2026_open_problems#direct-3d-ink-segmentation) in the Open Problems post, and the released [ink\_3d\_dino\_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided) checkpoint.
 
-For example, the model input of ink detection could be sampled directly from the original 3D X-ray volume, instead of using a “surface volume” as an intermediate step. This could avoid loss of resolution during the sampling process into a differently oriented volume, which happens when constructing a surface volume.
-
-The downside of such an approach is that a lot more data needs to be accessible on disk, since the original 3D X-ray volumes are much bigger than the surface volumes (37GB vs 1.6TB in total for all fragments). This can be problematic for cloud training, which might not have enough available hard drive space. However, since we only need to access the voxels around the mesh, the data size could be reduced (creating something like a surface volume, but retaining the original coordinate space, and avoiding any resampling).
+Sampling model inputs directly from the original 3D X-ray volume avoids the loss of resolution that resampling into a differently oriented surface volume introduces. The trade-off is data scale: full-scroll volumes are teravoxel-sized, which is why current releases are cloud-optimized OME-Zarr streamed from S3 so tools read only the region they need — see [Data scale](2026_open_problems#4-data-scale-the-infrastructure-bottleneck).
 
 ### Fiji/ImageJ crashes, what can I do about that?
 
-Fiji/ImageJ doesn’t work well with extremely large datasets such as our scrolls or fragment volumes, though downsampling might help. If you’re experiencing problems even with the <a href="https://gist.github.com/janpaul123/280262ebce904f7366fe4cc155593e90">campfire.zip</a> dataset, then try to increase the memory limit: *“Edit > Options > Memory and Threads”*. It might also help to run the software in a different operating system, such as in a Linux VM. For example, on Windows the following setup [seems to work well](https://discord.com/channels/1079907749569237093/1088311252595507242/1088314069519441950): WSL2, Ubuntu 20, Windows 11, using the default WSL X server setup.
+Fiji/ImageJ doesn’t work well with extremely large datasets such as our scrolls or fragment volumes. For viewing and working with scroll data we recommend the purpose-built tools instead: [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) for interactive viewing, segmentation, and unwrapping; the Neuroglancer links on each scroll’s [Data Browser](data_browser) page for in-browser volume exploration; and the [`vesuvius`](https://github.com/ScrollPrize/villa/tree/main/vesuvius) Python library for programmatic access.
 
-A great contribution to the community would be to build an open source 3D volume viewer that is tailored to this problem. If you are interested in building something like that, do let us know in Discord!
+If you specifically want Fiji/ImageJ, downsampling might help, and you can increase its memory limit under *“Edit > Options > Memory and Threads”*.
 
 ### How are the scroll slices oriented?
 

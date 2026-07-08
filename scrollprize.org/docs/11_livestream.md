@@ -35,7 +35,7 @@ title: "Livestreams"
   />
 </head>
 
-Be sure to check [Discord](https://discord.com/invite/uTfNwwecCQ), [Substack](https://scrollprize.substack.com/), and [X](https://x.com/scrollprize) for livestream announcements!
+Be sure to check [Discord](https://discord.gg/V4fJhvtaQn), [Substack](https://scrollprize.substack.com/), and [X](https://x.com/scrollprize) for livestream announcements!
 
 ### June 25, 2026 - Press Conference
 
@@ -57,7 +57,7 @@ On [X](https://x.com/natfriedman/status/1790379272873623743) and [our recording]
 
 <iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/F5ak1pRaqVo?si=njl57GBT0wFUeTV2"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
 
-### Mar 15, 2024 - 2023 Grand Prize Celebration talks
+### Mar 16, 2024 - 2023 Grand Prize Celebration talks
 
 <iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/uPefxeXfssA?si=d6IB7KLvskAxFGMc"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
 

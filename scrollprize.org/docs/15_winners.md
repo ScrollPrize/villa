@@ -239,7 +239,7 @@ This page lists all the prizes awarded so far:
   </a>
 </div>
 
-### \$60,000 First Automated Segmentation
+### \$60,000 First Automated Segmentation (December, 2024)
 
 **Goal:** Reproduce the 2023 Grand Prize segmentation result, but faster.<br/>
 **Announcement:** <a href="https://scrollprize.substack.com/p/awarding-the-amazing-autosegmentation">Blog post</a>

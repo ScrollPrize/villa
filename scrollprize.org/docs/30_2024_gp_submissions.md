@@ -38,6 +38,12 @@ slug: "2024_gp_submissions"
   />
 </head>
 
+:::warning[SUBMISSIONS CLOSED]
+
+Submissions for the 2024 Grand Prize are closed. See [Prizes](prizes) for what is currently open.
+
+:::
+
 
 ### Submitting your result
 

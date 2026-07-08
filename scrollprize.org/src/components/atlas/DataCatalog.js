@@ -154,7 +154,7 @@ export default function DataCatalog({ scroll }) {
         <dt>Voxel size (min)</dt>
         <dd>{scroll.min_px ? `${scroll.min_px} µm` : "—"}</dd>
         <dt>Energies</dt>
-        <dd>{(energies.join(", ") || "—") + " keV"}</dd>
+        <dd>{energies.length ? `${energies.join(", ")} keV` : "—"}</dd>
         <dt>Source / beamline</dt>
         <dd>{locations.join(", ") || "—"}</dd>
         <dt>Scans / volumes</dt>

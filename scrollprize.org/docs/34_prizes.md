@@ -243,9 +243,9 @@ Just as with the Grand Prize, please **do not** make your discovery public until
 
 ## PHerc. Paris 4’s Title Prize {#first-title-prize}
 
-Discovering a scroll’s title tells scholars what — and whom — they have been reading, and helps contextualize the entire work. We have already recovered the titles of [PHerc. 172](/data_browser/PHerc0172) and [PHerc. 139](/data_browser/PHerc0139) — but the title of our most-read scroll is still missing.
+Discovering a scroll’s title tells scholars what — and whom — they have been reading, and helps contextualize the entire work. We have already recovered the titles of [PHerc. 172](/data_browser/PHerc0172) and [PHerc. 139](/data_browser/PHerc0139) — but the title of Scroll 1, the scroll where the first passages were read, is still missing.
 
-**PHerc. Paris 4’s Title: \$50,000 to the first team to discover the title of [PHerc. Paris 4](/data_browser/PHercParis4) (Scroll 1), using any of its scans — including the 2.4 µm volumes.** Scroll 1 is our most-read scroll: substantial continuous Greek text of an Epicurean prose work has been recovered, yet its author and title remain unknown. The expected title region has shown no detectable ink so far — possibly a different ink, and the top rows are physically missing — so finding it may take better methods, higher resolution, or looking somewhere new.
+**PHerc. Paris 4’s Title: \$50,000 to the first team to discover the title of [PHerc. Paris 4](/data_browser/PHercParis4) (Scroll 1), using any of its scans — including the 2.4 µm volumes.** Scroll 1 is one of our most-read scrolls: substantial continuous Greek text of an Epicurean prose work has been recovered, yet its author and title remain unknown. The expected title region has shown no detectable ink so far — possibly a different ink, and the top rows are physically missing — so finding it may take better methods, higher resolution, or looking somewhere new.
 
 **Deadline: June 25th, 2027 (11:59pm Pacific)**
 
@@ -310,7 +310,7 @@ We maintain a [public wishlist](https://github.com/ScrollPrize/villa/issues?q=is
 [Improvements to VC3D](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3AVC3D) can be also considered for progress prizes!
 Some are additionally labeled as [good first issues](https://github.com/ScrollPrize/villa/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) for newcomers!
 
-Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, June 30th, 2026!
+Submissions are evaluated monthly, and multiple submissions/awards per month are permitted. The next deadline is 11:59pm Pacific, July 31st, 2026!
 
 <details>
 <summary>Submission criteria and requirements</summary>

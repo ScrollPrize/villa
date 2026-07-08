@@ -869,8 +869,8 @@ export function Landing() {
                   Carbon ink is nearly indistinguishable from papyrus in
                   X-ray CT. Models train on fragments with visible ink and
                   infer it inside sealed scrolls; iterative pseudo-labeling
-                  bootstraps legibility. Ink has surfaced on 9 of 45 scanned
-                  scrolls, not always legibly. Generalization is the open
+                  bootstraps legibility. Ink has surfaced on 9 of the 45 scanned
+                  scrolls and fragments, not always legibly. Generalization is the open
                   problem.
                 </p>
               </ChallengeBox>

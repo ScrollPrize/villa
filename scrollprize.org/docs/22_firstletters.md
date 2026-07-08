@@ -22,6 +22,12 @@ hide_title: true
   <meta property="twitter:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 </head>
 
+:::info[HISTORICAL MILESTONE]
+
+This announcement is from October 2023. The \$700,000 2023 Grand Prize it references has since been [awarded](grandprize); see [Prizes](prizes) for what is open today.
+
+:::
+
 import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"First word discovered in unopened Herculaneum scroll","datePublished":"2023-10-12","dateModified":"2023-10-12","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/firstletters/purple_card-new.webp","mainEntityOfPage":"https://scrollprize.org/firstletters"}} />

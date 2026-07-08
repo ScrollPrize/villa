@@ -90,7 +90,7 @@ The Grand Prize deadline is 11:59pm Pacific, December 31st, 2023.
 
 If no team meets the criteria by the deadline, we reserve the right to award the prizes to the teams that came closest. **This is not a guarantee** — we will only award prizes if we believe the spirit of the prize has substantially been met and if a submission comes very close to the objective threshold. This is entirely at our discretion. If you are very very close to meeting the bar, we encourage you to submit your work before the deadline.
 
-<div>Prizes are awarded in the order that qualifying submisisons are made:</div>
+<div>Prizes are awarded in the order that qualifying submissions are made:</div>
 
 - 1st place: \$700,000
 - 2nd place: \$100,000

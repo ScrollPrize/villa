@@ -99,7 +99,7 @@ The X-ray photos are combined into a 3D scan volume using [tomographic reconstru
   <figcaption className="mt-0">Artistic visualization of constructing a 3D volume; in reality the object rotates as it is scanned.</figcaption>
 </figure>
 
-We store the 3D scan volume as a directory full of .tif files, where each file represents one horizontal cross-section or "slice" of the object, typically starting at the bottom of the scroll or scroll fragment and moving upwards. We call this a .tif image stack. You can view and explore a 3D scan volume of a scroll in your browser right now in [one click](https://dl.ash2txt.org/view/Scroll1), or with a few lines of code ([Python](https://github.com/ScrollPrize/vesuvius), [C](https://github.com/ScrollPrize/vesuvius-c)).
+We store the 3D scan volume as a directory full of .tif files, where each file represents one horizontal cross-section or "slice" of the object, typically starting at the bottom of the scroll or scroll fragment and moving upwards. We call this a .tif image stack. You can view and explore a 3D scan volume of a scroll in your browser right now in [one click](https://dl.ash2txt.org/view/Scroll1), or with a few lines of code ([Python](https://github.com/ScrollPrize/vesuvius)).
 
 Remember that each pixel in the image stack actually represents a cube (voxel) of physical space. If your volume has a 10um voxel size, then 100 slices will be 1mm (1000um) of the object.
 
@@ -149,7 +149,7 @@ The goal of segmentation is to map and capture information near the written surf
 
 The output of this process is a flattened 3D volume of the voxels around the mapped surface, which we call a “surface volume”. This is again a .tif image stack, just like our original volume. However, it is much smaller than the original volume and more consistent since the papyrus always sits roughly in the middle of the volume.
 
-In ["Tutorial: Segmentation and Flattening"](segmentation) we’ll dive deeper into segmentation and virtual unwrapping.
+In ["Tutorial: Segmentation"](segmentation) we’ll dive deeper into segmentation and virtual unwrapping.
 
 ### 4. Ink detection
 
@@ -180,7 +180,7 @@ We go into great detail in [“Tutorial 5: Ink Detection”](tutorial5).
 </div>
 
 <figure className="">
-  <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/engedi-reconstruction3.webm">
+  <video autoPlay playsInline loop muted className="w-[100%]">
     <source src="/img/tutorials/engedi-reconstruction3.webm" type="video/webm"/>
   </video>
   <figcaption className="mt-0">En-Gedi reconstruction of multiple segments, showing Hebrew text. Can you read it? <a href="https://www.youtube.com/watch?v=tL7rhIFNtQg">(source)</a></figcaption>
