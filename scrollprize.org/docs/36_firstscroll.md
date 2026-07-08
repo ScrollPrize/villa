@@ -26,6 +26,12 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"An entire Herculaneum scroll has been read for the first time","datePublished":"2026-06-25","dateModified":"2026-06-25","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/firstscroll/og.webp","mainEntityOfPage":"https://scrollprize.org/firstscroll"}} />
 
+:::info[HISTORICAL MILESTONE]
+
+This announcement is from June 25th, 2026. See [Prizes](prizes) for what is open today.
+
+:::
+
 <figure className="!mt-0 !mb-6">
   <video autoPlay playsInline loop muted className="w-[100%] rounded-lg" poster="/img/firstscroll/hero-poster.webp">
     <source src="/img/firstscroll/hero-reveal.webm" type="video/webm" />

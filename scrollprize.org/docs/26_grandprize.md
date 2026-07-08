@@ -26,6 +26,12 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"Vesuvius Challenge 2023 Grand Prize awarded: we can read the scrolls","datePublished":"2024-02-05","dateModified":"2024-02-05","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/social/opengraph.jpg","mainEntityOfPage":"https://scrollprize.org/grandprize"}} />
 
+:::info[HISTORICAL MILESTONE]
+
+This announcement is from February 2024. The 2023 Grand Prize it describes has been awarded; see [Prizes](prizes) for what is open today.
+
+:::
+
 <h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">Vesuvius Challenge 2023 Grand Prize awarded: <span className="text-accent">we can read the first scroll!</span></h1>
 
 <div className="md:text-2xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">The 2000-year-old scroll discusses music, food, and how to enjoy life’s pleasures.</div>

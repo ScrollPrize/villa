@@ -69,7 +69,7 @@ Recovered text is collected in the [Data Browser](data_browser) — each scroll'
 Here are the scholarly publications so far resulting from Vesuvius Challenge:
 
 * [Complete virtual unwrapping and reading of a rolled Herculaneum papyrus](/pdf/main.pdf) ([arXiv](https://arxiv.org/abs/2606.29085)) — the 2026 PHerc. 1667 results
-* [Ink Detection from Surface Topography of the Herculaneum Papyri](https://www.nature.com/articles/s41598-026-58467-1) ([arXiv](https://arxiv.org/abs/2603.27698)) — Angelotti et al., *Scientific Reports*, 2026
+* [Ink Detection from Surface Topography of the Herculaneum Papyri](https://www.nature.com/articles/s41598-026-58467-1) — Angelotti et al., *Scientific Reports*, 2026
 * [Revealing Text from a Still-rolled Herculaneum Papyrus Scroll (PHerc. Paris. 4)](https://www.iris.unina.it/handle/11588/959427) (2023 First Letters results)
 * [The final columns of PHerc.Paris. 4 revealed through virtual unwrapping](https://www.iris.unina.it/handle/11588/985203) (2023 Grand Prize results)
 
