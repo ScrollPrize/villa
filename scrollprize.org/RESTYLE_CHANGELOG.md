@@ -269,6 +269,11 @@ Brings the branch current with main: the data page rewrite (dataset naming, depr
 The Tutorials pipeline strip (Scanning → Representation → Segmentation and Flattening → Ink Detection) now also sits in the Open Problems post's "The pipeline" section, directly under the three-step list. On this page the four thumbs deep-link to the post's own section anchors (§1 Scanning, §2 Unwrapping ×2, §3 Ink recovery) — a visual table of contents — via a new optional `links` prop on `TutorialsTop` (tutorial pages keep their default destinations). Verified: thumbs land sections below the fixed navbar; mobile wraps 3+1 with zero overflow.
 **Files:** `src/components/TutorialsTop.js`, `docs/37_2026_open_problems.md`.
 
+## C32 — Open Problems strip labels match the post's section names
+
+The pipeline strip on /2026_open_problems now reads Scanning → Unwrapping → Flattening → Ink recovery (was Representation / Segmentation and Flattening / Ink Detection), via a `labels` override prop on `TutorialsTop` mirroring the `links` one. Tutorial pages keep their original labels.
+**Files:** `src/components/TutorialsTop.js`, `docs/37_2026_open_problems.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

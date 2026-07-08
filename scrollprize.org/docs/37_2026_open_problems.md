@@ -66,6 +66,11 @@ Reading a scroll is a chain of complex problems:
     segmentation: '#2d-parameterization-and-flattening-the-easier-problem-after-the-hard-one',
     ink: '#3-ink-recovery-detecting-what-is-written',
   }}
+  labels={{
+    representation: 'Unwrapping',
+    segmentation: 'Flattening',
+    ink: 'Ink recovery',
+  }}
 />
 
 The most important thing to understand is what we actually get after scanning. We do not get sheets. We do not get a mesh, a graph, or a map of which layer connects to which. We get a **3D grid of voxels**.
