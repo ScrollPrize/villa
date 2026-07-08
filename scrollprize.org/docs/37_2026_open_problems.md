@@ -624,16 +624,6 @@ High effective resolution matters here too: some ink information may live at ver
 * 3D DINO implementation: [https://github.com/ScrollPrize/dinovol](https://github.com/ScrollPrize/dinovol)
 * ScrollFiesta, community automatic mesher: [https://github.com/Hob3rMallow/scrollfiesta_public](https://github.com/Hob3rMallow/scrollfiesta_public)
 
-### Model checkpoints (Hugging Face)
-
-* All released checkpoints: [https://huggingface.co/scrollprize](https://huggingface.co/scrollprize) — including the recto-surface predictor [surface_recto_3dunet](https://huggingface.co/scrollprize/surface_recto_3dunet), the Kaggle-winning [surface_m7_nnunet](https://huggingface.co/scrollprize/surface_m7_nnunet), the neural copy-tracer [copy_displacement_latest](https://huggingface.co/scrollprize/copy_displacement_latest) and baseline [ps256_copy_baseline](https://huggingface.co/scrollprize/ps256_copy_baseline), fiber models [fiber_hz_vt](https://huggingface.co/scrollprize/fiber_hz_vt) / [fiber_dinoguided_2class_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000) / [fiber_ink_4class_selfdistill](https://huggingface.co/scrollprize/fiber_ink_4class_selfdistill) / [fiber_selftrain_teacher_epoch30](https://huggingface.co/scrollprize/fiber_selftrain_teacher_epoch30), the PHerc. 1667 pseudo-labeling series [iteration-0](https://huggingface.co/scrollprize/PHerc.1667-iteration-0)–[iteration-5](https://huggingface.co/scrollprize/PHerc.1667-iteration-5), the current 2 µm ink model [ink_canonical_2um](https://huggingface.co/scrollprize/ink_canonical_2um) and the PHerc. Paris 4 3D model [ink_3d_dino_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided), the DINO checkpoints [dinovol_v2_ps8_with_paris4_352500](https://huggingface.co/scrollprize/dinovol_v2_ps8_with_paris4_352500) / [dinovol_v2_ps6_step032350](https://huggingface.co/scrollprize/dinovol_v2_ps6_step032350) / [dinovol_v2_ps8_supcon3class_step362500](https://huggingface.co/scrollprize/dinovol_v2_ps8_supcon3class_step362500), and the [ink_detection_pipeline](https://huggingface.co/scrollprize/ink_detection_pipeline) reference pipeline.
-
-### Data
-
-* Vesuvius Challenge public data: [https://scrollprize.org/data](https://scrollprize.org/data) · Data Browser: [https://scrollprize.org/data_browser](https://scrollprize.org/data_browser)
-* S3 Open Data Bucket (AWS Open Data Program): [https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html)
-* Curated datasets (ink and spiral) on Hugging Face: [https://huggingface.co/buckets/scrollprize/datasets](https://huggingface.co/buckets/scrollprize/datasets)
-
 ### Project & further reading
 
 * Vesuvius Challenge website: [https://scrollprize.org/](https://scrollprize.org/) · GitHub org: [https://github.com/ScrollPrize](https://github.com/ScrollPrize) · Hugging Face org: [https://huggingface.co/scrollprize](https://huggingface.co/scrollprize)
