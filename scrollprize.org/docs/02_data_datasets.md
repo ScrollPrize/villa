@@ -107,7 +107,8 @@ Ink labels are binary images marking the location of ink on a papyrus surface. N
 
 <hr className="mt-16 mb-10 border-t-2 border-solid opacity-20" />
 
-<div className="uppercase tracking-widest text-sm opacity-50 mb-4">Archived datasets</div>
+<details className="mb-4">
+<summary className="cursor-pointer uppercase tracking-widest text-sm opacity-60">Archived datasets — earlier pipeline generation</summary>
 
 :::warning[OUTDATED CONTENT]
 
@@ -173,3 +174,5 @@ We also provide predictions from machine learning [models](https://dl.ash2txt.or
 - [gp_tifstack.7z](https://dl.ash2txt.org/datasets/grand-prize-banner-region/volumes/gp_tifstack.7z) (389.9 GB)
 - [gp_legendary-medial-surfaces.7z](https://dl.ash2txt.org/datasets/grand-prize-banner-region/predictions/gp_legendary-medial-cubes.7z) (5.8 GB)
 - [gp_legendary-medial-surfaces-softmax.7z](https://dl.ash2txt.org/datasets/grand-prize-banner-region/predictions/gp_legendary-medial-cubes-softmax.7z) (146.8 GB)
+
+</details>
