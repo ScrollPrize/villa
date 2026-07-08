@@ -161,7 +161,7 @@ Here are some other excellent books we recommend:
 
 Yes, in fact we encourage you to share your progress. Be sure to also post in our Discord, to get feedback from the community.
 
-The only exception is that per the data agreement, you’re not allowed to publicly share material revelation of text (e.g. entire words) without our permission (including the associated code), or share the raw data. You _are_ allowed to share these things on Discord, since everything uploaded on Discord falls under the same data agreement as our data server.
+The only exception: if you are competing for the Grand Prize, you may not publicly reveal substantial new text (e.g., entire words or passages) until we have reviewed and evaluated your submission.
 
 ### I’m outside the United States, can I participate and win prizes?
 
