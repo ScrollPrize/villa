@@ -54,23 +54,23 @@ Click one of the datasets to find a download along with more information.
 
 A collection of same-winding and multi-winding annotations, in the form of: surface patches, line annotations, and point collections.
 
+<div className="flex flex-wrap mb-4">
+  <div className="w-[41%] mr-[3%] mb-2">
+    <img src="/img/data/datasets/spiral-input-multiwinding.webp" className="w-[100%]"/>
+    <figcaption className="mt-[-6px]">Multi-winding annotations.</figcaption>
+  </div>
+  <div className="w-[52%]">
+    <img src="/img/data/datasets/spiral-input-fiber.webp" className="w-[100%]"/>
+    <figcaption className="mt-[-6px]">Same-winding fiber annotation.</figcaption>
+  </div>
+</div>
+
 This dataset contains manual annotations of the scroll wraps, recording which parts of the surface belong to the same wrap (*winding*) of the sheet for use as ground-truth inputs when fitting a global winding solution. It is organized by scroll. Each scroll below provides some combination of: verified and unverified surface patches (grid-topology quad meshes sampled on the papyrus surface), line annotations (curves traced across the surface), point collections, same-/relative-/absolute-winding annotations, and the fitted umbilicus.
 
 ### Paris4
 
 {/* Paris4 = Scroll 1 / PHercParis4. */}
 Spiral annotations for scroll PHercParis4 (Scroll 1). Contents include ~27,000 verified and ~204,000 unverified surface patches, traced tracks, and point collections, together with `same_windings` / `relative_windings` / `abs_winding` graphs, the fitted `umbilicus`, fiber and outer-shell geometry, and the volume inputs used by the fitting pipeline (~49.6 GB total).
-
-<div className="flex flex-wrap items-start gap-4 mb-4">
-  <div className="mb-2">
-    <img src="/img/data/datasets/spiral-input-multiwinding.webp" className="h-[240px] w-auto"/>
-    <figcaption className="mt-[-6px]">Multi-winding annotations.</figcaption>
-  </div>
-  <div className="mb-2">
-    <img src="/img/data/datasets/spiral-input-fiber.webp" className="h-[240px] w-auto"/>
-    <figcaption className="mt-[-6px]">Same-winding fiber annotation.</figcaption>
-  </div>
-</div>
 
 - [README](pathname:///data/datasets/spiral-input-PHercParis4-README.md)
 - [Browse on Hugging Face](https://huggingface.co/buckets/scrollprize/datasets/tree/spiral/PHercParis4)
