@@ -149,6 +149,115 @@ def _tangent_at(points_xyz: np.ndarray, index: int) -> np.ndarray:
     return np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
 
 
+def _arc_lengths(points_xyz: np.ndarray) -> np.ndarray:
+    if points_xyz.shape[0] <= 1:
+        return np.zeros(points_xyz.shape[0], dtype=np.float64)
+    segment_lengths = np.linalg.norm(np.diff(points_xyz, axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(segment_lengths)])
+
+
+def _line_index_for_control_point(line_points_xyz: np.ndarray, control_point_xyz: np.ndarray) -> int:
+    matches = np.flatnonzero(np.all(line_points_xyz == control_point_xyz[None, :], axis=1))
+    if matches.size == 0:
+        raise ValueError(
+            "control point is not an exact member of line_points; fiber JSON is inconsistent"
+        )
+    return int(matches[0])
+
+
+def _arc_derivatives(points_xyz: np.ndarray, cumulative: np.ndarray) -> np.ndarray:
+    derivatives = np.zeros_like(points_xyz, dtype=np.float64)
+    if points_xyz.shape[0] < 2:
+        derivatives[:] = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        return derivatives
+    for i in range(points_xyz.shape[0]):
+        if i == 0:
+            denom = cumulative[1] - cumulative[0]
+            delta = points_xyz[1] - points_xyz[0]
+        elif i + 1 == points_xyz.shape[0]:
+            denom = cumulative[i] - cumulative[i - 1]
+            delta = points_xyz[i] - points_xyz[i - 1]
+        else:
+            denom = cumulative[i + 1] - cumulative[i - 1]
+            delta = points_xyz[i + 1] - points_xyz[i - 1]
+        if denom > _EPS:
+            derivatives[i] = delta / denom
+        else:
+            derivatives[i] = _tangent_at(points_xyz, i)
+    return derivatives
+
+
+def _arc_segment_indices(cumulative: np.ndarray, arc_coord: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    total = float(cumulative[-1])
+    valid = (arc_coord >= 0.0) & (arc_coord <= total)
+    arc = np.clip(arc_coord, 0.0, total)
+    c1 = np.searchsorted(cumulative, arc, side="right")
+    c1 = np.clip(c1, 1, cumulative.shape[0] - 1)
+    c0 = c1 - 1
+    span = cumulative[c1] - cumulative[c0]
+    t = np.divide(
+        arc - cumulative[c0],
+        span,
+        out=np.zeros_like(arc, dtype=np.float64),
+        where=span > _EPS,
+    )
+    return c0, c1, t, valid
+
+
+def _cubic_hermite_line(points_xyz: np.ndarray, arc_coord: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if points_xyz.shape[0] == 1:
+        center = np.broadcast_to(points_xyz[0], arc_coord.shape + (3,)).astype(np.float64)
+        return center, np.ones(arc_coord.shape, dtype=bool)
+    cumulative = _arc_lengths(points_xyz)
+    derivatives = _arc_derivatives(points_xyz, cumulative)
+    c0, c1, t, valid = _arc_segment_indices(cumulative, arc_coord)
+    span = cumulative[c1] - cumulative[c0]
+    p0 = points_xyz[c0]
+    p1 = points_xyz[c1]
+    m0 = derivatives[c0]
+    m1 = derivatives[c1]
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+    center = (
+        h00[..., None] * p0
+        + h10[..., None] * span[..., None] * m0
+        + h01[..., None] * p1
+        + h11[..., None] * span[..., None] * m1
+    )
+    return center, valid
+
+
+def _cubic_hermite_tangent(points_xyz: np.ndarray, arc: float) -> np.ndarray:
+    if points_xyz.shape[0] < 2:
+        return np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    cumulative = _arc_lengths(points_xyz)
+    derivatives = _arc_derivatives(points_xyz, cumulative)
+    c0, c1, t, _ = _arc_segment_indices(cumulative, np.asarray(arc, dtype=np.float64))
+    i0 = int(c0)
+    i1 = int(c1)
+    span = float(cumulative[i1] - cumulative[i0])
+    tv = float(t)
+    if span <= _EPS:
+        return _tangent_at(points_xyz, i0)
+    p0 = points_xyz[i0]
+    p1 = points_xyz[i1]
+    m0 = derivatives[i0]
+    m1 = derivatives[i1]
+    dh00 = 6.0 * tv * tv - 6.0 * tv
+    dh10 = 3.0 * tv * tv - 4.0 * tv + 1.0
+    dh01 = -6.0 * tv * tv + 6.0 * tv
+    dh11 = 3.0 * tv * tv - 2.0 * tv
+    tangent = (dh00 * p0 + dh10 * span * m0 + dh01 * p1 + dh11 * span * m1) / span
+    tangent = _normalized_or_zero(tangent)
+    if _valid_direction(tangent):
+        return tangent
+    return _tangent_at(points_xyz, i0)
+
+
 def _fallback_mesh_normal_for_tangent(tangent: np.ndarray) -> np.ndarray:
     side = _side_direction(_axis_fallback_least_aligned_with(tangent), tangent)
     normal = _normalized_or_zero(np.cross(tangent, side))
@@ -182,20 +291,9 @@ def _resolved_normals(points_xyz: np.ndarray, sampled_normal: np.ndarray) -> np.
     return np.repeat(normal[None, :], points_xyz.shape[0], axis=0)
 
 
-def build_vc3d_side_strip_frames(
-    fiber: Vc3dFiber, *, sampled_normal: np.ndarray
-) -> list[FiberStripFrame]:
-    """Port of VC3D/Lasagna LineViewBuilder frame construction.
-
-    VC3D builds side strips from control-point samples, transported tangents,
-    sampled normals projected into the tangent plane, and smoothed roll angles.
-    This Python port keeps those semantics so downstream code samples explicit
-    coordinates instead of using the neural-tracing crop reader.
-    """
-
-    points = np.asarray(fiber.control_points_xyz, dtype=np.float64)
+def _build_side_strip_frames_for_points(points: np.ndarray, *, sampled_normal: np.ndarray) -> list[FiberStripFrame]:
     if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
-        raise ValueError("fiber control_points_xyz must have shape [N, 3] with N > 0")
+        raise ValueError("fiber points must have shape [N, 3] with N > 0")
 
     tangents = np.stack([_tangent_at(points, i) for i in range(points.shape[0])], axis=0)
     normals = _resolved_normals(points, sampled_normal)
@@ -261,6 +359,36 @@ def build_vc3d_side_strip_frames(
     return [frame for frame in frames if frame is not None]
 
 
+def build_vc3d_side_strip_frames(
+    fiber: Vc3dFiber, *, sampled_normal: np.ndarray
+) -> list[FiberStripFrame]:
+    """Port of VC3D/Lasagna LineViewBuilder frame construction.
+
+    VC3D builds side strips from fiber-line samples, transported tangents,
+    sampled normals projected into the tangent plane, and smoothed roll angles.
+    This Python port keeps those semantics so downstream code samples explicit
+    coordinates instead of using the neural-tracing crop reader.
+    """
+
+    points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
+    return _build_side_strip_frames_for_points(points, sampled_normal=sampled_normal)
+
+
+def _frame_at_arc(points_xyz: np.ndarray, frames: list[FiberStripFrame], arc: float) -> FiberStripFrame:
+    tangent = _cubic_hermite_tangent(points_xyz, arc)
+    if points_xyz.shape[0] == 1:
+        return _frame_from_mesh_normal(frames[0].mesh_normal_xyz, tangent)
+    cumulative = _arc_lengths(points_xyz)
+    c0, c1, t, _ = _arc_segment_indices(cumulative, np.asarray(arc, dtype=np.float64))
+    i0 = int(c0)
+    i1 = int(c1)
+    tv = float(t)
+    n0 = np.asarray(frames[i0].mesh_normal_xyz, dtype=np.float64)
+    n1 = np.asarray(frames[i1].mesh_normal_xyz, dtype=np.float64)
+    normal = n0 * (1.0 - tv) + n1 * tv
+    return _frame_from_mesh_normal(normal, tangent)
+
+
 def _interpolate_line_side_slice(
     points_xyz: np.ndarray,
     frames: list[FiberStripFrame],
@@ -272,31 +400,16 @@ def _interpolate_line_side_slice(
         normal = np.broadcast_to(frames[0].mesh_normal_xyz, arc_coord.shape + (3,)).astype(np.float64)
         return center + normal * normal_offsets[..., None], np.ones(arc_coord.shape, dtype=bool)
 
-    segment_lengths = np.linalg.norm(np.diff(points_xyz, axis=0), axis=1)
-    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
-    total = float(cumulative[-1])
-    valid = (arc_coord >= 0.0) & (arc_coord <= total)
-    arc = np.clip(arc_coord, 0.0, total)
-    c1 = np.searchsorted(cumulative, arc, side="right")
-    c1 = np.clip(c1, 1, points_xyz.shape[0] - 1)
-    c0 = c1 - 1
-    span = cumulative[c1] - cumulative[c0]
-    t = np.divide(
-        arc - cumulative[c0],
-        span,
-        out=np.zeros_like(arc, dtype=np.float64),
-        where=span > _EPS,
-    )
+    cumulative = _arc_lengths(points_xyz)
+    center, valid = _cubic_hermite_line(points_xyz, arc_coord)
+    c0, c1, t, _ = _arc_segment_indices(cumulative, arc_coord)
 
-    p0 = points_xyz[c0]
-    p1 = points_xyz[c1]
     n0 = np.stack([frames[int(i)].mesh_normal_xyz for i in c0.reshape(-1)], axis=0).reshape(
-        arc.shape + (3,)
+        arc_coord.shape + (3,)
     )
     n1 = np.stack([frames[int(i)].mesh_normal_xyz for i in c1.reshape(-1)], axis=0).reshape(
-        arc.shape + (3,)
+        arc_coord.shape + (3,)
     )
-    center = p0 * (1.0 - t[..., None]) + p1 * t[..., None]
     normal = n0 * (1.0 - t[..., None]) + n1 * t[..., None]
     normal_len = np.linalg.norm(normal, axis=-1, keepdims=True)
     normal = np.divide(normal, normal_len, out=np.zeros_like(normal), where=normal_len > _EPS)
@@ -312,11 +425,12 @@ def build_side_strip_patch_grid(
     sampled_normal: np.ndarray,
     pixel_spacing_base: float = 1.0,
 ) -> FiberStripGrid:
-    points = np.asarray(fiber.control_points_xyz, dtype=np.float64)
-    if control_point_index < 0 or control_point_index >= points.shape[0]:
+    control_points = np.asarray(fiber.control_points_xyz, dtype=np.float64)
+    if control_point_index < 0 or control_point_index >= control_points.shape[0]:
         raise IndexError(
-            f"control_point_index {control_point_index} out of range for {points.shape[0]} control points"
+            f"control_point_index {control_point_index} out of range for {control_points.shape[0]} control points"
         )
+    line_points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
     height, width = (int(v) for v in patch_shape_hw)
     if height <= 0 or width <= 0:
         raise ValueError(f"patch_shape_hw must contain positive values, got {patch_shape_hw}")
@@ -324,17 +438,17 @@ def build_side_strip_patch_grid(
     if not np.isfinite(pixel_spacing_base) or pixel_spacing_base <= 0.0:
         raise ValueError(f"pixel_spacing_base must be positive and finite, got {pixel_spacing_base}")
 
-    frames = build_vc3d_side_strip_frames(fiber, sampled_normal=sampled_normal)
+    frames = _build_side_strip_frames_for_points(line_points, sampled_normal=sampled_normal)
     row_offsets = ((np.arange(height, dtype=np.float64) - (height - 1) * 0.5) + float(strip_z_offset)) * pixel_spacing_base
     col_offsets = (np.arange(width, dtype=np.float64) - (width - 1) * 0.5) * pixel_spacing_base
     row_grid, col_grid = np.meshgrid(row_offsets, col_offsets, indexing="ij")
-    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
-    arc_coord = float(cumulative[control_point_index]) + col_grid
-    coords_xyz, valid = _interpolate_line_side_slice(points, frames, arc_coord, row_grid)
+    line_index = _line_index_for_control_point(line_points, control_points[control_point_index])
+    anchor_arc = float(_arc_lengths(line_points)[line_index])
+    arc_coord = anchor_arc + col_grid
+    coords_xyz, valid = _interpolate_line_side_slice(line_points, frames, arc_coord, row_grid)
     shape_valid = np.isfinite(coords_xyz).all(axis=-1)
     coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32)
-    frame = frames[control_point_index]
+    frame = _frame_at_arc(line_points, frames, anchor_arc)
     return FiberStripGrid(
         coords_xyz=coords_xyz.astype(np.float32),
         coords_zyx=coords_zyx,
@@ -354,11 +468,12 @@ def build_planar_side_strip_patch_grid(
 ) -> FiberStripGrid:
     """Build a local planar debug slice from the same CP frame as the side strip."""
 
-    points = np.asarray(fiber.control_points_xyz, dtype=np.float64)
-    if control_point_index < 0 or control_point_index >= points.shape[0]:
+    control_points = np.asarray(fiber.control_points_xyz, dtype=np.float64)
+    if control_point_index < 0 or control_point_index >= control_points.shape[0]:
         raise IndexError(
-            f"control_point_index {control_point_index} out of range for {points.shape[0]} control points"
+            f"control_point_index {control_point_index} out of range for {control_points.shape[0]} control points"
         )
+    line_points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
     height, width = (int(v) for v in patch_shape_hw)
     if height <= 0 or width <= 0:
         raise ValueError(f"patch_shape_hw must contain positive values, got {patch_shape_hw}")
@@ -366,9 +481,11 @@ def build_planar_side_strip_patch_grid(
     if not np.isfinite(pixel_spacing_base) or pixel_spacing_base <= 0.0:
         raise ValueError(f"pixel_spacing_base must be positive and finite, got {pixel_spacing_base}")
 
-    frames = build_vc3d_side_strip_frames(fiber, sampled_normal=sampled_normal)
-    frame = frames[control_point_index]
-    origin = points[control_point_index]
+    frames = _build_side_strip_frames_for_points(line_points, sampled_normal=sampled_normal)
+    line_index = _line_index_for_control_point(line_points, control_points[control_point_index])
+    anchor_arc = float(_arc_lengths(line_points)[line_index])
+    frame = _frame_at_arc(line_points, frames, anchor_arc)
+    origin = line_points[line_index]
     row_offsets = ((np.arange(height, dtype=np.float64) - (height - 1) * 0.5) + float(strip_z_offset)) * pixel_spacing_base
     col_offsets = (np.arange(width, dtype=np.float64) - (width - 1) * 0.5) * pixel_spacing_base
     row_grid, col_grid = np.meshgrid(row_offsets, col_offsets, indexing="ij")

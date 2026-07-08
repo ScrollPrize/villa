@@ -20,13 +20,18 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
 )
 
 
-def _write_fiber(path: Path, points: list[list[float]] | None = None) -> Path:
+def _write_fiber(
+    path: Path,
+    points: list[list[float]] | None = None,
+    control_points: list[list[float]] | None = None,
+) -> Path:
     points = points or [[0.0, 20.0, 20.0], [10.0, 20.0, 20.0], [20.0, 20.0, 20.0]]
+    control_points = control_points or points
     obj = {
         "type": "vc3d_fiber",
         "version": 1,
         "line_points": points,
-        "control_points": points,
+        "control_points": control_points,
         "generation": 1,
     }
     path.write_text(json.dumps(obj), encoding="utf-8")
@@ -152,6 +157,61 @@ def test_strip_and_planar_pixel_spacing_is_in_base_voxels(tmp_path: Path) -> Non
     assert np.allclose(strip.coords_xyz[:, 1, 2], [18.0, 20.0, 22.0])
     assert np.allclose(planar.coords_xyz[1, :, 0], [8.0, 10.0, 12.0])
     assert np.allclose(planar.coords_xyz[:, 1, 2], [18.0, 20.0, 22.0])
+
+
+def test_side_strip_uses_fiber_line_points_not_sparse_control_chord(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(
+        _write_fiber(
+            tmp_path / "fiber.json",
+            points=[
+                [0.0, 20.0, 20.0],
+                [10.0, 30.0, 20.0],
+                [20.0, 20.0, 20.0],
+            ],
+            control_points=[
+                [0.0, 20.0, 20.0],
+                [10.0, 30.0, 20.0],
+                [20.0, 20.0, 20.0],
+            ],
+        )
+    )
+    grid = build_side_strip_patch_grid(
+        fiber,
+        control_point_index=1,
+        patch_shape_hw=(1, 3),
+        strip_z_offset=0.0,
+        sampled_normal=np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+        pixel_spacing_base=2.0,
+    )
+
+    assert grid.coords_xyz[0, 1, 1] > 29.0
+    assert grid.coords_xyz[0, 0, 0] < grid.coords_xyz[0, 2, 0]
+
+
+def test_side_strip_rejects_control_point_not_in_line_points(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(
+        _write_fiber(
+            tmp_path / "fiber.json",
+            points=[
+                [0.0, 20.0, 20.0],
+                [10.0, 30.0, 20.0],
+                [20.0, 20.0, 20.0],
+            ],
+            control_points=[
+                [10.0, 20.0, 20.0],
+            ],
+        )
+    )
+
+    with pytest.raises(ValueError, match="not an exact member of line_points"):
+        build_side_strip_patch_grid(
+            fiber,
+            control_point_index=0,
+            patch_shape_hw=(1, 3),
+            strip_z_offset=0.0,
+            sampled_normal=np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+            pixel_spacing_base=2.0,
+        )
 
 
 def test_strip_z_offsets_generated_from_count_and_step() -> None:

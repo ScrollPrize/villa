@@ -2,11 +2,13 @@
 
 - The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
 - Fiber JSON parsing follows the existing VC3D fiber parsing semantics from `vesuvius.neural_tracing.fiber_trace.fiber_json`.
+- Each selected control point must be an exact member of `line_points`; otherwise the fiber JSON is rejected as inconsistent.
 - The loader works on 2D sampled fiber side-strip patches.
 - Neighboring strip-z context is represented as separate 2D patches.
 - The default strip-z offset settings are `strip_z_offset_count=16` and `strip_z_offset_step=1.0`, generating `-7..8` selected-scale offsets and giving 16 patches per selected control point.
 - Lasagna normals are used where needed to construct aligned strip frames.
 - VC3D side-strip/surface/segment sampling semantics define patch coordinates.
+- Strip centerlines are sampled from all `line_points` with cubic Hermite interpolation over arc length; control points only select the strip anchor.
 - The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
 - The implementation should reuse/export VC3D side-strip coordinate APIs when possible, or port the same algorithm with only small rounding/interpolation differences.
 - Image loading samples base-volume Zarr values from explicit coordinates.
