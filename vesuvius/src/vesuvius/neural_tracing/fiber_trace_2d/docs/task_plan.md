@@ -19,8 +19,8 @@ The deliverable is a loader/iterator plus a small tester/runner. It loads VC3D-e
 
 - Add a Vesuvius-style JSON config for the loader/runner.
 - Dataset entries identify fiber JSON files or globs, base volume Zarr path, cache settings, volume scale/group, and any Lasagna normal/manifest input needed for strip frames.
-- Loader settings include `batch_size`, strip patch size, strip-z offsets, seed, deterministic tester sample index, and prefetch worker count.
-- The default strip-z offsets are `-7..8`, giving 16 patches per selected control point.
+- Loader settings include `batch_size`, strip patch size, strip-z offset count/step, seed, deterministic tester sample index, and prefetch worker count.
+- The default strip-z offset settings are count `16` and selected-scale step `1.0`, generating `-7..8` and giving 16 patches per selected control point.
 - Prefetch worker count is capped at 16.
 
 ## Data Model
@@ -74,7 +74,7 @@ The deliverable is a loader/iterator plus a small tester/runner. It loads VC3D-e
 - Fiber side strips as defined in VC3D: fulfilled by reusing/exporting the VC3D side-strip coordinate code or porting it closely with parity tests.
 - Data streamed and cached from S3: fulfilled by Zarr chunk-key prefetch and cache population.
 - Use VC3D strip extraction to get side-strip views of CPs: fulfilled by loading CP-centered strip views through explicit VC3D-style coordinates.
-- Slices plus/minus voxels along strip z: fulfilled by the default `-7..8` strip-z offsets.
+- Slices plus/minus voxels along strip z: fulfilled by the default count/step settings, which generate `-7..8` strip-z offsets.
 
 ## task.md
 
@@ -82,7 +82,7 @@ The deliverable is a loader/iterator plus a small tester/runner. It loads VC3D-e
 - Write initial data-loader/iterator: add the deterministic loader and batch iterator for fiber-strip patches.
 - Use fiber side-strip code from VC3D/Lasagna/fiber-trace: use VC3D-style side-strip coordinates and Lasagna normal inputs.
 - Initial batch loading around random CPs: normal batches sample random control points from the fiber dataset.
-- Load `+-7/8` patches around the CP strip: load 16 independently sampled strip-z offset patches per selected CP.
+- Load `+-7/8` patches around the CP strip: load 16 independently sampled strip-z offset patches per selected CP from the generated count/step offsets.
 - Write a data-loader tester/runner: add a command that loads a batch from a specified deterministic CP sample index.
 - Specified CP is deterministic random index: map the requested index deterministically into the full fiber/control-point dataset.
 - Each patch sampled independently: build and sample a separate coordinate grid per strip-z offset.
