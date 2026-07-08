@@ -80,10 +80,7 @@ function AtlasBrowserInner() {
     });
     return r;
   };
-  const segOf = (s) =>
-    (s.progress && s.progress.segments != null
-      ? s.progress.segments
-      : s.n_segments) || 0;
+  const segOf = (s) => s.n_segments || 0;
   const score = (s) => (s.progress && s.progress.score) || 0;
 
   const q = query.trim().toLowerCase();

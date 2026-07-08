@@ -138,8 +138,7 @@ export default function ScrollDetailPage(props) {
       : typeof up === "string" && up
       ? ` · unrolled: ${up}`
       : "";
-  const segments =
-    progress.segments != null ? progress.segments : scroll.n_segments;
+  const segments = scroll.n_segments;
   const segmentsTxt = segments != null ? Number(segments).toLocaleString() : "—";
 
   // Furthest pipeline stage reached.
