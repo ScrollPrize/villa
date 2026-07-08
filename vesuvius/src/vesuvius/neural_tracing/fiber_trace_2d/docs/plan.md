@@ -4,8 +4,9 @@
 
 # general
 - work on 2d slices only (maybe 2.5D by moving a bit in z on the 2d slices?)
-- use lasagna normals to extract aligned 2d slices
+- use lasagna normals to extract aligned 2d slices (fiber side strips as defined in vc3d)
 - very small CNN (10 layer resent)
+- data is streamed+cached from s3 (compare the existing fiber tracer code vesuvius/src/vesuvius/neural_tracing/fiber_trace/)
 
 # V0 - semi-supervised direction & curvature pretraining
 

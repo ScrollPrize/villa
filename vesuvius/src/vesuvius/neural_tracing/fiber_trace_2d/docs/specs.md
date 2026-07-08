@@ -1,0 +1,21 @@
+# 2D Fiber Trace Initial Loader Specs
+
+- The initial implementation loads batches of fiber-strip patches around random control points from the fiber dataset.
+- Fiber JSON parsing follows the existing VC3D fiber parsing semantics from `vesuvius.neural_tracing.fiber_trace.fiber_json`.
+- The loader works on 2D sampled fiber side-strip patches.
+- Neighboring strip-z context is represented as separate 2D patches.
+- The default strip-z offsets are `-7..8`, giving 16 patches per selected control point.
+- Lasagna normals are used where needed to construct aligned strip frames.
+- VC3D side-strip/surface/segment sampling semantics define patch coordinates.
+- The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
+- The implementation should reuse/export VC3D side-strip coordinate APIs when possible, or port the same algorithm with only small rounding/interpolation differences.
+- Image loading samples base-volume Zarr values from explicit coordinates.
+- The loader must not use the existing neural-tracing crop-loading path for image loading.
+- Each strip-z patch is sampled independently.
+- Dataset and loader settings are specified in Vesuvius-style JSON.
+- Normal batch loading samples random control points deterministically from the configured seed.
+- The tester/runner loads a batch from a specified deterministic control-point sample index.
+- Prefetch computes needed base-volume Zarr chunk keys from explicit coordinates before image loading.
+- Prefetch deduplicates chunk requests, skips cached chunks, and fetches missing chunks into the configured cache.
+- Prefetch parallelism is capped at 16 workers.
+- Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
