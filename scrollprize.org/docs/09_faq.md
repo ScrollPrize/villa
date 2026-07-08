@@ -161,7 +161,7 @@ Here are some other excellent books we recommend:
 
 Yes, in fact we encourage you to share your progress. Be sure to also post in our Discord, to get feedback from the community.
 
-The only exception: if you are competing for the Grand Prize, you may not publicly reveal substantial new text (e.g., entire words or passages) until we have reviewed and evaluated your submission.
+The only exception: if you are competing for a prize that involves reading new text (the [Grand Prize](prizes#2027-grand-prize), [First Letters](prizes#first-letters-prizes), or [PHerc. Paris 4’s Title](prizes#first-title-prize)), do not make your discovery public — e.g., entire words or passages — until the prize is officially announced. We will work with you to announce your findings.
 
 ### I’m outside the United States, can I participate and win prizes?
 
