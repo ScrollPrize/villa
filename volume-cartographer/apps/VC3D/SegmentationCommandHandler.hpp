@@ -10,6 +10,7 @@
 #include <QStringList>
 #include <QSet>
 #include <QTemporaryFile>
+#include <QVector3D>
 
 #include "elements/VolumeSelector.hpp"
 
@@ -54,6 +55,12 @@ public:
 
     struct ResumeLocalJob {
         QString segmentId;
+        QString outputDir;
+        QString paramsPath;
+        std::unique_ptr<QTemporaryFile> paramsFile;
+    };
+
+    struct GrowPatchSeedJob {
         QString outputDir;
         QString paramsPath;
         std::unique_ptr<QTemporaryFile> paramsFile;
@@ -139,6 +146,7 @@ public slots:
     void onAddIgnoreLabel();
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
+    void onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint);
     void onReloadFromBackup(const QString& segmentId, int backupIndex);
     void onCopySurfaceRequested(const QString& segmentId);
     void onMoveSegmentToPaths(const QString& segmentId);
@@ -191,6 +199,7 @@ private:
 
     std::optional<NeighborCopyJob> _neighborCopyJob;
     std::optional<ResumeLocalJob> _resumeLocalJob;
+    std::optional<GrowPatchSeedJob> _growPatchSeedJob;
 
     // Callbacks for CWindow-specific operations
     std::function<QString()> _normal3dZarrPathGetter;

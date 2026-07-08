@@ -68,6 +68,7 @@
 #include <QTimer>
 #include <QSize>
 #include <QVector>
+#include <QVector3D>
 #include <QLoggingCategory>
 #include <QDebug>
 #include <QFrame>
@@ -3746,6 +3747,30 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                         }
 
                         QMenu menu(this);
+
+                        QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
+                        newLineAnnotationAction->setEnabled(
+                            _lineAnnotationController &&
+                            _lineAnnotationController->canLaunchFromViewer(viewer) &&
+                            viewer->sampleSceneVolume(scenePoint).has_value());
+
+                        QAction* createGrowPatchAction = menu.addAction(tr("Create Segment (GrowPatch)"));
+                        createGrowPatchAction->setEnabled(validVolumePoint &&
+                                                          _segmentationCommandHandler &&
+                                                          _state &&
+                                                          _state->vpkg() &&
+                                                          _state->currentVolume());
+                        connect(createGrowPatchAction, &QAction::triggered, this,
+                                [this, volumePoint]() {
+                                    if (!_segmentationCommandHandler) {
+                                        return;
+                                    }
+                                    _segmentationCommandHandler->onCreateSegmentGrowPatchFromSeed(
+                                        QVector3D(volumePoint[0], volumePoint[1], volumePoint[2]));
+                                });
+
+                        menu.addSeparator();
+
                         auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
                         auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
                         const int mainViewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
@@ -3930,12 +3955,10 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             }
                         }
 
-                        QAction* action = menu.addAction(tr("New line annotation"));
-                        action->setEnabled(_lineAnnotationController &&
-                                           _lineAnnotationController->canLaunchFromViewer(viewer) &&
-                                           viewer->sampleSceneVolume(scenePoint).has_value());
                         QAction* selected = menu.exec(globalPos);
-                        if (selected == action && action->isEnabled() && _lineAnnotationController) {
+                        if (selected == newLineAnnotationAction &&
+                            newLineAnnotationAction->isEnabled() &&
+                            _lineAnnotationController) {
                             _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
                         }
                     });
