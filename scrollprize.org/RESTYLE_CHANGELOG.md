@@ -296,6 +296,14 @@ The pipeline strip on /2026_open_problems now reads Scanning → Unwrapping → 
 - **`plugins/atlas-data.js` now exposes live sample counts** (scrolls/fragments/samples from the build-time index). Hero stat strip: "10 fragments scanned" added before "35 scrolls scanned", and both counts are now dynamic instead of hardcoded.
 **Files:** `plugins/winners-data.js` (new), `src/components/AwardedTotal.js` (new), `plugins/atlas-data.js`, `src/components/Landing.js`, `src/components/LatestPosts.js`, `docs/15_winners.md`, `docs/09_faq.md`, `docusaurus.config.js`.
 
+## C36 — ink detection tutorial rewritten for the koine_machines pipeline
+
+- **Full rewrite of docs/07_tutorial5.md** (was a 2023-era overview with an OUTDATED banner, pointing at Kaggle notebooks): now a hands-on tutorial for the `ink-detection/koine_machines` pipeline (villa `merge-ink-pipelines` branch), in the style of tutorial2. Conceptual intro (signal recovery, iterative labeling, safeguards, arXiv 2606.29085) followed by dataset → setup → 2.5D training → inference → native-3D training + inference → scaling up → iterative labeling.
+- Runs end-to-end on **one segment** (`phercparis4/w00_20231016151002`, ~25 GB) from the `ink-labels` HF bucket (cross-linked to the C-series curated-datasets entry on /data_datasets); native-3D section documents `volume_source.txt` with the 2.4 µm open-data S3 volume (anonymous reads verified in the pipeline code).
+- **New figures rendered from real bucket data**: labels overlay (red), supervision-mask overlay (green), and the trained model's prediction with training labels overlaid — 1.3% of pixels labeled, ~10% predicted as ink.
+- Every command and config key verified against the branch code; training/inference runs reproduced on cluster GPUs before writing. Note: the tutorial depends on ink-detection fixes that must land on `merge-ink-pipelines` (tifxyz reader fallback, lazy cuCIM import + empty-validation checkpoint save, full_3d_single_wrap surface-mask reconstruction in inference).
+**Files:** `docs/07_tutorial5.md`, `static/img/tutorials/ink-labels-overlay-w00.webp` (new), `static/img/tutorials/ink-supervision-overlay-w00.webp` (new), `static/img/tutorials/ink-prediction-w00.webp` (new).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
