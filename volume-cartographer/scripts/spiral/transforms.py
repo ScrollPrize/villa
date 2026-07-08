@@ -91,12 +91,31 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
 
 class GapExpanderParams(nn.Module):
 
-    def __init__(self, resolution, min_z, max_z, num_windings, dr_per_winding):
+    def __init__(self, resolution, min_z, max_z, num_windings, dr_per_winding,
+                 spiral_residual_enabled=False, spiral_residual_amplitude=0.15,
+                 spiral_residual_n_theta=16, spiral_residual_n_z=16, spiral_residual_lr_scale=60.0):
         super().__init__()
         self.num_by_winding = (2 * torch.pi * (torch.arange(1, num_windings) + 0.5) * dr_per_winding / resolution + 0.5).to(torch.int64)
         self.num_z = int((max_z - min_z) / resolution)
         self.logits = nn.Parameter(torch.zeros([1, 1, self.num_z, sum(self.num_by_winding)]))
         self.register_buffer('winding_first_logit_idx', torch.cat([torch.zeros([1]), torch.cumsum(self.num_by_winding, dim=0)]))
+        # Spiral-space radial residual: a learnable low-res additive offset delta(n, theta, z) on the
+        # per-winding target radii, letting the target spiral flex instead of forcing the volumetric
+        # diffeo to do all conforming. Amplitude-bounded via tanh so windings cannot cross (see
+        # GapExpandingTransform.get_transformed_winding_radii). Living inside GapExpanderParams means
+        # it automatically joins the gap-expander optimizer group (weight_decay ~1e-2).
+        self.spiral_residual_enabled = bool(spiral_residual_enabled)
+        self.spiral_residual_amplitude = float(spiral_residual_amplitude)
+        self.spiral_residual_n_theta = int(spiral_residual_n_theta)
+        self.spiral_residual_n_z = int(spiral_residual_n_z)
+        self.spiral_residual_lr_scale = float(spiral_residual_lr_scale)
+        if self.spiral_residual_enabled:
+            # One entry per transformed winding radius (len(num_by_winding) == num_windings - 1
+            # entries, matching get_transformed_winding_radii's output), each with an
+            # (n_theta, n_z) grid. Zero init => delta == 0 at start (exactly baseline).
+            self.spiral_residual_raw = nn.Parameter(torch.zeros([
+                len(self.num_by_winding), self.spiral_residual_n_theta, self.spiral_residual_n_z,
+            ]))
 
 
 class GapExpandingTransform(pyro.distributions.transforms.Transform):
@@ -138,6 +157,34 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         inter_winding_distances = self.dr_per_winding * scales_by_winding
         winding_zero_radii = self.dr_per_winding * theta_normalised
         winding_radii = winding_zero_radii[..., None] + torch.cat([torch.zeros_like(inter_winding_distances[..., :1]), torch.cumsum(inter_winding_distances, dim=-1)[..., :-1]], dim=-1)
+        if getattr(self.params, 'spiral_residual_enabled', False):
+            # Additive low-res radial residual delta(n, theta, z) on the target winding radii.
+            # Sampled along the flattened spiral (winding-major, theta-minor) so linear interpolation
+            # at theta -> 2pi continues into winding n+1's theta=0 bin: the residual is continuous
+            # along the spiral sheet, mirroring the gap-expander logits arrangement above.
+            n_theta = self.params.spiral_residual_n_theta
+            raw = self.params.spiral_residual_raw  # [num_windings, n_theta, n_z]
+            flat = raw.permute(2, 0, 1).reshape(1, 1, raw.shape[2], num_windings * n_theta)
+            # Pin winding 0 entirely (it is structurally canonical in the gap expander: cumsum starts
+            # at zero there and the umbilicus loss anchors the centre) plus winding 1's theta=0 bin,
+            # mirroring the pinned 0th gap-expander logit, to avoid a jump crossing the seam ray.
+            flat = torch.cat([torch.zeros_like(flat[..., :n_theta + 1]), flat[..., n_theta + 1:]], dim=-1)
+            residual_coords = (torch.arange(num_windings, device=theta.device, dtype=theta_normalised.dtype) + theta_normalised[..., None]) * n_theta
+            residual_coords_normalised = residual_coords / (num_windings * n_theta) * 2 - 1
+            delta_raw = F.grid_sample(
+                flat,
+                torch.stack([residual_coords_normalised, z_normalised[..., None].expand(*theta.shape, num_windings)], dim=-1).view(1, -1, num_windings, 2),
+                mode='bilinear',
+                padding_mode='border',
+                align_corners=True,
+            ).squeeze(1).squeeze(0).view(*theta.shape, num_windings)
+            # tanh bounds |delta| <= amplitude * dr_per_winding, guaranteeing non-crossing windings
+            # for amplitude <= 0.5 at nominal gap scales. lr_scale matches the gap expander's
+            # effective logit multiplier (gap_expander_lr_scale * 2e2) since base lr is small.
+            delta = torch.tanh(delta_raw * self.params.spiral_residual_lr_scale) * (self.params.spiral_residual_amplitude * self.dr_per_winding)
+            if self.truncate_frac is not None:
+                delta = delta * self.truncate_frac
+            winding_radii = winding_radii + delta
         return winding_radii
 
     def _call(self, input_zyx):
@@ -283,6 +330,12 @@ class SpiralAndTransform(nn.Module):
             max_z=flow_max_corner_zyx[0],
             num_windings=config['gap_expander_num_windings'],
             dr_per_winding=config['initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
+            # Spiral-space radial residual (.get so older checkpoint cfgs still load)
+            spiral_residual_enabled=bool(config.get('spiral_residual_enabled', 0)),
+            spiral_residual_amplitude=float(config.get('spiral_residual_amplitude', 0.15)),
+            spiral_residual_n_theta=int(config.get('spiral_residual_n_theta', 16)),
+            spiral_residual_n_z=int(config.get('spiral_residual_n_z', 16)),
+            spiral_residual_lr_scale=float(config.get('spiral_residual_lr_scale', 60.0)),
         )
 
     @property

@@ -141,6 +141,17 @@ default_config = {
     'gap_expander_logit_resolution': 24,
     'gap_expander_num_windings': 130,
     'gap_expander_lr_scale': 0.3,
+    # Spiral-space radial residual: learnable low-res additive delta(n, theta, z) on the target
+    # winding radii (r_n = n*dr + gaps + delta), letting the target spiral flex instead of forcing
+    # the volumetric diffeo to do all conforming. Applied inside the gap expander so losses,
+    # satisfaction metrics and rendering all see it consistently. delta is bounded by
+    # tanh(raw * lr_scale) * amplitude * dr_per_winding (non-crossing windings for amplitude <= 0.5
+    # at nominal gap scales). Parameters share the gap-expander optimizer group (wd 1e-2).
+    'spiral_residual_enabled': 0,
+    'spiral_residual_amplitude': 0.15,
+    'spiral_residual_n_theta': 16,
+    'spiral_residual_n_z': 16,
+    'spiral_residual_lr_scale': 60.0,  # tanh input multiplier; matches gap expander's effective 0.3*2e2
     'linear_z_resolution': 48,
     'initial_dr_per_winding': 16.,
     'patch_radius_loss_margin': 0.025,
