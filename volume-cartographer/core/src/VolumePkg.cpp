@@ -17,6 +17,7 @@
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
@@ -87,6 +88,9 @@ bool isSegmentDir(const fs::path& dir)
 bool isNormalGridDir(const fs::path& dir)
 {
     if (!fs::is_directory(dir)) return false;
+    // A streaming cache dir is a valid store even before any grid files have
+    // been fetched — NormalGridVolume pulls them on demand via the marker URL.
+    if (fs::is_regular_file(dir / vc::core::util::kNormalGridsRemoteMarker)) return true;
     return fs::is_directory(dir / "xy")
         && fs::is_directory(dir / "xz")
         && fs::is_directory(dir / "yz")

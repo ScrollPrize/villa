@@ -23,6 +23,7 @@
 
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
+#include "OpenDataNormalGrids.hpp"
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
 #include <QGridLayout>
@@ -67,6 +68,7 @@
 #include <QTimer>
 #include <QSize>
 #include <QVector>
+#include <QVector3D>
 #include <QLoggingCategory>
 #include <QDebug>
 #include <QFrame>
@@ -2280,6 +2282,7 @@ void ensureDockWidgetFeatures(QDockWidget* dock)
 }
 
 QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
+                                        const std::string& loadedVolumeId,
                                         QString* checkedPath)
 {
     if (checkedPath) {
@@ -2296,10 +2299,64 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         qCInfo(lcSegGrowth) << "Normal grid lookup: no normal_grids entries in project";
         return QString();
     }
-    const QString candidateStr = QString::fromStdString(paths.front().string());
-    if (checkedPath) *checkedPath = candidateStr;
-    qCInfo(lcSegGrowth) << "Normal grid resolved to" << candidateStr;
-    return candidateStr;
+
+    // Entries tagged with an open-data volume id only apply to that volume;
+    // untagged entries keep the legacy behavior of applying to everything.
+    const auto catalogIds =
+        openDataCatalogVolumeIdCandidates(*pkg, loadedVolumeId);
+    constexpr std::string_view volumeIdTagPrefix = "vc-open-data-volume-id:";
+
+    QString untaggedFallback;
+    for (const auto& path : paths) {
+        const auto pathStr = path.string();
+        const vc::project::Entry* owningEntry = nullptr;
+        for (const auto& entry : pkg->normalGridEntries()) {
+            if (pathStr == entry.location ||
+                pathStr.rfind(entry.location + "/", 0) == 0) {
+                owningEntry = &entry;
+                break;
+            }
+        }
+
+        std::vector<QString> entryVolumeIds;
+        if (owningEntry) {
+            for (const auto& tag : owningEntry->tags) {
+                if (tag.rfind(volumeIdTagPrefix, 0) == 0) {
+                    entryVolumeIds.push_back(
+                        QString::fromStdString(tag.substr(volumeIdTagPrefix.size())));
+                }
+            }
+        }
+
+        const QString candidateStr = QString::fromStdString(pathStr);
+        if (entryVolumeIds.empty()) {
+            if (untaggedFallback.isEmpty()) {
+                untaggedFallback = candidateStr;
+            }
+            continue;
+        }
+        const bool matchesVolume = std::any_of(
+            entryVolumeIds.begin(), entryVolumeIds.end(), [&](const QString& id) {
+                return std::find(catalogIds.begin(), catalogIds.end(), id) !=
+                       catalogIds.end();
+            });
+        if (matchesVolume) {
+            if (checkedPath) *checkedPath = candidateStr;
+            qCInfo(lcSegGrowth) << "Normal grid resolved to" << candidateStr
+                                << "for volume" << QString::fromStdString(loadedVolumeId);
+            return candidateStr;
+        }
+    }
+
+    if (!untaggedFallback.isEmpty()) {
+        if (checkedPath) *checkedPath = untaggedFallback;
+        qCInfo(lcSegGrowth) << "Normal grid resolved to" << untaggedFallback;
+        return untaggedFallback;
+    }
+
+    qCInfo(lcSegGrowth) << "Normal grid lookup: no store paired with volume"
+                        << QString::fromStdString(loadedVolumeId);
+    return QString();
 }
 
 QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
@@ -3690,6 +3747,30 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                         }
 
                         QMenu menu(this);
+
+                        QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
+                        newLineAnnotationAction->setEnabled(
+                            _lineAnnotationController &&
+                            _lineAnnotationController->canLaunchFromViewer(viewer) &&
+                            viewer->sampleSceneVolume(scenePoint).has_value());
+
+                        QAction* createGrowPatchAction = menu.addAction(tr("Create Segment (GrowPatch)"));
+                        createGrowPatchAction->setEnabled(validVolumePoint &&
+                                                          _segmentationCommandHandler &&
+                                                          _state &&
+                                                          _state->vpkg() &&
+                                                          _state->currentVolume());
+                        connect(createGrowPatchAction, &QAction::triggered, this,
+                                [this, volumePoint]() {
+                                    if (!_segmentationCommandHandler) {
+                                        return;
+                                    }
+                                    _segmentationCommandHandler->onCreateSegmentGrowPatchFromSeed(
+                                        QVector3D(volumePoint[0], volumePoint[1], volumePoint[2]));
+                                });
+
+                        menu.addSeparator();
+
                         auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
                         auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
                         const int mainViewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
@@ -3775,6 +3856,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             connect(closeAction, &QAction::triggered, this, [subWindow]() {
                                 if (subWindow)
                                     subWindow->close();
+                            });
+                            menu.addSeparator();
+                        }
+
+                        if (viewer->measurementSupported()) {
+                            QAction* measureAction = menu.addAction(tr("Measure"));
+                            connect(measureAction, &QAction::triggered, this, [viewer]() {
+                                viewer->startMeasurementMode();
                             });
                             menu.addSeparator();
                         }
@@ -3866,12 +3955,10 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             }
                         }
 
-                        QAction* action = menu.addAction(tr("New line annotation"));
-                        action->setEnabled(_lineAnnotationController &&
-                                           _lineAnnotationController->canLaunchFromViewer(viewer) &&
-                                           viewer->sampleSceneVolume(scenePoint).has_value());
                         QAction* selected = menu.exec(globalPos);
-                        if (selected == action && action->isEnabled() && _lineAnnotationController) {
+                        if (selected == newLineAnnotationAction &&
+                            newLineAnnotationAction->isEnabled() &&
+                            _lineAnnotationController) {
                             _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
                         }
                     });
@@ -4411,7 +4498,8 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
 void CWindow::updateNormalGridAvailability()
 {
     QString checkedPath;
-    const QString path = normalGridDirectoryForVolumePkg(_state->vpkg(), &checkedPath);
+    const QString path = normalGridDirectoryForVolumePkg(
+        _state->vpkg(), _state->currentVolumeId(), &checkedPath);
     const bool available = !path.isEmpty();
 
     _normalGridAvailable = available;
@@ -4421,7 +4509,15 @@ void CWindow::updateNormalGridAvailability()
         _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
         _segmentationWidget->setNormalGridPath(_normalGridPath);
         QString hint;
+        if (!_normalGridAvailable && _state->vpkg()) {
+            const auto info = vc3d::opendata::normalGridsInfoFromTags(
+                _state->vpkg()->volumeTags(_state->currentVolumeId()));
+            if (info) {
+                hint = tr("No normal grids are published for this open-data volume.");
+            }
+        }
         if (_normalGridAvailable) {
+        } else if (!hint.isEmpty()) {
         } else if (!checkedPath.isEmpty()) {
             hint = tr("Checked: %1").arg(checkedPath);
         } else {
@@ -7473,6 +7569,10 @@ void CWindow::CreateWidgets(void)
     _segmentationCommandHandler->setNormal3dZarrPathGetter([this]() -> QString {
         return _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString();
     });
+    _segmentationCommandHandler->setNormalGridPathGetter([this]() -> QString {
+        updateNormalGridAvailability();
+        return _normalGridPath;
+    });
     connect(_segmentationCommandHandler.get(), &SegmentationCommandHandler::statusMessage,
             this, &CWindow::onShowStatusMessage);
 
@@ -10177,6 +10277,8 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         return;
     }
 
+    updateNormalGridAvailability();
+
     SegmentationGrower::Context context{
         _segmentationModule.get(),
         _segmentationWidget,
@@ -10500,6 +10602,8 @@ void CWindow::onCopyWithNtRequested()
         showStatusBarMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
     }
+
+    updateNormalGridAvailability();
 
     SegmentationGrower::Context context{
         _segmentationModule.get(),
