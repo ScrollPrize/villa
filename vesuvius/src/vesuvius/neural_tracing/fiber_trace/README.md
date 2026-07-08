@@ -268,6 +268,13 @@ Run a training smoke or short job with:
 python -m vesuvius.neural_tracing.fiber_trace.train /path/to/config.json
 ```
 
+With `device: "cuda"`, training uses PyTorch single-node DDP and spawns one
+worker per visible GPU by default. Limit visibility with `CUDA_VISIBLE_DEVICES`,
+or set `multi_gpu: false`/`multi_gpu: 1` for a single process. Set
+`multi_gpu: N` to use the first `N` visible GPUs. Each GPU receives its own
+configured `batch_size`; deterministic sample ordinals are offset by rank so the
+workers do not train on duplicated crops.
+
 To prefetch the zarr chunks that the same training config will touch, run:
 
 ```bash
@@ -304,6 +311,7 @@ Implemented:
 - pairwise embedding contrastive loss
 - JSON-config train entrypoint with TensorBoard scalar/config logging and
   sample-slice visualization plus current/best snapshots
+- single-node PyTorch DDP training across all visible GPUs by default
 - one debug timing/cache row per training step when `debug_sampling` or
   `debug_cache` is enabled
 - unit and smoke tests on synthetic volumes
@@ -312,5 +320,5 @@ Out of scope for this MVP:
 
 - cross-fiber negatives
 - inference/trace integration
-- distributed dataloading
+- PyTorch DataLoader-based distributed loading
 - Lasagna sampler or sparse-solve sampler integration

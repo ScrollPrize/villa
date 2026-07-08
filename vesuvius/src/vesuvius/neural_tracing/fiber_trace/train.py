@@ -5,13 +5,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
+import socket
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
 
 from vesuvius.neural_tracing.fiber_trace.dataset import (
     FiberTraceBatch,
@@ -70,6 +74,107 @@ def _resolve_run_layout(config: dict[str, Any]) -> tuple[Path, Path]:
     run_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     return run_dir, snapshot_dir
+
+
+def _ensure_run_datestr(config: dict[str, Any]) -> str:
+    date_str = str(
+        config.get("run_datestr") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
+    config["run_datestr"] = date_str
+    return date_str
+
+
+def _device_from_config(config: dict[str, Any]) -> torch.device:
+    return torch.device(
+        config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    )
+
+
+def _is_truthy_multi_gpu(value: Any) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    if value is None:
+        return True
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized not in {"", "0", "1", "false", "no", "off", "single", "none"}
+    return int(value) != 1
+
+
+def _configured_distributed_world_size(config: dict[str, Any]) -> int:
+    env_world_size = os.environ.get("WORLD_SIZE")
+    if env_world_size:
+        return max(1, int(env_world_size))
+
+    requested = config.get("multi_gpu", config.get("distributed", "auto"))
+    if not _is_truthy_multi_gpu(requested):
+        return 1
+
+    device = _device_from_config(config)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return 1
+    if device.index is not None and requested in (None, "auto"):
+        return 1
+
+    visible_gpus = int(torch.cuda.device_count())
+    if visible_gpus <= 1:
+        return 1
+    if isinstance(requested, bool) or requested is None:
+        return visible_gpus
+    if isinstance(requested, str):
+        normalized = requested.strip().lower()
+        if normalized in {"auto", "all", "true", "yes", "on"}:
+            return visible_gpus
+        return max(1, min(visible_gpus, int(normalized)))
+    return max(1, min(visible_gpus, int(requested)))
+
+
+def _distributed_sample_iteration(step: int, *, rank: int, world_size: int) -> int:
+    return (int(step) - 1) * int(world_size) + int(rank) + 1
+
+
+def _find_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _maybe_init_distributed(
+    *,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    init_method: str | None,
+) -> None:
+    if world_size <= 1 or dist.is_initialized():
+        return
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "nccl":
+        torch.cuda.set_device(int(local_rank))
+    dist.init_process_group(
+        backend=backend,
+        init_method=init_method or "env://",
+        rank=int(rank),
+        world_size=int(world_size),
+    )
+
+
+def _sync_run_datestr(config: dict[str, Any], *, rank: int, world_size: int) -> None:
+    if world_size <= 1:
+        _ensure_run_datestr(config)
+        return
+    payload = [_ensure_run_datestr(config) if int(rank) == 0 else ""]
+    dist.broadcast_object_list(payload, src=0)
+    config["run_datestr"] = str(payload[0])
+
+
+def _distributed_barrier(world_size: int) -> None:
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def _unwrap_distributed_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
 
 
 def _json_safe(value: Any) -> Any:
@@ -361,6 +466,8 @@ def _compute_losses(
                 ),
                 "cache_hit_ms": cache_ms,
                 "cache_download_ms": download_ms,
+                "cache_hit_mib": cache_mib,
+                "cache_download_mib": download_mib,
                 "cache_mib_s": (
                     cache_mib / max(cache_ms / 1000.0, 1e-9)
                     if cache_mib > 0.0
@@ -392,6 +499,75 @@ def _average_scalar_dicts(scalars: list[dict[str, float]]) -> dict[str, float]:
         / float(sum(1 for item in scalars if key in item))
         for key in keys
     }
+
+
+def _distributed_average_scalars(
+    scalars: dict[str, float] | None,
+    *,
+    device: torch.device,
+    world_size: int,
+) -> dict[str, float] | None:
+    if scalars is None or world_size <= 1:
+        return scalars
+    keys = sorted(scalars)
+    values = torch.tensor(
+        [float(scalars[key]) for key in keys], device=device, dtype=torch.float64
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values = values / float(world_size)
+    return {key: float(value.detach().cpu()) for key, value in zip(keys, values)}
+
+
+def _distributed_reduce_step_timings(
+    timings: dict[str, float],
+    *,
+    device: torch.device,
+    world_size: int,
+) -> dict[str, float]:
+    if world_size <= 1:
+        return timings
+
+    reduced = dict(timings)
+    sum_keys = (
+        "cache_hits",
+        "cache_downloads",
+        "cache_missing",
+        "cache_hit_ms",
+        "cache_download_ms",
+        "cache_hit_mib",
+        "cache_download_mib",
+    )
+    max_keys = ("data_ms", "train_ms")
+    sum_values = torch.tensor(
+        [float(timings.get(key, 0.0)) for key in sum_keys],
+        device=device,
+        dtype=torch.float64,
+    )
+    max_values = torch.tensor(
+        [float(timings.get(key, 0.0)) for key in max_keys],
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.all_reduce(sum_values, op=dist.ReduceOp.SUM)
+    dist.all_reduce(max_values, op=dist.ReduceOp.MAX)
+    for key, value in zip(sum_keys, sum_values):
+        reduced[key] = float(value.detach().cpu())
+    for key, value in zip(max_keys, max_values):
+        reduced[key] = float(value.detach().cpu())
+
+    cache_mib = float(reduced.get("cache_hit_mib", 0.0))
+    cache_ms = float(reduced.get("cache_hit_ms", 0.0))
+    download_mib = float(reduced.get("cache_download_mib", 0.0))
+    download_ms = float(reduced.get("cache_download_ms", 0.0))
+    reduced["cache_mib_s"] = (
+        cache_mib / max(cache_ms / 1000.0, 1e-9) if cache_mib > 0.0 else 0.0
+    )
+    reduced["download_mib_s"] = (
+        download_mib / max(download_ms / 1000.0, 1e-9)
+        if download_mib > 0.0
+        else 0.0
+    )
+    return reduced
 
 
 def _compute_test_scalars(
@@ -1183,13 +1359,32 @@ def run_prefetch(
     }
 
 
-def run_training(config: dict[str, Any]) -> dict[str, Any]:
-    device = torch.device(
-        config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+def _run_training_worker(
+    config: dict[str, Any],
+    *,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
+    local_rank: int = 0,
+    init_method: str | None = None,
+) -> dict[str, Any]:
+    rank = int(distributed_rank)
+    world_size = int(distributed_world_size)
+    _maybe_init_distributed(
+        rank=rank,
+        world_size=world_size,
+        local_rank=int(local_rank),
+        init_method=init_method,
     )
+    _sync_run_datestr(config, rank=rank, world_size=world_size)
+
+    if world_size > 1:
+        device = torch.device("cuda", int(local_rank))
+    else:
+        device = _device_from_config(config)
     if "seed" in config:
         torch.manual_seed(int(config["seed"]))
     _reject_legacy_checkpoint_path(config)
+    is_main_process = rank == 0
 
     debug_table_state = FiberTraceDebugTableState()
     batch_builder = FiberTraceBatchBuilder(
@@ -1198,17 +1393,27 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     test_config = _make_test_config(config)
     test_batch_builder = (
         FiberTraceBatchBuilder(test_config, debug_table_state=debug_table_state)
-        if test_config is not None
+        if is_main_process and test_config is not None
         else None
     )
     run_dir, snapshot_dir = _resolve_run_layout(config)
     current_snapshot = snapshot_dir / "current.pt"
     best_snapshot = snapshot_dir / "best.pt"
     writer = _make_summary_writer(
-        run_dir, enabled=bool(config.get("tensorboard_enabled", True))
+        run_dir,
+        enabled=is_main_process and bool(config.get("tensorboard_enabled", True)),
     )
 
     model = build_fiber_trace_model(config).to(device)
+    if world_size > 1:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[int(local_rank)] if device.type == "cuda" else None,
+            output_device=int(local_rank) if device.type == "cuda" else None,
+            find_unused_parameters=bool(
+                config.get("ddp_find_unused_parameters", False)
+            ),
+        )
     opt_cfg = dict(config.get("optimizer", {}))
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1236,7 +1441,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
     if test_visualization_every < 0:
         raise ValueError("test_visualization_every must be >= 0")
     best_metric = float("inf")
-    test_enabled = test_batch_builder is not None and test_every > 0
+    test_enabled = test_config is not None and test_every > 0
     best_metric_name = "test/total" if test_enabled else "train/total"
     debug_timing = bool(config.get("debug_sampling", False) or config.get("debug_cache", False))
     debug_step_rows = 0
@@ -1254,8 +1459,16 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         for step in range(1, steps + 1):
             step_t0 = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
+            sample_iteration = _distributed_sample_iteration(
+                step, rank=rank, world_size=world_size
+            )
             losses, train_batch, train_outputs, step_timings = _compute_losses(
-                model, batch_builder, device, config, loss_kwargs, iteration=step
+                model,
+                batch_builder,
+                device,
+                config,
+                loss_kwargs,
+                iteration=sample_iteration,
             )
             losses.total.backward()
             optimizer.step()
@@ -1279,15 +1492,24 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 if debug_timing or should_log or should_test
                 else None
             )
+            train_row_scalars = _distributed_average_scalars(
+                train_row_scalars, device=device, world_size=world_size
+            )
             train_scalars = train_row_scalars if should_log else None
             step_ms = (time.perf_counter() - step_t0) * 1000.0
             step_timings["train_ms"] = max(
                 0.0, step_ms - float(step_timings.get("data_ms", 0.0))
             )
+            if debug_timing:
+                step_timings = _distributed_reduce_step_timings(
+                    step_timings, device=device, world_size=world_size
+                )
+
             test_scalars = None
-            if should_test and test_batch_builder is not None:
+            raw_model = _unwrap_distributed_model(model)
+            if is_main_process and should_test and test_batch_builder is not None:
                 test_scalars = _compute_test_scalars(
-                    model,
+                    raw_model,
                     test_batch_builder,
                     device,
                     test_config,
@@ -1296,20 +1518,24 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                     sample_count=test_sample_count,
                 )
 
-            if should_log and train_scalars is not None:
+            if is_main_process and should_log and train_scalars is not None:
                 _log_scalars(writer, "train", train_scalars, step)
-            if test_scalars is not None:
+            if is_main_process and test_scalars is not None:
                 _log_scalars(writer, "test", test_scalars, step)
-            if should_visualize:
+            if is_main_process and should_visualize:
                 with torch.no_grad():
                     _log_training_sample_visualization(
                         writer,
-                        model,
+                        raw_model,
                         train_batch,
                         step=step,
                         sample_index=sample_visualization_index,
                     )
-            if should_visualize_test and test_batch_builder is not None:
+            if (
+                is_main_process
+                and should_visualize_test
+                and test_batch_builder is not None
+            ):
                 with torch.no_grad():
                     test_batch = _sample_classified_batch(
                         test_batch_builder,
@@ -1319,18 +1545,18 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                     )
                     _log_training_sample_visualization(
                         writer,
-                        model,
+                        raw_model,
                         test_batch,
                         step=step,
                         sample_index=sample_visualization_index,
                         tag_prefix="test_sample",
                     )
-            if writer is not None and (
+            if is_main_process and writer is not None and (
                 should_log or should_test or should_visualize or should_visualize_test
             ):
                 writer.flush()
 
-            if debug_timing:
+            if is_main_process and debug_timing:
                 _print_step_timing(
                     step=step,
                     timings=step_timings,
@@ -1344,7 +1570,8 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 debug_step_legend_printed = True
 
             should_snapshot = should_test or (not test_enabled and should_log)
-            if not should_snapshot or train_row_scalars is None:
+            if not is_main_process or not should_snapshot or train_row_scalars is None:
+                _distributed_barrier(world_size)
                 continue
 
             metric_value = (
@@ -1354,7 +1581,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
             )
             _save_snapshot(
                 current_snapshot,
-                model=model,
+                model=raw_model,
                 optimizer=optimizer,
                 config=config,
                 step=step,
@@ -1366,7 +1593,7 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 best_metric = metric_value
                 _save_snapshot(
                     best_snapshot,
-                    model=model,
+                    model=raw_model,
                     optimizer=optimizer,
                     config=config,
                     step=step,
@@ -1386,9 +1613,12 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
                 )
             if not debug_timing:
                 print(message, flush=True)
+            _distributed_barrier(world_size)
     finally:
         if writer is not None:
             writer.close()
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
     return {
         "run_dir": str(run_dir),
@@ -1397,6 +1627,64 @@ def run_training(config: dict[str, Any]) -> dict[str, Any]:
         "best_snapshot": str(best_snapshot),
         "best_metric_name": best_metric_name,
         "best_metric": best_metric,
+    }
+
+
+def _spawn_training_worker(
+    rank: int,
+    world_size: int,
+    config: dict[str, Any],
+    init_method: str,
+) -> None:
+    _run_training_worker(
+        config,
+        distributed_rank=int(rank),
+        distributed_world_size=int(world_size),
+        local_rank=int(rank),
+        init_method=str(init_method),
+    )
+
+
+def run_training(config: dict[str, Any]) -> dict[str, Any]:
+    world_size = _configured_distributed_world_size(config)
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if env_world_size > 1:
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+        return _run_training_worker(
+            config,
+            distributed_rank=rank,
+            distributed_world_size=env_world_size,
+            local_rank=local_rank,
+            init_method=None,
+        )
+
+    if world_size <= 1:
+        return _run_training_worker(config)
+
+    _reject_legacy_checkpoint_path(config)
+    _ensure_run_datestr(config)
+    init_method = f"tcp://127.0.0.1:{_find_free_tcp_port()}"
+    print(f"fiber_trace distributed: spawning {world_size} GPU workers", flush=True)
+    mp.spawn(
+        _spawn_training_worker,
+        args=(world_size, config, init_method),
+        nprocs=world_size,
+        join=True,
+    )
+    run_dir, snapshot_dir = _resolve_run_layout(config)
+    test_config = _make_test_config(config)
+    test_every = int(config.get("test_every", config.get("log_every", 100)))
+    best_metric_name = (
+        "test/total" if test_config is not None and test_every > 0 else "train/total"
+    )
+    return {
+        "run_dir": str(run_dir),
+        "snapshot_dir": str(snapshot_dir),
+        "current_snapshot": str(snapshot_dir / "current.pt"),
+        "best_snapshot": str(snapshot_dir / "best.pt"),
+        "best_metric_name": best_metric_name,
+        "best_metric": float("nan"),
     }
 
 

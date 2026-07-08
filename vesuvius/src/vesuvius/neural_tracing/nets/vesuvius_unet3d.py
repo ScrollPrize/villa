@@ -526,7 +526,8 @@ class Decoder(nn.Module):
                  nonlin: Union[None, Type[nn.Module]] = None,
                  nonlin_kwargs: dict = None,
                  conv_bias: bool = None,
-                 time_emb_dim: int = None):
+                 time_emb_dim: int = None,
+                 keep_inactive_deep_supervision_layers: bool = True):
         super().__init__()
         
         self.deep_supervision = deep_supervision
@@ -598,8 +599,12 @@ class Decoder(nn.Module):
                 time_emb_dim=time_emb_dim
             ))
 
-            # Segmentation layer
-            seg_layers.append(encoder.conv_op(input_features_skip, num_classes, 1, 1, 0, bias=True))
+            if self.deep_supervision or keep_inactive_deep_supervision_layers:
+                seg_layers.append(
+                    encoder.conv_op(
+                        input_features_skip, num_classes, 1, 1, 0, bias=True
+                    )
+                )
 
         self.stages = nn.ModuleList(stages)
         self.transpconvs = nn.ModuleList(transpconvs)
@@ -634,20 +639,16 @@ class Decoder(nn.Module):
             
             if self.deep_supervision:
                 seg_outputs.append(self.seg_layers[s](x))
-            elif s == (len(self.stages) - 1):
-                seg_outputs.append(self.seg_layers[-1](x))
             lres_input = x
 
         lres_input = self.final_transpconv(lres_input)
-        seg_outputs.append(self.final_seg_layer(lres_input))
-        
-        # Invert seg outputs so largest prediction is first
-        seg_outputs = seg_outputs[::-1]
-
         if not self.deep_supervision:
-            return seg_outputs[0]
-        else:
-            return seg_outputs
+            return self.final_seg_layer(lres_input)
+
+        seg_outputs.append(self.final_seg_layer(lres_input))
+
+        # Invert seg outputs so largest prediction is first
+        return seg_outputs[::-1]
 
 
 class Vesuvius3dUnetModel(nn.Module):
@@ -693,6 +694,9 @@ class Vesuvius3dUnetModel(nn.Module):
         self.kernel_sizes = [[3, 3, 3]] * self.num_stages
         self.strides = model_config.get('strides', [[2, 2, 2]] * self.num_stages)
         self.decoder_upsample_mode = model_config.get('decoder_upsample_mode', 'transpose')
+        self.keep_inactive_deep_supervision_layers = model_config.get(
+            'keep_inactive_deep_supervision_layers', True
+        )
         
         # Timestep embedding
         self.time_embedding = SinusoidalPositionEmbeddings(self.time_emb_dim) if self.time_emb_dim else None
@@ -730,7 +734,10 @@ class Vesuvius3dUnetModel(nn.Module):
             n_conv_per_stage=[1] * (self.num_stages - 1),
             deep_supervision=False,
             upsample_mode=self.decoder_upsample_mode,
-            time_emb_dim=self.time_emb_dim
+            time_emb_dim=self.time_emb_dim,
+            keep_inactive_deep_supervision_layers=bool(
+                self.keep_inactive_deep_supervision_layers
+            ),
         )
 
     def _get_n_blocks_per_stage(self, num_stages):

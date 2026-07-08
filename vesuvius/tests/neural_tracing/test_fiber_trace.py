@@ -1097,6 +1097,37 @@ def test_model_pixelshuffle_decoder_keeps_dense_and_sampled_output_shapes():
     assert sampled["fw"].shape == (3, 3)
 
 
+def test_model_sampled_embedding_backward_uses_all_registered_parameters():
+    model = build_fiber_trace_model(
+        {
+            "model": {
+                "input_channels": 1,
+                "features_per_stage": [2, 4],
+                "strides": [[1, 1, 1], [2, 2, 2]],
+                "conditioned_feature_channels": 4,
+                "embedding_dim": 3,
+                "head_channels": 4,
+                "decoder_upsample_mode": "pixelshuffle",
+            }
+        }
+    )
+    assert len(model.backbone.decoder.seg_layers) == 0
+
+    volume = torch.randn((1, 1, 8, 8, 8), dtype=torch.float32)
+    cond = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    outputs = model(volume, cond, sample_indices=torch.tensor([0, 73, 511]))
+    weights = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    loss = torch.sum(outputs["embedding"] * weights)
+    loss.backward()
+
+    missing = [
+        name
+        for name, param in model.named_parameters()
+        if param.requires_grad and param.grad is None
+    ]
+    assert missing == []
+
+
 def test_sample_plane_visualization_fuses_labels_to_uint8_values():
     volume = torch.zeros((1, 1, 3, 3, 3), dtype=torch.float32)
     labels = torch.full((3, 3, 3), IGNORE_INDEX, dtype=torch.long)
@@ -1261,6 +1292,76 @@ def test_training_sample_visualization_uses_cp_local_reference_not_crop_center()
     principal_zy = writer.images["train_sample/principal_zy/cos_emb_cp"][0]
     assert float(principal_zy[1, 2]) == pytest.approx(1.0, abs=1e-6)
     assert float(principal_zy[5, 12]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_distributed_world_size_defaults_to_all_visible_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+
+    assert fiber_train._configured_distributed_world_size({"device": "cuda"}) == 4
+    assert (
+        fiber_train._configured_distributed_world_size(
+            {"device": "cuda", "multi_gpu": 2}
+        )
+        == 2
+    )
+    assert (
+        fiber_train._configured_distributed_world_size(
+            {"device": "cuda", "multi_gpu": False}
+        )
+        == 1
+    )
+    assert (
+        fiber_train._configured_distributed_world_size({"device": "cuda:0"}) == 1
+    )
+    assert fiber_train._configured_distributed_world_size({"device": "cpu"}) == 1
+
+
+def test_distributed_sample_iteration_offsets_by_rank():
+    assert [
+        fiber_train._distributed_sample_iteration(1, rank=rank, world_size=4)
+        for rank in range(4)
+    ] == [1, 2, 3, 4]
+    assert [
+        fiber_train._distributed_sample_iteration(2, rank=rank, world_size=4)
+        for rank in range(4)
+    ] == [5, 6, 7, 8]
+
+
+def test_run_training_spawns_internal_workers_for_multi_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(
+        fiber_train, "_configured_distributed_world_size", lambda config: 2
+    )
+    monkeypatch.setattr(fiber_train, "_find_free_tcp_port", lambda: 12345)
+    calls: list[tuple[object, tuple[object, ...], int, bool]] = []
+
+    def fake_spawn(fn, args, nprocs, join):
+        calls.append((fn, args, int(nprocs), bool(join)))
+
+    monkeypatch.setattr(fiber_train.mp, "spawn", fake_spawn)
+
+    config = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "ddp unit",
+        "tensorboard_enabled": False,
+    }
+    result = fiber_train.run_training(config)
+
+    assert len(calls) == 1
+    fn, args, nprocs, join = calls[0]
+    assert fn is fiber_train._spawn_training_worker
+    assert nprocs == 2
+    assert join is True
+    assert args[0] == 2
+    assert str(args[2]).startswith("tcp://127.0.0.1:")
+    assert "run_datestr" in config
+    assert Path(result["run_dir"]).name.startswith("ddp_unit_")
 
 
 def test_test_fiber_glob_builds_separate_test_config():

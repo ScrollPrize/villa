@@ -40,6 +40,7 @@ class DirectionConditionedFiberTraceModel(nn.Module):
             "time_emb_dim": 0,
             "squeeze_excitation": False,
             "decoder_upsample_mode": str(decoder_upsample_mode),
+            "keep_inactive_deep_supervision_layers": False,
         }
         self.backbone = Vesuvius3dUnetModel(
             int(input_channels),

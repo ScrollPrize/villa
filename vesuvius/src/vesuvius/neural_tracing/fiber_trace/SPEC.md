@@ -221,6 +221,16 @@ Training starter config:
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace.train vesuvius/src/vesuvius/neural_tracing/configs/fiber_trace_lasagna_train.json
 ```
 
+When the selected device is CUDA, the training entrypoint uses PyTorch
+single-node DistributedDataParallel by default and launches one worker per
+visible GPU. `multi_gpu: false` or `multi_gpu: 1` keeps single-process training;
+`multi_gpu: N` limits the run to the first `N` visible GPUs. The JSON
+`batch_size` is per GPU. Each rank maps training step `s` to sample ordinal
+`(s - 1) * world_size + rank + 1`, so deterministic sampling remains stable
+without duplicating crops across ranks. Rank 0 owns TensorBoard, test
+evaluation, progress rows, and current/best snapshot writes while other ranks
+wait at the per-step synchronization point.
+
 Before running either config, replace:
 
 - `base_volume_path`
