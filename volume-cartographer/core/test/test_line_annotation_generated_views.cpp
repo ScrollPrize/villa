@@ -309,6 +309,49 @@ TEST_CASE("line annotation fixed current slice snaps only within quarter line po
           doctest::Approx(19.7499));
 }
 
+TEST_CASE("line annotation max control distance uses nearest flattened control")
+{
+    const std::vector<double> controlPositions{10.0, 100.0};
+
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+        250.0,
+        controlPositions,
+        0.0));
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+        70.0,
+        controlPositions,
+        80.0));
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+        95.0,
+        controlPositions,
+        80.0));
+    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+        55.0,
+        controlPositions,
+        40.0));
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+        100.25,
+        controlPositions,
+        80.0));
+    CHECK(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+        5.0,
+        controlPositions,
+        80.0));
+    CHECK_FALSE(vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+        5.0,
+        std::vector<double>{100.0},
+        80.0));
+
+    CHECK(vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
+        95.0,
+        controlPositions,
+        80.0));
+    CHECK_FALSE(vc3d::line_annotation::generatedLinePositionWithinAnyControlDistance(
+        55.0,
+        controlPositions,
+        40.0));
+}
+
 TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
 {
     CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");
@@ -492,7 +535,44 @@ TEST_CASE("line annotation generated strip static and dynamic overlays split own
     CHECK(dynamicOverlay.currentLinePosition == doctest::Approx(1.0));
 }
 
-TEST_CASE("line annotation generated line tail style uses control span")
+TEST_CASE("line annotation span alignment metric uses control midpoint")
+{
+    using vc3d::line_annotation::GeneratedOverlay;
+    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
+        {{0.0f, 0.0f, 0.0f}, 4.0, false},
+        {{0.0f, 0.0f, 0.0f}, 10.0, false},
+        {{0.0f, 0.0f, 0.0f}, 20.0, true},
+    };
+
+    auto metric = vc3d::line_annotation::makeGeneratedSpanAlignmentMetric(
+        2,
+        0,
+        2,
+        controls);
+    metric.available = true;
+    metric.maxErrorDegrees = 52.0;
+
+    CHECK(metric.spanIndex == 2);
+    CHECK(metric.firstControlIndex == 0);
+    CHECK(metric.secondControlIndex == 2);
+    CHECK(metric.firstControlLinePosition == doctest::Approx(4.0));
+    CHECK(metric.secondControlLinePosition == doctest::Approx(20.0));
+    CHECK(metric.maxErrorDegrees == doctest::Approx(52.0));
+    const auto center =
+        vc3d::line_annotation::generatedSpanAlignmentMetricCenterLinePosition(metric);
+    REQUIRE(center.has_value());
+    CHECK(*center == doctest::Approx(12.0));
+
+    const auto invalid = vc3d::line_annotation::makeGeneratedSpanAlignmentMetric(
+        0,
+        0,
+        99,
+        controls);
+    CHECK_FALSE(vc3d::line_annotation::generatedSpanAlignmentMetricCenterLinePosition(
+        invalid).has_value());
+}
+
+TEST_CASE("line annotation generated line tail detection uses control span")
 {
     using vc3d::line_annotation::GeneratedOverlay;
     using vc3d::line_annotation::generatedControlLinePositionRange;

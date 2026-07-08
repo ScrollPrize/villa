@@ -1,6 +1,15 @@
 # Dependencies
 /node_modules
 
+# Yarn (Berry) — node-modules linker + global cache
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
+
 # Production
 /build
 
@@ -19,3 +28,6 @@ static/data/latestPosts.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Generated build-time image dimension manifest
+.image-dimensions.json

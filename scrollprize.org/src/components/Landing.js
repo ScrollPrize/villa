@@ -330,13 +330,6 @@ const prizes = [
   //   href: "/winners",
   // },
   {
-    title: "Unwrapping at Scale Prize",
-    prizeMoney: "$200,000",
-    description: "Automate virtual unwrapping",
-    requirement: "",
-    href: "prizes#unwrapping-at-scale-prize",
-  },
-  {
     title: "First Letters / First Title Prizes",
     prizeMoney: "7 x $60,000",
     description:
@@ -373,6 +366,12 @@ const creators = [
 
 const sponsors = [
   {
+    name: "Nat Friedman",
+    amount: 2250000,
+    href: "https://nat.org/",
+    image: "/img/landing/nat.webp",
+  },
+  {
     name: "Musk Foundation",
     amount: 2084000,
     href: "https://www.muskfoundation.org/",
@@ -389,12 +388,6 @@ const sponsors = [
     amount: 250000,
     href: "https://twitter.com/JosephJacks_",
     image: "/img/landing/Joseph Jacks.webp",
-  },
-  {
-    name: "Nat Friedman",
-    amount: 225000,
-    href: "https://nat.org/",
-    image: "/img/landing/nat.webp",
   },
   {
     name: "Daniel Gross",
@@ -700,11 +693,6 @@ const team = {
       href: "https://blog.virtual-void.net/",
     },
     {
-      name: "Forrest McDonald",
-      title: "Software Engineer",
-      href: "https://www.linkedin.com/in/forrest-mcdonald-a80b9885/",
-    },
-    {
       name: "David Josey",
       title: "ML Annotation Team Lead, PhD",
       href: "https://www.linkedin.com/in/davidsjosey/",
@@ -784,6 +772,11 @@ const team = {
       href: "https://www.linkedin.com/in/julian-schilliger-963b21294/",
     },
     {
+      name: "Forrest McDonald",
+      title: "Software Engineer",
+      href: "https://www.linkedin.com/in/forrest-mcdonald-a80b9885/",
+    },
+    {
       name: "Adrionna Fey",
       title: "Annotation Specialist",
       href: "https://twitter.com/Meadowsnax1",
@@ -860,7 +853,7 @@ const team = {
     {
       name: "Kilian Fleischer",
       title:
-        "Research Director and Papyrologist, University of Tübingen and CNR",
+        "Research Director and Papyrologist, University of Tübingen",
       href: "https://www.klassphil.uni-wuerzburg.de/team/pd-dr-kilian-fleischer/",
     },
     {
@@ -1526,26 +1519,20 @@ const BuildingBlock = ({ title, description, showDividerMobile = true, showDivid
 export function Landing() {
   const { siteConfig } = useDocusaurusContext();
   const canonicalUrl = `${siteConfig?.url ?? ""}${siteConfig?.baseUrl ?? "/"}`;
+
+  // EMBARGO FLAG — local preview only. Keep false in any online commit/deploy;
+  // flip to true on 2026-06-25 (Naples press conference) to launch publicly.
+  const SHOW_BREAKING = true;
+
   useBrokenLinks().collectAnchor("sponsors");
   useBrokenLinks().collectAnchor("educelab-funders");
   useBrokenLinks().collectAnchor("our-story");
 
-  // JSON-LD (Organization + WebSite)
+  // siteUrl is used by the OpenGraph/Twitter tags below. Sitewide JSON-LD
+  // (Organization + WebSite) is injected via headTags in docusaurus.config.js
+  // so it is present in the server-rendered static HTML (react-helmet drops
+  // <script> children from SSR output).
   const siteUrl = (siteConfig?.url ?? "") + (siteConfig?.baseUrl ?? "/");
-  const orgJsonLd = {
-    "@context": "https://schema.org",
-    "@type": "Organization",
-    "name": "Vesuvius Challenge",
-    "url": siteUrl,
-    "logo": siteUrl + "img/social/opengraph.jpg",
-    "sameAs": ["https://twitter.com/scrollprize","https://github.com/ScrollPrize"],
-  };
-  const webSiteJsonLd = {
-    "@context": "https://schema.org",
-    "@type": "WebSite",
-    "name": "Vesuvius Challenge",
-    "url": siteUrl
-  };
 
   const heroVideo = useRef(null);
   const unrollVideo = useRef(null);
@@ -1601,10 +1588,10 @@ export function Landing() {
   return (
     <>
       <Head>
-        <title>Vesuvius Challenge</title>
+        <title>Vesuvius Challenge — Reading the Herculaneum Scrolls with AI</title>
         <meta
           name="description"
-          content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+          content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded."
         />
         <link rel="canonical" href={canonicalUrl} />
         {/* Preload the LCP poster image */}
@@ -1612,20 +1599,16 @@ export function Landing() {
         {/* OpenGraph/Twitter */}
         <meta property="og:type" content="website" />
         <meta property="og:url" content={siteUrl} />
-        <meta property="og:title" content="Vesuvius Challenge" />
-        <meta property="og:description" content="A machine learning and computer vision competition with $1,800,500 awarded in prizes" />
+        <meta property="og:title" content="Vesuvius Challenge — Reading the Herculaneum Scrolls with AI" />
+        <meta property="og:description" content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded." />
         <meta property="og:image" content={siteUrl + "img/social/opengraph.jpg"} />
         <meta property="og:image:width" content="1200" />
         <meta property="og:image:height" content="630" />
         <meta name="twitter:card" content="summary_large_image" />
-        <meta name="twitter:title" content="Vesuvius Challenge" />
-        <meta name="twitter:description" content="A machine learning and computer vision competition with $1,800,500 awarded in prizes" />
+        <meta name="twitter:title" content="Vesuvius Challenge — Reading the Herculaneum Scrolls with AI" />
+        <meta name="twitter:description" content="Vesuvius Challenge uses machine learning and computer vision to read the carbonized Herculaneum scrolls buried by Vesuvius in 79 AD. Over $1,800,500 awarded." />
         <meta name="twitter:image" content={siteUrl + "img/social/opengraph.jpg"} />
-        {/* JSON-LD */}
-        <script type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(orgJsonLd) }} />
-        <script type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(webSiteJsonLd) }} />
+        {/* Sitewide JSON-LD (Organization + WebSite) is injected via headTags in docusaurus.config.js */}
       </Head>
       <div className="absolute inset-0 z-0 md:block hidden">
         {stories({ unrollVideo }).map((s, index) => (
@@ -1689,6 +1672,61 @@ export function Landing() {
                   </span>
                 </p>
               </div>
+
+              {SHOW_BREAKING && (
+                <a
+                  href="/firstscroll"
+                  className="block no-underline hover:no-underline mb-8 group"
+                >
+                  <div
+                    className="relative overflow-hidden rounded-2xl border border-solid border-[#F5653F60] bg-[#131114cc] text-white p-5 md:p-6 hover:-translate-y-1 transition-transform ease-in-out duration-300"
+                    style={{
+                      boxShadow:
+                        "0px 2.767px 2.214px 0px rgba(0, 0, 0, 0.09), 0px 6.65px 5.32px 0px rgba(0, 0, 0, 0.13), 0px 12.522px 10.017px 0px rgba(0, 0, 0, 0.16), 0px 22.336px 17.869px 0px rgba(0, 0, 0, 0.19), 0px 41.778px 33.422px 0px rgba(0, 0, 0, 0.23), 0px 100px 80px 0px rgba(0, 0, 0, 0.32)",
+                    }}
+                  >
+                    <div className="flex flex-col md:flex-row md:items-center gap-4 md:gap-6">
+                      <div className="flex-1 min-w-0">
+                        <span
+                          className="inline-block text-xs font-black uppercase tracking-widest text-white px-2.5 py-1 rounded-full mb-3"
+                          style={{
+                            background:
+                              "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
+                          }}
+                        >
+                          Breaking
+                        </span>
+                        <div className="text-2xl md:text-4xl font-black !mb-1 leading-none tracking-tighter">
+                          We read an{" "}
+                          <span
+                            style={{
+                              background:
+                                "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
+                              WebkitBackgroundClip: "text",
+                              WebkitTextFillColor: "transparent",
+                              backgroundClip: "text",
+                              textFillColor: "transparent",
+                            }}
+                          >
+                            entire Herculaneum scroll
+                          </span>
+                        </div>
+                        <p className="opacity-70 md:text-lg !mb-0 tracking-tight">
+                          PHerc. 1667, sealed since 79&nbsp;AD, has been virtually
+                          unwrapped and read end&nbsp;to&nbsp;end. Read the announcement →
+                        </p>
+                      </div>
+                      <div className="hidden md:block w-[44%] shrink-0">
+                        <img
+                          src="/img/firstscroll/banner-strip.webp"
+                          alt="The unwrapped writing surface of PHerc. 1667, columns of ancient Greek."
+                          className="rounded-lg w-full h-[120px] object-cover"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </a>
+              )}
 
               <div className="grid items-start max-w-8xl">
                 <LatestPosts />

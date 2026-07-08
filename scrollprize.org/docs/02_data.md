@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge open data portal: synchrotron X-ray CT volumes, segments, and meshes of the carbonized Herculaneum scrolls for virtual unwrapping research."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge open data portal: synchrotron X-ray CT volumes, segments, and meshes of the carbonized Herculaneum scrolls for virtual unwrapping research."
   />
   <meta
     property="og:image"
@@ -28,13 +28,17 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Vesuvius Challenge open data portal: synchrotron X-ray CT volumes, segments, and meshes of the carbonized Herculaneum scrolls for virtual unwrapping research."
   />
   <meta
     property="twitter:image"
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
+
+import JsonLd from '@site/src/components/JsonLd';
+
+<JsonLd data={{ "@context":"https://schema.org","@type":"Dataset","name":"Herculaneum Scrolls — X-ray CT Data Portal","description":"Open data portal aggregating synchrotron micro-CT volumes, extracted surface segments, meshes, and ML predictions of the carbonized Herculaneum scrolls and fragments.","url":"https://scrollprize.org/data","creator":{"@type":"Organization","name":"Vesuvius Challenge","url":"https://scrollprize.org/"},"measurementTechnique":"X-ray computed tomography","keywords":["Herculaneum scrolls","papyri","X-ray CT","virtual unwrapping","ink detection","machine learning"],"isAccessibleForFree":true,"license":"https://dl.ash2txt.org/LICENSE.txt","distribution":{"@type":"DataDownload","encodingFormat":"image/tiff","contentUrl":"https://scrollprize.org/data"} }} />
 
 > **Work‑in‑progress 👷‍♀️**
 > We are transitioning data hosting to a new repository. During the transition, some assets may appear in one location before the other. Both repositories follow the same organization structure.
@@ -51,8 +55,8 @@ Our goal is to **virtually unwrap** the scrolls from their 3D X‑ray volumes an
 
 This portal aggregates multiple released datasets under one Vesuvius Challenge data portal.
 
-- **EduceLab-Scrolls**: the legacy dataset. Scrolls 1-4 and Fragments 1-6 belong to this dataset.
 - **Vesuvius Challenge - CT Scans of Herculaneum Papyri**: newer scans released directly by Vesuvius Challenge. Most current releases on this portal belong to this dataset.
+- **EduceLab-Scrolls**: the legacy dataset. Scrolls 1-4 and Fragments 1-6 scanned before 2025 at DLS belong to this dataset.
 
 If you are publishing or presenting results, make sure you cite the dataset that corresponds to the scans you used.
 
@@ -60,8 +64,8 @@ If you are publishing or presenting results, make sure you cite the dataset that
 
 We host the dataset in **two repositories** (with the **same folder layout**):
 
-- **Web-browsable samples:** https://data.aws.ash2txt.org/samples/
 - **Open data bucket:** `s3://vesuvius-challenge-open-data/` usable with any S3‑compatible client (e.g., AWS CLI, boto3, s3fs, etc.). It's also [browsable directly](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html).
+- **(deprecated) Web-browsable samples:** https://data.aws.ash2txt.org/samples/
 
 An overview of the dataset can be found in the [Data Browser](data_browser).
 The browser is the unified sample index for both scrolls and fragments.
@@ -113,15 +117,13 @@ You will typically browse by **sample ID** (e.g., a specific scroll or fragment)
 
 ➡️ **Browse all samples:** [Data Browser](data_browser)
 
-Looking for scroll-only or fragment-only views? Use the same browser row-by-row and apply the relevant filters.
-- [Segments](data_segments) for mapped surface exports and segment artifacts
-
 
 ## Documentation and references
 
-- [EduceLab-Scrolls (2019)](https://arxiv.org/abs/2304.02084): technical paper describing the original dataset work.
-- [EduceLab Data Sheet (2023)](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing): technical description of more recent scans added to the dataset.
-- [Scan at ESRF Draft Info Sheet (2025)](https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing)
+- For information on the updated scans (2026), read the [technical pre-print](https://arxiv.org/abs/2606.29085).
+- [Scan at ESRF Draft Info Sheet (2025)](https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing) draft regarding the 2025 scans.
+- [EduceLab Data Sheet (2023)](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing): technical description of the 2023 scans.
+- [EduceLab-Scrolls (2019)](https://arxiv.org/abs/2304.02084): technical paper describing the original dataset work from 2019.
 
 ## How to Cite
 
@@ -135,7 +137,7 @@ Use this citation for newer scans released directly by Vesuvius Challenge:
 
 ### EduceLab-Scrolls
 
-Scrolls 1-4 and Fragments 1-6 belong to the legacy EduceLab-Scrolls dataset.
+Scrolls 1-4 and Fragments 1-6 scanned at DLS before 2025 belong to the legacy EduceLab-Scrolls dataset.
 
 - In any published abstract, cite `EduceLab-Scrolls` as the source of the data.
 - In any published manuscripts using data from EduceLab-Scrolls, reference: Parsons, S., Parker, C. S., Chapman, C., Hayashida, M., & Seales, W. B. (2023). *EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT*. ArXiv [Cs.CV]. https://doi.org/10.48550/arXiv.2304.02084.
@@ -149,4 +151,4 @@ Scrolls 1-4 and Fragments 1-6 belong to the legacy EduceLab-Scrolls dataset.
 ## Licenses
 
 - [CC‑BY‑NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (unless otherwise noted for specific assets)
-- Scrolls 1-4 and Fragments 1-6 are from the EduceLab-Scrolls Dataset, copyrighted by EduceLab/The University of Kentucky. Permission to use the data linked herein according to the terms outlined above is granted to Vesuvius Challenge, with additional citation requirements listed in [How to Cite](#how-to-cite).
+- Scrolls 1-4 and Fragments 1-6 scanned at DLS before 2025 are from the EduceLab-Scrolls Dataset, copyrighted by EduceLab/The University of Kentucky. Permission to use the data linked herein according to the terms outlined above is granted to Vesuvius Challenge, with additional citation requirements listed in [How to Cite](#how-to-cite).

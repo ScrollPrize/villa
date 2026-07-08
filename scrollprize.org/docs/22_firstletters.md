@@ -23,7 +23,11 @@ hide_title: true
   <meta property="twitter:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 </head>
 
-<img src="/img/firstletters/composite_thumb.webp" />
+import JsonLd from '@site/src/components/JsonLd';
+
+<JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"First word discovered in unopened Herculaneum scroll","datePublished":"2023-10-12","dateModified":"2023-10-12","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/firstletters/purple_card-new.webp","mainEntityOfPage":"https://scrollprize.org/firstletters"}} />
+
+<img src="/img/firstletters/composite_thumb.webp" alt="Composite image of recovered text from inside a Herculaneum scroll." />
 
 <h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">First word discovered in <span style={{
   background:
@@ -49,7 +53,7 @@ hide_title: true
 
 
 <figure className="">
-  <img src="/img/firstletters/image_3840-clipped-new.webp" />
+  <img src="/img/firstletters/image_3840-clipped-new.webp" alt="Ancient Greek handwriting recovered from inside the scroll, hidden for 2000 years." />
   <figcaption className="mt-0">This handwriting has been hidden for 2000 years.</figcaption>
 </figure>
 
@@ -62,11 +66,11 @@ That is until Luke Farritor, a contestant of the <a href="/">Vesuvius Challenge<
 
 <div className="flex flex-wrap items-end max-w-[100%] mb-4">
   <figure className="w-[50%]">
-    <img src="/img/firstletters/luke-submission.webp" />
+    <img src="/img/firstletters/luke-submission.webp" alt="Luke Farritor's First Letters Prize submission showing recovered letters." />
     <figcaption className="mt-0">Luke Farritor’s First Letters Prize submission.</figcaption>
   </figure>
   <figure className="w-[50%] max-w-[250px]">
-    <img className="w-[250px]" src="/img/firstletters/luke.webp" />
+    <img className="w-[250px]" src="/img/firstletters/luke.webp" alt="Luke Farritor holding the campfire scroll at EduceLab." />
     <figcaption className="mt-0">Luke holding the <a href="tutorial1#campfire-scroll">campfire scroll</a> at EduceLab.</figcaption>
   </figure>
 </div>
@@ -75,11 +79,11 @@ Shortly after that, another contestant, Youssef Nader, *independently* discovere
 
 <div className="flex flex-wrap items-end max-w-[100%] mb-4">
   <figure className="w-[50%]">
-    <img src="/img/firstletters/youssef-submission.webp" />
+    <img src="/img/firstletters/youssef-submission.webp" alt="Youssef Nader's First Letters Prize submission, showing the same word even more clearly." />
     <figcaption className="mt-0">Youssef’s even clearer submission.</figcaption>
   </figure>
   <figure className="w-[50%] max-w-[250px]">
-    <img src="/img/firstletters/youssef-reaction.webp" />
+    <img src="/img/firstletters/youssef-reaction.webp" alt="Youssef Nader smiling happily on a video call." />
     <figcaption className="mt-0">Youssef’s happy face on a call.</figcaption>
   </figure>
 </div>
@@ -93,14 +97,14 @@ So how did we get here, and how do these models work? Let’s start with a littl
 Our story starts in 2019, when professor Brent Seales at the University of Kentucky’s EduceLab <a href="https://www.theguardian.com/science/2019/oct/03/ancient-scrolls-charred-by-vesuvius-could-be-read-once-again">imaged Herculaneum scrolls</a> in a particle accelerator, generating 3D CT-scans at resolutions as high as 4 µm.
 
 <figure>
-  <img className="w-[500px]" src="/img/landing/brent1.webp" />
+  <img className="w-[500px]" src="/img/landing/brent1.webp" alt="Professor Brent Seales and team scanning Herculaneum scrolls at the particle accelerator." />
   <figcaption className="mt-0">Professor Seales and team scanning at the particle accelerator.</figcaption>
 </figure>
 
 His team also scanned and photographed detached scroll fragments bearing visible ink, thus providing a ground truth dataset.
 
 <figure>
-  <img className="w-[500px]" src="/img/tutorials/ml-overview-alpha.webp" />
+  <img className="w-[500px]" src="/img/tutorials/ml-overview-alpha.webp" alt="Diagram of training a machine learning model on ground truth data from detached scroll fragments." />
   <figcaption className="mt-0">Training a machine learning model on the ground truth data from the detached fragments. From Stephen Parsons’ <a href="https://uknowledge.uky.edu/cs_etds/138/">PhD dissertation</a>.</figcaption>
 </figure>
 
@@ -109,7 +113,7 @@ Professor Seales’ graduate student, Stephen Parsons, worked on detecting ink f
 Early in the summer, a small team of annotators (the “segmentation team”) joined our effort. They began <a href="tutorial3">mapping the 3D structure of the scroll</a> using tools initially built by EduceLab and improved by our community. By July we had segmented and “virtually flattened” hundreds of cm2 of papyrus.
 
 <figure>
-  <img className="w-[500px]" src="/img/firstletters/segmentation-chart.webp" />
+  <img className="w-[500px]" src="/img/firstletters/segmentation-chart.webp" alt="Chart showing the growth in area of mapped scroll surface, in square centimeters, over time." />
   <figcaption className="mt-0">Progress of mapping the scrolls, in area (cm²), from the <a href="https://docs.google.com/spreadsheets/d/1zC_5vkqWgb_5z4Q9BYsETF7_3r1BYPccdAnS_GRYOaQ/edit#gid=2051117465">Segment Directory spreadsheet</a>.</figcaption>
 </figure>
 
@@ -124,10 +128,10 @@ Casey was the first person in 2,000 years to find ink — and a letter — insid
 <div className="mb-4">
   <div className="flex flex-wrap justify-between items-end max-w-[500px]">
     <figure className="w-[49%] mb-0">
-      <img src="/img/firstletters/pi1.webp" />
+      <img src="/img/firstletters/pi1.webp" alt="Ink visible as a cracked texture in the scroll surface volume." />
     </figure>
     <figure className="w-[49%] mb-0">
-      <img src="/img/firstletters/pi2.webp" />
+      <img src="/img/firstletters/pi2.webp" alt="Annotation showing the location of the ink, possibly a pi or the bottom of a capital eta." />
     </figure>
   </div>
   <figcaption className="mt-0">Left: Ink visible as cracked texture. Right: annotation showing ink location. It could be a “pi” or the bottom of a capital “eta”. From Casey’s <a href="https://caseyhandmer.wordpress.com/2023/08/05/reading-ancient-scrolls/">blog post</a>.</figcaption>
@@ -142,7 +146,7 @@ He saw Casey’s crackle pattern being discussed in the Discord, and began spend
 He found a few dozen ink strokes — and some complete letters — that could be labeled and used as training data.
 
 <figure>
-  <img className="w-[500px]" src="/img/firstletters/ink-label.webp" />
+  <img className="w-[500px]" src="/img/firstletters/ink-label.webp" alt="Left: cracked ink visible against the papyrus fiber background. Right: the resulting binary ink label." />
   <figcaption className="mt-0">Left: cracked ink visible against papyrus fiber background. Right: Resulting binary ink label.</figcaption>
 </figure>
 
@@ -151,7 +155,7 @@ Before long, the model was unveiling traces of crackle invisible to his own eye.
 Luke then made a submission to our First Letters Prize, which required contestants to find at least 10 letters in a 4 cm2 area. This was his first submission:
 
 <figure>
-  <img className="w-[500px]" src="/img/firstletters/luke-first.webp" />
+  <img className="w-[500px]" src="/img/firstletters/luke-first.webp" alt="Luke's first submission, faintly showing the Greek word ΠΟΡΦΥΡΑϹ (porphyras)." />
   <figcaption className="mt-0">Luke’s first submission, faintly showing the word ΠΟΡΦΥΡΑϹ (porphyras).</figcaption>
 </figure>
 
@@ -160,7 +164,7 @@ When professor Seales showed this image to our team of papyrologists, scholars s
 After thorough technical review, we sent a newer version of his picture to the panel of papyrologists. Independently and unanimously, they annotated 13 letters, albeit with varying levels of confidence:
 
 <figure>
-  <img className="w-[500px]" src="/img/firstletters/luke-boxes.webp" />
+  <img className="w-[500px]" src="/img/firstletters/luke-boxes.webp" alt="The recovered word with colored boxes marking each papyrologist's confidence in the 13 annotated letters." />
   <figcaption className="mt-0">Each square represents one review. <span className="text-green-500">Green</span>: over 80% confidence. <span className="text-yellow-500">Yellow</span>: 50-80% confidence. <span className="text-red-500">Red</span>: under 50% confidence.</figcaption>
 </figure>
 
@@ -175,7 +179,7 @@ If you’re trying to find these letters in the image, keep in mind that our mod
 Luke’s First Letters Prize submission is available now on <a href="https://github.com/lukeboi/scroll-first-letters">GitHub</a>.
 
 <figure>
-  <img className="max-w-[300px]" src="/img/firstletters/luke-reaction.gif" />
+  <img className="max-w-[300px]" src="/img/firstletters/luke-reaction.gif" alt="Animated reaction of Luke celebrating when told he won the prize." />
   <figcaption className="mt-0">Luke’s reaction when we told him he won the prize a few days ago.</figcaption>
 </figure>
 
@@ -184,7 +188,7 @@ Luke’s First Letters Prize submission is available now on <a href="https://git
 Meanwhile, another contestant, Youssef Nader, an Egyptian biorobotics grad student in Berlin, pursued a different approach. Motivated by Casey and Luke’s findings, he sifted through the winning entries of the <a href="https://www.kaggle.com/competitions/vesuvius-challenge-ink-detection">Ink Detection prize on Kaggle</a> — which was focused on improving Stephen Parsons’ approach of machine learning in detached fragments. He used a domain transfer technique to adapt these models to the scrolls: <a href="https://github.com/younader/VesuviusPretraining">unsupervised pretraining</a> on the scroll data, followed by fine-tuning on the fragment labels.
 
 <figure>
-  <img className="w-[100%]" src="/img/data/francoise.webp" />
+  <img className="w-[100%]" src="/img/data/francoise.webp" alt="One of the detached scroll fragments with known ground truth being scanned at the particle accelerator." />
   <figcaption className="mt-0">One of the detached fragments with known ground truth being scanned at the particle accelerator.</figcaption>
 </figure>
 
@@ -194,11 +198,11 @@ With this modified model from the Kaggle competition, he managed to find some le
 
 <div className="flex flex-wrap items-end max-w-[100%] mb-4">
   <figure className="w-[50%]">
-    <img src="/img/firstletters/youssef-first.webp" />
+    <img src="/img/firstletters/youssef-first.webp" alt="Youssef's earliest image of recovered letters from the scroll." />
     <figcaption className="mt-0">Youssef’s earliest image.</figcaption>
   </figure>
   <figure className="w-[50%]">
-    <img src="/img/firstletters/youssef-inklabels.webp" />
+    <img src="/img/firstletters/youssef-inklabels.webp" alt="Youssef's first set of hypothesized ink labels traced over the letter shapes." />
     <figcaption className="mt-0">His first set of hypothesized ink labels.</figcaption>
   </figure>
 </div>
@@ -208,7 +212,7 @@ He repeated this pseudo-labeling iteratively, resulting in speculative labels fo
 The final models trained solely on internal scroll segments resulted in the image below, securing Youssef the prize.
 
 <figure>
-  <img className="w-[500px]" src="/img/firstletters/youssef-submission2.webp" />
+  <img className="w-[500px]" src="/img/firstletters/youssef-submission2.webp" alt="Youssef's final First Letters Prize submission with clearly recovered letters." />
   <figcaption className="mt-0">Youssef’s final submission.</figcaption>
 </figure>
 
@@ -235,7 +239,7 @@ Looking back at what got us to this point, it seems that almost every single thi
 The segmentation team and contestants continue to make progress, and a few days ago Youssef’s model generated a new image of shocking clarity and size:
 
 <figure>
-  <img src="/img/firstletters/youssef-new.webp" />
+  <img src="/img/firstletters/youssef-new.webp" alt="Youssef's latest image showing four and a half columns of scroll text separated by margins." />
   <figcaption className="mt-0">Youssef’s <a target="_blank" href="/img/firstletters/youssef-new.webp">latest image</a> (<a target="_blank" href="/img/firstletters/composite_fullsize.webp">variant</a>), from segments <a href="https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/20230929220924/">20230929220924</a> and <a href="https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/paths/20231005123333/">20231005123333</a>.</figcaption>
 </figure>
 

@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Work on Vesuvius Challenge and help read the Herculaneum scrolls. No open roles right now, but we're always glad to meet exceptional people who can help."
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Work on Vesuvius Challenge and help read the Herculaneum scrolls. No open roles right now, but we're always glad to meet exceptional people who can help."
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Work on Vesuvius Challenge and help read the Herculaneum scrolls. No open roles right now, but we're always glad to meet exceptional people who can help."
   />
   <meta
     property="twitter:image"

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -30,13 +31,28 @@ enum class GeneratedControlPointContextResult {
     NewLineAnnotationRequested,
 };
 
+enum class GeneratedCurrentLineMarkerState {
+    Neutral,
+    Allowed,
+    Blocked,
+};
+
 struct GeneratedOverlay {
     struct ControlPointMarker {
         cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
         double linePosition = std::numeric_limits<double>::quiet_NaN();
+        struct BranchLink {
+            uint64_t fiberId = 0;
+            int controlPointIndex = -1;
+        };
+
+        size_t controlIndex = std::numeric_limits<size_t>::max();
         bool isSeed = false;
+        bool hasBranches = false;
+        std::vector<uint64_t> branchIds;
+        std::vector<BranchLink> branchLinks;
     };
 
     struct PredSnapMarker {
@@ -52,6 +68,7 @@ struct GeneratedOverlay {
     };
 
     std::vector<cv::Vec3f> linePoints;
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
@@ -63,9 +80,23 @@ struct GeneratedOverlay {
     std::vector<ControlPointMarker> controlPoints;
     std::vector<PredSnapMarker> predSnapPoints;
     double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
+    GeneratedCurrentLineMarkerState currentLineMarkerState =
+        GeneratedCurrentLineMarkerState::Neutral;
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
     bool currentLineMarkerAsCross = false;
+};
+
+struct GeneratedSpanAlignmentMetric {
+    int spanIndex = 0;
+    int firstControlIndex = 0;
+    int secondControlIndex = 0;
+    double firstControlLinePosition = std::numeric_limits<double>::quiet_NaN();
+    double secondControlLinePosition = std::numeric_limits<double>::quiet_NaN();
+    double maxErrorDegrees = 0.0;
+    bool available = false;
+    bool pending = false;
+    std::string error;
 };
 
 struct GeneratedViews {
@@ -75,9 +106,11 @@ struct GeneratedViews {
     QString lineSideSliceTitle;
     std::string currentCutName;
     std::shared_ptr<PlaneSurface> currentCutSurface;
-    std::vector<std::pair<std::string, std::shared_ptr<PlaneSurface>>> bottomCutSurfaces;
+    std::string sideCutName;
+    std::shared_ptr<PlaneSurface> sideCutSurface;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN()};
@@ -86,9 +119,11 @@ struct GeneratedViews {
                          std::numeric_limits<float>::quiet_NaN()};
     int seedLineIndex = -1;
     int initialCenterIndex = 0;
+    std::optional<std::pair<double, double>> initialStripLinePositionRange;
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
+    std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
 };
 
 struct GeneratedControlPointLinePositionIndex {
@@ -224,6 +259,39 @@ inline bool validGeneratedLinePosition(double position, size_t pointCount)
            pointCount > 0 &&
            position >= 0.0 &&
            position <= static_cast<double>(pointCount - 1);
+}
+
+inline GeneratedSpanAlignmentMetric makeGeneratedSpanAlignmentMetric(
+    int spanIndex,
+    int firstControlIndex,
+    int secondControlIndex,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints)
+{
+    GeneratedSpanAlignmentMetric metric;
+    metric.spanIndex = spanIndex;
+    metric.firstControlIndex = firstControlIndex;
+    metric.secondControlIndex = secondControlIndex;
+    if (firstControlIndex >= 0 &&
+        static_cast<size_t>(firstControlIndex) < controlPoints.size()) {
+        metric.firstControlLinePosition =
+            controlPoints[static_cast<size_t>(firstControlIndex)].linePosition;
+    }
+    if (secondControlIndex >= 0 &&
+        static_cast<size_t>(secondControlIndex) < controlPoints.size()) {
+        metric.secondControlLinePosition =
+            controlPoints[static_cast<size_t>(secondControlIndex)].linePosition;
+    }
+    return metric;
+}
+
+inline std::optional<double> generatedSpanAlignmentMetricCenterLinePosition(
+    const GeneratedSpanAlignmentMetric& metric)
+{
+    if (!std::isfinite(metric.firstControlLinePosition) ||
+        !std::isfinite(metric.secondControlLinePosition)) {
+        return std::nullopt;
+    }
+    return (metric.firstControlLinePosition + metric.secondControlLinePosition) * 0.5;
 }
 
 inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& linePoints,
@@ -460,6 +528,151 @@ inline std::optional<double> closestGeneratedControlPointLinePosition(
     return closest;
 }
 
+inline bool generatedControlPointPlacementWithinAnyDistance(
+    double linePosition,
+    const std::vector<double>& controlLinePositions,
+    double maxDistance,
+    double existingControlTolerance = 0.5)
+{
+    if (!std::isfinite(maxDistance) || maxDistance <= 0.0) {
+        return true;
+    }
+    if (!std::isfinite(linePosition)) {
+        return false;
+    }
+
+    bool hasFiniteControl = false;
+    double nearestDistance = std::numeric_limits<double>::infinity();
+    for (const double controlPosition : controlLinePositions) {
+        if (!std::isfinite(controlPosition)) {
+            continue;
+        }
+        hasFiniteControl = true;
+        const double distance = std::abs(controlPosition - linePosition);
+        if (distance <= existingControlTolerance) {
+            return true;
+        }
+        nearestDistance = std::min(nearestDistance, distance);
+    }
+    if (!hasFiniteControl) {
+        return controlLinePositions.empty();
+    }
+    return nearestDistance <= maxDistance + 1.0e-6;
+}
+
+inline bool generatedControlPointPlacementWithinPreviousDistance(
+    double linePosition,
+    const std::vector<double>& controlLinePositions,
+    double maxDistance,
+    double existingControlTolerance = 0.5)
+{
+    return generatedControlPointPlacementWithinAnyDistance(linePosition,
+                                                          controlLinePositions,
+                                                          maxDistance,
+                                                          existingControlTolerance);
+}
+
+inline bool generatedControlPointPlacementWithinPreviousDistance(
+    double linePosition,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double maxDistance,
+    double existingControlTolerance = 0.5)
+{
+    std::vector<double> positions;
+    positions.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        positions.push_back(control.linePosition);
+    }
+    return generatedControlPointPlacementWithinPreviousDistance(linePosition,
+                                                               positions,
+                                                               maxDistance,
+                                                               existingControlTolerance);
+}
+
+inline bool generatedControlPointPlacementWithinAnyDistance(
+    double linePosition,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double maxDistance,
+    double existingControlTolerance = 0.5)
+{
+    std::vector<double> positions;
+    positions.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        positions.push_back(control.linePosition);
+    }
+    return generatedControlPointPlacementWithinAnyDistance(linePosition,
+                                                          positions,
+                                                          maxDistance,
+                                                          existingControlTolerance);
+}
+
+inline bool generatedLinePositionWithinAnyControlDistance(
+    double linePosition,
+    const std::vector<double>& controlLinePositions,
+    double maxDistance)
+{
+    if (!std::isfinite(maxDistance) || maxDistance <= 0.0) {
+        return true;
+    }
+    if (!std::isfinite(linePosition)) {
+        return false;
+    }
+
+    constexpr double kExactControlTolerance = 1.0e-6;
+    bool hasFiniteControl = false;
+    double nearestDistance = std::numeric_limits<double>::infinity();
+    for (const double controlPosition : controlLinePositions) {
+        if (!std::isfinite(controlPosition)) {
+            continue;
+        }
+        hasFiniteControl = true;
+        const double distance = std::abs(controlPosition - linePosition);
+        if (distance <= kExactControlTolerance) {
+            return true;
+        }
+        nearestDistance = std::min(nearestDistance, distance);
+    }
+    if (!hasFiniteControl) {
+        return controlLinePositions.empty();
+    }
+    return nearestDistance <= maxDistance + 1.0e-6;
+}
+
+inline bool generatedLinePositionWithinPreviousControlDistance(
+    double linePosition,
+    const std::vector<double>& controlLinePositions,
+    double maxDistance)
+{
+    return generatedLinePositionWithinAnyControlDistance(linePosition,
+                                                        controlLinePositions,
+                                                        maxDistance);
+}
+
+inline bool generatedLinePositionWithinAnyControlDistance(
+    double linePosition,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double maxDistance)
+{
+    std::vector<double> positions;
+    positions.reserve(controlPoints.size());
+    for (const auto& control : controlPoints) {
+        positions.push_back(control.linePosition);
+    }
+    return generatedLinePositionWithinAnyControlDistance(linePosition,
+                                                        positions,
+                                                        maxDistance);
+}
+
+inline bool generatedLinePositionWithinPreviousControlDistance(
+    double linePosition,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
+    double maxDistance)
+{
+    return generatedLinePositionWithinAnyControlDistance(linePosition,
+                                                        controlPoints,
+                                                        maxDistance);
+}
+
 inline std::optional<size_t> nearestGeneratedControlPointIndex(
     const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
     const cv::Vec3f& point)
@@ -502,6 +715,7 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
 {
     GeneratedOverlay overlay;
     overlay.linePoints = views.linePoints;
+    overlay.branchLinePoints = views.branchLinePoints;
     overlay.seedPoint = views.seedPoint;
     overlay.seedLineIndex = views.controlPoints.empty() ? views.seedLineIndex : -1;
     overlay.useSurfaceCenterLine = true;
@@ -516,6 +730,7 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
 {
     GeneratedOverlay overlay;
     overlay.linePoints = views.linePoints;
+    overlay.branchLinePoints = views.branchLinePoints;
     overlay.seedPoint = views.seedPoint;
     overlay.seedLineIndex = views.controlPoints.empty() ? views.seedLineIndex : -1;
     overlay.useSurfaceCenterLine = true;
@@ -546,6 +761,7 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
     std::optional<double> controlLinePositionRadius = std::nullopt)
 {
     GeneratedOverlay overlay;
+    overlay.branchLinePoints = views.branchLinePoints;
     overlay.pointMarker = emphasized && finiteGeneratedPoint(views.focusPoint)
         ? views.focusPoint
         : interpolatedGeneratedLinePoint(views.linePoints, linePosition);
@@ -601,6 +817,8 @@ struct GeneratedControlPointContextMenuOptions {
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
+    std::function<void(size_t)> addBranch;
+    std::function<void(uint64_t, int)> openBranch;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,

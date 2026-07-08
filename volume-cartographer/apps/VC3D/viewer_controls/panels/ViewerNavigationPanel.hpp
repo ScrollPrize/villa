@@ -3,6 +3,7 @@
 #include <QWidget>
 
 class ViewerManager;
+class QDoubleSpinBox;
 
 class ViewerNavigationPanel : public QWidget
 {
@@ -18,4 +19,5 @@ private:
                                double defaultValue);
 
     ViewerManager* _viewerManager{nullptr};
+    QDoubleSpinBox* _zScrollSpin{nullptr};
 };

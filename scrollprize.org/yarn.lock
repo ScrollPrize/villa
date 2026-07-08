@@ -10003,6 +10003,7 @@ __metadata:
     remark-math: "npm:^6.0.0"
     rss-parser: "npm:^3.13.0"
     tailwindcss: "npm:^3.4.10"
+    three: "npm:0.160.0"
   languageName: unknown
   linkType: soft
 
@@ -13374,6 +13375,13 @@ __metadata:
   dependencies:
     any-promise: "npm:^1.0.0"
   checksum: 10c0/f375aeb2b05c100a456a30bc3ed07ef03a39cbdefe02e0403fb714b8c7e57eeaad1a2f5c4ecfb9ce554ce3db9c2b024eba144843cd9e344566d9fcee73b04767
+  languageName: node
+  linkType: hard
+
+"three@npm:0.160.0":
+  version: 0.160.0
+  resolution: "three@npm:0.160.0"
+  checksum: 10c0/d78e9605de6f8072e7fbebe36db7741c13f2ae89be15b4421d2fc7d549e216f53cb3e136d98e9424648f19a42345f47f8186478e038f0046655475166c156b0b
   languageName: node
   linkType: hard
 

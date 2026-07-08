@@ -2,6 +2,8 @@
 
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
+#include "OpenDataCatalogWindow.hpp"
+#include "OpenDataSampleProject.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -9,6 +11,7 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
+#include "RemoteVolumeCachePaths.hpp"
 #include "SettingsDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
@@ -36,17 +39,21 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QMetaObject>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProcess>
+#include <QProgressDialog>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStringList>
@@ -64,6 +71,7 @@
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -72,6 +80,12 @@ namespace
 constexpr int kMaxStoredRemoteUrls = 10;
 QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
+
+struct OpenDataOpenTaskResult {
+    std::shared_ptr<VolumePkg> pkg;
+    vc3d::opendata::OpenDataSampleProjectResult result;
+    QString error;
+};
 
 } // namespace
 
@@ -109,18 +123,15 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _detachEntryAct = new QAction(QObject::tr("&Detach..."), this);
     connect(_detachEntryAct, &QAction::triggered, this, &MenuActionController::detachEntry);
 
-    _setOutputSegmentsAct = new QAction(QObject::tr("Set Output Segments..."), this);
-    connect(_setOutputSegmentsAct, &QAction::triggered, this, &MenuActionController::setOutputSegments);
-
-    _convertLegacyAct = new QAction(QObject::tr("Convert Legacy Volpkg..."), this);
-    connect(_convertLegacyAct, &QAction::triggered, this, &MenuActionController::convertLegacyVolpkg);
-
     _openAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogOpenButton), QObject::tr("&Open Project..."), this);
     _openAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::OpenVolpkg));
     connect(_openAct, &QAction::triggered, this, &MenuActionController::openVolpkg);
 
     _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
     connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
+
+    _openDataCatalogAct = new QAction(QObject::tr("Open Data Catalog..."), this);
+    connect(_openDataCatalogAct, &QAction::triggered, this, &MenuActionController::showOpenDataCatalog);
 
     _settingsAct = new QAction(QObject::tr("Settings"), this);
     connect(_settingsAct, &QAction::triggered, this, &MenuActionController::showSettingsDialog);
@@ -144,7 +155,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _drawBBoxAct->setCheckable(true);
     connect(_drawBBoxAct, &QAction::toggled, this, &MenuActionController::toggleDrawBBox);
 
-    _mirrorCursorAct = new QAction(QObject::tr("Sync cursor to Surface view"), this);
+    _mirrorCursorAct = new QAction(QObject::tr("Sync cursor across views"), this);
     _mirrorCursorAct->setCheckable(true);
     if (qWindow) {
         _mirrorCursorAct->setChecked(qWindow->segmentationCursorMirroringEnabled());
@@ -157,9 +168,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _selectionClearAct = new QAction(QObject::tr("Clear"), this);
     connect(_selectionClearAct, &QAction::triggered, this, &MenuActionController::clearSelection);
 
-    _importObjAct = new QAction(QObject::tr("Import OBJ as Patch..."), this);
-    connect(_importObjAct, &QAction::triggered, this, &MenuActionController::importObjAsPatch);
-
     _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
     connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
 
@@ -171,13 +179,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
-    _recalculateFiberScoresAct = new QAction(QObject::tr("Recalc fiber H/V scores"), this);
-    connect(_recalculateFiberScoresAct, &QAction::triggered, this, [qWindow]() {
-        if (qWindow->_lineAnnotationController) {
-            qWindow->_lineAnnotationController->recalculateAllFiberHvClassifications();
-        }
-    });
-
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
@@ -188,11 +189,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_attachSegmentsAct);
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_detachEntryAct);
-    _fileMenu->addAction(_setOutputSegmentsAct);
-    _fileMenu->addSeparator();
-    _fileMenu->addAction(_convertLegacyAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachRemoteZarrAct);
+    _fileMenu->addAction(_openDataCatalogAct);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent project"), _fileMenu);
     _recentMenu->setEnabled(false);
@@ -202,8 +201,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     _fileMenu->addSeparator();
     _fileMenu->addAction(_settingsAct);
-    _fileMenu->addSeparator();
-    _fileMenu->addAction(_importObjAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_exitAct);
 
@@ -222,7 +219,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
-    _actionsMenu->addAction(_recalculateFiberScoresAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);
@@ -441,6 +437,228 @@ void MenuActionController::attachRemoteZarr()
     attachRemoteZarrUrl(url.trimmed());
 }
 
+void MenuActionController::showOpenDataCatalog()
+{
+    if (!_window) {
+        return;
+    }
+
+    if (_openDataCatalogDialog) {
+        _openDataCatalogDialog->show();
+        _openDataCatalogDialog->raise();
+        _openDataCatalogDialog->activateWindow();
+        emit openDataCatalogVisibilityChanged(true);
+        return;
+    }
+
+    auto* dialog = new vc3d::opendata::OpenDataCatalogWindow(_window);
+    _openDataCatalogDialog = dialog;
+    dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
+        return openOpenDataSample(sample);
+    });
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dialog, &QDialog::finished, this, [this]() {
+        emit openDataCatalogVisibilityChanged(false);
+    });
+    connect(dialog, &QDialog::finished, dialog, &QObject::deleteLater);
+    connect(dialog, &QObject::destroyed, this, [this]() {
+        _openDataCatalogDialog = nullptr;
+        emit openDataCatalogVisibilityChanged(false);
+    });
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+    emit openDataCatalogVisibilityChanged(true);
+}
+
+bool MenuActionController::isOpenDataCatalogVisible() const
+{
+    return _openDataCatalogDialog && _openDataCatalogDialog->isVisible();
+}
+
+bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)
+{
+    if (!_window || !_window->_state) {
+        return false;
+    }
+
+    if (_window->_state->vpkg()) {
+        QMessageBox prompt(_window);
+        prompt.setWindowTitle(QObject::tr("Open Data Sample"));
+        prompt.setText(QObject::tr("Open sample %1").arg(QString::fromStdString(sample.id)));
+        prompt.setInformativeText(
+            QObject::tr("This will replace the current project."));
+        auto* replaceButton = prompt.addButton(QObject::tr("Replace Project"), QMessageBox::AcceptRole);
+        prompt.addButton(QMessageBox::Cancel);
+        prompt.setDefaultButton(replaceButton);
+        prompt.exec();
+
+        if (prompt.clickedButton() != replaceButton) {
+            return false;
+        }
+    }
+
+    const QString cacheDir = vc3d::remoteCachePath();
+    const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    _window->CloseVolume();
+
+    QPointer<QProgressDialog> progressDialog;
+    if (sampleCopy.tifxyzSegmentCount() > 0) {
+        auto* dialog = new QProgressDialog(
+            QObject::tr("Preparing segment downloads..."),
+            QString(),
+            0,
+            static_cast<int>(sampleCopy.tifxyzSegmentCount()) * 6,
+            _window);
+        dialog->setWindowTitle(QObject::tr("Open Data Sample"));
+        dialog->setCancelButton(nullptr);
+        dialog->setWindowModality(Qt::WindowModal);
+        dialog->setMinimumDuration(0);
+        dialog->setAutoClose(false);
+        dialog->setAutoReset(false);
+        dialog->show();
+        progressDialog = dialog;
+    }
+
+    auto progressCallback =
+        [progressDialog](const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
+            if (!progressDialog) {
+                return;
+            }
+            QMetaObject::invokeMethod(
+                progressDialog.data(),
+                [progressDialog, progress]() {
+                    if (!progressDialog) {
+                        return;
+                    }
+                    const int totalDone = progress.completedSegments + progress.failedSegments;
+                    const QString segment = QString::fromStdString(progress.segmentId);
+                    const QString file = QString::fromStdString(progress.fileName);
+                    const QString status = QString::fromStdString(progress.status);
+                    const bool transforming = status.startsWith(QStringLiteral("transform-"));
+                    QString label = transforming
+                        ? QObject::tr("Transforming segments with %1 worker(s): %2/%3 transforms.")
+                              .arg(progress.totalWorkers)
+                              .arg(totalDone)
+                              .arg(progress.totalSegments)
+                        : QObject::tr("Downloading segments with %1 worker(s): %2/%3 segments, %4/%5 files.")
+                              .arg(progress.totalWorkers)
+                              .arg(totalDone)
+                              .arg(progress.totalSegments)
+                              .arg(progress.completedFiles)
+                              .arg(progress.totalFiles);
+                    if (!segment.isEmpty() && !file.isEmpty()) {
+                        label += transforming
+                            ? QObject::tr("\n%1 -> %2").arg(segment, file)
+                            : QObject::tr("\n%1: %2").arg(segment, file);
+                    } else if (!segment.isEmpty()) {
+                        label += QObject::tr("\n%1").arg(segment);
+                    }
+                    if (progress.failedSegments > 0) {
+                        label += QObject::tr("\nFailures: %1").arg(progress.failedSegments);
+                    }
+                    progressDialog->setMaximum(std::max(progress.totalFiles, 1));
+                    progressDialog->setValue(std::min(progress.completedFiles,
+                                                      std::max(progress.totalFiles, 1)));
+                    progressDialog->setLabelText(label);
+                },
+                Qt::QueuedConnection);
+        };
+
+    QFutureWatcher<OpenDataOpenTaskResult> watcher;
+    QEventLoop loop;
+    QObject::connect(&watcher,
+                     &QFutureWatcher<OpenDataOpenTaskResult>::finished,
+                     &loop,
+                     &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run(
+        [sampleCopy, cacheDir, progressCallback]() mutable {
+            OpenDataOpenTaskResult taskResult;
+            try {
+                taskResult.pkg = vc3d::opendata::createOpenDataSampleProject(
+                    sampleCopy,
+                    cacheDir.toStdString(),
+                    &taskResult.result,
+                    progressCallback);
+            } catch (const std::exception& e) {
+                taskResult.error = QString::fromUtf8(e.what());
+            } catch (...) {
+                taskResult.error = QObject::tr("Unknown error while opening open-data sample.");
+            }
+            return taskResult;
+        }));
+    if (!watcher.isFinished()) {
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+    }
+    OpenDataOpenTaskResult task = watcher.result();
+    if (progressDialog) {
+        progressDialog->close();
+        progressDialog->deleteLater();
+    }
+
+    if (!task.error.isEmpty()) {
+        QMessageBox::warning(
+            _window,
+            QObject::tr("Open Data Sample"),
+            QObject::tr("Failed to open sample %1:\n\n%2")
+                .arg(QString::fromStdString(sampleCopy.id), task.error));
+        return false;
+    }
+
+    vc3d::opendata::OpenDataSampleProjectResult result = std::move(task.result);
+
+    auto pkg = std::move(task.pkg);
+    if (!pkg) {
+        QMessageBox::warning(
+            _window,
+            QObject::tr("Open Data Sample"),
+            QObject::tr("Failed to create sample project for %1.")
+                .arg(QString::fromStdString(sampleCopy.id)));
+        return false;
+    }
+    _window->_state->setVpkg(pkg);
+    if (!pkg->path().empty()) {
+        updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));
+    }
+
+    _window->refreshCurrentVolumePackageUi(
+        QString::fromStdString(result.preferredVolumeId),
+        true);
+    _window->UpdateView();
+
+    QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
+                          .arg(QString::fromStdString(sampleCopy.id))
+                          .arg(result.attachedVolumeEntries)
+                          .arg(result.supportedVolumes);
+    if (sampleCopy.tifxyzSegmentCount() > 0) {
+        message += QObject::tr(" Cached %1 of %2 tifxyz segments; attached %3 segment source(s).")
+                       .arg(result.cachedTifxyzSegments)
+                       .arg(result.supportedTifxyzSegments)
+                       .arg(result.attachedSegmentEntries);
+    }
+    if (_window->statusBar()) {
+        _window->showStatusBarMessage(message, 7000);
+    }
+
+    if (result.supportedVolumes == 0 ||
+        result.failedVolumes > 0 ||
+        result.failedTifxyzSegments > 0) {
+        QString details;
+        for (const auto& item : result.messages) {
+            if (!details.isEmpty()) {
+                details += QLatin1Char('\n');
+            }
+            details += QString::fromStdString(item);
+        }
+        QMessageBox::information(
+            _window,
+            QObject::tr("Open Data Sample"),
+            details.isEmpty() ? message : message + QObject::tr("\n\n%1").arg(details));
+    }
+
+    return true;
+}
+
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
                                                 vc::HttpAuth* authOut,
                                                 bool allowPrompt,
@@ -602,7 +820,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
         _attachRemoteZarrAct->setEnabled(false);
     }
     if (_window->statusBar()) {
-        _window->statusBar()->showMessage(QObject::tr("Attaching remote zarr..."));
+        _window->showStatusBarMessage(QObject::tr("Attaching remote zarr..."));
     }
 
     auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
@@ -642,7 +860,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                         _window->_state->vpkg()->addVolumeEntry(url.trimmed().toStdString());
 
                         if (_window->statusBar()) {
-                            _window->statusBar()->showMessage(
+                            _window->showStatusBarMessage(
                                 QObject::tr("Attached remote zarr: %1")
                                     .arg(QString::fromStdString(volume->id())),
                                 5000);
@@ -739,8 +957,35 @@ void MenuActionController::showSettingsDialog()
         return;
     }
 
-    auto* dialog = new SettingsDialog(_window);
+    CState* state = _window->_state;
+    const auto cacheDir = state
+        ? vc3d::persistentCacheDirForVolume(state->currentVolume(), state)
+        : std::filesystem::path{};
+
+    // Chunk geometry drives the delta-zyx filter used when compacting the
+    // current volume's disk cache from the dialog.
+    CacheChunkLayout chunkLayout;
+    if (!cacheDir.empty()) {
+        if (auto volume = state->currentVolume()) {
+            if (auto* chunked = volume->chunkedCache()) {
+                chunkLayout.elemSize =
+                    chunked->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
+                for (int level = 0; level < chunked->numLevels(); ++level)
+                    chunkLayout.levelChunkShapes.push_back(chunked->chunkShape(level));
+            }
+        }
+    }
+
+    auto* dialog = new SettingsDialog(
+        state ? state->vpkg() : nullptr,
+        state ? state->currentVolume() : nullptr,
+        cacheDir,
+        std::move(chunkLayout),
+        _window);
     dialog->exec();
+    if (dialog->outputSegmentsChanged()) {
+        _window->refreshCurrentVolumePackageUi(QString(), true);
+    }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
@@ -748,21 +993,32 @@ void MenuActionController::showSettingsDialog()
     const bool resetViewOnSurfaceChange =
         settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                        vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
+    const bool showPlaneLines =
+        settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
+                       vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
     if (_window->_viewerManager) {
-        _window->_viewerManager->forEachBaseViewer([showDirHints](VolumeViewerBase* viewer) {
+        _window->_viewerManager->forEachBaseViewer([showDirHints, showPlaneLines](VolumeViewerBase* viewer) {
             if (viewer) {
                 viewer->setShowDirectionHints(showDirHints);
-                // Re-read viewer settings (sensitivities, scalebar voxel size, ...)
-                // so changes made in the dialog take effect immediately.
+                viewer->setPlaneIntersectionLinesVisible(showPlaneLines);
+                // Re-read viewer settings so changes made in the dialog take effect immediately.
                 viewer->reloadPerfSettings();
+                viewer->renderVisible(true);
             }
         });
     }
-    if (_window->ui.chkMoveOnSurfaceChanged) {
-        QSignalBlocker blocker(_window->ui.chkMoveOnSurfaceChanged);
-        _window->ui.chkMoveOnSurfaceChanged->setChecked(resetViewOnSurfaceChange);
-    }
     _window->onMoveOnSurfaceChangedToggled(resetViewOnSurfaceChange);
+
+    if (_window->_viewerManager) {
+        const int intersectionOpacity =
+            settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
+                           vc3d::settings::viewer::INTERSECTION_OPACITY_DEFAULT).toInt();
+        _window->_viewerManager->setIntersectionOpacity(
+            std::clamp(static_cast<float>(intersectionOpacity) / 100.0f, 0.0f, 1.0f));
+    }
+    _window->onAxisOverlayOpacityChanged(
+        settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
+                       vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
 
     dialog->deleteLater();
 }
@@ -845,10 +1101,7 @@ void MenuActionController::resetSegmentationViews()
         return;
     }
 
-    for (auto* sub : _window->mdiArea->subWindowList()) {
-        sub->showNormal();
-    }
-    _window->mdiArea->tileSubWindows();
+    _window->resetSegmentationViews();
 }
 
 void MenuActionController::toggleConsoleOutput()
@@ -875,7 +1128,7 @@ void MenuActionController::toggleDrawBBox(bool enabled)
         if (viewer && viewer->surfName() == "segmentation") {
             viewer->setBBoxMode(enabled);
             if (_window->statusBar()) {
-                _window->statusBar()->showMessage(enabled ? QObject::tr("BBox mode active: drag on Surface view")
+                _window->showStatusBarMessage(enabled ? QObject::tr("BBox mode active: drag on Surface view")
                                                          : QObject::tr("BBox mode off"),
                                                   3000);
             }
@@ -900,18 +1153,18 @@ void MenuActionController::surfaceFromSelection()
     VolumeViewerBase* segViewer = _window->segmentationBaseViewer();
 
     if (!segViewer) {
-        _window->statusBar()->showMessage(QObject::tr("No Surface viewer found"), 3000);
+        _window->showStatusBarMessage(QObject::tr("No Surface viewer found"), 3000);
         return;
     }
 
     auto sels = segViewer->selections();
     if (sels.empty()) {
-        _window->statusBar()->showMessage(QObject::tr("No selections to convert"), 3000);
+        _window->showStatusBarMessage(QObject::tr("No selections to convert"), 3000);
         return;
     }
 
     if (_window->_state->activeSurfaceId().empty() || !_window->_state->vpkg()->getSurface(_window->_state->activeSurfaceId())) {
-        _window->statusBar()->showMessage(QObject::tr("Select a segmentation first"), 3000);
+        _window->showStatusBarMessage(QObject::tr("Select a segmentation first"), 3000);
         return;
     }
 
@@ -935,7 +1188,7 @@ void MenuActionController::surfaceFromSelection()
             filtered->save(outDir.string(), newId);
             created++;
         } catch (const std::exception& e) {
-            _window->statusBar()->showMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);
+            _window->showStatusBarMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);
         }
     }
 
@@ -943,12 +1196,12 @@ void MenuActionController::surfaceFromSelection()
         if (_window->_surfacePanel) {
             _window->_surfacePanel->reloadSurfacesFromDisk();
         }
-        _window->statusBar()->showMessage(QObject::tr("Created %1 surface(s) from selection").arg(created), 5000);
+        _window->showStatusBarMessage(QObject::tr("Created %1 surface(s) from selection").arg(created), 5000);
     } else {
         if (_window->_surfacePanel) {
             _window->_surfacePanel->refreshFiltersOnly();
         }
-        _window->statusBar()->showMessage(QObject::tr("No surfaces created from selection"), 3000);
+        _window->showStatusBarMessage(QObject::tr("No surfaces created from selection"), 3000);
     }
 }
 
@@ -960,12 +1213,12 @@ void MenuActionController::clearSelection()
 
     VolumeViewerBase* segViewer = _window->segmentationBaseViewer();
     if (!segViewer) {
-        _window->statusBar()->showMessage(QObject::tr("No Surface viewer found"), 3000);
+        _window->showStatusBarMessage(QObject::tr("No Surface viewer found"), 3000);
         return;
     }
 
     segViewer->clearSelections();
-    _window->statusBar()->showMessage(QObject::tr("Selections cleared"), 2000);
+    _window->showStatusBarMessage(QObject::tr("Selections cleared"), 2000);
 }
 
 void MenuActionController::importObjAsPatch()
@@ -1070,7 +1323,7 @@ void MenuActionController::beginRotateSurfaceTransform()
 
     _window->_surfaceRotationOverlay->beginRotate();
     if (_window->statusBar()) {
-        _window->statusBar()->showMessage(QObject::tr("Surface rotation active"), 3000);
+        _window->showStatusBarMessage(QObject::tr("Surface rotation active"), 3000);
     }
 }
 

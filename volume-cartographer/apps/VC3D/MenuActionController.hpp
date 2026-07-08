@@ -15,6 +15,11 @@ class QMenuBar;
 class CWindow;
 class Volume;
 
+namespace vc3d::opendata {
+struct OpenDataSample;
+class OpenDataCatalogWindow;
+}
+
 class MenuActionController : public QObject
 {
     Q_OBJECT
@@ -29,6 +34,8 @@ public:
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
+    void showOpenDataCatalog();
+    bool isOpenDataCatalogVisible() const;
 
 private slots:
     void newProject();
@@ -64,6 +71,7 @@ signals:
     // wires this to SegmentationCommandHandler::onMergePatch with an
     // empty seed list so the dialog opens with empty combo boxes.
     void mergePatchFromMenuRequested();
+    void openDataCatalogVisibilityChanged(bool visible);
 
 private:
     QStringList loadRecentPaths() const;
@@ -74,6 +82,7 @@ private:
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
+    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample);
     bool tryResolveRemoteAuth(const QString& url,
                               vc::HttpAuth* authOut,
                               bool allowPrompt,
@@ -113,6 +122,7 @@ private:
     QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
+    QAction* _openDataCatalogAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
@@ -131,4 +141,5 @@ private:
     QAction* _recalculateFiberScoresAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
+    QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
 };

@@ -6,12 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "vesuvius"
 dynamic = ["version"]
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.14,<3.15"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
@@ -27,10 +25,11 @@ dependencies = [
     "requests>=2.32.5",
     "pyyaml>=6.0.2",
     "fsspec>=2025.9.0",
-    "numcodecs>=0.12.1,<0.16", # <0.16 because zarr 2.x is not compatible with numcodecs 0.16+
-    "zarr>=2,<3",
+    "numcodecs>=0.16.5,<0.17",
+    "zarr>=3.2,<4",
     "s3fs>=2025.9.0",
     "cachetools>=6.2.4",
+    "volume-cartographer",
 ]
 
 [project.optional-dependencies]
@@ -42,13 +41,13 @@ volume-only = [
     "requests>=2.32.5",
     "pyyaml>=6.0.2",
     "fsspec>=2025.9.0",
-    "numcodecs>=0.12.1,<0.16", # <0.16 because zarr 2.x is not compatible with numcodecs 0.16+
-    "zarr>=2,<3",
+    "numcodecs>=0.16.5,<0.17",
+    "zarr>=3.2,<4",
     "s3fs>=2025.9.0",
 ]
 # Machine-learning & training stack
 models = [
-    "torch>=2.6,<2.9",
+    "torch>=2.12,<3",
     "pytorch-lightning>=2.5.5",
     "pytorch-optimizer>=3.8.0",
     "monai>=1.5.1",
@@ -78,11 +77,10 @@ models = [
     "dask>=2024.8.0",
     "dask-image>=2024.5.3",
     "lxml>=6.0.2",
-    "cucim-cu13>=25.12",
+    "cucim-cu13>=26.6",
 ]
 # Rendering and geometry utilities
 render = [
-    "open3d>=0.18,<0.19",
     "trimesh>=4.8.2",
     "opencv-python-headless>=4.11.0.86",
     "opencv-contrib-python>=4.11.0.86",
@@ -120,7 +118,7 @@ tests = ["pytest>=8.4.2"]
 # Convenience alias to install everything
 all = [
     # Machine-learning & training stack
-    "torch>=2.6,<2.9",
+    "torch>=2.12,<3",
     "pytorch-lightning>=2.5.5",
     "pytorch-optimizer>=3.8.0",
     "monai>=1.5.1",
@@ -144,7 +142,6 @@ all = [
     "psutil>=7.1.0",
 
     # Rendering and geometry utilities
-    "open3d>=0.18,<0.19",
     "trimesh>=4.8.2",
     "opencv-python-headless>=4.11.0.86",
     "opencv-contrib-python>=4.11.0.86",
@@ -224,6 +221,7 @@ name = "nvidia"
 url = "https://pypi.nvidia.com"
 
 [tool.uv.sources]
+volume-cartographer = { path = "../volume-cartographer", editable = true }
 cucim-cu13 = { index = "nvidia" }
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
 nnunetv2 = { path = "../segmentation/models/arch/nnunet" }

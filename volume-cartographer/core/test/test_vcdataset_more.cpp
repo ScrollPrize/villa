@@ -5,12 +5,16 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/util/CacheCompression.hpp"
 #include "utils/zarr.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -67,6 +71,43 @@ TEST_CASE("VcDataset::decompress: too-short input throws for 'none' compressor")
         ds->decompress(std::span<const uint8_t>(tiny.data(), tiny.size()),
                        out.data(), out.size()),
         std::runtime_error);
+    fs::remove_all(d);
+}
+
+TEST_CASE("ZarrArray::read_chunk_into decodes vcz1 chunks")
+{
+    auto d = tmpDir("vcz_read_into");
+    const std::array<int, 3> shape{2, 3, 4};
+    const auto n = static_cast<size_t>(shape[0] * shape[1] * shape[2]);
+
+    std::vector<std::byte> payload(n);
+    for (size_t i = 0; i < payload.size(); ++i)
+        payload[i] = static_cast<std::byte>((i * 17 + 3) & 0xFF);
+
+    const auto encoded = vc::cacheCompress(
+        std::span<const std::byte>(payload.data(), payload.size()), shape, 1);
+
+    std::ofstream(d / ".zarray") << R"({
+        "zarr_format": 2,
+        "shape": [2, 3, 4],
+        "chunks": [2, 3, 4],
+        "dtype": "|u1",
+        "compressor": {"id": "vcz1"},
+        "fill_value": 0,
+        "order": "C",
+        "filters": null,
+        "dimension_separator": "."
+    })";
+    std::ofstream chunk(d / "0.0.0", std::ios::binary);
+    chunk.write(reinterpret_cast<const char*>(encoded.data()),
+                static_cast<std::streamsize>(encoded.size()));
+    chunk.close();
+
+    auto array = utils::ZarrArray::open(d, vc::buildZarrCodecRegistry(1));
+    std::vector<std::byte> out(payload.size(), std::byte{0xCC});
+    const std::array<size_t, 3> index{0, 0, 0};
+    CHECK(array.read_chunk_into(index, out));
+    CHECK(out == payload);
     fs::remove_all(d);
 }
 
@@ -177,5 +218,38 @@ TEST_CASE("readChunkOrFill: present chunk returns true; output mirrors written d
     std::vector<uint8_t> out(payload.size(), 0);
     CHECK(ds->readChunkOrFill(0, 0, 0, out.data()));
     CHECK(out[0] == 0x77);
+    fs::remove_all(d);
+}
+
+TEST_CASE("ZarrArray reads a v2 array stored with the vcz1 codec")
+{
+    // Mirrors what scripts/recompress_zarr.py produces: VCZ1 chunk payloads
+    // plus a .zarray whose compressor id is "vcz1".
+    auto d = tmpDir("vcdeltazstd_read");
+    const std::array<int, 3> shape{4, 4, 4};
+    std::vector<std::byte> voxels(64);
+    for (std::size_t i = 0; i < voxels.size(); ++i)
+        voxels[i] = static_cast<std::byte>((i * 7 + 3) & 0xFF);
+    const auto encoded = vc::cacheCompress(
+        std::span<const std::byte>(voxels.data(), voxels.size()), shape, 1);
+
+    {
+        std::ofstream meta(d / ".zarray");
+        meta << R"({"zarr_format":2,"shape":[4,4,4],"chunks":[4,4,4],)"
+             << R"("dtype":"|u1","order":"C","fill_value":0,"filters":null,)"
+             << R"("compressor":{"id":"vcz1"}})";
+    }
+    {
+        std::ofstream chunk(d / "0.0.0", std::ios::binary);
+        chunk.write(reinterpret_cast<const char*>(encoded.data()),
+                    static_cast<std::streamsize>(encoded.size()));
+    }
+
+    auto array = utils::ZarrArray::open(d, vc::buildZarrCodecRegistry(1));
+    const std::array<std::size_t, 3> indices{0, 0, 0};
+    auto bytes = array.read_chunk(indices);
+    REQUIRE(bytes.has_value());
+    REQUIRE(bytes->size() == voxels.size());
+    CHECK(std::memcmp(bytes->data(), voxels.data(), voxels.size()) == 0);
     fs::remove_all(d);
 }

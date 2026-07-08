@@ -5,6 +5,67 @@ const lightCodeTheme = require("prism-react-renderer").themes.github;
 const darkCodeTheme = require("prism-react-renderer").themes.dracula;
 const rehypeKatex = require("rehype-katex").default; // Extract default export for rehype-katex
 const remarkMath = require("remark-math").default; // Extract default export for remark-math
+const rehypeImageDimensions = require("./plugins/rehype-image-dimensions");
+
+// Sitewide structured data. Injected via headTags (below) so it is present in
+// the server-rendered static HTML — react-helmet (<Head>) drops <script>
+// children from SSR output, which is why prior on-page JSON-LD was invisible
+// to non-JS crawlers.
+const SITE_URL = "https://scrollprize.org/";
+const orgJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  name: "Vesuvius Challenge",
+  alternateName: "Scroll Prize",
+  url: SITE_URL,
+  logo: SITE_URL + "img/social/opengraph.jpg",
+  description:
+    "Vesuvius Challenge is a machine learning, computer vision, and geometry competition reading the carbonized Herculaneum scrolls — papyri buried by the eruption of Mount Vesuvius in 79 AD — using X-ray CT scanning and AI. Over $1,800,500 in prizes has been awarded.",
+  foundingDate: "2023",
+  founder: [
+    { "@type": "Person", name: "Nat Friedman" },
+    { "@type": "Person", name: "Daniel Gross" },
+    { "@type": "Person", name: "Brent Seales" },
+  ],
+  employee: {
+    "@type": "Person",
+    name: "Giorgio Angelotti",
+    jobTitle: "Project Lead",
+  },
+  sameAs: [
+    "https://en.wikipedia.org/wiki/Vesuvius_Challenge",
+    "https://x.com/scrollprize",
+    "https://github.com/ScrollPrize",
+    "https://scrollprize.substack.com",
+    "https://www.youtube.com/@scrollprize",
+  ],
+};
+const webSiteJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  name: "Vesuvius Challenge",
+  url: SITE_URL,
+  publisher: { "@type": "Organization", name: "Vesuvius Challenge" },
+};
+
+// The sitemap's per-page <lastmod> is derived from git history. Some build
+// environments have no git repository available — notably Vercel monorepo
+// subdir builds, which run in a copied directory with no .git — and there the
+// git lookup throws and aborts the whole build. Detect git up-front and only
+// enable lastmod when it's actually available; otherwise omit it (the prior
+// behavior) so the build always succeeds.
+function gitLastmodSupported() {
+  try {
+    require("child_process").execSync("git rev-parse --is-inside-work-tree", {
+      cwd: __dirname,
+      stdio: "ignore",
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+const SITEMAP_LASTMOD = gitLastmodSupported() ? "date" : null;
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
@@ -23,6 +84,34 @@ const config = {
       defer: true,
       "data-spa": "auto",
     },
+  ],
+  headTags: [
+    {
+      tagName: "meta",
+      attributes: { name: "theme-color", content: "#000000" },
+    },
+    {
+      tagName: "link",
+      attributes: { rel: "apple-touch-icon", href: "/apple-touch-icon.png" },
+    },
+    {
+      tagName: "link",
+      attributes: { rel: "manifest", href: "/manifest.json" },
+    },
+    {
+      tagName: "script",
+      attributes: { type: "application/ld+json" },
+      innerHTML: JSON.stringify(orgJsonLd),
+    },
+    {
+      tagName: "script",
+      attributes: { type: "application/ld+json" },
+      innerHTML: JSON.stringify(webSiteJsonLd),
+    },
+  ],
+  clientModules: [
+    require.resolve("./src/clientModules/imageZoom.js"),
+    require.resolve("./src/clientModules/gtagSafeStub.js"),
   ],
   markdown: {
     mermaid: true,
@@ -47,19 +136,23 @@ const config = {
           editUrl:
               "https://github.com/ScrollPrize/villa/tree/main/scrollprize.org",
           remarkPlugins: [remarkMath],
-          rehypePlugins: [[rehypeKatex, { strict: false }]],
+          rehypePlugins: [[rehypeKatex, { strict: false }], rehypeImageDimensions],
         },
         blog: false,
         theme: {
-          customCss: require.resolve("./src/css/custom.css"),
+          customCss: [
+            require.resolve("./src/css/custom.css"),
+            require.resolve("./src/css/imageZoom.css"),
+          ],
         },
         gtag: {
           trackingID: "G-NLQQENBL0L",
           anonymizeIP: false,
         },
         sitemap: {
-          changefreq: 'monthly',
-          priority: 0.5,
+          lastmod: SITEMAP_LASTMOD,
+          changefreq: null,
+          priority: null,
           filename: 'sitemap.xml',
           ignorePatterns: [],
         },
@@ -200,6 +293,7 @@ const config = {
       };
     },
     './plugins/fetch-substack-posts',
+    './plugins/atlas-data',
     [
       "@docusaurus/plugin-client-redirects",
       {

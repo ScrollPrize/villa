@@ -79,6 +79,31 @@ vc_add_test(NAME test_segmentation_intersection_invalidation
     LIBS Qt6::Core Qt6::Gui Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+qt6_wrap_cpp(ink_detection_overlay_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.hpp)
+qt6_wrap_cpp(viewer_overlay_base_ink_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
+qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(vccollection_ink_detection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+vc_add_test(NAME test_ink_detection_overlay
+    SOURCES test_ink_detection_overlay.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            test_viewer_manager_stub.cpp
+            ${ink_detection_overlay_moc}
+            ${viewer_overlay_base_ink_moc}
+            ${cstate_ink_detection_moc}
+            ${vccollection_ink_detection_moc}
+    LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
+    DEFS VC_TESTING)
+
+qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(viewer_manager_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
@@ -89,6 +114,7 @@ vc_add_test(NAME test_viewer_overlay_surface_primitives
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
             test_viewer_manager_stub.cpp
+            ${viewer_overlay_base_surface_primitives_moc}
             ${viewer_manager_overlay_surface_primitives_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -97,6 +123,13 @@ vc_add_test(NAME test_line_annotation_context_menu
     SOURCES test_line_annotation_context_menu.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+vc_add_test(NAME test_scale_bar_units
+    SOURCES test_scale_bar_units.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.hpp
+    LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
@@ -174,6 +207,18 @@ vc_add_test(NAME test_vccollection_signals
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${vccollection_test_moc}
     LIBS doctest::doctest vc_core Qt6::Core Qt6::Test)
+
+qt6_wrap_cpp(point_collection_widget_moc
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CPointCollectionWidget.hpp
+    ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+vc_add_test(NAME test_point_collection_widget
+    SOURCES test_point_collection_widget.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/CPointCollectionWidget.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+            ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            ${point_collection_widget_moc}
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_quadsurface_save_roundtrip)
 
@@ -332,6 +377,17 @@ vc_add_test(NAME test_load_json)
 
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 
+vc_add_test(NAME test_open_data_manifest
+    SOURCES test_open_data_manifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.hpp
+    LIBS doctest::doctest vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
 
 vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagna)
@@ -423,6 +479,8 @@ vc_add_test(NAME test_vcdataset_compressors)
 vc_add_test(NAME test_volume_static_read)
 
 vc_add_test(NAME test_volume_pyramid)
+
+vc_add_test(NAME test_cache_compression)
 
 vc_add_test(NAME test_chunk_cache_persist)
 

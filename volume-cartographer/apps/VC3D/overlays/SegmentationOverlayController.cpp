@@ -18,9 +18,12 @@
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <string>
+#include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <opencv2/imgcodecs.hpp>
@@ -55,9 +58,41 @@ constexpr qreal kManualAddIntersectionZ = 121.0;
 constexpr float kManualAddIntersectionOpacityScale = 1.2f;
 constexpr float kManualAddIntersectionWidthScale = 1.3f;
 constexpr float kManualAddIntersectionMinWidthDelta = 0.75f;
+constexpr int kSurfaceOverlapSampleStride = 1;
 
 // Full opacity for mask pixels - the slider controls overall opacity via QGraphicsPixmapItem::setOpacity
 constexpr int kApprovalMaskAlpha = 255;
+
+bool validSurfaceOverlapPoint(const cv::Vec3f& p)
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
+           p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
+}
+
+std::size_t mixHash(std::size_t seed, std::size_t value)
+{
+    return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
+}
+
+int overlapSampleCount(int fullCount)
+{
+    if (fullCount <= 0) {
+        return 0;
+    }
+    int count = (fullCount - 1) / kSurfaceOverlapSampleStride + 1;
+    if ((fullCount - 1) % kSurfaceOverlapSampleStride != 0) {
+        ++count;
+    }
+    return count;
+}
+
+int overlapSampleIndex(int sampleIndex, int sampleCount, int fullCount)
+{
+    if (sampleIndex + 1 == sampleCount) {
+        return fullCount - 1;
+    }
+    return std::min(sampleIndex * kSurfaceOverlapSampleStride, fullCount - 1);
+}
 
 class OverlayProfileScope {
 public:
@@ -301,6 +336,9 @@ void SegmentationOverlayController::detachViewer(VolumeViewerBase* viewer)
     _overlapCaches.erase(viewer);
     if (_pendingOverlap.viewer == viewer) {
         _pendingOverlap.viewer = nullptr;
+        if (_overlapCancel) {
+            _overlapCancel->store(true, std::memory_order_relaxed);
+        }
     }
     ViewerOverlayControllerBase::detachViewer(viewer);
 }
@@ -1641,48 +1679,104 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
     }
 
     const float threshold = viewer->surfaceOverlapThreshold();
+    if (threshold <= 0.0f || !_state || !_viewerManager) {
+        return;
+    }
+
+    const cv::Mat_<cv::Vec3f>* currentPts = currentQuad->rawPointsPtr();
+    if (!currentPts || currentPts->empty()) {
+        return;
+    }
+    const int rows = currentPts->rows;
+    const int cols = currentPts->cols;
+    if (rows <= 0 || cols <= 0) {
+        return;
+    }
+
+    auto* patchIndex = _viewerManager->surfacePatchIndex();
+    if (!patchIndex) {
+        return;
+    }
+
+    std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
+    std::unordered_map<QuadSurface*, cv::Vec3b> targetColors;
+    targets.reserve(overlays.size());
+    targetColors.reserve(overlays.size());
+
+    std::size_t generationHash = 0;
+    generationHash = mixHash(generationHash, std::hash<const void*>{}(currentQuad));
+    generationHash = mixHash(generationHash, std::hash<std::uint64_t>{}(patchIndex->generation(
+        SurfacePatchIndex::SurfacePtr(currentQuad, [](QuadSurface*) {}))));
+
+    for (const auto& [surfId, color] : overlays) {
+        auto surfBase = _state->surface(surfId);
+        auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(surfBase);
+        if (!overlaySurf || overlaySurf.get() == currentQuad ||
+            (!overlaySurf->id.empty() && overlaySurf->id == currentQuad->id)) {
+            continue;
+        }
+        if (!patchIndex->containsSurface(overlaySurf)) {
+            continue;
+        }
+        targets.insert(overlaySurf);
+        targetColors[overlaySurf.get()] = color;
+        generationHash = mixHash(generationHash, std::hash<const void*>{}(overlaySurf.get()));
+        generationHash = mixHash(generationHash, std::hash<std::uint64_t>{}(
+            patchIndex->generation(overlaySurf)));
+    }
+
+    const int sampleRows = overlapSampleCount(rows);
+    const int sampleCols = overlapSampleCount(cols);
+    if (sampleRows <= 0 || sampleCols <= 0) {
+        return;
+    }
 
     // Check cache validity (cheap - stays on main thread)
     auto cacheIt = _overlapCaches.find(viewer);
     bool needsRebuild = (cacheIt == _overlapCaches.end()) ||
                         (cacheIt->second.surface != currentQuad) ||
                         (cacheIt->second.overlays != overlays) ||
-                        (std::abs(cacheIt->second.threshold - threshold) > 0.01f);
+                        (std::abs(cacheIt->second.threshold - threshold) > 0.01f) ||
+                        (cacheIt->second.generationHash != generationHash) ||
+                        (cacheIt->second.sampleStride != kSurfaceOverlapSampleStride) ||
+                        (cacheIt->second.image.width() != sampleCols) ||
+                        (cacheIt->second.image.height() != sampleRows);
+
+    if (needsRebuild && targets.empty()) {
+        OverlapCache emptyCache;
+        emptyCache.surface = currentQuad;
+        emptyCache.overlays = overlays;
+        emptyCache.threshold = threshold;
+        emptyCache.generationHash = generationHash;
+        emptyCache.sampleStride = kSurfaceOverlapSampleStride;
+        _overlapCaches[viewer] = std::move(emptyCache);
+        return;
+    }
+
+    // If a compute for *different* parameters is still in flight (e.g. the
+    // previously shown surface), cancel it so the fresh one can start as soon
+    // as the watcher fires instead of waiting out the stale pass.
+    if (needsRebuild && _overlapComputeRunning && _overlapCancel) {
+        const OverlapCache& pending = _pendingOverlap.cache;
+        const bool pendingMatches = _pendingOverlap.viewer == viewer &&
+                                    pending.surface == currentQuad &&
+                                    pending.overlays == overlays &&
+                                    std::abs(pending.threshold - threshold) <= 0.01f &&
+                                    pending.generationHash == generationHash &&
+                                    pending.sampleStride == kSurfaceOverlapSampleStride;
+        if (!pendingMatches) {
+            _overlapCancel->store(true, std::memory_order_relaxed);
+        }
+    }
 
     if (needsRebuild && !_overlapComputeRunning) {
-        // Gather data on the main thread, then dispatch to background
-        const cv::Mat_<cv::Vec3f>* currentPts = currentQuad->rawPointsPtr();
-        if (!currentPts || currentPts->empty()) {
-            return;
-        }
-        if (!_state) {
-            return;
-        }
-
-        // Deep-copy current surface points for thread safety
-        cv::Mat_<cv::Vec3f> currentPtsCopy = currentPts->clone();
-
-        // Collect overlay points + colors (deep copies for thread safety)
-        struct OverlayData {
-            cv::Mat_<cv::Vec3f> points;
-            cv::Vec3b color;
-        };
-        std::vector<OverlayData> overlayDataVec;
-
-        for (const auto& [surfId, color] : overlays) {
-            if (surfId == currentQuad->id) {
-                continue;
+        cv::Mat_<cv::Vec3f> sampledPoints(sampleRows, sampleCols);
+        for (int sr = 0; sr < sampleRows; ++sr) {
+            const int r = overlapSampleIndex(sr, sampleRows, rows);
+            for (int sc = 0; sc < sampleCols; ++sc) {
+                const int c = overlapSampleIndex(sc, sampleCols, cols);
+                sampledPoints(sr, sc) = (*currentPts)(r, c);
             }
-            auto surfBase = _state->surface(surfId);
-            auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(surfBase);
-            if (!overlaySurf) {
-                continue;
-            }
-            const cv::Mat_<cv::Vec3f>* overlayPts = overlaySurf->rawPointsPtr();
-            if (!overlayPts || overlayPts->empty()) {
-                continue;
-            }
-            overlayDataVec.push_back({overlayPts->clone(), color});
         }
 
         // Store cache metadata for when the result arrives
@@ -1691,97 +1785,101 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
         _pendingOverlap.cache.surface = currentQuad;
         _pendingOverlap.cache.overlays = overlays;
         _pendingOverlap.cache.threshold = threshold;
+        _pendingOverlap.cache.generationHash = generationHash;
+        _pendingOverlap.cache.sampleStride = kSurfaceOverlapSampleStride;
 
         _overlapComputeRunning = true;
+        _overlapIndexReadInFlight = true;
+        _viewerManager->beginIndexRead();
+
+        auto cancel = std::make_shared<std::atomic_bool>(false);
+        _overlapCancel = cancel;
 
         auto future = QtConcurrent::run(
-            [currentPtsCopy = std::move(currentPtsCopy),
-             overlayDataVec = std::move(overlayDataVec),
-             threshold]() -> QImage {
+            [sampledPoints = std::move(sampledPoints),
+             targets = std::move(targets),
+             targetColors = std::move(targetColors),
+             threshold,
+             patchIndex,
+             cancel]() -> QImage {
                 try {
-                const int rows = currentPtsCopy.rows;
-                const int cols = currentPtsCopy.cols;
+                    QElapsedTimer timer;
+                    timer.start();
 
-                // Spatial hash: discretize 3D space into cells of size `threshold`
-                struct CellKey {
-                    int x, y, z;
-                    bool operator==(const CellKey& o) const {
-                        return x == o.x && y == o.y && z == o.z;
+                    QImage sampledImage(sampledPoints.cols, sampledPoints.rows,
+                                        QImage::Format_ARGB32);
+                    sampledImage.fill(Qt::transparent);
+                    uchar* const bits = sampledImage.bits();
+                    const auto bytesPerLine = sampledImage.bytesPerLine();
+
+                    // Raw-pointer include set: locateAny filters against it
+                    // without copying (targets keeps the surfaces alive).
+                    std::unordered_set<QuadSurface*> targetsRaw;
+                    targetsRaw.reserve(targets.size());
+                    for (const auto& surf : targets) {
+                        targetsRaw.insert(surf.get());
                     }
-                };
-                struct CellKeyHash {
-                    size_t operator()(const CellKey& k) const {
-                        size_t h = std::hash<int>()(k.x);
-                        h ^= std::hash<int>()(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
-                        h ^= std::hash<int>()(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
-                        return h;
-                    }
-                };
 
-                std::unordered_map<CellKey, cv::Vec3b, CellKeyHash> spatialHash;
-                const float invThreshold = 1.0f / threshold;
+                    // Explicit fan-out: VC3D pins the implicit pools (OpenCV/
+                    // OMP) to one thread, so parallelism must be spawned here.
+                    // locateAny() only takes a shared_lock, so rows can be
+                    // resolved concurrently; each row owns its scanline.
+                    const unsigned hw = std::thread::hardware_concurrency();
+                    const std::size_t workerCount = std::max<std::size_t>(
+                        1, std::min<std::size_t>(hw == 0 ? 4 : hw,
+                                                 static_cast<std::size_t>(sampledPoints.rows)));
+                    std::atomic_int nextRow{0};
+                    std::vector<std::future<void>> workers;
+                    workers.reserve(workerCount);
+                    for (std::size_t w = 0; w < workerCount; ++w) {
+                        workers.emplace_back(std::async(std::launch::async, [&]() {
+                            SurfacePatchIndex::PointQuery query;
+                            query.tolerance = threshold;
+                            query.surfaces.includeRaw = &targetsRaw;
 
-                // Build spatial hash from overlay surfaces
-                for (const auto& od : overlayDataVec) {
-                    for (int r = 0; r < od.points.rows; ++r) {
-                        for (int c = 0; c < od.points.cols; ++c) {
-                            const cv::Vec3f& pt = od.points(r, c);
-                            if (pt[0] == -1.f) continue;
-                            CellKey key{
-                                static_cast<int>(std::floor(pt[0] * invThreshold)),
-                                static_cast<int>(std::floor(pt[1] * invThreshold)),
-                                static_cast<int>(std::floor(pt[2] * invThreshold))};
-                            spatialHash.try_emplace(key, od.color);
-                        }
-                    }
-                }
-
-                if (spatialHash.empty()) {
-                    return {};  // Null QImage signals empty overlap
-                }
-
-                QImage overlapImage(cols, rows, QImage::Format_ARGB32);
-                overlapImage.fill(Qt::transparent);
-
-                // Scan current surface against spatial hash
-                for (int r = 0; r < rows; ++r) {
-                    auto* scanline =
-                        reinterpret_cast<QRgb*>(overlapImage.scanLine(r));
-                    for (int c = 0; c < cols; ++c) {
-                        const cv::Vec3f& pt = currentPtsCopy(r, c);
-                        if (pt[0] == -1.f) continue;
-
-                        const int cx = static_cast<int>(
-                            std::floor(pt[0] * invThreshold));
-                        const int cy = static_cast<int>(
-                            std::floor(pt[1] * invThreshold));
-                        const int cz = static_cast<int>(
-                            std::floor(pt[2] * invThreshold));
-
-                        cv::Vec3b hitColor{0, 0, 0};
-                        bool found = false;
-
-                        for (int dz = -1; dz <= 1 && !found; ++dz) {
-                            for (int dy = -1; dy <= 1 && !found; ++dy) {
-                                for (int dx = -1; dx <= 1 && !found; ++dx) {
-                                    auto it = spatialHash.find(
-                                        {cx + dx, cy + dy, cz + dz});
-                                    if (it != spatialHash.end()) {
-                                        hitColor = it->second;
-                                        found = true;
+                            while (true) {
+                                const int r = nextRow.fetch_add(1, std::memory_order_relaxed);
+                                if (r >= sampledPoints.rows ||
+                                    cancel->load(std::memory_order_relaxed)) {
+                                    return;
+                                }
+                                auto* scanline = reinterpret_cast<QRgb*>(bits + r * bytesPerLine);
+                                for (int c = 0; c < sampledPoints.cols; ++c) {
+                                    const cv::Vec3f& pt = sampledPoints(r, c);
+                                    if (!validSurfaceOverlapPoint(pt)) {
+                                        continue;
                                     }
+
+                                    query.worldPoint = pt;
+                                    auto hit = patchIndex->locateAny(query);
+                                    if (!hit || !hit->surface) {
+                                        continue;
+                                    }
+                                    auto colorIt = targetColors.find(hit->surface.get());
+                                    if (colorIt == targetColors.end()) {
+                                        continue;
+                                    }
+                                    const cv::Vec3b& hitColor = colorIt->second;
+                                    scanline[c] = qRgba(hitColor[2], hitColor[1], hitColor[0], 200);
                                 }
                             }
-                        }
-
-                        if (found) {
-                            scanline[c] = qRgba(
-                                hitColor[2], hitColor[1], hitColor[0], 200);
-                        }
+                        }));
                     }
-                }
+                    for (auto& worker : workers) {
+                        worker.get();
+                    }
 
-                return overlapImage;
+                    const bool canceled = cancel->load(std::memory_order_relaxed);
+                    if (ProfileLoggingEnabled()) {
+                        Logger()->info("[vc3d-profile] surfaceOverlapCompute elapsed_ms={} "
+                                       "size={}x{} targets={} workers={} canceled={}",
+                                       timer.elapsed(), sampledPoints.cols, sampledPoints.rows,
+                                       targetsRaw.size(), workerCount, canceled);
+                    }
+                    if (canceled) {
+                        return {};  // canceled: result is discarded
+                    }
+                    return sampledImage;
                 } catch (const std::exception& e) {
                     qWarning() << "Segmentation overlap worker failed:" << e.what();
                 } catch (...) {
@@ -1822,18 +1920,39 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
     }
 
     QPointF topLeft = gridToScene(0, 0);
-    builder.addImage(cache.image, topLeft, gridToSceneScale, 0.6, kSurfaceOverlapZ);
+    builder.addImage(cache.image,
+                     topLeft,
+                     gridToSceneScale * static_cast<qreal>(std::max(1, cache.sampleStride)),
+                     0.6,
+                     kSurfaceOverlapZ);
 }
 
 void SegmentationOverlayController::handleOverlapComputeFinished()
 {
     _overlapComputeRunning = false;
+    if (_overlapIndexReadInFlight) {
+        if (_viewerManager) {
+            _viewerManager->endIndexRead();
+        }
+        _overlapIndexReadInFlight = false;
+    }
+
+    const bool wasCanceled = _overlapCancel &&
+                             _overlapCancel->load(std::memory_order_relaxed);
+    _overlapCancel.reset();
 
     if (!_pendingOverlap.viewer) {
         return;  // Viewer was detached while computing
     }
 
     QImage result = _overlapWatcher->result();
+    if (result.isNull() && wasCanceled) {
+        // Stale compute was canceled mid-run: don't cache it. refreshAll()
+        // re-enters buildSurfaceOverlapOverlay, which starts the fresh compute.
+        _pendingOverlap.viewer = nullptr;
+        refreshAll();
+        return;
+    }
     _pendingOverlap.cache.image = std::move(result);
     _overlapCaches[_pendingOverlap.viewer] = std::move(_pendingOverlap.cache);
     _pendingOverlap.viewer = nullptr;

@@ -1,9 +1,14 @@
+---
+title: "Open Problem: Representation"
+hide_table_of_contents: true
+---
+
 <head>
   <html data-theme="dark" />
 
   <meta
     name="description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Representation, an open problem in Vesuvius Challenge: parameterizing and mapping a 3D Herculaneum scroll surface to a flattened 2D papyrus sheet."
   />
 
   <meta property="og:type" content="website" />
@@ -11,7 +16,7 @@
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Representation, an open problem in Vesuvius Challenge: parameterizing and mapping a 3D Herculaneum scroll surface to a flattened 2D papyrus sheet."
   />
   <meta
     property="og:image"
@@ -23,7 +28,7 @@
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A machine learning and computer vision competition with $1,800,500 awarded in prizes"
+    content="Representation, an open problem in Vesuvius Challenge: parameterizing and mapping a 3D Herculaneum scroll surface to a flattened 2D papyrus sheet."
   />
   <meta
     property="twitter:image"
