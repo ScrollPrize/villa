@@ -383,9 +383,11 @@ vc_add_test(NAME test_open_data_manifest
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.hpp
-    LIBS doctest::doctest vc_core
+    LIBS doctest::doctest Qt6::Core vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
