@@ -590,7 +590,7 @@ High effective resolution matters here too: some ink information may live at ver
 ### Publications
 
 * G. Angelotti, S. Parsons, F. Nicolardi, Y. Nader, S. Johnson, D. Josey, P. Henderson, H. Schilling, J. Rudolph, F. McDonald, E. R. Dal Prá, P. Tafforeau, A. Mirone, C. S. Parker, J. P. Posma, B. Kyles, C. Vergara, A. Lavorante, R. Villa, M. C. Robustelli, M. D'Angelo, G. Del Mastro, M. McOsker, K. Fleischer, C. Chapman, N. Friedman, and W. B. Seales, "Complete virtual unwrapping and reading of a rolled Herculaneum papyrus," arXiv:2606.29085, 2026. [https://arxiv.org/abs/2606.29085](https://arxiv.org/abs/2606.29085)
-* G. Angelotti, F. Nicolardi, P. Henderson, and W. B. Seales, "Ink Detection from Surface Topography of the Herculaneum Papyri," *Scientific Reports*, 2026. [https://www.nature.com/articles/s41598-026-58467-1](https://www.nature.com/articles/s41598-026-58467-1) (open-access preprint, no cookie wall: [arXiv:2603.27698](https://arxiv.org/abs/2603.27698))
+* G. Angelotti, F. Nicolardi, P. Henderson, and W. B. Seales, "Ink Detection from Surface Topography of the Herculaneum Papyri," *Scientific Reports*, 2026. [https://www.nature.com/articles/s41598-026-58467-1](https://www.nature.com/articles/s41598-026-58467-1) (preprint: [arXiv:2603.27698](https://arxiv.org/abs/2603.27698))
 * S. Parsons, C. S. Parker, C. Chapman, M. Hayashida, and W. B. Seales, "EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT," arXiv:2304.02084, 2023. [https://arxiv.org/abs/2304.02084](https://arxiv.org/abs/2304.02084)
 
 ### Methods cited
