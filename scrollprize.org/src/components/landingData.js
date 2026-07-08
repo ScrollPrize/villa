@@ -152,8 +152,8 @@ export const creators = [
     href: "https://dcgross.com/",
   },
   {
-    name: "Dr. Brent Seales",
-    role: "Principal Advisor",
+    name: "Brent Seales",
+    role: "Principal Advisor, PhD",
     image: "/img/landing/brent.webp",
     href: "https://educelab.engr.uky.edu/w-brent-seales",
   },
