@@ -20,3 +20,16 @@ Validation:
 Environment note:
 
 - The same command with `PYTHONNOUSERSITE=1` failed before reaching the loader because that environment resolved a zarr install where `zarr.storage.Store` is missing. The normal local command above matches the currently working checkout environment.
+
+## Complete Current-State Documentation
+
+- Replaced the active task and task plan with the docs TODO from `planning/todo.md`.
+- Expanded `docs/code_structure.md` from a short module list into current-state documentation covering module responsibilities, config keys, dataset construction, deterministic sample selection, scale semantics, Lasagna normal handling, batch shapes, prefetch, augmentation contact sheets, runner commands, tests, and local caveats.
+- Added a documentation-maintenance expectation to `planning/specs.md`: `docs/code_structure.md` describes current implementation details while `planning/specs.md` remains the normative behavior source.
+- Marked the docs TODO as complete in `planning/todo.md`.
+
+Validation:
+
+- Docs-only pass; no runtime behavior changed.
+- `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_plan.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/status.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/specs.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_log.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/todo.md`
+  - Result: passed.

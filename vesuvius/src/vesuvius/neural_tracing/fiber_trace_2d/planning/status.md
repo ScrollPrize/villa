@@ -1,12 +1,10 @@
-# Status: Vectorized Strip And Line Coordinate Generation
+# Status: Complete Current-State Documentation
 
-- [x] Read current task, task plan, specs, and local subproject instructions.
-- [x] Confirm scope is limited to vectorizing/reusing strip and line coordinate generation.
-- [x] Implement CP-local geometry reuse for augment visualization.
-- [x] Implement vectorized dense strip-coordinate generation while preserving frame semantics.
-- [x] Implement vectorized transformed centerline coordinates where exact.
-- [x] Add/update focused regression tests.
-- [x] Update specs and code structure docs.
-- [x] Run focused test command.
-- [x] Run or attempt augment-vis performance validation and record timings.
-- [x] Update task log with findings and any deviations.
+- [x] Read current TODO, task docs, specs, local instructions, and implementation files.
+- [x] Rewrite `planning/task.md` for the active docs TODO.
+- [x] Rewrite `planning/task_plan.md` for the docs-only task.
+- [x] Expand `docs/code_structure.md` with current implementation details.
+- [x] Add documentation-maintenance expectations to `planning/specs.md`.
+- [x] Update `planning/todo.md` for the completed docs TODO.
+- [x] Update `planning/task_log.md` with documentation changes.
+- [x] Run docs-only validation.

@@ -40,6 +40,11 @@ numcodecs==0.15.1
 volume-cartographer==3.0.3
 ```
 
+Do not run the fiber-trace 2D runner with `PYTHONNOUSERSITE=1` in this
+checkout. On this machine that bypasses the working user-site package set and
+can select a zarr/numcodecs combination where `zarr.storage.Store` is missing.
+Use the normal `PYTHONPATH=...` runner commands below instead.
+
 Verify the active import:
 
 ```bash

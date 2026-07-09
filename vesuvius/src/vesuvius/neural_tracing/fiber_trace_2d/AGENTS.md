@@ -60,6 +60,11 @@ plannning/local_development.md contains specifics about how to work with this sp
 
 planning/context.md contains additional context information for the current task.
 
+## changelog
+
+planning/changelog.md should contain high level changes done grouped per date
+small changes (like tweaks, parameter changes etc) do not need an entry, or iterations on a task but most tasks should probably leave at least a one line entry.
+
 # docs
 
 docs/ should contain code documentation at a level that should be sufficient for all high level understanding and planning as well as code details where appropriate (e.g. not all functions but important ones).
