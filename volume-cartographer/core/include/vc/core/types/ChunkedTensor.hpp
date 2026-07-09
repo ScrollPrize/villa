@@ -18,11 +18,7 @@
 #include <thread>
 #include <unordered_map>
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "vc/core/util/MemMap.hpp"
 #include <cerrno>
 #include <cstring>
 #include <sstream>
@@ -84,7 +80,7 @@ inline std::unique_ptr<vc::render::ChunkCache> openChunkedArrayCache(
 static std::string tmp_name_proc_thread()
 {
     std::stringstream ss;
-    ss << "tmp_" << getpid() << "_" << std::this_thread::get_id();
+    ss << "tmp_" << vc::memmap::pid() << "_" << std::this_thread::get_id();
     return ss.str();
 }
 
@@ -107,8 +103,12 @@ public:
     };
     ~Chunked3d()
     {
-        if (!_persistent)
-            remove_all(_cache_dir);
+        if (!_persistent) {
+            // Best effort: on Windows files with live mappings can't be
+            // deleted, and a throwing remove_all would terminate() here.
+            std::error_code ec;
+            std::filesystem::remove_all(_cache_dir, ec);
+        }
     };
     Chunked3d(C &compute_f, vc::VcDataset *ds, vc::render::IChunkedArray *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
     {
@@ -258,9 +258,7 @@ public:
         size_t len_bytes = len*sizeof(T);
 
         if (std::filesystem::exists(tgt_path)) {
-            int fd = open(tgt_path.string().c_str(), O_RDWR);
-            T *chunk = (T*)mmap(NULL, len_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            close(fd);
+            T *chunk = (T*)vc::memmap::mapFileRW(tgt_path, len_bytes);
 
             _mutex.lock();
             if (!_chunks.count(id)) {
@@ -269,7 +267,7 @@ public:
             else {
 #pragma omp atomic
                 chunk_compute_collisions++;
-                munmap(chunk, len_bytes);
+                vc::memmap::unmapRW(chunk, len_bytes);
                 chunk = _chunks[id];
             }
 #pragma omp atomic
@@ -285,24 +283,7 @@ public:
         ss << this << "_" << std::this_thread::get_id() << "_" << _tmp_counter++;
         tmp_path = std::filesystem::path(_cache_dir) / ss.str();
         _mutex.unlock();
-        int fd = open(tmp_path.string().c_str(), O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
-        if (fd == -1) {
-            const int err = errno;
-            std::stringstream msg;
-            msg << "Chunked3d: open failed for " << tmp_path << ": " << std::strerror(err);
-            throw std::runtime_error(msg.str());
-        }
-        int ret = ftruncate(fd, len_bytes);
-        if (ret != 0) {
-            const int err = errno;
-            close(fd);
-            std::stringstream msg;
-            msg << "Chunked3d: ftruncate failed for " << tmp_path
-                << " (" << len_bytes << " bytes): " << std::strerror(err);
-            throw std::runtime_error(msg.str());
-        }
-        T *chunk = (T*)mmap(NULL, len_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        close(fd);
+        T *chunk = (T*)vc::memmap::mapFileRW(tmp_path, len_bytes);
         
         cv::Vec3i offset =
         {static_cast<int>(id[0]*s-_border),
@@ -330,16 +311,20 @@ public:
         _mutex.lock();
         if (!_chunks.count(id)) {
             _chunks[id] = chunk;
-            int ret = rename(tmp_path.string().c_str(), tgt_path.string().c_str());
+            // std::filesystem::rename replaces an existing target atomically on
+            // POSIX and via MOVEFILE_REPLACE_EXISTING on Windows.
+            std::error_code rename_ec;
+            std::filesystem::rename(tmp_path, tgt_path, rename_ec);
 
-            if (ret)
+            if (rename_ec)
                 throw std::runtime_error("oops rename failed!");
         }
         else {
 #pragma omp atomic
             chunk_compute_collisions++;
-            munmap(chunk, len_bytes);
-            unlink(tmp_path.string().c_str());
+            vc::memmap::unmapRW(chunk, len_bytes);
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp_path, rm_ec);
             chunk = _chunks[id];
         }
 #pragma omp atomic

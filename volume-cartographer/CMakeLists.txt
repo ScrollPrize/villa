@@ -16,9 +16,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build vc_* and FetchContent deps as .so")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Exes default to -fPIE; force -fPIC to match the shared libs' PCH. -no-pie
-# only on exe links (mold/lld reject it on a .so).
-add_compile_options(-fPIC)
-add_link_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-no-pie>)
+# only on exe links (mold/lld reject it on a .so). PE/COFF has no PIC/PIE
+# distinction, so skip both on Windows.
+if(NOT WIN32)
+    add_compile_options(-fPIC)
+    add_link_options($<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-no-pie>)
+endif()
 # Find the .so via $ORIGIN without LD_LIBRARY_PATH.
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
@@ -37,7 +40,13 @@ option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
-option(VC_BUILD_FLATBOI    "Build the flatboi SLIM flattening tool"      ON)
+# flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
+# practical Windows build — default it off there.
+if(WIN32)
+    option(VC_BUILD_FLATBOI "Build the flatboi SLIM flattening tool"      OFF)
+else()
+    option(VC_BUILD_FLATBOI "Build the flatboi SLIM flattening tool"      ON)
+endif()
 option(VC_BUILD_PYTHON     "Build Python bindings"                       OFF)
 option(VC_USE_SYSTEM_LIBBACKTRACE "Prefer installed libbacktrace when available" ON)
 option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
@@ -189,6 +198,9 @@ else()
     set(_lto -flto=auto)
     if(APPLE)
         set(_link "")
+    elseif(WIN32)
+        # binutils PE linker: --gc-sections works, mold/lld are not options.
+        set(_link -Wl,--gc-sections -Wl,--as-needed)
     else()
         find_program(VC_MOLD_BINARY mold)
         if(VC_MOLD_BINARY)
@@ -200,6 +212,12 @@ else()
 endif()
 add_compile_options(${_dbg} -ffunction-sections -fdata-sections)
 add_link_options(${_link})
+
+if(WIN32)
+    # Several large TUs (Qt-heavy VC3D sources, template-dense core) exceed
+    # the default COFF 32k-section limit; -mbig-obj lifts it.
+    add_compile_options(-Wa,-mbig-obj)
+endif()
 
 # ---- Sanitizers + coverage --------------------------------------------------
 if(VC_ENABLE_ASAN AND VC_ENABLE_TSAN)
@@ -271,7 +289,9 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
 elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
     add_compile_options(-Os)
 endif()
-if(NOT _san AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
+# LTO stays off on Windows: GCC LTO across DLLs interacts badly with PE
+# auto-import/export-all, and link times on the CI runners balloon.
+if(NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     add_compile_options(${_lto})
     add_link_options(${_lto})
 endif()
@@ -469,14 +489,16 @@ else()
 endif()
 
 set(VC_LIBBACKTRACE "")
-if(VC_USE_SYSTEM_LIBBACKTRACE)
+if(VC_USE_SYSTEM_LIBBACKTRACE AND NOT WIN32)
     pkg_check_modules(LIBBACKTRACE QUIET IMPORTED_TARGET libbacktrace)
     if(TARGET PkgConfig::LIBBACKTRACE)
         set(VC_LIBBACKTRACE PkgConfig::LIBBACKTRACE)
         message(STATUS "Using system libbacktrace")
     endif()
 endif()
-if(NOT VC_LIBBACKTRACE)
+# The crash handler (sole libbacktrace consumer) is Linux-only, and the
+# vendored build is autotools — skip it entirely on Windows.
+if(NOT VC_LIBBACKTRACE AND NOT WIN32)
     include(ExternalProject)
     include(ProcessorCount)
     ProcessorCount(_nproc)
@@ -551,13 +573,27 @@ foreach(_dir IN LISTS _vc_install_dirs)
     foreach(_tgt IN LISTS _dir_targets)
         get_target_property(_tgt_type ${_tgt} TYPE)
         if(_tgt_type STREQUAL "EXECUTABLE" OR _tgt_type STREQUAL "SHARED_LIBRARY")
-            install(TARGETS ${_tgt}
-                COMPONENT vc_runtime
-                RUNTIME DESTINATION bin
-                LIBRARY DESTINATION lib)
+            if(WIN32)
+                # Register each binary in a dependency set so the packaging
+                # step (cmake/WindowsPackaging.cmake) can bundle the full DLL
+                # closure. DLLs land in bin next to the executables — Windows
+                # has no RPATH.
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME_DEPENDENCY_SET vc_runtime_deps
+                    RUNTIME DESTINATION bin
+                    LIBRARY DESTINATION lib)
+            else()
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME DESTINATION bin
+                    LIBRARY DESTINATION lib)
+            endif()
         endif()
     endforeach()
 endforeach()
+
+include(${CMAKE_SOURCE_DIR}/cmake/WindowsPackaging.cmake)
 
 if(VC_TESTING)
     enable_testing()

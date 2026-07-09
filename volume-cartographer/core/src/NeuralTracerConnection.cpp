@@ -1,10 +1,8 @@
 #include <iostream>
 #include <string>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
 #include <cstring>
 #include "utils/Json.hpp"
+#include "vc/core/util/UnixSocket.hpp"
 
 #include "vc/tracer/NeuralTracerConnection.h"
 
@@ -43,29 +41,14 @@ namespace
 
 NeuralTracerConnection::NeuralTracerConnection(std::string const & socket_path) {
 
-    sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    sock = vc::unixsocket::connectStream(socket_path);
     if (sock < 0) {
-        throw std::runtime_error("Failed to create socket");
-    }
-
-    sockaddr_un addr{AF_UNIX};
-    if (socket_path.size() >= sizeof(addr.sun_path)) {
-        throw std::runtime_error("Socket path too long");
-    }
-    strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (connect(sock, (sockaddr *)&addr, sizeof(addr)) < 0) {
-        if (sock >= 0) {
-            close(sock);
-        }
         throw std::runtime_error("Failed to connect to socket " + socket_path);
     }
 }
 
 NeuralTracerConnection::~NeuralTracerConnection() {
-    if (sock >= 0) {
-        close(sock);
-    }
+    vc::unixsocket::closeSocket(sock);
 }
 
 std::vector<NeuralTracerConnection::NextUvs> NeuralTracerConnection::get_next_points(

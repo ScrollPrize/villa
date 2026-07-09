@@ -11,8 +11,12 @@
 #include <utility>
 #include <vector>
 
+#include <cstdlib>
+
+#if !defined(_WIN32)
 #include <pwd.h>
 #include <unistd.h>
+#endif
 
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -241,9 +245,15 @@ const vc::project::Entry* firstLocalSegmentsEntry(const std::vector<vc::project:
 fs::path defaultAutosaveRoot()
 {
     if (!VolumePkg::autosaveRoot().empty()) return VolumePkg::autosaveRoot();
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+    if (home == nullptr || home[0] == '\0') return {};
+    return fs::path(home) / ".VC3D";
+#else
     const struct passwd* pw = getpwuid(geteuid());
     if (pw == nullptr || pw->pw_dir == nullptr || pw->pw_dir[0] == '\0') return {};
     return fs::path(pw->pw_dir) / ".VC3D";
+#endif
 }
 
 void atomicWriteString(const fs::path& target, const std::string& text)

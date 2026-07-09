@@ -28,12 +28,18 @@
 #include <chrono>
 #include <atomic>
 
+#include <stdio.h>
+
+#ifdef __linux__
+// renameat2(RENAME_EXCHANGE) in save() needs the GNU prototypes.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include <fcntl.h>
-#include <stdio.h>
 #include <unistd.h>
+#endif
+
+#include "vc/core/util/MemMap.hpp"
 
 // Use libtiff for BigTIFF
 #include <tiffio.h>
@@ -1343,7 +1349,7 @@ void QuadSurface::saveChannel(const std::string& name)
     // overlapping saves don't reuse a name; non-throwing rename so a lost race
     // degrades to a logged warning instead of std::terminate.
     static std::atomic<uint64_t> tmpCounter{0};
-    const std::string tmpStem = "." + name + ".tmp" + std::to_string(::getpid())
+    const std::string tmpStem = "." + name + ".tmp" + std::to_string(vc::memmap::pid())
         + "_" + std::to_string(tmpCounter.fetch_add(1, std::memory_order_relaxed));
     writeChannelFile(path, tmpStem, it->second);
     std::error_code ec;

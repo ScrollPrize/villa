@@ -38,6 +38,17 @@
 #include <unistd.h>
 #endif
 
+// POSIX setenv with an MSVCRT/UCRT fallback (Windows has no setenv).
+static void vcSetEnv(const char* name, const char* value, int overwrite)
+{
+#if defined(_WIN32)
+    if (!overwrite && std::getenv(name)) return;
+    _putenv_s(name, value);
+#else
+    ::setenv(name, value, overwrite);
+#endif
+}
+
 // Runs before main() AND before all shared-library constructors.
 // .preinit_array is processed by the dynamic linker before any .init_array,
 // so env vars are visible when OpenBLAS/OpenMP create their thread pools.
@@ -46,13 +57,13 @@ static void setThreadPoliciesEarly()
     // Force passive wait policy so OpenMP threads sleep instead of
     // spin-waiting with sched_yield.  overwrite=1 is intentional —
     // spin-waiting on 500+ OMP threads kills the machine.
-    setenv("OMP_WAIT_POLICY", "passive", 1);
-    setenv("OMP_NUM_THREADS", "1", 0);       // limit OpenMP parallelism
-    setenv("KMP_BLOCKTIME", "0", 1);         // LLVM/Intel OpenMP: sleep immediately
-    setenv("KMP_AFFINITY", "disabled", 0);   // skip sched_setaffinity per fork/join
-    setenv("OPENBLAS_NUM_THREADS", "1", 0);
-    setenv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
-    setenv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
+    vcSetEnv("OMP_WAIT_POLICY", "passive", 1);
+    vcSetEnv("OMP_NUM_THREADS", "1", 0);       // limit OpenMP parallelism
+    vcSetEnv("KMP_BLOCKTIME", "0", 1);         // LLVM/Intel OpenMP: sleep immediately
+    vcSetEnv("KMP_AFFINITY", "disabled", 0);   // skip sched_setaffinity per fork/join
+    vcSetEnv("OPENBLAS_NUM_THREADS", "1", 0);
+    vcSetEnv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
+    vcSetEnv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
 }
 #ifdef __linux__
 __attribute__((section(".preinit_array"), used))

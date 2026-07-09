@@ -137,6 +137,22 @@
       "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
 
     {
+      "name": "ci-windows-mingw",
+      "displayName": "CI Windows (MSYS2 UCRT64 gcc, Release, NSIS packaging)",
+      "description": "Native Windows build under an MSYS2 UCRT64 shell. Dependencies come from mingw-w64 pacman packages; flatboi (PaStiX) is unavailable on Windows and defaults off.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "VC_USE_PCH": "ON",
+        "VC_TESTING": "OFF"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
       "name": "macos-homebrew-llvm",
       "displayName": "macOS Homebrew LLVM",
       "description": "Native macOS build using Homebrew LLVM/Clang, lld, and Homebrew binutils. The only Apple-toolchain pieces in the loop are SDKROOT (system headers/frameworks) and libSystem, because there is no Homebrew alternative for those.",
@@ -196,7 +212,8 @@
     { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc" },
     { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" },
     { "name": "ci-dead-code-gcc",         "configurePreset": "ci-dead-code-gcc" },
-    { "name": "ci-dead-code-clang",       "configurePreset": "ci-dead-code-clang" }
+    { "name": "ci-dead-code-clang",       "configurePreset": "ci-dead-code-clang" },
+    { "name": "ci-windows-mingw",         "configurePreset": "ci-windows-mingw" }
   ],
 
   "testPresets": [
