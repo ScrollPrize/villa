@@ -64,16 +64,18 @@ This is where one of the core difficulties of the Herculaneum Papyri comes in: t
 
 So why scan with X-rays at all? Because visible and infrared light can't see inside a *rolled* scroll — they don't penetrate the papyrus. X-ray CT does: it images the interior of an intact scroll at high resolution, but, as the fragment above shows, at the cost of the visible ink contrast. Ink detection exists to win that contrast back computationally.
 
-Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, where the ink lies proud of the surface. This crackle is what first revealed [letters inside an intact scroll](/firstletters), spotted by eye in raw surface volumes; a model learns to recognize the same signal, and picks up fainter variants a human would miss.
+Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, where the ink lies proud of the surface.
 
 <figure>
   <a href="/img/tutorials/ink-signal-volumetric.webp" target="_blank"><img src="/img/tutorials/ink-signal-volumetric.webp" /></a>
   <figcaption className="mt-0">The ink signal in the data: (a) a slice through the CT volume, (b) the same region with the ink segmented in red, and (c) a flattened surface volume where the crackle texture and the letter π are visible directly. Source: <a href="https://arxiv.org/abs/2606.29085">the PHerc. 1667 paper</a>.</figcaption>
 </figure>
 
+This crackle is what first revealed [letters inside an intact scroll](/firstletters), spotted by eye in raw surface volumes; a model learns to recognize the same signal, and picks up fainter variants a human would miss. Several scrolls are still waiting for theirs, and each is worth \$50,000 in the open [First Letters Prizes](/prizes#first-letters-prizes). Finding them takes this combination of a searching eye and a model's predictions. By the end of this tutorial you'll have both — and maybe you'll be the first person to read those words in 2,000 years.
+
 ### How ink detection works
 
-An ink detection model is not reading letters — it is doing signal recovery. The model looks at a small local patch of the surface volume (the stack of slices sampled around the papyrus surface) and predicts, for each pixel, the probability that there is ink at that location. Stitching these predictions together produces an image of the segment where the writing becomes visible to a human reader.
+An ink detection model is not reading letters, it is doing signal recovery. The model looks at a small local patch of the surface volume (the stack of slices sampled around the papyrus surface) and predicts, for each pixel, the probability that there is ink at that location. Stitching these predictions together produces an image of the segment where the writing becomes visible to a human reader.
 
 We train the model by picking a pixel in a binary label image, sampling a subvolume around the same coordinates from the surface volume, and backpropagating the known label to update the model weights:
 
@@ -93,7 +95,7 @@ We can then use the model to predict what a label image would have looked like, 
 
 Where do the labels come from? The first ink labels came from detached fragments, where the exposed writing can be photographed in infrared and aligned with the surface volume. For the intact scrolls, labels are made **iteratively**: an existing model is run on a scroll segment, a human inspects the predictions, labels the regions where letter strokes are clearly visible, and the model is retrained on the enlarged dataset. Repeating this loop is how ink detection has improved from isolated letters to entire scrolls.
 
-This process recently achieved the complete virtual unwrapping and reading of PHerc. 1667 — the first Herculaneum scroll to be fully digitally unrolled and read without physical opening. The methods, including the labeling and validation methodology this tutorial is based on, are described in detail in [the paper](https://arxiv.org/abs/2606.29085).
+This process recently achieved the complete virtual unwrapping and reading of PHerc. 1667: the first Herculaneum scroll to be fully digitally unrolled and read without physical opening. The methods, including the labeling and validation methodology this tutorial is based on, are described in detail in [the paper](https://arxiv.org/abs/2606.29085).
 
 Because the labels come from model predictions, the process is designed to avoid reinforcing the model's own errors:
 
@@ -145,7 +147,7 @@ Here is what that looks like on a crop of the tutorial segment. First, the ink l
   <figcaption className="mt-0">A crop of the tutorial segment's surface volume with its ink labels overlaid in red</figcaption>
 </figure>
 
-The supervision mask covers those strokes *plus* the clean papyrus around them — the background pixels are the negative examples, and they matter just as much as the ink:
+The supervision mask covers those strokes *plus* the clean papyrus around them, the background pixels are the negative examples, and they matter just as much as the ink:
 
 <figure>
   <a href="/img/tutorials/ink-supervision-overlay-w00.webp" target="_blank"><img src="/img/tutorials/ink-supervision-overlay-w00.webp" /></a>
@@ -258,7 +260,7 @@ uv run python -m koine_machines.inference.infer \
   --batch-size 4
 ```
 
-The three positional arguments are the segment's surface volume, the checkpoint (here the last one written by the 20,000-iteration run above), and the output path. The model slides across the whole segment in overlapping windows, blends the overlapping predictions, and writes a grayscale TIFF where each pixel's brightness (0–255) is the predicted probability of ink. Expect this to take on the order of an hour on a single GPU for a full segment. Open the result in any image viewer — if all went well, you'll see letters, including outside the regions you had labels for.
+The three positional arguments are the segment's surface volume, the checkpoint (here the last one written by the 20,000-iteration run above), and the output path. The model slides across the whole segment in overlapping windows, blends the overlapping predictions, and writes a grayscale TIFF where each pixel's brightness (0–255) is the predicted probability of ink. Expect this to take on the order of an hour on a single GPU for a full segment. Open the result in any image viewer, and if all went well, you'll see letters, including outside the regions you had labels for.
 
 :::tip
 For a faster first look, pass `--mask-path region.tif` — a grayscale TIFF the size of the segment where nonzero pixels mark the region to predict — to limit inference to an area of interest.
