@@ -1,0 +1,129 @@
+name: VC3D macOS App
+
+# Builds VC3D natively on macOS (Apple Silicon) with the Homebrew LLVM
+# toolchain and produces a self-contained VC3D.app — full dylib closure and
+# Qt plugins bundled via macdeployqt, everything ad-hoc signed — wrapped in a
+# drag-and-drop DMG (+ ZIP) by CPack. On published releases both are attached
+# to the GitHub release.
+#
+# No Developer ID signing / notarization: downloads are Gatekeeper-quarantined,
+# so the first launch is right-click -> Open (or
+# `xattr -dr com.apple.quarantine VC3D.app`).
+#
+# Binaries link Homebrew bottles built for the runner's macOS release, so the
+# package effectively requires that macOS major version or newer (recorded as
+# LSMinimumSystemVersion in the app's Info.plist).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-macos.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-macos.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to upload DMG assets to releases
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-macos:
+    name: Build + package (Homebrew LLVM, arm64)
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    defaults:
+      run:
+        working-directory: volume-cartographer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refresh Homebrew index
+        run: brew update --quiet
+
+      # build_macos.sh installs the missing Homebrew formulae (LLVM/clang,
+      # lld, flang, Qt, OpenCV, Ceres, ...), sets up the toolchain env, and
+      # configures + builds via the macos-homebrew-llvm preset.
+      - name: Build
+        run: ./scripts/build_macos.sh --install-deps
+
+      - name: Package (DMG + ZIP)
+        run: |
+          cd build-macos
+          cpack -V
+          ls -la VC3D-*-macos-*.dmg VC3D-*-macos-*.zip
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-macos-app
+          path: |
+            volume-cartographer/build-macos/VC3D-*-macos-*.dmg
+            volume-cartographer/build-macos/VC3D-*-macos-*.zip
+          if-no-files-found: error
+
+      # Prove the bundle is self-contained: check no absolute Homebrew or
+      # build-tree paths survived in any Mach-O, then hide the entire Homebrew
+      # prefix and run binaries out of the DMG-installed app, so any dylib
+      # missing from the bundle fails loudly here instead of on a user's Mac.
+      - name: Smoke test packaged app
+        timeout-minutes: 15
+        working-directory: volume-cartographer/build-macos
+        run: |
+          hdiutil attach VC3D-*-macos-*.dmg -nobrowse -readonly -mountpoint /tmp/vc3d-dmg
+          cp -R /tmp/vc3d-dmg/VC3D.app smoke.app
+          hdiutil detach /tmp/vc3d-dmg
+          bin="$PWD/smoke.app/Contents/MacOS"
+
+          # Any absolute Homebrew/build-tree dependency path in the bundle
+          # would resolve on this runner but not on a user's machine. Scan
+          # every executable/dylib including framework binaries (no .dylib
+          # suffix); otool noise on non-Mach-O files is discarded.
+          leaks=$(find smoke.app -type f \( -perm +111 -o -name '*.dylib' \) \
+                    -exec otool -L {} + 2>/dev/null \
+                    | grep -E "$(brew --prefix)/|$GITHUB_WORKSPACE" || true)
+          if [[ -n "$leaks" ]]; then
+            echo "::error::absolute dependency paths leaked into the bundle:"
+            echo "$leaks"
+            exit 1
+          fi
+
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+
+          # Console CLI tool: loads the vc_core/OpenCV/Ceres dylib closure.
+          # No-args prints usage and exits 1; anything else means load failure.
+          set +e
+          "$bin/vc_tifxyz_trim"; rc=$?
+          set -e
+          if [[ $rc -ne 0 && $rc -ne 1 ]]; then
+            echo "::error::vc_tifxyz_trim failed to start (exit $rc)"
+            exit 1
+          fi
+          echo "vc_tifxyz_trim OK (exit $rc)"
+
+          # GUI app: --version under the offscreen platform exercises every Qt
+          # framework plus the platform plugin lookup.
+          QT_QPA_PLATFORM=offscreen "$bin/VC3D" --version
+          echo "VC3D --version OK"
+
+      - name: Attach DMG to release
+        if: github.event_name == 'release'
+        working-directory: volume-cartographer/build-macos
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            VC3D-*-macos-*.dmg VC3D-*-macos-*.zip --clobber

@@ -24,7 +24,16 @@ if(NOT WIN32)
 endif()
 # Find the .so via $ORIGIN without LD_LIBRARY_PATH.
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
-set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+if(APPLE)
+    # Packaged layout (cmake/MacPackaging.cmake): executables live in
+    # VC3D.app/Contents/MacOS, every dylib in ../Frameworks. Mach-O has no
+    # $ORIGIN; @loader_path is its equivalent and covers both the executables
+    # and dylib->dylib references (Frameworks/../Frameworks resolves to
+    # itself).
+    set(CMAKE_INSTALL_RPATH "@loader_path/../Frameworks")
+else()
+    set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+endif()
 set(CMAKE_BUILD_WITH_INSTALL_RPATH OFF)
 
 option(VC_MARCH_NATIVE     "Tune for the host CPU (-march=native)"        OFF)
@@ -589,6 +598,15 @@ foreach(_dir IN LISTS _vc_install_dirs)
                     RUNTIME_DEPENDENCY_SET vc_runtime_deps
                     RUNTIME DESTINATION bin
                     LIBRARY DESTINATION lib)
+            elseif(APPLE AND VC_BUILD_APPS)
+                # Everything ships inside the app bundle
+                # (cmake/MacPackaging.cmake): CLI tools next to VC3D in
+                # Contents/MacOS, vc_* dylibs in Contents/Frameworks, both
+                # wired up via the @loader_path rpath set above.
+                install(TARGETS ${_tgt}
+                    COMPONENT vc_runtime
+                    RUNTIME DESTINATION "VC3D.app/Contents/MacOS"
+                    LIBRARY DESTINATION "VC3D.app/Contents/Frameworks")
             else()
                 install(TARGETS ${_tgt}
                     COMPONENT vc_runtime
@@ -600,6 +618,7 @@ foreach(_dir IN LISTS _vc_install_dirs)
 endforeach()
 
 include(${CMAKE_SOURCE_DIR}/cmake/WindowsPackaging.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/MacPackaging.cmake)
 
 if(VC_TESTING)
     enable_testing()
