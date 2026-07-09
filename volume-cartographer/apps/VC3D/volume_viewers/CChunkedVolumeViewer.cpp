@@ -848,6 +848,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
         _chunkCbId = 0;
     }
     _chunkArray.reset();
+    _lastRenderResult.reset();
     if (!_volume)
         return;
 
@@ -1387,6 +1388,7 @@ struct CChunkedVolumeViewer::RenderContext {
     OverlayCompositeSettings overlayComposite;
     std::shared_ptr<GeneratedSurfaceCache> genCache;
     bool genCacheDirty = false;
+    std::shared_ptr<const RenderResult> prevResult;
     std::string profileReason;
     std::string profileCaller;
 };
@@ -1395,6 +1397,12 @@ struct CChunkedVolumeViewer::RenderResult {
     std::uint64_t serial = 0;
     PendingRenderJob renderJob;
     QImage framebuffer;
+    // Pre-LUT sample values and their coverage, kept so the next
+    // same-geometry render can fill chunk holes from this frame.
+    cv::Mat_<uint8_t> values;
+    cv::Mat_<uint8_t> coverage;
+    cv::Mat_<uint8_t> overlayValues;
+    cv::Mat_<uint8_t> overlayCoverage;
     float surfacePtrX = 0.0f;
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
@@ -1723,6 +1731,43 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
     }
 
+    // Carry forward the previous frame's pixels where this frame has no
+    // chunk data yet (evicted or still in flight). Chunk-ready re-renders
+    // arrive constantly while streaming, and presenting a from-scratch
+    // frame that lost a chunk flashes the region blank until the refetch
+    // lands. Sampling above always runs first, so refined data still
+    // replaces carried pixels as soon as it exists.
+    if (const RenderResult* prev = ctx.prevResult.get();
+        prev && !ctx.genCacheDirty &&
+        renderJobsSameGeometry(ctx.renderJob, prev->renderJob)) {
+        auto fillFromPrev = [](cv::Mat_<uint8_t>& dst, cv::Mat_<uint8_t>& cov,
+                               const cv::Mat_<uint8_t>& prevDst,
+                               const cv::Mat_<uint8_t>& prevCov) {
+            if (dst.empty() || prevDst.empty() ||
+                dst.size() != prevDst.size() || cov.size() != prevCov.size())
+                return;
+            for (int y = 0; y < dst.rows; ++y) {
+                uint8_t* dstRow = dst.ptr<uint8_t>(y);
+                uint8_t* covRow = cov.ptr<uint8_t>(y);
+                const uint8_t* prevDstRow = prevDst.ptr<uint8_t>(y);
+                const uint8_t* prevCovRow = prevCov.ptr<uint8_t>(y);
+                for (int x = 0; x < dst.cols; ++x) {
+                    if (!covRow[x] && prevCovRow[x]) {
+                        dstRow[x] = prevDstRow[x];
+                        covRow[x] = 1;
+                    }
+                }
+            }
+        };
+        fillFromPrev(values, coverage, prev->values, prev->coverage);
+        fillFromPrev(overlayValues, overlayCoverage,
+                     prev->overlayValues, prev->overlayCoverage);
+    }
+    result.values = values;
+    result.coverage = coverage;
+    result.overlayValues = overlayValues;
+    result.overlayCoverage = overlayCoverage;
+
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
     vc::buildWindowLevelColormapLut(lut, ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
@@ -1810,6 +1855,14 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
 bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob& a,
                                                           const PendingRenderJob& b)
 {
+    return renderJobsSameGeometry(a, b) &&
+           a.chunkContentEpoch == b.chunkContentEpoch &&
+           a.genCacheDirty == b.genCacheDirty;
+}
+
+bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
+                                                  const PendingRenderJob& b)
+{
     auto vecEqual = [](const cv::Vec3f& lhs, const cv::Vec3f& rhs) {
         return lhs[0] == rhs[0] && lhs[1] == rhs[1] && lhs[2] == rhs[2];
     };
@@ -1837,9 +1890,7 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
            a.overlayWindowLow == b.overlayWindowLow &&
            a.overlayWindowHigh == b.overlayWindowHigh &&
            a.overlayComposite == b.overlayComposite &&
-           a.chunkContentEpoch == b.chunkContentEpoch &&
-           a.surfaceGeometryEpoch == b.surfaceGeometryEpoch &&
-           a.genCacheDirty == b.genCacheDirty;
+           a.surfaceGeometryEpoch == b.surfaceGeometryEpoch;
 }
 
 void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
@@ -1913,6 +1964,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.overlayComposite = job.overlayComposite;
     ctx.genCache = job.genCache;
     ctx.genCacheDirty = job.genCacheDirty;
+    ctx.prevResult = _lastRenderResult;
     ctx.profileReason = job.profileReason;
     ctx.profileCaller = job.profileCaller;
     _genCacheDirty = false;
@@ -2056,6 +2108,7 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
 
     _framebuffer = std::move(result->framebuffer);
     _displayedRenderJob = result->renderJob;
+    _lastRenderResult = result;
     syncCameraTransform();
     scheduleIntersectionRender("stable render finished");
     emit overlaysUpdated();
@@ -2461,6 +2514,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
         return;
     if (modifiers & Qt::ShiftModifier) {
         if (_shiftScrollOverride && _shiftScrollOverride(steps, scenePoint, modifiers)) {
+            refreshCursorPositionAt(scenePoint);
             return;
         }
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
@@ -2487,6 +2541,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
             _genCacheDirty = true;
             submitRender("z offset mouse wheel");
         }
+        refreshCursorPositionAt(scenePoint);
     } else if (modifiers & Qt::ControlModifier) {
         emit sendSegmentationRadiusWheel(steps, scenePoint, sceneToVolume(scenePoint));
     } else {
@@ -3291,6 +3346,17 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
             p += n * _zOff;
     }
     return p;
+}
+
+void CChunkedVolumeViewer::refreshCursorPositionAt(const QPointF& scenePos)
+{
+    _lastScenePos = scenePos;
+    _lastCursorVolumePos = cursorVolumePosition(scenePos);
+    updateCursorCrosshair(scenePos);
+    updateStatusLabel();
+    if (_viewerManager) {
+        _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
+    }
 }
 
 std::optional<std::pair<uint64_t, uint64_t>> CChunkedVolumeViewer::pointAtScenePosition(const QPointF& scenePos)
