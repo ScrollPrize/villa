@@ -416,6 +416,19 @@ h1, h2, h3, h4, h5, h6 {
   padding: 0;
   margin: 0;
 }
+/* Desktop TOC announces itself: small ember header above the rail. */
+@media (min-width: 997px) {
+  .theme-doc-toc-desktop::before {
+    content: "On this page";
+    display: block;
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--vc-accent);
+    padding: 0 12px 8px;
+  }
+}
 .table-of-contents,
 .table-of-contents ul {
   list-style: none;
@@ -434,7 +447,7 @@ h1, h2, h3, h4, h5, h6 {
   display: block;
   padding: 4px 12px;
   border-left: 1px solid var(--vc-line);
-  color: var(--vc-text-faint);
+  color: var(--vc-text-dim);
   line-height: 1.45;
 }
 .table-of-contents ul .table-of-contents__link {

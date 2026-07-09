@@ -794,6 +794,12 @@ export function Landing() {
           aria-label="Latest updates"
         >
           <div className="container mx-auto">
+            <a
+              className="vc-updates__head"
+              href="https://scrollprize.substack.com"
+            >
+              News — from our Substack
+            </a>
             <LatestPosts />
           </div>
         </section>

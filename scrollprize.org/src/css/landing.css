@@ -44,7 +44,22 @@
   padding-top: var(--vc-section-pad);
 }
 .vc-landing .vc-section--tight {
-  padding-top: 32px;
+  padding-top: 14px;
+}
+/* News strip header: tiny ember kicker so the strip reads as news links. */
+.vc-landing a.vc-updates__head {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--vc-accent);
+  text-decoration: none;
+  margin: 0 0 7px;
+}
+.vc-landing a.vc-updates__head:hover {
+  color: var(--vc-accent);
+  text-decoration: underline;
 }
 .vc-landing .vc-section--last {
   padding-bottom: var(--vc-section-pad);
@@ -990,7 +1005,7 @@
     padding-top: 64px;
   }
   .vc-landing .vc-section--tight {
-    padding-top: 24px;
+    padding-top: 8px;
   }
   .vc-landing .vc-section--last {
     padding-bottom: 64px;

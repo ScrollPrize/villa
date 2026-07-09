@@ -189,6 +189,15 @@ const config = {
                 { label: "Discord", href: "https://discord.gg/V4fJhvtaQn" },
                 { label: "𝕏", href: "https://x.com/scrollprize" },
                 { label: "Substack", href: "https://scrollprize.substack.com" },
+                { label: "GitHub", href: "https://github.com/ScrollPrize" },
+                {
+                  label: "Hugging Face",
+                  href: "https://huggingface.co/scrollprize",
+                },
+                {
+                  label: "Weights & Biases",
+                  href: "https://wandb.ai/scrollprize",
+                },
                 {
                   label: "Donate",
                   href: "https://donate.stripe.com/aEUg101vt9eN8gM144",
@@ -222,6 +231,14 @@ const config = {
                 {
                   label: "GitHub",
                   href: "https://github.com/ScrollPrize",
+                },
+                {
+                  label: "Hugging Face",
+                  href: "https://huggingface.co/scrollprize",
+                },
+                {
+                  label: "Weights & Biases",
+                  href: "https://wandb.ai/scrollprize",
                 },
                 {
                   label: "Substack",
