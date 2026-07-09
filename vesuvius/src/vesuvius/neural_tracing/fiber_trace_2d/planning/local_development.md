@@ -1,0 +1,91 @@
+# Local Development Notes For This Checkout
+
+These notes are for coding agents and local runs in this checkout:
+
+`/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3`
+
+They document machine-specific workflow details that are not general project
+specs.
+
+## Python/VC3D Import Layout
+
+Normal training/debug commands import the editable installed `vc` package from:
+
+`/home/hendrik/.local/lib/python3.14/site-packages/vc`
+
+Even if `PYTHONPATH` contains:
+
+`$SRC/volume-cartographer/build/python-bindings/python`
+
+the editable scikit-build import hook can still route `import vc.volume` to the
+installed editable package. Therefore, after changing VC3D Python bindings,
+update the installed editable package, not only the CMake build tree.
+
+## Updating The Installed VC Package
+
+From repo root:
+
+```bash
+python -m pip install -e volume-cartographer --no-deps --break-system-packages
+```
+
+Use `--no-deps`. Without it, pip may upgrade `numcodecs` to a version
+incompatible with the local `zarr 2.18.7` install.
+
+Known compatible local versions after the update:
+
+```text
+zarr==2.18.7
+numcodecs==0.15.1
+volume-cartographer==3.0.3
+```
+
+Verify the active import:
+
+```bash
+python -c "import vc.volume, zarr, numcodecs; print(vc.volume.__file__); print(zarr.__version__); print(numcodecs.__version__); help(vc.volume.Volume.sample_coords)"
+```
+
+For the current blocking coordinate sampler, the help output must include:
+
+```text
+sample_coords(..., tile_size: int = 32, blocking: bool = True) -> tuple
+```
+
+## Optional Build-Tree Rebuild
+
+For checking the C++ binding build before reinstalling:
+
+```bash
+cmake --build volume-cartographer/build/python-bindings --target vc_volume -j 8
+```
+
+This updates:
+
+`volume-cartographer/build/python-bindings/python/vc/volume.cpython-314-x86_64-linux-gnu.so`
+
+However, normal Python may still import the editable installed module from
+`~/.local`. Use the editable reinstall above before relying on normal runner
+commands.
+
+## Fiber Trace 2D Runner Command
+
+Use this command to inspect the augment contact sheet for the current example
+config:
+
+```bash
+PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.runner $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --export-dir ./ --sample-index 1 --augment-vis
+```
+
+The runner prints startup timings, per-augmentation timings, volume sampler
+stats, and raw image stats. For the blocking sampler fix, the first
+`unaugmented` row must have nonzero valid pixels and should match `noise_min`
+and `blur_min`.
+
+## Focused Test Command
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
+```
+
+These tests use local/fake arrays and should not require network access.
