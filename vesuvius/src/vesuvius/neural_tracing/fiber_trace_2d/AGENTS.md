@@ -56,7 +56,11 @@ it should also contain relevant chunks of task_plan items at some sensible granu
 
 plannning/local_development.md contains specifics about how to work with this specific checkout and system
 
+## context
+
+planning/context.md contains additional context information for the current task.
+
 # docs
 
-docs should contain code documentation at a level that should be sufficient for all high level understanding and planning as well as code details where appropriate (e.g. not all functions but important ones).
+docs/ should contain code documentation at a level that should be sufficient for all high level understanding and planning as well as code details where appropriate (e.g. not all functions but important ones).
 It should document the coarse code structure and where to find what functionality and how things are implemented but high level details can be found in the code itself.
