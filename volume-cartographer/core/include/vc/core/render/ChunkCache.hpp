@@ -49,6 +49,13 @@ public:
         // CacheCompression.hpp). Combined (max) with the process-wide
         // default below at construction.
         int cacheQuantBinWidth = 1;
+        // Entries read within this window are skipped by capacity eviction
+        // (until the hard ceiling of twice the capacity): they belong to a
+        // view that is still being rendered, so dropping them frees little
+        // memory (render workers pin the bytes for the frame anyway) and
+        // guarantees a refetch plus a visible blank on the next re-render.
+        // Zero restores strict-capacity LRU.
+        std::chrono::milliseconds evictionProtectionWindow{3000};
     };
 
     struct Stats {
@@ -89,6 +96,7 @@ public:
     Stats stats() const;
     void invalidate();
     void beginViewRequest();
+    void waitForPersistentWrites() const;
 
     // Process-wide default for Options::compressPersistentCache, OR-ed into
     // every cache built afterwards. Lets an application apply a user setting
@@ -116,10 +124,12 @@ private:
         std::string error;
         std::size_t decodedBytes = 0;
         bool persisted = false;
+        bool persistentWriteQueued = false;
         bool inLru = false;
         int basePriority = 0;
         std::int64_t priority = 0;
         std::uint64_t fetchSerial = 0;
+        std::chrono::steady_clock::time_point lastTouch{};
         std::list<ChunkKey>::iterator lruIt;
     };
 
@@ -156,9 +166,11 @@ private:
         std::deque<std::pair<std::chrono::steady_clock::time_point, std::size_t>> remoteDownloadHistory_;
         std::atomic<std::int64_t> persistentCacheBytes_{0};
         std::atomic_bool persistentCacheScanInFlight_{false};
+        std::atomic_size_t persistentWritesInFlight_{0};
     };
 
     static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);
+    static int fetchBasePriority(const State& state, const ChunkKey& key, int priorityOffset);
     static void queueFetchLocked(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  std::uint64_t generation,
@@ -167,6 +179,11 @@ private:
                               ChunkKey key,
                               std::uint64_t generation,
                               std::uint64_t fetchSerial);
+    static void probePersistentAndStore(const std::shared_ptr<State>& state,
+                                        ChunkKey key,
+                                        std::uint64_t generation,
+                                        std::uint64_t fetchSerial,
+                                        std::int64_t priority);
     static void storeFetchResultLocked(const std::shared_ptr<State>& state,
                                        const ChunkKey& key,
                                        ChunkFetchResult fetch,
@@ -178,8 +195,8 @@ private:
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
     static bool queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
                                           const ChunkKey& key);
-    static void writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
-    static void writePersistentEmpty(State& state, const ChunkKey& key);
+    static bool writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
+    static bool writePersistentEmpty(State& state, const ChunkKey& key);
     static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentCompressedPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
