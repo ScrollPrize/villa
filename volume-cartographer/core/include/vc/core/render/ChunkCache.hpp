@@ -124,6 +124,7 @@ private:
         std::string error;
         std::size_t decodedBytes = 0;
         bool persisted = false;
+        bool persistentWriteQueued = false;
         bool inLru = false;
         int basePriority = 0;
         std::int64_t priority = 0;

@@ -607,6 +607,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
     entry.error.clear();
     entry.decodedBytes = 0;
     entry.persisted = false;
+    entry.persistentWriteQueued = false;
 
     switch (fetch.status) {
     case ChunkFetchStatus::Found: {
@@ -621,7 +622,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
             // the bytes are actually on disk (same for the cases below).
             entry.persisted = loadedFromPersistentCache;
             if (!loadedFromPersistentCache)
-                (void)queuePersistentEmptyWrite(state, key);
+                entry.persistentWriteQueued = queuePersistentEmptyWrite(state, key);
             break;
         }
         entry.status = EntryStatus::Data;
@@ -635,14 +636,15 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
         }
         entry.persisted = loadedFromPersistentCache;
         if (!loadedFromPersistentCache)
-            (void)queuePersistentWrite(state, key, std::move(persistentBytes));
+            entry.persistentWriteQueued =
+                queuePersistentWrite(state, key, std::move(persistentBytes));
         break;
     }
     case ChunkFetchStatus::Missing:
         entry.status = EntryStatus::Missing;
         entry.persisted = loadedFromPersistentCache;
         if (!loadedFromPersistentCache)
-            (void)queuePersistentEmptyWrite(state, key);
+            entry.persistentWriteQueued = queuePersistentEmptyWrite(state, key);
         break;
     case ChunkFetchStatus::HttpError:
     case ChunkFetchStatus::IoError:
@@ -743,8 +745,15 @@ bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
             if (written) {
                 auto it = state->entries_.find(key);
                 if (it != state->entries_.end() &&
-                    it->second.status == EntryStatus::Data)
+                    it->second.status == EntryStatus::Data) {
+                    it->second.persistentWriteQueued = false;
                     it->second.persisted = true;
+                }
+            } else {
+                auto it = state->entries_.find(key);
+                if (it != state->entries_.end() &&
+                    it->second.status == EntryStatus::Data)
+                    it->second.persistentWriteQueued = false;
             }
             state->persistentWritesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
         }
@@ -772,8 +781,16 @@ bool ChunkCache::queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
                 auto it = state->entries_.find(key);
                 if (it != state->entries_.end() &&
                     (it->second.status == EntryStatus::Missing ||
-                     it->second.status == EntryStatus::AllFill))
+                     it->second.status == EntryStatus::AllFill)) {
+                    it->second.persistentWriteQueued = false;
                     it->second.persisted = true;
+                }
+            } else {
+                auto it = state->entries_.find(key);
+                if (it != state->entries_.end() &&
+                    (it->second.status == EntryStatus::Missing ||
+                     it->second.status == EntryStatus::AllFill))
+                    it->second.persistentWriteQueued = false;
             }
             state->persistentWritesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
         }
@@ -1077,8 +1094,8 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
         state->lru_.erase(victimIt);
         entry.inLru = false;
         if (entry.status == EntryStatus::Data) {
-            if (entry.bytes && !entry.persisted)
-                (void)queuePersistentWrite(state, victim, entry.bytes);
+            if (entry.bytes && !entry.persisted && !entry.persistentWriteQueued)
+                entry.persistentWriteQueued = queuePersistentWrite(state, victim, entry.bytes);
             state->decodedBytes_ -= entry.decodedBytes;
         }
         state->entries_.erase(entryIt);

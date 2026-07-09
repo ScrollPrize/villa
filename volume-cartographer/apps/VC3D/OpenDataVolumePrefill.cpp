@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <fstream>
@@ -51,6 +52,16 @@ nlohmann::json markerJsonForInfo(const OpenDataVolumePrefillMarkerInfo& info)
         {"chunk_grid_shape", info.chunkGridShape},
         {"chunk_count", info.totalChunks},
     };
+}
+
+std::filesystem::path uniqueMarkerTempPath(const std::filesystem::path& path)
+{
+    static std::atomic_uint64_t sequence{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    return std::filesystem::path(
+        path.string() + ".tmp." + std::to_string(stamp) + "." +
+        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
 }
 
 bool markerMatchesJson(const nlohmann::json& marker,
@@ -152,7 +163,7 @@ bool writeOpenDataVolumePrefillMarker(const std::filesystem::path& cacheDir,
             std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 
         const auto path = openDataVolumePrefillMarkerPath(cacheDir, info.level);
-        const auto tmp = path.string() + ".tmp";
+        const auto tmp = uniqueMarkerTempPath(path);
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
             if (!out) {
@@ -163,6 +174,8 @@ bool writeOpenDataVolumePrefillMarker(const std::filesystem::path& cacheDir,
             }
             out << marker.dump(2) << '\n';
             if (!out) {
+                out.close();
+                std::filesystem::remove(tmp, ec);
                 if (errorOut) {
                     *errorOut = "could not write marker temp file";
                 }

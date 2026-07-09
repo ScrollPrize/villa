@@ -7,6 +7,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "vc/core/util/RemoteAuth.hpp"
 #include "OpenDataVolumePrefill.hpp"
@@ -149,5 +150,6 @@ private:
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
     std::vector<QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>*> _openDataPrefillWatchers;
+    std::vector<std::shared_ptr<std::atomic<bool>>> _openDataPrefillCancelFlags;
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
 };

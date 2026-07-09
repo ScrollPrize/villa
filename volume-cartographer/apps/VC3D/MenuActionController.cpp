@@ -690,6 +690,7 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
     _openDataPrefillCancelFlag = cancelFlag;
     auto* watcher = new QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>(this);
     _openDataPrefillWatchers.push_back(watcher);
+    _openDataPrefillCancelFlags.push_back(cancelFlag);
 
     const QString volumeId = QString::fromStdString(volume->id());
     if (_window) {
@@ -703,7 +704,7 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
     connect(watcher,
             &QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>::finished,
             this,
-            [this, watcher, volumeId]() {
+            [this, watcher, cancelFlag, volumeId]() {
                 vc3d::opendata::OpenDataVolumePrefillResult result;
                 try {
                     result = watcher->result();
@@ -722,6 +723,14 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
                                 _openDataPrefillWatchers.end(),
                                 watcher),
                     _openDataPrefillWatchers.end());
+                _openDataPrefillCancelFlags.erase(
+                    std::remove(_openDataPrefillCancelFlags.begin(),
+                                _openDataPrefillCancelFlags.end(),
+                                cancelFlag),
+                    _openDataPrefillCancelFlags.end());
+                if (_openDataPrefillCancelFlag == cancelFlag) {
+                    _openDataPrefillCancelFlag.reset();
+                }
                 watcher->deleteLater();
 
                 if (!_window) {
@@ -788,6 +797,11 @@ void MenuActionController::cancelOpenDataVolumePrefills()
 {
     if (_openDataPrefillCancelFlag) {
         _openDataPrefillCancelFlag->store(true, std::memory_order_release);
+    }
+    for (const auto& cancelFlag : _openDataPrefillCancelFlags) {
+        if (cancelFlag) {
+            cancelFlag->store(true, std::memory_order_release);
+        }
     }
     for (auto* watcher : _openDataPrefillWatchers) {
         if (watcher) {
