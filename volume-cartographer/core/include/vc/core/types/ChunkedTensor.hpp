@@ -647,7 +647,7 @@ private:
 
 struct Chunked3dFloatFromUint8
 {
-    Chunked3dFloatFromUint8(std::unique_ptr<vc::VcDataset> &&ds, float scale, std::string const &cache_root, std::string const &unique_id) :
+    Chunked3dFloatFromUint8(std::unique_ptr<vc::VcDataset> &&ds, float scale, std::filesystem::path const &cache_root, std::string const &unique_id) :
         _passthrough{unique_id},
         _ownedCache(openChunkedArrayCache(ds->path(), 128ULL << 20)),
         _x(_passthrough, ds.get(), _ownedCache.get(), 0, cache_root),
@@ -679,7 +679,7 @@ struct Chunked3dFloatFromUint8
 
 struct Chunked3dVec3fFromUint8
 {
-    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<vc::VcDataset>> &&dss, float scale, std::string const &cache_root, std::string const &unique_id) :
+    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<vc::VcDataset>> &&dss, float scale, std::filesystem::path const &cache_root, std::string const &unique_id) :
         _passthrough_x{unique_id + "_x"},
         _passthrough_y{unique_id + "_y"},
         _passthrough_z{unique_id + "_z"},

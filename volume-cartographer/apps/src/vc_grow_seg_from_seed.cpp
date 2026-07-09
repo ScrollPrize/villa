@@ -1404,7 +1404,7 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
-    QuadSurface *surf = tracer(*volume, 1.0, 0, origin, params, cache_root, voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    QuadSurface *surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
 
     double area_cm2 = surf->meta["area_cm2"].get_double();
     if (area_cm2 < min_area_cm) {
@@ -1444,7 +1444,7 @@ int main(int argc, char *argv[])
 
         // Check for additional surfaces in target directory
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
-            if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename()))
+            if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename().string()))
             {
                 std::string name = entry.path().filename().string();
                 if (name.compare(0, name_prefix.size(), name_prefix))
