@@ -225,7 +225,7 @@
 /* Reveal card — the unwrap payoff (PHerc. 1667 unrolling into Greek). */
 .vc-landing a.vc-hero__reveal {
   display: block;
-  width: min(100%, 340px);
+  width: min(100%, 300px);
   flex: 0 1 auto;
   color: var(--vc-text);
   text-decoration: none;
@@ -252,11 +252,6 @@
   padding: 12px 16px;
   border-top: 1px solid var(--vc-line);
   background: var(--vc-surface);
-}
-.vc-landing .vc-hero__reveal-caption .vc-kicker {
-  display: inline;
-  margin: 0;
-  flex: 0 0 auto;
 }
 .vc-landing .vc-hero__reveal-title {
   font-size: 0.875rem;

@@ -745,9 +745,8 @@ export function Landing() {
                     />
                   </video>
                   <span className="vc-hero__reveal-caption">
-                    <span className="vc-kicker">Breaking</span>
                     <span className="vc-hero__reveal-title">
-                      We read an entire Herculaneum scroll&nbsp;→
+                      We read an entire scroll&nbsp;→
                     </span>
                   </span>
                 </a>
