@@ -49,8 +49,6 @@ import JsonLd from '@site/src/components/JsonLd';
 
 A vast library of papyrus scrolls in ancient Herculaneum was buried beneath volcanic mud and ash during the 79 AD eruption of Mount Vesuvius. The scrolls were carbonized into a fragile but remarkably preserved state. The Vesuvius Challenge uses synchrotron micro‑CT imaging to study both **intact scrolls** and **detached fragments**.
 
-Our goal is to **virtually unwrap** the scrolls from their 3D X‑ray volumes and recover ink that is invisible to the naked eye. Detached fragments include exposed ink and serve as **ground truth** for improving machine‑learning approaches to ink detection.
-
 ## Multiple datasets
 
 This portal aggregates multiple released datasets under one Vesuvius Challenge data portal.
