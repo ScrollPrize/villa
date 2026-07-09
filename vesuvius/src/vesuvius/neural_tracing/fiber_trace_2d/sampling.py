@@ -45,11 +45,13 @@ class Vc3dCoordinateSampler(CoordinateSampler):
         level: int,
         cache_root: str | None,
         sampling: str = "trilinear",
+        blocking: bool = True,
     ) -> None:
         from vc.volume import Volume
 
         self.level = int(level)
         self.sampling = str(sampling)
+        self.blocking = bool(blocking)
         path = str(volume_path)
         if path.startswith("s3://"):
             # VC3D remote volume loading is HTTP-backed. The public Vesuvius S3
@@ -74,6 +76,7 @@ class Vc3dCoordinateSampler(CoordinateSampler):
             self.level,
             self.sampling,
             32,
+            self.blocking,
         )
         image_arr = np.asarray(image, dtype=np.float32)
         valid_arr = np.asarray(sampled_valid, dtype=np.uint8)

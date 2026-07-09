@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -91,6 +92,90 @@ def _batch_control_points(batch) -> list[tuple[int, np.ndarray]]:
     return points
 
 
+class _Timer:
+    def __init__(self) -> None:
+        self.start = 0.0
+        self.elapsed_ms = 0.0
+
+    def __enter__(self) -> "_Timer":
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.elapsed_ms = (time.perf_counter() - self.start) * 1000.0
+        return None
+
+
+def _add_timing(total: dict[str, float], key: str, value_ms: float) -> None:
+    total[key] = total.get(key, 0.0) + float(value_ms)
+
+
+def _print_timing_table(rows: list[tuple[str, dict[str, float]]], totals: dict[str, float]) -> None:
+    keys = [
+        "total",
+        "loader_total",
+        "descriptor",
+        "line_window",
+        "lasagna_normals",
+        "strip_coords",
+        "coord_augmentation",
+        "volume_sample",
+        "value_augmentation",
+        "line_coords",
+        "to_u8",
+        "overlay",
+    ]
+    header = "name".ljust(16) + "".join(key[:12].rjust(13) for key in keys)
+    print("fiber_trace_2d augment-vis timings in ms")
+    print(header)
+    for name, timing in rows:
+        print(name.ljust(16) + "".join(f"{timing.get(key, 0.0):13.1f}" for key in keys))
+    print("total".ljust(16) + "".join(f"{totals.get(key, 0.0):13.1f}" for key in keys))
+    volume_stats = {
+        key.removeprefix("volume_stat_"): value
+        for key, value in totals.items()
+        if key.startswith("volume_stat_")
+    }
+    if volume_stats:
+        print(
+            "fiber_trace_2d volume sampler stats: "
+            + " ".join(f"{key}={value:.0f}" for key, value in sorted(volume_stats.items()))
+        )
+
+
+def _image_stats(image: np.ndarray, valid_mask: np.ndarray, image_u8: np.ndarray) -> dict[str, float]:
+    arr = np.asarray(image, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(arr)
+    out: dict[str, float] = {
+        "valid": float(np.count_nonzero(valid)),
+        "u8_nonzero": float(np.count_nonzero(np.asarray(image_u8))),
+    }
+    if bool(valid.any()):
+        values = arr[valid]
+        out["min"] = float(values.min())
+        out["max"] = float(values.max())
+        out["mean"] = float(values.mean())
+    else:
+        out["min"] = 0.0
+        out["max"] = 0.0
+        out["mean"] = 0.0
+    return out
+
+
+def _print_image_stats(rows: list[tuple[str, dict[str, float]]]) -> None:
+    print("fiber_trace_2d augment-vis image stats")
+    print("name".ljust(16) + f"{'valid':>10}{'min':>12}{'max':>12}{'mean':>12}{'u8_nz':>10}")
+    for name, stats in rows:
+        print(
+            name.ljust(16)
+            + f"{stats.get('valid', 0.0):10.0f}"
+            + f"{stats.get('min', 0.0):12.3f}"
+            + f"{stats.get('max', 0.0):12.3f}"
+            + f"{stats.get('mean', 0.0):12.3f}"
+            + f"{stats.get('u8_nonzero', 0.0):10.0f}"
+        )
+
+
 def _export_batch(batch, output_dir: str | Path) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -153,21 +238,38 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
     contact_images: list[np.ndarray] = []
     contact_labels: list[str] = []
     first_sample = None
+    timing_rows: list[tuple[str, dict[str, float]]] = []
+    timing_totals: dict[str, float] = {}
+    image_stat_rows: list[tuple[str, dict[str, float]]] = []
     summary_lines = [
         f"sample_index={sample_index}",
         f"device={device}",
         "layout=row 1: lower limits; row 2: upper limits; row 3: random combined training-style augmentations",
     ]
     for name, params in entries:
-        sample, aug_image, aug_valid, line_xy = loader.build_augmented_center_strip_patch(
-            sample_index,
-            params,
-            device=device,
-        )
+        timing: dict[str, float] = {}
+        with _Timer() as total_timer:
+            with _Timer() as loader_timer:
+                sample, aug_image, aug_valid, line_xy = loader.build_augmented_center_strip_patch(
+                    sample_index,
+                    params,
+                    device=device,
+                    profile=timing,
+                )
+            timing["loader_total"] = loader_timer.elapsed_ms
+            with _Timer() as to_u8_timer:
+                image_u8 = _to_u8_image(aug_image, aug_valid)
+            timing["to_u8"] = to_u8_timer.elapsed_ms
+            image_stat_rows.append((name, _image_stats(aug_image, aug_valid, image_u8)))
+            with _Timer() as overlay_timer:
+                overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.5, thickness=1)
+            timing["overlay"] = overlay_timer.elapsed_ms
+        timing["total"] = total_timer.elapsed_ms
+        timing_rows.append((name, timing))
+        for key, value in timing.items():
+            _add_timing(timing_totals, key, value)
         if first_sample is None:
             first_sample = sample
-        image_u8 = _to_u8_image(aug_image, aug_valid)
-        overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.5, thickness=1)
         contact_images.append(overlay)
         contact_labels.append(name)
         summary_lines.append(f"{name}: {params}")
@@ -176,13 +278,24 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
         summary_lines.insert(3, f"control_point_index={first_sample.control_point_index}")
         summary_lines.insert(4, f"strip_z_offset={first_sample.strip_z_offset}")
 
-    _write_contact_sheet(
-        out / "augment_contact_sheet.jpg",
-        contact_images,
-        columns=len(lower_entries),
-        labels=contact_labels,
+    with _Timer() as write_timer:
+        _write_contact_sheet(
+            out / "augment_contact_sheet.jpg",
+            contact_images,
+            columns=len(lower_entries),
+            labels=contact_labels,
+        )
+    timing_totals["write_contact_sheet"] = write_timer.elapsed_ms
+    with _Timer() as summary_timer:
+        (out / "augment_summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    timing_totals["write_summary"] = summary_timer.elapsed_ms
+    _print_timing_table(timing_rows, timing_totals)
+    _print_image_stats(image_stat_rows)
+    print(
+        "fiber_trace_2d output timings: "
+        f"write_contact_sheet={timing_totals['write_contact_sheet']:.1f}ms "
+        f"write_summary={timing_totals['write_summary']:.1f}ms"
     )
-    (out / "augment_summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
     print(f"exported augment_contact_sheet.jpg and augment_summary.txt to {out}")
 
 
@@ -198,8 +311,15 @@ def main() -> None:
     parser.add_argument("--augment-vis", action="store_true")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    loader = FiberStrip2DLoader(config)
+    with _Timer() as config_timer:
+        config = load_config(args.config)
+    with _Timer() as loader_timer:
+        loader = FiberStrip2DLoader(config)
+    print(
+        "fiber_trace_2d startup timings: "
+        f"load_config={config_timer.elapsed_ms:.1f}ms "
+        f"construct_loader={loader_timer.elapsed_ms:.1f}ms"
+    )
     batch_size = config.batch_size if args.batch_size is None else args.batch_size
 
     if args.prefetch:

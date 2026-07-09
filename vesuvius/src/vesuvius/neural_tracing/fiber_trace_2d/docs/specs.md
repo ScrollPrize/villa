@@ -15,6 +15,8 @@
 - The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
 - The implementation should reuse/export VC3D side-strip coordinate APIs when possible, or port the same algorithm with only small rounding/interpolation differences.
 - Image loading samples base-volume Zarr values from explicit coordinates.
+- Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
+- Interactive/progressive VC3D `tryGetChunk` semantics are not acceptable for this loader path because they can queue I/O and return an all-invalid first sample.
 - `base_volume_scale` selects both the Zarr level to read and the sampling pixel scale: by default, one output patch pixel advances by one voxel at that selected level.
 - Internally, fiber control-point coordinates remain in base-volume coordinates, so a selected level `s` uses a patch pixel spacing of `2**s` base voxels before coordinates are divided for reading level `/s`.
 - The loader must not use the existing neural-tracing crop-loading path for image loading.
@@ -32,6 +34,7 @@
 - Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
 - Augment visualization uses raw clipped image values and must not apply percentile or per-cell normalization.
 - The augment visualization mode renders a three-row JPG contact sheet: lower-limit examples, upper-limit examples, and random combined training-style examples.
+- Augment visualization prints timing and raw image-stat diagnostics, including per-cell valid pixel count and raw min/max/mean, so invalid sampling and display-scale issues are distinguishable.
 - Augment contact sheets draw the transformed fiber-line coordinates at 50 percent opacity with fixed drawing thickness.
 - Augment contact-sheet cells include a small top label naming the shown augmentation.
 - Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.

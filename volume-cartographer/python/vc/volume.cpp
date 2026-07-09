@@ -519,14 +519,28 @@ nb::tuple sampleCoords(Volume& volume,
                        const BoolMask& validMask,
                        int level,
                        const std::string& sampling,
-                       int tileSize)
+                       int tileSize,
+                       bool blocking)
 {
     auto coords = coordsArrayToMat(coordsXyz);
     auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
     cv::Mat_<uint8_t> out(coords.rows, coords.cols, uint8_t{0});
     vc::render::ChunkedPlaneSampler::Stats stats;
+    int blockingPrefetchChunks = 0;
     {
         nb::gil_scoped_release release;
+        if (blocking) {
+            std::vector<vc::render::ChunkKey> keys =
+                vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+                    *volume.chunkedCache(),
+                    level,
+                    coords,
+                    coverage,
+                    vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
+            blockingPrefetchChunks = static_cast<int>(keys.size());
+            if (!keys.empty())
+                volume.chunkedCache()->prefetchChunks(keys, true);
+        }
         stats = vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
             *volume.chunkedCache(),
             level,
@@ -553,7 +567,9 @@ nb::tuple sampleCoords(Volume& volume,
         static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
     auto validArr = makeNumpyArray<uint8_t>(std::move(sampledValid), {
         static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
-    return nb::make_tuple(imageArr, validArr, statsToDict(stats));
+    nb::dict statsDict = statsToDict(stats);
+    statsDict["blocking_prefetch_chunks"] = blockingPrefetchChunks;
+    return nb::make_tuple(imageArr, validArr, statsDict);
 }
 
 std::vector<std::tuple<int, int, int, int>> collectCoordsDependencies(
@@ -650,7 +666,8 @@ NB_MODULE(volume, m)
             "valid_mask"_a,
             "level"_a = 0,
             "sampling"_a = "trilinear",
-            "tile_size"_a = 32)
+            "tile_size"_a = 32,
+            "blocking"_a = true)
         .def("collect_coords_dependencies", &collectCoordsDependencies,
             "coords_xyz"_a,
             "valid_mask"_a,

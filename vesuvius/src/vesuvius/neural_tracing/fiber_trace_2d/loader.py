@@ -413,6 +413,33 @@ def _resample_coords_like_augmentation(
     return sampled_coords.cpu().numpy().astype(np.float32), sampled_valid.cpu().numpy().astype(bool)
 
 
+class _ProfileBlock:
+    def __init__(self, profile: dict[str, float] | None, name: str, device: torch.device | None = None) -> None:
+        self.profile = profile
+        self.name = str(name)
+        self.device = device
+        self.start = 0.0
+
+    def __enter__(self) -> None:
+        if self.profile is None:
+            return None
+        _sync_if_needed(self.device)
+        self.start = time.perf_counter()
+        return None
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.profile is None:
+            return None
+        _sync_if_needed(self.device)
+        self.profile[self.name] = self.profile.get(self.name, 0.0) + (time.perf_counter() - self.start) * 1000.0
+        return None
+
+
+def _sync_if_needed(device: torch.device | None) -> None:
+    if device is not None and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 SamplerFactory = Callable[..., CoordinateSampler]
 
 
@@ -877,54 +904,71 @@ class FiberStrip2DLoader:
         return sample, image.astype(np.float32, copy=False), result.valid_mask.astype(bool, copy=False)
 
     def build_augmented_center_strip_patch(
-        self, sample_index: int, params: Any, *, device: torch.device
+        self,
+        sample_index: int,
+        params: Any,
+        *,
+        device: torch.device,
+        profile: dict[str, float] | None = None,
     ) -> tuple[FiberStripSample, np.ndarray, np.ndarray, np.ndarray]:
-        record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
-        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
-        pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
-        source_shape_hw = (
-            int(self.config.patch_shape_hw[0]) + 2 * pad.y,
-            int(self.config.patch_shape_hw[1]) + 2 * pad.x,
-        )
-        line_window = self._line_window_for_patch(
-            record,
-            control_point_index=cp_index,
-            patch_shape_hw=source_shape_hw,
-        )
-        sampled_normals = self._lasagna_normals_for_line_window(
-            record,
-            line_window,
-            control_point_index=cp_index,
-        )
-        grid = build_side_strip_patch_grid_from_line_window(
-            line_window,
-            patch_shape_hw=source_shape_hw,
-            strip_z_offset=float(center_offset),
-            sampled_normals=sampled_normals,
-            pixel_spacing_base=record.volume_spacing_base,
-        )
-        coords_zyx, valid_mask = _resample_coords_like_augmentation(
-            grid.coords_zyx.astype(np.float32, copy=False),
-            grid.valid_mask.astype(bool, copy=False),
-            params,
-            output_shape_hw=self.config.patch_shape_hw,
-            device=device,
-        )
-        result = record.sampler.sample_coords(coords_zyx, valid_mask)
-        image = result.image
-        valid_mask = result.valid_mask
-        image_t, valid_t = apply_value_augmentation(
-            image,
-            valid_mask,
-            value_only_params(params),
-            device=device,
-        )
-        line_xy = transformed_centerline_coords(
-            self.config.patch_shape_hw,
-            source_shape_hw,
-            params,
-            device=device,
-        )
+        with _ProfileBlock(profile, "descriptor"):
+            record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
+            center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+            pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
+            source_shape_hw = (
+                int(self.config.patch_shape_hw[0]) + 2 * pad.y,
+                int(self.config.patch_shape_hw[1]) + 2 * pad.x,
+            )
+        with _ProfileBlock(profile, "line_window"):
+            line_window = self._line_window_for_patch(
+                record,
+                control_point_index=cp_index,
+                patch_shape_hw=source_shape_hw,
+            )
+        with _ProfileBlock(profile, "lasagna_normals"):
+            sampled_normals = self._lasagna_normals_for_line_window(
+                record,
+                line_window,
+                control_point_index=cp_index,
+            )
+        with _ProfileBlock(profile, "strip_coords"):
+            grid = build_side_strip_patch_grid_from_line_window(
+                line_window,
+                patch_shape_hw=source_shape_hw,
+                strip_z_offset=float(center_offset),
+                sampled_normals=sampled_normals,
+                pixel_spacing_base=record.volume_spacing_base,
+            )
+        with _ProfileBlock(profile, "coord_augmentation", device):
+            coords_zyx, valid_mask = _resample_coords_like_augmentation(
+                grid.coords_zyx.astype(np.float32, copy=False),
+                grid.valid_mask.astype(bool, copy=False),
+                params,
+                output_shape_hw=self.config.patch_shape_hw,
+                device=device,
+            )
+        with _ProfileBlock(profile, "volume_sample"):
+            result = record.sampler.sample_coords(coords_zyx, valid_mask)
+            image = result.image
+            valid_mask = result.valid_mask
+            if profile is not None:
+                for key, value in result.stats.items():
+                    if isinstance(value, (int, float)):
+                        profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
+        with _ProfileBlock(profile, "value_augmentation", device):
+            image_t, valid_t = apply_value_augmentation(
+                image,
+                valid_mask,
+                value_only_params(params),
+                device=device,
+            )
+        with _ProfileBlock(profile, "line_coords", device):
+            line_xy = transformed_centerline_coords(
+                self.config.patch_shape_hw,
+                source_shape_hw,
+                params,
+                device=device,
+            )
         sample = FiberStripSample(
             record_index=record_index,
             fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",

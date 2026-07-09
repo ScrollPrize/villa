@@ -13,6 +13,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
     FiberStripAugmentParams,
     apply_value_augmentation,
+    limit_augmentation_rows,
     random_combined_augmentation,
     smooth_offset_field,
     source_coordinate_grid_for_output,
@@ -572,6 +573,33 @@ def test_augmented_center_patch_loads_one_zarr_sample(
     assert line.ndim == 2
     assert line.shape[1] == 2
     assert sample.strip_z_offset == 0.0
+
+
+def test_identity_equivalent_augment_vis_entries_match(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    lower_entries, _ = limit_augmentation_rows(loader.config.augment, sample_index=0)
+    params_by_name = dict(lower_entries)
+
+    outputs = {}
+    for name in ("unaugmented", "noise_min", "blur_min"):
+        _, image, valid, line = loader.build_augmented_center_strip_patch(
+            0,
+            params_by_name[name],
+            device=torch.device("cpu"),
+        )
+        outputs[name] = (image, valid, line)
+
+    base_image, base_valid, base_line = outputs["unaugmented"]
+    for name in ("noise_min", "blur_min"):
+        image, valid, line = outputs[name]
+        assert np.allclose(image, base_image), name
+        assert np.array_equal(valid, base_valid), name
+        assert np.allclose(line, base_line), name
 
 
 def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path) -> None:
