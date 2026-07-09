@@ -79,6 +79,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
+- [vesuvius-segment-triage](https://github.com/VECTRION-HQ/vesuvius-segment-triage) by Aakash Kapoor. A read-only web dashboard that crawls a VC3D .volpkg and shows every segment's review-status tags (approved/defective/reviewed/inspect/partial_review) in one filterable, sortable table — a whole-scroll view of what's reviewed vs the backlog. Mirrors VC3D's surface-tree filters; metadata only, zero-install.
+
 - [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/999) by pscamillo. Three GPU-native augmentations for the segmentation training pipeline, addressing #201: Squeeze (compression, [#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion (beam-scatter blur) and Warp (coherent warping). Each models a real scroll distortion rather than generic elastic noise, and is validated with a controlled ablation and a real-data demo to improve segmentation in compressed/warped/scattered regions.
 
 - [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
