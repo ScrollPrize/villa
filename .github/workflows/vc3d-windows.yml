@@ -1,0 +1,100 @@
+name: VC3D Windows Installer
+
+# Builds VC3D natively on Windows under MSYS2/UCRT64 and produces a
+# self-contained NSIS installer (+ ZIP) with all DLLs and Qt plugins bundled.
+# On published releases the installer is attached to the GitHub release so
+# users can download and run a single .exe on Windows 10/11.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-windows.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-windows.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to upload installer assets to releases
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-windows:
+    name: Build + package (MSYS2 UCRT64)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: msys2 {0}
+        working-directory: volume-cartographer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: git
+          pacboy: >-
+            gcc:p
+            cmake:p
+            ninja:p
+            pkgconf:p
+            qt6-base:p
+            qt6-svg:p
+            opencv:p
+            ceres-solver:p
+            cgal:p
+            gmp:p
+            mpfr:p
+            boost:p
+            eigen3:p
+            nlohmann-json:p
+            curl:p
+            libtiff:p
+            zlib:p
+            zstd:p
+            lz4:p
+            blosc:p
+            nsis:p
+
+      - name: Configure
+        run: cmake --preset ci-windows-mingw
+
+      - name: Build
+        run: cmake --build --preset ci-windows-mingw
+
+      - name: Package (NSIS installer + ZIP)
+        run: |
+          cd build/ci-windows-mingw
+          cpack -V
+          ls -la *.exe *.zip
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-windows-installer
+          path: |
+            volume-cartographer/build/ci-windows-mingw/VC3D-*-win64.exe
+            volume-cartographer/build/ci-windows-mingw/VC3D-*-win64.zip
+          if-no-files-found: error
+
+      - name: Attach installer to release
+        if: github.event_name == 'release'
+        shell: pwsh
+        working-directory: volume-cartographer/build/ci-windows-mingw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          gh release upload $tag (Get-Item VC3D-*-win64.exe).FullName (Get-Item VC3D-*-win64.zip).FullName --clobber

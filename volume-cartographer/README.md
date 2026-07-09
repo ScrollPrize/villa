@@ -21,7 +21,21 @@ Due to a complex set of dependencies, it is *highly* recommended to use the dock
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
 
-If you want to install vc3d from source, the easiest path is to look at the [Dockerfile](Dockerfile) (and the shared [scripts/install_build_deps.sh](scripts/install_build_deps.sh) it uses) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
+If you want to install vc3d from source, the easiest path is to look at the [Dockerfile](Dockerfile) (and the shared [scripts/install_build_deps.sh](scripts/install_build_deps.sh) it uses) and adapt for your environment.
+
+#### Windows
+
+A self-contained Windows 10/11 installer (`VC3D-<version>-win64.exe`, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases) — download, run, and launch VC3D from the Start menu. A portable `.zip` of the same tree is published alongside it.
+
+To build natively from source on Windows, use an [MSYS2](https://www.msys2.org/) UCRT64 shell (see [.github/workflows/vc3d-windows.yml](../.github/workflows/vc3d-windows.yml) for the package list), then:
+
+```bash
+cmake --preset ci-windows-mingw
+cmake --build --preset ci-windows-mingw
+cpack --config build/ci-windows-mingw/CPackConfig.cmake
+```
+
+Note: the flatboi SLIM flattening tool (PaStiX-based) is not available on Windows; Docker or WSL still covers that workflow.
 
 On macOS, use the Homebrew LLVM build helper:
 
