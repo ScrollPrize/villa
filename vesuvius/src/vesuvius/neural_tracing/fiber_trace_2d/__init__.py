@@ -8,12 +8,15 @@ from .loader import (
     FiberStripSample,
     load_config,
 )
+from .model import FiberStripDirectionModelConfig, FiberStripDirectionNet
 
 __all__ = [
     "FiberStripAugmentConfig",
     "FiberStrip2DBatch",
     "FiberStrip2DConfig",
     "FiberStrip2DLoader",
+    "FiberStripDirectionModelConfig",
+    "FiberStripDirectionNet",
     "FiberStripSample",
     "load_config",
 ]

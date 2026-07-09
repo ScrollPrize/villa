@@ -1,7 +1,7 @@
 # 2D Fiber Trace Loader Code Structure
 
-This package currently implements a loader/debug runner for 2D fiber side-strip
-patches around VC3D fiber control points. It is not yet a training pipeline.
+This package implements a loader/debug runner and a V0 training path for 2D
+fiber side-strip patches around VC3D fiber control points.
 
 The important behavior is:
 
@@ -11,6 +11,8 @@ The important behavior is:
 - sample image values through the VC3D blocking coordinate sampler;
 - optionally apply coordinate-space geometric augmentation and torch value
   augmentation;
+- train a small 2D direction model using CP-local Lasagna two-cos-channel
+  direction targets;
 - export JPG batches and augmentation contact sheets for inspection;
 - prefetch addressed base-volume chunks into the configured cache.
 
@@ -73,6 +75,23 @@ The important behavior is:
 - Debug line overlays are drawn only as the final visualization step. The line
   coordinates themselves are transformed geometrically, not raster-warped.
 
+`direction.py`
+
+- Implements the Lasagna ambiguous two-cos-channel strip direction encoding:
+  `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`.
+- Builds V0 training targets from transformed strip-line coordinates.
+- Selects only the eight neighboring pixels around the rounded transformed CP
+  location, filtered by valid image samples.
+- Provides a visualization-only approximate decoder for drawing predicted
+  direction arrows.
+
+`model.py`
+
+- Defines `FiberStripDirectionNet`, a deliberately small V0 2D CNN.
+- Consumes flattened strip patches shaped `[patch_batch, 1, height, width]`.
+- Outputs exactly two per-pixel direction channels in the Lasagna encoded
+  representation.
+
 `loader.py`
 
 - Parses Vesuvius-style JSON configs into `FiberStrip2DConfig`.
@@ -100,6 +119,26 @@ The important behavior is:
   exports augmentation contact sheets.
 - Prints augment-visualization timing rows and raw image stats.
 
+`train.py`
+
+- Provides the command-line entry point:
+
+  ```bash
+  python -m vesuvius.neural_tracing.fiber_trace_2d.train
+  ```
+
+- Loads the same JSON config as the runner, then reads a `training` section for
+  optimizer, logging, and snapshot settings.
+- Builds batches with `FiberStrip2DLoader`, so production training uses the
+  same VC3D blocking sampler and coordinate-space augmentation path as
+  augment-vis.
+- Flattens `[control_point_sample, strip_z_offset]` into one patch batch for the
+  model.
+- Computes direction targets from transformed line coordinates after geometric
+  augmentation.
+- Logs scalars/images to TensorBoard and writes `current.pt` / `best.pt`
+  snapshots under the run directory.
+
 `configs/loader_example.json`
 
 - Example local Staticsheep config using:
@@ -124,6 +163,22 @@ Top-level keys used by `load_config`:
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
 - `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
 - `augment_*`: parsed into `FiberStripAugmentConfig`.
+- `training`: optional object used by `train.py`; ignored by the loader/debug
+  runner config parser.
+
+Training keys:
+
+- `run_path`: parent directory for dated run directories.
+- `run_name`: prefix for the run directory.
+- `max_steps`: number of training steps.
+- `learning_rate`: AdamW learning rate.
+- `scalar_log_interval`: TensorBoard scalar/console interval.
+- `tensorboard_image_interval`: TensorBoard batch-image interval.
+- `checkpoint_interval`: interval for writing `snapshots/current.pt`.
+- `control_points_per_step`: deterministic CP samples per step; default `4`.
+- `device`: `auto`, `cpu`, or a torch device string.
+- `tensorboard_enabled`: set false for smoke tests without TensorBoard.
+- `model_hidden_channels` and `model_depth`: V0 CNN size knobs.
 
 Dataset entries must contain:
 
@@ -235,6 +290,64 @@ When augmentation is enabled, the loader builds an oversized source strip,
 maps the requested output patch into it, samples the volume at final augmented
 coordinates, and then applies value augmentation.
 
+Each `FiberStripSample` also stores `line_xy` and `control_point_xy` in final
+output-pixel coordinates after geometric augmentation. Training labels and
+debug overlays use those coordinates directly.
+
+## V0 Training
+
+The V0 trainer samples deterministic control-point groups by step:
+
+```text
+start_sample_index = (step - 1) * training.control_points_per_step
+```
+
+The default training shape is four control-point samples times 16 strip-z
+offsets, producing 64 patches. `load_batch` returns `[4, 16, 1, H, W]`; the
+trainer reshapes this to `[64, 1, H, W]` before the CNN forward pass.
+
+Images are normalized per patch over valid pixels. Invalid pixels are set to
+zero after normalization.
+
+Targets are built from `FiberStripSample.line_xy` and
+`FiberStripSample.control_point_xy`, which are already transformed output-pixel
+coordinates from the loader's augmentation path. The local tangent near the
+transformed CP is encoded into Lasagna's ambiguous two-cos-channel format:
+
+```text
+cos2theta = (dx^2 - dy^2) / (dx^2 + dy^2 + eps)
+sin2theta = 2*dx*dy / (dx^2 + dy^2 + eps)
+dir0 = 0.5 + 0.5*cos2theta
+dir1 = 0.5 + 0.5*(cos2theta - sin2theta)/sqrt(2)
+```
+
+Only the eight neighboring pixels around the rounded transformed CP location
+are supervised. The model is not supervised on the whole line or full patch in
+V0.
+
+TensorBoard output is written under:
+
+```text
+<training.run_path>/<training.run_name>_<YYYYmmdd_HHMMSS>/
+```
+
+The trainer logs:
+
+- `config/json` as text;
+- `train/loss_direction`;
+- `train/supervision_samples`;
+- `timing/load_ms`;
+- cache hit/download diagnostics where available;
+- `train/batch_direction_overlay` images showing the transformed line, CP
+  neighborhood, and predicted direction arrow.
+
+Snapshots are written under:
+
+```text
+<run_dir>/snapshots/current.pt
+<run_dir>/snapshots/best.pt
+```
+
 ## Prefetch
 
 `chunk_requests_for_sample_index` builds the same final coordinate grids that
@@ -319,6 +432,12 @@ Export an augmentation contact sheet:
 
 ```bash
 PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.runner config.json --sample-index 0 --augment-vis --export-dir /tmp/fiber_trace_2d_aug
+```
+
+Run V0 direction training:
+
+```bash
+PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.train config.json
 ```
 
 For this checkout, prefer the more specific local command in

@@ -33,3 +33,40 @@ Validation:
 - Docs-only pass; no runtime behavior changed.
 - `git diff --check -- vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_plan.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/status.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/specs.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/task_log.md vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/planning/todo.md`
   - Result: passed.
+
+## Planned V0 2D Fiber-Strip Direction Training
+
+- Moved the remaining training TODO from `planning/todo.md` into `planning/task.md`.
+- Replaced the docs task plan with a scoped V0 training plan in `planning/task_plan.md`.
+- The plan preserves the current VC3D/Lasagna strip loader, coordinate-space geometric augmentation, GPU value augmentation, deterministic sample selection, and fake/local-array testing constraints.
+- Added `planning/status.md` checklist entries for planning, implementation, spec/docs updates, and validation.
+- Refined the training plan to require the Lasagna ambiguous two-cos-channel direction encoding, `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`, instead of raw signed vector regression or an `abs(dot)` loss.
+
+## V0 2D Fiber-Strip Direction Training Implementation
+
+- Added `direction.py` with Lasagna two-cos-channel direction encoding, an approximate visualization decoder, augmented-line CP/tangent extraction, and CP-local eight-neighbor supervision gathering.
+- Added `model.py` with a small V0 2D CNN that predicts exactly two encoded direction channels per pixel.
+- Added `train.py` with JSON `training` config parsing, deterministic sample-index stepping, `[control_point, strip_z]` batch flattening, encoded MSE loss, TensorBoard scalar/text/image logging, and `snapshots/current.pt` / `snapshots/best.pt`.
+- Updated `configs/loader_example.json` to enable the current augmentation settings and include the default four-control-point/16-strip-offset training config.
+- Updated `planning/specs.md`, `docs/code_structure.md`, `planning/local_development.md`, `planning/changelog.md`, and `planning/status.md` for the new training path.
+- Added focused tests for double-angle direction ambiguity, CP-local supervision, 64-patch batch assembly, and one-step local-array training smoke.
+
+Validation:
+
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result before final docs/status edits: `30 passed in 3.57s`.
+  - Final result after explicit transformed-CP coordinate and docs/status edits: `30 passed in 2.75s`.
+
+## Planned Full-Augmentation Training Prefetch
+
+- Updated `planning/task.md` with the active prefetch-hardening task.
+- Replaced `planning/task_plan.md` with a focused plan for training-oriented
+  prefetch and full-augmentation request/load coordinate regression tests.
+- Current code inspection indicates `chunk_requests_for_sample_index` already
+  uses augmentation padding, final coordinate-space augmentation, deterministic
+  per-offset augmentation parameters, and all strip-z offsets.
+- The plan therefore focuses on adding a convenient `train.py --prefetch`
+  command, documenting the command, and adding tests that prove prefetch
+  coordinates match actual augmented loading coordinates.
+- Refined the plan so `--prefetch-steps 0` means prefetch all configured
+  training steps, and negative step counts are rejected.

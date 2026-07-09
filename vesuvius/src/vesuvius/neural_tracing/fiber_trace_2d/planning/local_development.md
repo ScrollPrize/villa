@@ -87,6 +87,19 @@ stats, and raw image stats. For the blocking sampler fix, the first
 `unaugmented` row must have nonzero valid pixels and should match `noise_min`
 and `blur_min`.
 
+## Fiber Trace 2D Training Command
+
+Use this command to run the V0 strip-direction trainer with the current example
+config:
+
+```bash
+PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.train $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json
+```
+
+The trainer writes TensorBoard events and snapshots under the configured
+`training.run_path`. Do not add `PYTHONNOUSERSITE=1` to this command in this
+checkout.
+
 ## Focused Test Command
 
 ```bash

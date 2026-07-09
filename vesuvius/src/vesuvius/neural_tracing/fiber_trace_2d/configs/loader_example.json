@@ -5,7 +5,7 @@
   "strip_z_offset_step": 1.0,
   "seed": 0,
   "prefetch_workers": 16,
-  "augment_enabled": false,
+  "augment_enabled": true,
   "augment_seed": 0,
   "augment_device": "auto",
   "augment_shift_x": 32.0,
@@ -25,6 +25,20 @@
   "augment_noise_std": 0.125,
   "augment_blur_sigma": 2.0,
   "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache",
+  "training": {
+    "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_2d_runs",
+    "run_name": "fiber_strip_direction",
+    "max_steps": 1000,
+    "learning_rate": 0.001,
+    "scalar_log_interval": 100,
+    "tensorboard_image_interval": 1000,
+    "checkpoint_interval": 1000,
+    "control_points_per_step": 4,
+    "device": "auto",
+    "tensorboard_enabled": true,
+    "model_hidden_channels": 32,
+    "model_depth": 5
+  },
   "datasets": [
     {
       "fiber_glob": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_2026-06-16/*.json",

@@ -45,6 +45,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     resolve_torch_device,
     source_coordinate_grid_for_output,
     transformed_centerline_coords,
+    transformed_source_point_coords,
     value_only_params,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
@@ -81,6 +82,7 @@ class FiberStripSample:
     valid_mask: np.ndarray
     frame: FiberStripFrame
     line_xy: np.ndarray
+    control_point_xy: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -787,6 +789,10 @@ class FiberStrip2DLoader:
         y = np.full((width,), (float(height) - 1.0) * 0.5, dtype=np.float32)
         return np.stack([x, y], axis=1)
 
+    def _unaugmented_control_point_xy(self, shape_hw: tuple[int, int]) -> np.ndarray:
+        height, width = (int(v) for v in shape_hw)
+        return np.asarray([(float(width) - 1.0) * 0.5, (float(height) - 1.0) * 0.5], dtype=np.float32)
+
     def build_sample(
         self, sample_index: int
     ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
@@ -829,6 +835,7 @@ class FiberStrip2DLoader:
             coords_zyx = grid.coords_zyx.astype(np.float32, copy=False)
             valid_mask = grid.valid_mask.astype(bool, copy=False)
             line_xy = self._unaugmented_centerline_coords(patch_shape_hw)
+            control_point_xy = self._unaugmented_control_point_xy(patch_shape_hw)
             if self.config.augment.enabled:
                 assert augment_device is not None
                 assert params is not None
@@ -843,6 +850,16 @@ class FiberStrip2DLoader:
                     self.config.patch_shape_hw,
                     patch_shape_hw,
                     params,
+                    device=augment_device,
+                )
+                control_point_xy = transformed_source_point_coords(
+                    self.config.patch_shape_hw,
+                    patch_shape_hw,
+                    params,
+                    (
+                        (float(patch_shape_hw[1]) - 1.0) * 0.5,
+                        (float(patch_shape_hw[0]) - 1.0) * 0.5,
+                    ),
                     device=augment_device,
                 )
             result = record.sampler.sample_coords(coords_zyx, valid_mask)
@@ -869,6 +886,7 @@ class FiberStrip2DLoader:
                 valid_mask=valid_mask,
                 frame=grid.frame,
                 line_xy=line_xy,
+                control_point_xy=control_point_xy,
             )
             images.append(image)
             coords.append(coords_zyx)
@@ -913,6 +931,7 @@ class FiberStrip2DLoader:
             valid_mask=result.valid_mask.astype(bool, copy=False),
             frame=grid.frame,
             line_xy=self._unaugmented_centerline_coords(self.config.patch_shape_hw),
+            control_point_xy=self._unaugmented_control_point_xy(self.config.patch_shape_hw),
         )
         return sample, image.astype(np.float32, copy=False), result.valid_mask.astype(bool, copy=False)
 
@@ -1008,6 +1027,16 @@ class FiberStrip2DLoader:
                 params,
                 device=device,
             )
+            control_point_xy = transformed_source_point_coords(
+                self.config.patch_shape_hw,
+                source_shape_hw,
+                params,
+                (
+                    (float(source_shape_hw[1]) - 1.0) * 0.5,
+                    (float(source_shape_hw[0]) - 1.0) * 0.5,
+                ),
+                device=device,
+            )
         sample = FiberStripSample(
             record_index=record_index,
             fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
@@ -1018,6 +1047,7 @@ class FiberStrip2DLoader:
             valid_mask=valid_t.cpu().numpy().astype(bool),
             frame=grid.frame,
             line_xy=line_xy,
+            control_point_xy=control_point_xy,
         )
         return (
             sample,

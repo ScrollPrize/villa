@@ -424,6 +424,41 @@ def transformed_centerline_coords(
     return coords[keep].detach().cpu().numpy().astype(np.float32)
 
 
+def transformed_source_point_coords(
+    output_shape_hw: tuple[int, int],
+    source_shape_hw: tuple[int, int],
+    params: FiberStripAugmentParams,
+    source_xy: tuple[float, float],
+    *,
+    device: torch.device,
+) -> np.ndarray:
+    output_height, output_width = (int(v) for v in output_shape_hw)
+    source_height, source_width = (int(v) for v in source_shape_hw)
+    source_point = torch.tensor([[float(source_xy[0]), float(source_xy[1])]], dtype=torch.float32, device=device)
+    if float(params.smooth_offset) != 0.0:
+        source_coords = source_coordinate_grid_for_output(
+            output_height,
+            output_width,
+            source_height,
+            source_width,
+            params,
+            device=device,
+        )
+        flat = source_coords.reshape(-1, 2)
+        out_pixels = _pixel_grid(output_height, output_width, device=device).reshape(-1, 2)
+        coords = _nearest_output_pixels_for_source_points(flat, out_pixels, source_point)
+        if coords.numel() == 0:
+            return np.asarray([np.nan, np.nan], dtype=np.float32)
+        return coords[0].detach().cpu().numpy().astype(np.float32)
+    return _transformed_source_point_coords_affine(
+        output_shape_hw,
+        source_shape_hw,
+        params,
+        source_point,
+        device=device,
+    )[0]
+
+
 def _nearest_output_pixels_for_source_points(
     source_flat_xy: torch.Tensor,
     output_flat_xy: torch.Tensor,
@@ -444,6 +479,52 @@ def _nearest_output_pixels_for_source_points(
     if not kept:
         return torch.zeros((0, 2), dtype=output_flat_xy.dtype, device=output_flat_xy.device)
     return torch.cat(kept, dim=0)
+
+
+def _transformed_source_point_coords_affine(
+    output_shape_hw: tuple[int, int],
+    source_shape_hw: tuple[int, int],
+    params: FiberStripAugmentParams,
+    source_points_xy: torch.Tensor,
+    *,
+    device: torch.device,
+) -> np.ndarray:
+    output_height, output_width = (int(v) for v in output_shape_hw)
+    source_height, source_width = (int(v) for v in source_shape_hw)
+    output_center_x = (float(output_width) - 1.0) * 0.5
+    output_center_y = (float(output_height) - 1.0) * 0.5
+    source_center_x = (float(source_width) - 1.0) * 0.5
+    source_center_y = (float(source_height) - 1.0) * 0.5
+
+    points = torch.as_tensor(source_points_xy, dtype=torch.float32, device=device)
+    src_x = points[:, 0]
+    src_y = points[:, 1]
+    u = src_x - source_center_x + float(params.shift_x)
+    v = src_y - source_center_y + float(params.shift_y)
+
+    angle = math.radians(float(params.rotation_degrees))
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    x_sheared = cos_a * u + sin_a * v
+    y_sheared = -sin_a * u + cos_a * v
+
+    shear_x = float(params.shear_x)
+    shear_y = float(params.shear_y)
+    det = 1.0 - shear_x * shear_y
+    if abs(det) <= 1.0e-6:
+        return np.full((points.shape[0], 2), np.nan, dtype=np.float32)
+    x = (x_sheared - shear_x * y_sheared) / det
+    y = (-shear_y * x_sheared + y_sheared) / det
+
+    scale = max(float(params.scale), 1.0e-6)
+    x = x * scale
+    y = y * scale
+    if params.flip_x:
+        x = -x
+    if params.flip_y:
+        y = -y
+    coords = torch.stack([x + output_center_x, y + output_center_y], dim=1)
+    return coords.detach().cpu().numpy().astype(np.float32)
 
 
 def _transformed_centerline_coords_affine(

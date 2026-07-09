@@ -47,6 +47,21 @@
 - Prefetch computes needed base-volume Zarr chunk keys from explicit coordinates before image loading.
 - Prefetch deduplicates chunk requests, skips cached chunks, and fetches missing chunks into the configured cache.
 - Prefetch parallelism is capped at 16 workers.
+- V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.
+- The V0 trainer uses `FiberStrip2DLoader` batches directly; it must not use the neural-tracing 3D crop loader or a separate image sampling path.
+- Training geometric augmentations are the same coordinate-space augmentations used by augment-vis. Value augmentations run through the existing torch augmentation functions after Zarr sampling.
+- A training step samples `training.control_points_per_step` deterministic control-point samples and every configured strip-z offset. The default is four control points and 16 strip-z offsets, giving 64 2D strip patches.
+- Training flattens control-point and strip-z dimensions into a patch batch before the 2D model forward pass.
+- V0 model output is exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding.
+- For strip-image tangent angle `theta`, target channels are `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`.
+- Equivalent implementation formulas are `cos2theta=(dx^2-dy^2)/(dx^2+dy^2+eps)`, `sin2theta=2*dx*dy/(dx^2+dy^2+eps)`, `dir0=0.5+0.5*cos2theta`, and `dir1=0.5+0.5*(cos2theta-sin2theta)/sqrt(2)`.
+- Forward/backward ambiguity comes from the double-angle encoding itself; `(dx,dy)` and `(-dx,-dy)` must encode identically.
+- Direction targets are derived from the transformed output-pixel line coordinates produced by the same augmentation path as the image. They must not be derived from unaugmented line points for augmented patches.
+- Each loaded strip sample carries the transformed control-point output-pixel coordinate. V0 direction supervision is limited to the eight neighboring pixels around that rounded transformed control-point location, filtered by image validity and patch bounds.
+- The V0 loss compares predicted and target encoded channels directly with MSE over those CP-local samples; raw signed `(dx,dy)` regression and `abs(dot)` losses are not the V0 training representation.
+- Training creates a run directory from `training.run_path` and `training.run_name` plus a date string.
+- TensorBoard logging writes the training config JSON as text, direction-loss scalars, timing/cache diagnostics, and batch direction overlay images at configured intervals.
+- Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`; best is the lowest observed training loss until validation is added.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.

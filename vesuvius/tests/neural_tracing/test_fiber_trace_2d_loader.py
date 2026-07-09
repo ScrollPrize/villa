@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +20,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     source_coordinate_grid_for_output,
     transformed_centerline_coords,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.direction import (
+    build_direction_supervision,
+    cp_neighborhood_yx,
+    encode_lasagna_direction_xy,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     FiberStrip2DLoader,
@@ -26,6 +32,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     load_config,
     strip_z_offsets_from_count_step,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.train import run_training
 from vesuvius.neural_tracing.fiber_trace_2d.runner import _export_augment_contact_sheet
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
@@ -732,3 +739,83 @@ def test_prefetch_deduplicates_and_skips_cached(monkeypatch: pytest.MonkeyPatch,
     assert summary["missing"] == 1
     assert summary["downloaded"] == 1
     assert summary["errors"] == 0
+
+
+def test_lasagna_direction_encoding_is_forward_backward_ambiguous() -> None:
+    directions = torch.tensor(
+        [
+            [1.0, 0.0],
+            [-1.0, 0.0],
+            [0.0, 1.0],
+            [math.sqrt(0.5), math.sqrt(0.5)],
+        ],
+        dtype=torch.float32,
+    )
+
+    encoded = encode_lasagna_direction_xy(directions)
+
+    assert torch.allclose(encoded[0], encoded[1])
+    assert torch.allclose(encoded[0], torch.tensor([1.0, 0.5 + 0.5 / math.sqrt(2.0)]))
+    assert torch.allclose(encoded[2], torch.tensor([0.0, 0.5 - 0.5 / math.sqrt(2.0)]), atol=1.0e-6)
+    assert torch.allclose(encoded[3], torch.tensor([0.5, 0.5 - 0.5 / math.sqrt(2.0)]), atol=1.0e-6)
+
+
+def test_cp_local_supervision_uses_eight_samples_and_augmented_line() -> None:
+    valid = np.ones((1, 5, 5), dtype=bool)
+    sample = SimpleNamespace(
+        line_xy=np.asarray(
+            [
+                [0.0, 1.0],
+                [1.0, 1.5],
+                [2.0, 2.0],
+                [3.0, 2.5],
+                [4.0, 3.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+
+    supervision = build_direction_supervision([sample], valid, device=torch.device("cpu"))
+
+    assert supervision.target.shape == (8, 2)
+    assert sorted(zip(supervision.y.tolist(), supervision.x.tolist())) == sorted(
+        tuple(item) for item in cp_neighborhood_yx(np.asarray([2.0, 2.0], dtype=np.float32), (5, 5)).tolist()
+    )
+    expected = encode_lasagna_direction_xy(torch.tensor([1.0, 0.5]))
+    assert torch.allclose(supervision.target[0], expected, atol=1.0e-6)
+
+
+def test_training_batch_assembly_default_patch_count_is_64(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["strip_z_offset_count"] = 16
+    raw["training"] = {"control_points_per_step": 4}
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    batch = loader.load_batch(0, batch_size=4)
+
+    assert batch.images.shape == (4, 16, 1, 5, 5)
+    assert len(batch.samples) == 64
+
+
+def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "smoke",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+
+    assert (run_dir / "snapshots" / "current.pt").is_file()
+    assert (run_dir / "snapshots" / "best.pt").is_file()
