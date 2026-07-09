@@ -432,7 +432,12 @@ HttpResponse HttpClient::put_file(std::string_view url,
                                   std::string_view content_type) const {
     auto resolved = resolve_url(url);
 
+    // path::c_str() is wchar_t* on Windows; _wfopen takes it directly.
+#if defined(_WIN32)
+    FILE* f = ::_wfopen(file_path.c_str(), L"rb");
+#else
     FILE* f = std::fopen(file_path.c_str(), "rb");
+#endif
     if (!f) throw std::runtime_error("put_file: cannot open " + file_path.string());
     std::fseek(f, 0, SEEK_END);
     auto file_size = std::ftell(f);

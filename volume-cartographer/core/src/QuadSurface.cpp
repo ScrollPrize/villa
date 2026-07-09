@@ -1230,9 +1230,9 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
 void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 {
     if (path_.filename().empty())
-        save(path_, path_.parent_path().filename(), force_overwrite);
+        save(path_, path_.parent_path().filename().string(), force_overwrite);
     else
-        save(path_, path_.filename(), force_overwrite);
+        save(path_, path_.filename().string(), force_overwrite);
 }
 
 std::recursive_mutex& QuadSurface::dirWriteMutex(const std::filesystem::path& dir)
@@ -1533,7 +1533,7 @@ void QuadSurface::saveSnapshot(int maxBackups, bool force)
 }
 
 
-void QuadSurface::save(const std::string &path_, const std::string &uuid, bool force_overwrite)
+void QuadSurface::save(const std::filesystem::path &path_, const std::string &uuid, bool force_overwrite)
 {
     std::filesystem::path target_path = path_;
     std::filesystem::path final_path = path_;
@@ -1735,7 +1735,7 @@ Rect3D QuadSurface::bbox()
     return _bbox;
 }
 
-std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int flags)
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags)
 {
     auto read_band_into = [](const std::filesystem::path& fpath,
                              cv::Mat_<cv::Vec3f>& points,

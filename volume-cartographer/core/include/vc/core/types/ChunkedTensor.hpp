@@ -136,7 +136,7 @@ public:
             if (_persistent) {
                 for (auto const& entry : std::filesystem::directory_iterator(root))
                     if (std::filesystem::is_directory(entry) && std::filesystem::exists(entry.path()/"meta.json") && std::filesystem::is_regular_file(entry.path()/"meta.json")) {
-                        paths.insert(entry.path());
+                        paths.insert(entry.path().string());
                         auto src = read_cache_meta_dataset_path(entry.path()/"meta.json");
                         if (src.empty())
                             continue;

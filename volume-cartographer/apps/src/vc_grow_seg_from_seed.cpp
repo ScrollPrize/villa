@@ -126,7 +126,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
             continue;
         }
 
-        std::string name = entry.path().filename();
+        std::string name = entry.path().filename().string();
         if (name.compare(0, name_prefix.size(), name_prefix)) {
             continue;
         }
@@ -400,7 +400,7 @@ int main(int argc, char *argv[])
 
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
             if (std::filesystem::is_directory(entry)) {
-                std::string name = entry.path().filename();
+                std::string name = entry.path().filename().string();
                 if (name.compare(0, name_prefix.size(), name_prefix))
                     continue;
 
@@ -1446,7 +1446,7 @@ int main(int argc, char *argv[])
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
             if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename()))
             {
-                std::string name = entry.path().filename();
+                std::string name = entry.path().filename().string();
                 if (name.compare(0, name_prefix.size(), name_prefix))
                     continue;
 
