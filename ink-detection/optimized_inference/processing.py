@@ -22,13 +22,19 @@ from numcodecs import LZ4
 from tqdm.auto import tqdm
 import fsspec
 from vendored_cache_store import CacheStore
-from zarr.storage import LocalStore, FsspecStore, MemoryStore
+from zarr.storage import LocalStore, FsspecStore
 
 from k8s import get_tqdm_kwargs
 from profiling import dir_size_bytes, get_active_profiler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def get_partition_cache_dir() -> str:
+    """Return the local cache directory used during partition reduction."""
+    return os.environ.get("PARTITION_CACHE_DIR", "/tmp/partition_cache").strip() or "/tmp/partition_cache"
+
 
 def path_exists(path: str) -> bool:
     """Check if path exists (supports local paths and S3 URLs)."""
@@ -97,18 +103,6 @@ def get_cached_zarr_store(path: str):
             f"  Cache size limit: {cache_size_gb} GB\n"
             f"  Cache max age: {cache_max_age}"
         )
-
-        # Optional in-memory layer on top of disk cache to avoid repeated
-        # pathlib read_bytes/open calls during sliding window inference.
-        mem_cache_mb = int(os.environ.get("ZARR_MEM_CACHE_MB", "512"))
-        if mem_cache_mb > 0:
-            cached_store = CacheStore(
-                store=cached_store,
-                cache_store=MemoryStore(),
-                max_size=mem_cache_mb * 1024 * 1024,
-                max_age_seconds="infinity",
-            )
-            logger.info(f"  In-memory cache layer: {mem_cache_mb} MB")
 
         return cached_store
 
@@ -236,10 +230,12 @@ def create_surface_volume_zarr(
     # Check disk space only for local paths
     if not is_s3:
         zarr_root = os.path.dirname(output_path) or "/tmp"
+        os.makedirs(zarr_root, exist_ok=True)
         free_gib = shutil.disk_usage(zarr_root).free / (1024**3)
         logger.info(
             f"Creating surface volume zarr at {output_path} (H,W,C={h},{w},{c} ~{uncompressed_gib:.2f} GiB uncompressed, "
-            f"~{estimated_gib:.2f} GiB estimated with LZ4). Free on {zarr_root}: {free_gib:.2f} GiB."
+            f"~{estimated_gib:.2f} GiB estimated with LZ4). Free on {zarr_root}: {free_gib:.2f} GiB. "
+            "Note: this free-space check does not account for per-user or project quota limits."
         )
         if free_gib < estimated_gib * 1.10:
             raise RuntimeError(
@@ -278,41 +274,49 @@ def create_surface_volume_zarr(
     if profiler is not None:
         profiler.add_duration("zarr_write_seconds", time.monotonic() - open_start, flag="approximate")
 
-    # Parallel reads with batching to limit memory usage
     if max_workers is None:
         max_workers = int(os.environ.get("MMAP_READ_WORKERS", str(min(6, (os.cpu_count() or 4)))))
-    # Limit in-flight futures to prevent memory buildup
-    batch_size = max_workers * 2
+    if max_workers != 1:
+        logger.info(
+            "Using serialized local-layer zarr construction for stability; "
+            f"requested max_workers={max_workers} will be ignored for writes."
+        )
 
-    def _read_and_write(idx_path):
-        """Read image and write directly to zarr, return only index."""
-        idx, p = idx_path
+    def _read_and_write(idx: int, p: str):
+        """Read one layer and write it directly to zarr."""
         img = _read_gray_any(p)
         if img is None:
             raise RuntimeError(f"Failed to read image: {p}")
         if img.shape != (h, w):
             raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
         write_start = time.monotonic()
-        z[:, :, idx] = img  # write to zarr immediately
+        try:
+            z[:, :, idx] = img
+        except OSError as exc:
+            if exc.errno == 122:
+                raise RuntimeError(
+                    f"Disk quota exceeded while writing layer {idx} into prepared zarr {output_path}. "
+                    "Filesystem free space may still look large because the failure is quota-based, not "
+                    "device-free-space based."
+                ) from exc
+            raise
         if profiler is not None:
             profiler.add_duration("zarr_write_seconds", time.monotonic() - write_start, flag="approximate")
             if not is_s3:
                 profiler.add_duration("local_write_seconds", time.monotonic() - write_start, flag="approximate")
                 profiler.increment_counter("local_write_bytes", int(img.nbytes))
         del img  # release memory ASAP
-        return idx
 
-    with tqdm(total=c, desc="Building surface volume", unit="layer", **get_tqdm_kwargs()) as pbar:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            # Process in batches to limit memory
-            for batch_start in range(0, c, batch_size):
-                batch_end = min(batch_start + batch_size, c)
-                batch_paths = [(i, layer_paths[i]) for i in range(batch_start, batch_end)]
-                futures = [ex.submit(_read_and_write, ip) for ip in batch_paths]
-
-                for fut in concurrent.futures.as_completed(futures):
-                    idx = fut.result()
-                    pbar.update(1)
+    try:
+        with tqdm(total=c, desc="Building surface volume", unit="layer", **get_tqdm_kwargs()) as pbar:
+            for idx, p in enumerate(layer_paths):
+                _read_and_write(idx, p)
+                pbar.update(1)
+    except Exception:
+        if not is_s3:
+            logger.warning("Prepare failed; removing partial local zarr at %s", output_path)
+            shutil.rmtree(output_path, ignore_errors=True)
+        raise
 
     logger.info(f"Surface volume zarr created successfully at {output_path}")
     if profiler is not None and not is_s3:
@@ -578,7 +582,7 @@ def reduce_partitions(
     logger.info(f"Starting reduce phase: will blend {num_parts} partitions tile-by-tile (tile_size={tile_size})")
 
     # Cache directory for partition zarrs (network filesystem -> local /tmp)
-    cache_dir = "/tmp/partition_cache"
+    cache_dir = get_partition_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
 
     # Open all partition zarr arrays once (outside the generator loop)
@@ -600,7 +604,14 @@ def reduce_partitions(
         if not os.path.exists(cached_pred_path):
             bytes_to_copy = dir_size_bytes(mask_pred_path)
             copy_start = time.monotonic()
-            shutil.copytree(mask_pred_path, cached_pred_path)
+            try:
+                shutil.copytree(mask_pred_path, cached_pred_path)
+            except FileExistsError:
+                logger.warning(
+                    "Partition cache path already exists during copy; refreshing in place: %s",
+                    cached_pred_path,
+                )
+                shutil.copytree(mask_pred_path, cached_pred_path, dirs_exist_ok=True)
             if profiler is not None:
                 elapsed = time.monotonic() - copy_start
                 profiler.add_duration("cache_fill_seconds", elapsed, flag="approximate")
@@ -613,7 +624,14 @@ def reduce_partitions(
         if not os.path.exists(cached_count_path):
             bytes_to_copy = dir_size_bytes(mask_count_path)
             copy_start = time.monotonic()
-            shutil.copytree(mask_count_path, cached_count_path)
+            try:
+                shutil.copytree(mask_count_path, cached_count_path)
+            except FileExistsError:
+                logger.warning(
+                    "Partition cache path already exists during copy; refreshing in place: %s",
+                    cached_count_path,
+                )
+                shutil.copytree(mask_count_path, cached_count_path, dirs_exist_ok=True)
             if profiler is not None:
                 elapsed = time.monotonic() - copy_start
                 profiler.add_duration("cache_fill_seconds", elapsed, flag="approximate")
@@ -710,6 +728,78 @@ def reduce_partitions(
                     tile_idx_x += 1
 
     return tile_generator(), pred_shape
+
+
+def reduce_single_partition_arrays(
+    mask_pred: np.ndarray,
+    mask_count: np.ndarray,
+    tile_size: int,
+    add_scale_bar: bool = False,
+    pixel_resolution_um: Optional[float] = None,
+    scale_bar_length_um: float = 10000.0,
+    profiler=None,
+) -> Tuple:
+    """
+    Create a lazy tile generator from a single in-memory partition result.
+
+    This avoids spilling large intermediate partition zarrs when the job is
+    already running with NUM_PARTS=1 and can write its final TIFF directly.
+    """
+    if mask_pred.shape != mask_count.shape:
+        raise ValueError(
+            f"mask_pred and mask_count must have the same shape, got "
+            f"{mask_pred.shape} vs {mask_count.shape}"
+        )
+
+    H, W = mask_pred.shape
+    logger.info(
+        "Starting direct single-part reduce from in-memory accumulators "
+        "(shape=%sx%s, tile_size=%s)",
+        H,
+        W,
+        tile_size,
+    )
+
+    scale_bar_tiles = []
+    mask_tiles = []
+    if add_scale_bar and pixel_resolution_um is not None:
+        scale_bar_tiles, mask_tiles = create_scale_bar_tiles(
+            W, H, tile_size, pixel_resolution_um, scale_bar_length_um
+        )
+
+    def tile_generator():
+        total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
+
+        with tqdm(total=total_tiles, desc="Processing tiles", unit="tile", **get_tqdm_kwargs()) as pbar:
+            for y in range(0, H, tile_size):
+                y_end = min(y + tile_size, H)
+                tile_h = y_end - y
+                tile_idx_x = 0
+
+                for x in range(0, W, tile_size):
+                    tile_start = time.monotonic()
+                    x_end = min(x + tile_size, W)
+                    tile_w = x_end - x
+
+                    pred_chunk = np.asarray(mask_pred[y:y_end, x:x_end], dtype=np.float32)
+                    count_chunk = np.asarray(mask_count[y:y_end, x:x_end], dtype=np.float32)
+
+                    result_tile = pred_chunk / np.clip(count_chunk, 1e-6, None)
+                    result_tile = np.clip(result_tile, 0, 1)
+                    result_uint8 = (result_tile * 255).astype(np.uint8)
+
+                    if y == 0 and scale_bar_tiles and tile_idx_x < len(scale_bar_tiles):
+                        scale_tile = scale_bar_tiles[tile_idx_x][:tile_h, :tile_w]
+                        mask_tile = mask_tiles[tile_idx_x][:tile_h, :tile_w]
+                        result_uint8 = np.where(mask_tile == 255, scale_tile, result_uint8)
+
+                    if profiler is not None:
+                        profiler.add_duration("reduce_seconds", time.monotonic() - tile_start, flag="approximate")
+                    yield result_uint8
+                    pbar.update(1)
+                    tile_idx_x += 1
+
+    return tile_generator(), (H, W)
 
 
 # ----------------------------- TIFF Writing ------------------------------

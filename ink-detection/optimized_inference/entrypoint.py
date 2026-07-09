@@ -1,33 +1,16 @@
 import os
 import io
 import sys
-import logging as _logging
-import warnings
 
 # Allow huge images before anything imports cv2 (and before importing inference_timesformer)
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
-
-# Suppress harmless "Unclosed client session / connector" noise from aiohttp.
-# s3fs/fsspec create aiohttp sessions that aren't explicitly closed when
-# DataLoader worker processes exit.  aiohttp.__del__ emits these via two paths:
-#   1) warnings.warn(..., ResourceWarning)  — suppressed by the filter below
-#   2) loop.call_exception_handler()        — suppressed by the asyncio log filter
-warnings.filterwarnings("ignore", message="Unclosed", category=ResourceWarning)
-
-
-class _FilterUnclosed(_logging.Filter):
-    def filter(self, record: _logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        return "Unclosed client session" not in msg and "Unclosed connector" not in msg
-
-
-_logging.getLogger("asyncio").addFilter(_FilterUnclosed())
 
 import json
 import time
 import math
 import shutil
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import uuid
@@ -52,7 +35,6 @@ from profiling import (
     dir_size_bytes,
     scoped_timer,
 )
-from runtime_contracts import normalize_model_type, validate_image_role_for_step
 
 # WebKnossos imports
 try:
@@ -69,15 +51,40 @@ logging.basicConfig(
 logger = logging.getLogger("optimized_inference.entrypoint")
 
 
+def get_work_dir() -> str:
+    """Return the writable work directory used for local staging."""
+    return os.getenv("WORK_DIR", "/workspace").strip() or "/workspace"
+
+
+def get_runtime_dir() -> str:
+    """Return the writable runtime directory for temporary local artifacts."""
+    return os.getenv("RUNTIME_DIR", "/tmp").strip() or "/tmp"
+
+
+def parse_roi_xyxy_env(raw_value: str) -> Optional[Tuple[int, int, int, int]]:
+    raw_value = (raw_value or "").strip()
+    if not raw_value:
+        return None
+    parts = [part.strip() for part in raw_value.split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"ROI_XYXY must have four comma-separated integers, got '{raw_value}'")
+    x0, y0, x1, y1 = [int(part) for part in parts]
+    if x0 >= x1 or y0 >= y1:
+        raise ValueError(f"ROI_XYXY must satisfy x0 < x1 and y0 < y1, got '{raw_value}'")
+    return (x0, y0, x1, y1)
+
+
 @dataclass
 class Inputs:
     model_key: str
     s3_path: str
     start_layer: int
     end_layer: int
+    model_in_chans: int
     force_reverse: bool = False
     wk_inference: bool = False
     wk_dataset_id: str = ""
+    local_layers_dir: str = ""
     step: str = "inference"  # "prepare", "inference", "reduce", or "aggregate-profiling"
     num_parts: int = 1
     part_id: int = 0
@@ -85,11 +92,27 @@ class Inputs:
     surface_volume_zarr: str = ""  # Path to pre-created surface volume zarr
     chunk_size: int = 1024  # Chunk size for zarr array creation (SURFACE_VOLUME_CHUNK_SIZE)
     use_zarr_compression: bool = False  # Enable/disable zarr compression
-    model_type: str = "timesformer"  # "timesformer", "resnet3d-50", or "resnet3d-152-3d-decoder"
+    prepare_max_workers: int = 4
+    model_type: str = "timesformer"  # "timesformer", "resnet3d", or "resnet3d-<depth>"
     tile_size: int = 64  # Tile size for sliding window inference (size will be set to same value)
     stride: int = 16  # Stride for sliding window
     batch_size: int = 256  # Batch size for inference
+    inference_workers: int = min(8, os.cpu_count() or 4)  # DataLoader worker count
     prefetch_factor: int = 8  # Prefetch factor for DataLoader
+    accumulator_mode: str = "auto"  # "auto", "ram", or "memmap"
+    accumulator_auto_threshold_gib: float = 32.0
+    accumulator_flush_every_batches: int = 64
+    progress_log_every_batches: int = 0
+    progress_log_every_seconds: float = 0.0
+    max_batches: int = 0
+    skip_partition_write: bool = False
+    skip_empty_tiles: bool = True
+    prune_empty_tiles: bool = False
+    direct_single_part_write: bool = False
+    z_downsample_mean_factor: int = 1  # Optional on-the-fly z mean-downsample factor (1 or 2)
+    roi_xyxy: Optional[Tuple[int, int, int, int]] = None
+    blend_mode: str = "hann"  # "hann" or "gaussian"
+    gaussian_sigma: float = 0.0  # 0 -> auto (~ tile/2.5) when blend_mode=gaussian
     output_path: str = ""  # Full output path (S3 URI or local path) for prediction result
     pixel_resolution_um: Optional[float] = None  # Real-world pixel resolution in micrometers (µm), None to omit
     add_scale_bar: bool = False  # Whether to add scale bar overlay to output
@@ -109,8 +132,10 @@ def parse_env() -> Inputs:
         s3_path = os.getenv("S3_PATH", "").strip()
         start_layer = int(os.environ["START_LAYER"].strip())
         end_layer = int(os.environ["END_LAYER"].strip())
+        model_in_chans_raw = os.getenv("MODEL_IN_CHANS", "").strip()
         force_reverse = os.getenv("FORCE_REVERSE", "false").lower() == "true"
         wk_dataset_id = os.getenv("WK_DATASET_ID", "").strip()
+        local_layers_dir = os.getenv("LOCAL_LAYERS_DIR", "").strip()
 
         # Map/reduce parameters
         step = os.getenv("STEP", "inference").strip().lower()
@@ -120,15 +145,46 @@ def parse_env() -> Inputs:
         surface_volume_zarr = os.getenv("SURFACE_VOLUME_ZARR", "").strip()
         chunk_size = int(os.getenv("SURFACE_VOLUME_CHUNK_SIZE", "1024"))
         use_zarr_compression = os.getenv("USE_ZARR_COMPRESSION", "false").lower() == "true"
+        prepare_max_workers = int(os.getenv("PREPARE_MAX_WORKERS", "4"))
 
         # Model type parameter
-        model_type = normalize_model_type(os.getenv("MODEL_TYPE", "timesformer"))
+        model_type = os.getenv("MODEL_TYPE", "timesformer").strip().lower()
+
+        # Validate model_type
+        valid_model_types = {
+            "timesformer",
+            "resnet3d",
+            "resnet3d-50",
+            "resnet3d-101",
+            "resnet3d-152",
+            "resnet3d-200",
+        }
+        if model_type not in valid_model_types:
+            raise ValueError(
+                "MODEL_TYPE must be one of "
+                f"{sorted(valid_model_types)}, got '{model_type}'"
+            )
 
         # Inference configuration parameters
         tile_size = int(os.getenv("TILE_SIZE", "64"))
         stride = int(os.getenv("STRIDE", "16"))
         batch_size = int(os.getenv("BATCH_SIZE", "256"))
+        inference_workers = int(os.getenv("INFERENCE_WORKERS", str(min(8, os.cpu_count() or 4))))
         prefetch_factor = int(os.getenv("PREFETCH_FACTOR", "8"))
+        accumulator_mode = os.getenv("ACCUMULATOR_MODE", "ram").strip().lower()
+        accumulator_auto_threshold_gib = float(os.getenv("ACCUMULATOR_AUTO_THRESHOLD_GIB", "32.0"))
+        accumulator_flush_every_batches = int(os.getenv("ACCUMULATOR_FLUSH_EVERY_BATCHES", "64"))
+        progress_log_every_batches = int(os.getenv("PROGRESS_LOG_EVERY_BATCHES", "0"))
+        progress_log_every_seconds = float(os.getenv("PROGRESS_LOG_EVERY_SECONDS", "0.0"))
+        max_batches = int(os.getenv("MAX_BATCHES", "0"))
+        skip_partition_write = os.getenv("SKIP_PARTITION_WRITE", "false").lower() == "true"
+        skip_empty_tiles = os.getenv("SKIP_EMPTY_TILES", "true").lower() == "true"
+        prune_empty_tiles = os.getenv("PRUNE_EMPTY_TILES", "false").lower() == "true"
+        direct_single_part_write = os.getenv("DIRECT_SINGLE_PART_WRITE", "false").lower() == "true"
+        z_downsample_mean_factor = int(os.getenv("Z_DOWNSAMPLE_MEAN_FACTOR", "1"))
+        roi_xyxy = parse_roi_xyxy_env(os.getenv("ROI_XYXY", ""))
+        blend_mode = os.getenv("BLEND_MODE", "hann").strip().lower()
+        gaussian_sigma = float(os.getenv("GAUSSIAN_SIGMA", "0.0"))
         output_path = os.getenv("OUTPUT_PATH", "").strip()
         segment_id = os.getenv("SEGMENT_ID", "").strip()
         profiling_level = os.getenv("PROFILING_LEVEL", "basic").strip().lower()
@@ -154,8 +210,43 @@ def parse_env() -> Inputs:
             raise ValueError(f"STRIDE must be positive, got {stride}")
         if batch_size <= 0:
             raise ValueError(f"BATCH_SIZE must be positive, got {batch_size}")
+        if inference_workers < 0:
+            raise ValueError(f"INFERENCE_WORKERS must be >= 0, got {inference_workers}")
         if prefetch_factor <= 0:
             raise ValueError(f"PREFETCH_FACTOR must be positive, got {prefetch_factor}")
+        if accumulator_mode not in ("auto", "ram", "memmap"):
+            raise ValueError(
+                f"ACCUMULATOR_MODE must be 'auto', 'ram', or 'memmap', got '{accumulator_mode}'"
+            )
+        if accumulator_auto_threshold_gib <= 0:
+            raise ValueError(
+                f"ACCUMULATOR_AUTO_THRESHOLD_GIB must be positive, got {accumulator_auto_threshold_gib}"
+            )
+        if accumulator_flush_every_batches < 0:
+            raise ValueError(
+                "ACCUMULATOR_FLUSH_EVERY_BATCHES must be >= 0, "
+                f"got {accumulator_flush_every_batches}"
+            )
+        if progress_log_every_batches < 0:
+            raise ValueError(
+                f"PROGRESS_LOG_EVERY_BATCHES must be >= 0, got {progress_log_every_batches}"
+            )
+        if progress_log_every_seconds < 0:
+            raise ValueError(
+                f"PROGRESS_LOG_EVERY_SECONDS must be >= 0, got {progress_log_every_seconds}"
+            )
+        if max_batches < 0:
+            raise ValueError(f"MAX_BATCHES must be >= 0, got {max_batches}")
+        if prepare_max_workers <= 0:
+            raise ValueError(f"PREPARE_MAX_WORKERS must be positive, got {prepare_max_workers}")
+        if z_downsample_mean_factor not in (1, 2):
+            raise ValueError(
+                f"Z_DOWNSAMPLE_MEAN_FACTOR must be 1 or 2, got {z_downsample_mean_factor}"
+            )
+        if blend_mode not in ("hann", "gaussian"):
+            raise ValueError(f"BLEND_MODE must be 'hann' or 'gaussian', got '{blend_mode}'")
+        if gaussian_sigma < 0:
+            raise ValueError(f"GAUSSIAN_SIGMA must be >= 0, got {gaussian_sigma}")
         if stride > tile_size:
             logger.warning(f"STRIDE ({stride}) > TILE_SIZE ({tile_size}) may create gaps in coverage")
         if pixel_resolution_um is not None and pixel_resolution_um <= 0:
@@ -166,21 +257,20 @@ def parse_env() -> Inputs:
         # Validate step parameter
         if step not in ("prepare", "inference", "reduce", "aggregate-profiling"):
             raise ValueError(f"STEP must be 'prepare', 'inference', 'reduce', or 'aggregate-profiling', got '{step}'")
-        validate_image_role_for_step(step, os.getenv("IMAGE_ROLE", ""))
 
         # Validate NUM_PARTS upfront
         if num_parts < 1:
             raise ValueError(f"NUM_PARTS must be >= 1, got {num_parts}")
 
         # Validate PART_ID for inference step
-        if step == "inference" and part_id < 0 or part_id >= num_parts:
+        if step == "inference" and (part_id < 0 or part_id >= num_parts):
             raise ValueError(f"PART_ID must be in range [0, {num_parts}), got {part_id}")
 
         # Validate required parameters per step
         if step == "prepare":
-            # Prepare step requires s3_path or wk_dataset_id
-            if not s3_path and not wk_dataset_id:
-                raise ValueError("STEP=prepare requires either S3_PATH or WK_DATASET_ID")
+            # Prepare step requires s3_path, wk_dataset_id, or local_layers_dir
+            if not s3_path and not wk_dataset_id and not local_layers_dir:
+                raise ValueError("STEP=prepare requires S3_PATH, WK_DATASET_ID, or LOCAL_LAYERS_DIR")
         elif step == "inference":
             # Inference step requires surface_volume_zarr
             if not surface_volume_zarr:
@@ -191,17 +281,31 @@ def parse_env() -> Inputs:
 
         wk_inference = bool(wk_dataset_id)
 
-        if start_layer > end_layer:
-            raise ValueError("START_LAYER must be <= END_LAYER")
+        if start_layer >= end_layer:
+            raise ValueError("START_LAYER must be < END_LAYER")
+
+        raw_requested_channels = int(end_layer - start_layer)
+        downsampled_requested_channels = int(
+            (raw_requested_channels + z_downsample_mean_factor - 1) // z_downsample_mean_factor
+        )
+        model_in_chans = int(model_in_chans_raw) if model_in_chans_raw else downsampled_requested_channels
+        if model_in_chans < 1 or model_in_chans > downsampled_requested_channels:
+            raise ValueError(
+                "MODEL_IN_CHANS must be in "
+                f"[1, {downsampled_requested_channels}] after z downsample x{z_downsample_mean_factor}, "
+                f"got {model_in_chans}"
+            )
 
         return Inputs(
             model_key=model_key,
             s3_path=s3_path,
             start_layer=start_layer,
             end_layer=end_layer,
+            model_in_chans=model_in_chans,
             force_reverse=force_reverse,
             wk_inference=wk_inference,
             wk_dataset_id=wk_dataset_id,
+            local_layers_dir=local_layers_dir,
             step=step,
             num_parts=num_parts,
             part_id=part_id,
@@ -209,11 +313,27 @@ def parse_env() -> Inputs:
             surface_volume_zarr=surface_volume_zarr,
             chunk_size=chunk_size,
             use_zarr_compression=use_zarr_compression,
+            prepare_max_workers=prepare_max_workers,
             model_type=model_type,
             tile_size=tile_size,
             stride=stride,
             batch_size=batch_size,
+            inference_workers=inference_workers,
             prefetch_factor=prefetch_factor,
+            accumulator_mode=accumulator_mode,
+            accumulator_auto_threshold_gib=accumulator_auto_threshold_gib,
+            accumulator_flush_every_batches=accumulator_flush_every_batches,
+            progress_log_every_batches=progress_log_every_batches,
+            progress_log_every_seconds=progress_log_every_seconds,
+            max_batches=max_batches,
+            skip_partition_write=skip_partition_write,
+            skip_empty_tiles=skip_empty_tiles,
+            prune_empty_tiles=prune_empty_tiles,
+            direct_single_part_write=direct_single_part_write,
+            z_downsample_mean_factor=z_downsample_mean_factor,
+            roi_xyxy=roi_xyxy,
+            blend_mode=blend_mode,
+            gaussian_sigma=gaussian_sigma,
             output_path=output_path,
             pixel_resolution_um=pixel_resolution_um,
             add_scale_bar=add_scale_bar,
@@ -241,10 +361,73 @@ def parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
     return parts[0], parts[1]
 
 
+def is_weight_file(path_or_uri: str) -> bool:
+    lower = path_or_uri.strip().lower()
+    return lower.endswith((".ckpt", ".safetensors", ".bin", ".pt"))
+
+
 def ensure_clean_dir(path: str) -> None:
     if os.path.isdir(path):
         shutil.rmtree(path)
     os.makedirs(path, exist_ok=True)
+
+
+def sanitize_model_tag(model_key: str) -> str:
+    """Collapse model identifiers or checkpoint paths into a safe filename fragment."""
+    base = os.path.basename(model_key.rstrip("/")) or model_key
+    stem, _ = os.path.splitext(base)
+    candidate = stem or base or "model"
+    candidate = re.sub(r"[^A-Za-z0-9._-]+", "_", candidate).strip("._-")
+    return candidate or "model"
+
+
+def resolve_final_output_path(inputs: Inputs) -> str:
+    model_tag = sanitize_model_tag(inputs.model_key)
+    if inputs.output_path:
+        return inputs.output_path
+    if inputs.s3_path:
+        bucket, prefix = parse_s3_uri(inputs.s3_path)
+        out_key = os.path.join(
+            prefix.rstrip("/"),
+            "predictions",
+            f"prediction_{model_tag}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif",
+        )
+        return f"s3://{bucket}/{out_key}"
+    if inputs.wk_inference:
+        return os.path.join(
+            get_runtime_dir(),
+            f"prediction_{model_tag}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif",
+        )
+    raise ValueError("Result output requires OUTPUT_PATH, S3_PATH, or WK_DATASET_ID")
+
+
+def persist_local_tiff_result(
+    *,
+    inputs: Inputs,
+    local_tiff_path: str,
+    profiler: Optional[WorkflowProfiler] = None,
+) -> str:
+    final_output_path = resolve_final_output_path(inputs)
+    s3_client = boto3.client("s3")
+
+    if final_output_path.startswith("s3://"):
+        output_bucket, output_key = parse_s3_uri(final_output_path)
+        logger.info(f"Uploading tiled TIFF to S3: {final_output_path}")
+        profiled_s3_upload_file(s3_client, local_tiff_path, output_bucket, output_key, profiler)
+        result_uri = final_output_path
+    else:
+        os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
+        logger.info(f"Copying tiled TIFF to local path: {final_output_path}")
+        with scoped_timer(profiler, "local_write_seconds", flag=FLAG_APPROXIMATE):
+            shutil.copy2(local_tiff_path, final_output_path)
+        if profiler is not None:
+            profiler.increment_counter("local_write_bytes", os.path.getsize(local_tiff_path))
+        result_uri = final_output_path
+
+    logger.info(f"Saved result to: {result_uri}")
+    with open(os.path.join(get_runtime_dir(), "result_s3_url.txt"), "w", encoding="utf-8") as f:
+        f.write(result_uri)
+    return result_uri
 
 
 def build_profiler(inputs: Inputs, template_name: str) -> WorkflowProfiler:
@@ -259,13 +442,20 @@ def build_profiler(inputs: Inputs, template_name: str) -> WorkflowProfiler:
         s3_path=inputs.s3_path,
         start_layer=inputs.start_layer,
         end_layer=inputs.end_layer,
+        model_in_chans=inputs.model_in_chans,
+        local_layers_dir=inputs.local_layers_dir,
         num_parts=inputs.num_parts,
         part_id=inputs.part_id,
         tile_size=inputs.tile_size,
         stride=inputs.stride,
         batch_size=inputs.batch_size,
+        z_downsample_mean_factor=inputs.z_downsample_mean_factor,
+        roi_xyxy=inputs.roi_xyxy,
+        progress_log_every_batches=inputs.progress_log_every_batches,
+        progress_log_every_seconds=inputs.progress_log_every_seconds,
         surface_volume_zarr=inputs.surface_volume_zarr,
         zarr_output_dir=inputs.zarr_output_dir,
+        prepare_max_workers=inputs.prepare_max_workers,
         profiling_level=inputs.profiling_level,
         profiling_keep_raw_traces=inputs.profiling_keep_raw_traces,
     )
@@ -321,7 +511,7 @@ def profiled_s3_upload_file(
 
 
 def write_aggregate_output_parameters(results: Dict[str, str]) -> None:
-    parameter_dir = "/tmp/outputs/parameters"
+    parameter_dir = os.path.join(get_runtime_dir(), "outputs", "parameters")
     os.makedirs(parameter_dir, exist_ok=True)
     for name, path in results.items():
         target = os.path.join(parameter_dir, f"{name}.txt")
@@ -435,14 +625,30 @@ def load_layers_to_numpy(layer_paths: List[str]) -> np.ndarray:
 
 def download_model_weights(model_name: str, dest_dir: str, s3_client, profiler: Optional[WorkflowProfiler] = None) -> str:
     """
-    Resolve model weights by checking S3 registry first, then fall back to Hugging Face.
+    Resolve model weights from a direct path/URI, S3 registry key, or Hugging Face repo.
 
     Search order preference for files: .ckpt, .safetensors, .bin, .pt
     """
     os.makedirs(dest_dir, exist_ok=True)
+    model_name = model_name.strip()
+
+    # 0) Allow direct local filesystem paths for ad hoc checkpoints.
+    if os.path.isfile(model_name) and is_weight_file(model_name):
+        local_path = os.path.abspath(model_name)
+        logger.info(f"Using local model weights: {local_path}")
+        return local_path
+
+    # 0b) Allow direct S3 URIs to a specific checkpoint file.
+    if model_name.startswith("s3://") and is_weight_file(model_name):
+        bucket, key = parse_s3_uri(model_name)
+        local_path = os.path.join(dest_dir, os.path.basename(key))
+        logger.info(f"Downloading model weights from direct S3 URI: {model_name}")
+        profiled_s3_download_file(s3_client, bucket, key, local_path, profiler)
+        logger.info(f"Downloaded weights from S3 to: {local_path}")
+        return local_path
 
     registry_bucket = "scrollprize-models-registry"
-    registry_prefix = f"ink-detection/{model_name.strip().rstrip('/')}/"
+    registry_prefix = f"ink-detection/{model_name.rstrip('/')}/"
 
     def _prefer(weights: List[str]) -> Optional[str]:
         if not weights:
@@ -551,7 +757,7 @@ def upload_to_webknossos(wk_dataset_id: str, prediction: np.ndarray, model_key: 
         dataset = Dataset.open_remote(wk_dataset_id)
 
         # Create layer name
-        layer_name = f"ink_prediction_{model_key}_{start_layer:02d}_{end_layer:02d}"
+        layer_name = f"ink_prediction_{sanitize_model_tag(model_key)}_{start_layer:02d}_{end_layer:02d}"
         logger.info(f"Creating layer: {layer_name}")
 
         # Convert prediction to uint8
@@ -608,7 +814,8 @@ def save_and_upload_prediction(
         final_output_path = output_path
     elif default_bucket and default_prefix:
         # Use legacy default: s3://bucket/prefix/predictions/prediction_MODEL_START_END.png
-        out_key = os.path.join(default_prefix.rstrip("/"), "predictions", f"prediction_{model_key}_{start_layer:02d}_{end_layer:02d}.png")
+        model_tag = sanitize_model_tag(model_key)
+        out_key = os.path.join(default_prefix.rstrip("/"), "predictions", f"prediction_{model_tag}_{start_layer:02d}_{end_layer:02d}.png")
         final_output_path = f"s3://{default_bucket}/{out_key}"
     else:
         raise ValueError("No output_path specified and no default bucket/prefix provided")
@@ -618,8 +825,9 @@ def save_and_upload_prediction(
         bucket, key = parse_s3_uri(final_output_path)
 
         # Save to local temp file first
-        os.makedirs("/tmp/outputs", exist_ok=True)
-        local_path = os.path.join("/tmp/outputs", os.path.basename(key))
+        output_dir = os.path.join(get_runtime_dir(), "outputs")
+        os.makedirs(output_dir, exist_ok=True)
+        local_path = os.path.join(output_dir, os.path.basename(key))
         cv2.imwrite(local_path, prediction_uint8)
 
         # Upload to S3
@@ -647,44 +855,76 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
         inputs.s3_path = get_wk_dataset_metadata(inputs.wk_dataset_id)
         logger.info(f"Retrieved s3_path from WebKnossos metadata: {inputs.s3_path}")
 
-    # S3 setup
-    logger.info("Setting up S3 client...")
-    s3_client = boto3.client("s3")
-    logger.info(f"Parsing S3 URI: {inputs.s3_path}")
-    bucket, prefix = parse_s3_uri(inputs.s3_path)
+    if inputs.local_layers_dir:
+        layers_dir = inputs.local_layers_dir
+        if not os.path.isdir(layers_dir):
+            raise RuntimeError(f"Local layers dir not found: {layers_dir}")
+        supported_exts = {".tif", ".tiff", ".png", ".jpeg", ".jpg"}
+        layer_paths = []
+        for name in os.listdir(layers_dir):
+            path = os.path.join(layers_dir, name)
+            stem, ext = os.path.splitext(name)
+            if ext.lower() not in supported_exts:
+                continue
+            try:
+                layer_idx = int(stem)
+            except ValueError:
+                continue
+            layer_paths.append((layer_idx, path))
+        if not layer_paths:
+            raise RuntimeError(f"No local layers found under {layers_dir}")
+        layer_paths.sort(key=lambda item: item[0])
+        layer_paths = [path for _, path in layer_paths]
+        logger.info(
+            "Found %s local layers in %s; prepare will build the full local zarr and inference will later use range [%s, %s)",
+            len(layer_paths),
+            layers_dir,
+            inputs.start_layer,
+            inputs.end_layer,
+        )
+    else:
+        # S3 setup
+        logger.info("Setting up S3 client...")
+        s3_client = boto3.client("s3")
+        logger.info(f"Parsing S3 URI: {inputs.s3_path}")
+        bucket, prefix = parse_s3_uri(inputs.s3_path)
 
-    logger.info(f"Listing layer objects in S3 bucket '{bucket}' with prefix '{prefix}' for layers [{inputs.start_layer}, {inputs.end_layer})")
-    layer_objects = list_layers_objects(
-        s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer, profiler=profiler
-    )
-    logger.info(f"Found {len(layer_objects)} layer objects to download")
+        logger.info(f"Listing layer objects in S3 bucket '{bucket}' with prefix '{prefix}' for layers [{inputs.start_layer}, {inputs.end_layer})")
+        layer_objects = list_layers_objects(
+            s3_client, bucket, prefix, inputs.start_layer, inputs.end_layer, profiler=profiler
+        )
+        logger.info(f"Found {len(layer_objects)} layer objects to download")
 
-    # Download layers to temporary directory
-    work_dir = "/workspace"
-    input_dir = os.path.join(work_dir, "input", "layers")
-    logger.info(f"Ensuring clean input directory at {os.path.join(work_dir, 'input')}")
-    ensure_clean_dir(os.path.join(work_dir, "input"))
+        # Download layers to temporary directory
+        work_dir = get_work_dir()
+        input_dir = os.path.join(work_dir, "input", "layers")
+        logger.info(f"Ensuring clean input directory at {os.path.join(work_dir, 'input')}")
+        ensure_clean_dir(os.path.join(work_dir, "input"))
 
-    logger.info(f"Downloading layer files to {input_dir} ...")
-    layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir, profiler=profiler)
-    logger.info(f"Downloaded {len(layer_paths)} layer files")
+        logger.info(f"Downloading layer files to {input_dir} ...")
+        layer_paths = download_layers(s3_client, bucket, layer_objects, input_dir, profiler=profiler)
+        logger.info(f"Downloaded {len(layer_paths)} layer files")
 
     if inputs.surface_volume_zarr:
         output_path = inputs.surface_volume_zarr
     else:
-        output_path = f"/tmp/surface_volume_{inputs.start_layer:02d}_{inputs.end_layer:02d}.zarr"
+        output_path = os.path.join(
+            get_runtime_dir(),
+            f"surface_volume_{inputs.start_layer:02d}_{inputs.end_layer:02d}.zarr",
+        )
 
     logger.info(f"Creating surface volume zarr at {output_path} with chunk_size={inputs.chunk_size}, compression={inputs.use_zarr_compression}")
     created_zarr_path = create_surface_volume_zarr(
         layer_paths,
         output_path,
         chunk_size=inputs.chunk_size,
+        max_workers=inputs.prepare_max_workers,
         use_compression=inputs.use_zarr_compression,
         profiler=profiler,
     )
 
     # Write output path to file for next step
-    output_file = "/tmp/surface_volume_zarr_path.txt"
+    output_file = os.path.join(get_runtime_dir(), "surface_volume_zarr_path.txt")
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(created_zarr_path)
 
@@ -701,25 +941,72 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     from processing import path_exists
 
     # Configure inference parameters
-    CFG.in_chans = inputs.end_layer - inputs.start_layer
+    raw_requested_channels = inputs.end_layer - inputs.start_layer
+    downsampled_requested_channels = int(
+        (raw_requested_channels + inputs.z_downsample_mean_factor - 1)
+        // inputs.z_downsample_mean_factor
+    )
+    CFG.in_chans = inputs.model_in_chans
     CFG.tile_size = inputs.tile_size
     CFG.size = inputs.tile_size  # Set size to same as tile_size
     CFG.stride = inputs.stride
     CFG.batch_size = inputs.batch_size
+    CFG.workers = inputs.inference_workers
     CFG.prefetch_factor = inputs.prefetch_factor
-    logger.info(f"Using {CFG.in_chans} input channels (layers [{inputs.start_layer}, {inputs.end_layer}))")
-    logger.info(f"Inference config: tile_size={CFG.tile_size}, size={CFG.size}, stride={CFG.stride}, batch_size={CFG.batch_size}, prefetch_factor={CFG.prefetch_factor}")
+    CFG.accumulator_mode = inputs.accumulator_mode
+    CFG.accumulator_auto_threshold_gib = inputs.accumulator_auto_threshold_gib
+    CFG.accumulator_flush_every_batches = inputs.accumulator_flush_every_batches
+    CFG.progress_log_every_batches = inputs.progress_log_every_batches
+    CFG.progress_log_every_seconds = inputs.progress_log_every_seconds
+    CFG.max_batches = inputs.max_batches
+    CFG.skip_partition_write = inputs.skip_partition_write
+    CFG.skip_empty_tiles = inputs.skip_empty_tiles
+    CFG.prune_empty_tiles = inputs.prune_empty_tiles
+    CFG.direct_single_part_write = inputs.direct_single_part_write
+    CFG.use_hann_window = inputs.blend_mode == "hann"
+    CFG.gaussian_sigma = inputs.gaussian_sigma
+    logger.info(
+        "Using %s input channels from raw z range [%s, %s) "
+        "(raw=%s, after z downsample x%s=%s)",
+        CFG.in_chans,
+        inputs.start_layer,
+        inputs.end_layer,
+        raw_requested_channels,
+        inputs.z_downsample_mean_factor,
+        downsampled_requested_channels,
+    )
+    logger.info(
+        f"Inference config: tile_size={CFG.tile_size}, size={CFG.size}, stride={CFG.stride}, "
+        f"batch_size={CFG.batch_size}, workers={CFG.workers}, prefetch_factor={CFG.prefetch_factor}, "
+        f"accumulator_mode={CFG.accumulator_mode}, "
+        f"accumulator_auto_threshold_gib={CFG.accumulator_auto_threshold_gib}, "
+        f"accumulator_flush_every_batches={CFG.accumulator_flush_every_batches}, "
+        f"progress_log_every_batches={CFG.progress_log_every_batches}, "
+        f"progress_log_every_seconds={CFG.progress_log_every_seconds}, "
+        f"max_batches={CFG.max_batches}, "
+        f"skip_partition_write={CFG.skip_partition_write}, "
+        f"skip_empty_tiles={CFG.skip_empty_tiles}, "
+        f"prune_empty_tiles={CFG.prune_empty_tiles}, "
+        f"direct_single_part_write={CFG.direct_single_part_write}, "
+        f"blend_mode={inputs.blend_mode}, gaussian_sigma={inputs.gaussian_sigma}, "
+        f"z_downsample_mean_factor={inputs.z_downsample_mean_factor}"
+    )
+    if inputs.roi_xyxy is not None:
+        logger.info("Inference ROI: [%s, %s, %s, %s)", *inputs.roi_xyxy)
+
+    requested_resnet_depth = None
 
     # Import model-specific module based on model_type
     if inputs.model_type == "timesformer":
         from model_timesformer import load_model
         logger.info(f"Using TimeSformer model")
-    elif inputs.model_type == "resnet3d-50":
+    elif inputs.model_type == "resnet3d" or inputs.model_type.startswith("resnet3d-"):
         from model_resnet3d import load_model
-        logger.info(f"Using ResNet3D-50 model")
-    elif inputs.model_type == "resnet3d-152-3d-decoder":
-        from model_resnet3d_3d_decoder import load_model
-        logger.info("Using ResNet3D-152 3D decoder model")
+        if inputs.model_type.startswith("resnet3d-"):
+            requested_resnet_depth = int(inputs.model_type.split("-", 1)[1])
+            logger.info(f"Using ResNet3D model (requested depth={requested_resnet_depth})")
+        else:
+            logger.info("Using ResNet3D model (depth will be inferred from checkpoint)")
     else:
         raise ValueError(f"Unknown model_type: {inputs.model_type}")
 
@@ -749,7 +1036,7 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     )
 
     # Prepare models directory
-    work_dir = "/workspace"
+    work_dir = get_work_dir()
     models_dir = os.path.join(work_dir, "models")
     logger.info(f"Ensuring models directory exists at {models_dir}")
     os.makedirs(models_dir, exist_ok=True)
@@ -770,7 +1057,16 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
 
     # Load model with dynamic number of frames
     with scoped_timer(profiler, "model_load_seconds", cuda_sync=device.type == "cuda"):
-        model = load_model(weight_path, device, num_frames=CFG.in_chans)
+        if inputs.model_type == "timesformer":
+            model = load_model(weight_path, device, num_frames=CFG.in_chans)
+        else:
+            model = load_model(
+                weight_path,
+                device,
+                num_frames=CFG.in_chans,
+                model_depth=requested_resnet_depth,
+            )
+    logger.info("Model loader returned successfully")
 
     # -------- Performance toggles ------------------------------------------------
     # TF32 on Ampere+ gives fast GEMMs with tiny accuracy impact for this task.
@@ -779,9 +1075,11 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
         torch.set_float32_matmul_precision("high")
     except Exception:
         pass
+    logger.info("TF32 / matmul precision toggles applied")
     # torch.compile defaults
     COMPILE = os.getenv("COMPILE", "1") == "1" and hasattr(torch, "compile")
     COMPILE_MODE = os.getenv("COMPILE_MODE", "reduce-overhead")  # <- default changed
+    logger.info("Compile gate resolved: COMPILE=%s COMPILE_MODE=%s", COMPILE, COMPILE_MODE)
     if COMPILE:
         with scoped_timer(profiler, "compile_warmup_seconds", cuda_sync=device.type == "cuda"):
             # Persist Inductor cache across runs (huge win after the first run)
@@ -812,6 +1110,7 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
                 del dummy
             except Exception as e:
                 logger.warning(f"Warmup after compile failed (continuing un-warmed): {e}")
+    logger.info("Compile block complete")
 
     # Determine reverse option similar to local test
     if inputs.force_reverse:
@@ -833,6 +1132,9 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
         is_reverse_segment=is_reverse_segment,
         start_z=inputs.start_layer,
         end_z=inputs.end_layer,
+        z_downsample_mean_factor=inputs.z_downsample_mean_factor,
+        target_in_chans=CFG.in_chans,
+        roi_xyxy=inputs.roi_xyxy,
         profiler=profiler,
     )
     infer_elapsed = time.time() - start_infer_time
@@ -846,10 +1148,52 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
                 flag=FLAG_ESTIMATED,
             )
 
-    # Zarr files written, log and exit
-    # Result is a dict with zarr paths: {"mask_pred": path, "mask_count": path}
-    logger.info(f"Partition {inputs.part_id} completed. Zarr arrays written to {inputs.zarr_output_dir}")
-    logger.info("Inference step complete. Run STEP=reduce after all partitions finish to blend and upload results.")
+    if result.get("skipped_partition_write"):
+        logger.info(
+            "Inference benchmark complete for partition %d. Partition write was skipped by request.",
+            inputs.part_id,
+        )
+    elif result.get("direct_single_part_write"):
+        from processing import reduce_single_partition_arrays, write_tiled_tiff
+
+        logger.info(
+            "Direct single-part TIFF write requested for partition %d; "
+            "skipping partition zarr spill and reduce re-read",
+            inputs.part_id,
+        )
+
+        if inputs.add_scale_bar:
+            if inputs.pixel_resolution_um is not None:
+                logger.info(
+                    "Scale bar enabled: %.1fmm at %.2fum/pixel",
+                    inputs.scale_bar_length_um / 1000.0,
+                    inputs.pixel_resolution_um,
+                )
+            else:
+                logger.warning("ADD_SCALE_BAR=true but PIXEL_RESOLUTION_UM not set, skipping scale bar")
+
+        tile_size = 1024
+        tile_iterator, shape = reduce_single_partition_arrays(
+            result["mask_pred_array"],
+            result["mask_count_array"],
+            tile_size,
+            add_scale_bar=inputs.add_scale_bar,
+            pixel_resolution_um=inputs.pixel_resolution_um,
+            scale_bar_length_um=inputs.scale_bar_length_um,
+            profiler=profiler,
+        )
+        model_tag = sanitize_model_tag(inputs.model_key)
+        local_tiff_path = os.path.join(
+            get_runtime_dir(),
+            f"prediction_{model_tag}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif",
+        )
+        start_reduce_time = time.time()
+        write_tiled_tiff(tile_iterator, shape, local_tiff_path, tile_size, inputs.pixel_resolution_um, profiler=profiler)
+        logger.info(f"Direct reduce and TIFF write completed in {time.time() - start_reduce_time:.2f} seconds")
+        persist_local_tiff_result(inputs=inputs, local_tiff_path=local_tiff_path, profiler=profiler)
+    else:
+        logger.info(f"Partition {inputs.part_id} completed. Zarr arrays written to {inputs.zarr_output_dir}")
+        logger.info("Inference step complete. Run STEP=reduce after all partitions finish to blend and upload results.")
 
 
 def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None) -> None:
@@ -858,9 +1202,6 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
     from processing import reduce_partitions, write_tiled_tiff
 
     logger.info(f"Starting reduce step: blending {inputs.num_parts} partitions")
-
-    # S3 setup (need it for uploading final result)
-    s3_client = boto3.client("s3")
 
     # Handle WebKnossos workflow to get s3_path
     if inputs.wk_inference:
@@ -902,48 +1243,16 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
         else:
             logger.warning("ADD_SCALE_BAR=true but PIXEL_RESOLUTION_UM not set, skipping scale bar")
 
-    # Determine output path
-    if inputs.output_path:
-        final_output_path = inputs.output_path
-    elif inputs.s3_path:
-        # Use legacy default: s3://bucket/prefix/predictions/prediction_MODEL_START_END.tif
-        bucket, prefix = parse_s3_uri(inputs.s3_path)
-        out_key = os.path.join(prefix.rstrip("/"), "predictions", f"prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif")
-        final_output_path = f"s3://{bucket}/{out_key}"
-    elif inputs.wk_inference:
-        # For WebKnossos-only mode, we still need to save locally before uploading to WK
-        final_output_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"
-        logger.info(f"WebKnossos mode: will save locally to {final_output_path} before uploading to WebKnossos")
-    else:
-        raise ValueError("STEP=reduce requires OUTPUT_PATH, S3_PATH, or WK_DATASET_ID for result upload")
-
     # Write to local tiled TIFF first (this is when the lazy reduction actually happens)
-    local_tiff_path = f"/tmp/prediction_{inputs.model_key}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif"
+    model_tag = sanitize_model_tag(inputs.model_key)
+    local_tiff_path = os.path.join(
+        get_runtime_dir(),
+        f"prediction_{model_tag}_{inputs.start_layer:02d}_{inputs.end_layer:02d}.tif",
+    )
     start_reduce_time = time.time()
     write_tiled_tiff(tile_iterator, shape, local_tiff_path, tile_size, inputs.pixel_resolution_um, profiler=profiler)
     logger.info(f"Reduce and TIFF write completed in {time.time() - start_reduce_time:.2f} seconds")
-
-    # Handle S3 upload or local save
-    if final_output_path.startswith("s3://"):
-        output_bucket, output_key = parse_s3_uri(final_output_path)
-        logger.info(f"Uploading tiled TIFF to S3: {final_output_path}")
-        profiled_s3_upload_file(s3_client, local_tiff_path, output_bucket, output_key, profiler)
-        result_uri = final_output_path
-    else:
-        # Local file path
-        os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
-        logger.info(f"Copying tiled TIFF to local path: {final_output_path}")
-        with scoped_timer(profiler, "local_write_seconds", flag=FLAG_APPROXIMATE):
-            shutil.copy2(local_tiff_path, final_output_path)
-        if profiler is not None:
-            profiler.increment_counter("local_write_bytes", os.path.getsize(local_tiff_path))
-        result_uri = final_output_path
-
-    logger.info(f"Saved result to: {result_uri}")
-
-    # Write result URI
-    with open("/tmp/result_s3_url.txt", "w", encoding="utf-8") as f:
-        f.write(result_uri)
+    result_uri = persist_local_tiff_result(inputs=inputs, local_tiff_path=local_tiff_path, profiler=profiler)
 
     # If WebKnossos mode, also upload to WebKnossos
     if inputs.wk_inference:
@@ -962,7 +1271,7 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
         )
         logger.info(f"Uploaded prediction to WebKnossos layer: {wk_layer_name}")
 
-        with open("/tmp/result_wk_layer.txt", "w", encoding="utf-8") as f:
+        with open(os.path.join(get_runtime_dir(), "result_wk_layer.txt"), "w", encoding="utf-8") as f:
             f.write(wk_layer_name)
 
         logger.info(f"Reduce completed successfully - S3: {result_uri}, WebKnossos layer: {wk_layer_name}")
@@ -971,7 +1280,7 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
 
 
 def run_aggregate_profiling_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None) -> None:
-    output_dir = "/tmp/profiling-outputs"
+    output_dir = os.path.join(get_runtime_dir(), "profiling-outputs")
     os.makedirs(output_dir, exist_ok=True)
     try:
         with scoped_timer(profiler, "reduce_seconds", flag=FLAG_APPROXIMATE):

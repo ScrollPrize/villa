@@ -63,6 +63,108 @@ def _grid_1d(L: int, tile: int, stride: int) -> List[int]:
         xs.append(end)
     return xs
 
+
+def _downsample_mean_last_axis_factor2(current: np.ndarray) -> np.ndarray:
+    out_c = int((current.shape[2] + 1) // 2)
+    accum = current[..., 0::2].astype(np.float64, copy=True)
+    counts = np.ones(out_c, dtype=np.float64)
+    odd = current[..., 1::2]
+    if odd.shape[2] > 0:
+        accum[..., :odd.shape[2]] += odd.astype(np.float64, copy=False)
+        counts[:odd.shape[2]] += 1.0
+    mean = accum / counts.reshape((1, 1, -1))
+    if np.issubdtype(current.dtype, np.integer):
+        mean = np.rint(mean).astype(current.dtype, copy=False)
+    else:
+        mean = mean.astype(current.dtype, copy=False)
+    return np.ascontiguousarray(mean)
+
+
+def _resolve_z_window(
+    *,
+    full_depth: int,
+    start_z: Optional[int],
+    end_z: Optional[int],
+    z_downsample_mean_factor: int,
+    target_in_chans: Optional[int],
+) -> Tuple[int, int, int]:
+    raw_start = int(start_z if start_z is not None else 0)
+    raw_end = int(end_z if end_z is not None else full_depth)
+
+    if raw_end > full_depth:
+        logger.warning(f"Requested end_z={raw_end} exceeds available channels={full_depth}, clamping")
+        raw_end = full_depth
+
+    if raw_start >= raw_end:
+        raise ValueError(f"Invalid z-range: start_z={raw_start} >= end_z={raw_end}")
+
+    raw_count = int(raw_end - raw_start)
+    original_raw_start = raw_start
+    original_raw_end = raw_end
+    if z_downsample_mean_factor == 1:
+        output_count = raw_count
+        if target_in_chans is not None:
+            target = int(target_in_chans)
+            if target < 1 or target > output_count:
+                raise ValueError(
+                    f"target_in_chans must be in [1, {output_count}] for z_downsample_mean_factor=1, got {target}"
+                )
+            crop_start = max(0, (output_count - target) // 2)
+            raw_start += crop_start
+            raw_end = raw_start + target
+            output_count = target
+        return raw_start, raw_end, output_count
+
+    if z_downsample_mean_factor != 2:
+        raise ValueError(f"Unsupported z_downsample_mean_factor={z_downsample_mean_factor}; expected 1 or 2")
+
+    downsampled_count = int((raw_count + z_downsample_mean_factor - 1) // z_downsample_mean_factor)
+    target = int(target_in_chans) if target_in_chans is not None else downsampled_count
+    if target < 1 or target > downsampled_count:
+        raise ValueError(
+            f"target_in_chans must be in [1, {downsampled_count}] after z downsample x{z_downsample_mean_factor}, got {target}"
+        )
+
+    cropped_start = max(0, (downsampled_count - target) // 2)
+    cropped_stop = int(cropped_start + target)
+    raw_start = int(original_raw_start + cropped_start * z_downsample_mean_factor)
+    raw_end = int(
+        min(
+            original_raw_end,
+            original_raw_start + cropped_stop * z_downsample_mean_factor,
+        )
+    )
+    raw_end = min(raw_end, full_depth)
+
+    output_count = int((max(0, raw_end - raw_start) + z_downsample_mean_factor - 1) // z_downsample_mean_factor)
+    if output_count != target:
+        raise ValueError(
+            f"Expected {target} channels after z downsample x{z_downsample_mean_factor}, got {output_count} from raw slice [{raw_start}, {raw_end})"
+        )
+    return raw_start, raw_end, output_count
+
+
+def _resolve_xy_roi(
+    *,
+    full_h: int,
+    full_w: int,
+    roi_xyxy: Optional[Tuple[int, int, int, int]],
+) -> Tuple[int, int, int, int]:
+    if roi_xyxy is None:
+        return 0, 0, full_w, full_h
+
+    x0, y0, x1, y1 = [int(v) for v in roi_xyxy]
+    x0 = max(0, min(full_w, x0))
+    y0 = max(0, min(full_h, y0))
+    x1 = max(0, min(full_w, x1))
+    y1 = max(0, min(full_h, y1))
+    if x0 >= x1 or y0 >= y1:
+        raise ValueError(
+            f"ROI must intersect the source volume; got clamped ROI "
+            f"[{x0}, {y0}, {x1}, {y1}) for full shape {full_h}x{full_w}"
+        )
+    return x0, y0, x1, y1
+
 # ----------------------------- Model Protocol --------------------------------
 class InferenceModel(Protocol):
     """Protocol that model wrappers must implement."""
@@ -97,6 +199,15 @@ class InferenceConfig:
     batch_size: int = 256
     workers: int = min(8, os.cpu_count() or 4)
     prefetch_factor: int = 8
+    accumulator_mode: str = "ram"  # "auto", "ram", or "memmap"
+    accumulator_auto_threshold_gib: float = 32.0
+    accumulator_flush_every_batches: int = 64
+    progress_log_every_batches: int = 0
+    progress_log_every_seconds: float = 0.0
+    max_batches: int = 0
+    skip_partition_write: bool = False
+    skip_empty_tiles: bool = True
+    prune_empty_tiles: bool = False
 
     # Image processing / scaling
     max_clip_value: int = 200
@@ -112,11 +223,85 @@ class InferenceConfig:
     num_parts: int = 1
     part_id: int = 0
     zarr_output_dir: str = os.environ.get("ZARR_OUTPUT_DIR", "/tmp/partitions")
+    direct_single_part_write: bool = False
 
     # Compression settings
     use_zarr_compression: bool = True
 
 CFG = InferenceConfig()
+
+
+def _use_memmap_accumulators(h: int, w: int) -> bool:
+    mode = str(getattr(CFG, "accumulator_mode", "auto")).strip().lower()
+    if mode == "memmap":
+        return True
+    if mode == "ram":
+        return False
+    if mode != "auto":
+        raise ValueError(f"Unsupported accumulator_mode={mode!r}; expected 'auto', 'ram', or 'memmap'")
+    total_bytes = int(h) * int(w) * np.dtype(np.float32).itemsize * 2
+    threshold_bytes = float(getattr(CFG, "accumulator_auto_threshold_gib", 32.0)) * (1024 ** 3)
+    return total_bytes >= threshold_bytes
+
+
+def _make_accumulators(h: int, w: int) -> Tuple[np.ndarray, np.ndarray, bool, List[str]]:
+    use_memmap = _use_memmap_accumulators(h, w)
+    if not use_memmap:
+        return (
+            np.zeros((h, w), dtype=np.float32),
+            np.zeros((h, w), dtype=np.float32),
+            False,
+            [],
+        )
+
+    runtime_dir = os.environ.get("RUNTIME_DIR", CFG.zarr_output_dir)
+    os.makedirs(runtime_dir, exist_ok=True)
+    pred_tmp = os.path.join(runtime_dir, f"mask_pred_accum_part_{CFG.part_id:03d}.f32")
+    count_tmp = os.path.join(runtime_dir, f"mask_count_accum_part_{CFG.part_id:03d}.f32")
+    for path in (pred_tmp, count_tmp):
+        with suppress(FileNotFoundError):
+            os.remove(path)
+
+    mask_pred = np.memmap(pred_tmp, mode="w+", dtype=np.float32, shape=(h, w))
+    mask_count = np.memmap(count_tmp, mode="w+", dtype=np.float32, shape=(h, w))
+    mask_pred[:] = 0.0
+    mask_count[:] = 0.0
+    logger.info(
+        "Using disk-backed accumulators in %s for prediction canvas %sx%s "
+        "(two float32 planes ~= %.2f GiB)",
+        runtime_dir,
+        h,
+        w,
+        (int(h) * int(w) * np.dtype(np.float32).itemsize * 2) / (1024 ** 3),
+    )
+    return mask_pred, mask_count, True, [pred_tmp, count_tmp]
+
+
+def _write_array_to_zarr_chunks(
+    src: np.ndarray,
+    out_path: str,
+    shape: Tuple[int, int],
+    compressor,
+    profiler=None,
+    chunk_size: int = 1024,
+) -> None:
+    dst = zarr.open(
+        out_path,
+        mode='w',
+        shape=shape,
+        chunks=(chunk_size, chunk_size),
+        dtype=np.float32,
+        compressor=compressor,
+        zarr_format=2,
+        config={'write_empty_chunks': False}
+    )
+    h, w = shape
+    with scoped_timer(profiler, "zarr_write_seconds", flag="approximate"):
+        for y0 in range(0, h, chunk_size):
+            y1 = min(y0 + chunk_size, h)
+            for x0 in range(0, w, chunk_size):
+                x1 = min(x0 + chunk_size, w)
+                dst[y0:y1, x0:x1] = np.asarray(src[y0:y1, x0:x1], dtype=np.float32)
 
 # --------------------- Disk-backed / Array-backed layers ---------------------
 class LayersSource:
@@ -127,19 +312,47 @@ class LayersSource:
 
     For reading tiles during inference without holding the whole stack in RAM.
     """
-    def __init__(self, src: Union[np.ndarray, str], start_z: Optional[int] = None, end_z: Optional[int] = None):
+    def __init__(
+        self,
+        src: Union[np.ndarray, str],
+        start_z: Optional[int] = None,
+        end_z: Optional[int] = None,
+        z_downsample_mean_factor: int = 1,
+        target_in_chans: Optional[int] = None,
+        roi_xyxy: Optional[Tuple[int, int, int, int]] = None,
+    ):
+        self._z_downsample_mean_factor = int(z_downsample_mean_factor or 1)
+        if self._z_downsample_mean_factor not in (1, 2):
+            raise ValueError(
+                f"Unsupported z_downsample_mean_factor={self._z_downsample_mean_factor}; expected 1 or 2"
+            )
         if isinstance(src, np.ndarray):
             if src.ndim != 3:
                 raise ValueError(f"Expected (H,W,C) array, got {src.shape}")
+            self._roi_x0, self._roi_y0, self._roi_x1, self._roi_y1 = _resolve_xy_roi(
+                full_h=int(src.shape[0]),
+                full_w=int(src.shape[1]),
+                roi_xyxy=roi_xyxy,
+            )
             start_z = start_z if start_z is not None else 0
             end_z = end_z if end_z is not None else src.shape[2]
-            self._arr = src[:, :, start_z:end_z]
+            raw_start, raw_end, output_count = _resolve_z_window(
+                full_depth=int(src.shape[2]),
+                start_z=start_z,
+                end_z=end_z,
+                z_downsample_mean_factor=self._z_downsample_mean_factor,
+                target_in_chans=target_in_chans,
+            )
+            current = src[self._roi_y0:self._roi_y1, self._roi_x0:self._roi_x1, raw_start:raw_end]
+            if self._z_downsample_mean_factor == 2:
+                current = _downsample_mean_last_axis_factor2(current)
+            self._arr = current
             self._mm = None
-            self._shape = self._arr.shape
+            self._shape = (self._arr.shape[0], self._arr.shape[1], output_count)
             self._dtype = self._arr.dtype
             self._needs_transpose = False
-            self._start_z = None
-            self._end_z = None
+            self._start_z = raw_start
+            self._end_z = raw_end
             self.storage_kind = "array"
         elif isinstance(src, str):
             if not path_exists(src):
@@ -169,26 +382,40 @@ class LayersSource:
             else:
                 self._needs_transpose = False
                 full_shape = raw_shape
+            self._roi_x0, self._roi_y0, self._roi_x1, self._roi_y1 = _resolve_xy_roi(
+                full_h=int(full_shape[0]),
+                full_w=int(full_shape[1]),
+                roi_xyxy=roi_xyxy,
+            )
 
-            self._start_z = start_z if start_z is not None else 0
-            self._end_z = end_z if end_z is not None else full_shape[2]
+            self._start_z, self._end_z, output_count = _resolve_z_window(
+                full_depth=int(full_shape[2]),
+                start_z=start_z,
+                end_z=end_z,
+                z_downsample_mean_factor=self._z_downsample_mean_factor,
+                target_in_chans=target_in_chans,
+            )
             self.storage_kind = "remote_zarr" if src.startswith("s3://") else "local_zarr"
-
-            if self._end_z > full_shape[2]:
-                logger.warning(f"Requested end_z={self._end_z} exceeds available channels={full_shape[2]}, clamping")
-                self._end_z = full_shape[2]
-
-            if self._start_z >= self._end_z:
-                raise ValueError(f"Invalid z-range: start_z={self._start_z} >= end_z={self._end_z}")
-
-            self._shape = (full_shape[0], full_shape[1], self._end_z - self._start_z)
-            logger.info(f"Loaded zarr: shape={self._shape}, z-range=[{self._start_z}, {self._end_z}), dtype={self._dtype}")
+            self._shape = (
+                self._roi_y1 - self._roi_y0,
+                self._roi_x1 - self._roi_x0,
+                output_count,
+            )
+            logger.info(
+                f"Loaded zarr: shape={self._shape}, roi=[{self._roi_x0}, {self._roi_y0}, {self._roi_x1}, {self._roi_y1}), "
+                f"raw_z_range=[{self._start_z}, {self._end_z}), "
+                f"z_downsample_mean_factor={self._z_downsample_mean_factor}, dtype={self._dtype}"
+            )
         else:
             raise TypeError("LayersSource expects np.ndarray or str (zarr path)")
 
     @property
     def shape(self) -> Tuple[int, int, int]:
         return self._shape
+
+    @property
+    def roi_xyxy(self) -> Tuple[int, int, int, int]:
+        return (self._roi_x0, self._roi_y0, self._roi_x1, self._roi_y1)
 
     def read_roi(self, y1: int, y2: int, x1: int, x2: int) -> np.ndarray:
         """Read ROI with zero-padding for out-of-bounds, returns (tile_h, tile_w, C)."""
@@ -200,13 +427,49 @@ class LayersSource:
             if self._arr is not None:
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = self._arr[yy1:yy2, xx1:xx2, :]
             else:
+                src_y1 = self._roi_y0 + yy1
+                src_y2 = self._roi_y0 + yy2
+                src_x1 = self._roi_x0 + xx1
+                src_x2 = self._roi_x0 + xx2
                 if self._needs_transpose:
-                    roi = self._mm[self._start_z:self._end_z, yy1:yy2, xx1:xx2]
+                    roi = self._mm[self._start_z:self._end_z, src_y1:src_y2, src_x1:src_x2]
                     roi = np.transpose(roi, (1, 2, 0))
                 else:
-                    roi = self._mm[yy1:yy2, xx1:xx2, self._start_z:self._end_z]
+                    roi = self._mm[src_y1:src_y2, src_x1:src_x2, self._start_z:self._end_z]
+                if self._z_downsample_mean_factor == 2:
+                    roi = _downsample_mean_last_axis_factor2(np.asarray(roi))
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = roi
         return out
+
+    def roi_has_signal(self, y1: int, y2: int, x1: int, x2: int) -> bool:
+        """
+        Return True when the in-bounds portion of the ROI contains any non-zero voxel.
+
+        This is used to prune empty tiles before building the dataloader so they never
+        contribute to dataset length or inference scheduling.
+        """
+        H, W, _ = self._shape
+        yy1, yy2 = max(0, y1), min(H, y2)
+        xx1, xx2 = max(0, x1), min(W, x2)
+        if yy2 <= yy1 or xx2 <= xx1:
+            return False
+
+        if self._arr is not None:
+            roi = self._arr[yy1:yy2, xx1:xx2, :]
+        else:
+            src_y1 = self._roi_y0 + yy1
+            src_y2 = self._roi_y0 + yy2
+            src_x1 = self._roi_x0 + xx1
+            src_x2 = self._roi_x0 + xx2
+            if self._needs_transpose:
+                roi = self._mm[self._start_z:self._end_z, src_y1:src_y2, src_x1:src_x2]
+                roi = np.transpose(roi, (1, 2, 0))
+            else:
+                roi = self._mm[src_y1:src_y2, src_x1:src_x2, self._start_z:self._end_z]
+            if self._z_downsample_mean_factor == 2:
+                roi = _downsample_mean_last_axis_factor2(np.asarray(roi))
+
+        return bool(np.any(roi))
 
 # ----------------------------- Preprocess ------------------------------------
 def preprocess_layers(
@@ -214,8 +477,11 @@ def preprocess_layers(
     fragment_mask: Optional[np.ndarray] = None,
     is_reverse_segment: bool = False,
     start_z: Optional[int] = None,
-    end_z: Optional[int] = None
-) -> Tuple[LayersSource, Optional[np.ndarray], Tuple[int, int], bool]:
+    end_z: Optional[int] = None,
+    z_downsample_mean_factor: int = 1,
+    target_in_chans: Optional[int] = None,
+    roi_xyxy: Optional[Tuple[int, int, int, int]] = None,
+) -> Tuple[LayersSource, np.ndarray, Tuple[int, int], bool]:
     """
     Prepare layers for streaming inference.
 
@@ -227,16 +493,31 @@ def preprocess_layers(
         end_z: Optional ending z-layer index (exclusive)
 
     Returns:
-        (source, mask_or_None, orig_shape, reverse_flag)
+        (source, mask, orig_shape, reverse_flag)
     """
     try:
-        src = LayersSource(layers, start_z=start_z, end_z=end_z)
+        src = LayersSource(
+            layers,
+            start_z=start_z,
+            end_z=end_z,
+            z_downsample_mean_factor=z_downsample_mean_factor,
+            target_in_chans=target_in_chans,
+            roi_xyxy=roi_xyxy,
+        )
         h, w, c = src.shape
         if c != CFG.in_chans:
             logger.warning(f"Model expects {CFG.in_chans} channels, got {c}")
 
-        mask_desc = f"{fragment_mask.shape}" if fragment_mask is not None else "None"
-        logger.info(f"Prepared layers source: shape={src.shape}, mask={mask_desc}, reverse={is_reverse_segment}")
+        if fragment_mask is None:
+            fragment_mask = np.ones((h, w), dtype=np.uint8) * 255
+        else:
+            roi_x0, roi_y0, roi_x1, roi_y1 = src.roi_xyxy
+            fragment_mask = fragment_mask[roi_y0:roi_y1, roi_x0:roi_x1]
+
+        logger.info(
+            f"Prepared layers source: shape={src.shape}, roi={src.roi_xyxy}, "
+            f"mask={fragment_mask.shape}, reverse={is_reverse_segment}"
+        )
         return src, fragment_mask, (h, w), bool(is_reverse_segment)
 
     except Exception as e:
@@ -271,19 +552,17 @@ class SlidingWindowDataset(Dataset):
                 worker_profiler.increment_counter("local_read_bytes", int(tile.nbytes), flag="approximate")
             if self.reverse:
                 tile = tile[:, :, ::-1]
-            # Validity: pixel is valid iff at least one z-layer is non-zero.
-            # Computed from the raw ROI before clipping so it reflects true surface coverage.
-            valid = np.any(tile != 0, axis=-1).astype(np.uint8)  # (tile_h, tile_w)
             # Clip to match training range - in-place for speed
             np.clip(tile, 0, CFG.max_clip_value, out=tile)
+            is_empty = bool(CFG.skip_empty_tiles and tile.max() == 0)
 
             data = self.transform(image=tile)  # -> tensor (C,H,W)
             tens = data["image"].unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
-            return tens, self.xyxys[idx], valid
+            return tens, self.xyxys[idx], is_empty
 
 def create_inference_dataloader(
     source: LayersSource,
-    fragment_mask: Optional[np.ndarray],
+    fragment_mask: np.ndarray,
     reverse: bool
 ) -> Tuple[DataLoader, Tuple[int, int], Dict[str, int]]:
     """Return (loader, pred_shape=(H,W), partition_info)."""
@@ -293,26 +572,31 @@ def create_inference_dataloader(
         x1_list = _grid_1d(w, CFG.tile_size, CFG.stride)
         y1_list = _grid_1d(h, CFG.tile_size, CFG.stride)
 
-        if fragment_mask is None or CFG.min_valid_ratio <= 0.0:
-            # No filtering needed: either no mask or threshold admits everything
-            xyxys = [[x1, y1, x1 + CFG.tile_size, y1 + CFG.tile_size]
-                     for y1 in y1_list for x1 in x1_list]
-        else:
-            # Use integral image for O(1) per-tile mask validity check
-            sat = np.zeros((h + 1, w + 1), dtype=np.float64)
-            sat[1:, 1:] = np.cumsum(np.cumsum((fragment_mask != 0).astype(np.float64), axis=0), axis=1)
-            min_valid = CFG.min_valid_ratio
-            xyxys: List[List[int]] = []
-            for y1 in y1_list:
-                for x1 in x1_list:
-                    y2, x2 = y1 + CFG.tile_size, x1 + CFG.tile_size
-                    yy1, yy2 = max(0, y1), min(h, y2)
-                    xx1, xx2 = max(0, x1), min(w, x2)
-                    area = (yy2 - yy1) * (xx2 - xx1)
-                    if area > 0:
-                        roi_sum = sat[yy2, xx2] - sat[yy1, xx2] - sat[yy2, xx1] + sat[yy1, xx1]
-                        if roi_sum / area >= min_valid:
-                            xyxys.append([x1, y1, x2, y2])
+        total_grid_tiles = len(x1_list) * len(y1_list)
+        xyxys: List[List[int]] = []
+        mask_filtered_tiles = 0
+        empty_pruned_tiles = 0
+        tile_prune_start = time.monotonic()
+        if CFG.prune_empty_tiles:
+            logger.info(
+                "Pruning empty tiles at tile-list creation time across %d candidates",
+                total_grid_tiles,
+            )
+        for y1 in y1_list:
+            for x1 in x1_list:
+                y2, x2 = y1 + CFG.tile_size, x1 + CFG.tile_size
+                # compute valid ratio inside bounds
+                yy1, yy2 = max(0, y1), min(h, y2)
+                xx1, xx2 = max(0, x1), min(w, x2)
+                roi = fragment_mask[yy1:yy2, xx1:xx2]
+                valid_ratio = float(roi.size and (roi != 0).mean() or 0.0)
+                if valid_ratio < CFG.min_valid_ratio:
+                    mask_filtered_tiles += 1
+                    continue
+                if CFG.prune_empty_tiles and not source.roi_has_signal(y1, y2, x1, x2):
+                    empty_pruned_tiles += 1
+                    continue
+                xyxys.append([x1, y1, x2, y2])
 
         if not xyxys:
             raise ValueError("No valid tiles (mask empty or fully filtered).")
@@ -321,10 +605,13 @@ def create_inference_dataloader(
 
         # Apply range-based partitioning if num_parts > 1
         partition_info = {
+            "grid_tiles": total_grid_tiles,
             "total_tiles": total_tiles,
             "start_idx": 0,
             "end_idx": total_tiles,
             "partition_tiles": total_tiles,
+            "mask_filtered_tiles": mask_filtered_tiles,
+            "empty_pruned_tiles": empty_pruned_tiles,
         }
 
         if CFG.num_parts > 1:
@@ -350,7 +637,8 @@ def create_inference_dataloader(
         if CFG.tile_size != CFG.size:
             tfm_list.append(A.Resize(CFG.size, CFG.size))
         tfm_list += [
-            A.ToFloat(max_value=CFG.max_clip_value),
+            A.Normalize(mean=[0.0] * CFG.in_chans, std=[1.0] * CFG.in_chans,
+                        max_pixel_value=CFG.max_clip_value),
             ToTensorV2(),
         ]
         transform = A.Compose(tfm_list)
@@ -368,7 +656,14 @@ def create_inference_dataloader(
             drop_last=False,
             multiprocessing_context='spawn' if CFG.workers > 0 else None,
         )
-        logger.info(f"Created dataloader with {len(dataset)} tiles")
+        logger.info(
+            "Created dataloader with %d tiles (grid=%d, mask_filtered=%d, empty_pruned=%d, prune_seconds=%.2f)",
+            len(dataset),
+            total_grid_tiles,
+            mask_filtered_tiles,
+            empty_pruned_tiles,
+            time.monotonic() - tile_prune_start,
+        )
         return loader, (h, w), partition_info
 
     except Exception as e:
@@ -392,14 +687,25 @@ def predict_fn(
     try:
         H, W = pred_shape
 
-        # Always use in-memory numpy arrays during inference loop for speed
-        mask_pred = np.zeros((H, W), dtype=np.float32)
-        mask_count = np.zeros((H, W), dtype=np.float32)
+        accumulator_start = time.monotonic()
+        mask_pred, mask_count, using_memmap, accumulator_paths = _make_accumulators(H, W)
+        logger.info(
+            "Accumulator setup completed in %.2f seconds (mode=%s)",
+            time.monotonic() - accumulator_start,
+            "memmap" if using_memmap else "ram",
+        )
+        flush_every = max(0, int(getattr(CFG, "accumulator_flush_every_batches", 64) or 0))
+        progress_log_every_batches = max(0, int(getattr(CFG, "progress_log_every_batches", 0) or 0))
+        progress_log_every_seconds = float(getattr(CFG, "progress_log_every_seconds", 0.0) or 0.0)
+        max_batches = max(0, int(getattr(CFG, "max_batches", 0) or 0))
+        skip_partition_write = bool(getattr(CFG, "skip_partition_write", False))
 
         weight_tensor: Optional[torch.Tensor] = None
         model.eval()
         batch_count = 0
         tile_count = 0
+        inferred_tile_count = 0
+        skipped_empty_tile_count = 0
         torch_profiler_batches = 20
         if profiler is not None and profiler.enable_torch_profiler():
             profiler.start_torch_profiler(use_cuda=device.type == "cuda")
@@ -409,34 +715,83 @@ def predict_fn(
                 total_tiles = len(test_loader.dataset)
             except Exception:
                 total_tiles = None
+            infer_wall_start = time.monotonic()
+            last_progress_log_time = infer_wall_start
+            last_progress_log_tiles = 0
+            last_progress_log_batches = 0
             pbar = tqdm(total=total_tiles,
                         desc="Running inference",
                         unit="tile",
                         **get_tqdm_kwargs())
 
-            # Only sync CUDA for per-phase timing when detailed profiling is enabled;
-            # in production this avoids ~20s of GPU pipeline stalls per run.
-            detailed_sync = (
-                device.type == "cuda"
-                and profiler is not None
-                and getattr(profiler, "detailed_enabled", False)
-            )
-
-            for (images, xys, valids) in test_loader:
-                raw_batch_size = int(images.size(0))
-                # If the whole batch is empty (all tiles fully zero), skip the forward
-                # pass entirely. We don't filter within a batch because torch.compile
-                # is invoked with dynamic=False and would recompile on every new shape.
-                if not bool(valids.view(raw_batch_size, -1).any()):
-                    pbar.update(raw_batch_size)
-                    continue
+            for (images, xys, is_empty_batch) in test_loader:
                 batch_count += 1
-                tile_count += raw_batch_size
-                with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
+                batch_tiles = int(images.size(0))
+                tile_count += batch_tiles
+                if torch.is_tensor(is_empty_batch):
+                    non_empty_mask = ~is_empty_batch.bool()
+                else:
+                    non_empty_mask = torch.as_tensor(
+                        np.logical_not(np.asarray(is_empty_batch, dtype=bool)),
+                        dtype=torch.bool,
+                    )
+                non_empty_tiles = int(non_empty_mask.sum().item())
+                skipped_now = batch_tiles - non_empty_tiles
+                skipped_empty_tile_count += skipped_now
+                if non_empty_tiles == 0:
+                    now = time.monotonic()
+                    should_log_progress = False
+                    if progress_log_every_batches > 0 and batch_count % progress_log_every_batches == 0:
+                        should_log_progress = True
+                    if progress_log_every_seconds > 0 and (now - last_progress_log_time) >= progress_log_every_seconds:
+                        should_log_progress = True
+                    if should_log_progress:
+                        elapsed = max(now - infer_wall_start, 1e-6)
+                        window_elapsed = max(now - last_progress_log_time, 1e-6)
+                        batch_delta = batch_count - last_progress_log_batches
+                        tile_delta = tile_count - last_progress_log_tiles
+                        completion = (
+                            f"{tile_count}/{total_tiles} ({100.0 * tile_count / total_tiles:.2f}%)"
+                            if total_tiles
+                            else str(tile_count)
+                        )
+                        logger.info(
+                            "Inference progress: scheduled_tiles=%s inferred_tiles=%d skipped_empty_tiles=%d batches=%d "
+                            "avg_tiles_per_sec=%.2f window_tiles_per_sec=%.2f avg_batches_per_sec=%.3f window_batches_per_sec=%.3f",
+                            completion,
+                            inferred_tile_count,
+                            skipped_empty_tile_count,
+                            batch_count,
+                            tile_count / elapsed,
+                            tile_delta / window_elapsed,
+                            batch_count / elapsed,
+                            batch_delta / window_elapsed,
+                        )
+                        last_progress_log_time = now
+                        last_progress_log_tiles = tile_count
+                        last_progress_log_batches = batch_count
+                    pbar.update(batch_tiles)
+                    if max_batches > 0 and batch_count >= max_batches:
+                        logger.info(
+                            "Reached max_batches=%d after %d batches / %d scheduled tiles; stopping early for benchmark mode",
+                            max_batches,
+                            batch_count,
+                            tile_count,
+                        )
+                        break
+                    continue
+                if non_empty_tiles != batch_tiles:
+                    images = images[non_empty_mask]
+                    if torch.is_tensor(xys):
+                        xys = xys[non_empty_mask]
+                    else:
+                        xys = np.asarray(xys)[non_empty_mask.cpu().numpy()]
+                inferred_tile_count += non_empty_tiles
+                with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=device.type == "cuda"):
                     images = images.to(device, non_blocking=True)
 
                 amp_device = "cuda" if device.type == "cuda" else "cpu"
-                with scoped_timer(profiler, "forward_seconds", cuda_sync=detailed_sync):
+                with scoped_timer(profiler, "forward_seconds", cuda_sync=device.type == "cuda"):
                     with torch.autocast(device_type=amp_device, enabled=True):
                         y_preds = model.forward(images)  # Model-specific forward
                     y_preds = torch.sigmoid(y_preds)
@@ -466,69 +821,68 @@ def predict_fn(
 
                 y_weighted = (y_preds_resized * weight_tensor).squeeze(1)  # (B,th,tw)
 
-                with scoped_timer(profiler, "device_to_host_seconds", cuda_sync=detailed_sync):
+                with scoped_timer(profiler, "device_to_host_seconds", cuda_sync=device.type == "cuda"):
                     y_cpu = y_weighted.cpu().numpy()
                     w_cpu = weight_tensor.detach().cpu().numpy().astype(np.float32)
 
                 with scoped_timer(profiler, "postprocess_seconds"):
                     if torch.is_tensor(xys):
                         xys = xys.cpu().numpy().astype(np.int32)
-                    if torch.is_tensor(valids):
-                        valids_np = valids.cpu().numpy().astype(np.float32)
-                    else:
-                        valids_np = np.asarray(valids, dtype=np.float32)
                     for i in range(xys.shape[0]):
                         x1, y1, x2, y2 = [int(v) for v in xys[i]]
-                        v = valids_np[i]
-                        mask_pred[y1:y2, x1:x2] += y_cpu[i] * v
-                        mask_count[y1:y2, x1:x2] += w_cpu * v
-                pbar.update(raw_batch_size)
+                        mask_pred[y1:y2, x1:x2] += y_cpu[i]
+                        mask_count[y1:y2, x1:x2] += w_cpu
+                    if using_memmap and flush_every > 0 and batch_count % flush_every == 0:
+                        mask_pred.flush()
+                        mask_count.flush()
+                    now = time.monotonic()
+                    should_log_progress = False
+                    if progress_log_every_batches > 0 and batch_count % progress_log_every_batches == 0:
+                        should_log_progress = True
+                    if progress_log_every_seconds > 0 and (now - last_progress_log_time) >= progress_log_every_seconds:
+                        should_log_progress = True
+                    if should_log_progress:
+                        elapsed = max(now - infer_wall_start, 1e-6)
+                        window_elapsed = max(now - last_progress_log_time, 1e-6)
+                        batch_delta = batch_count - last_progress_log_batches
+                        tile_delta = tile_count - last_progress_log_tiles
+                        completion = (
+                            f"{tile_count}/{total_tiles} ({100.0 * tile_count / total_tiles:.2f}%)"
+                            if total_tiles
+                            else str(tile_count)
+                        )
+                        logger.info(
+                            "Inference progress: scheduled_tiles=%s inferred_tiles=%d skipped_empty_tiles=%d batches=%d avg_tiles_per_sec=%.2f "
+                            "window_tiles_per_sec=%.2f avg_batches_per_sec=%.3f window_batches_per_sec=%.3f",
+                            completion,
+                            inferred_tile_count,
+                            skipped_empty_tile_count,
+                            batch_count,
+                            tile_count / elapsed,
+                            tile_delta / window_elapsed,
+                            batch_count / elapsed,
+                            batch_delta / window_elapsed,
+                        )
+                        last_progress_log_time = now
+                        last_progress_log_tiles = tile_count
+                        last_progress_log_batches = batch_count
+                pbar.update(batch_tiles)
+                if max_batches > 0 and batch_count >= max_batches:
+                    logger.info(
+                        "Reached max_batches=%d after %d batches / %d scheduled tiles; stopping early for benchmark mode",
+                        max_batches,
+                        batch_count,
+                        tile_count,
+                    )
+                    break
             pbar.close()
 
-        # Always write results to zarr
-        from numcodecs import LZ4
-
-        logger.info(f"Writing partition {CFG.part_id} results to zarr arrays...")
-        os.makedirs(CFG.zarr_output_dir, exist_ok=True)
-
-        mask_pred_path = os.path.join(CFG.zarr_output_dir, f"mask_pred_part_{CFG.part_id:03d}.zarr")
-        mask_count_path = os.path.join(CFG.zarr_output_dir, f"mask_count_part_{CFG.part_id:03d}.zarr")
-
-        compressor = LZ4(acceleration=1) if CFG.use_zarr_compression else None
-
-        # Create and write mask_pred zarr
-        with scoped_timer(profiler, "zarr_write_seconds", flag="approximate"):
-            mask_pred_z = zarr.open(
-                mask_pred_path,
-                mode='w',
-                shape=(H, W),
-                chunks=(1024, 1024),
-                dtype=np.float32,
-                compressor=compressor,
-                zarr_format=2,
-                config={'write_empty_chunks': False}
-            )
-            mask_pred_z[:] = mask_pred
-
-        # Create and write mask_count zarr
-        with scoped_timer(profiler, "zarr_write_seconds", flag="approximate"):
-            mask_count_z = zarr.open(
-                mask_count_path,
-                mode='w',
-                shape=(H, W),
-                chunks=(1024, 1024),
-                dtype=np.float32,
-                compressor=compressor,
-                zarr_format=2,
-                config={'write_empty_chunks': False}
-            )
-            mask_count_z[:] = mask_count
         if profiler is not None:
-            profiler.increment_counter("local_write_bytes", int(mask_pred.nbytes + mask_count.nbytes), flag="approximate")
             profiler.set_metric("partition_batches", batch_count, semantics="counter delta")
             profiler.set_metric("partition_tiles", tile_count, semantics="counter delta")
+            profiler.set_metric("partition_inferred_tiles", inferred_tile_count, semantics="counter delta")
+            profiler.set_metric("partition_skipped_empty_tiles", skipped_empty_tile_count, semantics="counter delta")
             if batch_count > 0:
-                wall = profiler.metrics.get("total_wall_seconds")
                 active_seconds = (
                     float(profiler.metrics.get("host_to_device_seconds") or 0.0)
                     + float(profiler.metrics.get("forward_seconds") or 0.0)
@@ -542,17 +896,78 @@ def predict_fn(
                         flag="estimated",
                     )
 
+        if skip_partition_write:
+            logger.info(
+                "Skipping partition zarr write for partition %d (benchmark mode enabled)",
+                CFG.part_id,
+            )
+            return {
+                "mask_pred": "",
+                "mask_count": "",
+                "partition_batches": batch_count,
+                "partition_tiles": tile_count,
+                "partition_inferred_tiles": inferred_tile_count,
+                "partition_skipped_empty_tiles": skipped_empty_tile_count,
+                "skipped_partition_write": True,
+            }
+
+        if CFG.direct_single_part_write:
+            logger.info(
+                "Direct single-part TIFF write enabled; returning in-memory accumulators "
+                "for partition %d without spilling partition zarrs",
+                CFG.part_id,
+            )
+            return {
+                "mask_pred_array": mask_pred,
+                "mask_count_array": mask_count,
+                "partition_batches": batch_count,
+                "partition_tiles": tile_count,
+                "partition_inferred_tiles": inferred_tile_count,
+                "partition_skipped_empty_tiles": skipped_empty_tile_count,
+                "direct_single_part_write": True,
+            }
+
+        from numcodecs import LZ4
+
+        logger.info(f"Writing partition {CFG.part_id} results to zarr arrays...")
+        os.makedirs(CFG.zarr_output_dir, exist_ok=True)
+
+        mask_pred_path = os.path.join(CFG.zarr_output_dir, f"mask_pred_part_{CFG.part_id:03d}.zarr")
+        mask_count_path = os.path.join(CFG.zarr_output_dir, f"mask_count_part_{CFG.part_id:03d}.zarr")
+
+        compressor = LZ4(acceleration=1) if CFG.use_zarr_compression else None
+
+        if using_memmap:
+            mask_pred.flush()
+            mask_count.flush()
+
+        _write_array_to_zarr_chunks(mask_pred, mask_pred_path, (H, W), compressor, profiler=profiler)
+        _write_array_to_zarr_chunks(mask_count, mask_count_path, (H, W), compressor, profiler=profiler)
+        if profiler is not None:
+            profiler.increment_counter("local_write_bytes", int(mask_pred.nbytes + mask_count.nbytes), flag="approximate")
+
         logger.info(f"Partition {CFG.part_id} completed. Wrote zarr arrays to {CFG.zarr_output_dir}")
         return {
             "mask_pred": mask_pred_path,
             "mask_count": mask_count_path,
             "partition_batches": batch_count,
             "partition_tiles": tile_count,
+            "partition_inferred_tiles": inferred_tile_count,
+            "partition_skipped_empty_tiles": skipped_empty_tile_count,
         }
 
     except Exception as e:
         logger.error(f"Error in predict_fn: {e}")
         raise
+    finally:
+        for arr in ("mask_pred", "mask_count"):
+            value = locals().get(arr)
+            with suppress(Exception):
+                if isinstance(value, np.memmap):
+                    value.flush()
+        for path in locals().get("accumulator_paths", []):
+            with suppress(FileNotFoundError):
+                os.remove(path)
 
 
 def run_inference(
@@ -563,6 +978,9 @@ def run_inference(
     is_reverse_segment: bool = False,
     start_z: Optional[int] = None,
     end_z: Optional[int] = None,
+    z_downsample_mean_factor: int = 1,
+    target_in_chans: Optional[int] = None,
+    roi_xyxy: Optional[Tuple[int, int, int, int]] = None,
     profiler=None,
 ) -> Dict[str, str]:
     """
@@ -584,7 +1002,14 @@ def run_inference(
         logger.info("Starting inference process...")
         with scoped_timer(profiler, "preprocess_seconds", flag="approximate"):
             source, mask, orig_shape, reverse = preprocess_layers(
-                layers, fragment_mask, is_reverse_segment, start_z=start_z, end_z=end_z
+                layers,
+                fragment_mask,
+                is_reverse_segment,
+                start_z=start_z,
+                end_z=end_z,
+                z_downsample_mean_factor=z_downsample_mean_factor,
+                target_in_chans=target_in_chans,
+                roi_xyxy=roi_xyxy,
             )
         test_loader, pred_shape, partition_info = create_inference_dataloader(source, mask, reverse)
         if profiler is not None:
