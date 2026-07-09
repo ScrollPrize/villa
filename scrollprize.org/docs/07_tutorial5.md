@@ -42,23 +42,33 @@ import { TutorialsTop } from '@site/src/components/TutorialsTop';
 
 Ink detection is the last step of the pipeline: taking the flattened surface of a papyrus sheet ([segmented](/segmentation) from the 3D X-ray scan) and identifying where the ink is, so that the text can be read.
 
-This is where one of the core difficulties of the Herculaneum Papyri comes in: the carbon ink and the carbonized papyrus have very similar densities, so the ink is mostly invisible to the naked eye in the scans. But the data is there — machine learning models can detect it, and humans can sometimes see subtle textural patterns directly:
-
-<figure className="">
-  <img src="/img/tutorials/ink2-alpha.webp" />
-</figure>
-
-<figure className="">
-  <img src="/img/tutorials/ink1-alpha.webp" />
-
-  <figcaption className="mt-0">Ink visible in 3D surface volumes (left: 3D volume slice; right: infrared photo), found by Stephen Parsons</figcaption>
-</figure>
-
-In the electron microscope images below (from [From invisibility to readability: Recovering the ink of Herculaneum](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0215775)), you can clearly see the difference between the inked and non-inked regions. Machine learning models appear to learn some of these features from the 3D X-ray scans:
+This is where one of the core difficulties of the Herculaneum Papyri comes in: the carbon ink and the carbonized papyrus have almost the same density, so in an X-ray scan the ink is nearly invisible to the naked eye. The problem is easiest to see on a *detached* fragment, where the writing is exposed and we can photograph it directly: in a color photograph the letters are faint, in 1000&nbsp;nm infrared they are crisp and legible, but in the X-ray CT scan the ink contrast almost completely disappears.
 
 <figure>
-  <a href="/img/tutorials/sem.webp" target="_blank"><img src="/img/tutorials/sem-alpha.webp"  className="w-[100%]"/></a>
-  <figcaption className="mt-0">Electron microscope pictures from the top (A and B) and the side (C) <a href="https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0215775">(source)</a></figcaption>
+  <div className="flex flex-wrap justify-center">
+    <div className="w-[31%] mr-[2%]">
+      <img src="/img/tutorials/ink-modality-color.webp" />
+      <div className="text-center text-sm text-dim">(a) Color photograph</div>
+    </div>
+    <div className="w-[31%] mr-[2%]">
+      <img src="/img/tutorials/ink-modality-infrared.webp" />
+      <div className="text-center text-sm text-dim">(b) 1000&nbsp;nm infrared</div>
+    </div>
+    <div className="w-[31%]">
+      <img src="/img/tutorials/ink-modality-xray.webp" />
+      <div className="text-center text-sm text-dim">(c) X-ray CT</div>
+    </div>
+  </div>
+  <figcaption className="mt-0">Three images of the same detached fragment (P.Herc. Paris 2 fr. 47). The writing is faint in visible light, sharp in infrared, and nearly gone in the X-ray. Source: Stephen Parsons, <a href="https://uknowledge.uky.edu/cs_etds/138/"><em>Hard-Hearted Scrolls</em></a>.</figcaption>
+</figure>
+
+So why scan with X-rays at all? Because visible and infrared light can't see inside a *rolled* scroll — they don't penetrate the papyrus. X-ray CT does: it images the interior of an intact scroll at high resolution, but, as the fragment above shows, at the cost of the visible ink contrast. Ink detection exists to win that contrast back computationally.
+
+Not all of that contrast is lost, though. What does the surviving signal look like? In PHerc. Paris 4 in particular, ink can sit as a thin layer on the papyrus surface, and on the flattened surface volume it often shows up as a **crackle** — a texture like cracked mud, where the ink lies proud of the surface. This crackle is what first revealed [letters inside an intact scroll](/firstletters), spotted by eye in raw surface volumes; a model learns to recognize the same signal, and picks up fainter variants a human would miss.
+
+<figure>
+  <a href="/img/tutorials/ink-signal-volumetric.webp" target="_blank"><img src="/img/tutorials/ink-signal-volumetric.webp" /></a>
+  <figcaption className="mt-0">The ink signal in the data: (a) a slice through the CT volume, (b) the same region with the ink segmented in red, and (c) a flattened surface volume where the crackle texture and the letter π are visible directly. Source: <a href="https://arxiv.org/abs/2606.29085">the PHerc. 1667 paper</a>.</figcaption>
 </figure>
 
 ### How ink detection works
@@ -148,7 +158,7 @@ The filename prefixes must exactly match the segment folder name: a segment fold
 
 ### Setting up the pipeline
 
-The ink detection pipeline lives in the [villa repository](https://github.com/ScrollPrize/villa), under `ink-detection/`. It uses [uv](https://docs.astral.sh/uv/getting-started/installation/) to manage its Python environment, so there is nothing to install system-wide.
+The ink detection pipeline lives in the [villa repository](https://github.com/ScrollPrize/villa), under `ink-detection/`. It uses [uv](https://docs.astral.sh/uv/getting-started/installation/) to manage its Python environment.
 
 ```bash
 git clone https://github.com/ScrollPrize/villa.git
@@ -166,10 +176,6 @@ The pipeline described here currently lives on the `merge-ink-pipelines` branch:
 ```bash
 uv run python -c "import torch; print(torch.__version__, '| cuda:', torch.cuda.is_available())"
 ```
-
-:::info
-If you later enable native-3D label dilation (`full_3d.label_dilation_distance` or `full_3d.supervision_dilation_distance`), install cuCIM/CuPy too. Pick the build matching your CUDA major version: `uv pip install --extra-index-url https://pypi.nvidia.com "cucim-cu12==26.6.0"` for CUDA 12.x, or the corresponding `cucim-cu13` build for CUDA 13.x.
-:::
 
 ### Training
 
@@ -315,10 +321,14 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with t
 }
 ```
 
-* `volume_path` is where the 3D crops come from. The public `vesuvius-challenge-open-data` S3 bucket is read anonymously — no AWS account needed — but training streams many small random reads, so if you have local disk to spare, downloading the volume (or just the chunks your segments touch, with `koine_machines.preprocessing.download_required_zarr_chunks`) and pointing `volume_path` at the local copy is considerably faster.
+* `volume_path` is where the 3D crops come from. The public `vesuvius-challenge-open-data` S3 bucket is read anonymously — no AWS account needed. You can also download the volume locally (or just the chunks your segments touch, with `koine_machines.preprocessing.download_required_zarr_chunks`) and point `volume_path` at the local copy instead.
 * Native 3D patches are much heavier than 2.5D surface-volume patches. The `[80, 128, 128]` patch size and batch size 1 are conservative first-run defaults; increase them only after you have confirmed your GPU has enough memory and I/O headroom.
 * `in_channels` is set automatically in the native 3D modes (2 for `full_3d_single_wrap`: image + wrap mask), so you don't need to change it.
 * How far above and below the surface the 2D labels are projected is controlled by an optional `"full_3d": { "projection_half_thickness": ... }` block (default 1 voxel).
+
+:::info
+If you enable native-3D label dilation (`full_3d.label_dilation_distance` or `full_3d.supervision_dilation_distance`), install cuCIM/CuPy too. Pick the build matching your CUDA major version: `uv pip install --extra-index-url https://pypi.nvidia.com "cucim-cu12==26.6.0"` for CUDA 12.x, or the corresponding `cucim-cu13` build for CUDA 13.x.
+:::
 
 Training starts the same way:
 
@@ -351,6 +361,8 @@ uv run python -m koine_machines.inference.infer_full3d_tifxyz \
 ```
 
 `--write-region occupied --chunk-halo 0` restricts the output to just the chunks that actually contain surface points, which is much faster for a first run than the default (which also writes a halo of neighboring chunks). Even so, a single segment can plan hundreds of thousands of native-3D patches — add `--plan-only` to preview the chunk/patch plan first, and only launch the full command when the printed patch count fits your compute budget. For `full_3d_single_wrap` checkpoints, the script reconstructs the surface-mask input channel from the `.tifxyz` geometry automatically.
+
+The result is an ink prediction in scroll coordinates rather than a flattened image. To turn it into something readable across a whole scroll, the spiral fit's [`render_ink.py` step](tutorial_spiral#rendering-ink) renders the fitted windings through exactly this kind of ink-prediction volume, producing flattened strips winding by winding.
 
 ### Scaling up: the full dataset
 
@@ -386,6 +398,13 @@ Labels are ordinary image files, so you can edit them in any image editor that h
 ```bash
 uv run python -m koine_machines.preprocessing.create_label_zarrs /path/to/ink-dataset/phercparis4
 ```
+
+The figure below shows this loop in action on PHerc. 1667: with each iteration the labels (row a) grow from a handful of strokes to dense coverage, the model's predictions (row b) sharpen, and — crucially — the reading improves even on a held-out region that was never labeled (row c).
+
+<figure>
+  <a href="/img/tutorials/ink-iterative-labeling.webp" target="_blank"><img src="/img/tutorials/ink-iterative-labeling.webp" /></a>
+  <figcaption className="mt-0">Pseudo-labeling process. Each column is an iteration. Model 0 is the starting point, not trained on PHerc. 1667. Row a: the training labels created from the previous iteration's inference. Row b: this iteration's prediction, with the labels used overlaid in magenta. Row c: the validation region, never used for creating labels. Source: <a href="https://arxiv.org/abs/2606.29085">the PHerc. 1667 paper</a>.</figcaption>
+</figure>
 
 ### What's next
 

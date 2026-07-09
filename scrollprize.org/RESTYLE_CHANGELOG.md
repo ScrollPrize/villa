@@ -304,6 +304,14 @@ The pipeline strip on /2026_open_problems now reads Scanning → Unwrapping → 
 - Every command and config key verified against the branch code; training/inference runs reproduced on cluster GPUs before writing. Note: the tutorial depends on ink-detection fixes that must land on `merge-ink-pipelines` (tifxyz reader fallback, lazy cuCIM import + empty-validation checkpoint save, full_3d_single_wrap surface-mask reconstruction in inference).
 **Files:** `docs/07_tutorial5.md`, `static/img/tutorials/ink-labels-overlay-w00.webp` (new), `static/img/tutorials/ink-supervision-overlay-w00.webp` (new), `static/img/tutorials/ink-prediction-w00.webp` (new).
 
+## C37 — ink tutorial: spiral cross-link, figure refresh, wording cleanup
+
+- **Reciprocal link to the new [spiral tutorial](docs/38_tutorial_spiral.md)** (added upstream in `7de6f7f45`): the native-3D inference section now notes its scroll-space ink-prediction volume is exactly what the spiral fit's `render_ink.py` renders each winding through, linking to `tutorial_spiral#rendering-ink`. (Spiral → ink links already existed; this closes the loop.)
+- **New/replaced figures**: intro now shows the color / 1000nm-infrared / X-ray comparison of one detached fragment (Parsons, *Hard-Hearted Scrolls*, Fig 1.3), replacing the old `ink1-alpha`/`ink2-alpha` — makes the "ink is invisible in X-ray, but the signal is there" point concretely, plus a paragraph on why we scan with X-rays (penetration vs. contrast). "How ink detection works" gains a **crackle / ink-signal** figure (PHerc. 1667 paper Fig 2) with a link to `/firstletters` (Casey Handmer's crackle discovery). The iterative-labeling section ends with the **pseudo-labeling process** figure (Model 0→5, labels/prediction/held-out rows).
+- **Wording cleanups**: dropped "so there is nothing to install system-wide"; moved the cuCIM/CuPy `:::info` from setup to the native-3D training section where dilation is relevant; simplified the `volume_path` local-download note (removed the "considerably faster" hand-holding).
+- `ink1-alpha.webp` / `ink2-alpha.webp` are now orphaned (no references) — left in place for the owner to prune.
+**Files:** `docs/07_tutorial5.md`, `static/img/tutorials/ink-modality-color.webp` (new), `ink-modality-infrared.webp` (new), `ink-modality-xray.webp` (new), `ink-signal-volumetric.webp` (new), `ink-iterative-labeling.webp` (new).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
