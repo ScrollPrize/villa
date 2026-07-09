@@ -1413,10 +1413,17 @@ int main(int argc, char *argv[])
         if (std::filesystem::exists(seg_dir)) {
             std::filesystem::remove_all(seg_dir);
         }
+#if defined(_WIN32)
+        // See end of main(): skip CRT teardown, worker threads deadlock it.
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(EXIT_SUCCESS);
+#else
         return EXIT_SUCCESS;
+#endif
     }
 
-    std::cout << "saving " << seg_dir << std::endl;
+    std::cout << "saving " << seg_dir.string() << std::endl;
     surf->save(seg_dir, uuid, true);
     surf->path = seg_dir;
 
@@ -1485,5 +1492,15 @@ int main(int argc, char *argv[])
         delete sm;
     }
 
+#if defined(_WIN32)
+    // Skip CRT shutdown: live worker threads (ChunkCache IO pool, OpenMP)
+    // deadlock Windows DLL-detach/static-destructor teardown, leaving the
+    // process alive after main() returns — VC3D then never sees the tool
+    // finish. Same approach as VC3D's own main().
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(EXIT_SUCCESS);
+#else
     return EXIT_SUCCESS;
+#endif
 }

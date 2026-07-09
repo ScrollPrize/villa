@@ -81,6 +81,9 @@ set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
 set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
 set(CPACK_NSIS_MODIFY_PATH OFF)
 set(CPACK_NSIS_INSTALLED_ICON_NAME "bin\\\\VC3D.exe")
+# Installer/uninstaller executable icon.
+set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/apps/VC3D/logo.ico")
+set(CPACK_NSIS_MUI_UNIICON "${CMAKE_SOURCE_DIR}/apps/VC3D/logo.ico")
 set(CPACK_NSIS_MUI_FINISHPAGE_RUN "VC3D.exe")
 set(CPACK_NSIS_URL_INFO_ABOUT "https://github.com/ScrollPrize/villa")
 # Start-menu + optional desktop shortcut to bin/VC3D.exe.

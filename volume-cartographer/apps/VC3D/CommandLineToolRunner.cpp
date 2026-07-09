@@ -299,7 +299,8 @@ bool CommandLineToolRunner::execute(Tool tool)
 
     QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     QString toolBaseName = QFileInfo(toolCmd).baseName();
-    QString logFilePath = QString("/tmp/%1_%2.txt").arg(toolBaseName).arg(timestamp);
+    QString logFilePath = QString("%1/%2_%3.txt")
+        .arg(QDir::tempPath()).arg(toolBaseName).arg(timestamp);
 
     if (_logStream) {
         delete _logStream;
