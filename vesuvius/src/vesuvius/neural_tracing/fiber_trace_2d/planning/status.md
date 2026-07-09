@@ -1,12 +1,17 @@
-# Status: Prefetch Debug Profiling
+# Status: Parallel Transparent Prefetch
 
-- [x] Read `planning/task.md`, local AGENTS instructions, and current prefetch code.
-- [x] Update `planning/task.md` with the active profiling task.
-- [x] Replace `planning/task_plan.md` with the focused profiling plan.
-- [x] Add per-source and per-patch prefetch timing output.
-- [x] Add a pre-sampler start line so blocking sampler/cache stalls are visible.
-- [x] Preserve current prefetch coordinate/cache behavior.
-- [x] Run compile check.
-- [x] Run focused 2D loader tests.
-- [x] Run CLI/help smoke check.
-- [x] Update `planning/task_log.md` with validation results.
+- [x] Read local `AGENTS.md` instructions.
+- [x] Read `planning/todo.md`.
+- [x] Read current high-level plan and specs.
+- [x] Replace `planning/task.md` with the active prefetch task.
+- [x] Replace `planning/task_plan.md` with a reviewable implementation plan.
+- [x] Include the Python-side `.empty` marker handling in the plan.
+- [x] Include the dependency-producer/download-consumer parallelization plan.
+- [ ] User review of `planning/task_plan.md`.
+- [ ] Implement VC3D dependency-only binding/accessors.
+- [ ] Implement Python prefetch request/cache/download pipeline.
+- [ ] Remove temporary debug prefetch output.
+- [ ] Update specs and docs.
+- [ ] Add/update tests.
+- [ ] Run validation commands.
+- [ ] Update task log and changelog.
