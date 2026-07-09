@@ -179,7 +179,7 @@ const config = {
           items: [
             { to: "/prizes", label: "Prizes", position: "left" },
             { to: "/2026_open_problems", label: "Open Problems", position: "left" },
-            { to: "/data", label: "Data", position: "left" },
+            { to: "/data_browser", label: "Data", position: "left" },
             { to: "/winners", label: "Milestones", position: "left" },
             {
               type: "dropdown",

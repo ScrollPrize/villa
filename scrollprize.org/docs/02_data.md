@@ -1,5 +1,6 @@
 ---
-title: "The Data"
+title: "Data Formats"
+sidebar_label: "Data Formats"
 ---
 
 <head>

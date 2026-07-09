@@ -46,6 +46,20 @@
 .vc-landing .vc-section--tight {
   padding-top: 14px;
 }
+/* Section header with an inline action (Sponsors + Donate). */
+.vc-landing .vc-h2-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+}
+.vc-landing .vc-h2-row .vc-h2 {
+  margin-bottom: 0;
+}
+.vc-landing .vc-h2-row {
+  margin-bottom: 32px;
+}
+
 /* News strip header: tiny ember kicker so the strip reads as news links. */
 .vc-landing a.vc-updates__head {
   display: inline-block;

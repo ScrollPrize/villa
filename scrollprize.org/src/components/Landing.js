@@ -1047,9 +1047,17 @@ export function Landing() {
         ------------------------------------------------------------------ */}
         <section className="vc-section" aria-labelledby="sponsors">
           <div className="container mx-auto">
-            <Heading as="h2" id="sponsors" className="vc-h2">
-              Sponsors
-            </Heading>
+            <div className="vc-h2-row">
+              <Heading as="h2" id="sponsors" className="vc-h2">
+                Sponsors
+              </Heading>
+              <a
+                href="https://donate.stripe.com/aEUg101vt9eN8gM144"
+                className="vc-btn-outline vc-h2-row__action"
+              >
+                Donate
+              </a>
+            </div>
             <SponsorTier
               label="$200,000 and above"
               title="Caesars"
@@ -1073,14 +1081,6 @@ export function Landing() {
                 dense
                 collapsible
               />
-            </div>
-            <div className="vc-sponsors__cta">
-              <a
-                href="https://donate.stripe.com/aEUg101vt9eN8gM144"
-                className="vc-btn-outline"
-              >
-                Become a sponsor
-              </a>
             </div>
           </div>
         </section>

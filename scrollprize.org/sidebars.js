@@ -50,9 +50,9 @@ const sidebars = {
       label: 'Data',
       collapsible: true,
       collapsed: false,
-      link: { type: 'doc', id: 'data' },
+      link: { type: 'doc', id: 'data_browser' },
       items: [
-        { type: 'doc', id: 'data_browser', label: 'Data Browser' },
+        { type: 'doc', id: 'data' },
         { type: 'doc', id: 'data_datasets' },
       ],
     },
