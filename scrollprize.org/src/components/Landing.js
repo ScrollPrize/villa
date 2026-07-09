@@ -702,30 +702,23 @@ export function Landing() {
             <Heading as="h1" id="home-hero-title" className="vc-hero__title">
               Resurrect an ancient library from the ashes of a volcano.
             </Heading>
-            <div
-              className={`vc-hero__grid${
-                SHOW_BREAKING ? "" : " vc-hero__grid--solo"
-              }`}
-            >
-              <div className="vc-hero__copy">
-                <p className="vc-hero__tagline">Win Prizes. Make History.</p>
-                <p className="vc-hero__intro">
-                  Vesuvius Challenge is a machine learning, computer vision,
-                  and geometry competition that is{" "}
-                  <a href="/firstscroll">reading</a> the carbonized Herculaneum
-                  scrolls without opening them.
-                </p>
-                <div className="vc-hero__ctas">
-                  <a className="vc-btn" href="/get_started">
-                    Get Started
-                  </a>
-                  <a
-                    className="vc-btn-outline"
-                    href="https://discord.gg/V4fJhvtaQn"
-                  >
-                    Join Discord
-                  </a>
-                </div>
+            <p className="vc-hero__tagline">Win Prizes. Make History.</p>
+            <p className="vc-hero__intro">
+              Vesuvius Challenge is a machine learning, computer vision, and
+              geometry competition that is <a href="/firstscroll">reading</a>{" "}
+              the carbonized Herculaneum scrolls without opening them.
+            </p>
+            <div className="vc-hero__row">
+              <div className="vc-hero__ctas">
+                <a className="vc-btn" href="/get_started">
+                  Get Started
+                </a>
+                <a
+                  className="vc-btn-outline"
+                  href="https://discord.gg/V4fJhvtaQn"
+                >
+                  Join Discord
+                </a>
               </div>
 
               {/* The unwrap payoff: PHerc. 1667 unrolling into readable Greek.
@@ -759,8 +752,9 @@ export function Landing() {
                   </span>
                 </a>
               )}
+            </div>
 
-              <div className="vc-stat-strip vc-hero__stats">
+            <div className="vc-stat-strip vc-hero__stats">
                 {openPrizes.length > 0 && (
                   <a className="vc-stat vc-stat--link" href="/prizes">
                     <span className="vc-stat__value">
@@ -792,7 +786,6 @@ export function Landing() {
                   <span className="vc-stat__label">scroll fully read</span>
                 </a>
               </div>
-            </div>
           </div>
         </section>
 

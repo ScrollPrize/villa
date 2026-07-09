@@ -178,8 +178,7 @@
   margin: 0 0 28px;
 }
 .vc-landing .vc-hero__stats {
-  grid-column: 1 / -1;
-  margin: 4px 0 0;
+  margin: 28px 0 0;
   padding-top: 24px;
   border-top: 1px solid var(--vc-line);
   row-gap: 12px;
@@ -215,23 +214,19 @@
   gap: 12px;
 }
 
-/* Hero grid: copy left, reveal card right, stat band closing full-width. */
-.vc-landing .vc-hero__grid {
-  display: grid;
-  grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
-  gap: 24px 56px;
-  align-items: start;
-}
-.vc-landing .vc-hero__grid--solo {
-  grid-template-columns: minmax(0, 1fr);
+/* CTA row: buttons and the small reveal card sit side by side. */
+.vc-landing .vc-hero__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 24px 40px;
 }
 
 /* Reveal card — the unwrap payoff (PHerc. 1667 unrolling into Greek). */
 .vc-landing a.vc-hero__reveal {
   display: block;
-  width: min(100%, 420px);
-  justify-self: end;
-  align-self: end;
+  width: min(100%, 340px);
+  flex: 0 1 auto;
   color: var(--vc-text);
   text-decoration: none;
   background: var(--vc-bg);
@@ -273,19 +268,11 @@
 /* Below desktop the grid stacks; the reveal card follows the stat band so the
    money stays high; poster-only (no video attach) at these widths. */
 @media (max-width: 996px) {
-  .vc-landing .vc-hero__grid {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 28px 0;
-  }
-  .vc-landing a.vc-hero__reveal {
-    max-width: 560px;
-    order: 3;
-  }
   .vc-landing .vc-hero__stats {
     display: grid;
     grid-template-columns: 1fr 1fr;
     padding-top: 20px;
-    margin: 0;
+    margin-top: 24px;
   }
   .vc-landing .vc-hero__stats .vc-stat:first-child {
     grid-column: 1 / -1;
