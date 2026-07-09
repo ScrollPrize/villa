@@ -116,9 +116,11 @@ PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/s
 ```
 
 Training prefetch exits before model/TensorBoard/snapshot setup. It still uses
-the same deterministic control-point sample sequence and final augmented
-base-volume coordinates as training. Lasagna manifest channels are not
-prefetched.
+the same deterministic control-point sample sequence and the same CP-local
+source-strip path as training. For each CP and strip-z offset it covers the
+configured augmentation envelope through the sampler-level VC3D blocking
+coordinate/cache path, so it is intentionally independent of one particular
+random augmentation draw. Lasagna manifest channels are not prefetched.
 
 ## Focused Test Command
 

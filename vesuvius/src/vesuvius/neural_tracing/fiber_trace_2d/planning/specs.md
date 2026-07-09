@@ -15,14 +15,16 @@
 - The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
 - The implementation should reuse/export VC3D side-strip coordinate APIs when possible, or port the same algorithm with only small rounding/interpolation differences.
 - Dense side-strip coordinate generation may use torch vectorization for per-pixel Hermite interpolation and normal interpolation, but it must preserve the existing VC3D/Lasagna frame construction semantics.
-- Augmentation visualization may build and reuse CP-local source geometry once per selected sample across all augmentation variants, as long as each variant still samples final image values from transformed coordinates.
+- The augment-vis source/patch path is the canonical loader path for runner exports, training batch loading, and prefetch coordinate generation.
+- Augmentation visualization, training, runner batch loading, and prefetch must share the same CP-local source-strip and final-coordinate generation implementation.
+- The loader builds CP-local source geometry once per selected control point and reuses it across augmentation variants or strip-z offsets as appropriate.
 - Image loading samples base-volume Zarr values from explicit coordinates.
 - Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
 - Interactive/progressive VC3D `tryGetChunk` semantics are not acceptable for this loader path because they can queue I/O and return an all-invalid first sample.
 - `base_volume_scale` selects both the Zarr level to read and the sampling pixel scale: by default, one output patch pixel advances by one voxel at that selected level.
 - Internally, fiber control-point coordinates remain in base-volume coordinates, so a selected level `s` uses a patch pixel spacing of `2**s` base voxels before coordinates are divided for reading level `/s`.
 - The loader must not use the existing neural-tracing crop-loading path for image loading.
-- Each strip-z patch is sampled independently.
+- Training's multiple strip-z offsets are derived from one CP-local source geometry by offsetting along the strip normal/frame direction, not by rebuilding a separate coordinate-generation path.
 - Dataset and loader settings are specified in Vesuvius-style JSON.
 - Config keys include `datasets`, `batch_size`, `patch_shape_hw`, `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `prefetch_workers`, and optional cache settings.
 - Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
@@ -44,9 +46,11 @@
 - Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.
 - Normal batch loading samples random control points deterministically from the configured seed.
 - The tester/runner loads a batch from a specified deterministic control-point sample index.
-- Prefetch computes needed base-volume Zarr chunk keys from explicit coordinates before image loading.
-- Prefetch coordinates must be the final augmented coordinates passed to the base-volume sampler, not the unaugmented oversized source-strip coordinates.
-- Prefetch deduplicates chunk requests, skips cached chunks, and fetches missing chunks into the configured cache.
+- Prefetch uses the same shared source-strip implementation as training and augment-vis.
+- Prefetch is independent of any one random augmentation draw: for each selected CP and strip-z offset it covers the configured maximum augmentation envelope represented by the oversized source-strip coordinates.
+- Prefetch may conservatively cover more chunks than one concrete augmented training sample, but it should avoid misses for later random augmentations within the configured extrema.
+- Prefetch must use sampler-level cache-aware semantics for the base-volume sampler. For VC3D this means using the same blocking coordinate sampling/cache path as image loading, not a separate Python chunk-store path that cannot see VC3D cache state.
+- Prefetch reports progress while processing samples/strip patches and includes dependency/download/error counters where the sampler can report them.
 - Prefetch parallelism is capped at 16 workers.
 - Prefetch remains base-volume-only; Lasagna manifest channels are not prefetched by the VC3D base-volume prefetch path.
 - V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.

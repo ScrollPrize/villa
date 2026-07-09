@@ -1,5 +1,30 @@
 # Task Log
 
+## Prefetch Debug Profiling
+
+- Added temporary prefetch profiling output in `loader.py`.
+- Prefetch now prints a short column legend, then for each patch:
+  - source-construction stage start/done lines for descriptor lookup,
+    line-window construction, Lasagna-normal sampling, and source-coordinate
+    generation, so stalls before the first patch row are visible;
+  - a `prefetch start ...` line before the potentially blocking sampler call;
+  - a completed timing row with source total, descriptor, line-window,
+    Lasagna-normal, source-coordinate, envelope-coordinate, sampler/cache, and
+    total patch milliseconds;
+  - sampler stats for valid pixels, dependency count, downloaded chunks, bytes,
+    and sampler prefetch mode.
+- Existing shared coordinate/cache behavior is unchanged; the patch only adds
+  timings and debug output around it.
+
+Validation:
+
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
+  - Result: passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result after inner source-stage debug print fix: `34 passed in 2.73s`.
+- `PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_2d.train --help`
+  - Result: passed.
+
 ## Vectorized Strip And Line Coordinate Generation
 
 - Added a torch-backed dense side-strip grid builder in `strip_geometry.py`. It keeps the existing Python/Numpy VC3D/Lasagna frame transport and roll smoothing, then vectorizes the per-pixel arc-coordinate, cubic Hermite, and normal interpolation work.
@@ -105,3 +130,34 @@ Validation:
 - Refined the prefetch requirement: prefetch must cover the configured maximum
   augmentation envelope for each CP/offset instead of depending on one sampled
   random augmentation draw.
+
+## Augment-Vis Path Unification Implementation
+
+- Added offset-axis data to `FiberStripGrid` so strip-z offsets can be derived
+  from one CP-local torch-vectorized source grid.
+- Refactored `FiberStrip2DLoader` around `build_strip_source` and
+  `build_strip_patch_from_source`; training, center-strip loading, and
+  augment-vis now delegate to this shared source/patch path.
+- Replaced production `build_sample` use of the old NumPy strip-grid builder
+  with shared torch source geometry and per-offset coordinate derivation.
+- Changed prefetch to process the shared source-envelope coordinates per
+  CP/strip-z offset and call `CoordinateSampler.prefetch_coords`.
+- Added sampler-level prefetch. VC3D prefetch uses the same blocking
+  `sample_coords` path as loading and discards values; the NumPy test sampler
+  keeps a local chunk-request implementation.
+- Kept `chunk_requests_for_sample_index` only as a compatibility/test helper
+  derived from the same prefetch envelope.
+- Updated specs, code docs, and local development notes for canonical
+  augment-vis-style loading and augmentation-envelope prefetch.
+- Added regression tests for sampler-level prefetch, envelope coverage of
+  augmented load dependencies, and failure if training calls the old NumPy
+  strip builder.
+
+Validation:
+
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result: `34 passed in 2.74s`.
+- `PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_2d.train --help`
+  - Result: passed.
+- `PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_2d.runner --help`
+  - Result: passed.

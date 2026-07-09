@@ -712,32 +712,24 @@ def test_deterministic_sample_index_independent_of_batch_size(tmp_path: Path) ->
     assert a == b
 
 
-class _FakeStore(dict):
-    _url = "s3://bucket/vol.zarr"
-    _cache_dir = "/tmp/fake-cache"
-    _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
-
-
-def test_prefetch_deduplicates_and_skips_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_prefetch_uses_sampler_level_prefetch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, batch_size=1))
     loader = _make_loader(config)
-    store = _FakeStore({"0.0.0": b"abc", "0.0.1": b"def"})
-    seen = [
-        ZarrChunkRequest(store=store, store_identity="same", key="0.0.0"),
-        ZarrChunkRequest(store=store, store_identity="same", key="0.0.0"),
-        ZarrChunkRequest(store=store, store_identity="same", key="0.0.1"),
-    ]
-    monkeypatch.setattr(loader, "chunk_requests_for_samples", lambda start, count: seen)
-    cache_dir = tmp_path / "cache"
-    monkeypatch.setattr(store, "_cache_dir", str(cache_dir), raising=False)
-    (cache_dir / "0.0.0").parent.mkdir(parents=True, exist_ok=True)
-    (cache_dir / "0.0.0").write_bytes(b"cached")
+    calls: list[tuple[np.ndarray, np.ndarray]] = []
 
-    summary = loader.prefetch(0, 1, workers=1)
+    def fake_prefetch(coords, valid):
+        calls.append((np.asarray(coords), np.asarray(valid)))
+        return {"unique_chunks": 2, "downloaded": 1, "bytes": 32, "errors": 0}
 
-    assert summary["generated"] == 2
-    assert summary["missing"] == 1
-    assert summary["downloaded"] == 1
+    monkeypatch.setattr(loader.records[0].sampler, "prefetch_coords", fake_prefetch)
+
+    summary = loader.prefetch(0, 1, workers=8)
+
+    assert len(calls) == 3
+    assert summary["patches"] == 3
+    assert summary["generated"] == 6
+    assert summary["downloaded"] == 3
+    assert summary["bytes"] == 96
     assert summary["errors"] == 0
 
 
@@ -746,6 +738,7 @@ class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
         super().__init__(array, level_spacing_base=level_spacing_base)
         self.sample_coords_calls: list[tuple[np.ndarray, np.ndarray]] = []
         self.chunk_request_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.prefetch_calls: list[tuple[np.ndarray, np.ndarray]] = []
 
     def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
         self.sample_coords_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
@@ -753,12 +746,35 @@ class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
 
     def chunk_requests_for_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
         self.chunk_request_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
-        return super().chunk_requests_for_coords(coords_zyx_base, valid_mask)
+        coords = np.asarray(coords_zyx_base, dtype=np.float64)
+        valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(coords).all(axis=-1)
+        if not bool(valid.any()):
+            return []
+        chunk_idx = np.floor(coords[valid] / 16.0).astype(np.int64)
+        unique = np.unique(chunk_idx, axis=0)
+        return [
+            ZarrChunkRequest(store={}, store_identity="recording", key=f"{z}.{y}.{x}")
+            for z, y, x in unique.tolist()
+        ]
+
+    def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
+        self.prefetch_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
+        return super().prefetch_coords(coords_zyx_base, valid_mask)
 
 
-def test_prefetch_uses_same_augmented_coords_as_loading(tmp_path: Path) -> None:
+def _request_keys(requests: list[ZarrChunkRequest]) -> set[tuple[str, str]]:
+    return {(request.store_identity, request.key) for request in requests}
+
+
+def test_prefetch_envelope_covers_augmented_loading_dependencies(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
+    fiber = _write_fiber(
+        tmp_path / "long_fiber.json",
+        points=[[float(x), 24.0, 24.0] for x in range(8, 41, 4)],
+        control_points=[[24.0, 24.0, 24.0]],
+    )
+    raw["datasets"][0]["fiber_paths"] = [str(fiber)]
     raw["patch_shape_hw"] = [5, 5]
     raw["strip_z_offset_count"] = 2
     raw["augment_enabled"] = True
@@ -792,18 +808,35 @@ def test_prefetch_uses_same_augmented_coords_as_loading(tmp_path: Path) -> None:
     loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
     sample_index = 4
 
-    loader.chunk_requests_for_sample_index(sample_index)
+    prefetch_requests = loader.chunk_requests_for_sample_index(sample_index)
     loader.build_sample(sample_index)
 
     sampler = samplers[0]
     assert len(sampler.chunk_request_calls) == 2
     assert len(sampler.sample_coords_calls) == 2
-    for (prefetch_coords, prefetch_valid), (load_coords, load_valid) in zip(
-        sampler.chunk_request_calls,
-        sampler.sample_coords_calls,
-    ):
-        assert np.array_equal(prefetch_valid, load_valid)
-        assert np.allclose(prefetch_coords, load_coords, atol=1.0e-6)
+    prefetch_keys = _request_keys(prefetch_requests)
+    assert prefetch_keys
+    for load_coords, load_valid in sampler.sample_coords_calls:
+        load_keys = _request_keys(sampler.chunk_requests_for_coords(load_coords, load_valid))
+        assert load_keys <= prefetch_keys
+
+
+def test_training_load_does_not_call_numpy_strip_builder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import vesuvius.neural_tracing.fiber_trace_2d.loader as loader_module
+    import vesuvius.neural_tracing.fiber_trace_2d.strip_geometry as strip_geometry_module
+
+    config = load_config(_write_config(tmp_path, batch_size=1))
+    loader = _make_loader(config)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("training loader must use shared torch source path")
+
+    assert not hasattr(loader_module, "build_side_strip_patch_grid_from_line_window")
+    monkeypatch.setattr(strip_geometry_module, "build_side_strip_patch_grid_from_line_window", forbidden)
+
+    batch = loader.load_batch(0)
+
+    assert batch.images.shape == (1, 3, 1, 3, 3)
 
 
 def test_training_prefetch_maps_steps_to_sample_count(

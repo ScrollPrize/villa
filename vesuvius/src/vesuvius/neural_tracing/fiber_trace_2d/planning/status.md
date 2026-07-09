@@ -1,26 +1,12 @@
-# Status: Use Augment-Vis Loading Path Everywhere
+# Status: Prefetch Debug Profiling
 
-- [x] Read `planning/task.md`, `planning/specs.md`, `planning/plan.md`, and local AGENTS instructions.
-- [x] Inspect current augment-vis, training batch loading, and prefetch paths.
-- [x] Update `planning/task.md` with the active mismatch-removal task.
-- [x] Create `planning/task_plan.md` for user review.
-- [x] Include required spec update section in `planning/task_plan.md`.
-- [x] Include required docs update section in `planning/task_plan.md`.
-- [x] Include testing strategy in `planning/task_plan.md`.
-- [x] Review `planning/task_plan.md` against `planning/specs.md`, `planning/plan.md`, and `planning/task.md`.
-- [ ] Implement shared augment-vis-style source/patch API for training and runner loading.
-- [ ] Derive all training strip-z offsets from one CP-local source geometry.
-- [ ] Rewrite prefetch to use shared final-coordinate generation.
-- [ ] Make prefetch cover the configured augmentation envelope independent of random augmentation draws.
-- [ ] Move prefetch/cache behavior into sampler-level VC3D-aware APIs.
-- [ ] Remove production training/prefetch dependency on old NumPy strip-grid builder.
-- [ ] Add shared-coordinate parity tests.
-- [ ] Add multi-offset derivation tests.
-- [ ] Add prefetch/load parity and cache-path tests.
-- [ ] Update `planning/specs.md`.
-- [ ] Update `docs/code_structure.md`.
-- [ ] Update `planning/local_development.md`.
-- [ ] Update `planning/changelog.md`.
-- [ ] Update `planning/task_log.md` after implementation.
-- [ ] Run focused tests.
-- [ ] Run CLI/help and local smoke checks where feasible.
+- [x] Read `planning/task.md`, local AGENTS instructions, and current prefetch code.
+- [x] Update `planning/task.md` with the active profiling task.
+- [x] Replace `planning/task_plan.md` with the focused profiling plan.
+- [x] Add per-source and per-patch prefetch timing output.
+- [x] Add a pre-sampler start line so blocking sampler/cache stalls are visible.
+- [x] Preserve current prefetch coordinate/cache behavior.
+- [x] Run compile check.
+- [x] Run focused 2D loader tests.
+- [x] Run CLI/help smoke check.
+- [x] Update `planning/task_log.md` with validation results.

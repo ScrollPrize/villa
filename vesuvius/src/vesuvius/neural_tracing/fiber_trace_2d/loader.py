@@ -3,9 +3,7 @@ from __future__ import annotations
 import glob
 import json
 import math
-import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -25,7 +23,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     FiberStripFrame,
     FiberStripGrid,
     FiberStripLineWindow,
-    build_side_strip_patch_grid_from_line_window,
     build_side_strip_patch_grid_from_line_window_torch,
     side_strip_line_window,
 )
@@ -38,6 +35,7 @@ from vesuvius.neural_tracing.fiber_trace.dataset import (
 )
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
+    FiberStripAugmentParams,
     apply_value_augmentation,
     augmentation_padding,
     augment_config_from_mapping,
@@ -116,7 +114,7 @@ class _Record:
 
 
 @dataclass(frozen=True)
-class _AugmentedCenterStripSource:
+class _StripSource:
     record: _Record
     record_index: int
     control_point_index: int
@@ -793,103 +791,234 @@ class FiberStrip2DLoader:
         height, width = (int(v) for v in shape_hw)
         return np.asarray([(float(width) - 1.0) * 0.5, (float(height) - 1.0) * 0.5], dtype=np.float32)
 
-    def build_sample(
-        self, sample_index: int
-    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
-        record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
-        patch_shape_hw = self.config.patch_shape_hw
-        if self.config.augment.enabled:
-            pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
-            patch_shape_hw = (
-                int(self.config.patch_shape_hw[0]) + 2 * pad.y,
-                int(self.config.patch_shape_hw[1]) + 2 * pad.x,
-            )
-        line_window = self._line_window_for_patch(
-            record,
-            control_point_index=cp_index,
-            patch_shape_hw=patch_shape_hw,
+    def _source_shape_hw(self, *, use_augmentation_envelope: bool | None = None) -> tuple[int, int]:
+        use_envelope = self.config.augment.enabled if use_augmentation_envelope is None else bool(use_augmentation_envelope)
+        if not use_envelope:
+            return self.config.patch_shape_hw
+        pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
+        return (
+            int(self.config.patch_shape_hw[0]) + 2 * pad.y,
+            int(self.config.patch_shape_hw[1]) + 2 * pad.x,
         )
-        sampled_normals = self._lasagna_normals_for_line_window(
-            record,
-            line_window,
-            control_point_index=cp_index,
-        )
-        images: list[np.ndarray] = []
-        coords: list[np.ndarray] = []
-        valids: list[np.ndarray] = []
-        samples: list[FiberStripSample] = []
-        augment_device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else None
-        for offset_index, offset in enumerate(self.strip_z_offsets):
-            params = (
-                random_combined_augmentation(self.config.augment, sample_index, offset_index)
-                if self.config.augment.enabled
-                else None
+
+    def build_strip_source(
+        self,
+        sample_index: int,
+        *,
+        device: torch.device,
+        profile: dict[str, float] | None = None,
+        use_augmentation_envelope: bool | None = None,
+        debug_label: str | None = None,
+    ) -> _StripSource:
+        if debug_label is not None:
+            print(f"{debug_label} descriptor start", flush=True)
+        with _ProfileBlock(profile, "descriptor"):
+            record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
+            center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+            source_shape_hw = self._source_shape_hw(use_augmentation_envelope=use_augmentation_envelope)
+        if debug_label is not None:
+            print(
+                f"{debug_label} descriptor done rec={record_index} cp={cp_index} "
+                f"source_hw={source_shape_hw}",
+                flush=True,
             )
-            grid = build_side_strip_patch_grid_from_line_window(
+            print(f"{debug_label} line_window start", flush=True)
+        with _ProfileBlock(profile, "line_window"):
+            line_window = self._line_window_for_patch(
+                record,
+                control_point_index=cp_index,
+                patch_shape_hw=source_shape_hw,
+            )
+        if debug_label is not None:
+            print(
+                f"{debug_label} line_window done points={len(line_window.line_points_xyz)} "
+                f"cp_local={line_window.local_control_point_index}",
+                flush=True,
+            )
+            print(f"{debug_label} lasagna_normals start", flush=True)
+        with _ProfileBlock(profile, "lasagna_normals"):
+            sampled_normals = self._lasagna_normals_for_line_window(
+                record,
                 line_window,
-                patch_shape_hw=patch_shape_hw,
-                strip_z_offset=float(offset),
+                control_point_index=cp_index,
+            )
+        if debug_label is not None:
+            print(f"{debug_label} lasagna_normals done count={len(sampled_normals)}", flush=True)
+            print(f"{debug_label} strip_coords start device={device}", flush=True)
+        with _ProfileBlock(profile, "strip_coords", device):
+            grid = build_side_strip_patch_grid_from_line_window_torch(
+                line_window,
+                patch_shape_hw=source_shape_hw,
+                strip_z_offset=float(center_offset),
                 sampled_normals=sampled_normals,
                 pixel_spacing_base=record.volume_spacing_base,
+                device=device,
             )
-            coords_zyx = grid.coords_zyx.astype(np.float32, copy=False)
-            valid_mask = grid.valid_mask.astype(bool, copy=False)
-            line_xy = self._unaugmented_centerline_coords(patch_shape_hw)
-            control_point_xy = self._unaugmented_control_point_xy(patch_shape_hw)
-            if self.config.augment.enabled:
-                assert augment_device is not None
-                assert params is not None
+        if debug_label is not None:
+            print(
+                f"{debug_label} strip_coords done valid={int(np.count_nonzero(grid.valid_mask))}",
+                flush=True,
+            )
+        return _StripSource(
+            record=record,
+            record_index=record_index,
+            control_point_index=cp_index,
+            center_offset=float(center_offset),
+            source_shape_hw=source_shape_hw,
+            grid=grid,
+        )
+
+    def _offset_grid_from_source(self, source: _StripSource, offset: float) -> FiberStripGrid:
+        axis_zyx = source.grid.offset_axis_zyx
+        axis_xyz = source.grid.offset_axis_xyz
+        if axis_zyx is None or axis_xyz is None:
+            raise ValueError("strip source grid is missing offset-axis data")
+        delta_base = (float(offset) - float(source.center_offset)) * float(source.record.volume_spacing_base)
+        coords_zyx = source.grid.coords_zyx.astype(np.float32, copy=True)
+        coords_xyz = source.grid.coords_xyz.astype(np.float32, copy=True)
+        coords_zyx += axis_zyx.astype(np.float32, copy=False) * np.float32(delta_base)
+        coords_xyz += axis_xyz.astype(np.float32, copy=False) * np.float32(delta_base)
+        return FiberStripGrid(
+            coords_xyz=coords_xyz,
+            coords_zyx=coords_zyx,
+            valid_mask=source.grid.valid_mask.astype(bool, copy=False),
+            frame=source.grid.frame,
+            offset_axis_xyz=axis_xyz,
+            offset_axis_zyx=axis_zyx,
+        )
+
+    def _line_and_cp_xy_for_params(
+        self,
+        source_shape_hw: tuple[int, int],
+        params: FiberStripAugmentParams | None,
+        *,
+        device: torch.device,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if params is None:
+            return (
+                self._unaugmented_centerline_coords(source_shape_hw),
+                self._unaugmented_control_point_xy(source_shape_hw),
+            )
+        line_xy = transformed_centerline_coords(
+            self.config.patch_shape_hw,
+            source_shape_hw,
+            params,
+            device=device,
+        )
+        control_point_xy = transformed_source_point_coords(
+            self.config.patch_shape_hw,
+            source_shape_hw,
+            params,
+            (
+                (float(source_shape_hw[1]) - 1.0) * 0.5,
+                (float(source_shape_hw[0]) - 1.0) * 0.5,
+            ),
+            device=device,
+        )
+        return line_xy, control_point_xy
+
+    def build_strip_patch_from_source(
+        self,
+        source: _StripSource,
+        offset_index: int,
+        params: FiberStripAugmentParams | None,
+        *,
+        device: torch.device,
+        profile: dict[str, float] | None = None,
+        load_image: bool = True,
+    ) -> tuple[FiberStripSample, np.ndarray | None, np.ndarray | None, np.ndarray]:
+        offset = float(self.strip_z_offsets[int(offset_index)])
+        grid = self._offset_grid_from_source(source, offset)
+        coords_zyx = grid.coords_zyx.astype(np.float32, copy=False)
+        valid_mask = grid.valid_mask.astype(bool, copy=False)
+        if params is not None:
+            with _ProfileBlock(profile, "coord_augmentation", device):
                 coords_zyx, valid_mask = _resample_coords_like_augmentation(
                     coords_zyx,
                     valid_mask,
                     params,
                     output_shape_hw=self.config.patch_shape_hw,
-                    device=augment_device,
+                    device=device,
                 )
-                line_xy = transformed_centerline_coords(
-                    self.config.patch_shape_hw,
-                    patch_shape_hw,
-                    params,
-                    device=augment_device,
-                )
-                control_point_xy = transformed_source_point_coords(
-                    self.config.patch_shape_hw,
-                    patch_shape_hw,
-                    params,
-                    (
-                        (float(patch_shape_hw[1]) - 1.0) * 0.5,
-                        (float(patch_shape_hw[0]) - 1.0) * 0.5,
-                    ),
-                    device=augment_device,
-                )
-            result = record.sampler.sample_coords(coords_zyx, valid_mask)
-            image = result.image
-            valid_mask = result.valid_mask
-            if self.config.augment.enabled:
-                assert augment_device is not None
-                assert params is not None
-                image_t, valid_t = apply_value_augmentation(
-                    image,
-                    valid_mask,
-                    value_only_params(params),
-                    device=augment_device,
-                )
-                image = image_t.cpu().numpy().astype(np.float32)
-                valid_mask = valid_t.cpu().numpy().astype(bool)
-            sample = FiberStripSample(
-                record_index=record_index,
-                fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
-                control_point_index=cp_index,
-                control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
-                strip_z_offset=float(offset),
-                coords_zyx=coords_zyx,
-                valid_mask=valid_mask,
-                frame=grid.frame,
-                line_xy=line_xy,
-                control_point_xy=control_point_xy,
+        with _ProfileBlock(profile, "line_coords", device):
+            line_xy, control_point_xy = self._line_and_cp_xy_for_params(
+                source.source_shape_hw,
+                params,
+                device=device,
             )
+        image: np.ndarray | None = None
+        sampled_valid: np.ndarray | None = None
+        if load_image:
+            with _ProfileBlock(profile, "volume_sample"):
+                result = source.record.sampler.sample_coords(coords_zyx, valid_mask)
+                image = result.image
+                sampled_valid = result.valid_mask
+                if profile is not None:
+                    for key, value in result.stats.items():
+                        if isinstance(value, (int, float)):
+                            profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
+            if params is not None:
+                with _ProfileBlock(profile, "value_augmentation", device):
+                    image_t, valid_t = apply_value_augmentation(
+                        image,
+                        sampled_valid,
+                        value_only_params(params),
+                        device=device,
+                    )
+                    image = image_t.cpu().numpy().astype(np.float32)
+                    sampled_valid = valid_t.cpu().numpy().astype(bool)
+        sample_valid = valid_mask if sampled_valid is None else sampled_valid
+        sample = FiberStripSample(
+            record_index=source.record_index,
+            fiber_path=str(source.record.fiber.path) if source.record.fiber.path is not None else "",
+            control_point_index=source.control_point_index,
+            control_point_xyz=np.asarray(
+                source.record.fiber.control_points_xyz[source.control_point_index], dtype=np.float32
+            ),
+            strip_z_offset=offset,
+            coords_zyx=coords_zyx,
+            valid_mask=sample_valid,
+            frame=grid.frame,
+            line_xy=line_xy,
+            control_point_xy=control_point_xy,
+        )
+        return sample, image, sampled_valid, line_xy
+
+    def _prefetch_envelope_coords_from_source(
+        self,
+        source: _StripSource,
+        offset_index: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        offset = float(self.strip_z_offsets[int(offset_index)])
+        grid = self._offset_grid_from_source(source, offset)
+        return grid.coords_zyx.astype(np.float32, copy=False), grid.valid_mask.astype(bool, copy=False)
+
+    def build_sample(
+        self, sample_index: int
+    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
+        device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
+        source = self.build_strip_source(sample_index, device=device)
+        images: list[np.ndarray] = []
+        coords: list[np.ndarray] = []
+        valids: list[np.ndarray] = []
+        samples: list[FiberStripSample] = []
+        for offset_index, _ in enumerate(self.strip_z_offsets):
+            params = (
+                random_combined_augmentation(self.config.augment, sample_index, offset_index)
+                if self.config.augment.enabled
+                else None
+            )
+            sample, image, valid_mask, _ = self.build_strip_patch_from_source(
+                source,
+                offset_index,
+                params,
+                device=device,
+                load_image=True,
+            )
+            assert image is not None
+            assert valid_mask is not None
             images.append(image)
-            coords.append(coords_zyx)
+            coords.append(sample.coords_zyx)
             valids.append(valid_mask)
             samples.append(sample)
         return (
@@ -900,40 +1029,18 @@ class FiberStrip2DLoader:
         )
 
     def build_center_strip_patch(self, sample_index: int) -> tuple[FiberStripSample, np.ndarray, np.ndarray]:
-        record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
-        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
-        line_window = self._line_window_for_patch(
-            record,
-            control_point_index=cp_index,
-            patch_shape_hw=self.config.patch_shape_hw,
+        source = self.build_strip_source(sample_index, device=torch.device("cpu"))
+        center_index = min(range(len(self.strip_z_offsets)), key=lambda index: abs(float(self.strip_z_offsets[index])))
+        sample, image, valid_mask, _ = self.build_strip_patch_from_source(
+            source,
+            center_index,
+            None,
+            device=torch.device("cpu"),
+            load_image=True,
         )
-        sampled_normals = self._lasagna_normals_for_line_window(
-            record,
-            line_window,
-            control_point_index=cp_index,
-        )
-        grid = build_side_strip_patch_grid_from_line_window(
-            line_window,
-            patch_shape_hw=self.config.patch_shape_hw,
-            strip_z_offset=float(center_offset),
-            sampled_normals=sampled_normals,
-            pixel_spacing_base=record.volume_spacing_base,
-        )
-        result = record.sampler.sample_coords(grid.coords_zyx, grid.valid_mask)
-        image = result.image
-        sample = FiberStripSample(
-            record_index=record_index,
-            fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
-            control_point_index=cp_index,
-            control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
-            strip_z_offset=float(center_offset),
-            coords_zyx=grid.coords_zyx.astype(np.float32, copy=False),
-            valid_mask=result.valid_mask.astype(bool, copy=False),
-            frame=grid.frame,
-            line_xy=self._unaugmented_centerline_coords(self.config.patch_shape_hw),
-            control_point_xy=self._unaugmented_control_point_xy(self.config.patch_shape_hw),
-        )
-        return sample, image.astype(np.float32, copy=False), result.valid_mask.astype(bool, copy=False)
+        assert image is not None
+        assert valid_mask is not None
+        return sample, image.astype(np.float32, copy=False), valid_mask.astype(bool, copy=False)
 
     def build_augmented_center_strip_source(
         self,
@@ -941,120 +1048,37 @@ class FiberStrip2DLoader:
         *,
         device: torch.device,
         profile: dict[str, float] | None = None,
-    ) -> _AugmentedCenterStripSource:
-        with _ProfileBlock(profile, "descriptor"):
-            record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
-            center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
-            pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
-            source_shape_hw = (
-                int(self.config.patch_shape_hw[0]) + 2 * pad.y,
-                int(self.config.patch_shape_hw[1]) + 2 * pad.x,
-            )
-        with _ProfileBlock(profile, "line_window"):
-            line_window = self._line_window_for_patch(
-                record,
-                control_point_index=cp_index,
-                patch_shape_hw=source_shape_hw,
-            )
-        with _ProfileBlock(profile, "lasagna_normals"):
-            sampled_normals = self._lasagna_normals_for_line_window(
-                record,
-                line_window,
-                control_point_index=cp_index,
-            )
-        with _ProfileBlock(profile, "strip_coords", device):
-            grid = build_side_strip_patch_grid_from_line_window_torch(
-                line_window,
-                patch_shape_hw=source_shape_hw,
-                strip_z_offset=float(center_offset),
-                sampled_normals=sampled_normals,
-                pixel_spacing_base=record.volume_spacing_base,
-                device=device,
-            )
-        return _AugmentedCenterStripSource(
-            record=record,
-            record_index=record_index,
-            control_point_index=cp_index,
-            center_offset=float(center_offset),
-            source_shape_hw=source_shape_hw,
-            grid=grid,
+    ) -> _StripSource:
+        return self.build_strip_source(
+            sample_index,
+            device=device,
+            profile=profile,
+            use_augmentation_envelope=True,
         )
 
     def build_augmented_center_strip_patch(
         self,
         sample_index: int,
-        params: Any,
+        params: FiberStripAugmentParams,
         *,
         device: torch.device,
         profile: dict[str, float] | None = None,
-        source: _AugmentedCenterStripSource | None = None,
+        source: _StripSource | None = None,
     ) -> tuple[FiberStripSample, np.ndarray, np.ndarray, np.ndarray]:
         if source is None:
             source = self.build_augmented_center_strip_source(sample_index, device=device, profile=profile)
-        record = source.record
-        record_index = source.record_index
-        cp_index = source.control_point_index
-        center_offset = source.center_offset
-        source_shape_hw = source.source_shape_hw
-        grid = source.grid
-        with _ProfileBlock(profile, "coord_augmentation", device):
-            coords_zyx, valid_mask = _resample_coords_like_augmentation(
-                grid.coords_zyx.astype(np.float32, copy=False),
-                grid.valid_mask.astype(bool, copy=False),
-                params,
-                output_shape_hw=self.config.patch_shape_hw,
-                device=device,
-            )
-        with _ProfileBlock(profile, "volume_sample"):
-            result = record.sampler.sample_coords(coords_zyx, valid_mask)
-            image = result.image
-            valid_mask = result.valid_mask
-            if profile is not None:
-                for key, value in result.stats.items():
-                    if isinstance(value, (int, float)):
-                        profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
-        with _ProfileBlock(profile, "value_augmentation", device):
-            image_t, valid_t = apply_value_augmentation(
-                image,
-                valid_mask,
-                value_only_params(params),
-                device=device,
-            )
-        with _ProfileBlock(profile, "line_coords", device):
-            line_xy = transformed_centerline_coords(
-                self.config.patch_shape_hw,
-                source_shape_hw,
-                params,
-                device=device,
-            )
-            control_point_xy = transformed_source_point_coords(
-                self.config.patch_shape_hw,
-                source_shape_hw,
-                params,
-                (
-                    (float(source_shape_hw[1]) - 1.0) * 0.5,
-                    (float(source_shape_hw[0]) - 1.0) * 0.5,
-                ),
-                device=device,
-            )
-        sample = FiberStripSample(
-            record_index=record_index,
-            fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
-            control_point_index=cp_index,
-            control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
-            strip_z_offset=center_offset,
-            coords_zyx=coords_zyx,
-            valid_mask=valid_t.cpu().numpy().astype(bool),
-            frame=grid.frame,
-            line_xy=line_xy,
-            control_point_xy=control_point_xy,
+        center_index = min(range(len(self.strip_z_offsets)), key=lambda index: abs(float(self.strip_z_offsets[index])))
+        sample, image, valid_mask, line_xy = self.build_strip_patch_from_source(
+            source,
+            center_index,
+            params,
+            device=device,
+            profile=profile,
+            load_image=True,
         )
-        return (
-            sample,
-            image_t.cpu().numpy().astype(np.float32),
-            valid_t.cpu().numpy().astype(bool),
-            line_xy,
-        )
+        assert image is not None
+        assert valid_mask is not None
+        return sample, image.astype(np.float32, copy=False), valid_mask.astype(bool, copy=False), line_xy
 
     def load_batch(self, start_sample_index: int = 0, batch_size: int | None = None) -> FiberStrip2DBatch:
         batch_size = self.config.batch_size if batch_size is None else int(batch_size)
@@ -1098,52 +1122,12 @@ class FiberStrip2DLoader:
         )
 
     def chunk_requests_for_sample_index(self, sample_index: int) -> list[ZarrChunkRequest]:
-        record, _, cp_index = self.descriptor_for_sample_index(sample_index)
+        device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
+        source = self.build_strip_source(sample_index, device=device)
         requests: list[ZarrChunkRequest] = []
-        augment_device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else None
-        patch_shape_hw = self.config.patch_shape_hw
-        if self.config.augment.enabled:
-            pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
-            patch_shape_hw = (
-                int(self.config.patch_shape_hw[0]) + 2 * pad.y,
-                int(self.config.patch_shape_hw[1]) + 2 * pad.x,
-            )
-        line_window = self._line_window_for_patch(
-            record,
-            control_point_index=cp_index,
-            patch_shape_hw=patch_shape_hw,
-        )
-        sampled_normals = self._lasagna_normals_for_line_window(
-            record,
-            line_window,
-            control_point_index=cp_index,
-        )
-        for offset_index, offset in enumerate(self.strip_z_offsets):
-            params = (
-                random_combined_augmentation(self.config.augment, sample_index, offset_index)
-                if self.config.augment.enabled
-                else None
-            )
-            grid = build_side_strip_patch_grid_from_line_window(
-                line_window,
-                patch_shape_hw=patch_shape_hw,
-                strip_z_offset=float(offset),
-                sampled_normals=sampled_normals,
-                pixel_spacing_base=record.volume_spacing_base,
-            )
-            coords_zyx = grid.coords_zyx.astype(np.float32, copy=False)
-            valid_mask = grid.valid_mask.astype(bool, copy=False)
-            if self.config.augment.enabled:
-                assert augment_device is not None
-                assert params is not None
-                coords_zyx, valid_mask = _resample_coords_like_augmentation(
-                    coords_zyx,
-                    valid_mask,
-                    params,
-                    output_shape_hw=self.config.patch_shape_hw,
-                    device=augment_device,
-                )
-            requests.extend(record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
+        for offset_index, _ in enumerate(self.strip_z_offsets):
+            coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
+            requests.extend(source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
         return requests
 
     def chunk_requests_for_samples(self, start_sample_index: int, sample_count: int) -> list[ZarrChunkRequest]:
@@ -1154,68 +1138,111 @@ class FiberStrip2DLoader:
         return list(unique.values())
 
     def prefetch(self, start_sample_index: int, sample_count: int, *, workers: int | None = None) -> dict[str, Any]:
-        raw_requests = self.chunk_requests_for_samples(start_sample_index, sample_count)
-        deduped: dict[tuple[str, str], ZarrChunkRequest] = {}
-        for request in raw_requests:
-            deduped[(request.store_identity, request.key)] = request
-        requests = list(deduped.values())
-        pending: list[ZarrChunkRequest] = []
-        for request in requests:
-            cache_dir = getattr(request.store, "_cache_dir", None)
-            if cache_dir is None:
-                pending.append(request)
-                continue
-            cached = os.path.join(cache_dir, request.key)
-            marker = cached + getattr(request.store, "_NEGATIVE_MARKER_SUFFIX", ".__notfound__")
-            if not os.path.isfile(cached) and not os.path.isfile(marker):
-                pending.append(request)
-
-        total = len(pending)
-        workers = min(16, max(1, int(self.config.prefetch_workers if workers is None else workers)))
+        del workers
+        total_samples = int(sample_count)
+        total_patches = total_samples * len(self.strip_z_offsets)
+        completed_patches = 0
+        generated = 0
         downloaded = 0
-        bytes_read = 0
+        bytes_read = 0.0
         errors = 0
+        valid_pixels = 0
         start = time.perf_counter()
         print(
-            f"prefetch chunks: generated={len(requests)} missing={total} "
-            f"samples={int(sample_count)} workers={workers}",
+            f"prefetch: samples={total_samples} patches={total_patches} "
+            "mode=sampler_envelope",
             flush=True,
         )
-
-        def fetch(request: ZarrChunkRequest) -> int:
-            data = request.store[request.key]
-            return len(data) if isinstance(data, (bytes, bytearray, memoryview)) else len(bytes(data))
-
-        if total:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(fetch, request) for request in pending]
-                for future in as_completed(futures):
-                    downloaded += 1
-                    try:
-                        bytes_read += int(future.result())
-                    except Exception:
-                        errors += 1
-                    elapsed = max(time.perf_counter() - start, 1.0e-9)
-                    mib_s = (bytes_read / (1024.0 * 1024.0)) / elapsed
-                    remaining = total - downloaded
-                    eta = remaining / max(downloaded / elapsed, 1.0e-9)
-                    bar_width = 24
-                    filled = int(math.floor(bar_width * downloaded / max(total, 1)))
-                    bar = "#" * filled + "-" * (bar_width - filled)
-                    print(
-                        f"prefetch [{bar}] {downloaded}/{total} chunks "
-                        f"{bytes_read / (1024.0 * 1024.0):.1f} MiB "
-                        f"{mib_s:.1f} MiB/s eta={eta:.1f}s errors={errors}",
-                        flush=True,
+        print(
+            "prefetch profile columns: sample=deterministic sample index off=strip-z offset index "
+            "src/desc/win/norm/coord/env/samp/tot=ms valid=valid pixels deps=dependency/chunk count "
+            "dl=downloaded chunks bytes=download/read bytes mode=sampler prefetch mode",
+            flush=True,
+        )
+        print(
+            "sample off      src     desc      win     norm    coord      env     samp      tot "
+            "    valid   deps    dl      bytes mode",
+            flush=True,
+        )
+        device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
+        for sample_index in range(int(start_sample_index), int(start_sample_index) + total_samples):
+            source_profile: dict[str, float] = {}
+            print(f"prefetch sample={sample_index} source start", flush=True)
+            source_start = time.perf_counter()
+            source = self.build_strip_source(
+                sample_index,
+                device=device,
+                profile=source_profile,
+                debug_label=f"prefetch sample={sample_index}",
+            )
+            source_ms = (time.perf_counter() - source_start) * 1000.0
+            print(f"prefetch sample={sample_index} source done src_ms={source_ms:.1f}", flush=True)
+            for offset_index, _ in enumerate(self.strip_z_offsets):
+                patch_start = time.perf_counter()
+                envelope_start = time.perf_counter()
+                coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
+                envelope_ms = (time.perf_counter() - envelope_start) * 1000.0
+                patch_valid_pixels = int(np.count_nonzero(valid_mask))
+                valid_pixels += patch_valid_pixels
+                print(
+                    f"prefetch start sample={sample_index} off={offset_index} "
+                    f"valid={patch_valid_pixels} src_ms={source_ms:.1f} env_ms={envelope_ms:.1f}",
+                    flush=True,
+                )
+                sampler_start = time.perf_counter()
+                stats = source.record.sampler.prefetch_coords(coords_zyx, valid_mask)
+                sampler_ms = (time.perf_counter() - sampler_start) * 1000.0
+                patch_total_ms = (time.perf_counter() - patch_start) * 1000.0
+                patch_generated = int(
+                    stats.get(
+                        "unique_chunks",
+                        stats.get("generated", stats.get("requested_chunks", stats.get("valid_pixels", 0))),
                     )
+                )
+                patch_downloaded = int(
+                    stats.get("downloaded", stats.get("download_chunks", stats.get("downloaded_chunks", 0)))
+                )
+                patch_bytes = float(stats.get("bytes", stats.get("download_bytes", 0.0)))
+                generated += patch_generated
+                downloaded += patch_downloaded
+                bytes_read += patch_bytes
+                errors += int(stats.get("errors", stats.get("error_chunks", 0)))
+                completed_patches += 1
+                elapsed = max(time.perf_counter() - start, 1.0e-9)
+                mib_s = (bytes_read / (1024.0 * 1024.0)) / elapsed
+                remaining = total_patches - completed_patches
+                eta = remaining / max(completed_patches / elapsed, 1.0e-9)
+                bar_width = 24
+                filled = int(math.floor(bar_width * completed_patches / max(total_patches, 1)))
+                bar = "#" * filled + "-" * (bar_width - filled)
+                print(
+                    f"{sample_index:6d} {offset_index:3d} "
+                    f"{source_ms:8.1f} {source_profile.get('descriptor', 0.0):8.1f} "
+                    f"{source_profile.get('line_window', 0.0):8.1f} "
+                    f"{source_profile.get('lasagna_normals', 0.0):8.1f} "
+                    f"{source_profile.get('strip_coords', 0.0):8.1f} "
+                    f"{envelope_ms:8.1f} {sampler_ms:8.1f} {patch_total_ms:8.1f} "
+                    f"{patch_valid_pixels:9d} {patch_generated:6d} {patch_downloaded:5d} "
+                    f"{int(patch_bytes):10d} {str(stats.get('prefetch_mode', 'unknown'))}",
+                    flush=True,
+                )
+                print(
+                    f"prefetch [{bar}] {completed_patches}/{total_patches} patches "
+                    f"deps={generated} dl={downloaded} "
+                    f"{bytes_read / (1024.0 * 1024.0):.1f} MiB "
+                    f"{mib_s:.1f} MiB/s eta={eta:.1f}s errors={errors}",
+                    flush=True,
+                )
 
         return {
-            "generated": len(requests),
-            "missing": total,
+            "generated": generated,
+            "missing": downloaded,
             "downloaded": downloaded,
-            "bytes": bytes_read,
+            "bytes": int(bytes_read),
             "errors": errors,
-            "workers": workers,
+            "workers": 1,
+            "patches": completed_patches,
+            "valid_pixels": valid_pixels,
         }
 
 

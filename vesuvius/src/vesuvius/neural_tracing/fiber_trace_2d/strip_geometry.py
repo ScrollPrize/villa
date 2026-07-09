@@ -25,6 +25,8 @@ class FiberStripGrid:
     coords_zyx: np.ndarray
     valid_mask: np.ndarray
     frame: FiberStripFrame
+    offset_axis_xyz: np.ndarray | None = None
+    offset_axis_zyx: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -462,11 +464,11 @@ def _interpolate_line_side_slice(
     frames: list[FiberStripFrame],
     arc_coord: np.ndarray,
     normal_offsets: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if points_xyz.shape[0] == 1:
         center = np.broadcast_to(points_xyz[0], arc_coord.shape + (3,)).astype(np.float64)
         normal = np.broadcast_to(frames[0].mesh_normal_xyz, arc_coord.shape + (3,)).astype(np.float64)
-        return center + normal * normal_offsets[..., None], np.ones(arc_coord.shape, dtype=bool)
+        return center + normal * normal_offsets[..., None], normal, np.ones(arc_coord.shape, dtype=bool)
 
     cumulative = _arc_lengths(points_xyz)
     center, valid = _cubic_hermite_line(points_xyz, arc_coord)
@@ -481,7 +483,7 @@ def _interpolate_line_side_slice(
     normal = n0 * (1.0 - t[..., None]) + n1 * t[..., None]
     normal_len = np.linalg.norm(normal, axis=-1, keepdims=True)
     normal = np.divide(normal, normal_len, out=np.zeros_like(normal), where=normal_len > _EPS)
-    return center + normal * normal_offsets[..., None], valid
+    return center + normal * normal_offsets[..., None], normal, valid
 
 
 def _frame_normal_array(frames: list[FiberStripFrame]) -> np.ndarray:
@@ -527,14 +529,15 @@ def _interpolate_line_side_slice_torch(
     frames: list[FiberStripFrame],
     arc_coord: torch.Tensor,
     normal_offsets: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = arc_coord.device
     dtype = torch.float64
     points = torch.as_tensor(points_xyz, dtype=dtype, device=device)
     if points.shape[0] == 1:
         center = points[0].view(1, 1, 3).expand(arc_coord.shape + (3,))
         normal = torch.as_tensor(frames[0].mesh_normal_xyz, dtype=dtype, device=device).view(1, 1, 3)
-        return center + normal * normal_offsets[..., None], torch.ones_like(arc_coord, dtype=torch.bool)
+        normal = normal.expand(arc_coord.shape + (3,))
+        return center + normal * normal_offsets[..., None], normal, torch.ones_like(arc_coord, dtype=torch.bool)
 
     cumulative_np = _arc_lengths(points_xyz)
     derivatives_np = _arc_derivatives(points_xyz, cumulative_np)
@@ -548,7 +551,7 @@ def _interpolate_line_side_slice_torch(
     normal = n0 * (1.0 - t[..., None]) + n1 * t[..., None]
     normal_len = torch.linalg.norm(normal, dim=-1, keepdim=True)
     normal = torch.where(normal_len > _EPS, normal / normal_len.clamp_min(_EPS), torch.zeros_like(normal))
-    return center + normal * normal_offsets[..., None], valid
+    return center + normal * normal_offsets[..., None], normal, valid
 
 
 def build_side_strip_patch_grid_from_line_window_torch(
@@ -592,16 +595,22 @@ def build_side_strip_patch_grid_from_line_window_torch(
     cumulative = _arc_lengths(line_points)
     anchor_arc = float(cumulative[line_index])
     arc_coord = anchor_arc + col_grid
-    coords_xyz_t, valid_t = _interpolate_line_side_slice_torch(line_points, frames, arc_coord, row_grid)
+    coords_xyz_t, offset_axis_xyz_t, valid_t = _interpolate_line_side_slice_torch(
+        line_points, frames, arc_coord, row_grid
+    )
     shape_valid_t = torch.isfinite(coords_xyz_t).all(dim=-1)
     coords_xyz = coords_xyz_t.detach().cpu().numpy()
+    offset_axis_xyz = offset_axis_xyz_t.detach().cpu().numpy()
     coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32)
+    offset_axis_zyx = offset_axis_xyz[..., (2, 1, 0)].astype(np.float32)
     frame = _frame_at_arc(line_points, frames, anchor_arc)
     return FiberStripGrid(
         coords_xyz=coords_xyz.astype(np.float32),
         coords_zyx=coords_zyx,
         valid_mask=(valid_t & shape_valid_t).detach().cpu().numpy().astype(bool),
         frame=frame,
+        offset_axis_xyz=offset_axis_xyz.astype(np.float32),
+        offset_axis_zyx=offset_axis_zyx,
     )
 
 
@@ -636,15 +645,18 @@ def build_side_strip_patch_grid_from_line_window(
         )
     anchor_arc = float(_arc_lengths(line_points)[line_index])
     arc_coord = anchor_arc + col_grid
-    coords_xyz, valid = _interpolate_line_side_slice(line_points, frames, arc_coord, row_grid)
+    coords_xyz, offset_axis_xyz, valid = _interpolate_line_side_slice(line_points, frames, arc_coord, row_grid)
     shape_valid = np.isfinite(coords_xyz).all(axis=-1)
     coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32)
+    offset_axis_zyx = offset_axis_xyz[..., (2, 1, 0)].astype(np.float32)
     frame = _frame_at_arc(line_points, frames, anchor_arc)
     return FiberStripGrid(
         coords_xyz=coords_xyz.astype(np.float32),
         coords_zyx=coords_zyx,
         valid_mask=(valid & shape_valid),
         frame=frame,
+        offset_axis_xyz=offset_axis_xyz.astype(np.float32),
+        offset_axis_zyx=offset_axis_zyx,
     )
 
 

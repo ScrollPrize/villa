@@ -41,6 +41,8 @@ The important behavior is:
 - Provides a torch-vectorized dense grid builder,
   `build_side_strip_patch_grid_from_line_window_torch`, which keeps the same
   frame semantics but vectorizes per-pixel interpolation work.
+- The dense grid also exposes the per-pixel strip offset axis so nearby
+  strip-z patches can be derived from one CP-local source grid.
 
 `loader_support.py`
 
@@ -57,7 +59,8 @@ The important behavior is:
   - opens remote paths with `Volume.open_url`;
   - calls `Volume.sample_coords(..., blocking=True)` so missing chunks are
     fetched/decoded before sampling returns;
-  - calls `Volume.collect_coords_dependencies` for prefetch chunk discovery.
+  - uses the same blocking sampling/cache path for sampler-level prefetch by
+    sampling the requested coordinate envelope and discarding image values.
 - `NumpyZarrCoordinateSampler` remains useful for tests and local fake arrays.
 - `make_coordinate_sampler` currently returns the VC3D sampler for normal
   runtime.
@@ -100,13 +103,17 @@ The important behavior is:
 - Skips any fiber whose control points are outside the manifest/base-volume
   bounds.
 - Loads only CP-local Lasagna normals needed for the requested strip window.
+- Builds one CP-local source strip with the torch-vectorized augment-vis path,
+  then derives all configured strip-z offsets from that source using the stored
+  strip offset axis.
 - Builds one sample as all configured strip-z offsets around one control point.
 - Builds a batch by stacking deterministic samples.
-- Computes prefetch chunk requests from explicit final augmented coordinates
-  for the base-volume sampler only.
-- Implements `build_augmented_center_strip_source` to build CP-local source
-  geometry once for augmentation contact sheets, then reuses it for each
-  augmentation variant.
+- Implements `build_strip_source` / `build_strip_patch_from_source` as the
+  shared path for training, runner loading, augment-vis, and prefetch.
+- Computes prefetch envelopes from the same shared source geometry and calls
+  sampler-level prefetch for the base-volume sampler only.
+- Keeps `build_augmented_center_strip_source` as a compatibility wrapper for
+  the runner contact sheet.
 
 `runner.py`
 
@@ -271,7 +278,9 @@ around zero. The default count/step yields 16 selected-scale offsets:
 -7, -6, ..., -1, 0, 1, ..., 8
 ```
 
-Each offset is sampled as a separate 2D patch in the batch tensor.
+Each offset is returned as a separate 2D patch in the batch tensor, but the
+coordinates are derived from one CP-local source grid rather than rebuilding
+the side-strip frame and line window for every offset.
 
 ## Lasagna Normal Handling
 
@@ -306,9 +315,10 @@ a separate `normal_xyz` storage format.
 - `samples`: flat tuple of `FiberStripSample`, ordered by sample then offset;
 - `cache_stats`: cache trace object returned by the existing Zarr cache tracer.
 
-When augmentation is enabled, the loader builds an oversized source strip,
-maps the requested output patch into it, samples the volume at final augmented
-coordinates, and then applies value augmentation.
+The loader builds the same CP-local source strip path used by augment-vis. When
+augmentation is enabled, that source strip is oversized for the configured
+augmentation envelope, output pixels map into it, the volume is sampled at final
+augmented coordinates, and value augmentation is applied afterward.
 
 Each `FiberStripSample` also stores `line_xy` and `control_point_xy` in final
 output-pixel coordinates after geometric augmentation. Training labels and
@@ -370,16 +380,23 @@ Snapshots are written under:
 
 ## Prefetch
 
-`chunk_requests_for_sample_index` builds the same final coordinate grids that
-loading would use, then asks the sampler which chunks are needed.
+`chunk_requests_for_sample_index` is a compatibility/test helper that derives
+dependency requests from the same conservative source-envelope coordinates used
+by prefetch.
 
 `prefetch(start_sample_index, sample_count)`:
 
-- deduplicates requests by store identity and chunk key;
-- skips requests whose cache file or negative marker already exists;
-- downloads missing chunks through the request store;
-- uses at most 16 worker threads;
-- prints progress, MiB/s, ETA, and error count.
+- builds the shared CP-local source once per deterministic sample index;
+- derives each configured strip-z offset from that source;
+- sends the source-envelope coordinates to `CoordinateSampler.prefetch_coords`;
+- uses VC3D's blocking coordinate sampling/cache path for remote volumes;
+- prints progress, MiB/s, ETA, dependency/download counters where available,
+  and error count.
+
+Prefetch covers the configured augmentation envelope, not a single random
+augmentation draw. It may fetch a conservative superset for one patch, but later
+training draws within the configured extrema should be covered by the same
+cached base-volume chunks.
 
 Prefetch is only for addressed base-volume image chunks. Lasagna channels are
 local manifest channels in the current Staticsheep config and are not part of
@@ -398,8 +415,9 @@ The runner builds CP-local source geometry once:
 - local Lasagna normals;
 - torch-vectorized source strip grid.
 
-Every contact-sheet cell then reuses that source grid and applies its own
-geometric coordinate mapping before volume sampling.
+Every contact-sheet cell then delegates to the same shared patch builder used
+by training and applies its own geometric coordinate mapping before volume
+sampling.
 
 Layout:
 
@@ -479,7 +497,7 @@ They cover:
 - side-strip coordinate generation;
 - torch vectorized strip-grid equivalence to the NumPy path;
 - vectorized line-coordinate augmentation behavior;
-- prefetch request generation;
+- sampler-level prefetch and augmentation-envelope dependency coverage;
 - runner export behavior where practical.
 
 Run them with:

@@ -26,6 +26,13 @@ class CoordinateSampler:
     def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
         raise NotImplementedError
 
+    def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> dict[str, Any]:
+        result = self.sample_coords(coords_zyx_base, valid_mask)
+        stats = dict(result.stats)
+        stats.setdefault("prefetch_mode", "sample_coords")
+        stats.setdefault("valid_pixels", int(np.count_nonzero(valid_mask)))
+        return stats
+
     def chunk_requests_for_coords(
         self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
     ) -> list[ZarrChunkRequest]:
@@ -148,6 +155,31 @@ class NumpyZarrCoordinateSampler(CoordinateSampler):
     ) -> list[ZarrChunkRequest]:
         coords_zyx_level = np.asarray(coords_zyx_base, dtype=np.float32) / self.level_spacing_base
         return chunk_requests_for_coords(self.array, coords_zyx_level, valid_mask)
+
+    def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> dict[str, Any]:
+        requests = self.chunk_requests_for_coords(coords_zyx_base, valid_mask)
+        unique: dict[tuple[str, str], ZarrChunkRequest] = {
+            (request.store_identity, request.key): request for request in requests
+        }
+        downloaded = 0
+        bytes_read = 0
+        errors = 0
+        for request in unique.values():
+            try:
+                data = request.store[request.key]
+                bytes_read += len(data) if isinstance(data, (bytes, bytearray, memoryview)) else len(bytes(data))
+                downloaded += 1
+            except Exception:
+                errors += 1
+        return {
+            "prefetch_mode": "chunk_requests",
+            "generated": len(requests),
+            "unique_chunks": len(unique),
+            "downloaded": downloaded,
+            "bytes": bytes_read,
+            "errors": errors,
+            "valid_pixels": int(np.count_nonzero(valid_mask)),
+        }
 
 
 def make_coordinate_sampler(
