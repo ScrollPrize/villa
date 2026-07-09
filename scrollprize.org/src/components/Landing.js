@@ -555,6 +555,7 @@ export function Landing() {
   const siteUrl = (siteConfig?.url ?? "") + (siteConfig?.baseUrl ?? "/");
 
   const heroVideo = useRef(null);
+  const revealVideo = useRef(null);
   const unrollVideo = useRef(null);
 
   useEffect(() => {
@@ -571,9 +572,33 @@ export function Landing() {
       v.load();
       autoPlay(heroVideo);
     };
+    // The reveal card's unrolling video: desktop-only (phones keep the 29 KB
+    // end-frame poster), data-saver-aware, plays ONCE and holds on its final
+    // frame — the fully-read scroll.
+    const rv = revealVideo.current;
+    const enableReveal = () => {
+      if (!rv) return;
+      if (!window.matchMedia("(min-width: 997px)").matches) return;
+      if (navigator.connection?.saveData) return;
+      const sources = rv.querySelectorAll("source[data-src]");
+      if (!sources.length || sources[0].src) return;
+      // Swap to the first-frame poster so playback is monotonic (rolled →
+      // unrolls once → holds); the end-frame poster stays for poster-only
+      // contexts (mobile, reduced-motion, data-saver).
+      rv.poster = "/img/firstscroll/hero-reveal-start-960.webp";
+      sources.forEach((s) => {
+        s.src = s.dataset.src;
+      });
+      rv.load();
+      autoPlay(revealVideo);
+    };
+    const enableAll = () => {
+      enableVideo();
+      enableReveal();
+    };
     if ("requestIdleCallback" in window)
-      window.requestIdleCallback(enableVideo, { timeout: 1200 });
-    else setTimeout(enableVideo, 600);
+      window.requestIdleCallback(enableAll, { timeout: 1200 });
+    else setTimeout(enableAll, 600);
     autoPlay(unrollVideo);
   }, []);
 
@@ -605,6 +630,14 @@ export function Landing() {
           rel="preload"
           as="image"
           href="/img/landing/vesuvius.webp"
+          fetchpriority="high"
+        />
+        {/* Reveal-card poster (desktop hero right column) */}
+        <link
+          rel="preload"
+          as="image"
+          href="/img/firstscroll/hero-reveal-end-960.webp"
+          media="(min-width: 997px)"
           fetchpriority="high"
         />
         {/* OpenGraph/Twitter */}
@@ -669,82 +702,99 @@ export function Landing() {
             <Heading as="h1" id="home-hero-title" className="vc-hero__title">
               Resurrect an ancient library from the ashes of a volcano.
             </Heading>
-            <p className="vc-hero__tagline">Win Prizes. Make History.</p>
-            <p className="vc-hero__intro">
-              Vesuvius Challenge is a machine learning, computer vision, and
-              geometry competition that is <a href="/grandprize">reading</a>{" "}
-              the carbonized Herculaneum scrolls — without opening them. Our
-              current challenge: <a href="/get_started">join the community</a>{" "}
-              and read entire scrolls.
-            </p>
-            <div className="vc-stat-strip vc-hero__stats">
-              {openPrizes.length > 0 && (
-                <a className="vc-stat vc-stat--link" href="/prizes">
-                  <span className="vc-stat__value">
-                    {usd.format(openPrizeTotal)}
-                  </span>
-                  <span className="vc-stat__label">open prize pool</span>
-                </a>
-              )}
-              {awardedTotal > 0 && (
-                <a className="vc-stat vc-stat--link" href="/winners">
-                  <span className="vc-stat__value">
-                    {usd.format(awardedTotal)}
-                  </span>
-                  <span className="vc-stat__label">already awarded</span>
-                </a>
-              )}
-              <a className="vc-stat vc-stat--link" href="/data_browser">
-                <span className="vc-stat__value">{counts.fragments ?? 10}</span>
-                <span className="vc-stat__label">fragments scanned</span>
-              </a>
-              <a className="vc-stat vc-stat--link" href="/data_browser">
-                <span className="vc-stat__value">{counts.scrolls ?? 35}</span>
-                <span className="vc-stat__label">scrolls scanned</span>
-              </a>
-              <a className="vc-stat vc-stat--link" href="/data_browser">
-                <span className="vc-stat__value">1</span>
-                <span className="vc-stat__label">scroll fully read</span>
-              </a>
-            </div>
-            <div className="vc-hero__ctas">
-              <a className="vc-btn" href="/get_started">
-                Get Started
-              </a>
-              <a
-                className="vc-btn-outline"
-                href="https://discord.gg/V4fJhvtaQn"
-              >
-                Join Discord
-              </a>
-              <a className="vc-cta" href="/firstscroll">
-                Read the breaking announcement
-              </a>
-            </div>
+            <div
+              className={`vc-hero__grid${
+                SHOW_BREAKING ? "" : " vc-hero__grid--solo"
+              }`}
+            >
+              <div className="vc-hero__copy">
+                <p className="vc-hero__tagline">Win Prizes. Make History.</p>
+                <p className="vc-hero__intro">
+                  Vesuvius Challenge is a machine learning, computer vision,
+                  and geometry competition that is{" "}
+                  <a href="/grandprize">reading</a> the carbonized Herculaneum
+                  scrolls — without opening them. Our current challenge:{" "}
+                  <a href="/get_started">join the community</a> and read entire
+                  scrolls.
+                </p>
+                <div className="vc-hero__ctas">
+                  <a className="vc-btn" href="/get_started">
+                    Get Started
+                  </a>
+                  <a
+                    className="vc-btn-outline"
+                    href="https://discord.gg/V4fJhvtaQn"
+                  >
+                    Join Discord
+                  </a>
+                </div>
+              </div>
 
-            {SHOW_BREAKING && (
-              <a
-                href="/firstscroll"
-                className="vc-card vc-card--hero vc-breaking"
-              >
-                <span className="vc-breaking__text">
-                  <span className="vc-kicker">Breaking</span>
-                  <span className="vc-breaking__title">
-                    We read an entire Herculaneum scroll.
+              {/* The unwrap payoff: PHerc. 1667 unrolling into readable Greek.
+                  Poster = the video's final frame, so poster-only contexts
+                  (mobile, reduced-motion, data-saver) still get the reveal. */}
+              {SHOW_BREAKING && (
+                <a href="/firstscroll" className="vc-hero__reveal">
+                  <video
+                    playsInline
+                    muted
+                    preload="none"
+                    title="PHerc. 1667 virtually unwrapping into readable Greek"
+                    poster="/img/firstscroll/hero-reveal-end-960.webp"
+                    className="vc-hero__reveal-media"
+                    ref={revealVideo}
+                  >
+                    <source
+                      data-src="/img/firstscroll/hero-reveal.webm"
+                      type="video/webm"
+                    />
+                    <source
+                      data-src="/img/firstscroll/hero-reveal.mp4"
+                      type="video/mp4"
+                    />
+                  </video>
+                  <span className="vc-hero__reveal-caption">
+                    <span className="vc-kicker">Breaking</span>
+                    <span className="vc-hero__reveal-title">
+                      We read an entire Herculaneum scroll&nbsp;→
+                    </span>
                   </span>
-                  <span className="vc-breaking__desc">
-                    PHerc. 1667, sealed since 79&nbsp;AD, has been virtually
-                    unwrapped and read end to end. Read the announcement&nbsp;→
+                </a>
+              )}
+
+              <div className="vc-stat-strip vc-hero__stats">
+                {openPrizes.length > 0 && (
+                  <a className="vc-stat vc-stat--link" href="/prizes">
+                    <span className="vc-stat__value">
+                      {usd.format(openPrizeTotal)}
+                    </span>
+                    <span className="vc-stat__label">open prize pool</span>
+                  </a>
+                )}
+                {awardedTotal > 0 && (
+                  <a className="vc-stat vc-stat--link" href="/winners">
+                    <span className="vc-stat__value">
+                      {usd.format(awardedTotal)}
+                    </span>
+                    <span className="vc-stat__label">already awarded</span>
+                  </a>
+                )}
+                <a className="vc-stat vc-stat--link" href="/data_browser">
+                  <span className="vc-stat__value">
+                    {counts.fragments ?? 10}
                   </span>
-                </span>
-                <img
-                  src="/img/firstscroll/banner-strip.webp"
-                  alt="The unwrapped writing surface of PHerc. 1667, columns of ancient Greek."
-                  decoding="async"
-                  className="vc-media vc-breaking__img"
-                />
-              </a>
-            )}
+                  <span className="vc-stat__label">fragments scanned</span>
+                </a>
+                <a className="vc-stat vc-stat--link" href="/data_browser">
+                  <span className="vc-stat__value">{counts.scrolls ?? 35}</span>
+                  <span className="vc-stat__label">scrolls scanned</span>
+                </a>
+                <a className="vc-stat vc-stat--link" href="/data_browser">
+                  <span className="vc-stat__value">1</span>
+                  <span className="vc-stat__label">scroll fully read</span>
+                </a>
+              </div>
+            </div>
           </div>
         </section>
 

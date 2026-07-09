@@ -1,8 +1,7 @@
 import React, { useState, useEffect } from "react";
-import AwardedTotal from "./AwardedTotal";
 
-// Dense "Updates" strip: 1 permanent "Get Started" entry + 3 latest Substack
-// posts, one compact row per entry (title 15px/600 + date 12px faint).
+// Dense "Updates" strip: the 4 latest Substack posts, one compact row per
+// entry (title + date).
 // Layout/skin lives in chrome.css (.vc-updates): 4-up >=1280px, 2-up >=480px,
 // single column below 480px, hairline separators, no shadows.
 // Fetches posts from /data/latestPosts.json (generated at build time by fetchLatestPosts.js)
@@ -24,6 +23,11 @@ const FALLBACK_POSTS = [
     title: "New Prizes and Progress Update",
     href: "https://scrollprize.substack.com/p/new-prizes-and-an-update-on-progress",
     subtext: "February 27"
+  },
+  {
+    title: "First Letters Found in New Scroll",
+    href: "https://scrollprize.substack.com/p/first-letters-found-in-new-scroll",
+    subtext: "February 5"
   }
 ];
 
@@ -46,7 +50,7 @@ const LatestPosts = () => {
           const data = await response.json();
           if (data.posts && data.posts.length > 0) {
             // Format the posts data
-            const formattedPosts = data.posts.slice(0, 3).map(post => ({
+            const formattedPosts = data.posts.slice(0, 4).map(post => ({
               title: post.title,
               href: post.link,
               subtext: formatDate(post.pubDate)
@@ -66,13 +70,7 @@ const LatestPosts = () => {
   }, []);
 
   return (
-    <div className="vc-updates mb-3" role="list">
-      <a className="vc-updates__item" href="/get_started" role="listitem">
-        <span className="vc-updates__title">Get Started</span>
-        <span className="vc-updates__meta">
-          <AwardedTotal compact /> already awarded
-        </span>
-      </a>
+    <div className="vc-updates" role="list">
       {posts.map((post, index) => (
         <a
           key={index}

@@ -312,6 +312,15 @@ The pipeline strip on /2026_open_problems now reads Scanning → Unwrapping → 
 - `ink1-alpha.webp` / `ink2-alpha.webp` are now orphaned (no references) — left in place for the owner to prune.
 **Files:** `docs/07_tutorial5.md`, `static/img/tutorials/ink-modality-color.webp` (new), `ink-modality-infrared.webp` (new), `ink-modality-xray.webp` (new), `ink-signal-volumetric.webp` (new), `ink-iterative-labeling.webp` (new).
 
+## C36 — landing: reveal-split hero, tighter margins, compact news (design workflow)
+
+Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact the news strip, use desktop width better. Built from three parallel design-agent specs + a visual-critic iteration (all prototyped against the live build before implementation).
+- **Hero 865px → 566px (desktop), 1085 → 910px (mobile)**: content-driven height (no more viewport filling); headline capped at 2 lines; copy+CTAs left, new **reveal card** right — plays /img/firstscroll/hero-reveal.webm ONCE on desktop (idle-deferred, data-saver-aware, first-frame poster swapped in pre-attach so playback is monotonic) and holds on its final frame; poster-only (29 KB end-frame webp = the payoff) on mobile/reduced-motion. Card is 21:9 (crops the footage's dead black + watermark). The 5-stat strip becomes a full-width hairline-topped band closing the hero (space-between on desktop; 1+2×2 grid on phones). Deleted: the old BREAKING card + duplicate "Read the breaking announcement" link (−233 KB eager images). 3D-model option evaluated and rejected (three.js on the critical path duplicating what the video shows).
+- **Margins**: landing container 1152 → 1280px (40px gutters ≥997px), content 1088 → 1200px at 1440; story section media widens to 880px while prose keeps its 640px measure; awarded-prizes table aligns with the open board. Docs pages untouched; zero effect <997px.
+- **News strip**: section padding 48→32px (24px mobile), rows 56→48px min-height, single-line ellipsis titles on desktop, single-line "title … date" ticker rows on phones (44px tap targets kept); the hardcoded "Get Started" cell removed — the strip is now 4 real posts. Desktop section 132→107px; mobile 313→217px.
+- New assets: `hero-reveal-end-960.webp` (29 KB), `hero-reveal-start-960.webp` (7 KB), generated from hero-reveal.webm.
+**Files:** `src/components/{Landing,LatestPosts}.js`, `src/css/{landing,chrome}.css`, `static/img/firstscroll/hero-reveal-{start,end}-960.webp` (new).
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
