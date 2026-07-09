@@ -13,12 +13,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
     FiberStripAugmentParams,
     apply_value_augmentation,
-    apply_strip_augmentation,
     random_combined_augmentation,
     smooth_offset_field,
     source_coordinate_grid_for_output,
+    transformed_centerline_coords,
 )
-from vesuvius.neural_tracing.fiber_trace_2d import loader as loader_module
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     FiberStrip2DLoader,
@@ -27,8 +26,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     strip_z_offsets_from_count_step,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import _export_augment_contact_sheet
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
-    build_planar_side_strip_patch_grid,
     build_side_strip_patch_grid,
 )
 
@@ -124,6 +123,17 @@ def _write_config(tmp_path: Path, *, batch_size: int = 2) -> Path:
     return path
 
 
+def _test_sampler_factory(**kwargs):
+    return NumpyZarrCoordinateSampler(
+        kwargs["array"],
+        level_spacing_base=kwargs["level_spacing_base"],
+    )
+
+
+def _make_loader(config) -> FiberStrip2DLoader:
+    return FiberStrip2DLoader(config, sampler_factory=_test_sampler_factory)
+
+
 def test_fiber_parser_reuse(tmp_path: Path) -> None:
     path = _write_fiber(tmp_path / "fiber.json")
     fiber = load_vc3d_fiber(path)
@@ -147,7 +157,7 @@ def test_side_strip_grid_matches_vc3d_simple_line_boundaries(tmp_path: Path) -> 
     assert np.all(grid.valid_mask)
 
 
-def test_strip_and_planar_pixel_spacing_is_in_base_voxels(tmp_path: Path) -> None:
+def test_strip_pixel_spacing_is_in_base_voxels(tmp_path: Path) -> None:
     fiber = load_vc3d_fiber(_write_fiber(tmp_path / "fiber.json"))
     normal = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
     strip = build_side_strip_patch_grid(
@@ -158,19 +168,9 @@ def test_strip_and_planar_pixel_spacing_is_in_base_voxels(tmp_path: Path) -> Non
         sampled_normal=normal,
         pixel_spacing_base=2.0,
     )
-    planar = build_planar_side_strip_patch_grid(
-        fiber,
-        control_point_index=1,
-        patch_shape_hw=(3, 3),
-        strip_z_offset=0.0,
-        sampled_normal=normal,
-        pixel_spacing_base=2.0,
-    )
 
     assert np.allclose(strip.coords_xyz[1, :, 0], [8.0, 10.0, 12.0])
     assert np.allclose(strip.coords_xyz[:, 1, 2], [18.0, 20.0, 22.0])
-    assert np.allclose(planar.coords_xyz[1, :, 0], [8.0, 10.0, 12.0])
-    assert np.allclose(planar.coords_xyz[:, 1, 2], [18.0, 20.0, 22.0])
 
 
 def test_side_strip_uses_fiber_line_points_not_sparse_control_chord(tmp_path: Path) -> None:
@@ -245,14 +245,119 @@ def test_config_rejects_literal_strip_z_offsets(tmp_path: Path) -> None:
 
 def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, batch_size=2))
-    loader = FiberStrip2DLoader(config)
+    loader = _make_loader(config)
     batch = loader.load_batch(0)
 
     assert batch.images.shape == (2, 3, 1, 3, 3)
     assert batch.coords_zyx.shape == (2, 3, 3, 3, 3)
     assert batch.valid_mask.shape == (2, 3, 3, 3)
+    assert not hasattr(batch, "planar_images")
     assert batch.strip_z_offsets.tolist() == [-1.0, 0.0, 1.0]
     assert batch.control_point_indices.shape == (2,)
+
+
+def test_loader_skips_whole_fiber_with_out_of_volume_control_point(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    bad_fiber = _write_fiber(
+        tmp_path / "bad_fiber.json",
+        points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0], [20.0, 20.0, 60.0]],
+        control_points=[[0.0, 20.0, 20.0], [20.0, 20.0, 60.0]],
+    )
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["datasets"][0]["fiber_paths"].append(str(bad_fiber))
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loader = _make_loader(load_config(config_path))
+
+    assert loader.sample_count == 3
+    assert len(loader.records) == 1
+    assert Path(loader.records[0].fiber.path).name == "fiber.json"
+
+
+def test_loader_does_not_sample_normals_for_remote_line_endpoints(tmp_path: Path) -> None:
+    points = [[0.0, 20.0, -10.0]]
+    points.extend([[float(x), 20.0, 20.0] for x in range(5, 50, 5)])
+    fiber = _write_fiber(
+        tmp_path / "fiber.json",
+        points=points,
+        control_points=[[30.0, 20.0, 20.0]],
+    )
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "batch_size": 1,
+                "patch_shape_hw": [3, 3],
+                "strip_z_offset_count": 1,
+                "strip_z_offset_step": 1.0,
+                "seed": 123,
+                "datasets": [
+                    {
+                        "fiber_paths": [str(fiber)],
+                        "base_volume_path": str(volume),
+                        "base_volume_scale": 0,
+                        "lasagna_manifest_path": str(manifest),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loader = _make_loader(load_config(config_path))
+
+    batch = loader.load_batch(0)
+
+    assert batch.images.shape == (1, 1, 1, 3, 3)
+    assert batch.control_point_indices.tolist() == [0]
+
+
+def test_loader_samples_only_cp_local_lasagna_normals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    points = [[float(x), 20.0, 20.0] for x in range(0, 90, 10)]
+    fiber = _write_fiber(
+        tmp_path / "fiber.json",
+        points=points,
+        control_points=[[40.0, 20.0, 20.0]],
+    )
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "batch_size": 1,
+                "patch_shape_hw": [3, 3],
+                "strip_z_offset_count": 1,
+                "strip_z_offset_step": 1.0,
+                "seed": 123,
+                "datasets": [
+                    {
+                        "fiber_paths": [str(fiber)],
+                        "base_volume_path": str(volume),
+                        "base_volume_scale": 0,
+                        "lasagna_manifest_path": str(manifest),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loader = _make_loader(load_config(config_path))
+    sampled_indices: list[int | None] = []
+
+    def fake_normal(record, point_zyx_base, *, line_point_index=None, control_point_index=None):
+        sampled_indices.append(line_point_index)
+        return np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+
+    monkeypatch.setattr(loader, "_lasagna_normal_at_zyx", fake_normal)
+
+    loader.build_center_strip_patch(0)
+
+    assert sampled_indices == [1, 2, 3, 4, 5, 6, 7]
+    assert len(sampled_indices) < len(points)
 
 
 def test_augmentation_config_defaults_and_overrides(tmp_path: Path) -> None:
@@ -325,23 +430,17 @@ def test_coordinate_scale_and_smooth_offset_are_deterministic() -> None:
     assert abs(float(scaled[2, 3, 0] - scaled[2, 2, 0])) < abs(float(base[2, 3, 0] - base[2, 2, 0]))
 
 
-def test_torch_augmentation_marks_out_of_bounds_invalid() -> None:
-    image = np.arange(25, dtype=np.float32).reshape(5, 5)
-    valid = np.ones((5, 5), dtype=bool)
-    params = FiberStripAugmentParams(shift_x=10.0)
-
-    augmented, augmented_valid, line = apply_strip_augmentation(
-        image,
-        valid,
-        params,
+def test_line_augmentation_returns_coordinates_not_mask() -> None:
+    line = transformed_centerline_coords(
+        (5, 5),
+        (9, 9),
+        FiberStripAugmentParams(shift_x=2.0),
         device=torch.device("cpu"),
-        return_line_mask=True,
     )
 
-    assert augmented.device.type == "cpu"
-    assert augmented_valid.sum().item() == 0
-    assert float(augmented.abs().sum().item()) == 0.0
-    assert float(line.sum().item()) == 0.0
+    assert line.ndim == 2
+    assert line.shape[1] == 2
+    assert line.dtype == np.float32
 
 
 def test_value_augmentation_noise_and_blur_are_torch_based() -> None:
@@ -410,8 +509,8 @@ def test_augmented_loader_preserves_shape_and_changes_values(tmp_path: Path) -> 
     base_dir.mkdir()
     base_config = load_config(_write_config(base_dir, batch_size=1))
     aug_config = load_config(config_path)
-    base = FiberStrip2DLoader(base_config).load_batch(0)
-    augmented = FiberStrip2DLoader(aug_config).load_batch(0)
+    base = _make_loader(base_config).load_batch(0)
+    augmented = _make_loader(aug_config).load_batch(0)
 
     assert augmented.images.shape == base.images.shape
     assert augmented.valid_mask.shape == base.valid_mask.shape
@@ -422,16 +521,16 @@ def test_augment_center_patch_loads_one_zarr_sample(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = load_config(_write_config(tmp_path, batch_size=1))
-    loader = FiberStrip2DLoader(config)
+    loader = _make_loader(config)
     calls = 0
-    original = loader_module._sample_array_trilinear
+    original = loader.records[0].sampler.sample_coords
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(loader_module, "_sample_array_trilinear", counted)
+    monkeypatch.setattr(loader.records[0].sampler, "sample_coords", counted)
 
     sample, image, valid = loader.build_center_strip_patch(0)
 
@@ -449,17 +548,17 @@ def test_augmented_center_patch_loads_one_zarr_sample(
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = FiberStrip2DLoader(load_config(config_path))
+    loader = _make_loader(load_config(config_path))
     params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
     calls = 0
-    original = loader_module._sample_array_trilinear
+    original = loader.records[0].sampler.sample_coords
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(loader_module, "_sample_array_trilinear", counted)
+    monkeypatch.setattr(loader.records[0].sampler, "sample_coords", counted)
 
     sample, image, valid, line = loader.build_augmented_center_strip_patch(
         0,
@@ -470,7 +569,8 @@ def test_augmented_center_patch_loads_one_zarr_sample(
     assert calls == 1
     assert image.shape == (3, 3)
     assert valid.shape == (3, 3)
-    assert line.shape == (3, 3)
+    assert line.ndim == 2
+    assert line.shape[1] == 2
     assert sample.strip_z_offset == 0.0
 
 
@@ -480,7 +580,7 @@ def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path) -> None:
     raw["augment_enabled"] = True
     raw["augment_device"] = "cpu"
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    loader = FiberStrip2DLoader(load_config(config_path))
+    loader = _make_loader(load_config(config_path))
     out = tmp_path / "aug_out"
 
     _export_augment_contact_sheet(loader, 0, out)
@@ -508,8 +608,8 @@ def test_deterministic_sample_index_independent_of_batch_size(tmp_path: Path) ->
     config_path = _write_config(tmp_path, batch_size=1)
     config_a = load_config(config_path)
     config_b = load_config(config_path)
-    loader_a = FiberStrip2DLoader(config_a)
-    loader_b = FiberStrip2DLoader(config_b)
+    loader_a = _make_loader(config_a)
+    loader_b = _make_loader(config_b)
 
     a = [loader_a.descriptor_for_sample_index(i)[2] for i in range(8)]
     b = [loader_b.descriptor_for_sample_index(i)[2] for i in range(8)]
@@ -524,7 +624,7 @@ class _FakeStore(dict):
 
 def test_prefetch_deduplicates_and_skips_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, batch_size=1))
-    loader = FiberStrip2DLoader(config)
+    loader = _make_loader(config)
     store = _FakeStore({"0.0.0": b"abc", "0.0.1": b"def"})
     seen = [
         ZarrChunkRequest(store=store, store_identity="same", key="0.0.0"),

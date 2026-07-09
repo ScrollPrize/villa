@@ -26,6 +26,13 @@ class FiberStripGrid:
     frame: FiberStripFrame
 
 
+@dataclass(frozen=True)
+class FiberStripLineWindow:
+    line_points_xyz: np.ndarray
+    original_line_indices: np.ndarray
+    local_control_point_index: int
+
+
 def _finite(v: np.ndarray) -> bool:
     return bool(np.isfinite(v).all())
 
@@ -165,6 +172,49 @@ def _line_index_for_control_point(line_points_xyz: np.ndarray, control_point_xyz
     return int(matches[0])
 
 
+def side_strip_line_window(
+    fiber: Vc3dFiber,
+    *,
+    control_point_index: int,
+    patch_shape_hw: tuple[int, int],
+    pixel_spacing_base: float = 1.0,
+    interpolation_point_margin: int = 2,
+) -> FiberStripLineWindow:
+    control_points = np.asarray(fiber.control_points_xyz, dtype=np.float64)
+    if control_point_index < 0 or control_point_index >= control_points.shape[0]:
+        raise IndexError(
+            f"control_point_index {control_point_index} out of range for {control_points.shape[0]} control points"
+        )
+    line_points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
+    if line_points.ndim != 2 or line_points.shape[1] != 3 or line_points.shape[0] == 0:
+        raise ValueError("fiber points must have shape [N, 3] with N > 0")
+    _, width = (int(v) for v in patch_shape_hw)
+    if width <= 0:
+        raise ValueError(f"patch_shape_hw must contain positive values, got {patch_shape_hw}")
+    pixel_spacing_base = float(pixel_spacing_base)
+    if not np.isfinite(pixel_spacing_base) or pixel_spacing_base <= 0.0:
+        raise ValueError(f"pixel_spacing_base must be positive and finite, got {pixel_spacing_base}")
+
+    line_index = _line_index_for_control_point(line_points, control_points[control_point_index])
+    cumulative = _arc_lengths(line_points)
+    anchor_arc = float(cumulative[line_index])
+    half_width = (float(width) - 1.0) * 0.5 * pixel_spacing_base
+    start_arc = anchor_arc - half_width
+    end_arc = anchor_arc + half_width
+    start_index = int(np.searchsorted(cumulative, start_arc, side="right") - 1)
+    end_index = int(np.searchsorted(cumulative, end_arc, side="left"))
+    margin = max(0, int(interpolation_point_margin))
+    start_index = max(0, min(start_index, line_index) - margin)
+    end_index = min(line_points.shape[0] - 1, max(end_index, line_index) + margin)
+    local_points = line_points[start_index : end_index + 1]
+    original_indices = np.arange(start_index, end_index + 1, dtype=np.int64)
+    return FiberStripLineWindow(
+        line_points_xyz=local_points.astype(np.float64, copy=False),
+        original_line_indices=original_indices,
+        local_control_point_index=line_index - start_index,
+    )
+
+
 def _arc_derivatives(points_xyz: np.ndarray, cumulative: np.ndarray) -> np.ndarray:
     derivatives = np.zeros_like(points_xyz, dtype=np.float64)
     if points_xyz.shape[0] < 2:
@@ -284,19 +334,33 @@ def _frame_from_mesh_normal(mesh_normal: np.ndarray, tangent: np.ndarray) -> Fib
     )
 
 
-def _resolved_normals(points_xyz: np.ndarray, sampled_normal: np.ndarray) -> np.ndarray:
-    normal = _normalized_or_zero(sampled_normal)
-    if not _valid_direction(normal):
-        raise ValueError("sampled Lasagna normal is invalid")
-    return np.repeat(normal[None, :], points_xyz.shape[0], axis=0)
+def _resolved_normals(points_xyz: np.ndarray, sampled_normals: np.ndarray) -> np.ndarray:
+    normals = np.asarray(sampled_normals, dtype=np.float64)
+    if normals.shape == (3,):
+        normals = np.repeat(normals[None, :], points_xyz.shape[0], axis=0)
+    if normals.shape != points_xyz.shape:
+        raise ValueError(
+            f"sampled Lasagna normals must have shape (3,) or {points_xyz.shape}, got {normals.shape}"
+        )
+    resolved = np.zeros_like(points_xyz, dtype=np.float64)
+    previous = np.zeros(3, dtype=np.float64)
+    for i, normal in enumerate(normals):
+        unit = _normalized_or_zero(normal)
+        if not _valid_direction(unit):
+            unit = previous if _valid_direction(previous) else _fallback_mesh_normal_for_tangent(_tangent_at(points_xyz, i))
+        if _valid_direction(previous) and float(np.dot(unit, previous)) < 0.0:
+            unit *= -1.0
+        resolved[i] = unit
+        previous = unit
+    return resolved
 
 
-def _build_side_strip_frames_for_points(points: np.ndarray, *, sampled_normal: np.ndarray) -> list[FiberStripFrame]:
+def _build_side_strip_frames_for_points(points: np.ndarray, *, sampled_normals: np.ndarray) -> list[FiberStripFrame]:
     if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
         raise ValueError("fiber points must have shape [N, 3] with N > 0")
 
     tangents = np.stack([_tangent_at(points, i) for i in range(points.shape[0])], axis=0)
-    normals = _resolved_normals(points, sampled_normal)
+    normals = _resolved_normals(points, sampled_normals)
 
     anchor = points.shape[0] // 2
     base_normals = np.zeros_like(points, dtype=np.float64)
@@ -360,7 +424,7 @@ def _build_side_strip_frames_for_points(points: np.ndarray, *, sampled_normal: n
 
 
 def build_vc3d_side_strip_frames(
-    fiber: Vc3dFiber, *, sampled_normal: np.ndarray
+    fiber: Vc3dFiber, *, sampled_normal: np.ndarray | None = None, sampled_normals: np.ndarray | None = None
 ) -> list[FiberStripFrame]:
     """Port of VC3D/Lasagna LineViewBuilder frame construction.
 
@@ -371,7 +435,10 @@ def build_vc3d_side_strip_frames(
     """
 
     points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
-    return _build_side_strip_frames_for_points(points, sampled_normal=sampled_normal)
+    normals = sampled_normals if sampled_normals is not None else sampled_normal
+    if normals is None:
+        raise ValueError("sampled_normal or sampled_normals is required")
+    return _build_side_strip_frames_for_points(points, sampled_normals=normals)
 
 
 def _frame_at_arc(points_xyz: np.ndarray, frames: list[FiberStripFrame], arc: float) -> FiberStripFrame:
@@ -416,21 +483,16 @@ def _interpolate_line_side_slice(
     return center + normal * normal_offsets[..., None], valid
 
 
-def build_side_strip_patch_grid(
-    fiber: Vc3dFiber,
+def build_side_strip_patch_grid_from_line_window(
+    line_window: FiberStripLineWindow,
     *,
-    control_point_index: int,
     patch_shape_hw: tuple[int, int],
     strip_z_offset: float,
-    sampled_normal: np.ndarray,
+    sampled_normal: np.ndarray | None = None,
+    sampled_normals: np.ndarray | None = None,
     pixel_spacing_base: float = 1.0,
 ) -> FiberStripGrid:
-    control_points = np.asarray(fiber.control_points_xyz, dtype=np.float64)
-    if control_point_index < 0 or control_point_index >= control_points.shape[0]:
-        raise IndexError(
-            f"control_point_index {control_point_index} out of range for {control_points.shape[0]} control points"
-        )
-    line_points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
+    line_points = np.asarray(line_window.line_points_xyz, dtype=np.float64)
     height, width = (int(v) for v in patch_shape_hw)
     if height <= 0 or width <= 0:
         raise ValueError(f"patch_shape_hw must contain positive values, got {patch_shape_hw}")
@@ -438,11 +500,18 @@ def build_side_strip_patch_grid(
     if not np.isfinite(pixel_spacing_base) or pixel_spacing_base <= 0.0:
         raise ValueError(f"pixel_spacing_base must be positive and finite, got {pixel_spacing_base}")
 
-    frames = _build_side_strip_frames_for_points(line_points, sampled_normal=sampled_normal)
+    normals = sampled_normals if sampled_normals is not None else sampled_normal
+    if normals is None:
+        raise ValueError("sampled_normal or sampled_normals is required")
+    frames = _build_side_strip_frames_for_points(line_points, sampled_normals=normals)
     row_offsets = ((np.arange(height, dtype=np.float64) - (height - 1) * 0.5) + float(strip_z_offset)) * pixel_spacing_base
     col_offsets = (np.arange(width, dtype=np.float64) - (width - 1) * 0.5) * pixel_spacing_base
     row_grid, col_grid = np.meshgrid(row_offsets, col_offsets, indexing="ij")
-    line_index = _line_index_for_control_point(line_points, control_points[control_point_index])
+    line_index = int(line_window.local_control_point_index)
+    if line_index < 0 or line_index >= line_points.shape[0]:
+        raise IndexError(
+            f"local_control_point_index {line_index} out of range for {line_points.shape[0]} line points"
+        )
     anchor_arc = float(_arc_lengths(line_points)[line_index])
     arc_coord = anchor_arc + col_grid
     coords_xyz, valid = _interpolate_line_side_slice(line_points, frames, arc_coord, row_grid)
@@ -457,47 +526,34 @@ def build_side_strip_patch_grid(
     )
 
 
-def build_planar_side_strip_patch_grid(
+def build_side_strip_patch_grid(
     fiber: Vc3dFiber,
     *,
     control_point_index: int,
     patch_shape_hw: tuple[int, int],
     strip_z_offset: float,
-    sampled_normal: np.ndarray,
+    sampled_normal: np.ndarray | None = None,
+    sampled_normals: np.ndarray | None = None,
     pixel_spacing_base: float = 1.0,
 ) -> FiberStripGrid:
-    """Build a local planar debug slice from the same CP frame as the side strip."""
-
-    control_points = np.asarray(fiber.control_points_xyz, dtype=np.float64)
-    if control_point_index < 0 or control_point_index >= control_points.shape[0]:
-        raise IndexError(
-            f"control_point_index {control_point_index} out of range for {control_points.shape[0]} control points"
-        )
-    line_points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
-    height, width = (int(v) for v in patch_shape_hw)
-    if height <= 0 or width <= 0:
-        raise ValueError(f"patch_shape_hw must contain positive values, got {patch_shape_hw}")
-    pixel_spacing_base = float(pixel_spacing_base)
-    if not np.isfinite(pixel_spacing_base) or pixel_spacing_base <= 0.0:
-        raise ValueError(f"pixel_spacing_base must be positive and finite, got {pixel_spacing_base}")
-
-    frames = _build_side_strip_frames_for_points(line_points, sampled_normal=sampled_normal)
-    line_index = _line_index_for_control_point(line_points, control_points[control_point_index])
-    anchor_arc = float(_arc_lengths(line_points)[line_index])
-    frame = _frame_at_arc(line_points, frames, anchor_arc)
-    origin = line_points[line_index]
-    row_offsets = ((np.arange(height, dtype=np.float64) - (height - 1) * 0.5) + float(strip_z_offset)) * pixel_spacing_base
-    col_offsets = (np.arange(width, dtype=np.float64) - (width - 1) * 0.5) * pixel_spacing_base
-    row_grid, col_grid = np.meshgrid(row_offsets, col_offsets, indexing="ij")
-    coords_xyz = (
-        origin[None, None, :]
-        + row_grid[..., None] * np.asarray(frame.mesh_normal_xyz, dtype=np.float64)
-        + col_grid[..., None] * np.asarray(frame.tangent_xyz, dtype=np.float64)
+    line_window = side_strip_line_window(
+        fiber,
+        control_point_index=control_point_index,
+        patch_shape_hw=patch_shape_hw,
+        pixel_spacing_base=pixel_spacing_base,
+        interpolation_point_margin=0,
     )
-    shape_valid = np.isfinite(coords_xyz).all(axis=-1)
-    return FiberStripGrid(
-        coords_xyz=coords_xyz.astype(np.float32),
-        coords_zyx=coords_xyz[..., (2, 1, 0)].astype(np.float32),
-        valid_mask=shape_valid,
-        frame=frame,
+    normals = sampled_normals
+    if normals is not None:
+        normals_array = np.asarray(normals)
+        full_count = np.asarray(fiber.line_points_xyz).shape[0]
+        if normals_array.ndim == 2 and normals_array.shape[0] == full_count:
+            normals = normals_array[line_window.original_line_indices]
+    return build_side_strip_patch_grid_from_line_window(
+        line_window,
+        patch_shape_hw=patch_shape_hw,
+        strip_z_offset=strip_z_offset,
+        sampled_normal=sampled_normal,
+        sampled_normals=normals,
+        pixel_spacing_base=pixel_spacing_base,
     )

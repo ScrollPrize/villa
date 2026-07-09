@@ -4,6 +4,7 @@
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
 #include <Python.h>
@@ -20,7 +21,9 @@
 #include <vector>
 
 #include "vc/core/render/IChunkedArray.hpp"
+#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Array3D.hpp"
+#include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/Volume.hpp"
 
 namespace nb = nanobind;
@@ -62,6 +65,15 @@ nb::object jsonToPython(const utils::Json& json)
 nb::tuple tuple3(const std::array<int, 3>& value)
 {
     return nb::make_tuple(value[0], value[1], value[2]);
+}
+
+vc::Sampling parseSampling(const std::string& value)
+{
+    if (value == "nearest")
+        return vc::Sampling::Nearest;
+    if (value == "trilinear")
+        return vc::Sampling::Trilinear;
+    throw std::invalid_argument("sampling must be one of: nearest, trilinear");
 }
 
 template <typename T>
@@ -454,6 +466,124 @@ nb::object readChunk(Volume& volume,
     return chunkResultToArray<uint16_t>(result, volume.fillValue());
 }
 
+using FloatCoords = nb::ndarray<float, nb::numpy, nb::c_contig>;
+using BoolMask = nb::ndarray<bool, nb::numpy, nb::c_contig>;
+
+cv::Mat_<cv::Vec3f> coordsArrayToMat(const FloatCoords& coords)
+{
+    if (coords.ndim() != 3 || coords.shape(2) != 3)
+        throw nb::value_error("coords_xyz must have shape [H, W, 3]");
+    const int h = static_cast<int>(coords.shape(0));
+    const int w = static_cast<int>(coords.shape(1));
+    cv::Mat_<cv::Vec3f> mat(h, w);
+    const float* src = coords.data();
+    for (int y = 0; y < h; ++y) {
+        auto* row = mat.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < w; ++x) {
+            const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 3;
+            row[x] = cv::Vec3f(src[idx + 0], src[idx + 1], src[idx + 2]);
+        }
+    }
+    return mat;
+}
+
+cv::Mat_<uint8_t> skipCoverageFromValidMask(const BoolMask& validMask, int h, int w)
+{
+    if (validMask.ndim() != 2 || validMask.shape(0) != static_cast<size_t>(h) ||
+        validMask.shape(1) != static_cast<size_t>(w)) {
+        throw nb::value_error("valid_mask must have shape [H, W] matching coords");
+    }
+    cv::Mat_<uint8_t> coverage(h, w);
+    const bool* src = validMask.data();
+    for (int y = 0; y < h; ++y) {
+        auto* row = coverage.ptr<uint8_t>(y);
+        for (int x = 0; x < w; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
+            row[x] = src[idx] ? uint8_t{0} : uint8_t{1};
+        }
+    }
+    return coverage;
+}
+
+nb::dict statsToDict(const vc::render::ChunkedPlaneSampler::Stats& stats)
+{
+    nb::dict out;
+    out["covered_pixels"] = stats.coveredPixels;
+    out["requested_chunks"] = stats.requestedChunks;
+    out["error_chunks"] = stats.errorChunks;
+    return out;
+}
+
+nb::tuple sampleCoords(Volume& volume,
+                       const FloatCoords& coordsXyz,
+                       const BoolMask& validMask,
+                       int level,
+                       const std::string& sampling,
+                       int tileSize)
+{
+    auto coords = coordsArrayToMat(coordsXyz);
+    auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
+    cv::Mat_<uint8_t> out(coords.rows, coords.cols, uint8_t{0});
+    vc::render::ChunkedPlaneSampler::Stats stats;
+    {
+        nb::gil_scoped_release release;
+        stats = vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+            *volume.chunkedCache(),
+            level,
+            coords,
+            out,
+            coverage,
+            vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
+    }
+
+    std::vector<uint8_t> image(static_cast<size_t>(coords.rows) * static_cast<size_t>(coords.cols));
+    std::vector<uint8_t> sampledValid(image.size());
+    const bool* validSrc = validMask.data();
+    for (int y = 0; y < coords.rows; ++y) {
+        const auto* outRow = out.ptr<uint8_t>(y);
+        const auto* covRow = coverage.ptr<uint8_t>(y);
+        for (int x = 0; x < coords.cols; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(coords.cols) + static_cast<size_t>(x);
+            image[idx] = outRow[x];
+            sampledValid[idx] = (validSrc[idx] && covRow[x]) ? uint8_t{1} : uint8_t{0};
+        }
+    }
+
+    auto imageArr = makeNumpyArray<uint8_t>(std::move(image), {
+        static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
+    auto validArr = makeNumpyArray<uint8_t>(std::move(sampledValid), {
+        static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
+    return nb::make_tuple(imageArr, validArr, statsToDict(stats));
+}
+
+std::vector<std::tuple<int, int, int, int>> collectCoordsDependencies(
+    Volume& volume,
+    const FloatCoords& coordsXyz,
+    const BoolMask& validMask,
+    int level,
+    const std::string& sampling,
+    int tileSize)
+{
+    auto coords = coordsArrayToMat(coordsXyz);
+    auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
+    std::vector<vc::render::ChunkKey> keys;
+    {
+        nb::gil_scoped_release release;
+        keys = vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+            *volume.chunkedCache(),
+            level,
+            coords,
+            coverage,
+            vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
+    }
+    std::vector<std::tuple<int, int, int, int>> out;
+    out.reserve(keys.size());
+    for (const auto& key : keys) {
+        out.emplace_back(key.level, key.iz, key.iy, key.ix);
+    }
+    return out;
+}
+
 } // namespace
 
 NB_MODULE(volume, m)
@@ -515,6 +645,18 @@ NB_MODULE(volume, m)
             "level"_a,
             "chunk_zyx"_a,
             "blocking"_a = true)
+        .def("sample_coords", &sampleCoords,
+            "coords_xyz"_a,
+            "valid_mask"_a,
+            "level"_a = 0,
+            "sampling"_a = "trilinear",
+            "tile_size"_a = 32)
+        .def("collect_coords_dependencies", &collectCoordsDependencies,
+            "coords_xyz"_a,
+            "valid_mask"_a,
+            "level"_a = 0,
+            "sampling"_a = "trilinear",
+            "tile_size"_a = 32)
         .def("__getitem__",
             [](Volume& self, const nb::object& key) {
                 const auto region = parseSliceKey(key, self.shape());

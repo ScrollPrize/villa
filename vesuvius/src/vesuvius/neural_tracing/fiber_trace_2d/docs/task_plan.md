@@ -1,154 +1,162 @@
-# Task Plan: 2D Fiber Strip Augmentations
+# Task Plan: 2D Fiber Strip Loader Correctness And Sampling
 
 ## Scope
 
-Implement augmentation support for the existing fiber-strip patch loader.
+Fix the 2D fiber-strip loader so it follows the original VC3D/Lasagna data path instead of reimplementing slow or divergent sampling behavior in Python.
 
-The loader must keep using the Lasagna-manifest data path and the current strip coordinate generation. This plan only adds augmentation behavior and a debug visualization mode for it.
+The current strip images look correct enough to remove the temporary planar debug slices. The primary work is to replace the Python zarr point sampler with the VC3D chunked coordinate sampler, align normal/frame construction with VC3D/Lasagna, make prefetch use the exact coordinates that runtime sampling will use, and keep existing augmentation behavior on top of that corrected sampling path.
 
-## Requirements From `task.md`
+## Requirements
 
-- Implement all augmentations for strip patches.
-- Add an augment debug mode that loads only the center strip patch for each sample.
-- In augment debug mode, apply every augmentation once per sample and save a contact sheet.
-- Include one unaugmented sample in the contact sheet.
-- Augment contact sheets must use three rows: lower-limit examples, upper-limit examples, and all-random combined examples.
-- Random augmentation ranges are rotation `+-180` degrees, shear/skew up to `+-1` px per px, offsets up to one quarter of the patch size per axis, scale around `sqrt(0.5)x..sqrt(2.0)x`, smooth curve offset with sampled control offsets and cubic interpolation, brightness `+-0.25` of the valid patch image range, contrast from `0.5x` to `2.0x` around the valid patch center, gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
-- All geometric augmentations must modify strip coordinates before image sampling.
-- Geometric augmentations must use an oversized strip-coordinate source area so the final patch can be sampled from augmented coordinates without edge or image reinterpolation artifacts.
-- Zarr sampling must still happen only once for the center strip patch.
-- All augmentations that happen after loading from Zarr must be GPU based. For this task, that means image/value augmentations run on GPU.
-- Contact sheets must draw the fiber line over each patch at 50 percent opacity. The line is normally straight, and geometric distortion augmentations must distort the overlay consistently with the image.
-- Contact-sheet cells must include a small top label naming the shown augmentation.
+- Use the Lasagna manifest path only for dataset volume/channel discovery.
+- Use VC3D side-strip/surface/segment coordinate semantics for strip construction.
+- Use VC3D chunked coordinate sampling for image reads, not Python zarr advanced indexing over 8 trilinear corners.
+- Use VC3D/Lasagna normal sampling semantics instead of a one-normal-per-control-point approximation where possible.
+- Keep `base_volume_scale` semantics unchanged: it selects the zarr level and the output pixel scale.
+- Keep geometric augmentations as coordinate-space transforms before image sampling.
+- Keep image/value augmentations after volume sampling as GPU torch operations.
+- Represent training/debug fiber lines as transformed output pixel coordinates, not raster masks.
+- Do not apply geometric transforms by image-space resampling of any image, valid mask, line mask, or label mask.
+- Remove planar debug slice sampling and output from loader batches and runner/debug exports.
+- Make prefetch derive chunk keys from the exact final coords used by normal runtime sampling, including geometric augmentations when enabled.
+- Preserve deterministic sample and augmentation selection.
+- Keep contact-sheet JPG augmentation visualization with labels and 50 percent line overlay.
 
 ## Implementation Plan
 
-### 1. Define Augmentation Config
+### 1. Introduce A VC3D Sampling Bridge
 
-Add explicit config keys for the augmentation families used by the strip loader.
+Add a narrow Python-facing wrapper around the VC3D coordinate sampler used by line probe rendering:
 
-Use explicit extrema for random training augmentation and deterministic limit examples for visualization:
+- Input: selected zarr/volume handle, selected level, `H x W x 3` coordinates, and valid mask.
+- Output: sampled image and coverage/valid mask.
+- Sampling mode: trilinear for now, matching current output semantics.
+- Internal implementation should use VC3D `IChunkedArray` plus `ChunkedPlaneSampler::sampleCoordsFineToCoarse` or the equivalent `readInterpolated3D` path.
+- The bridge must expose dependency collection for the same coords using VC3D chunk dependency logic, so prefetch and runtime sampling agree.
+- The bridge should own the chunk-cache-backed volume object, not repeatedly reopen it per patch.
 
-- `augment_enabled`
-- `augment_seed`
-- `augment_shift_x=patch_width/4`
-- `augment_shift_y=patch_height/4`
-- `augment_rotation_degrees=180`
-- `augment_shear_x=1`
-- `augment_shear_y=1`
-- `augment_scale_min=sqrt(0.5)`
-- `augment_scale_max=sqrt(2.0)`
-- `augment_smooth_offset=8`
-- `augment_smooth_offset_stride=16`
-- `augment_brightness=0.25`
-- `augment_contrast_min=0.5`
-- `augment_contrast_max=2.0`
-- `augment_gamma_min=0.5`
-- `augment_gamma_max=2.0`
-- `augment_noise_std=0.125`
-- `augment_blur_sigma=2.0`
-- geometric controls:
-  - horizontal shift along the strip
-  - vertical strip-z shift
-  - in-plane rotation
-  - scale
-  - shear/skew
-  - smooth curve distortion by offsetting strip columns/rows along the strip-normal image axis with a cubic-interpolated random field
-  - horizontal flip along the fiber direction
-  - vertical flip across strip-z
-- value controls:
-  - brightness/offset
-  - contrast min/max scale
-  - gamma
-  - additive noise
-  - Gaussian blur
+Keep the Python API small enough that the loader only asks for:
 
-Do not add training-only hooks for future augmentation types unless they are implemented in this task.
+- `sample_coords(coords_zyx_base, valid_mask) -> image, valid_mask, stats`
+- `chunk_requests_for_coords(coords_zyx_base, valid_mask) -> chunk requests`
 
-### 2. Split Augmentation Into Two Stages
+### 2. Replace Python Zarr Point Sampling
 
-Use two explicit stages:
+Remove `_sample_array_trilinear()` and `_read_array_points()` from the runtime image path.
 
-- coordinate augmentations: build an oversized strip-coordinate source area, transform output patch pixels into that source, apply affine transforms and smooth curve offset in strip-patch coordinates, then sample the volume at the final transformed coordinates.
-- image augmentations: transform sampled image values after coordinate augmentation on GPU.
+Replace all image reads with the VC3D sampling bridge:
 
-The center strip coordinate source is built once per variant. Geometric augmentation never resamples an already loaded image patch; it derives final volume coordinates first and then samples Zarr at those coordinates.
-Any augmentation after the Zarr-loaded patch becomes an image tensor must use torch tensor operations on the selected device, not CPU numpy/PIL-style processing.
+- normal strip patches;
+- center strip patches;
+- augmented center strip patches for contact sheets.
 
-### 3. Implement Coordinate-Space Sampling
+Do not keep a fallback Python sampler for production paths. Tests can use a fake bridge where needed.
 
-Add coordinate-space derivation for augmented patches:
+### 3. Remove Planar Debug Slice Path
 
-- input: oversized strip coordinate grid, oversized valid mask, and 2D float source coordinates.
-- output: final augmented volume coordinates and augmented valid mask.
-- coordinate interpolation: bilinear over the oversized coordinate grid.
-- smooth curve offset: sample deterministic random offsets every `augment_smooth_offset_stride` pixels, cubic-interpolate them across the strip, and add them along the strip-normal image axis before coordinate-grid lookup.
-- valid mask interpolation: nearest with explicit invalid handling.
-- out-of-bounds pixels: invalid in the mask and visually distinguishable in debug output.
+Delete planar debug outputs from the 2D loader:
 
-Keep coordinate math in strip-patch pixel units. Do not reinterpret Lasagna normals or rebuild the 3D strip path for augmentation.
+- remove `planar_images`, `planar_coords_zyx`, and `planar_valid_mask` from `FiberStrip2DBatch`;
+- remove `build_planar_side_strip_patch_grid()` usage from `build_sample()`;
+- remove runner prints/exports for planar debug data;
+- remove tests that assert planar debug output shape/content.
 
-### 4. Deterministic Augmentation Selection
+Leave the side-strip path as the only sampled patch path.
 
-Generate augmentation parameters from stable fields:
+### 4. Align Normal And Frame Construction With VC3D/Lasagna
 
-- base seed
-- sample index
-- augmentation name
-- combined-training augmentation marker
+Stop using a single CP normal repeated over every line point as the strip-frame normal field.
 
-This keeps debug sheets reproducible and prevents call-order-dependent augmentation behavior.
+Use VC3D/Lasagna semantics:
 
-### 5. Add Augment Debug Mode
+- sample Lasagna normals for all line points needed to build the strip frame;
+- preserve sign ambiguity handling as done by VC3D `LineViewBuilder`;
+- resolve invalid/missing normals the same way as VC3D;
+- build side-strip frames from those per-point samples;
+- keep exact control-point membership validation.
 
-Extend the runner with an explicit augment visualization mode.
+Preferred implementation is to expose/reuse VC3D/Lasagna `LineModel`, `NormalSampler`, and `LineViewBuilder` behavior. A Python port is acceptable only if it is explicitly tested against VC3D fixtures and kept byte/geometry close.
 
-Behavior:
+### 5. Keep Coordinate Augmentations Before Sampling
 
-- build an oversized center strip coordinate source per rendered patch.
-- render row 1 as lower-limit augmentation examples.
-- render row 2 as upper-limit augmentation examples.
-- render row 3 as random combined-training augmentation variants with all augmentation families active together.
-- draw the corresponding fiber line overlay at 50 percent opacity on every rendered patch.
-- draw a small label at the top of every patch naming the augmentation.
-- render raw clipped image values without percentile or per-cell normalization so value augmentations remain visible.
-- save JPG contact sheets only.
+Retain the current augmentation model, but make final coords the single source of truth:
 
-The output should make it clear which images are min limit, max limit, and combined training-style random augmentations.
-The debug path may move final images back to CPU only for JPG encoding after GPU augmentation has completed.
-The line overlay can be rasterized with OpenCV or an equivalent existing image utility, but it must use the same coordinate transform as the geometric augmentation so distorted patches and overlays stay aligned.
+- build oversized side-strip coords;
+- apply deterministic geometric augmentation in strip pixel space;
+- produce final `H x W x 3` read coords;
+- produce transformed fiber-line output pixel coordinates from the same geometric transform;
+- pass those final coords to the VC3D sampler exactly once per rendered patch;
+- apply value augmentations on torch tensors after sampling.
 
-### 6. Wire Training Loader
+Avoid image-space resampling of already loaded volume patches for geometric transforms. The same rule applies to masks and line targets: do not transform a rasterized line or label mask. Compute the transformed line coordinates first, then rasterize only at the final consumer boundary.
 
-When augmentations are enabled for normal loading:
+### 6. Replace Raster Line-Mask Overlay With Coordinate Drawing
 
-- build an oversized strip-coordinate source for the selected patch.
-- draw deterministic augmentation parameters for that sample.
-- derive final output patch coordinates from the oversized source and sample the volume once at those final coordinates.
-- move the loaded patch tensor to the training device.
-- apply image/value augmentations afterward using GPU torch operations.
-- return the augmented image and valid mask in the existing batch structure.
+Remove the current debug overlay path that creates a center-line raster mask and transforms it with `grid_sample`.
 
-Keep non-augment mode byte-for-byte equivalent where possible.
+Instead:
 
-### 7. Tests
+- keep the strip centerline as pixel coordinates in the unaugmented strip parameterization;
+- map those coordinates through the same geometric augmentation mapping used to derive sampled image coords;
+- draw the resulting coordinate polyline directly into the contact-sheet cell at fixed screen-space thickness and 50 percent opacity;
+- expose the transformed line coordinates in the loader result if needed for training targets;
+- use those coordinates for future line/label supervision so target pixels are aligned with the image sampled from the same coordinate transform.
 
-Add focused tests for:
+### 7. Make Prefetch Exact
 
-- augmentation config parsing and defaults.
-- Zarr/base patch load count remains one in augment debug mode.
-- unaugmented debug sheet entry matches the center strip patch content.
-- individual geometric augmentations alter final volume coordinates, not an already loaded image patch.
-- geometric augmentations use an oversized coordinate source before volume sampling.
-- combined augmentation is deterministic for a fixed seed/sample.
-- image/value augmentations run on torch tensors on the configured device after Zarr loading.
-- gamma augmentation is applied as a torch tensor operation using the valid patch range so it is independent of raw intensity scale.
-- Gaussian blur is applied as a torch convolution on the selected device.
-- contact-sheet fiber line overlays are present and follow the same geometric transform as the image.
-- contact-sheet cells include visible augmentation labels.
-- contact-sheet min/max rows include scale, smooth curve offset, and gamma examples.
-- valid mask marks out-of-bounds augmented pixels invalid.
-- disabled augmentations preserve current loader behavior.
+Change prefetch to use the same coord generation function as runtime:
+
+- for non-augmented samples, collect chunks from the final non-augmented coords;
+- for augmented samples, collect chunks from the deterministic augmented coords for that sample/offset;
+- include all strip-z offsets that runtime will load;
+- deduplicate using VC3D chunk keys;
+- skip existing cached chunks before reporting progress;
+- report missing count, downloaded count, MiB/s, and ETA.
+
+Do not prefetch Lasagna-local normal channels as remote base-volume chunks.
+
+### 8. Update Batch And Runner Interfaces
+
+Keep batch output focused on training data:
+
+- images;
+- coords;
+- valid masks;
+- transformed line coordinates/targets when enabled for training or debug;
+- strip offsets;
+- control-point metadata;
+- cache/sampling stats.
+
+Remove planar debug fields and any CLI output referring to them.
+
+Keep `--augment-vis` writing JPG contact sheets only. Contact sheets should still show:
+
+- min-limit row;
+- max-limit row;
+- all-random row;
+- unaugmented/base sample;
+- labels;
+- 50 percent fiber-line overlay drawn from transformed line coordinates with fixed visual thickness.
+
+### 9. Tests
+
+Update focused tests to cover the corrected contract:
+
+- loader no longer returns planar debug arrays.
+- runtime sampling calls the sampler bridge once per side-strip patch.
+- Python trilinear zarr sampler is not used by runtime paths.
+- fake sampler bridge receives coords already scaled to the selected zarr level.
+- `base_volume_scale` still controls both level and pixel spacing.
+- augmented loader passes final augmented coords to the sampler bridge.
+- prefetch uses the same final coords as runtime, including augmentations.
+- prefetch deduplicates and skips existing cached chunks.
+- normals are sampled for line points, not just repeated from the CP.
+- side-strip coordinates match VC3D/Lasagna fixtures within explicit tolerance.
+- contact sheet still writes JPG, labels, and coordinate-drawn line overlay.
+- geometric line augmentation returns transformed line coordinates, not a resampled raster line mask.
+- scale/rotation/shear do not change debug overlay drawing thickness except through intended coordinate position changes.
+- value augmentations still run through torch on the configured device.
+- deterministic sample and augmentation selection remains stable.
 
 Run:
 
@@ -156,21 +164,23 @@ Run:
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
 ```
 
+If the VC3D bridge adds C++ bindings or build targets, also run the smallest available VC3D sampler/LineViewBuilder tests that cover:
+
+- `LineViewBuilder`;
+- `ChunkedPlaneSampler`;
+- coordinate dependency collection;
+- trilinear coordinate sampling.
+
 ## Fulfillment
 
-- `task.md`: "implement all the augmentations" - add implemented config-backed geometric and value augmentation paths.
-- `task.md`: "augment mode" - add a runner mode that writes augmentation contact sheets.
-- `task.md`: "load just the center strip-patch" - debug mode restricts sampling to the center strip offset and derives each view from augmented center-strip coordinates.
-- `task.md`: "only once per sample" - deterministic one-pass individual augmentation rendering per sample.
-- `task.md`: "one sample ... not-augmentationed" - first contact-sheet entry is unaugmented.
-- `task.md`: "all augmentations applied as they would be used together" - contact sheet row 3 contains random combined training-style augmentations.
-- `task.md`: "three rows ... min, max, all-random" - contact sheet uses lower-limit, upper-limit, and random-combined rows.
-- `docs/plan.md`: "affine: rotate, skew, scale, flips" - scale is included as a coordinate-space augmentation.
-- `docs/plan.md`: "image: contrast, brightness, gamma, blur, noise" - gamma, blur, and noise are included as GPU value augmentations.
-- `docs/plan.md`: "curve distortion ... smooth field ... cubic interpolation" - smooth curve offset is included as a coordinate-space augmentation with deterministic sampled offsets and cubic interpolation.
-- `task.md`: "geometric augmentations should happen on the coords" - geometric augmentation is implemented as 2D coordinate transforms before image sampling.
-- `task.md`: "oversized area of strip coords" - geometric augmentation derives final patch coordinates from an oversized strip-coordinate source before Zarr sampling.
-- `task.md`: "sampling is still only once from the zarr" - remote/base Zarr read happens before augmentation and is not repeated for variants.
-- `task.md`: "after loading from zarr should be gpu based" - image/value augmentations operate on torch tensors on the selected device after the single Zarr load.
-- `task.md`: "contact sheets should visualize the fiber line" - each debug patch gets a 50 percent opacity line overlay transformed with the same geometry as the patch.
-- User follow-up: contact-sheet labels - each debug patch is labeled with its augmentation name.
+- Original spec: "use VC3D side-strip/surface/segment sampling semantics" - strip coordinates and frames come from VC3D/Lasagna behavior, not an ad hoc Python approximation.
+- Original spec: "use vc3d sampling methods" - image loading goes through the VC3D chunked coordinate sampler.
+- Original spec: "prefetch approach" - prefetch uses the exact final coords and VC3D chunk dependencies before sampling.
+- Original spec: "do not use neural_tracing crop loading" - loader remains coordinate-strip based and does not use 3D crop readers.
+- Current task: "geometric augmentations on coords" - augmentations modify coords before VC3D sampling.
+- Current task: "oversized coords for augmentation" - augmented coords are derived from oversized strip-coordinate sources.
+- Current task: line must match image by pixel coords - transformed line coordinates are generated from the same geometric transform as image sample coordinates.
+- User correction: "do not transform line pixels" - raster line-mask grid sampling is removed; the line is drawn only from transformed coordinates.
+- Current task: "image augmentations GPU based" - brightness, contrast, gamma, noise, and blur remain torch operations after sampling.
+- User correction: "remove planar dbg slice sampling and output" - planar debug fields and sampling are deleted from loader and runner.
+- User correction: "current sampling works but is too slow" - preserve output semantics while replacing the slow Python sampler with VC3D chunked sampling.

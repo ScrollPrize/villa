@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import torch
@@ -23,11 +23,11 @@ from vesuvius.neural_tracing.datasets.common import (
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import Vc3dFiber, load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     FiberStripFrame,
-    build_planar_side_strip_patch_grid,
-    build_side_strip_patch_grid,
+    FiberStripLineWindow,
+    build_side_strip_patch_grid_from_line_window,
+    side_strip_line_window,
 )
 from vesuvius.neural_tracing.fiber_trace.dataset import (
-    _SpatialChannelView,
     _load_lasagna_volume,
     _omezarr_level_shape,
     _open_manifest_channel,
@@ -37,14 +37,16 @@ from vesuvius.neural_tracing.fiber_trace.dataset import (
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
     apply_value_augmentation,
-    augmented_line_mask,
     augmentation_padding,
     augment_config_from_mapping,
     random_combined_augmentation,
     resolve_torch_device,
     source_coordinate_grid_for_output,
+    transformed_centerline_coords,
     value_only_params,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampler, make_coordinate_sampler
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
@@ -76,6 +78,7 @@ class FiberStripSample:
     coords_zyx: np.ndarray
     valid_mask: np.ndarray
     frame: FiberStripFrame
+    line_xy: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -83,9 +86,6 @@ class FiberStrip2DBatch:
     images: np.ndarray
     coords_zyx: np.ndarray
     valid_mask: np.ndarray
-    planar_images: np.ndarray
-    planar_coords_zyx: np.ndarray
-    planar_valid_mask: np.ndarray
     strip_z_offsets: np.ndarray
     control_point_indices: np.ndarray
     record_indices: np.ndarray
@@ -101,6 +101,7 @@ class _Record:
     volume_path: str
     volume_scale: int
     volume_spacing_base: float
+    sampler: CoordinateSampler
     grad_mag: Any
     grad_mag_spacing_base: float
     nx: Any | None
@@ -108,14 +109,6 @@ class _Record:
     nx_spacing_base: float | None
     ny_spacing_base: float | None
     dataset_config: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class ZarrChunkRequest:
-    store: Any
-    store_identity: str
-    key: str
-
 
 def _is_remote_path(path: str | Path) -> bool:
     return str(path).startswith(_REMOTE_PREFIXES)
@@ -216,6 +209,29 @@ def _resolve_fiber_paths(dataset_config: dict[str, Any], config: FiberStrip2DCon
     return paths
 
 
+def _control_points_in_base_shape(fiber: Vc3dFiber, base_shape_zyx: tuple[int, int, int]) -> bool:
+    cps = np.asarray(fiber.control_points_zyx, dtype=np.float64)
+    if cps.ndim != 2 or cps.shape[1] != 3 or cps.shape[0] == 0:
+        return False
+    shape = np.asarray(base_shape_zyx, dtype=np.float64)
+    return bool(np.isfinite(cps).all() and np.all(cps >= 0.0) and np.all(cps <= (shape - 1.0)))
+
+
+def _first_out_of_bounds_control_point(
+    fiber: Vc3dFiber, base_shape_zyx: tuple[int, int, int]
+) -> tuple[int, np.ndarray] | None:
+    cps = np.asarray(fiber.control_points_zyx, dtype=np.float64)
+    shape = np.asarray(base_shape_zyx, dtype=np.float64)
+    valid = np.isfinite(cps).all(axis=1)
+    valid &= np.all(cps >= 0.0, axis=1)
+    valid &= np.all(cps <= (shape - 1.0), axis=1)
+    bad = np.flatnonzero(~valid)
+    if bad.size == 0:
+        return None
+    index = int(bad[0])
+    return index, cps[index]
+
+
 def _open_dataset_volume(dataset_config: dict[str, Any], config: FiberStrip2DConfig) -> Any:
     volume_path = dataset_config.get("base_volume_path", dataset_config.get("volume_path"))
     if volume_path is None:
@@ -238,7 +254,7 @@ def _open_dataset_volume(dataset_config: dict[str, Any], config: FiberStrip2DCon
 
 def _open_manifest_channels(
     dataset_config: dict[str, Any], config: FiberStrip2DConfig, *, volume: Any, volume_path: str
-) -> tuple[Any, float, Any, Any, float, float]:
+) -> tuple[tuple[int, int, int], Any, float, Any, Any, float, float]:
     manifest_path = dataset_config.get("lasagna_manifest_path")
     if not manifest_path:
         raise ValueError("dataset entry missing lasagna_manifest_path")
@@ -297,148 +313,15 @@ def _open_manifest_channels(
         raise ValueError(
             f"Lasagna nx and ny normal channel spacing mismatch: nx={nx_spacing_base} ny={ny_spacing_base}"
         )
-    return grad_mag, float(grad_mag_spacing_base), nx, ny, float(nx_spacing_base), float(ny_spacing_base)
-
-
-def _store_identity(store: Any) -> str:
-    url = getattr(store, "_url", None)
-    cache_dir = getattr(store, "_cache_dir", None)
-    if url is not None:
-        return f"{type(store).__module__}.{type(store).__name__}:{url}:{cache_dir}"
-    path = getattr(store, "path", None)
-    if path is not None:
-        return f"{type(store).__module__}.{type(store).__name__}:{path}"
-    return f"{type(store).__module__}.{type(store).__name__}:{repr(store)}"
-
-
-def _array_chunks_zyx(array: Any) -> tuple[int, int, int] | None:
-    chunks = getattr(array, "chunks", None)
-    if chunks is None:
-        return None
-    chunks_tuple = tuple(int(v) for v in chunks)
-    if isinstance(array, _SpatialChannelView):
-        return array.chunks
-    if len(chunks_tuple) == 4:
-        return chunks_tuple[1:]
-    if len(chunks_tuple) == 3:
-        return chunks_tuple
-    return None
-
-
-def _is_remote_cached_store(store: Any) -> bool:
-    return getattr(store, "_url", None) is not None and getattr(store, "_cache_dir", None) is not None
-
-
-def _chunk_key(array: Any, chunk_zyx: tuple[int, int, int]) -> str | None:
-    key_fn = getattr(array, "_chunk_key", None)
-    if not callable(key_fn):
-        return None
-    shape = tuple(int(v) for v in getattr(array, "shape", ()))
-    chunks = tuple(int(v) for v in getattr(array, "chunks", ()))
-    if len(shape) == 3:
-        return str(key_fn(chunk_zyx))
-    if len(shape) == 4 and len(chunks) == 4:
-        return str(key_fn((0,) + chunk_zyx))
-    return None
-
-
-def chunk_requests_for_coords(array: Any, coords_zyx: np.ndarray, valid_mask: np.ndarray) -> list[ZarrChunkRequest]:
-    store = getattr(array, "store", None)
-    chunks = getattr(array, "chunks", None)
-    if store is None or chunks is None or not _is_remote_cached_store(store):
-        return []
-    chunks_tuple = tuple(int(v) for v in chunks)
-    if len(chunks_tuple) == 4:
-        chunks_zyx = chunks_tuple[1:]
-    elif len(chunks_tuple) == 3:
-        chunks_zyx = chunks_tuple
-    else:
-        return []
-    if min(chunks_zyx) <= 0:
-        return []
-
-    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(coords_zyx).all(axis=-1)
-    if not bool(valid.any()):
-        return []
-    shape = tuple(int(v) for v in getattr(array, "shape", ()))
-    spatial_shape = shape[-3:]
-    coords = np.asarray(coords_zyx, dtype=np.float64)
-    valid &= (coords[..., 0] >= 0.0) & (coords[..., 0] <= float(spatial_shape[0] - 1))
-    valid &= (coords[..., 1] >= 0.0) & (coords[..., 1] <= float(spatial_shape[1] - 1))
-    valid &= (coords[..., 2] >= 0.0) & (coords[..., 2] <= float(spatial_shape[2] - 1))
-    if not bool(valid.any()):
-        return []
-
-    base = np.floor(coords[valid]).astype(np.int64)
-    high = np.minimum(base + 1, np.asarray(spatial_shape, dtype=np.int64) - 1)
-    corners = []
-    for dz in (0, 1):
-        z = base[:, 0] if dz == 0 else high[:, 0]
-        for dy in (0, 1):
-            y = base[:, 1] if dy == 0 else high[:, 1]
-            for dx in (0, 1):
-                x = base[:, 2] if dx == 0 else high[:, 2]
-                corners.append(np.stack([z, y, x], axis=1))
-    corner_coords = np.concatenate(corners, axis=0)
-    chunk_idx = corner_coords // np.asarray(chunks_zyx, dtype=np.int64)
-    unique = np.unique(chunk_idx, axis=0)
-    identity = _store_identity(store)
-    requests: list[ZarrChunkRequest] = []
-    for chunk in unique:
-        key = _chunk_key(array, tuple(int(v) for v in chunk))
-        if key is None:
-            continue
-        requests.append(ZarrChunkRequest(store=store, store_identity=identity, key=key))
-    return requests
-
-
-def _read_array_points(array: Any, z: np.ndarray, y: np.ndarray, x: np.ndarray) -> np.ndarray:
-    shape = tuple(int(v) for v in getattr(array, "shape", ()))
-    if len(shape) == 4:
-        values = array[(0, z, y, x)]
-    else:
-        values = array[(z, y, x)]
-    return np.asarray(values, dtype=np.float32)
-
-
-def _sample_array_trilinear(array: Any, coords_zyx: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
-    shape = tuple(int(v) for v in getattr(array, "shape", ()))
-    spatial_shape = shape[-3:]
-    out = np.zeros(coords_zyx.shape[:2], dtype=np.float32)
-    coords = np.asarray(coords_zyx, dtype=np.float64)
-    valid = np.asarray(valid_mask, dtype=bool).copy()
-    valid &= np.isfinite(coords).all(axis=-1)
-    valid &= (coords[..., 0] >= 0.0) & (coords[..., 0] <= float(spatial_shape[0] - 1))
-    valid &= (coords[..., 1] >= 0.0) & (coords[..., 1] <= float(spatial_shape[1] - 1))
-    valid &= (coords[..., 2] >= 0.0) & (coords[..., 2] <= float(spatial_shape[2] - 1))
-    if not bool(valid.any()):
-        return out
-
-    sample_coords = coords[valid]
-    base = np.floor(sample_coords).astype(np.int64)
-    high = np.minimum(base + 1, np.asarray(spatial_shape, dtype=np.int64) - 1)
-    frac = (sample_coords - base.astype(np.float64)).astype(np.float32)
-    fz, fy, fx = frac[:, 0], frac[:, 1], frac[:, 2]
-
-    z0, y0, x0 = base[:, 0], base[:, 1], base[:, 2]
-    z1, y1, x1 = high[:, 0], high[:, 1], high[:, 2]
-    c000 = _read_array_points(array, z0, y0, x0)
-    c001 = _read_array_points(array, z0, y0, x1)
-    c010 = _read_array_points(array, z0, y1, x0)
-    c011 = _read_array_points(array, z0, y1, x1)
-    c100 = _read_array_points(array, z1, y0, x0)
-    c101 = _read_array_points(array, z1, y0, x1)
-    c110 = _read_array_points(array, z1, y1, x0)
-    c111 = _read_array_points(array, z1, y1, x1)
-
-    c00 = c000 * (1.0 - fx) + c001 * fx
-    c01 = c010 * (1.0 - fx) + c011 * fx
-    c10 = c100 * (1.0 - fx) + c101 * fx
-    c11 = c110 * (1.0 - fx) + c111 * fx
-    c0 = c00 * (1.0 - fy) + c01 * fy
-    c1 = c10 * (1.0 - fy) + c11 * fy
-    out[valid] = c0 * (1.0 - fz) + c1 * fz
-    return out
+    return (
+        tuple(int(v) for v in lasagna_volume.base_shape_zyx),
+        grad_mag,
+        float(grad_mag_spacing_base),
+        nx,
+        ny,
+        float(nx_spacing_base),
+        float(ny_spacing_base),
+    )
 
 
 def _decode_normal_components(nx_raw: np.ndarray, ny_raw: np.ndarray) -> np.ndarray:
@@ -530,14 +413,18 @@ def _resample_coords_like_augmentation(
     return sampled_coords.cpu().numpy().astype(np.float32), sampled_valid.cpu().numpy().astype(bool)
 
 
+SamplerFactory = Callable[..., CoordinateSampler]
+
+
 class FiberStrip2DLoader:
-    def __init__(self, config: FiberStrip2DConfig) -> None:
+    def __init__(self, config: FiberStrip2DConfig, *, sampler_factory: SamplerFactory | None = None) -> None:
         if config.batch_size <= 0:
             raise ValueError("batch_size must be > 0")
         self.strip_z_offsets = strip_z_offsets_from_count_step(
             config.strip_z_offset_count, config.strip_z_offset_step
         )
         self.config = config
+        self._sampler_factory = make_coordinate_sampler if sampler_factory is None else sampler_factory
         self.records = self._load_records()
         self._flat_sample_count = sum(record.fiber.control_points_xyz.shape[0] for record in self.records)
         if self._flat_sample_count <= 0:
@@ -553,7 +440,22 @@ class FiberStrip2DLoader:
             )
             volume_scale = int(dataset_config.get("base_volume_scale", dataset_config.get("volume_scale", 0)))
             volume_spacing_base = float(1 << volume_scale)
-            grad_mag, grad_mag_spacing_base, nx, ny, nx_spacing_base, ny_spacing_base = _open_manifest_channels(
+            sampler = self._sampler_factory(
+                volume_path=volume_path,
+                array=volume,
+                level=volume_scale,
+                level_spacing_base=volume_spacing_base,
+                cache_root=self.config.volume_cache_dir,
+            )
+            (
+                base_shape_zyx,
+                grad_mag,
+                grad_mag_spacing_base,
+                nx,
+                ny,
+                nx_spacing_base,
+                ny_spacing_base,
+            ) = _open_manifest_channels(
                 dataset_config,
                 self.config,
                 volume=volume,
@@ -561,6 +463,17 @@ class FiberStrip2DLoader:
             )
             for fiber_path in _resolve_fiber_paths(dataset_config, self.config):
                 fiber = load_vc3d_fiber(fiber_path)
+                bad_control = _first_out_of_bounds_control_point(fiber, base_shape_zyx)
+                if bad_control is not None:
+                    bad_index, bad_zyx = bad_control
+                    print(
+                        "fiber_trace_2d: skipping fiber with out-of-volume control point "
+                        f"fiber_path='{fiber_path}' control_point_index={bad_index} "
+                        f"control_point_zyx=({bad_zyx[0]:.3f}, {bad_zyx[1]:.3f}, {bad_zyx[2]:.3f}) "
+                        f"base_shape_zyx={base_shape_zyx}",
+                        flush=True,
+                    )
+                    continue
                 records.append(
                     _Record(
                         fiber=fiber,
@@ -568,6 +481,7 @@ class FiberStrip2DLoader:
                         volume_path=volume_path,
                         volume_scale=volume_scale,
                         volume_spacing_base=volume_spacing_base,
+                        sampler=sampler,
                         grad_mag=grad_mag,
                         grad_mag_spacing_base=grad_mag_spacing_base,
                         nx=nx,
@@ -646,26 +560,100 @@ class FiberStrip2DLoader:
         c1 = c10 * (1.0 - fy) + c11 * fy
         return float(c0 * (1.0 - fz) + c1 * fz)
 
+    def _normal_sample_context(
+        self,
+        record: _Record,
+        point_zyx_base: np.ndarray,
+        *,
+        channel: str,
+        spacing_base: float,
+        line_point_index: int | None = None,
+        control_point_index: int | None = None,
+    ) -> str:
+        point = np.asarray(point_zyx_base, dtype=np.float64)
+        channel_pos = point / float(spacing_base)
+        array = getattr(record, channel)
+        shape = tuple(int(v) for v in getattr(array, "shape", ()))
+        in_bounds = (
+            bool(np.isfinite(channel_pos).all())
+            and len(shape) == 3
+            and bool(np.all(channel_pos >= 0.0))
+            and bool(np.all(channel_pos <= (np.asarray(shape, dtype=np.float64) - 1.0)))
+        )
+        fiber_path = str(record.fiber.path) if record.fiber.path is not None else ""
+        return (
+            f"channel={channel} spacing_base={float(spacing_base):.6g} "
+            f"shape_zyx={shape} point_zyx_base=({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f}) "
+            f"point_xyz_base=({point[2]:.3f}, {point[1]:.3f}, {point[0]:.3f}) "
+            f"channel_pos_zyx=({channel_pos[0]:.3f}, {channel_pos[1]:.3f}, {channel_pos[2]:.3f}) "
+            f"in_bounds={in_bounds} base_volume_scale={record.volume_scale} "
+            f"volume_spacing_base={record.volume_spacing_base:.6g} "
+            f"line_point_index={line_point_index} control_point_index={control_point_index} "
+            f"fiber_path='{fiber_path}' volume_path='{record.volume_path}'"
+        )
+
     def _lasagna_normal_for_control_point(self, record: _Record, cp_index: int) -> np.ndarray:
         cp_xyz = np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float64)
         cp_zyx = cp_xyz[[2, 1, 0]]
+        return self._lasagna_normal_at_zyx(record, cp_zyx, control_point_index=cp_index)
+
+    def _lasagna_normal_at_zyx(
+        self,
+        record: _Record,
+        point_zyx_base: np.ndarray,
+        *,
+        line_point_index: int | None = None,
+        control_point_index: int | None = None,
+    ) -> np.ndarray:
         grad_request = self._interpolation_cube(
             record.grad_mag,
-            cp_zyx,
+            point_zyx_base,
             array_spacing_base=record.grad_mag_spacing_base,
         )
         if grad_request is None:
-            raise ValueError("missing Lasagna grad_mag sample at control point")
+            raise ValueError(
+                "missing Lasagna grad_mag sample at fiber line point: "
+                + self._normal_sample_context(
+                    record,
+                    point_zyx_base,
+                    channel="grad_mag",
+                    spacing_base=record.grad_mag_spacing_base,
+                    line_point_index=line_point_index,
+                    control_point_index=control_point_index,
+                )
+            )
         grad_value = self._trilinear_cube(*grad_request)
         if grad_value <= 0.0:
-            raise ValueError("Lasagna grad_mag sample is zero at control point")
+            raise ValueError(
+                f"Lasagna grad_mag sample is zero at fiber line point value={grad_value:.6g}: "
+                + self._normal_sample_context(
+                    record,
+                    point_zyx_base,
+                    channel="grad_mag",
+                    spacing_base=record.grad_mag_spacing_base,
+                    line_point_index=line_point_index,
+                    control_point_index=control_point_index,
+                )
+            )
 
         assert record.nx_spacing_base is not None
         assert record.ny_spacing_base is not None
-        nx_request = self._interpolation_cube(record.nx, cp_zyx, array_spacing_base=record.nx_spacing_base)
-        ny_request = self._interpolation_cube(record.ny, cp_zyx, array_spacing_base=record.ny_spacing_base)
+        nx_request = self._interpolation_cube(record.nx, point_zyx_base, array_spacing_base=record.nx_spacing_base)
+        ny_request = self._interpolation_cube(record.ny, point_zyx_base, array_spacing_base=record.ny_spacing_base)
         if nx_request is None or ny_request is None:
-            raise ValueError("missing Lasagna nx/ny sample at control point")
+            missing = "nx" if nx_request is None else "ny"
+            spacing = record.nx_spacing_base if nx_request is None else record.ny_spacing_base
+            raise ValueError(
+                "missing Lasagna nx/ny sample at fiber line point: "
+                + self._normal_sample_context(
+                    record,
+                    point_zyx_base,
+                    channel=missing,
+                    spacing_base=float(spacing),
+                    line_point_index=line_point_index,
+                    control_point_index=control_point_index,
+                )
+            )
         nx_cube, frac = nx_request
         ny_cube, _ = ny_request
 
@@ -693,23 +681,96 @@ class FiberStrip2DLoader:
                     hint += normal * weight
                     total_weight += weight
         if total_weight <= 1.0e-12:
-            raise ValueError("degenerate Lasagna normal sample at control point")
+            raise ValueError(
+                "degenerate Lasagna normal sample at fiber line point: "
+                + self._normal_sample_context(
+                    record,
+                    point_zyx_base,
+                    channel="nx",
+                    spacing_base=record.nx_spacing_base,
+                    line_point_index=line_point_index,
+                    control_point_index=control_point_index,
+                )
+            )
         normal = _principal_tensor_axis(tensor, hint)
         if float(np.linalg.norm(normal)) <= 1.0e-12:
-            raise ValueError("degenerate Lasagna normal sample at control point")
+            raise ValueError(
+                "degenerate Lasagna normal sample at fiber line point after principal-axis solve: "
+                + self._normal_sample_context(
+                    record,
+                    point_zyx_base,
+                    channel="nx",
+                    spacing_base=record.nx_spacing_base,
+                    line_point_index=line_point_index,
+                    control_point_index=control_point_index,
+                )
+            )
         return normal.astype(np.float32)
+
+    def _line_window_for_patch(
+        self,
+        record: _Record,
+        *,
+        control_point_index: int,
+        patch_shape_hw: tuple[int, int],
+    ) -> FiberStripLineWindow:
+        return side_strip_line_window(
+            record.fiber,
+            control_point_index=control_point_index,
+            patch_shape_hw=patch_shape_hw,
+            pixel_spacing_base=record.volume_spacing_base,
+        )
+
+    def _lasagna_normals_for_line_window(
+        self,
+        record: _Record,
+        line_window: FiberStripLineWindow,
+        *,
+        control_point_index: int | None = None,
+    ) -> np.ndarray:
+        normals = []
+        for local_index, point_xyz in enumerate(np.asarray(line_window.line_points_xyz, dtype=np.float64)):
+            line_point_index = int(line_window.original_line_indices[local_index])
+            normals.append(
+                self._lasagna_normal_at_zyx(
+                    record,
+                    point_xyz[[2, 1, 0]],
+                    line_point_index=line_point_index,
+                    control_point_index=control_point_index,
+                )
+            )
+        return np.stack(normals, axis=0).astype(np.float32)
+
+    def _unaugmented_centerline_coords(self, shape_hw: tuple[int, int]) -> np.ndarray:
+        height, width = (int(v) for v in shape_hw)
+        x = np.arange(width, dtype=np.float32)
+        y = np.full((width,), (float(height) - 1.0) * 0.5, dtype=np.float32)
+        return np.stack([x, y], axis=1)
 
     def build_sample(
         self, sample_index: int
-    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
         record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
-        sampled_normal = self._lasagna_normal_for_control_point(record, cp_index)
+        patch_shape_hw = self.config.patch_shape_hw
+        if self.config.augment.enabled:
+            pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
+            patch_shape_hw = (
+                int(self.config.patch_shape_hw[0]) + 2 * pad.y,
+                int(self.config.patch_shape_hw[1]) + 2 * pad.x,
+            )
+        line_window = self._line_window_for_patch(
+            record,
+            control_point_index=cp_index,
+            patch_shape_hw=patch_shape_hw,
+        )
+        sampled_normals = self._lasagna_normals_for_line_window(
+            record,
+            line_window,
+            control_point_index=cp_index,
+        )
         images: list[np.ndarray] = []
         coords: list[np.ndarray] = []
         valids: list[np.ndarray] = []
-        planar_images: list[np.ndarray] = []
-        planar_coords: list[np.ndarray] = []
-        planar_valids: list[np.ndarray] = []
         samples: list[FiberStripSample] = []
         augment_device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else None
         for offset_index, offset in enumerate(self.strip_z_offsets):
@@ -718,27 +779,243 @@ class FiberStrip2DLoader:
                 if self.config.augment.enabled
                 else None
             )
-            patch_shape_hw = self.config.patch_shape_hw
-            if self.config.augment.enabled:
-                pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
-                patch_shape_hw = (
-                    int(self.config.patch_shape_hw[0]) + 2 * pad.y,
-                    int(self.config.patch_shape_hw[1]) + 2 * pad.x,
-                )
-            grid = build_side_strip_patch_grid(
-                record.fiber,
-                control_point_index=cp_index,
+            grid = build_side_strip_patch_grid_from_line_window(
+                line_window,
                 patch_shape_hw=patch_shape_hw,
                 strip_z_offset=float(offset),
-                sampled_normal=sampled_normal,
+                sampled_normals=sampled_normals,
                 pixel_spacing_base=record.volume_spacing_base,
             )
-            planar_grid = build_planar_side_strip_patch_grid(
-                record.fiber,
+            coords_zyx = grid.coords_zyx.astype(np.float32, copy=False)
+            valid_mask = grid.valid_mask.astype(bool, copy=False)
+            line_xy = self._unaugmented_centerline_coords(patch_shape_hw)
+            if self.config.augment.enabled:
+                assert augment_device is not None
+                assert params is not None
+                coords_zyx, valid_mask = _resample_coords_like_augmentation(
+                    coords_zyx,
+                    valid_mask,
+                    params,
+                    output_shape_hw=self.config.patch_shape_hw,
+                    device=augment_device,
+                )
+                line_xy = transformed_centerline_coords(
+                    self.config.patch_shape_hw,
+                    patch_shape_hw,
+                    params,
+                    device=augment_device,
+                )
+            result = record.sampler.sample_coords(coords_zyx, valid_mask)
+            image = result.image
+            valid_mask = result.valid_mask
+            if self.config.augment.enabled:
+                assert augment_device is not None
+                assert params is not None
+                image_t, valid_t = apply_value_augmentation(
+                    image,
+                    valid_mask,
+                    value_only_params(params),
+                    device=augment_device,
+                )
+                image = image_t.cpu().numpy().astype(np.float32)
+                valid_mask = valid_t.cpu().numpy().astype(bool)
+            sample = FiberStripSample(
+                record_index=record_index,
+                fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
                 control_point_index=cp_index,
-                patch_shape_hw=self.config.patch_shape_hw,
+                control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
                 strip_z_offset=float(offset),
-                sampled_normal=sampled_normal,
+                coords_zyx=coords_zyx,
+                valid_mask=valid_mask,
+                frame=grid.frame,
+                line_xy=line_xy,
+            )
+            images.append(image)
+            coords.append(coords_zyx)
+            valids.append(valid_mask)
+            samples.append(sample)
+        return (
+            samples,
+            np.stack(images, axis=0),
+            np.stack(coords, axis=0),
+            np.stack(valids, axis=0),
+        )
+
+    def build_center_strip_patch(self, sample_index: int) -> tuple[FiberStripSample, np.ndarray, np.ndarray]:
+        record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
+        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+        line_window = self._line_window_for_patch(
+            record,
+            control_point_index=cp_index,
+            patch_shape_hw=self.config.patch_shape_hw,
+        )
+        sampled_normals = self._lasagna_normals_for_line_window(
+            record,
+            line_window,
+            control_point_index=cp_index,
+        )
+        grid = build_side_strip_patch_grid_from_line_window(
+            line_window,
+            patch_shape_hw=self.config.patch_shape_hw,
+            strip_z_offset=float(center_offset),
+            sampled_normals=sampled_normals,
+            pixel_spacing_base=record.volume_spacing_base,
+        )
+        result = record.sampler.sample_coords(grid.coords_zyx, grid.valid_mask)
+        image = result.image
+        sample = FiberStripSample(
+            record_index=record_index,
+            fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
+            control_point_index=cp_index,
+            control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
+            strip_z_offset=float(center_offset),
+            coords_zyx=grid.coords_zyx.astype(np.float32, copy=False),
+            valid_mask=result.valid_mask.astype(bool, copy=False),
+            frame=grid.frame,
+            line_xy=self._unaugmented_centerline_coords(self.config.patch_shape_hw),
+        )
+        return sample, image.astype(np.float32, copy=False), result.valid_mask.astype(bool, copy=False)
+
+    def build_augmented_center_strip_patch(
+        self, sample_index: int, params: Any, *, device: torch.device
+    ) -> tuple[FiberStripSample, np.ndarray, np.ndarray, np.ndarray]:
+        record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
+        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+        pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
+        source_shape_hw = (
+            int(self.config.patch_shape_hw[0]) + 2 * pad.y,
+            int(self.config.patch_shape_hw[1]) + 2 * pad.x,
+        )
+        line_window = self._line_window_for_patch(
+            record,
+            control_point_index=cp_index,
+            patch_shape_hw=source_shape_hw,
+        )
+        sampled_normals = self._lasagna_normals_for_line_window(
+            record,
+            line_window,
+            control_point_index=cp_index,
+        )
+        grid = build_side_strip_patch_grid_from_line_window(
+            line_window,
+            patch_shape_hw=source_shape_hw,
+            strip_z_offset=float(center_offset),
+            sampled_normals=sampled_normals,
+            pixel_spacing_base=record.volume_spacing_base,
+        )
+        coords_zyx, valid_mask = _resample_coords_like_augmentation(
+            grid.coords_zyx.astype(np.float32, copy=False),
+            grid.valid_mask.astype(bool, copy=False),
+            params,
+            output_shape_hw=self.config.patch_shape_hw,
+            device=device,
+        )
+        result = record.sampler.sample_coords(coords_zyx, valid_mask)
+        image = result.image
+        valid_mask = result.valid_mask
+        image_t, valid_t = apply_value_augmentation(
+            image,
+            valid_mask,
+            value_only_params(params),
+            device=device,
+        )
+        line_xy = transformed_centerline_coords(
+            self.config.patch_shape_hw,
+            source_shape_hw,
+            params,
+            device=device,
+        )
+        sample = FiberStripSample(
+            record_index=record_index,
+            fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
+            control_point_index=cp_index,
+            control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
+            strip_z_offset=float(center_offset),
+            coords_zyx=coords_zyx,
+            valid_mask=valid_t.cpu().numpy().astype(bool),
+            frame=grid.frame,
+            line_xy=line_xy,
+        )
+        return (
+            sample,
+            image_t.cpu().numpy().astype(np.float32),
+            valid_t.cpu().numpy().astype(bool),
+            line_xy,
+        )
+
+    def load_batch(self, start_sample_index: int = 0, batch_size: int | None = None) -> FiberStrip2DBatch:
+        batch_size = self.config.batch_size if batch_size is None else int(batch_size)
+        begin_zarr_cache_trace()
+        all_samples: list[FiberStripSample] = []
+        images: list[np.ndarray] = []
+        coords: list[np.ndarray] = []
+        valids: list[np.ndarray] = []
+        record_indices: list[int] = []
+        cp_indices: list[int] = []
+        fiber_paths: list[str] = []
+        try:
+            for batch_pos in range(batch_size):
+                sample_index = int(start_sample_index) + batch_pos
+                (
+                    sample_records,
+                    sample_images,
+                    sample_coords,
+                    sample_valids,
+                ) = self.build_sample(sample_index)
+                first = sample_records[0]
+                all_samples.extend(sample_records)
+                images.append(sample_images)
+                coords.append(sample_coords)
+                valids.append(sample_valids)
+                record_indices.append(first.record_index)
+                cp_indices.append(first.control_point_index)
+                fiber_paths.append(first.fiber_path)
+        finally:
+            cache_stats = end_zarr_cache_trace()
+        return FiberStrip2DBatch(
+            images=np.stack(images, axis=0)[:, :, None, :, :],
+            coords_zyx=np.stack(coords, axis=0),
+            valid_mask=np.stack(valids, axis=0),
+            strip_z_offsets=np.asarray(self.strip_z_offsets, dtype=np.float32),
+            control_point_indices=np.asarray(cp_indices, dtype=np.int32),
+            record_indices=np.asarray(record_indices, dtype=np.int32),
+            fiber_paths=tuple(fiber_paths),
+            samples=tuple(all_samples),
+            cache_stats=cache_stats,
+        )
+
+    def chunk_requests_for_sample_index(self, sample_index: int) -> list[ZarrChunkRequest]:
+        record, _, cp_index = self.descriptor_for_sample_index(sample_index)
+        requests: list[ZarrChunkRequest] = []
+        augment_device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else None
+        patch_shape_hw = self.config.patch_shape_hw
+        if self.config.augment.enabled:
+            pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
+            patch_shape_hw = (
+                int(self.config.patch_shape_hw[0]) + 2 * pad.y,
+                int(self.config.patch_shape_hw[1]) + 2 * pad.x,
+            )
+        line_window = self._line_window_for_patch(
+            record,
+            control_point_index=cp_index,
+            patch_shape_hw=patch_shape_hw,
+        )
+        sampled_normals = self._lasagna_normals_for_line_window(
+            record,
+            line_window,
+            control_point_index=cp_index,
+        )
+        for offset_index, offset in enumerate(self.strip_z_offsets):
+            params = (
+                random_combined_augmentation(self.config.augment, sample_index, offset_index)
+                if self.config.augment.enabled
+                else None
+            )
+            grid = build_side_strip_patch_grid_from_line_window(
+                line_window,
+                patch_shape_hw=patch_shape_hw,
+                strip_z_offset=float(offset),
+                sampled_normals=sampled_normals,
                 pixel_spacing_base=record.volume_spacing_base,
             )
             coords_zyx = grid.coords_zyx.astype(np.float32, copy=False)
@@ -753,201 +1030,7 @@ class FiberStrip2DLoader:
                     output_shape_hw=self.config.patch_shape_hw,
                     device=augment_device,
                 )
-            read_coords_zyx = coords_zyx / float(record.volume_spacing_base)
-            image = _sample_array_trilinear(record.volume, read_coords_zyx, valid_mask)
-            if self.config.augment.enabled:
-                assert augment_device is not None
-                assert params is not None
-                image_t, valid_t = apply_value_augmentation(
-                    image,
-                    valid_mask,
-                    value_only_params(params),
-                    device=augment_device,
-                )
-                image = image_t.cpu().numpy().astype(np.float32)
-                valid_mask = valid_t.cpu().numpy().astype(bool)
-            planar_read_coords_zyx = planar_grid.coords_zyx / float(record.volume_spacing_base)
-            planar_image = _sample_array_trilinear(
-                record.volume, planar_read_coords_zyx, planar_grid.valid_mask
-            )
-            sample = FiberStripSample(
-                record_index=record_index,
-                fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
-                control_point_index=cp_index,
-                control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
-                strip_z_offset=float(offset),
-                coords_zyx=coords_zyx,
-                valid_mask=valid_mask,
-                frame=grid.frame,
-            )
-            images.append(image)
-            coords.append(coords_zyx)
-            valids.append(valid_mask)
-            planar_images.append(planar_image)
-            planar_coords.append(planar_grid.coords_zyx)
-            planar_valids.append(planar_grid.valid_mask)
-            samples.append(sample)
-        return (
-            samples,
-            np.stack(images, axis=0),
-            np.stack(coords, axis=0),
-            np.stack(valids, axis=0),
-            np.stack(planar_images, axis=0),
-            np.stack(planar_coords, axis=0),
-            np.stack(planar_valids, axis=0),
-        )
-
-    def build_center_strip_patch(self, sample_index: int) -> tuple[FiberStripSample, np.ndarray, np.ndarray]:
-        record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
-        sampled_normal = self._lasagna_normal_for_control_point(record, cp_index)
-        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
-        grid = build_side_strip_patch_grid(
-            record.fiber,
-            control_point_index=cp_index,
-            patch_shape_hw=self.config.patch_shape_hw,
-            strip_z_offset=float(center_offset),
-            sampled_normal=sampled_normal,
-            pixel_spacing_base=record.volume_spacing_base,
-        )
-        read_coords_zyx = grid.coords_zyx / float(record.volume_spacing_base)
-        image = _sample_array_trilinear(record.volume, read_coords_zyx, grid.valid_mask)
-        sample = FiberStripSample(
-            record_index=record_index,
-            fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
-            control_point_index=cp_index,
-            control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
-            strip_z_offset=float(center_offset),
-            coords_zyx=grid.coords_zyx.astype(np.float32, copy=False),
-            valid_mask=grid.valid_mask.astype(bool, copy=False),
-            frame=grid.frame,
-        )
-        return sample, image.astype(np.float32, copy=False), grid.valid_mask.astype(bool, copy=False)
-
-    def build_augmented_center_strip_patch(
-        self, sample_index: int, params: Any, *, device: torch.device
-    ) -> tuple[FiberStripSample, np.ndarray, np.ndarray, np.ndarray]:
-        record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
-        sampled_normal = self._lasagna_normal_for_control_point(record, cp_index)
-        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
-        pad = augmentation_padding(self.config.augment, self.config.patch_shape_hw)
-        source_shape_hw = (
-            int(self.config.patch_shape_hw[0]) + 2 * pad.y,
-            int(self.config.patch_shape_hw[1]) + 2 * pad.x,
-        )
-        grid = build_side_strip_patch_grid(
-            record.fiber,
-            control_point_index=cp_index,
-            patch_shape_hw=source_shape_hw,
-            strip_z_offset=float(center_offset),
-            sampled_normal=sampled_normal,
-            pixel_spacing_base=record.volume_spacing_base,
-        )
-        coords_zyx, valid_mask = _resample_coords_like_augmentation(
-            grid.coords_zyx.astype(np.float32, copy=False),
-            grid.valid_mask.astype(bool, copy=False),
-            params,
-            output_shape_hw=self.config.patch_shape_hw,
-            device=device,
-        )
-        read_coords_zyx = coords_zyx / float(record.volume_spacing_base)
-        image = _sample_array_trilinear(record.volume, read_coords_zyx, valid_mask)
-        image_t, valid_t = apply_value_augmentation(
-            image,
-            valid_mask,
-            value_only_params(params),
-            device=device,
-        )
-        line_t = augmented_line_mask(
-            self.config.patch_shape_hw,
-            source_shape_hw,
-            params,
-            device=device,
-        ) * valid_t.to(torch.float32)
-        sample = FiberStripSample(
-            record_index=record_index,
-            fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
-            control_point_index=cp_index,
-            control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
-            strip_z_offset=float(center_offset),
-            coords_zyx=coords_zyx,
-            valid_mask=valid_t.cpu().numpy().astype(bool),
-            frame=grid.frame,
-        )
-        return (
-            sample,
-            image_t.cpu().numpy().astype(np.float32),
-            valid_t.cpu().numpy().astype(bool),
-            line_t.cpu().numpy().astype(np.float32),
-        )
-
-    def load_batch(self, start_sample_index: int = 0, batch_size: int | None = None) -> FiberStrip2DBatch:
-        batch_size = self.config.batch_size if batch_size is None else int(batch_size)
-        begin_zarr_cache_trace()
-        all_samples: list[FiberStripSample] = []
-        images: list[np.ndarray] = []
-        coords: list[np.ndarray] = []
-        valids: list[np.ndarray] = []
-        planar_images: list[np.ndarray] = []
-        planar_coords: list[np.ndarray] = []
-        planar_valids: list[np.ndarray] = []
-        record_indices: list[int] = []
-        cp_indices: list[int] = []
-        fiber_paths: list[str] = []
-        try:
-            for batch_pos in range(batch_size):
-                sample_index = int(start_sample_index) + batch_pos
-                (
-                    sample_records,
-                    sample_images,
-                    sample_coords,
-                    sample_valids,
-                    sample_planar_images,
-                    sample_planar_coords,
-                    sample_planar_valids,
-                ) = self.build_sample(sample_index)
-                first = sample_records[0]
-                all_samples.extend(sample_records)
-                images.append(sample_images)
-                coords.append(sample_coords)
-                valids.append(sample_valids)
-                planar_images.append(sample_planar_images)
-                planar_coords.append(sample_planar_coords)
-                planar_valids.append(sample_planar_valids)
-                record_indices.append(first.record_index)
-                cp_indices.append(first.control_point_index)
-                fiber_paths.append(first.fiber_path)
-        finally:
-            cache_stats = end_zarr_cache_trace()
-        return FiberStrip2DBatch(
-            images=np.stack(images, axis=0)[:, :, None, :, :],
-            coords_zyx=np.stack(coords, axis=0),
-            valid_mask=np.stack(valids, axis=0),
-            planar_images=np.stack(planar_images, axis=0)[:, :, None, :, :],
-            planar_coords_zyx=np.stack(planar_coords, axis=0),
-            planar_valid_mask=np.stack(planar_valids, axis=0),
-            strip_z_offsets=np.asarray(self.strip_z_offsets, dtype=np.float32),
-            control_point_indices=np.asarray(cp_indices, dtype=np.int32),
-            record_indices=np.asarray(record_indices, dtype=np.int32),
-            fiber_paths=tuple(fiber_paths),
-            samples=tuple(all_samples),
-            cache_stats=cache_stats,
-        )
-
-    def chunk_requests_for_sample_index(self, sample_index: int) -> list[ZarrChunkRequest]:
-        record, _, cp_index = self.descriptor_for_sample_index(sample_index)
-        sampled_normal = self._lasagna_normal_for_control_point(record, cp_index)
-        requests: list[ZarrChunkRequest] = []
-        for offset in self.strip_z_offsets:
-            grid = build_side_strip_patch_grid(
-                record.fiber,
-                control_point_index=cp_index,
-                patch_shape_hw=self.config.patch_shape_hw,
-                strip_z_offset=float(offset),
-                sampled_normal=sampled_normal,
-                pixel_spacing_base=record.volume_spacing_base,
-            )
-            read_coords_zyx = grid.coords_zyx / float(record.volume_spacing_base)
-            requests.extend(chunk_requests_for_coords(record.volume, read_coords_zyx, grid.valid_mask))
+            requests.extend(record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
         return requests
 
     def chunk_requests_for_samples(self, start_sample_index: int, sample_count: int) -> list[ZarrChunkRequest]:
@@ -967,6 +1050,7 @@ class FiberStrip2DLoader:
         for request in requests:
             cache_dir = getattr(request.store, "_cache_dir", None)
             if cache_dir is None:
+                pending.append(request)
                 continue
             cached = os.path.join(cache_dir, request.key)
             marker = cached + getattr(request.store, "_NEGATIVE_MARKER_SUFFIX", ".__notfound__")

@@ -7,6 +7,9 @@
 - Neighboring strip-z context is represented as separate 2D patches.
 - The default strip-z offset settings are `strip_z_offset_count=16` and `strip_z_offset_step=1.0`, generating `-7..8` selected-scale offsets and giving 16 patches per selected control point.
 - Lasagna normals are used where needed to construct aligned strip frames.
+- For a selected control point, the loader computes the CP-local line window that can affect the requested strip width plus interpolation/frame margin, and samples Lasagna normals only for that local window.
+- Fiber endpoints or other distant line points outside the CP-local window must not be touched while loading that CP-local patch.
+- If a line point inside the CP-local window cannot be sampled from the Lasagna manifest channels, loading that patch fails instead of fabricating or propagating a replacement normal.
 - VC3D side-strip/surface/segment sampling semantics define patch coordinates.
 - Strip centerlines are sampled from all `line_points` with cubic Hermite interpolation over arc length; control points only select the strip anchor.
 - The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
@@ -22,10 +25,14 @@
 - Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
 - Geometric strip augmentations operate on strip coordinates before image sampling.
 - Geometric augmentation builds an oversized strip-coordinate source area, maps output patch pixels into that source, and samples the volume once at the final augmented coordinates to avoid edge and image reinterpolation artifacts.
+- Training line targets and debug line overlays are geometric coordinate products, not raster images. The line must be represented by strip/output pixel coordinates after the same geometric coordinate transform used for image sampling.
+- The line must never be transformed by resampling a raster line mask. No geometric augmentation may be implemented as an image-space transform of a previously rasterized line, mask, or image patch.
+- Debug visualization may rasterize the transformed line coordinates only as the final drawing step, with fixed screen-space thickness/opacity, so line thickness and sharpness are not affected by scale, rotation, shear, or interpolation artifacts.
+- Any future training target derived from the fiber line must use the same transformed output pixel coordinates as the sampled image, so labels and image pixels remain aligned exactly.
 - Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
 - Augment visualization uses raw clipped image values and must not apply percentile or per-cell normalization.
 - The augment visualization mode renders a three-row JPG contact sheet: lower-limit examples, upper-limit examples, and random combined training-style examples.
-- Augment contact sheets draw the fiber line at 50 percent opacity, transformed consistently with geometric augmentations.
+- Augment contact sheets draw the transformed fiber-line coordinates at 50 percent opacity with fixed drawing thickness.
 - Augment contact-sheet cells include a small top label naming the shown augmentation.
 - Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.
 - Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.

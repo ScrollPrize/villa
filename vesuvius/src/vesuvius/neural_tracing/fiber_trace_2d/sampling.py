@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+
+from vesuvius.neural_tracing.fiber_trace_2d.loader_support import (
+    ZarrChunkRequest,
+    chunk_requests_for_coords,
+    sample_array_trilinear,
+)
+
+
+_REMOTE_PREFIXES = ("http://", "https://", "s3://")
+
+
+@dataclass(frozen=True)
+class CoordinateSampleResult:
+    image: np.ndarray
+    valid_mask: np.ndarray
+    stats: dict[str, Any]
+
+
+class CoordinateSampler:
+    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
+        raise NotImplementedError
+
+    def chunk_requests_for_coords(
+        self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
+    ) -> list[ZarrChunkRequest]:
+        raise NotImplementedError
+
+
+def _coords_zyx_base_to_xyz(coords_zyx_base: np.ndarray) -> np.ndarray:
+    coords = np.asarray(coords_zyx_base, dtype=np.float32)
+    return np.ascontiguousarray(coords[..., (2, 1, 0)])
+
+
+class Vc3dCoordinateSampler(CoordinateSampler):
+    def __init__(
+        self,
+        volume_path: str,
+        *,
+        level: int,
+        cache_root: str | None,
+        sampling: str = "trilinear",
+    ) -> None:
+        from vc.volume import Volume
+
+        self.level = int(level)
+        self.sampling = str(sampling)
+        path = str(volume_path)
+        if path.startswith("s3://"):
+            # VC3D remote volume loading is HTTP-backed. The public Vesuvius S3
+            # zarrs are also exposed through the standard virtual-hosted URL.
+            without_scheme = path[len("s3://") :]
+            bucket, _, key = without_scheme.partition("/")
+            path = f"https://{bucket}.s3.amazonaws.com/{key}"
+        if path.startswith(_REMOTE_PREFIXES):
+            self.volume = Volume.open_url(path, "" if cache_root is None else str(cache_root))
+        else:
+            self.volume = Volume.open(path)
+
+    @property
+    def store_identity(self) -> str:
+        volume_id = getattr(self.volume, "remote_url", "") or getattr(self.volume, "path", "")
+        return f"vc3d:{volume_id}:level={self.level}"
+
+    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
+        image, sampled_valid, stats = self.volume.sample_coords(
+            _coords_zyx_base_to_xyz(coords_zyx_base),
+            np.ascontiguousarray(valid_mask, dtype=np.bool_),
+            self.level,
+            self.sampling,
+            32,
+        )
+        image_arr = np.asarray(image, dtype=np.float32)
+        valid_arr = np.asarray(sampled_valid, dtype=np.uint8)
+        if image_arr.ndim == 3 and image_arr.shape[-1] == 1:
+            image_arr = image_arr[..., 0]
+        if valid_arr.ndim == 3 and valid_arr.shape[-1] == 1:
+            valid_arr = valid_arr[..., 0]
+        return CoordinateSampleResult(
+            image=image_arr.astype(np.float32, copy=False),
+            valid_mask=valid_arr.astype(bool, copy=False),
+            stats=dict(stats),
+        )
+
+    def chunk_requests_for_coords(
+        self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
+    ) -> list[ZarrChunkRequest]:
+        keys = self.volume.collect_coords_dependencies(
+            _coords_zyx_base_to_xyz(coords_zyx_base),
+            np.ascontiguousarray(valid_mask, dtype=np.bool_),
+            self.level,
+            self.sampling,
+            32,
+        )
+        store = _Vc3dChunkStore(self.volume)
+        requests: list[ZarrChunkRequest] = []
+        for level, iz, iy, ix in keys:
+            requests.append(
+                ZarrChunkRequest(
+                    store=store,
+                    store_identity=self.store_identity,
+                    key=f"{int(level)}/{int(iz)}/{int(iy)}/{int(ix)}",
+                )
+            )
+        return requests
+
+
+class _Vc3dChunkStore:
+    def __init__(self, volume: Any) -> None:
+        self.volume = volume
+
+    def __getitem__(self, key: str) -> bytes:
+        level_s, iz_s, iy_s, ix_s = str(key).split("/")
+        chunk = self.volume.read_chunk(
+            int(level_s),
+            (int(iz_s), int(iy_s), int(ix_s)),
+            True,
+        )
+        if chunk is None:
+            return b""
+        return np.asarray(chunk).tobytes()
+
+
+class NumpyZarrCoordinateSampler(CoordinateSampler):
+    def __init__(self, array: Any, *, level_spacing_base: float) -> None:
+        self.array = array
+        self.level_spacing_base = float(level_spacing_base)
+
+    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
+        coords_zyx_level = np.asarray(coords_zyx_base, dtype=np.float32) / self.level_spacing_base
+        image = sample_array_trilinear(self.array, coords_zyx_level, valid_mask)
+        return CoordinateSampleResult(
+            image=image,
+            valid_mask=np.asarray(valid_mask, dtype=bool),
+            stats={"covered_pixels": int(np.count_nonzero(valid_mask)), "requested_chunks": 0, "error_chunks": 0},
+        )
+
+    def chunk_requests_for_coords(
+        self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
+    ) -> list[ZarrChunkRequest]:
+        coords_zyx_level = np.asarray(coords_zyx_base, dtype=np.float32) / self.level_spacing_base
+        return chunk_requests_for_coords(self.array, coords_zyx_level, valid_mask)
+
+
+def make_coordinate_sampler(
+    *,
+    volume_path: str,
+    array: Any,
+    level: int,
+    level_spacing_base: float,
+    cache_root: str | None,
+) -> CoordinateSampler:
+    del array, level_spacing_base
+    return Vc3dCoordinateSampler(volume_path, level=level, cache_root=cache_root)

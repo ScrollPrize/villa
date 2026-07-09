@@ -335,26 +335,6 @@ def value_only_params(params: FiberStripAugmentParams) -> FiberStripAugmentParam
     )
 
 
-def _grid_sample_coords(pixel_coords_xy: torch.Tensor, height: int, width: int) -> torch.Tensor:
-    x = pixel_coords_xy[..., 0]
-    y = pixel_coords_xy[..., 1]
-    if width > 1:
-        x = x * (2.0 / float(width - 1)) - 1.0
-    else:
-        x = torch.zeros_like(x)
-    if height > 1:
-        y = y * (2.0 / float(height - 1)) - 1.0
-    else:
-        y = torch.zeros_like(y)
-    return torch.stack([x, y], dim=-1).unsqueeze(0)
-
-
-def _line_mask(height: int, width: int, *, device: torch.device) -> torch.Tensor:
-    y = torch.arange(height, device=device, dtype=torch.float32).view(height, 1)
-    center_y = (float(height) - 1.0) * 0.5
-    return (torch.abs(y - center_y) <= 0.75).expand(height, width).to(torch.float32)
-
-
 def _valid_range_and_center(image: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if bool(valid.any().item()):
         values = image[valid]
@@ -397,16 +377,16 @@ def _apply_gamma(image: torch.Tensor, valid: torch.Tensor, gamma: float, value_r
     return torch.where(valid, corrected, image)
 
 
-def augmented_line_mask(
+def transformed_centerline_coords(
     output_shape_hw: tuple[int, int],
     source_shape_hw: tuple[int, int],
     params: FiberStripAugmentParams,
     *,
     device: torch.device,
-) -> torch.Tensor:
+) -> np.ndarray:
     output_height, output_width = (int(v) for v in output_shape_hw)
     source_height, source_width = (int(v) for v in source_shape_hw)
-    coords = source_coordinate_grid_for_output(
+    source_coords = source_coordinate_grid_for_output(
         output_height,
         output_width,
         source_height,
@@ -414,75 +394,33 @@ def augmented_line_mask(
         params,
         device=device,
     )
-    grid = _grid_sample_coords(coords, source_height, source_width)
-    line = _line_mask(source_height, source_width, device=device)
-    return torch.clamp(
-        F.grid_sample(
-            line.view(1, 1, source_height, source_width),
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )[0, 0],
-        0.0,
-        1.0,
-    )
-
-
-def apply_strip_augmentation(
-    image: np.ndarray | torch.Tensor,
-    valid_mask: np.ndarray | torch.Tensor,
-    params: FiberStripAugmentParams,
-    *,
-    device: torch.device,
-    return_line_mask: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    image_t = torch.as_tensor(image, dtype=torch.float32, device=device)
-    valid_t = torch.as_tensor(valid_mask, dtype=torch.float32, device=device)
-    if image_t.ndim != 2 or valid_t.ndim != 2:
-        raise ValueError("image and valid_mask must be 2D")
-    height, width = int(image_t.shape[0]), int(image_t.shape[1])
-    coords = source_coordinate_grid(height, width, params, device=device)
-    grid = _grid_sample_coords(coords, height, width)
-
-    sampled = F.grid_sample(
-        image_t.view(1, 1, height, width),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, 0]
-    valid = F.grid_sample(
-        valid_t.view(1, 1, height, width),
-        grid,
-        mode="nearest",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, 0] > 0.5
-
-    value_range, center = _valid_range_and_center(sampled, valid)
-    sampled = (sampled - center) * float(params.contrast) + center + float(params.brightness) * value_range
-    sampled = _apply_gamma(sampled, valid, params.gamma, value_range, center)
-    if params.noise_std > 0.0:
-        generator = torch.Generator(device=device)
-        generator.manual_seed(int(params.noise_seed))
-        sampled = sampled + torch.randn(sampled.shape, generator=generator, device=device) * float(params.noise_std) * value_range
-    sampled = _gaussian_blur_2d(sampled, params.blur_sigma)
-    sampled = torch.where(valid, sampled, torch.zeros_like(sampled))
-
-    if not return_line_mask:
-        return sampled, valid
-
-    line = _line_mask(height, width, device=device)
-    sampled_line = F.grid_sample(
-        line.view(1, 1, height, width),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, 0]
-    sampled_line = torch.clamp(sampled_line, 0.0, 1.0) * valid.to(torch.float32)
-    return sampled, valid, sampled_line
+    source_center_y = (float(source_height) - 1.0) * 0.5
+    target_x = torch.linspace(0.0, float(source_width - 1), max(source_width, output_width), device=device)
+    flat = source_coords.reshape(-1, 2)
+    out_pixels = _pixel_grid(output_height, output_width, device=device).reshape(-1, 2)
+    points: list[torch.Tensor] = []
+    for sx in target_x:
+        delta = flat - torch.stack([sx, torch.as_tensor(source_center_y, dtype=torch.float32, device=device)])
+        dist2 = torch.sum(delta * delta, dim=1)
+        idx = int(torch.argmin(dist2).item())
+        if float(dist2[idx].item()) <= 4.0:
+            points.append(out_pixels[idx])
+    if not points:
+        return np.zeros((0, 2), dtype=np.float32)
+    coords = torch.stack(points, dim=0)
+    coords = coords[
+        (coords[:, 0] >= 0.0)
+        & (coords[:, 0] <= float(output_width - 1))
+        & (coords[:, 1] >= 0.0)
+        & (coords[:, 1] <= float(output_height - 1))
+    ]
+    if coords.numel() == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    # Remove adjacent duplicates from nearest-pixel inversion while preserving order.
+    rounded = torch.round(coords)
+    keep = torch.ones((rounded.shape[0],), dtype=torch.bool, device=device)
+    keep[1:] = torch.any(rounded[1:] != rounded[:-1], dim=1)
+    return coords[keep].detach().cpu().numpy().astype(np.float32)
 
 
 def apply_value_augmentation(
@@ -507,11 +445,32 @@ def apply_value_augmentation(
     return torch.where(valid, out, torch.zeros_like(out)), valid
 
 
-def overlay_line_rgb(image_u8: np.ndarray, line_mask: np.ndarray, *, opacity: float = 0.5) -> np.ndarray:
+def overlay_line_coords_rgb(
+    image_u8: np.ndarray,
+    line_xy: np.ndarray,
+    *,
+    opacity: float = 0.5,
+    thickness: int = 1,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
     gray = np.asarray(image_u8, dtype=np.uint8)
-    rgb = np.repeat(gray[..., None], 3, axis=-1).astype(np.float32)
-    alpha = np.clip(np.asarray(line_mask, dtype=np.float32), 0.0, 1.0)[..., None] * float(opacity)
-    color = np.zeros_like(rgb)
-    color[..., 0] = 255.0
-    rgb = rgb * (1.0 - alpha) + color * alpha
-    return np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+    if gray.ndim == 2:
+        rgb = np.repeat(gray[..., None], 3, axis=-1)
+    else:
+        rgb = gray.copy()
+    coords = np.asarray(line_xy, dtype=np.float32)
+    if coords.ndim != 2 or coords.shape[1] != 2 or coords.shape[0] == 0:
+        return rgb
+    pil = Image.fromarray(rgb, mode="RGB")
+    overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, mode="RGBA")
+    points = [(float(x), float(y)) for x, y in coords.tolist()]
+    alpha = int(np.clip(float(opacity), 0.0, 1.0) * 255.0)
+    if len(points) == 1:
+        x, y = points[0]
+        r = max(1, int(thickness))
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 0, 0, alpha))
+    else:
+        draw.line(points, fill=(255, 0, 0, alpha), width=max(1, int(thickness)), joint="curve")
+    return np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8)

@@ -7,7 +7,7 @@ import numpy as np
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     limit_augmentation_rows,
-    overlay_line_rgb,
+    overlay_line_coords_rgb,
     random_combined_augmentation,
     resolve_torch_device,
 )
@@ -97,16 +97,11 @@ def _export_batch(batch, output_dir: str | Path) -> None:
     image_files: list[str] = []
     mask_files: list[str] = []
     contact_images: list[np.ndarray] = []
-    planar_image_files: list[str] = []
-    planar_mask_files: list[str] = []
-    planar_contact_images: list[np.ndarray] = []
     for batch_index in range(batch.images.shape[0]):
         for offset_index, offset in enumerate(batch.strip_z_offsets.tolist()):
             stem = f"sample_{batch_index:03d}_offset_{_offset_label(offset)}"
             image_name = f"{stem}.jpg"
             mask_name = f"{stem}_valid.jpg"
-            planar_image_name = f"{stem}_planar.jpg"
-            planar_mask_name = f"{stem}_planar_valid.jpg"
             image = batch.images[batch_index, offset_index, 0]
             valid_mask = batch.valid_mask[batch_index, offset_index].astype(bool)
             image_u8 = _to_u8_image(image, valid_mask)
@@ -114,29 +109,15 @@ def _export_batch(batch, output_dir: str | Path) -> None:
             _write_jpg(out / image_name, image_u8)
             _write_jpg(out / mask_name, mask_u8)
 
-            planar_image = batch.planar_images[batch_index, offset_index, 0]
-            planar_valid_mask = batch.planar_valid_mask[batch_index, offset_index].astype(bool)
-            planar_image_u8 = _to_u8_image(planar_image, planar_valid_mask)
-            planar_mask_u8 = (planar_valid_mask.astype(np.uint8) * 255)
-            _write_jpg(out / planar_image_name, planar_image_u8)
-            _write_jpg(out / planar_mask_name, planar_mask_u8)
-
             contact_images.append(image_u8)
-            planar_contact_images.append(planar_image_u8)
             image_files.append(image_name)
             mask_files.append(mask_name)
-            planar_image_files.append(planar_image_name)
-            planar_mask_files.append(planar_mask_name)
 
     _write_contact_sheet(out / "contact_sheet.jpg", contact_images)
-    _write_contact_sheet(out / "contact_sheet_planar.jpg", planar_contact_images)
     summary_lines = [
         f"images_shape={list(batch.images.shape)}",
         f"coords_zyx_shape={list(batch.coords_zyx.shape)}",
         f"valid_mask_shape={list(batch.valid_mask.shape)}",
-        f"planar_images_shape={list(batch.planar_images.shape)}",
-        f"planar_coords_zyx_shape={list(batch.planar_coords_zyx.shape)}",
-        f"planar_valid_mask_shape={list(batch.planar_valid_mask.shape)}",
         f"strip_z_offsets={batch.strip_z_offsets.tolist()}",
         f"record_indices={batch.record_indices.tolist()}",
         f"control_point_indices={batch.control_point_indices.tolist()}",
@@ -153,8 +134,7 @@ def _export_batch(batch, output_dir: str | Path) -> None:
     (out / "summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
     print(
         f"exported {len(image_files)} strip jpgs, {len(mask_files)} strip mask jpgs, "
-        f"{len(planar_image_files)} planar jpgs, {len(planar_mask_files)} planar mask jpgs, "
-        f"contact sheets, and summary.txt to {out}"
+        f"contact sheet, and summary.txt to {out}"
     )
 
 
@@ -179,7 +159,7 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
         "layout=row 1: lower limits; row 2: upper limits; row 3: random combined training-style augmentations",
     ]
     for name, params in entries:
-        sample, aug_image, aug_valid, line = loader.build_augmented_center_strip_patch(
+        sample, aug_image, aug_valid, line_xy = loader.build_augmented_center_strip_patch(
             sample_index,
             params,
             device=device,
@@ -187,7 +167,7 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
         if first_sample is None:
             first_sample = sample
         image_u8 = _to_u8_image(aug_image, aug_valid)
-        overlay = overlay_line_rgb(image_u8, line, opacity=0.5)
+        overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.5, thickness=1)
         contact_images.append(overlay)
         contact_labels.append(name)
         summary_lines.append(f"{name}: {params}")
@@ -246,9 +226,6 @@ def main() -> None:
     print(f"images shape={batch.images.shape} dtype={batch.images.dtype}")
     print(f"coords_zyx shape={batch.coords_zyx.shape} dtype={batch.coords_zyx.dtype}")
     print(f"valid_mask shape={batch.valid_mask.shape} dtype={batch.valid_mask.dtype}")
-    print(f"planar_images shape={batch.planar_images.shape} dtype={batch.planar_images.dtype}")
-    print(f"planar_coords_zyx shape={batch.planar_coords_zyx.shape} dtype={batch.planar_coords_zyx.dtype}")
-    print(f"planar_valid_mask shape={batch.planar_valid_mask.shape} dtype={batch.planar_valid_mask.dtype}")
     print(f"strip_z_offsets={batch.strip_z_offsets.tolist()}")
     print(f"record_indices={batch.record_indices.tolist()}")
     print(f"control_point_indices={batch.control_point_indices.tolist()}")
