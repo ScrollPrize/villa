@@ -1,4 +1,4 @@
-import React, { useContext, useEffect, useState } from "react";
+import React, { useContext, useState } from "react";
 import BrowserOnly from "@docusaurus/BrowserOnly";
 import Dashboard from "./Dashboard";
 import ScrollGrid from "./ScrollGrid";
@@ -6,14 +6,16 @@ import AtlasRendererProvider, {
   AtlasRendererContext,
 } from "./AtlasRendererProvider";
 import useDarkModeGuard from "./useDarkModeGuard";
+import useAtlasData from "./useAtlasData";
 
 // Native React rebuild of the /data_browser index. Replaces the old component
 // of the same import name (the mdx imports this default export). Mirrors the
 // reference renderer's DOM/class structure (index.html) so the global ".atlas"
 // CSS block styles it unchanged. The title/subtitle render server-side (for SEO
 // and an immediate paint); the data-driven 3D grid is client-only.
-
-const DATA_URL = "/data_browser/index.json";
+//
+// Data comes from useAtlasData(): the live metadata.min.json projection merged
+// in-browser with the curated overlay, falling back to the build-time snapshot.
 
 // Pause/resume control for the shared 3D renderer. Must live inside the
 // AtlasRendererProvider subtree because it reads paused/setPaused from context.
@@ -36,9 +38,9 @@ function AtlasBrowserInner() {
   // Keep the atlas dark-themed regardless of the site light/dark toggle.
   useDarkModeGuard();
 
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
+  // Load the merged index (live metadata.min.json → buildIndex, or bundled
+  // snapshot fallback). See useAtlasData.
+  const { index: data, loading, error } = useAtlasData();
 
   // Grid controls: free-text search, sort key, and filter toggles.
   const [query, setQuery] = useState("");
@@ -51,27 +53,6 @@ function AtlasBrowserInner() {
     ct: false,
   });
   const toggleFeat = (k) => setFeat((f) => ({ ...f, [k]: !f[k] }));
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const res = await fetch(DATA_URL);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const json = await res.json();
-        if (!cancelled) setData(json);
-      } catch (err) {
-        console.error("Failed to load data browser index:", err);
-        if (!cancelled) setError(true);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    load();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   if (loading) {
     return <p className="sub">Loading 3D models…</p>;
@@ -99,10 +80,7 @@ function AtlasBrowserInner() {
     });
     return r;
   };
-  const segOf = (s) =>
-    (s.progress && s.progress.segments != null
-      ? s.progress.segments
-      : s.n_segments) || 0;
+  const segOf = (s) => s.n_segments || 0;
   const score = (s) => (s.progress && s.progress.score) || 0;
 
   const q = query.trim().toLowerCase();

@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import Layout from "@theme/Layout";
 import Head from "@docusaurus/Head";
 import Link from "@docusaurus/Link";
@@ -11,6 +11,7 @@ import { photoThumb, neuroglancerUrl } from "./dataAccess";
 import ReadingsGallery from "./ReadingsGallery";
 import InkSegmentsGallery from "./InkSegmentsGallery";
 import useDarkModeGuard from "./useDarkModeGuard";
+import { loadAtlasIndex } from "./useAtlasData";
 
 // ScrollDetailPage — the per-scroll detail route for the rebuilt /data_browser.
 // This is a Docusaurus ROUTE component: a plugin injects one merged `scroll`
@@ -18,6 +19,13 @@ import useDarkModeGuard from "./useDarkModeGuard";
 // page (ref/scroll.html ~154-182) and keeps its exact class names so the global
 // `.atlas` CSS block styles it. Everything is server-rendered except the
 // interactive 3D viewer (wrapped in <BrowserOnly>).
+//
+// The build-time `props.scroll` renders server-side (SEO/JSON-LD/instant paint);
+// on mount we refresh it from the live metadata.min.json projection (same
+// loadAtlasIndex() the index grid uses) so counts/segments/predictions stay
+// current without a rebuild. Any fetch failure silently keeps the build-time
+// prop. NOTE: brand-new scrolls only get a detail route at the next build, so a
+// live-only scroll has no page here regardless — the grid hides such cards.
 
 const SITE = "https://scrollprize.org";
 const LICENSE_URL = "https://dl.ash2txt.org/LICENSE.txt";
@@ -57,8 +65,29 @@ function metaDescription(scroll) {
 }
 
 export default function ScrollDetailPage(props) {
-  const scroll = props.scroll;
   useDarkModeGuard();
+  // Seed from the build-time prop (SSR/instant paint), then refresh from live
+  // data. props.scroll carries `_general` (merged by the atlas-data plugin);
+  // the live index exposes it top-level, so re-attach it when refreshing.
+  const [scroll, setScroll] = useState(props.scroll);
+  const baseId = props.scroll && props.scroll.id;
+  useEffect(() => {
+    if (!baseId) return undefined;
+    let cancelled = false;
+    // Restrict derivation to this one scroll: per-scroll facts are independent
+    // of the rest of the set, so passing [baseId] yields an identical `fresh`
+    // while buildIndex projects a single sample instead of all ~45.
+    loadAtlasIndex([baseId])
+      .then(({ index }) => {
+        if (cancelled) return;
+        const fresh = (index.scrolls || []).find((s) => s.id === baseId);
+        if (fresh) setScroll({ ...fresh, _general: index._general });
+      })
+      .catch(() => {}); // keep the build-time prop on any failure
+    return () => {
+      cancelled = true;
+    };
+  }, [baseId]);
 
   if (!scroll) {
     return (
@@ -110,8 +139,7 @@ export default function ScrollDetailPage(props) {
       : typeof up === "string" && up
       ? ` · unrolled: ${up}`
       : "";
-  const segments =
-    progress.segments != null ? progress.segments : scroll.n_segments;
+  const segments = scroll.n_segments;
   const segmentsTxt = segments != null ? Number(segments).toLocaleString() : "—";
 
   // Furthest pipeline stage reached.

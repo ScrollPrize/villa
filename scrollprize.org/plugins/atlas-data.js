@@ -30,18 +30,26 @@ module.exports = function atlasDataPlugin(context, options) {
     },
 
     async contentLoaded({ content, actions }) {
-      const { createData, addRoute } = actions;
+      const { createData, addRoute, setGlobalData } = actions;
       const { scrolls = [], _general = '' } = content || {};
 
-      // Live sample counts for the landing hero stats (regenerated every
-      // build from the open-data metadata via scripts/genAtlasData.js).
-      actions.setGlobalData({
+      // One setGlobalData call (it replaces the plugin's whole global-data
+      // object, so both consumers must share it):
+      //   - counts: live sample counts for the landing hero stats (regenerated
+      //     every build from the open-data metadata via scripts/genAtlasData.js).
+      //   - routedIds: the scroll ids that got a static detail route this build.
+      //     The index grid (AtlasBrowser) uses it to hide any live-only scroll
+      //     that appears in the fresher metadata.min.json but has no page here
+      //     yet, so a card never links to a 404. New scrolls surface next build.
+      setGlobalData({
         counts: {
           scrolls: scrolls.filter((s) => s.type === 'scroll').length,
           fragments: scrolls.filter((s) => s.type === 'fragment').length,
           samples: scrolls.length,
         },
+        routedIds: scrolls.map((s) => s.id),
       });
+
 
       await Promise.all(
         scrolls.map(async (scroll) => {
