@@ -712,7 +712,7 @@ export function Landing() {
                 <p className="vc-hero__intro">
                   Vesuvius Challenge is a machine learning, computer vision,
                   and geometry competition that is{" "}
-                  <a href="/grandprize">reading</a> the carbonized Herculaneum
+                  <a href="/firstscroll">reading</a> the carbonized Herculaneum
                   scrolls without opening them.
                 </p>
                 <div className="vc-hero__ctas">

@@ -136,7 +136,7 @@
   width: 100%;
   height: 100%;
   object-fit: cover;
-  object-position: 72% 30%;
+  object-position: 72% center;
   opacity: 0.35; /* demoted backdrop, spec cap ≤40% */
 }
 /* Solid→transparent overlay ON MEDIA (allowed masking gradient): the text
@@ -145,8 +145,8 @@
 .vc-landing .vc-hero__scrim {
   position: absolute;
   inset: 0;
-  background: linear-gradient(180deg, var(--vc-bg) 40%, transparent 82%),
-    linear-gradient(0deg, var(--vc-bg) 2%, transparent 16%);
+  background: linear-gradient(90deg, var(--vc-bg) 34%, transparent 72%),
+    linear-gradient(0deg, var(--vc-bg) 4%, transparent 28%);
 }
 .vc-landing .vc-hero__content {
   position: relative;
@@ -229,6 +229,9 @@
 /* Reveal card — the unwrap payoff (PHerc. 1667 unrolling into Greek). */
 .vc-landing a.vc-hero__reveal {
   display: block;
+  width: min(100%, 420px);
+  justify-self: end;
+  align-self: end;
   color: var(--vc-text);
   text-decoration: none;
   background: var(--vc-bg);
