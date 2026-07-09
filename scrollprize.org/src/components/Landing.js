@@ -709,18 +709,6 @@ export function Landing() {
               the carbonized Herculaneum scrolls without opening them.
             </p>
             <div className="vc-hero__row">
-              <div className="vc-hero__ctas">
-                <a className="vc-btn" href="/get_started">
-                  Get Started
-                </a>
-                <a
-                  className="vc-btn-outline"
-                  href="https://discord.gg/V4fJhvtaQn"
-                >
-                  Join Discord
-                </a>
-              </div>
-
               {/* The unwrap payoff: PHerc. 1667 unrolling into readable Greek.
                   Poster = the video's final frame, so poster-only contexts
                   (mobile, reduced-motion, data-saver) still get the reveal. */}
@@ -751,6 +739,18 @@ export function Landing() {
                   </span>
                 </a>
               )}
+
+              <div className="vc-hero__ctas">
+                <a
+                  className="vc-btn-outline"
+                  href="https://discord.gg/V4fJhvtaQn"
+                >
+                  Join Discord
+                </a>
+                <a className="vc-btn" href="/get_started">
+                  Get Started
+                </a>
+              </div>
             </div>
 
             <div className="vc-stat-strip vc-hero__stats">
