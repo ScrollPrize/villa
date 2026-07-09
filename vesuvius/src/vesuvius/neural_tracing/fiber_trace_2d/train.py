@@ -372,10 +372,69 @@ def run_training(
     return run_dir
 
 
+def prefetch_training(
+    config_path: str | Path,
+    *,
+    prefetch_steps: int | None = None,
+    prefetch_start_step: int = 1,
+    sampler_factory: SamplerFactory | None = None,
+) -> dict[str, Any]:
+    raw_config = _load_raw_config(config_path)
+    training = _training_config_from_raw(raw_config)
+    if int(prefetch_start_step) <= 0:
+        raise ValueError("--prefetch-start-step must be >= 1")
+    if prefetch_steps is not None and int(prefetch_steps) < 0:
+        raise ValueError("--prefetch-steps must be >= 0")
+
+    effective_steps = training.max_steps if prefetch_steps is None or int(prefetch_steps) == 0 else int(prefetch_steps)
+    start_sample_index = (int(prefetch_start_step) - 1) * int(training.train_control_points_per_step)
+    sample_count = int(effective_steps) * int(training.train_control_points_per_step)
+    loader_config = load_config(config_path)
+    loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    print(
+        "fiber_trace_2d prefetch "
+        f"start_step={int(prefetch_start_step)} steps={int(effective_steps)} "
+        f"control_points_per_step={int(training.train_control_points_per_step)} "
+        f"start_sample_index={start_sample_index} samples={sample_count}",
+        flush=True,
+    )
+    summary = loader.prefetch(start_sample_index, sample_count)
+    print(
+        "fiber_trace_2d prefetch complete "
+        f"generated={int(summary.get('generated', 0))} missing={int(summary.get('missing', 0))} "
+        f"downloaded={int(summary.get('downloaded', 0))} errors={int(summary.get('errors', 0))}",
+        flush=True,
+    )
+    return summary
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train V0 2D fiber-strip direction model")
     parser.add_argument("config", help="Path to fiber_trace_2d JSON config")
+    parser.add_argument("--prefetch", action="store_true", help="Prefetch training chunks and exit without training")
+    parser.add_argument(
+        "--prefetch-steps",
+        type=int,
+        default=None,
+        help="Training steps to prefetch; 0 or omitted means all configured training.max_steps",
+    )
+    parser.add_argument(
+        "--prefetch-start-step",
+        type=int,
+        default=1,
+        help="1-based training step whose deterministic sample range starts prefetching",
+    )
     args = parser.parse_args(argv)
+    if args.prefetch:
+        try:
+            prefetch_training(
+                args.config,
+                prefetch_steps=args.prefetch_steps,
+                prefetch_start_step=args.prefetch_start_step,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        return
     run_training(args.config)
 
 

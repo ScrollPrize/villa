@@ -32,7 +32,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     load_config,
     strip_z_offsets_from_count_step,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.train import run_training
+from vesuvius.neural_tracing.fiber_trace_2d.train import prefetch_training, run_training
 from vesuvius.neural_tracing.fiber_trace_2d.runner import _export_augment_contact_sheet
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
@@ -739,6 +739,126 @@ def test_prefetch_deduplicates_and_skips_cached(monkeypatch: pytest.MonkeyPatch,
     assert summary["missing"] == 1
     assert summary["downloaded"] == 1
     assert summary["errors"] == 0
+
+
+class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
+    def __init__(self, array, *, level_spacing_base: float) -> None:
+        super().__init__(array, level_spacing_base=level_spacing_base)
+        self.sample_coords_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.chunk_request_calls: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
+        self.sample_coords_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
+        return super().sample_coords(coords_zyx_base, valid_mask)
+
+    def chunk_requests_for_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
+        self.chunk_request_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
+        return super().chunk_requests_for_coords(coords_zyx_base, valid_mask)
+
+
+def test_prefetch_uses_same_augmented_coords_as_loading(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["strip_z_offset_count"] = 2
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    raw["augment_shift_x"] = 1.0
+    raw["augment_shift_y"] = 1.0
+    raw["augment_rotation_degrees"] = 12.0
+    raw["augment_shear_x"] = 0.2
+    raw["augment_shear_y"] = 0.15
+    raw["augment_scale_min"] = 0.95
+    raw["augment_scale_max"] = 1.05
+    raw["augment_smooth_offset"] = 0.0
+    raw["augment_brightness"] = 0.0
+    raw["augment_contrast_min"] = 1.0
+    raw["augment_contrast_max"] = 1.0
+    raw["augment_gamma_min"] = 1.0
+    raw["augment_gamma_max"] = 1.0
+    raw["augment_noise_std"] = 0.0
+    raw["augment_blur_sigma"] = 0.0
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    samplers: list[_RecordingCoordinateSampler] = []
+
+    def factory(**kwargs):
+        sampler = _RecordingCoordinateSampler(
+            kwargs["array"],
+            level_spacing_base=kwargs["level_spacing_base"],
+        )
+        samplers.append(sampler)
+        return sampler
+
+    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+    sample_index = 4
+
+    loader.chunk_requests_for_sample_index(sample_index)
+    loader.build_sample(sample_index)
+
+    sampler = samplers[0]
+    assert len(sampler.chunk_request_calls) == 2
+    assert len(sampler.sample_coords_calls) == 2
+    for (prefetch_coords, prefetch_valid), (load_coords, load_valid) in zip(
+        sampler.chunk_request_calls,
+        sampler.sample_coords_calls,
+    ):
+        assert np.array_equal(prefetch_valid, load_valid)
+        assert np.allclose(prefetch_coords, load_coords, atol=1.0e-6)
+
+
+def test_training_prefetch_maps_steps_to_sample_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    run_path = tmp_path / "runs"
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["training"] = {
+        "run_path": str(run_path),
+        "run_name": "prefetch",
+        "max_steps": 7,
+        "control_points_per_step": 3,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[tuple[int, int]] = []
+
+    def fake_prefetch(self, start_sample_index, sample_count, *, workers=None):
+        del self, workers
+        calls.append((int(start_sample_index), int(sample_count)))
+        return {
+            "generated": 11,
+            "missing": 5,
+            "downloaded": 5,
+            "bytes": 123,
+            "errors": 0,
+            "workers": 1,
+        }
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    summary = prefetch_training(config_path, prefetch_steps=3, sampler_factory=_test_sampler_factory)
+
+    assert calls == [(0, 9)]
+    assert summary["generated"] == 11
+    assert not run_path.exists()
+
+    calls.clear()
+    prefetch_training(
+        config_path,
+        prefetch_steps=0,
+        prefetch_start_step=2,
+        sampler_factory=_test_sampler_factory,
+    )
+
+    assert calls == [(3, 21)]
+    assert not run_path.exists()
+
+
+def test_training_prefetch_rejects_negative_steps(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+
+    with pytest.raises(ValueError, match="--prefetch-steps must be >= 0"):
+        prefetch_training(config_path, prefetch_steps=-1, sampler_factory=_test_sampler_factory)
 
 
 def test_lasagna_direction_encoding_is_forward_backward_ambiguous() -> None:

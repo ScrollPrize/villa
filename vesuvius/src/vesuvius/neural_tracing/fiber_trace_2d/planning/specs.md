@@ -45,9 +45,16 @@
 - Normal batch loading samples random control points deterministically from the configured seed.
 - The tester/runner loads a batch from a specified deterministic control-point sample index.
 - Prefetch computes needed base-volume Zarr chunk keys from explicit coordinates before image loading.
+- Prefetch coordinates must be the final augmented coordinates passed to the base-volume sampler, not the unaugmented oversized source-strip coordinates.
 - Prefetch deduplicates chunk requests, skips cached chunks, and fetches missing chunks into the configured cache.
 - Prefetch parallelism is capped at 16 workers.
+- Prefetch remains base-volume-only; Lasagna manifest channels are not prefetched by the VC3D base-volume prefetch path.
 - V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.
+- `train.py --prefetch` runs training-oriented chunk prefetch only and exits before model, optimizer, TensorBoard, run-directory, or snapshot setup.
+- Training prefetch uses the same deterministic sample-index sequence as training.
+- Training prefetch sample count is `effective_prefetch_steps * training.control_points_per_step`.
+- `--prefetch-steps 0` means all configured training steps, i.e. `effective_prefetch_steps = training.max_steps`.
+- Negative `--prefetch-steps` values are invalid.
 - The V0 trainer uses `FiberStrip2DLoader` batches directly; it must not use the neural-tracing 3D crop loader or a separate image sampling path.
 - Training geometric augmentations are the same coordinate-space augmentations used by augment-vis. Value augmentations run through the existing torch augmentation functions after Zarr sampling.
 - A training step samples `training.control_points_per_step` deterministic control-point samples and every configured strip-z offset. The default is four control points and 16 strip-z offsets, giving 64 2D strip patches.

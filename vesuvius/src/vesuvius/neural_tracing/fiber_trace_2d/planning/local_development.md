@@ -100,6 +100,26 @@ The trainer writes TensorBoard events and snapshots under the configured
 `training.run_path`. Do not add `PYTHONNOUSERSITE=1` to this command in this
 checkout.
 
+## Fiber Trace 2D Training Prefetch Commands
+
+Prefetch the base-volume chunks needed for the first 10 configured training
+steps:
+
+```bash
+PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.train $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --prefetch --prefetch-steps 10
+```
+
+Prefetch all configured training steps:
+
+```bash
+PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.train $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --prefetch --prefetch-steps 0
+```
+
+Training prefetch exits before model/TensorBoard/snapshot setup. It still uses
+the same deterministic control-point sample sequence and final augmented
+base-volume coordinates as training. Lasagna manifest channels are not
+prefetched.
+
 ## Focused Test Command
 
 ```bash

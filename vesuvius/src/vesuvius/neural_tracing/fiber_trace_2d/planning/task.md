@@ -1,18 +1,24 @@
 # Current Task
 
-Verify and harden prefetch for full-augmentation 2D fiber-strip training.
+Unify 2D fiber-strip training, batch loading, prefetch, and augmentation
+visualization around the same augment-vis-style loading path.
 
-- Training needs to download addressed base-volume chunks before running, using
-  the same full augmentation footprint as actual batch loading.
-- Prefetch must account for the oversized source strip, coordinate-space
-  geometric augmentation, deterministic per-strip-z augmentation parameters,
-  and all configured strip-z offsets.
-- Prefetch must remain base-volume-only; Lasagna manifest channels are not part
-  of the VC3D base-volume prefetch path.
-- Add a convenient training-oriented way to prefetch the samples needed by a
-  training run or a specified number of training steps.
-- Allow prefetching the full configured training run, for example with
-  `--prefetch-steps 0`.
-- Add tests proving prefetch chunk requests are generated from the same final
-  augmented coordinates used by loading.
-- Update specs/docs/local commands so the correct prefetch command is clear.
+- The augment-vis path is the intended behavior and must become the shared
+  implementation used by training and prefetch too.
+- Remove mismatches where training or prefetch still use older NumPy/Python
+  strip-coordinate generation instead of the torch-vectorized source geometry
+  path tested by augment-vis.
+- Remove cache/prefetch mismatches where prefetch uses a separate Python chunk
+  store path that does not match VC3D blocking sample/cache behavior.
+- Keep the one intended training difference: training needs multiple strip-z
+  offsets. Generate the CP-local source strip once, then derive offset strips
+  by applying each strip-z offset along the strip normals/frame instead of
+  rebuilding unrelated coordinate machinery.
+- Prefetch must be independent of the particular random augmentation draws used
+  by a training step. For each CP, prefetch an area/chunk set sufficient for the
+  maximum configured augmentation envelope, so later random augmentations within
+  that configured range should be cache-covered.
+- Preserve coordinate-space geometric augmentation: image pixels are sampled
+  once from final augmented coordinates, never image-warped after loading.
+- Add tests proving augment-vis, training batch loading, and prefetch use the
+  same final coordinate generation and cache-aware VC3D sampling path.

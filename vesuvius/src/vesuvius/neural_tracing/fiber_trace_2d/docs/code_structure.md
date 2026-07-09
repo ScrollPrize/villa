@@ -102,7 +102,8 @@ The important behavior is:
 - Loads only CP-local Lasagna normals needed for the requested strip window.
 - Builds one sample as all configured strip-z offsets around one control point.
 - Builds a batch by stacking deterministic samples.
-- Computes prefetch chunk requests from explicit final coordinates.
+- Computes prefetch chunk requests from explicit final augmented coordinates
+  for the base-volume sampler only.
 - Implements `build_augmented_center_strip_source` to build CP-local source
   geometry once for augmentation contact sheets, then reuses it for each
   augmentation variant.
@@ -117,6 +118,8 @@ The important behavior is:
 
 - Loads a config, optionally prefetches chunks, loads a batch, exports JPGs, and
   exports augmentation contact sheets.
+- Its prefetch mode is sample-count oriented:
+  `--prefetch --prefetch-samples <control-point-samples>`.
 - Prints augment-visualization timing rows and raw image stats.
 
 `train.py`
@@ -132,6 +135,10 @@ The important behavior is:
 - Builds batches with `FiberStrip2DLoader`, so production training uses the
   same VC3D blocking sampler and coordinate-space augmentation path as
   augment-vis.
+- Supports `--prefetch` for training-oriented prefetch-only runs. This maps
+  training steps to deterministic control-point sample ranges, calls loader
+  prefetch, and exits before model, optimizer, TensorBoard, run-directory, or
+  snapshot setup.
 - Flattens `[control_point_sample, strip_z_offset]` into one patch batch for the
   model.
 - Computes direction targets from transformed line coordinates after geometric
@@ -179,6 +186,19 @@ Training keys:
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
 - `model_hidden_channels` and `model_depth`: V0 CNN size knobs.
+
+Training prefetch:
+
+- `python -m vesuvius.neural_tracing.fiber_trace_2d.train config.json
+  --prefetch --prefetch-steps N` prefetches the first `N` training steps.
+- `--prefetch-steps 0` or omitting `--prefetch-steps` prefetches all configured
+  `training.max_steps`.
+- `--prefetch-start-step S` starts from the 1-based training step `S`.
+- Sample count is `effective_steps * training.control_points_per_step`; start
+  sample index is `(S - 1) * training.control_points_per_step`.
+- Negative `--prefetch-steps` values are rejected.
+- Training prefetch only fetches base-volume chunks; Lasagna manifest channels
+  are opened for geometry/normal metadata but are not prefetched.
 
 Dataset entries must contain:
 

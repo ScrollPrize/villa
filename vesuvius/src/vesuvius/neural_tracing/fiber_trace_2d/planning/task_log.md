@@ -70,3 +70,38 @@ Validation:
   coordinates match actual augmented loading coordinates.
 - Refined the plan so `--prefetch-steps 0` means prefetch all configured
   training steps, and negative step counts are rejected.
+
+## Full-Augmentation Training Prefetch Implementation
+
+- Added `train.py --prefetch` mode. It maps training steps to the same
+  deterministic control-point sample-index range used by training, calls
+  `FiberStrip2DLoader.prefetch`, prints a compact summary, and exits before
+  model, TensorBoard, run-directory, or snapshot setup.
+- Added `--prefetch-steps`; omitted or `0` means all configured
+  `training.max_steps`, and negative values are rejected.
+- Added `--prefetch-start-step` for resuming prefetch ranges by 1-based
+  training step.
+- Added a regression test that records final augmented coordinates seen by
+  `chunk_requests_for_coords` and `sample_coords`, proving prefetch and loading
+  use the same per-strip-z coordinates.
+- Added training prefetch tests for explicit step counts, all-steps mode, and
+  negative-step validation.
+- Updated specs and local docs with the train prefetch command and
+  base-volume-only/final-coordinate semantics.
+
+## Planned Augment-Vis Path Unification
+
+- Replaced the active task with the broader mismatch-removal task: augment-vis
+  source/patch handling is the intended behavior and should be the shared path
+  for training, runner loading, and prefetch.
+- Wrote a new task plan that removes the current differences:
+  - training/prefetch using old NumPy strip-coordinate generation;
+  - augment-vis-only source-geometry reuse;
+  - prefetch using a cache-incompatible Python chunk-store wrapper;
+  - opaque prefetch discovery with no progress.
+- The plan keeps the only intended difference for training: multiple strip-z
+  offsets, derived from one CP-local source geometry by offsetting along the
+  strip normals/frame direction.
+- Refined the prefetch requirement: prefetch must cover the configured maximum
+  augmentation envelope for each CP/offset instead of depending on one sampled
+  random augmentation draw.
