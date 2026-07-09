@@ -89,6 +89,32 @@ jobs:
             volume-cartographer/build/ci-windows-mingw/VC3D-*-win64.zip
           if-no-files-found: error
 
+      # Prove the package is self-contained: unpack the ZIP and run binaries
+      # from plain PowerShell (no MSYS2 on PATH), so any DLL missing from the
+      # bundle fails loudly here instead of on a user's machine.
+      - name: Smoke test packaged tree
+        shell: pwsh
+        timeout-minutes: 10
+        working-directory: volume-cartographer/build/ci-windows-mingw
+        run: |
+          $zip = Get-Item VC3D-*-win64.zip
+          Expand-Archive $zip.FullName -DestinationPath smoke
+          $exe = Get-ChildItem smoke -Recurse -Filter VC3D.exe | Select-Object -First 1
+          $bin = $exe.DirectoryName
+          Write-Host "bundle bin dir: $bin"
+          # Console CLI tool: loads the vc_core/OpenCV/Ceres DLL closure.
+          # No-args prints usage and exits 1; anything else means load failure.
+          & "$bin\vc_tifxyz_trim.exe"
+          if ($LASTEXITCODE -notin 0,1) { throw "vc_tifxyz_trim failed to start (exit $LASTEXITCODE)" }
+          Write-Host "vc_tifxyz_trim OK (exit $LASTEXITCODE)"
+          # GUI app: --version under the offscreen platform exercises every Qt
+          # DLL plus the platform plugin lookup. GUI-subsystem exe, so wait via
+          # Start-Process and check the exit code.
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "--version" -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "VC3D --version failed (exit $($p.ExitCode))" }
+          Write-Host "VC3D --version OK"
+
       - name: Attach installer to release
         if: github.event_name == 'release'
         shell: pwsh

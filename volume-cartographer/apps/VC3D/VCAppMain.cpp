@@ -20,6 +20,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
+#include <cstdio>
 #include <iostream>
 #include <thread>
 #include <omp.h>
@@ -29,7 +30,15 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <sys/resource.h>
 #endif
@@ -82,6 +91,16 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
 __attribute__((visibility("default")))
 auto main(int argc, char* argv[]) -> int
 {
+#ifdef _WIN32
+    // GUI-subsystem exe: stdout/stderr are detached by default. When launched
+    // from a terminal, reattach them so logs and --version/--help output are
+    // visible; double-click launches still get no console window.
+    if (::AttachConsole(ATTACH_PARENT_PROCESS)) {
+        std::freopen("CONOUT$", "w", stdout);
+        std::freopen("CONOUT$", "w", stderr);
+    }
+#endif
+
     vc::crash::install();
 
 #ifndef __linux__

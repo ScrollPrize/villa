@@ -279,6 +279,14 @@ HttpResponse perform(const HttpClient::Config& config,
         // URL
         curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
 
+#if defined(_WIN32)
+        // MSYS2's libcurl is OpenSSL-backed and its default CA bundle path
+        // (/ucrt64/...) doesn't exist on end-user machines, so every HTTPS
+        // request fails verification with an empty response. Use the Windows
+        // native certificate store instead (curl >= 7.71).
+        curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#endif
+
         // Timeouts
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
                          static_cast<long>(config.connect_timeout.count()));
@@ -452,6 +460,11 @@ HttpResponse HttpClient::put_file(std::string_view url,
         curl_easy_reset(curl);
 
         curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
+#if defined(_WIN32)
+        // See perform(): use the Windows native cert store — the MSYS2
+        // OpenSSL CA bundle path doesn't exist on end-user machines.
+        curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#endif
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
                          static_cast<long>(config_.connect_timeout.count()));
         curl_easy_setopt(curl, CURLOPT_TIMEOUT,
