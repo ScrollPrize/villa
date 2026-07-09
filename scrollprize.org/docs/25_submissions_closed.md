@@ -23,6 +23,12 @@ hide_title: true
   <meta property="twitter:image" content="https://scrollprize.org/img/firstletters/purple_card-new.webp" />
 </head>
 
+:::warning[ARCHIVED]
+
+This page has been archived and is kept for historical reference: the prizes it describes have concluded. See [Winners](winners) for the results and [Prizes](prizes) for what is open today.
+
+:::
+
 <img src="/img/firstletters/composite_thumb.webp" />
 
 <h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">

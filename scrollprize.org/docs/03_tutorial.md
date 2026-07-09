@@ -46,9 +46,9 @@ There are five steps in our process for reading a carbonized scroll:
 
 <TutorialsTop/>
 
-:::warning[OUTDATED CONTENT]
+:::warning[ARCHIVED]
 
-This page describes an earlier generation of the Vesuvius Challenge pipeline. Tools, data layouts, and results referenced here may have been superseded.
+This page has been archived and is no longer maintained. It describes an earlier generation of the Vesuvius Challenge pipeline — tools, data layouts, and results referenced here may have been superseded. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
 
 :::
 

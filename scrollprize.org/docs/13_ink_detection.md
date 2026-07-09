@@ -37,9 +37,9 @@ hide_table_of_contents: true
   />
 </head>
 
-:::warning[COMPETITION CLOSED]
+:::warning[ARCHIVED]
 
-This 2023 Kaggle competition has concluded. See the [Winners page](winners) for the results and [Prizes](prizes) for what is currently open.
+This page has been archived: the 2023 Kaggle competition it describes has concluded. See [Winners](winners) for the results and [Prizes](prizes) for what is open today.
 
 :::
 

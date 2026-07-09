@@ -37,6 +37,12 @@ hide_table_of_contents: true
   />
 </head>
 
+:::warning[ARCHIVED]
+
+This page has been archived and is kept for historical reference: the prizes it describes have concluded. See [Winners](winners) for the results and [Prizes](prizes) for what is open today.
+
+:::
+
 We’re extremely curious about everyone’s progress, and want to be optimally prepared for reviewing the Grand Prize. That’s why we’re awarding a tiny prize:
 
 **5x \$200 Private Progress Pics Prize** for the best *confidential* submissions of ink detection pictures from the inside of the scrolls, by Friday Dec 15th 11:59pm PT. This is completely confidential: we will not share your submission with anyone, and prize winners are not announced publicly.

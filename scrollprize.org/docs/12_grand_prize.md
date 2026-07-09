@@ -37,6 +37,12 @@ hide_table_of_contents: true
   />
 </head>
 
+:::warning[ARCHIVED]
+
+This page has been archived and is kept for historical reference: the prizes it describes have concluded. See [Winners](winners) for the results and [Prizes](prizes) for what is open today.
+
+:::
+
 
 _The 2023 Grand Prize has been awarded — see [the announcement](/grandprize)._
 

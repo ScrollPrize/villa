@@ -35,6 +35,12 @@ title: "Master Plan"
   />
 </head>
 
+:::warning[ARCHIVED]
+
+This page has been archived and is kept for historical reference — it reflects the project's plans as originally written. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
+
+:::
+
 <div className="opacity-60 mb-8 italic">July 25th, 2025</div>
 
 ## Vesuvius Challenge – Stage Two
