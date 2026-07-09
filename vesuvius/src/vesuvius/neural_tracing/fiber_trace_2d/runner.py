@@ -241,13 +241,20 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
     timing_rows: list[tuple[str, dict[str, float]]] = []
     timing_totals: dict[str, float] = {}
     image_stat_rows: list[tuple[str, dict[str, float]]] = []
+    source_profile: dict[str, float] = {}
+    with _Timer() as source_timer:
+        source = loader.build_augmented_center_strip_source(
+            sample_index,
+            device=device,
+            profile=source_profile,
+        )
     summary_lines = [
         f"sample_index={sample_index}",
         f"device={device}",
         "layout=row 1: lower limits; row 2: upper limits; row 3: random combined training-style augmentations",
     ]
-    for name, params in entries:
-        timing: dict[str, float] = {}
+    for entry_index, (name, params) in enumerate(entries):
+        timing: dict[str, float] = dict(source_profile) if entry_index == 0 else {}
         with _Timer() as total_timer:
             with _Timer() as loader_timer:
                 sample, aug_image, aug_valid, line_xy = loader.build_augmented_center_strip_patch(
@@ -255,6 +262,7 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
                     params,
                     device=device,
                     profile=timing,
+                    source=source,
                 )
             timing["loader_total"] = loader_timer.elapsed_ms
             with _Timer() as to_u8_timer:
@@ -265,6 +273,9 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
                 overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.5, thickness=1)
             timing["overlay"] = overlay_timer.elapsed_ms
         timing["total"] = total_timer.elapsed_ms
+        if entry_index == 0:
+            timing["loader_total"] += source_timer.elapsed_ms
+            timing["total"] += source_timer.elapsed_ms
         timing_rows.append((name, timing))
         for key, value in timing.items():
             _add_timing(timing_totals, key, value)

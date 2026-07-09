@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import numpy as np
+import torch
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 
@@ -481,6 +482,127 @@ def _interpolate_line_side_slice(
     normal_len = np.linalg.norm(normal, axis=-1, keepdims=True)
     normal = np.divide(normal, normal_len, out=np.zeros_like(normal), where=normal_len > _EPS)
     return center + normal * normal_offsets[..., None], valid
+
+
+def _frame_normal_array(frames: list[FiberStripFrame]) -> np.ndarray:
+    return np.stack([np.asarray(frame.mesh_normal_xyz, dtype=np.float64) for frame in frames], axis=0)
+
+
+def _cubic_hermite_line_torch(
+    points_xyz: torch.Tensor,
+    cumulative: torch.Tensor,
+    derivatives: torch.Tensor,
+    arc_coord: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    total = cumulative[-1]
+    valid = (arc_coord >= 0.0) & (arc_coord <= total)
+    arc = torch.clamp(arc_coord, 0.0, float(total.item()))
+    c1 = torch.searchsorted(cumulative, arc.contiguous(), right=True)
+    c1 = torch.clamp(c1, 1, int(cumulative.numel()) - 1)
+    c0 = c1 - 1
+    span = cumulative[c1] - cumulative[c0]
+    t = torch.where(span > _EPS, (arc - cumulative[c0]) / span, torch.zeros_like(arc))
+
+    p0 = points_xyz[c0]
+    p1 = points_xyz[c1]
+    m0 = derivatives[c0]
+    m1 = derivatives[c1]
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+    center = (
+        h00[..., None] * p0
+        + h10[..., None] * span[..., None] * m0
+        + h01[..., None] * p1
+        + h11[..., None] * span[..., None] * m1
+    )
+    return center, c0, c1, t, valid
+
+
+def _interpolate_line_side_slice_torch(
+    points_xyz: np.ndarray,
+    frames: list[FiberStripFrame],
+    arc_coord: torch.Tensor,
+    normal_offsets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = arc_coord.device
+    dtype = torch.float64
+    points = torch.as_tensor(points_xyz, dtype=dtype, device=device)
+    if points.shape[0] == 1:
+        center = points[0].view(1, 1, 3).expand(arc_coord.shape + (3,))
+        normal = torch.as_tensor(frames[0].mesh_normal_xyz, dtype=dtype, device=device).view(1, 1, 3)
+        return center + normal * normal_offsets[..., None], torch.ones_like(arc_coord, dtype=torch.bool)
+
+    cumulative_np = _arc_lengths(points_xyz)
+    derivatives_np = _arc_derivatives(points_xyz, cumulative_np)
+    cumulative = torch.as_tensor(cumulative_np, dtype=dtype, device=device)
+    derivatives = torch.as_tensor(derivatives_np, dtype=dtype, device=device)
+    frame_normals = torch.as_tensor(_frame_normal_array(frames), dtype=dtype, device=device)
+
+    center, c0, c1, t, valid = _cubic_hermite_line_torch(points, cumulative, derivatives, arc_coord)
+    n0 = frame_normals[c0]
+    n1 = frame_normals[c1]
+    normal = n0 * (1.0 - t[..., None]) + n1 * t[..., None]
+    normal_len = torch.linalg.norm(normal, dim=-1, keepdim=True)
+    normal = torch.where(normal_len > _EPS, normal / normal_len.clamp_min(_EPS), torch.zeros_like(normal))
+    return center + normal * normal_offsets[..., None], valid
+
+
+def build_side_strip_patch_grid_from_line_window_torch(
+    line_window: FiberStripLineWindow,
+    *,
+    patch_shape_hw: tuple[int, int],
+    strip_z_offset: float,
+    sampled_normal: np.ndarray | None = None,
+    sampled_normals: np.ndarray | None = None,
+    pixel_spacing_base: float = 1.0,
+    device: torch.device | str | None = None,
+) -> FiberStripGrid:
+    line_points = np.asarray(line_window.line_points_xyz, dtype=np.float64)
+    height, width = (int(v) for v in patch_shape_hw)
+    if height <= 0 or width <= 0:
+        raise ValueError(f"patch_shape_hw must contain positive values, got {patch_shape_hw}")
+    pixel_spacing_base = float(pixel_spacing_base)
+    if not np.isfinite(pixel_spacing_base) or pixel_spacing_base <= 0.0:
+        raise ValueError(f"pixel_spacing_base must be positive and finite, got {pixel_spacing_base}")
+
+    normals = sampled_normals if sampled_normals is not None else sampled_normal
+    if normals is None:
+        raise ValueError("sampled_normal or sampled_normals is required")
+    frames = _build_side_strip_frames_for_points(line_points, sampled_normals=normals)
+    line_index = int(line_window.local_control_point_index)
+    if line_index < 0 or line_index >= line_points.shape[0]:
+        raise IndexError(
+            f"local_control_point_index {line_index} out of range for {line_points.shape[0]} line points"
+        )
+
+    torch_device = torch.device("cpu") if device is None else torch.device(device)
+    dtype = torch.float64
+    row_offsets = (
+        (torch.arange(height, dtype=dtype, device=torch_device) - (float(height) - 1.0) * 0.5)
+        + float(strip_z_offset)
+    ) * pixel_spacing_base
+    col_offsets = (
+        torch.arange(width, dtype=dtype, device=torch_device) - (float(width) - 1.0) * 0.5
+    ) * pixel_spacing_base
+    row_grid, col_grid = torch.meshgrid(row_offsets, col_offsets, indexing="ij")
+    cumulative = _arc_lengths(line_points)
+    anchor_arc = float(cumulative[line_index])
+    arc_coord = anchor_arc + col_grid
+    coords_xyz_t, valid_t = _interpolate_line_side_slice_torch(line_points, frames, arc_coord, row_grid)
+    shape_valid_t = torch.isfinite(coords_xyz_t).all(dim=-1)
+    coords_xyz = coords_xyz_t.detach().cpu().numpy()
+    coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32)
+    frame = _frame_at_arc(line_points, frames, anchor_arc)
+    return FiberStripGrid(
+        coords_xyz=coords_xyz.astype(np.float32),
+        coords_zyx=coords_zyx,
+        valid_mask=(valid_t & shape_valid_t).detach().cpu().numpy().astype(bool),
+        frame=frame,
+    )
 
 
 def build_side_strip_patch_grid_from_line_window(

@@ -30,6 +30,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import _export_augment_contac
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     build_side_strip_patch_grid,
+    build_side_strip_patch_grid_from_line_window,
+    build_side_strip_patch_grid_from_line_window_torch,
+    side_strip_line_window,
 )
 
 
@@ -172,6 +175,52 @@ def test_strip_pixel_spacing_is_in_base_voxels(tmp_path: Path) -> None:
 
     assert np.allclose(strip.coords_xyz[1, :, 0], [8.0, 10.0, 12.0])
     assert np.allclose(strip.coords_xyz[:, 1, 2], [18.0, 20.0, 22.0])
+
+
+def test_torch_side_strip_grid_matches_numpy_path(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(
+        _write_fiber(
+            tmp_path / "fiber.json",
+            points=[
+                [0.0, 20.0, 20.0],
+                [8.0, 22.0, 20.0],
+                [16.0, 20.0, 20.0],
+                [24.0, 18.0, 20.0],
+            ],
+            control_points=[
+                [8.0, 22.0, 20.0],
+                [16.0, 20.0, 20.0],
+            ],
+        )
+    )
+    window = side_strip_line_window(
+        fiber,
+        control_point_index=1,
+        patch_shape_hw=(5, 7),
+        pixel_spacing_base=2.0,
+        interpolation_point_margin=0,
+    )
+    normals = np.repeat(np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32), window.line_points_xyz.shape[0], axis=0)
+
+    numpy_grid = build_side_strip_patch_grid_from_line_window(
+        window,
+        patch_shape_hw=(5, 7),
+        strip_z_offset=0.25,
+        sampled_normals=normals,
+        pixel_spacing_base=2.0,
+    )
+    torch_grid = build_side_strip_patch_grid_from_line_window_torch(
+        window,
+        patch_shape_hw=(5, 7),
+        strip_z_offset=0.25,
+        sampled_normals=normals,
+        pixel_spacing_base=2.0,
+        device=torch.device("cpu"),
+    )
+
+    assert np.array_equal(torch_grid.valid_mask, numpy_grid.valid_mask)
+    assert np.allclose(torch_grid.coords_xyz, numpy_grid.coords_xyz, atol=1.0e-5)
+    assert np.allclose(torch_grid.coords_zyx, numpy_grid.coords_zyx, atol=1.0e-5)
 
 
 def test_side_strip_uses_fiber_line_points_not_sparse_control_chord(tmp_path: Path) -> None:
@@ -442,6 +491,18 @@ def test_line_augmentation_returns_coordinates_not_mask() -> None:
     assert line.ndim == 2
     assert line.shape[1] == 2
     assert line.dtype == np.float32
+
+
+def test_line_augmentation_shift_is_vectorized_direct_mapping() -> None:
+    line = transformed_centerline_coords(
+        (5, 5),
+        (5, 5),
+        FiberStripAugmentParams(shift_x=1.0),
+        device=torch.device("cpu"),
+    )
+
+    assert np.allclose(line[:, 0], np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
+    assert np.allclose(line[:, 1], np.full((4,), 2.0, dtype=np.float32))
 
 
 def test_value_augmentation_noise_and_blur_are_torch_based() -> None:

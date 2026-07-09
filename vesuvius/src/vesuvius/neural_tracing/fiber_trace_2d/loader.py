@@ -23,8 +23,10 @@ from vesuvius.neural_tracing.datasets.common import (
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import Vc3dFiber, load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     FiberStripFrame,
+    FiberStripGrid,
     FiberStripLineWindow,
     build_side_strip_patch_grid_from_line_window,
+    build_side_strip_patch_grid_from_line_window_torch,
     side_strip_line_window,
 )
 from vesuvius.neural_tracing.fiber_trace.dataset import (
@@ -109,6 +111,17 @@ class _Record:
     nx_spacing_base: float | None
     ny_spacing_base: float | None
     dataset_config: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _AugmentedCenterStripSource:
+    record: _Record
+    record_index: int
+    control_point_index: int
+    center_offset: float
+    source_shape_hw: tuple[int, int]
+    grid: FiberStripGrid
+
 
 def _is_remote_path(path: str | Path) -> bool:
     return str(path).startswith(_REMOTE_PREFIXES)
@@ -903,14 +916,13 @@ class FiberStrip2DLoader:
         )
         return sample, image.astype(np.float32, copy=False), result.valid_mask.astype(bool, copy=False)
 
-    def build_augmented_center_strip_patch(
+    def build_augmented_center_strip_source(
         self,
         sample_index: int,
-        params: Any,
         *,
         device: torch.device,
         profile: dict[str, float] | None = None,
-    ) -> tuple[FiberStripSample, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> _AugmentedCenterStripSource:
         with _ProfileBlock(profile, "descriptor"):
             record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
             center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
@@ -931,14 +943,41 @@ class FiberStrip2DLoader:
                 line_window,
                 control_point_index=cp_index,
             )
-        with _ProfileBlock(profile, "strip_coords"):
-            grid = build_side_strip_patch_grid_from_line_window(
+        with _ProfileBlock(profile, "strip_coords", device):
+            grid = build_side_strip_patch_grid_from_line_window_torch(
                 line_window,
                 patch_shape_hw=source_shape_hw,
                 strip_z_offset=float(center_offset),
                 sampled_normals=sampled_normals,
                 pixel_spacing_base=record.volume_spacing_base,
+                device=device,
             )
+        return _AugmentedCenterStripSource(
+            record=record,
+            record_index=record_index,
+            control_point_index=cp_index,
+            center_offset=float(center_offset),
+            source_shape_hw=source_shape_hw,
+            grid=grid,
+        )
+
+    def build_augmented_center_strip_patch(
+        self,
+        sample_index: int,
+        params: Any,
+        *,
+        device: torch.device,
+        profile: dict[str, float] | None = None,
+        source: _AugmentedCenterStripSource | None = None,
+    ) -> tuple[FiberStripSample, np.ndarray, np.ndarray, np.ndarray]:
+        if source is None:
+            source = self.build_augmented_center_strip_source(sample_index, device=device, profile=profile)
+        record = source.record
+        record_index = source.record_index
+        cp_index = source.control_point_index
+        center_offset = source.center_offset
+        source_shape_hw = source.source_shape_hw
+        grid = source.grid
         with _ProfileBlock(profile, "coord_augmentation", device):
             coords_zyx, valid_mask = _resample_coords_like_augmentation(
                 grid.coords_zyx.astype(np.float32, copy=False),
@@ -974,7 +1013,7 @@ class FiberStrip2DLoader:
             fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
             control_point_index=cp_index,
             control_point_xyz=np.asarray(record.fiber.control_points_xyz[cp_index], dtype=np.float32),
-            strip_z_offset=float(center_offset),
+            strip_z_offset=center_offset,
             coords_zyx=coords_zyx,
             valid_mask=valid_t.cpu().numpy().astype(bool),
             frame=grid.frame,

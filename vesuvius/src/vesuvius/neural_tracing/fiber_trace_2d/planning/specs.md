@@ -14,6 +14,8 @@
 - Strip centerlines are sampled from all `line_points` with cubic Hermite interpolation over arc length; control points only select the strip anchor.
 - The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
 - The implementation should reuse/export VC3D side-strip coordinate APIs when possible, or port the same algorithm with only small rounding/interpolation differences.
+- Dense side-strip coordinate generation may use torch vectorization for per-pixel Hermite interpolation and normal interpolation, but it must preserve the existing VC3D/Lasagna frame construction semantics.
+- Augmentation visualization may build and reuse CP-local source geometry once per selected sample across all augmentation variants, as long as each variant still samples final image values from transformed coordinates.
 - Image loading samples base-volume Zarr values from explicit coordinates.
 - Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
 - Interactive/progressive VC3D `tryGetChunk` semantics are not acceptable for this loader path because they can queue I/O and return an all-invalid first sample.
@@ -28,6 +30,7 @@
 - Geometric strip augmentations operate on strip coordinates before image sampling.
 - Geometric augmentation builds an oversized strip-coordinate source area, maps output patch pixels into that source, and samples the volume once at the final augmented coordinates to avoid edge and image reinterpolation artifacts.
 - Training line targets and debug line overlays are geometric coordinate products, not raster images. The line must be represented by strip/output pixel coordinates after the same geometric coordinate transform used for image sampling.
+- Transformed line coordinates should be computed as vectorized coordinate products where possible; any fallback must still derive coordinates from the geometric source-to-output mapping, not from a rasterized line.
 - The line must never be transformed by resampling a raster line mask. No geometric augmentation may be implemented as an image-space transform of a previously rasterized line, mask, or image patch.
 - Debug visualization may rasterize the transformed line coordinates only as the final drawing step, with fixed screen-space thickness/opacity, so line thickness and sharpness are not affected by scale, rotation, shear, or interpolation artifacts.
 - Any future training target derived from the fiber line must use the same transformed output pixel coordinates as the sampled image, so labels and image pixels remain aligned exactly.
