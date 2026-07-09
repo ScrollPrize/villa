@@ -28,7 +28,21 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'get_started' },
         { type: 'doc', id: 'prizes' },
-        { type: 'doc', id: '2026_open_problems' },
+        {
+          type: 'category',
+          label: 'Open Problems',
+          collapsible: true,
+          collapsed: true,
+          link: { type: 'doc', id: '2026_open_problems' },
+          items: [
+            { type: 'doc', id: 'tutorial1' },
+            { type: 'doc', id: 'tutorial2' },
+            { type: 'doc', id: 'tutorial3' },
+            { type: 'doc', id: 'segmentation' },
+            { type: 'doc', id: 'tutorial5' },
+            { type: 'doc', id: 'tutorial_spiral' },
+          ],
+        },
       ],
     },
     {
@@ -40,21 +54,6 @@ const sidebars = {
       items: [
         { type: 'doc', id: 'data_browser', label: 'Data Browser' },
         { type: 'doc', id: 'data_datasets' },
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Tutorials',
-      collapsible: true,
-      collapsed: true,
-      link: { type: 'doc', id: 'tutorial' },
-      items: [
-        { type: 'doc', id: 'tutorial1' },
-        { type: 'doc', id: 'tutorial2' },
-        { type: 'doc', id: 'tutorial3' },
-        { type: 'doc', id: 'segmentation' },
-        { type: 'doc', id: 'tutorial5' },
-        { type: 'doc', id: 'tutorial_spiral' },
       ],
     },
     { type: 'doc', id: 'faq' },
@@ -88,6 +87,7 @@ const sidebars = {
       collapsed: true,
       items: [
         { type: 'doc', id: 'master_plan' },
+        { type: 'doc', id: 'tutorial' },
         { type: 'doc', id: 'unwrapping' },
         { type: 'doc', id: 'tutorial_VC' },
         { type: 'doc', id: 'grand_prize' },

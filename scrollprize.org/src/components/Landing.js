@@ -713,9 +713,7 @@ export function Landing() {
                   Vesuvius Challenge is a machine learning, computer vision,
                   and geometry competition that is{" "}
                   <a href="/grandprize">reading</a> the carbonized Herculaneum
-                  scrolls — without opening them. Our current challenge:{" "}
-                  <a href="/get_started">join the community</a> and read entire
-                  scrolls.
+                  scrolls without opening them.
                 </p>
                 <div className="vc-hero__ctas">
                   <a className="vc-btn" href="/get_started">

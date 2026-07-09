@@ -138,8 +138,6 @@ const config = {
           sidebarPath: require.resolve("./sidebars.js"),
           sidebarCollapsible: true,
           breadcrumbs: false,
-          editUrl:
-              "https://github.com/ScrollPrize/villa/tree/main/scrollprize.org",
           remarkPlugins: [remarkMath],
           rehypePlugins: [[rehypeKatex, { strict: false }], rehypeImageDimensions],
         },
@@ -182,7 +180,6 @@ const config = {
             { to: "/prizes", label: "Prizes", position: "left" },
             { to: "/2026_open_problems", label: "Open Problems", position: "left" },
             { to: "/data", label: "Data", position: "left" },
-            { to: "/tutorial", label: "Tutorials", position: "left" },
             { to: "/winners", label: "Milestones", position: "left" },
             {
               type: "dropdown",

@@ -136,7 +136,7 @@
   width: 100%;
   height: 100%;
   object-fit: cover;
-  object-position: 72% center;
+  object-position: 72% 30%;
   opacity: 0.35; /* demoted backdrop, spec cap ≤40% */
 }
 /* Solid→transparent overlay ON MEDIA (allowed masking gradient): the text
@@ -145,8 +145,8 @@
 .vc-landing .vc-hero__scrim {
   position: absolute;
   inset: 0;
-  background: linear-gradient(90deg, var(--vc-bg) 32%, transparent 78%),
-    linear-gradient(0deg, var(--vc-bg) 4%, transparent 36%);
+  background: linear-gradient(180deg, var(--vc-bg) 40%, transparent 82%),
+    linear-gradient(0deg, var(--vc-bg) 2%, transparent 16%);
 }
 .vc-landing .vc-hero__content {
   position: relative;
@@ -154,7 +154,7 @@
   width: 100%;
 }
 .vc-landing .vc-hero__title {
-  font-size: clamp(2.25rem, 3.4vw, 3rem);
+  font-size: clamp(2rem, 3vw, 2.625rem);
   font-weight: 700;
   letter-spacing: -0.015em;
   line-height: 1.05;
@@ -163,7 +163,7 @@
   margin: 0 0 12px;
 }
 .vc-landing .vc-hero__tagline {
-  font-size: clamp(1.125rem, 1.5vw, 1.375rem);
+  font-size: clamp(1rem, 1.35vw, 1.25rem);
   font-weight: 700;
   letter-spacing: -0.01em;
   line-height: 1.15;
@@ -261,7 +261,7 @@
   flex: 0 0 auto;
 }
 .vc-landing .vc-hero__reveal-title {
-  font-size: 0.9375rem;
+  font-size: 0.875rem;
   font-weight: 600;
   color: var(--vc-text);
   min-width: 0;
@@ -1022,8 +1022,8 @@
     opacity: 0.25;
   }
   .vc-landing .vc-hero__scrim {
-    background: linear-gradient(0deg, var(--vc-bg) 12%, transparent 64%),
-      linear-gradient(90deg, var(--vc-bg) 8%, transparent 92%);
+    background: linear-gradient(180deg, var(--vc-bg) 52%, transparent 88%),
+      linear-gradient(0deg, var(--vc-bg) 4%, transparent 18%);
   }
   .vc-landing .vc-hero__intro {
     font-size: 1rem;

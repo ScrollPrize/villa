@@ -321,6 +321,16 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - New assets: `hero-reveal-end-960.webp` (29 KB), `hero-reveal-start-960.webp` (7 KB), generated from hero-reveal.webm.
 **Files:** `src/components/{Landing,LatestPosts}.js`, `src/css/{landing,chrome}.css`, `static/img/firstscroll/hero-reveal-{start,end}-960.webp` (new).
 
+## C37 — hero polish, volcano repositioned, TOC beside content, tutorials under Open Problems
+
+- **Hero**: intro cut to one sentence ("…reading the carbonized Herculaneum scrolls without opening them."); title clamp 2.25–3rem → 2–2.625rem, tagline and reveal caption a step smaller. **Volcano moved below the text**: scrim flipped from left-solid/right-visible (the reveal card was covering the volcano zone) to top-solid/bottom-visible — the eruption glow now rises along the hero's lower band on desktop and mobile.
+- **News strip**: title 14→13px, meta 11→10px.
+- **"Edit this page" removed site-wide** (docs `editUrl` dropped).
+- **Docs TOC now sits beside the main column**: `--ifm-container-width` 1100→1000px; TOC gap to the article 89px → 16px at 1440.
+- **Tutorials restructure**: the outdated tutorials hub (`/tutorial`) moved to Archive (URL alive); the six tutorials now nest as a collapsed expandable under **Open Problems** in the sidebar (category link = the post); the post gains a "🎓 Related tutorials" section with a stage-by-stage expandable list; the navbar "Tutorials" item removed (Open Problems is the entry point).
+- Verified at 360/1024/1440/1920: zero horizontal overflow everywhere; build green (link checker).
+**Files:** `src/components/Landing.js`, `src/css/{landing,chrome}.css`, `docusaurus.config.js`, `sidebars.js`, `docs/37_2026_open_problems.md`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
