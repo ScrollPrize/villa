@@ -305,15 +305,7 @@ export default function ScrollDetailPage(props) {
                   {unrolledPctTxt}
                 </dd>
                 <dt>Segments</dt>
-                <dd>
-                  {segmentsTxt}
-                  {progress.patches ? (
-                    <span style={{ color: "var(--dim)", fontSize: "12px" }}>
-                      {" "}
-                      / {Number(progress.patches).toLocaleString()} patches
-                    </span>
-                  ) : null}
-                </dd>
+                <dd>{segmentsTxt}</dd>
                 <dt>Min pixel size</dt>
                 <dd>{scroll.min_px ? `${scroll.min_px} µm` : "—"}</dd>
                 <dt>Scans</dt>

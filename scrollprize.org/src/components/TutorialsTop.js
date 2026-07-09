@@ -67,11 +67,11 @@ export function TutorialsTop({ highlightId, links = {}, labels = {} } = {}) {
         <div className="text-sm">&nbsp;</div>
       </div>
 
-      {/* This one uses the JPG image and is square */}
       <Thumb
         href={links.representation || "/tutorial2"}
         label={labels.representation || "Representation"}
-        imgSrc="/img/segmentation/normals_z0022.jpg"
+        videoSrc="/img/tutorial-thumbs/top-representation-small.webm"
+        poster="/img/tutorial-thumbs/top-representation-small.webp"
         highlight={highlightId == 3}
       />
 

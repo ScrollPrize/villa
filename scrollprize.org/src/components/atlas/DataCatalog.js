@@ -134,9 +134,6 @@ export default function DataCatalog({ scroll }) {
   const segments = scroll.n_segments;
   const segmentsTxt =
     segments != null ? Number(segments).toLocaleString() : "—";
-  const patchesTxt = progress.patches
-    ? ` / ${Number(progress.patches).toLocaleString()} patches`
-    : "";
 
   return (
     <div className="panel full catalog">
@@ -162,10 +159,7 @@ export default function DataCatalog({ scroll }) {
           {scroll.n_scans} / {scroll.n_volumes}
         </dd>
         <dt>Segments</dt>
-        <dd>
-          {segmentsTxt}
-          {patchesTxt}
-        </dd>
+        <dd>{segmentsTxt}</dd>
         <dt>Formats</dt>
         <dd>CT volumes (TIFF stacks · OME-Zarr) · surface segments</dd>
         {predsTxt ? (

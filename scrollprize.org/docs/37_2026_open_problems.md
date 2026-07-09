@@ -60,14 +60,16 @@ Most of the code is publicly available in the GitHub [ScrollPrize](https://githu
 Hands-on guides for every stage of the pipeline described in this post:
 
 <details>
-<summary>Tutorials, stage by stage</summary>
+<summary>Tutorials</summary>
 
-- [Scanning](tutorial1) — how the scrolls are imaged with synchrotron micro-CT
-- [Representation](tutorial2) — working with the 3D volumes and derived data
-- [Segmentation](segmentation) — tracing papyrus surfaces interactively with VC3D
-- [Segmentation and Flattening](tutorial3) — the pipeline walkthrough from surface to flattened image
-- [Ink Detection](tutorial5) — training and running ink-detection models
+Up to date:
+
 - [Spiral Fitting](tutorial_spiral) — fitting the global spiral prior to a scroll
+- [Ink Detection](tutorial5) — training and running ink-detection models
+
+Archived (describe earlier tooling and data layouts):
+
+- [Scanning](tutorial1) · [Representation](tutorial2) · [Segmentation](segmentation) · [Segmentation and Flattening](tutorial3)
 
 </details>
 
