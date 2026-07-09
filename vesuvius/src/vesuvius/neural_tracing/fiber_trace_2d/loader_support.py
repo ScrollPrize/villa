@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 
@@ -13,6 +14,13 @@ class ZarrChunkRequest:
     store: Any
     store_identity: str
     key: str
+    cache_path: Path | None = None
+    empty_path: Path | None = None
+    remote_url: str | None = None
+    remote_chunk_key: str | None = None
+    cache_payload_format: str | None = None
+    persistent_extension: str | None = None
+    downloader: Callable[["ZarrChunkRequest"], bytes | None] | None = None
 
 
 def store_identity(store: Any) -> str:

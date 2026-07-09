@@ -161,3 +161,74 @@ Validation:
   - Result: passed.
 - `PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_2d.runner --help`
   - Result: passed.
+
+## Prefetch Progress Split
+
+- Split prefetch progress output into separate sample/dependency and download
+  bars, each with its own ETA.
+- Replaced the ambiguous `queued=` display with `downloads done/needed`; the
+  denominator is the number of chunks that were neither cache hits nor existing
+  `.empty` markers.
+- Added `download_done` to the prefetch summary for tests and log consumers.
+
+## Parallel Transparent Prefetch Implementation
+
+- Replaced loader prefetch's temporary per-offset profiling table and
+  `CoordinateSampler.prefetch_coords` calls with dependency-only chunk request
+  generation through the shared CP-local source-envelope path.
+- Kept normal image loading on VC3D blocking `sample_coords`, but made prefetch
+  use `collect_coords_dependencies` through `chunk_requests_for_coords`.
+- Added VC3D cache-path helpers to the Python chunk store so prefetch can
+  classify existing data files and existing `.empty` markers before scheduling
+  any fetch work.
+- Added Python-side `.empty` marker writing for definitive missing chunks.
+- Implemented a bounded two-stage prefetch pipeline: deterministic sample
+  dependency producers and capped download workers, with global chunk dedupe.
+- Replaced prefetch progress with a compact line showing samples, patches,
+  chunks, queued downloads, hits, missing chunks, downloads, errors, MiB/s, and
+  ETA.
+- Updated the prefetch regression test so it verifies dedupe, cache hits,
+  `.empty` hits, downloaded chunks, newly missing chunks, and that
+  `prefetch_coords` is not used by loader prefetch.
+
+Validation:
+
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -q`
+  - Result: `34 passed`.
+- `PYTHONPATH=vesuvius/src:. python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/sampling.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader_support.py`
+  - Result: passed.
+- `PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_2d.train --help`
+  - Result: passed.
+- `PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_2d.runner --help`
+  - Result: passed.
+
+## Python-Owned Prefetch Download Boundary
+
+- Removed the VC3D `prefetch_chunk` binding and the backing
+  `ChunkCache::fetchPersistentChunkBlocking` API that performed persistent
+  cache downloads/writes from VC3D.
+- Added dependency-only VC3D chunk metadata: chunk source key/URL, final
+  persistent cache data path, `.empty` marker path, persistent extension, and
+  whether the remote source payload is safe to copy directly into the
+  persistent cache.
+- Limited Python prefetch writes to uncompressed direct-source chunks where the
+  remote bytes are exactly the `.bin` payload VC3D expects. Unsupported
+  compressed/filtered/sharded/byte-swapped chunks fail immediately with a clear
+  error instead of retrying or guessing a cache format.
+- Changed Python and VC3D `.empty` marker writers to create zero-byte marker
+  files.
+- Replaced Python prefetch fallback reads (`prefetch_chunk`, `read_chunk`, and
+  generic store indexing) with explicit Python URL/download or test downloader
+  hooks, unique temp files, and atomic rename to the VC3D-provided cache path.
+- Updated progress ETA so download ETA extrapolates from observed chunks per
+  sample and observed cache-hit/known-missing/download-needed ratios while
+  dependency generation is still incomplete.
+
+Validation:
+
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/sampling.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader_support.py`
+  - Result: passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result: `34 passed in 2.94s`.
+- `cmake --build volume-cartographer/build/python-bindings`
+  - Result: passed.

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "vc/core/render/IChunkedArray.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Sampling.hpp"
@@ -572,7 +573,14 @@ nb::tuple sampleCoords(Volume& volume,
     return nb::make_tuple(imageArr, validArr, statsDict);
 }
 
-std::vector<std::tuple<int, int, int, int>> collectCoordsDependencies(
+std::string joinUrl(std::string base, const std::string& key)
+{
+    while (!base.empty() && base.back() == '/')
+        base.pop_back();
+    return base.empty() ? std::string{} : base + "/" + key;
+}
+
+nb::list collectCoordsDependencies(
     Volume& volume,
     const FloatCoords& coordsXyz,
     const BoolMask& validMask,
@@ -592,10 +600,41 @@ std::vector<std::tuple<int, int, int, int>> collectCoordsDependencies(
             coverage,
             vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
     }
-    std::vector<std::tuple<int, int, int, int>> out;
-    out.reserve(keys.size());
+    nb::list out;
+    const std::string remoteUrl = volume.remoteUrl();
+    auto* cache = dynamic_cast<vc::render::ChunkCache*>(volume.chunkedCache());
+    if (!cache)
+        throw std::runtime_error("VC3D dependency metadata requires a ChunkCache-backed volume");
     for (const auto& key : keys) {
-        out.emplace_back(key.level, key.iz, key.iy, key.ix);
+        const auto dependency = cache->persistentChunkDependency(
+            key.level,
+            key.iz,
+            key.iy,
+            key.ix);
+        nb::dict item;
+        item["level"] = key.level;
+        item["iz"] = key.iz;
+        item["iy"] = key.iy;
+        item["ix"] = key.ix;
+        item["key"] = std::to_string(key.level) + "/" +
+                      std::to_string(key.iz) + "/" +
+                      std::to_string(key.iy) + "/" +
+                      std::to_string(key.ix);
+        item["valid"] = dependency.valid;
+        item["remote_chunk_key"] = dependency.sourceChunkKey
+            ? *dependency.sourceChunkKey
+            : std::string{};
+        item["remote_url"] = dependency.sourceChunkKey
+            ? joinUrl(remoteUrl, *dependency.sourceChunkKey)
+            : std::string{};
+        item["cache_path"] = dependency.persistentPath.string();
+        item["empty_path"] = dependency.persistentEmptyPath.string();
+        item["persistent_extension"] = dependency.persistentExtension;
+        item["cache_payload_format"] = dependency.sourcePayloadMatchesPersistentCache
+            ? std::string{"source_bytes"}
+            : std::string{"unsupported"};
+        item["source_payload_matches_cache"] = dependency.sourcePayloadMatchesPersistentCache;
+        out.append(std::move(item));
     }
     return out;
 }

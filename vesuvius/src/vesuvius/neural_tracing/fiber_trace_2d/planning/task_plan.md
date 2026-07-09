@@ -1,193 +1,227 @@
-# Task Plan: Parallel Transparent Prefetch
+# Task Plan: Python-Owned Parallel Prefetch Downloads
 
 ## Scope
 
-Replace the current 2D fiber-strip prefetch implementation with a transparent
-two-stage pipeline:
+The prefetch path should have one clean split of responsibility:
 
-1. Generate deterministic CP-local prefetch envelopes and map them to required
-   base-volume chunks.
-2. Deduplicate, classify, and download those chunks in Python while respecting
-   the VC3D persistent cache layout, including `.empty` markers for known
-   missing chunks.
+- VC3D calculates required base-volume chunk dependencies for the configured
+  strip coordinate envelopes.
+- Python owns everything after that: cache-path checks, deduplication,
+  `.empty` marker handling, downloading, retrying, temporary files, atomic
+  renames, and progress reporting.
 
-The training, runner, augment-vis, and normal image-loading paths must keep
-their existing shared source-strip and coordinate-generation behavior.
+Do not add or keep VC3D code whose purpose is downloading chunks, reading chunk
+payloads, or writing persistent-cache files for this prefetch feature.
 
-## Requirements From The Todo
+## Requirements
 
-- Add a VC3D dependency-only binding that does not call blocking image sampling.
-- The binding returns all chunk dependencies for explicit coordinate envelopes.
-- Python performs cache-path checking and global chunk deduplication.
-- Coordinate/dependency generation runs in parallel with chunk fetching.
-- Several dependency workers may run concurrently to keep CPU-side geometry and
-  chunk mapping busy.
-- Downloading runs Python-side with bounded concurrency, capped at 16 workers.
-- Transient connection failures are retried until a 10-minute deadline.
-- Missing zarr chunks are not repeatedly fetched.
-- Missing chunks are recorded using VC3D-compatible persistent-cache markers:
-  `<cache>/level_<level>/<iz>/<iy>/<ix>.empty`.
-- Temporary prefetch debug/profiling rows are removed.
-- Progress reports samples processed, queued chunks, downloads, hits, missing
-  chunks, errors, throughput, and ETA.
+- Revert accidental VC3D changes unrelated to dependency calculation:
+  - remove any new VC3D blocking chunk-fetch/prefetch API;
+  - remove any Python binding that exposes VC3D chunk fetching;
+  - remove any VC3D persistent-cache write changes made only for Python
+    prefetch downloading, except the requested `.empty` marker semantic change.
+- Change VC3D's existing `.empty` marker writer to create zero-byte marker
+  files. VC3D reads `.empty` markers by existence only, so this should preserve
+  read behavior while matching the Python marker convention.
+- Keep only the VC3D dependency/chunk-calculation function if it is already
+  needed for prefetch.
+- `.empty` files are zero-byte empty marker files:
+  - no temporary file is needed for `.empty`;
+  - create the final marker directly for definitive missing chunks only;
+  - never create `.empty` for transient network/decode/cache errors.
+- Python must perform the actual data download/cache write:
+  - derive each chunk's remote URL and final persistent cache path;
+  - download/decode/write the chunk payload in Python as required by the cache
+    format VC3D will later read;
+  - write payloads to a unique temp file in the same cache directory;
+  - atomically rename temp file to the final data path after a complete write;
+  - clean up temp files on failed attempts where possible.
+- Use up to 16 parallel Python download workers.
+- Do not use VC3D `sample_coords`, VC3D image sampling, or VC3D chunk-fetch
+  calls as the production download path.
+- Remove production prefetch fallbacks that call VC3D `prefetch_chunk`,
+  VC3D `read_chunk`, `sample_coords`, or generic `store[...]` indexing for
+  remote VC3D chunk fetching.
+- Ensure VC3D chunk dependency output provides enough information for Python to
+  consume directly:
+  - remote zarr chunk key/URL;
+  - final persistent cache data path;
+  - expected persistent cache extension/format;
+  - `.empty` marker path.
+- Python must not reconstruct VC3D remote/cache paths for VC3D chunk requests.
+- Keep dependency discovery independent of the specific random augmentation
+  draw by using the configured maximum augmentation envelope.
+- Preserve deterministic sample order and deterministic set of prefetched
+  samples/chunks.
 
 ## Design
 
-### VC3D Binding
+### VC3D Dependency Boundary
 
-- Extend the VC3D Python binding with a dependency/introspection function for
-  coordinate sampling, separate from `sample_coords`.
-- Reuse the existing `ChunkedPlaneSampler::collectCoordsDependencies(...)`
-  logic so chunk coverage matches the production coordinate sampler.
-- Return chunk keys as structured dictionaries or tuples:
-  `level, iz, iy, ix`.
-- Also expose enough cache metadata from `Volume` for Python to derive paths:
-  `remote_url`, `remote_cache_path`, chunk shape/grid if needed, and the
-  persistent extension used for present chunks.
-- Keep this function non-fetching. It must not call
-  `ChunkCache::prefetchChunks(...)`, `getChunkBlocking(...)`, or
-  `sampleCoordsFineToCoarse(...)`.
-- Preserve the existing blocking `sample_coords` image-loading path for actual
-  batches.
+- Audit `volume-cartographer` diffs and revert changes that fetch or write
+  chunks.
+- Keep or extend the dependency-only API so each dependency item includes chunk
+  coordinates plus VC3D-owned path/format metadata: remote chunk source/path,
+  final persistent cache data path, expected cache format/extension, and
+  `.empty` marker path. It must not perform chunk download/fetch or image
+  sampling.
+- The Python side should treat VC3D dependency output as immutable chunk IDs:
+  `(level, iz, iy, ix)` plus VC3D-provided remote/cache path metadata.
+- Update VC3D `writePersistentEmpty(...)` so it opens/truncates the marker file
+  and writes no bytes.
+- Do not add a VC3D `prefetch_chunk` or equivalent download API for this
+  feature.
 
-### Python Chunk Request Model
+### Python Chunk Requests
 
-- Add a small prefetch request type in `sampling.py` or a helper module:
-  `store_identity, level, iz, iy, ix, remote_url, cache_path, empty_path`.
-- For VC3D requests, use the VC3D persistent cache layout:
-  - data path under `<remote_cache_path>/level_<level>/<iz>/<iy>/<ix><ext>`;
-  - missing marker under
-    `<remote_cache_path>/level_<level>/<iz>/<iy>/<ix>.empty`.
-- The prefetcher treats existing data files as hits.
-- The prefetcher treats existing `.empty` files as known-missing hits.
-- If a download returns a definitive not-found result, write the `.empty`
-  marker and count it as known missing.
-- If a download has a transient failure, retry until the configured retry
-  deadline.
+- Represent each chunk request with:
+  - store identity;
+  - zarr level;
+  - chunk index `(iz, iy, ix)`;
+  - VC3D-provided remote chunk URL or remote store key;
+  - VC3D-provided final persistent cache data path including extension;
+  - VC3D-provided expected payload/cache format;
+  - VC3D-provided `.empty` marker path.
+- Deduplicate requests globally by the stable chunk identity.
+- Before queueing a download, check:
+  - existing data path: count as cache hit;
+  - existing `.empty`: count as known missing;
+  - otherwise queue one download for that chunk.
+- If the request lacks a remote source or exact final cache path/format, fail
+  prefetch with a clear error. Do not reconstruct VC3D paths in Python and do
+  not fall back to VC3D chunk reads.
 
-### Remote Downloading
+### Python Download And Cache Write
 
-- Implement download logic in Python for the base-volume chunks produced by the
-  dependency stage.
-- Derive chunk URLs from the opened remote zarr URL and chunk key/path mapping
-  used by VC3D.
-- Write to a temporary file in the cache directory, then atomically rename.
-- Do not overwrite existing data or `.empty` markers discovered after a request
-  was queued.
-- Keep downloads bounded by `prefetch_workers`, capped at 16.
-- Use a retry loop with backoff until `volume_cache_retry_seconds` if configured,
-  otherwise use the todo default of 600 seconds for prefetch downloads.
-- Distinguish:
-  - cache hit;
-  - known missing marker;
-  - newly downloaded;
-  - newly marked missing;
-  - transient failure still retrying;
-  - final error.
+- Implement a Python download/write helper with this sequence:
+  1. Re-check final data path and `.empty` marker after the chunk reaches a
+     worker.
+  2. Fetch the remote chunk payload or decoded chunk bytes in the format needed
+     by the VC3D persistent cache.
+  3. Write to a unique temp path in the final cache directory.
+  4. Flush/close the temp file.
+  5. Atomically rename with `os.replace(temp_path, final_path)`.
+  6. Remove the temp file if the attempt fails before rename.
+- Unique temp names should include at least final filename, process id, thread
+  id or random token, and an attempt token.
+- Use direct final-file creation for zero-byte `.empty` only when the remote
+  result is a definitive not-found/missing chunk.
+- Retry transient failures until the configured retry deadline, defaulting to
+  600 seconds for prefetch.
+- For remote VC3D prefetch, the implementation must not call:
+  - `request.store.prefetch_chunk`;
+  - `request.store.read_chunk`;
+  - `request.store[...]`;
+  - VC3D `sample_coords`.
+- Preserve tests/local fake stores with explicit fake download hooks instead of
+  relying on generic store indexing.
 
-### Parallel Pipeline
+### Parallelism
 
-- Dependency producers:
-  - iterate deterministic sample indices in the same order as training;
-  - build the shared CP-local source-strip once per sample;
-  - derive all configured strip-z offset envelopes from that source;
-  - call the VC3D dependency-only function for each envelope;
-  - push chunk requests into a bounded queue.
-- Download consumers:
-  - deduplicate chunk requests globally by `(store_identity, level, iz, iy, ix)`;
-  - perform path checks before queueing network work;
-  - download missing real chunks with the bounded worker pool;
-  - write `.empty` for definitive missing chunks.
-- The pipeline should allow dependency generation to continue while downloads
-  are in flight.
-- Use deterministic sample indexing only; parallel scheduling must not change
-  which samples/chunks are requested.
+- Dependency workers:
+  - generate deterministic sample coordinate envelopes;
+  - call dependency-only VC3D chunk calculation;
+  - push deduplicated chunk requests toward the download stage.
+- Download workers:
+  - run Python download/cache writes;
+  - cap concurrency at 16;
+  - avoid duplicate concurrent writes for the same chunk.
+- Parallel scheduling must not affect which samples or chunks are requested.
 
 ### Progress Output
 
-- Remove the temporary per-source/per-offset debug timing table.
-- Print a concise progress line, refreshed in place when possible:
-  - samples_done / samples_total;
-  - patches_done / patches_total;
-  - unique_chunks_seen;
-  - queued_for_download;
-  - cache_hits;
-  - known_missing;
-  - downloaded;
-  - download_errors;
-  - MiB downloaded;
-  - current MiB/s;
-  - ETA.
-- ETA should account for incomplete dependency generation by estimating final
-  chunk count from the observed chunks-per-sample and hit/missing/download
-  ratios so far.
-- The final summary should print one stable multi-field line suitable for logs.
+- Keep two progress lines or two clearly separated progress sections:
+  - sample/dependency progress with its own ETA;
+  - download progress with its own ETA.
+- Report:
+  - samples done/total;
+  - patches done/total;
+  - unique chunks seen;
+  - cache hits;
+  - known missing markers;
+  - chunks needing download;
+  - chunks downloaded;
+  - active/download errors;
+  - MiB downloaded and MiB/s;
+  - separate sample ETA and download ETA.
+- Download ETA must account for incomplete dependency generation. While sample
+  dependency workers are still running, estimate the final download-needed count
+  from observed chunks-per-sample and observed cache-hit / known-missing /
+  download-needed ratios, then combine that estimate with the observed download
+  completion rate.
+- Once dependency generation is complete, download ETA uses the exact remaining
+  download-needed count.
+- Do not label unresolved queued chunks as downloaded.
+- Do not print temporary per-offset profiling rows in normal prefetch mode.
 
 ## Spec Update
 
-Update `planning/specs.md`:
+Update `planning/specs.md` to state:
 
-- Replace the current prefetch statement that says VC3D prefetch uses the same
-  blocking coordinate sampling/cache path with the new dependency-only prefetch
-  semantics.
-- State that normal image loading still uses blocking `sample_coords`, while
-  prefetch uses dependency-only chunk discovery plus Python-side cache/dl logic.
-- State that missing chunks are represented by VC3D-compatible `.empty` marker
-  files in the persistent cache.
-- State that prefetch is parallelized as dependency producers plus bounded
-  download consumers, capped at 16 downloads.
-- State that the prefetch path remains base-volume-only and augmentation-envelope
-  based.
+- Prefetch uses VC3D only for dependency/chunk calculation.
+- Python owns download/cache behavior.
+- Data chunks are written through unique temp files followed by atomic rename.
+- `.empty` markers are direct zero-byte empty marker files and are only created
+  for definitive missing chunks.
+- VC3D also writes zero-byte `.empty` markers and reads them by existence.
+- Up to 16 Python download workers are used.
+- VC3D image sampling and chunk fetching are not part of production prefetch
+  downloading.
+- Remote/cache path metadata must be explicit enough that Python never guesses
+  or reconstructs VC3D persistent cache paths/formats.
+- Prefetch download ETA is extrapolated from observed download rate and observed
+  hit/missing/download-needed ratio while dependency generation is incomplete.
 
 ## Docs Updates
 
-Update `docs/code_structure.md`:
+Update `docs/code_structure.md` to document:
 
-- Document the new VC3D dependency-only binding and Python prefetch pipeline.
-- Document the cache file conventions for data chunks and `.empty` missing
-  markers.
-- Document the prefetch progress counters and retry behavior.
-- Remove references that describe prefetch as sampling image values and
-  discarding them.
+- The dependency-only VC3D boundary.
+- The Python prefetch pipeline and worker roles.
+- Cache hit, known-missing, download, retry, and atomic-write behavior.
+- Zero-byte `.empty` marker behavior on both Python and VC3D sides.
+- The two progress views and what their ETAs mean.
 
-Update `planning/task_log.md` after implementation with:
+Update planning docs after implementation:
 
-- Important implementation decisions.
-- Any deviations from this plan.
-- Validation commands and results.
-
-Update `planning/changelog.md` with a short entry after implementation.
+- `planning/status.md`: current checklist and validation status.
+- `planning/task_log.md`: implementation decisions, deviations, commands, and
+  results.
+- `planning/changelog.md`: one concise entry for the prefetch fix.
 
 ## Testing
 
-- Add or update unit tests with fake/local samplers for:
-  - dependency requests are deduplicated globally;
-  - existing data cache paths are counted as hits and not downloaded;
-  - existing `.empty` paths are counted as known missing and not downloaded;
-  - definitive 404/not-found responses write `.empty` markers;
-  - transient download failures retry and eventually succeed/fail by deadline;
-  - progress summary counters are internally consistent.
-- Add a focused VC3D-adapter test if feasible without network:
-  - monkeypatch/fake `vc.volume.Volume` to verify dependency-only calls do not
-    call `sample_coords`;
-  - verify base-coordinate to selected-level scaling is preserved in dependency
-    collection.
+- Add/update unit tests with fake chunk stores/downloaders for:
+  - data cache hit skips download;
+  - `.empty` marker skips download;
+  - definitive missing response creates a zero-byte `.empty` marker directly;
+  - transient failure retries and eventually succeeds/fails by deadline;
+  - data writes use unique temp files and atomic rename;
+  - duplicate requests trigger at most one download;
+  - download worker limit is capped at 16;
+  - progress counters distinguish chunks needed, downloaded, hits, and missing;
+  - ETA estimation uses hit/missing/download-needed ratios before dependency
+    generation is complete and exact remaining download count after it is
+    complete.
+- Add a regression check that the prefetch path does not call VC3D image
+  sampling or VC3D chunk fetching.
+- Add/adjust a VC3D unit or smoke check, if available, that
+  `writePersistentEmpty(...)` creates an existing zero-byte marker accepted by
+  `readPersistentEmpty(...)`.
 - Run:
   - `python -m py_compile` for touched Python files;
-  - focused `fiber_trace_2d` tests with plugin autoload disabled;
-  - training and runner CLI help smoke checks.
+  - focused `fiber_trace_2d` pytest suite with plugin autoload disabled;
+  - CLI smoke for prefetch help or a mocked/local prefetch path.
 - Do not require network access for automated tests.
 
 ## Risks And Checks
 
-- The remote chunk URL mapping must exactly match VC3D's zarr fetcher. If the
-  binding cannot expose enough information, add the minimal VC3D accessor rather
-  than duplicating hidden path logic in Python.
-- Python-side downloads must write cache bytes in the same encoded/raw format
-  expected by VC3D for that volume. If VC3D stores transformed persistent bytes,
-  expose the expected remote/cache path and extension through VC3D rather than
-  guessing.
-- `.empty` markers must be written only for definitive missing chunks, not for
-  transient network errors.
-- Parallel dependency workers must not mutate shared loader state in a way that
-  changes deterministic sample selection.
+- The Python writer must produce exactly the cache file format VC3D expects for
+  the current zarr codec using VC3D-provided path/format metadata. If VC3D does
+  not provide enough metadata, stop and report the missing metadata instead of
+  guessing or reconstructing paths in Python.
+- Atomic rename only protects final visibility if the temp file is in the same
+  filesystem/directory as the final cache path.
+- Zero-byte `.empty` marker creation must be limited to definitive not-found
+  cases.
+- Reverting VC3D fetch code must not remove dependency-only chunk calculation.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -100,7 +101,7 @@ class Vc3dCoordinateSampler(CoordinateSampler):
     def chunk_requests_for_coords(
         self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
     ) -> list[ZarrChunkRequest]:
-        keys = self.volume.collect_coords_dependencies(
+        dependencies = self.volume.collect_coords_dependencies(
             _coords_zyx_base_to_xyz(coords_zyx_base),
             np.ascontiguousarray(valid_mask, dtype=np.bool_),
             self.level,
@@ -109,13 +110,37 @@ class Vc3dCoordinateSampler(CoordinateSampler):
         )
         store = _Vc3dChunkStore(self.volume)
         requests: list[ZarrChunkRequest] = []
-        for level, iz, iy, ix in keys:
-            requests.append(
-                ZarrChunkRequest(
-                    store=store,
-                    store_identity=self.store_identity,
-                    key=f"{int(level)}/{int(iz)}/{int(iy)}/{int(ix)}",
+        for dependency in dependencies:
+            if isinstance(dependency, dict):
+                def _path_or_none(name: str) -> Path | None:
+                    value = str(dependency.get(name, "") or "")
+                    return Path(value) if value else None
+
+                key = str(dependency.get("key", ""))
+                if not key:
+                    level = int(dependency["level"])
+                    iz = int(dependency["iz"])
+                    iy = int(dependency["iy"])
+                    ix = int(dependency["ix"])
+                    key = f"{level}/{iz}/{iy}/{ix}"
+                requests.append(
+                    ZarrChunkRequest(
+                        store=store,
+                        store_identity=self.store_identity,
+                        key=key,
+                        cache_path=_path_or_none("cache_path"),
+                        empty_path=_path_or_none("empty_path"),
+                        remote_url=str(dependency.get("remote_url", "")) or None,
+                        remote_chunk_key=str(dependency.get("remote_chunk_key", "")) or None,
+                        cache_payload_format=str(dependency.get("cache_payload_format", "")) or None,
+                        persistent_extension=str(dependency.get("persistent_extension", "")) or None,
+                    )
                 )
+                continue
+            raise RuntimeError(
+                "VC3D collect_coords_dependencies returned legacy tuple dependencies. "
+                "Rebuild/use the updated volume-cartographer Python bindings so chunk "
+                "metadata includes remote_url, cache_path, empty_path, and cache_payload_format."
             )
         return requests
 
@@ -123,17 +148,6 @@ class Vc3dCoordinateSampler(CoordinateSampler):
 class _Vc3dChunkStore:
     def __init__(self, volume: Any) -> None:
         self.volume = volume
-
-    def __getitem__(self, key: str) -> bytes:
-        level_s, iz_s, iy_s, ix_s = str(key).split("/")
-        chunk = self.volume.read_chunk(
-            int(level_s),
-            (int(iz_s), int(iy_s), int(ix_s)),
-            True,
-        )
-        if chunk is None:
-            return b""
-        return np.asarray(chunk).tobytes()
 
 
 class NumpyZarrCoordinateSampler(CoordinateSampler):
@@ -161,23 +175,13 @@ class NumpyZarrCoordinateSampler(CoordinateSampler):
         unique: dict[tuple[str, str], ZarrChunkRequest] = {
             (request.store_identity, request.key): request for request in requests
         }
-        downloaded = 0
-        bytes_read = 0
-        errors = 0
-        for request in unique.values():
-            try:
-                data = request.store[request.key]
-                bytes_read += len(data) if isinstance(data, (bytes, bytearray, memoryview)) else len(bytes(data))
-                downloaded += 1
-            except Exception:
-                errors += 1
         return {
             "prefetch_mode": "chunk_requests",
             "generated": len(requests),
             "unique_chunks": len(unique),
-            "downloaded": downloaded,
-            "bytes": bytes_read,
-            "errors": errors,
+            "downloaded": 0,
+            "bytes": 0,
+            "errors": 0,
             "valid_pixels": int(np.count_nonzero(valid_mask)),
         }
 

@@ -712,25 +712,77 @@ def test_deterministic_sample_index_independent_of_batch_size(tmp_path: Path) ->
     assert a == b
 
 
-def test_prefetch_uses_sampler_level_prefetch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_prefetch_uses_dependency_chunks_and_cache_markers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     config = load_config(_write_config(tmp_path, batch_size=1))
     loader = _make_loader(config)
-    calls: list[tuple[np.ndarray, np.ndarray]] = []
 
-    def fake_prefetch(coords, valid):
-        calls.append((np.asarray(coords), np.asarray(valid)))
-        return {"unique_chunks": 2, "downloaded": 1, "bytes": 32, "errors": 0}
+    class Store:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+            self.calls: list[str] = []
 
-    monkeypatch.setattr(loader.records[0].sampler, "prefetch_coords", fake_prefetch)
+    store = Store(tmp_path / "cache")
+    store.root.mkdir(parents=True)
+    (store.root / "hit.bin").write_bytes(b"cached")
+    (store.root / "known_missing.empty").write_bytes(b"")
+
+    def downloader(request: ZarrChunkRequest) -> bytes | None:
+        store.calls.append(request.key)
+        if request.key == "new_missing":
+            return None
+        return b"\x01\x02"
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="test",
+            key=key,
+            cache_path=store.root / f"{key}.bin",
+            empty_path=store.root / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            cache_payload_format="source_bytes",
+            downloader=downloader,
+        )
+
+    def fake_chunk_requests(coords, valid):
+        del coords, valid
+        return [
+            request("hit"),
+            request("known_missing"),
+            request("download"),
+            request("new_missing"),
+            request("download"),
+        ]
+
+    def forbidden_prefetch(coords, valid):
+        del coords, valid
+        raise AssertionError("loader prefetch must not call sampler.prefetch_coords")
+
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
+    monkeypatch.setattr(loader.records[0].sampler, "prefetch_coords", forbidden_prefetch)
 
     summary = loader.prefetch(0, 1, workers=8)
 
-    assert len(calls) == 3
+    assert sorted(store.calls) == ["download", "new_missing"]
     assert summary["patches"] == 3
-    assert summary["generated"] == 6
-    assert summary["downloaded"] == 3
-    assert summary["bytes"] == 96
+    assert summary["generated"] == 4
+    assert summary["cache_hits"] == 1
+    assert summary["known_missing"] == 1
+    assert summary["newly_missing"] == 1
+    assert summary["missing"] == 2
+    assert summary["downloaded"] == 1
+    assert summary["queued_for_download"] == 2
+    assert summary["download_done"] == 2
+    assert summary["bytes"] == 2
     assert summary["errors"] == 0
+    assert (store.root / "new_missing.empty").is_file()
+    assert (store.root / "new_missing.empty").read_bytes() == b""
+    assert (store.root / "download.bin").read_bytes() == b"\x01\x02"
+    output = capsys.readouterr().out
+    assert "samples[" in output
+    assert "downloads[" in output
 
 
 class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):

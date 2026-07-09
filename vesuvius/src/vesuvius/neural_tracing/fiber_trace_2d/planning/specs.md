@@ -49,9 +49,17 @@
 - Prefetch uses the same shared source-strip implementation as training and augment-vis.
 - Prefetch is independent of any one random augmentation draw: for each selected CP and strip-z offset it covers the configured maximum augmentation envelope represented by the oversized source-strip coordinates.
 - Prefetch may conservatively cover more chunks than one concrete augmented training sample, but it should avoid misses for later random augmentations within the configured extrema.
-- Prefetch must use sampler-level cache-aware semantics for the base-volume sampler. For VC3D this means using the same blocking coordinate sampling/cache path as image loading, not a separate Python chunk-store path that cannot see VC3D cache state.
-- Prefetch reports progress while processing samples/strip patches and includes dependency/download/error counters where the sampler can report them.
-- Prefetch parallelism is capped at 16 workers.
+- Prefetch must use dependency-only chunk discovery for the base-volume sampler. For VC3D this means `collect_coords_dependencies` over the same conservative source-envelope coordinates, without `sample_coords`, image-value sampling, or discarded sampled pixels.
+- VC3D dependency discovery must return explicit per-chunk metadata for Python prefetch: remote chunk key/URL, final persistent cache data path, `.empty` marker path, persistent extension, and cache payload format.
+- Python prefetch must not reconstruct VC3D persistent cache paths or remote chunk keys; it consumes the metadata returned by VC3D dependency discovery.
+- Python prefetch currently supports only direct-source uncompressed chunks whose remote payload is exactly the persistent `.bin` payload VC3D expects. Compressed, filtered, sharded, byte-swapped, or otherwise non-direct payloads must fail clearly until explicit codec support is added.
+- Normal image loading still uses the VC3D blocking coordinate sampler, so training/export samples are decoded before image sampling returns.
+- Prefetch classifies VC3D persistent-cache files in Python: existing data files are cache hits, existing `<cache>/level_<level>/<iz>/<iy>/<ix>.empty` files are known-missing hits, and definitive missing chunks write that same zero-byte `.empty` marker.
+- Prefetch data downloads are written to unique temporary files in the final cache directory and then atomically renamed to the VC3D-provided final cache path.
+- VC3D also writes persistent-cache `.empty` markers as zero-byte files and reads them by existence.
+- Prefetch performs global chunk deduplication by store identity and chunk key before network work.
+- Prefetch runs parallel dependency producers plus bounded chunk download workers; download worker count is capped at 16.
+- Prefetch reports separate sample/dependency and download progress bars with separate ETAs, and includes patches, unique chunks, cache hits, known-missing chunks, downloaded chunks, errors, and MiB/s. The download denominator is the number of chunks that were not cache hits or pre-existing `.empty` markers and therefore needed fetch/missing resolution. While dependency generation is incomplete, download ETA extrapolates from observed chunks per sample and observed cache-hit/known-missing/download-needed ratios.
 - Prefetch remains base-volume-only; Lasagna manifest channels are not prefetched by the VC3D base-volume prefetch path.
 - V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.
 - `train.py --prefetch` runs training-oriented chunk prefetch only and exits before model, optimizer, TensorBoard, run-directory, or snapshot setup.

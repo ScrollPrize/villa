@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -61,6 +62,16 @@ public:
         double remoteDownloadBytesPerSecond = 0.0;
     };
 
+    struct PersistentChunkDependency {
+        ChunkKey key;
+        bool valid = false;
+        std::optional<std::string> sourceChunkKey;
+        std::filesystem::path persistentPath;
+        std::filesystem::path persistentEmptyPath;
+        std::string persistentExtension;
+        bool sourcePayloadMatchesPersistentCache = false;
+    };
+
     ChunkCache(std::vector<LevelInfo> levels,
                std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
                double fillValue,
@@ -85,6 +96,8 @@ public:
 
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override;
     void removeChunkReadyListener(ChunkReadyCallbackId id) override;
+
+    PersistentChunkDependency persistentChunkDependency(int level, int iz, int iy, int ix) const;
 
     Stats stats() const;
     void invalidate();

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,6 +59,16 @@ public:
     virtual std::string persistentCacheExtension(const ChunkKey&) const
     {
         return ".bin";
+    }
+
+    virtual std::optional<std::string> sourceChunkKey(const ChunkKey&) const
+    {
+        return std::nullopt;
+    }
+
+    virtual bool sourcePayloadMatchesPersistentCache(const ChunkKey&) const
+    {
+        return false;
     }
 
     virtual ChunkFetchResult decodePersistentBytes(

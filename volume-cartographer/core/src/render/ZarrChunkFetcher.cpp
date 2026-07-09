@@ -199,6 +199,20 @@ public:
         return persistEncodedExtension_.empty() ? ".bin" : persistEncodedExtension_;
     }
 
+    std::optional<std::string> sourceChunkKey(const ChunkKey& key) const override
+    {
+        const std::array<std::size_t, 3> indices{
+            static_cast<std::size_t>(key.iz),
+            static_cast<std::size_t>(key.iy),
+            static_cast<std::size_t>(key.ix)};
+        return array_->chunk_store_key(indices);
+    }
+
+    bool sourcePayloadMatchesPersistentCache(const ChunkKey&) const override
+    {
+        return persistEncodedExtension_.empty() && array_->direct_chunk_payload_is_decoded_bytes();
+    }
+
     ChunkFetchResult decodePersistentBytes(
         const ChunkKey&,
         std::vector<std::byte> bytes) const override

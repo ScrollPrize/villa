@@ -59,8 +59,10 @@ The important behavior is:
   - opens remote paths with `Volume.open_url`;
   - calls `Volume.sample_coords(..., blocking=True)` so missing chunks are
     fetched/decoded before sampling returns;
-  - uses the same blocking sampling/cache path for sampler-level prefetch by
-    sampling the requested coordinate envelope and discarding image values.
+  - uses `Volume.collect_coords_dependencies(...)` for prefetch dependency
+    discovery, without sampling image values;
+  - exposes VC3D persistent-cache data and `.empty` marker paths for Python
+    prefetch classification.
 - `NumpyZarrCoordinateSampler` remains useful for tests and local fake arrays.
 - `make_coordinate_sampler` currently returns the VC3D sampler for normal
   runtime.
@@ -110,8 +112,9 @@ The important behavior is:
 - Builds a batch by stacking deterministic samples.
 - Implements `build_strip_source` / `build_strip_patch_from_source` as the
   shared path for training, runner loading, augment-vis, and prefetch.
-- Computes prefetch envelopes from the same shared source geometry and calls
-  sampler-level prefetch for the base-volume sampler only.
+- Computes prefetch envelopes from the same shared source geometry, asks the
+  sampler for dependency-only chunk requests, deduplicates those requests, and
+  fetches only chunks not already represented in the VC3D persistent cache.
 - Keeps `build_augmented_center_strip_source` as a compatibility wrapper for
   the runner contact sheet.
 
@@ -206,6 +209,9 @@ Training prefetch:
 - Negative `--prefetch-steps` values are rejected.
 - Training prefetch only fetches base-volume chunks; Lasagna manifest channels
   are opened for geometry/normal metadata but are not prefetched.
+- Prefetch uses dependency-only chunk discovery and Python-side cache
+  classification. It does not call the image-sampling path just to warm the
+  cache.
 
 Dataset entries must contain:
 
@@ -388,10 +394,29 @@ by prefetch.
 
 - builds the shared CP-local source once per deterministic sample index;
 - derives each configured strip-z offset from that source;
-- sends the source-envelope coordinates to `CoordinateSampler.prefetch_coords`;
-- uses VC3D's blocking coordinate sampling/cache path for remote volumes;
-- prints progress, MiB/s, ETA, dependency/download counters where available,
-  and error count.
+- sends the source-envelope coordinates to `chunk_requests_for_coords`, which
+  maps them to dependency-only base-volume chunk metadata;
+- deduplicates globally by `(store_identity, key)`;
+- treats existing VC3D persistent-cache data files as hits;
+- treats existing `<cache>/level_<level>/<iz>/<iy>/<ix>.empty` files as
+  known-missing hits;
+- fetches only still-missing direct-source chunks with bounded Python workers,
+  writes data through unique temp files followed by atomic rename, and writes
+  zero-byte `.empty` markers for definitive missing chunks;
+- prints progress with separate sample/dependency and download bars, separate
+  ETAs, patches, unique chunks, cache hits, known-missing chunks, downloaded
+  chunks, errors, and MiB/s. The download denominator counts chunks that were
+  not cache hits or pre-existing `.empty` markers. While sample dependency
+  generation is incomplete, download ETA extrapolates from observed chunks per
+  sample and observed cache-hit/known-missing/download-needed ratios.
+
+For VC3D-backed remote volumes, dependency discovery returns the authoritative
+remote chunk URL/key, final persistent-cache data path, `.empty` marker path,
+persistent extension, and cache payload format. Python prefetch does not
+reconstruct those paths. The current Python writer supports only uncompressed
+direct-source chunks where the remote payload is exactly the `.bin` payload VC3D
+expects; compressed, filtered, sharded, or byte-swapped payloads fail clearly
+until explicit codec support is added.
 
 Prefetch covers the configured augmentation envelope, not a single random
 augmentation draw. It may fetch a conservative superset for one patch, but later
@@ -497,7 +522,8 @@ They cover:
 - side-strip coordinate generation;
 - torch vectorized strip-grid equivalence to the NumPy path;
 - vectorized line-coordinate augmentation behavior;
-- sampler-level prefetch and augmentation-envelope dependency coverage;
+- dependency-only prefetch, cache-hit / `.empty` marker handling, and
+  augmentation-envelope dependency coverage;
 - runner export behavior where practical.
 
 Run them with:

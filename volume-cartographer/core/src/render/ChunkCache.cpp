@@ -6,11 +6,15 @@
 #include "vc/core/util/Logging.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -24,6 +28,17 @@ constexpr int kViewEpochPriorityStride = 1024;
 std::size_t normalizedWorkerCount(std::size_t requested)
 {
     return std::max<std::size_t>(1, requested);
+}
+
+std::filesystem::path uniqueTmpPathFor(const std::filesystem::path& path)
+{
+    static std::atomic<std::uint64_t> counter{0};
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    const auto serial = counter.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream suffix;
+    suffix << ".tmp." << stamp << "." << tid << "." << serial;
+    return std::filesystem::path(path.string() + suffix.str());
 }
 
 utils::PriorityThreadPool& chunkWorkerPool(std::size_t workerCount)
@@ -276,6 +291,31 @@ void ChunkCache::removeChunkReadyListener(ChunkReadyCallbackId id)
     auto state = state_;
     std::lock_guard lock(state->mutex_);
     state->callbacks_.erase(id);
+}
+
+ChunkCache::PersistentChunkDependency ChunkCache::persistentChunkDependency(
+    int level,
+    int iz,
+    int iy,
+    int ix) const
+{
+    auto state = state_;
+    const ChunkKey key{level, iz, iy, ix};
+    PersistentChunkDependency result;
+    result.key = key;
+    if (!state->options_.persistentCachePath || !isValidKey(*state, key))
+        return result;
+
+    const auto& fetcher = state->fetchers_.at(static_cast<std::size_t>(key.level));
+    result.valid = static_cast<bool>(fetcher);
+    if (!result.valid)
+        return result;
+    result.sourceChunkKey = fetcher->sourceChunkKey(key);
+    result.persistentPath = persistentPath(*state, key);
+    result.persistentEmptyPath = persistentEmptyPath(*state, key);
+    result.persistentExtension = fetcher->persistentCacheExtension(key);
+    result.sourcePayloadMatchesPersistentCache = fetcher->sourcePayloadMatchesPersistentCache(key);
+    return result;
 }
 
 ChunkCache::Stats ChunkCache::stats() const
@@ -658,7 +698,7 @@ void ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     if (ec)
         return;
     const auto oldSize = regularFileSize(path).value_or(0);
-    const auto tmp = path.string() + ".tmp";
+    const auto tmp = uniqueTmpPathFor(path);
     {
         std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
         if (!file)
@@ -708,26 +748,12 @@ void ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
     if (ec)
         return;
     const auto oldSize = regularFileSize(path).value_or(0);
-    const auto tmp = path.string() + ".tmp";
     {
-        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
-        if (!file)
-            return;
-        file.put('\n');
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
         if (!file)
             return;
     }
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
-        std::filesystem::remove(path, ec);
-        ec.clear();
-        std::filesystem::rename(tmp, path, ec);
-    }
-    if (ec) {
-        std::filesystem::remove(tmp, ec);
-        return;
-    }
-    const auto newSize = regularFileSize(path).value_or(std::size_t{1});
+    const auto newSize = regularFileSize(path).value_or(std::size_t{0});
     addPersistentCacheBytesDelta(
         state,
         static_cast<std::int64_t>(newSize) - static_cast<std::int64_t>(oldSize));
