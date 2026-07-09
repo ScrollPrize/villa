@@ -40,6 +40,7 @@ class QGraphicsEllipseItem;
 class QGraphicsItem;
 class QGraphicsPathItem;
 class QGraphicsScene;
+class QGraphicsSimpleTextItem;
 class QTimer;
 struct POI;
 class PlaneSurface;
@@ -196,6 +197,10 @@ public:
     void setLineAnnotationPlacementPreviewEnabled(bool enabled);
     bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
     bool lineAnnotationPlacementMarkerVisible() const;
+    bool measurementSupported() const;
+    void startMeasurementMode();
+    bool isMeasurementActive() const;
+    void clearMeasurement();
     void markSurfaceGeometryChanged();
     void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
 
@@ -336,6 +341,12 @@ private:
     void updateDisplayedFramebufferMapping();
     static bool renderJobsEquivalentForDisplay(const PendingRenderJob& a,
                                                const PendingRenderJob& b);
+    // Everything of renderJobsEquivalentForDisplay except the chunk-content
+    // epoch and gen-cache dirtiness: true when two jobs sample the same
+    // pixels from the same source, so one frame's data can stand in for
+    // missing chunks in the other.
+    static bool renderJobsSameGeometry(const PendingRenderJob& a,
+                                       const PendingRenderJob& b);
     struct RenderContext;
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
@@ -345,9 +356,12 @@ private:
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
+    void refreshCursorPositionAt(const QPointF& scenePos);
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateLineAnnotationPlacementMarker(const QPointF& scenePos);
     void clearLineAnnotationPlacementMarker();
+    bool handleMeasurementClick(const QPointF& scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void refreshMeasurementOverlay();
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
     std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);
@@ -394,6 +408,10 @@ private:
     std::optional<PendingRenderJob> _activeRenderJob;
     std::optional<PendingRenderJob> _pendingRenderJob;
     std::optional<PendingRenderJob> _displayedRenderJob;
+    // Last presented render (sample values + coverage). The next render of
+    // the same geometry reuses its pixels where chunks are missing so a
+    // transient cache miss never blanks an already-shown region.
+    std::shared_ptr<RenderResult> _lastRenderResult;
     bool _pendingRenderDirty = false;
     std::uint64_t _renderRequestSerial = 0;
     std::uint64_t _chunkContentEpoch = 0;
@@ -563,6 +581,17 @@ private:
     bool _lineAnnotationPlacementPreviewEnabled = false;
     QGraphicsItem* _focusMarker = nullptr;
     bool _segmentationCursorMirroring = false;
+
+    struct MeasurementPoint {
+        cv::Vec2f surface{0.0f, 0.0f};
+        cv::Vec3f volume{0.0f, 0.0f, 0.0f};
+    };
+    struct MeasurementState {
+        bool active = false;
+        std::optional<MeasurementPoint> first;
+        std::optional<MeasurementPoint> second;
+    };
+    MeasurementState _measurement;
 
     uint64_t _highlightedPointId = 0;
     uint64_t _selectedCollectionId = 0;

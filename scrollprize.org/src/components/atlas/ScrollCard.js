@@ -63,8 +63,8 @@ export default function ScrollCard({ scroll }) {
   // Honest image count: 3D model + photo + 2D-ink + 3D-ink renders.
   const imgN = (mesh ? 1 : 0) + (photo ? 1 : 0) + nInk + nAlpha;
 
-  // Segment count: explicit progress value, else the sample's n_segments.
-  const segN = progress.segments != null ? progress.segments : scroll.n_segments || 0;
+  // Segment count: the sample's factual segment count from the S3 metadata.
+  const segN = scroll.n_segments || 0;
 
   const isScroll = scroll.type === "scroll";
   const label = scroll.label || scroll.id;

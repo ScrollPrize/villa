@@ -38,6 +38,7 @@ private slots:
     void updateSelectedSample();
     void copySelectedVolumeUrl();
     void openSelectedVolumeUrl();
+    void downloadSelectedVolumeNormalGrids();
     void copySelectedSegmentUrl();
     void openSelectedSegmentUrl();
     void cacheSelectedSegment();
@@ -101,6 +102,7 @@ private:
     QPushButton* _openSampleButton{nullptr};
     QPushButton* _copyVolumeUrlButton{nullptr};
     QPushButton* _openVolumeUrlButton{nullptr};
+    QPushButton* _downloadNormalGridsButton{nullptr};
     QPushButton* _copySegmentUrlButton{nullptr};
     QPushButton* _openSegmentUrlButton{nullptr};
     QPushButton* _cacheSegmentButton{nullptr};

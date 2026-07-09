@@ -358,7 +358,11 @@ int main(int argc, char *argv[])
     int search_effort = params.value("search_effort", 10);
     int thread_limit = params.value("thread_limit", 0);
 
-    const float voxelsize = static_cast<float>(volume->voxelSize());
+    float voxelsize = static_cast<float>(volume->voxelSize());
+    const double params_voxelsize = params.value("voxelsize", 0.0);
+    if (std::isfinite(params_voxelsize) && params_voxelsize > 0.0) {
+        voxelsize = static_cast<float>(params_voxelsize);
+    }
     
     std::filesystem::path cache_root;
     if (params.contains("cache_root") && params["cache_root"].is_string()) {
@@ -372,6 +376,7 @@ int main(int argc, char *argv[])
     std::cout << "mode: " << mode << std::endl;
     std::cout << "step size: " << params.value("step_size", 20.0f) << std::endl;
     std::cout << "min_area_cm: " << min_area_cm << std::endl;
+    std::cout << "voxelsize: " << voxelsize << std::endl;
     std::cout << "tgt_overlap_count: " << tgt_overlap_count << std::endl;
 
     auto direction_fields = load_direction_fields(params, cache_root);
@@ -1403,6 +1408,8 @@ int main(int argc, char *argv[])
 
     double area_cm2 = surf->meta["area_cm2"].get_double();
     if (area_cm2 < min_area_cm) {
+        std::cout << "discarding generated surface because area_cm2 " << area_cm2
+                  << " is below min_area_cm " << min_area_cm << std::endl;
         if (std::filesystem::exists(seg_dir)) {
             std::filesystem::remove_all(seg_dir);
         }

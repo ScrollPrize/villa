@@ -41,6 +41,10 @@ set(srcs
     OpenDataManifest.hpp
     OpenDataSampleProject.cpp
     OpenDataSampleProject.hpp
+    OpenDataVolumePrefill.cpp
+    OpenDataVolumePrefill.hpp
+    OpenDataNormalGrids.cpp
+    OpenDataNormalGrids.hpp
     OpenDataSegmentCache.cpp
     OpenDataSegmentCache.hpp
     SurfaceAffineTransformController.cpp

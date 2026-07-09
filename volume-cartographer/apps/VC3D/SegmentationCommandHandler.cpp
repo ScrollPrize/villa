@@ -20,6 +20,7 @@
 #include <QMessageBox>
 #include <QProcess>
 #include <QDir>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QCoreApplication>
 #include <QDateTime>
@@ -48,9 +49,13 @@
 #include <QSet>
 #include <QVector>
 #include <QSpinBox>
+#include <QDoubleSpinBox>
 #include <QLineEdit>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QtConcurrent/QtConcurrentRun>
+#include <QToolButton>
+#include <QVector3D>
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
 #include <QStandardPaths>
 #endif
@@ -221,6 +226,223 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
                     minRow,
                     maxCol - minCol + 1,
                     maxRow - minRow + 1);
+}
+
+QString segmentsEntryLocationForPath(const QString& outputDir, const QString& volpkgRoot)
+{
+    const std::filesystem::path outputAbs =
+        std::filesystem::absolute(std::filesystem::path(outputDir.toStdString())).lexically_normal();
+    const std::filesystem::path rootAbs =
+        std::filesystem::absolute(std::filesystem::path(volpkgRoot.toStdString())).lexically_normal();
+
+    std::error_code relEc;
+    const std::filesystem::path rel = std::filesystem::relative(outputAbs, rootAbs, relEc);
+    if (!relEc && !rel.empty()) {
+        const std::string relStr = rel.generic_string();
+        if (relStr != "." && relStr.rfind("../", 0) != 0 && relStr != "..") {
+            return QString::fromStdString(relStr);
+        }
+    }
+    return QString::fromStdString(outputAbs.string());
+}
+
+bool entryHasTag(const vc::project::Entry& entry, const std::string& tag)
+{
+    return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
+}
+
+QString catalogVolumeIdForLoadedVolume(const VolumePkg& pkg, const QString& loadedVolumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-volume-id:";
+    const auto tags = pkg.volumeTags(loadedVolumeId.toStdString());
+    for (const auto& tag : tags) {
+        if (tag.rfind(prefix, 0) == 0) {
+            return QString::fromStdString(tag.substr(prefix.size()));
+        }
+    }
+    return loadedVolumeId;
+}
+
+std::optional<std::pair<QString, QString>> openDataSegmentRootsForVolume(const VolumePkg& pkg,
+                                                                         const QString& loadedVolumeId)
+{
+    if (loadedVolumeId.isEmpty()) {
+        return std::nullopt;
+    }
+
+    const QString catalogVolumeId = catalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
+    const std::string targetTag = "vc-open-data-target-volume-id:" + catalogVolumeId.toStdString();
+    const std::string sourceTag = "vc-open-data-source-volume-id:" + catalogVolumeId.toStdString();
+
+    const vc::project::Entry* fallbackEntry = nullptr;
+    const vc::project::Entry* matchingEntry = nullptr;
+    for (const auto& entry : pkg.segmentEntries()) {
+        if (!entryHasTag(entry, "open-data") || vc::project::isLocationRemote(entry.location)) {
+            continue;
+        }
+        if (entryHasTag(entry, targetTag)) {
+            matchingEntry = &entry;
+            break;
+        }
+        if (!matchingEntry && entryHasTag(entry, sourceTag)) {
+            matchingEntry = &entry;
+        } else if (!fallbackEntry) {
+            fallbackEntry = &entry;
+        }
+    }
+
+    const auto* entry = matchingEntry ? matchingEntry : fallbackEntry;
+    if (!entry) {
+        return std::nullopt;
+    }
+
+    const std::filesystem::path volumeRoot =
+        vc::project::resolveLocalPath(entry->location, pkg.path().parent_path()).lexically_normal();
+    const std::filesystem::path sampleRoot = volumeRoot.parent_path();
+    return std::make_pair(QString::fromStdString(sampleRoot.string()),
+                          QString::fromStdString(volumeRoot.string()));
+}
+
+bool selectGrowPatchSeedParams(QWidget* parent,
+                               const QString& volpkgRoot,
+                               const QVector<VolumeSelector::VolumeOption>& volumeOptions,
+                               const QStringList& outputDirChoices,
+                               const QHash<QString, QString>& openDataSampleRootsByVolumeId,
+                               const QHash<QString, QString>& openDataVolumeRootsByVolumeId,
+                               QString* selectedVolumeId,
+                               QString* selectedVolumePath,
+                               int* iterations,
+                               double* minAreaCm,
+                               QString* outputDir)
+{
+    QDialog dlg(parent);
+    dlg.setWindowTitle(QObject::tr("Create Segment (GrowPatch)"));
+
+    auto* layout = new QVBoxLayout(&dlg);
+    auto* form = new QFormLayout();
+
+    auto* volumeCombo = new QComboBox(&dlg);
+    for (const auto& option : volumeOptions) {
+        const QString label = option.name.isEmpty()
+            ? option.id
+            : QStringLiteral("%1 (%2)").arg(option.name, option.id);
+        volumeCombo->addItem(label, option.id);
+        volumeCombo->setItemData(volumeCombo->count() - 1, option.path, Qt::UserRole + 1);
+    }
+    if (selectedVolumeId && !selectedVolumeId->isEmpty()) {
+        const int idx = volumeCombo->findData(*selectedVolumeId);
+        if (idx >= 0) {
+            volumeCombo->setCurrentIndex(idx);
+        }
+    }
+    form->addRow(QObject::tr("Volume:"), volumeCombo);
+
+    auto* iterationsSpin = new QSpinBox(&dlg);
+    iterationsSpin->setRange(1, 100000);
+    iterationsSpin->setValue(iterations ? std::clamp(*iterations, 1, 100000) : 200);
+    form->addRow(QObject::tr("Iterations:"), iterationsSpin);
+
+    auto* minAreaSpin = new QDoubleSpinBox(&dlg);
+    minAreaSpin->setRange(0.0, 1000000.0);
+    minAreaSpin->setDecimals(6);
+    minAreaSpin->setSingleStep(0.001);
+    minAreaSpin->setValue(minAreaCm ? std::clamp(*minAreaCm, 0.0, 1000000.0) : 0.002);
+    minAreaSpin->setToolTip(QObject::tr("Writes the min_area_cm parameter for vc_grow_seg_from_seed."));
+    form->addRow(QObject::tr("Min size:"), minAreaSpin);
+
+    auto* outputCombo = new QComboBox(&dlg);
+    outputCombo->setEditable(true);
+    outputCombo->addItems(outputDirChoices);
+    if (outputDir && !outputDir->isEmpty()) {
+        outputCombo->setCurrentText(*outputDir);
+    } else if (!outputDirChoices.isEmpty()) {
+        outputCombo->setCurrentText(outputDirChoices.front());
+    }
+    outputCombo->setProperty("vc_user_edited", false);
+    QObject::connect(outputCombo, &QComboBox::editTextChanged, &dlg, [outputCombo]() {
+        if (outputCombo->hasFocus()) {
+            outputCombo->setProperty("vc_user_edited", true);
+        }
+    });
+
+    auto selectedOpenDataSampleRoot = [&]() -> QString {
+        return openDataSampleRootsByVolumeId.value(volumeCombo->currentData().toString());
+    };
+    auto selectedOpenDataVolumeRoot = [&]() -> QString {
+        return openDataVolumeRootsByVolumeId.value(volumeCombo->currentData().toString());
+    };
+
+    QObject::connect(volumeCombo, &QComboBox::currentIndexChanged, &dlg, [=, &selectedOpenDataVolumeRoot](int) {
+        if (outputCombo->property("vc_user_edited").toBool()) {
+            return;
+        }
+        const QString preferredOutput = selectedOpenDataVolumeRoot();
+        if (!preferredOutput.isEmpty()) {
+            outputCombo->setCurrentText(preferredOutput);
+        }
+    });
+
+    auto* outputRow = new QWidget(&dlg);
+    auto* outputLayout = new QHBoxLayout(outputRow);
+    outputLayout->setContentsMargins(0, 0, 0, 0);
+    outputLayout->addWidget(outputCombo, 1);
+    auto* browseButton = new QToolButton(outputRow);
+    browseButton->setText(QObject::tr("..."));
+    outputLayout->addWidget(browseButton);
+    form->addRow(QObject::tr("Output folder:"), outputRow);
+
+    layout->addLayout(form);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    layout->addWidget(buttons);
+
+    QObject::connect(browseButton, &QToolButton::clicked, &dlg, [&]() {
+        QString startDir = selectedOpenDataSampleRoot();
+        if (startDir.isEmpty()) {
+            startDir = outputCombo->currentText().trimmed().isEmpty()
+                ? volpkgRoot
+                : outputCombo->currentText().trimmed();
+        }
+        const QString selected = QFileDialog::getExistingDirectory(
+            &dlg,
+            QObject::tr("Choose Output Folder"),
+            startDir,
+            QFileDialog::ShowDirsOnly);
+        if (!selected.isEmpty()) {
+            outputCombo->setCurrentText(selected);
+        }
+    });
+
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, [&]() {
+        const QString selected = outputCombo->currentText().trimmed();
+        if (selected.isEmpty()) {
+            QMessageBox::warning(&dlg, QObject::tr("Create Segment"), QObject::tr("Output folder cannot be empty."));
+            return;
+        }
+        if (volumeCombo->currentIndex() < 0) {
+            QMessageBox::warning(&dlg, QObject::tr("Create Segment"), QObject::tr("Select a volume."));
+            return;
+        }
+        if (selectedVolumeId) {
+            *selectedVolumeId = volumeCombo->currentData().toString();
+        }
+        if (selectedVolumePath) {
+            *selectedVolumePath = volumeCombo->currentData(Qt::UserRole + 1).toString();
+        }
+        if (iterations) {
+            *iterations = iterationsSpin->value();
+        }
+        if (minAreaCm) {
+            *minAreaCm = minAreaSpin->value();
+        }
+        if (outputDir) {
+            *outputDir = selected;
+        }
+        dlg.accept();
+    });
+
+    return dlg.exec() == QDialog::Accepted;
 }
 
 static bool hasTifxyzMeshFiles(const std::filesystem::path& dir)
@@ -2004,8 +2226,8 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     }
     outputDirPath = outDir.absolutePath();
 
-    QString normalGridPath;
-    if (_state && _state->vpkg()) {
+    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
+    if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
         const auto paths = _state->vpkg()->normalGridPaths();
         if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
     }
@@ -2184,8 +2406,8 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
     }
     outputDirPath = outDir.absolutePath();
 
-    QString normalGridPath;
-    if (_state && _state->vpkg()) {
+    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
+    if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
         const auto paths = _state->vpkg()->normalGridPaths();
         if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
     }
@@ -2260,6 +2482,260 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
     _cmdRunner->showConsoleOutput();
     _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
     emit statusMessage(tr("Resume-opt local GrowPatch started for %1").arg(segmentId), 5000);
+}
+
+void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint)
+{
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    if (_state->currentVolume() == nullptr) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume loaded."));
+        return;
+    }
+
+    if (!_cmdRunner) {
+        emit statusMessage(tr("Command line tools not available"), 3000);
+        return;
+    }
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A command line tool is already running."));
+        return;
+    }
+
+    if (_growPatchSeedJob) {
+        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A GrowPatch seed run is already active."));
+        return;
+    }
+
+    const QString executable = findVcTool("vc_grow_seg_from_seed");
+    if (executable.isEmpty()) {
+        QMessageBox::critical(_parentWidget, tr("Error"),
+            tr("Could not find the 'vc_grow_seg_from_seed' executable.\n"
+               "Looked in known locations and PATH.\n\n"
+               "Tip: set an override via VC.ini [tools] vc_grow_seg_from_seed, or put "
+               "the binary on PATH."));
+        return;
+    }
+
+    QString defaultVolumeId;
+    const auto volumeOptions = buildVolumeOptionList(&defaultVolumeId);
+    if (volumeOptions.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volumes available in the volume package."));
+        return;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString selectedVolumeId = settings.value(QStringLiteral("growpatch_seed/volume_id")).toString();
+    if (selectedVolumeId.isEmpty() || std::none_of(volumeOptions.begin(), volumeOptions.end(),
+                                                   [&](const auto& option) { return option.id == selectedVolumeId; })) {
+        selectedVolumeId = defaultVolumeId;
+    }
+    QString selectedVolumePath;
+    for (const auto& option : volumeOptions) {
+        if (option.id == selectedVolumeId) {
+            selectedVolumePath = option.path;
+            break;
+        }
+    }
+    if (selectedVolumePath.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Cannot determine selected volume path."));
+        return;
+    }
+
+    QHash<QString, QString> openDataSampleRootsByVolumeId;
+    QHash<QString, QString> openDataVolumeRootsByVolumeId;
+    for (const auto& option : volumeOptions) {
+        if (auto roots = openDataSegmentRootsForVolume(*_state->vpkg(), option.id)) {
+            openDataSampleRootsByVolumeId.insert(option.id, roots->first);
+            openDataVolumeRootsByVolumeId.insert(option.id, roots->second);
+        }
+    }
+
+    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
+    if (normalGridPath.isEmpty()) {
+        const auto paths = _state->vpkg()->normalGridPaths();
+        if (!paths.empty()) {
+            normalGridPath = QString::fromStdString(paths.front().string());
+        }
+    }
+    if (normalGridPath.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No normal grid is available for GrowPatch."));
+        return;
+    }
+
+    QString volpkgRoot = _state->vpkgPath();
+    if (volpkgRoot.isEmpty()) {
+        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
+    }
+    if (volpkgRoot.isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Cannot determine volume package folder."));
+        return;
+    }
+
+    QStringList outputChoices;
+    auto appendChoice = [&outputChoices](const QString& path) {
+        const QString cleaned = QDir::cleanPath(path);
+        if (!cleaned.isEmpty() && !outputChoices.contains(cleaned)) {
+            outputChoices << cleaned;
+        }
+    };
+
+    const auto outputSegmentsPath = _state->vpkg()->outputSegmentsPath();
+    if (const QString openDataOutput = openDataVolumeRootsByVolumeId.value(selectedVolumeId);
+        !openDataOutput.isEmpty()) {
+        appendChoice(openDataOutput);
+    }
+    if (!outputSegmentsPath.empty()) {
+        appendChoice(QString::fromStdString(outputSegmentsPath.string()));
+    }
+    for (const auto& path : _state->vpkg()->availableSegmentPaths()) {
+        appendChoice(QString::fromStdString(path.string()));
+    }
+    appendChoice(QDir(volpkgRoot).filePath(QStringLiteral("paths")));
+    appendChoice(QDir(volpkgRoot).filePath(QStringLiteral("traces")));
+
+    int iterations = 200;
+    double minAreaCm = 0.002;
+    QString outputDirPath = outputChoices.isEmpty()
+        ? QDir(volpkgRoot).filePath(QStringLiteral("paths"))
+        : outputChoices.front();
+    if (!selectGrowPatchSeedParams(_parentWidget,
+                                   volpkgRoot,
+                                   volumeOptions,
+                                   outputChoices,
+                                   openDataSampleRootsByVolumeId,
+                                   openDataVolumeRootsByVolumeId,
+                                   &selectedVolumeId,
+                                   &selectedVolumePath,
+                                   &iterations,
+                                   &minAreaCm,
+                                   &outputDirPath)) {
+        emit statusMessage(tr("Create segment cancelled"), 3000);
+        return;
+    }
+    if (selectedVolumePath.trimmed().isEmpty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume selected."));
+        return;
+    }
+    settings.setValue(QStringLiteral("growpatch_seed/volume_id"), selectedVolumeId);
+
+    double selectedVoxelSize = 0.0;
+    if (auto selectedVolume = _state->vpkg()->volume(selectedVolumeId.toStdString())) {
+        selectedVoxelSize = selectedVolume->voxelSize();
+    }
+
+    outputDirPath = outputDirPath.trimmed();
+    if (QDir::isRelativePath(outputDirPath)) {
+        outputDirPath = QDir(volpkgRoot).filePath(outputDirPath);
+    }
+    QDir outDir(outputDirPath);
+    if (!outDir.exists() && !outDir.mkpath(QStringLiteral("."))) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create output folder: %1").arg(outputDirPath));
+        return;
+    }
+    outputDirPath = outDir.absolutePath();
+
+    const QString segmentsEntry = segmentsEntryLocationForPath(outputDirPath, volpkgRoot);
+    _state->vpkg()->addSegmentsEntry(segmentsEntry.toStdString(), {"growpatch"});
+    _state->vpkg()->setOutputSegments(segmentsEntry.toStdString());
+
+    QJsonObject params;
+    params.insert(QStringLiteral("mode"), QStringLiteral("seed"));
+    params.insert(QStringLiteral("step_size"), 20);
+    params.insert(QStringLiteral("min_area_cm"), minAreaCm);
+    params.insert(QStringLiteral("generations"), iterations);
+    params.insert(QStringLiteral("thread_limit"), 1);
+    params.insert(QStringLiteral("normal_grid_path"), normalGridPath);
+    params.insert(QStringLiteral("cache_root"), QDir(volpkgRoot).filePath(QStringLiteral("cache")));
+    if (std::isfinite(selectedVoxelSize) && selectedVoxelSize > 0.0) {
+        params.insert(QStringLiteral("voxelsize"), selectedVoxelSize);
+    }
+    if (_normal3dZarrPathGetter) {
+        const QString normal3dPath = _normal3dZarrPathGetter();
+        if (!normal3dPath.isEmpty()) {
+            params.insert(QStringLiteral("normal3d_zarr_path"), normal3dPath);
+        }
+    }
+
+    auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("growpatch_seed_XXXXXX.json"));
+    if (!paramsFile->open()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file."));
+        return;
+    }
+    paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
+    paramsFile->flush();
+
+    _growPatchSeedJob = GrowPatchSeedJob{};
+    _growPatchSeedJob->outputDir = outputDirPath;
+    _growPatchSeedJob->paramsPath = paramsFile->fileName();
+    _growPatchSeedJob->paramsFile = std::move(paramsFile);
+
+    QStringList args;
+    args << selectedVolumePath
+         << outputDirPath
+         << _growPatchSeedJob->paramsPath
+         << QString::number(seedPoint.x(), 'g', 10)
+         << QString::number(seedPoint.y(), 'g', 10)
+         << QString::number(seedPoint.z(), 'g', 10);
+
+    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
+
+    QPointer<SegmentationCommandHandler> guard(this);
+    auto connection = std::make_shared<QMetaObject::Connection>();
+    *connection = connect(_cmdRunner,
+                          &CommandLineToolRunner::toolFinished,
+                          this,
+                          [this, guard, connection, outputDirPath](CommandLineToolRunner::Tool tool,
+                                                                   bool success,
+                                                                   const QString& message,
+                                                                   const QString&,
+                                                                   bool) {
+        if (!guard) {
+            disconnect(*connection);
+            return;
+        }
+        if (tool != CommandLineToolRunner::Tool::CustomCommand) {
+            return;
+        }
+        disconnect(*connection);
+        _growPatchSeedJob.reset();
+
+        if (!success) {
+            QMessageBox::critical(_parentWidget,
+                                  tr("Error"),
+                                  tr("vc_grow_seg_from_seed failed.\n%1").arg(message));
+            emit statusMessage(tr("Create segment failed"), 3000);
+            return;
+        }
+
+        if (_state && _state->vpkg()) {
+            _state->vpkg()->refreshSegmentations();
+        }
+        if (_surfacePanel) {
+            _surfacePanel->reloadSurfacesFromDisk();
+        }
+        emit statusMessage(
+            tr("GrowPatch segment created in %1").arg(QDir::toNativeSeparators(outputDirPath)),
+            5000);
+    });
+
+    _cmdRunner->showConsoleOutput();
+    if (!_cmdRunner->executeCustomCommand(executable, args, QStringLiteral("vc_grow_seg_from_seed"))) {
+        QObject::disconnect(*connection);
+        _growPatchSeedJob.reset();
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to start vc_grow_seg_from_seed."));
+        return;
+    }
+
+    emit statusMessage(
+        tr("GrowPatch seed started at (%1, %2, %3)")
+            .arg(seedPoint.x(), 0, 'g', 6)
+            .arg(seedPoint.y(), 0, 'g', 6)
+            .arg(seedPoint.z(), 0, 'g', 6),
+        5000);
 }
 
 void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)

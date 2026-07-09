@@ -81,7 +81,14 @@ jobs:
   analyze_deep:
     if: github.event_name == 'push'
     needs: [changes]
-    runs-on: ubuntu-latest
+    # Pin to Ubuntu 26.04 (resolute) rather than ubuntu-latest (still 24.04).
+    # install_build_deps.sh — the single source of truth for the VC3D
+    # toolchain, shared with the Dockerfile (FROM ubuntu:26.04) — pulls
+    # flang-21 / libclang-rt-21-dev, which only exist in 26.04's default
+    # repos. On noble the deps install failed with "Unable to locate package".
+    # NOTE: ubuntu-26.04 is currently a *preview* runner image; revisit once
+    # ubuntu-latest migrates to 26.04 (GA), at which point this pin can drop.
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     permissions:
       security-events: write
