@@ -131,7 +131,7 @@ export default function DataCatalog({ scroll }) {
   // Metadata rows (ref lines 115-123).
   const energies = scroll.energies || [];
   const locations = scroll.locations || [];
-  const segments = progress.segments != null ? progress.segments : scroll.n_segments;
+  const segments = scroll.n_segments;
   const segmentsTxt =
     segments != null ? Number(segments).toLocaleString() : "—";
   const patchesTxt = progress.patches

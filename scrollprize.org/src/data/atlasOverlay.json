@@ -145,7 +145,6 @@
         "caveat": "The title region shows no detectable ink (possibly a different ink; the top rows are physically missing)."
       },
       "progress": {
-        "segments": 20,
         "patches": 49936,
         "textFound": "Substantial text",
         "textRank": 4,
@@ -191,7 +190,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis3/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -229,7 +227,6 @@
         "caveat": null
       },
       "progress": {
-        "segments": 10,
         "patches": null,
         "textFound": "Segmenting",
         "textRank": 1,
@@ -266,7 +263,6 @@
         "caveat": "Only the compact inner core survives — about 8 cm of an original 19–24 cm height — after earlier attempts to open the scroll by hand destroyed its outer layers, so only the lower parts of the columns remain."
       },
       "progress": {
-        "segments": 21,
         "patches": null,
         "textFound": "Full scroll read",
         "textRank": 3,
@@ -298,7 +294,6 @@
         "caveat": null
       },
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Title found",
         "textRank": 2,
@@ -337,7 +332,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0009B/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Ink detected",
         "textRank": 0,
@@ -364,7 +358,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0125/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -396,7 +389,6 @@
         "caveat": "About 20% is virtually unrolled; the title and author are secure, but the body text is still being recovered."
       },
       "progress": {
-        "segments": 23,
         "patches": null,
         "textFound": "Title found",
         "textRank": 2,
@@ -423,7 +415,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0175A/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -450,7 +441,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0175B/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -477,7 +467,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0191/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -504,7 +493,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0211/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -531,7 +519,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0257/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -558,7 +545,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0268/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -585,7 +571,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0306B/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -612,7 +597,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0343/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -639,7 +623,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0343P/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Ink detected",
         "textRank": 0,
@@ -666,7 +649,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0358/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -693,7 +675,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0483A/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -720,7 +701,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0483B/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -747,7 +727,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0490A/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -774,7 +753,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0490B/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -802,7 +780,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0500P2/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Ink detected",
         "textRank": 0,
@@ -829,7 +806,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0800/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -856,7 +832,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0813/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -884,7 +859,6 @@
       "volume": "s3://vesuvius-challenge/PHerc0814/representations/predictions/surfaces/20260309142202-surface-20260413222639-surface-m7-L2-th0.2.zarr",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Ink detected",
         "textRank": 0,
@@ -911,7 +885,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0826/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -938,7 +911,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0841/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Ink detected",
         "textRank": 0,
@@ -965,7 +937,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0846A/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -992,7 +963,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc0846B/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1019,7 +989,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1203/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1046,7 +1015,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1218/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1073,7 +1041,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1299/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1100,7 +1067,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1447/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1132,7 +1098,6 @@
         "caveat": null
       },
       "progress": {
-        "segments": 9,
         "patches": null,
         "textFound": "Segmenting",
         "textRank": 1,
@@ -1159,7 +1124,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1545/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1186,7 +1150,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc1667Cr1Fr3/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1213,7 +1176,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHerc51Cr4Fr8/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1240,7 +1202,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMAN5/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1267,7 +1228,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANB/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1294,7 +1254,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercMANBp/",
       "content": null,
       "progress": {
-        "segments": 11,
         "patches": null,
         "textFound": "Segmenting",
         "textRank": 1,
@@ -1327,7 +1286,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis1Fr34/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1360,7 +1318,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis1Fr39/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1393,7 +1350,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis2Fr143/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
@@ -1426,7 +1382,6 @@
       "bucketUrl": "https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html#PHercParis2Fr47/",
       "content": null,
       "progress": {
-        "segments": 0,
         "patches": null,
         "textFound": "Scanned",
         "textRank": 0,
