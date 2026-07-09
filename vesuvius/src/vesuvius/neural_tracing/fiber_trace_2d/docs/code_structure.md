@@ -250,7 +250,10 @@ For each dataset entry:
 Only control points are checked during construction. Non-control line points are
 not globally sampled up front. When a CP-local strip needs normals for a local
 line window, missing or invalid Lasagna samples in that local window raise a
-detailed error instead of being replaced.
+detailed error instead of being replaced. Batch-oriented callers handle that
+data-quality error differently: prefetch and training skip the invalid
+deterministic sample, report the first reason, and continue with later sample
+indices.
 
 ## Sample Selection
 
@@ -341,6 +344,10 @@ start_sample_index = (step - 1) * training.control_points_per_step
 The default training shape is four control-point samples times 16 strip-z
 offsets, producing 64 patches. `load_batch` returns `[4, 16, 1, H, W]`; the
 trainer reshapes this to `[64, 1, H, W]` before the CNN forward pass.
+If one deterministic sample cannot build its CP-local Lasagna normal window
+for data reasons such as `grad_mag == 0`, `load_batch` skips it and advances
+through following deterministic sample indices until the requested number of
+control-point samples is loaded.
 
 Images are normalized per patch over valid pixels. Invalid pixels are set to
 zero after normalization.
@@ -408,7 +415,9 @@ by prefetch.
   chunks, errors, and MiB/s. The download denominator counts chunks that were
   not cache hits or pre-existing `.empty` markers. While sample dependency
   generation is incomplete, download ETA extrapolates from observed chunks per
-  sample and observed cache-hit/known-missing/download-needed ratios.
+  sample and observed cache-hit/known-missing/download-needed ratios;
+- reports invalid deterministic sample skips separately from download errors
+  and includes the first skip reason.
 
 For VC3D-backed remote volumes, dependency discovery returns the authoritative
 remote chunk URL/key, final persistent-cache data path, `.empty` marker path,

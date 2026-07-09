@@ -16,3 +16,5 @@
 - [x] Add/update tests.
 - [x] Run focused validation commands.
 - [x] Update task log and changelog.
+- [x] Handle invalid CP-local Lasagna samples as skipped prefetch/training samples.
+- [x] Cancel queued executor work on fatal prefetch errors.

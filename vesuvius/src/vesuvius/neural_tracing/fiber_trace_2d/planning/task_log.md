@@ -232,3 +232,23 @@ Validation:
   - Result: `34 passed in 2.94s`.
 - `cmake --build volume-cartographer/build/python-bindings`
   - Result: passed.
+
+## Invalid Lasagna Sample Skip Handling
+
+- Changed prefetch producer failures from invalid CP-local Lasagna data
+  (`ValueError`, including in-bounds `grad_mag == 0`) into skipped deterministic
+  samples instead of run-ending errors.
+- Added prefetch progress/summary fields for skipped samples and the first skip
+  reason.
+- Changed training batch assembly to skip invalid deterministic samples and
+  advance through following sample indices until the requested batch is filled.
+- Kept infrastructure/programming failures fatal; fatal prefetch shutdown now
+  cancels queued producer/download futures instead of waiting for a large stale
+  download backlog.
+
+Validation:
+
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
+  - Result: passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result: `36 passed in 2.95s`.

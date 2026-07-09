@@ -9,7 +9,9 @@
 - Lasagna normals are used where needed to construct aligned strip frames.
 - For a selected control point, the loader computes the CP-local line window that can affect the requested strip width plus interpolation/frame margin, and samples Lasagna normals only for that local window.
 - Fiber endpoints or other distant line points outside the CP-local window must not be touched while loading that CP-local patch.
-- If a line point inside the CP-local window cannot be sampled from the Lasagna manifest channels, loading that patch fails instead of fabricating or propagating a replacement normal.
+- If a line point inside the CP-local window cannot be sampled from the Lasagna manifest channels, the loader must not fabricate or propagate a replacement normal.
+- During prefetch and training batch assembly, invalid CP-local samples caused by Lasagna channel data such as missing samples or in-bounds `grad_mag == 0` are skipped and reported, then the deterministic sample stream advances to the next sample.
+- Fatal prefetch/training errors are infrastructure or programming failures such as missing APIs, broken bindings, interrupts, memory errors, or unexpected internal exceptions; those should stop the run rather than being hidden as data skips.
 - VC3D side-strip/surface/segment sampling semantics define patch coordinates.
 - Strip centerlines are sampled from all `line_points` with cubic Hermite interpolation over arc length; control points only select the strip anchor.
 - The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
@@ -60,6 +62,8 @@
 - Prefetch performs global chunk deduplication by store identity and chunk key before network work.
 - Prefetch runs parallel dependency producers plus bounded chunk download workers; download worker count is capped at 16.
 - Prefetch reports separate sample/dependency and download progress bars with separate ETAs, and includes patches, unique chunks, cache hits, known-missing chunks, downloaded chunks, errors, and MiB/s. The download denominator is the number of chunks that were not cache hits or pre-existing `.empty` markers and therefore needed fetch/missing resolution. While dependency generation is incomplete, download ETA extrapolates from observed chunks per sample and observed cache-hit/known-missing/download-needed ratios.
+- Prefetch reports skipped invalid samples separately from download errors and includes the first skip reason.
+- If prefetch hits a fatal producer error, queued producer/download futures are cancelled so shutdown does not wait on a large stale download backlog.
 - Prefetch remains base-volume-only; Lasagna manifest channels are not prefetched by the VC3D base-volume prefetch path.
 - V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.
 - `train.py --prefetch` runs training-oriented chunk prefetch only and exits before model, optimizer, TensorBoard, run-directory, or snapshot setup.
@@ -70,6 +74,7 @@
 - The V0 trainer uses `FiberStrip2DLoader` batches directly; it must not use the neural-tracing 3D crop loader or a separate image sampling path.
 - Training geometric augmentations are the same coordinate-space augmentations used by augment-vis. Value augmentations run through the existing torch augmentation functions after Zarr sampling.
 - A training step samples `training.control_points_per_step` deterministic control-point samples and every configured strip-z offset. The default is four control points and 16 strip-z offsets, giving 64 2D strip patches.
+- If a deterministic training sample is invalid because its CP-local Lasagna normal window is invalid, batch loading skips it and continues with following deterministic sample indices until the requested number of control-point samples is loaded. If too many consecutive samples are invalid, batch loading fails with a clear error.
 - Training flattens control-point and strip-z dimensions into a patch batch before the 2D model forward pass.
 - V0 model output is exactly two per-pixel direction channels in the Lasagna ambiguous two-cos-channel encoding.
 - For strip-image tangent angle `theta`, target channels are `0.5 + 0.5*cos(2*theta)` and `0.5 + 0.5*cos(2*theta + pi/4)`.

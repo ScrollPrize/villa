@@ -132,6 +132,7 @@ class _StripSource:
 @dataclass
 class _PrefetchCounters:
     samples_done: int = 0
+    samples_skipped: int = 0
     patches_done: int = 0
     unique_chunks_seen: int = 0
     queued_for_download: int = 0
@@ -144,6 +145,7 @@ class _PrefetchCounters:
     bytes_downloaded: int = 0
     valid_pixels: int = 0
     first_error: str = ""
+    first_sample_skip: str = ""
     active_downloads: int = 0
     oldest_active_download_seconds: float = 0.0
 
@@ -625,6 +627,7 @@ class FiberStrip2DLoader:
         self._flat_sample_count = sum(record.fiber.control_points_xyz.shape[0] for record in self.records)
         if self._flat_sample_count <= 0:
             raise ValueError("no control points found in configured fibers")
+        self._load_batch_skipped_samples = 0
 
     def _load_records(self) -> list[_Record]:
         records: list[_Record] = []
@@ -1247,14 +1250,34 @@ class FiberStrip2DLoader:
         cp_indices: list[int] = []
         fiber_paths: list[str] = []
         try:
-            for batch_pos in range(batch_size):
-                sample_index = int(start_sample_index) + batch_pos
-                (
-                    sample_records,
-                    sample_images,
-                    sample_coords,
-                    sample_valids,
-                ) = self.build_sample(sample_index)
+            sample_index = int(start_sample_index)
+            max_attempts = max(batch_size * 100, batch_size + 1000)
+            attempts = 0
+            while len(images) < batch_size and attempts < max_attempts:
+                attempts += 1
+                current_sample_index = sample_index
+                sample_index += 1
+                try:
+                    (
+                        sample_records,
+                        sample_images,
+                        sample_coords,
+                        sample_valids,
+                    ) = self.build_sample(current_sample_index)
+                except ValueError as exc:
+                    self._load_batch_skipped_samples += 1
+                    if self._load_batch_skipped_samples <= 10:
+                        print(
+                            "fiber_trace_2d: skipping invalid training sample "
+                            f"sample_index={current_sample_index} reason={exc}",
+                            flush=True,
+                        )
+                    elif self._load_batch_skipped_samples == 11:
+                        print(
+                            "fiber_trace_2d: further invalid training sample skip messages suppressed",
+                            flush=True,
+                        )
+                    continue
                 first = sample_records[0]
                 all_samples.extend(sample_records)
                 images.append(sample_images)
@@ -1263,6 +1286,12 @@ class FiberStrip2DLoader:
                 record_indices.append(first.record_index)
                 cp_indices.append(first.control_point_index)
                 fiber_paths.append(first.fiber_path)
+            if len(images) < batch_size:
+                raise ValueError(
+                    "could not assemble a full fiber_trace_2d batch after "
+                    f"{attempts} deterministic sample attempts; requested={batch_size} "
+                    f"loaded={len(images)} skipped={attempts - len(images)}"
+                )
         finally:
             cache_stats = end_zarr_cache_trace()
         return FiberStrip2DBatch(
@@ -1351,6 +1380,7 @@ class FiberStrip2DLoader:
                 f"patches={counters.patches_done}/{total_patches} "
                 f"chunks={counters.unique_chunks_seen} hits={counters.cache_hits} "
                 f"active={counters.active_downloads} oldest={_format_seconds(counters.oldest_active_download_seconds)} "
+                f"skipped={counters.samples_skipped} "
                 f"missing={counters.known_missing + counters.newly_missing} "
                 f"downloaded={counters.downloaded} errors={counters.download_errors} "
                 f"{mib:.1f} MiB {mib_s:.1f} MiB/s"
@@ -1417,9 +1447,10 @@ class FiberStrip2DLoader:
         next_sample = int(start_sample_index)
         end_sample = next_sample + total_samples
         last_progress = 0.0
-        with ThreadPoolExecutor(max_workers=producer_count) as producer_executor, ThreadPoolExecutor(
-            max_workers=worker_count
-        ) as download_executor:
+        producer_executor = ThreadPoolExecutor(max_workers=producer_count)
+        download_executor = ThreadPoolExecutor(max_workers=worker_count)
+        normal_shutdown = False
+        try:
             producer_futures: dict[Future[tuple[int, int, list[ZarrChunkRequest]]], int] = {}
             download_futures: dict[Future[dict[str, Any]], tuple[ZarrChunkRequest, float]] = {}
 
@@ -1448,8 +1479,16 @@ class FiberStrip2DLoader:
                 done, _ = wait(active, timeout=0.25, return_when=FIRST_COMPLETED)
                 for future in done:
                     if future in producer_futures:
-                        del producer_futures[future]
-                        _, sample_valid_pixels, requests = future.result()
+                        sample_index_for_error = producer_futures.pop(future)
+                        try:
+                            _, sample_valid_pixels, requests = future.result()
+                        except ValueError as exc:
+                            counters.samples_done += 1
+                            counters.samples_skipped += 1
+                            if not counters.first_sample_skip:
+                                counters.first_sample_skip = f"sample={sample_index_for_error}: {exc}"
+                            submit_producers()
+                            continue
                         counters.samples_done += 1
                         counters.patches_done += len(self.strip_z_offsets)
                         counters.valid_pixels += int(sample_valid_pixels)
@@ -1466,6 +1505,19 @@ class FiberStrip2DLoader:
                     last_progress = now
             update_active_download_counters()
             print_progress(final=True)
+            normal_shutdown = True
+        except BaseException:
+            for future in producer_futures:
+                future.cancel()
+            for future in download_futures:
+                future.cancel()
+            producer_executor.shutdown(wait=False, cancel_futures=True)
+            download_executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            if normal_shutdown:
+                producer_executor.shutdown(wait=True)
+                download_executor.shutdown(wait=True)
 
         return {
             "generated": counters.unique_chunks_seen,
@@ -1482,8 +1534,10 @@ class FiberStrip2DLoader:
             "producer_workers": producer_count,
             "patches": counters.patches_done,
             "samples": counters.samples_done,
+            "skipped_samples": counters.samples_skipped,
             "valid_pixels": counters.valid_pixels,
             "first_error": counters.first_error,
+            "first_sample_skip": counters.first_sample_skip,
         }
 
 

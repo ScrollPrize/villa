@@ -47,3 +47,7 @@ renames, retries, and parallelism are handled in Python.
   need, deduplicate globally, then download/cache only the missing chunks.
 - Preserve deterministic sample selection and training/augment-vis loading
   behavior.
+- If CP-local strip construction hits invalid Lasagna normal data such as an
+  in-bounds `grad_mag == 0` line-window point, prefetch and training should
+  skip that deterministic sample and continue. Infrastructure/programming
+  failures still stop the run instead of being hidden.

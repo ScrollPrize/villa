@@ -785,6 +785,52 @@ def test_prefetch_uses_dependency_chunks_and_cache_markers(
     assert "downloads[" in output
 
 
+def test_prefetch_skips_invalid_sample_construction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=2)))
+    original_build_strip_source = loader.build_strip_source
+
+    def build_strip_source(sample_index: int, **kwargs):
+        if int(sample_index) == 0:
+            raise ValueError("Lasagna grad_mag sample is zero at fiber line point")
+        return original_build_strip_source(sample_index, **kwargs)
+
+    monkeypatch.setattr(loader, "build_strip_source", build_strip_source)
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
+
+    summary = loader.prefetch(0, 2, workers=2)
+
+    assert summary["samples"] == 2
+    assert summary["skipped_samples"] == 1
+    assert summary["patches"] == 3
+    assert "grad_mag sample is zero" in summary["first_sample_skip"]
+    output = capsys.readouterr().out
+    assert "skipped=1" in output
+    assert "first_skip" not in output
+
+
+def test_load_batch_skips_invalid_training_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=2)))
+    original_build_sample = loader.build_sample
+    attempted: list[int] = []
+
+    def build_sample(sample_index: int):
+        attempted.append(int(sample_index))
+        if int(sample_index) == 0:
+            raise ValueError("Lasagna grad_mag sample is zero at fiber line point")
+        return original_build_sample(sample_index)
+
+    monkeypatch.setattr(loader, "build_sample", build_sample)
+
+    batch = loader.load_batch(0, batch_size=2)
+
+    assert attempted[:3] == [0, 1, 2]
+    assert batch.images.shape[0] == 2
+    assert batch.coords_zyx.shape[0] == 2
+    assert loader._load_batch_skipped_samples == 1
+
+
 class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
     def __init__(self, array, *, level_spacing_base: float) -> None:
         super().__init__(array, level_spacing_base=level_spacing_base)
