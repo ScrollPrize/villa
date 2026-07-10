@@ -196,7 +196,7 @@ const config = {
                 },
                 {
                   label: "Weights & Biases",
-                  href: "https://wandb.ai/scrollprize",
+                  href: "https://wandb.ai/vesuvius-challenge/projects",
                 },
                 {
                   label: "Donate",
@@ -237,7 +237,7 @@ const config = {
                 },
                 {
                   label: "Weights & Biases",
-                  href: "https://wandb.ai/scrollprize",
+                  href: "https://wandb.ai/vesuvius-challenge/projects",
                 },
                 {
                   label: "Substack",
