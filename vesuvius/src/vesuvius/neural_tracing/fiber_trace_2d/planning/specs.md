@@ -124,9 +124,10 @@
 - Any future training target derived from the fiber line must use the same transformed output pixel coordinates as the sampled image, so labels and image pixels remain aligned exactly.
 - Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
 - Value augmentations after VC3D image loading should run as batched tensor
-  operations where possible. Per-patch operations remain acceptable only when
-  required to preserve behavior, such as per-patch blur kernels or deterministic
-  per-patch noise streams.
+  operations where possible. Variable per-patch Gaussian blur uses grouped
+  batched convolutions instead of one CUDA convolution loop per patch.
+  Per-patch operations remain acceptable only when required to preserve behavior,
+  such as deterministic per-patch noise streams.
 - VC3D coordinate sampling remains the explicit image I/O boundary unless the
   sampler exposes a true batched coordinate API. The loader must not add a
   separate image sampling path just to batch around that boundary.
@@ -191,6 +192,10 @@
 - If `--prefetch-steps` is omitted, prefetch uses `training.max_steps`; if that configured value is `0`, omitted prefetch also means every configured training/test CP once.
 - Negative `--prefetch-steps` values are invalid.
 - The V0 trainer uses `FiberStrip2DLoader` batches directly; it must not use the neural-tracing 3D crop loader or a separate image sampling path.
+- In training and benchmark modes, top-level `batch_size` is the number of CP
+  samples loaded per step and must match `training.control_points_per_step`.
+  Non-default flattened CNN patch counts are valid and must not warn; the
+  flattened CNN patch count is `batch_size * strip_z_offset_count`.
 - Training geometric augmentations are the same coordinate-space augmentations used by augment-vis. Value augmentations run through the existing torch augmentation functions after Zarr sampling.
 - On CUDA training runs, `training.pipeline_enabled` may overlap future batch loading with current-batch model work through a bounded deterministic producer/consumer queue. `training.pipeline_depth` controls the number of submitted whole-batch futures. `training.pipeline_workers` controls how many whole-batch `load_batch` calls may run concurrently; `0` means use `pipeline_depth`. Whole batches are still consumed strictly by step number, so the deterministic CP sample stream is unchanged.
 - The training pipeline keeps strip-coordinate generation and geometric coordinate augmentation on the configured `augment_device`. It does not move those torch coordinate operations to CPU. The only unavoidable CPU/NumPy boundary remains the VC3D coordinate sampler call after final coordinates are generated.

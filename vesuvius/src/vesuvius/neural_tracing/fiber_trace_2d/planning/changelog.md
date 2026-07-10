@@ -2,6 +2,9 @@
 
 ## 2026-07-10
 
+- Removed the 2D training default patch-count warning, added a real
+  `batch_size`/`control_points_per_step` validation error, and batched
+  variable-sigma value-augmentation blur with grouped convolutions.
 - Added configurable concurrent whole-batch CUDA training loaders and moved
   CUDA preparation submission into a background preparation executor.
 - Added CUDA side-stream training preparation for deferred image/value

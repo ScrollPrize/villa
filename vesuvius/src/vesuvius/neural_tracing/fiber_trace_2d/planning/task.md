@@ -1,14 +1,13 @@
-# Parallel CUDA Training Pipeline
+# Training Batch Config Validation And Prep Slowdown
 
-Improve `fiber_trace_2d` training overlap after observing:
+Remove the warning:
 
-- `load_ms` around 900 ms,
-- `prep_ms` around 970 ms,
-- `prep_submit_ms` around 950 ms,
-- `prep_wait_ms` at 0 ms,
-- low CPU and GPU utilization.
+`fiber_trace_2d train: patch batch is ..., expected 64 for the default 4 control points x 16 strip offsets`
 
-This means preparation is ready when consumed, but the main training thread is
-still spending nearly a second submitting/preparing future work. Add concurrent
-whole-batch loading and move CUDA preparation submission off the main training
-thread while preserving deterministic step-order consumption.
+Non-default patch counts are valid and should not print anything. If the
+training CP count and configured loader batch size disagree, fail early with a
+clear config error instead of silently ignoring one of the settings.
+
+Also fix the observed training slowdown after the parallel preparation change:
+benchmark/profile shows CUDA value augmentation blur running as a Python loop
+over patches, creating many tiny CUDA convolutions per batch.

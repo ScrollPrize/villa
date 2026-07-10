@@ -108,6 +108,17 @@ def _test_loader_config_from_raw(
     return replace(loader_config, datasets=tuple(dict(entry) for entry in test_datasets))
 
 
+def _validate_training_batch_config(training: FiberStripTrainingConfig, loader_config: Any) -> None:
+    loader_batch_size = int(loader_config.batch_size)
+    control_points = int(training.train_control_points_per_step)
+    if loader_batch_size != control_points:
+        raise ValueError(
+            "training.control_points_per_step must match top-level batch_size "
+            "because training loads one control-point batch per step: "
+            f"control_points_per_step={control_points} batch_size={loader_batch_size}"
+        )
+
+
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
@@ -688,6 +699,7 @@ def run_benchmark(
     raw_config = _load_raw_config(config_path)
     training = _training_config_from_raw(raw_config)
     loader_config = load_config(config_path)
+    _validate_training_batch_config(training, loader_config)
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
     device = resolve_torch_device(training.device)
     model: FiberStripDirectionNet | None = None
@@ -1066,6 +1078,7 @@ def run_training(
     raw_config = _load_raw_config(config_path)
     training = _training_config_from_raw(raw_config)
     loader_config = load_config(config_path)
+    _validate_training_batch_config(training, loader_config)
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
     test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
     test_loader = (
@@ -1073,14 +1086,6 @@ def run_training(
         if test_loader_config is None
         else FiberStrip2DLoader(test_loader_config, sampler_factory=sampler_factory)
     )
-    expected_patches = int(training.train_control_points_per_step) * int(loader_config.strip_z_offset_count)
-    if expected_patches != 64:
-        print(
-            "fiber_trace_2d train: patch batch is "
-            f"{expected_patches}, expected 64 for the default 4 control points x 16 strip offsets",
-            flush=True,
-        )
-
     device = resolve_torch_device(training.device)
     model = FiberStripDirectionNet(
         FiberStripDirectionModelConfig(

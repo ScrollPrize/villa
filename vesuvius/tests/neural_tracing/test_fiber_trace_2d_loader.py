@@ -52,6 +52,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _TrainingBatchPipeline,
     _test_loader_config_from_raw,
     _training_config_from_raw,
+    _validate_training_batch_config,
     FiberStripTrainingConfig,
     prefetch_training,
     run_benchmark,
@@ -1633,6 +1634,43 @@ def test_deferred_batch_image_augmentation_matches_inline_batch(tmp_path: Path) 
     assert len(deferred_base.augmentation_params) == deferred_base.images.shape[0] * deferred_base.images.shape[1]
     np.testing.assert_allclose(deferred.images, inline.images)
     np.testing.assert_array_equal(deferred.valid_mask, inline.valid_mask)
+
+
+def test_batched_value_blur_matches_single_patch_path() -> None:
+    images = np.arange(2 * 7 * 7, dtype=np.float32).reshape(2, 7, 7)
+    valid = np.ones((2, 7, 7), dtype=bool)
+    params = (
+        FiberStripAugmentParams(blur_sigma=0.5),
+        FiberStripAugmentParams(blur_sigma=1.25),
+    )
+
+    batch_images, batch_valid = apply_value_augmentation_batch(
+        images,
+        valid,
+        params,
+        device=torch.device("cpu"),
+    )
+    single_images = []
+    for index, param in enumerate(params):
+        image, single_valid = apply_value_augmentation(
+            images[index],
+            valid[index],
+            param,
+            device=torch.device("cpu"),
+        )
+        single_images.append(image)
+        assert torch.equal(single_valid, batch_valid[index])
+
+    torch.testing.assert_close(batch_images, torch.stack(single_images), rtol=1.0e-5, atol=1.0e-5)
+
+
+def test_training_rejects_batch_size_control_point_mismatch(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    loader_config = load_config(config_path)
+    training = FiberStripTrainingConfig(train_control_points_per_step=3)
+
+    with pytest.raises(ValueError, match="control_points_per_step.*batch_size"):
+        _validate_training_batch_config(training, loader_config)
 
 
 def test_training_batch_pipeline_preserves_step_sample_order() -> None:

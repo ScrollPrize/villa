@@ -19,3 +19,4 @@
     - lets add a separate med-tta flag that triggers this mode - it should then be visualized as a third columne vs reference only and the flock of traces
 - [ ] trace2cp vis should paint both tta (if enabled) and the reference trace (no augmentations)
 - [ ] augmentations: overlay angled strips! see trace2cp_vis_3.jpg
+- [ ] trace2cp its not a score its an error (hence we choose btest result as 0.0!) so fix this label in the vis

@@ -111,7 +111,10 @@ The important behavior is:
 - Value augmentation runs as torch tensor operations on the configured device:
   brightness, contrast, gamma, noise, and separable Gaussian blur. Training
   `build_sample` applies value augmentation to the loaded image stack, while
-  retaining per-patch noise seeds and blur parameters.
+  retaining per-patch noise seeds and blur parameters. Batched value
+  augmentation applies variable per-patch Gaussian blur with grouped
+  convolutions so CUDA training does not launch one blur convolution pair per
+  patch.
 - Debug line overlays are drawn only as the final visualization step. The line
   coordinates themselves are transformed geometrically, not raster-warped.
 
@@ -353,6 +356,9 @@ Training keys:
   evaluation.
 - `test_start_sample_index`: deterministic held-out sample start index.
 - `control_points_per_step`: deterministic CP samples per step; default `4`.
+  Training and benchmark modes require this to match top-level `batch_size`.
+  Changing `strip_z_offset_count` changes the flattened CNN patch count without
+  any default-shape warning.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
 - `pipeline_enabled`: enables CUDA training batch pipelining; default `true`.
@@ -568,8 +574,10 @@ training stops after that many steps. For `training.max_steps = 0`, training
 continues indefinitely.
 
 The default training shape is four control-point samples times 16 strip-z
-offsets, producing 64 patches. `load_batch` returns `[4, 16, 1, H, W]`; the
-trainer reshapes this to `[64, 1, H, W]` before the CNN forward pass.
+offsets, producing 64 patches. Non-default shapes are valid. `load_batch`
+returns `[control_points_per_step, strip_z_offset_count, 1, H, W]`; the trainer
+reshapes this to `[control_points_per_step * strip_z_offset_count, 1, H, W]`
+before the CNN forward pass.
 If one deterministic sample cannot build its CP-local Lasagna normal window
 for data reasons such as `grad_mag == 0`, `load_batch` skips it and advances
 through following deterministic sample indices until the requested number of

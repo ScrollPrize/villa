@@ -1,29 +1,33 @@
-# Parallel CUDA Training Pipeline Task Log
+# Training Batch Config Validation And Prep Slowdown Task Log
 
 ## Implementation Notes
 
-- Added `training.pipeline_workers`; `0` means use `pipeline_depth`.
-- `_TrainingBatchPipeline` now uses `pipeline_workers` concurrent whole-batch
-  loader workers while consuming steps in deterministic order.
-- `_CudaPreparedBatchPipeline` now submits load+prepare work through a
-  background preparation executor. The main thread waits for the current
-  prepared batch and only refills the queue, so `prep_submit_ms` should now be
-  small queue overhead rather than full preparation work.
-- Updated `loader_example.json` with explicit `pipeline_depth: 4` and
-  `pipeline_workers: 4`.
-- Updated specs, code-structure docs, and changelog.
+- Removed the hard-coded `expected 64` training warning. Non-default flattened
+  patch counts now run silently.
+- Added `_validate_training_batch_config()` and call it from training and
+  benchmark paths. Top-level `batch_size` is the CP-sample batch size and must
+  match `training.control_points_per_step`.
+- Replaced per-patch batched-value Gaussian blur loops with
+  `_gaussian_blur_2d_batch()`, using grouped separable convolutions. This keeps
+  different blur sigmas per patch without launching one vertical and one
+  horizontal convolution per patch.
+- Added regression tests for batch config mismatch and batched blur equivalence
+  against the single-patch path.
+- Updated specs, docs, and changelog.
+
+## Benchmark Notes
+
+- Before the grouped blur change, warm benchmark/profile rows commonly showed
+  `prep`/`prep_gpu` around `8-15 ms/patch`, which corresponds to roughly
+  one second or more of CUDA preparation per 128-patch step.
+- After grouped blur, common warm rows dropped to about `0.25-2.1 ms/patch`.
+  Heavy augmentation rows still appear around `7 ms/patch`.
+- The benchmark command was interrupted after enough rows for comparison rather
+  than waiting for all 100 batches.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/augmentation.py`
   passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 104 tests.
-
-## Follow-Up Signals
-
-- If `prep_wait_ms` rises, preparation is no longer hidden and the next
-  bottleneck is CUDA prep/value augmentation or supervision building.
-- If `wait_ms` rises, whole-batch loading is the bottleneck; increase
-  `training.pipeline_workers`, `training.pipeline_depth`, or `loader_workers`
-  carefully while watching CPU utilization.
+  passed: 106 tests.

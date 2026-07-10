@@ -608,6 +608,40 @@ def _gaussian_blur_2d(image: torch.Tensor, sigma: float) -> torch.Tensor:
     return F.conv2d(padded, kernel_x)[0, 0]
 
 
+def _gaussian_blur_2d_batch(images: torch.Tensor, sigmas: torch.Tensor) -> torch.Tensor:
+    if images.ndim != 3 or sigmas.ndim != 1:
+        raise ValueError("images must be B,H,W and sigmas must be B")
+    batch, height, width = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
+    if batch == 0 or not bool((sigmas > 0.0).any().item()):
+        return images
+    max_sigma = float(sigmas.max().item())
+    max_radius = max(1, int(math.ceil(3.0 * max_sigma)))
+    x = torch.arange(-max_radius, max_radius + 1, dtype=images.dtype, device=images.device)
+    sigma_safe = sigmas.clamp_min(1.0e-6).view(batch, 1)
+    radii = torch.ceil(3.0 * sigmas.clamp_min(0.0)).view(batch, 1)
+    offsets = x.abs().view(1, -1)
+    active = sigmas.view(batch, 1) > 0.0
+    support = offsets <= radii
+    kernels = torch.exp(-0.5 * (x.view(1, -1) / sigma_safe) ** 2)
+    kernels = torch.where(active & support, kernels, torch.zeros_like(kernels))
+    center = max_radius
+    if bool((~active).any().item()):
+        kernels = kernels.clone()
+        kernels[~active.squeeze(1)] = 0.0
+        kernels[~active.squeeze(1), center] = 1.0
+    kernels = kernels / kernels.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
+
+    grouped = images.unsqueeze(0)
+    kernel_y = kernels.view(batch, 1, -1, 1)
+    kernel_x = kernels.view(batch, 1, 1, -1)
+    pad_mode_y = "reflect" if max_radius < height else "replicate"
+    pad_mode_x = "reflect" if max_radius < width else "replicate"
+    padded = F.pad(grouped, (0, 0, max_radius, max_radius), mode=pad_mode_y)
+    blurred = F.conv2d(padded, kernel_y, groups=batch)
+    padded = F.pad(blurred, (max_radius, max_radius, 0, 0), mode=pad_mode_x)
+    return F.conv2d(padded, kernel_x, groups=batch)[0]
+
+
 def _apply_gamma(image: torch.Tensor, valid: torch.Tensor, gamma: float, value_range: torch.Tensor, center: torch.Tensor) -> torch.Tensor:
     gamma = float(gamma)
     if abs(gamma - 1.0) <= 1.0e-6:
@@ -912,9 +946,8 @@ def apply_value_augmentation_batch(
                 generator=generator,
                 device=device,
             ) * float(param.noise_std) * value_range[index]
-    for index, param in enumerate(params):
-        if float(param.blur_sigma) > 0.0:
-            out[index] = _gaussian_blur_2d(out[index], float(param.blur_sigma))
+    blur_sigmas = torch.tensor([float(param.blur_sigma) for param in params], dtype=image_t.dtype, device=device)
+    out = _gaussian_blur_2d_batch(out, blur_sigmas)
     return torch.where(valid, out, torch.zeros_like(out)), valid
 
 

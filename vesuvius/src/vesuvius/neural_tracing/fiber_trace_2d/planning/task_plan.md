@@ -1,41 +1,41 @@
-# Parallel CUDA Training Pipeline Plan
+# Training Batch Config Validation And Prep Slowdown Plan
 
 ## Implementation
 
-- Add `training.pipeline_workers` as the concurrent whole-batch loader worker
-  count. Default it to `training.pipeline_depth` so existing CUDA pipeline
-  configs immediately allow more than one in-flight `load_batch` call.
-- Keep deterministic sample semantics by submitting steps concurrently but
-  consuming completed whole batches strictly by step number.
-- Keep `training.pipeline_depth` as the bounded queue depth for in-flight
-  whole-batch loads/prepared batches.
-- Move CUDA batch preparation submission into a small background preparation
-  executor. The main training thread should wait only for the current prepared
-  batch event, then run forward/backward/step.
-- Preserve the side CUDA stream and prepared CUDA tensors introduced by the
-  prior task.
+- Remove the hard-coded default patch-count warning from `run_training`.
+- Add a small train/benchmark validation helper that requires
+  `training.control_points_per_step` to match loader `batch_size`, because
+  training loads exactly one CP batch per step.
+- Keep non-default flattened patch counts valid:
+  `batch_size * strip_z_offset_count` may be any positive configured value.
+- Replace per-patch CUDA Gaussian blur in batched value augmentation with a
+  grouped batched blur so variable per-patch blur sigmas use two grouped
+  convolutions for the whole patch batch.
 
 ## Spec Update
 
-- Replace the single whole-batch producer wording with deterministic concurrent
-  whole-batch loading.
-- Document `training.pipeline_workers` and the ordered-consumption guarantee.
-- Clarify that `prep_submit_ms` measures main-thread queue refill overhead, not
-  the full preparation work.
+- Document that top-level `batch_size` is the CP-sample count and training
+  `control_points_per_step` must match it.
+- Document that changing `strip_z_offset_count` changes the flattened CNN patch
+  count without warning.
+- Document that batched value augmentation should avoid per-patch CUDA blur
+  loops.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` training/config sections with
-  `pipeline_workers` and the background preparation executor.
+- Update `docs/code_structure.md` config/training notes with the same meaning.
+- Update augmentation implementation notes for grouped batch blur.
 
 ## Testing
 
-- Run:
-  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`
+- Add a focused regression test for rejecting mismatched
+  `control_points_per_step` and loader `batch_size`.
+- Add a regression test that batched blur matches the single-patch path for
+  different blur sigmas.
 - Run:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
 ## Changelog
 
-- Add a short changelog entry for concurrent whole-batch loading and background
-  CUDA-preparation submission.
+- Add a short entry for removing the default patch-count warning, validating
+  training batch config, and batching value-augmentation blur.
