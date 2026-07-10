@@ -19,6 +19,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     smooth_offset_field,
     source_coordinate_grid_for_output,
     transformed_centerline_coords,
+    transformed_source_point_coords,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     build_direction_supervision,
@@ -485,6 +486,23 @@ def test_coordinate_scale_and_smooth_offset_are_deterministic() -> None:
     assert float(torch.abs(smooth_a).max().item()) <= 4.5
     assert torch.allclose(base[2, 2], scaled[2, 2])
     assert abs(float(scaled[2, 3, 0] - scaled[2, 2, 0])) < abs(float(base[2, 3, 0] - base[2, 2, 0]))
+
+
+def test_shift_is_applied_after_scale_in_output_space() -> None:
+    device = torch.device("cpu")
+    params = FiberStripAugmentParams(shift_x=1.0, shift_y=-2.0, scale=2.0)
+
+    point = transformed_source_point_coords(
+        (9, 9),
+        (9, 9),
+        params,
+        (5.0, 4.0),
+        device=device,
+    )
+    grid = source_coordinate_grid_for_output(9, 9, 9, 9, params, device=device)
+
+    assert np.allclose(point, np.asarray([7.0, 2.0], dtype=np.float32))
+    assert torch.allclose(grid[int(round(point[1])), int(round(point[0]))], torch.tensor([5.0, 4.0]))
 
 
 def test_line_augmentation_returns_coordinates_not_mask() -> None:

@@ -73,6 +73,9 @@ The important behavior is:
 - Builds geometric augmentation maps in strip pixel coordinates. The image is
   never geometrically warped after loading; instead, output pixels map into an
   oversized source coordinate grid, and final 3D coordinates are sampled once.
+- Affine shift is composed as an output-space translation after scale/flip, and
+  the inverse sampling grid plus transformed line/control-point coordinates use
+  that same order.
 - Implements affine transforms, flips, smooth row offsets, value augmentation,
   line-coordinate mapping, and debug line overlays.
 - Value augmentation runs as torch tensor operations on the configured device:

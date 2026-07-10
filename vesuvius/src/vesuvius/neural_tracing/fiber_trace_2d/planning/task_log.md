@@ -252,3 +252,19 @@ Validation:
   - Result: passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
   - Result: `36 passed in 2.95s`.
+
+## Shift/Scale Augmentation Order
+
+- Moved affine geometric shift to output space after scale/flip for the inverse
+  sampling grid and the forward line/control-point coordinate maps.
+- Added a combined shift+scale regression test proving that a transformed
+  source point and the sampling grid agree on the same output pixel.
+- Updated specs and code docs with the explicit composition order.
+- Removed the completed todo entry from `planning/todo.md`.
+
+Validation:
+
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/augmentation.py`
+  - Result: passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result: `37 passed in 5.32s`.

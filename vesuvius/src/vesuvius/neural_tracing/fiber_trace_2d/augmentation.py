@@ -273,8 +273,8 @@ def source_coordinate_grid_for_output(
     source_center_x = (float(source_width) - 1.0) * 0.5
     source_center_y = (float(source_height) - 1.0) * 0.5
     coords = _pixel_grid(output_height, output_width, device=device)
-    x = coords[..., 0] - output_center_x
-    y = coords[..., 1] - output_center_y
+    x = coords[..., 0] - output_center_x - float(params.shift_x)
+    y = coords[..., 1] - output_center_y - float(params.shift_y)
 
     if params.flip_x:
         x = -x
@@ -290,8 +290,8 @@ def source_coordinate_grid_for_output(
     angle = math.radians(float(params.rotation_degrees))
     cos_a = math.cos(angle)
     sin_a = math.sin(angle)
-    src_x = cos_a * x_sheared - sin_a * y_sheared + source_center_x - float(params.shift_x)
-    src_y = sin_a * x_sheared + cos_a * y_sheared + source_center_y - float(params.shift_y)
+    src_x = cos_a * x_sheared - sin_a * y_sheared + source_center_x
+    src_y = sin_a * x_sheared + cos_a * y_sheared + source_center_y
     if float(params.smooth_offset) != 0.0:
         src_y = src_y + smooth_offset_field(
             output_height,
@@ -499,8 +499,8 @@ def _transformed_source_point_coords_affine(
     points = torch.as_tensor(source_points_xy, dtype=torch.float32, device=device)
     src_x = points[:, 0]
     src_y = points[:, 1]
-    u = src_x - source_center_x + float(params.shift_x)
-    v = src_y - source_center_y + float(params.shift_y)
+    u = src_x - source_center_x
+    v = src_y - source_center_y
 
     angle = math.radians(float(params.rotation_degrees))
     cos_a = math.cos(angle)
@@ -523,7 +523,10 @@ def _transformed_source_point_coords_affine(
         x = -x
     if params.flip_y:
         y = -y
-    coords = torch.stack([x + output_center_x, y + output_center_y], dim=1)
+    coords = torch.stack(
+        [x + output_center_x + float(params.shift_x), y + output_center_y + float(params.shift_y)],
+        dim=1,
+    )
     return coords.detach().cpu().numpy().astype(np.float32)
 
 
@@ -544,8 +547,8 @@ def _transformed_centerline_coords_affine(
     count = max(source_width, output_width)
     src_x = torch.linspace(0.0, float(source_width - 1), count, device=device, dtype=torch.float32)
     src_y = torch.full_like(src_x, source_center_y)
-    u = src_x - source_center_x + float(params.shift_x)
-    v = src_y - source_center_y + float(params.shift_y)
+    u = src_x - source_center_x
+    v = src_y - source_center_y
 
     angle = math.radians(float(params.rotation_degrees))
     cos_a = math.cos(angle)
@@ -568,7 +571,10 @@ def _transformed_centerline_coords_affine(
         x = -x
     if params.flip_y:
         y = -y
-    coords = torch.stack([x + output_center_x, y + output_center_y], dim=1)
+    coords = torch.stack(
+        [x + output_center_x + float(params.shift_x), y + output_center_y + float(params.shift_y)],
+        dim=1,
+    )
     coords = coords[
         (coords[:, 0] >= 0.0)
         & (coords[:, 0] <= float(output_width - 1))

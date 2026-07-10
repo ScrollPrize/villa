@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-10
+
+- Fixed 2D fiber-strip affine augmentation composition so shift is applied in output/scaled space and image sampling stays aligned with line/control-point coordinates.
+
 ## 2026-07-09
 
 - Tightened 2D fiber-strip prefetch so VC3D only reports dependency metadata while Python handles direct-source uncompressed chunk downloads, atomic cache writes, zero-byte `.empty` markers, and retry/progress behavior.
