@@ -44,8 +44,8 @@ class FiberStripTrainingConfig:
     train_control_points_per_step: int = 4
     device: str = "auto"
     tensorboard_enabled: bool = True
-    model_hidden_channels: int = 32
-    model_depth: int = 5
+    model_hidden_channels: int = 64
+    model_depth: int = 10
 
 
 def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
@@ -73,8 +73,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         train_control_points_per_step=max(1, int(get("control_points_per_step", get("control_points", 4)))),
         device=str(get("device", "auto")),
         tensorboard_enabled=bool(get("tensorboard_enabled", True)),
-        model_hidden_channels=max(1, int(get("model_hidden_channels", 32))),
-        model_depth=max(1, int(get("model_depth", 5))),
+        model_hidden_channels=max(1, int(get("model_hidden_channels", 64))),
+        model_depth=max(1, int(get("model_depth", 10))),
     )
     if config.max_steps < 0:
         raise ValueError("training.max_steps must be >= 0")

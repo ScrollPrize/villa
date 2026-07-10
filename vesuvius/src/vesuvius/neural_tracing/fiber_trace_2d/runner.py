@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     limit_augmentation_rows,
@@ -98,6 +99,53 @@ def _overlay_polyline_rgb(
     else:
         draw.line(points, fill=color_rgba, width=max(1, int(thickness)), joint="curve")
     return np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8)
+
+
+def _direction_field_overlay_rgb(
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    direction_xy: np.ndarray,
+    *,
+    scale: int = 2,
+    stride: int = 2,
+    color_rgba: tuple[int, int, int, int] = (32, 255, 255, 220),
+) -> tuple[np.ndarray, int]:
+    from PIL import Image, ImageDraw
+
+    base = np.asarray(image, dtype=np.uint8)
+    if base.ndim == 2:
+        base = np.repeat(base[..., None], 3, axis=-1)
+    valid = np.asarray(valid_mask, dtype=bool)
+    field = np.asarray(direction_xy, dtype=np.float32)
+    if valid.shape != base.shape[:2]:
+        raise ValueError("valid_mask must match image shape")
+    if field.shape != (*base.shape[:2], 2):
+        raise ValueError("direction_xy must have shape H,W,2 matching image")
+    display_scale = max(1, int(scale))
+    sample_stride = max(1, int(stride))
+    scaled = np.repeat(np.repeat(base, display_scale, axis=0), display_scale, axis=1)
+    pil = Image.fromarray(scaled, mode="RGB")
+    overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, mode="RGBA")
+    half_len = max(1.0, float(display_scale * sample_stride) * 0.375)
+    drawn = 0
+    height, width = valid.shape
+    for y in range(0, height, sample_stride):
+        for x in range(0, width, sample_stride):
+            if not bool(valid[y, x]):
+                continue
+            direction = field[y, x]
+            norm = float(np.linalg.norm(direction))
+            if not np.isfinite(norm) or norm <= 1.0e-6:
+                continue
+            unit = direction / np.float32(norm)
+            cx = (float(x) + 0.5) * float(display_scale)
+            cy = (float(y) + 0.5) * float(display_scale)
+            dx = float(unit[0]) * half_len
+            dy = float(unit[1]) * half_len
+            draw.line((cx - dx, cy - dy, cx + dx, cy + dy), fill=color_rgba, width=1)
+            drawn += 1
+    return np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8), drawn
 
 
 def _draw_label_band(image: np.ndarray, label: str) -> np.ndarray:
@@ -249,6 +297,115 @@ def _trace_direction_line(
     return np.stack(combined, axis=0).astype(np.float32)
 
 
+def _trace_tta_matrix(
+    shape_hw: tuple[int, int],
+    *,
+    flip_x: bool = False,
+    flip_y: bool = False,
+    rotation_degrees: int = 0,
+    shift_xy: tuple[float, float] = (0.0, 0.0),
+) -> np.ndarray:
+    height, width = (int(v) for v in shape_hw)
+    cx = (float(width) - 1.0) * 0.5
+    cy = (float(height) - 1.0) * 0.5
+
+    def translate(tx: float, ty: float) -> np.ndarray:
+        return np.asarray([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+    center_to_origin = translate(-cx, -cy)
+    origin_to_center = translate(cx, cy)
+    flip = np.asarray(
+        [[-1.0 if flip_x else 1.0, 0.0, 0.0], [0.0, -1.0 if flip_y else 1.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    angle = np.deg2rad(float(rotation_degrees))
+    rot = np.asarray(
+        [[np.cos(angle), -np.sin(angle), 0.0], [np.sin(angle), np.cos(angle), 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    shift = translate(float(shift_xy[0]), float(shift_xy[1]))
+    return (shift @ origin_to_center @ rot @ flip @ center_to_origin).astype(np.float32)
+
+
+def _transform_points_xy(points_xy: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_xy, dtype=np.float32)
+    if points.ndim == 1:
+        points = points.reshape(1, 2)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points_xy must have shape N,2")
+    ones = np.ones((points.shape[0], 1), dtype=np.float32)
+    homogeneous = np.concatenate([points, ones], axis=1)
+    transformed = homogeneous @ np.asarray(matrix, dtype=np.float32).T
+    return transformed[:, :2].astype(np.float32)
+
+
+def _transform_direction_xy(direction_xy: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    direction = np.asarray(direction_xy, dtype=np.float32)
+    if direction.shape != (2,):
+        raise ValueError("direction_xy must have shape (2,)")
+    linear = np.asarray(matrix, dtype=np.float32)[:2, :2]
+    transformed = linear @ direction
+    norm = float(np.linalg.norm(transformed))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return direction
+    return (transformed / norm).astype(np.float32)
+
+
+def _warp_patch_by_matrix(
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    matrix_original_to_augmented: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.asarray(image, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if arr.ndim != 2 or valid.shape != arr.shape:
+        raise ValueError("image and valid_mask must be matching 2D arrays")
+    height, width = arr.shape
+    inv = np.linalg.inv(np.asarray(matrix_original_to_augmented, dtype=np.float32))
+    yy, xx = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing="ij",
+    )
+    ones = torch.ones_like(xx)
+    out = torch.stack([xx, yy, ones], dim=-1).reshape(-1, 3)
+    inv_t = torch.as_tensor(inv.T, dtype=torch.float32)
+    src = (out @ inv_t).reshape(height, width, 3)[..., :2]
+    if width > 1:
+        grid_x = src[..., 0] * (2.0 / float(width - 1)) - 1.0
+    else:
+        grid_x = torch.zeros_like(src[..., 0])
+    if height > 1:
+        grid_y = src[..., 1] * (2.0 / float(height - 1)) - 1.0
+    else:
+        grid_y = torch.zeros_like(src[..., 1])
+    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+    image_t = torch.as_tensor(arr, dtype=torch.float32).view(1, 1, height, width)
+    valid_t = torch.as_tensor(valid.astype(np.float32), dtype=torch.float32).view(1, 1, height, width)
+    warped = F.grid_sample(image_t, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
+    warped_valid = F.grid_sample(valid_t, grid, mode="nearest", padding_mode="zeros", align_corners=True)[0, 0] > 0.5
+    return warped.numpy().astype(np.float32), warped_valid.numpy().astype(bool)
+
+
+def _line_trace_tta_entries(shape_hw: tuple[int, int], loader: FiberStrip2DLoader) -> list[tuple[str, np.ndarray]]:
+    height, width = (int(v) for v in shape_hw)
+    shift_x = float(getattr(loader.config.augment, "shift_x", max(1.0, float(width) * 0.25)))
+    shift_y = float(getattr(loader.config.augment, "shift_y", max(1.0, float(height) * 0.25)))
+    variants = [
+        ("flip_h", dict(flip_x=True)),
+        ("flip_v", dict(flip_y=True)),
+        ("flip_hv", dict(flip_x=True, flip_y=True)),
+        ("rot90", dict(rotation_degrees=90)),
+        ("rot180", dict(rotation_degrees=180)),
+        ("rot270", dict(rotation_degrees=270)),
+        ("shift_x_min", dict(shift_xy=(-shift_x, 0.0))),
+        ("shift_x_max", dict(shift_xy=(shift_x, 0.0))),
+        ("shift_y_min", dict(shift_xy=(0.0, -shift_y))),
+        ("shift_y_max", dict(shift_xy=(0.0, shift_y))),
+    ]
+    return [(name, _trace_tta_matrix(shape_hw, **kwargs)) for name, kwargs in variants]
+
+
 def _prepare_model_image(image: np.ndarray, valid_mask: np.ndarray, *, device: torch.device) -> torch.Tensor:
     image_t = torch.as_tensor(np.asarray(image, dtype=np.float32), dtype=torch.float32, device=device).view(
         1, 1, *np.asarray(image).shape
@@ -271,8 +428,8 @@ def _model_config_from_checkpoint(checkpoint: dict, loader: FiberStrip2DLoader) 
         training = {}
     return FiberStripDirectionModelConfig(
         in_channels=1,
-        hidden_channels=max(1, int(training.get("model_hidden_channels", 32))),
-        depth=max(1, int(training.get("model_depth", 5))),
+        hidden_channels=max(1, int(training.get("model_hidden_channels", 64))),
+        depth=max(1, int(training.get("model_depth", 10))),
     )
 
 
@@ -290,6 +447,19 @@ def _load_direction_model(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint
+
+
+def _predict_direction_field(
+    model: FiberStripDirectionNet,
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    device: torch.device,
+) -> np.ndarray:
+    with torch.no_grad():
+        input_image = _prepare_model_image(image, valid_mask, device=device)
+        encoded = model(input_image)[0].permute(1, 2, 0)
+        return decode_lasagna_direction_xy(encoded, bins=720).detach().cpu().numpy().astype(np.float32)
 
 
 def _export_line_trace_vis(
@@ -310,13 +480,11 @@ def _export_line_trace_vis(
         raise ValueError("selected sample has no usable transformed CP/tangent line")
     cp_xy, tangent_xy = cp_tangent
     model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
-    # The model has one 3x3 convolution per configured depth, giving radius=depth.
+    # The model has a 3x3 input projection and two 3x3 convolutions per residual block.
     configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
-    margin = float(configured_depth if rf_margin_px is None else rf_margin_px)
-    with torch.no_grad():
-        input_image = _prepare_model_image(image, valid_mask, device=device)
-        encoded = model(input_image)[0].permute(1, 2, 0)
-        direction_xy = decode_lasagna_direction_xy(encoded, bins=720).detach().cpu().numpy()
+    default_margin = 1 + 2 * configured_depth
+    margin = float(default_margin if rf_margin_px is None else rf_margin_px)
+    direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
     traced_line = _trace_direction_line(
         direction_xy,
         cp_xy,
@@ -326,10 +494,43 @@ def _export_line_trace_vis(
         rf_margin_px=margin,
     )
     image_u8 = _to_u8_image(image, valid_mask)
-    overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.5, thickness=1)
-    overlay = _overlay_polyline_rgb(overlay, traced_line, color_rgba=(0, 255, 0, 230), thickness=1)
-    overlay = _draw_cp_crosshair(overlay, cp_xy)
-    _write_jpg(out / "line_trace_vis.jpg", overlay)
+    single_overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.5, thickness=1)
+    single_overlay = _overlay_polyline_rgb(single_overlay, traced_line, color_rgba=(0, 255, 0, 230), thickness=1)
+    single_overlay = _draw_cp_crosshair(single_overlay, cp_xy)
+
+    flock_overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.35, thickness=1)
+    flock_overlay = _overlay_polyline_rgb(flock_overlay, traced_line, color_rgba=(0, 255, 0, 220), thickness=1)
+    tta_rows: list[str] = []
+    for tta_name, matrix in _line_trace_tta_entries(image.shape, loader):
+        try:
+            tta_image, tta_valid = _warp_patch_by_matrix(image, valid_mask, matrix)
+            tta_cp = _transform_points_xy(cp_xy, matrix)[0]
+            tta_tangent = _transform_direction_xy(tangent_xy, matrix)
+            tta_direction = _predict_direction_field(model, tta_image, tta_valid, device=device)
+            tta_trace = _trace_direction_line(
+                tta_direction,
+                tta_cp,
+                tta_tangent,
+                valid_mask=tta_valid,
+                step_px=step_px,
+                rf_margin_px=margin,
+            )
+            trace_back = _transform_points_xy(tta_trace, np.linalg.inv(matrix))
+            flock_overlay = _overlay_polyline_rgb(
+                flock_overlay,
+                trace_back,
+                color_rgba=(64, 224, 255, 120),
+                thickness=1,
+            )
+            tta_rows.append(f"{tta_name}: points={int(trace_back.shape[0])}")
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            tta_rows.append(f"{tta_name}: skipped={exc}")
+    flock_overlay = _draw_cp_crosshair(flock_overlay, cp_xy)
+
+    combined = np.zeros((image_u8.shape[0], image_u8.shape[1] * 2, 3), dtype=np.uint8)
+    combined[:, : image_u8.shape[1], :] = single_overlay
+    combined[:, image_u8.shape[1] :, :] = flock_overlay
+    _write_jpg(out / "line_trace_vis.jpg", combined)
     summary = [
         f"sample_index={sample_index}",
         f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
@@ -342,9 +543,49 @@ def _export_line_trace_vis(
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
         f"trace_points={int(traced_line.shape[0])}",
+        "tta_traces:",
+        *tta_rows,
     ]
     (out / "line_trace_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
     print(f"exported line_trace_vis.jpg and line_trace_summary.txt to {out}")
+
+
+def _export_dir_vis(
+    loader: FiberStrip2DLoader,
+    sample_index: int,
+    output_dir: str | Path,
+    *,
+    checkpoint_path: str | Path,
+) -> None:
+    out = Path(output_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    device = resolve_torch_device(loader.config.augment.device)
+    sample, image, valid_mask = loader.build_center_strip_patch(sample_index)
+    model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
+    direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
+    image_u8 = _to_u8_image(image, valid_mask)
+    overlay, drawn = _direction_field_overlay_rgb(
+        image_u8,
+        valid_mask,
+        direction_xy,
+        scale=2,
+        stride=2,
+    )
+    _write_jpg(out / "dir_vis.jpg", overlay)
+    summary = [
+        f"sample_index={sample_index}",
+        f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
+        f"checkpoint_step={checkpoint.get('step', 'unknown')}",
+        f"fiber_path={sample.fiber_path}",
+        f"control_point_index={sample.control_point_index}",
+        f"strip_z_offset={sample.strip_z_offset}",
+        f"image_shape_hw=({int(image.shape[0])}, {int(image.shape[1])})",
+        "display_scale=2",
+        "direction_stride=2",
+        f"drawn_directions={drawn}",
+    ]
+    (out / "dir_vis_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    print(f"exported dir_vis.jpg and dir_vis_summary.txt to {out}")
 
 
 def _offset_label(offset: float) -> str:
@@ -594,6 +835,7 @@ def main() -> None:
     parser.add_argument("--export-dir", default=None)
     parser.add_argument("--augment-vis", action="store_true")
     parser.add_argument("--line-trace-vis", action="store_true")
+    parser.add_argument("--dir-vis", action="store_true")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--line-trace-step", type=float, default=4.0)
     parser.add_argument("--line-trace-rf-margin", type=float, default=None)
@@ -639,6 +881,19 @@ def main() -> None:
             checkpoint_path=args.checkpoint,
             step_px=args.line_trace_step,
             rf_margin_px=args.line_trace_rf_margin,
+        )
+        return
+
+    if args.dir_vis:
+        if args.export_dir is None:
+            raise SystemExit("--dir-vis requires --export-dir")
+        if args.checkpoint is None:
+            raise SystemExit("--dir-vis requires --checkpoint")
+        _export_dir_vis(
+            loader,
+            args.sample_index,
+            args.export_dir,
+            checkpoint_path=args.checkpoint,
         )
         return
 

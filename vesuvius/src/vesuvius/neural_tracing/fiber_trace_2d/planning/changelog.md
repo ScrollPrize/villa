@@ -2,7 +2,11 @@
 
 ## 2026-07-10
 
+- Switched the default 2D fiber-strip direction model to a 10-block, 64-channel residual CNN.
+- Switched the default 2D direction ResNet normalization to 8-group GroupNorm.
+- Added `--dir-vis` runner direction-field inspection for checkpointed per-pixel direction predictions.
 - Added the V0.1 runner line-tracing inspection mode for tracing checkpointed direction predictions on one deterministic side-strip patch.
+- Added fixed test-time augmentation flock visualization to the V0.1 line-trace runner output.
 - Added folded unoriented direction angle-error reporting in degrees for 2D fiber-strip train/test output.
 - Fixed prefetch `idx` progress semantics so it reports the cache-complete safe sample prefix rather than dependency-generation progress.
 - Added `prefetch_sampler_workers` to tune dependency producer concurrency separately from download worker concurrency.

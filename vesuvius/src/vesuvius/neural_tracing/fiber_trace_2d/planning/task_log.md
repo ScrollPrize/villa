@@ -1,38 +1,24 @@
-# Task Log: Tool1 Patch Line Tracing
+# Task Log: 10-Block 64-Channel ResNet Direction Model
 
-## Implemented
+## Implementation Notes
 
-- Added runner-only `--line-trace-vis` mode requiring `--checkpoint` and
-  `--export-dir`.
-- Added checkpoint loading for `FiberStripDirectionNet` using the saved training
-  config model depth/hidden-channel settings.
-- Added side-strip direction-field tracing helpers:
-  - decoded Lasagna ambiguous two-cos-channel output;
-  - bilinear direction sampling;
-  - forward/backward sign continuity;
-  - receptive-field margin stop before patch borders;
-  - image-validity checks for sampled bilinear corners.
-- Changed the public line-trace CLI default step to `4.0` px.
-- Exported:
-  - `line_trace_vis.jpg` with original strip line, traced line, and CP marker;
-  - `line_trace_summary.txt` with sample/checkpoint/trace metadata.
-- Updated `planning/specs.md`, `docs/code_structure.md`, and
-  `planning/changelog.md`.
-- Added synthetic regression tests for direction sampling, border stopping, and
-  ambiguous direction sign continuity.
+- Replaced the plain convolution stack with a constant-width residual CNN.
+- Updated default model sizing to 10 residual blocks and 64 hidden channels in
+  `model.py`, `train.py`, runner checkpoint fallback, and `loader_example.json`.
+- Updated line-trace default receptive-field margin to `1 + 2 * model_depth`
+  to match the ResNet's input projection plus two 3x3 convolutions per block.
+- Switched ResNet normalization from one GroupNorm group to eight groups for
+  the default 64-channel width, with a valid-divisor fallback for smaller
+  explicit test models.
+- Added tests for default block/channel count and forward output shape/range.
 
 ## Deviations
 
-- No deviations from `task_plan.md`.
-- The broader worktree has unrelated/user edits in `planning/plan.md` and
-  `planning/todo.md`; they were left untouched.
+- None.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/model.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
   passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 60 tests.
-- Targeted whitespace check for touched files passed.
-- Full fiber_trace_2d whitespace check still reports pre-existing trailing
-  whitespace in `planning/plan.md`.
+  passed: 64 tests.

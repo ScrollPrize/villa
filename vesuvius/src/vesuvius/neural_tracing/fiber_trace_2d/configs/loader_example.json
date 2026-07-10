@@ -41,8 +41,8 @@
     "control_points_per_step": 4,
     "device": "auto",
     "tensorboard_enabled": true,
-    "model_hidden_channels": 32,
-    "model_depth": 5
+    "model_hidden_channels": 64,
+    "model_depth": 10
   },
   "datasets": [
     {

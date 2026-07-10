@@ -95,7 +95,10 @@ The important behavior is:
 
 `model.py`
 
-- Defines `FiberStripDirectionNet`, a deliberately small V0 2D CNN.
+- Defines `FiberStripDirectionNet`, the V0 2D residual CNN.
+- The default model has 10 residual blocks and 64 hidden channels.
+- The default normalization is `GroupNorm(8, 64)`; smaller explicit hidden
+  widths use the largest valid group count up to 8.
 - Consumes flattened strip patches shaped `[patch_batch, 1, height, width]`.
 - Outputs exactly two per-pixel direction channels in the Lasagna encoded
   representation.
@@ -138,8 +141,17 @@ The important behavior is:
   V0.1 patch line-tracing inspection. This mode loads the deterministic
   center side-strip patch for `--sample-index`, runs the checkpointed direction
   model, bilinearly traces the decoded direction field from the transformed CP
-  in both directions with a default 4 px trace step, and writes
+  in both directions with a default 4 px trace step and a default receptive
+  field margin of `1 + 2 * model_depth`, and writes
   `line_trace_vis.jpg` plus `line_trace_summary.txt`.
+- The line-trace JPG has two columns: the unaugmented trace view, then the
+  original patch with a flock of traces from fixed test-time augmentations
+  inverse-warped back into original patch coordinates.
+- Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
+  direction-field inspection. This mode loads the same deterministic center
+  side-strip patch, runs the checkpointed direction model, decodes the
+  direction field, scales the patch image by 2x, and writes `dir_vis.jpg` with
+  short direction segments drawn every second source pixel.
 
 `train.py`
 
@@ -223,7 +235,8 @@ Training keys:
 - `control_points_per_step`: deterministic CP samples per step; default `4`.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
-- `model_hidden_channels` and `model_depth`: V0 CNN size knobs.
+- `model_hidden_channels` and `model_depth`: V0 ResNet size knobs. Defaults
+  are 64 hidden channels and 10 residual blocks.
 
 Training prefetch:
 
@@ -583,6 +596,12 @@ Export a line-tracing inspection image:
 
 ```bash
 PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.runner config.json --sample-index 0 --line-trace-vis --checkpoint /path/to/current.pt --export-dir /tmp/fiber_trace_2d_trace
+```
+
+Export a direction-field inspection image:
+
+```bash
+PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.runner config.json --sample-index 0 --dir-vis --checkpoint /path/to/current.pt --export-dir /tmp/fiber_trace_2d_dir
 ```
 
 Run V0 direction training:

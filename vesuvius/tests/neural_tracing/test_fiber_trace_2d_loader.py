@@ -34,6 +34,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     load_config,
     strip_z_offsets_from_count_step,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.model import (
+    FiberStripDirectionModelConfig,
+    FiberStripDirectionNet,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _draw_predicted_cp_direction,
     _select_visualization_patch_indices,
@@ -45,7 +49,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _bilinear_direction_sample,
+    _direction_field_overlay_rgb,
     _export_augment_contact_sheet,
+    _line_trace_tta_entries,
+    _transform_points_xy,
     _trace_direction_line,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
@@ -202,6 +209,63 @@ def test_line_trace_keeps_ambiguous_direction_continuous() -> None:
     assert np.all(np.diff(line[:, 0]) > 0.0)
     assert np.isclose(line[0, 0], 1.0)
     assert np.isclose(line[-1, 0], 7.0)
+
+
+def test_line_trace_tta_point_transforms_round_trip() -> None:
+    loader = SimpleNamespace(
+        config=SimpleNamespace(
+            augment=SimpleNamespace(
+                shift_x=3.0,
+                shift_y=2.0,
+            )
+        )
+    )
+    points = np.asarray([[1.0, 2.0], [4.5, 6.25], [8.0, 3.0]], dtype=np.float32)
+
+    for _, matrix in _line_trace_tta_entries((11, 13), loader):
+        warped = _transform_points_xy(points, matrix)
+        restored = _transform_points_xy(warped, np.linalg.inv(matrix))
+        assert np.allclose(restored, points, atol=1.0e-5)
+
+
+def test_dir_vis_overlay_scales_and_strides() -> None:
+    image = np.full((5, 7), 64, dtype=np.uint8)
+    valid = np.zeros((5, 7), dtype=bool)
+    valid[0::2, 0::2] = True
+    valid[2, 2] = False
+    direction = np.zeros((5, 7, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+
+    overlay, drawn = _direction_field_overlay_rgb(image, valid, direction, scale=2, stride=2)
+
+    assert overlay.shape == (10, 14, 3)
+    assert drawn == 11
+    scaled = np.repeat(np.repeat(np.repeat(image[..., None], 3, axis=2), 2, axis=0), 2, axis=1)
+    assert not np.array_equal(overlay, scaled)
+
+
+def test_direction_model_defaults_to_10_block_64_channel_resnet() -> None:
+    config = FiberStripDirectionModelConfig()
+    model = FiberStripDirectionNet(config)
+
+    assert config.hidden_channels == 64
+    assert config.depth == 10
+    assert len(model.blocks) == 10
+    assert model.input[0].out_channels == 64
+    assert model.input[1].num_groups == 8
+    assert model.blocks[0].norm1.num_groups == 8
+
+
+def test_direction_model_forward_shape_and_range() -> None:
+    model = FiberStripDirectionNet(FiberStripDirectionModelConfig(hidden_channels=4, depth=2))
+    image = torch.zeros((3, 1, 8, 9), dtype=torch.float32)
+
+    output = model(image)
+
+    assert model.input[1].num_groups == 4
+    assert output.shape == (3, 2, 8, 9)
+    assert bool(torch.all(output >= 0.0))
+    assert bool(torch.all(output <= 1.0))
 
 
 def test_fiber_parser_reuse(tmp_path: Path) -> None:
