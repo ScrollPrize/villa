@@ -1,13 +1,12 @@
-# Status: Shift/Scale Augmentation Order
+# Status: Augment-Vis CP Marker And Label Padding
 
 - [x] Read local `AGENTS.md` instructions.
-- [x] Read first item from `planning/todo.md`.
-- [x] Replace `planning/task.md` with the active todo-derived task.
+- [x] Replace `planning/task.md` with the active visualization task.
 - [x] Replace `planning/task_plan.md` with the implementation plan.
-- [x] Review current specs and augmentation implementation.
-- [x] Update affine image-sampling coordinate map.
-- [x] Update affine line/control-point coordinate maps.
-- [x] Add combined shift+scale regression test.
+- [x] Add augment-vis CP crosshair from transformed control-point coordinates.
+- [x] Move contact-sheet labels into a separate top band.
+- [x] Add transformed CP coordinates to the augment summary.
 - [x] Update specs and docs.
+- [x] Update focused test expectations.
 - [x] Run focused validation commands.
 - [x] Update task log and changelog.

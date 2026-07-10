@@ -464,9 +464,12 @@ Layout:
 - row 2: upper-limit examples;
 - row 3: random combined training-style examples.
 
-Each cell is a raw clipped image, not percentile-normalized. Invalid pixels are
-black. A red 50 percent opacity line is drawn from transformed line coordinates
-with fixed screen-space thickness.
+Each cell has a top label band naming the augmentation, then a raw clipped
+image below it. Labels do not cover image pixels. Invalid pixels are black. A
+red 50 percent opacity line is drawn from transformed line coordinates with
+fixed screen-space thickness, and a final thin cyan vertical marker shows the
+transformed control-point coordinate from `FiberStripSample.control_point_xy`
+while leaving the CP pixel itself visible.
 
 The runner writes:
 

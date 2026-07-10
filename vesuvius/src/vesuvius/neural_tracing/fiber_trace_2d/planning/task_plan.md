@@ -1,37 +1,35 @@
-# Task Plan: Shift/Scale Augmentation Order
+# Task Plan: Augment-Vis CP Marker And Label Padding
 
 ## Scope
 
-Implement the first item from `planning/todo.md`: geometric shift must be
-applied in scaled output space rather than original source space.
+Only change augment-vis debug rendering. Do not change sampled images,
+coordinates, masks, augmentation parameters, or training behavior.
 
 ## Plan
 
-- Update the inverse output-pixel-to-source coordinate map so output-space
-  shift is subtracted before undoing flip/scale/shear/rotation.
-- Update the affine source-point and centerline coordinate maps so shift is
-  added only after scale/flip and before the output center offset.
-- Keep smooth-offset fallback behavior on the same source-coordinate grid path
-  so image sampling and line/control-point coordinates stay aligned.
-- Add a regression test for combined shift+scale verifying that a transformed
-  source point lands at the shifted scaled output coordinate and that the
-  sampling grid at that output pixel points back to the same source point.
+- Draw a final visualization-only CP crosshair at each patch's
+  `FiberStripSample.control_point_xy`.
+- Leave the center pixel open so the exact sampled CP pixel remains visible.
+- Render contact-sheet labels in a dedicated top band for each cell instead of
+  drawing text over the image.
+- Include the per-cell transformed CP coordinate in `augment_summary.txt`.
+- Update the existing augment contact-sheet export test for the larger labeled
+  cell height and visible CP marker.
 
 ## Spec Update
 
-Update `planning/specs.md` to state that geometric shift is an output-space
-translation applied after scale.
+Update `planning/specs.md` to state that augment-vis contact sheets draw a CP
+crosshair from transformed control-point coordinates and reserve a label band.
 
 ## Docs Updates
 
-Update `docs/code_structure.md` to mention the affine geometric order used by
-`augmentation.py`.
+Update `docs/code_structure.md` under runner/augment-vis documentation.
 
 ## Testing
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/augmentation.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
 ## Changelog
 
-Add a concise changelog entry for the augmentation composition fix.
+Add a concise changelog entry for the augment-vis rendering change.

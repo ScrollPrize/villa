@@ -704,11 +704,15 @@ def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path) -> None:
     from PIL import Image
 
     with Image.open(out / "augment_contact_sheet.jpg") as image:
-        assert image.size == (3 * 15, 3 * 3)
+        assert image.size[0] == 3 * 15
+        assert image.size[1] > 3 * 3
         arr = np.asarray(image)
         assert arr[:2, :8].max() > 0
+        cyan_dominant = (arr[:, :, 1] > arr[:, :, 0] + 40) & (arr[:, :, 2] > arr[:, :, 0] + 40)
+        assert np.count_nonzero(cyan_dominant) > 0
     summary = (out / "augment_summary.txt").read_text(encoding="utf-8")
     assert "layout=row 1: lower limits; row 2: upper limits; row 3: random combined" in summary
+    assert "cp_xy=" in summary
     assert "rotate_min" in summary
     assert "rotate_max" in summary
     assert "blur_max" in summary

@@ -268,3 +268,31 @@ Validation:
   - Result: passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
   - Result: `37 passed in 5.32s`.
+
+## Augment-Vis CP Marker And Label Padding
+
+- Added a final visualization-only CP crosshair to each `--augment-vis`
+  contact-sheet cell using `FiberStripSample.control_point_xy`.
+- Changed contact-sheet label rendering to use a separate top band above each
+  image so text no longer covers image pixels.
+- Added transformed `cp_xy` values to `augment_summary.txt` rows.
+- Updated the contact-sheet export regression to check the larger labeled cells
+  and visible red CP marker.
+
+Validation:
+
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
+  - Result: passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  - Result: `37 passed in 5.06s`.
+
+Follow-up:
+
+- Changed the CP marker from a thick red crosshair to two 1-pixel cyan vertical
+  ticks above and below the CP, leaving the CP pixel itself visible.
+- Updated the contact-sheet regression to detect the cyan marker.
+- Re-ran validation:
+  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
+    - Result: passed.
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+    - Result: `37 passed in 3.09s`.

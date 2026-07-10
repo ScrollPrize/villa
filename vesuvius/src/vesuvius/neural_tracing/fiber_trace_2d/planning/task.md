@@ -1,8 +1,6 @@
-# Task: Shift/Scale Augmentation Order
+# Task: Augment-Vis CP Marker And Label Padding
 
-Fix the shift/scale augmentation composition so shift happens in scaled output
-space, not in original source space. If a patch is strongly shifted and then
-zoomed, the control point should not be scaled away from the intended shifted
-location. The expected implementation is to move shift after scale in the
-coordinate transform while keeping image sampling, line-coordinate generation,
-and control-point coordinate generation aligned.
+Update `runner.py --augment-vis` contact sheets so every patch shows the
+transformed control-point location with a crosshair. Contact-sheet labels should
+be rendered in a separate top band above each patch instead of overlaid on the
+image data.

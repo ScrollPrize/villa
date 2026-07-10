@@ -31,25 +31,58 @@ def _write_jpg(path: Path, image_u8: np.ndarray) -> None:
     Image.fromarray(image, mode=mode).save(path, quality=95)
 
 
-def _draw_label(image: np.ndarray, label: str) -> np.ndarray:
+def _draw_cp_crosshair(image: np.ndarray, cp_xy: np.ndarray | None) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=-1)
+    point = np.asarray(cp_xy, dtype=np.float32) if cp_xy is not None else np.asarray([np.nan, np.nan])
+    if point.shape != (2,) or not bool(np.isfinite(point).all()):
+        return arr
+    x = int(round(float(point[0])))
+    y = int(round(float(point[1])))
+    height, width = arr.shape[:2]
+    if x < 0 or x >= width or y < 0 or y >= height:
+        return arr
+    pil = Image.fromarray(arr, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    arm = 5
+    gap = 1
+    color = (32, 255, 255, 255)
+    segments = [
+        ((x, y - arm), (x, y - gap)),
+        ((x, y + gap), (x, y + arm)),
+    ]
+    for start, end in segments:
+        draw.line((start, end), fill=color, width=1)
+    return np.asarray(pil, dtype=np.uint8)
+
+
+def _draw_label_band(image: np.ndarray, label: str) -> np.ndarray:
     from PIL import Image, ImageDraw, ImageFont
 
     arr = np.asarray(image, dtype=np.uint8)
     if arr.ndim == 2:
         arr = np.repeat(arr[..., None], 3, axis=-1)
-    pil = Image.fromarray(arr, mode="RGB")
-    draw = ImageDraw.Draw(pil, mode="RGBA")
     text = str(label)
     font = ImageFont.load_default()
+    probe = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(probe, mode="RGBA")
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         text_w = int(bbox[2] - bbox[0])
         text_h = int(bbox[3] - bbox[1])
     except AttributeError:
         text_w, text_h = draw.textsize(text, font=font)
-    pad = 2
-    draw.rectangle((0, 0, min(arr.shape[1], text_w + 2 * pad), text_h + 2 * pad), fill=(0, 0, 0, 160))
-    draw.text((pad, pad), text, fill=(255, 255, 255, 255), font=font)
+    pad_x = 3
+    pad_y = 2
+    band_h = int(text_h + 2 * pad_y)
+    cell = np.zeros((arr.shape[0] + band_h, arr.shape[1], 3), dtype=np.uint8)
+    cell[band_h:, :, :] = arr
+    pil = Image.fromarray(cell, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    draw.text((pad_x, pad_y), text[: max(1, arr.shape[1])], fill=(255, 255, 255, 255), font=font)
     return np.asarray(pil, dtype=np.uint8)
 
 
@@ -60,11 +93,12 @@ def _write_contact_sheet(
         return
     if labels is not None and len(labels) != len(images):
         raise ValueError("labels length must match images length")
-    h, w = images[0].shape[:2]
     prepared = [
-        _draw_label(image, labels[i]) if labels is not None else np.asarray(image, dtype=np.uint8)
+        _draw_label_band(image, labels[i]) if labels is not None else np.asarray(image, dtype=np.uint8)
         for i, image in enumerate(images)
     ]
+    h = max(int(image.shape[0]) for image in prepared)
+    w = max(int(image.shape[1]) for image in prepared)
     channels = () if prepared[0].ndim == 2 else (prepared[0].shape[2],)
     cols = max(1, min(columns, len(images)))
     rows = (len(images) + cols - 1) // cols
@@ -72,7 +106,8 @@ def _write_contact_sheet(
     for i, image in enumerate(prepared):
         row = i // cols
         col = i % cols
-        sheet[row * h : (row + 1) * h, col * w : (col + 1) * w] = image
+        image_h, image_w = image.shape[:2]
+        sheet[row * h : row * h + image_h, col * w : col * w + image_w] = image
     _write_jpg(path, sheet)
 
 
@@ -271,6 +306,7 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
             image_stat_rows.append((name, _image_stats(aug_image, aug_valid, image_u8)))
             with _Timer() as overlay_timer:
                 overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.5, thickness=1)
+                overlay = _draw_cp_crosshair(overlay, sample.control_point_xy)
             timing["overlay"] = overlay_timer.elapsed_ms
         timing["total"] = total_timer.elapsed_ms
         if entry_index == 0:
@@ -283,7 +319,8 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
             first_sample = sample
         contact_images.append(overlay)
         contact_labels.append(name)
-        summary_lines.append(f"{name}: {params}")
+        cp_xy = np.asarray(sample.control_point_xy, dtype=np.float32)
+        summary_lines.append(f"{name}: {params} cp_xy=({cp_xy[0]:.3f}, {cp_xy[1]:.3f})")
     if first_sample is not None:
         summary_lines.insert(2, f"fiber_path={first_sample.fiber_path}")
         summary_lines.insert(3, f"control_point_index={first_sample.control_point_index}")

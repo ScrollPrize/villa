@@ -44,7 +44,8 @@
 - The augment visualization mode renders a three-row JPG contact sheet: lower-limit examples, upper-limit examples, and random combined training-style examples.
 - Augment visualization prints timing and raw image-stat diagnostics, including per-cell valid pixel count and raw min/max/mean, so invalid sampling and display-scale issues are distinguishable.
 - Augment contact sheets draw the transformed fiber-line coordinates at 50 percent opacity with fixed drawing thickness.
-- Augment contact-sheet cells include a small top label naming the shown augmentation.
+- Augment contact sheets draw a final visualization-only thin vertical marker at the transformed control-point coordinate for each patch, leaving a small gap around the CP pixel itself.
+- Augment contact-sheet cells include a top label band naming the shown augmentation; labels must not overlay image pixels.
 - Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.
 - Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.
 - Normal batch loading samples random control points deterministically from the configured seed.

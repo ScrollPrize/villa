@@ -2,6 +2,7 @@
 
 ## 2026-07-10
 
+- Added `--augment-vis` contact-sheet CP crosshairs and separate label bands so labels no longer cover image pixels.
 - Fixed 2D fiber-strip affine augmentation composition so shift is applied in output/scaled space and image sampling stays aligned with line/control-point coordinates.
 
 ## 2026-07-09
