@@ -41,6 +41,16 @@ function caption(scroll) {
   return out.length > 15 ? out : "";
 }
 
+
+// Distinct scan pixel sizes, finest first — "2.4 µm / 7.91 µm / …".
+function pixelSizesText(scroll) {
+  const px = [...new Set((scroll.scans || []).map((s) => s.px).filter((v) => v != null))].sort(
+    (a, b) => a - b,
+  );
+  if (!px.length) return scroll.min_px ? `${scroll.min_px} µm` : "—";
+  return px.map((v) => `${v} µm`).join(" / ");
+}
+
 export default function ScrollCard({ scroll }) {
   // Registers this card's 3D viewport with the shared renderer. No-op when the
   // sample has no mesh; we only attach the ref to the .view in that case.
@@ -148,8 +158,8 @@ export default function ScrollCard({ scroll }) {
           </dd>
           <dt>Segments</dt>
           <dd>{segN.toLocaleString()}</dd>
-          <dt>Min pixel size</dt>
-          <dd>{scroll.min_px ? `${scroll.min_px} µm` : "—"}</dd>
+          <dt>Available pixel sizes</dt>
+          <dd>{pixelSizesText(scroll)}</dd>
         </dl>
         {cap ? <p className="desc">{cap}</p> : null}
       </div>
