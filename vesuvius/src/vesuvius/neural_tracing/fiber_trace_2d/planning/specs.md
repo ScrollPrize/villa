@@ -86,7 +86,8 @@
 - Each loaded strip sample carries the transformed control-point output-pixel coordinate. V0 direction supervision is limited to the eight neighboring pixels around that rounded transformed control-point location, filtered by image validity and patch bounds.
 - The V0 loss compares predicted and target encoded channels directly with MSE over those CP-local samples; raw signed `(dx,dy)` regression and `abs(dot)` losses are not the V0 training representation.
 - Training creates a run directory from `training.run_path` and `training.run_name` plus a date string.
-- TensorBoard logging writes the training config JSON as text, direction-loss scalars, timing/cache diagnostics, and batch direction overlay images at configured intervals.
+- TensorBoard logging writes the training config JSON as text, direction-loss scalars, timing/cache diagnostics, and batch direction overlay images at configured intervals. Batch direction overlays show the transformed fiber centerline as context and one short network-predicted direction segment at the transformed CP; they do not draw CP-neighborhood supervision boxes or extra CP markers.
+- Console training progress prints every step covering the first 100 deterministic control-point sample indices, then falls back to `training.scalar_log_interval`.
 - Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`; best is the lowest observed training loss until validation is added.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`.

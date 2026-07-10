@@ -1,6 +1,6 @@
-# Task: Augment-Vis CP Marker And Label Padding
+# Task: Simplify Training TensorBoard Direction Overlay
 
-Update `runner.py --augment-vis` contact sheets so every patch shows the
-transformed control-point location with a crosshair. Contact-sheet labels should
-be rendered in a separate top band above each patch instead of overlaid on the
-image data.
+Update the 2D training TensorBoard batch visualization so each patch shows the
+transformed fiber centerline as the background context and only one short line
+for the network-predicted CP direction. Remove the extra CP neighborhood and CP
+marker visualizations from this training overlay.

@@ -384,8 +384,12 @@ The trainer logs:
 - `train/supervision_samples`;
 - `timing/load_ms`;
 - cache hit/download diagnostics where available;
-- `train/batch_direction_overlay` images showing the transformed line, CP
-  neighborhood, and predicted direction arrow.
+- `train/batch_direction_overlay` images showing the transformed centerline
+  behind one short network-predicted direction segment at the transformed CP.
+
+Console progress prints use the same loss/supervision/load summary for every
+step whose deterministic control-point sample range starts before sample index
+100, then return to `training.scalar_log_interval`.
 
 Snapshots are written under:
 

@@ -28,10 +28,10 @@
   "training": {
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_2d_runs",
     "run_name": "fiber_strip_direction",
-    "max_steps": 1000,
+    "max_steps": 1000000,
     "learning_rate": 0.001,
-    "scalar_log_interval": 100,
-    "tensorboard_image_interval": 1000,
+    "scalar_log_interval": 10,
+    "tensorboard_image_interval": 10,
     "checkpoint_interval": 1000,
     "control_points_per_step": 4,
     "device": "auto",

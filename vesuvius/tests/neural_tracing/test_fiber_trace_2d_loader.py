@@ -33,7 +33,12 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
     load_config,
     strip_z_offsets_from_count_step,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.train import prefetch_training, run_training
+from vesuvius.neural_tracing.fiber_trace_2d.train import (
+    _draw_predicted_cp_direction,
+    _should_print_training_step,
+    prefetch_training,
+    run_training,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.runner import _export_augment_contact_sheet
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
@@ -1071,6 +1076,50 @@ def test_training_batch_assembly_default_patch_count_is_64(tmp_path: Path) -> No
 
     assert batch.images.shape == (4, 16, 1, 5, 5)
     assert len(batch.samples) == 64
+
+
+def test_training_prints_first_100_samples_then_interval() -> None:
+    assert _should_print_training_step(
+        1,
+        scalar_log_interval=50,
+        start_sample_index=0,
+        sample_count=4,
+    )
+    assert _should_print_training_step(
+        25,
+        scalar_log_interval=50,
+        start_sample_index=96,
+        sample_count=4,
+    )
+    assert not _should_print_training_step(
+        26,
+        scalar_log_interval=50,
+        start_sample_index=100,
+        sample_count=4,
+    )
+    assert _should_print_training_step(
+        50,
+        scalar_log_interval=50,
+        start_sample_index=196,
+        sample_count=4,
+    )
+
+
+def test_training_visualization_draws_only_predicted_cp_direction() -> None:
+    rgb = np.zeros((17, 17, 3), dtype=np.uint8)
+    out = _draw_predicted_cp_direction(
+        rgb,
+        cp_xy=np.asarray([8.0, 8.0], dtype=np.float32),
+        prediction_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+    )
+
+    green = (out[:, :, 1] > out[:, :, 0] + 40) & (out[:, :, 1] > out[:, :, 2] + 40)
+    yellow = (out[:, :, 0] > 180) & (out[:, :, 1] > 180) & (out[:, :, 2] < 80)
+    cyan = (out[:, :, 1] > 180) & (out[:, :, 2] > 180) & (out[:, :, 0] < 80)
+
+    assert np.count_nonzero(green) > 0
+    assert np.count_nonzero(yellow) == 0
+    assert np.count_nonzero(cyan) == 0
 
 
 def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:

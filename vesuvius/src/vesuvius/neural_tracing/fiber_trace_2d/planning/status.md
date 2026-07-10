@@ -1,12 +1,11 @@
-# Status: Augment-Vis CP Marker And Label Padding
+# Status: Simplify Training TensorBoard Direction Overlay
 
 - [x] Read local `AGENTS.md` instructions.
-- [x] Replace `planning/task.md` with the active visualization task.
+- [x] Replace `planning/task.md` with the active TensorBoard visualization task.
 - [x] Replace `planning/task_plan.md` with the implementation plan.
-- [x] Add augment-vis CP crosshair from transformed control-point coordinates.
-- [x] Move contact-sheet labels into a separate top band.
-- [x] Add transformed CP coordinates to the augment summary.
+- [x] Remove CP-neighborhood and CP-marker drawing from training overlay.
+- [x] Draw one short predicted CP direction segment on top of the centerline.
+- [x] Add focused visualization helper regression.
 - [x] Update specs and docs.
-- [x] Update focused test expectations.
 - [x] Run focused validation commands.
-- [x] Update task log and changelog.
+- [x] Update current-task log.

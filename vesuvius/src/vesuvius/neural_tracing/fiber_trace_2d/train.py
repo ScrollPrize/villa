@@ -16,7 +16,6 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import overlay_line_coo
 from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     DirectionSupervision,
     build_direction_supervision,
-    cp_neighborhood_yx,
     decode_lasagna_direction_xy,
     direction_mse_loss,
     line_cp_and_tangent_xy,
@@ -165,6 +164,22 @@ def _cache_scalars(cache_stats: Any | None) -> dict[str, float]:
     }
 
 
+def _should_print_training_step(
+    step: int,
+    *,
+    scalar_log_interval: int,
+    start_sample_index: int,
+    sample_count: int,
+    startup_sample_print_count: int = 100,
+) -> bool:
+    if int(step) <= 1:
+        return True
+    sample_end = int(start_sample_index) + max(1, int(sample_count))
+    if int(start_sample_index) < int(startup_sample_print_count) and sample_end > 0:
+        return True
+    return int(step) % max(1, int(scalar_log_interval)) == 0
+
+
 def _to_u8_image(image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     arr = np.asarray(image, dtype=np.float32)
     valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(arr)
@@ -178,10 +193,9 @@ def _to_u8_image(image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     return out
 
 
-def _draw_supervision_and_direction(
+def _draw_predicted_cp_direction(
     rgb: np.ndarray,
     *,
-    sample_line_xy: np.ndarray,
     cp_xy: np.ndarray,
     prediction_xy: np.ndarray | None,
 ) -> np.ndarray:
@@ -190,23 +204,17 @@ def _draw_supervision_and_direction(
     pil = Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
     overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, mode="RGBA")
-    for y, x in cp_neighborhood_yx(cp_xy, (pil.height, pil.width)).tolist():
-        draw.rectangle((x - 1, y - 1, x + 1, y + 1), outline=(255, 255, 0, 220))
     x0, y0 = float(cp_xy[0]), float(cp_xy[1])
-    draw.line((x0 - 4, y0, x0 - 2, y0), fill=(0, 255, 255, 240), width=1)
-    draw.line((x0 + 2, y0, x0 + 4, y0), fill=(0, 255, 255, 240), width=1)
-    draw.line((x0, y0 - 4, x0, y0 - 2), fill=(0, 255, 255, 240), width=1)
-    draw.line((x0, y0 + 2, x0, y0 + 4), fill=(0, 255, 255, 240), width=1)
     if prediction_xy is not None and np.isfinite(prediction_xy).all():
         direction = np.asarray(prediction_xy, dtype=np.float32)
         norm = float(np.linalg.norm(direction))
         if norm > 1.0e-6:
             direction = direction / norm
-            length = 8.0
+            length = 10.0
             draw.line(
                 (
-                    x0 - direction[0] * length,
-                    y0 - direction[1] * length,
+                    x0,
+                    y0,
                     x0 + direction[0] * length,
                     y0 + direction[1] * length,
                 ),
@@ -239,9 +247,8 @@ def _make_training_visualization(
             x = int(np.clip(center[0], 0, flat_valid.shape[2] - 1))
             encoded = outputs_cpu[patch_index, :, y, x]
             prediction_xy = decode_lasagna_direction_xy(encoded).cpu().numpy()
-            rgb = _draw_supervision_and_direction(
+            rgb = _draw_predicted_cp_direction(
                 rgb,
-                sample_line_xy=sample.line_xy,
                 cp_xy=cp_xy,
                 prediction_xy=prediction_xy,
             )
@@ -358,7 +365,12 @@ def run_training(
                     loss=loss_value,
                     raw_config=raw_config,
                 )
-            if step == 1 or step % training.scalar_log_interval == 0:
+            if _should_print_training_step(
+                step,
+                scalar_log_interval=training.scalar_log_interval,
+                start_sample_index=start_sample_index,
+                sample_count=training.train_control_points_per_step,
+            ):
                 print(
                     f"step={step} loss_direction={loss_value:.6f} "
                     f"supervision_samples={int(supervision.target.shape[0])} load_ms={load_ms:.1f}",
