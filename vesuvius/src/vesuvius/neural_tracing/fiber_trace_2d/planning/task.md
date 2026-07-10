@@ -1,14 +1,14 @@
-# CUDA Training Preparation Pipeline
+# Parallel CUDA Training Pipeline
 
-Implement CUDA-side image/value augmentation and image preparation overlap for
-`fiber_trace_2d` training.
+Improve `fiber_trace_2d` training overlap after observing:
 
-- Keep deterministic CPU/VC3D batch loading ahead of training.
-- Run deferred image/value augmentation and image normalization on a separate
-  CUDA stream where possible.
-- Keep prepared tensors on CUDA for model forward/backward instead of
-  round-tripping augmented images through NumPy.
-- Add timing measurements for work outside the critical forward/backward/step
-  path, including preparation wait and preparation work.
-- Preserve deterministic sample order, target semantics, and existing runner
-  loader APIs.
+- `load_ms` around 900 ms,
+- `prep_ms` around 970 ms,
+- `prep_submit_ms` around 950 ms,
+- `prep_wait_ms` at 0 ms,
+- low CPU and GPU utilization.
+
+This means preparation is ready when consumed, but the main training thread is
+still spending nearly a second submitting/preparing future work. Add concurrent
+whole-batch loading and move CUDA preparation submission off the main training
+thread while preserving deterministic step-order consumption.

@@ -2,6 +2,8 @@
 
 ## 2026-07-10
 
+- Added configurable concurrent whole-batch CUDA training loaders and moved
+  CUDA preparation submission into a background preparation executor.
 - Added CUDA side-stream training preparation for deferred image/value
   augmentation, normalization, and supervision tensors, plus prep/outside
   timing diagnostics.

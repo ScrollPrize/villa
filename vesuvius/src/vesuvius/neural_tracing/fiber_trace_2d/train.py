@@ -54,6 +54,7 @@ class FiberStripTrainingConfig:
     model_depth: int = 10
     pipeline_enabled: bool = True
     pipeline_depth: int = 2
+    pipeline_workers: int = 0
 
 
 def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
@@ -85,6 +86,7 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         model_depth=max(1, int(get("model_depth", 10))),
         pipeline_enabled=bool(get("pipeline_enabled", True)),
         pipeline_depth=max(1, int(get("pipeline_depth", 2))),
+        pipeline_workers=max(0, int(get("pipeline_workers", 0))),
     )
     if config.max_steps < 0:
         raise ValueError("training.max_steps must be >= 0")
@@ -311,6 +313,23 @@ def _wait_for_prepared_batch(prepared: _PreparedTrainingBatch, *, device: torch.
     return replace(prepared, prep_wait_ms=wait_ms, prep_gpu_ms=float(prep_gpu_ms))
 
 
+def _load_and_prepare_training_batch(
+    load_pipeline: "_TrainingBatchPipeline",
+    *,
+    device: torch.device,
+    stream: torch.cuda.Stream,
+) -> _PreparedTrainingBatch:
+    loaded, load_wait_ms = load_pipeline.next()
+    prepared = _prepare_loaded_training_batch(
+        loaded,
+        device=device,
+        stream=stream,
+    )
+    if load_wait_ms:
+        loaded.profile["pipeline_wait"] = loaded.profile.get("pipeline_wait", 0.0) + load_wait_ms
+    return prepared
+
+
 class _CudaPreparedBatchPipeline:
     def __init__(
         self,
@@ -324,25 +343,26 @@ class _CudaPreparedBatchPipeline:
         self.device = device
         self.depth = load_pipeline.depth
         self.stream = torch.cuda.Stream(device=device)
-        self.pending: dict[int, _PreparedTrainingBatch] = {}
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fiber-strip-train-prep")
+        self.pending: dict[int, Future[_PreparedTrainingBatch]] = {}
+        self.next_submit_step = load_pipeline.next_consume_step
+        self.next_consume_step = load_pipeline.next_consume_step
         self.closed = False
         self._submit_until_full()
 
     def _submit_until_full(self) -> float:
         submit_start = time.perf_counter()
         while not self.closed and len(self.pending) < self.depth:
-            try:
-                loaded, load_wait_ms = self.load_pipeline.next()
-            except StopIteration:
+            if self.load_pipeline.max_step is not None and self.next_submit_step > self.load_pipeline.max_step:
                 break
-            prepared = _prepare_loaded_training_batch(
-                loaded,
+            step = self.next_submit_step
+            self.next_submit_step += 1
+            self.pending[step] = self.executor.submit(
+                _load_and_prepare_training_batch,
+                self.load_pipeline,
                 device=self.device,
                 stream=self.stream,
             )
-            if load_wait_ms:
-                loaded.profile["pipeline_wait"] = loaded.profile.get("pipeline_wait", 0.0) + load_wait_ms
-            self.pending[loaded.step] = prepared
         return (time.perf_counter() - submit_start) * 1000.0
 
     def next(self) -> _PreparedTrainingBatch:
@@ -350,14 +370,25 @@ class _CudaPreparedBatchPipeline:
             raise RuntimeError("training preparation pipeline is closed")
         if not self.pending:
             self._submit_until_full()
-        step = min(self.pending)
-        prepared = self.pending.pop(step)
+        step = self.next_consume_step
+        future = self.pending.get(step)
+        if future is None:
+            self._submit_until_full()
+            future = self.pending.get(step)
+        if future is None:
+            raise StopIteration
+        prepared = future.result()
+        del self.pending[step]
+        self.next_consume_step += 1
         prepared = _wait_for_prepared_batch(prepared, device=self.device)
         submit_ms = self._submit_until_full()
         return replace(prepared, prep_submit_ms=submit_ms)
 
     def close(self) -> None:
         self.closed = True
+        for future in self.pending.values():
+            future.cancel()
+        self.executor.shutdown(wait=True, cancel_futures=True)
         self.pending.clear()
         self.load_pipeline.close()
 
@@ -417,10 +448,12 @@ class _TrainingBatchPipeline:
         self.profile_enabled = bool(profile_enabled)
         self.apply_image_augmentation = bool(apply_image_augmentation)
         self.depth = max(1, int(training.pipeline_depth))
-        # One load_batch call may already fan out across loader_workers and uses
-        # shared cache tracing. Keep whole-batch prefetching ordered and single
-        # producer while allowing it to overlap with model work.
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fiber-strip-train-load")
+        configured_workers = int(training.pipeline_workers)
+        self.worker_count = max(1, configured_workers if configured_workers > 0 else self.depth)
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.worker_count,
+            thread_name_prefix="fiber-strip-train-load",
+        )
         self.pending: dict[int, Future[_LoadedTrainingBatch]] = {}
         self.closed = False
         self._submit_until_full()

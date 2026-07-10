@@ -1,15 +1,29 @@
-# CUDA Training Preparation Pipeline Task Log
+# Parallel CUDA Training Pipeline Task Log
 
-- Started task from user request to overlap image augmentation/preparation on a
-  separate CUDA stream and measure time outside the critical forward/backward
-  path.
-- Implemented a training-only prepared-batch path that applies deferred value
-  augmentation, normalization, and direction supervision on the training device.
-- CUDA training with `pipeline_enabled` now wraps the loader pipeline with a
-  side-stream preparation queue. The model stream waits on each prepared batch's
-  CUDA event before forward.
-- Added timing fields: `prep_enqueue_ms`, `prep_gpu_ms`, `prep_wait_ms`, and
-  `prep_submit_ms`; benchmark profile also reports `outside`.
-- Updated `planning/specs.md`, `docs/code_structure.md`, and changelog.
-- Validation: `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`.
-- Validation: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py` passed with 104 tests.
+## Implementation Notes
+
+- Added `training.pipeline_workers`; `0` means use `pipeline_depth`.
+- `_TrainingBatchPipeline` now uses `pipeline_workers` concurrent whole-batch
+  loader workers while consuming steps in deterministic order.
+- `_CudaPreparedBatchPipeline` now submits load+prepare work through a
+  background preparation executor. The main thread waits for the current
+  prepared batch and only refills the queue, so `prep_submit_ms` should now be
+  small queue overhead rather than full preparation work.
+- Updated `loader_example.json` with explicit `pipeline_depth: 4` and
+  `pipeline_workers: 4`.
+- Updated specs, code-structure docs, and changelog.
+
+## Validation
+
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`
+  passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed: 104 tests.
+
+## Follow-Up Signals
+
+- If `prep_wait_ms` rises, preparation is no longer hidden and the next
+  bottleneck is CUDA prep/value augmentation or supervision building.
+- If `wait_ms` rises, whole-batch loading is the bottleneck; increase
+  `training.pipeline_workers`, `training.pipeline_depth`, or `loader_workers`
+  carefully while watching CPU utilization.
