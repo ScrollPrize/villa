@@ -309,6 +309,17 @@ def test_config_rejects_literal_strip_z_offsets(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_config_prefetch_workers_is_not_capped_at_16(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["prefetch_workers"] = 64
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.prefetch_workers == 64
+
+
 def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
     config = load_config(_write_config(tmp_path, batch_size=2))
     loader = _make_loader(config)
@@ -742,6 +753,31 @@ def test_deterministic_sample_index_independent_of_batch_size(tmp_path: Path) ->
     assert a == b
 
 
+def test_random_sample_mode_covers_all_control_points_before_repeating(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path, batch_size=1))
+    loader = _make_loader(config)
+
+    first_pass = [loader._random_flat_index(i) for i in range(loader.sample_count)]
+    second_pass = [
+        loader._random_flat_index(i)
+        for i in range(loader.sample_count, loader.sample_count * 2)
+    ]
+    again = [loader._random_flat_index(i) for i in range(loader.sample_count)]
+
+    assert sorted(first_pass) == list(range(loader.sample_count))
+    assert sorted(second_pass) == list(range(loader.sample_count))
+    assert first_pass == again
+
+
+def test_flat_sample_mode_iterates_control_points_sequentially_for_debug(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path, batch_size=1))
+    loader = _make_loader(config)
+
+    indices = [loader.descriptor_for_sample_index(i, sample_mode="flat")[2] for i in range(5)]
+
+    assert indices == [0, 1, 2, 0, 1]
+
+
 def test_prefetch_uses_dependency_chunks_and_cache_markers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -845,11 +881,11 @@ def test_load_batch_skips_invalid_training_samples(tmp_path: Path, monkeypatch: 
     original_build_sample = loader.build_sample
     attempted: list[int] = []
 
-    def build_sample(sample_index: int):
+    def build_sample(sample_index: int, **kwargs):
         attempted.append(int(sample_index))
         if int(sample_index) == 0:
             raise ValueError("Lasagna grad_mag sample is zero at fiber line point")
-        return original_build_sample(sample_index)
+        return original_build_sample(sample_index, **kwargs)
 
     monkeypatch.setattr(loader, "build_sample", build_sample)
 
@@ -981,11 +1017,11 @@ def test_training_prefetch_maps_steps_to_sample_count(
         "tensorboard_enabled": False,
     }
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    calls: list[tuple[int, int]] = []
+    calls: list[tuple[int, int, str]] = []
 
-    def fake_prefetch(self, start_sample_index, sample_count, *, workers=None):
+    def fake_prefetch(self, start_sample_index, sample_count, *, workers=None, sample_mode="random"):
         del self, workers
-        calls.append((int(start_sample_index), int(sample_count)))
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode)))
         return {
             "generated": 11,
             "missing": 5,
@@ -999,8 +1035,19 @@ def test_training_prefetch_maps_steps_to_sample_count(
 
     summary = prefetch_training(config_path, prefetch_steps=3, sampler_factory=_test_sampler_factory)
 
-    assert calls == [(0, 9)]
+    assert calls == [(0, 9, "random")]
     assert summary["generated"] == 11
+    assert not run_path.exists()
+
+    calls.clear()
+    prefetch_training(
+        config_path,
+        prefetch_steps=None,
+        prefetch_start_step=2,
+        sampler_factory=_test_sampler_factory,
+    )
+
+    assert calls == [(3, 21, "random")]
     assert not run_path.exists()
 
     calls.clear()
@@ -1011,8 +1058,85 @@ def test_training_prefetch_maps_steps_to_sample_count(
         sampler_factory=_test_sampler_factory,
     )
 
-    assert calls == [(3, 21)]
+    assert calls == [(0, 3, "random")]
     assert not run_path.exists()
+
+
+def test_training_prefetch_max_steps_zero_prefetches_dataset_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["training"] = {
+        "max_steps": 0,
+        "control_points_per_step": 2,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[tuple[int, int, str]] = []
+
+    def fake_prefetch(self, start_sample_index, sample_count, *, workers=None, sample_mode="random"):
+        del workers
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode)))
+        return {
+            "generated": 3,
+            "missing": 0,
+            "downloaded": 0,
+            "bytes": 0,
+            "errors": 0,
+            "workers": 1,
+            "samples": int(sample_count),
+            "loader_sample_count": int(self.sample_count),
+        }
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    summary = prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+
+    assert calls == [(0, 3, "random")]
+    assert summary["samples"] == 3
+    assert summary["loader_sample_count"] == 3
+
+
+def test_training_prefetch_max_steps_zero_prefetches_test_datasets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    test_fiber = _write_fiber(tmp_path / "heldout_fiber.json", points=[[8.0, 24.0, 24.0], [18.0, 24.0, 24.0]])
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["test_datasets"] = [
+        {
+            **raw["datasets"][0],
+            "fiber_paths": [str(test_fiber)],
+        }
+    ]
+    raw["training"] = {
+        "max_steps": 0,
+        "control_points_per_step": 2,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[tuple[int, int, str, int]] = []
+
+    def fake_prefetch(self, start_sample_index, sample_count, *, workers=None, sample_mode="random"):
+        del workers
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(self.sample_count)))
+        return {
+            "generated": int(sample_count),
+            "missing": 0,
+            "downloaded": 0,
+            "bytes": 0,
+            "errors": 0,
+            "workers": 1,
+            "samples": int(sample_count),
+        }
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    summary = prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+
+    assert calls == [(0, 3, "random", 3), (0, 2, "random", 2)]
+    assert summary["samples"] == 5
 
 
 def test_training_prefetch_rejects_negative_steps(tmp_path: Path) -> None:
@@ -1036,6 +1160,12 @@ def test_training_config_parses_test_settings() -> None:
     assert config.test_interval == 17
     assert config.test_control_points == 3
     assert config.test_start_sample_index == 11
+
+
+def test_training_config_allows_zero_max_steps() -> None:
+    config = _training_config_from_raw({"training": {"max_steps": 0}})
+
+    assert config.max_steps == 0
 
 
 def test_test_datasets_replace_training_datasets_for_loader_config(tmp_path: Path) -> None:

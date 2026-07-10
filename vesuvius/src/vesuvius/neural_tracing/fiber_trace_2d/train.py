@@ -73,8 +73,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         model_hidden_channels=max(1, int(get("model_hidden_channels", 32))),
         model_depth=max(1, int(get("model_depth", 5))),
     )
-    if config.max_steps <= 0:
-        raise ValueError("training.max_steps must be > 0")
+    if config.max_steps < 0:
+        raise ValueError("training.max_steps must be >= 0")
     if not math.isfinite(config.learning_rate) or config.learning_rate <= 0.0:
         raise ValueError("training.learning_rate must be positive and finite")
     return config
@@ -212,6 +212,19 @@ def _cache_scalars(cache_stats: Any | None) -> dict[str, float]:
         "cache/hit_ms": float(getattr(cache_stats, "cache_hit_ms", 0.0)),
         "cache/download_ms": float(getattr(cache_stats, "download_ms", 0.0)),
     }
+
+
+def _merge_prefetch_summaries(*summaries: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for summary in summaries:
+        for key, value in summary.items():
+            if isinstance(value, bool):
+                merged[key] = value
+            elif isinstance(value, (int, float)):
+                merged[key] = merged.get(key, 0) + value
+            else:
+                merged.setdefault(key, value)
+    return merged
 
 
 def _should_print_training_step(
@@ -417,14 +430,24 @@ def run_training(
         writer.add_text("config/json", json.dumps(_json_safe(raw_config), indent=2, sort_keys=True), 0)
     print(f"fiber_trace_2d train run_dir={run_dir}", flush=True)
 
+    sample_mode = "random"
+    finite_steps = training.max_steps > 0
     best_metric = float("inf")
     last_loss = float("nan")
     last_test_loss = float("nan")
     try:
-        for step in range(1, training.max_steps + 1):
-            start_sample_index = (step - 1) * int(training.train_control_points_per_step)
+        step = 1
+        while True:
+            if finite_steps and step > training.max_steps:
+                break
+            raw_start_sample_index = (step - 1) * int(training.train_control_points_per_step)
+            start_sample_index = raw_start_sample_index
             t0 = time.perf_counter()
-            batch = loader.load_batch(start_sample_index, batch_size=training.train_control_points_per_step)
+            batch = loader.load_batch(
+                start_sample_index,
+                batch_size=training.train_control_points_per_step,
+                sample_mode=sample_mode,
+            )
             load_ms = (time.perf_counter() - t0) * 1000.0
 
             model.train()
@@ -436,7 +459,7 @@ def run_training(
             last_loss = loss_value
             should_test = (
                 test_loader is not None
-                and (step == 1 or step % training.test_interval == 0 or step == training.max_steps)
+                and (step == 1 or step % training.test_interval == 0 or (finite_steps and step == training.max_steps))
             )
             test_result = None
             if should_test:
@@ -472,7 +495,7 @@ def run_training(
             should_save_current = (
                 bool(should_test)
                 if test_loader is not None
-                else (step == 1 or step % training.checkpoint_interval == 0 or step == training.max_steps)
+                else (step == 1 or step % training.checkpoint_interval == 0 or (finite_steps and step == training.max_steps))
             )
             if should_save_current:
                 checkpoint_loss = test_result.loss if test_result is not None else loss_value
@@ -503,7 +526,7 @@ def run_training(
             if _should_print_training_step(
                 step,
                 scalar_log_interval=training.scalar_log_interval,
-                start_sample_index=start_sample_index,
+                start_sample_index=raw_start_sample_index,
                 sample_count=training.train_control_points_per_step,
             ):
                 test_part = "" if test_result is None else f" test_loss_direction={test_result.loss:.6f}"
@@ -513,6 +536,7 @@ def run_training(
                     f"load_ms={load_ms:.1f}",
                     flush=True,
                 )
+            step += 1
     finally:
         if writer is not None:
             writer.flush()
@@ -540,19 +564,42 @@ def prefetch_training(
     if prefetch_steps is not None and int(prefetch_steps) < 0:
         raise ValueError("--prefetch-steps must be >= 0")
 
-    effective_steps = training.max_steps if prefetch_steps is None or int(prefetch_steps) == 0 else int(prefetch_steps)
-    start_sample_index = (int(prefetch_start_step) - 1) * int(training.train_control_points_per_step)
-    sample_count = int(effective_steps) * int(training.train_control_points_per_step)
     loader_config = load_config(config_path)
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    sample_mode = "random"
+    requested_prefetch_steps = None if prefetch_steps is None else int(prefetch_steps)
+    prefetch_full_dataset = requested_prefetch_steps == 0 or (
+        requested_prefetch_steps is None and training.max_steps == 0
+    )
+    if prefetch_full_dataset:
+        effective_steps: int | str = "dataset"
+        sample_count = int(loader.sample_count)
+    else:
+        effective_steps = training.max_steps if requested_prefetch_steps is None else requested_prefetch_steps
+        sample_count = int(effective_steps) * int(training.train_control_points_per_step)
+    start_sample_index = 0 if prefetch_full_dataset else (
+        (int(prefetch_start_step) - 1) * int(training.train_control_points_per_step)
+    )
+    effective_steps_text = str(effective_steps)
     print(
         "fiber_trace_2d prefetch "
-        f"start_step={int(prefetch_start_step)} steps={int(effective_steps)} "
+        f"start_step={int(prefetch_start_step)} steps={effective_steps_text} "
         f"control_points_per_step={int(training.train_control_points_per_step)} "
-        f"start_sample_index={start_sample_index} samples={sample_count}",
+        f"sample_mode={sample_mode} start_sample_index={start_sample_index} samples={sample_count}",
         flush=True,
     )
-    summary = loader.prefetch(start_sample_index, sample_count)
+    summary = loader.prefetch(start_sample_index, sample_count, sample_mode=sample_mode)
+    if prefetch_full_dataset:
+        test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
+        if test_loader_config is not None:
+            test_loader = FiberStrip2DLoader(test_loader_config, sampler_factory=sampler_factory)
+            print(
+                "fiber_trace_2d prefetch test_datasets "
+                f"sample_mode={sample_mode} start_sample_index=0 samples={int(test_loader.sample_count)}",
+                flush=True,
+            )
+            test_summary = test_loader.prefetch(0, int(test_loader.sample_count), sample_mode=sample_mode)
+            summary = _merge_prefetch_summaries(summary, test_summary)
     print(
         "fiber_trace_2d prefetch complete "
         f"generated={int(summary.get('generated', 0))} missing={int(summary.get('missing', 0))} "
@@ -570,7 +617,10 @@ def main(argv: list[str] | None = None) -> None:
         "--prefetch-steps",
         type=int,
         default=None,
-        help="Training steps to prefetch; 0 or omitted means all configured training.max_steps",
+        help=(
+            "Training steps to prefetch; positive values override training.max_steps, "
+            "0 prefetches the full configured CP dataset once, omitted uses training.max_steps"
+        ),
     )
     parser.add_argument(
         "--prefetch-start-step",

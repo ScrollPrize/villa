@@ -49,7 +49,9 @@
 - Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.
 - Optional top-level `test_datasets` uses the same dataset-entry schema as `datasets`; when present it defines a separate deterministic test loader while reusing the rest of the loader configuration.
 - Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.
-- Normal batch loading samples random control points deterministically from the configured seed.
+- Normal batch loading samples control points in deterministic pseudo-random order from the configured seed.
+- The deterministic pseudo-random training order covers every configured control point exactly once per dataset pass before repeating.
+- Changing training step counts, batch size, or control points per step must only truncate or extend the consumed prefix of that deterministic sample stream; it must not reshuffle earlier samples.
 - The tester/runner loads a batch from a specified deterministic control-point sample index.
 - Prefetch uses the same shared source-strip implementation as training and augment-vis.
 - Prefetch is independent of any one random augmentation draw: for each selected CP and strip-z offset it covers the configured maximum augmentation envelope represented by the oversized source-strip coordinates.
@@ -63,16 +65,18 @@
 - Prefetch data downloads are written to unique temporary files in the final cache directory and then atomically renamed to the VC3D-provided final cache path.
 - VC3D also writes persistent-cache `.empty` markers as zero-byte files and reads them by existence.
 - Prefetch performs global chunk deduplication by store identity and chunk key before network work.
-- Prefetch runs parallel dependency producers plus bounded chunk download workers; download worker count is capped at 16.
+- Prefetch runs parallel dependency producers plus bounded chunk download workers; download worker count is controlled by `prefetch_workers` without an additional hard-coded cap.
 - Prefetch reports sample/dependency progress only while dependency generation is incomplete; once all requested samples have been processed or skipped, live progress reports only download progress. The live progress includes unique chunks, cache hits, known-missing chunks, downloaded chunks, queued download futures, configured transfer worker count, skipped samples, errors, and MiB/s. The download denominator is the number of chunks that were not cache hits or pre-existing `.empty` markers and therefore needed fetch/missing resolution. While dependency generation is incomplete, download ETA extrapolates from observed chunks per sample and observed cache-hit/known-missing/download-needed ratios.
 - Prefetch reports skipped invalid samples separately from download errors and includes the first skip reason.
 - If prefetch hits a fatal producer error, queued producer/download futures are cancelled so shutdown does not wait on a large stale download backlog.
 - Prefetch remains base-volume-only; Lasagna manifest channels are not prefetched by the VC3D base-volume prefetch path.
 - V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.
 - `train.py --prefetch` runs training-oriented chunk prefetch only and exits before model, optimizer, TensorBoard, run-directory, or snapshot setup.
-- Training prefetch uses the same deterministic sample-index sequence as training.
-- Training prefetch sample count is `effective_prefetch_steps * training.control_points_per_step`.
-- `--prefetch-steps 0` means all configured training steps, i.e. `effective_prefetch_steps = training.max_steps`.
+- Training and training prefetch use the same deterministic pseudo-random CP sample-index sequence: each pass visits all configured CPs once in seeded random order and wraps at dataset end.
+- With `training.max_steps = 0`, training repeats the full training dataset indefinitely.
+- Explicit positive `--prefetch-steps N` overrides `training.max_steps` and prefetches exactly `N * training.control_points_per_step` CP samples from the deterministic random training stream.
+- Explicit `--prefetch-steps 0` overrides `training.max_steps` and prefetches every configured training-dataset CP once, independent of `control_points_per_step`; when `test_datasets` is configured, it also prefetches every held-out test CP once.
+- If `--prefetch-steps` is omitted, prefetch uses `training.max_steps`; if that configured value is `0`, omitted prefetch also means every configured training/test CP once.
 - Negative `--prefetch-steps` values are invalid.
 - The V0 trainer uses `FiberStrip2DLoader` batches directly; it must not use the neural-tracing 3D crop loader or a separate image sampling path.
 - Training geometric augmentations are the same coordinate-space augmentations used by augment-vis. Value augmentations run through the existing torch augmentation functions after Zarr sampling.

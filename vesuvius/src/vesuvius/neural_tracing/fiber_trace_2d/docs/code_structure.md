@@ -183,7 +183,8 @@ Top-level keys used by `load_config`:
 - `strip_z_offset_count`: number of parallel strip-z offsets per sample.
 - `strip_z_offset_step`: offset step in selected-scale voxels.
 - `seed`: deterministic control-point sample seed.
-- `prefetch_workers`: capped to 16.
+- `prefetch_workers`: transfer-worker count for prefetch; values above 16 are
+  allowed and are not clamped by the loader.
 - `volume_cache_dir`: optional cache directory for remote volume chunks.
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
 - `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
@@ -195,7 +196,8 @@ Training keys:
 
 - `run_path`: parent directory for dated run directories.
 - `run_name`: prefix for the run directory.
-- `max_steps`: number of training steps.
+- `max_steps`: number of training steps; `0` means indefinite mode, where
+  training repeats deterministic pseudo-random full-dataset CP passes.
 - `learning_rate`: AdamW learning rate.
 - `scalar_log_interval`: TensorBoard scalar/console interval.
 - `tensorboard_image_interval`: TensorBoard batch-image interval.
@@ -213,12 +215,19 @@ Training keys:
 Training prefetch:
 
 - `python -m vesuvius.neural_tracing.fiber_trace_2d.train config.json
-  --prefetch --prefetch-steps N` prefetches the first `N` training steps.
-- `--prefetch-steps 0` or omitting `--prefetch-steps` prefetches all configured
-  `training.max_steps`.
+  --prefetch --prefetch-steps N` prefetches the first `N` training steps and
+  overrides `training.max_steps`.
+- Explicit `--prefetch-steps 0` also overrides `training.max_steps` and
+  prefetches every configured training CP once in deterministic pseudo-random
+  order, plus every configured `test_datasets` CP once when held-out data is
+  present.
+- Omitting `--prefetch-steps` uses `training.max_steps`; if that configured
+  value is `0`, omitted prefetch also means every configured training/test CP
+  once.
 - `--prefetch-start-step S` starts from the 1-based training step `S`.
-- Sample count is `effective_steps * training.control_points_per_step`; start
-  sample index is `(S - 1) * training.control_points_per_step`.
+- For positive prefetch step counts, sample count is `effective_steps *
+  training.control_points_per_step`; start sample index is `(S - 1) *
+  training.control_points_per_step` in the deterministic pseudo-random stream.
 - Negative `--prefetch-steps` values are rejected.
 - Training prefetch only fetches base-volume chunks; Lasagna manifest channels
   are opened for geometry/normal metadata but are not prefetched.
@@ -272,13 +281,15 @@ indices.
 
 The loader uses deterministic stateless sampling by sample index:
 
-- `_random_flat_index(sample_index)` hashes `(seed, "cp", sample_index)` into a
-  NumPy RNG seed;
-- that RNG chooses one flat control-point index across all loaded records;
+- `_random_flat_index(sample_index)` maps the sample index into a dataset pass
+  and offset within that pass;
+- each pass sorts all flat control-point indices by seeded content-based random
+  keys, so every configured CP appears once before the stream repeats;
 - `_locate_flat_index` maps it back to `(record_index, control_point_index)`.
 
-Changing batch size changes which sample indices are grouped together, but not
-the selected control point for a given sample index.
+Changing max steps, batch size, or control points per step changes how much of
+the stream is consumed or how indices are grouped, but not the selected control
+point for a given sample index.
 
 ## Coordinate And Scale Semantics
 
@@ -348,11 +359,17 @@ debug overlays use those coordinates directly.
 
 ## V0 Training
 
-The V0 trainer samples deterministic control-point groups by step:
+The V0 trainer samples deterministic pseudo-random control-point groups by
+step:
 
 ```text
 start_sample_index = (step - 1) * training.control_points_per_step
 ```
+
+Each deterministic random dataset pass visits every configured CP once and then
+wraps to another deterministic pass. For finite `training.max_steps > 0`,
+training stops after that many steps. For `training.max_steps = 0`, training
+continues indefinitely.
 
 The default training shape is four control-point samples times 16 strip-z
 offsets, producing 64 patches. `load_batch` returns `[4, 16, 1, H, W]`; the

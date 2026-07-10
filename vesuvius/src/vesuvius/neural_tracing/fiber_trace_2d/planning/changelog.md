@@ -2,6 +2,8 @@
 
 ## 2026-07-10
 
+- Restored 2D fiber-strip training/prefetch to deterministic pseudo-random full-dataset CP passes instead of flat sequential CP order.
+- Switched 2D fiber-strip training/prefetch to flat CP order and made explicit `--prefetch-steps` override configured `training.max_steps`; `--prefetch-steps 0` now covers every configured training/test CP once.
 - Added 2D fiber-strip `test_datasets` evaluation with deterministic held-out batches and test-loss current/best snapshot cadence.
 - Added `--augment-vis` contact-sheet CP crosshairs and separate label bands so labels no longer cover image pixels.
 - Fixed 2D fiber-strip affine augmentation composition so shift is applied in output/scaled space and image sampling stays aligned with line/control-point coordinates.

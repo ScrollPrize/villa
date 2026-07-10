@@ -109,14 +109,17 @@ steps:
 PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.train $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --prefetch --prefetch-steps 10
 ```
 
-Prefetch all configured training steps:
+Prefetch every configured training control point once in deterministic
+pseudo-random order, plus every configured held-out `test_datasets` control
+point once when present. The explicit `--prefetch-steps 0` overrides
+`training.max_steps`:
 
 ```bash
 PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.train $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --prefetch --prefetch-steps 0
 ```
 
 Training prefetch exits before model/TensorBoard/snapshot setup. It still uses
-the same deterministic control-point sample sequence and the same CP-local
+the same deterministic control-point sample mode and the same CP-local
 source-strip path as training. For each CP and strip-z offset it covers the
 configured augmentation envelope through the sampler-level VC3D blocking
 coordinate/cache path, so it is intentionally independent of one particular

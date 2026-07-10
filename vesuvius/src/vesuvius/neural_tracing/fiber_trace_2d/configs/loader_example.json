@@ -1,5 +1,5 @@
 {
-  "batch_size": 1,
+  "batch_size": 4,
   "patch_shape_hw": [64, 64],
   "strip_z_offset_count": 16,
   "strip_z_offset_step": 2.0,
@@ -28,7 +28,7 @@
   "training": {
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_2d_runs",
     "run_name": "fiber_strip_direction",
-    "max_steps": 1000000,
+    "max_steps": 20,
     "learning_rate": 0.001,
     "scalar_log_interval": 1,
     "tensorboard_image_interval": 100,

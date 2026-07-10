@@ -205,7 +205,7 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         strip_z_offset_count=int(raw.get("strip_z_offset_count", 16)),
         strip_z_offset_step=float(raw.get("strip_z_offset_step", 1.0)),
         seed=int(raw.get("seed", 1)),
-        prefetch_workers=min(16, max(1, int(raw.get("prefetch_workers", 16)))),
+        prefetch_workers=max(1, int(raw.get("prefetch_workers", 16))),
         volume_cache_dir=None if cache_dir is None else str(cache_dir),
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
         volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
@@ -626,6 +626,9 @@ class FiberStrip2DLoader:
         self._flat_sample_count = sum(record.fiber.control_points_xyz.shape[0] for record in self.records)
         if self._flat_sample_count <= 0:
             raise ValueError("no control points found in configured fibers")
+        self._sample_identity_keys = self._build_sample_identity_keys()
+        self._random_pass_cache: dict[int, np.ndarray] = {}
+        self._random_pass_cache_lock = threading.Lock()
         self._load_batch_skipped_samples = 0
 
     def _load_records(self) -> list[_Record]:
@@ -697,9 +700,48 @@ class FiberStrip2DLoader:
     def sample_count(self) -> int:
         return self._flat_sample_count
 
+    def _build_sample_identity_keys(self) -> tuple[str, ...]:
+        keys: list[str] = []
+        for record_index, record in enumerate(self.records):
+            line = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
+            line_key = json.dumps(np.round(line, 6).tolist(), separators=(",", ":"))
+            cps = np.asarray(record.fiber.control_points_xyz, dtype=np.float64)
+            for control_index, cp_xyz in enumerate(cps):
+                cp_key = json.dumps(np.round(cp_xyz, 6).tolist(), separators=(",", ":"))
+                keys.append(
+                    f"line={line_key}|cp={cp_key}|record={record_index}|control={control_index}"
+                )
+        if len(keys) != int(self._flat_sample_count):
+            raise ValueError("internal sample identity count mismatch")
+        return tuple(keys)
+
     def _random_flat_index(self, sample_index: int) -> int:
-        rng = np.random.default_rng(_stable_seed(self.config.seed, "cp", int(sample_index)))
-        return int(rng.integers(0, self._flat_sample_count))
+        sample_count = int(self._flat_sample_count)
+        position = int(sample_index)
+        pass_index = math.floor(position / sample_count)
+        offset = position % sample_count
+        with self._random_pass_cache_lock:
+            order = self._random_pass_cache.get(pass_index)
+            if order is None:
+                order_list = sorted(
+                    range(sample_count),
+                    key=lambda flat: (
+                        _stable_seed(
+                            self.config.seed,
+                            "cp_permutation",
+                            pass_index,
+                            self._sample_identity_keys[flat],
+                        ),
+                        self._sample_identity_keys[flat],
+                        flat,
+                    ),
+                )
+                order = np.asarray(order_list, dtype=np.int64)
+                self._random_pass_cache[pass_index] = order
+        return int(order[offset])
+
+    def _flat_sample_index(self, sample_index: int) -> int:
+        return int(sample_index) % int(self._flat_sample_count)
 
     def _locate_flat_index(self, flat_index: int) -> tuple[int, int]:
         remaining = int(flat_index)
@@ -710,8 +752,15 @@ class FiberStrip2DLoader:
             remaining -= count
         raise IndexError(flat_index)
 
-    def descriptor_for_sample_index(self, sample_index: int) -> tuple[_Record, int, int]:
-        flat = self._random_flat_index(sample_index)
+    def descriptor_for_sample_index(
+        self, sample_index: int, *, sample_mode: str = "random"
+    ) -> tuple[_Record, int, int]:
+        if sample_mode == "random":
+            flat = self._random_flat_index(sample_index)
+        elif sample_mode == "flat":
+            flat = self._flat_sample_index(sample_index)
+        else:
+            raise ValueError("sample_mode must be 'random' or 'flat'")
         record_index, control_index = self._locate_flat_index(flat)
         return self.records[record_index], record_index, control_index
 
@@ -964,6 +1013,7 @@ class FiberStrip2DLoader:
         sample_index: int,
         *,
         device: torch.device,
+        sample_mode: str = "random",
         profile: dict[str, float] | None = None,
         use_augmentation_envelope: bool | None = None,
         debug_label: str | None = None,
@@ -971,7 +1021,9 @@ class FiberStrip2DLoader:
         if debug_label is not None:
             print(f"{debug_label} descriptor start", flush=True)
         with _ProfileBlock(profile, "descriptor"):
-            record, record_index, cp_index = self.descriptor_for_sample_index(sample_index)
+            record, record_index, cp_index = self.descriptor_for_sample_index(
+                sample_index, sample_mode=sample_mode
+            )
             center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
             source_shape_hw = self._source_shape_hw(use_augmentation_envelope=use_augmentation_envelope)
         if debug_label is not None:
@@ -1152,10 +1204,10 @@ class FiberStrip2DLoader:
         return grid.coords_zyx.astype(np.float32, copy=False), grid.valid_mask.astype(bool, copy=False)
 
     def build_sample(
-        self, sample_index: int
+        self, sample_index: int, *, sample_mode: str = "random"
     ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
         device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
-        source = self.build_strip_source(sample_index, device=device)
+        source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode)
         images: list[np.ndarray] = []
         coords: list[np.ndarray] = []
         valids: list[np.ndarray] = []
@@ -1238,7 +1290,13 @@ class FiberStrip2DLoader:
         assert valid_mask is not None
         return sample, image.astype(np.float32, copy=False), valid_mask.astype(bool, copy=False), line_xy
 
-    def load_batch(self, start_sample_index: int = 0, batch_size: int | None = None) -> FiberStrip2DBatch:
+    def load_batch(
+        self,
+        start_sample_index: int = 0,
+        batch_size: int | None = None,
+        *,
+        sample_mode: str = "random",
+    ) -> FiberStrip2DBatch:
         batch_size = self.config.batch_size if batch_size is None else int(batch_size)
         begin_zarr_cache_trace()
         all_samples: list[FiberStripSample] = []
@@ -1262,7 +1320,7 @@ class FiberStrip2DLoader:
                         sample_images,
                         sample_coords,
                         sample_valids,
-                    ) = self.build_sample(current_sample_index)
+                    ) = self.build_sample(current_sample_index, sample_mode=sample_mode)
                 except ValueError as exc:
                     self._load_batch_skipped_samples += 1
                     if self._load_batch_skipped_samples <= 10:
@@ -1305,26 +1363,37 @@ class FiberStrip2DLoader:
             cache_stats=cache_stats,
         )
 
-    def chunk_requests_for_sample_index(self, sample_index: int) -> list[ZarrChunkRequest]:
+    def chunk_requests_for_sample_index(
+        self, sample_index: int, *, sample_mode: str = "random"
+    ) -> list[ZarrChunkRequest]:
         device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
-        source = self.build_strip_source(sample_index, device=device)
+        source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode)
         requests: list[ZarrChunkRequest] = []
         for offset_index, _ in enumerate(self.strip_z_offsets):
             coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
             requests.extend(source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
         return requests
 
-    def chunk_requests_for_samples(self, start_sample_index: int, sample_count: int) -> list[ZarrChunkRequest]:
+    def chunk_requests_for_samples(
+        self, start_sample_index: int, sample_count: int, *, sample_mode: str = "random"
+    ) -> list[ZarrChunkRequest]:
         unique: dict[tuple[str, str], ZarrChunkRequest] = {}
         for sample_index in range(int(start_sample_index), int(start_sample_index) + int(sample_count)):
-            for request in self.chunk_requests_for_sample_index(sample_index):
+            for request in self.chunk_requests_for_sample_index(sample_index, sample_mode=sample_mode):
                 unique[(request.store_identity, request.key)] = request
         return list(unique.values())
 
-    def prefetch(self, start_sample_index: int, sample_count: int, *, workers: int | None = None) -> dict[str, Any]:
+    def prefetch(
+        self,
+        start_sample_index: int,
+        sample_count: int,
+        *,
+        workers: int | None = None,
+        sample_mode: str = "random",
+    ) -> dict[str, Any]:
         total_samples = int(sample_count)
         total_patches = total_samples * len(self.strip_z_offsets)
-        worker_count = min(16, max(1, int(self.config.prefetch_workers if workers is None else workers)))
+        worker_count = max(1, int(self.config.prefetch_workers if workers is None else workers))
         producer_count = min(worker_count, max(1, total_samples))
         retry_seconds = self.config.volume_cache_retry_seconds
         if retry_seconds <= 0.0:
@@ -1335,6 +1404,7 @@ class FiberStrip2DLoader:
         print(
             "prefetch: "
             f"samples={total_samples} patches={total_patches} workers={worker_count} "
+            f"sample_mode={sample_mode} "
             "mode=dependency_chunks",
             flush=True,
         )
@@ -1401,6 +1471,7 @@ class FiberStrip2DLoader:
             source = self.build_strip_source(
                 int(sample_index),
                 device=torch.device("cpu"),
+                sample_mode=sample_mode,
                 use_augmentation_envelope=True,
             )
             requests: list[ZarrChunkRequest] = []
@@ -1539,8 +1610,13 @@ class FiberStrip2DLoader:
         }
 
 
-def iter_batches(loader: FiberStrip2DLoader, *, start_sample_index: int = 0) -> Iterable[FiberStrip2DBatch]:
+def iter_batches(
+    loader: FiberStrip2DLoader,
+    *,
+    start_sample_index: int = 0,
+    sample_mode: str = "random",
+) -> Iterable[FiberStrip2DBatch]:
     sample_index = int(start_sample_index)
     while True:
-        yield loader.load_batch(sample_index)
+        yield loader.load_batch(sample_index, sample_mode=sample_mode)
         sample_index += loader.config.batch_size

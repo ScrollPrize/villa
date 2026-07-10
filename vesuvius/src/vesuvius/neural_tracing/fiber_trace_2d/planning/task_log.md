@@ -1,25 +1,35 @@
-# Task Log: Batch Visualization Samples Different CPs
+# Task Log: Restore Exhaustive Deterministic Random Sample Order
 
 ## Implementation Notes
 
-- Started from the first item in `planning/todo.md`.
-- Plan is local to TensorBoard/debug visualization selection and should not
-  affect sampling, training loss, augmentation, or cache behavior.
-- Added `_select_visualization_patch_indices` so training/test batch overlays
-  prefer one center strip-z patch from each loaded CP sample before filling
-  remaining cells.
-- Updated the TensorBoard overlay path to use the selected patch indices.
-- Added a focused unit test covering multi-CP, multi-offset selection.
-- Updated `planning/specs.md` and `docs/code_structure.md`.
+- Replaced trainer/prefetch use of flat sequential sample mode with the default
+  deterministic pseudo-random sample mode.
+- Changed loader random sampling from random-with-replacement to deterministic
+  random-without-replacement full-dataset passes.
+- Each pass sorts all flat CP indices by seeded content-based random keys, so
+  every configured CP is visited once before the stream repeats.
+- Full-dataset prefetch (`--prefetch-steps 0`) now starts at sample position 0
+  and covers exactly one complete deterministic-random pass for train and test
+  loaders.
+- Positive `--prefetch-steps N` still starts at the requested training-step
+  offset and covers the same deterministic random prefix that training would
+  consume from that step.
+- Retained explicit `sample_mode="flat"` only as a debug/test mode; normal
+  training and training prefetch do not use it.
+- Updated specs, code docs, local development notes, and changelog.
+- Added focused tests for exhaustive random pass coverage and updated prefetch
+  mode/count expectations.
 
 ## Deviations
 
-- None.
+- The plan said repeated passes could be deterministic but not necessarily
+  identical. The implementation uses pass-specific seeded keys, so repeated
+  passes are deterministic and may have different random order.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py`
-  passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed with `43 passed in 3.23s`.
-- `git diff --check` over touched files passed.
+  passed with `49 passed in 5.63s`.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
+  passed.
+- `git diff --check -- <touched fiber_trace_2d files>` passed.
