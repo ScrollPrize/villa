@@ -72,6 +72,8 @@
 - Prefetch remains base-volume-only; Lasagna manifest channels are not prefetched by the VC3D base-volume prefetch path.
 - V0 training is provided by `python -m vesuvius.neural_tracing.fiber_trace_2d.train`.
 - `train.py --prefetch` runs training-oriented chunk prefetch only and exits before model, optimizer, TensorBoard, run-directory, or snapshot setup.
+- `train.py --benchmark` runs 100 training batches and exits without test evaluation, TensorBoard, run-directory creation, or snapshot setup. It reports throughput in CNN image patches per second, where one patch is one flattened strip-z image sent through the 2D model.
+- `train.py --profile` runs the same 100-batch benchmark path with per-batch timing rows and a final average milliseconds-per-patch summary. Profiled stages are coordinate generation, coordinate augmentation, base-volume Zarr read/sampling, torch image/value augmentation, forward plus loss, and backward plus optimizer step.
 - Training and training prefetch use the same deterministic pseudo-random CP sample-index sequence: each pass visits all configured CPs once in seeded random order and wraps at dataset end.
 - With `training.max_steps = 0`, training repeats the full training dataset indefinitely.
 - `training.max_sample_index` is an optional positive exclusive deterministic sample-index limit. The default `0` means no limit. When positive, training wraps every global sample position with `sample_index % training.max_sample_index`, so long runs reuse that deterministic prefix independently of `training.max_steps`.

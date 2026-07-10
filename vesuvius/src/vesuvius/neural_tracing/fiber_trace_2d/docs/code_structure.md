@@ -170,6 +170,16 @@ The important behavior is:
   training steps to deterministic control-point sample ranges, calls loader
   prefetch, and exits before model, optimizer, TensorBoard, run-directory, or
   snapshot setup.
+- Supports `--benchmark` for a 100-batch training-work benchmark that skips
+  test evaluation, TensorBoard, run-directory creation, and snapshots. It
+  reports throughput as CNN image patches per second, where patches are the
+  flattened `[control point, strip-z offset]` images sent through the model.
+- Supports `--profile` on the benchmark path. It prints per-batch rows and a
+  final milliseconds-per-patch summary for coordinate generation, coordinate
+  augmentation, base-volume sampling, torch value augmentation, forward plus
+  loss, and backward plus optimizer step. Loader-side stage timings come from
+  the shared `load_batch` / `build_strip_source` / `build_strip_patch_from_source`
+  profile hooks, so profiling uses the same sampling path as normal training.
 - Flattens `[control_point_sample, strip_z_offset]` into one patch batch for the
   model.
 - Computes direction targets from transformed line coordinates after geometric
@@ -265,6 +275,23 @@ Training prefetch:
 - Prefetch uses dependency-only chunk discovery and Python-side cache
   classification. It does not call the image-sampling path just to warm the
   cache.
+
+Training benchmark/profile:
+
+- `python -m vesuvius.neural_tracing.fiber_trace_2d.train config.json
+  --benchmark` runs 100 training batches and prints a final
+  `patches_per_second` summary.
+- `--profile` implies the same 100-batch benchmark work and additionally prints
+  table rows with milliseconds per CNN patch for:
+  - `coord`: descriptor lookup, CP-local line window, Lasagna normals, strip
+    coordinate grid, and transformed line/control-point coordinates;
+  - `coord_aug`: coordinate-space geometric augmentation;
+  - `load`: base-volume Zarr/VC3D coordinate sampling;
+  - `img_aug`: torch image/value augmentation;
+  - `fw`: model forward plus loss;
+  - `bw_step`: backward pass plus optimizer step.
+- Benchmark/profile mode intentionally does not create a run directory or write
+  checkpoints.
 
 Dataset entries must contain:
 

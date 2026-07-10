@@ -163,6 +163,15 @@ class _DirectionMetrics:
     angle_mean_deg: float
 
 
+@dataclass(frozen=True)
+class _BenchmarkSummary:
+    batches: int
+    patches: int
+    elapsed_ms: float
+    patches_per_second: float
+    stage_ms_per_patch: dict[str, float]
+
+
 def _compute_batch_loss(
     model: FiberStripDirectionNet,
     batch: FiberStrip2DBatch,
@@ -177,6 +186,165 @@ def _compute_batch_loss(
     angle_error = direction_angle_error_degrees(outputs, supervision)
     metrics = _DirectionMetrics(angle_mean_deg=float(angle_error.detach().mean().cpu().item()))
     return loss, outputs, supervision, metrics
+
+
+def _sync_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _stage_ms(profile: dict[str, float], key: str) -> float:
+    return float(profile.get(key, 0.0))
+
+
+def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dict[str, float]) -> dict[str, float]:
+    coord_gen = (
+        _stage_ms(loader_profile, "descriptor")
+        + _stage_ms(loader_profile, "line_window")
+        + _stage_ms(loader_profile, "lasagna_normals")
+        + _stage_ms(loader_profile, "strip_coords")
+        + _stage_ms(loader_profile, "line_coords")
+    )
+    return {
+        "coord_gen": coord_gen,
+        "coord_aug": _stage_ms(loader_profile, "coord_augmentation"),
+        "loading": _stage_ms(loader_profile, "volume_sample"),
+        "image_aug": _stage_ms(loader_profile, "value_augmentation"),
+        "fw": _stage_ms(train_profile, "fw"),
+        "bw_step": _stage_ms(train_profile, "bw_step"),
+    }
+
+
+def _print_profile_header() -> None:
+    print(
+        "fiber_trace_2d profile columns: "
+        "batch=batch-index patches=CNN image patches total/coord/coord_aug/load/img_aug/fw/bw_step=ms per patch",
+        flush=True,
+    )
+    print(
+        f"{'batch':>5} {'patches':>7} {'total':>9} {'coord':>9} {'coord_aug':>9} "
+        f"{'load':>9} {'img_aug':>9} {'fw':>9} {'bw_step':>9}",
+        flush=True,
+    )
+
+
+def _print_profile_row(batch_index: int, patch_count: int, elapsed_ms: float, stages: dict[str, float]) -> None:
+    denom = max(1, int(patch_count))
+    print(
+        f"{int(batch_index):5d} {int(patch_count):7d} "
+        f"{elapsed_ms / denom:9.2f} "
+        f"{stages.get('coord_gen', 0.0) / denom:9.2f} "
+        f"{stages.get('coord_aug', 0.0) / denom:9.2f} "
+        f"{stages.get('loading', 0.0) / denom:9.2f} "
+        f"{stages.get('image_aug', 0.0) / denom:9.2f} "
+        f"{stages.get('fw', 0.0) / denom:9.2f} "
+        f"{stages.get('bw_step', 0.0) / denom:9.2f}",
+        flush=True,
+    )
+
+
+def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> None:
+    print(
+        "fiber_trace_2d benchmark complete "
+        f"batches={summary.batches} patches={summary.patches} "
+        f"elapsed_ms={summary.elapsed_ms:.1f} patches_per_second={summary.patches_per_second:.2f}",
+        flush=True,
+    )
+    if profile:
+        print("fiber_trace_2d profile summary ms_per_patch:", flush=True)
+        for key in ("coord_gen", "coord_aug", "loading", "image_aug", "fw", "bw_step"):
+            print(f"  {key}={summary.stage_ms_per_patch.get(key, 0.0):.3f}", flush=True)
+
+
+def run_benchmark(
+    config_path: str | Path,
+    *,
+    sampler_factory: SamplerFactory | None = None,
+    batches: int = 100,
+    profile: bool = False,
+) -> _BenchmarkSummary:
+    if int(batches) <= 0:
+        raise ValueError("benchmark batches must be > 0")
+    raw_config = _load_raw_config(config_path)
+    training = _training_config_from_raw(raw_config)
+    loader_config = load_config(config_path)
+    loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    device = resolve_torch_device(training.device)
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            in_channels=1,
+            hidden_channels=training.model_hidden_channels,
+            depth=training.model_depth,
+        )
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
+    model.train()
+
+    sample_mode = "random"
+    stage_totals = {key: 0.0 for key in ("coord_gen", "coord_aug", "loading", "image_aug", "fw", "bw_step")}
+    total_patches = 0
+    total_batches = int(batches)
+    if profile:
+        _print_profile_header()
+
+    _sync_device(device)
+    wall_start = time.perf_counter()
+    for batch_index in range(1, total_batches + 1):
+        raw_start_sample_index = (batch_index - 1) * int(training.train_control_points_per_step)
+        loader_profile: dict[str, float] = {}
+        batch_start = time.perf_counter()
+        batch = loader.load_batch(
+            raw_start_sample_index,
+            batch_size=training.train_control_points_per_step,
+            sample_mode=sample_mode,
+            sample_index_limit=training.max_sample_index,
+            profile=loader_profile if profile else None,
+        )
+
+        images_np, valid_np = _flatten_batch(batch)
+        patch_count = int(images_np.shape[0])
+        images = _prepare_images(images_np, valid_np, device=device)
+        supervision = build_direction_supervision(batch.samples, valid_np, device=device)
+
+        optimizer.zero_grad(set_to_none=True)
+        train_profile: dict[str, float] = {}
+        _sync_device(device)
+        fw_start = time.perf_counter()
+        outputs = model(images)
+        loss = direction_mse_loss(outputs, supervision)
+        _sync_device(device)
+        train_profile["fw"] = (time.perf_counter() - fw_start) * 1000.0
+
+        bw_start = time.perf_counter()
+        loss.backward()
+        optimizer.step()
+        _sync_device(device)
+        train_profile["bw_step"] = (time.perf_counter() - bw_start) * 1000.0
+
+        batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
+        stages = _benchmark_stage_totals(loader_profile, train_profile)
+        for key, value in stages.items():
+            stage_totals[key] += float(value)
+        total_patches += patch_count
+        if profile:
+            _print_profile_row(batch_index, patch_count, batch_elapsed_ms, stages)
+
+    _sync_device(device)
+    elapsed_ms = (time.perf_counter() - wall_start) * 1000.0
+    patches_per_second = float(total_patches) / max(elapsed_ms / 1000.0, 1.0e-9)
+    stage_ms_per_patch = {
+        key: float(value) / max(1, int(total_patches))
+        for key, value in stage_totals.items()
+    }
+    summary = _BenchmarkSummary(
+        batches=total_batches,
+        patches=total_patches,
+        elapsed_ms=elapsed_ms,
+        patches_per_second=patches_per_second,
+        stage_ms_per_patch=stage_ms_per_patch,
+    )
+    _print_benchmark_summary(summary, profile=profile)
+    return summary
 
 
 @dataclass(frozen=True)
@@ -653,6 +821,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("config", help="Path to fiber_trace_2d JSON config")
     parser.add_argument("--prefetch", action="store_true", help="Prefetch training chunks and exit without training")
     parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run 100 training batches without testing, TensorBoard, or snapshots, then report patch samples/s",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Print benchmark/training-stage timing rows and per-patch summary for the 100-batch benchmark run",
+    )
+    parser.add_argument(
         "--prefetch-steps",
         type=int,
         default=None,
@@ -675,6 +853,12 @@ def main(argv: list[str] | None = None) -> None:
                 prefetch_steps=args.prefetch_steps,
                 prefetch_start_step=args.prefetch_start_step,
             )
+        except ValueError as exc:
+            parser.error(str(exc))
+        return
+    if args.benchmark or args.profile:
+        try:
+            run_benchmark(args.config, batches=100, profile=bool(args.profile))
         except ValueError as exc:
             parser.error(str(exc))
         return

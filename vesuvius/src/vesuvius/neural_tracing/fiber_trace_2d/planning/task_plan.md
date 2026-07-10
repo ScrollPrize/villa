@@ -1,45 +1,60 @@
-# Task Plan: 10-Block 64-Channel ResNet Direction Model
+# Task Plan: Training Benchmark And Profiling Mode
 
 ## Scope
 
-Change the V0 2D direction model architecture and defaults. This does not
-change sampling, prefetch, augmentation, loss semantics, output encoding, runner
-inspection modes, or checkpoint file layout.
+Add training-only benchmark/profiling command-line modes. This should not
+change normal training semantics, sampling order, model architecture, loss,
+TensorBoard logging, checkpoints, prefetch, or runner inspection modes.
 
 ## Plan
 
-- Replace the current plain Conv/GroupNorm/SiLU stack in `model.py` with a
-  residual CNN:
-  - input projection from `in_channels` to `hidden_channels`;
-  - `depth` residual blocks at constant hidden width;
-  - each block uses two 3x3 convolutions, GroupNorm, and SiLU, with identity
-    skip connection;
-  - final 1x1 projection to the existing two Lasagna direction channels.
-- Change default model knobs to `hidden_channels=64` and `depth=10`.
-  - `FiberStripDirectionModelConfig` defaults.
-  - `FiberStripTrainingConfig` defaults and raw-config fallback.
-  - runner checkpoint fallback for older checkpoints missing config metadata.
-  - checked-in example config.
-- Keep explicit user/test config values honored, including smaller test models.
-- Add focused model tests for output shape/range and residual-block count.
+- Extend `train.py` CLI with:
+  - `--benchmark`: run 100 train batches by default, skip test evaluation,
+    TensorBoard, run-directory creation, and snapshots, then report patch
+    samples/s.
+  - `--profile`: enable stage timing and per-batch table output. It can be used
+    alone or with `--benchmark`; with benchmark it profiles the benchmark run.
+- Add a shared benchmark runner that:
+  - uses the existing `FiberStrip2DLoader.load_batch` path;
+  - performs the same image preparation, supervision building, forward,
+    backward, and optimizer step as training;
+  - counts CNN patches as `control_points_per_step * strip_z_offset_count`;
+  - defaults to 100 batches without changing config files.
+- Pass optional profile dictionaries through `load_batch` / `build_sample` so
+  existing loader profile blocks collect:
+  - coordinate generation from descriptor, line-window, Lasagna normal, strip
+    grid, and line-coordinate timing;
+  - coordinate augmentation;
+  - volume sampling/Zarr read;
+  - image/value augmentation.
+- Time model stages in `train.py`:
+  - forward plus loss;
+  - backward plus optimizer step.
+- Print:
+  - one table header followed by per-batch rows when profiling;
+  - a final summary with total patches, elapsed wall time, patches/s, and
+    average ms per CNN patch by stage.
 
 ## Spec Update
 
-Update `planning/specs.md` to state that the V0 model is a 10-block,
-64-channel residual CNN by default and still outputs the Lasagna ambiguous
-two-cos-channel direction encoding.
+Update `planning/specs.md` to document `train.py --benchmark` and
+`train.py --profile`, including the fixed 100-batch default, skipped
+side-effects, patch-sample throughput unit, and profiled stage meanings.
 
 ## Docs Updates
 
-Update `docs/code_structure.md` to describe the ResNet model and 10/64 default
-training knobs.
+Update `docs/code_structure.md` to describe the benchmark/profile CLI modes and
+the source of the profile stages.
 
 ## Testing
 
+- Add focused tests using the existing fake local sampler:
+  - loader profile collection records expected stage keys through `load_batch`;
+  - benchmark mode returns a summary and does not create run directories.
 - Run:
-  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/model.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
+  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
 ## Changelog
 
-Add a changelog entry because this changes the default model architecture.
+Add a changelog entry for the new training benchmark/profile modes.

@@ -1,16 +1,15 @@
-# Task Log: 10-Block 64-Channel ResNet Direction Model
+# Task Log: Training Benchmark And Profiling Mode
 
 ## Implementation Notes
 
-- Replaced the plain convolution stack with a constant-width residual CNN.
-- Updated default model sizing to 10 residual blocks and 64 hidden channels in
-  `model.py`, `train.py`, runner checkpoint fallback, and `loader_example.json`.
-- Updated line-trace default receptive-field margin to `1 + 2 * model_depth`
-  to match the ResNet's input projection plus two 3x3 convolutions per block.
-- Switched ResNet normalization from one GroupNorm group to eight groups for
-  the default 64-channel width, with a valid-divisor fallback for smaller
-  explicit test models.
-- Added tests for default block/channel count and forward output shape/range.
+- Added optional loader profile plumbing through `load_batch` and `build_sample`
+  while keeping the default path unchanged when no profile dict is passed.
+- Added `train.py --benchmark` for a 100-batch training-work benchmark that
+  skips test evaluation, TensorBoard, run-directory creation, and snapshots.
+- Added `train.py --profile` for per-batch stage timing rows plus a final
+  milliseconds-per-CNN-patch summary.
+- Added tests for loader profile collection and benchmark throughput reporting
+  without training run-directory side effects.
 
 ## Deviations
 
@@ -18,7 +17,8 @@
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/model.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
   passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 64 tests.
+  passed: 66 tests.
+- `git diff --check -- <touched files>` passed.

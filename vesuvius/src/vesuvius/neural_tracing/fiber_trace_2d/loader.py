@@ -1216,10 +1216,14 @@ class FiberStrip2DLoader:
         return grid.coords_zyx.astype(np.float32, copy=False), grid.valid_mask.astype(bool, copy=False)
 
     def build_sample(
-        self, sample_index: int, *, sample_mode: str = "random"
+        self,
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile: dict[str, float] | None = None,
     ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
         device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
-        source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode)
+        source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode, profile=profile)
         images: list[np.ndarray] = []
         coords: list[np.ndarray] = []
         valids: list[np.ndarray] = []
@@ -1235,6 +1239,7 @@ class FiberStrip2DLoader:
                 offset_index,
                 params,
                 device=device,
+                profile=profile,
                 load_image=True,
             )
             assert image is not None
@@ -1309,6 +1314,7 @@ class FiberStrip2DLoader:
         *,
         sample_mode: str = "random",
         sample_index_limit: int | None = None,
+        profile: dict[str, float] | None = None,
     ) -> FiberStrip2DBatch:
         batch_size = self.config.batch_size if batch_size is None else int(batch_size)
         begin_zarr_cache_trace()
@@ -1334,7 +1340,7 @@ class FiberStrip2DLoader:
                         sample_images,
                         sample_coords,
                         sample_valids,
-                    ) = self.build_sample(current_sample_index, sample_mode=sample_mode)
+                    ) = self.build_sample(current_sample_index, sample_mode=sample_mode, profile=profile)
                 except ValueError as exc:
                     self._load_batch_skipped_samples += 1
                     if self._load_batch_skipped_samples <= 10:

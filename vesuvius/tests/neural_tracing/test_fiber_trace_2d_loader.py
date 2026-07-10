@@ -45,6 +45,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _test_loader_config_from_raw,
     _training_config_from_raw,
     prefetch_training,
+    run_benchmark,
     run_training,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
@@ -458,6 +459,32 @@ def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
     assert not hasattr(batch, "planar_images")
     assert batch.strip_z_offsets.tolist() == [-1.0, 0.0, 1.0]
     assert batch.control_point_indices.shape == (2,)
+
+
+def test_loader_batch_profile_collects_stage_timings(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    profile: dict[str, float] = {}
+
+    batch = loader.load_batch(0, profile=profile)
+
+    assert batch.images.shape == (1, 3, 1, 3, 3)
+    for key in (
+        "descriptor",
+        "line_window",
+        "lasagna_normals",
+        "strip_coords",
+        "coord_augmentation",
+        "line_coords",
+        "volume_sample",
+        "value_augmentation",
+    ):
+        assert key in profile
+        assert profile[key] >= 0.0
 
 
 def test_loader_skips_whole_fiber_with_out_of_volume_control_point(tmp_path: Path) -> None:
@@ -1102,8 +1129,9 @@ def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch
     loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
     attempted: list[int] = []
 
-    def build_sample(sample_index: int, *, sample_mode: str = "random"):
+    def build_sample(sample_index: int, *, sample_mode: str = "random", profile=None):
         del sample_mode
+        del profile
         attempted.append(int(sample_index))
         record, record_index, control_index = loader.descriptor_for_sample_index(sample_index)
         sample = SimpleNamespace(
@@ -1651,6 +1679,30 @@ def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:
 
     assert (run_dir / "snapshots" / "current.pt").is_file()
     assert (run_dir / "snapshots" / "best.pt").is_file()
+
+
+def test_training_benchmark_reports_patch_throughput_without_run_dir(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "benchmark",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    summary = run_benchmark(config_path, sampler_factory=_test_sampler_factory, batches=2, profile=True)
+
+    assert summary.batches == 2
+    assert summary.patches == 6
+    assert summary.patches_per_second > 0.0
+    assert "coord_gen" in summary.stage_ms_per_patch
+    assert not (tmp_path / "runs").exists()
 
 
 def test_training_with_test_dataset_uses_test_interval_for_snapshots(tmp_path: Path) -> None:
