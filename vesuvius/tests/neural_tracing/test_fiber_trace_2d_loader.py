@@ -835,7 +835,7 @@ def test_strip_augment_transform_affine_round_trip() -> None:
     assert torch.allclose(round_tripped, source_points, atol=1.0e-4)
 
 
-def test_strip_augment_transform_smooth_round_trip_without_dense_search() -> None:
+def test_strip_augment_transform_smooth_round_trip_is_direct() -> None:
     device = torch.device("cpu")
     params = FiberStripAugmentParams(
         shift_x=2.0,
@@ -858,7 +858,7 @@ def test_strip_augment_transform_smooth_round_trip_without_dense_search() -> Non
     output_points = transform.source_to_output_points(source_points)
     round_tripped = transform.output_to_source_points(output_points)
 
-    assert torch.allclose(round_tripped, source_points, atol=2.0e-3)
+    assert torch.allclose(round_tripped, source_points, atol=1.0e-4)
 
 
 def test_line_augmentation_returns_coordinates_not_mask() -> None:

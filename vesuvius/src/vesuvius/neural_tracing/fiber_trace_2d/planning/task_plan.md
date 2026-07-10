@@ -1,81 +1,94 @@
-# Task Plan: Fused Forward/Backward Augmentation Coordinate Maps
+# Task Plan: Cached Fused Augmentation Maps For Line And CP Warp
 
 ## Implementation
 
-1. Introduce a shared geometric transform helper in `augmentation.py`.
-   - Add a small class or pure-function bundle, e.g.
-     `StripAugmentTransform`, built from `output_shape_hw`,
-     `source_shape_hw`, `FiberStripAugmentParams`, and `device`.
-   - It must expose:
-     - `output_to_source_points(xy)`;
-     - `source_to_output_points(xy)`;
-     - `output_to_source_grid()`.
-   - Keep tensors on the requested torch device.
+1. Refine `StripAugmentTransform` into a real fused map object.
+   - Construct all shape/parameter/device-dependent tensors once in
+     `__post_init__` or a factory.
+   - Precompute scalar affine constants once.
+   - Precompute deterministic smooth-offset controls or a source-x lookup
+     tensor once per transform object.
+   - Remove per-call `torch.Generator` construction and per-call smooth control
+     regeneration from point mapping and grid mapping.
 
-2. Represent transforms as composable map functions.
-   - Affine components should be represented by paired forward/backward matrix
-     or vectorized functions.
-   - Smooth offset should be represented as a vertical column-dependent map
-     using the existing deterministic `smooth_offset_field` control generation.
-   - Compose the functions in one place so the backward map used for image
-     sampling and the forward map used for line/CP coordinates are paired.
+2. Make smooth control generation stateless or cached.
+   - Replace generator-per-call behavior with either:
+     - a deterministic vectorized hash function over control index + seed; or
+     - one cached control tensor stored on the transform object.
+   - Keep outputs deterministic for identical `(seed, amplitude, stride,
+     source_width, device)`.
+   - Keep smooth as a direct paired map:
+     - backward/image sampling: `source_y += f(source_x)`;
+     - forward/line mapping: `source_y -= f(source_x)` before affine forward.
 
-3. Remove smooth nearest-search line/CP mapping.
-   - Replace the smooth branches in `transformed_centerline_coords_torch` and
-     `transformed_source_point_coords_torch`.
-   - Delete or stop using `_nearest_output_pixels_for_source_points` for normal
-     augmentation line/CP generation.
-   - Source-to-output line mapping should be vectorized over the cached line
-     points and should not build an `H x W` source grid unless the caller asks
-     for the grid.
+3. Use one batched source-to-output call for line and CP.
+   - In `FiberStrip2DLoader._line_and_cp_xy_for_params`, concatenate
+     `source_line_xy` and `source_control_point_xy[None]`.
+   - Call `transform.source_to_output_points(...)` once.
+   - Split the returned tensor into line and CP.
+   - Apply finite/in-bounds filtering only to the line rows, not by remapping
+     the CP separately.
 
-4. Adapt loader line generation.
-   - `_line_and_cp_xy_for_params` should use cached `source_line_xy` and
-     `source_control_point_xy`.
-   - For `params is None`, return cached source tensors directly.
-   - For augmented params, build the fused transform once and apply
-     `source_to_output_points` to cached source line/CP tensors.
+4. Reuse transformed line/CP across strip-z offsets.
+   - Audit the training/loader batch path to find whether the same CP source
+     and augmentation params are currently recomputing line/CP for every
+     strip-z offset.
+   - If yes, compute line/CP once per CP source + params and pass/reuse it for
+     all offset patches derived from that source.
+   - Preserve per-offset image coordinates and image sampling.
 
-5. Preserve existing sampling behavior.
-   - `source_coordinate_grid_for_output` should call the shared transform's
-     `output_to_source_grid()` so coordinate augmentation and runner TTA still
-     use the same backward map as before.
-   - `_resample_coord_tensors_like_augmentation` should continue to sample once
-     from the fused backward map.
+5. Route all relevant geometric consumers through the fused object.
+   - `source_coordinate_grid_for_output(...)` should still call the transform's
+     grid method.
+   - Runner/tracing helpers should not rebuild a separate smooth/affine inverse
+     path when a fused transform/map can be used.
+   - Do not add a second implementation for TTA, line-trace, dir-vis, or
+     augment-vis.
 
-6. Runner/TTA cleanup where in scope.
-   - Update runner helpers that call `source_coordinate_grid_for_output` to keep
-     working through the shared transform.
-   - Do not redesign the full tracing API in this task, but avoid introducing a
-     second transform implementation.
+6. Add profiling visibility.
+   - Keep the existing `line` profile column.
+   - Add or preserve enough focused timing to confirm line/CP mapping time
+     drops after batching/caching.
+   - Do not insert extra CUDA syncs outside existing profile timing behavior.
 
 ## Spec Update
 
-Update `planning/specs.md` to state that geometric augmentation exposes paired
-fused forward/backward maps, and smooth vertical offset line/CP mapping must use
-the analytic map rather than nearest-pixel search.
+Update `planning/specs.md` to state:
+
+- A fused geometric map object is constructed once per source/output shape,
+  augmentation params, and device.
+- Shape/params/device-dependent smooth controls and constants are cached in
+  that object.
+- Line and CP coordinates are transformed together in one vectorized call.
+- Shared CP line/CP mapping is reused for all strip-z offsets that share the
+  same source and augmentation params.
+- No geometric stage may use brute-force inversion, nearest-grid search,
+  rasterized image/mask transforms, or iterative solvers.
 
 ## Docs Updates
 
-Update `docs/code_structure.md` to document the shared transform helper and the
-new line/CP path through cached source coordinates plus
-`source_to_output_points`.
+Update `docs/code_structure.md` if implementation changes public module
+structure or loader data flow.
+
+Update `planning/changelog.md`, `planning/status.md`, and
+`planning/task_log.md` for this current task only.
 
 ## Tests
 
-- Add unit tests that compare affine forward/backward round trips.
-- Add unit tests for smooth offset:
-  - `output_to_source_points(source_to_output_points(points))` round trips
-    within tolerance for representative line/CP points;
-  - transformed line/CP generation does not call the nearest-search helper.
-- Add a loader test confirming augmented `line_xy` is generated from cached
-  source line coordinates through the shared transform.
-- Keep existing augment-vis, TTA, direction-supervision, and loader tests
-  passing.
+- Add a unit test that monkeypatches smooth control generation or counts calls
+  to verify one transform object does not regenerate controls for line and CP
+  separately.
+- Add a loader test verifying augmented line and CP are transformed through one
+  batched `source_to_output_points` call.
+- Add/keep round-trip tests for affine and smooth direct maps.
+- If line/CP reuse across strip-z offsets changes loader behavior, add a test
+  that a multi-offset batch does not recompute line/CP per offset.
 - Run:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
-## Changelog
+## Validation
 
-Add one 2026-07-10 changelog line for fused forward/backward geometric
-augmentation maps and analytic smooth-offset line/CP mapping.
+- Run compile checks for touched Python files.
+- Run the focused pytest command above.
+- If practical, run the existing training `--profile` or augment profile path
+  on the same sample before/after and report the `line` column change.

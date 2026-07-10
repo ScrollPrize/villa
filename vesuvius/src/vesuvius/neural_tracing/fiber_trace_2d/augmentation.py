@@ -316,10 +316,10 @@ class StripAugmentTransform:
     def source_center_y(self) -> float:
         return (float(self.source_height) - 1.0) * 0.5
 
-    def _smooth_offsets_at_output_x(self, output_x: torch.Tensor) -> torch.Tensor:
+    def _smooth_offsets_at_source_x(self, source_x: torch.Tensor) -> torch.Tensor:
         return _smooth_offset_values(
-            output_x,
-            self.output_width,
+            source_x,
+            self.source_width,
             amplitude=float(self.params.smooth_offset),
             stride=float(self.params.smooth_offset_stride),
             seed=int(self.params.smooth_offset_seed),
@@ -347,7 +347,7 @@ class StripAugmentTransform:
         src_x = cos_a * x_sheared - sin_a * y_sheared + self.source_center_x
         src_y = sin_a * x_sheared + cos_a * y_sheared + self.source_center_y
         if float(self.params.smooth_offset) != 0.0:
-            src_y = src_y + self._smooth_offsets_at_output_x(points[..., 0])
+            src_y = src_y + self._smooth_offsets_at_source_x(src_x)
         return torch.stack([src_x, src_y], dim=-1).to(dtype=torch.float32)
 
     def output_to_source_grid(self) -> torch.Tensor:
@@ -386,16 +386,13 @@ class StripAugmentTransform:
             dim=-1,
         ).to(dtype=torch.float32)
 
-    def source_to_output_points(self, source_xy: torch.Tensor, *, iterations: int = 8) -> torch.Tensor:
+    def source_to_output_points(self, source_xy: torch.Tensor) -> torch.Tensor:
         points = torch.as_tensor(source_xy, dtype=torch.float32, device=self.device)
         if float(self.params.smooth_offset) == 0.0:
             return self._source_to_output_points_affine(points)
-        output = self._source_to_output_points_affine(points)
-        for _ in range(max(1, int(iterations))):
-            offsets = self._smooth_offsets_at_output_x(output[..., 0])
-            adjusted = torch.stack([points[..., 0], points[..., 1] - offsets], dim=-1)
-            output = self._source_to_output_points_affine(adjusted)
-        return output.to(dtype=torch.float32)
+        offsets = self._smooth_offsets_at_source_x(points[..., 0])
+        adjusted = torch.stack([points[..., 0], points[..., 1] - offsets], dim=-1)
+        return self._source_to_output_points_affine(adjusted)
 
 
 def strip_augment_transform(

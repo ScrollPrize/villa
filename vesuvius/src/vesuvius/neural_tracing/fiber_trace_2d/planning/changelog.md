@@ -3,8 +3,8 @@
 ## 2026-07-10
 
 - Added paired forward/backward strip augmentation transforms and routed
-  smooth line/CP mapping through vectorized source-to-output point transforms
-  instead of dense nearest-grid inversion.
+  smooth line/CP mapping through direct source-coordinate forward/backward
+  point transforms instead of iterative or dense nearest-grid inversion.
 - Cached source-space line/CP coordinates in strip-coordinate cache v2 and split coordinate profiling into descriptor/cache/source/line columns.
 - Added configurable CP-local strip-coordinate caching shared by training, visualization, and prefetch source-grid construction.
 - Kept 2D fiber-strip source grids, strip-z offsets, coordinate augmentation, and line/control-point transforms torch-native until explicit VC3D/export NumPy boundaries.

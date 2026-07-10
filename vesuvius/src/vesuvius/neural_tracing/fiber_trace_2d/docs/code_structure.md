@@ -87,8 +87,8 @@ The important behavior is:
   that same order.
 - Implements affine transforms, flips, smooth row offsets, value augmentation,
   line-coordinate mapping, and debug line overlays. Smooth line/CP mapping uses
-  vectorized source-to-output point mapping rather than dense nearest-grid
-  inversion.
+  direct source-coordinate forward/backward maps rather than iterative solves
+  or dense nearest-grid inversion.
 - Value augmentation runs as torch tensor operations on the configured device:
   brightness, contrast, gamma, noise, and separable Gaussian blur.
 - Debug line overlays are drawn only as the final visualization step. The line
