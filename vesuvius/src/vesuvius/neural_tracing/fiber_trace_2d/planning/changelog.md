@@ -2,6 +2,10 @@
 
 ## 2026-07-10
 
+- Batched 2D strip training sample augmentation across strip-z offsets:
+  sparse line/CP lookup now uses direct batched bilinear gather, coordinate
+  augmentation stacks fused maps, and post-load value augmentation runs on the
+  loaded image stack.
 - Replaced formula-based 2D strip point mapping with concrete cached
   `backward_map_xy`/`forward_map_xy` tensors so coordinate augmentation and
   line/CP mapping use the same fused geometric augmentation maps.

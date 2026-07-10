@@ -16,8 +16,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
     FiberStripAugmentParams,
     apply_value_augmentation,
+    apply_value_augmentation_batch,
     limit_augmentation_rows,
     random_combined_augmentation,
+    sample_xy_maps_bilinear,
     smooth_offset_field,
     source_coordinate_grid_for_output,
     strip_augment_transform,
@@ -956,6 +958,71 @@ def test_line_augmentation_shift_is_vectorized_direct_mapping() -> None:
     assert np.allclose(line[:, 1], np.full((4,), 2.0, dtype=np.float32))
 
 
+def test_batched_xy_map_bilinear_matches_single_transform_lookup() -> None:
+    device = torch.device("cpu")
+    params = [
+        FiberStripAugmentParams(shift_x=1.0, shift_y=-0.5, scale=1.1),
+        FiberStripAugmentParams(rotation_degrees=8.0, smooth_offset=1.5, smooth_offset_seed=4),
+    ]
+    transforms = [strip_augment_transform((9, 9), (13, 13), param, device=device) for param in params]
+    maps = torch.stack([transform.forward_map_xy for transform in transforms], dim=0)
+    points = torch.tensor(
+        [
+            [[6.0, 6.0], [3.5, 7.25], [10.0, 9.0]],
+            [[6.0, 6.0], [3.5, 7.25], [10.0, 9.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    batched, valid = sample_xy_maps_bilinear(maps, points)
+
+    assert bool(valid.all().item())
+    for index, transform in enumerate(transforms):
+        assert torch.allclose(batched[index], transform.source_to_output_points(points[index]), atol=1.0e-6)
+
+
+def test_batched_xy_map_bilinear_marks_oob_points() -> None:
+    maps = torch.zeros((1, 5, 5, 2), dtype=torch.float32)
+    points = torch.tensor([[[-1.0, 2.0], [2.0, 2.0], [5.0, 1.0]]], dtype=torch.float32)
+
+    sampled, valid = sample_xy_maps_bilinear(maps, points)
+
+    assert valid.tolist() == [[False, True, False]]
+    assert not torch.isfinite(sampled[0, 0]).all()
+    assert torch.isfinite(sampled[0, 1]).all()
+    assert not torch.isfinite(sampled[0, 2]).all()
+
+
+def test_batched_coordinate_augmentation_matches_single_patch_path() -> None:
+    device = torch.device("cpu")
+    yy, xx = torch.meshgrid(torch.arange(7, dtype=torch.float32), torch.arange(7, dtype=torch.float32), indexing="ij")
+    base = torch.stack([yy, xx, yy + xx], dim=-1)
+    coords = torch.stack([base, base + 10.0], dim=0)
+    valid = torch.ones((2, 7, 7), dtype=torch.bool)
+    params = [
+        FiberStripAugmentParams(shift_x=1.0, shift_y=-0.5, scale=1.1),
+        FiberStripAugmentParams(rotation_degrees=5.0, shear_x=0.1),
+    ]
+    transforms = [strip_augment_transform((5, 5), (7, 7), param, device=device) for param in params]
+    maps = torch.stack([transform.backward_map_xy for transform in transforms], dim=0)
+
+    batch_coords, batch_valid = loader_module._resample_coord_tensor_batch_like_augmentation(coords, valid, maps)
+    singles = [
+        loader_module._resample_coord_tensors_like_augmentation(
+            coords[index],
+            valid[index],
+            params[index],
+            output_shape_hw=(5, 5),
+            device=device,
+            transform=transforms[index],
+        )
+        for index in range(2)
+    ]
+
+    assert torch.allclose(batch_coords, torch.stack([item[0] for item in singles], dim=0), atol=1.0e-6)
+    assert torch.equal(batch_valid, torch.stack([item[1] for item in singles], dim=0))
+
+
 def test_value_augmentation_noise_and_blur_are_torch_based() -> None:
     image = np.zeros((9, 9), dtype=np.float32)
     image[4, 4] = 255.0
@@ -979,6 +1046,30 @@ def test_value_augmentation_noise_and_blur_are_torch_based() -> None:
     assert 0.0 < float(blurred[4, 4].item()) < 255.0
     assert float(blurred[4, 3].item()) > 0.0
     assert not torch.allclose(noisy, torch.as_tensor(image))
+
+
+def test_batched_value_augmentation_matches_single_patch_path() -> None:
+    images = np.stack(
+        [
+            np.linspace(0.0, 1.0, 16, dtype=np.float32).reshape(4, 4),
+            np.linspace(1.0, 2.0, 16, dtype=np.float32).reshape(4, 4),
+        ],
+        axis=0,
+    )
+    valid = np.ones((2, 4, 4), dtype=bool)
+    params = [
+        FiberStripAugmentParams(brightness=0.1, contrast=1.2, gamma=1.0, noise_std=0.0, blur_sigma=0.0),
+        FiberStripAugmentParams(brightness=-0.1, contrast=0.8, gamma=2.0, noise_std=0.0, blur_sigma=0.0),
+    ]
+
+    batched, batched_valid = apply_value_augmentation_batch(images, valid, params, device=torch.device("cpu"))
+    singles = [
+        apply_value_augmentation(images[index], valid[index], params[index], device=torch.device("cpu"))[0]
+        for index in range(2)
+    ]
+
+    assert bool(batched_valid.all().item())
+    assert torch.allclose(batched, torch.stack(singles, dim=0), atol=1.0e-6)
 
 
 def test_gamma_augmentation_is_range_based() -> None:
@@ -1246,23 +1337,28 @@ def test_loader_maps_augmented_line_and_cp_in_one_batched_call(
     assert cp_xy.shape == (2,)
 
 
-def test_build_sample_reuses_line_and_cp_for_shared_params(
+def test_build_sample_uses_batched_line_lookup_for_augmented_offsets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
-    calls = 0
-    original = loader._line_and_cp_xy_for_params
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    original = loader_module.sample_xy_maps_bilinear
+    call_shapes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
 
     def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
+        call_shapes.append((tuple(args[0].shape), tuple(args[1].shape)))
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(loader, "_line_and_cp_xy_for_params", counted)
+    monkeypatch.setattr(loader_module, "sample_xy_maps_bilinear", counted)
 
     samples, images, coords, valids = loader.build_sample(0, sample_mode="flat")
 
-    assert calls == 1
+    assert call_shapes
+    assert any(shape[0][0] == len(loader.strip_z_offsets) for shape in call_shapes)
     assert len(samples) == len(loader.strip_z_offsets)
     assert images.shape[0] == len(loader.strip_z_offsets)
     assert coords.shape[0] == len(loader.strip_z_offsets)

@@ -57,6 +57,11 @@
 - Internally, fiber control-point coordinates remain in base-volume coordinates, so a selected level `s` uses a patch pixel spacing of `2**s` base voxels before coordinates are divided for reading level `/s`.
 - The loader must not use the existing neural-tracing crop-loading path for image loading.
 - Training's multiple strip-z offsets are derived from one CP-local source geometry by offsetting along the strip normal/frame direction, not by rebuilding a separate coordinate-generation path.
+- Runtime geometric augmentation work should be batched across strip-z offsets
+  and patches where tensor shapes are compatible. The implementation should
+  avoid many tiny per-patch GPU calls when the same operation can be expressed
+  as one batched tensor operation without changing deterministic sample order
+  or augmentation semantics.
 - Dataset and loader settings are specified in Vesuvius-style JSON.
 - Config keys include `datasets`, `batch_size`, `patch_shape_hw`, `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `prefetch_workers`, `prefetch_sampler_workers`, `volume_cache_dir`, optional `strip_coord_cache_dir`, and optional cache settings.
 - Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
@@ -92,6 +97,16 @@
 - Line points and the control point for a patch must be transformed together in
   one vectorized lookup call through the fused map object, then split back into
   line and CP outputs.
+- Sparse line/control-point mapping must use direct bilinear gather against
+  `forward_map_xy`. Tiny `grid_sample` calls for sparse point lists are not the
+  intended implementation because their fixed launch overhead dominates the
+  small amount of point data.
+- When multiple patches from one loader sample need transformed line/control
+  point coordinates, their `forward_map_xy` tensors and source point lists
+  should be stacked and processed as a batched sparse lookup where shapes are
+  compatible.
+- Coordinate augmentation should stack `backward_map_xy` tensors and run
+  batched dense sampling for compatible strip-z offset patches.
 - When multiple strip-z offsets share the same CP source geometry and the same
   augmentation parameters, transformed line/control-point coordinates must be
   computed once and reused across those offsets.
@@ -99,6 +114,13 @@
 - Debug visualization may rasterize the transformed line coordinates only as the final drawing step, with fixed screen-space thickness/opacity, so line thickness and sharpness are not affected by scale, rotation, shear, or interpolation artifacts.
 - Any future training target derived from the fiber line must use the same transformed output pixel coordinates as the sampled image, so labels and image pixels remain aligned exactly.
 - Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
+- Value augmentations after VC3D image loading should run as batched tensor
+  operations where possible. Per-patch operations remain acceptable only when
+  required to preserve behavior, such as per-patch blur kernels or deterministic
+  per-patch noise streams.
+- VC3D coordinate sampling remains the explicit image I/O boundary unless the
+  sampler exposes a true batched coordinate API. The loader must not add a
+  separate image sampling path just to batch around that boundary.
 - Augment visualization uses raw clipped image values and must not apply percentile or per-cell normalization.
 - The augment visualization mode renders a three-row JPG contact sheet: lower-limit examples, upper-limit examples, and random combined training-style examples.
 - Augment visualization prints no timing diagnostics by default.

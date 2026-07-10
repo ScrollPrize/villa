@@ -44,10 +44,12 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
     FiberStripAugmentParams,
     apply_value_augmentation,
+    apply_value_augmentation_batch,
     augmentation_padding,
     augment_config_from_mapping,
     random_combined_augmentation,
     resolve_torch_device,
+    sample_xy_maps_bilinear,
     source_coordinate_grid_for_output,
     strip_augment_transform,
     value_only_params,
@@ -491,6 +493,53 @@ def _resample_coord_tensors_like_augmentation(
         padding_mode="zeros",
         align_corners=True,
     )[0, 0] > 0.5
+    sampled_coords = torch.where(sampled_valid[..., None], sampled_coords, torch.zeros_like(sampled_coords))
+    return sampled_coords, sampled_valid
+
+
+def _resample_coord_tensor_batch_like_augmentation(
+    coords_zyx: torch.Tensor,
+    valid_mask: torch.Tensor,
+    backward_maps_xy: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    coords_t = torch.as_tensor(coords_zyx, dtype=torch.float32, device=backward_maps_xy.device)
+    valid_bool = torch.as_tensor(valid_mask, dtype=torch.bool, device=backward_maps_xy.device)
+    maps = torch.as_tensor(backward_maps_xy, dtype=torch.float32, device=backward_maps_xy.device)
+    if coords_t.ndim != 4 or coords_t.shape[-1] != 3:
+        raise ValueError("coords_zyx must have shape B,H,W,3")
+    if valid_bool.shape != coords_t.shape[:3]:
+        raise ValueError("valid_mask must have shape B,H,W")
+    if maps.ndim != 4 or maps.shape[-1] != 2 or maps.shape[0] != coords_t.shape[0]:
+        raise ValueError("backward_maps_xy must have shape B,Hout,Wout,2")
+    batch, source_height, source_width = int(coords_t.shape[0]), int(coords_t.shape[1]), int(coords_t.shape[2])
+    x = maps[..., 0]
+    y = maps[..., 1]
+    if source_width > 1:
+        x = x * (2.0 / float(source_width - 1)) - 1.0
+    else:
+        x = torch.zeros_like(x)
+    if source_height > 1:
+        y = y * (2.0 / float(source_height - 1)) - 1.0
+    else:
+        y = torch.zeros_like(y)
+    grid = torch.stack([x, y], dim=-1)
+    sampled_coords = F.grid_sample(
+        coords_t.permute(0, 3, 1, 2),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ).permute(0, 2, 3, 1)
+    sampled_valid = (
+        F.grid_sample(
+            valid_bool.to(dtype=torch.float32).view(batch, 1, source_height, source_width),
+            grid,
+            mode="nearest",
+            padding_mode="zeros",
+            align_corners=True,
+        )[:, 0]
+        > 0.5
+    )
     sampled_coords = torch.where(sampled_valid[..., None], sampled_coords, torch.zeros_like(sampled_coords))
     return sampled_coords, sampled_valid
 
@@ -1500,60 +1549,144 @@ class FiberStrip2DLoader:
     ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
         device = resolve_torch_device(self.config.augment.device)
         source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode, profile=profile)
-        images: list[np.ndarray] = []
-        coords: list[np.ndarray] = []
-        valids: list[np.ndarray] = []
-        samples: list[FiberStripSample] = []
-        line_and_cp_cache: dict[FiberStripAugmentParams | None, tuple[torch.Tensor, torch.Tensor]] = {}
-        transform_cache: dict[FiberStripAugmentParams, Any] = {}
-        for offset_index, _ in enumerate(self.strip_z_offsets):
-            params = (
+        params_by_offset: list[FiberStripAugmentParams | None] = [
+            (
                 random_combined_augmentation(self.config.augment, sample_index, offset_index)
                 if self.config.augment.enabled
                 else None
             )
-            augment_transform = None
-            if params is not None:
-                augment_transform = transform_cache.get(params)
-                if augment_transform is None:
-                    augment_transform = strip_augment_transform(
+            for offset_index, _ in enumerate(self.strip_z_offsets)
+        ]
+        transforms_by_params: dict[FiberStripAugmentParams, Any] = {}
+        if self.config.augment.enabled:
+            with _ProfileBlock(profile, "map_build", device):
+                for params in dict.fromkeys(params for params in params_by_offset if params is not None):
+                    assert params is not None
+                    transforms_by_params[params] = strip_augment_transform(
                         self.config.patch_shape_hw,
                         source.source_shape_hw,
                         params,
                         device=device,
                     )
-                    transform_cache[params] = augment_transform
-            line_and_cp_xy = line_and_cp_cache.get(params)
-            if line_and_cp_xy is None:
-                with _ProfileBlock(profile, "line_coords", device):
-                    line_and_cp_xy = self._line_and_cp_xy_for_params(
-                        source,
-                        params,
-                        device=device,
-                        transform=augment_transform,
-                    )
-                line_and_cp_cache[params] = line_and_cp_xy
-            sample, image, valid_mask, _ = self.build_strip_patch_from_source(
-                source,
-                offset_index,
-                params,
-                device=device,
-                profile=profile,
-                load_image=True,
-                apply_image_augmentation=apply_image_augmentation,
-                line_and_cp_xy=line_and_cp_xy,
-                augment_transform=augment_transform,
+
+        line_and_cp_cache: dict[FiberStripAugmentParams | None, tuple[torch.Tensor, torch.Tensor]] = {}
+        if not self.config.augment.enabled:
+            line_and_cp_cache[None] = (
+                source.source_line_xy.to(device=device, dtype=torch.float32),
+                source.source_control_point_xy.to(device=device, dtype=torch.float32),
             )
-            assert image is not None
-            assert valid_mask is not None
+        else:
+            unique_params = [params for params in dict.fromkeys(params_by_offset) if params is not None]
+            if unique_params:
+                source_line_xy = source.source_line_xy.to(device=device, dtype=torch.float32)
+                source_cp_xy = source.source_control_point_xy.to(device=device, dtype=torch.float32).view(1, 2)
+                source_points = torch.cat([source_line_xy, source_cp_xy], dim=0)
+                point_batch = source_points.unsqueeze(0).expand(len(unique_params), -1, -1)
+                forward_maps = torch.stack([transforms_by_params[params].forward_map_xy for params in unique_params], dim=0)
+                line_lookup_before = 0.0 if profile is None else profile.get("line_lookup", 0.0)
+                with _ProfileBlock(profile, "line_lookup", device):
+                    mapped_batch, _ = sample_xy_maps_bilinear(forward_maps, point_batch)
+                height, width = self.config.patch_shape_hw
+                line_filter_before = 0.0 if profile is None else profile.get("line_filter", 0.0)
+                with _ProfileBlock(profile, "line_filter", device):
+                    for index, params in enumerate(unique_params):
+                        mapped = mapped_batch[index]
+                        line_xy = mapped[:-1]
+                        cp_xy = mapped[-1]
+                        if line_xy.numel() != 0:
+                            line_xy = line_xy[
+                                torch.isfinite(line_xy).all(dim=1)
+                                & (line_xy[:, 0] >= 0.0)
+                                & (line_xy[:, 0] <= float(int(width) - 1))
+                                & (line_xy[:, 1] >= 0.0)
+                                & (line_xy[:, 1] <= float(int(height) - 1))
+                            ]
+                        line_and_cp_cache[params] = (line_xy, cp_xy)
+                if profile is not None:
+                    profile["line_coords"] = profile.get("line_coords", 0.0) + (
+                        profile.get("line_lookup", 0.0)
+                        - line_lookup_before
+                        + profile.get("line_filter", 0.0)
+                        - line_filter_before
+                    )
+
+        offset_grids = [self._offset_grid_from_source(source, offset) for offset in self.strip_z_offsets]
+        coords_zyx_t = torch.stack([grid.coords_zyx.to(device=device, dtype=torch.float32) for grid in offset_grids], dim=0)
+        valid_mask_t = torch.stack([grid.valid_mask.to(device=device, dtype=torch.bool) for grid in offset_grids], dim=0)
+        if self.config.augment.enabled:
+            backward_maps = torch.stack(
+                [transforms_by_params[params].backward_map_xy for params in params_by_offset if params is not None],
+                dim=0,
+            )
+            coord_aug_before = 0.0 if profile is None else profile.get("coord_aug_batch", 0.0)
+            with _ProfileBlock(profile, "coord_aug_batch", device):
+                coords_zyx_t, valid_mask_t = _resample_coord_tensor_batch_like_augmentation(
+                    coords_zyx_t,
+                    valid_mask_t,
+                    backward_maps,
+                )
+            if profile is not None:
+                profile["coord_augmentation"] = profile.get("coord_augmentation", 0.0) + (
+                    profile.get("coord_aug_batch", 0.0) - coord_aug_before
+                )
+
+        coords_zyx_np = _as_numpy_float32(coords_zyx_t)
+        valid_mask_np = _as_numpy_bool(valid_mask_t)
+        images: list[np.ndarray] = []
+        valids: list[np.ndarray] = []
+        samples: list[FiberStripSample] = []
+        for offset_index, offset in enumerate(self.strip_z_offsets):
+            params = params_by_offset[offset_index]
+            line_xy_t, control_point_xy_t = line_and_cp_cache[params]
+            line_xy = _as_numpy_float32(line_xy_t)
+            control_point_xy = _as_numpy_float32(control_point_xy_t)
+            coords_zyx = coords_zyx_np[offset_index]
+            valid_mask = valid_mask_np[offset_index]
+            with _ProfileBlock(profile, "volume_sample"):
+                result = source.record.sampler.sample_coords(coords_zyx, valid_mask)
+                image = result.image
+                sampled_valid = result.valid_mask
+                if profile is not None:
+                    for key, value in result.stats.items():
+                        if isinstance(value, (int, float)):
+                            profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
+            sample = FiberStripSample(
+                record_index=source.record_index,
+                fiber_path=str(source.record.fiber.path) if source.record.fiber.path is not None else "",
+                control_point_index=source.control_point_index,
+                control_point_xyz=np.asarray(
+                    source.record.fiber.control_points_xyz[source.control_point_index], dtype=np.float32
+                ),
+                strip_z_offset=float(offset),
+                coords_zyx=coords_zyx,
+                valid_mask=sampled_valid,
+                frame=offset_grids[offset_index].frame,
+                line_xy=line_xy,
+                control_point_xy=control_point_xy,
+            )
             images.append(image)
-            coords.append(sample.coords_zyx)
-            valids.append(valid_mask)
+            valids.append(sampled_valid)
             samples.append(sample)
+        if self.config.augment.enabled and apply_image_augmentation:
+            value_params = [value_only_params(params) for params in params_by_offset if params is not None]
+            value_aug_before = 0.0 if profile is None else profile.get("value_aug_batch", 0.0)
+            with _ProfileBlock(profile, "value_aug_batch", device):
+                image_t, valid_t = apply_value_augmentation_batch(
+                    np.stack(images, axis=0),
+                    np.stack(valids, axis=0),
+                    value_params,
+                    device=device,
+                )
+                images = list(image_t.cpu().numpy().astype(np.float32))
+                valids = list(valid_t.cpu().numpy().astype(bool))
+            if profile is not None:
+                profile["value_augmentation"] = profile.get("value_augmentation", 0.0) + (
+                    profile.get("value_aug_batch", 0.0) - value_aug_before
+                )
         return (
             samples,
             np.stack(images, axis=0),
-            np.stack(coords, axis=0),
+            coords_zyx_np,
             np.stack(valids, axis=0),
         )
 

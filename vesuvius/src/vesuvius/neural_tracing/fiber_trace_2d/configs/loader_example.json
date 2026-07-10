@@ -8,7 +8,7 @@
   "prefetch_sampler_workers": 4,
   "augment_enabled": true,
   "augment_seed": 0,
-  "augment_device": "auto",
+  "augment_device": "cpu",
   "augment_shift_x": 16.0,
   "augment_shift_y": 16.0,
   "augment_rotation_degrees": 180.0,

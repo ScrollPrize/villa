@@ -91,12 +91,21 @@ The important behavior is:
   line-coordinate mapping, and debug line overlays. Smooth line/CP mapping uses
   bilinear lookup against the prebuilt `forward_map_xy`; smooth interpolation is
   only used while constructing the maps.
+- Provides a batched sparse bilinear gather for line/CP point lookup. Training
+  batch construction stacks `forward_map_xy` tensors across strip-z offsets and
+  avoids tiny sparse `grid_sample` calls.
 - Loader patch construction reuses one transform object for coordinate
   augmentation and line/CP mapping. Line points and the CP are mapped together
   in one batched source-to-output call, and shared line/CP results can be reused
   across strip-z offsets with identical augmentation params.
+- Training `build_sample` batches compatible strip-z offset coordinate
+  augmentation by stacking `backward_map_xy` tensors and running dense
+  coordinate/valid-mask sampling over the stack. VC3D image sampling remains the
+  per-patch I/O boundary.
 - Value augmentation runs as torch tensor operations on the configured device:
-  brightness, contrast, gamma, noise, and separable Gaussian blur.
+  brightness, contrast, gamma, noise, and separable Gaussian blur. Training
+  `build_sample` applies value augmentation to the loaded image stack, while
+  retaining per-patch noise seeds and blur parameters.
 - Debug line overlays are drawn only as the final visualization step. The line
   coordinates themselves are transformed geometrically, not raster-warped.
 
@@ -647,8 +656,9 @@ With `--augment-profile`, it also prints two timing tables:
 
 - timing table with `descriptor`, `line_window`, `lasagna_normals`,
   `strip_coords`, `coord_augmentation`, `volume_sample`, `value_augmentation`,
-  `line_coords`, `to_u8`, and `overlay`, plus `total`, `avg/patch`,
-  `total/no-first`, and `avg/no-first` rows;
+  `line_coords`, `to_u8`, and `overlay`, plus finer training profile keys such
+  as `map_build`, `line_lookup`, `line_filter`, `coord_aug_batch`, and
+  `value_aug_batch` where those paths are used;
 - volume sampler stats.
 
 ## Batch Export

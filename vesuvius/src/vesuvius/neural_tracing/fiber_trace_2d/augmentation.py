@@ -205,39 +205,65 @@ def _pixel_grid(height: int, width: int, *, device: torch.device) -> torch.Tenso
     return torch.stack([xx, yy], dim=-1)
 
 
+def sample_xy_maps_bilinear(
+    maps_xy: torch.Tensor,
+    points_xy: torch.Tensor,
+    *,
+    valid_lengths: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    maps = torch.as_tensor(maps_xy, dtype=torch.float32)
+    points = torch.as_tensor(points_xy, dtype=torch.float32, device=maps.device)
+    if maps.ndim != 4 or maps.shape[-1] != 2:
+        raise ValueError("maps_xy must have shape B,H,W,2")
+    if points.ndim != 3 or points.shape[-1] != 2:
+        raise ValueError("points_xy must have shape B,N,2")
+    if int(points.shape[0]) != int(maps.shape[0]):
+        raise ValueError("maps_xy and points_xy batch dimensions must match")
+
+    batch, height, width = int(maps.shape[0]), int(maps.shape[1]), int(maps.shape[2])
+    x = points[..., 0]
+    y = points[..., 1]
+    valid = (
+        torch.isfinite(points).all(dim=-1)
+        & (x >= 0.0)
+        & (x <= float(width - 1))
+        & (y >= 0.0)
+        & (y <= float(height - 1))
+    )
+    if valid_lengths is not None:
+        lengths = torch.as_tensor(valid_lengths, dtype=torch.long, device=maps.device)
+        if lengths.shape != (batch,):
+            raise ValueError("valid_lengths must have shape B")
+        index = torch.arange(int(points.shape[1]), dtype=torch.long, device=maps.device).view(1, -1)
+        valid = valid & (index < lengths.view(-1, 1))
+
+    x0 = torch.floor(torch.clamp(x, 0.0, float(width - 1))).to(torch.long)
+    y0 = torch.floor(torch.clamp(y, 0.0, float(height - 1))).to(torch.long)
+    x1 = torch.clamp(x0 + 1, max=width - 1)
+    y1 = torch.clamp(y0 + 1, max=height - 1)
+    wx = torch.clamp(x - x0.to(dtype=torch.float32), 0.0, 1.0)
+    wy = torch.clamp(y - y0.to(dtype=torch.float32), 0.0, 1.0)
+
+    batch_index = torch.arange(batch, dtype=torch.long, device=maps.device).view(batch, 1)
+    v00 = maps[batch_index, y0, x0]
+    v10 = maps[batch_index, y0, x1]
+    v01 = maps[batch_index, y1, x0]
+    v11 = maps[batch_index, y1, x1]
+    top = v00 * (1.0 - wx)[..., None] + v10 * wx[..., None]
+    bottom = v01 * (1.0 - wx)[..., None] + v11 * wx[..., None]
+    sampled = top * (1.0 - wy)[..., None] + bottom * wy[..., None]
+    sampled = torch.where(valid[..., None], sampled, torch.full_like(sampled, float("nan")))
+    return sampled.to(dtype=torch.float32), valid
+
+
 def _sample_xy_map(map_xy: torch.Tensor, points_xy: torch.Tensor) -> torch.Tensor:
     points = torch.as_tensor(points_xy, dtype=torch.float32, device=map_xy.device)
     shape = points.shape
-    flat = points.reshape(-1, 2)
-    height, width = int(map_xy.shape[0]), int(map_xy.shape[1])
-    if width > 1:
-        x = flat[:, 0] * (2.0 / float(width - 1)) - 1.0
-    else:
-        x = torch.zeros_like(flat[:, 0])
-    if height > 1:
-        y = flat[:, 1] * (2.0 / float(height - 1)) - 1.0
-    else:
-        y = torch.zeros_like(flat[:, 1])
-    grid = torch.stack([x, y], dim=-1).view(1, -1, 1, 2)
-    sampled = F.grid_sample(
-        map_xy.permute(2, 0, 1).unsqueeze(0),
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )[0, :, :, 0].transpose(0, 1)
-    valid = (
-        torch.isfinite(flat).all(dim=1)
-        & (flat[:, 0] >= 0.0)
-        & (flat[:, 0] <= float(width - 1))
-        & (flat[:, 1] >= 0.0)
-        & (flat[:, 1] <= float(height - 1))
+    sampled, _ = sample_xy_maps_bilinear(
+        map_xy.unsqueeze(0),
+        points.reshape(1, -1, 2),
     )
-    sampled = torch.where(
-        valid[:, None],
-        sampled,
-        torch.full_like(sampled, float("nan")),
-    )
+    sampled = sampled[0]
     return sampled.reshape(*shape[:-1], 2)
 
 
@@ -837,6 +863,58 @@ def apply_value_augmentation(
         generator.manual_seed(int(params.noise_seed))
         out = out + torch.randn(out.shape, generator=generator, device=device) * float(params.noise_std) * value_range
     out = _gaussian_blur_2d(out, params.blur_sigma)
+    return torch.where(valid, out, torch.zeros_like(out)), valid
+
+
+def apply_value_augmentation_batch(
+    images: np.ndarray | torch.Tensor,
+    valid_masks: np.ndarray | torch.Tensor,
+    params: list[FiberStripAugmentParams] | tuple[FiberStripAugmentParams, ...],
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    image_t = torch.as_tensor(images, dtype=torch.float32, device=device)
+    valid = torch.as_tensor(valid_masks, dtype=torch.bool, device=device)
+    if image_t.ndim != 3 or valid.ndim != 3:
+        raise ValueError("images and valid_masks must have shape B,H,W")
+    batch = int(image_t.shape[0])
+    if len(params) != batch:
+        raise ValueError("params length must match image batch")
+
+    inf = torch.tensor(float("inf"), dtype=image_t.dtype, device=device)
+    neg_inf = torch.tensor(float("-inf"), dtype=image_t.dtype, device=device)
+    valid_any = valid.view(batch, -1).any(dim=1)
+    lo = torch.where(valid, image_t, inf).view(batch, -1).amin(dim=1)
+    hi = torch.where(valid, image_t, neg_inf).view(batch, -1).amax(dim=1)
+    lo = torch.where(valid_any, lo, torch.zeros_like(lo))
+    hi = torch.where(valid_any, hi, torch.zeros_like(hi))
+    value_range = torch.clamp(hi - lo, min=1.0e-6)
+    center = (hi + lo) * 0.5
+
+    contrast = torch.tensor([float(param.contrast) for param in params], dtype=image_t.dtype, device=device)
+    brightness = torch.tensor([float(param.brightness) for param in params], dtype=image_t.dtype, device=device)
+    gamma = torch.tensor([float(param.gamma) for param in params], dtype=image_t.dtype, device=device)
+    view = (batch, 1, 1)
+    out = (image_t - center.view(view)) * contrast.view(view) + center.view(view) + brightness.view(view) * value_range.view(view)
+
+    gamma_mask = torch.abs(gamma - 1.0) > 1.0e-6
+    if bool(gamma_mask.any().item()):
+        norm = torch.clamp((out - lo.view(view)) / value_range.view(view), 0.0, 1.0)
+        corrected = torch.pow(norm, gamma.view(view)) * value_range.view(view) + lo.view(view)
+        out = torch.where((valid & gamma_mask.view(view)), corrected, out)
+
+    for index, param in enumerate(params):
+        if float(param.noise_std) > 0.0:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(param.noise_seed))
+            out[index] = out[index] + torch.randn(
+                out[index].shape,
+                generator=generator,
+                device=device,
+            ) * float(param.noise_std) * value_range[index]
+    for index, param in enumerate(params):
+        if float(param.blur_sigma) > 0.0:
+            out[index] = _gaussian_blur_2d(out[index], float(param.blur_sigma))
     return torch.where(valid, out, torch.zeros_like(out)), valid
 
 
