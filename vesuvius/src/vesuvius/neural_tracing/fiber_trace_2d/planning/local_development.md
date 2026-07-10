@@ -125,6 +125,19 @@ configured augmentation envelope through the sampler-level VC3D blocking
 coordinate/cache path, so it is intentionally independent of one particular
 random augmentation draw. Lasagna manifest channels are not prefetched.
 
+Set `training.max_sample_index` to a positive exclusive sample-index count to
+run many training steps over a bounded deterministic prefix. The default `0`
+means no limit. Prefetch progress prints `idx=<exclusive-index>` for the
+largest contiguous deterministic prefix whose required chunks are already in
+the cache or represented by missing markers. After stopping a long prefetch, use
+that `idx` value as `training.max_sample_index` to train only on the
+cache-complete prefix.
+
+Use `prefetch_sampler_workers` to limit CPU-side dependency/source generation
+without reducing download concurrency. `prefetch_workers` controls chunk
+download workers; `prefetch_sampler_workers` controls the producer threads that
+build CP-local source strips and collect chunk dependencies.
+
 ## Focused Test Command
 
 ```bash

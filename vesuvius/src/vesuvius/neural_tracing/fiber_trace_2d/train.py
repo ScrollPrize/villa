@@ -17,6 +17,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     DirectionSupervision,
     build_direction_supervision,
     decode_lasagna_direction_xy,
+    direction_angle_error_degrees,
     direction_mse_loss,
     line_cp_and_tangent_xy,
 )
@@ -32,6 +33,7 @@ class FiberStripTrainingConfig:
     run_path: str = "runs/fiber_trace_2d"
     run_name: str = "fiber_strip_direction"
     max_steps: int = 1000
+    max_sample_index: int = 0
     learning_rate: float = 1.0e-3
     scalar_log_interval: int = 100
     tensorboard_image_interval: int = 1000
@@ -60,6 +62,7 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         run_path=str(get("run_path", "runs/fiber_trace_2d")),
         run_name=str(get("run_name", "fiber_strip_direction")),
         max_steps=int(get("max_steps", 1000)),
+        max_sample_index=int(get("max_sample_index", 0)),
         learning_rate=float(get("learning_rate", 1.0e-3)),
         scalar_log_interval=max(1, int(get("scalar_log_interval", 100))),
         tensorboard_image_interval=max(1, int(get("tensorboard_image_interval", 1000))),
@@ -75,6 +78,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
     )
     if config.max_steps < 0:
         raise ValueError("training.max_steps must be >= 0")
+    if config.max_sample_index < 0:
+        raise ValueError("training.max_sample_index must be >= 0")
     if not math.isfinite(config.learning_rate) or config.learning_rate <= 0.0:
         raise ValueError("training.learning_rate must be positive and finite")
     return config
@@ -153,23 +158,31 @@ def _prepare_images(images_np: np.ndarray, valid_np: np.ndarray, *, device: torc
     return torch.where(valid, (images - mean) / std, torch.zeros_like(images))
 
 
+@dataclass(frozen=True)
+class _DirectionMetrics:
+    angle_mean_deg: float
+
+
 def _compute_batch_loss(
     model: FiberStripDirectionNet,
     batch: FiberStrip2DBatch,
     *,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, DirectionSupervision]:
+) -> tuple[torch.Tensor, torch.Tensor, DirectionSupervision, _DirectionMetrics]:
     images_np, valid_np = _flatten_batch(batch)
     images = _prepare_images(images_np, valid_np, device=device)
     supervision = build_direction_supervision(batch.samples, valid_np, device=device)
     outputs = model(images)
     loss = direction_mse_loss(outputs, supervision)
-    return loss, outputs, supervision
+    angle_error = direction_angle_error_degrees(outputs, supervision)
+    metrics = _DirectionMetrics(angle_mean_deg=float(angle_error.detach().mean().cpu().item()))
+    return loss, outputs, supervision, metrics
 
 
 @dataclass(frozen=True)
 class _EvalResult:
     loss: float
+    angle_mean_deg: float
     supervision_samples: int
     batch: FiberStrip2DBatch
     outputs: torch.Tensor
@@ -187,13 +200,14 @@ def _evaluate_fixed_batch(
     model.eval()
     with torch.no_grad():
         batch = loader.load_batch(start_sample_index, batch_size=batch_size)
-        loss, outputs, supervision = _compute_batch_loss(model, batch, device=device)
+        loss, outputs, supervision, metrics = _compute_batch_loss(model, batch, device=device)
         loss_value = float(loss.detach().cpu().item())
         outputs_cpu = outputs.detach().cpu()
     if was_training:
         model.train()
     return _EvalResult(
         loss=loss_value,
+        angle_mean_deg=metrics.angle_mean_deg,
         supervision_samples=int(supervision.target.shape[0]),
         batch=batch,
         outputs=outputs_cpu,
@@ -434,7 +448,9 @@ def run_training(
     finite_steps = training.max_steps > 0
     best_metric = float("inf")
     last_loss = float("nan")
+    last_angle_mean_deg = float("nan")
     last_test_loss = float("nan")
+    last_test_angle_mean_deg = float("nan")
     try:
         step = 1
         while True:
@@ -447,16 +463,18 @@ def run_training(
                 start_sample_index,
                 batch_size=training.train_control_points_per_step,
                 sample_mode=sample_mode,
+                sample_index_limit=training.max_sample_index,
             )
             load_ms = (time.perf_counter() - t0) * 1000.0
 
             model.train()
             optimizer.zero_grad(set_to_none=True)
-            loss, outputs, supervision = _compute_batch_loss(model, batch, device=device)
+            loss, outputs, supervision, metrics = _compute_batch_loss(model, batch, device=device)
             loss.backward()
             optimizer.step()
             loss_value = float(loss.detach().cpu().item())
             last_loss = loss_value
+            last_angle_mean_deg = metrics.angle_mean_deg
             should_test = (
                 test_loader is not None
                 and (step == 1 or step % training.test_interval == 0 or (finite_steps and step == training.max_steps))
@@ -471,15 +489,18 @@ def run_training(
                     batch_size=training.test_control_points,
                 )
                 last_test_loss = test_result.loss
+                last_test_angle_mean_deg = test_result.angle_mean_deg
 
             if writer is not None and (step == 1 or step % training.scalar_log_interval == 0):
                 writer.add_scalar("train/loss_direction", loss_value, step)
+                writer.add_scalar("train/angle_error_mean_deg", metrics.angle_mean_deg, step)
                 writer.add_scalar("train/supervision_samples", int(supervision.target.shape[0]), step)
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 for key, value in _cache_scalars(batch.cache_stats).items():
                     writer.add_scalar(key, value, step)
             if writer is not None and test_result is not None:
                 writer.add_scalar("test/loss_direction", test_result.loss, step)
+                writer.add_scalar("test/angle_error_mean_deg", test_result.angle_mean_deg, step)
                 writer.add_scalar("test/supervision_samples", test_result.supervision_samples, step)
                 for key, value in _cache_scalars(test_result.batch.cache_stats).items():
                     writer.add_scalar(f"test_{key}", value, step)
@@ -529,9 +550,17 @@ def run_training(
                 start_sample_index=raw_start_sample_index,
                 sample_count=training.train_control_points_per_step,
             ):
-                test_part = "" if test_result is None else f" test_loss_direction={test_result.loss:.6f}"
+                test_part = (
+                    ""
+                    if test_result is None
+                    else (
+                        f" test_loss_direction={test_result.loss:.6f} "
+                        f"test_angle_mean_deg={test_result.angle_mean_deg:.2f}"
+                    )
+                )
                 print(
                     f"step={step} loss_direction={loss_value:.6f} "
+                    f"angle_mean_deg={metrics.angle_mean_deg:.2f} "
                     f"supervision_samples={int(supervision.target.shape[0])}{test_part} "
                     f"load_ms={load_ms:.1f}",
                     flush=True,
@@ -541,10 +570,14 @@ def run_training(
         if writer is not None:
             writer.flush()
             writer.close()
-    test_complete = "" if math.isnan(last_test_loss) else f" test_loss_direction={last_test_loss:.6f}"
+    test_complete = (
+        ""
+        if math.isnan(last_test_loss)
+        else f" test_loss_direction={last_test_loss:.6f} test_angle_mean_deg={last_test_angle_mean_deg:.2f}"
+    )
     print(
         f"fiber_trace_2d train complete step={training.max_steps} "
-        f"loss_direction={last_loss:.6f}{test_complete}",
+        f"loss_direction={last_loss:.6f} angle_mean_deg={last_angle_mean_deg:.2f}{test_complete}",
         flush=True,
     )
     return run_dir
@@ -573,7 +606,7 @@ def prefetch_training(
     )
     if prefetch_full_dataset:
         effective_steps: int | str = "dataset"
-        sample_count = int(loader.sample_count)
+        sample_count = int(training.max_sample_index) if training.max_sample_index > 0 else int(loader.sample_count)
     else:
         effective_steps = training.max_steps if requested_prefetch_steps is None else requested_prefetch_steps
         sample_count = int(effective_steps) * int(training.train_control_points_per_step)
@@ -585,10 +618,16 @@ def prefetch_training(
         "fiber_trace_2d prefetch "
         f"start_step={int(prefetch_start_step)} steps={effective_steps_text} "
         f"control_points_per_step={int(training.train_control_points_per_step)} "
-        f"sample_mode={sample_mode} start_sample_index={start_sample_index} samples={sample_count}",
+        f"sample_mode={sample_mode} start_sample_index={start_sample_index} "
+        f"max_sample_index={int(training.max_sample_index)} samples={sample_count}",
         flush=True,
     )
-    summary = loader.prefetch(start_sample_index, sample_count, sample_mode=sample_mode)
+    summary = loader.prefetch(
+        start_sample_index,
+        sample_count,
+        sample_mode=sample_mode,
+        sample_index_limit=training.max_sample_index,
+    )
     if prefetch_full_dataset:
         test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
         if test_loader_config is not None:

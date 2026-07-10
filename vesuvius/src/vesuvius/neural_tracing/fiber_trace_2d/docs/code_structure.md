@@ -185,6 +185,9 @@ Top-level keys used by `load_config`:
 - `seed`: deterministic control-point sample seed.
 - `prefetch_workers`: transfer-worker count for prefetch; values above 16 are
   allowed and are not clamped by the loader.
+- `prefetch_sampler_workers`: dependency/sampler producer-worker count for
+  prefetch. This limits CPU-side CP-local source generation separately from
+  download concurrency.
 - `volume_cache_dir`: optional cache directory for remote volume chunks.
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
 - `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
@@ -198,6 +201,10 @@ Training keys:
 - `run_name`: prefix for the run directory.
 - `max_steps`: number of training steps; `0` means indefinite mode, where
   training repeats deterministic pseudo-random full-dataset CP passes.
+- `max_sample_index`: optional exclusive deterministic sample-index limit;
+  `0` means unlimited. Positive values make training wrap global sample
+  positions through that deterministic prefix, so many steps can reuse a
+  prefetched subset.
 - `learning_rate`: AdamW learning rate.
 - `scalar_log_interval`: TensorBoard scalar/console interval.
 - `tensorboard_image_interval`: TensorBoard batch-image interval.
@@ -219,8 +226,8 @@ Training prefetch:
   overrides `training.max_steps`.
 - Explicit `--prefetch-steps 0` also overrides `training.max_steps` and
   prefetches every configured training CP once in deterministic pseudo-random
-  order, plus every configured `test_datasets` CP once when held-out data is
-  present.
+  order, or the `training.max_sample_index` prefix when configured, plus every
+  configured `test_datasets` CP once when held-out data is present.
 - Omitting `--prefetch-steps` uses `training.max_steps`; if that configured
   value is `0`, omitted prefetch also means every configured training/test CP
   once.
@@ -228,6 +235,11 @@ Training prefetch:
 - For positive prefetch step counts, sample count is `effective_steps *
   training.control_points_per_step`; start sample index is `(S - 1) *
   training.control_points_per_step` in the deterministic pseudo-random stream.
+- Prefetch progress prints `idx=<exclusive-index>`, the largest contiguous
+  exclusive deterministic sample-index prefix whose required chunks are
+  cache-complete: cache hits, known/new missing markers, or completed
+  successful downloads. That value can be used as `training.max_sample_index`
+  for a later run over the prefetched subset.
 - Negative `--prefetch-steps` values are rejected.
 - Training prefetch only fetches base-volume chunks; Lasagna manifest channels
   are opened for geometry/normal metadata but are not prefetched.
@@ -396,7 +408,9 @@ dir1 = 0.5 + 0.5*(cos2theta - sin2theta)/sqrt(2)
 
 Only the eight neighboring pixels around the rounded transformed CP location
 are supervised. The model is not supervised on the whole line or full patch in
-V0.
+V0. The optimization loss is MSE in the encoded two-channel representation.
+For readability, training also reports folded unoriented angular error in
+degrees over the same supervised pixels.
 
 TensorBoard output is written under:
 
@@ -408,6 +422,7 @@ The trainer logs:
 
 - `config/json` as text;
 - `train/loss_direction`;
+- `train/angle_error_mean_deg`;
 - `train/supervision_samples`;
 - `timing/load_ms`;
 - cache hit/download diagnostics where available;
@@ -416,12 +431,13 @@ The trainer logs:
   The contact sheet picks one center-offset representative from each loaded
   control-point sample before filling with additional strip-z offsets.
 - when `test_datasets` is configured, `test/loss_direction`,
-  `test/supervision_samples`, test cache diagnostics, and
+  `test/angle_error_mean_deg`, `test/supervision_samples`, test cache diagnostics, and
   `test/batch_direction_overlay` at test evaluation steps.
 
-Console progress prints use the same loss/supervision/load summary for every
-step whose deterministic control-point sample range starts before sample index
-100, then return to `training.scalar_log_interval`.
+Console progress prints the same loss, mean angle error in degrees,
+supervision, and load-time summary for every step whose deterministic
+control-point sample range starts before sample index 100, then return to
+`training.scalar_log_interval`.
 
 Snapshots are written under:
 
@@ -458,9 +474,10 @@ by prefetch.
 - prints sample/dependency progress only while dependency generation is still
   running, then switches to download-only progress. The live line includes
   unique chunks, cache hits, known-missing chunks, downloaded chunks, queued
-  download futures, configured transfer workers, skipped samples, errors, and
-  MiB/s. The download denominator counts chunks that were not cache hits or
-  pre-existing `.empty` markers. While sample dependency generation is
+  download futures, configured transfer workers, configured sampler/dependency
+  producer workers, skipped samples, errors, and MiB/s. The download
+  denominator counts chunks that were not cache hits or pre-existing `.empty`
+  markers. While sample dependency generation is
   incomplete, download ETA extrapolates from observed chunks per sample and
   observed cache-hit/known-missing/download-needed ratios;
 - reports invalid deterministic sample skips separately from download errors

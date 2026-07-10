@@ -24,6 +24,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
 from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     build_direction_supervision,
     cp_neighborhood_yx,
+    direction_angle_error_degrees,
     encode_lasagna_direction_xy,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import load_vc3d_fiber
@@ -318,6 +319,19 @@ def test_config_prefetch_workers_is_not_capped_at_16(tmp_path: Path) -> None:
     parsed = load_config(config_path)
 
     assert parsed.prefetch_workers == 64
+
+
+def test_config_prefetch_sampler_workers_is_separate_from_download_workers(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["prefetch_workers"] = 64
+    config["prefetch_sampler_workers"] = 3
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.prefetch_workers == 64
+    assert parsed.prefetch_sampler_workers == 3
 
 
 def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
@@ -843,12 +857,86 @@ def test_prefetch_uses_dependency_chunks_and_cache_markers(
     assert summary["download_done"] == 2
     assert summary["bytes"] == 2
     assert summary["errors"] == 0
+    assert summary["workers"] == 8
+    assert summary["producer_workers"] == 1
     assert (store.root / "new_missing.empty").is_file()
     assert (store.root / "new_missing.empty").read_bytes() == b""
     assert (store.root / "download.bin").read_bytes() == b"\x01\x02"
     output = capsys.readouterr().out
     assert "samples[" in output
     assert "downloads[" in output
+    assert "idx=1" in output
+    assert "samplers=1" in output
+
+
+def test_prefetch_idx_requires_cache_complete_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_sampler_workers"] = 1
+    raw["volume_cache_retry_seconds"] = 0.001
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    class Store:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+    store = Store(tmp_path / "cache")
+    store.root.mkdir(parents=True)
+    (store.root / "hit.bin").write_bytes(b"cached")
+    call_count = 0
+
+    def failing_downloader(request: ZarrChunkRequest) -> bytes:
+        del request
+        raise RuntimeError("network failed")
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="idx-test",
+            key=key,
+            cache_path=store.root / f"{key}.bin",
+            empty_path=store.root / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            cache_payload_format="source_bytes",
+            downloader=failing_downloader,
+        )
+
+    def fake_chunk_requests(coords, valid):
+        nonlocal call_count
+        del coords, valid
+        call_count += 1
+        return [request("error" if call_count <= len(loader.strip_z_offsets) else "hit")]
+
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
+
+    summary = loader.prefetch(0, 2, workers=1)
+
+    assert summary["errors"] == 1
+    assert summary["cache_hits"] == 1
+    assert summary["max_exclusive_sample_index"] == 0
+    output = capsys.readouterr().out
+    assert "idx=0" in output
+    assert "idx=1" not in output
+
+
+def test_prefetch_sampler_workers_limits_dependency_producers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_workers"] = 8
+    raw["prefetch_sampler_workers"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
+
+    summary = loader.prefetch(0, 3)
+
+    assert summary["workers"] == 8
+    assert summary["producer_workers"] == 2
 
 
 def test_prefetch_skips_invalid_sample_construction(
@@ -895,6 +983,32 @@ def test_load_batch_skips_invalid_training_samples(tmp_path: Path, monkeypatch: 
     assert batch.images.shape[0] == 2
     assert batch.coords_zyx.shape[0] == 2
     assert loader._load_batch_skipped_samples == 1
+
+
+def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    attempted: list[int] = []
+
+    def build_sample(sample_index: int, *, sample_mode: str = "random"):
+        del sample_mode
+        attempted.append(int(sample_index))
+        record, record_index, control_index = loader.descriptor_for_sample_index(sample_index)
+        sample = SimpleNamespace(
+            record_index=record_index,
+            control_point_index=control_index,
+            fiber_path=f"fiber_{control_index}.json",
+        )
+        image = np.zeros((len(loader.strip_z_offsets), 3, 3), dtype=np.float32)
+        coords = np.zeros((len(loader.strip_z_offsets), 3, 3, 3), dtype=np.float32)
+        valid = np.ones((len(loader.strip_z_offsets), 3, 3), dtype=bool)
+        return [sample], image, coords, valid
+
+    monkeypatch.setattr(loader, "build_sample", build_sample)
+
+    batch = loader.load_batch(1, batch_size=4, sample_index_limit=2)
+
+    assert attempted == [1, 0, 1, 0]
+    assert batch.images.shape == (4, len(loader.strip_z_offsets), 1, 3, 3)
 
 
 class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
@@ -1017,11 +1131,19 @@ def test_training_prefetch_maps_steps_to_sample_count(
         "tensorboard_enabled": False,
     }
     config_path.write_text(json.dumps(raw), encoding="utf-8")
-    calls: list[tuple[int, int, str]] = []
+    calls: list[tuple[int, int, str, int]] = []
 
-    def fake_prefetch(self, start_sample_index, sample_count, *, workers=None, sample_mode="random"):
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+    ):
         del self, workers
-        calls.append((int(start_sample_index), int(sample_count), str(sample_mode)))
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(sample_index_limit or 0)))
         return {
             "generated": 11,
             "missing": 5,
@@ -1035,7 +1157,7 @@ def test_training_prefetch_maps_steps_to_sample_count(
 
     summary = prefetch_training(config_path, prefetch_steps=3, sampler_factory=_test_sampler_factory)
 
-    assert calls == [(0, 9, "random")]
+    assert calls == [(0, 9, "random", 0)]
     assert summary["generated"] == 11
     assert not run_path.exists()
 
@@ -1047,7 +1169,7 @@ def test_training_prefetch_maps_steps_to_sample_count(
         sampler_factory=_test_sampler_factory,
     )
 
-    assert calls == [(3, 21, "random")]
+    assert calls == [(3, 21, "random", 0)]
     assert not run_path.exists()
 
     calls.clear()
@@ -1058,8 +1180,41 @@ def test_training_prefetch_maps_steps_to_sample_count(
         sampler_factory=_test_sampler_factory,
     )
 
-    assert calls == [(0, 3, "random")]
-    assert not run_path.exists()
+    assert calls == [(0, 3, "random", 0)]
+
+
+def test_training_prefetch_respects_max_sample_index_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["training"] = {
+        "max_steps": 7,
+        "max_sample_index": 2,
+        "control_points_per_step": 3,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[tuple[int, int, str, int]] = []
+
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+    ):
+        del self, workers
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(sample_index_limit or 0)))
+        return {"generated": 0, "missing": 0, "downloaded": 0, "bytes": 0, "errors": 0, "workers": 1}
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+
+    assert calls == [(0, 2, "random", 2)]
 
 
 def test_training_prefetch_max_steps_zero_prefetches_dataset_once(
@@ -1075,7 +1230,15 @@ def test_training_prefetch_max_steps_zero_prefetches_dataset_once(
     config_path.write_text(json.dumps(raw), encoding="utf-8")
     calls: list[tuple[int, int, str]] = []
 
-    def fake_prefetch(self, start_sample_index, sample_count, *, workers=None, sample_mode="random"):
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+    ):
         del workers
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode)))
         return {
@@ -1118,7 +1281,15 @@ def test_training_prefetch_max_steps_zero_prefetches_test_datasets(
     config_path.write_text(json.dumps(raw), encoding="utf-8")
     calls: list[tuple[int, int, str, int]] = []
 
-    def fake_prefetch(self, start_sample_index, sample_count, *, workers=None, sample_mode="random"):
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+    ):
         del workers
         calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(self.sample_count)))
         return {
@@ -1166,6 +1337,17 @@ def test_training_config_allows_zero_max_steps() -> None:
     config = _training_config_from_raw({"training": {"max_steps": 0}})
 
     assert config.max_steps == 0
+
+
+def test_training_config_parses_max_sample_index() -> None:
+    config = _training_config_from_raw({"training": {"max_sample_index": 123}})
+
+    assert config.max_sample_index == 123
+
+
+def test_training_config_rejects_negative_max_sample_index() -> None:
+    with pytest.raises(ValueError, match="training.max_sample_index must be >= 0"):
+        _training_config_from_raw({"training": {"max_sample_index": -1}})
 
 
 def test_test_datasets_replace_training_datasets_for_loader_config(tmp_path: Path) -> None:
@@ -1231,6 +1413,36 @@ def test_cp_local_supervision_uses_eight_samples_and_augmented_line() -> None:
     )
     expected = encode_lasagna_direction_xy(torch.tensor([1.0, 0.5]))
     assert torch.allclose(supervision.target[0], expected, atol=1.0e-6)
+
+
+def test_direction_angle_error_reports_degrees() -> None:
+    valid = np.ones((1, 5, 5), dtype=bool)
+    sample = SimpleNamespace(
+        line_xy=np.asarray(
+            [
+                [0.0, 2.0],
+                [1.0, 2.0],
+                [2.0, 2.0],
+                [3.0, 2.0],
+                [4.0, 2.0],
+            ],
+            dtype=np.float32,
+        ),
+        control_point_xy=np.asarray([2.0, 2.0], dtype=np.float32),
+    )
+    supervision = build_direction_supervision([sample], valid, device=torch.device("cpu"))
+    perfect = torch.zeros((1, 2, 5, 5), dtype=torch.float32)
+    perpendicular = torch.zeros((1, 2, 5, 5), dtype=torch.float32)
+    perfect_value = encode_lasagna_direction_xy(torch.tensor([1.0, 0.0], dtype=torch.float32))
+    perpendicular_value = encode_lasagna_direction_xy(torch.tensor([0.0, 1.0], dtype=torch.float32))
+    perfect[:, :, :, :] = perfect_value.view(1, 2, 1, 1)
+    perpendicular[:, :, :, :] = perpendicular_value.view(1, 2, 1, 1)
+
+    perfect_error = direction_angle_error_degrees(perfect, supervision)
+    perpendicular_error = direction_angle_error_degrees(perpendicular, supervision)
+
+    assert float(perfect_error.max()) < 0.5
+    assert float(perpendicular_error.min()) > 89.0
 
 
 def test_training_batch_assembly_default_patch_count_is_64(tmp_path: Path) -> None:

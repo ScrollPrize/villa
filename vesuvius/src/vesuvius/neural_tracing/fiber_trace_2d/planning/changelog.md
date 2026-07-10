@@ -2,6 +2,10 @@
 
 ## 2026-07-10
 
+- Added folded unoriented direction angle-error reporting in degrees for 2D fiber-strip train/test output.
+- Fixed prefetch `idx` progress semantics so it reports the cache-complete safe sample prefix rather than dependency-generation progress.
+- Added `prefetch_sampler_workers` to tune dependency producer concurrency separately from download worker concurrency.
+- Added `training.max_sample_index` for bounded deterministic-prefix reuse and prefetch `idx` progress reporting.
 - Restored 2D fiber-strip training/prefetch to deterministic pseudo-random full-dataset CP passes instead of flat sequential CP order.
 - Switched 2D fiber-strip training/prefetch to flat CP order and made explicit `--prefetch-steps` override configured `training.max_steps`; `--prefetch-steps 0` now covers every configured training/test CP once.
 - Added 2D fiber-strip `test_datasets` evaluation with deterministic held-out batches and test-loss current/best snapshot cadence.

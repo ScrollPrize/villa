@@ -179,3 +179,23 @@ def direction_mse_loss(prediction: torch.Tensor, supervision: DirectionSupervisi
     if gathered.numel() == 0:
         raise ValueError("no valid CP-local direction supervision samples")
     return torch.nn.functional.mse_loss(gathered, supervision.target)
+
+
+def direction_angle_error_degrees(
+    prediction: torch.Tensor,
+    supervision: DirectionSupervision,
+    *,
+    bins: int = 720,
+) -> torch.Tensor:
+    """Folded unoriented angular error in degrees for supervised pixels."""
+
+    gathered = gather_direction_predictions(prediction, supervision)
+    if gathered.numel() == 0:
+        raise ValueError("no valid CP-local direction supervision samples")
+    pred_xy = decode_lasagna_direction_xy(gathered, bins=bins)
+    target_xy = supervision.tangent_xy.to(dtype=torch.float32, device=pred_xy.device)
+    pred_norm = torch.linalg.vector_norm(pred_xy, dim=1).clamp_min(1.0e-12)
+    target_norm = torch.linalg.vector_norm(target_xy, dim=1).clamp_min(1.0e-12)
+    dot = torch.sum(pred_xy * target_xy, dim=1) / (pred_norm * target_norm)
+    folded = torch.clamp(torch.abs(dot), 0.0, 1.0)
+    return torch.rad2deg(torch.arccos(folded))

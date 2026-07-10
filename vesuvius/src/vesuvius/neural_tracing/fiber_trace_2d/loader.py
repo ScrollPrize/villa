@@ -68,6 +68,7 @@ class FiberStrip2DConfig:
     strip_z_offset_step: float = 1.0
     seed: int = 1
     prefetch_workers: int = 16
+    prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
@@ -147,6 +148,7 @@ class _PrefetchCounters:
     first_error: str = ""
     first_sample_skip: str = ""
     queued_download_futures: int = 0
+    max_exclusive_sample_index: int = 0
 
 
 def _is_remote_path(path: str | Path) -> bool:
@@ -206,6 +208,7 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         strip_z_offset_step=float(raw.get("strip_z_offset_step", 1.0)),
         seed=int(raw.get("seed", 1)),
         prefetch_workers=max(1, int(raw.get("prefetch_workers", 16))),
+        prefetch_sampler_workers=max(1, int(raw.get("prefetch_sampler_workers", 2))),
         volume_cache_dir=None if cache_dir is None else str(cache_dir),
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
         volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
@@ -742,6 +745,15 @@ class FiberStrip2DLoader:
 
     def _flat_sample_index(self, sample_index: int) -> int:
         return int(sample_index) % int(self._flat_sample_count)
+
+    @staticmethod
+    def _bounded_sample_index(sample_index: int, sample_index_limit: int | None) -> int:
+        if sample_index_limit is None:
+            return int(sample_index)
+        limit = int(sample_index_limit)
+        if limit <= 0:
+            return int(sample_index)
+        return int(sample_index) % limit
 
     def _locate_flat_index(self, flat_index: int) -> tuple[int, int]:
         remaining = int(flat_index)
@@ -1296,6 +1308,7 @@ class FiberStrip2DLoader:
         batch_size: int | None = None,
         *,
         sample_mode: str = "random",
+        sample_index_limit: int | None = None,
     ) -> FiberStrip2DBatch:
         batch_size = self.config.batch_size if batch_size is None else int(batch_size)
         begin_zarr_cache_trace()
@@ -1312,7 +1325,8 @@ class FiberStrip2DLoader:
             attempts = 0
             while len(images) < batch_size and attempts < max_attempts:
                 attempts += 1
-                current_sample_index = sample_index
+                raw_sample_index = sample_index
+                current_sample_index = self._bounded_sample_index(raw_sample_index, sample_index_limit)
                 sample_index += 1
                 try:
                     (
@@ -1364,10 +1378,11 @@ class FiberStrip2DLoader:
         )
 
     def chunk_requests_for_sample_index(
-        self, sample_index: int, *, sample_mode: str = "random"
+        self, sample_index: int, *, sample_mode: str = "random", sample_index_limit: int | None = None
     ) -> list[ZarrChunkRequest]:
         device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
-        source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode)
+        bounded_sample_index = self._bounded_sample_index(sample_index, sample_index_limit)
+        source = self.build_strip_source(bounded_sample_index, device=device, sample_mode=sample_mode)
         requests: list[ZarrChunkRequest] = []
         for offset_index, _ in enumerate(self.strip_z_offsets):
             coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
@@ -1375,11 +1390,20 @@ class FiberStrip2DLoader:
         return requests
 
     def chunk_requests_for_samples(
-        self, start_sample_index: int, sample_count: int, *, sample_mode: str = "random"
+        self,
+        start_sample_index: int,
+        sample_count: int,
+        *,
+        sample_mode: str = "random",
+        sample_index_limit: int | None = None,
     ) -> list[ZarrChunkRequest]:
         unique: dict[tuple[str, str], ZarrChunkRequest] = {}
         for sample_index in range(int(start_sample_index), int(start_sample_index) + int(sample_count)):
-            for request in self.chunk_requests_for_sample_index(sample_index, sample_mode=sample_mode):
+            for request in self.chunk_requests_for_sample_index(
+                sample_index,
+                sample_mode=sample_mode,
+                sample_index_limit=sample_index_limit,
+            ):
                 unique[(request.store_identity, request.key)] = request
         return list(unique.values())
 
@@ -1390,21 +1414,30 @@ class FiberStrip2DLoader:
         *,
         workers: int | None = None,
         sample_mode: str = "random",
+        sample_index_limit: int | None = None,
     ) -> dict[str, Any]:
         total_samples = int(sample_count)
         total_patches = total_samples * len(self.strip_z_offsets)
         worker_count = max(1, int(self.config.prefetch_workers if workers is None else workers))
-        producer_count = min(worker_count, max(1, total_samples))
+        producer_count = min(max(1, int(self.config.prefetch_sampler_workers)), max(1, total_samples))
         retry_seconds = self.config.volume_cache_retry_seconds
         if retry_seconds <= 0.0:
             retry_seconds = 600.0
         counters = _PrefetchCounters()
+        start_sample = int(start_sample_index)
         seen: set[tuple[str, str]] = set()
+        completed_chunks: set[tuple[str, str]] = set()
+        chunk_waiters: dict[tuple[str, str], set[int]] = {}
+        sample_pending: dict[int, set[tuple[str, str]]] = {}
+        sample_bounded_index: dict[int, int] = {}
+        complete_raw_samples: set[int] = set()
+        next_safe_raw_sample = start_sample
         start = time.perf_counter()
         print(
             "prefetch: "
-            f"samples={total_samples} patches={total_patches} workers={worker_count} "
-            f"sample_mode={sample_mode} "
+            f"samples={total_samples} patches={total_patches} "
+            f"workers={worker_count} sampler_workers={producer_count} "
+            f"sample_mode={sample_mode} sample_index_limit={int(sample_index_limit or 0)} "
             "mode=dependency_chunks",
             flush=True,
         )
@@ -1453,8 +1486,10 @@ class FiberStrip2DLoader:
                 sample_prefix
                 + f"downloads[{download_bar}] {counters.download_done}/{counters.queued_for_download} "
                 f"eta={_format_seconds(download_eta)} "
+                f"idx={counters.max_exclusive_sample_index} "
                 f"chunks={counters.unique_chunks_seen} hits={counters.cache_hits} "
                 f"queued={counters.queued_download_futures} transfers={worker_count} "
+                f"samplers={producer_count} "
                 f"skipped={counters.samples_skipped} "
                 f"missing={counters.known_missing + counters.newly_missing} "
                 f"downloaded={counters.downloaded} errors={counters.download_errors} "
@@ -1468,8 +1503,9 @@ class FiberStrip2DLoader:
             print(line, end="\n" if final else "\r", flush=True)
 
         def build_requests(sample_index: int) -> tuple[int, int, list[ZarrChunkRequest]]:
+            bounded_sample_index = self._bounded_sample_index(sample_index, sample_index_limit)
             source = self.build_strip_source(
-                int(sample_index),
+                bounded_sample_index,
                 device=torch.device("cpu"),
                 sample_mode=sample_mode,
                 use_augmentation_envelope=True,
@@ -1480,47 +1516,88 @@ class FiberStrip2DLoader:
                 coords_zyx, valid_mask = self._prefetch_envelope_coords_from_source(source, offset_index)
                 valid_pixels += int(np.count_nonzero(valid_mask))
                 requests.extend(source.record.sampler.chunk_requests_for_coords(coords_zyx, valid_mask))
-            return int(sample_index), valid_pixels, requests
+            return bounded_sample_index, valid_pixels, requests
 
         def classify_or_submit(
             request: ZarrChunkRequest,
+            raw_sample_index: int,
             download_executor: ThreadPoolExecutor,
             download_futures: dict[Future[dict[str, Any]], tuple[ZarrChunkRequest, float]],
         ) -> None:
             identity = (request.store_identity, request.key)
+            if identity in completed_chunks:
+                return
+            sample_pending.setdefault(raw_sample_index, set()).add(identity)
+            chunk_waiters.setdefault(identity, set()).add(raw_sample_index)
             if identity in seen:
                 return
             seen.add(identity)
             counters.unique_chunks_seen += 1
             if _existing_data_path(request) is not None:
                 counters.cache_hits += 1
+                mark_chunk_complete(identity)
                 return
             empty_path = _empty_marker_path(request)
             if empty_path is not None and empty_path.is_file():
                 counters.known_missing += 1
+                mark_chunk_complete(identity)
                 return
             counters.queued_for_download += 1
             future = download_executor.submit(_download_prefetch_request, request, retry_seconds=retry_seconds)
             download_futures[future] = (request, time.perf_counter())
 
-        def consume_download_result(result: dict[str, Any]) -> None:
+        def advance_safe_prefix() -> None:
+            nonlocal next_safe_raw_sample
+            while next_safe_raw_sample < end_sample and next_safe_raw_sample in complete_raw_samples:
+                bounded_index = sample_bounded_index.get(
+                    next_safe_raw_sample,
+                    self._bounded_sample_index(next_safe_raw_sample, sample_index_limit),
+                )
+                counters.max_exclusive_sample_index = max(
+                    counters.max_exclusive_sample_index,
+                    int(bounded_index) + 1,
+                )
+                next_safe_raw_sample += 1
+
+        def mark_sample_complete(raw_sample_index: int) -> None:
+            if sample_pending.get(raw_sample_index):
+                return
+            complete_raw_samples.add(raw_sample_index)
+            advance_safe_prefix()
+
+        def mark_chunk_complete(identity: tuple[str, str]) -> None:
+            if identity in completed_chunks:
+                return
+            completed_chunks.add(identity)
+            for raw_sample_index in chunk_waiters.pop(identity, set()):
+                pending = sample_pending.get(raw_sample_index)
+                if pending is None:
+                    continue
+                pending.discard(identity)
+                mark_sample_complete(raw_sample_index)
+
+        def consume_download_result(request: ZarrChunkRequest, result: dict[str, Any]) -> None:
             counters.download_done += 1
             status = str(result.get("status", "error"))
             if status == "cache_hit":
                 counters.cache_hits += 1
+                mark_chunk_complete((request.store_identity, request.key))
             elif status == "known_missing":
                 counters.known_missing += 1
+                mark_chunk_complete((request.store_identity, request.key))
             elif status == "new_missing":
                 counters.newly_missing += 1
+                mark_chunk_complete((request.store_identity, request.key))
             elif status == "downloaded":
                 counters.downloaded += 1
                 counters.bytes_downloaded += int(result.get("bytes", 0))
+                mark_chunk_complete((request.store_identity, request.key))
             else:
                 counters.download_errors += 1
                 if not counters.first_error:
                     counters.first_error = str(result.get("error", "prefetch download failed"))
 
-        next_sample = int(start_sample_index)
+        next_sample = start_sample
         end_sample = next_sample + total_samples
         last_progress = 0.0
         producer_executor = ThreadPoolExecutor(max_workers=producer_count)
@@ -1550,23 +1627,29 @@ class FiberStrip2DLoader:
                     if future in producer_futures:
                         sample_index_for_error = producer_futures.pop(future)
                         try:
-                            _, sample_valid_pixels, requests = future.result()
+                            bounded_sample_index, sample_valid_pixels, requests = future.result()
                         except ValueError as exc:
                             counters.samples_done += 1
+                            bounded_index = self._bounded_sample_index(sample_index_for_error, sample_index_limit)
+                            sample_bounded_index[sample_index_for_error] = bounded_index
                             counters.samples_skipped += 1
                             if not counters.first_sample_skip:
                                 counters.first_sample_skip = f"sample={sample_index_for_error}: {exc}"
+                            mark_sample_complete(sample_index_for_error)
                             submit_producers()
                             continue
                         counters.samples_done += 1
+                        sample_bounded_index[sample_index_for_error] = int(bounded_sample_index)
+                        sample_pending.setdefault(sample_index_for_error, set())
                         counters.patches_done += len(self.strip_z_offsets)
                         counters.valid_pixels += int(sample_valid_pixels)
                         for request in requests:
-                            classify_or_submit(request, download_executor, download_futures)
+                            classify_or_submit(request, sample_index_for_error, download_executor, download_futures)
+                        mark_sample_complete(sample_index_for_error)
                         submit_producers()
                     else:
-                        del download_futures[future]
-                        consume_download_result(future.result())
+                        request, _submitted_at = download_futures.pop(future)
+                        consume_download_result(request, future.result())
                 now = time.perf_counter()
                 if now - last_progress >= 0.5:
                     update_download_queue_counters()
@@ -1607,6 +1690,7 @@ class FiberStrip2DLoader:
             "valid_pixels": counters.valid_pixels,
             "first_error": counters.first_error,
             "first_sample_skip": counters.first_sample_skip,
+            "max_exclusive_sample_index": counters.max_exclusive_sample_index,
         }
 
 

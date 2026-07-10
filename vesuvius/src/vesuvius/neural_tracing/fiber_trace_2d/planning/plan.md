@@ -8,6 +8,11 @@
 - very small CNN (10 layer resent)
 - data is streamed+cached from s3 (compare the existing fiber tracer code vesuvius/src/vesuvius/neural_tracing/fiber_trace/)
 
+# various details
+
+## strip-sampling self supervision metric & vis
+- 
+
 # V0 - semi-supervised direction & curvature pretraining
 
 a pretraining stage that does not require control points at all - but does benefit from lasagna normals
