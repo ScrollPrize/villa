@@ -1,4 +1,4 @@
-# Training Batch Config Validation And Prep Slowdown
+# Training Batch Config Validation, Prep Slowdown, And Pipeline Depth
 
 Remove the warning:
 
@@ -11,3 +11,9 @@ clear config error instead of silently ignoring one of the settings.
 Also fix the observed training slowdown after the parallel preparation change:
 benchmark/profile shows CUDA value augmentation blur running as a Python loop
 over patches, creating many tiny CUDA convolutions per batch.
+
+The latest training output still shows large `wait_ms` spikes, and the active
+example config does not specify `pipeline_depth` or `pipeline_workers`, so it
+falls back to a shallow two-batch pipeline. Make the training defaults and
+example config actually keep several batch loaders in flight, and print the
+effective pipeline settings at startup.

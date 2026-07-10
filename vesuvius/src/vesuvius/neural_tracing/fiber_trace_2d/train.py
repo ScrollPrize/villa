@@ -53,8 +53,8 @@ class FiberStripTrainingConfig:
     model_hidden_channels: int = 64
     model_depth: int = 10
     pipeline_enabled: bool = True
-    pipeline_depth: int = 2
-    pipeline_workers: int = 0
+    pipeline_depth: int = 16
+    pipeline_workers: int = 8
 
 
 def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
@@ -85,8 +85,8 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         model_hidden_channels=max(1, int(get("model_hidden_channels", 64))),
         model_depth=max(1, int(get("model_depth", 10))),
         pipeline_enabled=bool(get("pipeline_enabled", True)),
-        pipeline_depth=max(1, int(get("pipeline_depth", 2))),
-        pipeline_workers=max(0, int(get("pipeline_workers", 0))),
+        pipeline_depth=max(1, int(get("pipeline_depth", 16))),
+        pipeline_workers=max(0, int(get("pipeline_workers", 8))),
     )
     if config.max_steps < 0:
         raise ValueError("training.max_steps must be >= 0")
@@ -1102,6 +1102,13 @@ def run_training(
     if writer is not None:
         writer.add_text("config/json", json.dumps(_json_safe(raw_config), indent=2, sort_keys=True), 0)
     print(f"fiber_trace_2d train run_dir={run_dir}", flush=True)
+    print(
+        "fiber_trace_2d train pipeline "
+        f"enabled={bool(training.pipeline_enabled and device.type == 'cuda')} "
+        f"depth={int(training.pipeline_depth)} workers={int(training.pipeline_workers)} "
+        f"loader_workers={int(loader_config.loader_workers)}",
+        flush=True,
+    )
 
     sample_mode = "random"
     finite_steps = training.max_steps > 0

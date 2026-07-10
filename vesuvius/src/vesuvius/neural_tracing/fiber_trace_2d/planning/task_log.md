@@ -1,4 +1,4 @@
-# Training Batch Config Validation And Prep Slowdown Task Log
+# Training Batch Config Validation, Prep Slowdown, And Pipeline Depth Task Log
 
 ## Implementation Notes
 
@@ -11,6 +11,9 @@
   `_gaussian_blur_2d_batch()`, using grouped separable convolutions. This keeps
   different blur sigmas per patch without launching one vertical and one
   horizontal convolution per patch.
+- Increased CUDA training pipeline defaults to `pipeline_depth=16` and
+  `pipeline_workers=8`, added those explicit keys to `loader_example.json`, and
+  added a normal-training startup print of effective pipeline settings.
 - Added regression tests for batch config mismatch and batched blur equivalence
   against the single-patch path.
 - Updated specs, docs, and changelog.
@@ -22,7 +25,11 @@
   one second or more of CUDA preparation per 128-patch step.
 - After grouped blur, common warm rows dropped to about `0.25-2.1 ms/patch`.
   Heavy augmentation rows still appear around `7 ms/patch`.
-- The benchmark command was interrupted after enough rows for comparison rather
+- After increasing the queue depth/workers, the benchmark/profile run showed
+  `wait=0.00` per patch after the initial pipeline fill through the inspected
+  rows. Loader wall time remains visible in profile, but it is buffered by the
+  deeper pipeline.
+- Benchmark commands were interrupted after enough rows for comparison rather
   than waiting for all 100 batches.
 
 ## Validation

@@ -1,4 +1,4 @@
-# Training Batch Config Validation And Prep Slowdown Plan
+# Training Batch Config Validation, Prep Slowdown, And Pipeline Depth Plan
 
 ## Implementation
 
@@ -11,6 +11,10 @@
 - Replace per-patch CUDA Gaussian blur in batched value augmentation with a
   grouped batched blur so variable per-patch blur sigmas use two grouped
   convolutions for the whole patch batch.
+- Increase the default CUDA training pipeline depth/worker count so normal
+  runs keep several whole-batch loaders in flight.
+- Add explicit `pipeline_depth` and `pipeline_workers` to the example config.
+- Print effective pipeline settings once at startup.
 
 ## Spec Update
 
@@ -20,11 +24,13 @@
   count without warning.
 - Document that batched value augmentation should avoid per-patch CUDA blur
   loops.
+- Document the updated pipeline defaults and startup print.
 
 ## Docs Updates
 
 - Update `docs/code_structure.md` config/training notes with the same meaning.
 - Update augmentation implementation notes for grouped batch blur.
+- Update training config docs for the loader pipeline defaults.
 
 ## Testing
 

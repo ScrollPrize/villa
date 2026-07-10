@@ -43,7 +43,9 @@
     "device": "auto",
     "tensorboard_enabled": true,
     "model_hidden_channels": 64,
-    "model_depth": 10
+    "model_depth": 10,
+    "pipeline_depth": 16,
+    "pipeline_workers": 8
   },
   "datasets": [
     {

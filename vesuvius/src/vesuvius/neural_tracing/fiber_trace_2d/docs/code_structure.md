@@ -364,9 +364,9 @@ Training keys:
 - `pipeline_enabled`: enables CUDA training batch pipelining; default `true`.
   CPU training keeps the synchronous path.
 - `pipeline_depth`: queued whole-batch futures for the CUDA training pipeline;
-  default `2`.
+  default `16`.
 - `pipeline_workers`: concurrent whole-batch loader calls for the CUDA training
-  pipeline. `0` means use `pipeline_depth`.
+  pipeline. Default `8`; `0` means use `pipeline_depth`.
 - `model_hidden_channels` and `model_depth`: V0 ResNet size knobs. Defaults
   are 64 hidden channels and 10 residual blocks.
 
@@ -612,6 +612,8 @@ overlap stages active:
 
 `prep_submit_ms` measures only main-thread queue refill overhead. The actual
 preparation work is represented by `prep_ms` and, on CUDA, `prep_gpu_ms`.
+Training prints the effective pipeline enable flag, queue depth, whole-batch
+loader worker count, and CP-level loader worker count once at startup.
 
 This training-only prepared-batch path avoids the runner/debug
 `apply_batch_image_augmentation()` NumPy round trip. Runner exports still use
