@@ -393,6 +393,13 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - **QA**: build green; 20 scripted checks (overflow 320–1440, console-clean, 22 figures with dims, enlarge-bypasses-lightbox ×3, lightbox open/close, callout ≥44px + prefill-unsent, strip 2×2, regressions on / /faq /firstscroll); 109 tiles captured; final Fable sign-off **SHIP** (its POLISH + date NIT applied; two "pair" nits were baked single-image composites — unfixable without editing images, out of scope).
 **Files:** `docs/37_2026_open_problems.md`, `src/components/Figure.js`, `src/components/ChatWidget/{ChatCallout,index,ChatPanel}.js`, `src/css/{chrome,chat}.css`, `scripts/genChatCorpus.js`, `src/data/teamRoles.json`.
 
+## C45 — open problems: owner review round
+
+- All figure captions and pair micro-captions centered (were left-hung per the critique; owner preference wins).
+- "Project & further reading" reference subsection removed (site/GitHub/HF/Substack links — all cited inline in the piece anyway; no inbound anchors).
+- ID11 fiber cross-sections (image2+3) switched from grouped stack to side-by-side pair.
+**Files:** `docs/37_2026_open_problems.md`, `src/css/chrome.css`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

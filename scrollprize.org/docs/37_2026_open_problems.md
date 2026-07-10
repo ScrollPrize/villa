@@ -130,8 +130,7 @@ For as long as we’ve been working on these scans, it’s been apparent that so
 The working explanation starts at the fiber level. Carbonized papyrus fibers contain small internal cavities and tubular structures, and when many of them pack together densely, these microscopic structures disturb the X-ray beam enough to create a haze-like degradation. The likely culprit is the carbon itself: carbonized fibers are probably close to graphite, and graphite is a strong decoherer — a material that scrambles the X-ray wavefront rather than passing it through cleanly. The effect is worst in the most densely packed regions, where many fibers contribute to the haze at once.
 
 <Figure
-  variant="stack"
-  maxHeight={520}
+  variant="pair"
   srcs={["/img/ash2text/image2.png", "/img/ash2text/image3.png"]}
   alts={["Papyrus fiber cell walls and lumen cavities, detail 1", "Papyrus fiber cell walls and lumen cavities, detail 2"]}
   caption="Cross-section of PHerc. 500P2 at 0.55 µm pixel size (ESRF beamline ID11). Each fiber is surrounded by a cell wall enclosing a hollow lumen cavity — the same structures implicated in the compressed-region scattering effect described above."
@@ -733,8 +732,3 @@ High effective resolution matters here too: some ink information may live at ver
 * Neural mesh autoregression (MVP): [neural_tracing/autoreg_mesh](https://github.com/ScrollPrize/villa/tree/main/vesuvius/src/vesuvius/neural_tracing/autoreg_mesh)
 * 3D DINO implementation: [https://github.com/ScrollPrize/dinovol](https://github.com/ScrollPrize/dinovol)
 * ScrollFiesta, community automatic mesher: [https://github.com/Hob3rMallow/scrollfiesta_public](https://github.com/Hob3rMallow/scrollfiesta_public)
-
-### Project & further reading
-
-* Vesuvius Challenge website: [https://scrollprize.org/](https://scrollprize.org/) · GitHub org: [https://github.com/ScrollPrize](https://github.com/ScrollPrize) · Hugging Face org: [https://huggingface.co/scrollprize](https://huggingface.co/scrollprize)
-* Vesuvius Challenge Substack: [https://scrollprize.substack.com/](https://scrollprize.substack.com/) — posts cited in this piece: ["Finally—letters in Scroll 4!"](https://scrollprize.substack.com/p/finallyletters-in-scroll-4), ["~70% of PHerc. 172 is now digitally unwrapped"](https://scrollprize.substack.com/p/70-of-pherc-172-is-now-digitally), ["We are cooking"](https://scrollprize.substack.com/p/we-are-cooking), ["Unveiling the Mystery of Compressed Regions"](https://scrollprize.substack.com/p/unveiling-the-mystery-of-compressed), ["Back to the Challenge: $100K Kaggle Surface Detection"](https://scrollprize.substack.com/p/back-to-the-challenge-100k-kaggle), ["Summer haze comes with ink"](https://scrollprize.substack.com/p/summer-haze-comes-with-ink), ["May Progress Prizes and Updates to Tooling"](https://scrollprize.substack.com/p/may-progress-prizes-and-updates-to)
