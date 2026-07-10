@@ -2,6 +2,9 @@
 
 ## 2026-07-10
 
+- Removed avoidable warm-path loader threading overhead by prewarming cached
+  deterministic random pass orders and reusing a persistent CP worker executor
+  across `load_batch` calls.
 - Batched 2D strip-z image loading through `CoordinateSampler.sample_coord_batch`
   and added `loader_workers` CP-level parallel `load_batch` construction with
   deterministic accepted-sample ordering.

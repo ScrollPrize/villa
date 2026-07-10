@@ -1,12 +1,12 @@
-# Status: Parallel And Batched Loader I/O
+# Status: Fix Loader Threading Bottlenecks
 
 - [x] Create current `task.md`.
 - [x] Create current `task_plan.md`.
-- [x] Update `planning/specs.md` with loader I/O batching requirements.
-- [x] Add `loader_workers` config with logical-core default.
-- [x] Add sampler-level batch API.
-- [x] Implement flattened single-call sampler batch loading.
-- [x] Wire `build_sample` to batch sample strip-z stacks.
-- [x] Parallelize `load_batch` across CP samples while preserving order/skips.
-- [x] Update docs/changelog/task log after implementation.
+- [x] Identify warm-path threading bottlenecks in `load_batch`.
+- [x] Add random-pass order prewarming before worker submission.
+- [x] Make random pass lookup use a cached fast path.
+- [x] Add a persistent loader-owned CP worker executor.
+- [x] Keep `loader_workers=1` as a direct serial path.
+- [x] Preserve deterministic output order and invalid-sample skip behavior.
+- [x] Update specs, code docs, changelog, and task log.
 - [x] Run focused validation.

@@ -200,7 +200,7 @@ def _stage_ms(profile: dict[str, float], key: str) -> float:
 def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dict[str, float]) -> dict[str, float]:
     loader_wall = _stage_ms(loader_profile, "load_batch_wall")
     loader_worker = _stage_ms(loader_profile, "load_batch_worker")
-    descriptor = _stage_ms(loader_profile, "descriptor")
+    descriptor = _stage_ms(loader_profile, "random_order") + _stage_ms(loader_profile, "descriptor")
     coord_cache = _stage_ms(loader_profile, "strip_coord_cache")
     source_geom = (
         _stage_ms(loader_profile, "line_window")

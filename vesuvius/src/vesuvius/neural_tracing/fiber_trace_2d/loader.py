@@ -732,6 +732,47 @@ class FiberStrip2DLoader:
         self._random_pass_cache: dict[int, np.ndarray] = {}
         self._random_pass_cache_lock = threading.Lock()
         self._load_batch_skipped_samples = 0
+        self._loader_executor: ThreadPoolExecutor | None = None
+        self._loader_executor_workers = 0
+        self._loader_executor_lock = threading.Lock()
+
+    def close(self) -> None:
+        with self._loader_executor_lock:
+            executor = self._loader_executor
+            self._loader_executor = None
+            self._loader_executor_workers = 0
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> "FiberStrip2DLoader":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        del exc_type, exc, tb
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _get_loader_executor(self, worker_count: int) -> ThreadPoolExecutor:
+        worker_count = max(1, int(worker_count))
+        with self._loader_executor_lock:
+            if (
+                self._loader_executor is None
+                or self._loader_executor_workers != worker_count
+            ):
+                old_executor = self._loader_executor
+                self._loader_executor = ThreadPoolExecutor(max_workers=worker_count)
+                self._loader_executor_workers = worker_count
+            else:
+                old_executor = None
+            executor = self._loader_executor
+        if old_executor is not None:
+            old_executor.shutdown(wait=True, cancel_futures=True)
+        return executor
 
     def _load_records(self) -> list[_Record]:
         records: list[_Record] = []
@@ -823,11 +864,12 @@ class FiberStrip2DLoader:
             raise ValueError("internal sample identity count mismatch")
         return tuple(keys)
 
-    def _random_flat_index(self, sample_index: int) -> int:
+    def _ensure_random_pass_order(self, pass_index: int) -> np.ndarray:
+        pass_index = int(pass_index)
+        order = self._random_pass_cache.get(pass_index)
+        if order is not None:
+            return order
         sample_count = int(self._flat_sample_count)
-        position = int(sample_index)
-        pass_index = math.floor(position / sample_count)
-        offset = position % sample_count
         with self._random_pass_cache_lock:
             order = self._random_pass_cache.get(pass_index)
             if order is None:
@@ -846,6 +888,24 @@ class FiberStrip2DLoader:
                 )
                 order = np.asarray(order_list, dtype=np.int64)
                 self._random_pass_cache[pass_index] = order
+        return order
+
+    def _ensure_random_pass_orders_for_indices(self, sample_indices: Iterable[int]) -> None:
+        if int(self._flat_sample_count) <= 0:
+            return
+        passes = {
+            math.floor(int(sample_index) / int(self._flat_sample_count))
+            for sample_index in sample_indices
+        }
+        for pass_index in sorted(passes):
+            self._ensure_random_pass_order(pass_index)
+
+    def _random_flat_index(self, sample_index: int) -> int:
+        sample_count = int(self._flat_sample_count)
+        position = int(sample_index)
+        pass_index = math.floor(position / sample_count)
+        offset = position % sample_count
+        order = self._ensure_random_pass_order(pass_index)
         return int(order[offset])
 
     def _flat_sample_index(self, sample_index: int) -> int:
@@ -1837,20 +1897,75 @@ class FiberStrip2DLoader:
             max_attempts = max(batch_size * 100, batch_size + 1000)
             attempts = 0
             worker_count = min(max(1, int(self.config.loader_workers)), max(1, batch_size), max_attempts)
-            pending: dict[Future[Any], int] = {}
-            outcomes: dict[
-                int,
-                tuple[
+            if sample_mode == "random":
+                with _ProfileBlock(profile, "random_order"):
+                    self._ensure_random_pass_orders_for_indices(
+                        self._bounded_sample_index(raw, sample_index_limit)
+                        for raw in range(int(start_sample_index), int(start_sample_index) + max_attempts)
+                    )
+
+            def consume_result(
+                current_sample_index: int,
+                local_profile: dict[str, float],
+                result: tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray] | None,
+                skip_exc: ValueError | None,
+            ) -> None:
+                if skip_exc is not None:
+                    report_skip(current_sample_index, skip_exc)
+                    _merge_profile(profile, local_profile)
+                    return
+                if result is None:
+                    raise RuntimeError("internal load_batch missing sample result")
+                _merge_profile(profile, local_profile)
+                (
+                    sample_records,
+                    sample_images,
+                    sample_coords,
+                    sample_valids,
+                ) = result
+                first = sample_records[0]
+                all_samples.extend(sample_records)
+                images.append(sample_images)
+                coords.append(sample_coords)
+                valids.append(sample_valids)
+                record_indices.append(first.record_index)
+                cp_indices.append(first.control_point_index)
+                fiber_paths.append(first.fiber_path)
+
+            if worker_count == 1:
+                while len(images) < batch_size and attempts < max_attempts:
+                    raw_sample_index = next_raw_to_submit
+                    next_raw_to_submit += 1
+                    attempts += 1
+                    (
+                        returned_raw,
+                        current_sample_index,
+                        local_profile,
+                        result,
+                        skip_exc,
+                    ) = build_candidate(raw_sample_index)
+                    if returned_raw != raw_sample_index:
+                        raise RuntimeError("internal load_batch raw sample index mismatch")
+                    consume_result(current_sample_index, local_profile, result, skip_exc)
+            else:
+                pending: dict[Future[Any], int] = {}
+                outcomes: dict[
                     int,
-                    dict[str, float],
-                    tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray] | None,
-                    ValueError | None,
-                ],
-            ] = {}
-            executor = ThreadPoolExecutor(max_workers=worker_count)
-            try:
+                    tuple[
+                        int,
+                        dict[str, float],
+                        tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray] | None,
+                        ValueError | None,
+                    ],
+                ] = {}
+                executor = self._get_loader_executor(worker_count)
                 while len(images) < batch_size and (pending or attempts < max_attempts):
-                    while len(pending) < worker_count and attempts < max_attempts:
+                    needed_candidates = batch_size - len(images)
+                    while (
+                        len(pending) < worker_count
+                        and len(pending) + len(outcomes) < needed_candidates
+                        and attempts < max_attempts
+                    ):
                         raw_sample_index = next_raw_to_submit
                         next_raw_to_submit += 1
                         attempts += 1
@@ -1884,31 +1999,9 @@ class FiberStrip2DLoader:
                             skip_exc,
                         ) = outcomes.pop(next_raw_to_consume)
                         next_raw_to_consume += 1
-                        if skip_exc is not None:
-                            report_skip(current_sample_index, skip_exc)
-                            _merge_profile(profile, local_profile)
-                            continue
-                        if result is None:
-                            raise RuntimeError("internal load_batch missing sample result")
-                        _merge_profile(profile, local_profile)
-                        (
-                            sample_records,
-                            sample_images,
-                            sample_coords,
-                            sample_valids,
-                        ) = result
-                        first = sample_records[0]
-                        all_samples.extend(sample_records)
-                        images.append(sample_images)
-                        coords.append(sample_coords)
-                        valids.append(sample_valids)
-                        record_indices.append(first.record_index)
-                        cp_indices.append(first.control_point_index)
-                        fiber_paths.append(first.fiber_path)
+                        consume_result(current_sample_index, local_profile, result, skip_exc)
                 for future in pending:
                     future.cancel()
-            finally:
-                executor.shutdown(wait=True, cancel_futures=True)
             if len(images) < batch_size:
                 raise ValueError(
                     "could not assemble a full fiber_trace_2d batch after "

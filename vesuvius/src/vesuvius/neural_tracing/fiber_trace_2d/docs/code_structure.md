@@ -281,7 +281,10 @@ Top-level keys used by `load_config`:
 - `loader_workers`: CP-sample worker count for `load_batch`. The default is
   the logical CPU count. Set `loader_workers: 1` for serial debugging. Parallel
   workers evaluate candidates concurrently, but accepted batch output remains
-  in deterministic sample-index order.
+  in deterministic sample-index order. For `loader_workers > 1`, the loader
+  keeps a lazy persistent executor and reuses it across batches; call
+  `FiberStrip2DLoader.close()` to shut it down explicitly in long-lived tools or
+  tests.
 - `volume_cache_dir`: optional cache directory for remote volume chunks.
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
 - `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
@@ -424,6 +427,9 @@ The loader uses deterministic stateless sampling by sample index:
   and offset within that pass;
 - each pass sorts all flat control-point indices by seeded content-based random
   keys, so every configured CP appears once before the stream repeats;
+- random pass orders are cached by pass index. `load_batch` prewarms the
+  attempted batch window before submitting parallel CP workers so warm workers
+  do not serialize on random-order construction locks;
 - `_locate_flat_index` maps it back to `(record_index, control_point_index)`.
 
 Changing max steps, batch size, or control points per step changes how much of
@@ -527,9 +533,14 @@ control-point samples is loaded.
 `load_batch` can evaluate CP candidates in parallel via `loader_workers`.
 Results are consumed by raw deterministic sample index, so changing
 `loader_workers` should affect latency but not the accepted output sequence.
+The parallel path reuses one loader-owned executor across batches instead of
+creating and destroying a thread pool per training step. `loader_workers=1`
+uses a direct serial path with no futures.
 In benchmark/profile output, `wall` is real `load_batch` wall time, `work` is
 summed per-candidate worker elapsed time, and `tf` is `work / wall`. The
 individual stage columns remain summed worker timings under parallel loading.
+Cold deterministic random-order setup is included in the descriptor column;
+warm batches should mostly avoid that cost.
 
 Images are normalized per patch over valid pixels. Invalid pixels are set to
 zero after normalization.

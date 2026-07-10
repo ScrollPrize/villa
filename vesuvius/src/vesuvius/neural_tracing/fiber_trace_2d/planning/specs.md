@@ -143,6 +143,13 @@
   defaulting to the machine logical CPU count. Parallel workers may evaluate
   candidate samples out of order, but accepted output samples and skip handling
   must follow the same deterministic sample-index order as serial loading.
+  `loader_workers=1` is the serial no-thread debug path. When
+  `loader_workers > 1`, the loader reuses a persistent CP-level executor across
+  batches instead of constructing a new thread pool per step.
+- Parallel loader workers must not serialize on deterministic random-order
+  locks during the warm path. Random dataset-pass orders are built once per
+  pass, cached by pass index, and prewarmed for the attempted batch window
+  before CP workers are submitted.
 - The tester/runner loads a batch from a specified deterministic control-point sample index.
 - Prefetch uses the same shared source-strip implementation as training and augment-vis.
 - Prefetch remains CPU-pinned, but it still uses the same torch-native source-grid and strip-offset path, converting to NumPy only once for VC3D dependency discovery.

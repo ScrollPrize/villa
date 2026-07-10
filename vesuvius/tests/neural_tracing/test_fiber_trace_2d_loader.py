@@ -1805,6 +1805,94 @@ def test_parallel_load_batch_preserves_output_order(tmp_path: Path, monkeypatch:
     assert batch.images[:, 0, 0, 0, 0].tolist() == [0.0, 1.0, 2.0, 3.0]
 
 
+def test_parallel_load_batch_reuses_executor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    def build_sample(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile=None,
+        apply_image_augmentation: bool = True,
+    ):
+        del sample_mode
+        del profile
+        del apply_image_augmentation
+        sample = SimpleNamespace(
+            record_index=0,
+            control_point_index=int(sample_index),
+            fiber_path=f"fiber_{sample_index}.json",
+        )
+        image = np.full((len(loader.strip_z_offsets), 3, 3), float(sample_index), dtype=np.float32)
+        coords = np.zeros((len(loader.strip_z_offsets), 3, 3, 3), dtype=np.float32)
+        valid = np.ones((len(loader.strip_z_offsets), 3, 3), dtype=bool)
+        return [sample], image, coords, valid
+
+    monkeypatch.setattr(loader, "build_sample", build_sample)
+
+    loader.load_batch(0, batch_size=2)
+    first_executor = loader._loader_executor
+    loader.load_batch(2, batch_size=2)
+
+    assert first_executor is not None
+    assert loader._loader_executor is first_executor
+    loader.close()
+    assert loader._loader_executor is None
+
+
+def test_random_pass_order_is_cached_before_parallel_worker_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    original_ensure = loader._ensure_random_pass_order
+    calls: list[int] = []
+
+    def ensure_random_pass_order(pass_index: int):
+        calls.append(int(pass_index))
+        return original_ensure(pass_index)
+
+    monkeypatch.setattr(loader, "_ensure_random_pass_order", ensure_random_pass_order)
+
+    def build_sample(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile=None,
+        apply_image_augmentation: bool = True,
+    ):
+        del profile
+        del apply_image_augmentation
+        record, record_index, control_index = loader.descriptor_for_sample_index(
+            sample_index, sample_mode=sample_mode
+        )
+        del record
+        sample = SimpleNamespace(
+            record_index=record_index,
+            control_point_index=control_index,
+            fiber_path=f"fiber_{control_index}.json",
+        )
+        image = np.full((len(loader.strip_z_offsets), 3, 3), float(control_index), dtype=np.float32)
+        coords = np.zeros((len(loader.strip_z_offsets), 3, 3, 3), dtype=np.float32)
+        valid = np.ones((len(loader.strip_z_offsets), 3, 3), dtype=bool)
+        return [sample], image, coords, valid
+
+    monkeypatch.setattr(loader, "build_sample", build_sample)
+
+    loader.load_batch(0, batch_size=2)
+
+    assert calls
+    assert 0 in loader._random_pass_cache
+    assert loader._random_pass_cache[0].shape[0] == loader.sample_count
+
+
 class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
     def __init__(self, array, *, level_spacing_base: float) -> None:
         super().__init__(array, level_spacing_base=level_spacing_base)

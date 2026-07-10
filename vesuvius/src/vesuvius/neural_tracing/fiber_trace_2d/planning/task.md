@@ -1,24 +1,23 @@
-# Task: Parallel And Batched Loader I/O
+# Task: Fix Loader Threading Bottlenecks
 
-Reduce warm-path loader time by batching and parallelizing the remaining I/O
-and cache work.
+The current CP-level loader threading overlaps work, but the profile still
+shows poor warm-path wall time:
+
+```text
+batch patches total wall work tf coord desc cache source line coord_aug load
+1     64     94.76 94.73 374.59 3.95 71.58 68.74 1.61 ...
+2     64      2.69  2.66   6.38 2.40  1.48  0.01 0.91 ...
+3     64      2.30  2.29   5.98 2.61  1.32  0.00 0.81 ...
+4     64      2.55  2.53   5.57 2.20  1.30  0.01 0.82 ...
+```
 
 Required behavior:
 
-- Add a sampler-level batch API for coordinate image loading.
-- Prefer one VC3D call per CP sample by flattening a stack of strip-z patches
-  into one larger coordinate image, then reshaping the returned image/valid
-  data back to `[patches, H, W]`.
-- This flattening is functionally valid because VC3D samples each requested
-  output pixel from explicit coordinates; spatial adjacency in the request
-  should only affect performance/chunk locality, not sampled values.
-- If a sampler exposes true native batched coordinate support, use it.
-  Otherwise, use the flattened single-call path before falling back to a loop.
-- Parallelize CP-level `build_sample` work in `load_batch` with deterministic
-  slot ordering.
-- Parallelize strip-coordinate cache/descriptor/source loading across the CP
-  samples in a batch through that CP-level executor.
-- Worker count must be config-driven and default to the machine logical CPU
-  count.
-- Preserve deterministic sample ordering, skipping behavior, output tensor
-  order, and existing augmentation/label semantics.
+- Remove avoidable lock contention from deterministic random-order descriptor
+  lookup.
+- Avoid constructing and shutting down a `ThreadPoolExecutor` every training
+  batch.
+- Keep deterministic sample order, skip handling, and existing batch outputs.
+- Keep wall-time vs worker-time profiling so the threading factor remains
+  visible.
+- Add tests for the lock/persistent-executor behavior where practical.
