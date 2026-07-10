@@ -1101,6 +1101,10 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
     timing_totals: dict[str, float] = {}
     image_stat_rows: list[tuple[str, dict[str, float]]] = []
     source_profile: dict[str, float] = {}
+    # Build the deterministic sample-order cache outside augment-vis profiling.
+    # The first random descriptor lookup sorts the whole CP order for this pass;
+    # that cost is global state setup, not per-sample patch construction.
+    loader.descriptor_for_sample_index(sample_index)
     with _Timer() as source_timer:
         source = loader.build_augmented_center_strip_source(
             sample_index,

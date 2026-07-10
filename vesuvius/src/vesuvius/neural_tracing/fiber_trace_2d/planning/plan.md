@@ -10,6 +10,14 @@
 
 # various details
 
+## trace2cp error
+- load the strip between two cps (with some margin to spare
+- run TTAs on the strip (leave out y shift and scales augs as thoase are hard to handle for long strips)
+- then run a trace starting at one point (initial dir should be aligned to point towards the second cp of course)
+    - this should share the code with the existing tracer, just some flags/args for the differences
+- the score is the distance (in y) against the second cp when reaching the second cp columns
+- 0 means we hit it exactly, 1.0 means we are at the strip edge (or we hit the edge before we could reach the tgt column in which case we should also stop the trace and assign error 1.0)
+
 # V0 - semi-supervised direction 
 
 a pretraining stage that does not require control points at all - but does benefit from lasagna normals

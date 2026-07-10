@@ -1,11 +1,8 @@
-# Status: Median TTA Line Tracing
+# Status: Augment-Vis Timing Cleanup
 
-- [x] Read `planning/todo.md`.
 - [x] Read local `AGENTS.md`.
-- [x] Create task.md for the median-TTA todo item.
+- [x] Create task.md for the timing cleanup.
 - [x] Create task_plan.md.
-- [x] Implement `runner.py --med-tta`.
-- [x] Add/update tests.
-- [x] Update specs and docs.
+- [x] Exclude deterministic sample-order cache setup from augment-vis timing.
 - [x] Run validation commands.
 - [x] Update task_log.md with results.
