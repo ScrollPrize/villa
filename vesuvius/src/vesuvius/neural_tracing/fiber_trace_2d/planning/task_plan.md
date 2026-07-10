@@ -1,108 +1,138 @@
-# Task Plan: Real Fused Geometric Augmentation Map Tensors
+# Task Plan: Batched Strip Augmentation And Line Mapping
 
 ## Implementation
 
-1. Redefine `StripAugmentTransform` around map tensors, not per-call formulas.
-   - On construction, build and store:
-     - `backward_map_xy`: output pixel -> source pixel, shape
-       `[output_h, output_w, 2]`;
-     - `forward_map_xy`: source pixel -> output pixel, shape
-       `[source_h, source_w, 2]`, or an equivalent dense lookup tensor.
-   - Bake all geometric stages into both maps during construction:
-     shift, flips, scale, shear, rotation, and smooth offset.
-   - Smooth offset is evaluated only while constructing the maps.
-   - After construction, no caller should evaluate smooth interpolation or
-     affine transform formulas for line/CP points.
+1. Add batched map helpers in `augmentation.py`.
+   - Keep `StripAugmentTransform` as the per-parameter owner of concrete
+     `backward_map_xy` and `forward_map_xy`.
+   - Add a helper to stack a sequence of transform maps into:
+     - `backward_maps_xy`: `[B, Hout, Wout, 2]`;
+     - `forward_maps_xy`: `[B, Hsrc, Wsrc, 2]`.
+   - Validate that maps in one stack have compatible shapes/device/dtype.
+   - Do not introduce formula-based runtime mapping as a fallback.
 
-2. Build the backward map directly.
-   - Keep the current output-grid -> source-grid semantics, but compute it once
-     into `backward_map_xy`.
-   - Smooth must be baked into the source coordinates before the map is stored.
-   - `output_to_source_grid()` returns the cached map tensor.
-   - `output_to_source_points(...)` should either be removed from hot paths or
-     use lookup against the cached map when needed.
+2. Replace sparse point `grid_sample` with batched bilinear gather.
+   - Add `sample_xy_maps_bilinear(maps_xy, points_xy, valid_lengths=None)`.
+   - Input shape should support padded point tensors:
+     - maps: `[B, H, W, 2]`;
+     - points: `[B, N, 2]`;
+     - optional lengths/mask for ragged line lengths.
+   - Compute `x0/x1/y0/y1`, gather four map values, blend weights, and return
+     `[B, N, 2]`.
+   - Mark points outside the source-map bounds as non-finite or return a valid
+     mask so downstream filtering remains deterministic.
+   - Rewire `StripAugmentTransform.source_to_output_points(...)` to use the
+     same gather helper for the single-transform case.
 
-3. Build the forward map as a real lookup map.
-   - Produce `forward_map_xy` over source pixel locations.
-   - Preferred construction:
-     - generate a source pixel grid;
-     - apply the exact inverse transform once to every source pixel;
-     - store source pixel -> output pixel coordinates.
-   - Because this work happens once per transform construction, formula use
-     here is acceptable.
-   - Smooth inverse is baked here as `source_y -= f(source_x)` during map
-     construction, not during line/CP lookup.
+3. Batch line/control-point mapping per source sample.
+   - In `FiberStrip2DLoader.build_sample`, build all strip-z offset params and
+     transforms before constructing patches.
+   - Group offsets by identical `FiberStripAugmentParams` so existing reuse
+     remains intact.
+   - For each unique params group, map the source line and CP once; for all
+     unique params in a source sample, use one batched gather where shapes
+     match.
+   - Store mapped `(line_xy, control_point_xy)` by params and pass them into
+     patch construction as today.
+   - Keep line/CP filtering after lookup, but implement it as batched mask work
+     where practical. If per-line compaction remains per patch, profile it
+     separately so it is not confused with map lookup.
 
-4. Make line/CP mapping lookup-only.
-   - `source_to_output_points(...)` must sample `forward_map_xy` at source
-     point coordinates using bilinear lookup.
-   - The function must not:
-     - call smooth interpolation;
-     - run affine formula stacks;
-     - construct random generators;
-     - iterate/solve;
-     - search a dense output grid.
-   - Line and CP stay batched in one lookup call.
+4. Batch coordinate augmentation across offsets.
+   - Add a batched coordinate-resampling helper that accepts:
+     - coords: `[B, Hsrc, Wsrc, 3]`;
+     - valid masks: `[B, Hsrc, Wsrc]`;
+     - backward maps: `[B, Hout, Wout, 2]`.
+   - Use one batched `grid_sample` for coordinates and one for valid masks.
+   - In `build_sample`, create offset grids for all offsets first, stack them,
+     apply batched coordinate augmentation for augmented patches, then split the
+     result back for VC3D image loading.
+   - Preserve the unaugmented path; it may simply stack and pass through without
+     geometric resampling.
 
-5. Reuse the same map object in loader paths.
-   - Coordinate augmentation uses `transform.backward_map_xy`.
-   - Line/CP mapping uses `transform.forward_map_xy` lookup.
-   - `build_strip_patch_from_source` keeps one `StripAugmentTransform` per
-     source/params and passes it to both paths.
-   - `build_sample` continues to cache map objects and line/CP results by
-     params so shared strip-z offsets do not recompute.
+5. Keep VC3D volume sampling as the explicit I/O boundary.
+   - Check whether the current sampler interface supports batched coordinate
+     arrays. If not, keep `sample_coords(...)` in a per-patch loop.
+   - Make sure all torch-to-NumPy conversion for coordinates happens once per
+     patch at that boundary, not before batched coordinate work.
+   - Do not add a separate image sampling path.
 
-6. Update runner/tracing helpers where relevant.
-   - Any helper that needs geometric inverse/forward mapping should consume the
-     map tensor object rather than rebuilding formula paths.
-   - Avoid broad tracing redesign unless required by tests, but do not add a
-     new formula-based duplicate path.
+6. Batch value augmentation after image loading.
+   - Extend `apply_value_augmentation` or add a batched wrapper for
+     `[B, H, W]` / `[B, 1, H, W]` tensors.
+   - Apply brightness/contrast/gamma/noise/blur across the image stack on the
+     configured augmentation device.
+   - Preserve per-patch augmentation params. For scalar params, use broadcasted
+     tensors over `B`; for blur, group by sigma when needed or apply a batched
+     kernel if all sigmas can be handled together without changing behavior.
+   - Keep deterministic noise seeds per patch.
 
-7. Profiling/result expectation.
-   - The `line` stage should become mostly bilinear lookup + filtering +
-     NumPy boundary cost.
-   - If `line` remains high, split timing in a follow-up into:
-     `line_lookup`, `line_filter`, and `line_numpy`.
+7. Update profiling to show where batching helps.
+   - Split current aggregate loader timing into at least:
+     - `map_build`;
+     - `line_lookup`;
+     - `line_filter`;
+     - `coord_aug_batch`;
+     - `volume_sample`;
+     - `value_aug_batch`.
+   - Keep the existing summary columns if required by callers, but record the
+     finer-grained keys so the next profile can distinguish lookup cost from
+     filtering/compaction and NumPy/VC3D boundaries.
+
+8. Preserve runner/debug behavior.
+   - `augment-vis`, `dir-vis`, `line-trace-vis`, benchmark/profile/load-only,
+     and training must continue to use the same shared loader path.
+   - Single-sample debug calls may use a batch size of one through the same
+     batched helpers rather than a separate implementation.
 
 ## Spec Update
 
-Update `planning/specs.md` to state unambiguously:
+Update `planning/specs.md` to add:
 
-- “Fused geometric augmentation” means actual precomputed map tensors, not a
-  shared function bundle.
-- Smooth, affine, flips, scale, shear, and rotation are baked into the maps at
-  construction time.
-- Line/CP mapping is lookup/interpolation against `forward_map_xy` only.
-- Image/coordinate augmentation uses `backward_map_xy` only.
-- No smooth interpolation or affine formula evaluation is allowed in the hot
-  line/CP mapping path.
+- Runtime geometric augmentation work should be batched across strip-z offsets
+  and patches where compatible.
+- Sparse line/CP mapping must use direct bilinear gather against
+  `forward_map_xy`; tiny `grid_sample` calls for sparse point lists are not the
+  intended implementation.
+- Coordinate augmentation should stack `backward_map_xy` tensors and run
+  batched dense sampling.
+- Value augmentations after VC3D image loading should run as batched tensor
+  operations when possible.
+- VC3D coordinate sampling remains the external I/O boundary unless the sampler
+  exposes a true batched coordinate API.
 
 ## Docs Updates
 
-Update `docs/code_structure.md` to describe the map-tensor based
-`StripAugmentTransform` and loader data flow.
+Update `docs/code_structure.md` to describe:
+
+- Batched transform-map stacking.
+- Batched sparse line/CP gather.
+- Batched coordinate augmentation.
+- The remaining per-patch VC3D image-sampling boundary.
+- Batched post-load image/value augmentation.
 
 Update `planning/changelog.md`, `planning/status.md`, and
 `planning/task_log.md` for this current task only.
 
 ## Tests
 
-- Add a unit test that monkeypatches smooth interpolation/control evaluation
-  after transform construction and verifies line/CP lookup still works.
-- Add a unit test that monkeypatches affine formula helpers after transform
-  construction and verifies `source_to_output_points` uses map lookup only.
-- Add a test for `forward_map_xy`/`backward_map_xy` round-trip consistency on
-  representative points.
-- Keep existing tests for:
-  - one transform object shared between coord augmentation and line/CP mapping;
-  - line+CP batched mapping;
-  - strip-z line/CP reuse.
-- Run:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+- Unit-test batched bilinear gather against the single-map lookup on
+  representative affine and smooth transforms.
+- Unit-test out-of-bounds point handling for batched line/CP lookup.
+- Unit-test that `build_sample` maps line/CP data through the batched helper
+  rather than one tiny sparse `grid_sample` per patch.
+- Unit-test batched coordinate augmentation equivalence to the existing
+  per-patch path on fake/local arrays.
+- Unit-test batched value augmentation equivalence for deterministic params and
+  seeds where exact equality is expected.
+- Keep existing loader, augment-vis, deterministic ordering, and cache tests.
 
 ## Validation
 
 - Run compile checks for touched Python files.
-- Run focused pytest.
-- If possible, run the GPU profile command and compare the `line` column before
-  and after this map-tensor change.
+- Run focused pytest:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+- Run the local profile command before and after implementation when possible:
+  `PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.train $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --profile`
+- Compare at minimum `line_lookup`, `line_filter`, `coord_aug_batch`, and
+  `value_aug_batch` timing before/after.
