@@ -82,6 +82,15 @@ const config = {
   onBrokenLinks: "throw",
   onBrokenMarkdownLinks: "throw",
   favicon: "img/social/favicon.ico",
+  customFields: {
+    // "Ask the Scrolls" chat endpoint. Same-origin Vercel function in prod;
+    // point CHAT_ENDPOINT at a local dev shim (scripts/devChatServer.mjs) when
+    // testing against `yarn serve`. Empty string disables the widget.
+    chatEndpoint:
+      process.env.CHAT_ENDPOINT !== undefined
+        ? process.env.CHAT_ENDPOINT
+        : "/api/chat",
+  },
   scripts: [
     {
       src: "https://cdn.usefathom.com/script.js",
@@ -150,6 +159,7 @@ const config = {
             require.resolve("./src/css/chrome.css"),
             require.resolve("./src/css/landing.css"),
             require.resolve("./src/css/imageZoom.css"),
+            require.resolve("./src/css/chat.css"),
           ],
         },
         gtag: {
