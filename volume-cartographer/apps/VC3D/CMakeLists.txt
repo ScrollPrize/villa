@@ -16,6 +16,8 @@ set(srcs
     Keybinds.hpp
     CWindow.cpp
     CWindowContextMenu.cpp
+    StatusDockPanelHost.cpp
+    StatusDockPanelHost.hpp
     RenderBenchRecorder.cpp
     RenderBenchRecorder.hpp
     RenderBenchReplay.cpp
@@ -33,6 +35,18 @@ set(srcs
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
     LineAnnotationGeneratedViews.hpp
+    OpenDataCatalogWindow.cpp
+    OpenDataCatalogWindow.hpp
+    OpenDataManifest.cpp
+    OpenDataManifest.hpp
+    OpenDataSampleProject.cpp
+    OpenDataSampleProject.hpp
+    OpenDataVolumePrefill.cpp
+    OpenDataVolumePrefill.hpp
+    OpenDataNormalGrids.cpp
+    OpenDataNormalGrids.hpp
+    OpenDataSegmentCache.cpp
+    OpenDataSegmentCache.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
@@ -65,6 +79,7 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    RemoteVolumeCachePaths.cpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
@@ -136,6 +151,8 @@ set(srcs
     overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
+    overlays/InkDetectionOverlayController.cpp
+    overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
@@ -165,14 +182,12 @@ set(srcs
     viewer_controls/ViewerControlsPanel.hpp
     viewer_controls/panels/ViewerCompositePanel.cpp
     viewer_controls/panels/ViewerCompositePanel.hpp
+    viewer_controls/panels/ViewerInkDetectionPanel.cpp
+    viewer_controls/panels/ViewerInkDetectionPanel.hpp
     viewer_controls/panels/ViewerNavigationPanel.cpp
     viewer_controls/panels/ViewerNavigationPanel.hpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.cpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.hpp
-    viewer_controls/panels/ViewerPostprocessingPanel.cpp
-    viewer_controls/panels/ViewerPostprocessingPanel.hpp
-    viewer_controls/panels/ViewerPreprocessingPanel.cpp
-    viewer_controls/panels/ViewerPreprocessingPanel.hpp
     viewer_controls/panels/ViewerTransformsPanel.cpp
     viewer_controls/panels/ViewerTransformsPanel.hpp
     viewer_controls/panels/ViewerViewExtrasPanel.cpp

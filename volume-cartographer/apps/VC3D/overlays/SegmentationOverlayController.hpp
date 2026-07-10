@@ -5,10 +5,13 @@
 #include <QColor>
 #include <QFutureWatcher>
 #include <QImage>
+#include <atomic>
 #include <chrono>
 #include <array>
+#include <cstddef>
 #include <deque>
 #include <map>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -274,7 +277,8 @@ private:
         std::map<std::string, cv::Vec3b> overlays;          // Overlay config when image was built
         float threshold{0.0f};                              // Threshold when image was built
         QuadSurface* surface{nullptr};                      // Current surface when image was built
-        uint64_t surfaceVersion{0};                         // Surface content version
+        std::size_t generationHash{0};                      // Surface/index generations when image was built
+        int sampleStride{1};                                // Raw grid stride represented by one image pixel
     };
     mutable std::map<VolumeViewerBase*, OverlapCache> _overlapCaches;
 
@@ -286,6 +290,10 @@ private:
     QFutureWatcher<QImage>* _overlapWatcher{nullptr};
     PendingOverlapResult _pendingOverlap;
     bool _overlapComputeRunning{false};
+    bool _overlapIndexReadInFlight{false};
+    // Cooperative cancel for the in-flight compute; a fresh flag is created per
+    // launch so a canceled worker can't clear a successor's flag.
+    std::shared_ptr<std::atomic_bool> _overlapCancel;
     void handleOverlapComputeFinished();
 
     // Deferred refresh timer - fires after throttle window to apply pending state

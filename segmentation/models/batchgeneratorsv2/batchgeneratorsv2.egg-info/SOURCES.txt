@@ -32,10 +32,13 @@ batchgeneratorsv2/transforms/noise/__init__.py
 batchgeneratorsv2/transforms/noise/extranoisetransforms.py
 batchgeneratorsv2/transforms/noise/gaussian_blur.py
 batchgeneratorsv2/transforms/spatial/__init__.py
+batchgeneratorsv2/transforms/spatial/decohesion.py
 batchgeneratorsv2/transforms/spatial/low_resolution.py
 batchgeneratorsv2/transforms/spatial/mirroring.py
 batchgeneratorsv2/transforms/spatial/spatial.py
+batchgeneratorsv2/transforms/spatial/squeeze.py
 batchgeneratorsv2/transforms/spatial/transpose.py
+batchgeneratorsv2/transforms/spatial/warp.py
 batchgeneratorsv2/transforms/utils/__init__.py
 batchgeneratorsv2/transforms/utils/compose.py
 batchgeneratorsv2/transforms/utils/cropping.py

@@ -10,6 +10,7 @@
 #include <QScrollBar>
 #include <QStandardItemModel>
 #include <QTreeView>
+#include <QThreadPool>
 
 #include <cstdlib>
 #include <iostream>
@@ -78,6 +79,7 @@ int main(int argc, char** argv)
 
     std::unique_ptr<QApplication> app;
     ensureApplication(argc, argv, app);
+    QThreadPool::globalInstance()->setMaxThreadCount(1);
 
     CFiberWidget widget;
     auto first = makeFiber(1, "aa_20260605T184821587_000001.json", 2, 20, 12.0, {"source-a"});
@@ -213,6 +215,10 @@ int main(int argc, char** argv)
 
     auto* deleteButton = widget.findChild<QPushButton*>(QStringLiteral("fiberDeleteButton"));
     require(deleteButton != nullptr, "Fiber delete button was not found");
+    auto* importButton = widget.findChild<QPushButton*>(QStringLiteral("fiberImportButton"));
+    require(importButton != nullptr, "Fiber import button was not found");
+    auto* exportButton = widget.findChild<QPushButton*>(QStringLiteral("fiberExportButton"));
+    require(exportButton != nullptr, "Fiber export button was not found");
     require(!deleteButton->isEnabled(), "Delete button should start disabled");
     require(!widget.canDeleteSelection(), "Empty selection should not allow delete");
     require(!widget.canCreateAtlasFromSelection(), "Empty selection should not allow atlas creation");
@@ -379,8 +385,22 @@ int main(int argc, char** argv)
 
     int confirmations = 0;
     int batchDeletes = 0;
+    int importRequests = 0;
+    int exportRequests = 0;
     std::vector<uint64_t> confirmedIds;
     std::vector<uint64_t> deletedIds;
+    QObject::connect(&widget,
+                     &CFiberWidget::importFibersRequested,
+                     &widget,
+                     [&]() {
+                         ++importRequests;
+                     });
+    QObject::connect(&widget,
+                     &CFiberWidget::exportFibersRequested,
+                     &widget,
+                     [&]() {
+                         ++exportRequests;
+                     });
     QObject::connect(&widget,
                      &CFiberWidget::deleteFibersRequested,
                      &widget,
@@ -388,6 +408,10 @@ int main(int argc, char** argv)
                          ++batchDeletes;
                          deletedIds = std::move(ids);
                      });
+    importButton->click();
+    require(importRequests == 1, "Import button did not emit one import request");
+    exportButton->click();
+    require(exportRequests == 1, "Export button did not emit one export request");
 
     widget.setDeleteConfirmationForTesting([&](const std::vector<uint64_t>& ids) {
         ++confirmations;
@@ -409,5 +433,6 @@ int main(int argc, char** argv)
     require(batchDeletes == 1, "Confirmed delete did not emit one batch delete request");
     require(sameIds(deletedIds, {1, 3}), "Batch delete request IDs are wrong");
 
+    QThreadPool::globalInstance()->waitForDone();
     return 0;
 }

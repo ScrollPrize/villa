@@ -670,6 +670,11 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
         return cv::Mat_<uint8_t>();
     }
 
+    // Guard the lazy build: gen() calls this concurrently from the renderer's
+    // OMP tile loop, so an unguarded build would race on _validMaskCache (the
+    // cv::Mat assignment is not atomic) and on _validMaskAllValid.
+    std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+
     if (!_validMaskCache.empty() &&
         _validMaskCache.rows == _points->rows &&
         _validMaskCache.cols == _points->cols) {
@@ -777,8 +782,14 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     bool skipValidity = _validMaskAllValid;
 
     // --- warp coords and validity ----------------------------------------
-    cv::Mat_<cv::Vec3f>& coords_big = _genCoordsScratch;
-    cv::Mat_<uint8_t>& valid_big = _genValidScratch;
+    // Per-call scratch is thread_local: gen() runs concurrently per-tile from
+    // the renderer's OMP loop, and the returned coords/normals are views into
+    // these buffers (see crop step below). Sharing them across threads raced
+    // on realloc -> SIGSEGV. thread_local keeps the per-frame reuse per-thread.
+    thread_local cv::Mat_<cv::Vec3f> coords_scratch_tls;
+    thread_local cv::Mat_<uint8_t>  valid_scratch_tls;
+    cv::Mat_<cv::Vec3f>& coords_big = coords_scratch_tls;
+    cv::Mat_<uint8_t>& valid_big = valid_scratch_tls;
 
     if (!_components.empty()) {
         // Multi-component surface: warp each component separately with
@@ -832,35 +843,41 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     }
 
     // --- normals: warp cached source-grid normals -------------------
-    cv::Mat_<cv::Vec3f>& normals_big = _genNormalsScratch;
+    thread_local cv::Mat_<cv::Vec3f> normals_scratch_tls;
+    cv::Mat_<cv::Vec3f>& normals_big = normals_scratch_tls;
     if (need_normals) {
         // Build source-grid normal cache once per surface. Subsequent gen()
         // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
-        // a different surface becomes active.
-        if (_normalCache.empty() || _normalCache.size() != _points->size()) {
-            _normalCache.create(_points->rows, _points->cols);
-            const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN());
-            const int rows = _points->rows;
-            const int cols = _points->cols;
-            // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
-            if (rows > 0) {
-                cv::Vec3f* top = _normalCache[0];
-                cv::Vec3f* bot = _normalCache[rows - 1];
-                for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
-            }
-            #pragma omp parallel for schedule(dynamic, 16)
-            for (int r = 1; r < rows - 1; r++) {
-                cv::Vec3f* dst = _normalCache[r];
-                const cv::Vec3f* row = (*_points)[r];
-                dst[0] = qn;
-                dst[cols - 1] = qn;
-                for (int c = 1; c < cols - 1; c++) {
-                    if (row[c][0] == -1.f) {
-                        dst[c] = qn;
-                    } else {
-                        dst[c] = grid_normal_int(*_points, r, c);
+        // a different surface becomes active. Guarded by _cacheMutex so the
+        // renderer's concurrent OMP tile calls build it exactly once; reads
+        // below run lock-free since the cache is immutable once built.
+        {
+            std::lock_guard<std::mutex> cacheLock(_cacheMutex);
+            if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+                _normalCache.create(_points->rows, _points->cols);
+                const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN(),
+                                   std::numeric_limits<float>::quiet_NaN());
+                const int rows = _points->rows;
+                const int cols = _points->cols;
+                // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
+                if (rows > 0) {
+                    cv::Vec3f* top = _normalCache[0];
+                    cv::Vec3f* bot = _normalCache[rows - 1];
+                    for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
+                }
+                #pragma omp parallel for schedule(dynamic, 16)
+                for (int r = 1; r < rows - 1; r++) {
+                    cv::Vec3f* dst = _normalCache[r];
+                    const cv::Vec3f* row = (*_points)[r];
+                    dst[0] = qn;
+                    dst[cols - 1] = qn;
+                    for (int c = 1; c < cols - 1; c++) {
+                        if (row[c][0] == -1.f) {
+                            dst[c] = qn;
+                        } else {
+                            dst[c] = grid_normal_int(*_points, r, c);
+                        }
                     }
                 }
             }

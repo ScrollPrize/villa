@@ -7,6 +7,7 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -16,6 +17,7 @@
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
@@ -86,6 +88,9 @@ bool isSegmentDir(const fs::path& dir)
 bool isNormalGridDir(const fs::path& dir)
 {
     if (!fs::is_directory(dir)) return false;
+    // A streaming cache dir is a valid store even before any grid files have
+    // been fetched — NormalGridVolume pulls them on demand via the marker URL.
+    if (fs::is_regular_file(dir / vc::core::util::kNormalGridsRemoteMarker)) return true;
     return fs::is_directory(dir / "xy")
         && fs::is_directory(dir / "xz")
         && fs::is_directory(dir / "yz")
@@ -105,6 +110,32 @@ bool isDirectRemoteZarrLocation(std::string location)
         && location.compare(location.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string_view prefix)
+{
+    for (const auto& tag : tags) {
+        if (tag.rfind(prefix, 0) == 0) {
+            return tag.substr(prefix.size());
+        }
+    }
+    return {};
+}
+
+utils::Json metadataFromVolumeEntryTags(const std::vector<std::string>& tags)
+{
+    auto metadata = utils::Json::object();
+    const auto voxelSizeTag = tagValueWithPrefix(tags, "vc-open-data-voxel-size-um:");
+    if (!voxelSizeTag.empty()) {
+        try {
+            const double voxelSize = std::stod(voxelSizeTag);
+            if (voxelSize > 0.0) {
+                metadata["voxelsize"] = voxelSize;
+            }
+        } catch (...) {
+        }
+    }
+    return metadata;
+}
+
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
 {
     std::vector<fs::path> out;
@@ -113,6 +144,7 @@ std::vector<fs::path> immediateSubdirs(const fs::path& dir)
         if (!e.is_directory()) continue;
         const auto name = e.path().filename().string();
         if (name.empty() || name[0] == '.' || name == ".tmp") continue;
+        if (name.find(".tmp-") != std::string::npos || name.ends_with(".previous")) continue;
         out.push_back(e.path());
     }
     std::sort(out.begin(), out.end());
@@ -390,6 +422,62 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
     resolveVolumeEntry(volumes_.back());
     persistProjectState();
     return true;
+}
+
+bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags)
+{
+    if (location.empty() || tags.empty()) return false;
+    for (auto& e : volumes_) {
+        if (e.location != location) continue;
+        bool changed = false;
+        for (const auto& tag : tags) {
+            if (tag.empty()) continue;
+            if (std::find(e.tags.begin(), e.tags.end(), tag) == e.tags.end()) {
+                e.tags.push_back(tag);
+                changed = true;
+            }
+        }
+        if (!changed) return false;
+
+        for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end(); ++it) {
+            const auto id = it->first;
+            const auto& volume = it->second;
+            if (!volume) continue;
+            if (volume->isRemote() && volume->remoteUrl() == location) {
+                auto metadata = metadataFromVolumeEntryTags(e.tags);
+                if (!metadata.empty()) {
+                    try {
+                        auto refreshed = Volume::NewFromUrl(location, opts_.remoteCacheRoot, {}, metadata);
+                        const auto refreshedId = refreshed->id();
+                        if (refreshedId != id && loadedVolumes_.count(refreshedId) == 0) {
+                            loadedVolumes_.erase(it);
+                            loadedVolumes_.emplace(refreshedId, refreshed);
+                            volumeTagsByID_.erase(id);
+                            volumeTagsByID_[refreshedId] = e.tags;
+                        } else if (refreshedId == id) {
+                            it->second = refreshed;
+                            volumeTagsByID_[id] = e.tags;
+                        } else {
+                            Logger()->warn(
+                                "Remote volume metadata for '{}' resolves to duplicate id '{}'; keeping existing loaded volume",
+                                location,
+                                refreshedId);
+                            volumeTagsByID_[id] = e.tags;
+                        }
+                    } catch (const std::exception& ex) {
+                        Logger()->warn("Failed to refresh remote volume manifest metadata '{}': {}", location, ex.what());
+                        volumeTagsByID_[id] = e.tags;
+                    }
+                } else {
+                    volumeTagsByID_[id] = e.tags;
+                }
+                break;
+            }
+        }
+        persistProjectState();
+        return true;
+    }
+    return false;
 }
 
 bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::string> tags)
@@ -749,8 +837,14 @@ void VolumePkg::unloadAllSurfaces()
         std::lock_guard<std::mutex> lk(segmentsMutex_);
         snapshot.reserve(loadedSegmentations_.size());
         for (auto& [id, seg] : loadedSegmentations_) snapshot.push_back(seg);
+        // Also drop surfaces retained for other segmentation directories.
+        for (auto& [location, segs] : segmentationsByLocation_) {
+            for (auto& [id, seg] : segs) snapshot.push_back(seg);
+        }
     }
-    for (auto& seg : snapshot) seg->unloadSurface();
+    for (auto& seg : snapshot) {
+        if (seg) seg->unloadSurface();
+    }
 }
 
 void VolumePkg::loadSurfacesBatch(const std::vector<std::string>& ids)
@@ -830,6 +924,8 @@ void VolumePkg::resolveAll()
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
         loadedSegmentations_.clear();
+        segmentationsByLocation_.clear();
+        activeSegmentsLocation_.clear();
         segmentationTagsByID_.clear();
     }
     resolvedNormalGridPaths_.clear();
@@ -853,6 +949,9 @@ void VolumePkg::resolveAll()
     if (selectedSegments) {
         outputSegments_ = selectedSegments->location;
         resolveSegmentsEntry(*selectedSegments);
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        activeSegmentsLocation_ = selectedSegments->location;
+        segmentationsByLocation_[activeSegmentsLocation_] = loadedSegmentations_;
     }
     for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
 }
@@ -866,7 +965,11 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
         }
 
         try {
-            auto v = Volume::NewFromUrl(e.location, opts_.remoteCacheRoot, {});
+            auto v = Volume::NewFromUrl(
+                e.location,
+                opts_.remoteCacheRoot,
+                {},
+                metadataFromVolumeEntryTags(e.tags));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
@@ -920,9 +1023,28 @@ void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e)
         Logger()->warn("Skipping segments '{}': path does not exist", e.location);
         return;
     }
+    // Reuse Segmentation objects retained from an earlier visit to this entry
+    // so surfaces they already loaded stay available. The directory is still
+    // rescanned, so segments added or removed on disk are picked up.
+    std::map<std::string, std::shared_ptr<Segmentation>> retainedByPath;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = segmentationsByLocation_.find(e.location);
+        if (it != segmentationsByLocation_.end()) {
+            for (const auto& [id, seg] : it->second) {
+                if (seg) retainedByPath[seg->path().string()] = seg;
+            }
+        }
+    }
     auto loadOne = [&](const fs::path& sp) {
         try {
-            auto s = Segmentation::New(sp);
+            std::shared_ptr<Segmentation> s;
+            if (auto retained = retainedByPath.find(sp.string());
+                retained != retainedByPath.end()) {
+                s = retained->second;
+            } else {
+                s = Segmentation::New(sp);
+            }
             const auto id = s->id();
             std::lock_guard<std::mutex> lk(segmentsMutex_);
             if (loadedSegmentations_.count(id) > 0) {
@@ -1084,6 +1206,12 @@ void VolumePkg::refreshSegmentations()
 {
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
+        // Retain the outgoing directory's segmentations so switching back to
+        // it reuses them (and their loaded surfaces) without hitting disk.
+        if (!activeSegmentsLocation_.empty()) {
+            segmentationsByLocation_[activeSegmentsLocation_] = loadedSegmentations_;
+        }
+        activeSegmentsLocation_.clear();
         loadedSegmentations_.clear();
         segmentationTagsByID_.clear();
     }
@@ -1106,6 +1234,9 @@ void VolumePkg::refreshSegmentations()
     if (selectedSegments) {
         outputSegments_ = selectedSegments->location;
         resolveSegmentsEntry(*selectedSegments);
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        activeSegmentsLocation_ = selectedSegments->location;
+        segmentationsByLocation_[activeSegmentsLocation_] = loadedSegmentations_;
     }
 }
 

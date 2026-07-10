@@ -2,22 +2,30 @@
 
 #include "RenderBenchRecorder.hpp"
 #include "RenderBenchReplay.hpp"
+#include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/AffineTransform.hpp"
+#include "vc/core/util/LoadJson.hpp"
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <iostream>
 
+#include <array>
 #include <functional>
+#include <optional>
 
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
+#include "OpenDataNormalGrids.hpp"
+#include "viewer_controls/panels/ViewerCompositePanel.hpp"
+#include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
 #include <QGridLayout>
 #include <QAction>
 #include <QVBoxLayout>
@@ -30,6 +38,9 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
+#include <QBrush>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
@@ -52,21 +63,37 @@
 #include <QLineEdit>
 #include <QDoubleSpinBox>
 #include <QSpinBox>
+#include <QStatusBar>
 #include <QSizePolicy>
 #include <QTimer>
 #include <QSize>
 #include <QVector>
+#include <QVector3D>
 #include <QLoggingCategory>
 #include <QDebug>
+#include <QFrame>
+#include <QMouseEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
 #include <QHeaderView>
 #include <QFormLayout>
 #include <QProgressBar>
+#include <QColorDialog>
+#include <QListView>
+#include <QTreeView>
+#include <QPainter>
+#include <QStandardItem>
+#include <QStandardItemModel>
+#include <QStyledItemDelegate>
+#include <QStyleOptionButton>
+#include <QPersistentModelIndex>
+#include <QSet>
 #include <QPushButton>
 #include <QItemSelectionModel>
 #include <QItemSelection>
@@ -92,6 +119,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <QStringList>
+#include <array>
 
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "viewer_controls/ViewerControlsPanel.hpp"
@@ -105,6 +133,7 @@
 #include "CFiberWidget.hpp"
 #include "FiberAnnotationController.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
@@ -112,6 +141,7 @@
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfacePanelController.hpp"
+#include "elements/DropdownChecklistButton.hpp"
 #include "MenuActionController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
@@ -148,6 +178,10 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 namespace
 {
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
+constexpr auto MAIN_VIEWER_SPLIT_X_SETTING = "mainWin/main_viewer_split_x";
+constexpr auto MAIN_VIEWER_SPLIT_Y_SETTING = "mainWin/main_viewer_split_y";
+constexpr auto MAIN_VIEWER_LAYOUT_SURFACES_SETTING = "mainWin/main_viewer_layout_surfaces";
+constexpr auto MAIN_VIEWER_LAYOUT_HIDDEN_SETTING = "mainWin/main_viewer_layout_hidden";
 constexpr auto ATLAS_INTERNAL_SURFACE_NAME = "__atlas_workspace_base_mesh";
 constexpr int ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS = 0;
 constexpr int ATLAS_SEARCH_MODE_NON_ATLAS_ONLY = 1;
@@ -160,7 +194,448 @@ constexpr int ATLAS_CONTROL_INDEX_ROLE = Qt::UserRole + 2;
 constexpr int ATLAS_CONTROL_SOURCE_INDEX_ROLE = Qt::UserRole + 3;
 constexpr int ATLAS_SURFACE_X_ROLE = Qt::UserRole + 4;
 constexpr int ATLAS_SURFACE_Y_ROLE = Qt::UserRole + 5;
+constexpr int SEGMENT_DIR_NAME_ROLE = Qt::UserRole + 100;
+constexpr int SEGMENT_DIR_COLOR_ROLE = Qt::UserRole + 101;
+constexpr int SEGMENT_DIR_DEFAULT_PALETTE_ROLE = Qt::UserRole + 102;
+constexpr int SURFACE_OVERLAY_KIND_ROLE = Qt::UserRole + 200;
+constexpr int SURFACE_OVERLAY_NAME_ROLE = Qt::UserRole + 201;
+constexpr int SURFACE_OVERLAY_FOLDER_ROLE = Qt::UserRole + 202;
 constexpr double ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD = 0.5;
+constexpr std::string_view OPEN_DATA_VOLUME_ID_TAG_PREFIX = "vc-open-data-volume-id:";
+
+enum class SurfaceOverlayItemKind {
+    Folder,
+    Surface,
+};
+
+SurfaceOverlayItemKind surfaceOverlayItemKind(const QStandardItem* item)
+{
+    return static_cast<SurfaceOverlayItemKind>(
+        item ? item->data(SURFACE_OVERLAY_KIND_ROLE).toInt()
+             : static_cast<int>(SurfaceOverlayItemKind::Surface));
+}
+
+bool isSurfaceOverlayFolder(const QStandardItem* item)
+{
+    return surfaceOverlayItemKind(item) == SurfaceOverlayItemKind::Folder;
+}
+
+bool isSurfaceOverlaySurface(const QStandardItem* item)
+{
+    return surfaceOverlayItemKind(item) == SurfaceOverlayItemKind::Surface;
+}
+
+QStandardItem* findSurfaceOverlayFolder(QStandardItemModel* model, const QString& folderName)
+{
+    if (!model) {
+        return nullptr;
+    }
+    for (int row = 0; row < model->rowCount(); ++row) {
+        QStandardItem* item = model->item(row);
+        if (isSurfaceOverlayFolder(item) &&
+            item->data(SURFACE_OVERLAY_FOLDER_ROLE).toString() == folderName) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
+QList<QStandardItem*> surfaceOverlaySurfaceItems(QStandardItemModel* model)
+{
+    QList<QStandardItem*> items;
+    if (!model) {
+        return items;
+    }
+    for (int folderRow = 0; folderRow < model->rowCount(); ++folderRow) {
+        QStandardItem* folder = model->item(folderRow);
+        if (!isSurfaceOverlayFolder(folder)) {
+            continue;
+        }
+        for (int row = 0; row < folder->rowCount(); ++row) {
+            QStandardItem* child = folder->child(row);
+            if (isSurfaceOverlaySurface(child)) {
+                items.append(child);
+            }
+        }
+    }
+    return items;
+}
+
+QString surfaceOverlayFolderName(const std::string& surfaceName,
+                                 const Surface* surface,
+                                 const QString& currentDir)
+{
+    if (surface && !surface->meta.is_null()) {
+        const auto folder = vc::json::string_or(
+            surface->meta,
+            "vc3d_segment_folder",
+            std::string{});
+        if (!folder.empty()) {
+            return QString::fromStdString(folder);
+        }
+    }
+
+    const QString name = QString::fromStdString(surfaceName);
+    const int slash = name.indexOf(QLatin1Char('/'));
+    if (slash > 0) {
+        return name.left(slash);
+    }
+    if (!currentDir.isEmpty()) {
+        return currentDir;
+    }
+    return QObject::tr("Segments");
+}
+
+QString surfaceOverlayLeafLabel(const std::string& surfaceName, const QString& folderName)
+{
+    const QString name = QString::fromStdString(surfaceName);
+    const QString prefix = folderName + QLatin1Char('/');
+    if (name.startsWith(prefix)) {
+        return name.mid(prefix.size());
+    }
+    return name;
+}
+
+void updateSurfaceOverlayFolderState(QStandardItem* folder)
+{
+    if (!folder || !isSurfaceOverlayFolder(folder)) {
+        return;
+    }
+
+    int checkedCount = 0;
+    int surfaceCount = 0;
+    for (int row = 0; row < folder->rowCount(); ++row) {
+        QStandardItem* child = folder->child(row);
+        if (!isSurfaceOverlaySurface(child)) {
+            continue;
+        }
+        ++surfaceCount;
+        if (child->checkState() == Qt::Checked) {
+            ++checkedCount;
+        }
+    }
+
+    if (checkedCount == 0) {
+        folder->setCheckState(Qt::Unchecked);
+    } else if (checkedCount == surfaceCount && surfaceCount > 0) {
+        folder->setCheckState(Qt::Checked);
+    } else {
+        folder->setCheckState(Qt::PartiallyChecked);
+    }
+}
+
+bool surfaceOverlayItemMatchesFilter(const QStandardItem* item, const QString& filter)
+{
+    if (!item || filter.isEmpty()) {
+        return true;
+    }
+    const QString needle = filter.toCaseFolded();
+    if (item->text().toCaseFolded().contains(needle) ||
+        item->data(SURFACE_OVERLAY_NAME_ROLE).toString().toCaseFolded().contains(needle) ||
+        item->data(SURFACE_OVERLAY_FOLDER_ROLE).toString().toCaseFolded().contains(needle)) {
+        return true;
+    }
+    for (int row = 0; row < item->rowCount(); ++row) {
+        if (surfaceOverlayItemMatchesFilter(item->child(row), filter)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
+
+QRect segmentFolderCheckRect(const QRect& row)
+{
+    return QRect(row.left() + 4, row.top() + (row.height() - 18) / 2, 18, 18);
+}
+
+QRect segmentFolderPaletteRect(const QRect& row)
+{
+    return QRect(row.right() - 26, row.top() + (row.height() - 20) / 2, 20, 20);
+}
+
+enum class SegmentFolderControl {
+    None,
+    CheckBox,
+    Palette,
+};
+
+SegmentFolderControl segmentFolderControlAt(const QRect& row, const QPoint& pos)
+{
+    if (segmentFolderCheckRect(row).contains(pos)) {
+        return SegmentFolderControl::CheckBox;
+    }
+    if (segmentFolderPaletteRect(row).contains(pos)) {
+        return SegmentFolderControl::Palette;
+    }
+    return SegmentFolderControl::None;
+}
+
+class SegmentFolderDelegate final : public QStyledItemDelegate
+{
+public:
+    using PaletteCallback = std::function<void(int)>;
+
+    explicit SegmentFolderDelegate(PaletteCallback paletteCallback, QObject* parent = nullptr)
+        : QStyledItemDelegate(parent)
+        , _paletteCallback(std::move(paletteCallback))
+    {
+    }
+
+    void paint(QPainter* painter,
+               const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override
+    {
+        painter->save();
+
+        QStyleOptionViewItem opt(option);
+        initStyleOption(&opt, index);
+        opt.text.clear();
+        QStyle* style = opt.widget ? opt.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
+
+        QStyleOptionButton check;
+        check.state = QStyle::State_Enabled;
+        check.state |= index.data(Qt::CheckStateRole).toInt() == Qt::Checked
+            ? QStyle::State_On
+            : QStyle::State_Off;
+        check.rect = segmentFolderCheckRect(option.rect);
+        style->drawPrimitive(QStyle::PE_IndicatorCheckBox, &check, painter, opt.widget);
+
+        const QRect icon = segmentFolderPaletteRect(option.rect);
+        const bool defaultPalette = index.data(SEGMENT_DIR_DEFAULT_PALETTE_ROLE).toBool();
+        const QColor color = index.data(SEGMENT_DIR_COLOR_ROLE).value<QColor>();
+        if (defaultPalette) {
+            const std::array<QColor, 4> colors = {
+                QColor(255, 120, 120),
+                QColor(120, 200, 255),
+                QColor(120, 255, 140),
+                QColor(255, 220, 100),
+            };
+            const int w = icon.width() / 2;
+            const int h = icon.height() / 2;
+            for (int i = 0; i < 4; ++i) {
+                painter->fillRect(QRect(icon.left() + (i % 2) * w,
+                                        icon.top() + (i / 2) * h,
+                                        w,
+                                        h),
+                                  colors[i]);
+            }
+            painter->setPen(option.palette.mid().color());
+            painter->drawRect(icon.adjusted(0, 0, -1, -1));
+        } else {
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            painter->setPen(option.palette.mid().color());
+            painter->setBrush(color.isValid() ? color : QColor(120, 200, 255));
+            painter->drawEllipse(icon.adjusted(2, 2, -2, -2));
+        }
+
+        QRect text = option.rect.adjusted(check.rect.width() + 10, 0, -(icon.width() + 10), 0);
+        painter->setPen(option.palette.text().color());
+        painter->drawText(text, Qt::AlignVCenter | Qt::AlignLeft, index.data(Qt::DisplayRole).toString());
+
+        painter->restore();
+    }
+
+    bool editorEvent(QEvent* event,
+                     QAbstractItemModel* model,
+                     const QStyleOptionViewItem& option,
+                     const QModelIndex& index) override
+    {
+        if (!event || !model || !index.isValid() || event->type() != QEvent::MouseButtonRelease) {
+            return QStyledItemDelegate::editorEvent(event, model, option, index);
+        }
+        const auto* mouse = static_cast<QMouseEvent*>(event);
+        if (segmentFolderCheckRect(option.rect).contains(mouse->pos())) {
+            const bool checked = index.data(Qt::CheckStateRole).toInt() == Qt::Checked;
+            model->setData(index, checked ? Qt::Unchecked : Qt::Checked, Qt::CheckStateRole);
+            return true;
+        }
+        if (segmentFolderPaletteRect(option.rect).contains(mouse->pos())) {
+            if (_paletteCallback) {
+                _paletteCallback(index.row());
+            }
+            return true;
+        }
+        return QStyledItemDelegate::editorEvent(event, model, option, index);
+    }
+
+private:
+    PaletteCallback _paletteCallback;
+};
+
+class SegmentFolderListView final : public QListView
+{
+public:
+    using PaletteCallback = std::function<void(int)>;
+
+    explicit SegmentFolderListView(PaletteCallback paletteCallback, QWidget* parent = nullptr)
+        : QListView(parent)
+        , _paletteCallback(std::move(paletteCallback))
+    {
+    }
+
+protected:
+    void showEvent(QShowEvent* event) override
+    {
+        // QComboBox's popup container filters viewport mouse events and closes
+        // the popup / selects the hovered row on release. Installing this
+        // filter on every show keeps it ahead of the container's, so clicks on
+        // the checkbox or palette controls can be consumed before the combo
+        // reacts to them.
+        viewport()->removeEventFilter(this);
+        viewport()->installEventFilter(this);
+        QListView::showEvent(event);
+    }
+
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (watched != viewport()) {
+            return QListView::eventFilter(watched, event);
+        }
+
+        switch (event->type()) {
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonDblClick: {
+            const auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() != Qt::LeftButton) {
+                break;
+            }
+            const QModelIndex index = indexAt(mouse->pos());
+            const SegmentFolderControl control =
+                index.isValid() ? segmentFolderControlAt(visualRect(index), mouse->pos())
+                                : SegmentFolderControl::None;
+            if (control != SegmentFolderControl::None) {
+                _pressedIndex = QPersistentModelIndex(index);
+                _pressedControl = control;
+                return true;
+            }
+            break;
+        }
+        case QEvent::MouseButtonRelease: {
+            const auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() != Qt::LeftButton || !_pressedIndex.isValid()) {
+                break;
+            }
+            const QModelIndex index = indexAt(mouse->pos());
+            const SegmentFolderControl control =
+                index == QModelIndex(_pressedIndex)
+                    ? segmentFolderControlAt(visualRect(index), mouse->pos())
+                    : SegmentFolderControl::None;
+            const QModelIndex pressed(_pressedIndex);
+            const bool activate = control == _pressedControl;
+            _pressedIndex = QPersistentModelIndex();
+            _pressedControl = SegmentFolderControl::None;
+            if (activate) {
+                activateControl(pressed, control);
+            }
+            // Swallow the release even on a cancelled press so the combo
+            // neither switches rows nor closes the popup.
+            return true;
+        }
+        default:
+            break;
+        }
+        return QListView::eventFilter(watched, event);
+    }
+
+private:
+    void activateControl(const QModelIndex& index, SegmentFolderControl control)
+    {
+        if (!index.isValid()) {
+            return;
+        }
+
+        if (control == SegmentFolderControl::CheckBox) {
+            if (QAbstractItemModel* itemModel = model()) {
+                const bool checked = index.data(Qt::CheckStateRole).toInt() == Qt::Checked;
+                itemModel->setData(index, checked ? Qt::Unchecked : Qt::Checked, Qt::CheckStateRole);
+            }
+            return;
+        }
+
+        if (control == SegmentFolderControl::Palette && _paletteCallback) {
+            // Defer so the menu's nested event loop does not run inside this
+            // event filter while the popup is still dispatching the release.
+            const int row = index.row();
+            QTimer::singleShot(0, this, [this, row]() { _paletteCallback(row); });
+        }
+    }
+
+    PaletteCallback _paletteCallback;
+    QPersistentModelIndex _pressedIndex;
+    SegmentFolderControl _pressedControl{SegmentFolderControl::None};
+};
+
+bool finiteVec3(const cv::Vec3f& p)
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+std::optional<cv::Vec3f> transformPoint(const cv::Vec3f& point, const cv::Matx44d& matrix)
+{
+    cv::Vec3d transformed;
+    if (!vc::core::util::applyAffineTransform(cv::Vec3d(point), matrix, transformed)) {
+        return std::nullopt;
+    }
+    const cv::Vec3f out(static_cast<float>(transformed[0]),
+                        static_cast<float>(transformed[1]),
+                        static_cast<float>(transformed[2]));
+    return finiteVec3(out) ? std::optional<cv::Vec3f>(out) : std::nullopt;
+}
+
+cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return point;
+    }
+    const auto [w, h, d] = volume->shapeXyz();
+    point[0] = std::clamp(point[0], 0.0f, static_cast<float>(std::max(1, w) - 1));
+    point[1] = std::clamp(point[1], 0.0f, static_cast<float>(std::max(1, h) - 1));
+    point[2] = std::clamp(point[2], 0.0f, static_cast<float>(std::max(1, d) - 1));
+    return point;
+}
+
+std::filesystem::path openDataCatalogManifestCachePath()
+{
+    QString base = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    if (base.isEmpty()) {
+        base = QDir::home().filePath(QStringLiteral(".VC3D"));
+    }
+    return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
+}
+
+std::optional<double> relativeAffineDistanceScale(const cv::Matx44d& matrix)
+{
+    cv::Mat linear(3, 3, CV_64F);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            linear.at<double>(row, col) = matrix(row, col);
+        }
+    }
+
+    cv::SVD svd(linear, cv::SVD::NO_UV);
+    if (svd.w.rows < 3) {
+        return std::nullopt;
+    }
+    const double s0 = svd.w.at<double>(0, 0);
+    const double s1 = svd.w.at<double>(1, 0);
+    const double s2 = svd.w.at<double>(2, 0);
+    if (!(std::isfinite(s0) && std::isfinite(s1) && std::isfinite(s2)) ||
+        s0 <= 0.0 || s1 <= 0.0 || s2 <= 0.0) {
+        return std::nullopt;
+    }
+
+    const double mean = (s0 + s1 + s2) / 3.0;
+    const double maxDeviation =
+        std::max({std::abs(s0 - mean), std::abs(s1 - mean), std::abs(s2 - mean)});
+    const double relativeDeviation = maxDeviation / mean;
+    if (!std::isfinite(relativeDeviation) || relativeDeviation > 0.02) {
+        return std::nullopt;
+    }
+    return mean;
+}
 
 QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
 {
@@ -174,6 +649,133 @@ QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
         return QString::number(value, 'f', 2);
     };
     return QStringLiteral("%1 x %2 vx").arg(formatValue(size.width), formatValue(size.height));
+}
+
+QString openDataCatalogVolumeIdForLoadedVolume(const VolumePkg& pkg, const std::string& loadedVolumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-volume-id:";
+    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
+        if (tag.rfind(prefix, 0) == 0) {
+            return QString::fromStdString(tag.substr(prefix.size()));
+        }
+    }
+    return {};
+}
+
+bool isOpenDataSegmentsEntry(const vc::project::Entry& entry)
+{
+    if (std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end()) {
+        return true;
+    }
+    return std::any_of(entry.tags.begin(), entry.tags.end(), [](const std::string& tag) {
+        constexpr std::string_view sourcePrefix = "vc-open-data-source-volume-id:";
+        constexpr std::string_view targetPrefix = "vc-open-data-target-volume-id:";
+        return tag.rfind(sourcePrefix, 0) == 0 || tag.rfind(targetPrefix, 0) == 0;
+    });
+}
+
+bool isAvailableOpenDataSegmentsEntry(const VolumePkg& pkg,
+                                      const vc::project::Entry& entry)
+{
+    if (!isOpenDataSegmentsEntry(entry)) {
+        return false;
+    }
+    if (vc::project::isLocationRemote(entry.location)) {
+        return true;
+    }
+
+    std::error_code ec;
+    const auto path = vc::project::resolveLocalPath(
+        entry.location,
+        pkg.path().parent_path());
+    if (!std::filesystem::is_directory(path, ec) || ec) {
+        return false;
+    }
+    return vc::project::validateLocation(
+        vc::project::Category::Segments,
+        path.string()).empty();
+}
+
+std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
+                                                       const std::string& loadedVolumeId)
+{
+    std::vector<QString> candidates;
+    constexpr std::string_view prefix = "vc-open-data-volume-id:";
+
+    auto addCandidate = [&candidates](QString candidate) {
+        if (candidate.isEmpty()) {
+            return;
+        }
+        if (std::find(candidates.begin(), candidates.end(), candidate) == candidates.end()) {
+            candidates.push_back(std::move(candidate));
+        }
+    };
+
+    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
+        if (tag.rfind(prefix, 0) == 0) {
+            addCandidate(QString::fromStdString(tag.substr(prefix.size())));
+        }
+    }
+    addCandidate(QString::fromStdString(loadedVolumeId));
+
+    return candidates;
+}
+
+const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pkg,
+                                                             const QString& catalogVolumeId)
+{
+    if (catalogVolumeId.isEmpty()) {
+        return nullptr;
+    }
+
+    const std::string targetTag = "vc-open-data-target-volume-id:" + catalogVolumeId.toStdString();
+    const std::string sourceTag = "vc-open-data-source-volume-id:" + catalogVolumeId.toStdString();
+    const vc::project::Entry* sourceMatch = nullptr;
+
+    for (const auto& entry : pkg.segmentEntries()) {
+        if (!isAvailableOpenDataSegmentsEntry(pkg, entry)) {
+            continue;
+        }
+        if (std::find(entry.tags.begin(), entry.tags.end(), targetTag) != entry.tags.end()) {
+            return &entry;
+        }
+        if (!sourceMatch &&
+            std::find(entry.tags.begin(), entry.tags.end(), sourceTag) != entry.tags.end()) {
+            sourceMatch = &entry;
+        }
+    }
+
+    return sourceMatch;
+}
+
+const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumePkg& pkg,
+                                                                   const std::string& loadedVolumeId,
+                                                                   QString* matchedCatalogVolumeId = nullptr)
+{
+    for (const QString& candidate : openDataCatalogVolumeIdCandidates(pkg, loadedVolumeId)) {
+        if (const auto* entry = findOpenDataSegmentsEntryForVolume(pkg, candidate)) {
+            if (matchedCatalogVolumeId) {
+                *matchedCatalogVolumeId = candidate;
+            }
+            return entry;
+        }
+    }
+    return nullptr;
+}
+
+bool packageHasOpenDataSegments(const VolumePkg& pkg)
+{
+    for (const auto& entry : pkg.segmentEntries()) {
+        if (isAvailableOpenDataSegmentsEntry(pkg, entry)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool volumeHasOpenDataSegmentsEntry(const VolumePkg& pkg, const std::string& loadedVolumeId)
+{
+    return findOpenDataSegmentsEntryForLoadedVolume(pkg, loadedVolumeId) != nullptr;
 }
 
 class DockMenuMainWindow : public QMainWindow
@@ -204,6 +806,557 @@ protected:
 private:
     DockMenuBuilder _dockMenuBuilder;
 };
+
+class ViewerSplitGrid : public QWidget
+{
+public:
+    explicit ViewerSplitGrid(QWidget* parent = nullptr)
+        : QWidget(parent)
+    {
+        setContentsMargins(0, 0, 0, 0);
+        _topColumnHandle = makeHandle(Qt::SplitHCursor);
+        _bottomColumnHandle = makeHandle(Qt::SplitHCursor);
+        _leftRowHandle = makeHandle(Qt::SplitVCursor);
+        _rightRowHandle = makeHandle(Qt::SplitVCursor);
+        _centerHandle = makeHandle(Qt::SizeAllCursor);
+    }
+
+    void setViewer(int index, QWidget* widget)
+    {
+        if (index < 0 || index >= 4) {
+            return;
+        }
+        if (_viewers[index] && _viewers[index] != widget) {
+            _viewers[index]->hide();
+        }
+        if (widget) {
+            for (int i = 0; i < 4; ++i) {
+                if (i != index && _viewers[i] == widget) {
+                    _viewers[i] = nullptr;
+                }
+            }
+            widget->setParent(this);
+            widget->setVisible(!_hidden[index]);
+        }
+        _viewers[index] = widget;
+        layoutChildren();
+    }
+
+    QWidget* viewer(int index) const
+    {
+        return index >= 0 && index < 4 ? _viewers[index] : nullptr;
+    }
+
+    int indexOf(QWidget* widget) const
+    {
+        if (!widget) {
+            return -1;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (_viewers[i] == widget) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    void swapViewers(int first, int second)
+    {
+        if (first < 0 || first >= 4 || second < 0 || second >= 4 || first == second) {
+            return;
+        }
+        std::swap(_viewers[first], _viewers[second]);
+        layoutChildren();
+    }
+
+    void setPaneHidden(int index, bool hidden)
+    {
+        if (index < 0 || index >= 4) {
+            return;
+        }
+        if (hidden && visiblePaneCount() <= 1 && !_hidden[index]) {
+            return;
+        }
+        _hidden[index] = hidden;
+        if (_viewers[index]) {
+            _viewers[index]->setVisible(!hidden);
+        }
+        layoutChildren();
+        notifySplitChanged();
+    }
+
+    bool paneHidden(int index) const
+    {
+        return index >= 0 && index < 4 ? _hidden[index] : false;
+    }
+
+    bool fullSizeActive() const
+    {
+        return _fullSizePane >= 0;
+    }
+
+    bool fullSizeActiveForPane(int index) const
+    {
+        return _fullSizePane == index;
+    }
+
+    void setFullSizePane(int index)
+    {
+        if (index < 0 || index >= 4 || !_viewers[index]) {
+            return;
+        }
+
+        if (_fullSizePane < 0) {
+            _savedFullSizeHidden = _hidden;
+            _savedFullSizeSplitX = _splitX;
+            _savedFullSizeSplitY = _splitY;
+        }
+
+        _fullSizePane = index;
+        for (int pane = 0; pane < 4; ++pane) {
+            _hidden[pane] = pane != index;
+        }
+        applyVisibility();
+        layoutChildren();
+    }
+
+    void exitFullSize()
+    {
+        if (_fullSizePane < 0) {
+            return;
+        }
+
+        _hidden = _savedFullSizeHidden;
+        _splitX = _savedFullSizeSplitX;
+        _splitY = _savedFullSizeSplitY;
+        _fullSizePane = -1;
+        applyVisibility();
+        layoutChildren();
+    }
+
+    void resetSplits()
+    {
+        _fullSizePane = -1;
+        _splitX = 0.5;
+        _splitY = 0.5;
+        layoutChildren();
+        notifySplitChanged();
+    }
+
+    void setSplits(double splitX, double splitY)
+    {
+        _splitX = std::clamp(splitX, 0.1, 0.9);
+        _splitY = std::clamp(splitY, 0.1, 0.9);
+        layoutChildren();
+    }
+
+    double splitX() const { return _splitX; }
+    double splitY() const { return _splitY; }
+
+    std::function<void()> onSplitChanged;
+
+protected:
+    void resizeEvent(QResizeEvent*) override
+    {
+        layoutChildren();
+    }
+
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        auto handle = handleKind(watched);
+        if (handle == HandleKind::None) {
+            return QWidget::eventFilter(watched, event);
+        }
+
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() != Qt::LeftButton) {
+                return false;
+            }
+            _dragging = handle;
+            _dragStartGlobal = mouse->globalPosition().toPoint();
+            _dragStartSplitX = splitXPx();
+            _dragStartSplitY = splitYPx();
+            event->accept();
+            return true;
+        }
+
+        if (event->type() == QEvent::MouseMove && _dragging != HandleKind::None) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            const QPoint delta = mouse->globalPosition().toPoint() - _dragStartGlobal;
+            const int widthPx = std::max(1, width());
+            const int heightPx = std::max(1, height());
+            if (_dragging == HandleKind::Column || _dragging == HandleKind::Both) {
+                _splitX = static_cast<double>(clampSplitPx(_dragStartSplitX + delta.x(), widthPx)) / widthPx;
+            }
+            if (_dragging == HandleKind::Row || _dragging == HandleKind::Both) {
+                _splitY = static_cast<double>(clampSplitPx(_dragStartSplitY + delta.y(), heightPx)) / heightPx;
+            }
+            layoutChildren();
+            notifySplitChanged();
+            event->accept();
+            return true;
+        }
+
+        if (event->type() == QEvent::MouseButtonRelease && _dragging != HandleKind::None) {
+            _dragging = HandleKind::None;
+            notifySplitChanged();
+            event->accept();
+            return true;
+        }
+
+        return QWidget::eventFilter(watched, event);
+    }
+
+private:
+    enum class HandleKind {
+        None,
+        Column,
+        Row,
+        Both,
+    };
+
+    QFrame* makeHandle(Qt::CursorShape cursor)
+    {
+        auto* handle = new QFrame(this);
+        handle->setFrameShape(QFrame::NoFrame);
+        handle->setCursor(cursor);
+        handle->setAutoFillBackground(true);
+        handle->setStyleSheet(QStringLiteral("background: rgba(80, 80, 80, 96);"));
+        handle->installEventFilter(this);
+        handle->show();
+        return handle;
+    }
+
+    HandleKind handleKind(QObject* object) const
+    {
+        if (object == _topColumnHandle || object == _bottomColumnHandle) {
+            return HandleKind::Column;
+        }
+        if (object == _leftRowHandle || object == _rightRowHandle) {
+            return HandleKind::Row;
+        }
+        if (object == _centerHandle) {
+            return HandleKind::Both;
+        }
+        return HandleKind::None;
+    }
+
+    int splitXPx() const
+    {
+        return clampSplitPx(static_cast<int>(std::lround(_splitX * width())), width());
+    }
+
+    int splitYPx() const
+    {
+        return clampSplitPx(static_cast<int>(std::lround(_splitY * height())), height());
+    }
+
+    int clampSplitPx(int value, int extent) const
+    {
+        const int halfHandle = handleWidth() / 2;
+        const int minValue = std::min(std::max(_minPanePx + halfHandle, halfHandle), extent / 2);
+        const int maxValue = std::max(minValue, extent - minValue);
+        return std::clamp(value, minValue, maxValue);
+    }
+
+    int handleWidth() const
+    {
+        return 5;
+    }
+
+    void layoutChildren()
+    {
+        const int w = width();
+        const int h = height();
+        if (w <= 0 || h <= 0) {
+            return;
+        }
+
+        const int handle = handleWidth();
+        const int half = handle / 2;
+        const int splitX = splitXPx();
+        const int splitY = splitYPx();
+
+        const bool leftVisible = paneVisible(0) || paneVisible(2);
+        const bool rightVisible = paneVisible(1) || paneVisible(3);
+        const int leftX = 0;
+        const int rightX = leftVisible ? splitX : 0;
+        const int leftW = rightVisible ? splitX : w;
+        const int rightW = leftVisible ? w - splitX : w;
+
+        layoutColumn(0, 2, QRect(leftX, 0, leftW, h), splitY);
+        layoutColumn(1, 3, QRect(rightX, 0, rightW, h), splitY);
+
+        const bool topLeft = paneVisible(0);
+        const bool bottomLeft = paneVisible(2);
+        const bool topRight = paneVisible(1);
+        const bool bottomRight = paneVisible(3);
+        _topColumnHandle->setVisible(leftVisible && rightVisible && (topLeft || topRight));
+        _bottomColumnHandle->setVisible(leftVisible && rightVisible && (bottomLeft || bottomRight));
+        _leftRowHandle->setVisible(topLeft && bottomLeft);
+        _rightRowHandle->setVisible(topRight && bottomRight);
+        _centerHandle->setVisible(leftVisible && rightVisible &&
+                                  (topLeft || topRight) &&
+                                  (bottomLeft || bottomRight));
+
+        _topColumnHandle->setGeometry(splitX - half, 0, handle, splitY);
+        _bottomColumnHandle->setGeometry(splitX - half, splitY, handle, h - splitY);
+        _leftRowHandle->setGeometry(0, splitY - half, splitX, handle);
+        _rightRowHandle->setGeometry(splitX, splitY - half, w - splitX, handle);
+        _centerHandle->setGeometry(splitX - half, splitY - half, handle, handle);
+
+        for (auto* handleWidget : {_topColumnHandle,
+                                   _bottomColumnHandle,
+                                   _leftRowHandle,
+                                   _rightRowHandle,
+                                   _centerHandle}) {
+            handleWidget->raise();
+        }
+    }
+
+    void layoutColumn(int topIndex, int bottomIndex, const QRect& columnRect, int splitY)
+    {
+        const bool topVisible = paneVisible(topIndex);
+        const bool bottomVisible = paneVisible(bottomIndex);
+        if (topVisible && bottomVisible) {
+            setViewerGeometry(topIndex, QRect(columnRect.x(), 0, columnRect.width(), splitY));
+            setViewerGeometry(bottomIndex, QRect(columnRect.x(), splitY, columnRect.width(), height() - splitY));
+        } else if (topVisible) {
+            setViewerGeometry(topIndex, columnRect);
+        } else if (bottomVisible) {
+            setViewerGeometry(bottomIndex, columnRect);
+        }
+        if (_viewers[topIndex]) {
+            _viewers[topIndex]->setVisible(topVisible);
+        }
+        if (_viewers[bottomIndex]) {
+            _viewers[bottomIndex]->setVisible(bottomVisible);
+        }
+    }
+
+    void applyVisibility()
+    {
+        for (int i = 0; i < 4; ++i) {
+            if (_viewers[i]) {
+                _viewers[i]->setVisible(!_hidden[i]);
+            }
+        }
+    }
+
+    void setViewerGeometry(int index, const QRect& rect)
+    {
+        if (index < 0 || index >= 4 || !_viewers[index]) {
+            return;
+        }
+        _viewers[index]->setGeometry(rect.normalized());
+    }
+
+    bool paneVisible(int index) const
+    {
+        return index >= 0 && index < 4 && _viewers[index] && !_hidden[index];
+    }
+
+    int visiblePaneCount() const
+    {
+        int count = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (paneVisible(i)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    void notifySplitChanged()
+    {
+        if (onSplitChanged) {
+            onSplitChanged();
+        }
+    }
+
+    QWidget* _viewers[4] = {};
+    std::array<bool, 4> _hidden{};
+    std::array<bool, 4> _savedFullSizeHidden{};
+    QFrame* _topColumnHandle = nullptr;
+    QFrame* _bottomColumnHandle = nullptr;
+    QFrame* _leftRowHandle = nullptr;
+    QFrame* _rightRowHandle = nullptr;
+    QFrame* _centerHandle = nullptr;
+    double _splitX = 0.5;
+    double _splitY = 0.5;
+    double _savedFullSizeSplitX = 0.5;
+    double _savedFullSizeSplitY = 0.5;
+    int _fullSizePane = -1;
+    static constexpr int _minPanePx = 80;
+    HandleKind _dragging = HandleKind::None;
+    QPoint _dragStartGlobal;
+    int _dragStartSplitX = 0;
+    int _dragStartSplitY = 0;
+};
+
+struct MainViewerSpec {
+    std::string surfaceName;
+    QString title;
+    std::set<std::string> intersects;
+};
+
+const std::array<const char*, 4> kDefaultMainViewerSurfaces{
+    "segmentation",
+    "xy plane",
+    "seg xz",
+    "seg yz",
+};
+
+const std::array<bool, 4> kDefaultMainViewerHidden{
+    false,
+    false,
+    true,
+    false,
+};
+
+const std::array<const char*, 4> kMainViewerPaneLabels{
+    "Top left",
+    "Top right",
+    "Bottom left",
+    "Bottom right",
+};
+
+std::optional<MainViewerSpec> mainViewerSpecForSurface(const std::string& surfaceName)
+{
+    if (surfaceName == "segmentation") {
+        return MainViewerSpec{surfaceName, QObject::tr("Surface"), {"seg xz", "seg yz"}};
+    }
+    if (surfaceName == "xy plane") {
+        return MainViewerSpec{surfaceName, QObject::tr("XY"), {"segmentation"}};
+    }
+    if (surfaceName == "seg xz") {
+        return MainViewerSpec{surfaceName, QObject::tr("XZ"), {"segmentation"}};
+    }
+    if (surfaceName == "seg yz") {
+        return MainViewerSpec{surfaceName, QObject::tr("YZ"), {"segmentation"}};
+    }
+    return std::nullopt;
+}
+
+QString mainViewerDisplayName(const std::string& surfaceName)
+{
+    if (surfaceName == "segmentation") {
+        return QObject::tr("Surface");
+    }
+    if (surfaceName == "xy plane") {
+        return QObject::tr("XY");
+    }
+    if (surfaceName == "seg xz") {
+        return QObject::tr("XZ");
+    }
+    if (surfaceName == "seg yz") {
+        return QObject::tr("YZ");
+    }
+    return QString::fromStdString(surfaceName);
+}
+
+std::array<std::string, 4> readMainViewerSurfaceLayout()
+{
+    std::array<std::string, 4> layout{};
+    for (int i = 0; i < 4; ++i) {
+        layout[i] = kDefaultMainViewerSurfaces[i];
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QStringList saved = settings.value(MAIN_VIEWER_LAYOUT_SURFACES_SETTING).toStringList();
+    if (saved.size() != 4) {
+        return layout;
+    }
+
+    std::set<std::string> seen;
+    std::array<std::string, 4> candidate{};
+    for (int i = 0; i < 4; ++i) {
+        const std::string name = saved[i].toStdString();
+        if (!mainViewerSpecForSurface(name) || !seen.insert(name).second) {
+            return layout;
+        }
+        candidate[i] = name;
+    }
+    return candidate;
+}
+
+std::array<bool, 4> readMainViewerHiddenLayout()
+{
+    std::array<bool, 4> hidden = kDefaultMainViewerHidden;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QStringList saved = settings.value(MAIN_VIEWER_LAYOUT_HIDDEN_SETTING).toStringList();
+    if (saved.size() != 4) {
+        return hidden;
+    }
+
+    int visibleCount = 0;
+    for (int i = 0; i < 4; ++i) {
+        hidden[i] = saved[i].toInt() != 0;
+        if (!hidden[i]) {
+            ++visibleCount;
+        }
+    }
+    if (visibleCount == 0) {
+        hidden[0] = false;
+    }
+    return hidden;
+}
+
+void persistMainViewerLayout(ViewerSplitGrid* grid)
+{
+    if (!grid) {
+        return;
+    }
+
+    QStringList surfaces;
+    QStringList hidden;
+    for (int i = 0; i < 4; ++i) {
+        std::string surfaceName = kDefaultMainViewerSurfaces[i];
+        if (auto* viewer = baseViewerFromWidget(grid->viewer(i))) {
+            surfaceName = viewer->surfName();
+        }
+        surfaces.push_back(QString::fromStdString(surfaceName));
+        hidden.push_back(grid->paneHidden(i) ? QStringLiteral("1") : QStringLiteral("0"));
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(MAIN_VIEWER_LAYOUT_SURFACES_SETTING, surfaces);
+    settings.setValue(MAIN_VIEWER_LAYOUT_HIDDEN_SETTING, hidden);
+}
+
+ViewerSplitGrid* mainViewerSplitGrid(QWidget* parent)
+{
+    auto* widget = parent
+        ? parent->findChild<QWidget*>(QStringLiteral("mainViewerSplitGrid"))
+        : nullptr;
+    return dynamic_cast<ViewerSplitGrid*>(widget);
+}
+
+void applyMainViewerLayout(ViewerSplitGrid* grid, ViewerManager* manager)
+{
+    if (!grid || !manager) {
+        return;
+    }
+
+    const auto surfaces = readMainViewerSurfaceLayout();
+    const auto hidden = readMainViewerHiddenLayout();
+    for (int pane = 0; pane < 4; ++pane) {
+        QWidget* widget = nullptr;
+        for (auto* viewer : manager->baseViewers()) {
+            if (!viewer || viewer->surfName() != surfaces[pane]) {
+                continue;
+            }
+            widget = qobject_cast<QWidget*>(viewer->asQObject());
+            if (widget && widget->parentWidget() == grid) {
+                break;
+            }
+            widget = nullptr;
+        }
+        grid->setViewer(pane, widget);
+        grid->setPaneHidden(pane, hidden[pane]);
+    }
+}
 
 QString atlasSearchIdListString(const std::vector<uint64_t>& ids)
 {
@@ -1129,6 +2282,7 @@ void ensureDockWidgetFeatures(QDockWidget* dock)
 }
 
 QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
+                                        const std::string& loadedVolumeId,
                                         QString* checkedPath)
 {
     if (checkedPath) {
@@ -1145,10 +2299,64 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         qCInfo(lcSegGrowth) << "Normal grid lookup: no normal_grids entries in project";
         return QString();
     }
-    const QString candidateStr = QString::fromStdString(paths.front().string());
-    if (checkedPath) *checkedPath = candidateStr;
-    qCInfo(lcSegGrowth) << "Normal grid resolved to" << candidateStr;
-    return candidateStr;
+
+    // Entries tagged with an open-data volume id only apply to that volume;
+    // untagged entries keep the legacy behavior of applying to everything.
+    const auto catalogIds =
+        openDataCatalogVolumeIdCandidates(*pkg, loadedVolumeId);
+    constexpr std::string_view volumeIdTagPrefix = "vc-open-data-volume-id:";
+
+    QString untaggedFallback;
+    for (const auto& path : paths) {
+        const auto pathStr = path.string();
+        const vc::project::Entry* owningEntry = nullptr;
+        for (const auto& entry : pkg->normalGridEntries()) {
+            if (pathStr == entry.location ||
+                pathStr.rfind(entry.location + "/", 0) == 0) {
+                owningEntry = &entry;
+                break;
+            }
+        }
+
+        std::vector<QString> entryVolumeIds;
+        if (owningEntry) {
+            for (const auto& tag : owningEntry->tags) {
+                if (tag.rfind(volumeIdTagPrefix, 0) == 0) {
+                    entryVolumeIds.push_back(
+                        QString::fromStdString(tag.substr(volumeIdTagPrefix.size())));
+                }
+            }
+        }
+
+        const QString candidateStr = QString::fromStdString(pathStr);
+        if (entryVolumeIds.empty()) {
+            if (untaggedFallback.isEmpty()) {
+                untaggedFallback = candidateStr;
+            }
+            continue;
+        }
+        const bool matchesVolume = std::any_of(
+            entryVolumeIds.begin(), entryVolumeIds.end(), [&](const QString& id) {
+                return std::find(catalogIds.begin(), catalogIds.end(), id) !=
+                       catalogIds.end();
+            });
+        if (matchesVolume) {
+            if (checkedPath) *checkedPath = candidateStr;
+            qCInfo(lcSegGrowth) << "Normal grid resolved to" << candidateStr
+                                << "for volume" << QString::fromStdString(loadedVolumeId);
+            return candidateStr;
+        }
+    }
+
+    if (!untaggedFallback.isEmpty()) {
+        if (checkedPath) *checkedPath = untaggedFallback;
+        qCInfo(lcSegGrowth) << "Normal grid resolved to" << untaggedFallback;
+        return untaggedFallback;
+    }
+
+    qCInfo(lcSegGrowth) << "Normal grid lookup: no store paired with volume"
+                        << QString::fromStdString(loadedVolumeId);
+    return QString();
 }
 
 QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
@@ -1558,7 +2766,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _segmentWorkspaceWindow = segmentWorkspaceWindow;
     _segmentWorkspaceWindow->setObjectName(QStringLiteral("segmentWorkspaceWindow"));
     _segmentWorkspaceWindow->setDockOptions(dockOptions());
-    _segmentWorkspaceWindow->setCentralWidget(segmentCentralWidget);
+    _statusDockPanelHost = new StatusDockPanelHost(segmentCentralWidget, _segmentWorkspaceWindow);
+    _segmentWorkspaceWindow->setCentralWidget(_statusDockPanelHost);
 
     auto moveExistingDockToSegment = [this](QDockWidget* dock, Qt::DockWidgetArea area) {
         if (!dock || !_segmentWorkspaceWindow) {
@@ -1571,13 +2780,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     moveExistingDockToSegment(ui.dockWidgetSegmentation, Qt::RightDockWidgetArea);
     moveExistingDockToSegment(ui.dockWidgetDistanceTransform, Qt::RightDockWidgetArea);
     moveExistingDockToSegment(ui.dockWidgetViewerControls, Qt::LeftDockWidgetArea);
-    for (QDockWidget* dock : {ui.dockWidgetPreprocessing,
-                              ui.dockWidgetNormalVis,
+    for (QDockWidget* dock : {ui.dockWidgetNormalVis,
                               ui.dockWidgetView,
                               ui.dockWidgetOverlay,
                               ui.dockWidgetRenderSettings,
-                              ui.dockWidgetComposite,
-                              ui.dockWidgetPostprocessing}) {
+                              ui.dockWidgetComposite}) {
         moveExistingDockToSegment(dock, Qt::LeftDockWidgetArea);
     }
 
@@ -1598,13 +2805,28 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
+    _workspaceTabs->setTabsClosable(true);
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
     _workspaceTabs->addTab(_atlasWorkspaceWindow, tr("Atlas"));
     _workspaceTabs->addTab(_fiberSliceWorkspaceWindow, tr("Fiber Slice"));
     _workspaceTabs->addTab(_intersectionsWorkspaceWindow, tr("Intersections"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) {
+        for (int i = 0; i < _workspaceTabs->count(); ++i) {
+            tabBar->setTabButton(i, QTabBar::RightSide, nullptr);
+        }
+    }
     setCentralWidget(_workspaceTabs);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
+        if (!_workspaceTabs) {
+            return;
+        }
+        auto* dialog = qobject_cast<LineAnnotationDialog*>(_workspaceTabs->widget(index));
+        if (dialog) {
+            dialog->close();
+        }
+    });
     auto* lasagnaEscapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), _lasagnaWorkspaceWindow);
     lasagnaEscapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(lasagnaEscapeShortcut, &QShortcut::activated, this, &CWindow::switchToMainWorkspace);
@@ -1669,6 +2891,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this,
             &CWindow::displayAtlasFromDirectory);
     connect(_lineAnnotationController.get(),
+            &LineAnnotationController::lineAnnotationWorkspaceRequested,
+            this,
+            &CWindow::openLineAnnotationWorkspace);
+    connect(_lineAnnotationController.get(),
             &LineAnnotationController::fiberSaved,
             this,
             [this](uint64_t fiberId, uint64_t) {
@@ -1693,12 +2919,18 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
-    // Slice step size label in status bar
+    _sharedCacheStatsLabel = new QLabel(this);
+    _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
+    _sharedCacheStatsLabel->setMinimumWidth(320);
+    _sharedCacheStatsLabel->setText(tr("RAM --  disk --  network --"));
+    statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
+
+    // Z-scroll sensitivity label in status bar
     _sliceStepLabel = new QLabel(this);
     _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
-    int initialStepSize = _viewerManager->sliceStepSize();
-    _sliceStepLabel->setText(tr("Step: %1").arg(initialStepSize));
-    _sliceStepLabel->setToolTip(tr("Slice step size: use Shift+G / Shift+H to adjust"));
+    double initialSensitivity = _viewerManager->zScrollSensitivity();
+    _sliceStepLabel->setText(tr("Z sens: %1").arg(initialSensitivity, 0, 'f', 1));
+    _sliceStepLabel->setToolTip(tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sliceStepLabel);
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
@@ -1715,6 +2947,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _vectorOverlay = std::make_unique<VectorOverlayController>(_state, this);
     _viewerManager->setVectorOverlay(_vectorOverlay.get());
+
+    _inkDetectionOverlay = std::make_unique<InkDetectionOverlayController>(_state, this);
+    _viewerManager->setInkDetectionOverlay(_inkDetectionOverlay.get());
 
     _atlasControlOverlay = std::make_unique<AtlasControlPointsOverlayController>(this);
     _atlasControlOverlay->bindToViewerManager(_viewerManager.get());
@@ -1737,10 +2972,40 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_volumeOverlay.get(), &VolumeOverlayController::requestStatusMessage, this,
             [this](const QString& message, int timeout) {
                 if (statusBar()) {
-                    statusBar()->showMessage(message, timeout);
+                    showStatusBarMessage(message, timeout);
                 }
             });
     _viewerManager->setVolumeOverlay(_volumeOverlay.get());
+
+    if (_statusDockPanelHost) {
+        if (auto* statusDockBar = _statusDockPanelHost->takeBarWidget()) {
+            statusDockBar->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+            statusBar()->insertWidget(0, statusDockBar, 0);
+        }
+    }
+
+    _statusMessageLabel = new QLabel(this);
+    _statusMessageLabel->setObjectName(QStringLiteral("statusMessageLabel"));
+    _statusMessageLabel->setContentsMargins(8, 0, 8, 0);
+    _statusMessageLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _statusMessageLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    _statusMessageLabel->setMinimumWidth(160);
+    _statusMessageLabel->setWordWrap(false);
+    statusBar()->addWidget(_statusMessageLabel, 1);
+
+    _statusMessageTimer = new QTimer(this);
+    _statusMessageTimer->setSingleShot(true);
+    connect(_statusMessageTimer, &QTimer::timeout, this, &CWindow::clearStatusBarMessage);
+    connect(statusBar(), &QStatusBar::messageChanged, this, [this](const QString& message) {
+        if (_relayingNativeStatusMessage || message.isEmpty()) {
+            return;
+        }
+
+        _relayingNativeStatusMessage = true;
+        showStatusBarMessage(message, 0);
+        statusBar()->clearMessage();
+        _relayingNativeStatusMessage = false;
+    });
 
     // create UI widgets
     CreateWidgets();
@@ -1759,6 +3024,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this, [this]() {
                 _segmentationCommandHandler->onMergePatch(QStringList{});
             });
+    connect(_menuController.get(), &MenuActionController::openDataCatalogVisibilityChanged,
+            this, [this](bool) {
+                updateVolumePackageEmptyState();
+            });
+    connect(ui.btnOpenDataCatalog, &QPushButton::clicked, this, [this]() {
+        if (_menuController) {
+            _menuController->showOpenDataCatalog();
+            updateVolumePackageEmptyState();
+        }
+    });
 
     if (isDarkMode()) {
         applyDarkPalette();
@@ -1874,6 +3149,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                ui.dockWidgetDistanceTransform,
                                _atlasOverviewDock,
                                _atlasSearchDock,
+                               ui.dockWidgetOverlay,
+                               _inkDetectionDock,
+                               _transformsDock,
                                static_cast<QDockWidget*>(_atlasControlDock),
                                _atlasWorkspaceOverviewDock,
                                _atlasWorkspaceSearchDock,
@@ -1904,6 +3182,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                ui.dockWidgetVolumes,
                                ui.dockWidgetViewerControls,
+                               ui.dockWidgetOverlay,
+                               ui.dockWidgetRenderSettings,
+                               _inkDetectionDock,
+                               _transformsDock,
                                _atlasOverviewDock,
                                _atlasSearchDock,
                                static_cast<QDockWidget*>(_atlasControlDock),
@@ -1940,6 +3222,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
+                                   ui.dockWidgetOverlay,
+                                   ui.dockWidgetComposite,
+                                   ui.dockWidgetRenderSettings,
+                                   _inkDetectionDock,
+                                   _transformsDock,
                                    _atlasOverviewDock,
                                    _atlasSearchDock,
                                    static_cast<QDockWidget*>(_atlasControlDock),
@@ -1954,12 +3241,38 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     }
 
+    if (_statusDockPanelHost) {
+        for (QDockWidget* dock : {ui.dockWidgetVolumes,
+                                  ui.dockWidgetViewerControls,
+                                  ui.dockWidgetComposite,
+                                  ui.dockWidgetRenderSettings,
+                                  ui.dockWidgetOverlay,
+                                  _inkDetectionDock,
+                                  _transformsDock,
+                                  ui.dockWidgetSegmentation,
+                                  _lasagnaDock,
+                                  ui.dockWidgetDistanceTransform,
+                                  static_cast<QDockWidget*>(_point_collection_widget),
+                                  static_cast<QDockWidget*>(_wrapAnnotationWidget),
+                                  _atlasOverviewDock,
+                                  _atlasSearchDock,
+                                  static_cast<QDockWidget*>(_atlasControlDock),
+                                  static_cast<QDockWidget*>(_fiberWidget)}) {
+            _statusDockPanelHost->addDock(dock);
+        }
+    }
+
     const QSize minWindowSize(960, 640);
     setMinimumSize(minWindowSize);
     if (width() < minWindowSize.width() || height() < minWindowSize.height()) {
         resize(std::max(width(), minWindowSize.width()),
                std::max(height(), minWindowSize.height()));
     }
+    if (!restoredGeometry) {
+        setWindowState(windowState() | Qt::WindowMaximized);
+    }
+
+    bool scheduledStartupAction = false;
 
     // If enabled, auto open the last used local volume package.
     if (settings.value(vc3d::settings::project::AUTO_OPEN, vc3d::settings::project::AUTO_OPEN_DEFAULT).toInt() != 0) {
@@ -1968,6 +3281,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
         if (!files.empty() && !files.at(0).isEmpty()) {
             QString path = files[0];
+            scheduledStartupAction = true;
             QTimer::singleShot(0, this, [this, path]() {
                 if (_menuController) {
                     _menuController->openVolpkgAt(path);
@@ -1976,12 +3290,23 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     }
 
+    if (!scheduledStartupAction &&
+        settings.value(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
+                       vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT).toBool()) {
+        QTimer::singleShot(0, this, [this]() {
+            if (_menuController && !_state->hasVpkg()) {
+                _menuController->showOpenDataCatalog();
+                updateVolumePackageEmptyState();
+            }
+        });
+    }
+
     // Create application-wide keyboard shortcuts
     fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
-        if (_viewerControlsPanel) {
-            _viewerControlsPanel->toggleSegmentationComposite();
+        if (_viewerCompositePanel) {
+            _viewerCompositePanel->toggleSegmentationComposite();
         }
     });
 
@@ -2019,7 +3344,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 }
             });
         }
-        statusBar()->showMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
+        showStatusBarMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
     });
 
     fAxisAlignedSlicesShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::AxisAlignedSlices), this);
@@ -2037,7 +3362,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (_rawPointsOverlay) {
             bool newEnabled = !_rawPointsOverlay->isEnabled();
             _rawPointsOverlay->setEnabled(newEnabled);
-            statusBar()->showMessage(
+            showStatusBarMessage(
                 newEnabled ? tr("Raw points overlay enabled") : tr("Raw points overlay disabled"),
                 2000);
         }
@@ -2138,7 +3463,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(fApplyApprovedTagShortcut, &QShortcut::activated, [this]() {
         if (_surfacePanel &&
             _surfacePanel->setTagChecked(SurfacePanelController::Tag::Approved, true)) {
-            statusBar()->showMessage(tr("Applied Approved tag"), 2000);
+            showStatusBarMessage(tr("Applied Approved tag"), 2000);
         }
     });
 
@@ -2147,7 +3472,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(fApplyDefectiveTagShortcut, &QShortcut::activated, [this]() {
         if (_surfacePanel &&
             _surfacePanel->setTagChecked(SurfacePanelController::Tag::Defective, true)) {
-            statusBar()->showMessage(tr("Applied Defective tag"), 2000);
+            showStatusBarMessage(tr("Applied Defective tag"), 2000);
         }
     });
 
@@ -2224,32 +3549,41 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
         return;
     }
 
-    auto addDock = [menu](QDockWidget* dock) {
+    auto addDock = [](QMenu* targetMenu, QDockWidget* dock) {
         if (dock) {
-            menu->addAction(dock->toggleViewAction());
+            targetMenu->addAction(dock->toggleViewAction());
         }
     };
 
-    addDock(ui.dockWidgetVolumes);
-    addDock(ui.dockWidgetSegmentation);
-    addDock(ui.dockWidgetDistanceTransform);
-    addDock(ui.dockWidgetViewerControls);
-    addDock(ui.dockWidgetPreprocessing);
-    addDock(ui.dockWidgetNormalVis);
-    addDock(ui.dockWidgetView);
-    addDock(ui.dockWidgetOverlay);
-    addDock(ui.dockWidgetRenderSettings);
-    addDock(ui.dockWidgetComposite);
-    addDock(ui.dockWidgetPostprocessing);
-    addDock(_lasagnaDock);
-    addDock(_atlasOverviewDock);
-    addDock(_atlasSearchDock);
-    addDock(_atlasControlDock);
-    addDock(_atlasWorkspaceFiberDock);
-    addDock(_point_collection_widget);
-    addDock(_wrapAnnotationWidget);
-    addDock(_fiberWidget);
-    addDock(_fiberSliceWidget);
+    addDock(menu, ui.dockWidgetVolumes);
+    addDock(menu, ui.dockWidgetSegmentation);
+    addDock(menu, ui.dockWidgetDistanceTransform);
+    addDock(menu, ui.dockWidgetViewerControls);
+    addDock(menu, ui.dockWidgetNormalVis);
+    addDock(menu, ui.dockWidgetView);
+    addDock(menu, ui.dockWidgetOverlay);
+    addDock(menu, _inkDetectionDock);
+    addDock(menu, _transformsDock);
+    addDock(menu, ui.dockWidgetRenderSettings);
+    addDock(menu, ui.dockWidgetComposite);
+    addDock(menu, _lasagnaDock);
+
+    if (_atlasOverviewDock || _atlasSearchDock || _atlasControlDock || _atlasWorkspaceFiberDock) {
+        auto* atlasMenu = menu->addMenu(tr("Atlas"));
+        addDock(atlasMenu, _atlasOverviewDock);
+        addDock(atlasMenu, _atlasSearchDock);
+        addDock(atlasMenu, _atlasControlDock);
+        addDock(atlasMenu, _atlasWorkspaceFiberDock);
+    }
+
+    addDock(menu, _point_collection_widget);
+    addDock(menu, _wrapAnnotationWidget);
+
+    if (_fiberWidget || _fiberSliceWidget) {
+        auto* fiberMenu = menu->addMenu(tr("Fibers"));
+        addDock(fiberMenu, _fiberWidget);
+        addDock(fiberMenu, _fiberSliceWidget);
+    }
 }
 
 VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
@@ -2269,6 +3603,26 @@ VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString t
     return viewer;
 }
 
+VolumeViewerBase* CWindow::newConnectedViewerInWidget(std::string surfaceName, QString title, QWidget* parent)
+{
+    if (!_viewerManager || !parent) {
+        return nullptr;
+    }
+
+    VolumeViewerBase* viewer = _viewerManager->createViewerInWidget(surfaceName, parent);
+    if (!viewer) {
+        return nullptr;
+    }
+
+    if (auto* viewerObject = viewer->asQObject())
+        viewerObject->setProperty("vc_viewer_label", title);
+
+    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+        configureChunkedViewerConnections(chunkedViewer);
+    }
+    return viewer;
+}
+
 void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 {
     if (!viewer) {
@@ -2279,6 +3633,11 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
     connect(_state, &CState::volumeChanged, viewer, &CChunkedVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
     connect(_state, &CState::volumeClosing, viewer, &CChunkedVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
+    connect(viewer,
+            &CChunkedVolumeViewer::sharedCacheStatsChanged,
+            this,
+            &CWindow::onSharedCacheStatsChanged,
+            Qt::UniqueConnection);
     if (!annotationViewer) {
         connect(viewer, &CChunkedVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
     } else if (!viewer->property("vc_annotation_focus_bound").toBool()) {
@@ -2314,6 +3673,21 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     }
 
     if (auto* graphicsView = viewer->graphicsView()) {
+        if (!viewer->property("vc_active_tracker_bound").toBool()) {
+            auto markActiveViewer = [this, viewer]() {
+                _activeBaseViewer = viewer;
+            };
+            connect(graphicsView, &CVolumeViewerView::sendMousePress, this, markActiveViewer);
+            connect(graphicsView, &CVolumeViewerView::sendMouseDoubleClick, this, markActiveViewer);
+            connect(graphicsView, &CVolumeViewerView::sendZoom, this, markActiveViewer);
+            connect(graphicsView, &CVolumeViewerView::sendCursorMove, this, markActiveViewer);
+            connect(viewer, &QObject::destroyed, this, [this, viewer]() {
+                if (_activeBaseViewer == viewer) {
+                    _activeBaseViewer = nullptr;
+                }
+            });
+            viewer->setProperty("vc_active_tracker_bound", true);
+        }
         if (!viewer->property("vc_annotation_context_bound").toBool()) {
             connect(graphicsView,
                     &CVolumeViewerView::sendAnnotationContextMenuRequested,
@@ -2373,6 +3747,127 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                         }
 
                         QMenu menu(this);
+
+                        QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
+                        newLineAnnotationAction->setEnabled(
+                            _lineAnnotationController &&
+                            _lineAnnotationController->canLaunchFromViewer(viewer) &&
+                            viewer->sampleSceneVolume(scenePoint).has_value());
+
+                        QAction* createGrowPatchAction = menu.addAction(tr("Create Segment (GrowPatch)"));
+                        createGrowPatchAction->setEnabled(validVolumePoint &&
+                                                          _segmentationCommandHandler &&
+                                                          _state &&
+                                                          _state->vpkg() &&
+                                                          _state->currentVolume());
+                        connect(createGrowPatchAction, &QAction::triggered, this,
+                                [this, volumePoint]() {
+                                    if (!_segmentationCommandHandler) {
+                                        return;
+                                    }
+                                    _segmentationCommandHandler->onCreateSegmentGrowPatchFromSeed(
+                                        QVector3D(volumePoint[0], volumePoint[1], volumePoint[2]));
+                                });
+
+                        menu.addSeparator();
+
+                        auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
+                        auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
+                        const int mainViewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
+                        if (viewerGrid && mainViewerPane >= 0) {
+                            const bool fullSizeActive = viewerGrid->fullSizeActive();
+                            QAction* fullSizeAction = menu.addAction(
+                                viewerGrid->fullSizeActiveForPane(mainViewerPane)
+                                    ? tr("Exit full size")
+                                    : tr("Full size viewer"));
+                            connect(fullSizeAction, &QAction::triggered, this,
+                                    [viewerGrid, mainViewerPane]() {
+                                        if (viewerGrid->fullSizeActiveForPane(mainViewerPane)) {
+                                            viewerGrid->exitFullSize();
+                                        } else {
+                                            viewerGrid->setFullSizePane(mainViewerPane);
+                                        }
+                                    });
+
+                            QAction* closeAction = menu.addAction(tr("Close viewer"));
+                            closeAction->setEnabled(!fullSizeActive && !viewerGrid->paneHidden(mainViewerPane));
+                            connect(closeAction, &QAction::triggered, this, [viewerGrid, mainViewerPane]() {
+                                viewerGrid->setPaneHidden(mainViewerPane, true);
+                                persistMainViewerLayout(viewerGrid);
+                            });
+
+                            auto* moveMenu = menu.addMenu(tr("Move viewer to"));
+                            for (int pane = 0; pane < 4; ++pane) {
+                                const QString paneLabel = QObject::tr(kMainViewerPaneLabels[pane]);
+                                QAction* paneAction = moveMenu->addAction(paneLabel);
+                                paneAction->setEnabled(!fullSizeActive && pane != mainViewerPane);
+                                connect(paneAction, &QAction::triggered, this,
+                                        [viewerGrid, mainViewerPane, pane]() {
+                                            const bool targetWasHidden = viewerGrid->paneHidden(pane);
+                                            viewerGrid->swapViewers(mainViewerPane, pane);
+                                            if (targetWasHidden) {
+                                                viewerGrid->setPaneHidden(pane, false);
+                                                viewerGrid->setPaneHidden(mainViewerPane, true);
+                                            }
+                                            persistMainViewerLayout(viewerGrid);
+                                        });
+                            }
+
+                            auto* showMenu = menu.addMenu(tr("Show closed viewer here"));
+                            bool hasClosedViewer = false;
+                            for (int pane = 0; pane < 4; ++pane) {
+                                if (!viewerGrid->paneHidden(pane) || !viewerGrid->viewer(pane)) {
+                                    continue;
+                                }
+                                auto* hiddenViewer = baseViewerFromWidget(viewerGrid->viewer(pane));
+                                const QString label = hiddenViewer
+                                    ? mainViewerDisplayName(hiddenViewer->surfName())
+                                    : QObject::tr(kMainViewerPaneLabels[pane]);
+                                QAction* showAction = showMenu->addAction(label);
+                                hasClosedViewer = true;
+                                connect(showAction, &QAction::triggered, this,
+                                        [viewerGrid, mainViewerPane, pane]() {
+                                            viewerGrid->swapViewers(mainViewerPane, pane);
+                                            viewerGrid->setPaneHidden(mainViewerPane, false);
+                                            viewerGrid->setPaneHidden(pane, true);
+                                            persistMainViewerLayout(viewerGrid);
+                                        });
+                            }
+                            showMenu->setEnabled(!fullSizeActive && hasClosedViewer);
+                            menu.addSeparator();
+                        }
+
+                        QPointer<QMdiSubWindow> subWindow = viewerWidget
+                            ? qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())
+                            : nullptr;
+                        if (subWindow) {
+                            QAction* maximizeAction = menu.addAction(
+                                subWindow->isMaximized() ? tr("Restore viewer") : tr("Maximize viewer"));
+                            connect(maximizeAction, &QAction::triggered, this, [subWindow]() {
+                                if (!subWindow)
+                                    return;
+                                if (subWindow->isMaximized())
+                                    subWindow->showNormal();
+                                else
+                                    subWindow->showMaximized();
+                            });
+
+                            QAction* closeAction = menu.addAction(tr("Close viewer"));
+                            connect(closeAction, &QAction::triggered, this, [subWindow]() {
+                                if (subWindow)
+                                    subWindow->close();
+                            });
+                            menu.addSeparator();
+                        }
+
+                        if (viewer->measurementSupported()) {
+                            QAction* measureAction = menu.addAction(tr("Measure"));
+                            connect(measureAction, &QAction::triggered, this, [viewer]() {
+                                viewer->startMeasurementMode();
+                            });
+                            menu.addSeparator();
+                        }
+
                         auto addLasagnaLaunchAction =
                             [this, lasagnaPanel, &menu, seedX, seedY, seedZ, validVolumePoint,
                              activeSegmentHasLasagnaModel](
@@ -2460,12 +3955,10 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             }
                         }
 
-                        QAction* action = menu.addAction(tr("New line annotation"));
-                        action->setEnabled(_lineAnnotationController &&
-                                           _lineAnnotationController->canLaunchFromViewer(viewer) &&
-                                           viewer->sampleSceneVolume(scenePoint).has_value());
                         QAction* selected = menu.exec(globalPos);
-                        if (selected == action && action->isEnabled() && _lineAnnotationController) {
+                        if (selected == newLineAnnotationAction &&
+                            newLineAnnotationAction->isEnabled() &&
+                            _lineAnnotationController) {
                             _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
                         }
                     });
@@ -2604,6 +4097,15 @@ VolumeViewerBase* CWindow::segmentationBaseViewer() const
 
 VolumeViewerBase* CWindow::activeBaseViewer() const
 {
+    if (_activeBaseViewer) {
+        if (auto* activeObject = _activeBaseViewer->asQObject()) {
+            if (!activeObject->parent()) {
+                return nullptr;
+            }
+        }
+        return _activeBaseViewer;
+    }
+
     if (!mdiArea) {
         return nullptr;
     }
@@ -2612,6 +4114,58 @@ VolumeViewerBase* CWindow::activeBaseViewer() const
         return nullptr;
     }
     return baseViewerFromWidget(subWindow->widget());
+}
+
+void CWindow::resetSegmentationViews(bool persistLayout)
+{
+    auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
+    if (!viewerGrid) {
+        return;
+    }
+
+    auto ensureDefaultViewer = [this, viewerGrid](const std::string& surfaceName,
+                                                  const QString& title,
+                                                  const std::set<std::string>& intersects) -> VolumeViewerBase* {
+        if (_viewerManager) {
+            for (auto* viewer : _viewerManager->baseViewers()) {
+                auto* viewerWidget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+                if (viewer && viewerWidget && viewer->surfName() == surfaceName && viewerWidget->parentWidget() == viewerGrid) {
+                    return viewer;
+                }
+            }
+        }
+
+        auto* viewer = newConnectedViewerInWidget(surfaceName, title, viewerGrid);
+        if (viewer) {
+            viewer->setIntersects(intersects);
+        }
+        return viewer;
+    };
+
+    auto* surfaceViewer = ensureDefaultViewer("segmentation", tr("Surface"), {"seg xz", "seg yz"});
+    auto* xyViewer = ensureDefaultViewer("xy plane", tr("XY"), {"segmentation"});
+    auto* xzViewer = ensureDefaultViewer("seg xz", tr("XZ"), {"segmentation"});
+    auto* yzViewer = ensureDefaultViewer("seg yz", tr("YZ"), {"segmentation"});
+
+    viewerGrid->setViewer(0, surfaceViewer ? qobject_cast<QWidget*>(surfaceViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(1, xyViewer ? qobject_cast<QWidget*>(xyViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(2, xzViewer ? qobject_cast<QWidget*>(xzViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(3, yzViewer ? qobject_cast<QWidget*>(yzViewer->asQObject()) : nullptr);
+
+    for (auto* viewer : {surfaceViewer, xzViewer, xyViewer, yzViewer}) {
+        if (auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr) {
+            widget->show();
+        }
+    }
+
+    viewerGrid->setPaneHidden(0, kDefaultMainViewerHidden[0]);
+    viewerGrid->setPaneHidden(1, kDefaultMainViewerHidden[1]);
+    viewerGrid->setPaneHidden(2, kDefaultMainViewerHidden[2]);
+    viewerGrid->setPaneHidden(3, kDefaultMainViewerHidden[3]);
+    viewerGrid->resetSplits();
+    if (persistLayout) {
+        persistMainViewerLayout(viewerGrid);
+    }
 }
 
 void CWindow::clearSurfaceSelection()
@@ -2641,13 +4195,168 @@ void CWindow::clearSurfaceSelection()
     }
 }
 
+bool CWindow::restoreActiveSurfaceAfterSurfaceReload(const std::string& surfaceId)
+{
+    if (!_state || surfaceId.empty()) {
+        return false;
+    }
+
+    auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(surfaceId));
+    if (!surf && _state->vpkg()) {
+        surf = _state->vpkg()->getSurface(surfaceId);
+    }
+    if (!surf) {
+        return false;
+    }
+
+    std::vector<std::pair<VolumeViewerBase*, bool>> resetDefaults;
+    if (_viewerManager) {
+        _viewerManager->forEachBaseViewer([this, &resetDefaults](VolumeViewerBase* viewer) {
+            if (!viewer || viewer->surfName() != "segmentation") {
+                return;
+            }
+            const bool defaultReset = _viewerManager->resetDefaultFor(viewer);
+            resetDefaults.emplace_back(viewer, defaultReset);
+            viewer->setResetViewOnSurfaceChange(false);
+        });
+    }
+
+    _state->setActiveSurface(surfaceId, surf);
+    _state->setSurface("segmentation", surf, false, true);
+
+    for (auto& entry : resetDefaults) {
+        auto* viewer = entry.first;
+        if (viewer) {
+            viewer->setResetViewOnSurfaceChange(entry.second);
+        }
+    }
+
+    if (_surfacePanel) {
+        _surfacePanel->selectSurfaceById(surfaceId);
+    }
+
+    if (_segmentationModule) {
+        try {
+            _segmentationModule->onActiveSegmentChanged(surf.get());
+        } catch (const std::exception& e) {
+            qWarning() << "Failed to reactivate segment"
+                       << QString::fromStdString(surfaceId)
+                       << "after reloading surfaces:"
+                       << e.what();
+            return false;
+        }
+    }
+
+    if (_point_collection_widget) {
+        if (!surf->path.empty()) {
+            _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
+        } else {
+            _point_collection_widget->clearCorrPointsResults();
+        }
+    }
+    if (_atlasControlDock) {
+        if (!surf->path.empty()) {
+            _atlasControlDock->loadResults(surf->path / "atlas_control_points_results.json");
+        } else {
+            _atlasControlDock->clearResults();
+        }
+    }
+
+    if (_viewerManager) {
+        _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
+            if (!viewer) {
+                return;
+            }
+            viewer->invalidateIntersect("segmentation");
+            viewer->renderIntersections("active segment restored after surface reload");
+            viewer->requestRender("active segment restored after surface reload");
+        });
+    }
+
+    if (_surfaceAffineTransforms) {
+        _surfaceAffineTransforms->refresh();
+    }
+    maybeAttachBenchRecorder();
+    return true;
+}
+
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
     const bool hadVolume = static_cast<bool>(_state->currentVolume());
     POI* existingFocusPoi = _state ? _state->poi("focus") : nullptr;
+    const std::string previousVolumeId = _state ? _state->currentVolumeId() : std::string{};
+    std::string targetVolumeId;
+    if (_state && _state->vpkg() && newvol) {
+        for (const auto& id : _state->vpkg()->volumeIDs()) {
+            if (_state->vpkg()->volume(id) == newvol) {
+                targetVolumeId = id;
+                break;
+            }
+        }
+    }
+    if (targetVolumeId.empty() && newvol) {
+        targetVolumeId = newvol->id();
+    }
+
+    struct CapturedViewerNavigation {
+        QPointer<CChunkedVolumeViewer> viewer;
+        CChunkedVolumeViewer::CameraState camera;
+        cv::Vec3f center{0, 0, 0};
+        bool hasCenter{false};
+    };
+
+    const auto navigationTransform =
+        (hadVolume && newvol && previousVolumeId != targetVolumeId)
+            ? openDataVolumeTransformForSwitch(previousVolumeId, targetVolumeId)
+            : std::optional<cv::Matx44d>{};
+    const auto navigationScale =
+        navigationTransform ? relativeAffineDistanceScale(*navigationTransform)
+                            : std::optional<double>{};
+    std::optional<cv::Vec3f> transformedFocusPoint;
+    std::optional<cv::Vec3f> transformedFocusNormal;
+    std::vector<CapturedViewerNavigation> capturedViewers;
+
+    if (navigationTransform) {
+        if (existingFocusPoi && finiteVec3(existingFocusPoi->p)) {
+            transformedFocusPoint = transformPoint(existingFocusPoi->p, *navigationTransform);
+            if (cv::norm(existingFocusPoi->n) > 0.0f) {
+                const cv::Vec3f normal =
+                    vc::core::util::transformNormal(existingFocusPoi->n, *navigationTransform);
+                if (finiteVec3(normal)) {
+                    transformedFocusNormal = normal;
+                }
+            }
+        }
+
+        if (_viewerManager) {
+            _viewerManager->forEachBaseViewer([&](VolumeViewerBase* baseViewer) {
+                auto* viewer = dynamic_cast<CChunkedVolumeViewer*>(baseViewer);
+                if (!viewer || !viewer->graphicsView()) {
+                    return;
+                }
+                CapturedViewerNavigation captured;
+                captured.viewer = viewer;
+                captured.camera = viewer->cameraState();
+                const QSize viewportSize = viewer->graphicsView()->viewport()->size();
+                const QPointF centerScene(
+                    static_cast<qreal>(std::max(1, viewportSize.width())) * 0.5,
+                    static_cast<qreal>(std::max(1, viewportSize.height())) * 0.5);
+                if (const auto sample = viewer->sampleSceneVolume(centerScene)) {
+                    if (finiteVec3(sample->position)) {
+                        captured.center = sample->position;
+                        captured.hasCenter = true;
+                    }
+                }
+                capturedViewers.push_back(std::move(captured));
+            });
+        }
+    }
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
     _state->setCurrentVolume(newvol);
+    if (_state->currentVolume() && !_state->currentVolumeId().empty()) {
+        rememberCurrentVolumeForPackage(QString::fromStdString(_state->currentVolumeId()));
+    }
 
     const bool growthVolumeValid = _state->hasVpkg() && !_state->segmentationGrowthVolumeId().empty() &&
                                    _state->vpkg()->hasVolume(_state->segmentationGrowthVolumeId());
@@ -2672,7 +4381,12 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
             poi->n = cv::Vec3f(0, 0, 1);
         }
 
-        if (createdPoi || !hadVolume) {
+        if (transformedFocusPoint) {
+            poi->p = clampToVolumeBounds(*transformedFocusPoint, _state->currentVolume());
+            if (transformedFocusNormal) {
+                poi->n = *transformedFocusNormal;
+            }
+        } else if (createdPoi || !hadVolume) {
             poi->p = cv::Vec3f((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, (z0 + z1) * 0.5f);
         } else {
             poi->p[0] = std::clamp(poi->p[0], x0, x1);
@@ -2684,8 +4398,39 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
         _state->setPOI("focus", poi);
     }
 
+    if (navigationTransform && _state->currentVolume()) {
+        for (const auto& captured : capturedViewers) {
+            CChunkedVolumeViewer* viewer = captured.viewer.data();
+            if (!viewer || viewer->currentVolume() != _state->currentVolume()) {
+                continue;
+            }
+
+            std::optional<cv::Vec3f> transformedCenter;
+            if (captured.hasCenter) {
+                transformedCenter = transformPoint(captured.center, *navigationTransform);
+            }
+            if (!transformedCenter) {
+                continue;
+            }
+
+            viewer->centerOnVolumePoint(
+                clampToVolumeBounds(*transformedCenter, _state->currentVolume()),
+                false);
+            auto camera = viewer->cameraState();
+            camera.scale = captured.camera.scale;
+            if (navigationScale) {
+                camera.scale = CChunkedVolumeViewer::clampCameraScale(
+                    static_cast<float>(static_cast<double>(captured.camera.scale) / *navigationScale));
+            }
+            camera.zOffset = captured.camera.zOffset;
+            camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
+            viewer->applyCameraState(camera, false);
+        }
+    }
+
     _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
     syncVolumeSelectionControls();
+    updateOpenDataSegmentTransformState(true);
 }
 
 bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
@@ -2724,28 +4469,14 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
     refreshVolumeSelectionUi(preferredVolumeId);
     if (!_state->vpkg()->hasVolumes()) {
         Logger()->info("Opened volpkg '{}' with no volumes", _state->vpkgPath().toStdString());
-        statusBar()->showMessage(tr("Opened volume package with no volumes."), 5000);
+        showStatusBarMessage(tr("Opened volume package with no volumes."), 5000);
     }
 
     if (_volumeOverlay) {
         _volumeOverlay->setVolumePkg(_state->vpkg(), _state->vpkgPath());
     }
 
-    {
-        const QSignalBlocker blocker{cmbSegmentationDir};
-        cmbSegmentationDir->clear();
-
-        auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
-        for (const auto& dirName : availableDirs) {
-            cmbSegmentationDir->addItem(QString::fromStdString(dirName));
-        }
-
-        int currentIndex = cmbSegmentationDir->findText(
-            QString::fromStdString(_state->vpkg()->getSegmentationDirectory()));
-        if (currentIndex >= 0) {
-            cmbSegmentationDir->setCurrentIndex(currentIndex);
-        }
-    }
+    refreshSegmentationDirectoryDropdown();
 
     if (_surfacePanel) {
         _surfacePanel->setVolumePkg(_state->vpkg());
@@ -2761,12 +4492,14 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
     if (_surfaceAffineTransforms) {
         _surfaceAffineTransforms->refresh();
     }
+    updateOpenDataSegmentTransformState(false);
 }
 
 void CWindow::updateNormalGridAvailability()
 {
     QString checkedPath;
-    const QString path = normalGridDirectoryForVolumePkg(_state->vpkg(), &checkedPath);
+    const QString path = normalGridDirectoryForVolumePkg(
+        _state->vpkg(), _state->currentVolumeId(), &checkedPath);
     const bool available = !path.isEmpty();
 
     _normalGridAvailable = available;
@@ -2776,7 +4509,15 @@ void CWindow::updateNormalGridAvailability()
         _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
         _segmentationWidget->setNormalGridPath(_normalGridPath);
         QString hint;
+        if (!_normalGridAvailable && _state->vpkg()) {
+            const auto info = vc3d::opendata::normalGridsInfoFromTags(
+                _state->vpkg()->volumeTags(_state->currentVolumeId()));
+            if (info) {
+                hint = tr("No normal grids are published for this open-data volume.");
+            }
+        }
         if (_normalGridAvailable) {
+        } else if (!hint.isEmpty()) {
         } else if (!checkedPath.isEmpty()) {
             hint = tr("Checked: %1").arg(checkedPath);
         } else {
@@ -2795,6 +4536,9 @@ void CWindow::toggleVolumeOverlayVisibility()
     if (_volumeOverlay) {
         _volumeOverlay->toggleVisibility();
     }
+    if (_inkDetectionOverlay && _inkDetectionOverlay->hasLoadedSelection()) {
+        _inkDetectionOverlay->toggleVisibility();
+    }
 }
 
 void CWindow::toggleFocusedView()
@@ -2812,7 +4556,7 @@ void CWindow::toggleFocusedView()
         }
         _savedDockStates.clear();
         _focusedViewActive = false;
-        statusBar()->showMessage(tr("Restored full view"), 2000);
+        showStatusBarMessage(tr("Restored full view"), 2000);
     } else {
         _savedDockStates.clear();
         const QList<QDockWidget*> docks = findChildren<QDockWidget*>();
@@ -2827,7 +4571,7 @@ void CWindow::toggleFocusedView()
             dock->hide();
         }
         _focusedViewActive = true;
-        statusBar()->showMessage(tr("Focused view (Shift+Ctrl+F to restore)"), 2000);
+        showStatusBarMessage(tr("Focused view (Shift+Ctrl+F to restore)"), 2000);
     }
 }
 
@@ -2868,6 +4612,41 @@ void CWindow::switchToFiberSliceWorkspace()
         _fiberSliceWorkspaceWindow->raise();
         _fiberSliceWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
     }
+}
+
+void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title)
+{
+    if (!_workspaceTabs || !dialog) {
+        return;
+    }
+
+    dialog->setWorkspaceEmbedded(true);
+
+    int index = _workspaceTabs->indexOf(dialog);
+    if (index < 0) {
+        index = _workspaceTabs->addTab(dialog, title.isEmpty() ? tr("Line Annotation") : title);
+        auto* escapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), dialog);
+        escapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+        connect(escapeShortcut, &QShortcut::activated, dialog, &QWidget::close);
+        QWidget* tabWidget = dialog;
+        connect(dialog, &QObject::destroyed, this, [this, tabWidget]() {
+            if (!_workspaceTabs) {
+                return;
+            }
+            for (int i = 0; i < _workspaceTabs->count(); ++i) {
+                if (_workspaceTabs->widget(i) == tabWidget) {
+                    _workspaceTabs->removeTab(i);
+                    switchToMainWorkspace();
+                    break;
+                }
+            }
+        });
+    }
+
+    _workspaceTabs->setCurrentIndex(index);
+    dialog->show();
+    dialog->raise();
+    dialog->setFocus(Qt::ShortcutFocusReason);
 }
 
 void CWindow::repeatLastLasagnaAction()
@@ -3047,7 +4826,7 @@ bool CWindow::recenterViewersOnCurrentFocus()
 
 bool CWindow::centerFocusOnCursor()
 {
-    if (!_state || !mdiArea) {
+    if (!_state) {
         return false;
     }
 
@@ -3108,7 +4887,8 @@ bool CWindow::centerFocusOnCursor()
 
     // Fall back to the active viewer if the cursor isn't currently over any
     // tiled viewport.
-    if (auto* subWindow = mdiArea->activeSubWindow()) {
+    if (mdiArea && mdiArea->activeSubWindow()) {
+        auto* subWindow = mdiArea->activeSubWindow();
         if (auto* viewer = baseViewerFromWidget(subWindow->widget())) {
             if (tryCenterFromViewer(viewer)) {
                 return true;
@@ -3140,8 +4920,8 @@ void CWindow::setSegmentationCursorMirroring(bool enabled)
     }
 
     if (statusBar()) {
-        statusBar()->showMessage(enabled ? tr("Mirroring cursor to Surface view enabled")
-                                         : tr("Mirroring cursor to Surface view disabled"),
+        showStatusBarMessage(enabled ? tr("Syncing cursor across views enabled")
+                                         : tr("Syncing cursor across views disabled"),
                                   2000);
     }
 }
@@ -3817,7 +5597,7 @@ void CWindow::remapCurrentAtlas()
         : vpkg->path().parent_path();
 
     if (statusBar()) {
-        statusBar()->showMessage(tr("Remapping atlas fibers..."), 3000);
+        showStatusBarMessage(tr("Remapping atlas fibers..."), 3000);
     }
     for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
         if (!dock || !dock->widget()) {
@@ -3843,7 +5623,7 @@ void CWindow::remapCurrentAtlas()
             const QString summary = watcher->result();
             displayAtlasFromDirectory(atlasDir);
             if (statusBar()) {
-                statusBar()->showMessage(tr("Remapped atlas fibers. %1").arg(summary), 7000);
+                showStatusBarMessage(tr("Remapped atlas fibers. %1").arg(summary), 7000);
             }
         } catch (const std::exception& ex) {
             refreshAtlasOverviewDocks();
@@ -3926,7 +5706,7 @@ void CWindow::optimizeAtlasSnapCandidates()
         ? manifestPath.filename().generic_string()
         : manifestPath.string();
     if (statusBar()) {
-        statusBar()->showMessage(tr("Preparing atlas snap candidates..."), 3000);
+        showStatusBarMessage(tr("Preparing atlas snap candidates..."), 3000);
     }
     auto setRankButtonsEnabled = [this](bool enabled) {
         for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
@@ -3950,7 +5730,7 @@ void CWindow::optimizeAtlasSnapCandidates()
             return;
         }
         if (statusBar()) {
-            statusBar()->showMessage(tr("Applying atlas snap candidate ranking..."), 3000);
+            showStatusBarMessage(tr("Applying atlas snap candidate ranking..."), 3000);
         }
         auto* finishWatcher = new QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>(this);
         connect(finishWatcher,
@@ -3964,7 +5744,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                 refreshAtlasOverviewDocks();
                 displayAtlasFromDirectory(atlasDir);
                 if (statusBar()) {
-                    statusBar()->showMessage(
+                    showStatusBarMessage(
                         tr("Ranked snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 queued, %7 cached.")
                             .arg(report.controls)
                             .arg(report.successfulPairTerms)
@@ -4039,7 +5819,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                       << std::endl;
             QJsonObject qtRequest = toQtJsonObject(serviceRequest);
             if (statusBar()) {
-                statusBar()->showMessage(tr("Ranking atlas snap candidates..."), 3000);
+                showStatusBarMessage(tr("Ranking atlas snap candidates..."), 3000);
             }
             LasagnaServiceManager::instance().rankLaplaceSnapPairs(
                 qtRequest,
@@ -4500,7 +6280,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
                             : tr("Atlas object search found %1 signed result(s); skipped %2 result(s)")
                                   .arg(static_cast<int>(workerResult.results.size()))
                                   .arg(static_cast<int>(workerResult.skippedSigningCount));
-                        statusBar()->showMessage(message, 3000);
+                        showStatusBarMessage(message, 3000);
                     }
                 } else {
                     qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 finishing_results start total=1")
@@ -4520,7 +6300,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
                         }
                     }
                     if (statusBar()) {
-                        statusBar()->showMessage(tr("Atlas object search canceled"), 3000);
+                        showStatusBarMessage(tr("Atlas object search canceled"), 3000);
                     }
                 }
                 const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -5301,7 +7081,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
             _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
         }
         if (statusBar()) {
-            statusBar()->showMessage(tr("Displayed atlas %1")
+            showStatusBarMessage(tr("Displayed atlas %1")
                                          .arg(QString::fromStdString(atlas.metadata.name)),
                                      3000);
         }
@@ -5340,8 +7120,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                     throw std::runtime_error(
                         "Selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
                 }
-                vc::atlas::rebuildAtlasFromSourceFibers(
-                    atlasDir, volpkgRoot, sampler);
+                vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
                 displayAtlasFromDirectory(atlasDir);
             } catch (const std::exception& rebuildEx) {
                 QMessageBox::warning(
@@ -5365,29 +7144,28 @@ void CWindow::CreateWidgets(void)
 
     // add volume viewer
     auto aWidgetLayout = new QVBoxLayout;
+    aWidgetLayout->setContentsMargins(0, 0, 0, 0);
+    aWidgetLayout->setSpacing(0);
     ui.tabSegment->setLayout(aWidgetLayout);
 
-    mdiArea = new QMdiArea(ui.tabSegment);
-    aWidgetLayout->addWidget(mdiArea);
+    mdiArea = nullptr;
 
-    // Ensure the viewer's graphics view gets focus when subwindow is activated
-    connect(mdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
-        if (subWindow) {
-            if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
-                if (auto* graphicsView = viewer->graphicsView()) {
-                    graphicsView->setFocus();
-                }
-            }
-        }
-    });
+    auto* viewerGrid = new ViewerSplitGrid(ui.tabSegment);
+    viewerGrid->setObjectName(QStringLiteral("mainViewerSplitGrid"));
+    aWidgetLayout->addWidget(viewerGrid, 1);
 
     {
-        newConnectedViewer("seg xz", tr("Segmentation XZ"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("seg yz", tr("Segmentation YZ"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("xy plane", tr("XY / Slices"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("segmentation", tr("Surface"), mdiArea)->setIntersects({"seg xz","seg yz"});
+        resetSegmentationViews(false);
+        applyMainViewerLayout(viewerGrid, _viewerManager.get());
+        viewerGrid->setSplits(settings.value(MAIN_VIEWER_SPLIT_X_SETTING, 0.5).toDouble(),
+                              settings.value(MAIN_VIEWER_SPLIT_Y_SETTING, 0.5).toDouble());
     }
-    mdiArea->tileSubWindows();
+
+    viewerGrid->onSplitChanged = [viewerGrid]() {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(MAIN_VIEWER_SPLIT_X_SETTING, viewerGrid->splitX());
+        settings.setValue(MAIN_VIEWER_SPLIT_Y_SETTING, viewerGrid->splitY());
+    };
 
     if (_fiberSliceWorkspaceWindow) {
         _fiberSliceMdiArea = new QMdiArea(_fiberSliceWorkspaceWindow);
@@ -5462,13 +7240,16 @@ void CWindow::CreateWidgets(void)
                 if (!_state->vpkg()) {
                     return;
                 }
-                auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(segmentId.toStdString()));
+                if (!surf) {
+                    surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                }
                 if (!surf) {
                     return;
                 }
                 const QString path = absoluteSegmentPathForClipboard(surf->path, _state->vpkg());
                 QApplication::clipboard()->setText(path);
-                statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
+                showStatusBarMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::renderSegmentRequested,
             this, [this](const QString& segmentId) {
@@ -5528,7 +7309,10 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::focusSurfaceRequested,
             this, [this](const QString& segmentId) {
                 if (!_state || !_state->vpkg()) return;
-                auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(segmentId.toStdString()));
+                if (!surf) {
+                    surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                }
                 auto* quad = dynamic_cast<QuadSurface*>(surf.get());
                 if (!quad) return;
                 const auto focusPoint = findSegmentFocusPoint(*quad);
@@ -5575,6 +7359,10 @@ void CWindow::CreateWidgets(void)
         this, [this](const QStringList& segmentIds) {
             _segmentationCommandHandler->onRasterizeSegments(segmentIds);
         });
+    connect(_surfacePanel.get(), &SurfacePanelController::generateSegmentMaskRequested,
+        this, &CWindow::onEditMaskPressed);
+    connect(_surfacePanel.get(), &SurfacePanelController::appendSegmentMaskRequested,
+        this, &CWindow::onAppendMaskPressed);
     connect(_surfacePanel.get(), &SurfacePanelController::addIgnoreLabelRequested,
         this, [this]() {
             _segmentationCommandHandler->onAddIgnoreLabel();
@@ -5608,7 +7396,7 @@ void CWindow::CreateWidgets(void)
                     }
                 }
                 if (okCount > 0) {
-                    statusBar()->showMessage(
+                    showStatusBarMessage(
                         tr("Recalculated area for %1 segment(s).").arg(okCount), 5000);
                 }
                 if (failCount > 0) {
@@ -5618,7 +7406,7 @@ void CWindow::CreateWidgets(void)
             });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
-                statusBar()->showMessage(message, timeoutMs);
+                showStatusBarMessage(message, timeoutMs);
             });
 
     const auto attachScrollAreaToDock = [](QDockWidget* dock, QWidget* content, const QString& objectName) {
@@ -5746,7 +7534,7 @@ void CWindow::CreateWidgets(void)
     SegmentationGrower::UiCallbacks growerCallbacks{
         [this](const QString& text, int timeout) {
             if (statusBar()) {
-                statusBar()->showMessage(text, timeout);
+                showStatusBarMessage(text, timeout);
             }
         },
         [this](QuadSurface* surface) {
@@ -5781,6 +7569,10 @@ void CWindow::CreateWidgets(void)
     _segmentationCommandHandler->setNormal3dZarrPathGetter([this]() -> QString {
         return _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString();
     });
+    _segmentationCommandHandler->setNormalGridPathGetter([this]() -> QString {
+        updateNormalGridAvailability();
+        return _normalGridPath;
+    });
     connect(_segmentationCommandHandler.get(), &SegmentationCommandHandler::statusMessage,
             this, &CWindow::onShowStatusMessage);
 
@@ -5792,7 +7584,7 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onCopyWithNtRequested);
     connect(_segmentationWidget, &SegmentationWidget::volumeSelectionChanged, this, [this](const QString& volumeId) {
         if (!_state->vpkg()) {
-            statusBar()->showMessage(tr("No volume package loaded."), 4000);
+            showStatusBarMessage(tr("No volume package loaded."), 4000);
             if (_segmentationWidget) {
                 const QString fallbackId = QString::fromStdString(!_state->segmentationGrowthVolumeId().empty()
                                                                    ? _state->segmentationGrowthVolumeId()
@@ -5810,9 +7602,9 @@ void CWindow::CreateWidgets(void)
             if (_segmentationWidget && vol) {
                 _segmentationWidget->setVolumeZarrPath(QString::fromStdString(vol->path().string()));
             }
-            statusBar()->showMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
+            showStatusBarMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
         } catch (const std::out_of_range&) {
-            statusBar()->showMessage(tr("Volume '%1' not found in this package.").arg(volumeId), 4000);
+            showStatusBarMessage(tr("Volume '%1' not found in this package.").arg(volumeId), 4000);
             if (_segmentationWidget) {
                 const QString fallbackId = QString::fromStdString(!_state->currentVolumeId().empty()
                                                                    ? _state->currentVolumeId()
@@ -5841,7 +7633,7 @@ void CWindow::CreateWidgets(void)
 
     connect(_segmentationWidget, &SegmentationWidget::lasagnaStopRequested, this, [this]() {
         LasagnaServiceManager::instance().stopOptimization();
-        statusBar()->showMessage(tr("Lasagna optimization stop requested."), 3000);
+        showStatusBarMessage(tr("Lasagna optimization stop requested."), 3000);
     });
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::serviceStarted,
             this, &CWindow::updateAtlasFiberDocks);
@@ -5851,7 +7643,7 @@ void CWindow::CreateWidgets(void)
     // Add only the segments placed by lasagna instead of rescanning every surface.
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::resultsPlaced,
             this, [this](const QString& outputDir, const QStringList& segmentNames) {
-        statusBar()->showMessage(
+        showStatusBarMessage(
             tr("Lasagna optimization finished. Added %1 segment(s) from %2")
                 .arg(segmentNames.size())
                 .arg(outputDir), 5000);
@@ -5980,7 +7772,7 @@ void CWindow::CreateWidgets(void)
     // Create fiber annotation controller and dock
     _fiberController = std::make_unique<FiberAnnotationController>(
         _state, _state->pointCollection(), this);
-    _fiberController->setMdiArea(mdiArea);
+    _fiberController->setMdiArea(_fiberSliceMdiArea);
 
     _fiberWidget = new CFiberWidget(this);
     _fiberWidget->setObjectName("fiberDock");
@@ -5989,6 +7781,7 @@ void CWindow::CreateWidgets(void)
     if (_fiberSliceWorkspaceWindow) {
         _fiberSliceWidget = new CFiberWidget(_fiberSliceWorkspaceWindow);
         _fiberSliceWidget->setObjectName(QStringLiteral("fiberSliceDock"));
+        _fiberSliceWidget->setWindowTitle(tr("Fiber Slice Fibers"));
         _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
     }
 
@@ -6108,6 +7901,14 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::renameFiberFile);
             connect(widget,
+                    &CFiberWidget::importFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::importFibers);
+            connect(widget,
+                    &CFiberWidget::exportFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::exportFibers);
+            connect(widget,
                     &CFiberWidget::metricsCalculationRequested,
                     _lineAnnotationController.get(),
                     [this](std::vector<uint64_t> orderedFiberIds) {
@@ -6132,6 +7933,10 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::newAtlasFromFiberRequested,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::createAtlasFromFiber);
+            connect(widget,
+                    &CFiberWidget::addFibersToPointCollectionsRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::addFibersToPointCollections);
             connect(widget,
                     &CFiberWidget::fiberSliceRequested,
                     this,
@@ -6201,8 +8006,26 @@ void CWindow::CreateWidgets(void)
         .viewContents = ui.dockWidgetViewContents,
         .overlayScrollArea = ui.scrollAreaOverlay,
         .overlayContents = ui.dockWidgetOverlayContents,
-        .compositeScrollArea = ui.scrollAreaComposite,
-        .compositeContents = ui.dockWidgetCompositeContents,
+        .normalVisualizationContents = ui.dockWidgetNormalVisContents,
+        .showSurfaceNormals = ui.chkShowSurfaceNormals,
+        .normalArrowLengthLabel = ui.labelNormalArrowLength,
+        .normalArrowLengthSlider = ui.sliderNormalArrowLength,
+        .normalArrowLengthValueLabel = ui.labelNormalArrowLengthValue,
+        .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
+        .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
+        .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
+        .zoomInButton = ui.btnZoomIn,
+        .zoomOutButton = ui.btnZoomOut,
+        .volumeWindowContainer = ui.volumeWindowContainer,
+        .overlayWindowContainer = ui.overlayWindowContainer,
+        .intersectionThicknessSpin = ui.doubleSpinIntersectionThickness,
+    };
+    _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
+                                                                 _viewerManager.get(),
+                                                                 ui.dockWidgetViewerControlsContents);
+    ViewerCompositePanel::UiRefs compositeUi{
+        .scrollArea = ui.scrollAreaComposite,
+        .contents = ui.dockWidgetCompositeContents,
         .compositeEnabled = ui.chkCompositeEnabled,
         .compositeMode = ui.cmbCompositeMode,
         .layersInFront = ui.spinLayersInFront,
@@ -6216,107 +8039,37 @@ void CWindow::CreateWidgets(void)
         .materialLabel = ui.lblMaterial,
         .material = ui.spinMaterial,
         .reverseDirection = ui.chkReverseDirection,
-        .methodScaleLabel = ui.lblMethodScale,
-        .methodScale = ui.sliderMethodScale,
-        .methodScaleValue = ui.lblMethodScaleValue,
-        .methodParamLabel = ui.lblMethodParam,
-        .methodParam = ui.sliderMethodParam,
-        .methodParamValue = ui.lblMethodParamValue,
-        .blExtinctionLabel = ui.lblBLExtinction,
-        .blExtinction = ui.spinBLExtinction,
-        .blEmissionLabel = ui.lblBLEmission,
-        .blEmission = ui.spinBLEmission,
-        .blAmbientLabel = ui.lblBLAmbient,
-        .blAmbient = ui.spinBLAmbient,
-        .lightingEnabled = ui.chkLightingEnabled,
-        .lightAzimuthLabel = ui.lblLightAzimuth,
-        .lightAzimuth = ui.spinLightAzimuth,
-        .lightElevationLabel = ui.lblLightElevation,
-        .lightElevation = ui.spinLightElevation,
-        .lightDiffuseLabel = ui.lblLightDiffuse,
-        .lightDiffuse = ui.spinLightDiffuse,
-        .lightAmbientLabel = ui.lblLightAmbient,
-        .lightAmbient = ui.spinLightAmbient,
-        .useVolumeGradients = ui.chkUseVolumeGradients,
-        .shadowStepsLabel = ui.lblShadowSteps,
-        .shadowSteps = ui.spinShadowSteps,
-        .rakingEnabled = ui.chkRakingEnabled,
-        .rakingAzimuthLabel = ui.lblRakingAzimuth,
-        .rakingAzimuth = ui.spinRakingAzimuth,
-        .rakingElevationLabel = ui.lblRakingElevation,
-        .rakingElevation = ui.spinRakingElevation,
-        .rakingStrengthLabel = ui.lblRakingStrength,
-        .rakingStrength = ui.spinRakingStrength,
-        .rakingDepthLabel = ui.lblRakingDepth,
-        .rakingDepthScale = ui.spinRakingDepthScale,
-        .preNormalizeLayers = ui.chkPreNormalizeLayers,
-        .preHistEqLayers = ui.chkPreHistEqLayers,
-        .preTfEnabled = ui.chkPreTfEnabled,
-        .preTfX1 = ui.spinPreTfX1,
-        .preTfY1 = ui.spinPreTfY1,
-        .preTfKnot2Label = ui.lblPreTfKnot2,
-        .preTfX2 = ui.spinPreTfX2,
-        .preTfY2 = ui.spinPreTfY2,
-        .postTfEnabled = ui.chkPostTfEnabled,
-        .postTfX1 = ui.spinPostTfX1,
-        .postTfY1 = ui.spinPostTfY1,
-        .postTfKnot2Label = ui.lblPostTfKnot2,
-        .postTfX2 = ui.spinPostTfX2,
-        .postTfY2 = ui.spinPostTfY2,
-        .dvrAmbientLabel = ui.lblDvrAmbient,
-        .dvrAmbient = ui.spinDvrAmbient,
-        .pbrRoughnessLabel = ui.lblPbrRoughness,
-        .pbrRoughness = ui.spinPbrRoughness,
-        .pbrMetallicLabel = ui.lblPbrMetallic,
-        .pbrMetallic = ui.spinPbrMetallic,
         .planeCompositeXY = ui.chkPlaneCompositeXY,
         .planeCompositeXZ = ui.chkPlaneCompositeXZ,
         .planeCompositeYZ = ui.chkPlaneCompositeYZ,
         .planeLayersFront = ui.spinPlaneLayersFront,
         .planeLayersBehind = ui.spinPlaneLayersBehind,
-        .renderSettingsScrollArea = ui.scrollAreaRenderSettings,
-        .renderSettingsContents = ui.dockWidgetRenderSettingsContents,
-        .normalVisualizationContents = ui.dockWidgetNormalVisContents,
-        .showSurfaceNormals = ui.chkShowSurfaceNormals,
-        .normalArrowLengthLabel = ui.labelNormalArrowLength,
-        .normalArrowLengthSlider = ui.sliderNormalArrowLength,
-        .normalArrowLengthValueLabel = ui.labelNormalArrowLengthValue,
-        .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
-        .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
-        .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
-        .preprocessingScrollArea = ui.scrollAreaPreprocessing,
-        .preprocessingContents = ui.dockWidgetPreprocessingContents,
-        .isoCutoff = ui.sliderIsoCutoff,
-        .isoCutoffValue = ui.lblIsoCutoffValue,
-        .postprocessingScrollArea = ui.scrollAreaPostprocessing,
-        .postprocessingContents = ui.dockWidgetPostprocessingContents,
-        .baseColormap = ui.baseColormapSelect,
-        .stretchValuesPost = ui.chkStretchValuesPost,
-        .removeSmallComponents = ui.chkRemoveSmallComponents,
-        .minComponentSizeLabel = ui.lblMinComponentSize,
-        .minComponentSize = ui.spinMinComponentSize,
-        .claheEnabled = ui.chkClaheEnabled,
-        .claheClipLimitLabel = ui.lblClaheClipLimit,
-        .claheClipLimit = ui.spinClaheClipLimit,
-        .claheTileSizeLabel = ui.lblClaheTileSize,
-        .claheTileSize = ui.spinClaheTileSize,
-        .zoomInButton = ui.btnZoomIn,
-        .zoomOutButton = ui.btnZoomOut,
-        .sliceStepSizeSpin = ui.spinSliceStepSize,
-        .volumeWindowContainer = ui.volumeWindowContainer,
-        .overlayWindowContainer = ui.overlayWindowContainer,
-        .intersectionOpacitySpin = ui.spinIntersectionOpacity,
-        .intersectionThicknessSpin = ui.doubleSpinIntersectionThickness,
     };
-    _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
-                                                                 _viewerManager.get(),
-                                                                 ui.dockWidgetViewerControlsContents);
+    _viewerCompositePanel = new ViewerCompositePanel(compositeUi, _viewerManager.get(), ui.dockWidgetComposite);
+    attachScrollAreaToDock(ui.dockWidgetComposite,
+                           _viewerCompositePanel,
+                           QStringLiteral("dockWidgetCompositeContent"));
+
+    _inkDetectionDock = new QDockWidget(tr("Ink Detection"), this);
+    _inkDetectionDock->setObjectName(QStringLiteral("dockWidgetInkDetection"));
+    attachScrollAreaToDock(_inkDetectionDock,
+                           new ViewerInkDetectionPanel(_viewerManager.get(), _inkDetectionDock),
+                           QStringLiteral("dockWidgetInkDetectionContent"));
+
+    _transformsDock = new QDockWidget(tr("Transforms"), this);
+    _transformsDock->setObjectName(QStringLiteral("dockWidgetTransforms"));
+    auto* transformsPanel = new ViewerTransformsPanel(_transformsDock);
+    attachScrollAreaToDock(_transformsDock,
+                           transformsPanel,
+                           QStringLiteral("dockWidgetTransformsContent"));
+    _viewerControlsPanel->setTransformsPanel(transformsPanel);
+
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomInRequested,
             this, &CWindow::onZoomIn);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomOutRequested,
             this, &CWindow::onZoomOut);
-    connect(_viewerManager.get(), &ViewerManager::sliceStepSizeChanged,
-            this, &CWindow::onSliceStepSizeChanged);
+    connect(_viewerManager.get(), &ViewerManager::zScrollSensitivityChanged,
+            this, &CWindow::onZScrollSensitivityChanged);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
     if (_viewerControlsPanel) {
@@ -6340,15 +8093,18 @@ void CWindow::CreateWidgets(void)
 
     _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
     _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetOverlay);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _inkDetectionDock);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _transformsDock);
+    _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetViewerControls, ui.dockWidgetOverlay, Qt::Vertical);
+    _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetOverlay, _inkDetectionDock, Qt::Vertical);
+    _segmentWorkspaceWindow->splitDockWidget(_inkDetectionDock, _transformsDock, Qt::Vertical);
 
     auto hideLegacyViewerDocks = [this]() {
-        for (QDockWidget* dock : { ui.dockWidgetPreprocessing,
-                                   ui.dockWidgetNormalVis,
+        for (QDockWidget* dock : { ui.dockWidgetNormalVis,
                                    ui.dockWidgetView,
-                                   ui.dockWidgetOverlay,
                                    ui.dockWidgetRenderSettings,
-                                   ui.dockWidgetComposite,
-                                   ui.dockWidgetPostprocessing }) {
+                                   ui.dockWidgetComposite }) {
             if (!dock) {
                 continue;
             }
@@ -6393,6 +8149,11 @@ void CWindow::CreateWidgets(void)
             .colormapSelect = ui.overlayColormapSelect,
             .opacitySpin = ui.overlayOpacitySpin,
             .thresholdSpin = ui.overlayThresholdSpin,
+            .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,
+            .compositeEnabledCheck = ui.chkOverlayComposite,
+            .compositeMethodSelect = ui.cmbOverlayCompositeMethod,
+            .compositeLayersFrontSpin = ui.spinOverlayCompositeLayersFront,
+            .compositeLayersBehindSpin = ui.spinOverlayCompositeLayersBehind,
         };
         _volumeOverlay->setUi(overlayUi);
         if (_viewerControlsPanel) {
@@ -6410,6 +8171,9 @@ void CWindow::CreateWidgets(void)
         ui.spinOverlapThreshold->setEnabled(checked);
     });
 
+    connect(ui.surfaceOverlaySelect, &QPushButton::clicked,
+            this, &CWindow::showSurfaceOverlaySelectionDialog);
+
     connect(ui.spinOverlapThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double value) {
         if (!_viewerManager) return;
         _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
@@ -6421,41 +8185,63 @@ void CWindow::CreateWidgets(void)
     ui.surfaceOverlaySelect->setEnabled(false);
     ui.spinOverlapThreshold->setEnabled(false);
 
-    // Initialize surface overlay dropdown (will be populated when surfaces load)
+    // Initialize surface overlay selection model (will be populated when surfaces load)
     updateSurfaceOverlayDropdown();
 
     connectVolumeSelector(volSelect);
 
     auto* filterDropdown = ui.btnFilterDropdown;
-    auto* cmbPointSetFilter = ui.cmbPointSetFilter;
-    auto* btnPointSetFilterAll = ui.btnPointSetFilterAll;
-    auto* btnPointSetFilterNone = ui.btnPointSetFilterNone;
-    auto* cmbPointSetFilterMode = new QComboBox();
+    auto* cmbPointSetFilter = new QComboBox(this);
+    auto* btnPointSetFilterAll = new QPushButton(tr("All"), this);
+    auto* btnPointSetFilterNone = new QPushButton(tr("None"), this);
+    auto* cmbPointSetFilterMode = new QComboBox(this);
+    auto* spinFocusPointFilterDistance = new QDoubleSpinBox(this);
+    auto* spinSurfaceZLowerBound = new QDoubleSpinBox(this);
+    auto* spinSurfaceZUpperBound = new QDoubleSpinBox(this);
     cmbPointSetFilterMode->addItem("Any (OR)");
     cmbPointSetFilterMode->addItem("All (AND)");
-    ui.pointSetFilterLayout->insertWidget(1, cmbPointSetFilterMode);
 
     SurfacePanelController::FilterUiRefs filterUi;
     filterUi.dropdown = filterDropdown;
+    filterUi.currentOnly = ui.chkFilterCurrentOnly;
     filterUi.pointSet = cmbPointSetFilter;
     filterUi.pointSetAll = btnPointSetFilterAll;
     filterUi.pointSetNone = btnPointSetFilterNone;
     filterUi.pointSetMode = cmbPointSetFilterMode;
     filterUi.surfaceIdFilter = ui.lineEditSurfaceFilter;
-    filterUi.focusPointDistance = ui.spinFocusPointFilterDistance;
-    filterUi.zLowerBound = ui.spinSurfaceZLowerBound;
-    filterUi.zUpperBound = ui.spinSurfaceZUpperBound;
+    filterUi.focusPointDistance = spinFocusPointFilterDistance;
+    filterUi.zLowerBound = spinSurfaceZLowerBound;
+    filterUi.zUpperBound = spinSurfaceZUpperBound;
     _surfacePanel->configureFilters(filterUi, _state->pointCollection());
 
+    auto* tagDropdown = ui.btnTagDropdown;
     SurfacePanelController::TagUiRefs tagUi{
-        .approved = ui.chkApproved,
-        .defective = ui.chkDefective,
-        .reviewed = ui.chkReviewed,
-        .inspect = ui.chkInspect,
+        .dropdown = tagDropdown,
+        .approved = tagDropdown->addOption(tr("Approved"), QStringLiteral("chkApproved")),
+        .defective = tagDropdown->addOption(tr("Defective"), QStringLiteral("chkDefective")),
+        .reviewed = tagDropdown->addOption(tr("Reviewed"), QStringLiteral("chkReviewed")),
+        .inspect = tagDropdown->addOption(tr("Inspect"), QStringLiteral("chkInspect")),
     };
     _surfacePanel->configureTags(tagUi);
 
     cmbSegmentationDir = ui.cmbSegmentationDir;
+    _segmentDirModel = new QStandardItemModel(cmbSegmentationDir);
+    cmbSegmentationDir->setModel(_segmentDirModel);
+    cmbSegmentationDir->setView(
+        new SegmentFolderListView([this](int row) { showSegmentFolderPaletteMenu(row); },
+                                  cmbSegmentationDir));
+    cmbSegmentationDir->view()->setItemDelegate(
+        new SegmentFolderDelegate([this](int row) { showSegmentFolderPaletteMenu(row); },
+                                  cmbSegmentationDir->view()));
+    connect(_segmentDirModel, &QStandardItemModel::dataChanged,
+            this, [this](const QModelIndex&, const QModelIndex&, const QVector<int>& roles) {
+        if (_updatingSegmentDirUi) {
+            return;
+        }
+        if (roles.isEmpty() || roles.contains(Qt::CheckStateRole)) {
+            applySegmentFolderSelection(true);
+        }
+    });
     connect(cmbSegmentationDir, &QComboBox::currentIndexChanged, this, &CWindow::onSegmentationDirChanged);
 
     // Location input element (single QLineEdit for comma-separated values)
@@ -6477,30 +8263,6 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
-    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
-        bool moveOnSurfaceChanged = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
-                                                   vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
-        QSignalBlocker blocker(chkMoveOnSurfaceChanged);
-        chkMoveOnSurfaceChanged->setChecked(moveOnSurfaceChanged);
-        connect(chkMoveOnSurfaceChanged, &QCheckBox::toggled, this, &CWindow::onMoveOnSurfaceChangedToggled);
-    }
-    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
-        bool showPlaneIntersectionLines = settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
-                                                         vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
-        QSignalBlocker blocker(chkPlaneIntersectionLines);
-        chkPlaneIntersectionLines->setChecked(showPlaneIntersectionLines);
-        connect(chkPlaneIntersectionLines, &QCheckBox::toggled,
-                this, &CWindow::onPlaneIntersectionLinesToggled);
-    }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
-                                           spinAxisOverlayOpacity->value()).toInt();
-        storedOpacity = std::clamp(storedOpacity, spinAxisOverlayOpacity->minimum(), spinAxisOverlayOpacity->maximum());
-        QSignalBlocker blocker(spinAxisOverlayOpacity);
-        spinAxisOverlayOpacity->setValue(storedOpacity);
-        connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
-    }
-
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
     }
@@ -6514,24 +8276,15 @@ void CWindow::CreateWidgets(void)
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
     }
 
-    connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
-    connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
-
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
     }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        onAxisOverlayOpacityChanged(spinAxisOverlayOpacity->value());
-    }
+    onAxisOverlayOpacityChanged(settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
+                                               vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
-    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
-        onMoveOnSurfaceChangedToggled(chkMoveOnSurfaceChanged->isChecked());
-    }
-    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
-        onPlaneIntersectionLinesToggled(chkPlaneIntersectionLines->isChecked());
-    }
+    onMoveOnSurfaceChangedToggled(moveOnSurfaceChangeEnabled());
 
 }
 
@@ -6624,18 +8377,14 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
-    // Shift+G decreases slice step size, Shift+H increases it
+    // Shift+G decreases Z-scroll sensitivity, Shift+H increases it
     if (event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers && _viewerManager) {
         if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
-            int currentStep = _viewerManager->sliceStepSize();
-            int newStep = std::max(1, currentStep - 1);
-            _viewerManager->setSliceStepSize(newStep);
+            _viewerManager->setZScrollSensitivity(_viewerManager->zScrollSensitivity() - 0.1);
             event->accept();
             return;
         } else if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
-            int currentStep = _viewerManager->sliceStepSize();
-            int newStep = std::min(100, currentStep + 1);
-            _viewerManager->setSliceStepSize(newStep);
+            _viewerManager->setZScrollSensitivity(_viewerManager->zScrollSensitivity() + 0.1);
             event->accept();
             return;
         }
@@ -6736,6 +8485,7 @@ void CWindow::closeEvent(QCloseEvent* event)
 void CWindow::setWidgetsEnabled(bool state)
 {
     ui.grpVolManager->setEnabled(state);
+    ui.btnOpenDataCatalog->setEnabled(!state);
     if (_viewerControlsPanel) {
         _viewerControlsPanel->setViewControlsEnabled(state);
         _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay && _volumeOverlay->hasOverlaySelection());
@@ -6783,10 +8533,12 @@ void CWindow::UpdateView(void)
     if (!_state->hasVpkg() && _state->currentVolume() == nullptr) {
         setWidgetsEnabled(false);  // Disable Widgets for User
         ui.lblVpkgName->setText("[ No Volume Package Loaded ]");
+        updateVolumePackageEmptyState();
         return;
     }
 
     setWidgetsEnabled(true);  // Enable Widgets for User
+    updateVolumePackageEmptyState();
 
     // show volume package name
     UpdateVolpkgLabel(0);
@@ -6794,6 +8546,13 @@ void CWindow::UpdateView(void)
     syncVolumeSelectionControls();
 
     update();
+}
+
+void CWindow::updateVolumePackageEmptyState()
+{
+    const bool hasOpenPackage = _state && (_state->hasVpkg() || _state->currentVolume() != nullptr);
+    const bool catalogVisible = _menuController && _menuController->isOpenDataCatalogVisible();
+    ui.btnOpenDataCatalog->setVisible(!hasOpenPackage && !catalogVisible);
 }
 
 void CWindow::UpdateVolpkgLabel(int filterCounter)
@@ -6809,7 +8568,40 @@ void CWindow::UpdateVolpkgLabel(int filterCounter)
 
 void CWindow::onShowStatusMessage(QString text, int timeout)
 {
-    statusBar()->showMessage(text, timeout);
+    showStatusBarMessage(text, timeout);
+}
+
+void CWindow::showStatusBarMessage(const QString& text, int timeout)
+{
+    if (!_statusMessageLabel) {
+        if (statusBar()) {
+            statusBar()->showMessage(text, timeout);
+        }
+        return;
+    }
+
+    _statusMessageLabel->setText(text);
+    _statusMessageLabel->setToolTip(text);
+
+    if (_statusMessageTimer) {
+        _statusMessageTimer->stop();
+        if (timeout > 0) {
+            _statusMessageTimer->start(timeout);
+        }
+    }
+}
+
+void CWindow::clearStatusBarMessage()
+{
+    if (_statusMessageTimer) {
+        _statusMessageTimer->stop();
+    }
+    if (_statusMessageLabel) {
+        _statusMessageLabel->clear();
+        _statusMessageLabel->setToolTip(QString());
+    } else if (statusBar()) {
+        statusBar()->clearMessage();
+    }
 }
 
 void CWindow::onSegmentationGrowthStatusChanged(bool running)
@@ -6837,31 +8629,34 @@ void CWindow::onSegmentationGrowthStatusChanged(bool running)
         _segmentationGrowthStatusText = tr("Surface growth in progress - surface selection locked");
         _segmentationGrowthWarning->setText(_segmentationGrowthStatusText);
         _segmentationGrowthWarning->setVisible(true);
-        statusBar()->showMessage(_segmentationGrowthStatusText, 0);
+        showStatusBarMessage(_segmentationGrowthStatusText, 0);
     } else if (_segmentationGrowthWarning) {
         _segmentationGrowthWarning->clear();
         _segmentationGrowthWarning->setVisible(false);
-        if (statusBar()->currentMessage() == _segmentationGrowthStatusText) {
-            statusBar()->clearMessage();
+        if (_statusMessageLabel && _statusMessageLabel->text() == _segmentationGrowthStatusText) {
+            clearStatusBarMessage();
+        } else if (statusBar()->currentMessage() == _segmentationGrowthStatusText) {
+            clearStatusBarMessage();
         }
         _segmentationGrowthStatusText.clear();
     }
 }
 
-void CWindow::onSliceStepSizeChanged(int newSize)
+void CWindow::onZScrollSensitivityChanged(double sensitivity)
 {
-    // Update status bar label
+    // Update status bar label. Persistence + viewer refresh happen in
+    // ViewerManager::setZScrollSensitivity (the single source of truth).
     if (_sliceStepLabel) {
-        _sliceStepLabel->setText(tr("Step: %1").arg(newSize));
+        _sliceStepLabel->setText(tr("Z sens: %1").arg(sensitivity, 0, 'f', 1));
     }
+}
 
-    // Save to settings
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, newSize);
-
-    if (_viewerControlsPanel) {
-        _viewerControlsPanel->setSliceStepSize(newSize);
+void CWindow::onSharedCacheStatsChanged(const QStringList& items)
+{
+    if (!_sharedCacheStatsLabel || items.isEmpty()) {
+        return;
     }
+    _sharedCacheStatsLabel->setText(items.join(QStringLiteral("  ")));
 }
 
 // Open volume package
@@ -6948,6 +8743,217 @@ void CWindow::connectVolumeSelector(QComboBox* selector)
             });
 }
 
+QString CWindow::lastVolumeSettingKeyForCurrentPackage() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+
+    QString projectPath = QString::fromStdString(_state->vpkg()->path().string());
+    if (projectPath.isEmpty()) {
+        return {};
+    }
+
+    const QFileInfo info(projectPath);
+    QString stablePath = info.canonicalFilePath();
+    if (stablePath.isEmpty()) {
+        stablePath = info.absoluteFilePath();
+    }
+    if (stablePath.isEmpty()) {
+        stablePath = projectPath;
+    }
+
+    return QStringLiteral("%1%2").arg(
+        QString::fromLatin1(vc3d::settings::project::LAST_VOLUME_PREFIX),
+        QString::fromLatin1(QUrl::toPercentEncoding(stablePath)));
+}
+
+QString CWindow::rememberedVolumeIdForCurrentPackage() const
+{
+    const QString key = lastVolumeSettingKeyForCurrentPackage();
+    if (key.isEmpty()) {
+        return {};
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(key).toString();
+}
+
+void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
+{
+    if (volumeId.isEmpty() || !_state || !_state->vpkg() ||
+        !_state->vpkg()->hasVolume(volumeId.toStdString())) {
+        return;
+    }
+
+    const QString key = lastVolumeSettingKeyForCurrentPackage();
+    if (key.isEmpty()) {
+        return;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(key, volumeId);
+}
+
+const vc3d::opendata::OpenDataManifest* CWindow::cachedOpenDataManifest() const
+{
+    if (_openDataManifestCache) {
+        return &*_openDataManifestCache;
+    }
+    if (_openDataManifestLoadAttempted) {
+        return nullptr;
+    }
+    _openDataManifestLoadAttempted = true;
+
+    const auto manifestPath = openDataCatalogManifestCachePath();
+    if (manifestPath.empty() || !std::filesystem::is_regular_file(manifestPath)) {
+        return nullptr;
+    }
+
+    try {
+        _openDataManifestCache = vc3d::opendata::loadOpenDataManifestFile(
+            manifestPath,
+            std::string(vc3d::opendata::kDefaultManifestUrl));
+        return &*_openDataManifestCache;
+    } catch (const std::exception& ex) {
+        Logger()->warn("Failed to load cached open-data manifest '{}': {}",
+                       manifestPath.string(), ex.what());
+    } catch (...) {
+        Logger()->warn("Failed to load cached open-data manifest '{}': unknown error",
+                       manifestPath.string());
+    }
+
+    return nullptr;
+}
+
+std::string CWindow::openDataVolumeIdForLoadedVolumeId(const std::string& volumeId) const
+{
+    if (volumeId.empty() || !_state || !_state->vpkg()) {
+        return {};
+    }
+
+    for (const auto& tag : _state->vpkg()->volumeTags(volumeId)) {
+        if (tag.rfind(OPEN_DATA_VOLUME_ID_TAG_PREFIX, 0) != 0) {
+            continue;
+        }
+        return tag.substr(OPEN_DATA_VOLUME_ID_TAG_PREFIX.size());
+    }
+
+    return {};
+}
+
+std::optional<cv::Matx44d> CWindow::openDataVolumeTransformForSwitch(
+    const std::string& fromLoadedVolumeId,
+    const std::string& toLoadedVolumeId) const
+{
+    const std::string fromCatalogId = openDataVolumeIdForLoadedVolumeId(fromLoadedVolumeId);
+    const std::string toCatalogId = openDataVolumeIdForLoadedVolumeId(toLoadedVolumeId);
+    if (fromCatalogId.empty() || toCatalogId.empty() || fromCatalogId == toCatalogId) {
+        return std::nullopt;
+    }
+
+    const auto* manifest = cachedOpenDataManifest();
+    if (!manifest) {
+        return std::nullopt;
+    }
+
+    for (const auto& sample : manifest->samples) {
+        if (auto matrix = vc3d::opendata::findSampleVolumeTransform(
+                sample, fromCatalogId, toCatalogId)) {
+            return matrix;
+        }
+    }
+
+    return std::nullopt;
+}
+
+void CWindow::updateOpenDataSegmentTransformState(bool showDialog)
+{
+    if (!_state || !_state->vpkg()) {
+        return;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::string loadedVolumeId = _state->currentVolumeId();
+    QString catalogVolumeId = openDataCatalogVolumeIdForLoadedVolume(*vpkg, loadedVolumeId);
+    const bool hasOpenDataSegments = packageHasOpenDataSegments(*vpkg);
+    const auto* matchingEntry = findOpenDataSegmentsEntryForLoadedVolume(
+        *vpkg,
+        loadedVolumeId,
+        &catalogVolumeId);
+
+    auto setWarning = [&](bool enabled) {
+        const QString warningText = tr("Current segments have no available transforms to selected volume.");
+        if (!_segmentTransformWarning && statusBar()) {
+            _segmentTransformWarning = new QLabel(statusBar());
+            _segmentTransformWarning->setObjectName(QStringLiteral("segmentTransformWarning"));
+            _segmentTransformWarning->setStyleSheet(QStringLiteral("color: #c62828; font-weight: 600;"));
+            _segmentTransformWarning->setContentsMargins(8, 0, 8, 0);
+            _segmentTransformWarning->setAlignment(Qt::AlignCenter);
+            _segmentTransformWarning->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            _segmentTransformWarning->setMinimumWidth(320);
+            _segmentTransformWarning->hide();
+            statusBar()->addPermanentWidget(_segmentTransformWarning, 1);
+        }
+
+        if (_surfacePanel) {
+            _surfacePanel->setTransformWarning(enabled ? warningText : QString());
+        }
+        if (_segmentTransformWarning) {
+            _segmentTransformWarning->setText(enabled ? warningText : QString());
+            _segmentTransformWarning->setVisible(enabled);
+        }
+        if (enabled) {
+            showStatusBarMessage(warningText, 0);
+        } else if (_statusMessageLabel && _statusMessageLabel->text() == warningText) {
+            clearStatusBarMessage();
+        }
+    };
+
+    if (!hasOpenDataSegments || loadedVolumeId.empty()) {
+        setWarning(false);
+        _lastSegmentTransformWarningVolumeId.clear();
+        return;
+    }
+
+    if (matchingEntry) {
+        const auto currentPath = vpkg->outputSegmentsPath().lexically_normal();
+        const auto targetPath = vc::project::resolveLocalPath(
+            matchingEntry->location,
+            vpkg->path().parent_path()).lexically_normal();
+        if (currentPath != targetPath) {
+            const std::string previousActiveSurfaceId = _state->activeSurfaceId();
+            vpkg->setOutputSegments(matchingEntry->location);
+            vpkg->refreshSegmentations();
+            refreshSegmentationDirectoryDropdown();
+            if (_surfacePanel) {
+                _surfacePanel->setVolumePkg(vpkg);
+                _surfacePanel->loadSurfaces(true);
+                _surfacePanel->refreshPointSetFilterOptions();
+            }
+            if (!restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId)) {
+                clearSurfaceSelection();
+                _state->setSurface("segmentation", nullptr, true);
+            }
+        }
+        setWarning(false);
+        _lastSegmentTransformWarningVolumeId.clear();
+        return;
+    }
+
+    setWarning(true);
+    const QString warningVolumeId = catalogVolumeId.isEmpty()
+        ? QString::fromStdString(loadedVolumeId)
+        : catalogVolumeId;
+    if (showDialog && _lastSegmentTransformWarningVolumeId != warningVolumeId) {
+        _lastSegmentTransformWarningVolumeId = warningVolumeId;
+        QMessageBox::information(
+            this,
+            tr("Segments unavailable"),
+            tr("Current segments have no available transforms to selected volume."));
+    }
+}
+
 QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)
 {
     auto* volumeSelector = new VolumeSelector(parent);
@@ -6992,8 +8998,11 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 
     QVector<QPair<QString, QString>> volumeEntries;
+    QVector<QPair<QString, QString>> openDataVolumeIdMap;
+    std::set<QString> openDataVolumesWithoutSegments;
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
+    const bool hasExplicitPreferredVolume = !activeCandidate.isEmpty();
     QString currentComboId;
     for (QComboBox* selector : selectors) {
         if (selector && selector->currentIndex() >= 0) {
@@ -7014,8 +9023,18 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         return false;
     };
 
+    auto openDataVolumeIdMappedToLoadedId = [&](const QString& catalogVolumeId) {
+        for (const auto& mapping : openDataVolumeIdMap) {
+            if (mapping.first == catalogVolumeId) {
+                return mapping.second;
+            }
+        }
+        return QString{};
+    };
+
     QString bestGrowthVolumeId;
     bool preferredVolumeFound = false;
+    const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
     const auto volumeIds = _state->vpkg()->volumeIDs();
     for (const auto& id : volumeIds) {
         try {
@@ -7026,6 +9045,21 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
+            if (hasOpenDataSegments && !volumeHasOpenDataSegmentsEntry(*_state->vpkg(), id)) {
+                openDataVolumesWithoutSegments.insert(idStr);
+            }
+            for (const auto& tag : _state->vpkg()->volumeTags(id)) {
+                constexpr std::string_view prefix = "vc-open-data-volume-id:";
+                if (tag.rfind(prefix, 0) != 0) {
+                    continue;
+                }
+                const QString catalogVolumeId =
+                    QString::fromStdString(tag.substr(prefix.size()));
+                if (!catalogVolumeId.isEmpty() &&
+                    openDataVolumeIdMappedToLoadedId(catalogVolumeId).isEmpty()) {
+                    openDataVolumeIdMap.append({catalogVolumeId, idStr});
+                }
+            }
 
             const QString loweredName = nameStr.toLower();
             const QString loweredId = idStr.toLower();
@@ -7048,7 +9082,13 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 
     if (!activeCandidate.isEmpty() && !hasVolume(activeCandidate)) {
-        activeCandidate.clear();
+        activeCandidate = openDataVolumeIdMappedToLoadedId(activeCandidate);
+    }
+    if (activeCandidate.isEmpty() && !hasExplicitPreferredVolume) {
+        const QString rememberedVolumeId = rememberedVolumeIdForCurrentPackage();
+        if (!rememberedVolumeId.isEmpty() && hasVolume(rememberedVolumeId)) {
+            activeCandidate = rememberedVolumeId;
+        }
     }
     if (activeCandidate.isEmpty() && !currentComboId.isEmpty() && hasVolume(currentComboId)) {
         activeCandidate = currentComboId;
@@ -7068,6 +9108,13 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         selector->clear();
         for (const auto& [id, label] : volumeEntries) {
             selector->addItem(label, QVariant(id));
+            const int row = selector->count() - 1;
+            if (openDataVolumesWithoutSegments.find(id) != openDataVolumesWithoutSegments.end()) {
+                selector->setItemData(row, QBrush(QColor(245, 124, 0)), Qt::ForegroundRole);
+                selector->setItemData(row,
+                                      tr("No segment transform is available for this volume."),
+                                      Qt::ToolTipRole);
+            }
         }
         if (activeCandidate.isEmpty()) {
             if (selector->count() > 0) {
@@ -7232,9 +9279,14 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
     const std::string previousSurfId = _state->activeSurfaceId();
     const std::string newSurfId = surfaceId.toStdString();
 
-    // Look up the shared_ptr by ID
-    if (_state->vpkg() && !newSurfId.empty()) {
-        _state->setActiveSurface(newSurfId, _state->vpkg()->getSurface(newSurfId));
+    // Look up the shared_ptr by display ID. Multi-folder entries are keyed only
+    // in CState, while current-folder entries are still owned by VolumePkg.
+    if (_state && !newSurfId.empty()) {
+        auto stateSurface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(newSurfId));
+        if (!stateSurface && _state->vpkg()) {
+            stateSurface = _state->vpkg()->getSurface(newSurfId);
+        }
+        _state->setActiveSurface(newSurfId, stateSurface);
     } else {
         _state->clearActiveSurface();
     }
@@ -7382,8 +9434,12 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
     const std::string previousSurfId = _state->activeSurfaceId();
     const std::string newSurfId = surfaceId.toStdString();
 
-    if (_state->vpkg() && !newSurfId.empty()) {
-        _state->setActiveSurface(newSurfId, _state->vpkg()->getSurface(newSurfId));
+    if (_state && !newSurfId.empty()) {
+        auto stateSurface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(newSurfId));
+        if (!stateSurface && _state->vpkg()) {
+            stateSurface = _state->vpkg()->getSurface(newSurfId);
+        }
+        _state->setActiveSurface(newSurfId, stateSurface);
     } else {
         _state->clearActiveSurface();
     }
@@ -7489,11 +9545,15 @@ void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> 
     // (the ID remains valid for lookup - will just return nullptr if surface is gone)
 }
 
-void CWindow::onEditMaskPressed(void)
+void CWindow::onEditMaskPressed(const QString& segmentId)
 {
-    auto surf = _state->activeSurface().lock();
-    if (!surf)
+    auto surf = (_state && _state->vpkg())
+        ? _state->vpkg()->getSurface(segmentId.toStdString())
+        : nullptr;
+    if (!surf) {
+        QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
         return;
+    }
 
     std::filesystem::path path = surf->path/"mask.tif";
 
@@ -7506,19 +9566,15 @@ void CWindow::onEditMaskPressed(void)
     if (_maskRenderInProgress)
         return;
     _maskRenderInProgress = true;
-    ui.btnEditMask->setEnabled(false);
-    ui.btnAppendMask->setEnabled(false);
-    statusBar()->showMessage(tr("Rendering mask..."));
+    showStatusBarMessage(tr("Rendering mask..."));
 
     auto* watcher = new QFutureWatcher<void>(this);
     connect(watcher, &QFutureWatcher<void>::finished, this,
             [this, watcher, surf, path]() {
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
-                ui.btnEditMask->setEnabled(true);
-                ui.btnAppendMask->setEnabled(true);
 
-                statusBar()->showMessage(tr("Mask saved"), 3000);
+                showStatusBarMessage(tr("Mask saved"), 3000);
                 QDesktopServices::openUrl(QUrl::fromLocalFile(
                     QString::fromStdString(path.string())));
             });
@@ -7534,9 +9590,11 @@ void CWindow::onEditMaskPressed(void)
     }));
 }
 
-void CWindow::onAppendMaskPressed(void)
+void CWindow::onAppendMaskPressed(const QString& segmentId)
 {
-    auto surf = _state->activeSurface().lock();
+    auto surf = (_state && _state->vpkg())
+        ? _state->vpkg()->getSurface(segmentId.toStdString())
+        : nullptr;
     if (!surf || !_state->currentVolume()) {
         if (!surf) {
             QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
@@ -7549,9 +9607,7 @@ void CWindow::onAppendMaskPressed(void)
     if (_maskRenderInProgress)
         return;
     _maskRenderInProgress = true;
-    ui.btnEditMask->setEnabled(false);
-    ui.btnAppendMask->setEnabled(false);
-    statusBar()->showMessage(tr("Rendering mask..."));
+    showStatusBarMessage(tr("Rendering mask..."));
 
     std::filesystem::path path = surf->path/"mask.tif";
     auto volume = _state->currentVolume();
@@ -7561,18 +9617,16 @@ void CWindow::onAppendMaskPressed(void)
             [this, watcher, path]() {
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
-                ui.btnEditMask->setEnabled(true);
-                ui.btnAppendMask->setEnabled(true);
 
                 try {
                     QString msg = watcher->result();
-                    statusBar()->showMessage(msg, 3000);
+                    showStatusBarMessage(msg, 3000);
                     QDesktopServices::openUrl(QUrl::fromLocalFile(
                         QString::fromStdString(path.string())));
                 } catch (const std::exception& e) {
                     QMessageBox::critical(this, tr("Error"),
                                          tr("Failed to render surface: %1").arg(e.what()));
-                    statusBar()->clearMessage();
+                    clearStatusBarMessage();
                 }
             });
 
@@ -7640,40 +9694,255 @@ QString CWindow::getCurrentVolumePath() const
     return QString::fromStdString(volume->path().string());
 }
 
+QColor CWindow::defaultSegmentFolderColor(const QString& dirName) const
+{
+    static const std::array<QColor, 10> colors = {
+        QColor(0, 180, 255),
+        QColor(255, 170, 0),
+        QColor(120, 220, 120),
+        QColor(255, 100, 150),
+        QColor(180, 120, 255),
+        QColor(70, 210, 190),
+        QColor(255, 230, 90),
+        QColor(240, 120, 70),
+        QColor(150, 210, 255),
+        QColor(210, 210, 210),
+    };
+    return colors[static_cast<size_t>(qHash(dirName)) % colors.size()];
+}
+
+QColor segmentFolderSolidColorOr(const std::map<QString, QColor>& colors,
+                                 const QString& dirName,
+                                 const QColor& fallback)
+{
+    auto it = colors.find(dirName);
+    return it != colors.end() ? it->second : fallback;
+}
+
+QString CWindow::effectiveDefaultSegmentFolderDir() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+
+    const QString currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
+    const auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
+    const auto containsDir = [&availableDirs](const QString& dirName) {
+        return std::any_of(availableDirs.begin(), availableDirs.end(), [&dirName](const std::string& available) {
+            return QString::fromStdString(available) == dirName;
+        });
+    };
+
+    if (!_segmentFolderDefaultPaletteDir.isEmpty() && containsDir(_segmentFolderDefaultPaletteDir)) {
+        return _segmentFolderDefaultPaletteDir;
+    }
+
+    if (!currentDir.isEmpty() && !_segmentFolderSolidColors.contains(currentDir)) {
+        return currentDir;
+    }
+    return {};
+}
+
+void CWindow::refreshSegmentationDirectoryDropdown()
+{
+    if (!_state || !_state->vpkg() || !cmbSegmentationDir || !_segmentDirModel) {
+        return;
+    }
+
+    QSet<QString> previouslyChecked;
+    for (int row = 0; row < _segmentDirModel->rowCount(); ++row) {
+        auto* item = _segmentDirModel->item(row);
+        if (item && item->checkState() == Qt::Checked) {
+            previouslyChecked.insert(item->data(SEGMENT_DIR_NAME_ROLE).toString());
+        }
+    }
+
+    const QString currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
+    if (!currentDir.isEmpty()) {
+        previouslyChecked.insert(currentDir);
+    }
+
+    const QSignalBlocker blocker{cmbSegmentationDir};
+    _updatingSegmentDirUi = true;
+    _segmentDirModel->clear();
+
+    const auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
+    const QString defaultPaletteDir = effectiveDefaultSegmentFolderDir();
+    int currentIndex = -1;
+    for (const auto& dirNameStd : availableDirs) {
+        const QString dirName = QString::fromStdString(dirNameStd);
+        auto* item = new QStandardItem(dirName);
+        item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsUserCheckable);
+        item->setCheckable(true);
+        item->setCheckState(previouslyChecked.contains(dirName) ? Qt::Checked : Qt::Unchecked);
+        item->setData(dirName, SEGMENT_DIR_NAME_ROLE);
+        item->setData(segmentFolderSolidColorOr(_segmentFolderSolidColors, dirName, QColor()),
+                      SEGMENT_DIR_COLOR_ROLE);
+        item->setData(dirName == defaultPaletteDir, SEGMENT_DIR_DEFAULT_PALETTE_ROLE);
+        _segmentDirModel->appendRow(item);
+        if (dirName == currentDir) {
+            currentIndex = _segmentDirModel->rowCount() - 1;
+        }
+    }
+
+    if (currentIndex >= 0) {
+        cmbSegmentationDir->setCurrentIndex(currentIndex);
+    }
+    _updatingSegmentDirUi = false;
+
+    applySegmentFolderSelection(false);
+}
+
+void CWindow::applySegmentFolderSelection(bool reloadSurfaces)
+{
+    if (!_state || !_state->vpkg() || !_surfacePanel || !_segmentDirModel) {
+        return;
+    }
+
+    const QString currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
+    const QString defaultPaletteDir = effectiveDefaultSegmentFolderDir();
+    std::vector<SurfacePanelController::SegmentFolderSelection> folders;
+    folders.reserve(static_cast<size_t>(_segmentDirModel->rowCount()));
+
+    _updatingSegmentDirUi = true;
+    for (int row = 0; row < _segmentDirModel->rowCount(); ++row) {
+        auto* item = _segmentDirModel->item(row);
+        if (!item) {
+            continue;
+        }
+        const QString dirName = item->data(SEGMENT_DIR_NAME_ROLE).toString();
+        if (dirName == currentDir && item->checkState() != Qt::Checked) {
+            item->setCheckState(Qt::Checked);
+        }
+        const bool checked = item->checkState() == Qt::Checked;
+        const bool isCurrent = dirName == currentDir;
+        const bool defaultPalette = dirName == defaultPaletteDir;
+        const QColor color = defaultPalette
+            ? QColor()
+            : segmentFolderSolidColorOr(_segmentFolderSolidColors,
+                                        dirName,
+                                        defaultSegmentFolderColor(dirName));
+        item->setData(color, SEGMENT_DIR_COLOR_ROLE);
+        item->setData(defaultPalette, SEGMENT_DIR_DEFAULT_PALETTE_ROLE);
+        if (!checked) {
+            continue;
+        }
+        folders.push_back(SurfacePanelController::SegmentFolderSelection{
+            dirName.toStdString(),
+            _state->vpkg()->findSegmentPathByName(dirName.toStdString()),
+            isCurrent,
+            defaultPalette,
+            color,
+        });
+    }
+    _updatingSegmentDirUi = false;
+
+    _surfacePanel->setVisibleSegmentFolders(std::move(folders));
+    if (reloadSurfaces) {
+        const std::string previousActiveSurfaceId = _state->activeSurfaceId();
+        _surfacePanel->resetTagUi();
+        _surfacePanel->loadSurfaces(true);
+        restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId);
+    }
+}
+
+void CWindow::showSegmentFolderPaletteMenu(int row)
+{
+    if (!_segmentDirModel || row < 0 || row >= _segmentDirModel->rowCount()) {
+        return;
+    }
+    auto* item = _segmentDirModel->item(row);
+    if (!item) {
+        return;
+    }
+    const QString dirName = item->data(SEGMENT_DIR_NAME_ROLE).toString();
+    const QString previousDefaultDir = effectiveDefaultSegmentFolderDir();
+
+    QMenu menu(cmbSegmentationDir);
+    QAction* defaultAction = menu.addAction(tr("Default palette"));
+    defaultAction->setCheckable(true);
+    defaultAction->setChecked(dirName == previousDefaultDir);
+    connect(defaultAction, &QAction::triggered, this, [this, dirName, previousDefaultDir]() {
+        if (!previousDefaultDir.isEmpty() && previousDefaultDir != dirName &&
+            !_segmentFolderSolidColors.contains(previousDefaultDir)) {
+            _segmentFolderSolidColors[previousDefaultDir] = defaultSegmentFolderColor(previousDefaultDir);
+        }
+        _segmentFolderSolidColors.erase(dirName);
+        _segmentFolderDefaultPaletteDir = dirName;
+        applySegmentFolderSelection(true);
+        if (cmbSegmentationDir) {
+            cmbSegmentationDir->view()->viewport()->update();
+        }
+    });
+    menu.addSeparator();
+
+    QAction* chooseAction = menu.addAction(tr("Solid color..."));
+    connect(chooseAction, &QAction::triggered, this, [this, dirName]() {
+        const QColor initial = segmentFolderSolidColorOr(_segmentFolderSolidColors,
+                                                        dirName,
+                                                        defaultSegmentFolderColor(dirName));
+        const QColor chosen = QColorDialog::getColor(initial, this, tr("Segment Folder Color"));
+        if (!chosen.isValid()) {
+            return;
+        }
+        _segmentFolderSolidColors[dirName] = chosen;
+        if (effectiveDefaultSegmentFolderDir() == dirName) {
+            _segmentFolderDefaultPaletteDir.clear();
+        }
+        applySegmentFolderSelection(true);
+        if (cmbSegmentationDir) {
+            cmbSegmentationDir->view()->viewport()->update();
+        }
+    });
+    menu.exec(QCursor::pos());
+}
+
 void CWindow::onSegmentationDirChanged(int index)
 {
     if (!_state->vpkg() || index < 0 || !cmbSegmentationDir) {
         return;
     }
 
-    std::string newDir = cmbSegmentationDir->itemText(index).toStdString();
+    std::string newDir;
+    if (_segmentDirModel && index < _segmentDirModel->rowCount()) {
+        newDir = _segmentDirModel->item(index)->data(SEGMENT_DIR_NAME_ROLE).toString().toStdString();
+    } else {
+        newDir = cmbSegmentationDir->itemText(index).toStdString();
+    }
 
     // Only reload if the directory actually changed
     if (newDir != _state->vpkg()->getSegmentationDirectory()) {
-        // Clear the current segmentation surface first to ensure viewers update
-        _state->setSurface("segmentation", nullptr, true);
-
-        // Clear current surface selection
-        _state->clearActiveSurface();
-        treeWidgetSurfaces->clearSelection();
-
-        if (_surfacePanel) {
-            _surfacePanel->resetTagUi();
-        }
+        const std::string previousActiveSurfaceId = _state->activeSurfaceId();
 
         // Set the new directory in the VolumePkg
         _state->vpkg()->setSegmentationDirectory(newDir);
+        _state->vpkg()->refreshSegmentations();
 
         // Reset stride user override for the new directory.
         if (_viewerManager) {
             _viewerManager->resetStrideUserOverride();
         }
+        applySegmentFolderSelection(false);
         if (_surfacePanel) {
             _surfacePanel->loadSurfaces(true);
         }
 
+        const bool restoredActiveSurface =
+            restoreActiveSurfaceAfterSurfaceReload(previousActiveSurfaceId);
+
+        if (!restoredActiveSurface) {
+            _state->clearActiveSurface();
+            _state->setSurface("segmentation", nullptr, true);
+            if (treeWidgetSurfaces) {
+                treeWidgetSurfaces->clearSelection();
+            }
+            if (_surfacePanel) {
+                _surfacePanel->resetTagUi();
+            }
+        }
+
         // Update the status bar to show the change
-        statusBar()->showMessage(tr("Switched to %1 directory").arg(QString::fromStdString(newDir)), 3000);
+        showStatusBarMessage(tr("Switched to %1 directory").arg(QString::fromStdString(newDir)), 3000);
     }
 }
 
@@ -7785,7 +10054,7 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
 {
     auto point_opt = _state->pointCollection()->getPoint(pointId);
     if (!point_opt) {
-        statusBar()->showMessage(tr("Point not found"), 2000);
+        showStatusBarMessage(tr("Point not found"), 2000);
         return;
     }
 
@@ -7793,7 +10062,7 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     auto seg_surface = _state->surface("segmentation");
     auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface.get());
     if (!quad_surface) {
-        statusBar()->showMessage(tr("No active segmentation surface for anchor conversion"), 3000);
+        showStatusBarMessage(tr("No active segmentation surface for anchor conversion"), 3000);
         return;
     }
 
@@ -7803,7 +10072,7 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     float dist = quad_surface->pointTo(ptr, point_opt->p, 4.0, 1000, patchIndex);
 
     if (dist > 10.0) {
-        statusBar()->showMessage(tr("Point is too far from surface (distance: %1)").arg(dist), 3000);
+        showStatusBarMessage(tr("Point is too far from surface (distance: %1)").arg(dist), 3000);
         return;
     }
 
@@ -7817,7 +10086,7 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     // Remove the point (it's now represented by the anchor)
     _state->pointCollection()->removePoint(pointId);
 
-    statusBar()->showMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
+    showStatusBarMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
 }
 
 void CWindow::onZoomOut()
@@ -7832,7 +10101,7 @@ void CWindow::onCopyCoordinates()
     QString coords = lblLocFocus->text().trimmed();
     if (!coords.isEmpty()) {
         QApplication::clipboard()->setText(coords);
-        statusBar()->showMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
+        showStatusBarMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
     }
 }
 
@@ -7843,16 +10112,13 @@ void CWindow::onResetAxisAlignedRotations()
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->refreshAll();
     }
-    statusBar()->showMessage(tr("All plane rotations reset"), 2000);
+    showStatusBarMessage(tr("All plane rotations reset"), 2000);
 }
 
 void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
 {
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->setAxisAlignedEnabled(enabled && _axisAlignedSliceController->isEnabled());
-    }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        spinAxisOverlayOpacity->setEnabled(_axisAlignedSliceController->isEnabled() && enabled);
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS, enabled ? "1" : "0");
@@ -7870,7 +10136,7 @@ void CWindow::onAxisOverlayOpacityChanged(int value)
 
 void CWindow::onAxisAlignedSlicesToggled(bool enabled)
 {
-    _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays, ui.spinAxisOverlayOpacity);
+    _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays);
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
 }
@@ -7957,7 +10223,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         auto activeSurfaceShared = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
 
         if (!_segmentationModule->beginEditingSession(activeSurfaceShared)) {
-            statusBar()->showMessage(tr("Unable to start segmentation editing"), 3000);
+            showStatusBarMessage(tr("Unable to start segmentation editing"), 3000);
             if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
                 QSignalBlocker blocker(_segmentationWidget);
                 _segmentationWidget->setEditingEnabled(false);
@@ -7984,7 +10250,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
     const QString message = enabled
         ? tr("Segmentation editing enabled")
         : tr("Segmentation editing disabled");
-    statusBar()->showMessage(message, 2000);
+    showStatusBarMessage(message, 2000);
     if (_surfaceAffineTransforms) {
         _surfaceAffineTransforms->refresh();
     }
@@ -7997,7 +10263,7 @@ void CWindow::onSegmentationStopToolsRequested()
     }
     if (_cmdRunner) {
         _cmdRunner->cancel();
-        statusBar()->showMessage(tr("Cancelling running tools..."), 3000);
+        showStatusBarMessage(tr("Cancelling running tools..."), 3000);
     }
 }
 
@@ -8007,9 +10273,11 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                         bool inpaintOnly)
 {
     if (!_segmentationGrower) {
-        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
+        showStatusBarMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
     }
+
+    updateNormalGridAvailability();
 
     SegmentationGrower::Context context{
         _segmentationModule.get(),
@@ -8039,138 +10307,268 @@ void CWindow::updateSurfaceOverlayDropdown()
         return;
     }
 
-    // Disconnect previous model's signals if any
+    QSet<QString> previouslyChecked;
     if (_surfaceOverlayModel) {
+        for (auto* item : surfaceOverlaySurfaceItems(_surfaceOverlayModel)) {
+            if (item && item->checkState() == Qt::Checked) {
+                previouslyChecked.insert(item->data(SURFACE_OVERLAY_NAME_ROLE).toString());
+            }
+        }
         disconnect(_surfaceOverlayModel, &QStandardItemModel::dataChanged,
                    this, &CWindow::onSurfaceOverlaySelectionChanged);
+        _surfaceOverlayModel->deleteLater();
     }
 
-    // Create new model
-    _surfaceOverlayModel = new QStandardItemModel(ui.surfaceOverlaySelect);
-    ui.surfaceOverlaySelect->setModel(_surfaceOverlayModel);
+    _surfaceOverlayModel = new QStandardItemModel(this);
+    _surfaceOverlayModel->setHorizontalHeaderLabels({tr("Surface")});
 
-    // Use a QListView to properly show checkboxes
-    auto* listView = new QListView(ui.surfaceOverlaySelect);
-    ui.surfaceOverlaySelect->setView(listView);
-
-    // Get current segmentation directory for filtering
-    std::string currentDir;
+    QString currentDir;
     if (_state->vpkg()) {
-        currentDir = _state->vpkg()->getSegmentationDirectory();
+        currentDir = QString::fromStdString(_state->vpkg()->getSegmentationDirectory());
     }
-
-    // Add "All" item at the top
-    auto* allItem = new QStandardItem(tr("All"));
-    allItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
-    allItem->setData(Qt::Unchecked, Qt::CheckStateRole);
-    allItem->setData(QStringLiteral("__all__"), Qt::UserRole);
-    _surfaceOverlayModel->appendRow(allItem);
 
     if (_state) {
         const auto names = _state->surfaceNames();
         for (const auto& name : names) {
-            // Only add QuadSurfaces (actual segmentations), skip PlaneSurfaces
             auto surf = _state->surface(name);
             auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get());
             if (!quadSurf) {
                 continue;
             }
 
-            // Filter by current segmentation directory
-            if (!currentDir.empty() && !surf->path.empty()) {
-                std::string surfDir = surf->path.parent_path().filename().string();
-                if (surfDir != currentDir) {
-                    continue;
-                }
+            const QString folderName = surfaceOverlayFolderName(name, surf.get(), currentDir);
+            QStandardItem* folderItem = findSurfaceOverlayFolder(_surfaceOverlayModel, folderName);
+            if (!folderItem) {
+                folderItem = new QStandardItem(folderName);
+                folderItem->setFlags(Qt::ItemIsUserCheckable |
+                                     Qt::ItemIsEnabled |
+                                     Qt::ItemIsSelectable |
+                                     Qt::ItemIsAutoTristate);
+                folderItem->setCheckable(true);
+                folderItem->setCheckState(Qt::Unchecked);
+                folderItem->setData(static_cast<int>(SurfaceOverlayItemKind::Folder),
+                                    SURFACE_OVERLAY_KIND_ROLE);
+                folderItem->setData(folderName, SURFACE_OVERLAY_FOLDER_ROLE);
+                _surfaceOverlayModel->appendRow(folderItem);
             }
 
-            auto* item = new QStandardItem(QString::fromStdString(name));
-            item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
-            item->setData(Qt::Unchecked, Qt::CheckStateRole);
-            item->setData(QString::fromStdString(name), Qt::UserRole);
-
-            // Assign persistent color if not already assigned
             if (_surfaceOverlayColorAssignments.find(name) == _surfaceOverlayColorAssignments.end()) {
                 _surfaceOverlayColorAssignments[name] = _nextSurfaceOverlayColorIndex++;
             }
             size_t colorIdx = _surfaceOverlayColorAssignments[name];
 
-            // Create color swatch icon (16x16 colored square)
+            auto* item = new QStandardItem(surfaceOverlayLeafLabel(name, folderName));
+            item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+            item->setCheckable(true);
+            item->setCheckState(previouslyChecked.contains(QString::fromStdString(name))
+                                    ? Qt::Checked
+                                    : Qt::Unchecked);
+            item->setData(static_cast<int>(SurfaceOverlayItemKind::Surface),
+                          SURFACE_OVERLAY_KIND_ROLE);
+            item->setData(QString::fromStdString(name), SURFACE_OVERLAY_NAME_ROLE);
+            item->setData(folderName, SURFACE_OVERLAY_FOLDER_ROLE);
+
             QPixmap swatch(16, 16);
             swatch.fill(getOverlayColor(colorIdx));
             item->setIcon(QIcon(swatch));
 
-            _surfaceOverlayModel->appendRow(item);
+            folderItem->appendRow(item);
         }
     }
 
-    // Connect model's dataChanged signal for checkbox state changes
+    for (int row = 0; row < _surfaceOverlayModel->rowCount(); ++row) {
+        updateSurfaceOverlayFolderState(_surfaceOverlayModel->item(row));
+    }
+
     connect(_surfaceOverlayModel, &QStandardItemModel::dataChanged,
             this, &CWindow::onSurfaceOverlaySelectionChanged);
+
+    applySurfaceOverlaySelection();
 }
 
 void CWindow::onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft,
-                                                const QModelIndex& /*bottomRight*/,
+                                                const QModelIndex& bottomRight,
                                                 const QVector<int>& roles)
 {
-    if (!roles.contains(Qt::CheckStateRole) || !_surfaceOverlayModel || !_viewerManager) {
+    if ((!roles.isEmpty() && !roles.contains(Qt::CheckStateRole)) ||
+        !_surfaceOverlayModel ||
+        !_viewerManager) {
         return;
     }
 
-    // Check if "All" was toggled (row 0)
-    QStandardItem* changedItem = _surfaceOverlayModel->itemFromIndex(topLeft);
-    if (changedItem && changedItem->data(Qt::UserRole).toString() == QStringLiteral("__all__")) {
-        bool allChecked = changedItem->checkState() == Qt::Checked;
-
-        // Block signals while updating all items
-        {
-            QSignalBlocker blocker(_surfaceOverlayModel);
-            for (int row = 1; row < _surfaceOverlayModel->rowCount(); ++row) {
-                QStandardItem* item = _surfaceOverlayModel->item(row);
-                if (item) {
-                    item->setCheckState(allChecked ? Qt::Checked : Qt::Unchecked);
+    {
+        QSignalBlocker blocker(_surfaceOverlayModel);
+        for (int row = topLeft.row(); row <= bottomRight.row(); ++row) {
+            const QModelIndex idx = topLeft.sibling(row, topLeft.column());
+            QStandardItem* changedItem = _surfaceOverlayModel->itemFromIndex(idx);
+            if (!changedItem) {
+                continue;
+            }
+            if (isSurfaceOverlayFolder(changedItem)) {
+                const Qt::CheckState state = changedItem->checkState() == Qt::Checked
+                    ? Qt::Checked
+                    : Qt::Unchecked;
+                for (int childRow = 0; childRow < changedItem->rowCount(); ++childRow) {
+                    QStandardItem* child = changedItem->child(childRow);
+                    if (isSurfaceOverlaySurface(child)) {
+                        child->setCheckState(state);
+                    }
                 }
+            } else if (isSurfaceOverlaySurface(changedItem) && changedItem->parent()) {
+                updateSurfaceOverlayFolderState(changedItem->parent());
             }
         }
     }
 
-    // Build map of selected surfaces with colors
+    applySurfaceOverlaySelection();
+}
+
+void CWindow::applySurfaceOverlaySelection()
+{
+    if (!_surfaceOverlayModel || !_viewerManager) {
+        updateSurfaceOverlayButtonText();
+        return;
+    }
+
     std::map<std::string, cv::Vec3b> selectedSurfaces;
-    int checkedCount = 0;
-    int totalSurfaces = 0;
-
-    for (int row = 1; row < _surfaceOverlayModel->rowCount(); ++row) {
-        QStandardItem* item = _surfaceOverlayModel->item(row);
-        if (!item) continue;
-
-        totalSurfaces++;
+    for (auto* item : surfaceOverlaySurfaceItems(_surfaceOverlayModel)) {
+        if (!item) {
+            continue;
+        }
         if (item->checkState() == Qt::Checked) {
-            checkedCount++;
-            std::string name = item->data(Qt::UserRole).toString().toStdString();
+            std::string name = item->data(SURFACE_OVERLAY_NAME_ROLE).toString().toStdString();
             size_t colorIdx = _surfaceOverlayColorAssignments[name];
             selectedSurfaces[name] = getOverlayColorBGR(colorIdx);
         }
     }
 
-    // Update "All" checkbox state (partial/full/none) without triggering recursion
-    {
-        QSignalBlocker blocker(_surfaceOverlayModel);
-        QStandardItem* allItem = _surfaceOverlayModel->item(0);
-        if (allItem) {
-            if (checkedCount == 0) {
-                allItem->setCheckState(Qt::Unchecked);
-            } else if (checkedCount == totalSurfaces && totalSurfaces > 0) {
-                allItem->setCheckState(Qt::Checked);
-            } else {
-                allItem->setCheckState(Qt::PartiallyChecked);
+    _viewerManager->forEachBaseViewer([&selectedSurfaces](VolumeViewerBase* viewer) {
+        viewer->setSurfaceOverlays(selectedSurfaces);
+    });
+
+    updateSurfaceOverlayButtonText();
+}
+
+void CWindow::updateSurfaceOverlayButtonText()
+{
+    if (!ui.surfaceOverlaySelect) {
+        return;
+    }
+
+    int checkedCount = 0;
+    int totalCount = 0;
+    if (_surfaceOverlayModel) {
+        for (auto* item : surfaceOverlaySurfaceItems(_surfaceOverlayModel)) {
+            if (!item) {
+                continue;
+            }
+            ++totalCount;
+            if (item->checkState() == Qt::Checked) {
+                ++checkedCount;
             }
         }
     }
 
-    // Propagate to all viewers
-    _viewerManager->forEachBaseViewer([&selectedSurfaces](VolumeViewerBase* viewer) {
-        viewer->setSurfaceOverlays(selectedSurfaces);
+    if (totalCount == 0) {
+        ui.surfaceOverlaySelect->setText(tr("No surfaces"));
+    } else if (checkedCount == 0) {
+        ui.surfaceOverlaySelect->setText(tr("Select..."));
+    } else if (checkedCount == totalCount) {
+        ui.surfaceOverlaySelect->setText(tr("All surfaces (%1)").arg(totalCount));
+    } else {
+        ui.surfaceOverlaySelect->setText(tr("%1 surfaces").arg(checkedCount));
+    }
+}
+
+void CWindow::showSurfaceOverlaySelectionDialog()
+{
+    if (!_surfaceOverlayModel) {
+        updateSurfaceOverlayDropdown();
+    }
+    if (!_surfaceOverlayModel) {
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Select Overlap Surfaces"));
+    dialog.resize(460, 560);
+
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* filterEdit = new QLineEdit(&dialog);
+    filterEdit->setPlaceholderText(tr("Filter surfaces or folders"));
+    layout->addWidget(filterEdit);
+
+    auto* tree = new QTreeView(&dialog);
+    tree->setModel(_surfaceOverlayModel);
+    tree->setHeaderHidden(true);
+    tree->setAlternatingRowColors(true);
+    tree->setSelectionMode(QAbstractItemView::NoSelection);
+    tree->expandAll();
+    layout->addWidget(tree, 1);
+
+    auto* bulkRow = new QHBoxLayout();
+    auto* checkAll = new QPushButton(tr("Check All"), &dialog);
+    auto* deselectAll = new QPushButton(tr("Deselect All"), &dialog);
+    bulkRow->addWidget(checkAll);
+    bulkRow->addWidget(deselectAll);
+    bulkRow->addStretch(1);
+    layout->addLayout(bulkRow);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    const auto refreshFilter = [tree, filterEdit, this]() {
+        const QString filter = filterEdit->text().trimmed();
+        for (int folderRow = 0; folderRow < _surfaceOverlayModel->rowCount(); ++folderRow) {
+            QStandardItem* folder = _surfaceOverlayModel->item(folderRow);
+            const bool folderVisible = surfaceOverlayItemMatchesFilter(folder, filter);
+            tree->setRowHidden(folderRow, QModelIndex(), !folderVisible);
+            for (int row = 0; folder && row < folder->rowCount(); ++row) {
+                QStandardItem* child = folder->child(row);
+                const bool childVisible = filter.isEmpty() ||
+                    surfaceOverlayItemMatchesFilter(child, filter) ||
+                    folder->text().toCaseFolded().contains(filter.toCaseFolded());
+                tree->setRowHidden(row, folder->index(), !childVisible);
+            }
+        }
+        tree->expandAll();
+    };
+
+    const auto setVisibleSurfaces = [tree, this](Qt::CheckState state) {
+        if (!_surfaceOverlayModel) {
+            return;
+        }
+        QSignalBlocker blocker(_surfaceOverlayModel);
+        for (int folderRow = 0; folderRow < _surfaceOverlayModel->rowCount(); ++folderRow) {
+            if (tree->isRowHidden(folderRow, QModelIndex())) {
+                continue;
+            }
+            QStandardItem* folder = _surfaceOverlayModel->item(folderRow);
+            for (int row = 0; folder && row < folder->rowCount(); ++row) {
+                if (tree->isRowHidden(row, folder->index())) {
+                    continue;
+                }
+                QStandardItem* child = folder->child(row);
+                if (isSurfaceOverlaySurface(child)) {
+                    child->setCheckState(state);
+                }
+            }
+            updateSurfaceOverlayFolderState(folder);
+        }
+        applySurfaceOverlaySelection();
+    };
+
+    connect(filterEdit, &QLineEdit::textChanged, &dialog, refreshFilter);
+    connect(checkAll, &QPushButton::clicked, &dialog, [setVisibleSurfaces]() {
+        setVisibleSurfaces(Qt::Checked);
     });
+    connect(deselectAll, &QPushButton::clicked, &dialog, [setVisibleSurfaces]() {
+        setVisibleSurfaces(Qt::Unchecked);
+    });
+
+    refreshFilter();
+    dialog.exec();
 }
 
 QColor CWindow::getOverlayColor(size_t index) const
@@ -8201,9 +10599,11 @@ cv::Vec3b CWindow::getOverlayColorBGR(size_t index) const
 void CWindow::onCopyWithNtRequested()
 {
     if (!_segmentationGrower) {
-        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
+        showStatusBarMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
     }
+
+    updateNormalGridAvailability();
 
     SegmentationGrower::Context context{
         _segmentationModule.get(),
@@ -8374,7 +10774,7 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         _planeSlicingOverlay->refreshAll();
     }
 
-    statusBar()->showMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
+    showStatusBarMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
 }
 
 // ---- Fiber annotation slots -------------------------------------------------
@@ -8401,6 +10801,10 @@ void CWindow::onFiberViewersRequested()
     if (!_fiberController) return;
 
     constexpr int N = FiberAnnotationController::kNumViews;
+    QMdiArea* targetMdiArea = _fiberSliceMdiArea ? _fiberSliceMdiArea : mdiArea;
+    if (!targetMdiArea) {
+        return;
+    }
 
     QMdiSubWindow* subWindows[N] = {};
 
@@ -8408,7 +10812,7 @@ void CWindow::onFiberViewersRequested()
         QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
 
         auto* baseViewer = newConnectedViewer(
-            FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
+            FiberAnnotationController::fiberSurfaceName(i), title, targetMdiArea);
         auto* viewer = baseViewer
             ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())
             : nullptr;
@@ -8436,7 +10840,7 @@ void CWindow::onFiberViewersRequested()
     }
 
     // Layout: 2 columns × 1 row — ref on the left, annotate on the right.
-    QRect area = mdiArea->contentsRect();
+    QRect area = targetMdiArea->contentsRect();
     int colW = area.width() / 2;
     int rowH = area.height();
 

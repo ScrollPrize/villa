@@ -84,7 +84,8 @@ public:
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
         const std::filesystem::path& cacheRoot = {},
-        const vc::HttpAuth& auth = {});
+        const vc::HttpAuth& auth = {},
+        const utils::Json& metadata = {});
 
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;

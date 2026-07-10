@@ -1,12 +1,16 @@
 #pragma once
 
 #include <QObject>
+#include <QFutureWatcher>
 #include <QPointer>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "vc/core/util/RemoteAuth.hpp"
+#include "OpenDataVolumePrefill.hpp"
 
 class QAction;
 class QDialog;
@@ -14,6 +18,11 @@ class QMenu;
 class QMenuBar;
 class CWindow;
 class Volume;
+
+namespace vc3d::opendata {
+struct OpenDataSample;
+class OpenDataCatalogWindow;
+}
 
 class MenuActionController : public QObject
 {
@@ -23,12 +32,15 @@ public:
     static constexpr int kMaxRecentVolpkg = 10;
 
     explicit MenuActionController(CWindow* window);
+    ~MenuActionController() override;
 
     void populateMenus(QMenuBar* menuBar);
     void updateRecentVolpkgList(const QString& path);
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
+    void showOpenDataCatalog();
+    bool isOpenDataCatalogVisible() const;
 
 private slots:
     void newProject();
@@ -64,6 +76,7 @@ signals:
     // wires this to SegmentationCommandHandler::onMergePatch with an
     // empty seed list so the dialog opens with empty combo boxes.
     void mergePatchFromMenuRequested();
+    void openDataCatalogVisibilityChanged(bool visible);
 
 private:
     QStringList loadRecentPaths() const;
@@ -74,6 +87,9 @@ private:
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
+    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample);
+    void startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume);
+    void cancelOpenDataVolumePrefills();
     bool tryResolveRemoteAuth(const QString& url,
                               vc::HttpAuth* authOut,
                               bool allowPrompt,
@@ -113,6 +129,7 @@ private:
     QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
+    QAction* _openDataCatalogAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
@@ -131,4 +148,8 @@ private:
     QAction* _recalculateFiberScoresAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
+    QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
+    std::vector<QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>*> _openDataPrefillWatchers;
+    std::vector<std::shared_ptr<std::atomic<bool>>> _openDataPrefillCancelFlags;
+    std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
 };

@@ -101,6 +101,30 @@ struct SampleTile {
     int yEnd = 0;
 };
 
+struct MissingLevelContext {
+    MissingLevelContext(IChunkedArray& array_,
+                        int level_,
+                        LevelAccess access_,
+                        LevelPlane plane_ = {})
+        : level(level_)
+        , access(access_)
+        , plane(plane_)
+        , cache(array_, 64)
+    {
+    }
+
+    int level = 0;
+    LevelAccess access;
+    LevelPlane plane;
+    LocalChunkCache cache;
+};
+
+enum class ChunkDependencyState {
+    Ready,
+    KnownMissing,
+    Transient
+};
+
 bool finiteCoord(const cv::Vec3f& p)
 {
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
@@ -238,6 +262,91 @@ bool addVoxelDependency(IChunkedArray& array,
 
     keys.insert({level, iz / chunkShape[0], iy / chunkShape[1], ix / chunkShape[2]});
     return true;
+}
+
+bool addRequiredVoxelChunk(const LevelAccess& access,
+                           int level,
+                           int iz,
+                           int iy,
+                           int ix,
+                           std::vector<ChunkKey>& keys)
+{
+    const auto& shape = access.shape;
+    if (unsigned(iz) >= unsigned(shape[0])
+        || unsigned(iy) >= unsigned(shape[1])
+        || unsigned(ix) >= unsigned(shape[2]))
+        return true;
+
+    const auto& chunkShape = access.chunkShape;
+    if (chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0)
+        return false;
+
+    const ChunkKey key{level, iz / chunkShape[0], iy / chunkShape[1], ix / chunkShape[2]};
+    if (std::find(keys.begin(), keys.end(), key) == keys.end())
+        keys.push_back(key);
+    return true;
+}
+
+bool collectRequiredLevelChunks(const LevelAccess& access,
+                                int level,
+                                const cv::Vec3f& p,
+                                vc::Sampling sampling,
+                                std::vector<ChunkKey>& keys)
+{
+    keys.clear();
+    if (!finiteCoord(p))
+        return true;
+
+    const auto& shape = access.shape;
+    const float x = p[0], y = p[1], z = p[2];
+    if (!inLevelBounds(shape, z, y, x))
+        return true;
+
+    if (sampling == vc::Sampling::Nearest) {
+        int ix = int(x + 0.5f);
+        int iy = int(y + 0.5f);
+        int iz = int(z + 0.5f);
+        ix = std::clamp(ix, 0, shape[2] - 1);
+        iy = std::clamp(iy, 0, shape[1] - 1);
+        iz = std::clamp(iz, 0, shape[0] - 1);
+        return addRequiredVoxelChunk(access, level, iz, iy, ix, keys);
+    }
+
+    const int ix = int(std::floor(x));
+    const int iy = int(std::floor(y));
+    const int iz = int(std::floor(z));
+    bool ok = true;
+    ok = addRequiredVoxelChunk(access, level, iz,     iy,     ix,     keys) && ok;
+    ok = addRequiredVoxelChunk(access, level, iz,     iy,     ix + 1, keys) && ok;
+    ok = addRequiredVoxelChunk(access, level, iz,     iy + 1, ix,     keys) && ok;
+    ok = addRequiredVoxelChunk(access, level, iz,     iy + 1, ix + 1, keys) && ok;
+    ok = addRequiredVoxelChunk(access, level, iz + 1, iy,     ix,     keys) && ok;
+    ok = addRequiredVoxelChunk(access, level, iz + 1, iy,     ix + 1, keys) && ok;
+    ok = addRequiredVoxelChunk(access, level, iz + 1, iy + 1, ix,     keys) && ok;
+    ok = addRequiredVoxelChunk(access, level, iz + 1, iy + 1, ix + 1, keys) && ok;
+    return ok;
+}
+
+ChunkDependencyState classifyRequiredChunks(LocalChunkCache& cache,
+                                            const std::vector<ChunkKey>& keys)
+{
+    if (keys.empty())
+        return ChunkDependencyState::Ready;
+
+    bool sawMissing = false;
+    int requested = 0;
+    int errors = 0;
+    for (const ChunkKey& key : keys) {
+        const ChunkResult& result = cache.get(key, requested, errors);
+        if (result.status == ChunkStatus::MissQueued ||
+            result.status == ChunkStatus::Error)
+            return ChunkDependencyState::Transient;
+        if (result.status == ChunkStatus::Missing)
+            sawMissing = true;
+    }
+
+    return sawMissing ? ChunkDependencyState::KnownMissing
+                      : ChunkDependencyState::Ready;
 }
 
 bool collectPointDependencies(IChunkedArray& array,
@@ -533,6 +642,136 @@ int countSampleableCoords(const cv::Mat_<uint8_t>& coverage,
                 ++count;
     }
     return count;
+}
+
+ChunkedPlaneSampler::Stats markKnownMissingPlanePixels(
+    IChunkedArray& array,
+    int startLevel,
+    const cv::Vec3f& origin,
+    const cv::Vec3f& vxStep,
+    const cv::Vec3f& vyStep,
+    cv::Mat_<uint8_t>& out,
+    cv::Mat_<uint8_t>& coverage,
+    const ChunkedPlaneSampler::Options& options)
+{
+    ChunkedPlaneSampler::Stats stats;
+    const int firstLevel = std::max(0, startLevel);
+    std::vector<MissingLevelContext> levels;
+    levels.reserve(std::max(0, array.numLevels() - firstLevel));
+    for (int level = firstLevel; level < array.numLevels(); ++level) {
+        const LevelAccess access = makeLevelAccess(array, level);
+        if (!hasSampleableLevel(access))
+            continue;
+        levels.emplace_back(array, level, access,
+                            toLevelPlane(access, origin, vxStep, vyStep));
+    }
+    std::vector<ChunkKey> keys;
+    keys.reserve(8);
+
+    for (int y = 0; y < out.rows; ++y) {
+        uint8_t* outRow = out.ptr<uint8_t>(y);
+        uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
+        for (int x = 0; x < out.cols; ++x) {
+            if (coverageRow[x])
+                continue;
+
+            bool sawKnownMissing = false;
+            bool sawReady = false;
+            bool sawTransient = false;
+            for (auto& levelCtx : levels) {
+                const cv::Vec3f p = levelCtx.plane.origin
+                                  + levelCtx.plane.vyStep * float(y)
+                                  + levelCtx.plane.vxStep * float(x);
+                if (!collectRequiredLevelChunks(levelCtx.access, levelCtx.level, p,
+                                                 options.sampling, keys)) {
+                    sawTransient = true;
+                    break;
+                }
+                const ChunkDependencyState state = classifyRequiredChunks(levelCtx.cache, keys);
+                if (state == ChunkDependencyState::Transient) {
+                    sawTransient = true;
+                    break;
+                }
+                if (state == ChunkDependencyState::KnownMissing) {
+                    sawKnownMissing = true;
+                } else {
+                    sawReady = true;
+                    break;
+                }
+            }
+
+            if (!sawTransient && sawKnownMissing && !sawReady) {
+                outRow[x] = 0;
+                coverageRow[x] = 1;
+                ++stats.coveredPixels;
+            }
+        }
+    }
+    return stats;
+}
+
+ChunkedPlaneSampler::Stats markKnownMissingCoordsPixels(
+    IChunkedArray& array,
+    int startLevel,
+    const cv::Mat_<cv::Vec3f>& coords,
+    cv::Mat_<uint8_t>& out,
+    cv::Mat_<uint8_t>& coverage,
+    const ChunkedPlaneSampler::Options& options)
+{
+    ChunkedPlaneSampler::Stats stats;
+    const int firstLevel = std::max(0, startLevel);
+    std::vector<MissingLevelContext> levels;
+    levels.reserve(std::max(0, array.numLevels() - firstLevel));
+    for (int level = firstLevel; level < array.numLevels(); ++level) {
+        const LevelAccess access = makeLevelAccess(array, level);
+        if (!hasSampleableLevel(access))
+            continue;
+        levels.emplace_back(array, level, access);
+    }
+    std::vector<ChunkKey> keys;
+    keys.reserve(8);
+
+    const int h = std::min({coords.rows, out.rows, coverage.rows});
+    const int w = std::min({coords.cols, out.cols, coverage.cols});
+    for (int y = 0; y < h; ++y) {
+        const cv::Vec3f* coordRow = coords.ptr<cv::Vec3f>(y);
+        uint8_t* outRow = out.ptr<uint8_t>(y);
+        uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
+        for (int x = 0; x < w; ++x) {
+            if (coverageRow[x] || surfaceSentinel(coordRow[x]))
+                continue;
+
+            bool sawKnownMissing = false;
+            bool sawReady = false;
+            bool sawTransient = false;
+            for (auto& levelCtx : levels) {
+                const cv::Vec3f p = toLevelCoord(levelCtx.access, coordRow[x]);
+                if (!collectRequiredLevelChunks(levelCtx.access, levelCtx.level, p,
+                                                 options.sampling, keys)) {
+                    sawTransient = true;
+                    break;
+                }
+                const ChunkDependencyState state = classifyRequiredChunks(levelCtx.cache, keys);
+                if (state == ChunkDependencyState::Transient) {
+                    sawTransient = true;
+                    break;
+                }
+                if (state == ChunkDependencyState::KnownMissing) {
+                    sawKnownMissing = true;
+                } else {
+                    sawReady = true;
+                    break;
+                }
+            }
+
+            if (!sawTransient && sawKnownMissing && !sawReady) {
+                outRow[x] = 0;
+                coverageRow[x] = 1;
+                ++stats.coveredPixels;
+            }
+        }
+    }
+    return stats;
 }
 
 } // namespace
@@ -918,6 +1157,11 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneFineToCoarse(
         if (remaining <= 0)
             break;
     }
+    if (remaining > 0) {
+        Stats stats = markKnownMissingPlanePixels(
+            array, startLevel, origin, vxStep, vyStep, out, coverage, options);
+        addStats(total, stats);
+    }
     return total;
 }
 
@@ -937,6 +1181,11 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsFineToCoarse(
         remaining -= stats.coveredPixels;
         if (remaining <= 0)
             break;
+    }
+    if (remaining > 0) {
+        Stats stats = markKnownMissingCoordsPixels(
+            array, startLevel, coords, out, coverage, options);
+        addStats(total, stats);
     }
     return total;
 }

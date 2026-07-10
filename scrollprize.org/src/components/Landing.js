@@ -366,6 +366,12 @@ const creators = [
 
 const sponsors = [
   {
+    name: "Nat Friedman",
+    amount: 2250000,
+    href: "https://nat.org/",
+    image: "/img/landing/nat.webp",
+  },
+  {
     name: "Musk Foundation",
     amount: 2084000,
     href: "https://www.muskfoundation.org/",
@@ -382,12 +388,6 @@ const sponsors = [
     amount: 250000,
     href: "https://x.com/JosephJacks_",
     image: "/img/landing/Joseph Jacks.webp",
-  },
-  {
-    name: "Nat Friedman",
-    amount: 225000,
-    href: "https://www.nat.org/",
-    image: "/img/landing/nat.webp",
   },
   {
     name: "Daniel Gross",
@@ -693,11 +693,6 @@ const team = {
       href: "https://blog.virtual-void.net/",
     },
     {
-      name: "Forrest McDonald",
-      title: "Software Engineer",
-      href: "https://www.linkedin.com/in/forrest-mcdonald-a80b9885/",
-    },
-    {
       name: "David Josey",
       title: "ML Annotation Team Lead, PhD",
       href: "https://www.linkedin.com/in/davidsjosey/",
@@ -777,6 +772,11 @@ const team = {
       href: "https://www.linkedin.com/in/julian-schilliger-963b21294/",
     },
     {
+      name: "Forrest McDonald",
+      title: "Software Engineer",
+      href: "https://www.linkedin.com/in/forrest-mcdonald-a80b9885/",
+    },
+    {
       name: "Adrionna Fey",
       title: "Annotation Specialist",
       href: "https://x.com/Meadowsnax1",
@@ -853,8 +853,8 @@ const team = {
     {
       name: "Kilian Fleischer",
       title:
-        "Research Director and Papyrologist, University of Tübingen and CNR",
-      href: "https://www.klassphil.uni-wuerzburg.de/personal/fleischer/",
+        "Research Director and Papyrologist, University of Tübingen",
+      href: "https://www.klassphil.uni-wuerzburg.de/team/pd-dr-kilian-fleischer/",
     },
     {
       name: "Alessia Lavorante",
