@@ -1,149 +1,218 @@
-# Task Plan: Pipeline Training Batch Loading And GPU Work
+# Task Plan: Trace2CP Metric Command-Line Tool
 
-## Feasibility
+## Scope
 
-This is feasible with a bounded producer/consumer pipeline, but it should be
-split at the existing sampler boundary:
+Implement a runner command-line inspection tool for the `trace2cp` metric
+described in `planning/plan.md`.
 
-- Background workers may prepare future batches by running the existing
-  `FiberStrip2DLoader.load_batch` path, but coordinate generation and geometric
-  coordinate augmentation must still run on the configured `augment_device`
-  exactly as they do today.
-- The main training thread should own model forward/backward and optimizer
-  state.
-- GPU image/value augmentation can be overlapped with CPU loading through a
-  small staging queue. If we use CUDA streams, they must be explicit and
-  synchronized before model input is consumed.
-- We should not create a second loading/augmentation implementation. The
-  augment-vis/training loader path remains canonical.
+This task is intentionally limited to an export/inspection command. It will not
+wire the metric into training, TensorBoard, snapshots, or evaluation loops.
 
-## Implementation
+## User-Facing Behavior
 
-1. Add pipeline configuration.
-   - Add training config keys:
-     - `pipeline_enabled` default `true` when CUDA is used, otherwise `false`.
-     - `pipeline_depth` default `2`, meaning keep up to two future CPU-loaded
-       batches queued.
-   - Keep a way to disable the pipeline for debugging and regression checks.
+- Add a runner flag, tentatively `--trace2cp-vis`, used like the existing
+  `--line-trace-vis`.
+- Required args:
+  - `config`
+  - `--checkpoint <snapshot>`
+  - `--export-dir <dir>`
+  - `--sample-index <idx>`
+- Default CP pair:
+  - `--sample-index` resolves through the same deterministic sample ordering as
+    training, prefetch, augment-vis, dir-vis, and line-trace-vis.
+  - The start CP is that sample's control point.
+  - The target CP defaults to the next control point in the same fiber
+    (`start_cp_index + 1`).
+- Add optional CP-pair controls:
+  - `--trace2cp-target-offset`, default `1`, for adjacent/future CP selection.
+  - `--trace2cp-target-cp-index`, optional absolute CP index override.
+  - Reject target indices outside the same fiber or equal to the start CP.
+- Add metric controls:
+  - Reuse `--line-trace-step`.
+  - Reuse `--line-trace-rf-margin`.
+  - Reuse `--line-trace-tta-count` if TTA visualization is enabled for this
+    tool.
+- Outputs:
+  - Print one concise score line to stdout, including sample index, fiber path,
+    start/target CP indices, score, raw y-error pixels, target column, and
+    traced status.
+  - Write `trace2cp_vis.jpg`.
+  - Write `trace2cp_summary.txt` with the same metadata plus checkpoint path,
+    checkpoint step, strip dimensions, CP coordinates, step size, RF margin, and
+    trace termination reason.
 
-2. Factor training-step batch preparation.
-   - Extract the current `loader.load_batch(...)` call and sample-index
-     calculation into a helper that returns the deterministic step batch.
-   - Preserve exact deterministic sample index use:
-     `raw_start_sample_index = (step - 1) * control_points_per_step`.
-   - Preserve `max_sample_index` wrapping and invalid-sample skip behavior by
-     continuing to call `load_batch` unchanged.
+## Metric Semantics
 
-3. Add a bounded CPU loading producer.
-   - Use one loader-owned or training-owned background executor for future
-     `load_batch` calls.
-   - Submit at most `pipeline_depth` future steps ahead.
-   - Consume results strictly by training step number, so completed future
-     batches cannot reorder training.
-   - Propagate non-data exceptions as fatal.
-   - Shut down cleanly on interrupt, finite-step completion, or fatal error.
+- Load a side-strip segment spanning the two CPs with enough x-margin on both
+  sides for the trace receptive-field margin and visualization context.
+- Run the existing direction model on the strip and decode the Lasagna
+  ambiguous two-cos-channel direction output through the existing direction
+  helpers.
+- Trace starts at the transformed start CP.
+- Initial direction is aligned toward the transformed target CP.
+- The trace runs only in the start-to-target direction, not both directions.
+- Stop when:
+  - the trace reaches/crosses the target CP x-column;
+  - the next point would enter the RF margin;
+  - bilinear direction sampling fails;
+  - image validity around the bilinear sample is insufficient;
+  - a configured maximum step cap is reached.
+- If the trace crosses the target CP x-column, linearly interpolate the trace
+  y-coordinate at that x-column between the bracketing trace points.
+- Raw error is `abs(trace_y_at_target_x - target_cp_y)`.
+- Normalized score is clamped to `0..1`.
+- `0.0` means exact y-hit at the target CP column.
+- `1.0` means strip-edge error or failure to reach the target column.
+- Normalization denominator:
+  - use the distance from target CP y to the nearest usable vertical strip edge
+    after RF-margin exclusion;
+  - if that denominator is non-positive, fail clearly because the segment strip
+    is unusable for trace2cp scoring.
 
-4. Preserve GPU coordinate-generation placement.
-   - Do not move strip-coordinate generation, fused-map coordinate
-     augmentation, or transformed line/CP coordinate work to CPU for the
-     pipeline.
-   - The background batch producer should still call the canonical loader path
-     with the configured `augment_device`.
-   - For CUDA runs, use a dedicated loader CUDA stream where practical so small
-     coordinate-generation kernels can be ordered separately from model
-     forward/backward, while preserving explicit synchronization before NumPy
-     conversion/VC3D sampling.
-   - The unavoidable boundary remains VC3D coordinate sampling: once final
-     coordinates are generated, they are converted for the sampler and the
-     volume read/sampling work proceeds off the training stream.
+## TTA Behavior
 
-5. Stage GPU-side image/value augmentation deliberately.
-   - Current `load_batch` applies image/value augmentation inside the loader.
-     For overlap, split loading into:
-       - GPU coordinate generation/geometric augmentation plus CPU/VC3D image
-         sampling in the background batch future.
-       - torch image/value augmentation on the training device in the main
-         process before forward.
-   - Do this by adding a loader option/helper that returns the same batch with
-     `apply_image_augmentation=False`, then applies the existing batched
-     value-augmentation function to the batch images on the configured device.
-   - Keep augmentation parameters generated by the existing loader path, not by
-     a separate training-only RNG.
-   - If practical, use a dedicated CUDA stream for value augmentation and
-     synchronize before forward; otherwise keep it on the default stream and
-     still overlap CPU loading with training.
+- For the first implementation, keep TTA optional and reuse existing
+  line-trace TTA infrastructure where possible.
+- `planning/plan.md` says trace2cp TTA should leave out y-shift and scale
+  because those are hard to handle for long strips.
+- Therefore trace2cp TTA variants should include only geometric transforms that
+  can be unambiguously mapped back to the reference segment strip for this
+  metric:
+  - horizontal flip only if start/target semantics are handled explicitly;
+  - rotations that preserve target-column interpretation only if mapped back
+    before scoring;
+  - x-shift and shear/smooth offset only if the target-column crossing is
+    evaluated after inverse mapping back to reference strip coordinates.
+- Conservative V1 for this task:
+  - implement the base unaugmented trace2cp score first;
+  - if TTA is included in the same implementation, score each TTA trace only
+    after inverse-mapping the trace back into reference strip coordinates;
+  - do not include y-shift or scale in trace2cp TTA.
+- Visualization may show the base trace and, if enabled, a flock/median overlay
+  in reference strip coordinates.
 
-6. Keep test and visualization behavior simple.
-   - Test evaluation remains synchronous at its configured interval.
-   - TensorBoard visualization uses the already-consumed train/test batches and
-     must not trigger extra queued training batches.
-   - Checkpoint cadence remains unchanged.
+## Loader/Data Path
 
-7. Extend profiling.
-   - Add pipeline-aware timing:
-     - batch wait time for the next loaded batch;
-     - CPU loader future wall time;
-     - GPU image augmentation time;
-     - combined forward/backward/optimizer time;
-     - total step wall time.
-   - Avoid extra CUDA synchronizations outside profile mode.
-   - In profile mode, synchronize around GPU stages so the numbers are
-     meaningful.
+- Add a loader method for CP-pair strip segment construction, rather than using
+  the fixed CP-local center patch shape.
+- It must keep the existing hard requirements:
+  - Lasagna manifest path only for normals;
+  - VC3D side-strip coordinate semantics;
+  - no neural-tracing 3D crop loader;
+  - same configured `augment_device` for torch coordinate generation except
+    prefetch;
+  - explicit NumPy boundary only at VC3D coordinate sampling and export;
+  - no fabricated normals.
+- The segment loader should:
+  - resolve `(record, record_index, start_cp_index)` from `sample_index` using
+    `descriptor_for_sample_index(..., sample_mode="random")`;
+  - validate target CP is in the same record/fiber;
+  - compute the CP-pair line window and side-strip coordinates covering the
+    start-to-target segment plus margins;
+  - use selected-level pixel spacing semantics from `base_volume_scale`;
+  - build transformed `line_xy`, `start_cp_xy`, and `target_cp_xy` in output
+    strip pixels;
+  - sample one center strip-z image for now, unless the current loader's
+    center-strip conventions naturally expose the same shape with z offset `0`.
+- Prefer extending existing strip geometry helpers over adding a second
+  incompatible coordinate generator.
+- Any new helper should be reusable later for the planned segment refinement
+  tool.
 
-8. Preserve benchmark modes.
-   - `--benchmark --load-only` should keep measuring the loader path directly.
-   - Normal `--benchmark` should exercise the pipeline by default when enabled.
-   - Add enough profile output to compare pipelined vs disabled runs using the
-     same command plus a config toggle.
+## Runner Implementation Plan
+
+1. Refactor small reusable pieces from `--line-trace-vis` if needed:
+   - single-direction trace helper;
+   - target-column interpolation/scoring helper;
+   - overlay helper for CP-pair traces and score text.
+2. Add `_export_trace2cp_vis(...)` in `runner.py`.
+3. Add CLI args:
+   - `--trace2cp-vis`
+   - `--trace2cp-target-offset`
+   - `--trace2cp-target-cp-index`
+4. Keep errors explicit for unsupported CP pairs, missing checkpoint, invalid
+   segment geometry, and invalid target column.
+5. Export a visualization:
+   - base strip image;
+   - original transformed fiber centerline at fixed opacity;
+   - start CP and target CP markers;
+   - traced line from start toward target;
+   - target x-column marker or small target crosshair;
+   - score text in a label band or non-overlapping overlay area.
+
+## Tests
+
+Add focused tests under `vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+or a new runner-focused test file if that keeps concerns cleaner.
+
+Minimum tests:
+
+- Scoring helper:
+  - exact hit at target column gives score `0.0`;
+  - y-error equal to usable edge distance gives score `1.0`;
+  - failure to reach target column gives score `1.0`;
+  - crossing target x interpolates y correctly.
+- CLI/export wiring with monkeypatched loader/model helpers:
+  - `--trace2cp-vis` requires `--checkpoint` and `--export-dir`;
+  - successful export writes `trace2cp_vis.jpg` and `trace2cp_summary.txt`;
+  - stdout includes the numeric score.
+- Loader CP-pair validation:
+  - target CP outside fiber is rejected;
+  - target CP equal to start CP is rejected.
+
+Validation commands:
+
+```bash
+python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
+```
+
+If a runner-specific test file is added, include it in the pytest command.
+
+Manual smoke command after implementation, using local checkout conventions from
+`planning/local_development.md`:
+
+```bash
+PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.runner $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --sample-index 0 --trace2cp-vis --checkpoint /path/to/current.pt --export-dir /tmp/fiber_trace_2d_trace2cp
+```
 
 ## Spec Update
 
 Update `planning/specs.md` to add:
 
-- Training may use a bounded deterministic producer/consumer pipeline.
-- CPU batch futures may run ahead, but consumed step order and deterministic
-  sample-index order must remain exactly the same as serial training.
-- Pipeline depth is configurable and bounded.
-- The model, optimizer, and loss computation remain on the main training
-  thread.
-- Coordinate generation and geometric coordinate augmentation continue to run
-  on the configured `augment_device`; pipelining must not move that work to
-  CPU.
-- GPU image/value augmentation may overlap with CPU loading, but must use the
-  existing loader augmentation semantics and must synchronize before model
-  forward consumes the tensors.
-- Test evaluation and checkpoint decisions remain synchronous relative to the
-  training step.
+- `--trace2cp-vis` runner tool behavior and required args.
+- CP-pair default selection from deterministic sample order.
+- Trace2CP score definition:
+  - trace from first CP toward second CP;
+  - evaluate y-error at target CP x-column;
+  - normalize/clamp to `0..1`;
+  - failed target-column reach scores `1.0`.
+- CP-pair strip loading uses VC3D/Lasagna side-strip semantics, not fixed center
+  patch shortcuts.
+- Trace2CP TTA, if enabled, excludes y-shift and scale and scores only after
+  inverse mapping traces back into reference strip coordinates.
 
 ## Docs Updates
 
 Update `docs/code_structure.md` to document:
 
-- The training pipeline stages.
-- Which work runs in background CPU futures.
-- Which work runs on the training device/main thread.
-- How to disable the pipeline when debugging deterministic behavior.
+- runner CLI usage for `--trace2cp-vis`;
+- output files;
+- how the score is computed;
+- relationship to existing `--line-trace-vis`.
 
-Update `planning/status.md`, `planning/task_log.md`, and
-`planning/changelog.md` during implementation.
+## Changelog Update
 
-## Tests
+Add a dated one-line entry after implementation:
 
-- Unit-test that pipelined training consumes the same deterministic sample
-  start indices as serial training.
-- Unit-test that queued futures are consumed in step order even if a later
-  future completes first.
-- Unit-test clean shutdown on a raised loader exception.
-- Unit-test that `pipeline_enabled=false` preserves the existing synchronous
-  path.
+- Added trace2cp runner visualization and score export for CP-pair segment
+  tracing.
 
-## Validation
+## Plan Review Notes
 
-- Compile touched Python files.
-- Run focused 2D loader/training tests:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-- Run the unchanged benchmark command before and after where local data is
-  available:
-  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --benchmark --profile`
-- Compare with the same config using `training.pipeline_enabled=false` to
-  quantify pipeline benefit.
+- Matches `planning/plan.md` trace2cp requirements: side strip between two CPs,
+  trace from first toward second, y-error at target column, `0..1` score.
+- Preserves current `planning/specs.md` requirements: deterministic sample
+  ordering, Lasagna normals, VC3D side-strip coordinate semantics, configured
+  augmentation device, and existing runner/checkpoint direction tooling.
+- Keeps out-of-scope training/evaluation integration out of this task.

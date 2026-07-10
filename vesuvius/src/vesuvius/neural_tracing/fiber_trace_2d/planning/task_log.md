@@ -1,47 +1,44 @@
-# Task Log: Pipeline Training Batch Loading And GPU Work
+# Task Log: Trace2CP Metric Command-Line Tool
 
-## Planning Notes
+Implemented:
 
-- The current `run_training` loop loads one batch synchronously, then runs
-  forward/backward/optimizer synchronously.
-- `FiberStrip2DLoader.load_batch` already owns deterministic CP ordering,
-  invalid-sample skips, VC3D coordinate sampling, and optional image/value
-  augmentation.
-- The plan keeps the shared loader path and only pipelines whole future batch
-  preparation around the existing deterministic step indices.
-- The main non-obvious constraint is image/value augmentation: today it happens
-  inside the loader. For useful overlap, CPU-loaded batches should be prepared
-  without value augmentation, then value augmentation should run on the training
-  device just before model forward using the existing augmentation code and
-  stored augmentation parameters.
-- Clarification: coordinate generation and geometric coordinate augmentation
-  must not be moved to CPU. The pipeline should preserve the configured
-  `augment_device` path for that work and only overlap it carefully with the
-  rest of training.
+- Added CP-pair side-strip segment helpers in `strip_geometry.py`:
+  `control_point_line_index`, `side_strip_segment_line_window`,
+  `source_line_xy_from_line_window`, and `source_point_xy_for_line_index`.
+- Extended side-strip grid builders with optional `anchor_column_px` so segment
+  strips can place the start CP at an explicit x-column instead of always at
+  image center.
+- Added `FiberStripSegmentSample` and
+  `FiberStrip2DLoader.build_trace2cp_segment_patch`, which resolves the start
+  CP from deterministic sample order, validates a same-fiber target CP, builds
+  a Lasagna/VC3D-style segment strip, and samples the center strip-z image.
+- Added runner helpers for one-way trace-to-target-column tracing and
+  normalized trace2cp scoring.
+- Added `--trace2cp-vis`, `--trace2cp-target-offset`, and
+  `--trace2cp-target-cp-index` to `runner.py`.
+- `--trace2cp-vis` now writes `trace2cp_vis.jpg`,
+  `trace2cp_summary.txt`, and prints a concise score/status line to stdout.
+- Updated `planning/specs.md`, `docs/code_structure.md`,
+  `planning/changelog.md`, and `planning/status.md`.
 
-## Implementation Notes
+Deviation:
 
-- Added `training.pipeline_enabled` and `training.pipeline_depth`.
-- CUDA training and non-load-only CUDA benchmarks now use a bounded
-  `_TrainingBatchPipeline` that submits future whole-batch loads while the
-  current batch trains.
-- Whole-batch loading stays single-producer because `load_batch` already owns
-  CP-level worker parallelism and one cache-trace scope.
-- `FiberStrip2DBatch` now carries deterministic per-patch augmentation
-  parameters. `load_batch(..., apply_image_augmentation=False)` can therefore
-  defer torch image/value augmentation without changing the geometric
-  coordinate path or sample order.
-- Added `FiberStrip2DLoader.apply_batch_image_augmentation(...)` so the main
-  training thread can apply the same batched value augmentation immediately
-  before normalization/forward.
-- CPU training keeps the synchronous path by default; load-only benchmark keeps
-  measuring only loader work.
+- The plan mentioned optional trace2cp TTA. V1 intentionally implements the
+  unaugmented trace2cp metric only, matching the plan's conservative option.
+- The plan mentioned a full CLI/export monkeypatch test. This pass added
+  focused metric and segment validation in the existing test file; full CLI
+  export coverage remains a useful follow-up if runner CLI behavior grows.
 
-## Validation
+Validation:
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed with 95 tests.
-- Approved local load-only benchmark command completed from
-  `/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_train`:
-  100 batches, 6400 patches, `17388.6 ms`, `368.06 patches/s`.
+```bash
+python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/strip_geometry.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
+```
+
+Result: passed.
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
+```
+
+Result: `100 passed in 4.63s`.

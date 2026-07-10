@@ -66,9 +66,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _nearest_tta_point_for_reference,
     _print_timing_table,
     _reference_direction_to_source_grid_direction,
+    _score_trace2cp,
     _source_grid_direction_to_reference,
     _transform_points_xy,
     _trace_direction_line,
+    _trace_direction_line_to_target,
     _trace_median_tta_direction_line,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
@@ -77,7 +79,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     build_side_strip_patch_grid_from_line_window,
     build_side_strip_patch_grid_from_line_window_torch,
     build_side_strip_patch_grid_tensor_from_line_window,
+    control_point_line_index,
+    side_strip_segment_line_window,
     side_strip_line_window,
+    source_point_xy_for_line_index,
 )
 
 
@@ -243,6 +248,103 @@ def test_line_trace_keeps_ambiguous_direction_continuous() -> None:
     assert np.all(np.diff(line[:, 0]) > 0.0)
     assert np.isclose(line[0, 0], 1.0)
     assert np.isclose(line[-1, 0], 7.0)
+
+
+def test_trace2cp_scoring_interpolates_target_column() -> None:
+    trace = np.asarray([[1.0, 4.0], [3.0, 6.0]], dtype=np.float32)
+    result = _score_trace2cp(
+        trace,
+        np.asarray([2.0, 5.0], dtype=np.float32),
+        shape_hw=(11, 11),
+        rf_margin_px=1.0,
+        termination_reason="target_column",
+    )
+
+    assert result.reached_target_column
+    assert result.score == pytest.approx(0.0)
+    assert result.raw_y_error_px == pytest.approx(0.0)
+    assert result.trace_y_at_target_x == pytest.approx(5.0)
+
+
+def test_trace2cp_scoring_failure_is_edge_score() -> None:
+    trace = np.asarray([[1.0, 4.0], [1.5, 4.0]], dtype=np.float32)
+    result = _score_trace2cp(
+        trace,
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        shape_hw=(11, 11),
+        rf_margin_px=1.0,
+        termination_reason="invalid_direction",
+    )
+
+    assert not result.reached_target_column
+    assert result.score == pytest.approx(1.0)
+    assert result.raw_y_error_px == pytest.approx(4.0)
+
+
+def test_trace2cp_one_way_trace_stops_at_target_column() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    line, reason = _trace_direction_line_to_target(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([6.0, 4.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert np.allclose(line[:, 1], 4.0)
+    assert np.isclose(line[0, 0], 2.0)
+    assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_trace2cp_segment_window_maps_start_and_target_cp(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(
+        _write_fiber(
+            tmp_path / "fiber_trace_2d_trace2cp_window.json",
+            points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0], [20.0, 20.0, 20.0]],
+            control_points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0], [20.0, 20.0, 20.0]],
+        )
+    )
+    window = side_strip_segment_line_window(
+        fiber,
+        start_control_point_index=0,
+        target_control_point_index=1,
+        margin_px=2.0,
+        pixel_spacing_base=1.0,
+    )
+    start_line_index = control_point_line_index(fiber, 0)
+    target_line_index = control_point_line_index(fiber, 1)
+    start_xy = source_point_xy_for_line_index(
+        window,
+        original_line_index=start_line_index,
+        patch_shape_hw=(9, 16),
+        anchor_column_px=2.0,
+        pixel_spacing_base=1.0,
+    )
+    target_xy = source_point_xy_for_line_index(
+        window,
+        original_line_index=target_line_index,
+        patch_shape_hw=(9, 16),
+        anchor_column_px=2.0,
+        pixel_spacing_base=1.0,
+    )
+
+    assert start_xy.tolist() == pytest.approx([2.0, 4.0])
+    assert target_xy.tolist() == pytest.approx([12.0, 4.0])
+
+
+def test_trace2cp_loader_rejects_same_cp(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+
+    with pytest.raises(ValueError, match="must differ"):
+        loader.build_trace2cp_segment_patch(
+            0,
+            target_control_point_index=0,
+            rf_margin_px=0.0,
+            sample_mode="flat",
+        )
 
 
 def test_line_trace_tta_point_transforms_round_trip() -> None:

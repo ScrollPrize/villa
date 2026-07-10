@@ -31,7 +31,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     FiberStripGridTorch,
     FiberStripLineWindow,
     build_side_strip_patch_grid_tensor_from_line_window,
+    control_point_line_index,
+    side_strip_segment_line_window,
     side_strip_line_window,
+    source_line_xy_from_line_window,
+    source_point_xy_for_line_index,
 )
 from vesuvius.neural_tracing.fiber_trace.dataset import (
     _load_lasagna_volume,
@@ -98,6 +102,23 @@ class FiberStripSample:
     frame: FiberStripFrame
     line_xy: np.ndarray
     control_point_xy: np.ndarray
+
+
+@dataclass(frozen=True)
+class FiberStripSegmentSample:
+    record_index: int
+    fiber_path: str
+    start_control_point_index: int
+    target_control_point_index: int
+    start_control_point_xyz: np.ndarray
+    target_control_point_xyz: np.ndarray
+    strip_z_offset: float
+    coords_zyx: np.ndarray
+    valid_mask: np.ndarray
+    frame: FiberStripFrame
+    line_xy: np.ndarray
+    start_control_point_xy: np.ndarray
+    target_control_point_xy: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -1931,6 +1952,133 @@ class FiberStrip2DLoader:
         assert image is not None
         assert valid_mask is not None
         return sample, image.astype(np.float32, copy=False), valid_mask.astype(bool, copy=False)
+
+    @staticmethod
+    def _line_arc_lengths(points_xyz: np.ndarray) -> np.ndarray:
+        points = np.asarray(points_xyz, dtype=np.float64)
+        if points.shape[0] <= 1:
+            return np.zeros(points.shape[0], dtype=np.float64)
+        segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        return np.concatenate([[0.0], np.cumsum(segment_lengths)])
+
+    def build_trace2cp_segment_patch(
+        self,
+        sample_index: int,
+        *,
+        target_control_point_index: int | None = None,
+        target_offset: int = 1,
+        rf_margin_px: float = 0.0,
+        device: torch.device | None = None,
+        sample_mode: str = "random",
+    ) -> tuple[FiberStripSegmentSample, np.ndarray, np.ndarray]:
+        resolved_device = resolve_torch_device(self.config.augment.device) if device is None else device
+        record, record_index, start_cp_index = self.descriptor_for_sample_index(
+            sample_index,
+            sample_mode=sample_mode,
+        )
+        cp_count = int(record.fiber.control_points_xyz.shape[0])
+        if target_control_point_index is None:
+            target_cp_index = int(start_cp_index) + int(target_offset)
+        else:
+            target_cp_index = int(target_control_point_index)
+        if target_cp_index < 0 or target_cp_index >= cp_count:
+            raise ValueError(
+                f"trace2cp target_control_point_index {target_cp_index} out of range for {cp_count} control points"
+            )
+        if target_cp_index == int(start_cp_index):
+            raise ValueError("trace2cp target control point must differ from start control point")
+
+        line_points = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
+        cumulative = self._line_arc_lengths(line_points)
+        start_line_index = control_point_line_index(record.fiber, int(start_cp_index))
+        target_line_index = control_point_line_index(record.fiber, target_cp_index)
+        start_arc = float(cumulative[start_line_index])
+        target_arc = float(cumulative[target_line_index])
+        signed_distance_px = (target_arc - start_arc) / float(record.volume_spacing_base)
+        distance_px = abs(float(signed_distance_px))
+        margin = max(float(rf_margin_px), 0.0) + 4.0
+        width = max(
+            int(self.config.patch_shape_hw[1]),
+            int(math.ceil(distance_px + 2.0 * margin + 1.0)),
+        )
+        height = int(self.config.patch_shape_hw[0])
+        if height <= 0 or width <= 0:
+            raise ValueError(f"invalid trace2cp segment shape {(height, width)}")
+        start_col = margin if signed_distance_px >= 0.0 else float(width - 1) - margin
+        target_col = start_col + float(signed_distance_px)
+        if target_col < 0.0 or target_col > float(width - 1):
+            raise ValueError(
+                "trace2cp target column is outside the generated strip: "
+                f"target_col={target_col:.3f} width={width} start_col={start_col:.3f}"
+            )
+
+        line_window = side_strip_segment_line_window(
+            record.fiber,
+            start_control_point_index=int(start_cp_index),
+            target_control_point_index=target_cp_index,
+            margin_px=margin,
+            pixel_spacing_base=record.volume_spacing_base,
+        )
+        sampled_normals = self._lasagna_normals_for_line_window(
+            record,
+            line_window,
+            control_point_index=int(start_cp_index),
+        )
+        center_offset = min(self.strip_z_offsets, key=lambda value: abs(float(value)))
+        grid = build_side_strip_patch_grid_tensor_from_line_window(
+            line_window,
+            patch_shape_hw=(height, width),
+            strip_z_offset=float(center_offset),
+            sampled_normals=sampled_normals,
+            pixel_spacing_base=record.volume_spacing_base,
+            anchor_column_px=start_col,
+            device=resolved_device,
+        )
+        line_xy = source_line_xy_from_line_window(
+            line_window,
+            patch_shape_hw=(height, width),
+            anchor_column_px=start_col,
+            pixel_spacing_base=record.volume_spacing_base,
+        )
+        start_xy = source_point_xy_for_line_index(
+            line_window,
+            original_line_index=start_line_index,
+            patch_shape_hw=(height, width),
+            anchor_column_px=start_col,
+            pixel_spacing_base=record.volume_spacing_base,
+        )
+        target_xy = source_point_xy_for_line_index(
+            line_window,
+            original_line_index=target_line_index,
+            patch_shape_hw=(height, width),
+            anchor_column_px=start_col,
+            pixel_spacing_base=record.volume_spacing_base,
+        )
+        coords_zyx = _as_numpy_float32(grid.coords_zyx)
+        grid_valid = _as_numpy_bool(grid.valid_mask)
+        result = record.sampler.sample_coords(coords_zyx, grid_valid)
+        image = np.asarray(result.image, dtype=np.float32)
+        valid_mask = np.asarray(result.valid_mask, dtype=bool)
+        sample = FiberStripSegmentSample(
+            record_index=record_index,
+            fiber_path=str(record.fiber.path) if record.fiber.path is not None else "",
+            start_control_point_index=int(start_cp_index),
+            target_control_point_index=target_cp_index,
+            start_control_point_xyz=np.asarray(
+                record.fiber.control_points_xyz[int(start_cp_index)], dtype=np.float32
+            ),
+            target_control_point_xyz=np.asarray(
+                record.fiber.control_points_xyz[target_cp_index], dtype=np.float32
+            ),
+            strip_z_offset=float(center_offset),
+            coords_zyx=coords_zyx,
+            valid_mask=valid_mask,
+            frame=grid.frame,
+            line_xy=line_xy,
+            start_control_point_xy=start_xy.astype(np.float32, copy=False),
+            target_control_point_xy=target_xy.astype(np.float32, copy=False),
+        )
+        return sample, image, valid_mask
 
     def build_augmented_center_strip_source(
         self,

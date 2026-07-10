@@ -310,6 +310,16 @@ class _TtaDirectionField:
     source_xy_grid: np.ndarray | None = None
 
 
+@dataclass(frozen=True)
+class _Trace2CpResult:
+    score: float
+    raw_y_error_px: float
+    trace_y_at_target_x: float
+    target_x: float
+    reached_target_column: bool
+    reason: str
+
+
 def _trace_tta_matrix(
     shape_hw: tuple[int, int],
     *,
@@ -752,6 +762,117 @@ def _trace_median_tta_direction_line(
     return np.stack(combined, axis=0).astype(np.float32)
 
 
+def _trace_direction_line_to_target(
+    direction_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+    max_steps: int | None = None,
+) -> tuple[np.ndarray, str]:
+    field = np.asarray(direction_xy, dtype=np.float32)
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    if start.shape != (2,) or target.shape != (2,):
+        raise ValueError("start_xy and target_xy must have shape (2,)")
+    target_delta = target - start
+    target_norm = float(np.linalg.norm(target_delta))
+    if not np.isfinite(target_norm) or target_norm <= 1.0e-6:
+        raise ValueError("trace2cp start and target points must be distinct")
+    step = max(float(step_px), 1.0e-3)
+    shape_hw = (int(field.shape[0]), int(field.shape[1]))
+    if max_steps is None:
+        max_steps = int(np.ceil(np.hypot(*shape_hw) / step)) + 2
+    target_x = float(target[0])
+    previous = (target_delta / target_norm).astype(np.float32)
+    current = start.astype(np.float32)
+    points = [current.copy()]
+
+    for _ in range(int(max_steps)):
+        if not _inside_trace_margin(current, shape_hw, rf_margin_px):
+            return np.stack(points, axis=0).astype(np.float32), "rf_margin"
+        sampled = _bilinear_direction_sample(field, current, valid_mask=valid_mask)
+        if sampled is None:
+            return np.stack(points, axis=0).astype(np.float32), "invalid_direction"
+        if float(np.dot(sampled, previous)) < 0.0:
+            sampled = -sampled
+        next_point = current + sampled * np.float32(step)
+        if not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
+            return np.stack(points, axis=0).astype(np.float32), "rf_margin"
+        points.append(next_point.astype(np.float32))
+        previous_x = float(current[0])
+        next_x = float(next_point[0])
+        if (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0:
+            return np.stack(points, axis=0).astype(np.float32), "target_column"
+        current = next_point.astype(np.float32)
+        previous = sampled.astype(np.float32)
+    return np.stack(points, axis=0).astype(np.float32), "max_steps"
+
+
+def _trace_y_at_x(trace_xy: np.ndarray, target_x: float) -> float | None:
+    trace = np.asarray(trace_xy, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[1] != 2 or trace.shape[0] == 0:
+        raise ValueError("trace_xy must have shape N,2")
+    x_target = float(target_x)
+    for p0, p1 in zip(trace[:-1], trace[1:]):
+        x0 = float(p0[0])
+        x1 = float(p1[0])
+        if (x0 - x_target) == 0.0:
+            return float(p0[1])
+        if (x0 - x_target) * (x1 - x_target) <= 0.0 and x0 != x1:
+            alpha = (x_target - x0) / (x1 - x0)
+            return float(p0[1] + np.float32(alpha) * (p1[1] - p0[1]))
+    if float(trace[-1, 0]) == x_target:
+        return float(trace[-1, 1])
+    return None
+
+
+def _score_trace2cp(
+    trace_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    rf_margin_px: float,
+    termination_reason: str,
+) -> _Trace2CpResult:
+    target = np.asarray(target_xy, dtype=np.float32)
+    if target.shape != (2,):
+        raise ValueError("target_xy must have shape (2,)")
+    height, _ = (int(v) for v in shape_hw)
+    margin = max(0.0, float(rf_margin_px))
+    top = margin
+    bottom = float(height - 1) - margin
+    denom = min(float(target[1]) - top, bottom - float(target[1]))
+    if not np.isfinite(denom) or denom <= 0.0:
+        raise ValueError(
+            "trace2cp target has no usable vertical edge-distance denominator: "
+            f"target_y={float(target[1]):.3f} height={height} rf_margin_px={margin:.3f}"
+        )
+    y_at_target = _trace_y_at_x(trace_xy, float(target[0]))
+    if y_at_target is None:
+        return _Trace2CpResult(
+            score=1.0,
+            raw_y_error_px=denom,
+            trace_y_at_target_x=float("nan"),
+            target_x=float(target[0]),
+            reached_target_column=False,
+            reason=termination_reason,
+        )
+    raw_error = abs(float(y_at_target) - float(target[1]))
+    return _Trace2CpResult(
+        score=float(np.clip(raw_error / denom, 0.0, 1.0)),
+        raw_y_error_px=float(raw_error),
+        trace_y_at_target_x=float(y_at_target),
+        target_x=float(target[0]),
+        reached_target_column=True,
+        reason=termination_reason,
+    )
+
+
 def _export_line_trace_vis(
     loader: FiberStrip2DLoader,
     sample_index: int,
@@ -895,6 +1016,141 @@ def _export_line_trace_vis(
     ]
     (out / "line_trace_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
     print(f"exported line_trace_vis.jpg and line_trace_summary.txt to {out}")
+
+
+def _draw_trace2cp_overlay(
+    image_u8: np.ndarray,
+    *,
+    line_xy: np.ndarray,
+    trace_xy: np.ndarray,
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    result: _Trace2CpResult,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw, ImageFont
+
+    overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.35, thickness=1)
+    overlay = _overlay_polyline_rgb(overlay, trace_xy, color_rgba=(0, 255, 0, 230), thickness=1)
+    arr = np.asarray(overlay, dtype=np.uint8)
+    pil = Image.fromarray(arr, mode="RGB")
+    draw = ImageDraw.Draw(pil, mode="RGBA")
+    height, width = arr.shape[:2]
+
+    sx, sy = (float(v) for v in np.asarray(start_xy, dtype=np.float32))
+    tx, ty = (float(v) for v in np.asarray(target_xy, dtype=np.float32))
+    if np.isfinite([sx, sy]).all():
+        draw.ellipse((sx - 2.0, sy - 2.0, sx + 2.0, sy + 2.0), outline=(32, 255, 255, 255), width=1)
+    if np.isfinite([tx, ty]).all():
+        draw.line((tx, 0.0, tx, float(height - 1)), fill=(255, 220, 64, 130), width=1)
+        gap = 2.0
+        arm = 6.0
+        draw.line((tx - arm, ty, tx - gap, ty), fill=(255, 220, 64, 255), width=1)
+        draw.line((tx + gap, ty, tx + arm, ty), fill=(255, 220, 64, 255), width=1)
+        draw.line((tx, ty - arm, tx, ty - gap), fill=(255, 220, 64, 255), width=1)
+        draw.line((tx, ty + gap, tx, ty + arm), fill=(255, 220, 64, 255), width=1)
+
+    label = (
+        f"score={result.score:.4f} yerr={result.raw_y_error_px:.2f}px "
+        f"hit={int(result.reached_target_column)} reason={result.reason}"
+    )
+    font = ImageFont.load_default()
+    try:
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = int(bbox[2] - bbox[0])
+        text_h = int(bbox[3] - bbox[1])
+    except AttributeError:
+        text_w, text_h = draw.textsize(label, font=font)
+    pad = 3
+    box_w = min(width, text_w + 2 * pad)
+    box_h = text_h + 2 * pad
+    draw.rectangle((0, 0, box_w, box_h), fill=(0, 0, 0, 190))
+    draw.text((pad, pad), label[: max(1, width)], fill=(255, 255, 255, 255), font=font)
+    return np.asarray(pil, dtype=np.uint8)
+
+
+def _export_trace2cp_vis(
+    loader: FiberStrip2DLoader,
+    sample_index: int,
+    output_dir: str | Path,
+    *,
+    checkpoint_path: str | Path,
+    step_px: float,
+    rf_margin_px: float | None,
+    target_offset: int,
+    target_cp_index: int | None,
+) -> None:
+    out = Path(output_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    device = resolve_torch_device(loader.config.augment.device)
+    model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
+    configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
+    default_margin = 1 + 2 * configured_depth
+    margin = float(default_margin if rf_margin_px is None else rf_margin_px)
+    sample, image, valid_mask = loader.build_trace2cp_segment_patch(
+        sample_index,
+        target_control_point_index=target_cp_index,
+        target_offset=target_offset,
+        rf_margin_px=margin,
+        device=device,
+    )
+    direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
+    start_xy = np.asarray(sample.start_control_point_xy, dtype=np.float32)
+    target_xy = np.asarray(sample.target_control_point_xy, dtype=np.float32)
+    traced_line, reason = _trace_direction_line_to_target(
+        direction_xy,
+        start_xy,
+        target_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=margin,
+    )
+    result = _score_trace2cp(
+        traced_line,
+        target_xy,
+        shape_hw=image.shape,
+        rf_margin_px=margin,
+        termination_reason=reason,
+    )
+    image_u8 = _to_u8_image(image, valid_mask)
+    overlay = _draw_trace2cp_overlay(
+        image_u8,
+        line_xy=sample.line_xy,
+        trace_xy=traced_line,
+        start_xy=start_xy,
+        target_xy=target_xy,
+        result=result,
+    )
+    _write_jpg(out / "trace2cp_vis.jpg", overlay)
+    summary = [
+        f"sample_index={sample_index}",
+        f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
+        f"checkpoint_step={checkpoint.get('step', 'unknown')}",
+        f"fiber_path={sample.fiber_path}",
+        f"start_control_point_index={sample.start_control_point_index}",
+        f"target_control_point_index={sample.target_control_point_index}",
+        f"strip_z_offset={sample.strip_z_offset}",
+        f"image_shape_hw=({int(image.shape[0])}, {int(image.shape[1])})",
+        f"start_cp_xy=({start_xy[0]:.3f}, {start_xy[1]:.3f})",
+        f"target_cp_xy=({target_xy[0]:.3f}, {target_xy[1]:.3f})",
+        f"step_px={float(step_px):.3f}",
+        f"rf_margin_px={margin:.3f}",
+        f"trace_points={int(traced_line.shape[0])}",
+        f"trace2cp_score={result.score:.8f}",
+        f"raw_y_error_px={result.raw_y_error_px:.6f}",
+        f"target_x={result.target_x:.6f}",
+        f"trace_y_at_target_x={result.trace_y_at_target_x:.6f}",
+        f"reached_target_column={result.reached_target_column}",
+        f"termination_reason={result.reason}",
+    ]
+    (out / "trace2cp_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    print(
+        "trace2cp "
+        f"sample_index={sample_index} fiber_path={sample.fiber_path} "
+        f"start_cp={sample.start_control_point_index} target_cp={sample.target_control_point_index} "
+        f"score={result.score:.8f} raw_y_error_px={result.raw_y_error_px:.6f} "
+        f"target_x={result.target_x:.3f} reached={result.reached_target_column} reason={result.reason}"
+    )
+    print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
 
 
 def _export_dir_vis(
@@ -1256,6 +1512,7 @@ def main() -> None:
         help="When used with --augment-vis, print two augment timing passes to expose cold and warm costs",
     )
     parser.add_argument("--line-trace-vis", action="store_true")
+    parser.add_argument("--trace2cp-vis", action="store_true")
     parser.add_argument("--med-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
     parser.add_argument("--checkpoint", default=None)
@@ -1263,6 +1520,8 @@ def main() -> None:
     parser.add_argument("--line-trace-tta-count", type=int, default=100)
     parser.add_argument("--med-tta-count", type=int, default=None)
     parser.add_argument("--line-trace-rf-margin", type=float, default=None)
+    parser.add_argument("--trace2cp-target-offset", type=int, default=1)
+    parser.add_argument("--trace2cp-target-cp-index", type=int, default=None)
     args = parser.parse_args()
 
     with _Timer() as config_timer:
@@ -1309,6 +1568,23 @@ def main() -> None:
             line_trace_tta_count=(
                 args.line_trace_tta_count if args.med_tta_count is None else args.med_tta_count
             ),
+        )
+        return
+
+    if args.trace2cp_vis:
+        if args.export_dir is None:
+            raise SystemExit("--trace2cp-vis requires --export-dir")
+        if args.checkpoint is None:
+            raise SystemExit("--trace2cp-vis requires --checkpoint")
+        _export_trace2cp_vis(
+            loader,
+            args.sample_index,
+            args.export_dir,
+            checkpoint_path=args.checkpoint,
+            step_px=args.line_trace_step,
+            rf_margin_px=args.line_trace_rf_margin,
+            target_offset=args.trace2cp_target_offset,
+            target_cp_index=args.trace2cp_target_cp_index,
         )
         return
 

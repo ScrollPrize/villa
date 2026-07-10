@@ -164,6 +164,11 @@ The important behavior is:
 - Builds a batch by stacking deterministic samples.
 - Implements `build_strip_source` / `build_strip_patch_from_source` as the
   shared path for training, runner loading, augment-vis, and prefetch.
+- Implements `build_trace2cp_segment_patch` for runner inspection of a segment
+  between two control points in the same fiber. This path resolves the start CP
+  from the deterministic sample stream, validates the target CP, builds a
+  Lasagna/VC3D-style side-strip segment covering both CPs plus margin, and
+  samples the center strip-z image through the normal coordinate sampler.
 - Computes prefetch envelopes from the same shared source geometry, asks the
   sampler for dependency-only chunk requests, deduplicates those requests, and
   fetches only chunks not already represented in the VC3D persistent cache.
@@ -206,6 +211,17 @@ The important behavior is:
   inverse-warps TTA orientations back to the original patch frame, resolves the
   ambiguous direction sign against the previous step, and steps along the
   normalized median direction.
+- Provides `--trace2cp-vis --checkpoint <snapshot> --export-dir <dir>` for
+  trace-to-next-control-point inspection. This mode resolves `--sample-index`
+  through the deterministic sample order, uses that CP as the start, targets
+  the next CP by default, and can use `--trace2cp-target-offset` or
+  `--trace2cp-target-cp-index` for other same-fiber target CPs.
+- `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
+  decoded direction-field model as line tracing, traces one direction from the
+  start CP toward the target CP, and scores the y-error where the trace reaches
+  the target CP x-column. It writes `trace2cp_vis.jpg`, writes
+  `trace2cp_summary.txt`, and prints the normalized `0..1` score plus raw pixel
+  error and trace status to stdout.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, runs the checkpointed direction model, decodes the
@@ -750,6 +766,12 @@ Export a line-tracing inspection image:
 
 ```bash
 PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.runner config.json --sample-index 0 --line-trace-vis --checkpoint /path/to/current.pt --export-dir /tmp/fiber_trace_2d_trace
+```
+
+Export a trace-to-control-point inspection image and score:
+
+```bash
+PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.runner config.json --sample-index 0 --trace2cp-vis --checkpoint /path/to/current.pt --export-dir /tmp/fiber_trace_2d_trace2cp
 ```
 
 Export a direction-field inspection image:

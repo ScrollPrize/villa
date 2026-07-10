@@ -2,6 +2,8 @@
 
 ## 2026-07-10
 
+- Added `--trace2cp-vis` runner inspection for CP-pair segment tracing,
+  normalized trace-to-target score output, and JPG/summary export.
 - Added CUDA training batch pipelining with bounded deterministic whole-batch
   futures, deferred torch value augmentation, and profile wait timing.
 - Removed avoidable warm-path loader threading overhead by prewarming cached

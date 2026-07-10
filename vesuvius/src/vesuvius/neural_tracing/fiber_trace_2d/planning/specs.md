@@ -239,6 +239,41 @@
   median direction before stepping. The median trace uses the same random TTA
   field list as the flock column. `line_trace_summary.txt` records
   `med_tta=true`, `line_trace_tta_count`, and the median trace point count.
+- Trace-to-control-point inspection is exported with `--trace2cp-vis
+  --checkpoint <snapshot> --export-dir <dir>`.
+- Trace2CP inspection uses the same deterministic `--sample-index` ordering as
+  training, prefetch, augment-vis, dir-vis, and line-trace-vis. The sampled
+  control point is the start CP. The default target is the next control point
+  in the same fiber; `--trace2cp-target-offset` changes the relative target and
+  `--trace2cp-target-cp-index` selects an absolute target CP index in the same
+  fiber. The target CP must be in range and different from the start CP.
+- Trace2CP loading constructs a side-strip segment that spans the start and
+  target CPs plus receptive-field/visualization margin. It uses the same
+  Lasagna manifest normal sampling and VC3D-equivalent side-strip coordinate
+  construction as CP-local patches, but anchors the start CP at an explicit
+  strip x-coordinate so the target CP lies in the same image at its arc-length
+  column. It does not use the neural-tracing 3D crop loader.
+- Trace2CP V1 samples the center strip-z image only, runs the checkpointed
+  direction model, decodes the Lasagna ambiguous two-cos-channel output, and
+  traces one direction from the start CP toward the target CP. The trace uses
+  `--line-trace-step` and the line-trace receptive-field margin default
+  `1 + 2 * model_depth`, overrideable with `--line-trace-rf-margin`.
+- Trace2CP scoring evaluates the traced y coordinate at the target CP x-column.
+  If the trace crosses that x-column, the y coordinate is linearly interpolated
+  between bracketing trace points. The raw error is
+  `abs(trace_y_at_target_x - target_cp_y)`.
+- Trace2CP normalized score is clamped to `0..1`; `0.0` is an exact y-hit at
+  the target column, and `1.0` is a miss at the usable strip edge or failure to
+  reach the target column. The denominator is the target CP's distance to the
+  nearest usable vertical strip edge after the receptive-field margin is
+  excluded.
+- Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
+  a concise stdout line with sample index, fiber path, start/target CP indices,
+  normalized score, raw y error in pixels, target x-column, and trace status.
+- Trace2CP TTA is not part of the V1 runner command. Future TTA support must
+  score only after inverse-mapping traces back into the reference segment strip
+  and must exclude y-shift and scale unless their target-column semantics are
+  explicitly defined.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.
