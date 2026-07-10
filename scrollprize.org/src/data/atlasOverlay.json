@@ -12,7 +12,7 @@
       {
         "big": "6",
         "label": "with recovered text",
-        "sub": "Greek read; first Latin in progress",
+        "sub": "Greek read",
         "derive": "text"
       },
       {
@@ -23,9 +23,7 @@
       },
       {
         "big": "~4.3 PB",
-        "label": "open research data",
-        "sub": "3 scans at sub-2µm, down to 1.1µm",
-        "derive": "resolution"
+        "label": "open research data"
       }
     ],
     "funnel": [

@@ -1,6 +1,5 @@
 ---
 title: "Curated Datasets"
-hide_table_of_contents: true
 ---
 
 <head>

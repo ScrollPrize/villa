@@ -78,6 +78,16 @@
 .vc-landing .vc-section--last {
   padding-bottom: var(--vc-section-pad);
 }
+/* Open problems follows the dense news strip directly — half the gap. */
+.vc-landing section[aria-labelledby="open-problems"] {
+  padding-top: 48px;
+}
+@media (max-width: 768px) {
+  .vc-landing section[aria-labelledby="open-problems"] {
+    padding-top: 32px;
+  }
+}
+
 /* Credits half (Awarded prizes → Partners) rides a tighter 64px rhythm — the
    list-dense lower page doesn't need the full 96px section gap (height pass). */
 .vc-landing section[aria-labelledby="awarded-prizes"],
@@ -149,7 +159,7 @@
 .vc-landing .vc-hero {
   position: relative;
   /* content-driven height: the hero earns its space, no viewport filling */
-  padding: 44px env(safe-area-inset-right) 40px env(safe-area-inset-left);
+  padding: 32px env(safe-area-inset-right) 40px env(safe-area-inset-left);
   overflow: hidden;
   background: var(--vc-bg);
 }
@@ -241,6 +251,49 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 12px;
+}
+
+/* Grand Prize countdown chip — floats over the volcano, top right. */
+.vc-landing a.vc-hero__countdown {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 14px;
+  border: 1px solid var(--vc-accent);
+  border-radius: var(--vc-r-card);
+  background: color-mix(in srgb, var(--vc-bg) 82%, transparent);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  text-decoration: none;
+  margin-bottom: 16px;
+}
+.vc-landing a.vc-hero__countdown:hover {
+  text-decoration: none;
+  background: color-mix(in srgb, var(--vc-bg) 92%, transparent);
+}
+.vc-landing .vc-hero__countdown-label {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--vc-text-dim);
+}
+.vc-landing .vc-hero__countdown-value {
+  font-family: var(--vc-mono);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--vc-accent);
+}
+@media (min-width: 997px) {
+  .vc-landing .vc-hero__content {
+    position: relative;
+  }
+  .vc-landing a.vc-hero__countdown {
+    position: absolute;
+    top: 4px;
+    right: 0;
+    margin-bottom: 0;
+  }
 }
 
 /* CTA row: buttons and the small reveal card sit side by side. */
@@ -864,8 +917,9 @@
 }
 .vc-landing .vc-collapse__arrow {
   flex: 0 0 auto;
-  color: var(--vc-text-faint);
-  font-size: 0.75rem;
+  color: var(--vc-text-dim);
+  font-size: 1.25rem;
+  line-height: 1;
   transition: transform 0.15s ease;
 }
 .vc-landing .vc-collapse[open] > summary .vc-collapse__arrow {
@@ -1028,7 +1082,7 @@
     font-size: 1.75rem;
   }
   .vc-landing .vc-hero {
-    padding-top: 32px;
+    padding-top: 20px;
     padding-bottom: 32px;
   }
   /* Text spans the full width on phones: quieter video, heavier mask. */

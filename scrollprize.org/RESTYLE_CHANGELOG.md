@@ -331,6 +331,16 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Verified at 360/1024/1440/1920: zero horizontal overflow everywhere; build green (link checker).
 **Files:** `src/components/Landing.js`, `src/css/{landing,chrome}.css`, `docusaurus.config.js`, `sidebars.js`, `docs/37_2026_open_problems.md`.
 
+## C38 — funnel rework + live review round (owner session)
+
+- **Funnel (A+C)**: Open problems moved above Open prizes (desktop offset 1,505 → 824px; mobile 2,171 → ~1,100px); gap after the news strip halved (48/32px); hero pool stat now scrolls to the on-page board.
+- **Hero**: intro trimmed ("…without opening them."); "after 275 years" and "sealed since 79 AD" clauses cut; "Vesuvius Challenge now moves" → "The challenge now moves"; headline gap 44 → 32px desktop / 32 → 20px mobile; **$1M Grand Prize countdown chip** top-right over the volcano (client-computed days to 2027-06-25, links prizes#2027-grand-prize; inline pill above the headline on mobile).
+- **Docs chrome**: TOC is a surface card with a bigger "ON THIS PAGE" header (13px); prizes page's inline TOCInline removed; TOCs restored on Get Started + Curated Datasets; story/sponsor expandable arrows 0.75 → 1.25rem and brighter.
+- **Responsive audit**: 7 routes × 11 widths (320–1920) zero horizontal overflow. Two real bugs found and fixed: the doc column now yields to the fixed 220px TOC at 997–1150px, and `main` gets `min-width: 0` (the no-wrap pipeline strip was propagating a 752px intrinsic minimum past the viewport at 997px).
+- **Navbar**: "Open Problems" → "Problems".
+- **Data browser**: patches count removed from grid cards too; "first Latin in progress" and "3 scans at sub-2µm…" subtexts dropped (the latter required removing the tile's `derive: resolution` so buildIndex doesn't regenerate it).
+**Files:** `src/components/{Landing,LatestPosts}.js`, `src/components/atlas/ScrollCard.js`, `src/css/{landing,chrome}.css`, `docusaurus.config.js`, `docs/{34_prizes,01_get_started,02_data_datasets}.md`, `src/data/atlasOverlay.json`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

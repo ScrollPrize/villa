@@ -88,19 +88,11 @@ prizes:
   />
 </head>
 
-import TOCInline from '@theme/TOCInline';
 import PrizePoolBanner from '@site/src/components/PrizePoolBanner';
 
 Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us make history!
 
 <PrizePoolBanner />
-
-***
-
-<TOCInline
-  toc={toc}
-  maxHeadingLevel={2}
-/>
 
 ***
 

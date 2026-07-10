@@ -147,15 +147,7 @@ export default function ScrollCard({ scroll }) {
             </b>
           </dd>
           <dt>Segments</dt>
-          <dd>
-            {segN.toLocaleString()}
-            {progress.patches ? (
-              <span className="hint">
-                {" "}
-                / {progress.patches.toLocaleString()} patches
-              </span>
-            ) : null}
-          </dd>
+          <dd>{segN.toLocaleString()}</dd>
           <dt>Min pixel size</dt>
           <dd>{scroll.min_px ? `${scroll.min_px} µm` : "—"}</dd>
         </dl>

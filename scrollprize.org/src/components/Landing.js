@@ -127,8 +127,8 @@ const stories = ({ unrollVideo }) => [
           Vesuvius Challenge launched in March 2023 with a Grand Prize for
           the first team to recover four passages of 140 characters from a
           Herculaneum scroll. Within a year,{" "}
-          <a href="/grandprize">the prize was claimed</a> — after 275 years,
-          the puzzle was cracked open. The quest was just beginning.
+          <a href="/grandprize">the prize was claimed</a>. The quest was
+          just beginning.
         </p>
         <div className="vc-media vc-panorama">
           <img
@@ -554,6 +554,16 @@ export function Landing() {
   // <script> children from SSR output).
   const siteUrl = (siteConfig?.url ?? "") + (siteConfig?.baseUrl ?? "/");
 
+  // Days until the 2027 Grand Prize deadline (client-only to avoid an SSR
+  // hydration mismatch; the chip simply appears after mount).
+  const [gpDaysLeft, setGpDaysLeft] = useState(null);
+  useEffect(() => {
+    const deadline = new Date("2027-06-25T23:59:59-07:00");
+    setGpDaysLeft(
+      Math.max(0, Math.ceil((deadline.getTime() - Date.now()) / 86400000)),
+    );
+  }, []);
+
   const heroVideo = useRef(null);
   const revealVideo = useRef(null);
   const unrollVideo = useRef(null);
@@ -699,6 +709,20 @@ export function Landing() {
             <div className="vc-hero__scrim" />
           </div>
           <div className="container mx-auto vc-hero__content">
+            {gpDaysLeft !== null && (
+              <a
+                className="vc-hero__countdown"
+                href="/prizes#2027-grand-prize"
+                aria-label={`${gpDaysLeft} days to the $1,000,000 Grand Prize deadline`}
+              >
+                <span className="vc-hero__countdown-label">
+                  $1M Grand Prize deadline
+                </span>
+                <span className="vc-hero__countdown-value vc-nums">
+                  {gpDaysLeft} days
+                </span>
+              </a>
+            )}
             <Heading as="h1" id="home-hero-title" className="vc-hero__title">
               Resurrect an ancient library from the ashes of a volcano.
             </Heading>
@@ -755,7 +779,7 @@ export function Landing() {
 
             <div className="vc-stat-strip vc-hero__stats">
                 {openPrizes.length > 0 && (
-                  <a className="vc-stat vc-stat--link" href="/prizes">
+                  <a className="vc-stat vc-stat--link" href="#open-prizes">
                     <span className="vc-stat__value">
                       {usd.format(openPrizeTotal)}
                     </span>
@@ -801,23 +825,6 @@ export function Landing() {
               News — from our Substack
             </a>
             <LatestPosts />
-          </div>
-        </section>
-
-        {/* ------------------------------------------------------------------
-            Open prizes — dense board fed by the prizes page frontmatter
-            (plugins/prizes-data.js). Sits directly above Open problems:
-            the money first, then the problems it pays for.
-        ------------------------------------------------------------------ */}
-        <section className="vc-section" aria-labelledby="open-prizes">
-          <div className="container mx-auto">
-            <Heading as="h2" id="open-prizes" className="vc-h2">
-              Open prizes
-            </Heading>
-            <OpenPrizeBoard prizes={openPrizes} />
-            <a href="/prizes" className="vc-cta">
-              Rules and details
-            </a>
           </div>
         </section>
 
@@ -954,6 +961,24 @@ export function Landing() {
         </section>
 
         {/* ------------------------------------------------------------------
+            Open prizes — dense board fed by the prizes page frontmatter
+            (plugins/prizes-data.js). Sits directly above Open problems:
+            the money first, then the problems it pays for.
+        ------------------------------------------------------------------ */}
+        <section className="vc-section" aria-labelledby="open-prizes">
+          <div className="container mx-auto">
+            <Heading as="h2" id="open-prizes" className="vc-h2">
+              Open prizes
+            </Heading>
+            <OpenPrizeBoard prizes={openPrizes} />
+            <a href="/prizes" className="vc-cta">
+              Rules and details
+            </a>
+          </div>
+        </section>
+
+
+        {/* ------------------------------------------------------------------
             Our story — five beats on one hairline timeline. The 2026 chapter
             carries the open prizes (merged per audit §4).
         ------------------------------------------------------------------ */}
@@ -1015,11 +1040,10 @@ export function Landing() {
                 </Heading>
                 <div className="vc-story__body">
                   <p>
-                    In 2026, <a href="/firstscroll">PHerc. 1667</a> — sealed
-                    since the eruption in 79 AD — became the first Herculaneum
-                    scroll to be virtually unwrapped and read end to end.
-                    Vesuvius Challenge now moves onto its next stage: reading
-                    multiple entire scrolls.
+                    In 2026, <a href="/firstscroll">PHerc. 1667</a> became
+                    the first Herculaneum scroll to be virtually unwrapped and
+                    read end to end. The challenge now moves onto its next
+                    stage: reading multiple entire scrolls.
                   </p>
                   <a
                     href="/firstscroll"
