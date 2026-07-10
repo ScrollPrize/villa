@@ -205,6 +205,42 @@ def _pixel_grid(height: int, width: int, *, device: torch.device) -> torch.Tenso
     return torch.stack([xx, yy], dim=-1)
 
 
+def _sample_xy_map(map_xy: torch.Tensor, points_xy: torch.Tensor) -> torch.Tensor:
+    points = torch.as_tensor(points_xy, dtype=torch.float32, device=map_xy.device)
+    shape = points.shape
+    flat = points.reshape(-1, 2)
+    height, width = int(map_xy.shape[0]), int(map_xy.shape[1])
+    if width > 1:
+        x = flat[:, 0] * (2.0 / float(width - 1)) - 1.0
+    else:
+        x = torch.zeros_like(flat[:, 0])
+    if height > 1:
+        y = flat[:, 1] * (2.0 / float(height - 1)) - 1.0
+    else:
+        y = torch.zeros_like(flat[:, 1])
+    grid = torch.stack([x, y], dim=-1).view(1, -1, 1, 2)
+    sampled = F.grid_sample(
+        map_xy.permute(2, 0, 1).unsqueeze(0),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )[0, :, :, 0].transpose(0, 1)
+    valid = (
+        torch.isfinite(flat).all(dim=1)
+        & (flat[:, 0] >= 0.0)
+        & (flat[:, 0] <= float(width - 1))
+        & (flat[:, 1] >= 0.0)
+        & (flat[:, 1] <= float(height - 1))
+    )
+    sampled = torch.where(
+        valid[:, None],
+        sampled,
+        torch.full_like(sampled, float("nan")),
+    )
+    return sampled.reshape(*shape[:-1], 2)
+
+
 def _cubic_interp_1d(values: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     n = int(values.numel())
     if n <= 1:
@@ -332,6 +368,10 @@ class StripAugmentTransform:
                 device=self.device,
             ),
         )
+        output_grid = _pixel_grid(output_height, output_width, device=self.device)
+        source_grid = _pixel_grid(source_height, source_width, device=self.device)
+        object.__setattr__(self, "_backward_map_xy", self._output_to_source_formula(output_grid))
+        object.__setattr__(self, "_forward_map_xy", self._source_to_output_formula(source_grid))
 
     @property
     def output_height(self) -> int:
@@ -371,7 +411,15 @@ class StripAugmentTransform:
         positions = source_x.to(dtype=torch.float32) / max(float(self.params.smooth_offset_stride), 1.0) + 1.0
         return _cubic_interp_1d(self._smooth_controls, positions)
 
-    def output_to_source_points(self, output_xy: torch.Tensor) -> torch.Tensor:
+    @property
+    def backward_map_xy(self) -> torch.Tensor:
+        return self._backward_map_xy
+
+    @property
+    def forward_map_xy(self) -> torch.Tensor:
+        return self._forward_map_xy
+
+    def _output_to_source_formula(self, output_xy: torch.Tensor) -> torch.Tensor:
         points = torch.as_tensor(output_xy, dtype=torch.float32, device=self.device)
         x = points[..., 0] - self.output_center_x - float(self.params.shift_x)
         y = points[..., 1] - self.output_center_y - float(self.params.shift_y)
@@ -392,13 +440,12 @@ class StripAugmentTransform:
             src_y = src_y + self._smooth_offsets_at_source_x(src_x)
         return torch.stack([src_x, src_y], dim=-1).to(dtype=torch.float32)
 
-    def output_to_source_grid(self) -> torch.Tensor:
-        return self.output_to_source_points(_pixel_grid(self.output_height, self.output_width, device=self.device))
-
-    def _source_to_output_points_affine(self, source_xy: torch.Tensor) -> torch.Tensor:
+    def _source_to_output_formula(self, source_xy: torch.Tensor) -> torch.Tensor:
         points = torch.as_tensor(source_xy, dtype=torch.float32, device=self.device)
         src_x = points[..., 0]
         src_y = points[..., 1]
+        if float(self.params.smooth_offset) != 0.0:
+            src_y = src_y - self._smooth_offsets_at_source_x(src_x)
         u = src_x - self.source_center_x
         v = src_y - self.source_center_y
 
@@ -424,13 +471,14 @@ class StripAugmentTransform:
             dim=-1,
         ).to(dtype=torch.float32)
 
+    def output_to_source_points(self, output_xy: torch.Tensor) -> torch.Tensor:
+        return _sample_xy_map(self.backward_map_xy, torch.as_tensor(output_xy, dtype=torch.float32, device=self.device))
+
+    def output_to_source_grid(self) -> torch.Tensor:
+        return self.backward_map_xy
+
     def source_to_output_points(self, source_xy: torch.Tensor) -> torch.Tensor:
-        points = torch.as_tensor(source_xy, dtype=torch.float32, device=self.device)
-        if float(self.params.smooth_offset) == 0.0:
-            return self._source_to_output_points_affine(points)
-        offsets = self._smooth_offsets_at_source_x(points[..., 0])
-        adjusted = torch.stack([points[..., 0], points[..., 1] - offsets], dim=-1)
-        return self._source_to_output_points_affine(adjusted)
+        return _sample_xy_map(self.forward_map_xy, torch.as_tensor(source_xy, dtype=torch.float32, device=self.device))
 
 
 def strip_augment_transform(

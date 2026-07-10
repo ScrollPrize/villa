@@ -77,10 +77,11 @@ The important behavior is:
   never geometrically warped after loading; instead, output pixels map into an
   oversized source coordinate grid, and final 3D coordinates are sampled once.
 - Provides `StripAugmentTransform`, the shared paired transform for geometric
-  augmentation. Its output-to-source map produces sampling grids; its
-  source-to-output point map transforms cached source-space line and CP
-  coordinates. The transform object caches shape/parameter/device constants and
-  smooth-offset controls for reuse by grid and point mapping.
+  augmentation. At construction it bakes the whole geometric stack into two
+  concrete tensors: `backward_map_xy` maps output pixels to source pixels for
+  image/coordinate sampling, and `forward_map_xy` maps source pixels to output
+  pixels for line/CP lookup. Runtime point mapping samples these cached maps; it
+  does not re-run affine/smooth formulas.
 - Exposes torch-native transformed line/control-point coordinate helpers for
   loader internals, with NumPy wrappers kept for public/debug callers.
 - Affine shift is composed as an output-space translation after scale/flip, and
@@ -88,8 +89,8 @@ The important behavior is:
   that same order.
 - Implements affine transforms, flips, smooth row offsets, value augmentation,
   line-coordinate mapping, and debug line overlays. Smooth line/CP mapping uses
-  direct source-coordinate forward/backward maps rather than iterative solves
-  or dense nearest-grid inversion.
+  bilinear lookup against the prebuilt `forward_map_xy`; smooth interpolation is
+  only used while constructing the maps.
 - Loader patch construction reuses one transform object for coordinate
   augmentation and line/CP mapping. Line points and the CP are mapped together
   in one batched source-to-output call, and shared line/CP results can be reused

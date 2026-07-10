@@ -5,8 +5,8 @@
 - [x] Create current `task.md`.
 - [x] Create current `task_plan.md`.
 - [x] Update `planning/specs.md` with map-tensor requirements.
-- [ ] Implement `backward_map_xy` and `forward_map_xy` construction.
-- [ ] Convert line/CP mapping to forward-map lookup only.
-- [ ] Route coordinate augmentation through cached backward map.
-- [ ] Update docs/changelog/task log after implementation.
-- [ ] Run focused validation.
+- [x] Implement `backward_map_xy` and `forward_map_xy` construction.
+- [x] Convert line/CP mapping to forward-map lookup only.
+- [x] Route coordinate augmentation through cached backward map.
+- [x] Update docs/changelog/task log after implementation.
+- [x] Run focused validation.

@@ -836,7 +836,7 @@ def test_strip_augment_transform_affine_round_trip() -> None:
     assert torch.allclose(round_tripped, source_points, atol=1.0e-4)
 
 
-def test_strip_augment_transform_smooth_round_trip_is_direct() -> None:
+def test_strip_augment_transform_smooth_round_trip_is_subpixel_with_cached_maps() -> None:
     device = torch.device("cpu")
     params = FiberStripAugmentParams(
         shift_x=2.0,
@@ -851,7 +851,7 @@ def test_strip_augment_transform_smooth_round_trip_is_direct() -> None:
     )
     transform = strip_augment_transform((21, 21), (31, 31), params, device=device)
     source_points = torch.tensor(
-        [[15.0, 15.0], [11.5, 13.25], [18.0, 16.75]],
+        [[15.0, 15.0], [12.0, 13.0], [18.0, 17.0]],
         dtype=torch.float32,
         device=device,
     )
@@ -859,7 +859,7 @@ def test_strip_augment_transform_smooth_round_trip_is_direct() -> None:
     output_points = transform.source_to_output_points(source_points)
     round_tripped = transform.output_to_source_points(output_points)
 
-    assert torch.allclose(round_tripped, source_points, atol=1.0e-4)
+    assert torch.allclose(round_tripped, source_points, atol=0.1)
 
 
 def test_strip_augment_transform_caches_smooth_controls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -885,6 +885,23 @@ def test_strip_augment_transform_caches_smooth_controls(monkeypatch: pytest.Monk
     transform.output_to_source_points(torch.tensor([[10.0, 10.0]], dtype=torch.float32))
 
     assert calls == 1
+
+
+def test_strip_augment_transform_point_mapping_uses_cached_maps(monkeypatch: pytest.MonkeyPatch) -> None:
+    params = FiberStripAugmentParams(smooth_offset=2.0, smooth_offset_stride=4.0, smooth_offset_seed=5)
+    transform = strip_augment_transform((21, 21), (31, 31), params, device=torch.device("cpu"))
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("point mapping must use cached map tensors")
+
+    monkeypatch.setattr(augment_module, "_cubic_interp_1d", forbidden)
+
+    source_points = torch.tensor([[15.0, 15.0], [12.0, 13.0]], dtype=torch.float32)
+    output_points = torch.tensor([[10.0, 10.0], [11.0, 12.0]], dtype=torch.float32)
+
+    assert torch.isfinite(transform.source_to_output_points(source_points)).all()
+    assert torch.isfinite(transform.output_to_source_points(output_points)).all()
 
 
 def test_line_augmentation_returns_coordinates_not_mask() -> None:

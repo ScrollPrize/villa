@@ -2,6 +2,9 @@
 
 ## 2026-07-10
 
+- Replaced formula-based 2D strip point mapping with concrete cached
+  `backward_map_xy`/`forward_map_xy` tensors so coordinate augmentation and
+  line/CP mapping use the same fused geometric augmentation maps.
 - Cached fused 2D strip augmentation transform constants/smooth controls,
   batched line+CP mapping, and reused transform/line mappings across matching
   strip-z offset patches.
