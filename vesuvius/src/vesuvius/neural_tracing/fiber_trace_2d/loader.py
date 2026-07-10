@@ -146,8 +146,7 @@ class _PrefetchCounters:
     valid_pixels: int = 0
     first_error: str = ""
     first_sample_skip: str = ""
-    active_downloads: int = 0
-    oldest_active_download_seconds: float = 0.0
+    queued_download_futures: int = 0
 
 
 def _is_remote_path(path: str | Path) -> bool:
@@ -1372,14 +1371,20 @@ class FiberStrip2DLoader:
             else:
                 download_filled = 0
             download_bar = "#" * download_filled + "-" * (bar_width - download_filled)
+            sample_prefix = ""
+            if counters.samples_done < total_samples:
+                sample_prefix = (
+                    f"prefetch samples[{sample_bar}] {counters.samples_done}/{total_samples} "
+                    f"eta={_format_seconds(sample_eta)} "
+                )
+            else:
+                sample_prefix = "prefetch "
             line = (
-                f"prefetch samples[{sample_bar}] {counters.samples_done}/{total_samples} "
-                f"eta={_format_seconds(sample_eta)} "
-                f"downloads[{download_bar}] {counters.download_done}/{counters.queued_for_download} "
+                sample_prefix
+                + f"downloads[{download_bar}] {counters.download_done}/{counters.queued_for_download} "
                 f"eta={_format_seconds(download_eta)} "
-                f"patches={counters.patches_done}/{total_patches} "
                 f"chunks={counters.unique_chunks_seen} hits={counters.cache_hits} "
-                f"active={counters.active_downloads} oldest={_format_seconds(counters.oldest_active_download_seconds)} "
+                f"queued={counters.queued_download_futures} transfers={worker_count} "
                 f"skipped={counters.samples_skipped} "
                 f"missing={counters.known_missing + counters.newly_missing} "
                 f"downloaded={counters.downloaded} errors={counters.download_errors} "
@@ -1454,15 +1459,8 @@ class FiberStrip2DLoader:
             producer_futures: dict[Future[tuple[int, int, list[ZarrChunkRequest]]], int] = {}
             download_futures: dict[Future[dict[str, Any]], tuple[ZarrChunkRequest, float]] = {}
 
-            def update_active_download_counters() -> None:
-                counters.active_downloads = len(download_futures)
-                if download_futures:
-                    now = time.perf_counter()
-                    counters.oldest_active_download_seconds = max(
-                        now - started_at for _, started_at in download_futures.values()
-                    )
-                else:
-                    counters.oldest_active_download_seconds = 0.0
+            def update_download_queue_counters() -> None:
+                counters.queued_download_futures = len(download_futures)
 
             def submit_producers() -> None:
                 nonlocal next_sample
@@ -1472,7 +1470,7 @@ class FiberStrip2DLoader:
                     next_sample += 1
 
             submit_producers()
-            update_active_download_counters()
+            update_download_queue_counters()
             print_progress()
             while producer_futures or download_futures:
                 active = set(producer_futures) | set(download_futures)
@@ -1500,10 +1498,10 @@ class FiberStrip2DLoader:
                         consume_download_result(future.result())
                 now = time.perf_counter()
                 if now - last_progress >= 0.5:
-                    update_active_download_counters()
+                    update_download_queue_counters()
                     print_progress()
                     last_progress = now
-            update_active_download_counters()
+            update_download_queue_counters()
             print_progress(final=True)
             normal_shutdown = True
         except BaseException:

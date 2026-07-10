@@ -410,12 +410,14 @@ by prefetch.
 - fetches only still-missing direct-source chunks with bounded Python workers,
   writes data through unique temp files followed by atomic rename, and writes
   zero-byte `.empty` markers for definitive missing chunks;
-- prints progress with separate sample/dependency and download bars, separate
-  ETAs, patches, unique chunks, cache hits, known-missing chunks, downloaded
-  chunks, errors, and MiB/s. The download denominator counts chunks that were
-  not cache hits or pre-existing `.empty` markers. While sample dependency
-  generation is incomplete, download ETA extrapolates from observed chunks per
-  sample and observed cache-hit/known-missing/download-needed ratios;
+- prints sample/dependency progress only while dependency generation is still
+  running, then switches to download-only progress. The live line includes
+  unique chunks, cache hits, known-missing chunks, downloaded chunks, queued
+  download futures, configured transfer workers, skipped samples, errors, and
+  MiB/s. The download denominator counts chunks that were not cache hits or
+  pre-existing `.empty` markers. While sample dependency generation is
+  incomplete, download ETA extrapolates from observed chunks per sample and
+  observed cache-hit/known-missing/download-needed ratios;
 - reports invalid deterministic sample skips separately from download errors
   and includes the first skip reason.
 
