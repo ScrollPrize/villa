@@ -76,13 +76,19 @@ The important behavior is:
 - Builds geometric augmentation maps in strip pixel coordinates. The image is
   never geometrically warped after loading; instead, output pixels map into an
   oversized source coordinate grid, and final 3D coordinates are sampled once.
+- Provides `StripAugmentTransform`, the shared paired transform for geometric
+  augmentation. Its output-to-source map produces sampling grids; its
+  source-to-output point map transforms cached source-space line and CP
+  coordinates.
 - Exposes torch-native transformed line/control-point coordinate helpers for
   loader internals, with NumPy wrappers kept for public/debug callers.
 - Affine shift is composed as an output-space translation after scale/flip, and
   the inverse sampling grid plus transformed line/control-point coordinates use
   that same order.
 - Implements affine transforms, flips, smooth row offsets, value augmentation,
-  line-coordinate mapping, and debug line overlays.
+  line-coordinate mapping, and debug line overlays. Smooth line/CP mapping uses
+  vectorized source-to-output point mapping rather than dense nearest-grid
+  inversion.
 - Value augmentation runs as torch tensor operations on the configured device:
   brightness, contrast, gamma, noise, and separable Gaussian blur.
 - Debug line overlays are drawn only as the final visualization step. The line

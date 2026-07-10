@@ -1,12 +1,16 @@
-# Task: Cache Source Line Coordinates And Split Coord Profiling
+# Task: Fused Forward/Backward Augmentation Coordinate Maps
 
-Extend the strip-coordinate cache.
+Refactor geometric augmentation coordinate handling.
 
-- Version-bump the strip-coordinate cache so old entries are ignored.
-- Include source-space line coordinates and source-space CP pixel coordinates
-  in the cached source entry.
-- Use the cached source line/CP coordinates for unaugmented patches.
-- Keep random augmented line coordinates computed per patch, because they
-  depend on each augmentation draw.
-- Split training profile output so strip-coordinate cache load time is reported
-  separately from the broader coordinate stage.
+- Make the coordinate transform handling generic: each geometric transform
+  should expose forward and backward map/application functions.
+- Compose transforms into one fused forward mapping and one fused backward
+  mapping instead of maintaining separate formulas for sampling, line/CP
+  generation, and tracing helpers.
+- Remove the smooth-offset nearest-output-pixel search. Smooth offset is a
+  vertical column-dependent displacement and should generate/apply both maps
+  directly.
+- Adapt line generation to start from cached source `line_xy`/CP coordinates and
+  apply the fused source-to-output augmentation transform.
+- Preserve the existing image sampling semantics: final image sampling still
+  uses one output-to-source map and samples the volume once at final coordinates.

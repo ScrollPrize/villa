@@ -63,9 +63,16 @@
 - Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
 - Geometric strip augmentations operate on strip coordinates before image sampling.
 - Geometric augmentation builds an oversized strip-coordinate source area, maps output patch pixels into that source, and samples the volume once at the final augmented coordinates to avoid edge and image reinterpolation artifacts.
+- Geometric augmentation map handling is centralized in one paired
+  forward/backward strip transform. The output-to-source map drives image
+  sampling, and the source-to-output point map drives transformed line/control
+  point coordinates.
 - Affine geometric shift is an output-space translation applied after scale/flip, not a source-space translation before scale. Combined shift+scale must keep image sampling, transformed line coordinates, and transformed control-point coordinates under that same composition.
 - Training line targets and debug line overlays are geometric coordinate products, not raster images. The line must be represented by strip/output pixel coordinates after the same geometric coordinate transform used for image sampling.
-- Transformed line coordinates should be computed as vectorized coordinate products where possible; any fallback must still derive coordinates from the geometric source-to-output mapping, not from a rasterized line.
+- Transformed line/control-point coordinates are computed from cached
+  source-space line/control-point coordinates through the shared
+  source-to-output transform. Smooth-offset line/control-point mapping must not
+  invert the patch by dense output-grid nearest-neighbor search.
 - The line must never be transformed by resampling a raster line mask. No geometric augmentation may be implemented as an image-space transform of a previously rasterized line, mask, or image patch.
 - Debug visualization may rasterize the transformed line coordinates only as the final drawing step, with fixed screen-space thickness/opacity, so line thickness and sharpness are not affected by scale, rotation, shear, or interpolation artifacts.
 - Any future training target derived from the fiber line must use the same transformed output pixel coordinates as the sampled image, so labels and image pixels remain aligned exactly.

@@ -253,6 +253,166 @@ def smooth_offset_field(
     return offsets.view(1, int(width)).expand(int(height), int(width))
 
 
+def _smooth_offset_values(
+    output_x: torch.Tensor,
+    output_width: int,
+    *,
+    amplitude: float,
+    stride: float,
+    seed: int,
+) -> torch.Tensor:
+    amplitude = float(amplitude)
+    if amplitude == 0.0:
+        return torch.zeros_like(output_x, dtype=torch.float32)
+    stride = max(float(stride), 1.0)
+    control_count = max(2, int(math.ceil(max(int(output_width) - 1, 1) / stride)) + 3)
+    generator = torch.Generator(device=output_x.device)
+    generator.manual_seed(int(seed))
+    controls = (torch.rand(control_count, dtype=torch.float32, device=output_x.device, generator=generator) * 2.0 - 1.0) * abs(
+        amplitude
+    )
+    if amplitude < 0.0:
+        controls = -controls
+    positions = output_x.to(dtype=torch.float32) / stride + 1.0
+    return _cubic_interp_1d(controls, positions)
+
+
+@dataclass(frozen=True)
+class StripAugmentTransform:
+    output_shape_hw: tuple[int, int]
+    source_shape_hw: tuple[int, int]
+    params: FiberStripAugmentParams
+    device: torch.device
+
+    @property
+    def output_height(self) -> int:
+        return int(self.output_shape_hw[0])
+
+    @property
+    def output_width(self) -> int:
+        return int(self.output_shape_hw[1])
+
+    @property
+    def source_height(self) -> int:
+        return int(self.source_shape_hw[0])
+
+    @property
+    def source_width(self) -> int:
+        return int(self.source_shape_hw[1])
+
+    @property
+    def output_center_x(self) -> float:
+        return (float(self.output_width) - 1.0) * 0.5
+
+    @property
+    def output_center_y(self) -> float:
+        return (float(self.output_height) - 1.0) * 0.5
+
+    @property
+    def source_center_x(self) -> float:
+        return (float(self.source_width) - 1.0) * 0.5
+
+    @property
+    def source_center_y(self) -> float:
+        return (float(self.source_height) - 1.0) * 0.5
+
+    def _smooth_offsets_at_output_x(self, output_x: torch.Tensor) -> torch.Tensor:
+        return _smooth_offset_values(
+            output_x,
+            self.output_width,
+            amplitude=float(self.params.smooth_offset),
+            stride=float(self.params.smooth_offset_stride),
+            seed=int(self.params.smooth_offset_seed),
+        )
+
+    def output_to_source_points(self, output_xy: torch.Tensor) -> torch.Tensor:
+        points = torch.as_tensor(output_xy, dtype=torch.float32, device=self.device)
+        x = points[..., 0] - self.output_center_x - float(self.params.shift_x)
+        y = points[..., 1] - self.output_center_y - float(self.params.shift_y)
+
+        if self.params.flip_x:
+            x = -x
+        if self.params.flip_y:
+            y = -y
+        scale = max(float(self.params.scale), 1.0e-6)
+        x = x / scale
+        y = y / scale
+
+        x_sheared = x + float(self.params.shear_x) * y
+        y_sheared = y + float(self.params.shear_y) * x
+
+        angle = math.radians(float(self.params.rotation_degrees))
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        src_x = cos_a * x_sheared - sin_a * y_sheared + self.source_center_x
+        src_y = sin_a * x_sheared + cos_a * y_sheared + self.source_center_y
+        if float(self.params.smooth_offset) != 0.0:
+            src_y = src_y + self._smooth_offsets_at_output_x(points[..., 0])
+        return torch.stack([src_x, src_y], dim=-1).to(dtype=torch.float32)
+
+    def output_to_source_grid(self) -> torch.Tensor:
+        return self.output_to_source_points(_pixel_grid(self.output_height, self.output_width, device=self.device))
+
+    def _source_to_output_points_affine(self, source_xy: torch.Tensor) -> torch.Tensor:
+        points = torch.as_tensor(source_xy, dtype=torch.float32, device=self.device)
+        src_x = points[..., 0]
+        src_y = points[..., 1]
+        u = src_x - self.source_center_x
+        v = src_y - self.source_center_y
+
+        angle = math.radians(float(self.params.rotation_degrees))
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        x_sheared = cos_a * u + sin_a * v
+        y_sheared = -sin_a * u + cos_a * v
+
+        shear_x = float(self.params.shear_x)
+        shear_y = float(self.params.shear_y)
+        det = 1.0 - shear_x * shear_y
+        if abs(det) <= 1.0e-6:
+            return torch.full(points.shape, float("nan"), dtype=torch.float32, device=self.device)
+        x = (x_sheared - shear_x * y_sheared) / det
+        y = (-shear_y * x_sheared + y_sheared) / det
+
+        scale = max(float(self.params.scale), 1.0e-6)
+        x = x * scale
+        y = y * scale
+        if self.params.flip_x:
+            x = -x
+        if self.params.flip_y:
+            y = -y
+        return torch.stack(
+            [x + self.output_center_x + float(self.params.shift_x), y + self.output_center_y + float(self.params.shift_y)],
+            dim=-1,
+        ).to(dtype=torch.float32)
+
+    def source_to_output_points(self, source_xy: torch.Tensor, *, iterations: int = 8) -> torch.Tensor:
+        points = torch.as_tensor(source_xy, dtype=torch.float32, device=self.device)
+        if float(self.params.smooth_offset) == 0.0:
+            return self._source_to_output_points_affine(points)
+        output = self._source_to_output_points_affine(points)
+        for _ in range(max(1, int(iterations))):
+            offsets = self._smooth_offsets_at_output_x(output[..., 0])
+            adjusted = torch.stack([points[..., 0], points[..., 1] - offsets], dim=-1)
+            output = self._source_to_output_points_affine(adjusted)
+        return output.to(dtype=torch.float32)
+
+
+def strip_augment_transform(
+    output_shape_hw: tuple[int, int],
+    source_shape_hw: tuple[int, int],
+    params: FiberStripAugmentParams,
+    *,
+    device: torch.device,
+) -> StripAugmentTransform:
+    return StripAugmentTransform(
+        output_shape_hw=(int(output_shape_hw[0]), int(output_shape_hw[1])),
+        source_shape_hw=(int(source_shape_hw[0]), int(source_shape_hw[1])),
+        params=params,
+        device=device,
+    )
+
+
 def source_coordinate_grid(
     height: int, width: int, params: FiberStripAugmentParams, *, device: torch.device
 ) -> torch.Tensor:
@@ -268,40 +428,12 @@ def source_coordinate_grid_for_output(
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    output_center_x = (float(output_width) - 1.0) * 0.5
-    output_center_y = (float(output_height) - 1.0) * 0.5
-    source_center_x = (float(source_width) - 1.0) * 0.5
-    source_center_y = (float(source_height) - 1.0) * 0.5
-    coords = _pixel_grid(output_height, output_width, device=device)
-    x = coords[..., 0] - output_center_x - float(params.shift_x)
-    y = coords[..., 1] - output_center_y - float(params.shift_y)
-
-    if params.flip_x:
-        x = -x
-    if params.flip_y:
-        y = -y
-    scale = max(float(params.scale), 1.0e-6)
-    x = x / scale
-    y = y / scale
-
-    x_sheared = x + float(params.shear_x) * y
-    y_sheared = y + float(params.shear_y) * x
-
-    angle = math.radians(float(params.rotation_degrees))
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-    src_x = cos_a * x_sheared - sin_a * y_sheared + source_center_x
-    src_y = sin_a * x_sheared + cos_a * y_sheared + source_center_y
-    if float(params.smooth_offset) != 0.0:
-        src_y = src_y + smooth_offset_field(
-            output_height,
-            output_width,
-            amplitude=float(params.smooth_offset),
-            stride=float(params.smooth_offset_stride),
-            seed=int(params.smooth_offset_seed),
-            device=device,
-        )
-    return torch.stack([src_x, src_y], dim=-1)
+    return strip_augment_transform(
+        (int(output_height), int(output_width)),
+        (int(source_height), int(source_width)),
+        params,
+        device=device,
+    ).output_to_source_grid()
 
 
 def augmentation_padding(config: FiberStripAugmentConfig, patch_shape_hw: tuple[int, int]) -> AugmentPadding:
@@ -386,30 +518,18 @@ def transformed_centerline_coords_torch(
 ) -> torch.Tensor:
     output_height, output_width = (int(v) for v in output_shape_hw)
     source_height, source_width = (int(v) for v in source_shape_hw)
-    if float(params.smooth_offset) == 0.0:
-        return _transformed_centerline_coords_affine(
-            output_shape_hw,
-            source_shape_hw,
-            params,
-            device=device,
-        )
-    source_coords = source_coordinate_grid_for_output(
-        output_height,
-        output_width,
-        source_height,
-        source_width,
-        params,
-        device=device,
-    )
     source_center_y = (float(source_height) - 1.0) * 0.5
     target_x = torch.linspace(0.0, float(source_width - 1), max(source_width, output_width), device=device)
-    flat = source_coords.reshape(-1, 2)
-    out_pixels = _pixel_grid(output_height, output_width, device=device).reshape(-1, 2)
-    targets = torch.stack([target_x, torch.full_like(target_x, source_center_y)], dim=1)
-    coords = _nearest_output_pixels_for_source_points(flat, out_pixels, targets)
-    if coords.numel() == 0:
-        return torch.zeros((0, 2), dtype=torch.float32, device=device)
+    source_line = torch.stack([target_x, torch.full_like(target_x, source_center_y)], dim=1)
+    coords = strip_augment_transform(
+        (output_height, output_width),
+        (source_height, source_width),
+        params,
+        device=device,
+    ).source_to_output_points(source_line)
     coords = coords[
+        torch.isfinite(coords).all(dim=1)
+        &
         (coords[:, 0] >= 0.0)
         & (coords[:, 0] <= float(output_width - 1))
         & (coords[:, 1] >= 0.0)
@@ -453,31 +573,13 @@ def transformed_source_point_coords_torch(
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    output_height, output_width = (int(v) for v in output_shape_hw)
-    source_height, source_width = (int(v) for v in source_shape_hw)
     source_point = torch.tensor([[float(source_xy[0]), float(source_xy[1])]], dtype=torch.float32, device=device)
-    if float(params.smooth_offset) != 0.0:
-        source_coords = source_coordinate_grid_for_output(
-            output_height,
-            output_width,
-            source_height,
-            source_width,
-            params,
-            device=device,
-        )
-        flat = source_coords.reshape(-1, 2)
-        out_pixels = _pixel_grid(output_height, output_width, device=device).reshape(-1, 2)
-        coords = _nearest_output_pixels_for_source_points(flat, out_pixels, source_point)
-        if coords.numel() == 0:
-            return torch.full((2,), float("nan"), dtype=torch.float32, device=device)
-        return coords[0].to(dtype=torch.float32)
-    return _transformed_source_point_coords_affine(
+    return strip_augment_transform(
         output_shape_hw,
         source_shape_hw,
         params,
-        source_point,
         device=device,
-    )[0]
+    ).source_to_output_points(source_point)[0]
 
 
 def transformed_source_point_coords(

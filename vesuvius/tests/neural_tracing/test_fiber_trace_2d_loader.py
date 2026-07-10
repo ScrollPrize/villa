@@ -10,6 +10,7 @@ import pytest
 import torch
 import zarr
 
+import vesuvius.neural_tracing.fiber_trace_2d.augmentation as augment_module
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
     FiberStripAugmentParams,
@@ -18,6 +19,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     random_combined_augmentation,
     smooth_offset_field,
     source_coordinate_grid_for_output,
+    strip_augment_transform,
     transformed_centerline_coords,
     transformed_source_point_coords,
 )
@@ -809,6 +811,56 @@ def test_shift_is_applied_after_scale_in_output_space() -> None:
     assert torch.allclose(grid[int(round(point[1])), int(round(point[0]))], torch.tensor([5.0, 4.0]))
 
 
+def test_strip_augment_transform_affine_round_trip() -> None:
+    device = torch.device("cpu")
+    params = FiberStripAugmentParams(
+        shift_x=3.0,
+        shift_y=-2.0,
+        rotation_degrees=17.0,
+        shear_x=0.15,
+        shear_y=-0.08,
+        scale=1.2,
+        flip_x=True,
+    )
+    transform = strip_augment_transform((19, 23), (31, 37), params, device=device)
+    source_points = torch.tensor(
+        [[18.0, 15.0], [12.5, 9.25], [24.0, 17.5]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    output_points = transform.source_to_output_points(source_points)
+    round_tripped = transform.output_to_source_points(output_points)
+
+    assert torch.allclose(round_tripped, source_points, atol=1.0e-4)
+
+
+def test_strip_augment_transform_smooth_round_trip_without_dense_search() -> None:
+    device = torch.device("cpu")
+    params = FiberStripAugmentParams(
+        shift_x=2.0,
+        shift_y=-1.0,
+        rotation_degrees=8.0,
+        shear_x=0.05,
+        shear_y=-0.03,
+        scale=1.1,
+        smooth_offset=2.5,
+        smooth_offset_stride=4.0,
+        smooth_offset_seed=19,
+    )
+    transform = strip_augment_transform((21, 21), (31, 31), params, device=device)
+    source_points = torch.tensor(
+        [[15.0, 15.0], [11.5, 13.25], [18.0, 16.75]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    output_points = transform.source_to_output_points(source_points)
+    round_tripped = transform.output_to_source_points(output_points)
+
+    assert torch.allclose(round_tripped, source_points, atol=2.0e-3)
+
+
 def test_line_augmentation_returns_coordinates_not_mask() -> None:
     line = transformed_centerline_coords(
         (5, 5),
@@ -820,6 +872,33 @@ def test_line_augmentation_returns_coordinates_not_mask() -> None:
     assert line.ndim == 2
     assert line.shape[1] == 2
     assert line.dtype == np.float32
+
+
+def test_smooth_line_and_cp_mapping_do_not_use_nearest_grid_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("smooth line mapping should not use dense nearest-grid search")
+
+    monkeypatch.setattr(augment_module, "_nearest_output_pixels_for_source_points", forbidden)
+    params = FiberStripAugmentParams(smooth_offset=2.0, smooth_offset_stride=3.0, smooth_offset_seed=7)
+
+    line = transformed_centerline_coords(
+        (9, 9),
+        (13, 13),
+        params,
+        device=torch.device("cpu"),
+    )
+    point = transformed_source_point_coords(
+        (9, 9),
+        (13, 13),
+        params,
+        (6.0, 6.0),
+        device=torch.device("cpu"),
+    )
+
+    assert line.shape[1] == 2
+    assert np.isfinite(line).all()
+    assert np.isfinite(point).all()
 
 
 def test_line_augmentation_shift_is_vectorized_direct_mapping() -> None:

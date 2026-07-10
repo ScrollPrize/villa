@@ -49,8 +49,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     random_combined_augmentation,
     resolve_torch_device,
     source_coordinate_grid_for_output,
-    transformed_centerline_coords_torch,
-    transformed_source_point_coords_torch,
+    strip_augment_transform,
     value_only_params,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
@@ -1368,22 +1367,25 @@ class FiberStrip2DLoader:
                 source.source_line_xy.to(device=device, dtype=torch.float32),
                 source.source_control_point_xy.to(device=device, dtype=torch.float32),
             )
-        line_xy = transformed_centerline_coords_torch(
+        transform = strip_augment_transform(
             self.config.patch_shape_hw,
             source.source_shape_hw,
             params,
             device=device,
         )
-        control_point_xy = transformed_source_point_coords_torch(
-            self.config.patch_shape_hw,
-            source.source_shape_hw,
-            params,
-            (
-                (float(source.source_shape_hw[1]) - 1.0) * 0.5,
-                (float(source.source_shape_hw[0]) - 1.0) * 0.5,
-            ),
-            device=device,
-        )
+        line_xy = transform.source_to_output_points(source.source_line_xy.to(device=device, dtype=torch.float32))
+        control_point_xy = transform.source_to_output_points(
+            source.source_control_point_xy.to(device=device, dtype=torch.float32).view(1, 2)
+        )[0]
+        if line_xy.numel() != 0:
+            height, width = self.config.patch_shape_hw
+            line_xy = line_xy[
+                torch.isfinite(line_xy).all(dim=1)
+                & (line_xy[:, 0] >= 0.0)
+                & (line_xy[:, 0] <= float(int(width) - 1))
+                & (line_xy[:, 1] >= 0.0)
+                & (line_xy[:, 1] <= float(int(height) - 1))
+            ]
         return line_xy, control_point_xy
 
     def build_strip_patch_from_source(
