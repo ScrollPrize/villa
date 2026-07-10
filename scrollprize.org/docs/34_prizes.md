@@ -98,7 +98,7 @@ Vesuvius Challenge is ongoing and **YOU** can win the below prizes and help us m
 
 ## 2027 Grand Prize {#2027-grand-prize}
 
-**\$800,000 to the first team or individual to fully unroll and read a scroll from the set below.** We also have prizes for **second place (\$100,000)**, **third place (\$50,000)**, and **fourth place (\$50,000)** — \$1,000,000 in total. Prizes are awarded in the order that qualifying submissions are made.
+**\$800,000 to the first team or individual to fully unroll and read a scroll from the set below.** We also have prizes for **second place (\$100,000)**, **third place (\$50,000)**, and **fourth place (\$50,000)** — \$1,000,000 in total. Prizes are awarded according to the rules listed below.
 
 Prizes will be awarded to any team or individual that fully digitally unrolls and makes readable (according to the conditions and requirements specified below) one of the eligible CT scans of carbonized scrolls from Herculaneum:
 
