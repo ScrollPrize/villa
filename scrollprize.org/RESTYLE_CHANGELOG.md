@@ -382,6 +382,17 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Default per-IP rate limit raised 10 → **30 requests / 10 minutes** (both Upstash and in-memory paths); daily cap raised 60 → 150 so the burst allowance stays meaningful across a day.
 **Files:** `api/_lib/handler.mjs`, `api/_lib/rateLimit.mjs`.
 
+## C44 — Open Problems restyle: figure system, Philodemus callout, team context (multi-agent)
+
+**Why:** the article's 26 images rendered as a one-size-fits-all full-width parade — white matplotlib figures glaring on the dark theme, comparisons stacked 700px apart, centered-italic caption walls, two captions silently unbound from their images. Owner also wanted a Last-updated stamp, an "ask Philodemus" pointer for overwhelmed readers, and the team in the chat corpus.
+- **Figure system** (Fable vision critique → implementation): new `src/components/Figure.js` (variants full/medium/pair/stack + `card`/`enlarge` modifiers; self-stamps width/height from the image manifest; caption strings render markdown links safely) + page-agnostic `.vc-fig*` CSS in chrome.css replacing the old adjacency-caption rule. All 26 images migrated to 22 figures per the critique's mapping: white figures on `--vc-surface` plate cards with brightness knockdown, comparisons as pair rows (micro-captions "DLS, 7.91 µm"/"ESRF, 2.4 µm") or grouped stacks with one caption (fixing both mis-bound caption pairs), VC3D walkthrough at 560px medium, dense grids click-to-enlarge, full-width reserved for the ~6 dark-native heroes. Captions left-hung 0.8125rem/60ch; figure rhythm 32px. Long captions' explanatory tails promoted to body text (content preserved verbatim).
+- **Date stamp**: `*Last updated: July 10, 2026*` (spiral-tutorial idiom); the old "July 2026" publish div removed (critic: double date).
+- **Philodemus callout**: `src/components/ChatWidget/ChatCallout.js` after the pipeline strip — surface card, ember rule, avatar, "Ask Philodemus" button dispatching new `vc:open-chat` CustomEvent; ChatWidget/ChatPanel gained the listener + prefill plumbing (draft prefilled, never auto-sent).
+- **Chat corpus**: `genChatCorpus.js` now extracts `<Figure>` captions (22/22 preserved — previously ALL image captions were dropped from the corpus); new synthetic "Vesuvius Challenge Team" section (`/#team`, anchor-verified) merging landing team groups with per-person roles from `src/data/teamRoles.json` (curated from arXiv:2606.29085 Author Contributions, cited); new self-check needles. Corpus +9k chars, byte-deterministic.
+- **Mobile**: TutorialsTop pipeline strip 2×2 below 768px (CSS-only, arrows hidden — was wrapping 3+1); pairs/stacks collapse to 1 col; portraits capped; desktop TOC max-height now clears the fixed chat trigger (was occluding its last entries at 1440×900).
+- **QA**: build green; 20 scripted checks (overflow 320–1440, console-clean, 22 figures with dims, enlarge-bypasses-lightbox ×3, lightbox open/close, callout ≥44px + prefill-unsent, strip 2×2, regressions on / /faq /firstscroll); 109 tiles captured; final Fable sign-off **SHIP** (its POLISH + date NIT applied; two "pair" nits were baked single-image composites — unfixable without editing images, out of scope).
+**Files:** `docs/37_2026_open_problems.md`, `src/components/Figure.js`, `src/components/ChatWidget/{ChatCallout,index,ChatPanel}.js`, `src/css/{chrome,chat}.css`, `scripts/genChatCorpus.js`, `src/data/teamRoles.json`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

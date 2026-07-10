@@ -33,8 +33,10 @@ sidebar_label: "Open Problems"
 
 import Admonition from '@theme/Admonition';
 import { TutorialsTop } from '@site/src/components/TutorialsTop';
+import Figure from "@site/src/components/Figure";
+import ChatCallout from "@site/src/components/ChatWidget/ChatCallout";
 
-<div className="opacity-60 mb-8 italic">July 2026</div>
+*Last updated: July 10, 2026*
 
 In 2026, **PHerc. 1667** **was virtually unwrapped and read without physically opening the scroll** (see [References](#references-and-implementation-links)). 
 
@@ -94,6 +96,8 @@ Reading a scroll is a chain of complex problems:
   }}
 />
 
+<ChatCallout prefill="Give me a quick tour of the open problems on this page" />
+
 The most important thing to understand is what we actually get after scanning. We do not get sheets. We do not get a mesh, a graph, or a map of which layer connects to which. We get a **3D grid of voxels**.
 
 A voxel is the 3D version of a pixel: a tiny cube with an intensity value. The scan gives us billions or trillions of these cubes. 
@@ -110,30 +114,43 @@ The scrolls are scanned using **synchrotron X-ray micro-computed tomography**, o
 
 There is, however, still a signal to be found. Ink may affect the scan in more subtle ways. Texture, morphology, density, and phase effects. Frequently, in some combination of all of them. Teasing out these subtle differences is difficult, and is the primary reason we scan at such high resolutions, and why we continue to invest time and money into ensuring our scans are as good as we can reasonably achieve. 
 
-![](/img/ash2text/image1.png)
+<Figure
+  variant="full"
+  maxWidth={633}
+  src="/img/ash2text/image1.png"
+  alt="Micro-CT cross-section of a carbonized Herculaneum scroll"
+  caption="A micro-CT cross-section of a carbonized Herculaneum scroll: hundreds of tightly wound, deformed papyrus windings packed into a few centimeters (scale bar: 5 cm)."
+/>
 
-*A micro-CT cross-section of a carbonized Herculaneum scroll: hundreds of tightly wound, deformed papyrus windings packed into a few centimeters (scale bar: 5 cm). The subtle differences that distinguish ink from papyrus must be teased out of data like this.*
+The subtle differences that distinguish ink from papyrus must be teased out of data like this.
 
 ### The compressed-region problem
 For as long as we’ve been working on these scans, it’s been apparent that some regions of a scroll look worse than the resolution used to scan them would suggest. These patches come out blurred, foggy, "compressed" — papyrus layers that should be cleanly separable become hard to tell apart. When panning through layers, the sheets could almost be seen “behind” this fog. Recent scanning experiments conducted at very high resolutions have finally given us an answer to the question of why these areas exist. 
 
 The working explanation starts at the fiber level. Carbonized papyrus fibers contain small internal cavities and tubular structures, and when many of them pack together densely, these microscopic structures disturb the X-ray beam enough to create a haze-like degradation. The likely culprit is the carbon itself: carbonized fibers are probably close to graphite, and graphite is a strong decoherer — a material that scrambles the X-ray wavefront rather than passing it through cleanly. The effect is worst in the most densely packed regions, where many fibers contribute to the haze at once.
 
-![](/img/ash2text/image2.png)![](/img/ash2text/image3.png)
+<Figure
+  variant="stack"
+  maxHeight={520}
+  srcs={["/img/ash2text/image2.png", "/img/ash2text/image3.png"]}
+  alts={["Papyrus fiber cell walls and lumen cavities, detail 1", "Papyrus fiber cell walls and lumen cavities, detail 2"]}
+  caption="Cross-section of PHerc. 500P2 at 0.55 µm pixel size (ESRF beamline ID11). Each fiber is surrounded by a cell wall enclosing a hollow lumen cavity — the same structures implicated in the compressed-region scattering effect described above."
+/>
 
-*Cross-section of PHerc. 500P2 at 0.55 µm pixel size (ESRF beamline ID11). Each fiber is surrounded by a cell wall enclosing a hollow lumen cavity — the same structures implicated in the compressed-region scattering effect described above.*
+<Figure
+  variant="medium"
+  src="/img/ash2text/image4.png"
+  alt="Naples and Mount Vesuvius on a clear day versus shrouded in haze"
+  caption="A visual analogy for the compressed-region problem: the same view of Naples and Mount Vesuvius on a clear day and shrouded in haze. In compressed regions of a scan, papyrus sheets can almost be seen “behind” this kind of fog."
+/>
 
-![](/img/ash2text/image4.png)
-
-*A visual analogy for the compressed-region problem: the same view of Naples and Mount Vesuvius on a clear day and shrouded in haze. In compressed regions of a scan, papyrus sheets can almost be seen "behind" this kind of fog.*
-
-![](/img/ash2text/image5.jpg)
-
-*A compressed region of PHerc. Paris 4, scanned at DLS at 7.91 µm with a suboptimal protocol: layer boundaries blur into haze and adjacent sheets become hard to tell apart.*
-
-![](/img/ash2text/image6.jpg)
-
-*The same compressed region of PHerc. Paris 4, rescanned at ESRF at 2.4 µm with a more optimized protocol: individual windings become far easier to separate.*
+<Figure
+  variant="pair"
+  srcs={["/img/ash2text/image5.jpg", "/img/ash2text/image6.jpg"]}
+  alts={["Compressed region of PHerc. Paris 4 scanned at DLS, 7.91 µm", "The same region rescanned at ESRF, 2.4 µm"]}
+  subCaptions={["DLS, 7.91 µm", "ESRF, 2.4 µm"]}
+  caption="The same compressed region of PHerc. Paris 4, imaged with two protocols. With a suboptimal protocol, layer boundaries blur into haze and adjacent sheets become hard to tell apart; with a more optimized protocol, individual windings become far easier to separate."
+/>
 
  The difficulty of unwrapping scrolls begins here. Blur the boundaries in the scan, and every downstream step gets harder: surface localization (finding the writing surface within the volume) turns noisier, mesh tracing turns less stable, and ink recovery may miss information it needs.
 
@@ -199,9 +216,12 @@ Surface prediction was the subject of a dedicated Kaggle competition, "Vesuvius 
 
 Here's the winning recipe condensed to a single sentence: take an off-the-shelf nnU-Net model configured for a couple of patch sizes, train it for a very long time (*well over the default 1,000 epochs)*, and average their predictions together (a process known as ensembling).
 
-![](/img/ash2text/image7.png)
-
-*A recto-surface prediction (red) overlaid on a CT cross-section: the binarized model output marks the written side of each papyrus wrap — the mask that downstream mesh tracing consumes (scale bar: 0.5 cm).*
+<Figure
+  variant="full"
+  src="/img/ash2text/image7.png"
+  alt="Recto-surface prediction overlaid in red on a CT cross-section"
+  caption="A recto-surface prediction (red) overlaid on a CT cross-section: the binarized model output marks the written side of each papyrus wrap — the mask that downstream mesh tracing consumes (scale bar: 0.5 cm)."
+/>
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
@@ -241,30 +261,46 @@ The unwrapping software used by our team, [VC3D](https://github.com/ScrollPrize/
 ### Visualizing a mesh
 [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) makes it possible to visualize the CT scans, meshes, and annotations all in one tool. The CT data for the large scrolls, which can reach dozens of terabytes, is streamed remotely and synchronized from the S3 Open Data bucket, generously provided to the project by AWS.
 
-![](/img/ash2text/image8.png)
+<Figure
+  variant="medium"
+  card
+  src="/img/ash2text/image8.png"
+  alt="VC3D catalog of data in the S3 Open Data bucket"
+  caption="VC3D - At start, the Catalog of data available in S3 Open Data Bucket opens up."
+/>
 
-*VC3D \- At start, the Catalog of data available in S3 Open Data Bucket opens up.*
-
-![](/img/ash2text/image9.png)
-
-*VC3D \- The Volume Package panel to list available patches/segments.*
+<Figure
+  variant="medium"
+  card
+  src="/img/ash2text/image9.png"
+  alt="VC3D Volume Package panel listing patches and segments"
+  caption="VC3D - The Volume Package panel to list available patches/segments."
+/>
 
 ### Normal grids, GrowPatch, and local tracing
 We have several different tools that all attack the same underlying task — turning a surface prediction into a trustworthy mesh — with different tradeoffs between speed, automation, and reliability. 
 
 To trace a surface [VC3D](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer) produces meshes (internally can be called also 'patches') based on a recto surface prediction volume, i.e. a volume produced by a surface segmentation model that is '1' everywhere that's on the papyrus surface.
 
-![](/img/ash2text/image10.png)
-
-*VC3D \- Opening up the Segmentation panel to Grow the patch / segment.*
+<Figure
+  variant="medium"
+  card
+  src="/img/ash2text/image10.png"
+  alt="VC3D Segmentation panel for growing a patch"
+  caption="VC3D - Opening up the Segmentation panel to Grow the patch / segment."
+/>
 
 VC3D needs local orientation information to trace surfaces well. A **normal** is simply a vector perpendicular to a surface — for a papyrus sheet, that means it points straight "out of" the sheet. Stack a coarse 3D field of these local orientations together and you get a **normal grid**, which helps guide mesh growth. A dedicated tool, [vc\_gen\_normalgrids](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/apps/src/vc_gen_normalgrids.cpp), generates, converts, and builds resolution pyramids of these normal grids from the CT volume.
 
 The workflow can then use routines such as **GrowPatch**. A GrowPatch-style routine starts from a seed point or an existing patch and extends a local mesh along the predicted surface. Recall the trail discussed in the [previous section](#meshes-adding-connectivity). GrowPatch attempts to follow this trail, iteratively. Mathematically, this means never optimizing for just one thing: the routine attempts to follow the predicted papyrus surface, keep the local geometry smooth, hold mesh spacing to something reasonable, follow whatever local orientation evidence is available, and resist the pull of a nearby sheet it could easily jump onto instead.
 
-![](/img/ash2text/image11.jpg)
-
-*A 4-panel VC3D screenshot (Surface auto\_grown\_20250602213649661) showing freehand-drawn correction curves (purple, yellow, green, red) manually added on top of an already auto-grown surface, across the main view and three synchronized slice views. Shown here: the manual-correction stage only.*
+<Figure
+  variant="full"
+  card
+  src="/img/ash2text/image11.jpg"
+  alt="VC3D four-panel view with freehand correction curves on an auto-grown surface"
+  caption="A 4-panel VC3D screenshot (Surface auto_grown_20250602213649661) showing freehand-drawn correction curves (purple, yellow, green, red) manually added on top of an already auto-grown surface, across the main view and three synchronized slice views. Shown here: the manual-correction stage only."
+/>
 
 This works well when the prediction is clean and the layers are separable. But it fails when the prediction topology does not match the real papyrus topology (e.g. because some predicted sheets incorrectly merge in the surface prediction volume). In practice, automatic growth still needs human inspection and correction.
 
@@ -284,9 +320,13 @@ The **lasagna** is an alternative to GrowPatch and copy out/in. It provides a cl
 
 The lasagna can (optionally) optimize several stacked sheets at the same time, so they are all consistent with each other; as such it can be used similarly to GrowPatch followed by copy out/in. Other modes include making local corrections so a 'draft' surface is moved closer to the true surface while keeping certain points fixed. In all cases, surfaces (represented as a stack of non-intersecting quad-meshes — quad-faced grids of vertices, more on why below) are iteratively adjusted to agree with prediction volumes as closely as possible, and also with user-provided 'correction points' that define locations known to be on the papyrus surface.
 
-![](/img/ash2text/image12.jpg)
-
-*VC3D workspace showing semi-global optimization of multiple adjacent mesh layers linked together (the lasagna's multi-sheet joint optimization), across four synchronized views, with "true"/"false" annotations marking a correction in progress.*
+<Figure
+  variant="full"
+  card
+  src="/img/ash2text/image12.jpg"
+  alt="VC3D semi-global optimization of multiple adjacent mesh layers"
+  caption="VC3D workspace showing semi-global optimization of multiple adjacent mesh layers linked together (the lasagna's multi-sheet joint optimization), across four synchronized views, with “true”/“false” annotations marking a correction in progress."
+/>
 
 The lasagna needs richer prediction volumes than a plain recto surface prediction can offer: a dense normal volume predicted by a U-Net, and a surface density (called 'gradient magnitude') volume that represents how closely spaced the papyrus windings are. The second one works like this: a second U-Net predicts a **fractional winding position** field for every voxel — essentially "how much further out in the scroll do we get, moving from one side of this voxel to the other point, expressed as a fraction of one full winding." That field is built from distance transforms to sheet skeletons, then normalized into a monotone field via iterative weighted averaging. Gradient magnitude is just the spatial gradient of that field: how fast winding position changes as you move through space. Integrate it along a short strip between two points and you get the number of windings crossed to go from one to the other — which is why it doubles as a proxy for winding spacing. High gradient magnitude means sheets are packed tightly together locally; low means they're far apart.
 
@@ -299,11 +339,12 @@ The full lasagna codebase lives at [github.com/ScrollPrize/villa/tree/main/lasag
 ### 2D Parameterization and Flattening: the easier problem after the hard one
 Flattening takes each point on the 3D mesh and assigns it a 2D coordinate. The same trick as making a flat map from a curved globe, but in our case we are aiming to preserve local distances as much as possible: we are looking for a transformation from 3D \-\> 2D which is isometric. 
 
-![](/img/ash2text/image13.png)
-
-![](/img/ash2text/image14.png)
-
-*VC3D preview of 3D ink recovery on a segment before and after flattening. Flattening aims for a low-distortion parametrization.*
+<Figure
+  variant="stack"
+  srcs={["/img/ash2text/image13.png", "/img/ash2text/image14.png"]}
+  alts={["3D ink recovery preview before flattening", "3D ink recovery preview after flattening"]}
+  caption="VC3D preview of 3D ink recovery on a segment before and after flattening. Flattening aims for a low-distortion parametrization."
+/>
 
 VC3D's current production flattening tool is [flatboi](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/libs/flatboi/flatboi.cpp), which uses **[SLIM](https://igl.ethz.ch/projects/slim/) (Scalable Locally Injective Mappings)**, minimizing the Symmetric Dirichlet Energy (which is small the lower the isometric distortion induced by the map).
 
@@ -314,9 +355,14 @@ If you recall from the flattening step, to get a mapping from 3D space to 2D spa
 
 If we can manage to trace the fibers, we can directly obtain oriented axes in the papyrus. This information can not only help us to flatten the segmented sheets, but also to segment the surface itself\!
 
-![](/img/ash2text/image15.png)
+<Figure
+  variant="full"
+  src="/img/ash2text/image15.png"
+  alt="3D rendering of individually segmented papyrus fibers"
+  caption="A 3D rendering of individually segmented papyrus fibers, each color a separate instance."
+/>
 
-*A 3D rendering of individually segmented papyrus fibers, each color a separate instance. The crossing horizontal and vertical bundles physically define the row-and-column (U and V) axes that can parameterize the sheet’s surface.*
+The crossing horizontal and vertical bundles physically define the row-and-column (U and V) axes that can parameterize the sheet’s surface.
 
 In VC3D we have a fiber tracer tool, which is part of the Lasagna optimization ecosystem. It is not fully automated, and the line annotation widget inside VC3D is what drives it. Once fibers are annotated, [atlas.py](https://github.com/ScrollPrize/villa/blob/main/lasagna/atlas.py) can pair fibers / skeleton annotations and optimize a “patch” through them.
 
@@ -346,9 +392,12 @@ A **spiral fit** starts from an idealized spiral and deforms it to match evidenc
 
 Each of these sources of information provides a hard (verified) or soft (unverified) constraint on where the spiral windings should be. The spiral tries to satisfy as many of these constraints as possible, deforming the spiral as needed, and preferring the hard constraints.
 
-![](/img/ash2text/image16.png)
-
-*The spiral prior, illustrated: an idealized rolled scroll (left) is related to the damaged, deformed scroll observed in the scan (right) by a smooth spatial deformation — the transformation the spiral fit estimates.*
+<Figure
+  variant="full"
+  src="/img/ash2text/image16.png"
+  alt="Idealized spiral scroll related to the deformed scanned scroll"
+  caption="The spiral prior, illustrated: an idealized rolled scroll (left) is related to the damaged, deformed scroll observed in the scan (right) by a smooth spatial deformation — the transformation the spiral fit estimates."
+/>
 
 One way to represent the deformation is through a **stationary velocity field**. In simple terms, this is a smooth 3D field that tells points how to move from the ideal spiral toward the observed scroll. If the transformation is smooth and does not tear or fold the coordinate system onto itself, it preserves the global structure of the spiral while still adapting to damage. The fitting process itself is implemented in [fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py), and there is a [full tutorial](tutorial_spiral) on running it.
 
@@ -366,11 +415,13 @@ This creates a subtle problem: the model isn't always learning the physical feat
 
 Why did we move forward with these datasets instead of fixing them first? The labels were not bad; they were good enough to support major progress in the previous phase of the project. However, as the pipeline becomes more ambitious, label quality has started to become one of the limiting factors.
 
-![](/img/ash2text/image17.jpg)
-
-![](/img/ash2text/image18.jpg)
-
-*Two real examples of label imprecision on a traced segment: the red line marking the recto surface runs visibly offset from the true fiber boundary in places (first pair, z=120), and drifts across fiber layers rather than tracking one sheet (second pair, z=200).*
+<Figure
+  variant="pair"
+  card
+  srcs={["/img/ash2text/image17.jpg", "/img/ash2text/image18.jpg"]}
+  alts={["Label imprecision on a traced segment at z=120", "Label drift across fiber layers at z=200"]}
+  caption="Two real examples of label imprecision on a traced segment: the red line marking the recto surface runs visibly offset from the true fiber boundary in places (first pair, z=120), and drifts across fiber layers rather than tracking one sheet (second pair, z=200)."
+/>
 
 A useful direction is **label snapping**: using the raw CT signal and local geometry to move approximate labels back onto the most plausible papyrus surface / fiber. Another direction is **active learning**, where the model identifies the most uncertain or valuable regions and asks humans to correct only those.
 
@@ -400,17 +451,24 @@ That creates a training pair:
 * input: CT data around the papyrus surface;    
 * label: visible ink from the photograph.
 
-![](/img/ash2text/image19.png)
-
-*The two halves of a fragment training pair: (a) a max-projection composite of the fragment’s CT data, where the ink is not apparent, and (b) the aligned infrared photograph of the same fragment, where the ink is clearly visible (scale bars: 5 mm).*
+<Figure
+  variant="full"
+  card
+  src="/img/ash2text/image19.png"
+  alt="Two halves of a fragment training pair: CT composite and infrared photograph"
+  caption="The two halves of a fragment training pair: (a) a max-projection composite of the fragment’s CT data, where the ink is not apparent, and (b) the aligned infrared photograph of the same fragment, where the ink is clearly visible (scale bars: 5 mm)."
+/>
 
 The model learns from fragments and is then applied to sealed scrolls. Generalization is not straightforward\!
 
 Working on surface-conditioned renders of the fragments’ outer sheet, the model receives a local 3D neighborhood and predicts a 2D ink probability map on the flattened surface.
 
-![](/img/ash2text/image20.png)
-
-*How a fragment becomes a training pair: the fragment (a) is photographed in infrared (e) and CT-scanned (b); a mesh of its exposed surface (c) extracts a flattened surface volume used as the model input (d), while the aligned IR photograph provides the 2D ink labels (f, g).*
+<Figure
+  variant="full"
+  src="/img/ash2text/image20.png"
+  alt="How a fragment becomes a training pair"
+  caption="How a fragment becomes a training pair: the fragment (a) is photographed in infrared (e) and CT-scanned (b); a mesh of its exposed surface (c) extracts a flattened surface volume used as the model input (d), while the aligned IR photograph provides the 2D ink labels (f, g)."
+/>
 
 This design makes sense because fragment labels are 2D: the photograph tells us where ink appears on the exposed surface, but not exactly where the ink signal sits in depth inside the CT volume.
 
@@ -429,9 +487,16 @@ A pseudo-label is a provisional label created from model output and human review
 9. Run inference again.    
 10. Repeat.
 
-![](/img/ash2text/image21.png)
+<Figure
+  variant="full"
+  card
+  enlarge
+  src="/img/ash2text/image21.png"
+  alt="Pseudo-labeling loop across six model iterations on PHerc. 1667"
+  caption="The pseudo-labeling loop in action on PHerc. 1667: six models (iterations 0–5) trained with progressively denser pseudo-label coverage, from a cross-segment baseline up to 33,061 tiles."
+/>
 
-*The pseudo-labeling loop in action on PHerc. 1667: six models (iterations 0–5) trained with progressively denser pseudo-label coverage, from a cross-segment baseline up to 33,061 tiles. Row (a) shows the training labels, row (b) predictions on a training segment (magenta = training label), and row (c) predictions on a held-out segment, which grow steadily cleaner and more legible.*
+Row (a) shows the training labels, row (b) predictions on a training segment (magenta = training label), and row (c) predictions on a held-out segment, which grow steadily cleaner and more legible.
 
 A concrete record of this loop exists in the six PHerc.1667-iteration-0 through \-5 checkpoints released alongside the project. Each of the six shares an identical architecture (a [ResNet3D-50](https://arxiv.org/abs/1711.09577) backbone initialized from [Kinetics-700](https://arxiv.org/abs/1907.06987) weights, feeding a 2D U-Net decoder) and an identical training budget (12,396 optimizer steps), differing only in how much pseudo-labeled data it was fine-tuned on — from a cross-segment baseline at iteration 0 up to the densest available label set, 33,061 tiles, at iteration 5\. Kinetics-700 is, on its face, an odd source for this: it's a video-action-recognition dataset, built for recognizing human activities in video clips, with nothing obviously to do with CT scans or ancient papyrus. The connection is architectural rather than topical — a video clip and a CT volume are both fundamentally 3D data (two spatial axes plus a third axis, time for one and depth for the other), so a 3D-convolutional network pretrained on one transfers surprisingly well to the other. All six checkpoints are released on Hugging Face: [iteration-0](https://huggingface.co/scrollprize/PHerc.1667-iteration-0), [iteration-1](https://huggingface.co/scrollprize/PHerc.1667-iteration-1), [iteration-2](https://huggingface.co/scrollprize/PHerc.1667-iteration-2), [iteration-3](https://huggingface.co/scrollprize/PHerc.1667-iteration-3), [iteration-4](https://huggingface.co/scrollprize/PHerc.1667-iteration-4), and [iteration-5](https://huggingface.co/scrollprize/PHerc.1667-iteration-5).
 
@@ -439,7 +504,11 @@ This process helped recover readable text in PHerc. 1667\. But it is not guarant
 
 We have evidence that working on 1.1 µm data yields cleaner results than 2.4 µm data. But scanning at high resolution is impractical.
 
-![](/img/ash2text/image22.png)
+<Figure
+  variant="full"
+  src="/img/ash2text/image22.png"
+  alt="Ink detection output compared at 1.1 µm and 2.4 µm resolution"
+/>
 
 <div className="flex flex-wrap gap-4 italic mb-4">
   <div className="flex-1 min-w-[240px]">At 1.1 µm:<br/>\]οὐδὲ γὰρ<br/>\]τὰ μέλλοντα τελεῖϲθαι πρ\[</div>
@@ -501,16 +570,29 @@ Sometimes, before training directly an UNet, it could be worth “reinforcing”
 
 We used this frozen checkpoint to guide a 2-class background/fiber segmentation model.[fiber\_dinoguided\_2class\_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000). "DINO-guided" doesn't mean what it might sound like: DINO isn't wired into this model's own architecture or forward pass. It's used externally, as a similarity signal for building the model's own training target. The training target itself is regenerated dynamically at every step: an ordinary intensity threshold (Otsu's method, the standard way to automatically pick the cutoff that separates an image into two classes) blended with cosine similarity (how closely two embedding vectors point in the same direction) between each voxel's embedding and a reference fiber embedding.
 
-![](/img/ash2text/image23.jpg)
+<Figure
+  variant="full"
+  card
+  enlarge
+  src="/img/ash2text/image23.jpg"
+  alt="Ten-panel training debug figure at step 11900"
+  caption="A 10-panel debug figure from step 11900 of training."
+/>
 
-*A 10-panel debug figure from step 11900 of training. Top row: the raw CT image; the input mask; the teacher's pre-mask; the teacher's sigmoid output; the teacher binarized. Bottom row: the cosine-similarity map; the same map binarized by Otsu's method (labeled "Sim bin (Otsu=0.503)" in the original figure — 0.503 is simply this step's dynamically computed threshold, not a fixed setting); the soft union of the two signals; the binarized training target; and the student's own prediction.*
+Top row: the raw CT image; the input mask; the teacher's pre-mask; the teacher's sigmoid output; the teacher binarized. Bottom row: the cosine-similarity map; the same map binarized by Otsu's method (labeled "Sim bin (Otsu=0.503)" in the original figure — 0.503 is simply this step's dynamically computed threshold, not a fixed setting); the soft union of the two signals; the binarized training target; and the student's own prediction.
 
 ### Direct 3D ink segmentation
 In recent high-resolution scans of PHerc. Paris 4, ink-bearing deposits become visible enough to support direct volumetric segmentation (see [this paper](https://arxiv.org/abs/2606.29085)).
 
-![](/img/ash2text/image24.png)
-
-*a) XY slice of PHerc. Paris 4, 2.4 µm scan. b) Ink segmented in 3D. c) Virtually unwrapped PI (no ink detection, the letter is directly visible). d): the flattened region with the recovered ink overlaid in red on the actual papyrus surface — multiple full lines of clearly legible Greek letters running the width of the sheet, not an isolated word or two.*
+<Figure
+  variant="medium"
+  card
+  enlarge
+  maxHeight={640}
+  src="/img/ash2text/image24.png"
+  alt="PHerc. Paris 4: ink segmented in 3D and overlaid on the flattened surface"
+  caption="a) XY slice of PHerc. Paris 4, 2.4 µm scan. b) Ink segmented in 3D. c) Virtually unwrapped PI (no ink detection, the letter is directly visible). d): the flattened region with the recovered ink overlaid in red on the actual papyrus surface — multiple full lines of clearly legible Greek letters running the width of the sheet, not an isolated word or two."
+/>
 
 Not every scroll will behave like PHerc. Paris 4 — but direct 3D ink segmentation is possible under favorable scan and preservation conditions, and it gives us a cleaner target for future models.
 
@@ -536,9 +618,15 @@ Each training crop's label is assembled in five steps, confirmed by reading labe
 * The ink teacher's probability map overrides the fiber classes wherever it's confident — ink wins over fiber, becoming class 3\.  
 * Voxels too dark in the raw, pre-augmentation scan are forced back to class 0 (background) regardless of what either teacher said, as a final safety guard.
 
-![](/img/ash2text/image25.jpg)
+<Figure
+  variant="full"
+  card
+  src="/img/ash2text/image25.jpg"
+  alt="Eight-panel training debug figure at step 26000"
+  caption="An 8-panel debug figure from step 26000 of training, with noticeably cleaner class separation than at earlier steps."
+/>
 
-*An 8-panel debug figure from step 26000 of training, with noticeably cleaner class separation than at earlier steps. Top row: the raw CT crop, cutting across several parallel fiber bundles; the pseudo-label overlaid on it; the pseudo-label alone; and the student model's own prediction, which closely tracks it. Bottom row: the fiber teacher's probability map, dominated by one long fiber bundle; the ink teacher's probability map, showing two distinct elongated streaks rather than one ambiguous blob; the watershed instances before the vertical/horizontal PCA split — each color is one instance, now legibly separated, including two compact, cleanly isolated cross-sections where a fiber runs roughly vertically through the slice; and the difference between the student's prediction and the pseudo-label it was trained on, mostly black, meaning close agreement. Legend: 0 \= background, 1 \= vertical fiber, 2 \= horizontal fiber, 3 \= ink.*
+Top row: the raw CT crop, cutting across several parallel fiber bundles; the pseudo-label overlaid on it; the pseudo-label alone; and the student model's own prediction, which closely tracks it. Bottom row: the fiber teacher's probability map, dominated by one long fiber bundle; the ink teacher's probability map, showing two distinct elongated streaks rather than one ambiguous blob; the watershed instances before the vertical/horizontal PCA split — each color is one instance, now legibly separated, including two compact, cleanly isolated cross-sections where a fiber runs roughly vertically through the slice; and the difference between the student's prediction and the pseudo-label it was trained on, mostly black, meaning close agreement. Legend: 0 = background, 1 = vertical fiber, 2 = horizontal fiber, 3 = ink.
 
 The result is released as [fiber\_ink\_4class\_selfdistill](https://huggingface.co/scrollprize/fiber_ink_4class_selfdistill), alongside the frozen fiber teacher that helped produce it, [fiber\_selftrain\_teacher\_epoch30](https://huggingface.co/scrollprize/fiber_selftrain_teacher_epoch30). 
 
@@ -596,9 +684,13 @@ An optical profilometer can image a fragment in a way that resembles a photograp
 
 Studies on opened Herculaneum fragments show that this surface shape alone carries usable information for telling inked regions from uninked ones. The finding comes from training machine learning models on three-dimensional optical profilometry of mechanically opened fragments ([Angelotti, Nicolardi, Henderson & Seales, 2026](https://www.nature.com/articles/s41598-026-58467-1) — see [References](#references-and-implementation-links)), which also measured how detection quality degrades as the lateral resolution of the height-map is coarsened: a direct, empirical link between spatial resolution and how much of the morphological ink signal survives. But ink doesn't always show up as simple raised relief — the signal is more subtle and heterogeneous, and may depend on fine texture, local roughness, cracks, deposits, deformation, or other small-scale surface changes.
 
-![](/img/ash2text/image26.jpg)
-
-*Figure 2 from the cited surface-topography paper: three papyri (PHerc. 248, PHerc. 250, PHerc. 500P2), each shown as (left) topographic heightmap converted to a uint16 image, (middle) the nnU-Net model's binary ink prediction, (right) the aligned brightfield photograph showing the actual visible ink — directly demonstrating that surface morphology alone predicts ink location.*
+<Figure
+  variant="full"
+  card
+  src="/img/ash2text/image26.jpg"
+  alt="Surface-topography ink prediction for three papyri"
+  caption="Figure 2 from the cited surface-topography paper: three papyri (PHerc. 248, PHerc. 250, PHerc. 500P2), each shown as (left) topographic heightmap converted to a uint16 image, (middle) the nnU-Net model's binary ink prediction, (right) the aligned brightfield photograph showing the actual visible ink — directly demonstrating that surface morphology alone predicts ink location."
+/>
 
 High effective resolution matters here too: some ink information may live at very small spatial scales. That's one more argument for smaller voxel sizes and better phase-retrieval regimes — and a reminder that no single contrast mechanism explains every scroll.
 

@@ -9,6 +9,7 @@ const INPUT_MAX_HEIGHT = 104; // 4 lines x 20px + 24px padding
 
 export default function ChatPanel({
   open,
+  prefill,
   messages,
   status,
   error,
@@ -54,6 +55,13 @@ export default function ChatPanel({
       document.documentElement.style.overflow = prev;
     };
   }, [open, isMobile]);
+
+  // A vc:open-chat prefill replaces the draft (never auto-sends). Keyed on the
+  // object's identity — the widget wraps each event's text in a fresh object,
+  // so clicking the same callout twice re-applies it.
+  useEffect(() => {
+    if (prefill && prefill.text) setDraft(prefill.text);
+  }, [prefill]);
 
   // Textarea autogrow, 1–4 lines.
   useEffect(() => {

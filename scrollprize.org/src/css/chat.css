@@ -566,3 +566,11 @@
 .vc-chat-trigger .vc-chat-avatar svg {
   color: var(--vc-accent);
 }
+/* Desktop TOC clearance: the sticky "On this page" card otherwise scrolls its
+   last entries underneath the fixed trigger on short viewports. */
+@media (min-width: 997px) {
+  .theme-doc-toc-desktop {
+    max-height: calc(100vh - var(--ifm-navbar-height) - 8.5rem);
+    overflow-y: auto;
+  }
+}

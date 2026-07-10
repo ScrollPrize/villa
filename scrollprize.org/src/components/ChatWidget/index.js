@@ -71,6 +71,9 @@ export default function ChatWidget() {
 
   const [open, setOpen] = useState(false);
   const [panelRequested, setPanelRequested] = useState(false);
+  // { text } object per vc:open-chat event — fresh identity each time so the
+  // panel re-applies the draft even when the same suggestion is clicked twice.
+  const [prefill, setPrefill] = useState(null);
   const [messages, setMessages] = useState([]);
   const [status, setStatus] = useState("idle"); // idle | waiting | streaming
   const [error, setError] = useState(null); // null | { kind: "rate" | "generic" }
@@ -231,6 +234,22 @@ export default function ChatWidget() {
     if (triggerRef.current) triggerRef.current.focus();
   }, []);
 
+  // Deep entry from page content (ChatCallout et al.): `vc:open-chat` opens
+  // the panel and drafts detail.prefill into the input — never auto-sent. If
+  // the panel is already open, only the draft changes.
+  useEffect(() => {
+    const onOpenChat = (e) => {
+      const text =
+        e && e.detail && typeof e.detail.prefill === "string"
+          ? e.detail.prefill.trim()
+          : "";
+      if (text) setPrefill({ text: text.slice(0, MAX_CONTENT_CHARS) });
+      openPanel();
+    };
+    window.addEventListener("vc:open-chat", onOpenChat);
+    return () => window.removeEventListener("vc:open-chat", onOpenChat);
+  }, [openPanel]);
+
   // No endpoint configured — the widget doesn't exist.
   if (!endpoint) return null;
 
@@ -253,6 +272,7 @@ export default function ChatWidget() {
         <Suspense fallback={null}>
           <ChatPanel
             open={open}
+            prefill={prefill}
             messages={messages}
             status={status}
             error={error}
