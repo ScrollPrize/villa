@@ -500,28 +500,6 @@ const ChallengeBox = ({
   </div>
 );
 
-const targets = [
-  {
-    title: "Accurate Surface Representation",
-    description:
-      "We lack the accuracy to make the meshing step as simple as it could be.",
-  },
-  {
-    title: "Generalizable Ink Detection",
-    description:
-      "Ink has been found in a handful of scrolls, but remains elusive in most of them.",
-  },
-  {
-    title: "High Quality Annotations",
-    description: "We need an abundance of high-quality annotations.",
-  },
-  {
-    title: "Robust Meshing",
-    description:
-      "Methods that function where Surface Representation is unreliable are needed.",
-  },
-];
-
 const autoPlay = (ref) =>
   ref &&
   ref.current &&
@@ -947,25 +925,6 @@ export function Landing() {
                   problem.
                 </p>
               </ChallengeBox>
-            </div>
-
-            <div className="vc-targets">
-              <p className="vc-label vc-targets__label">
-                What we're building towards
-              </p>
-              <div className="vc-targets__grid">
-                {targets.map((t) => (
-                  <a
-                    className="vc-target"
-                    href="https://github.com/ScrollPrize/villa"
-                    key={t.title}
-                    title="Build it with us — the ScrollPrize villa monorepo on GitHub"
-                  >
-                    <span className="vc-target__title">{t.title}</span>
-                    <span className="vc-target__desc">{t.description}</span>
-                  </a>
-                ))}
-              </div>
             </div>
           </div>
         </section>
