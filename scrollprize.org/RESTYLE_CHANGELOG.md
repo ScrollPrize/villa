@@ -360,6 +360,14 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - **Trigger**: much larger on desktop ≥997px (56px tall, 1rem label, 20px glyph, 28px inset); mobile keeps the compact 44px pill.
 **Files:** `api/_lib/handler.mjs`, `src/components/ChatWidget/ChatPanel.js`, `src/css/chat.css`.
 
+## C41 — chat endpoint: fix crash on Vercel + preview-domain origins
+
+**Why:** first remote deploy crashed with `request.headers.get is not a function` — Vercel's Node.js runtime invokes the default export classic-style (`handler(req, res)` with an IncomingMessage), not with a Web `Request`. And the origin allowlist only contained `https://scrollprize.org`, which would have 403'd every Vercel preview domain (browsers send `Origin` on every POST, same-origin included).
+- `api/chat.mjs` is now a dual-mode entry: bridges Node `(req, res)` ↔ Web Request/Response (same adapter the dev shim uses, streaming preserved via `Readable.fromWeb`), still handles a Web `Request` directly if the runtime passes one.
+- `resolveCors` gains a same-host rule: an `Origin` whose host equals the request's own `x-forwarded-host`/`host` is always allowed — production and preview domains both work with zero config.
+- Verified locally under the classic signature: same-origin POST streams 200, foreign origin 403, preflight 204, bad body 400.
+**Files:** `api/chat.mjs`, `api/_lib/handler.mjs`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

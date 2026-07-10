@@ -134,11 +134,20 @@ function isLocalhostOrigin(origin) {
   }
 }
 
-// Same-origin browser navigations and server-side calls send no Origin — allow
-// those. Otherwise the origin must be in the allowlist (or localhost in dev).
-function resolveCors(origin, env, opts) {
+// Browsers send an Origin header on every POST, including same-origin ones —
+// so "no Origin" (server-side calls) is allowed, and an Origin whose host
+// matches the request's own host (production AND Vercel preview domains) is
+// allowed. Anything else must be in the allowlist (or localhost in dev).
+function resolveCors(origin, env, opts, requestHost) {
   if (!origin) return { allowed: true, headers: {} };
+  let sameHost = false;
+  try {
+    sameHost = Boolean(requestHost) && new URL(origin).host === requestHost;
+  } catch {
+    sameHost = false;
+  }
   const allowed =
+    sameHost ||
     parseAllowedOrigins(env).has(origin) ||
     (opts.allowLocalhostOrigins && isLocalhostOrigin(origin));
   const headers = allowed
@@ -223,7 +232,9 @@ export async function handleChat(request, opts = {}) {
   const t0 = Date.now();
   const env = process.env;
   const origin = request.headers.get('origin');
-  const cors = resolveCors(origin, env, opts);
+  const requestHost =
+    request.headers.get('x-forwarded-host') || request.headers.get('host');
+  const cors = resolveCors(origin, env, opts, requestHost);
 
   // CORS preflight.
   if (request.method === 'OPTIONS') {
