@@ -1224,7 +1224,7 @@ class FiberStrip2DLoader:
         profile: dict[str, float] | None = None,
         apply_image_augmentation: bool = True,
     ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
-        device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
+        device = resolve_torch_device(self.config.augment.device)
         source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode, profile=profile)
         images: list[np.ndarray] = []
         coords: list[np.ndarray] = []
@@ -1258,14 +1258,20 @@ class FiberStrip2DLoader:
             np.stack(valids, axis=0),
         )
 
-    def build_center_strip_patch(self, sample_index: int) -> tuple[FiberStripSample, np.ndarray, np.ndarray]:
-        source = self.build_strip_source(sample_index, device=torch.device("cpu"))
+    def build_center_strip_patch(
+        self,
+        sample_index: int,
+        *,
+        device: torch.device | None = None,
+    ) -> tuple[FiberStripSample, np.ndarray, np.ndarray]:
+        resolved_device = resolve_torch_device(self.config.augment.device) if device is None else device
+        source = self.build_strip_source(sample_index, device=resolved_device)
         center_index = min(range(len(self.strip_z_offsets)), key=lambda index: abs(float(self.strip_z_offsets[index])))
         sample, image, valid_mask, _ = self.build_strip_patch_from_source(
             source,
             center_index,
             None,
-            device=torch.device("cpu"),
+            device=resolved_device,
             load_image=True,
         )
         assert image is not None
@@ -1395,7 +1401,7 @@ class FiberStrip2DLoader:
     def chunk_requests_for_sample_index(
         self, sample_index: int, *, sample_mode: str = "random", sample_index_limit: int | None = None
     ) -> list[ZarrChunkRequest]:
-        device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
+        device = resolve_torch_device(self.config.augment.device)
         bounded_sample_index = self._bounded_sample_index(sample_index, sample_index_limit)
         source = self.build_strip_source(bounded_sample_index, device=device, sample_mode=sample_mode)
         requests: list[ZarrChunkRequest] = []

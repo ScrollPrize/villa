@@ -2,6 +2,7 @@
 
 ## 2026-07-10
 
+- Added opt-in `--med-tta` runner line tracing that uses per-step median directions across reference and fixed TTA direction fields.
 - Added 100-batch `train.py --benchmark`, `--profile`, and `--load-only` modes for patch-throughput, per-stage timing, and loader-only diagnostics.
 - Switched the default 2D fiber-strip direction model to a 10-block, 64-channel residual CNN.
 - Switched the default 2D direction ResNet normalization to 8-group GroupNorm.

@@ -1,20 +1,18 @@
-# Task Log: Training Benchmark And Profiling Mode
+# Task Log: Median TTA Line Tracing
 
 ## Implementation Notes
 
-- Added optional loader profile plumbing through `load_batch` and `build_sample`
-  while keeping the default path unchanged when no profile dict is passed.
-- Added `train.py --benchmark` for a 100-batch training-work benchmark that
-  skips test evaluation, TensorBoard, run-directory creation, and snapshots.
-- Added `train.py --profile` for per-batch stage timing rows plus a final
-  milliseconds-per-CNN-patch summary.
-- Added `train.py --load-only` for the benchmark path. It still runs
-  deterministic sample selection, coordinate generation/augmentation, and
-  volume sampling, but skips value augmentation and model training work.
-- Added tests for loader profile collection and benchmark throughput reporting
-  without training run-directory side effects.
-- Added a test that load-only benchmark/profile reports zero image-augmentation,
-  forward, and backward/step timing.
+- Added `runner.py --med-tta` for `--line-trace-vis`.
+- Added reference-space median-TTA tracing. Each step samples the reference and
+  fixed TTA direction fields, transforms TTA orientations back to reference
+  space, resolves ambiguous sign against the previous step, and steps along the
+  normalized median direction.
+- The existing two-column line trace visualization remains unchanged unless
+  `--med-tta` is supplied; median TTA adds a third column.
+- Removed hardcoded CPU coordinate generation from non-prefetch center-patch and
+  direct chunk-request paths. Prefetch dependency generation remains CPU-only.
+- Added a focused test for median-TTA reference-space tracing and ambiguous
+  direction sign handling.
 
 ## Deviations
 
@@ -22,8 +20,8 @@
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
   passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 67 tests.
+  passed: 68 tests.
 - `git diff --check -- <touched files>` passed.

@@ -19,6 +19,11 @@
 - Dense side-strip coordinate generation may use torch vectorization for per-pixel Hermite interpolation and normal interpolation, but it must preserve the existing VC3D/Lasagna frame construction semantics.
 - The augment-vis source/patch path is the canonical loader path for runner exports, training batch loading, and prefetch coordinate generation.
 - Augmentation visualization, training, runner batch loading, and prefetch must share the same CP-local source-strip and final-coordinate generation implementation.
+- Normal training, benchmark/profile/load-only, augment-vis, line-trace-vis,
+  dir-vis, and direct runner/debug center-patch loading use the configured
+  `augment_device` for torch coordinate generation. With the example config,
+  `augment_device: "auto"` uses CUDA when available. Prefetch dependency
+  generation is the exception and stays CPU-pinned.
 - The loader builds CP-local source geometry once per selected control point and reuses it across augmentation variants or strip-z offsets as appropriate.
 - Image loading samples base-volume Zarr values from explicit coordinates.
 - Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
@@ -115,6 +120,15 @@
 - Line-tracing inspection writes `line_trace_vis.jpg` as a two-column image: the first column is the original transformed strip line plus the unaugmented direction-traced line, and the second column is the same original patch with a flock of traces from fixed test-time augmentations inverse-warped back into original patch coordinates.
 - Line-trace test-time augmentations are deterministic inspection-only patch-space transforms: horizontal flip, vertical flip, both flips, 90/180/270 degree rotations, and shifts by configured `augment_shift_x` and `augment_shift_y` in both signs.
 - Line-trace TTA runs the model and tracer in augmented patch coordinates, then inverse-transforms traced points back into original patch coordinates before drawing. It writes per-TTA trace counts to `line_trace_summary.txt`.
+- `--line-trace-vis --med-tta` adds a third `line_trace_vis.jpg` column for
+  median test-time augmentation tracing. Median TTA traces in the unaugmented
+  reference patch space; at each trace step it transforms the current reference
+  point into the reference/TTA direction fields, samples decoded Lasagna
+  ambiguous directions there, transforms orientations back to reference space,
+  keeps only the ambiguous sign aligned within 90 degrees of the previous
+  reference-space step direction, then takes and normalizes the component-wise
+  median direction before stepping. `line_trace_summary.txt` records
+  `med_tta=true` and the median trace point count.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.

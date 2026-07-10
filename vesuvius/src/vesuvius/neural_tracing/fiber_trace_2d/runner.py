@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -297,6 +298,15 @@ def _trace_direction_line(
     return np.stack(combined, axis=0).astype(np.float32)
 
 
+@dataclass(frozen=True)
+class _TtaDirectionField:
+    name: str
+    direction_xy: np.ndarray
+    valid_mask: np.ndarray
+    matrix_ref_to_tta: np.ndarray
+    matrix_tta_to_ref: np.ndarray
+
+
 def _trace_tta_matrix(
     shape_hw: tuple[int, int],
     *,
@@ -349,6 +359,24 @@ def _transform_direction_xy(direction_xy: np.ndarray, matrix: np.ndarray) -> np.
     if not np.isfinite(norm) or norm <= 1.0e-6:
         return direction
     return (transformed / norm).astype(np.float32)
+
+
+def _orient_direction_to_previous(direction_xy: np.ndarray, previous_xy: np.ndarray) -> np.ndarray | None:
+    direction = np.asarray(direction_xy, dtype=np.float32)
+    previous = np.asarray(previous_xy, dtype=np.float32)
+    if direction.shape != (2,) or previous.shape != (2,):
+        raise ValueError("direction_xy and previous_xy must have shape (2,)")
+    norm = float(np.linalg.norm(direction))
+    previous_norm = float(np.linalg.norm(previous))
+    if not np.isfinite(norm) or norm <= 1.0e-6 or not np.isfinite(previous_norm) or previous_norm <= 1.0e-6:
+        return None
+    unit = (direction / norm).astype(np.float32)
+    previous_unit = (previous / previous_norm).astype(np.float32)
+    if float(np.dot(unit, previous_unit)) < 0.0:
+        unit = -unit
+    if float(np.dot(unit, previous_unit)) < 0.0:
+        return None
+    return unit.astype(np.float32)
 
 
 def _warp_patch_by_matrix(
@@ -462,6 +490,78 @@ def _predict_direction_field(
         return decode_lasagna_direction_xy(encoded, bins=720).detach().cpu().numpy().astype(np.float32)
 
 
+def _sample_tta_direction_in_reference(
+    fields: list[_TtaDirectionField],
+    point_xy: np.ndarray,
+    previous_xy: np.ndarray,
+) -> np.ndarray | None:
+    candidates: list[np.ndarray] = []
+    for field in fields:
+        tta_point = _transform_points_xy(point_xy, field.matrix_ref_to_tta)[0]
+        sampled = _bilinear_direction_sample(field.direction_xy, tta_point, valid_mask=field.valid_mask)
+        if sampled is None:
+            continue
+        sampled_ref = _transform_direction_xy(sampled, field.matrix_tta_to_ref)
+        oriented = _orient_direction_to_previous(sampled_ref, previous_xy)
+        if oriented is not None:
+            candidates.append(oriented)
+    if not candidates:
+        return None
+    median = np.median(np.stack(candidates, axis=0), axis=0).astype(np.float32)
+    norm = float(np.linalg.norm(median))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return None
+    return (median / norm).astype(np.float32)
+
+
+def _trace_median_tta_direction_line(
+    fields: list[_TtaDirectionField],
+    cp_xy: np.ndarray,
+    tangent_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+    max_steps: int | None = None,
+) -> np.ndarray:
+    if not fields:
+        raise ValueError("fields must contain at least the reference direction field")
+    cp = np.asarray(cp_xy, dtype=np.float32)
+    tangent = np.asarray(tangent_xy, dtype=np.float32)
+    if cp.shape != (2,) or tangent.shape != (2,):
+        raise ValueError("cp_xy and tangent_xy must have shape (2,)")
+    tangent_norm = float(np.linalg.norm(tangent))
+    if not np.isfinite(tangent_norm) or tangent_norm <= 1.0e-6:
+        raise ValueError("tangent_xy must be finite and non-zero")
+    step = max(float(step_px), 1.0e-3)
+    unit_tangent = (tangent / tangent_norm).astype(np.float32)
+    if max_steps is None:
+        max_steps = int(np.ceil(np.hypot(*shape_hw) / step)) + 2
+
+    def one_side(initial: np.ndarray) -> list[np.ndarray]:
+        points = [cp.astype(np.float32)]
+        previous = initial.astype(np.float32)
+        current = cp.astype(np.float32)
+        for _ in range(int(max_steps)):
+            if not _inside_trace_margin(current, shape_hw, rf_margin_px):
+                break
+            sampled = _sample_tta_direction_in_reference(fields, current, previous)
+            if sampled is None:
+                break
+            next_point = current + sampled * np.float32(step)
+            if not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
+                break
+            points.append(next_point.astype(np.float32))
+            current = next_point.astype(np.float32)
+            previous = sampled.astype(np.float32)
+        return points
+
+    backward = one_side(-unit_tangent)
+    forward = one_side(unit_tangent)
+    combined = list(reversed(backward[1:])) + forward
+    return np.stack(combined, axis=0).astype(np.float32)
+
+
 def _export_line_trace_vis(
     loader: FiberStrip2DLoader,
     sample_index: int,
@@ -470,6 +570,7 @@ def _export_line_trace_vis(
     checkpoint_path: str | Path,
     step_px: float,
     rf_margin_px: float | None,
+    med_tta: bool = False,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -501,12 +602,23 @@ def _export_line_trace_vis(
     flock_overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.35, thickness=1)
     flock_overlay = _overlay_polyline_rgb(flock_overlay, traced_line, color_rgba=(0, 255, 0, 220), thickness=1)
     tta_rows: list[str] = []
+    tta_fields: list[_TtaDirectionField] = []
     for tta_name, matrix in _line_trace_tta_entries(image.shape, loader):
         try:
             tta_image, tta_valid = _warp_patch_by_matrix(image, valid_mask, matrix)
             tta_cp = _transform_points_xy(cp_xy, matrix)[0]
             tta_tangent = _transform_direction_xy(tangent_xy, matrix)
             tta_direction = _predict_direction_field(model, tta_image, tta_valid, device=device)
+            if med_tta:
+                tta_fields.append(
+                    _TtaDirectionField(
+                        name=tta_name,
+                        direction_xy=tta_direction,
+                        valid_mask=tta_valid,
+                        matrix_ref_to_tta=matrix,
+                        matrix_tta_to_ref=np.linalg.inv(matrix).astype(np.float32),
+                    )
+                )
             tta_trace = _trace_direction_line(
                 tta_direction,
                 tta_cp,
@@ -527,9 +639,38 @@ def _export_line_trace_vis(
             tta_rows.append(f"{tta_name}: skipped={exc}")
     flock_overlay = _draw_cp_crosshair(flock_overlay, cp_xy)
 
-    combined = np.zeros((image_u8.shape[0], image_u8.shape[1] * 2, 3), dtype=np.uint8)
+    overlays = [single_overlay, flock_overlay]
+    med_trace: np.ndarray | None = None
+    if med_tta:
+        identity = np.eye(3, dtype=np.float32)
+        med_fields = [
+            _TtaDirectionField(
+                name="reference",
+                direction_xy=direction_xy,
+                valid_mask=np.asarray(valid_mask, dtype=bool),
+                matrix_ref_to_tta=identity,
+                matrix_tta_to_ref=identity,
+            ),
+            *tta_fields,
+        ]
+        med_trace = _trace_median_tta_direction_line(
+            med_fields,
+            cp_xy,
+            tangent_xy,
+            shape_hw=image.shape,
+            step_px=step_px,
+            rf_margin_px=margin,
+        )
+        med_overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.35, thickness=1)
+        med_overlay = _overlay_polyline_rgb(med_overlay, med_trace, color_rgba=(255, 220, 64, 230), thickness=1)
+        med_overlay = _draw_cp_crosshair(med_overlay, cp_xy)
+        overlays.append(med_overlay)
+
+    combined = np.zeros((image_u8.shape[0], image_u8.shape[1] * len(overlays), 3), dtype=np.uint8)
     combined[:, : image_u8.shape[1], :] = single_overlay
-    combined[:, image_u8.shape[1] :, :] = flock_overlay
+    for index, overlay in enumerate(overlays[1:], start=1):
+        x0 = image_u8.shape[1] * index
+        combined[:, x0 : x0 + image_u8.shape[1], :] = overlay
     _write_jpg(out / "line_trace_vis.jpg", combined)
     summary = [
         f"sample_index={sample_index}",
@@ -543,6 +684,8 @@ def _export_line_trace_vis(
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
         f"trace_points={int(traced_line.shape[0])}",
+        f"med_tta={bool(med_tta)}",
+        f"med_tta_trace_points={int(med_trace.shape[0]) if med_trace is not None else 0}",
         "tta_traces:",
         *tta_rows,
     ]
@@ -835,6 +978,7 @@ def main() -> None:
     parser.add_argument("--export-dir", default=None)
     parser.add_argument("--augment-vis", action="store_true")
     parser.add_argument("--line-trace-vis", action="store_true")
+    parser.add_argument("--med-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--line-trace-step", type=float, default=4.0)
@@ -881,6 +1025,7 @@ def main() -> None:
             checkpoint_path=args.checkpoint,
             step_px=args.line_trace_step,
             rf_margin_px=args.line_trace_rf_margin,
+            med_tta=args.med_tta,
         )
         return
 

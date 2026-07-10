@@ -1,15 +1,17 @@
-# Task: Training Benchmark And Profiling Mode
+# Task: Median TTA Line Tracing
 
-Implement the profiling item from `planning/todo.md`:
+Implement the `planning/todo.md` item "median of TTA for tracing":
 
-- Add `--benchmark` to run training work for the first 100 batches, skip testing,
-  and report samples/s where samples are individual CNN image patches.
-- Add `--profile` to measure timings by stage: coord generation, coord
-  augmentation, Zarr read/sampling, image/value augmentations, forward, and
-  backward plus optimizer step.
-- Add `--load-only` so benchmark/profile can isolate data loading by running
-  coordinate generation, coordinate augmentation, and volume sampling, while
-  skipping image/value augmentation and model training work.
-- After the 100 batches, print a summary with average stage time per CNN patch.
-- During profiling, print table-like per-batch values so stage timing is easy to
-  inspect.
+- Use test-time augmentations inside a single trace rather than only drawing
+  separate flock traces.
+- Trace in the unaugmented reference patch space.
+- At each step, warp the current point into each TTA patch space, sample the
+  direction there, inverse-warp the orientation back into reference space, and
+  use the median direction in reference space.
+- Handle the ambiguous direction sign by trying both signs and discarding the
+  sign that points more than 90 degrees away from the previous step direction.
+- Add a separate `--med-tta` flag. With `--line-trace-vis`, it should add a
+  third visualization column after the reference-only trace and the TTA flock.
+- Follow-up cleanup: remove hardcoded CPU coordinate generation from
+  non-prefetch loader/runner paths. Prefetch may stay CPU-pinned for dependency
+  generation.

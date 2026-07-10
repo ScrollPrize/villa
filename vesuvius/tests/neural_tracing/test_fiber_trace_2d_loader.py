@@ -49,12 +49,14 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     run_training,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.runner import (
+    _TtaDirectionField,
     _bilinear_direction_sample,
     _direction_field_overlay_rgb,
     _export_augment_contact_sheet,
     _line_trace_tta_entries,
     _transform_points_xy,
     _trace_direction_line,
+    _trace_median_tta_direction_line,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
@@ -227,6 +229,37 @@ def test_line_trace_tta_point_transforms_round_trip() -> None:
         warped = _transform_points_xy(points, matrix)
         restored = _transform_points_xy(warped, np.linalg.inv(matrix))
         assert np.allclose(restored, points, atol=1.0e-5)
+
+
+def test_median_tta_trace_uses_reference_space_directions() -> None:
+    identity = np.eye(3, dtype=np.float32)
+    shift = np.asarray([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    shifted_inverse = np.linalg.inv(shift).astype(np.float32)
+    ref = np.zeros((9, 9, 2), dtype=np.float32)
+    ref[:, :, 0] = 1.0
+    up = np.zeros_like(ref)
+    up[:, :, 1] = 1.0
+    shifted_opposite = np.zeros_like(ref)
+    shifted_opposite[:, :, 0] = -1.0
+    valid = np.ones((9, 9), dtype=bool)
+    fields = [
+        _TtaDirectionField("ref", ref, valid, identity, identity),
+        _TtaDirectionField("up", up, valid, identity, identity),
+        _TtaDirectionField("shifted_opposite", shifted_opposite, valid, shift, shifted_inverse),
+    ]
+
+    line = _trace_median_tta_direction_line(
+        fields,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        shape_hw=(9, 9),
+        step_px=1.0,
+        rf_margin_px=2.0,
+    )
+
+    assert np.allclose(line[:, 1], 4.0)
+    assert np.isclose(line[0, 0], 2.0)
+    assert np.isclose(line[-1, 0], 6.0)
 
 
 def test_dir_vis_overlay_scales_and_strides() -> None:

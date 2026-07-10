@@ -134,6 +134,9 @@ The important behavior is:
 
 - Loads a config, optionally prefetches chunks, loads a batch, exports JPGs, and
   exports augmentation contact sheets.
+- Non-prefetch runner/debug patch loading uses the configured `augment_device`
+  for torch coordinate generation. With `augment_device: "auto"`, CUDA is used
+  when available. Prefetch dependency generation is intentionally CPU-only.
 - Its prefetch mode is sample-count oriented:
   `--prefetch --prefetch-samples <control-point-samples>`.
 - Prints augment-visualization timing rows and raw image stats.
@@ -144,9 +147,14 @@ The important behavior is:
   in both directions with a default 4 px trace step and a default receptive
   field margin of `1 + 2 * model_depth`, and writes
   `line_trace_vis.jpg` plus `line_trace_summary.txt`.
-- The line-trace JPG has two columns: the unaugmented trace view, then the
-  original patch with a flock of traces from fixed test-time augmentations
+- The line-trace JPG normally has two columns: the unaugmented trace view, then
+  the original patch with a flock of traces from fixed test-time augmentations
   inverse-warped back into original patch coordinates.
+- `--line-trace-vis --med-tta` adds a third column. That trace stays in the
+  original patch space and, at each step, samples the reference and TTA
+  direction fields, inverse-warps TTA orientations back to the original patch
+  frame, resolves the ambiguous direction sign against the previous step, and
+  steps along the normalized median direction.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, runs the checkpointed direction model, decodes the

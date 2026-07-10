@@ -1,10 +1,10 @@
-# Status: Training Benchmark And Profiling Mode
+# Status: Median TTA Line Tracing
 
 - [x] Read `planning/todo.md`.
 - [x] Read local `AGENTS.md`.
-- [x] Create task.md for the profiling todo item.
+- [x] Create task.md for the median-TTA todo item.
 - [x] Create task_plan.md.
-- [x] Implement load-only benchmark/profile mode.
+- [x] Implement `runner.py --med-tta`.
 - [x] Add/update tests.
 - [x] Update specs and docs.
 - [x] Run validation commands.

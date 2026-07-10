@@ -1,68 +1,60 @@
-# Task Plan: Training Benchmark And Profiling Mode
+# Task Plan: Median TTA Line Tracing
 
 ## Scope
 
-Add training-only benchmark/profiling command-line modes. This should not
-change normal training semantics, sampling order, model architecture, loss,
-TensorBoard logging, checkpoints, prefetch, or runner inspection modes.
+Add an opt-in median-TTA tracing mode to the runner line-trace visualization.
+This should not change training, prefetching, augment-vis, dir-vis, checkpoint
+loading, normal `--line-trace-vis` output, or the existing two-column TTA flock
+view unless `--med-tta` is supplied.
 
 ## Plan
 
-- Extend `train.py` CLI with:
-  - `--benchmark`: run 100 train batches by default, skip test evaluation,
-    TensorBoard, run-directory creation, and snapshots, then report patch
-    samples/s.
-  - `--profile`: enable stage timing and per-batch table output. It can be used
-    alone or with `--benchmark`; with benchmark it profiles the benchmark run.
-  - `--load-only`: use the benchmark path but skip value/image augmentation,
-    image normalization, supervision building, model forward, backward, and
-    optimizer work.
-- Add a shared benchmark runner that:
-  - uses the existing `FiberStrip2DLoader.load_batch` path;
-  - performs the same image preparation, supervision building, forward,
-    backward, and optimizer step as training;
-  - counts CNN patches as `control_points_per_step * strip_z_offset_count`;
-  - defaults to 100 batches without changing config files.
-- Pass optional profile dictionaries through `load_batch` / `build_sample` so
-  existing loader profile blocks collect:
-  - coordinate generation from descriptor, line-window, Lasagna normal, strip
-    grid, and line-coordinate timing;
-  - coordinate augmentation;
-  - volume sampling/Zarr read;
-  - image/value augmentation.
-- Time model stages in `train.py`:
-  - forward plus loss;
-  - backward plus optimizer step.
-- Add an opt-in loader flag that disables value augmentation only for
-  load-only benchmark/profile runs. Normal training and visualization paths keep
-  applying value augmentation unchanged.
-- Print:
-  - one table header followed by per-batch rows when profiling;
-  - a final summary with total patches, elapsed wall time, patches/s, and
-    average ms per CNN patch by stage.
+- Add `runner.py --med-tta` as an option for `--line-trace-vis`.
+- Reuse the existing deterministic line-trace TTA transforms: flips, 90 degree
+  rotations, and configured shift extremes.
+- Add a small internal representation for a TTA direction field containing:
+  predicted direction image, validity mask, reference-to-TTA transform, and
+  TTA-to-reference inverse transform.
+- Build median-TTA direction fields by running the checkpointed model on the
+  reference patch and each existing TTA-warped patch.
+- Implement reference-space median tracing:
+  - for each step, transform the current reference point into every TTA field;
+  - bilinearly sample the decoded ambiguous direction field in that TTA space;
+  - transform the sampled orientation back to reference space;
+  - resolve ambiguous sign by keeping the sign aligned with the previous
+    reference-space trace direction;
+  - take the component-wise median over surviving candidate directions and
+    normalize it before stepping.
+- Draw the median-TTA trace as a third column in `line_trace_vis.jpg` when
+  `--med-tta` is present.
+- Record whether median TTA was used and the median trace point count in
+  `line_trace_summary.txt`.
+- Remove CPU-pinning from non-prefetch center-patch and loader coordinate
+  generation. Use the configured `augment_device` for normal training,
+  benchmark/profile/load-only, augment-vis, line-trace-vis, dir-vis, and direct
+  chunk-request helpers. Keep prefetch dependency generation explicitly on CPU.
 
 ## Spec Update
 
-Update `planning/specs.md` to document `train.py --benchmark`,
-`train.py --profile`, and `train.py --load-only`, including the fixed
-100-batch default, skipped side-effects, patch-sample throughput unit, and
-profiled stage meanings.
+Update `planning/specs.md` to document `--med-tta`, reference-space per-step
+median-TTA tracing, ambiguous sign handling, the optional third JPG column, and
+configured-device coord generation for non-prefetch paths.
 
 ## Docs Updates
 
-Update `docs/code_structure.md` to describe the benchmark/profile CLI modes and
-the source of the profile stages.
+Update `docs/code_structure.md` to describe `--med-tta`, how it differs from
+the existing TTA flock visualization, and which loader paths use configured
+devices versus CPU-only prefetch.
 
 ## Testing
 
-- Add focused tests using the existing fake local sampler:
-  - loader profile collection records expected stage keys through `load_batch`;
-  - benchmark mode returns a summary and does not create run directories.
-  - load-only benchmark skips image augmentation and model-stage timings.
+- Add focused tests for:
+  - reference/TTA point transform round trips still work;
+  - median-TTA tracing resolves ambiguous sign and steps in reference space.
 - Run:
-  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
+  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
 ## Changelog
 
-Add a changelog entry for the new training benchmark/profile modes.
+Add a changelog entry for median-TTA line tracing.
