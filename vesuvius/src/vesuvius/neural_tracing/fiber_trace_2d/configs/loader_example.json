@@ -30,7 +30,7 @@
     "run_name": "fiber_strip_direction",
     "max_steps": 1000000,
     "learning_rate": 0.001,
-    "scalar_log_interval": 100,
+    "scalar_log_interval": 1,
     "tensorboard_image_interval": 100,
     "checkpoint_interval": 1000,
     "test_interval": 1000,

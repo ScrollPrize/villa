@@ -35,6 +35,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
 )
 from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _draw_predicted_cp_direction,
+    _select_visualization_patch_indices,
     _should_print_training_step,
     _test_loader_config_from_raw,
     _training_config_from_raw,
@@ -1159,6 +1160,21 @@ def test_training_visualization_draws_only_predicted_cp_direction() -> None:
     assert np.count_nonzero(green) > 0
     assert np.count_nonzero(yellow) == 0
     assert np.count_nonzero(cyan) == 0
+
+
+def test_training_visualization_selects_different_control_points_first() -> None:
+    batch = SimpleNamespace(
+        images=np.zeros((4, 16, 1, 5, 5), dtype=np.float32),
+        strip_z_offsets=np.asarray(
+            [-7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+            dtype=np.float32,
+        ),
+    )
+
+    indices = _select_visualization_patch_indices(batch, max_patches=8)
+
+    assert indices[:4] == [7, 23, 39, 55]
+    assert [index // 16 for index in indices[:4]] == [0, 1, 2, 3]
 
 
 def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:

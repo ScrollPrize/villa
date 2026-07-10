@@ -1,10 +1,9 @@
-# Status: Test Dataset Evaluation And Snapshots
+# Status: Batch Visualization Samples Different CPs
 
 - [x] Read `AGENTS.md` and first `todo.md` item.
 - [x] Replace `task.md` with the current todo item.
 - [x] Write `task_plan.md`.
-- [x] Implement training config/test-loader/evaluation changes.
-- [x] Update example config.
+- [x] Implement CP-diverse visualization selection.
 - [x] Update specs and docs.
 - [x] Add focused tests.
 - [x] Run validation commands.

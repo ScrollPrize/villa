@@ -243,6 +243,39 @@ def _to_u8_image(image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def _select_visualization_patch_indices(batch: FiberStrip2DBatch, *, max_patches: int) -> list[int]:
+    images = np.asarray(batch.images)
+    if images.ndim != 5 or images.shape[2] != 1:
+        raise ValueError("batch.images must have shape B,Z,1,H,W")
+    control_points = int(images.shape[0])
+    offsets = int(images.shape[1])
+    if control_points <= 0 or offsets <= 0 or max_patches <= 0:
+        return []
+    strip_offsets = np.asarray(batch.strip_z_offsets, dtype=np.float32).reshape(-1)
+    center_offset_index = (
+        int(np.argmin(np.abs(strip_offsets[:offsets])))
+        if int(strip_offsets.shape[0]) >= offsets
+        else offsets // 2
+    )
+    selected: list[int] = []
+    used: set[int] = set()
+
+    for cp_index in range(control_points):
+        patch_index = cp_index * offsets + center_offset_index
+        selected.append(patch_index)
+        used.add(patch_index)
+        if len(selected) >= max_patches:
+            return selected
+
+    for patch_index in range(control_points * offsets):
+        if patch_index in used:
+            continue
+        selected.append(patch_index)
+        if len(selected) >= max_patches:
+            break
+    return selected
+
+
 def _draw_predicted_cp_direction(
     rgb: np.ndarray,
     *,
@@ -282,9 +315,14 @@ def _make_training_visualization(
 ) -> np.ndarray:
     flat_images, flat_valid = _flatten_batch(batch)
     outputs_cpu = outputs.detach().cpu()
-    patch_count = min(int(flat_images.shape[0]), int(max_patches))
     cells: list[np.ndarray] = []
-    for patch_index in range(patch_count):
+    for patch_index in _select_visualization_patch_indices(batch, max_patches=max_patches):
+        if (
+            patch_index >= int(flat_images.shape[0])
+            or patch_index >= int(outputs_cpu.shape[0])
+            or patch_index >= len(batch.samples)
+        ):
+            continue
         sample = batch.samples[patch_index]
         image_u8 = _to_u8_image(flat_images[patch_index, 0], flat_valid[patch_index])
         rgb = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.5, thickness=1)

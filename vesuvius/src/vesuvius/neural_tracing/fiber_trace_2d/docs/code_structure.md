@@ -396,6 +396,8 @@ The trainer logs:
 - cache hit/download diagnostics where available;
 - `train/batch_direction_overlay` images showing the transformed centerline
   behind one short network-predicted direction segment at the transformed CP.
+  The contact sheet picks one center-offset representative from each loaded
+  control-point sample before filling with additional strip-z offsets.
 - when `test_datasets` is configured, `test/loss_direction`,
   `test/supervision_samples`, test cache diagnostics, and
   `test/batch_direction_overlay` at test evaluation steps.
