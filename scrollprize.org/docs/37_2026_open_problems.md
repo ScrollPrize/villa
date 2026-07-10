@@ -552,12 +552,6 @@ One important format is **[OME-Zarr](https://doi.org/10.1038/s41592-021-01326-w)
 
 Getting the data format right turns out to matter as much as the algorithms built on top of it, because it determines what research is practical at all. A model that requires copying tens of terabytes locally shuts most contributors out before they start. An interface that can't stream small regions interactively leaves annotators waiting instead of working. And predictions that aren't saved in formats VC3D can inspect are hard to validate.
 
-<Admonition type="danger" icon="⚠️" title="Open problem" className="vc-problem">
-
-A full-resolution scroll is too large to download and work on locally. Tools and models need to be cloud-native from the start — streaming chunks, tiled inference, inspectable outputs: **the data infrastructure determines what research is practical at all.**
-
-</Admonition>
-
 Useful community contributions should therefore be cloud-native from the beginning:
 
 * read chunks directly from OME-Zarr;    
