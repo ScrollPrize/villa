@@ -1,12 +1,13 @@
-# Status: Coordinate Tensor Boundary Cleanup
+# Status: Opt-In Augment-Vis Profiling
 
 - [x] Read local `AGENTS.md`.
-- [x] Read current coordinate-generation, augmentation, loader, and spec context.
-- [x] Create task.md for coordinate tensor boundary cleanup.
+- [x] Read current augment-vis timing/export code and docs/spec context.
+- [x] Create task.md for opt-in augment profiling.
 - [x] Create task_plan.md.
-- [ ] Review plan against specs and current code paths.
-- [ ] Implement torch-native internal coordinate grid path.
-- [ ] Keep final NumPy conversion at explicit sampler/export boundaries.
-- [ ] Update specs/docs/changelog.
-- [ ] Run focused validation.
-- [ ] Update task_log.md with implementation notes and results.
+- [x] Implement `--augment-profile`.
+- [x] Keep default `--augment-vis` timing output disabled.
+- [x] Run profiled augment-vis entries twice for cold/warm tables.
+- [x] Add focused tests for quiet default and profiled output.
+- [x] Update specs/docs.
+- [x] Run focused validation.
+- [x] Update task_log.md with implementation notes and results.

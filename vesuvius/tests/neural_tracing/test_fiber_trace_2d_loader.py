@@ -55,6 +55,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _export_augment_contact_sheet,
     _line_trace_tta_entries,
     _nearest_tta_point_for_reference,
+    _print_timing_table,
     _reference_direction_to_source_grid_direction,
     _source_grid_direction_to_reference,
     _transform_points_xy,
@@ -66,6 +67,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     build_side_strip_patch_grid,
     build_side_strip_patch_grid_from_line_window,
     build_side_strip_patch_grid_from_line_window_torch,
+    build_side_strip_patch_grid_tensor_from_line_window,
     side_strip_line_window,
 )
 
@@ -170,6 +172,23 @@ def _test_sampler_factory(**kwargs):
 
 def _make_loader(config) -> FiberStrip2DLoader:
     return FiberStrip2DLoader(config, sampler_factory=_test_sampler_factory)
+
+
+def test_augment_vis_timing_table_reports_warm_path_average(capsys: pytest.CaptureFixture[str]) -> None:
+    rows = [
+        ("unaugmented", {"total": 100.0, "loader_total": 90.0, "volume_sample": 80.0}),
+        ("shift_x_min", {"total": 10.0, "loader_total": 8.0, "volume_sample": 6.0}),
+        ("shift_x_max", {"total": 14.0, "loader_total": 10.0, "volume_sample": 8.0}),
+    ]
+    totals = {"total": 124.0, "loader_total": 108.0, "volume_sample": 94.0}
+
+    _print_timing_table(rows, totals)
+
+    output = capsys.readouterr().out
+    assert "total/no-first" in output
+    assert "avg/no-first" in output
+    assert "         24.0" in output
+    assert "         12.0" in output
 
 
 def test_line_trace_bilinear_direction_sample_normalizes() -> None:
@@ -407,10 +426,22 @@ def test_torch_side_strip_grid_matches_numpy_path(tmp_path: Path) -> None:
         pixel_spacing_base=2.0,
         device=torch.device("cpu"),
     )
+    tensor_grid = build_side_strip_patch_grid_tensor_from_line_window(
+        window,
+        patch_shape_hw=(5, 7),
+        strip_z_offset=0.25,
+        sampled_normals=normals,
+        pixel_spacing_base=2.0,
+        device=torch.device("cpu"),
+    )
 
     assert np.array_equal(torch_grid.valid_mask, numpy_grid.valid_mask)
     assert np.allclose(torch_grid.coords_xyz, numpy_grid.coords_xyz, atol=1.0e-5)
     assert np.allclose(torch_grid.coords_zyx, numpy_grid.coords_zyx, atol=1.0e-5)
+    assert isinstance(tensor_grid.coords_zyx, torch.Tensor)
+    assert tensor_grid.coords_zyx.device.type == "cpu"
+    assert tensor_grid.coords_zyx.dtype == torch.float32
+    assert np.allclose(tensor_grid.to_numpy().coords_zyx, numpy_grid.coords_zyx, atol=1.0e-5)
 
 
 def test_side_strip_uses_fiber_line_points_not_sparse_control_chord(tmp_path: Path) -> None:
@@ -920,7 +951,7 @@ def test_identity_equivalent_augment_vis_entries_match(tmp_path: Path) -> None:
         assert np.allclose(line, base_line), name
 
 
-def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path) -> None:
+def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["augment_enabled"] = True
@@ -931,6 +962,9 @@ def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path) -> None:
 
     _export_augment_contact_sheet(loader, 0, out)
 
+    output = capsys.readouterr().out
+    assert "augment-vis timings" not in output
+    assert "output timings" not in output
     assert (out / "augment_contact_sheet.jpg").is_file()
     assert (out / "augment_summary.txt").is_file()
     from PIL import Image
@@ -952,6 +986,27 @@ def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path) -> None:
     assert "smooth_max" in summary
     assert "gamma_max" in summary
     assert "combined_00" in summary
+
+
+def test_augment_contact_sheet_profile_prints_cold_and_warm_tables(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    out = tmp_path / "aug_profile_out"
+
+    _export_augment_contact_sheet(loader, 0, out, profile=True)
+
+    output = capsys.readouterr().out
+    assert "fiber_trace_2d augment-vis timings pass=1 cold-ish in ms" in output
+    assert "fiber_trace_2d augment-vis timings pass=2 warm in ms" in output
+    assert "total/no-first" in output
+    assert "avg/no-first" in output
+    assert (out / "augment_contact_sheet.jpg").is_file()
 
 
 def test_deterministic_sample_index_independent_of_batch_size(tmp_path: Path) -> None:

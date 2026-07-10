@@ -39,8 +39,11 @@ The important behavior is:
 - Builds explicit coordinate grids for side strips using cubic Hermite
   interpolation over line arc length.
 - Provides a torch-vectorized dense grid builder,
-  `build_side_strip_patch_grid_from_line_window_torch`, which keeps the same
-  frame semantics but vectorizes per-pixel interpolation work.
+  `build_side_strip_patch_grid_tensor_from_line_window`, which keeps the same
+  frame semantics but vectorizes per-pixel interpolation work and returns torch
+  tensors on the requested device. The older
+  `build_side_strip_patch_grid_from_line_window_torch` wrapper remains a
+  NumPy-returning compatibility boundary.
 - The dense grid also exposes the per-pixel strip offset axis so nearby
   strip-z patches can be derived from one CP-local source grid.
 
@@ -73,6 +76,8 @@ The important behavior is:
 - Builds geometric augmentation maps in strip pixel coordinates. The image is
   never geometrically warped after loading; instead, output pixels map into an
   oversized source coordinate grid, and final 3D coordinates are sampled once.
+- Exposes torch-native transformed line/control-point coordinate helpers for
+  loader internals, with NumPy wrappers kept for public/debug callers.
 - Affine shift is composed as an output-space translation after scale/flip, and
   the inverse sampling grid plus transformed line/control-point coordinates use
   that same order.
@@ -114,6 +119,12 @@ The important behavior is:
 - Builds one CP-local source strip with the torch-vectorized augment-vis path,
   then derives all configured strip-z offsets from that source using the stored
   strip offset axis.
+- Keeps source grids, strip-z offset grids, geometric coordinate augmentation,
+  and transformed line/control-point coordinates as torch tensors until an
+  explicit consumer needs NumPy.
+- Converts final coordinates and validity masks to contiguous CPU NumPy once
+  immediately before VC3D `sample_coords` or dependency discovery; runner/sample
+  metadata converts line and control-point coordinates at assembly/export time.
 - Builds one sample as all configured strip-z offsets around one control point.
 - Builds a batch by stacking deterministic samples.
 - Implements `build_strip_source` / `build_strip_patch_from_source` as the
@@ -139,8 +150,9 @@ The important behavior is:
   when available. Prefetch dependency generation is intentionally CPU-only.
 - Its prefetch mode is sample-count oriented:
   `--prefetch --prefetch-samples <control-point-samples>`.
-- Prints augment-visualization timing rows with total and average-per-patch
-  summaries.
+- `--augment-profile` enables augment-visualization timing rows with cold and
+  warm passes, full total/average-per-patch summaries, and no-first
+  total/average summaries for warm-path timing.
 - Provides `--line-trace-vis --checkpoint <snapshot> --export-dir <dir>` for
   V0.1 patch line-tracing inspection. This mode loads the deterministic
   center side-strip patch for `--sample-index`, runs the checkpointed direction
@@ -605,11 +617,12 @@ The runner writes:
 - `augment_contact_sheet.jpg`;
 - `augment_summary.txt`.
 
-It also prints:
+With `--augment-profile`, it also prints two timing tables:
 
 - timing table with `descriptor`, `line_window`, `lasagna_normals`,
   `strip_coords`, `coord_augmentation`, `volume_sample`, `value_augmentation`,
-  `line_coords`, `to_u8`, and `overlay`, plus total and `avg/patch` rows;
+  `line_coords`, `to_u8`, and `overlay`, plus `total`, `avg/patch`,
+  `total/no-first`, and `avg/no-first` rows;
 - volume sampler stats.
 
 ## Batch Export
@@ -641,6 +654,9 @@ Export an augmentation contact sheet:
 ```bash
 PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.runner config.json --sample-index 0 --augment-vis --export-dir /tmp/fiber_trace_2d_aug
 ```
+
+Add `--augment-profile` to print two timing passes for the same augment-vis
+sample: pass 1 for cold/first-use costs and pass 2 for warmed costs.
 
 Export a line-tracing inspection image:
 

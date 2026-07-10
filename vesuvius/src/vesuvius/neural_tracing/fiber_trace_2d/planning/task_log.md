@@ -1,15 +1,21 @@
-# Task Log: Coordinate Tensor Boundary Cleanup
+# Task Log: Opt-In Augment-Vis Profiling
 
-## Planning Notes
+## Implementation Notes
 
-- Current torch strip-grid construction converts dense coordinates and valid
-  masks back to NumPy immediately in `strip_geometry.py`.
-- Loader geometric augmentation then converts those arrays back to torch and
-  returns NumPy again before VC3D coordinate sampling.
-- The planned cleanup keeps coordinate tensors in torch through source-grid,
-  strip-z offset, geometric augmentation, and line/CP coordinate generation,
-  then converts once at explicit NumPy consumers.
+- Added `--augment-profile` for `runner.py --augment-vis`.
+- Default augment-vis export no longer passes profile dictionaries, uses no-op
+  timers, and does not print augment timing tables or output timing lines.
+- Profile mode repeats the same augment entries twice using the same CP-local
+  source geometry:
+  - pass 1 reports cold/first-use costs;
+  - pass 2 reports warmed costs.
+- Both profile tables retain `total/no-first` and `avg/no-first`.
+- Augmentations are still processed one patch at a time; batching was not
+  changed in this task.
 
 ## Validation
 
-- Not run yet; this turn produced the plan for review.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed: 71 tests.

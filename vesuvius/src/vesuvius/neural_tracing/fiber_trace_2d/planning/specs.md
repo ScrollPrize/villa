@@ -17,6 +17,8 @@
 - The coordinate construction must be equivalent to VC3D side strips; flat planar patch simplifications are not acceptable except where they match the VC3D algorithm for that case.
 - The implementation should reuse/export VC3D side-strip coordinate APIs when possible, or port the same algorithm with only small rounding/interpolation differences.
 - Dense side-strip coordinate generation may use torch vectorization for per-pixel Hermite interpolation and normal interpolation, but it must preserve the existing VC3D/Lasagna frame construction semantics.
+- Dense source-strip coordinates, strip-z offset coordinates, geometric coordinate augmentation, and transformed line/control-point coordinates stay as torch tensors on the configured augmentation device until an explicit NumPy consumer boundary.
+- The explicit NumPy boundaries are VC3D coordinate sampling, runner/PIL visualization/export, and sample metadata arrays. The loader must not repeatedly convert coordinates between NumPy and torch inside one source/augmentation path.
 - The augment-vis source/patch path is the canonical loader path for runner exports, training batch loading, and prefetch coordinate generation.
 - Augmentation visualization, training, runner batch loading, and prefetch must share the same CP-local source-strip and final-coordinate generation implementation.
 - Normal training, benchmark/profile/load-only, augment-vis, line-trace-vis,
@@ -47,7 +49,8 @@
 - Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
 - Augment visualization uses raw clipped image values and must not apply percentile or per-cell normalization.
 - The augment visualization mode renders a three-row JPG contact sheet: lower-limit examples, upper-limit examples, and random combined training-style examples.
-- Augment visualization prints timing diagnostics with per-entry rows plus total and average-per-patch summaries.
+- Augment visualization prints no timing diagnostics by default.
+- `--augment-vis --augment-profile` enables timing diagnostics. Profile mode runs the same sample and augmentation entries twice, prints a pass 1 table for cold/first-use costs and a pass 2 table for warmed costs, and each table includes per-entry rows plus full total/average-per-patch summaries and `total/no-first` plus `avg/no-first` summaries that exclude the first unaugmented row.
 - Augment contact sheets draw the transformed fiber-line coordinates at 50 percent opacity with fixed drawing thickness.
 - Augment contact sheets draw a final visualization-only thin vertical marker at the transformed control-point coordinate for each patch, leaving a small gap around the CP pixel itself.
 - Augment contact-sheet cells include a top label band naming the shown augmentation; labels must not overlay image pixels.
@@ -59,6 +62,7 @@
 - Changing training step counts, batch size, or control points per step must only truncate or extend the consumed prefix of that deterministic sample stream; it must not reshuffle earlier samples.
 - The tester/runner loads a batch from a specified deterministic control-point sample index.
 - Prefetch uses the same shared source-strip implementation as training and augment-vis.
+- Prefetch remains CPU-pinned, but it still uses the same torch-native source-grid and strip-offset path, converting to NumPy only once for VC3D dependency discovery.
 - Prefetch is independent of any one random augmentation draw: for each selected CP and strip-z offset it covers the configured maximum augmentation envelope represented by the oversized source-strip coordinates.
 - Prefetch may conservatively cover more chunks than one concrete augmented training sample, but it should avoid misses for later random augmentations within the configured extrema.
 - Prefetch must use dependency-only chunk discovery for the base-volume sampler. For VC3D this means `collect_coords_dependencies` over the same conservative source-envelope coordinates, without `sample_coords`, image-value sampling, or discarded sampled pixels.
@@ -108,7 +112,7 @@
 - Prefetch progress includes `idx=<exclusive-index>` showing the largest contiguous exclusive bounded deterministic sample index whose required chunks are cache-complete: each required chunk is a cache hit, a known/new missing marker, or a completed successful download. Dependency generation alone must not advance `idx` while downloads are still pending. Operators can use that value as `training.max_sample_index` to train on the prefetched deterministic prefix.
 - Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed test loss. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
-- Augment contact sheets are exported with `--augment-vis --export-dir <dir>`.
+- Augment contact sheets are exported with `--augment-vis --export-dir <dir>`. Add `--augment-profile` to print cold and warm augment timing tables.
 - Direction-field inspection is exported with `--dir-vis --checkpoint <snapshot> --export-dir <dir>`.
 - Direction-field inspection uses the same deterministic `--sample-index` ordering as training, prefetch, augment-vis, and line-trace-vis. It loads the center side-strip patch, runs the checkpointed direction model, decodes the Lasagna ambiguous two-cos-channel output, scales the patch image by 2x, and draws short direction line segments on top.
 - Direction-field inspection draws only every second source pixel in x and y, so each drawn sample corresponds to a 4x4 display-pixel cell in the 2x visualization. It skips invalid image pixels and invalid/non-finite decoded directions, writes `dir_vis.jpg`, and writes sample/checkpoint/drawn-count metadata to `dir_vis_summary.txt`.

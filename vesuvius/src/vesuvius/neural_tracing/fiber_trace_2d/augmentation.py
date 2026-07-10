@@ -377,13 +377,13 @@ def _apply_gamma(image: torch.Tensor, valid: torch.Tensor, gamma: float, value_r
     return torch.where(valid, corrected, image)
 
 
-def transformed_centerline_coords(
+def transformed_centerline_coords_torch(
     output_shape_hw: tuple[int, int],
     source_shape_hw: tuple[int, int],
     params: FiberStripAugmentParams,
     *,
     device: torch.device,
-) -> np.ndarray:
+) -> torch.Tensor:
     output_height, output_width = (int(v) for v in output_shape_hw)
     source_height, source_width = (int(v) for v in source_shape_hw)
     if float(params.smooth_offset) == 0.0:
@@ -408,7 +408,7 @@ def transformed_centerline_coords(
     targets = torch.stack([target_x, torch.full_like(target_x, source_center_y)], dim=1)
     coords = _nearest_output_pixels_for_source_points(flat, out_pixels, targets)
     if coords.numel() == 0:
-        return np.zeros((0, 2), dtype=np.float32)
+        return torch.zeros((0, 2), dtype=torch.float32, device=device)
     coords = coords[
         (coords[:, 0] >= 0.0)
         & (coords[:, 0] <= float(output_width - 1))
@@ -416,22 +416,43 @@ def transformed_centerline_coords(
         & (coords[:, 1] <= float(output_height - 1))
     ]
     if coords.numel() == 0:
-        return np.zeros((0, 2), dtype=np.float32)
+        return torch.zeros((0, 2), dtype=torch.float32, device=device)
     # Remove adjacent duplicates from nearest-pixel inversion while preserving order.
     rounded = torch.round(coords)
     keep = torch.ones((rounded.shape[0],), dtype=torch.bool, device=device)
     keep[1:] = torch.any(rounded[1:] != rounded[:-1], dim=1)
-    return coords[keep].detach().cpu().numpy().astype(np.float32)
+    return coords[keep].to(dtype=torch.float32)
 
 
-def transformed_source_point_coords(
+def transformed_centerline_coords(
+    output_shape_hw: tuple[int, int],
+    source_shape_hw: tuple[int, int],
+    params: FiberStripAugmentParams,
+    *,
+    device: torch.device,
+) -> np.ndarray:
+    return (
+        transformed_centerline_coords_torch(
+            output_shape_hw,
+            source_shape_hw,
+            params,
+            device=device,
+        )
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+
+def transformed_source_point_coords_torch(
     output_shape_hw: tuple[int, int],
     source_shape_hw: tuple[int, int],
     params: FiberStripAugmentParams,
     source_xy: tuple[float, float],
     *,
     device: torch.device,
-) -> np.ndarray:
+) -> torch.Tensor:
     output_height, output_width = (int(v) for v in output_shape_hw)
     source_height, source_width = (int(v) for v in source_shape_hw)
     source_point = torch.tensor([[float(source_xy[0]), float(source_xy[1])]], dtype=torch.float32, device=device)
@@ -448,8 +469,8 @@ def transformed_source_point_coords(
         out_pixels = _pixel_grid(output_height, output_width, device=device).reshape(-1, 2)
         coords = _nearest_output_pixels_for_source_points(flat, out_pixels, source_point)
         if coords.numel() == 0:
-            return np.asarray([np.nan, np.nan], dtype=np.float32)
-        return coords[0].detach().cpu().numpy().astype(np.float32)
+            return torch.full((2,), float("nan"), dtype=torch.float32, device=device)
+        return coords[0].to(dtype=torch.float32)
     return _transformed_source_point_coords_affine(
         output_shape_hw,
         source_shape_hw,
@@ -457,6 +478,29 @@ def transformed_source_point_coords(
         source_point,
         device=device,
     )[0]
+
+
+def transformed_source_point_coords(
+    output_shape_hw: tuple[int, int],
+    source_shape_hw: tuple[int, int],
+    params: FiberStripAugmentParams,
+    source_xy: tuple[float, float],
+    *,
+    device: torch.device,
+) -> np.ndarray:
+    return (
+        transformed_source_point_coords_torch(
+            output_shape_hw,
+            source_shape_hw,
+            params,
+            source_xy,
+            device=device,
+        )
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
 
 
 def _nearest_output_pixels_for_source_points(
@@ -488,7 +532,7 @@ def _transformed_source_point_coords_affine(
     source_points_xy: torch.Tensor,
     *,
     device: torch.device,
-) -> np.ndarray:
+) -> torch.Tensor:
     output_height, output_width = (int(v) for v in output_shape_hw)
     source_height, source_width = (int(v) for v in source_shape_hw)
     output_center_x = (float(output_width) - 1.0) * 0.5
@@ -512,7 +556,7 @@ def _transformed_source_point_coords_affine(
     shear_y = float(params.shear_y)
     det = 1.0 - shear_x * shear_y
     if abs(det) <= 1.0e-6:
-        return np.full((points.shape[0], 2), np.nan, dtype=np.float32)
+        return torch.full((points.shape[0], 2), float("nan"), dtype=torch.float32, device=device)
     x = (x_sheared - shear_x * y_sheared) / det
     y = (-shear_y * x_sheared + y_sheared) / det
 
@@ -527,7 +571,7 @@ def _transformed_source_point_coords_affine(
         [x + output_center_x + float(params.shift_x), y + output_center_y + float(params.shift_y)],
         dim=1,
     )
-    return coords.detach().cpu().numpy().astype(np.float32)
+    return coords.to(dtype=torch.float32)
 
 
 def _transformed_centerline_coords_affine(
@@ -536,7 +580,7 @@ def _transformed_centerline_coords_affine(
     params: FiberStripAugmentParams,
     *,
     device: torch.device,
-) -> np.ndarray:
+) -> torch.Tensor:
     output_height, output_width = (int(v) for v in output_shape_hw)
     source_height, source_width = (int(v) for v in source_shape_hw)
     output_center_x = (float(output_width) - 1.0) * 0.5
@@ -560,7 +604,7 @@ def _transformed_centerline_coords_affine(
     shear_y = float(params.shear_y)
     det = 1.0 - shear_x * shear_y
     if abs(det) <= 1.0e-6:
-        return np.zeros((0, 2), dtype=np.float32)
+        return torch.zeros((0, 2), dtype=torch.float32, device=device)
     x = (x_sheared - shear_x * y_sheared) / det
     y = (-shear_y * x_sheared + y_sheared) / det
 
@@ -582,11 +626,11 @@ def _transformed_centerline_coords_affine(
         & (coords[:, 1] <= float(output_height - 1))
     ]
     if coords.numel() == 0:
-        return np.zeros((0, 2), dtype=np.float32)
+        return torch.zeros((0, 2), dtype=torch.float32, device=device)
     rounded = torch.round(coords)
     keep = torch.ones((rounded.shape[0],), dtype=torch.bool, device=device)
     keep[1:] = torch.any(rounded[1:] != rounded[:-1], dim=1)
-    return coords[keep].detach().cpu().numpy().astype(np.float32)
+    return coords[keep].to(dtype=torch.float32)
 
 
 def apply_value_augmentation(

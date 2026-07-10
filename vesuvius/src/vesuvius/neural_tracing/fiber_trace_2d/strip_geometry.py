@@ -30,6 +30,39 @@ class FiberStripGrid:
 
 
 @dataclass(frozen=True)
+class FiberStripGridTorch:
+    coords_xyz: torch.Tensor
+    coords_zyx: torch.Tensor
+    valid_mask: torch.Tensor
+    frame: FiberStripFrame
+    offset_axis_xyz: torch.Tensor | None = None
+    offset_axis_zyx: torch.Tensor | None = None
+
+    def to_numpy(self) -> FiberStripGrid:
+        coords_xyz = self.coords_xyz.detach().cpu().numpy().astype(np.float32, copy=False)
+        coords_zyx = self.coords_zyx.detach().cpu().numpy().astype(np.float32, copy=False)
+        valid_mask = self.valid_mask.detach().cpu().numpy().astype(bool, copy=False)
+        offset_axis_xyz = (
+            None
+            if self.offset_axis_xyz is None
+            else self.offset_axis_xyz.detach().cpu().numpy().astype(np.float32, copy=False)
+        )
+        offset_axis_zyx = (
+            None
+            if self.offset_axis_zyx is None
+            else self.offset_axis_zyx.detach().cpu().numpy().astype(np.float32, copy=False)
+        )
+        return FiberStripGrid(
+            coords_xyz=coords_xyz,
+            coords_zyx=coords_zyx,
+            valid_mask=valid_mask,
+            frame=self.frame,
+            offset_axis_xyz=offset_axis_xyz,
+            offset_axis_zyx=offset_axis_zyx,
+        )
+
+
+@dataclass(frozen=True)
 class FiberStripLineWindow:
     line_points_xyz: np.ndarray
     original_line_indices: np.ndarray
@@ -554,7 +587,7 @@ def _interpolate_line_side_slice_torch(
     return center + normal * normal_offsets[..., None], normal, valid
 
 
-def build_side_strip_patch_grid_from_line_window_torch(
+def build_side_strip_patch_grid_tensor_from_line_window(
     line_window: FiberStripLineWindow,
     *,
     patch_shape_hw: tuple[int, int],
@@ -563,7 +596,7 @@ def build_side_strip_patch_grid_from_line_window_torch(
     sampled_normals: np.ndarray | None = None,
     pixel_spacing_base: float = 1.0,
     device: torch.device | str | None = None,
-) -> FiberStripGrid:
+) -> FiberStripGridTorch:
     line_points = np.asarray(line_window.line_points_xyz, dtype=np.float64)
     height, width = (int(v) for v in patch_shape_hw)
     if height <= 0 or width <= 0:
@@ -599,19 +632,36 @@ def build_side_strip_patch_grid_from_line_window_torch(
         line_points, frames, arc_coord, row_grid
     )
     shape_valid_t = torch.isfinite(coords_xyz_t).all(dim=-1)
-    coords_xyz = coords_xyz_t.detach().cpu().numpy()
-    offset_axis_xyz = offset_axis_xyz_t.detach().cpu().numpy()
-    coords_zyx = coords_xyz[..., (2, 1, 0)].astype(np.float32)
-    offset_axis_zyx = offset_axis_xyz[..., (2, 1, 0)].astype(np.float32)
     frame = _frame_at_arc(line_points, frames, anchor_arc)
-    return FiberStripGrid(
-        coords_xyz=coords_xyz.astype(np.float32),
-        coords_zyx=coords_zyx,
-        valid_mask=(valid_t & shape_valid_t).detach().cpu().numpy().astype(bool),
+    return FiberStripGridTorch(
+        coords_xyz=coords_xyz_t.to(dtype=torch.float32),
+        coords_zyx=coords_xyz_t[..., (2, 1, 0)].to(dtype=torch.float32),
+        valid_mask=valid_t & shape_valid_t,
         frame=frame,
-        offset_axis_xyz=offset_axis_xyz.astype(np.float32),
-        offset_axis_zyx=offset_axis_zyx,
+        offset_axis_xyz=offset_axis_xyz_t.to(dtype=torch.float32),
+        offset_axis_zyx=offset_axis_xyz_t[..., (2, 1, 0)].to(dtype=torch.float32),
     )
+
+
+def build_side_strip_patch_grid_from_line_window_torch(
+    line_window: FiberStripLineWindow,
+    *,
+    patch_shape_hw: tuple[int, int],
+    strip_z_offset: float,
+    sampled_normal: np.ndarray | None = None,
+    sampled_normals: np.ndarray | None = None,
+    pixel_spacing_base: float = 1.0,
+    device: torch.device | str | None = None,
+) -> FiberStripGrid:
+    return build_side_strip_patch_grid_tensor_from_line_window(
+        line_window,
+        patch_shape_hw=patch_shape_hw,
+        strip_z_offset=strip_z_offset,
+        sampled_normal=sampled_normal,
+        sampled_normals=sampled_normals,
+        pixel_spacing_base=pixel_spacing_base,
+        device=device,
+    ).to_numpy()
 
 
 def build_side_strip_patch_grid_from_line_window(

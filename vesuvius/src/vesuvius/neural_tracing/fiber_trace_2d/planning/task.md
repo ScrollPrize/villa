@@ -1,11 +1,7 @@
-# Task: Coordinate Tensor Boundary Cleanup
+# Task: Opt-In Augment-Vis Profiling
 
-Clean up fiber-strip coordinate handling so source-strip coordinate generation,
-geometric coordinate augmentation, and line/control-point coordinate generation
-do not bounce repeatedly between NumPy and PyTorch.
-
-The desired behavior is one explicit conversion boundary in each direction:
-metadata and Lasagna/VC3D inputs may enter as NumPy, torch coordinate work stays
-as torch tensors on the configured device, and conversion back to NumPy happens
-only at the final boundaries that require NumPy, such as VC3D coordinate
-sampling, runner image export, and sample metadata consumed by existing callers.
+Add an augment-visualization profiling flag. Normal `--augment-vis` exports
+should not run or print timing measurements by default. When profiling is
+requested, augment-vis should run the same sample/augmentation set twice and
+print timing tables for both passes so cold first-use costs and warmed costs
+can be compared.

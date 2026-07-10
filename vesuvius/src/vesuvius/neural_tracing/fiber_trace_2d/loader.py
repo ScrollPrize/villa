@@ -27,9 +27,9 @@ from vesuvius.neural_tracing.datasets.common import (
 from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import Vc3dFiber, load_vc3d_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     FiberStripFrame,
-    FiberStripGrid,
+    FiberStripGridTorch,
     FiberStripLineWindow,
-    build_side_strip_patch_grid_from_line_window_torch,
+    build_side_strip_patch_grid_tensor_from_line_window,
     side_strip_line_window,
 )
 from vesuvius.neural_tracing.fiber_trace.dataset import (
@@ -48,8 +48,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     random_combined_augmentation,
     resolve_torch_device,
     source_coordinate_grid_for_output,
-    transformed_centerline_coords,
-    transformed_source_point_coords,
+    transformed_centerline_coords_torch,
+    transformed_source_point_coords_torch,
     value_only_params,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
@@ -127,7 +127,7 @@ class _StripSource:
     control_point_index: int
     center_offset: float
     source_shape_hw: tuple[int, int]
-    grid: FiberStripGrid
+    grid: FiberStripGridTorch
 
 
 @dataclass
@@ -404,16 +404,25 @@ def _principal_tensor_axis(tensor: np.ndarray, hint: np.ndarray) -> np.ndarray:
     return axis
 
 
-def _resample_coords_like_augmentation(
-    coords_zyx: np.ndarray,
-    valid_mask: np.ndarray,
+def _as_numpy_float32(array: torch.Tensor) -> np.ndarray:
+    return array.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def _as_numpy_bool(array: torch.Tensor) -> np.ndarray:
+    return array.detach().cpu().numpy().astype(bool, copy=False)
+
+
+def _resample_coord_tensors_like_augmentation(
+    coords_zyx: torch.Tensor,
+    valid_mask: torch.Tensor,
     params: Any,
     *,
     output_shape_hw: tuple[int, int],
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
-    coords_t = torch.as_tensor(coords_zyx, dtype=torch.float32, device=device)
-    valid_t = torch.as_tensor(valid_mask, dtype=torch.float32, device=device)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    coords_t = coords_zyx.to(device=device, dtype=torch.float32)
+    valid_bool = valid_mask.to(device=device, dtype=torch.bool)
+    valid_t = valid_bool.to(dtype=torch.float32)
     if coords_t.ndim != 3 or coords_t.shape[-1] != 3:
         raise ValueError("coords_zyx must have shape H,W,3")
     source_height, source_width = int(coords_t.shape[0]), int(coords_t.shape[1])
@@ -452,7 +461,7 @@ def _resample_coords_like_augmentation(
         align_corners=True,
     )[0, 0] > 0.5
     sampled_coords = torch.where(sampled_valid[..., None], sampled_coords, torch.zeros_like(sampled_coords))
-    return sampled_coords.cpu().numpy().astype(np.float32), sampled_valid.cpu().numpy().astype(bool)
+    return sampled_coords, sampled_valid
 
 
 class _ProfileBlock:
@@ -1068,7 +1077,7 @@ class FiberStrip2DLoader:
             print(f"{debug_label} lasagna_normals done count={len(sampled_normals)}", flush=True)
             print(f"{debug_label} strip_coords start device={device}", flush=True)
         with _ProfileBlock(profile, "strip_coords", device):
-            grid = build_side_strip_patch_grid_from_line_window_torch(
+            grid = build_side_strip_patch_grid_tensor_from_line_window(
                 line_window,
                 patch_shape_hw=source_shape_hw,
                 strip_z_offset=float(center_offset),
@@ -1078,7 +1087,7 @@ class FiberStrip2DLoader:
             )
         if debug_label is not None:
             print(
-                f"{debug_label} strip_coords done valid={int(np.count_nonzero(grid.valid_mask))}",
+                f"{debug_label} strip_coords done valid={int(torch.count_nonzero(grid.valid_mask).item())}",
                 flush=True,
             )
         return _StripSource(
@@ -1090,20 +1099,19 @@ class FiberStrip2DLoader:
             grid=grid,
         )
 
-    def _offset_grid_from_source(self, source: _StripSource, offset: float) -> FiberStripGrid:
+    def _offset_grid_from_source(self, source: _StripSource, offset: float) -> FiberStripGridTorch:
         axis_zyx = source.grid.offset_axis_zyx
         axis_xyz = source.grid.offset_axis_xyz
         if axis_zyx is None or axis_xyz is None:
             raise ValueError("strip source grid is missing offset-axis data")
         delta_base = (float(offset) - float(source.center_offset)) * float(source.record.volume_spacing_base)
-        coords_zyx = source.grid.coords_zyx.astype(np.float32, copy=True)
-        coords_xyz = source.grid.coords_xyz.astype(np.float32, copy=True)
-        coords_zyx += axis_zyx.astype(np.float32, copy=False) * np.float32(delta_base)
-        coords_xyz += axis_xyz.astype(np.float32, copy=False) * np.float32(delta_base)
-        return FiberStripGrid(
+        delta = torch.as_tensor(delta_base, dtype=source.grid.coords_zyx.dtype, device=source.grid.coords_zyx.device)
+        coords_zyx = source.grid.coords_zyx + axis_zyx.to(device=source.grid.coords_zyx.device) * delta
+        coords_xyz = source.grid.coords_xyz + axis_xyz.to(device=source.grid.coords_xyz.device) * delta
+        return FiberStripGridTorch(
             coords_xyz=coords_xyz,
             coords_zyx=coords_zyx,
-            valid_mask=source.grid.valid_mask.astype(bool, copy=False),
+            valid_mask=source.grid.valid_mask,
             frame=source.grid.frame,
             offset_axis_xyz=axis_xyz,
             offset_axis_zyx=axis_zyx,
@@ -1115,19 +1123,26 @@ class FiberStrip2DLoader:
         params: FiberStripAugmentParams | None,
         *,
         device: torch.device,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if params is None:
+            height, width = (int(v) for v in source_shape_hw)
+            x = torch.arange(width, dtype=torch.float32, device=device)
+            y = torch.full((width,), (float(height) - 1.0) * 0.5, dtype=torch.float32, device=device)
             return (
-                self._unaugmented_centerline_coords(source_shape_hw),
-                self._unaugmented_control_point_xy(source_shape_hw),
+                torch.stack([x, y], dim=1),
+                torch.tensor(
+                    [(float(width) - 1.0) * 0.5, (float(height) - 1.0) * 0.5],
+                    dtype=torch.float32,
+                    device=device,
+                ),
             )
-        line_xy = transformed_centerline_coords(
+        line_xy = transformed_centerline_coords_torch(
             self.config.patch_shape_hw,
             source_shape_hw,
             params,
             device=device,
         )
-        control_point_xy = transformed_source_point_coords(
+        control_point_xy = transformed_source_point_coords_torch(
             self.config.patch_shape_hw,
             source_shape_hw,
             params,
@@ -1152,23 +1167,27 @@ class FiberStrip2DLoader:
     ) -> tuple[FiberStripSample, np.ndarray | None, np.ndarray | None, np.ndarray]:
         offset = float(self.strip_z_offsets[int(offset_index)])
         grid = self._offset_grid_from_source(source, offset)
-        coords_zyx = grid.coords_zyx.astype(np.float32, copy=False)
-        valid_mask = grid.valid_mask.astype(bool, copy=False)
+        coords_zyx_t = grid.coords_zyx
+        valid_mask_t = grid.valid_mask
         if params is not None:
             with _ProfileBlock(profile, "coord_augmentation", device):
-                coords_zyx, valid_mask = _resample_coords_like_augmentation(
-                    coords_zyx,
-                    valid_mask,
+                coords_zyx_t, valid_mask_t = _resample_coord_tensors_like_augmentation(
+                    coords_zyx_t,
+                    valid_mask_t,
                     params,
                     output_shape_hw=self.config.patch_shape_hw,
                     device=device,
                 )
         with _ProfileBlock(profile, "line_coords", device):
-            line_xy, control_point_xy = self._line_and_cp_xy_for_params(
+            line_xy_t, control_point_xy_t = self._line_and_cp_xy_for_params(
                 source.source_shape_hw,
                 params,
                 device=device,
             )
+        coords_zyx = _as_numpy_float32(coords_zyx_t)
+        valid_mask = _as_numpy_bool(valid_mask_t)
+        line_xy = _as_numpy_float32(line_xy_t)
+        control_point_xy = _as_numpy_float32(control_point_xy_t)
         image: np.ndarray | None = None
         sampled_valid: np.ndarray | None = None
         if load_image:
@@ -1214,7 +1233,7 @@ class FiberStrip2DLoader:
     ) -> tuple[np.ndarray, np.ndarray]:
         offset = float(self.strip_z_offsets[int(offset_index)])
         grid = self._offset_grid_from_source(source, offset)
-        return grid.coords_zyx.astype(np.float32, copy=False), grid.valid_mask.astype(bool, copy=False)
+        return _as_numpy_float32(grid.coords_zyx), _as_numpy_bool(grid.valid_mask)
 
     def build_sample(
         self,

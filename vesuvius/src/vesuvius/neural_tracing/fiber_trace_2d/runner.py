@@ -965,11 +965,38 @@ class _Timer:
         return None
 
 
+class _NullTimer:
+    elapsed_ms = 0.0
+
+    def __enter__(self) -> "_NullTimer":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+def _timer_if(enabled: bool) -> _Timer | _NullTimer:
+    return _Timer() if enabled else _NullTimer()
+
+
 def _add_timing(total: dict[str, float], key: str, value_ms: float) -> None:
     total[key] = total.get(key, 0.0) + float(value_ms)
 
 
-def _print_timing_table(rows: list[tuple[str, dict[str, float]]], totals: dict[str, float]) -> None:
+def _timing_totals_for_rows(rows: list[tuple[str, dict[str, float]]]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for _, timing in rows:
+        for key, value in timing.items():
+            _add_timing(totals, key, value)
+    return totals
+
+
+def _print_timing_table(
+    rows: list[tuple[str, dict[str, float]]],
+    totals: dict[str, float],
+    *,
+    title: str = "fiber_trace_2d augment-vis timings in ms",
+) -> None:
     keys = [
         "total",
         "loader_total",
@@ -985,7 +1012,7 @@ def _print_timing_table(rows: list[tuple[str, dict[str, float]]], totals: dict[s
         "overlay",
     ]
     header = "name".ljust(16) + "".join(key[:12].rjust(13) for key in keys)
-    print("fiber_trace_2d augment-vis timings in ms")
+    print(title)
     print(header)
     for name, timing in rows:
         print(name.ljust(16) + "".join(f"{timing.get(key, 0.0):13.1f}" for key in keys))
@@ -993,6 +1020,15 @@ def _print_timing_table(rows: list[tuple[str, dict[str, float]]], totals: dict[s
     row_count = len(rows)
     if row_count > 0:
         print("avg/patch".ljust(16) + "".join(f"{totals.get(key, 0.0) / row_count:13.1f}" for key in keys))
+    warm_rows = rows[1:]
+    warm_count = len(warm_rows)
+    if warm_count > 0:
+        warm_totals = _timing_totals_for_rows(warm_rows)
+        print("total/no-first".ljust(16) + "".join(f"{warm_totals.get(key, 0.0):13.1f}" for key in keys))
+        print(
+            "avg/no-first".ljust(16)
+            + "".join(f"{warm_totals.get(key, 0.0) / warm_count:13.1f}" for key in keys)
+        )
     volume_stats = {
         key.removeprefix("volume_stat_"): value
         for key, value in totals.items()
@@ -1000,7 +1036,7 @@ def _print_timing_table(rows: list[tuple[str, dict[str, float]]], totals: dict[s
     }
     if volume_stats:
         print(
-            "fiber_trace_2d volume sampler stats: "
+            f"{title} volume sampler stats: "
             + " ".join(f"{key}={value:.0f}" for key, value in sorted(volume_stats.items()))
         )
 
@@ -1052,7 +1088,68 @@ def _export_batch(batch, output_dir: str | Path) -> None:
     )
 
 
-def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int, output_dir: str | Path) -> None:
+def _run_augment_contact_sheet_pass(
+    loader: FiberStrip2DLoader,
+    sample_index: int,
+    entries: list[tuple[str, FiberStripAugmentParams]],
+    *,
+    device: torch.device,
+    source,
+    source_profile: dict[str, float] | None,
+    source_elapsed_ms: float,
+    collect_images: bool,
+    profile: bool,
+) -> tuple[list[np.ndarray], list[str], list[str], object | None, list[tuple[str, dict[str, float]]], dict[str, float]]:
+    contact_images: list[np.ndarray] = []
+    contact_labels: list[str] = []
+    summary_lines: list[str] = []
+    first_sample = None
+    timing_rows: list[tuple[str, dict[str, float]]] = []
+    timing_totals: dict[str, float] = {}
+    for entry_index, (name, params) in enumerate(entries):
+        timing: dict[str, float] | None
+        timing = dict(source_profile or {}) if profile and entry_index == 0 else ({} if profile else None)
+        with _timer_if(profile) as total_timer:
+            with _timer_if(profile) as loader_timer:
+                sample, aug_image, aug_valid, line_xy = loader.build_augmented_center_strip_patch(
+                    sample_index,
+                    params,
+                    device=device,
+                    profile=timing,
+                    source=source,
+                )
+            if timing is not None:
+                timing["loader_total"] = loader_timer.elapsed_ms
+            with _timer_if(profile) as to_u8_timer:
+                image_u8 = _to_u8_image(aug_image, aug_valid)
+            if timing is not None:
+                timing["to_u8"] = to_u8_timer.elapsed_ms
+            with _timer_if(profile) as overlay_timer:
+                overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.5, thickness=1)
+                overlay = _draw_cp_crosshair(overlay, sample.control_point_xy)
+            if timing is not None:
+                timing["overlay"] = overlay_timer.elapsed_ms
+        if timing is not None:
+            timing["total"] = total_timer.elapsed_ms
+            if entry_index == 0:
+                timing["loader_total"] += source_elapsed_ms
+                timing["total"] += source_elapsed_ms
+            timing_rows.append((name, timing))
+            for key, value in timing.items():
+                _add_timing(timing_totals, key, value)
+        if first_sample is None:
+            first_sample = sample
+        if collect_images:
+            contact_images.append(overlay)
+            contact_labels.append(name)
+            cp_xy = np.asarray(sample.control_point_xy, dtype=np.float32)
+            summary_lines.append(f"{name}: {params} cp_xy=({cp_xy[0]:.3f}, {cp_xy[1]:.3f})")
+    return contact_images, contact_labels, summary_lines, first_sample, timing_rows, timing_totals
+
+
+def _export_augment_contact_sheet(
+    loader: FiberStrip2DLoader, sample_index: int, output_dir: str | Path, *, profile: bool = False
+) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     device = resolve_torch_device(loader.config.augment.device)
@@ -1064,17 +1161,12 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
     ]
     entries = lower_entries + upper_entries + combined_entries
 
-    contact_images: list[np.ndarray] = []
-    contact_labels: list[str] = []
-    first_sample = None
-    timing_rows: list[tuple[str, dict[str, float]]] = []
-    timing_totals: dict[str, float] = {}
-    source_profile: dict[str, float] = {}
+    source_profile: dict[str, float] | None = {} if profile else None
     # Build the deterministic sample-order cache outside augment-vis profiling.
     # The first random descriptor lookup sorts the whole CP order for this pass;
     # that cost is global state setup, not per-sample patch construction.
     loader.descriptor_for_sample_index(sample_index)
-    with _Timer() as source_timer:
+    with _timer_if(profile) as source_timer:
         source = loader.build_augmented_center_strip_source(
             sample_index,
             device=device,
@@ -1085,60 +1177,66 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
         f"device={device}",
         "layout=row 1: lower limits; row 2: upper limits; row 3: random combined training-style augmentations",
     ]
-    for entry_index, (name, params) in enumerate(entries):
-        timing: dict[str, float] = dict(source_profile) if entry_index == 0 else {}
-        with _Timer() as total_timer:
-            with _Timer() as loader_timer:
-                sample, aug_image, aug_valid, line_xy = loader.build_augmented_center_strip_patch(
-                    sample_index,
-                    params,
-                    device=device,
-                    profile=timing,
-                    source=source,
-                )
-            timing["loader_total"] = loader_timer.elapsed_ms
-            with _Timer() as to_u8_timer:
-                image_u8 = _to_u8_image(aug_image, aug_valid)
-            timing["to_u8"] = to_u8_timer.elapsed_ms
-            with _Timer() as overlay_timer:
-                overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.5, thickness=1)
-                overlay = _draw_cp_crosshair(overlay, sample.control_point_xy)
-            timing["overlay"] = overlay_timer.elapsed_ms
-        timing["total"] = total_timer.elapsed_ms
-        if entry_index == 0:
-            timing["loader_total"] += source_timer.elapsed_ms
-            timing["total"] += source_timer.elapsed_ms
-        timing_rows.append((name, timing))
-        for key, value in timing.items():
-            _add_timing(timing_totals, key, value)
-        if first_sample is None:
-            first_sample = sample
-        contact_images.append(overlay)
-        contact_labels.append(name)
-        cp_xy = np.asarray(sample.control_point_xy, dtype=np.float32)
-        summary_lines.append(f"{name}: {params} cp_xy=({cp_xy[0]:.3f}, {cp_xy[1]:.3f})")
+    contact_images, contact_labels, entry_summary_lines, first_sample, timing_rows, timing_totals = (
+        _run_augment_contact_sheet_pass(
+            loader,
+            sample_index,
+            entries,
+            device=device,
+            source=source,
+            source_profile=source_profile,
+            source_elapsed_ms=source_timer.elapsed_ms if profile else 0.0,
+            collect_images=True,
+            profile=profile,
+        )
+    )
+    summary_lines.extend(entry_summary_lines)
+    warm_timing_rows: list[tuple[str, dict[str, float]]] = []
+    warm_timing_totals: dict[str, float] = {}
+    if profile:
+        _, _, _, _, warm_timing_rows, warm_timing_totals = _run_augment_contact_sheet_pass(
+            loader,
+            sample_index,
+            entries,
+            device=device,
+            source=source,
+            source_profile=None,
+            source_elapsed_ms=0.0,
+            collect_images=False,
+            profile=True,
+        )
     if first_sample is not None:
         summary_lines.insert(2, f"fiber_path={first_sample.fiber_path}")
         summary_lines.insert(3, f"control_point_index={first_sample.control_point_index}")
         summary_lines.insert(4, f"strip_z_offset={first_sample.strip_z_offset}")
 
-    with _Timer() as write_timer:
+    with _timer_if(profile) as write_timer:
         _write_contact_sheet(
             out / "augment_contact_sheet.jpg",
             contact_images,
             columns=len(lower_entries),
             labels=contact_labels,
         )
-    timing_totals["write_contact_sheet"] = write_timer.elapsed_ms
-    with _Timer() as summary_timer:
+    with _timer_if(profile) as summary_timer:
         (out / "augment_summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
-    timing_totals["write_summary"] = summary_timer.elapsed_ms
-    _print_timing_table(timing_rows, timing_totals)
-    print(
-        "fiber_trace_2d output timings: "
-        f"write_contact_sheet={timing_totals['write_contact_sheet']:.1f}ms "
-        f"write_summary={timing_totals['write_summary']:.1f}ms"
-    )
+    if profile:
+        timing_totals["write_contact_sheet"] = write_timer.elapsed_ms
+        timing_totals["write_summary"] = summary_timer.elapsed_ms
+        _print_timing_table(
+            timing_rows,
+            timing_totals,
+            title="fiber_trace_2d augment-vis timings pass=1 cold-ish in ms",
+        )
+        _print_timing_table(
+            warm_timing_rows,
+            warm_timing_totals,
+            title="fiber_trace_2d augment-vis timings pass=2 warm in ms",
+        )
+        print(
+            "fiber_trace_2d output timings: "
+            f"write_contact_sheet={timing_totals['write_contact_sheet']:.1f}ms "
+            f"write_summary={timing_totals['write_summary']:.1f}ms"
+        )
     print(f"exported augment_contact_sheet.jpg and augment_summary.txt to {out}")
 
 
@@ -1152,6 +1250,11 @@ def main() -> None:
     parser.add_argument("--skip-prefetch", action="store_true")
     parser.add_argument("--export-dir", default=None)
     parser.add_argument("--augment-vis", action="store_true")
+    parser.add_argument(
+        "--augment-profile",
+        action="store_true",
+        help="When used with --augment-vis, print two augment timing passes to expose cold and warm costs",
+    )
     parser.add_argument("--line-trace-vis", action="store_true")
     parser.add_argument("--med-tta", action="store_true")
     parser.add_argument("--dir-vis", action="store_true")
@@ -1187,7 +1290,7 @@ def main() -> None:
     if args.augment_vis:
         if args.export_dir is None:
             raise SystemExit("--augment-vis requires --export-dir")
-        _export_augment_contact_sheet(loader, args.sample_index, args.export_dir)
+        _export_augment_contact_sheet(loader, args.sample_index, args.export_dir, profile=bool(args.augment_profile))
         return
 
     if args.line_trace_vis:
