@@ -15,11 +15,11 @@ import { Redis } from '@upstash/redis';
 // for tests) without a code change. Window is fixed at 10 minutes.
 const BURST_WINDOW_MS = 10 * 60 * 1000;
 const BURST_WINDOW = '10 m'; // Upstash Duration form of BURST_WINDOW_MS
-const DAILY_MAX = 60;
+const DAILY_MAX = 150;
 
 function burstMax(env) {
   const n = Number.parseInt(env.CHAT_RATELIMIT_MAX ?? '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 10;
+  return Number.isFinite(n) && n > 0 ? n : 30;
 }
 
 // ---- IP extraction -------------------------------------------------------

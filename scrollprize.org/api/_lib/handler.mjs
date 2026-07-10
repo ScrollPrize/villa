@@ -360,8 +360,15 @@ export async function handleChat(request, opts = {}) {
       messages: chat,
       maxOutputTokens: maxOutputTokens(env),
       abortSignal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      // Gateway-managed prompt caching pass-through (v7 GatewayProviderOptions).
-      providerOptions: { gateway: { caching: 'auto' } },
+      // gateway: prompt-caching pass-through (v7 GatewayProviderOptions).
+      // openai: low reasoning effort — grounded Q&A over the corpus needs
+      // retrieval-and-phrasing, not deep chains of thought; low cuts latency
+      // and reasoning-token spend. Overridable without a deploy. Ignored by
+      // non-OpenAI providers if CHAT_MODEL is switched.
+      providerOptions: {
+        gateway: { caching: 'auto' },
+        openai: { reasoningEffort: env.CHAT_REASONING_EFFORT || 'low' },
+      },
       onError({ error }) {
         log({ status: 200, ms: Date.now() - t0, event: 'stream_error', model: id, error: String(error) });
       },

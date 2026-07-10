@@ -376,6 +376,12 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - **Identity**: renamed to **Virtual Philodemus** (panel title + subtitle "Vesuvius Challenge assistant", aria labels). New `ChatAvatar` mark — a drawn Archimedean spiral (the scroll CT cross-section, the project's most recognizable visual) as inline SVG, zero image payload: ember-on-raised circular chip in the header, large quiet version in the empty state, ember mark in the trigger, whose desktop label is now "Ask Philodemus" ("Ask" on mobile). Empty-state hint introduces the persona.
 **Files:** `api/_lib/handler.mjs`, `scripts/genChatCorpus.js`, `src/components/ChatWidget/{index,ChatPanel,ChatAvatar}.js`, `src/css/chat.css`.
 
+## C43 — chat: low reasoning effort, rate limit 30/10min
+
+- Model stays `openai/gpt-5-mini`; reasoning effort now `low` by default (`providerOptions.openai.reasoningEffort`, env-overridable via `CHAT_REASONING_EFFORT`) — grounded Q&A needs retrieval-and-phrasing, not deep reasoning; cuts latency and reasoning-token spend. Ignored by non-OpenAI models.
+- Default per-IP rate limit raised 10 → **30 requests / 10 minutes** (both Upstash and in-memory paths); daily cap raised 60 → 150 so the burst allowance stays meaningful across a day.
+**Files:** `api/_lib/handler.mjs`, `api/_lib/rateLimit.mjs`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
