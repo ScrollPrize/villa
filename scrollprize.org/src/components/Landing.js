@@ -350,17 +350,17 @@ const creators = [
   {
     name: "Nat Friedman",
     image: "/img/landing/nat.webp",
-    href: "https://nat.org/",
+    href: "https://www.nat.org/",
   },
   {
     name: "Daniel Gross",
     image: "/img/landing/daniel.webp",
-    href: "https://dcgross.com/",
+    href: "https://www.danielgross.com/",
   },
   {
     name: "Dr. Brent Seales",
     image: "/img/landing/brent.webp",
-    href: "https://educelab.engr.uky.edu/w-brent-seales",
+    href: "https://educelab.engr.uky.edu/people-6",
   },
 ];
 
@@ -386,19 +386,19 @@ const sponsors = [
   {
     name: "Joseph Jacks",
     amount: 250000,
-    href: "https://twitter.com/JosephJacks_",
+    href: "https://x.com/JosephJacks_",
     image: "/img/landing/Joseph Jacks.webp",
   },
   {
     name: "Daniel Gross",
     amount: 225000,
-    href: "https://dcgross.com/",
+    href: "https://www.danielgross.com/",
     image: "/img/landing/daniel.webp",
   },
   {
     name: "Matt Mullenweg",
     amount: 150000,
-    href: "https://ma.tt/",
+    href: "https://www.ma.tt/",
     image: "/img/landing/Matt Mullenweg.webp",
   },
   {
@@ -409,19 +409,19 @@ const sponsors = [
   {
     name: "Matt Huang",
     amount: 50000,
-    href: "https://twitter.com/matthuang",
+    href: "https://x.com/matthuang",
     image: "/img/landing/Matt Huang.webp",
   },
   {
     name: "John & Patrick Collison",
     amount: 125000,
-    href: "https://stripe.com/",
+    href: "https://www.stripe.com/",
     image: ["/img/landing/collison1.webp", "/img/landing/collison2.webp"],
   },
   {
     name: "Julia DeWahl & Dan Romero",
     amount: 100000,
-    href: "https://twitter.com/natfriedman/status/1637959778558439425",
+    href: "https://x.com/natfriedman/status/1637959778558439425",
     image: [
       "/img/landing/Julia DeWahl.webp",
       "/img/landing/Dan Romero.webp",
@@ -430,7 +430,7 @@ const sponsors = [
   {
     name: "Eugene Jhong",
     amount: 100000,
-    href: "https://twitter.com/ejhong",
+    href: "https://x.com/ejhong",
     image: "/img/landing/Eugene Jhong.webp",
   },
   {
@@ -442,25 +442,25 @@ const sponsors = [
   {
     name: "Bastian Lehmann",
     amount: 75000,
-    href: "https://twitter.com/Basti",
+    href: "https://x.com/Basti",
     image: "/img/landing/Bastian Lehmann.webp",
   },
   {
     name: "Tobi Lutke",
     amount: 75000,
-    href: "https://twitter.com/tobi",
+    href: "https://x.com/tobi",
     image: "/img/landing/Tobi Lutke.webp",
   },
   {
     name: "Guillermo Rauch",
     amount: 50000,
-    href: "https://rauchg.com/",
+    href: "https://www.rauchg.com/",
     image: "/img/landing/Guillermo Rauch.webp",
   },
   {
     name: "Arthur Breitman",
     amount: 50000,
-    href: "https://ex.rs/",
+    href: "https://www.ex.rs/",
     image: "/img/landing/Arthur Breitman.webp",
   },
   {
@@ -478,43 +478,43 @@ const sponsors = [
   {
     name: "Aaron Levie",
     amount: 25000,
-    href: "https://twitter.com/levie",
+    href: "https://x.com/levie",
     image: "/img/landing/Aaron Levie.webp",
   },
   {
     name: "Akshay Kothari",
     amount: 25000,
-    href: "https://twitter.com/akothari",
+    href: "https://x.com/akothari",
     image: "/img/landing/Akshay Kothari.webp",
   },
   {
     name: "Alexa McLain",
     amount: 25000,
-    href: "https://twitter.com/alexamclain",
+    href: "https://x.com/alexamclain",
     image: "/img/landing/Alexa McLain.webp",
   },
   {
     name: "Anjney Midha",
     amount: 25000,
-    href: "https://twitter.com/AnjneyMidha",
+    href: "https://x.com/AnjneyMidha",
     image: "/img/landing/Anjney Midha.webp",
   },
   {
     name: "franciscosan.org",
     amount: 25000,
-    href: "https://franciscosan.org/",
+    href: "https://www.franciscosan.org/",
     image: "/img/landing/franciscosan.webp",
   },
   {
     name: "John O'Brien",
     amount: 25000,
-    href: "https://twitter.com/jobriensf",
+    href: "https://x.com/jobriensf",
     image: "/img/landing/John O'Brien.webp",
   },
   {
     name: "Mark Cummins",
     amount: 25000,
-    href: "https://twitter.com/mark_cummins",
+    href: "https://x.com/mark_cummins",
     image: "/img/landing/Mark Cummins.webp",
   },
   {
@@ -526,13 +526,13 @@ const sponsors = [
   {
     name: "Mike Mignano",
     amount: 15000,
-    href: "https://mignano.co/",
+    href: "https://www.migna.no/",
     image: "/img/landing/Mike Mignano.webp",
   },
   {
     name: "Aravind Srinivas",
     amount: 10000,
-    href: "https://twitter.com/AravSrinivas",
+    href: "https://x.com/AravSrinivas",
     image: "/img/landing/Aravind Srinivas.webp",
   },
   {
@@ -544,19 +544,19 @@ const sponsors = [
   {
     name: "Brandon Silverman",
     amount: 10000,
-    href: "https://twitter.com/brandonsilverm",
+    href: "https://x.com/brandonsilverm",
     image: "/img/landing/Brandon Silverman.webp",
   },
   {
     name: "Chet Corcos",
     amount: 10000,
-    href: "https://chetcorcos.com",
+    href: "https://chetcorcos.notion.site/",
     image: "/img/landing/Chet Corcos.webp",
   },
   {
     name: "Ivan Zhao",
     amount: 10000,
-    href: "https://twitter.com/ivanhzhao",
+    href: "https://x.com/ivanhzhao",
     image: "/img/landing/Ivan Zhao.webp",
   },
   {
@@ -568,73 +568,73 @@ const sponsors = [
   {
     name: "Stephanie Sher",
     amount: 10000,
-    href: "https://twitter.com/stephxsher",
+    href: "https://x.com/stephxsher",
     image: "/img/landing/Stephanie Sher.webp",
   },
   {
     name: "Raymond Russell",
     amount: 10000,
-    href: "https://twitter.com/raymondopolis",
+    href: "https://x.com/raymondopolis",
     image: "/img/landing/Raymond Russell.webp",
   },
   {
     name: "Vignan Velivela",
     amount: 10000,
-    href: "https://vignanv.com/",
+    href: "https://www.vignanv.com/",
     image: "/img/landing/Vignan Velivela.webp",
   },
   {
     name: "Katsuya Noguchi",
     amount: 10000,
-    href: "https://twitter.com/kn",
+    href: "https://x.com/kn",
     image: "/img/landing/Katsuya Noguchi.webp",
   },
   {
     name: "Shariq Hashme",
     amount: 10000,
-    href: "https://shar.iq/",
+    href: "https://www.shar.iq/",
     image: "/img/landing/Shariq Hashme.webp",
   },
   {
     name: "Sahil Chaudhary",
     amount: 10000,
-    href: "https://twitter.com/csahil28",
+    href: "https://x.com/csahil28",
     image: "/img/landing/Sahil Chaudhary.webp",
   },
   {
     name: "Maya & Taylor Blau",
     amount: 10000,
-    href: "https://ttaylorr.com/",
+    href: "https://www.ttaylorr.com/",
     image: ["/img/landing/Maya Blau.webp", "/img/landing/Taylor Blau.webp"],
   },
   {
     name: "Matias Nisenson",
     amount: 10000,
-    href: "https://twitter.com/MatiasNisenson",
+    href: "https://x.com/MatiasNisenson",
     image: "/img/landing/Matias Nisenson.webp",
   },
   {
     name: "Mikhail Parakhin",
     amount: 10000,
-    href: "https://twitter.com/mparakhin",
+    href: "https://x.com/mparakhin",
     image: "/img/landing/Mikhail Parakhin.webp",
   },
   {
     name: "Alex Petkas",
     amount: 5000,
-    href: "https://twitter.com/costofglory",
+    href: "https://x.com/costofglory",
     image: "/img/landing/Alex Petkas.webp",
   },
   {
     name: "Amjad Masad",
     amount: 5000,
-    href: "https://twitter.com/amasad",
+    href: "https://x.com/amasad",
     image: "/img/landing/Amjad Masad.webp",
   },
   {
     name: "Conor White-Sullivan",
     amount: 5000,
-    href: "https://twitter.com/Conaw",
+    href: "https://x.com/Conaw",
     image: "/img/landing/Conor White-Sullivan.webp",
   },
   {
@@ -650,17 +650,17 @@ const team = {
     {
       name: "Nat Friedman",
       title: "Instigator & Founding Sponsor",
-      href: "https://nat.org/",
+      href: "https://www.nat.org/",
     },
     {
       name: "Daniel Gross",
       title: "Founding Sponsor",
-      href: "https://dcgross.com/",
+      href: "https://www.danielgross.com/",
     },
     {
       name: "Giorgio Angelotti",
       title: "Research Project Lead, PhD",
-      href: "https://thegiorgio.org/",
+      href: "https://www.thegiorgio.org/",
     },
     {
       name: "Sean Johnson",
@@ -670,12 +670,12 @@ const team = {
     {
       name: "Youssef Nader",
       title: "Machine Learning Researcher",
-      href: "https://youssefnader.com/",
+      href: "https://www.youssefnader.com/",
     },
     {
       name: "Hendrik Schilling",
       title: "Computer Vision & AI Expert, PhD",
-      href: "https://www.linkedin.com/in/dr-hendrik-schilling-a2019418a",
+      href: "https://www.linkedin.com/in/dr-hendrik-schilling-a2019418a/",
     },
     {
       name: "Paul Henderson",
@@ -685,7 +685,7 @@ const team = {
     {
       name: "Elian Rafael Dal Prá",
       title: "ML Intern & Annotation Specialist",
-      href: "https://twitter.com/elianrafaeldp",
+      href: "https://x.com/elianrafaeldp",
     },
     {
       name: "Johannes Rudolph",
@@ -717,7 +717,7 @@ const team = {
     {
       name: "Brent Seales",
       title: "Principal Investigator, Professor of Computer Science",
-      href: "https://educelab.engr.uky.edu/w-brent-seales",
+      href: "https://educelab.engr.uky.edu/people-6",
     },
     {
       name: "Seth Parker",
@@ -727,7 +727,7 @@ const team = {
     {
       name: "Christy Chapman",
       title: "Research & Partnership Manager",
-      href: "https://educelab.engr.uky.edu/christy-chapman",
+      href: "https://educelab.engr.uky.edu/people-6",
     },
     {
       name: "Mami Hayashida",
@@ -742,7 +742,7 @@ const team = {
     {
       name: "Beth Lutin",
       title: "College Business Analyst",
-      href: "https://www.engr.uky.edu/directory/lutin-elizabeth",
+      href: "https://www2.cs.uky.edu/dri/elizabeth-lutin/",
     },
     {
       name: "Roger Macfarlane",
@@ -754,7 +754,7 @@ const team = {
     {
       name: "JP Posma",
       title: "Project Lead",
-      href: "https://janpaulposma.nl/",
+      href: "https://www.janpaulposma.nl/",
     },
     {
       name: "Stephen Parsons",
@@ -764,7 +764,7 @@ const team = {
     {
       name: "Ben Kyles",
       title: "Segmentation Team Lead",
-      href: "https://twitter.com/ben_kyles",
+      href: "https://x.com/ben_kyles",
     },
     {
       name: "Julian Schilliger",
@@ -779,17 +779,17 @@ const team = {
     {
       name: "Adrionna Fey",
       title: "Annotation Specialist",
-      href: "https://twitter.com/Meadowsnax1",
+      href: "https://x.com/Meadowsnax1",
     },
     {
       name: "Konrad Rosenberg",
       title: "Annotation Specialist",
-      href: "https://twitter.com/germanicgems",
+      href: "https://x.com/germanicgems",
     },
     {
       name: "Cooper Miller",
       title: "Annotation Specialist",
-      href: "https://kcm.sh/",
+      href: "https://www.kcm.sh/",
     },
     {
       name: "Raymond Gasper",
@@ -799,7 +799,7 @@ const team = {
     {
       name: "Sergei Pnev",
       title: "Annotation Specialist",
-      href: "www.linkedin.com/in/sergey-pnev",
+      href: "https://www.linkedin.com/in/sergey-pnev/",
     },
     {
       name: "Techjays",
@@ -809,12 +809,12 @@ const team = {
     {
       name: "Daniel Havíř",
       title: "Machine Learning",
-      href: "https://danielhavir.com/",
+      href: "https://www.danielhavir.com/",
     },
     {
       name: "Ian Janicki",
       title: "Design",
-      href: "https://ianjanicki.com/",
+      href: "https://www.ianjanicki.com/",
     },
     {
       name: "Chris Frangione",
@@ -824,7 +824,7 @@ const team = {
     {
       name: "Garrett Ryan",
       title: "Classics",
-      href: "https://toldinstone.com/",
+      href: "https://www.toldinstone.com/",
     },
     {
       name: "Dejan Gotić",
@@ -834,7 +834,7 @@ const team = {
     {
       name: "Jonny Hyman",
       title: "2D Animator",
-      href: "https://jonnyhyman.com/",
+      href: "https://www.jonnyhyman.com/",
     },
   ],
   papyrology: [
@@ -894,13 +894,13 @@ const team = {
       name: "Gianluca Del Mastro",
       title:
         "Professor of Papyrology, l'Università della Campania «L. Vanvitelli»",
-      href: "https://www.facebook.com/GianlucaDelMastroSindaco",
+      href: "https://www.letterebeniculturali.unicampania.it/dipartimento/docenti?MATRICOLA=901366",
     },
     {
       name: "Robert Fowler",
       title:
         "Fellow of the British Academy;  Professor Emeritus of Classics, Bristol University",
-      href: "https://www.thebritishacademy.ac.uk/fellows/robert-fowler-FBA/",
+      href: "https://www.thebritishacademy.ac.uk/fellows/profiles/robert-fowler-FBA/",
     },
     {
       name: "Richard Janko",
@@ -917,7 +917,7 @@ const team = {
     {
       name: "Tobias Reinhardt",
       title:
-        "Corpus Christi Professor of the Latin Language and Literature, Oxford",
+        "Corpus Christi Professor of the Latin Language and Literature, University of Oxford",
       href: "https://www.classics.ox.ac.uk/people/professor-tobias-reinhardt",
     },
   ],
@@ -968,8 +968,8 @@ const educelabFunders = [
     href: "https://www.ukri.org/councils/ahrc/",
   },
   {
-    name: "The Lighthouse Beacon Foundation — Stanley and Karen Pigman",
-    href: undefined,
+    name: "The Lighthouse Beacon Foundation — Stanley & Karen Pigman",
+    href: "https://www.lighthousebeaconfoundation.org/our-founders",
   },
   {
     name: "John & Karen Maxwell",
