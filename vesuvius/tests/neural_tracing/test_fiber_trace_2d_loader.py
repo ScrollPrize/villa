@@ -545,6 +545,44 @@ def test_config_prefetch_sampler_workers_is_separate_from_download_workers(tmp_p
     assert parsed.prefetch_sampler_workers == 3
 
 
+def test_config_loader_workers_defaults_to_logical_cpu_count(tmp_path: Path) -> None:
+    parsed = load_config(_write_config(tmp_path, batch_size=1))
+
+    assert parsed.loader_workers == max(1, loader_module.os.cpu_count() or 1)
+
+
+def test_config_loader_workers_accepts_single_worker_debug_mode(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["loader_workers"] = 1
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.loader_workers == 1
+
+
+def test_numpy_sampler_batch_loading_matches_repeated_patch_loading(tmp_path: Path) -> None:
+    array = zarr.open(str(_write_zarr(tmp_path / "vol.zarr") / "0"), mode="r")
+    sampler = NumpyZarrCoordinateSampler(array, level_spacing_base=1.0)
+    coords = np.zeros((2, 3, 3, 3), dtype=np.float32)
+    valid = np.ones((2, 3, 3), dtype=bool)
+    coords[0, ..., 0] = 20.0
+    coords[0, ..., 1] = np.arange(3, dtype=np.float32).reshape(3, 1) + 20.0
+    coords[0, ..., 2] = np.arange(3, dtype=np.float32).reshape(1, 3) + 20.0
+    coords[1] = coords[0] + np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+
+    batch = sampler.sample_coord_batch(coords, valid)
+    repeated = [sampler.sample_coords(coords[index], valid[index]) for index in range(2)]
+
+    assert batch.image.shape == (2, 3, 3)
+    assert batch.valid_mask.shape == (2, 3, 3)
+    np.testing.assert_allclose(batch.image, np.stack([item.image for item in repeated], axis=0))
+    np.testing.assert_array_equal(batch.valid_mask, np.stack([item.valid_mask for item in repeated], axis=0))
+    assert batch.stats["batch_patches"] == 2
+    assert batch.stats["batch_mode_flattened"] == 1
+
+
 def test_config_parses_strip_coord_cache_dir(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, batch_size=1)
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1660,7 +1698,11 @@ def test_prefetch_skips_invalid_sample_construction(
 
 
 def test_load_batch_skips_invalid_training_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=2)))
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
     original_build_sample = loader.build_sample
     attempted: list[int] = []
 
@@ -1681,7 +1723,11 @@ def test_load_batch_skips_invalid_training_samples(tmp_path: Path, monkeypatch: 
 
 
 def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
     attempted: list[int] = []
 
     def build_sample(
@@ -1714,16 +1760,60 @@ def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch
     assert batch.images.shape == (4, len(loader.strip_z_offsets), 1, 3, 3)
 
 
+def test_parallel_load_batch_preserves_output_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = _write_config(tmp_path, batch_size=4)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 4
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    def build_sample(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile=None,
+        apply_image_augmentation: bool = True,
+    ):
+        del sample_mode
+        del profile
+        del apply_image_augmentation
+        if int(sample_index) == 0:
+            loader_module.time.sleep(0.02)
+        sample = SimpleNamespace(
+            record_index=0,
+            control_point_index=int(sample_index),
+            fiber_path=f"fiber_{sample_index}.json",
+        )
+        image = np.full((len(loader.strip_z_offsets), 3, 3), float(sample_index), dtype=np.float32)
+        coords = np.zeros((len(loader.strip_z_offsets), 3, 3, 3), dtype=np.float32)
+        valid = np.ones((len(loader.strip_z_offsets), 3, 3), dtype=bool)
+        return [sample], image, coords, valid
+
+    monkeypatch.setattr(loader, "build_sample", build_sample)
+
+    batch = loader.load_batch(0, batch_size=4)
+
+    assert batch.control_point_indices.tolist() == [0, 1, 2, 3]
+    assert batch.images[:, 0, 0, 0, 0].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
 class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
     def __init__(self, array, *, level_spacing_base: float) -> None:
         super().__init__(array, level_spacing_base=level_spacing_base)
         self.sample_coords_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.sample_coord_batch_calls: list[tuple[np.ndarray, np.ndarray]] = []
         self.chunk_request_calls: list[tuple[np.ndarray, np.ndarray]] = []
         self.prefetch_calls: list[tuple[np.ndarray, np.ndarray]] = []
 
     def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
         self.sample_coords_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
         return super().sample_coords(coords_zyx_base, valid_mask)
+
+    def sample_coord_batch(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
+        self.sample_coord_batch_calls.append(
+            (np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True))
+        )
+        return super().sample_coord_batch(coords_zyx_base, valid_mask)
 
     def chunk_requests_for_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
         self.chunk_request_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
@@ -1794,10 +1884,13 @@ def test_prefetch_envelope_covers_augmented_loading_dependencies(tmp_path: Path)
 
     sampler = samplers[0]
     assert len(sampler.chunk_request_calls) == 2
-    assert len(sampler.sample_coords_calls) == 2
+    assert len(sampler.sample_coord_batch_calls) == 1
+    assert len(sampler.sample_coords_calls) == 1
     prefetch_keys = _request_keys(prefetch_requests)
     assert prefetch_keys
-    for load_coords, load_valid in sampler.sample_coords_calls:
+    for load_coords, load_valid in sampler.sample_coord_batch_calls:
+        assert load_coords.shape[:3] == (2, 5, 5)
+        assert load_valid.shape == (2, 5, 5)
         load_keys = _request_keys(sampler.chunk_requests_for_coords(load_coords, load_valid))
         assert load_keys <= prefetch_keys
 

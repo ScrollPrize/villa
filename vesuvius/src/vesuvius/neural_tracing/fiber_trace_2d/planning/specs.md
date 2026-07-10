@@ -62,8 +62,13 @@
   avoid many tiny per-patch GPU calls when the same operation can be expressed
   as one batched tensor operation without changing deterministic sample order
   or augmentation semantics.
+- Runtime image sampling should batch each CP sample's strip-z coordinate stack
+  through `CoordinateSampler.sample_coord_batch`. If no native sampler batch API
+  is available, flattening `[strip_z,H,W,3]` to one larger coordinate image is
+  functionally valid because every output pixel samples from explicit 3D
+  coordinates; only request traversal and cache/chunk locality may change.
 - Dataset and loader settings are specified in Vesuvius-style JSON.
-- Config keys include `datasets`, `batch_size`, `patch_shape_hw`, `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `prefetch_workers`, `prefetch_sampler_workers`, `volume_cache_dir`, optional `strip_coord_cache_dir`, and optional cache settings.
+- Config keys include `datasets`, `batch_size`, `patch_shape_hw`, `strip_z_offset_count`, `strip_z_offset_step`, `seed`, `loader_workers`, `prefetch_workers`, `prefetch_sampler_workers`, `volume_cache_dir`, optional `strip_coord_cache_dir`, and optional cache settings.
 - Augmentation config keys include `augment_enabled`, `augment_device`, `augment_seed`, `augment_shift_x`, `augment_shift_y`, `augment_rotation_degrees`, `augment_shear_x`, `augment_shear_y`, `augment_scale_min`, `augment_scale_max`, `augment_smooth_offset`, `augment_smooth_offset_stride`, `augment_brightness`, `augment_contrast_min`, `augment_contrast_max`, `augment_gamma_min`, `augment_gamma_max`, `augment_noise_std`, and `augment_blur_sigma`.
 - Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
 - Geometric strip augmentations operate on strip coordinates before image sampling.
@@ -134,6 +139,10 @@
 - Normal batch loading samples control points in deterministic pseudo-random order from the configured seed.
 - The deterministic pseudo-random training order covers every configured control point exactly once per dataset pass before repeating.
 - Changing training step counts, batch size, or control points per step must only truncate or extend the consumed prefix of that deterministic sample stream; it must not reshuffle earlier samples.
+- `load_batch` may parallelize CP-sample construction with `loader_workers`,
+  defaulting to the machine logical CPU count. Parallel workers may evaluate
+  candidate samples out of order, but accepted output samples and skip handling
+  must follow the same deterministic sample-index order as serial loading.
 - The tester/runner loads a batch from a specified deterministic control-point sample index.
 - Prefetch uses the same shared source-strip implementation as training and augment-vis.
 - Prefetch remains CPU-pinned, but it still uses the same torch-native source-grid and strip-offset path, converting to NumPy only once for VC3D dependency discovery.

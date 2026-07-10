@@ -72,6 +72,7 @@ class FiberStrip2DConfig:
     seed: int = 1
     prefetch_workers: int = 16
     prefetch_sampler_workers: int = 2
+    loader_workers: int = max(1, os.cpu_count() or 1)
     volume_cache_dir: str | None = None
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
@@ -217,6 +218,7 @@ def load_config(path: str | Path) -> FiberStrip2DConfig:
         seed=int(raw.get("seed", 1)),
         prefetch_workers=max(1, int(raw.get("prefetch_workers", 16))),
         prefetch_sampler_workers=max(1, int(raw.get("prefetch_sampler_workers", 2))),
+        loader_workers=max(1, int(raw.get("loader_workers", max(1, os.cpu_count() or 1)))),
         volume_cache_dir=None if cache_dir is None else str(cache_dir),
         volume_cache_offline=bool(raw.get("volume_cache_offline", False)),
         volume_cache_retry_seconds=float(raw.get("volume_cache_retry_seconds", 0.0)),
@@ -564,6 +566,14 @@ class _ProfileBlock:
         _sync_if_needed(self.device)
         self.profile[self.name] = self.profile.get(self.name, 0.0) + (time.perf_counter() - self.start) * 1000.0
         return None
+
+
+def _merge_profile(dst: dict[str, float] | None, src: dict[str, float]) -> None:
+    if dst is None:
+        return
+    for key, value in src.items():
+        if isinstance(value, (int, float)):
+            dst[key] = dst.get(key, 0.0) + float(value)
 
 
 def _sync_if_needed(device: torch.device | None) -> None:
@@ -1632,6 +1642,24 @@ class FiberStrip2DLoader:
 
         coords_zyx_np = _as_numpy_float32(coords_zyx_t)
         valid_mask_np = _as_numpy_bool(valid_mask_t)
+        with _ProfileBlock(profile, "volume_sample"):
+            result = source.record.sampler.sample_coord_batch(coords_zyx_np, valid_mask_np)
+            images_np = np.asarray(result.image, dtype=np.float32)
+            valids_np = np.asarray(result.valid_mask, dtype=bool)
+            if images_np.shape != valid_mask_np.shape:
+                raise ValueError(
+                    "batched sampler returned incompatible image shape: "
+                    f"shape={images_np.shape} expected={valid_mask_np.shape}"
+                )
+            if valids_np.shape != valid_mask_np.shape:
+                raise ValueError(
+                    "batched sampler returned incompatible valid-mask shape: "
+                    f"shape={valids_np.shape} expected={valid_mask_np.shape}"
+                )
+            if profile is not None:
+                for key, value in result.stats.items():
+                    if isinstance(value, (int, float)):
+                        profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
         images: list[np.ndarray] = []
         valids: list[np.ndarray] = []
         samples: list[FiberStripSample] = []
@@ -1641,15 +1669,8 @@ class FiberStrip2DLoader:
             line_xy = _as_numpy_float32(line_xy_t)
             control_point_xy = _as_numpy_float32(control_point_xy_t)
             coords_zyx = coords_zyx_np[offset_index]
-            valid_mask = valid_mask_np[offset_index]
-            with _ProfileBlock(profile, "volume_sample"):
-                result = source.record.sampler.sample_coords(coords_zyx, valid_mask)
-                image = result.image
-                sampled_valid = result.valid_mask
-                if profile is not None:
-                    for key, value in result.stats.items():
-                        if isinstance(value, (int, float)):
-                            profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
+            image = images_np[offset_index]
+            sampled_valid = valids_np[offset_index]
             sample = FiberStripSample(
                 record_index=source.record_index,
                 fiber_path=str(source.record.fiber.path) if source.record.fiber.path is not None else "",
@@ -1767,49 +1788,119 @@ class FiberStrip2DLoader:
         record_indices: list[int] = []
         cp_indices: list[int] = []
         fiber_paths: list[str] = []
+
+        def report_skip(current_sample_index: int, exc: ValueError) -> None:
+            self._load_batch_skipped_samples += 1
+            if self._load_batch_skipped_samples <= 10:
+                print(
+                    "fiber_trace_2d: skipping invalid training sample "
+                    f"sample_index={current_sample_index} reason={exc}",
+                    flush=True,
+                )
+            elif self._load_batch_skipped_samples == 11:
+                print(
+                    "fiber_trace_2d: further invalid training sample skip messages suppressed",
+                    flush=True,
+                )
+
+        def build_candidate(raw_sample_index: int) -> tuple[
+            int,
+            int,
+            dict[str, float],
+            tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray] | None,
+            ValueError | None,
+        ]:
+            current_sample_index = self._bounded_sample_index(raw_sample_index, sample_index_limit)
+            local_profile: dict[str, float] = {} if profile is not None else {}
+            try:
+                result = self.build_sample(
+                    current_sample_index,
+                    sample_mode=sample_mode,
+                    profile=local_profile if profile is not None else None,
+                    apply_image_augmentation=apply_image_augmentation,
+                )
+            except ValueError as exc:
+                return raw_sample_index, current_sample_index, local_profile, None, exc
+            return raw_sample_index, current_sample_index, local_profile, result, None
+
         try:
-            sample_index = int(start_sample_index)
+            next_raw_to_submit = int(start_sample_index)
+            next_raw_to_consume = int(start_sample_index)
             max_attempts = max(batch_size * 100, batch_size + 1000)
             attempts = 0
-            while len(images) < batch_size and attempts < max_attempts:
-                attempts += 1
-                raw_sample_index = sample_index
-                current_sample_index = self._bounded_sample_index(raw_sample_index, sample_index_limit)
-                sample_index += 1
-                try:
-                    (
-                        sample_records,
-                        sample_images,
-                        sample_coords,
-                        sample_valids,
-                    ) = self.build_sample(
-                        current_sample_index,
-                        sample_mode=sample_mode,
-                        profile=profile,
-                        apply_image_augmentation=apply_image_augmentation,
-                    )
-                except ValueError as exc:
-                    self._load_batch_skipped_samples += 1
-                    if self._load_batch_skipped_samples <= 10:
-                        print(
-                            "fiber_trace_2d: skipping invalid training sample "
-                            f"sample_index={current_sample_index} reason={exc}",
-                            flush=True,
+            worker_count = min(max(1, int(self.config.loader_workers)), max(1, batch_size), max_attempts)
+            pending: dict[Future[Any], int] = {}
+            outcomes: dict[
+                int,
+                tuple[
+                    int,
+                    dict[str, float],
+                    tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray] | None,
+                    ValueError | None,
+                ],
+            ] = {}
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+            try:
+                while len(images) < batch_size and (pending or attempts < max_attempts):
+                    while len(pending) < worker_count and attempts < max_attempts:
+                        raw_sample_index = next_raw_to_submit
+                        next_raw_to_submit += 1
+                        attempts += 1
+                        future = executor.submit(build_candidate, raw_sample_index)
+                        pending[future] = raw_sample_index
+                    if not pending:
+                        break
+                    done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        raw_sample_index = pending.pop(future)
+                        (
+                            returned_raw,
+                            current_sample_index,
+                            local_profile,
+                            result,
+                            skip_exc,
+                        ) = future.result()
+                        if returned_raw != raw_sample_index:
+                            raise RuntimeError("internal load_batch raw sample index mismatch")
+                        outcomes[raw_sample_index] = (
+                            current_sample_index,
+                            local_profile,
+                            result,
+                            skip_exc,
                         )
-                    elif self._load_batch_skipped_samples == 11:
-                        print(
-                            "fiber_trace_2d: further invalid training sample skip messages suppressed",
-                            flush=True,
-                        )
-                    continue
-                first = sample_records[0]
-                all_samples.extend(sample_records)
-                images.append(sample_images)
-                coords.append(sample_coords)
-                valids.append(sample_valids)
-                record_indices.append(first.record_index)
-                cp_indices.append(first.control_point_index)
-                fiber_paths.append(first.fiber_path)
+                    while len(images) < batch_size and next_raw_to_consume in outcomes:
+                        (
+                            current_sample_index,
+                            local_profile,
+                            result,
+                            skip_exc,
+                        ) = outcomes.pop(next_raw_to_consume)
+                        next_raw_to_consume += 1
+                        if skip_exc is not None:
+                            report_skip(current_sample_index, skip_exc)
+                            _merge_profile(profile, local_profile)
+                            continue
+                        if result is None:
+                            raise RuntimeError("internal load_batch missing sample result")
+                        _merge_profile(profile, local_profile)
+                        (
+                            sample_records,
+                            sample_images,
+                            sample_coords,
+                            sample_valids,
+                        ) = result
+                        first = sample_records[0]
+                        all_samples.extend(sample_records)
+                        images.append(sample_images)
+                        coords.append(sample_coords)
+                        valids.append(sample_valids)
+                        record_indices.append(first.record_index)
+                        cp_indices.append(first.control_point_index)
+                        fiber_paths.append(first.fiber_path)
+                for future in pending:
+                    future.cancel()
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
             if len(images) < batch_size:
                 raise ValueError(
                     "could not assemble a full fiber_trace_2d batch after "

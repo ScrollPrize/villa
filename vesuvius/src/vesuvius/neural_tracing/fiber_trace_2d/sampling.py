@@ -27,6 +27,11 @@ class CoordinateSampler:
     def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
         raise NotImplementedError
 
+    def sample_coord_batch(
+        self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
+    ) -> CoordinateSampleResult:
+        return _sample_coord_batch_flattened(self, coords_zyx_base, valid_mask)
+
     def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> dict[str, Any]:
         result = self.sample_coords(coords_zyx_base, valid_mask)
         stats = dict(result.stats)
@@ -38,6 +43,43 @@ class CoordinateSampler:
         self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
     ) -> list[ZarrChunkRequest]:
         raise NotImplementedError
+
+
+def _sample_coord_batch_flattened(
+    sampler: CoordinateSampler,
+    coords_zyx_base: np.ndarray,
+    valid_mask: np.ndarray,
+) -> CoordinateSampleResult:
+    coords = np.asarray(coords_zyx_base, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if coords.ndim != 4 or coords.shape[-1] != 3:
+        raise ValueError("coords_zyx_base must have shape B,H,W,3")
+    if valid.shape != coords.shape[:3]:
+        raise ValueError("valid_mask must have shape B,H,W")
+    batch, height, width = (int(v) for v in coords.shape[:3])
+    flat_coords = np.ascontiguousarray(coords.reshape(batch * height, width, 3))
+    flat_valid = np.ascontiguousarray(valid.reshape(batch * height, width))
+    result = sampler.sample_coords(flat_coords, flat_valid)
+    image = np.asarray(result.image, dtype=np.float32)
+    sampled_valid = np.asarray(result.valid_mask, dtype=bool)
+    if image.shape != (batch * height, width):
+        raise ValueError(
+            "batched coordinate sampler returned incompatible image shape: "
+            f"shape={image.shape} expected={(batch * height, width)}"
+        )
+    if sampled_valid.shape != (batch * height, width):
+        raise ValueError(
+            "batched coordinate sampler returned incompatible valid-mask shape: "
+            f"shape={sampled_valid.shape} expected={(batch * height, width)}"
+        )
+    stats = dict(result.stats)
+    stats["batch_patches"] = batch
+    stats["batch_mode_flattened"] = 1
+    return CoordinateSampleResult(
+        image=image.reshape(batch, height, width),
+        valid_mask=sampled_valid.reshape(batch, height, width),
+        stats=stats,
+    )
 
 
 def _coords_zyx_base_to_xyz(coords_zyx_base: np.ndarray) -> np.ndarray:

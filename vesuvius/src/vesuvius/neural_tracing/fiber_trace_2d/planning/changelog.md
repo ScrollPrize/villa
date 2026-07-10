@@ -2,6 +2,9 @@
 
 ## 2026-07-10
 
+- Batched 2D strip-z image loading through `CoordinateSampler.sample_coord_batch`
+  and added `loader_workers` CP-level parallel `load_batch` construction with
+  deterministic accepted-sample ordering.
 - Batched 2D strip training sample augmentation across strip-z offsets:
   sparse line/CP lookup now uses direct batched bilinear gather, coordinate
   augmentation stacks fused maps, and post-load value augmentation runs on the

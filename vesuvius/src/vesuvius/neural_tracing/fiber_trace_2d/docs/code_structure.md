@@ -56,6 +56,10 @@ The important behavior is:
 `sampling.py`
 
 - Defines the `CoordinateSampler` interface used by the loader.
+- `CoordinateSampler.sample_coord_batch` loads a stack of coordinate patches
+  and returns `[patches,H,W]` image and valid-mask arrays. The default
+  implementation flattens `[patches,H,W,3]` into one larger coordinate image,
+  calls ordinary `sample_coords` once, and reshapes back.
 - `Vc3dCoordinateSampler` is the production sampler:
   - opens local paths with `vc.volume.Volume.open`;
   - converts `s3://bucket/key` to the matching public HTTPS URL;
@@ -100,8 +104,10 @@ The important behavior is:
   across strip-z offsets with identical augmentation params.
 - Training `build_sample` batches compatible strip-z offset coordinate
   augmentation by stacking `backward_map_xy` tensors and running dense
-  coordinate/valid-mask sampling over the stack. VC3D image sampling remains the
-  per-patch I/O boundary.
+  coordinate/valid-mask sampling over the stack. It then sends the whole
+  strip-z stack through `CoordinateSampler.sample_coord_batch`, so normal VC3D
+  loading is one flattened coordinate-sampling call per CP sample instead of
+  one call per strip-z offset.
 - Value augmentation runs as torch tensor operations on the configured device:
   brightness, contrast, gamma, noise, and separable Gaussian blur. Training
   `build_sample` applies value augmentation to the loaded image stack, while
@@ -272,6 +278,10 @@ Top-level keys used by `load_config`:
 - `prefetch_sampler_workers`: dependency/sampler producer-worker count for
   prefetch. This limits CPU-side CP-local source generation separately from
   download concurrency.
+- `loader_workers`: CP-sample worker count for `load_batch`. The default is
+  the logical CPU count. Set `loader_workers: 1` for serial debugging. Parallel
+  workers evaluate candidates concurrently, but accepted batch output remains
+  in deterministic sample-index order.
 - `volume_cache_dir`: optional cache directory for remote volume chunks.
 - `volume_cache_offline`: passed to the Vesuvius Zarr cache opener.
 - `volume_cache_retry_seconds`: passed to the Vesuvius Zarr cache opener.
@@ -482,6 +492,12 @@ augmentation is enabled, that source strip is oversized for the configured
 augmentation envelope, output pixels map into it, the volume is sampled at final
 augmented coordinates, and value augmentation is applied afterward.
 
+For each accepted CP sample, all configured strip-z offsets are sampled through
+one sampler batch call. With the current VC3D path this uses flattened explicit
+coordinate sampling: the stack is reshaped into one larger 2D coordinate image
+for `Volume.sample_coords(..., blocking=True)` and reshaped back afterward.
+This changes request grouping, not sampled values.
+
 Each `FiberStripSample` also stores `line_xy` and `control_point_xy` in final
 output-pixel coordinates after geometric augmentation. Training labels and
 debug overlays use those coordinates directly.
@@ -507,6 +523,10 @@ If one deterministic sample cannot build its CP-local Lasagna normal window
 for data reasons such as `grad_mag == 0`, `load_batch` skips it and advances
 through following deterministic sample indices until the requested number of
 control-point samples is loaded.
+
+`load_batch` can evaluate CP candidates in parallel via `loader_workers`.
+Results are consumed by raw deterministic sample index, so changing
+`loader_workers` should affect latency but not the accepted output sequence.
 
 Images are normalized per patch over valid pixels. Invalid pixels are set to
 zero after normalization.

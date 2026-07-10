@@ -1,138 +1,126 @@
-# Task Plan: Batched Strip Augmentation And Line Mapping
+# Task Plan: Parallel And Batched Loader I/O
 
 ## Implementation
 
-1. Add batched map helpers in `augmentation.py`.
-   - Keep `StripAugmentTransform` as the per-parameter owner of concrete
-     `backward_map_xy` and `forward_map_xy`.
-   - Add a helper to stack a sequence of transform maps into:
-     - `backward_maps_xy`: `[B, Hout, Wout, 2]`;
-     - `forward_maps_xy`: `[B, Hsrc, Wsrc, 2]`.
-   - Validate that maps in one stack have compatible shapes/device/dtype.
-   - Do not introduce formula-based runtime mapping as a fallback.
+1. Add loader worker configuration.
+   - Add `loader_workers` to `FiberStrip2DConfig`.
+   - Parse optional JSON key `loader_workers`.
+   - Default value: logical core count from `os.cpu_count()`; clamp to at least
+     `1`.
+   - Keep `loader_workers=1` as the deterministic single-thread debugging mode.
+   - Document that this is CP-sample parallelism, not GPU/model parallelism.
 
-2. Replace sparse point `grid_sample` with batched bilinear gather.
-   - Add `sample_xy_maps_bilinear(maps_xy, points_xy, valid_lengths=None)`.
-   - Input shape should support padded point tensors:
-     - maps: `[B, H, W, 2]`;
-     - points: `[B, N, 2]`;
-     - optional lengths/mask for ragged line lengths.
-   - Compute `x0/x1/y0/y1`, gather four map values, blend weights, and return
-     `[B, N, 2]`.
-   - Mark points outside the source-map bounds as non-finite or return a valid
-     mask so downstream filtering remains deterministic.
-   - Rewire `StripAugmentTransform.source_to_output_points(...)` to use the
-     same gather helper for the single-transform case.
+2. Add sampler batch API.
+   - Extend `CoordinateSampler` with:
+     `sample_coord_batch(coords_zyx_base, valid_mask)`.
+   - Expected input shape: `[B, H, W, 3]` and `[B, H, W]`.
+   - Expected output shape: image `[B, H, W]`, valid `[B, H, W]`, merged stats.
+   - Default implementation should call a shared flattening helper first if
+     the concrete sampler supports ordinary `sample_coords`.
+   - Stats should include enough information to preserve existing profile
+     counters by summing numeric per-call values.
 
-3. Batch line/control-point mapping per source sample.
-   - In `FiberStrip2DLoader.build_sample`, build all strip-z offset params and
-     transforms before constructing patches.
-   - Group offsets by identical `FiberStripAugmentParams` so existing reuse
-     remains intact.
-   - For each unique params group, map the source line and CP once; for all
-     unique params in a source sample, use one batched gather where shapes
-     match.
-   - Store mapped `(line_xy, control_point_xy)` by params and pass them into
-     patch construction as today.
-   - Keep line/CP filtering after lookup, but implement it as batched mask work
-     where practical. If per-line compaction remains per patch, profile it
-     separately so it is not confused with map lookup.
+3. Implement flattened single-call batch loading.
+   - Add helper:
+     - flatten coords `[B,H,W,3]` to `[B*H,W,3]` or `[B,H*W,3]`;
+     - flatten valid `[B,H,W]` accordingly;
+     - call `sample_coords(...)` once;
+     - reshape returned image/valid back to `[B,H,W]`.
+   - Prefer `[B*H, W, 3]` because it preserves row-like layout and avoids one
+     very long row.
+   - Validate returned shape and fail clearly if a sampler returns incompatible
+     output.
+   - This is allowed because coordinate sampling is value-by-coordinate; the
+     request image shape should not change values, only performance/chunk
+     traversal behavior.
 
-4. Batch coordinate augmentation across offsets.
-   - Add a batched coordinate-resampling helper that accepts:
-     - coords: `[B, Hsrc, Wsrc, 3]`;
-     - valid masks: `[B, Hsrc, Wsrc]`;
-     - backward maps: `[B, Hout, Wout, 2]`.
-   - Use one batched `grid_sample` for coordinates and one for valid masks.
-   - In `build_sample`, create offset grids for all offsets first, stack them,
-     apply batched coordinate augmentation for augmented patches, then split the
-     result back for VC3D image loading.
-   - Preserve the unaugmented path; it may simply stack and pass through without
-     geometric resampling.
+4. Use native VC3D support if available.
+   - Check whether current `Volume.sample_coords(...)` accepts `[B,H,W,3]` or
+     other native batched shape.
+   - If supported, use native batch mode.
+   - If not supported, use the flattened single-call path.
+   - Keep a final explicit loop fallback only for test/fake samplers that cannot
+     support flattening, and make that fallback visible in stats.
 
-5. Keep VC3D volume sampling as the explicit I/O boundary.
-   - Check whether the current sampler interface supports batched coordinate
-     arrays. If not, keep `sample_coords(...)` in a per-patch loop.
-   - Make sure all torch-to-NumPy conversion for coordinates happens once per
-     patch at that boundary, not before batched coordinate work.
-   - Do not add a separate image sampling path.
+5. Wire `build_sample` to sampler batch loading.
+   - After batched coordinate augmentation, call
+     `source.record.sampler.sample_coord_batch(coords_zyx_np, valid_mask_np)`.
+   - Remove the per-strip-z `sample_coords(...)` loop for normal samplers.
+   - Split returned images/valids back while constructing `FiberStripSample`
+     metadata.
+   - Preserve per-patch value augmentation and final sample order.
 
-6. Batch value augmentation after image loading.
-   - Extend `apply_value_augmentation` or add a batched wrapper for
-     `[B, H, W]` / `[B, 1, H, W]` tensors.
-   - Apply brightness/contrast/gamma/noise/blur across the image stack on the
-     configured augmentation device.
-   - Preserve per-patch augmentation params. For scalar params, use broadcasted
-     tensors over `B`; for blur, group by sigma when needed or apply a batched
-     kernel if all sigmas can be handled together without changing behavior.
-   - Keep deterministic noise seeds per patch.
+6. Parallelize `load_batch` across CP samples.
+   - Use `ThreadPoolExecutor(max_workers=config.loader_workers)`.
+   - Submit one `build_sample(...)` task per requested CP sample slot.
+   - Store results by original slot index so output order is exactly the same
+     as serial loading.
+   - Preserve invalid-sample skipping semantics:
+     - each slot should keep advancing through deterministic sample indices
+       until it finds a valid sample;
+     - skipped invalid data remains a skip, not a fatal error;
+     - programming/infrastructure exceptions remain fatal.
+   - Make sure profiling aggregates stats from worker results deterministically
+     after futures complete.
 
-7. Update profiling to show where batching helps.
-   - Split current aggregate loader timing into at least:
-     - `map_build`;
-     - `line_lookup`;
-     - `line_filter`;
-     - `coord_aug_batch`;
-     - `volume_sample`;
-     - `value_aug_batch`.
-   - Keep the existing summary columns if required by callers, but record the
-     finer-grained keys so the next profile can distinguish lookup cost from
-     filtering/compaction and NumPy/VC3D boundaries.
+7. Keep cache loading parallel through CP workers.
+   - Because `build_sample(...)` includes descriptor lookup, strip-coordinate
+     cache load, cache miss source construction, coordinate augmentation, and
+     image sampling, CP-level parallelism also parallelizes cache loading.
+   - Do not introduce separate cache-specific threads unless profiling shows
+     CP-level parallelism is insufficient.
 
-8. Preserve runner/debug behavior.
-   - `augment-vis`, `dir-vis`, `line-trace-vis`, benchmark/profile/load-only,
-     and training must continue to use the same shared loader path.
-   - Single-sample debug calls may use a batch size of one through the same
-     batched helpers rather than a separate implementation.
+8. Profile output updates.
+   - Add/record `batch_sample_parallel` or equivalent aggregate if useful.
+   - Preserve existing profile table columns.
+   - Add sampler stats indicating whether batch loading used:
+     - native batch;
+     - flattened single-call batch;
+     - loop fallback.
 
 ## Spec Update
 
-Update `planning/specs.md` to add:
+Update `planning/specs.md` to state:
 
-- Runtime geometric augmentation work should be batched across strip-z offsets
-  and patches where compatible.
-- Sparse line/CP mapping must use direct bilinear gather against
-  `forward_map_xy`; tiny `grid_sample` calls for sparse point lists are not the
-  intended implementation.
-- Coordinate augmentation should stack `backward_map_xy` tensors and run
-  batched dense sampling.
-- Value augmentations after VC3D image loading should run as batched tensor
-  operations when possible.
-- VC3D coordinate sampling remains the external I/O boundary unless the sampler
-  exposes a true batched coordinate API.
+- Loader image sampling should use sampler-level batch loading for strip-z
+  patch stacks.
+- Flattening `[B,H,W]` patch stacks into one larger coordinate image is
+  functionally valid because sampling is explicit-coordinate based; only
+  performance/chunk traversal may change.
+- `load_batch` may parallelize CP samples with `loader_workers`, defaulting to
+  logical CPU count, while preserving deterministic output order and skipping
+  behavior.
 
 ## Docs Updates
 
 Update `docs/code_structure.md` to describe:
 
-- Batched transform-map stacking.
-- Batched sparse line/CP gather.
-- Batched coordinate augmentation.
-- The remaining per-patch VC3D image-sampling boundary.
-- Batched post-load image/value augmentation.
+- `CoordinateSampler.sample_coord_batch`.
+- VC3D native/flattened/fallback batch modes.
+- `loader_workers` CP-sample parallelism and deterministic ordering.
 
 Update `planning/changelog.md`, `planning/status.md`, and
 `planning/task_log.md` for this current task only.
 
 ## Tests
 
-- Unit-test batched bilinear gather against the single-map lookup on
-  representative affine and smooth transforms.
-- Unit-test out-of-bounds point handling for batched line/CP lookup.
-- Unit-test that `build_sample` maps line/CP data through the batched helper
-  rather than one tiny sparse `grid_sample` per patch.
-- Unit-test batched coordinate augmentation equivalence to the existing
-  per-patch path on fake/local arrays.
-- Unit-test batched value augmentation equivalence for deterministic params and
-  seeds where exact equality is expected.
-- Keep existing loader, augment-vis, deterministic ordering, and cache tests.
+- Unit-test flattened sampler batch loading against repeated per-patch
+  `sample_coords` on the fake NumPy sampler.
+- Unit-test `build_sample` calls sampler batch API once for the strip-z stack.
+- Unit-test `load_batch` preserves deterministic output order with
+  `loader_workers > 1`.
+- Unit-test `loader_workers` default is logical CPU count and explicit
+  `loader_workers=1` is accepted.
+- Unit-test invalid-sample skip behavior remains deterministic under parallel
+  loading, if existing test harness makes this practical.
+- Keep existing loader, batching, augment, cache, and deterministic-order tests.
 
 ## Validation
 
 - Run compile checks for touched Python files.
 - Run focused pytest:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-- Run the local profile command before and after implementation when possible:
+- Run local warm-profile comparison when available:
   `PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.train $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --profile`
-- Compare at minimum `line_lookup`, `line_filter`, `coord_aug_batch`, and
-  `value_aug_batch` timing before/after.
+- Compare at minimum `load`, `cache`, `coord`, and total ms/patch for warm
+  cached steps.
