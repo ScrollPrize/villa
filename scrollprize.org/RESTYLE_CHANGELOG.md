@@ -400,6 +400,13 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - ID11 fiber cross-sections (image2+3) switched from grouped stack to side-by-side pair.
 **Files:** `docs/37_2026_open_problems.md`, `src/css/chrome.css`.
 
+## C46 — open problems: "Open problem" takeaway boxes
+
+**Why:** owner wants each article section's core problem statement to hit at a glance — starting from the ink-recovery caveat ("recovered PHerc. 1667's text, but not guaranteed everywhere"), which deserved a box of its own.
+- New admonition variant `.vc-problem` (chrome.css): same family as the help callouts, but ember label + icon, 3px edge, faint accent wash — unmistakably a problem statement.
+- Four boxes, one per major section, each distilling that section's takeaway (owner-reviewed wording): §1 Scanning — compressed regions leave the scanner degraded, sub-micron whole-scroll scans impractical, limiting pipeline stage unknown scroll-by-scroll; §2 Unwrapping — no fully automatic complete trace; label quality one of the main bottlenecks; §3 Ink — the verbatim PHerc. 1667 caveat (model links kept as following prose); §4 Data scale — cloud-native or impractical; infrastructure determines what research is possible.
+**Files:** `docs/37_2026_open_problems.md`, `src/css/chrome.css`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

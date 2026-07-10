@@ -196,6 +196,12 @@ Small regions can be scanned at higher resolution. Full scrolls cannot yet be sc
 
 Current failures have to be read carefully. Ink not recovered from a scroll doesn't necessarily mean the signal isn't there. It may be absent, or it may be present but not yet exploitable by the current surface placement, labels, model architecture, phase retrieval, or training data. Right now **we do not always know which part of the pipeline is limiting us** and the limiting factor is to be assessed on a scroll-by-scroll basis.
 
+<Admonition type="danger" icon="⚠️" title="Open problem" className="vc-problem">
+
+Some regions leave the scanner already degraded: densely compressed papyrus scatters the beam into haze that no downstream algorithm may fully undo — and scanning whole scrolls at sub-micron resolution is not yet practical. When ink fails to appear, we do not always know which part of the pipeline is limiting us; the limiting factor has to be assessed scroll by scroll.
+
+</Admonition>
+
 ***
 ## 2\. Unwrapping: turning disconnected voxels into a surface
 After scanning, we have voxels, packed together into a *volume* – a large 3D cuboid. The volume does not tell us which voxels belong to the same sheet. It does not tell us where one wrap — one full revolution of the papyrus around the roll — ends and another begins. It does not provide a graph of connectivity. And it does not tell us whether two distant points are part of the same papyrus layer. (This post uses "wrap," "winding," "sheet," and "layer" more or less interchangeably for the same idea: one continuous turn of the papyrus as it spirals from the outside of the roll toward the center.)
@@ -414,6 +420,12 @@ This creates a subtle problem: the model isn't always learning the physical feat
 
 Why did we move forward with these datasets instead of fixing them first? The labels were not bad; they were good enough to support major progress in the previous phase of the project. However, as the pipeline becomes more ambitious, label quality has started to become one of the limiting factors.
 
+<Admonition type="danger" icon="⚠️" title="Open problem" className="vc-problem">
+
+No method yet traces a complete, correct surface through a scroll automatically — and the labels used to train surface models are themselves approximate. The model isn't always learning the physical feature itself, but an imperfect representation of it: **label quality is now one of the main unwrapping bottlenecks.**
+
+</Admonition>
+
 <Figure
   variant="pair"
   card
@@ -499,7 +511,13 @@ Row (a) shows the training labels, row (b) predictions on a training segment (ma
 
 A concrete record of this loop exists in the six PHerc.1667-iteration-0 through \-5 checkpoints released alongside the project. Each of the six shares an identical architecture (a [ResNet3D-50](https://arxiv.org/abs/1711.09577) backbone initialized from [Kinetics-700](https://arxiv.org/abs/1907.06987) weights, feeding a 2D U-Net decoder) and an identical training budget (12,396 optimizer steps), differing only in how much pseudo-labeled data it was fine-tuned on — from a cross-segment baseline at iteration 0 up to the densest available label set, 33,061 tiles, at iteration 5\. Kinetics-700 is, on its face, an odd source for this: it's a video-action-recognition dataset, built for recognizing human activities in video clips, with nothing obviously to do with CT scans or ancient papyrus. The connection is architectural rather than topical — a video clip and a CT volume are both fundamentally 3D data (two spatial axes plus a third axis, time for one and depth for the other), so a 3D-convolutional network pretrained on one transfers surprisingly well to the other. All six checkpoints are released on Hugging Face: [iteration-0](https://huggingface.co/scrollprize/PHerc.1667-iteration-0), [iteration-1](https://huggingface.co/scrollprize/PHerc.1667-iteration-1), [iteration-2](https://huggingface.co/scrollprize/PHerc.1667-iteration-2), [iteration-3](https://huggingface.co/scrollprize/PHerc.1667-iteration-3), [iteration-4](https://huggingface.co/scrollprize/PHerc.1667-iteration-4), and [iteration-5](https://huggingface.co/scrollprize/PHerc.1667-iteration-5).
 
-This process helped recover readable text in PHerc. 1667\. But it is not guaranteed to work everywhere. In some scrolls, predictions improve and then plateau. In others, current models show little or no convincing ink. The current ink detection model, which works on 2.4 µm data, is [https://huggingface.co/scrollprize/ink\_canonical\_2um](https://huggingface.co/scrollprize/ink_canonical_2um), inference code: [https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized\_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)
+<Admonition type="danger" icon="⚠️" title="Open problem" className="vc-problem">
+
+This process helped recover readable text in PHerc. 1667\. **But it is not guaranteed to work everywhere.** In some scrolls, predictions improve and then plateau. In others, current models show little or no convincing ink.
+
+</Admonition>
+
+The current ink detection model, which works on 2.4 µm data, is [https://huggingface.co/scrollprize/ink\_canonical\_2um](https://huggingface.co/scrollprize/ink_canonical_2um), inference code: [https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized\_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)
 
 We have evidence that working on 1.1 µm data yields cleaner results than 2.4 µm data. But scanning at high resolution is impractical.
 
@@ -533,6 +551,12 @@ A full-resolution scroll volume is huge — too huge to just download to a lapto
 One important format is **[OME-Zarr](https://doi.org/10.1038/s41592-021-01326-w)**, which stores large multidimensional arrays in chunks and often at multiple resolutions, letting software read only the region it needs rather than loading an entire scroll.
 
 Getting the data format right turns out to matter as much as the algorithms built on top of it, because it determines what research is practical at all. A model that requires copying tens of terabytes locally shuts most contributors out before they start. An interface that can't stream small regions interactively leaves annotators waiting instead of working. And predictions that aren't saved in formats VC3D can inspect are hard to validate.
+
+<Admonition type="danger" icon="⚠️" title="Open problem" className="vc-problem">
+
+A full-resolution scroll is too large to download and work on locally. Tools and models need to be cloud-native from the start — streaming chunks, tiled inference, inspectable outputs: **the data infrastructure determines what research is practical at all.**
+
+</Admonition>
 
 Useful community contributions should therefore be cloud-native from the beginning:
 

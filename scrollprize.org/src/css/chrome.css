@@ -761,6 +761,21 @@ html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
   fill: currentColor;
 }
 
+/* "Open problem" variant: each article section's core takeaway. Same family
+   as the help callouts but unmistakably a problem statement — ember label,
+   heavier edge, and a barely-there accent wash (flat, not a gradient). */
+.theme-admonition.vc-problem {
+  border-left-width: 3px;
+  background: color-mix(in srgb, var(--vc-accent) 4%, var(--vc-surface));
+}
+.theme-admonition.vc-problem [class*="admonitionHeading"] {
+  color: var(--vc-accent);
+}
+.theme-admonition.vc-problem [class*="admonitionIcon"] {
+  filter: none;
+  opacity: 1;
+}
+
 /* Links inside admonitions follow body-link discipline (fallback for alerts
    outside .markdown; inside .markdown §6 wins on specificity anyway). */
 .alert a {
