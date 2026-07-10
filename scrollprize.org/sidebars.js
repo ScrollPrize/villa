@@ -99,7 +99,6 @@ const sidebars = {
         { type: 'doc', id: 'submissions_closed' },
       ],
     },
-    { type: 'doc', id: 'jobs' },
   ],
 };
 

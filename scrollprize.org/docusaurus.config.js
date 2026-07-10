@@ -202,7 +202,6 @@ const config = {
                   label: "Donate",
                   href: "https://donate.stripe.com/aEUg101vt9eN8gM144",
                 },
-                { label: "Jobs", to: "/jobs" },
               ],
             },
             {
