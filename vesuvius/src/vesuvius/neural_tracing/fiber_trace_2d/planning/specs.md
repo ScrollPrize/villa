@@ -102,8 +102,9 @@
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`.
 - V0.1 patch line-tracing inspection is exported with `--line-trace-vis --checkpoint <snapshot> --export-dir <dir>`.
 - Line-tracing inspection uses the same deterministic `--sample-index` ordering as training, prefetch, and augment-vis, loads the center side-strip patch, runs the checkpointed direction model, decodes the Lasagna ambiguous two-cos-channel output, and traces from the transformed CP in both directions.
-- The line-tracing tracer bilinearly samples the decoded per-pixel direction field, flips sampled directions as needed to maintain forward/backward sign continuity, and steps in strip-pixel coordinates.
+- The line tracer bilinearly samples the decoded per-pixel direction field, flips sampled directions as needed to maintain forward/backward sign continuity, and steps in strip-pixel coordinates.
 - The line tracer stops when the next point would enter the configured receptive-field border margin, when the sampled direction is invalid, or when image validity around the bilinear sample is insufficient. By default the receptive-field margin is the configured model depth, matching the radius of the V0 stack of 3x3 convolutions; `--line-trace-rf-margin` can override it for inspection.
+- The default line-trace step is `4.0` strip-image pixels and can be overridden with `--line-trace-step`.
 - Line-tracing inspection writes `line_trace_vis.jpg` with the original transformed strip line and the direction-traced line, plus `line_trace_summary.txt` with sample/checkpoint metadata and trace settings.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.

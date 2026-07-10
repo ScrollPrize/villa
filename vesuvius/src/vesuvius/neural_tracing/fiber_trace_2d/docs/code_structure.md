@@ -138,8 +138,8 @@ The important behavior is:
   V0.1 patch line-tracing inspection. This mode loads the deterministic
   center side-strip patch for `--sample-index`, runs the checkpointed direction
   model, bilinearly traces the decoded direction field from the transformed CP
-  in both directions, and writes `line_trace_vis.jpg` plus
-  `line_trace_summary.txt`.
+  in both directions with a default 4 px trace step, and writes
+  `line_trace_vis.jpg` plus `line_trace_summary.txt`.
 
 `train.py`
 

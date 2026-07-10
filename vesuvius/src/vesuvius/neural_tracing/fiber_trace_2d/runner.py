@@ -595,7 +595,7 @@ def main() -> None:
     parser.add_argument("--augment-vis", action="store_true")
     parser.add_argument("--line-trace-vis", action="store_true")
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--line-trace-step", type=float, default=1.0)
+    parser.add_argument("--line-trace-step", type=float, default=4.0)
     parser.add_argument("--line-trace-rf-margin", type=float, default=None)
     args = parser.parse_args()
 

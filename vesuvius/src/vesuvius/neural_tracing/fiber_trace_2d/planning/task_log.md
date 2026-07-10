@@ -12,6 +12,7 @@
   - forward/backward sign continuity;
   - receptive-field margin stop before patch borders;
   - image-validity checks for sampled bilinear corners.
+- Changed the public line-trace CLI default step to `4.0` px.
 - Exported:
   - `line_trace_vis.jpg` with original strip line, traced line, and CP marker;
   - `line_trace_summary.txt` with sample/checkpoint/trace metadata.
