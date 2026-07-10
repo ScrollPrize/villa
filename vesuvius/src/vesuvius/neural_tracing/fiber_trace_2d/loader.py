@@ -1788,6 +1788,7 @@ class FiberStrip2DLoader:
         record_indices: list[int] = []
         cp_indices: list[int] = []
         fiber_paths: list[str] = []
+        batch_wall_start = time.perf_counter()
 
         def report_skip(current_sample_index: int, exc: ValueError) -> None:
             self._load_batch_skipped_samples += 1
@@ -1812,6 +1813,7 @@ class FiberStrip2DLoader:
         ]:
             current_sample_index = self._bounded_sample_index(raw_sample_index, sample_index_limit)
             local_profile: dict[str, float] = {} if profile is not None else {}
+            worker_start = time.perf_counter()
             try:
                 result = self.build_sample(
                     current_sample_index,
@@ -1820,7 +1822,13 @@ class FiberStrip2DLoader:
                     apply_image_augmentation=apply_image_augmentation,
                 )
             except ValueError as exc:
+                if profile is not None:
+                    local_profile["load_batch_worker"] = (
+                        time.perf_counter() - worker_start
+                    ) * 1000.0
                 return raw_sample_index, current_sample_index, local_profile, None, exc
+            if profile is not None:
+                local_profile["load_batch_worker"] = (time.perf_counter() - worker_start) * 1000.0
             return raw_sample_index, current_sample_index, local_profile, result, None
 
         try:
@@ -1909,6 +1917,10 @@ class FiberStrip2DLoader:
                 )
         finally:
             cache_stats = end_zarr_cache_trace()
+            if profile is not None:
+                profile["load_batch_wall"] = profile.get("load_batch_wall", 0.0) + (
+                    time.perf_counter() - batch_wall_start
+                ) * 1000.0
         return FiberStrip2DBatch(
             images=np.stack(images, axis=0)[:, :, None, :, :],
             coords_zyx=np.stack(coords, axis=0),

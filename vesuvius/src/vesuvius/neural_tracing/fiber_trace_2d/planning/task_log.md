@@ -24,12 +24,20 @@
   serial-equivalent.
 - Worker tasks collect local profile dicts; the main thread merges numeric
   timings/stats after deterministic consumption.
+- Added profile-only loader overlap counters:
+  - `load_batch_wall`: real wall time for the whole `load_batch` call;
+  - `load_batch_worker`: summed elapsed time inside accepted/skipped worker
+    candidate builds;
+  - profile table `tf`: `load_batch_worker / load_batch_wall`.
 
 ## Deviations
 
 - No native VC3D multi-dimensional batch API was used. The implemented runtime
   path is the planned flattened single-call batch path, with stats exposing
   `batch_mode_flattened`.
+- The stage columns under `loader_workers > 1` are intentionally summed worker
+  timings. They are useful for CPU/work accounting but are not wall timings;
+  the new `wall/work/tf` columns should be used to judge actual overlap.
 
 ## Validation
 
@@ -37,3 +45,5 @@
   passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
   passed: 91 tests.
+- After adding wall/work/threading-factor profiling, the same compile command
+  passed again and the focused pytest command passed again: 91 tests.

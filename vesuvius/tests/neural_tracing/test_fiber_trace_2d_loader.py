@@ -628,6 +628,8 @@ def test_loader_batch_profile_collects_stage_timings(tmp_path: Path) -> None:
         "line_coords",
         "volume_sample",
         "value_augmentation",
+        "load_batch_wall",
+        "load_batch_worker",
     ):
         assert key in profile
         assert profile[key] >= 0.0
@@ -644,6 +646,8 @@ def test_training_profile_splits_coord_cache_and_line(capsys: pytest.CaptureFixt
             "line_coords": 6.0,
             "coord_augmentation": 7.0,
             "volume_sample": 8.0,
+            "load_batch_wall": 10.0,
+            "load_batch_worker": 25.0,
         },
         {},
     )
@@ -656,9 +660,13 @@ def test_training_profile_splits_coord_cache_and_line(capsys: pytest.CaptureFixt
     assert stages["source_geom"] == 12.0
     assert stages["line"] == 6.0
     assert stages["coord_gen"] == 21.0
+    assert stages["loader_wall"] == 10.0
+    assert stages["loader_worker"] == 25.0
+    assert stages["loader_thread_factor"] == 2.5
     assert "cache" in output
     assert "source" in output
     assert "line" in output
+    assert "tf" in output
 
 
 def test_loader_skips_whole_fiber_with_out_of_volume_control_point(tmp_path: Path) -> None:
@@ -2357,6 +2365,8 @@ def test_training_benchmark_reports_patch_throughput_without_run_dir(tmp_path: P
     assert summary.patches == 6
     assert summary.patches_per_second > 0.0
     assert "coord_gen" in summary.stage_ms_per_patch
+    assert "loader_wall" in summary.stage_ms_per_patch
+    assert "loader_worker" in summary.stage_ms_per_patch
     assert not (tmp_path / "runs").exists()
 
 

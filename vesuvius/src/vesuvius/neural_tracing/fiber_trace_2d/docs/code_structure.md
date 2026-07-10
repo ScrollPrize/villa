@@ -527,6 +527,9 @@ control-point samples is loaded.
 `load_batch` can evaluate CP candidates in parallel via `loader_workers`.
 Results are consumed by raw deterministic sample index, so changing
 `loader_workers` should affect latency but not the accepted output sequence.
+In benchmark/profile output, `wall` is real `load_batch` wall time, `work` is
+summed per-candidate worker elapsed time, and `tf` is `work / wall`. The
+individual stage columns remain summed worker timings under parallel loading.
 
 Images are normalized per patch over valid pixels. Invalid pixels are set to
 zero after normalization.

@@ -198,6 +198,8 @@ def _stage_ms(profile: dict[str, float], key: str) -> float:
 
 
 def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dict[str, float]) -> dict[str, float]:
+    loader_wall = _stage_ms(loader_profile, "load_batch_wall")
+    loader_worker = _stage_ms(loader_profile, "load_batch_worker")
     descriptor = _stage_ms(loader_profile, "descriptor")
     coord_cache = _stage_ms(loader_profile, "strip_coord_cache")
     source_geom = (
@@ -213,6 +215,9 @@ def _benchmark_stage_totals(loader_profile: dict[str, float], train_profile: dic
         + line
     )
     return {
+        "loader_wall": loader_wall,
+        "loader_worker": loader_worker,
+        "loader_thread_factor": loader_worker / loader_wall if loader_wall > 0.0 else 0.0,
         "coord_gen": coord_gen,
         "descriptor": descriptor,
         "coord_cache": coord_cache,
@@ -230,11 +235,13 @@ def _print_profile_header() -> None:
     print(
         "fiber_trace_2d profile columns: "
         "batch=batch-index patches=CNN image patches "
-        "total/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch",
+        "total/wall/work/coord/desc/cache/source/line/coord_aug/load/img_aug/fw/bw_step=ms per patch "
+        "tf=loader worker-time/wall-time",
         flush=True,
     )
     print(
-        f"{'batch':>5} {'patches':>7} {'total':>9} {'coord':>9} {'desc':>9} "
+        f"{'batch':>5} {'patches':>7} {'total':>9} {'wall':>9} {'work':>9} {'tf':>6} "
+        f"{'coord':>9} {'desc':>9} "
         f"{'cache':>9} {'source':>9} {'line':>9} {'coord_aug':>9} "
         f"{'load':>9} {'img_aug':>9} {'fw':>9} {'bw_step':>9}",
         flush=True,
@@ -246,6 +253,9 @@ def _print_profile_row(batch_index: int, patch_count: int, elapsed_ms: float, st
     print(
         f"{int(batch_index):5d} {int(patch_count):7d} "
         f"{elapsed_ms / denom:9.2f} "
+        f"{stages.get('loader_wall', 0.0) / denom:9.2f} "
+        f"{stages.get('loader_worker', 0.0) / denom:9.2f} "
+        f"{stages.get('loader_thread_factor', 0.0):6.2f} "
         f"{stages.get('coord_gen', 0.0) / denom:9.2f} "
         f"{stages.get('descriptor', 0.0) / denom:9.2f} "
         f"{stages.get('coord_cache', 0.0) / denom:9.2f} "
@@ -270,6 +280,8 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
     if profile:
         print("fiber_trace_2d profile summary ms_per_patch:", flush=True)
         for key in (
+            "loader_wall",
+            "loader_worker",
             "coord_gen",
             "descriptor",
             "coord_cache",
@@ -282,6 +294,10 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
             "bw_step",
         ):
             print(f"  {key}={summary.stage_ms_per_patch.get(key, 0.0):.3f}", flush=True)
+        wall = summary.stage_ms_per_patch.get("loader_wall", 0.0)
+        worker = summary.stage_ms_per_patch.get("loader_worker", 0.0)
+        factor = worker / wall if wall > 0.0 else 0.0
+        print(f"  loader_thread_factor={factor:.3f}", flush=True)
 
 
 def run_benchmark(
@@ -316,6 +332,9 @@ def run_benchmark(
     stage_totals = {
         key: 0.0
         for key in (
+            "loader_wall",
+            "loader_worker",
+            "loader_thread_factor",
             "coord_gen",
             "descriptor",
             "coord_cache",
