@@ -2,6 +2,7 @@
 
 ## 2026-07-10
 
+- Added the V0.1 runner line-tracing inspection mode for tracing checkpointed direction predictions on one deterministic side-strip patch.
 - Added folded unoriented direction angle-error reporting in degrees for 2D fiber-strip train/test output.
 - Fixed prefetch `idx` progress semantics so it reports the cache-complete safe sample prefix rather than dependency-generation progress.
 - Added `prefetch_sampler_workers` to tune dependency producer concurrency separately from download worker concurrency.

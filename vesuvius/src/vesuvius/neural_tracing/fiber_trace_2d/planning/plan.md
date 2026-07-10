@@ -10,10 +10,7 @@
 
 # various details
 
-## strip-sampling self supervision metric & vis
-- 
-
-# V0 - semi-supervised direction & curvature pretraining
+# V0 - semi-supervised direction 
 
 a pretraining stage that does not require control points at all - but does benefit from lasagna normals
 - use vc3d strip based extraction to get the side-strip views of cps
@@ -25,6 +22,10 @@ a pretraining stage that does not require control points at all - but does benef
     - affine: rotate, skew, scale, flips
     - image: (constrast, brightness, gamma, blur, noise)
     - curve distortion: given the baseline fiber-strip coords - offset columns along y with some smooth field - e.g. a random offset every N rows, cubic interpolation between of the offsets
+    
+# V0.1 initial fiber refinement and extrapolation tooling
+- adding tooling to trace using the trained network dir output
+- or refine the segment between to cps
 
 # V1 - short refinement self-supervision
 

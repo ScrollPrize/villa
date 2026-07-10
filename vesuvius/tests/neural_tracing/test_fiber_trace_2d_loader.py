@@ -43,7 +43,11 @@ from vesuvius.neural_tracing.fiber_trace_2d.train import (
     prefetch_training,
     run_training,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.runner import _export_augment_contact_sheet
+from vesuvius.neural_tracing.fiber_trace_2d.runner import (
+    _bilinear_direction_sample,
+    _export_augment_contact_sheet,
+    _trace_direction_line,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
     build_side_strip_patch_grid,
@@ -153,6 +157,51 @@ def _test_sampler_factory(**kwargs):
 
 def _make_loader(config) -> FiberStrip2DLoader:
     return FiberStrip2DLoader(config, sampler_factory=_test_sampler_factory)
+
+
+def test_line_trace_bilinear_direction_sample_normalizes() -> None:
+    field = np.zeros((3, 3, 2), dtype=np.float32)
+    field[:, :, 0] = 2.0
+
+    sampled = _bilinear_direction_sample(field, np.asarray([1.25, 1.5], dtype=np.float32))
+
+    assert sampled is not None
+    assert np.allclose(sampled, [1.0, 0.0])
+
+
+def test_line_trace_horizontal_stops_at_margin() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    line = _trace_direction_line(
+        field,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=2.0,
+    )
+
+    assert np.allclose(line[:, 1], 4.0)
+    assert np.isclose(line[0, 0], 2.0)
+    assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_line_trace_keeps_ambiguous_direction_continuous() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    field[:, :4, 0] = -1.0
+
+    line = _trace_direction_line(
+        field,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert np.all(np.diff(line[:, 0]) > 0.0)
+    assert np.isclose(line[0, 0], 1.0)
+    assert np.isclose(line[-1, 0], 7.0)
 
 
 def test_fiber_parser_reuse(tmp_path: Path) -> None:

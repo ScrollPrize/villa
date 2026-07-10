@@ -1,21 +1,37 @@
-# Task Log: Report Direction Error In Degrees
+# Task Log: Tool1 Patch Line Tracing
 
-## Implementation Notes
+## Implemented
 
-- Added `direction_angle_error_degrees(...)` in `direction.py`.
-- The metric gathers the same CP-local supervised pixels as the MSE loss,
-  decodes predicted two-channel Lasagna ambiguous direction vectors, folds the
-  sign with `abs(dot)`, and reports errors in `0..90` degrees.
-- Training loss remains encoded-channel MSE.
-- Train/test TensorBoard scalar logs now include `angle_error_mean_deg`.
-- Console progress and final training output now include mean angle error in
-  degrees.
+- Added runner-only `--line-trace-vis` mode requiring `--checkpoint` and
+  `--export-dir`.
+- Added checkpoint loading for `FiberStripDirectionNet` using the saved training
+  config model depth/hidden-channel settings.
+- Added side-strip direction-field tracing helpers:
+  - decoded Lasagna ambiguous two-cos-channel output;
+  - bilinear direction sampling;
+  - forward/backward sign continuity;
+  - receptive-field margin stop before patch borders;
+  - image-validity checks for sampled bilinear corners.
+- Exported:
+  - `line_trace_vis.jpg` with original strip line, traced line, and CP marker;
+  - `line_trace_summary.txt` with sample/checkpoint/trace metadata.
+- Updated `planning/specs.md`, `docs/code_structure.md`, and
+  `planning/changelog.md`.
+- Added synthetic regression tests for direction sampling, border stopping, and
+  ambiguous direction sign continuity.
 
 ## Deviations
 
-- None.
+- No deviations from `task_plan.md`.
+- The broader worktree has unrelated/user edits in `planning/plan.md` and
+  `planning/todo.md`; they were left untouched.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/direction.py` passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py` passed with 57 tests.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
+  passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
+  passed: 60 tests.
+- Targeted whitespace check for touched files passed.
+- Full fiber_trace_2d whitespace check still reports pre-existing trailing
+  whitespace in `planning/plan.md`.

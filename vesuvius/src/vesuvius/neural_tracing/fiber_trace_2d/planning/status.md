@@ -1,10 +1,10 @@
-# Status: Report Direction Error In Degrees
+# Status: Tool1 Patch Line Tracing
 
-- [x] Read current direction/training code
-- [x] Replace `planning/task.md` for this task
-- [x] Replace `planning/task_plan.md` for this task
-- [x] Add degree-based direction metric
-- [x] Thread metric into train/test logging and console output
-- [x] Update specs/docs/changelog/task log
-- [x] Add focused tests
-- [x] Run focused validation commands
+- [x] Read `AGENTS.md` and `todo.md`.
+- [x] Copy the active todo item into `task.md`.
+- [x] Create `task_plan.md`.
+- [x] Implement runner line-tracing helpers and CLI.
+- [x] Update specs and docs.
+- [x] Add regression tests.
+- [x] Run validation commands.
+- [x] Replace `task_log.md` with current-task implementation notes.

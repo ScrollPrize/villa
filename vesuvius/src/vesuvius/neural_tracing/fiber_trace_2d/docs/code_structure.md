@@ -134,6 +134,12 @@ The important behavior is:
 - Its prefetch mode is sample-count oriented:
   `--prefetch --prefetch-samples <control-point-samples>`.
 - Prints augment-visualization timing rows and raw image stats.
+- Provides `--line-trace-vis --checkpoint <snapshot> --export-dir <dir>` for
+  V0.1 patch line-tracing inspection. This mode loads the deterministic
+  center side-strip patch for `--sample-index`, runs the checkpointed direction
+  model, bilinearly traces the decoded direction field from the transformed CP
+  in both directions, and writes `line_trace_vis.jpg` plus
+  `line_trace_summary.txt`.
 
 `train.py`
 
@@ -571,6 +577,12 @@ Export an augmentation contact sheet:
 
 ```bash
 PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.runner config.json --sample-index 0 --augment-vis --export-dir /tmp/fiber_trace_2d_aug
+```
+
+Export a line-tracing inspection image:
+
+```bash
+PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace_2d.runner config.json --sample-index 0 --line-trace-vis --checkpoint /path/to/current.pt --export-dir /tmp/fiber_trace_2d_trace
 ```
 
 Run V0 direction training:

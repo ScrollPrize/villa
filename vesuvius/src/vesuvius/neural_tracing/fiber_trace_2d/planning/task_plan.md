@@ -1,41 +1,54 @@
-# Task Plan: Report Direction Error In Degrees
+# Task Plan: Tool1 Patch Line Tracing
 
 ## Scope
 
-Add degree-based angular metrics for the existing V0 direction prediction path.
+Add a runner-only inspection mode for V0.1 line tracing. This does not alter
+training, prefetch, augmentation, sampling order, or model architecture.
 
 ## Plan
 
-- Add a helper in `direction.py` that computes folded unoriented angular error
-  in degrees from model outputs and `DirectionSupervision`.
-  - Gather predictions at the same CP-local supervised pixels used by the loss.
-  - Decode the two-channel Lasagna ambiguous encoding to unoriented direction
-    vectors using the existing decoder.
-  - Compare to `supervision.tangent_xy` with `abs(dot)` and report angles in
-    `0..90` degrees.
-- Extend `_compute_batch_loss(...)` to return angle metrics while keeping MSE
-  as the loss.
-- Log mean angle error in degrees to TensorBoard for train and test.
-- Print train/test angle error in degrees in console progress and final output.
-- Keep checkpoint metric selection unchanged unless explicitly requested.
+- Add direction-field tracing helpers in `runner.py`.
+  - Prepare the center side-strip patch with the same loader path used by
+    `--augment-vis`.
+  - Load a `FiberStripDirectionNet` checkpoint and run inference on the patch.
+  - Decode model output to strip-image direction vectors with the existing
+    Lasagna ambiguous two-cos-channel decoder.
+  - Bilinearly sample the decoded direction field at floating-point trace
+    positions.
+  - Align each sampled direction to the current tracing direction so the
+    ambiguous sign is continuous.
+  - Step in both directions from the transformed CP and stop at the configured
+    receptive-field border margin or invalid/non-finite direction samples.
+- Add CLI flags to `runner.py`.
+  - `--line-trace-vis` enables the tool.
+  - `--checkpoint <path>` supplies the trained snapshot.
+  - `--line-trace-step <px>` controls trace step length.
+  - `--line-trace-rf-margin <px>` optionally overrides the default margin
+    derived from the configured model depth.
+- Export inspection artifacts under `--export-dir`.
+  - `line_trace_vis.jpg`: raw patch with original line and traced line.
+  - `line_trace_summary.txt`: sample/checkpoint metadata and trace stats.
+- Keep the tool deterministic for a given config/checkpoint/sample index.
 
 ## Spec Update
 
-Update `planning/specs.md` to state that direction MSE remains the training
-loss and angle error in degrees is a reported metric.
+Update `planning/specs.md` with the V0.1 runner tool behavior, checkpoint
+requirement, line tracing stop rule, and exported files.
 
 ## Docs Updates
 
-Update `docs/code_structure.md` to document the degree metric.
+Update `docs/code_structure.md` to document the new runner mode and CLI flags.
 
 ## Testing
 
-- Add focused direction tests that perfect predictions produce near-zero degree
-  error and perpendicular predictions produce near-90 degree error.
+- Add focused helper tests using synthetic direction fields:
+  - straight horizontal tracing from the CP;
+  - sign-continuity through the ambiguous decoded directions;
+  - border margin stops before the patch edge.
 - Run:
-  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/direction.py`
+  - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
 
 ## Changelog
 
-Add a changelog entry because this changes public training/TensorBoard output.
+Add a changelog entry because this adds a public runner inspection mode.

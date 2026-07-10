@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     limit_augmentation_rows,
@@ -12,7 +13,15 @@ from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     random_combined_augmentation,
     resolve_torch_device,
 )
+from vesuvius.neural_tracing.fiber_trace_2d.direction import (
+    decode_lasagna_direction_xy,
+    line_cp_and_tangent_xy,
+)
 from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DLoader, load_config
+from vesuvius.neural_tracing.fiber_trace_2d.model import (
+    FiberStripDirectionModelConfig,
+    FiberStripDirectionNet,
+)
 
 
 def _to_u8_image(image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
@@ -57,6 +66,38 @@ def _draw_cp_crosshair(image: np.ndarray, cp_xy: np.ndarray | None) -> np.ndarra
     for start, end in segments:
         draw.line((start, end), fill=color, width=1)
     return np.asarray(pil, dtype=np.uint8)
+
+
+def _overlay_polyline_rgb(
+    image: np.ndarray,
+    line_xy: np.ndarray,
+    *,
+    color_rgba: tuple[int, int, int, int],
+    thickness: int = 1,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=-1)
+    coords = np.asarray(line_xy, dtype=np.float32)
+    if coords.ndim != 2 or coords.shape[1] != 2 or coords.shape[0] == 0:
+        return arr
+    finite = np.isfinite(coords).all(axis=1)
+    coords = coords[finite]
+    if coords.shape[0] == 0:
+        return arr
+    pil = Image.fromarray(arr, mode="RGB")
+    overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, mode="RGBA")
+    points = [(float(x), float(y)) for x, y in coords.tolist()]
+    if len(points) == 1:
+        x, y = points[0]
+        r = max(1, int(thickness))
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=color_rgba)
+    else:
+        draw.line(points, fill=color_rgba, width=max(1, int(thickness)), joint="curve")
+    return np.asarray(Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB"), dtype=np.uint8)
 
 
 def _draw_label_band(image: np.ndarray, label: str) -> np.ndarray:
@@ -109,6 +150,201 @@ def _write_contact_sheet(
         image_h, image_w = image.shape[:2]
         sheet[row * h : row * h + image_h, col * w : col * w + image_w] = image
     _write_jpg(path, sheet)
+
+
+def _inside_trace_margin(point_xy: np.ndarray, shape_hw: tuple[int, int], margin: float) -> bool:
+    x, y = float(point_xy[0]), float(point_xy[1])
+    height, width = (int(v) for v in shape_hw)
+    m = max(0.0, float(margin))
+    return m <= x <= (float(width - 1) - m) and m <= y <= (float(height - 1) - m)
+
+
+def _bilinear_direction_sample(
+    direction_xy: np.ndarray,
+    point_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+) -> np.ndarray | None:
+    field = np.asarray(direction_xy, dtype=np.float32)
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    point = np.asarray(point_xy, dtype=np.float32)
+    if point.shape != (2,) or not bool(np.isfinite(point).all()):
+        return None
+    height, width = int(field.shape[0]), int(field.shape[1])
+    x = float(point[0])
+    y = float(point[1])
+    if x < 0.0 or y < 0.0 or x > float(width - 1) or y > float(height - 1):
+        return None
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != (height, width):
+            raise ValueError("valid_mask must match direction field shape")
+        if not (bool(valid[y0, x0]) and bool(valid[y0, x1]) and bool(valid[y1, x0]) and bool(valid[y1, x1])):
+            return None
+    tx = np.float32(x - float(x0))
+    ty = np.float32(y - float(y0))
+    top = field[y0, x0] * (1.0 - tx) + field[y0, x1] * tx
+    bottom = field[y1, x0] * (1.0 - tx) + field[y1, x1] * tx
+    direction = top * (1.0 - ty) + bottom * ty
+    norm = float(np.linalg.norm(direction))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return None
+    return (direction / norm).astype(np.float32)
+
+
+def _trace_direction_line(
+    direction_xy: np.ndarray,
+    cp_xy: np.ndarray,
+    tangent_xy: np.ndarray,
+    *,
+    valid_mask: np.ndarray | None = None,
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+    max_steps: int | None = None,
+) -> np.ndarray:
+    field = np.asarray(direction_xy, dtype=np.float32)
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("direction_xy must have shape H,W,2")
+    cp = np.asarray(cp_xy, dtype=np.float32)
+    tangent = np.asarray(tangent_xy, dtype=np.float32)
+    if cp.shape != (2,) or tangent.shape != (2,):
+        raise ValueError("cp_xy and tangent_xy must have shape (2,)")
+    tangent_norm = float(np.linalg.norm(tangent))
+    if not np.isfinite(tangent_norm) or tangent_norm <= 1.0e-6:
+        raise ValueError("tangent_xy must be finite and non-zero")
+    step = max(float(step_px), 1.0e-3)
+    unit_tangent = (tangent / tangent_norm).astype(np.float32)
+    shape_hw = (int(field.shape[0]), int(field.shape[1]))
+    if max_steps is None:
+        max_steps = int(np.ceil(np.hypot(*shape_hw) / step)) + 2
+
+    def one_side(initial: np.ndarray) -> list[np.ndarray]:
+        points = [cp.astype(np.float32)]
+        previous = initial.astype(np.float32)
+        current = cp.astype(np.float32)
+        for _ in range(int(max_steps)):
+            if not _inside_trace_margin(current, shape_hw, rf_margin_px):
+                break
+            sampled = _bilinear_direction_sample(field, current, valid_mask=valid_mask)
+            if sampled is None:
+                break
+            if float(np.dot(sampled, previous)) < 0.0:
+                sampled = -sampled
+            next_point = current + sampled * np.float32(step)
+            if not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
+                break
+            points.append(next_point.astype(np.float32))
+            current = next_point.astype(np.float32)
+            previous = sampled.astype(np.float32)
+        return points
+
+    backward = one_side(-unit_tangent)
+    forward = one_side(unit_tangent)
+    combined = list(reversed(backward[1:])) + forward
+    return np.stack(combined, axis=0).astype(np.float32)
+
+
+def _prepare_model_image(image: np.ndarray, valid_mask: np.ndarray, *, device: torch.device) -> torch.Tensor:
+    image_t = torch.as_tensor(np.asarray(image, dtype=np.float32), dtype=torch.float32, device=device).view(
+        1, 1, *np.asarray(image).shape
+    )
+    valid_t = torch.as_tensor(np.asarray(valid_mask, dtype=bool), dtype=torch.bool, device=device).view(
+        1, 1, *np.asarray(valid_mask).shape
+    )
+    counts = valid_t.sum(dim=(2, 3), keepdim=True).clamp_min(1)
+    masked = torch.where(valid_t, image_t, torch.zeros_like(image_t))
+    mean = masked.sum(dim=(2, 3), keepdim=True) / counts
+    var = torch.where(valid_t, (image_t - mean) ** 2, torch.zeros_like(image_t)).sum(dim=(2, 3), keepdim=True) / counts
+    std = torch.sqrt(var.clamp_min(1.0e-6))
+    return torch.where(valid_t, (image_t - mean) / std, torch.zeros_like(image_t))
+
+
+def _model_config_from_checkpoint(checkpoint: dict, loader: FiberStrip2DLoader) -> FiberStripDirectionModelConfig:
+    raw_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+    training = raw_config.get("training", {}) if isinstance(raw_config, dict) else {}
+    if not isinstance(training, dict):
+        training = {}
+    return FiberStripDirectionModelConfig(
+        in_channels=1,
+        hidden_channels=max(1, int(training.get("model_hidden_channels", 32))),
+        depth=max(1, int(training.get("model_depth", 5))),
+    )
+
+
+def _load_direction_model(
+    checkpoint_path: str | Path,
+    loader: FiberStrip2DLoader,
+    *,
+    device: torch.device,
+) -> tuple[FiberStripDirectionNet, dict]:
+    path = Path(checkpoint_path).expanduser().resolve()
+    checkpoint = torch.load(path, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise ValueError(f"{path} is not a fiber_trace_2d training checkpoint")
+    model = FiberStripDirectionNet(_model_config_from_checkpoint(checkpoint, loader)).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model, checkpoint
+
+
+def _export_line_trace_vis(
+    loader: FiberStrip2DLoader,
+    sample_index: int,
+    output_dir: str | Path,
+    *,
+    checkpoint_path: str | Path,
+    step_px: float,
+    rf_margin_px: float | None,
+) -> None:
+    out = Path(output_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    device = resolve_torch_device(loader.config.augment.device)
+    sample, image, valid_mask = loader.build_center_strip_patch(sample_index)
+    cp_tangent = line_cp_and_tangent_xy(sample.line_xy, sample.control_point_xy)
+    if cp_tangent is None:
+        raise ValueError("selected sample has no usable transformed CP/tangent line")
+    cp_xy, tangent_xy = cp_tangent
+    model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
+    # The model has one 3x3 convolution per configured depth, giving radius=depth.
+    configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
+    margin = float(configured_depth if rf_margin_px is None else rf_margin_px)
+    with torch.no_grad():
+        input_image = _prepare_model_image(image, valid_mask, device=device)
+        encoded = model(input_image)[0].permute(1, 2, 0)
+        direction_xy = decode_lasagna_direction_xy(encoded, bins=720).detach().cpu().numpy()
+    traced_line = _trace_direction_line(
+        direction_xy,
+        cp_xy,
+        tangent_xy,
+        valid_mask=valid_mask,
+        step_px=step_px,
+        rf_margin_px=margin,
+    )
+    image_u8 = _to_u8_image(image, valid_mask)
+    overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.5, thickness=1)
+    overlay = _overlay_polyline_rgb(overlay, traced_line, color_rgba=(0, 255, 0, 230), thickness=1)
+    overlay = _draw_cp_crosshair(overlay, cp_xy)
+    _write_jpg(out / "line_trace_vis.jpg", overlay)
+    summary = [
+        f"sample_index={sample_index}",
+        f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
+        f"checkpoint_step={checkpoint.get('step', 'unknown')}",
+        f"fiber_path={sample.fiber_path}",
+        f"control_point_index={sample.control_point_index}",
+        f"strip_z_offset={sample.strip_z_offset}",
+        f"cp_xy=({cp_xy[0]:.3f}, {cp_xy[1]:.3f})",
+        f"tangent_xy=({tangent_xy[0]:.6f}, {tangent_xy[1]:.6f})",
+        f"step_px={float(step_px):.3f}",
+        f"rf_margin_px={margin:.3f}",
+        f"trace_points={int(traced_line.shape[0])}",
+    ]
+    (out / "line_trace_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    print(f"exported line_trace_vis.jpg and line_trace_summary.txt to {out}")
 
 
 def _offset_label(offset: float) -> str:
@@ -357,6 +593,10 @@ def main() -> None:
     parser.add_argument("--skip-prefetch", action="store_true")
     parser.add_argument("--export-dir", default=None)
     parser.add_argument("--augment-vis", action="store_true")
+    parser.add_argument("--line-trace-vis", action="store_true")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--line-trace-step", type=float, default=1.0)
+    parser.add_argument("--line-trace-rf-margin", type=float, default=None)
     args = parser.parse_args()
 
     with _Timer() as config_timer:
@@ -385,6 +625,21 @@ def main() -> None:
         if args.export_dir is None:
             raise SystemExit("--augment-vis requires --export-dir")
         _export_augment_contact_sheet(loader, args.sample_index, args.export_dir)
+        return
+
+    if args.line_trace_vis:
+        if args.export_dir is None:
+            raise SystemExit("--line-trace-vis requires --export-dir")
+        if args.checkpoint is None:
+            raise SystemExit("--line-trace-vis requires --checkpoint")
+        _export_line_trace_vis(
+            loader,
+            args.sample_index,
+            args.export_dir,
+            checkpoint_path=args.checkpoint,
+            step_px=args.line_trace_step,
+            rf_margin_px=args.line_trace_rf_margin,
+        )
         return
 
     if not args.skip_prefetch:
