@@ -258,8 +258,8 @@
   display: inline-flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 2px;
-  padding: 14px 20px 12px;
+  gap: 4px;
+  padding: 18px 26px 16px;
   border: 1px solid var(--vc-accent);
   border-radius: var(--vc-r-card);
   background: color-mix(in srgb, var(--vc-bg) 78%, transparent);
@@ -273,7 +273,7 @@
   background: color-mix(in srgb, var(--vc-bg) 90%, transparent);
 }
 .vc-landing .vc-hero__countdown-label {
-  font-size: 12px;
+  font-size: clamp(13px, 1.1vw, 16px);
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -286,14 +286,14 @@
 }
 .vc-landing .vc-hero__countdown-value {
   font-family: var(--vc-mono);
-  font-size: 3rem;
+  font-size: clamp(3.5rem, 4.6vw, 5rem);
   font-weight: 700;
   line-height: 1;
   color: var(--vc-accent);
   letter-spacing: -0.02em;
 }
 .vc-landing .vc-hero__countdown-unit {
-  font-size: 0.8125rem;
+  font-size: clamp(0.9375rem, 1.1vw, 1.125rem);
   font-weight: 700;
   line-height: 1.15;
   letter-spacing: 0.08em;
@@ -301,13 +301,16 @@
   color: var(--vc-accent);
 }
 .vc-landing .vc-hero__countdown-date {
-  font-size: 11px;
+  font-size: clamp(12px, 1vw, 14px);
   letter-spacing: 0.04em;
   color: var(--vc-text-dim);
 }
 @media (max-width: 996px) {
+  .vc-landing a.vc-hero__countdown {
+    padding: 14px 20px 12px;
+  }
   .vc-landing .vc-hero__countdown-value {
-    font-size: 2rem;
+    font-size: 2.75rem;
   }
 }
 @media (min-width: 997px) {
