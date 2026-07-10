@@ -1,7 +1,7 @@
 {
-  "batch_size": 4,
+  "batch_size": 512,
   "patch_shape_hw": [64, 64],
-  "strip_z_offset_count": 16,
+  "strip_z_offset_count": 1,
   "strip_z_offset_step": 2.0,
   "seed": 0,
   "prefetch_workers": 16,
@@ -29,9 +29,9 @@
   "strip_coord_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_strip_coord_cache",
   "training": {
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_2d_runs",
-    "run_name": "fiber_strip_direction",
-    "max_steps": 100000,
-    "max_sample_index": 12000,
+    "run_name": "cps_only",
+    "max_steps": 1000000,
+    "max_sample_index": 0,
     "learning_rate": 0.001,
     "scalar_log_interval": 1,
     "tensorboard_image_interval": 100,
@@ -41,8 +41,6 @@
     "test_start_sample_index": 0,
     "control_points_per_step": 4,
     "device": "auto",
-    "pipeline_enabled": true,
-    "pipeline_depth": 2,
     "tensorboard_enabled": true,
     "model_hidden_channels": 64,
     "model_depth": 10

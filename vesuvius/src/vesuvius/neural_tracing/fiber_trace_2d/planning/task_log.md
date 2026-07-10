@@ -14,15 +14,20 @@ Implemented:
   a Lasagna/VC3D-style segment strip, and samples the center strip-z image.
 - Added runner helpers for one-way trace-to-target-column tracing and
   normalized trace2cp scoring.
-- Added trace2cp geometric TTA support: deterministic random TTAs reuse the
-  training geometric ranges but force y-shift to zero and scale to one, then
-  inverse-map traces back into the reference segment strip before scoring.
 - Added `--med-tta` support for trace2cp median-direction TTA tracing.
+  `--med-tta` is the switch that determines whether trace2cp uses TTA; without
+  it trace2cp uses the base direction field only.
 - Added `--trace2cp-vis`, `--trace2cp-target-offset`, and
   `--trace2cp-target-cp-index` to `runner.py`.
-- `--trace2cp-vis` now writes `trace2cp_vis.jpg`,
-  `trace2cp_summary.txt`, and prints a concise aggregate score/status line to
-  stdout.
+- `--trace2cp-vis` now writes a single-panel `trace2cp_vis.jpg`,
+  `trace2cp_summary.txt`, and prints a concise score/status line to stdout.
+- Moved trace2cp score text into a top label band so it does not cover image
+  pixels.
+- Fixed trace2cp target-column crossing to take precedence over next-step
+  RF-margin rejection, and made RF-margin stop reasons axis-specific.
+- Changed the default runner trace RF margin from `1 + 2 * model_depth` to
+  `model_depth`.
+- Changed trace2cp segment-strip height to twice the configured patch height.
 - Updated `planning/specs.md`, `docs/code_structure.md`,
   `planning/changelog.md`, and `planning/status.md`.
 
@@ -44,4 +49,4 @@ Result: passed.
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
 ```
 
-Result after completing trace2cp TTA: `102 passed in 5.58s`.
+Result after RF-margin default and trace2cp height changes: `104 passed in 4.70s`.

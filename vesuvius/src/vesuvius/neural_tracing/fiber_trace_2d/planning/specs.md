@@ -223,7 +223,7 @@
 - V0.1 patch line-tracing inspection is exported with `--line-trace-vis --checkpoint <snapshot> --export-dir <dir>`.
 - Line-tracing inspection uses the same deterministic `--sample-index` ordering as training, prefetch, and augment-vis, loads the center side-strip patch, runs the checkpointed direction model, decodes the Lasagna ambiguous two-cos-channel output, and traces from the transformed CP in both directions.
 - The line tracer bilinearly samples the decoded per-pixel direction field, flips sampled directions as needed to maintain forward/backward sign continuity, and steps in strip-pixel coordinates.
-- The line tracer stops when the next point would enter the configured receptive-field border margin, when the sampled direction is invalid, or when image validity around the bilinear sample is insufficient. By default the receptive-field margin is `1 + 2 * model_depth`, matching the radius of the V0 ResNet's 3x3 input projection plus two 3x3 convolutions per residual block; `--line-trace-rf-margin` can override it for inspection.
+- The line tracer stops when the next point would enter the configured receptive-field border margin, when the sampled direction is invalid, or when image validity around the bilinear sample is insufficient. By default the receptive-field margin is `model_depth`; `--line-trace-rf-margin` can override it for inspection.
 - The default line-trace step is `4.0` strip-image pixels and can be overridden with `--line-trace-step`.
 - Line-tracing inspection writes `line_trace_vis.jpg` as a two-column image by default: the first column is the original transformed strip line plus the unaugmented direction-traced line, and the second column is the same original patch with a flock of traces from random combined geometric test-time augmentations inverse-warped back into original patch coordinates.
 - Line-trace test-time augmentations are deterministic per `sample_index` and are sampled from the regular training geometric augmentation ranges: shift, rotation, shear, scale, smooth offset, and flips. Value-only augmentations are not applied for line tracing.
@@ -248,7 +248,9 @@
   `--trace2cp-target-cp-index` selects an absolute target CP index in the same
   fiber. The target CP must be in range and different from the start CP.
 - Trace2CP loading constructs a side-strip segment that spans the start and
-  target CPs plus receptive-field/visualization margin. It uses the same
+  target CPs plus receptive-field/visualization margin. The segment strip
+  height is twice the configured patch height so traces have more vertical room
+  before entering the RF margin. It uses the same
   Lasagna manifest normal sampling and VC3D-equivalent side-strip coordinate
   construction as CP-local patches, but anchors the start CP at an explicit
   strip x-coordinate so the target CP lies in the same image at its arc-length
@@ -257,7 +259,7 @@
   direction model, decodes the Lasagna ambiguous two-cos-channel output, and
   traces one direction from the start CP toward the target CP. The trace uses
   `--line-trace-step` and the line-trace receptive-field margin default
-  `1 + 2 * model_depth`, overrideable with `--line-trace-rf-margin`.
+  `model_depth`, overrideable with `--line-trace-rf-margin`.
 - Trace2CP scoring evaluates the traced y coordinate at the target CP x-column.
   If the trace crosses that x-column, the y coordinate is linearly interpolated
   between bracketing trace points. The raw error is
@@ -267,24 +269,28 @@
   reach the target column. The denominator is the target CP's distance to the
   nearest usable vertical strip edge after the receptive-field margin is
   excluded.
-- Trace2CP runs deterministic random geometric test-time augmentations using
-  `--line-trace-tta-count`, default `100`. It samples from the regular
-  training geometric augmentation ranges but forces y-shift to zero and scale
-  to one for long-strip target-column semantics.
-- Trace2CP TTA traces are run in augmented patch coordinates, inverse-mapped
-  back into the reference segment strip, and scored only in that reference
-  coordinate system. The printed aggregate score is the median over the base
-  trace score and all successfully mapped/scored TTA trace scores.
-- `--trace2cp-vis --med-tta` adds a median-direction TTA trace column. The
-  median trace is stepped in the reference segment strip by sampling the
-  reference and TTA direction fields, mapping TTA directions back to reference
-  coordinates, resolving ambiguous signs against the previous step, and using
-  the normalized component-wise median direction.
+- Trace2CP uses `--med-tta` to determine whether TTA is used. Without
+  `--med-tta`, it traces and scores only the base strip direction field. With
+  `--med-tta`, it builds deterministic random geometric TTA direction fields
+  using `--line-trace-tta-count`, default `100`, and traces one median-TTA line
+  in the reference segment strip.
+- Trace2CP TTA samples from the regular training geometric augmentation ranges
+  but forces y-shift to zero and scale to one for long-strip target-column
+  semantics. The median trace is stepped in the reference segment strip by
+  sampling the reference and TTA direction fields, mapping TTA directions back
+  to reference coordinates, resolving ambiguous signs against the previous
+  step, and using the normalized component-wise median direction.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
   a concise stdout line with sample index, fiber path, start/target CP indices,
-  aggregate normalized score, aggregate raw y error in pixels, base score,
-  TTA success count, target x-column, and trace status. The summary file also
-  records per-TTA score/status rows and median-TTA score/status when requested.
+  trace mode, normalized score, raw y error in pixels, target x-column, and
+  trace status. The JPG is always a single strip image containing the two CPs,
+  one traced line, and the score in a top label band; it does not add separate
+  TTA/flock columns or draw score text over image pixels.
+- Trace2CP target-column crossing takes precedence over RF-margin rejection for
+  the next step. If a step crosses the target x-column and would also enter the
+  RF margin, the trace is considered to have reached the target column and the
+  score is computed by interpolation at the target column. RF-margin stop
+  reasons should identify whether the x margin, y margin, or both were hit.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.

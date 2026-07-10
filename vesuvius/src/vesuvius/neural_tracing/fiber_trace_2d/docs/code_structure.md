@@ -198,7 +198,7 @@ The important behavior is:
   center side-strip patch for `--sample-index`, runs the checkpointed direction
   model, bilinearly traces the decoded direction field from the transformed CP
   in both directions with a default 4 px trace step and a default receptive
-  field margin of `1 + 2 * model_depth`, and writes
+  field margin of `model_depth`, and writes
   `line_trace_vis.jpg` plus `line_trace_summary.txt`.
 - The line-trace JPG normally has two columns: the unaugmented trace view, then
   the original patch with a flock of traces from random combined geometric
@@ -219,18 +219,18 @@ The important behavior is:
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
   decoded direction-field model as line tracing, traces one direction from the
   start CP toward the target CP, and scores the y-error where the trace reaches
-  the target CP x-column.
-- Trace2CP also runs deterministic random geometric test-time augmentations
-  controlled by `--line-trace-tta-count`. These use the training geometric
-  ranges except y-shift is forced to zero and scale to one. Each TTA trace is
-  inverse-mapped back to the reference segment strip before scoring. The stdout
-  score is the median over the base trace and successfully scored TTA traces.
-- `--trace2cp-vis --med-tta` adds a median-direction TTA trace column, using
-  the same reference/TTA direction-field median stepping scheme as
-  `--line-trace-vis --med-tta` but stopping at the target CP x-column.
+  the target CP x-column. The trace2cp segment strip uses twice the configured
+  patch height for more vertical room before the RF margin.
+- Trace2CP uses `--med-tta` to decide whether to use TTA. Without it, the tool
+  traces and scores the base direction field. With it, deterministic random
+  geometric TTA direction fields are built using `--line-trace-tta-count`; the
+  TTA set uses the training geometric ranges except y-shift is forced to zero
+  and scale to one. The tool then traces one median-direction line in the
+  reference segment strip.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
-  the aggregate normalized `0..1` score plus raw pixel error, base score, TTA
-  success count, and trace status to stdout.
+  the normalized `0..1` score plus raw pixel error, trace mode, and trace
+  status to stdout. The JPG is always one strip image with the two CPs, one
+  traced line, and the score in a top label band above the image pixels.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, runs the checkpointed direction model, decodes the

@@ -36,15 +36,16 @@ Required behavior:
   - normalized score is clamped to `0..1`;
   - `0.0` means exact hit;
   - `1.0` means usable strip-edge error or failure before the target column.
-- Run deterministic geometric TTAs on the strip. Per `planning/plan.md`, leave
-  out y-shift and scale for trace2cp because those are hard to handle for long
-  strips.
-- Each TTA trace must be scored only after inverse-mapping its trace points back
-  into the reference segment strip.
+- Use `--med-tta` to determine whether trace2cp uses TTA. Without `--med-tta`,
+  trace and score only the base strip. With `--med-tta`, build deterministic
+  geometric TTA direction fields and trace one median-TTA line in reference
+  strip coordinates.
+- Per `planning/plan.md`, leave out y-shift and scale for trace2cp TTA because
+  those are hard to handle for long strips.
 - Reuse `--line-trace-step`, `--line-trace-rf-margin`, and
   `--line-trace-tta-count`.
-- The visualization must show the reference trace and TTA flock in reference
-  segment-strip coordinates; `--med-tta` should also show the median-TTA trace.
+- The visualization must be a single strip image with the two CPs, one traced
+  line, and the score. It must not add separate TTA/flock columns.
 - Print a concise score line containing sample index, fiber path, start/target
   CP indices, score, raw y-error pixels, target column, and trace status.
 - Export `trace2cp_vis.jpg` and `trace2cp_summary.txt`.

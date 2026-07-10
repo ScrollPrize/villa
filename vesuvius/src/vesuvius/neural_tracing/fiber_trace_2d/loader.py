@@ -2001,7 +2001,7 @@ class FiberStrip2DLoader:
             int(self.config.patch_shape_hw[1]),
             int(math.ceil(distance_px + 2.0 * margin + 1.0)),
         )
-        height = int(self.config.patch_shape_hw[0])
+        height = int(self.config.patch_shape_hw[0]) * 2
         if height <= 0 or width <= 0:
             raise ValueError(f"invalid trace2cp segment shape {(height, width)}")
         start_col = margin if signed_distance_px >= 0.0 else float(width - 1) - margin

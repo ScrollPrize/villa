@@ -71,8 +71,10 @@ wire the metric into training, TensorBoard, snapshots, or evaluation loops.
 
 ## TTA Behavior
 
-- Implement trace2cp TTA and reuse existing line-trace TTA infrastructure where
-  possible.
+- Use `--med-tta` to control whether trace2cp uses TTA. Without `--med-tta`,
+  trace and score the base strip only. With `--med-tta`, reuse existing
+  line-trace TTA infrastructure where possible to build TTA direction fields
+  and trace one median-TTA line.
 - `planning/plan.md` says trace2cp TTA should leave out y-shift and scale
   because those are hard to handle for long strips.
 - Therefore trace2cp TTA variants should include only geometric transforms that
@@ -83,11 +85,9 @@ wire the metric into training, TensorBoard, snapshots, or evaluation loops.
     before scoring;
   - x-shift and shear/smooth offset only if the target-column crossing is
     evaluated after inverse mapping back to reference strip coordinates.
-- Score each TTA trace only after inverse-mapping the trace back into reference
-  strip coordinates.
 - Do not include y-shift or scale in trace2cp TTA.
-- Visualization shows the base trace, TTA flock overlay, and if `--med-tta` is
-  set a median-direction TTA trace, all in reference strip coordinates.
+- Visualization shows one strip only: the two CPs, one traced line, and the
+  score. It does not add separate TTA/flock columns.
 
 ## Loader/Data Path
 

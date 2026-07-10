@@ -301,6 +301,22 @@ def test_trace2cp_one_way_trace_stops_at_target_column() -> None:
     assert np.isclose(line[-1, 0], 6.0)
 
 
+def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    line, reason = _trace_direction_line_to_target(
+        field,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([6.0, 4.0], dtype=np.float32),
+        step_px=2.0,
+        rf_margin_px=3.0,
+    )
+
+    assert reason == "target_column"
+    assert np.isclose(line[-1, 0], 6.0)
+
+
 def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:
     params = FiberStripAugmentParams(
         shift_x=3.0,
@@ -413,6 +429,25 @@ def test_trace2cp_loader_rejects_same_cp(tmp_path: Path) -> None:
             rf_margin_px=0.0,
             sample_mode="flat",
         )
+
+
+def test_trace2cp_segment_patch_uses_double_configured_height(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 7]
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    sample, image, valid = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+    )
+
+    assert image.shape[0] == 10
+    assert valid.shape[0] == 10
+    assert sample.coords_zyx.shape[0] == 10
 
 
 def test_line_trace_tta_point_transforms_round_trip() -> None:

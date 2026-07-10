@@ -210,6 +210,21 @@ def _inside_trace_margin(point_xy: np.ndarray, shape_hw: tuple[int, int], margin
     return m <= x <= (float(width - 1) - m) and m <= y <= (float(height - 1) - m)
 
 
+def _trace_margin_reason(point_xy: np.ndarray, shape_hw: tuple[int, int], margin: float) -> str:
+    x, y = float(point_xy[0]), float(point_xy[1])
+    height, width = (int(v) for v in shape_hw)
+    m = max(0.0, float(margin))
+    outside_x = x < m or x > (float(width - 1) - m)
+    outside_y = y < m or y > (float(height - 1) - m)
+    if outside_x and outside_y:
+        return "rf_margin_xy"
+    if outside_x:
+        return "rf_margin_x"
+    if outside_y:
+        return "rf_margin_y"
+    return "rf_margin"
+
+
 def _bilinear_direction_sample(
     direction_xy: np.ndarray,
     point_xy: np.ndarray,
@@ -808,18 +823,24 @@ def _trace_median_tta_direction_line_to_target(
     target_x = float(target[0])
     for _ in range(int(max_steps)):
         if not _inside_trace_margin(current, shape_hw, rf_margin_px):
-            return np.stack(points, axis=0).astype(np.float32), "rf_margin"
+            return np.stack(points, axis=0).astype(np.float32), _trace_margin_reason(
+                current, shape_hw, rf_margin_px
+            )
         sampled = _sample_tta_direction_in_reference(fields, current, previous)
         if sampled is None:
             return np.stack(points, axis=0).astype(np.float32), "invalid_direction"
         next_point = current + sampled * np.float32(step)
-        if not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
-            return np.stack(points, axis=0).astype(np.float32), "rf_margin"
-        points.append(next_point.astype(np.float32))
         previous_x = float(current[0])
         next_x = float(next_point[0])
-        if (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0:
+        crosses_target = (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0
+        if crosses_target:
+            points.append(next_point.astype(np.float32))
             return np.stack(points, axis=0).astype(np.float32), "target_column"
+        if not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
+            return np.stack(points, axis=0).astype(np.float32), _trace_margin_reason(
+                next_point, shape_hw, rf_margin_px
+            )
+        points.append(next_point.astype(np.float32))
         current = next_point.astype(np.float32)
         previous = sampled.astype(np.float32)
     return np.stack(points, axis=0).astype(np.float32), "max_steps"
@@ -857,20 +878,26 @@ def _trace_direction_line_to_target(
 
     for _ in range(int(max_steps)):
         if not _inside_trace_margin(current, shape_hw, rf_margin_px):
-            return np.stack(points, axis=0).astype(np.float32), "rf_margin"
+            return np.stack(points, axis=0).astype(np.float32), _trace_margin_reason(
+                current, shape_hw, rf_margin_px
+            )
         sampled = _bilinear_direction_sample(field, current, valid_mask=valid_mask)
         if sampled is None:
             return np.stack(points, axis=0).astype(np.float32), "invalid_direction"
         if float(np.dot(sampled, previous)) < 0.0:
             sampled = -sampled
         next_point = current + sampled * np.float32(step)
-        if not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
-            return np.stack(points, axis=0).astype(np.float32), "rf_margin"
-        points.append(next_point.astype(np.float32))
         previous_x = float(current[0])
         next_x = float(next_point[0])
-        if (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0:
+        crosses_target = (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0
+        if crosses_target:
+            points.append(next_point.astype(np.float32))
             return np.stack(points, axis=0).astype(np.float32), "target_column"
+        if not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
+            return np.stack(points, axis=0).astype(np.float32), _trace_margin_reason(
+                next_point, shape_hw, rf_margin_px
+            )
+        points.append(next_point.astype(np.float32))
         current = next_point.astype(np.float32)
         previous = sampled.astype(np.float32)
     return np.stack(points, axis=0).astype(np.float32), "max_steps"
@@ -956,9 +983,8 @@ def _export_line_trace_vis(
         raise ValueError("selected sample has no usable transformed CP/tangent line")
     cp_xy, tangent_xy = cp_tangent
     model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
-    # The model has a 3x3 input projection and two 3x3 convolutions per residual block.
     configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
-    default_margin = 1 + 2 * configured_depth
+    default_margin = configured_depth
     margin = float(default_margin if rf_margin_px is None else rf_margin_px)
     direction_xy = _predict_direction_field(model, image, valid_mask, device=device)
     traced_line = _trace_direction_line(
@@ -1116,20 +1142,7 @@ def _draw_trace2cp_overlay(
         f"score={result.score:.4f} yerr={result.raw_y_error_px:.2f}px "
         f"hit={int(result.reached_target_column)} reason={result.reason}"
     )
-    font = ImageFont.load_default()
-    try:
-        bbox = draw.textbbox((0, 0), label, font=font)
-        text_w = int(bbox[2] - bbox[0])
-        text_h = int(bbox[3] - bbox[1])
-    except AttributeError:
-        text_w, text_h = draw.textsize(label, font=font)
-    pad = 3
-    box_w = min(width, text_w + 2 * pad)
-    box_h = text_h + 2 * pad
-    draw.rectangle((0, 0, box_w, box_h), fill=(0, 0, 0, 190))
-    draw.text((pad, pad), label[: max(1, width)], fill=(255, 255, 255, 255), font=font)
-    return np.asarray(pil, dtype=np.uint8)
-
+    return _draw_label_band(np.asarray(pil, dtype=np.uint8), label)
 
 def _export_trace2cp_vis(
     loader: FiberStrip2DLoader,
@@ -1149,7 +1162,7 @@ def _export_trace2cp_vis(
     device = resolve_torch_device(loader.config.augment.device)
     model, checkpoint = _load_direction_model(checkpoint_path, loader, device=device)
     configured_depth = max(1, int(_model_config_from_checkpoint(checkpoint, loader).depth))
-    default_margin = 1 + 2 * configured_depth
+    default_margin = configured_depth
     margin = float(default_margin if rf_margin_px is None else rf_margin_px)
     sample, image, valid_mask = loader.build_trace2cp_segment_patch(
         sample_index,
@@ -1176,86 +1189,13 @@ def _export_trace2cp_vis(
         rf_margin_px=margin,
         termination_reason=reason,
     )
-    image_u8 = _to_u8_image(image, valid_mask)
-    base_overlay = _draw_trace2cp_overlay(
-        image_u8,
-        line_xy=sample.line_xy,
-        trace_xy=traced_line,
-        start_xy=start_xy,
-        target_xy=target_xy,
-        result=result,
-    )
-
-    flock_overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.35, thickness=1)
-    flock_overlay = _overlay_polyline_rgb(flock_overlay, traced_line, color_rgba=(0, 255, 0, 220), thickness=1)
-    flock_overlay = _draw_cp_crosshair(flock_overlay, start_xy)
     tta_rows: list[str] = []
-    tta_scores: list[float] = []
-    tta_errors: list[float] = []
-    random_tta_fields: list[_TtaDirectionField] = []
-    tta_count = max(0, int(line_trace_tta_count))
-    for variant_index in range(tta_count):
-        params = _trace2cp_tta_params(
-            random_combined_augmentation(loader.config.augment, sample_index, variant_index)
-        )
-        tta_name = f"random_{variant_index:03d}"
-        try:
-            tta_image, tta_valid, source_xy_grid = _warp_patch_by_augment_params(
-                image,
-                valid_mask,
-                params,
-                device=device,
-            )
-            tta_start = _nearest_tta_point_for_reference(source_xy_grid, start_xy)
-            tta_target = _nearest_tta_point_for_reference(source_xy_grid, target_xy)
-            if tta_start is None or tta_target is None:
-                raise ValueError("could not map start/target CP into TTA patch")
-            tta_direction = _predict_direction_field(model, tta_image, tta_valid, device=device)
-            field = _TtaDirectionField(
-                name=tta_name,
-                direction_xy=tta_direction,
-                valid_mask=tta_valid,
-                source_xy_grid=source_xy_grid,
-            )
-            random_tta_fields.append(field)
-            tta_trace, tta_reason = _trace_direction_line_to_target(
-                tta_direction,
-                tta_start,
-                tta_target,
-                valid_mask=tta_valid,
-                step_px=step_px,
-                rf_margin_px=margin,
-            )
-            trace_back = _source_grid_points_to_reference(source_xy_grid, tta_trace)
-            tta_result = _score_trace2cp(
-                trace_back,
-                target_xy,
-                shape_hw=image.shape,
-                rf_margin_px=margin,
-                termination_reason=tta_reason,
-            )
-            tta_scores.append(float(tta_result.score))
-            tta_errors.append(float(tta_result.raw_y_error_px))
-            flock_overlay = _overlay_polyline_rgb(
-                flock_overlay,
-                trace_back,
-                color_rgba=(64, 224, 255, 120),
-                thickness=1,
-            )
-            tta_rows.append(
-                f"{tta_name}: score={tta_result.score:.8f} raw_y_error_px={tta_result.raw_y_error_px:.6f} "
-                f"points={int(trace_back.shape[0])} reached={tta_result.reached_target_column} reason={tta_result.reason}"
-            )
-        except (ValueError, np.linalg.LinAlgError) as exc:
-            tta_rows.append(f"{tta_name}: skipped={exc}")
-    aggregate_scores = [float(result.score), *tta_scores]
-    aggregate_errors = [float(result.raw_y_error_px), *tta_errors]
-    aggregate_score = float(np.median(np.asarray(aggregate_scores, dtype=np.float64)))
-    aggregate_error = float(np.median(np.asarray(aggregate_errors, dtype=np.float64)))
-
-    med_trace: np.ndarray | None = None
-    med_result: _Trace2CpResult | None = None
-    med_reason = ""
+    tta_count = max(0, int(line_trace_tta_count)) if med_tta else 0
+    selected_trace = traced_line
+    selected_result = result
+    selected_reason = reason
+    selected_mode = "base"
+    med_fields_count = 0
     if med_tta:
         identity = np.eye(3, dtype=np.float32)
         med_fields = [
@@ -1266,9 +1206,36 @@ def _export_trace2cp_vis(
                 matrix_ref_to_tta=identity,
                 matrix_tta_to_ref=identity,
             ),
-            *random_tta_fields,
         ]
-        med_trace, med_reason = _trace_median_tta_direction_line_to_target(
+        for variant_index in range(tta_count):
+            params = _trace2cp_tta_params(
+                random_combined_augmentation(loader.config.augment, sample_index, variant_index)
+            )
+            tta_name = f"random_{variant_index:03d}"
+            try:
+                tta_image, tta_valid, source_xy_grid = _warp_patch_by_augment_params(
+                    image,
+                    valid_mask,
+                    params,
+                    device=device,
+                )
+                tta_start = _nearest_tta_point_for_reference(source_xy_grid, start_xy)
+                tta_target = _nearest_tta_point_for_reference(source_xy_grid, target_xy)
+                if tta_start is None or tta_target is None:
+                    raise ValueError("could not map start/target CP into TTA patch")
+                med_fields.append(
+                    _TtaDirectionField(
+                        name=tta_name,
+                        direction_xy=_predict_direction_field(model, tta_image, tta_valid, device=device),
+                        valid_mask=tta_valid,
+                        source_xy_grid=source_xy_grid,
+                    )
+                )
+                tta_rows.append(f"{tta_name}: field=ok")
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                tta_rows.append(f"{tta_name}: skipped={exc}")
+        med_fields_count = len(med_fields)
+        selected_trace, selected_reason = _trace_median_tta_direction_line_to_target(
             med_fields,
             start_xy,
             target_xy,
@@ -1276,31 +1243,25 @@ def _export_trace2cp_vis(
             step_px=step_px,
             rf_margin_px=margin,
         )
-        med_result = _score_trace2cp(
-            med_trace,
+        selected_result = _score_trace2cp(
+            selected_trace,
             target_xy,
             shape_hw=image.shape,
             rf_margin_px=margin,
-            termination_reason=med_reason,
+            termination_reason=selected_reason,
         )
+        selected_mode = "med_tta"
 
-    overlays = [base_overlay, flock_overlay]
-    if med_trace is not None and med_result is not None:
-        med_overlay = _draw_trace2cp_overlay(
-            image_u8,
-            line_xy=sample.line_xy,
-            trace_xy=med_trace,
-            start_xy=start_xy,
-            target_xy=target_xy,
-            result=med_result,
-        )
-        med_overlay = _overlay_polyline_rgb(med_overlay, med_trace, color_rgba=(255, 220, 64, 230), thickness=1)
-        overlays.append(med_overlay)
-    combined = np.zeros((image_u8.shape[0], image_u8.shape[1] * len(overlays), 3), dtype=np.uint8)
-    for index, overlay in enumerate(overlays):
-        x0 = image_u8.shape[1] * index
-        combined[:, x0 : x0 + image_u8.shape[1], :] = overlay
-    _write_jpg(out / "trace2cp_vis.jpg", combined)
+    image_u8 = _to_u8_image(image, valid_mask)
+    overlay = _draw_trace2cp_overlay(
+        image_u8,
+        line_xy=sample.line_xy,
+        trace_xy=selected_trace,
+        start_xy=start_xy,
+        target_xy=target_xy,
+        result=selected_result,
+    )
+    _write_jpg(out / "trace2cp_vis.jpg", overlay)
     summary = [
         f"sample_index={sample_index}",
         f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
@@ -1314,23 +1275,18 @@ def _export_trace2cp_vis(
         f"target_cp_xy=({target_xy[0]:.3f}, {target_xy[1]:.3f})",
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
-        f"trace_points={int(traced_line.shape[0])}",
-        f"trace2cp_aggregate_score={aggregate_score:.8f}",
-        f"trace2cp_aggregate_raw_y_error_px={aggregate_error:.6f}",
-        f"trace2cp_score={result.score:.8f}",
-        f"raw_y_error_px={result.raw_y_error_px:.6f}",
-        f"target_x={result.target_x:.6f}",
-        f"trace_y_at_target_x={result.trace_y_at_target_x:.6f}",
-        f"reached_target_column={result.reached_target_column}",
-        f"termination_reason={result.reason}",
-        f"line_trace_tta_count={int(line_trace_tta_count)}",
-        f"trace2cp_tta_success_count={len(tta_scores)}",
-        f"trace2cp_tta_skipped_count={tta_count - len(tta_scores)}",
+        f"trace_mode={selected_mode}",
+        f"trace_points={int(selected_trace.shape[0])}",
+        f"trace2cp_score={selected_result.score:.8f}",
+        f"raw_y_error_px={selected_result.raw_y_error_px:.6f}",
+        f"target_x={selected_result.target_x:.6f}",
+        f"trace_y_at_target_x={selected_result.trace_y_at_target_x:.6f}",
+        f"reached_target_column={selected_result.reached_target_column}",
+        f"termination_reason={selected_result.reason}",
         f"med_tta={bool(med_tta)}",
-        f"med_tta_score={med_result.score:.8f}" if med_result is not None else "med_tta_score=nan",
-        f"med_tta_raw_y_error_px={med_result.raw_y_error_px:.6f}" if med_result is not None else "med_tta_raw_y_error_px=nan",
-        f"med_tta_reason={med_reason}" if med_result is not None else "med_tta_reason=",
-        "tta_traces:",
+        f"line_trace_tta_count={tta_count}",
+        f"med_tta_fields={med_fields_count}",
+        "tta_fields:",
         *tta_rows,
     ]
     (out / "trace2cp_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
@@ -1338,9 +1294,10 @@ def _export_trace2cp_vis(
         "trace2cp "
         f"sample_index={sample_index} fiber_path={sample.fiber_path} "
         f"start_cp={sample.start_control_point_index} target_cp={sample.target_control_point_index} "
-        f"score={aggregate_score:.8f} raw_y_error_px={aggregate_error:.6f} "
-        f"base_score={result.score:.8f} tta_success={len(tta_scores)}/{tta_count} "
-        f"target_x={result.target_x:.3f} reached={result.reached_target_column} reason={result.reason}"
+        f"mode={selected_mode} score={selected_result.score:.8f} "
+        f"raw_y_error_px={selected_result.raw_y_error_px:.6f} "
+        f"target_x={selected_result.target_x:.3f} "
+        f"reached={selected_result.reached_target_column} reason={selected_result.reason}"
     )
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
 
