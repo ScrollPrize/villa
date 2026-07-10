@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import MarkdownLite from "./MarkdownLite";
+import ChatAvatar from "./ChatAvatar";
 
 const EXAMPLES = ["How do I get started?", "What prizes are open?"];
 
@@ -136,11 +137,15 @@ export default function ChatPanel({
       tabIndex={-1}
       role="dialog"
       aria-modal={isMobile ? "true" : undefined}
-      aria-label="Ask the Scrolls"
+      aria-label="Virtual Philodemus — site assistant"
       onKeyDown={onKeyDown}
     >
       <header className="vc-chat-head">
-        <span className="vc-chat-head__title">Ask the Scrolls</span>
+        <ChatAvatar size={36} />
+        <span className="vc-chat-head__title">
+          Virtual Philodemus
+          <span className="vc-chat-head__subtitle">Vesuvius Challenge assistant</span>
+        </span>
         {messages.length > 0 && (
           <button
             type="button"
@@ -171,18 +176,12 @@ export default function ChatPanel({
         {messages.length === 0 && !error && (
           <div className="vc-chat-empty">
             <div className="vc-chat-empty__mark" aria-hidden="true">
-              <svg width="28" height="28" viewBox="0 0 16 16" fill="none">
-                <path
-                  d="M2.75 3.25h10.5a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H8.4l-3.15 2.9v-2.9H2.75a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"
-                  stroke="currentColor"
-                  strokeWidth="1"
-                  strokeLinejoin="round"
-                />
-              </svg>
+              <ChatAvatar size={64} className="vc-chat-avatar--empty" />
             </div>
             <p className="vc-chat-empty__hint">
-              Ask about the Vesuvius Challenge — answers come from this
-              site&rsquo;s content and may be out of date. Join the{" "}
+              I&rsquo;m <strong>Virtual Philodemus</strong> — ask me about the
+              Vesuvius Challenge. Answers come from this site&rsquo;s content
+              and may be out of date. Join the{" "}
               <a
                 href="https://discord.gg/uTfNwwecCQ"
                 target="_blank"

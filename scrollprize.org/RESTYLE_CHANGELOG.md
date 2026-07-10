@@ -368,6 +368,14 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 - Verified locally under the classic signature: same-origin POST streams 200, foreign origin 403, preflight 204, bad body 400.
 **Files:** `api/chat.mjs`, `api/_lib/handler.mjs`.
 
+## C42 — "Virtual Philodemus": prompt v2, section-anchor citations, assistant identity
+
+**Why:** owner prompt-tuning round — better answers, more precise citations, and a persona that makes the widget feel like talking to a real assistant.
+- **Prompt v2** (`api/_lib/handler.mjs`): restructured into VOICE / GROUNDING / CITATIONS / GUIDANCE / BOUNDARIES. New rules: go technically deep for technical questions (methods, architectures, resolutions, formats); never compute relative time — the model doesn't know today's date, so deadlines are stated as absolute dates only; licensing/data-use answers (esp. PHerc. Paris 4) restate the license/notice faithfully, no loose paraphrase, no legal advice; partial answers instead of all-or-nothing; 1–3 links woven in, not link dumps; archived pages flagged inline before/at the link with a pointer to the superseding page; vague questions get a brief best answer + one clarifying question; self-identity rule (AI assistant, never claims to be human or the historical Philodemus).
+- **Section-anchor citations**: `genChatCorpus.js` extracts every h2–h4 anchor id from the built HTML (runs post-build, so anchors are verified against what Docusaurus actually generated — no dead anchors possible) and annotates corpus headings as `[section: /page#anchor]`. 303/303 headings matched, incl. custom ids like `/prizes#first-title-prize`. The prompt instructs citing the most specific section.
+- **Identity**: renamed to **Virtual Philodemus** (panel title + subtitle "Vesuvius Challenge assistant", aria labels). New `ChatAvatar` mark — a drawn Archimedean spiral (the scroll CT cross-section, the project's most recognizable visual) as inline SVG, zero image payload: ember-on-raised circular chip in the header, large quiet version in the empty state, ember mark in the trigger, whose desktop label is now "Ask Philodemus" ("Ask" on mobile). Empty-state hint introduces the persona.
+**Files:** `api/_lib/handler.mjs`, `scripts/genChatCorpus.js`, `src/components/ChatWidget/{index,ChatPanel,ChatAvatar}.js`, `src/css/chat.css`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.

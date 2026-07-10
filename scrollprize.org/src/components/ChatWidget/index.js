@@ -8,6 +8,7 @@ import React, {
 } from "react";
 import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
 import useIsBrowser from "@docusaurus/useIsBrowser";
+import ChatAvatar from "./ChatAvatar";
 
 // The panel (renderer + streaming logic) stays out of the initial JS bundle;
 // it loads the first time the trigger is pressed.
@@ -239,26 +240,14 @@ export default function ChatWidget() {
         type="button"
         ref={triggerRef}
         className="vc-chat-trigger"
-        aria-label="Ask the Scrolls — site assistant"
+        aria-label="Virtual Philodemus — site assistant"
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={open ? closePanel : openPanel}
       >
-        <svg
-          width="15"
-          height="15"
-          viewBox="0 0 16 16"
-          fill="none"
-          aria-hidden="true"
-        >
-          <path
-            d="M2.75 3.25h10.5a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H8.4l-3.15 2.9v-2.9H2.75a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"
-            stroke="currentColor"
-            strokeWidth="1.3"
-            strokeLinejoin="round"
-          />
-        </svg>
-        <span>Ask</span>
+        <ChatAvatar size={26} className="vc-chat-avatar--bare" />
+        <span className="vc-chat-trigger__long">Ask Philodemus</span>
+        <span className="vc-chat-trigger__short">Ask</span>
       </button>
       {isBrowser && panelRequested && (
         <Suspense fallback={null}>
