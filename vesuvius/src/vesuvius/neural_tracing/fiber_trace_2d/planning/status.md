@@ -1,13 +1,12 @@
-# Status: Cached Fused Augmentation Maps For Line And CP Warp
+# Status: Real Fused Geometric Augmentation Map Tensors
 
-- [x] Read local requirements and current spec section.
-- [x] Identify remaining gap: transform object still permits per-call smooth
-  setup and line/CP are not batched/reused enough.
+- [x] Clarify requirement: fused means actual precomputed maps, not formula
+  centralization.
 - [x] Create current `task.md`.
 - [x] Create current `task_plan.md`.
-- [x] Update `planning/specs.md` with fused-map performance requirements.
-- [x] Implement cached fused transform internals.
-- [x] Batch line+CP source-to-output mapping.
-- [x] Reuse transformed line/CP across shared strip-z offsets where applicable.
-- [x] Update docs/changelog/task log after implementation.
-- [x] Run focused validation.
+- [x] Update `planning/specs.md` with map-tensor requirements.
+- [ ] Implement `backward_map_xy` and `forward_map_xy` construction.
+- [ ] Convert line/CP mapping to forward-map lookup only.
+- [ ] Route coordinate augmentation through cached backward map.
+- [ ] Update docs/changelog/task log after implementation.
+- [ ] Run focused validation.

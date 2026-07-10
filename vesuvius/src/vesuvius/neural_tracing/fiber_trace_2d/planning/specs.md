@@ -63,38 +63,35 @@
 - Default augmentation extrema are `+-patch_width/4` px horizontal offset, `+-patch_height/4` px vertical offset, `+-180` degree rotation, `+-1` px/px shear, `sqrt(0.5)x..sqrt(2.0)x` scale, smooth curve offset up to `+-8` px with 16 px control stride, `+-0.25` valid-range brightness offset, `0.5x..2.0x` contrast around the valid patch center, `0.5..2.0` gamma, valid-range-relative noise std up to `0.125`, and Gaussian blur sigma up to `2.0`.
 - Geometric strip augmentations operate on strip coordinates before image sampling.
 - Geometric augmentation builds an oversized strip-coordinate source area, maps output patch pixels into that source, and samples the volume once at the final augmented coordinates to avoid edge and image reinterpolation artifacts.
-- Geometric augmentation map handling is centralized in one paired
-  forward/backward strip transform. The output-to-source map drives image
-  sampling, and the source-to-output point map drives transformed line/control
-  point coordinates.
-- The paired transform must be a constructed fused map object for the specific
-  source shape, output shape, augmentation parameters, and torch device. It
-  must cache shape/parameter/device-dependent constants and tensors, including
-  smooth-offset controls or lookup tensors, rather than regenerating them on
-  every point or grid mapping call.
-- Every geometric augmentation stage must provide direct vectorized
-  forward/backward coordinate formulas as part of that paired transform:
-  translation, flips, scale, shear, rotation, and smooth offset. No geometric
-  augmentation may invert coordinates with rasterized masks, image warps,
-  nearest-neighbor searches over the output grid, brute-force distance scans,
-  or iterative solvers.
+- Geometric augmentation map handling is centralized in one paired fused map
+  object. In this spec, "fused map" means actual precomputed coordinate map
+  tensors, not a shared bundle of transform formulas.
+- The paired transform must be constructed once for the specific source shape,
+  output shape, augmentation parameters, and torch device. It must store:
+  `backward_map_xy` for output pixel -> source pixel sampling, and
+  `forward_map_xy` for source pixel -> output pixel line/control-point lookup.
+- Every geometric augmentation stage is baked into those map tensors at
+  construction time: translation, flips, scale, shear, rotation, and smooth
+  offset. No geometric augmentation may invert coordinates with rasterized
+  masks, image warps, nearest-neighbor searches over the output grid,
+  brute-force distance scans, or iterative solvers.
 - Smooth offset augmentation is a direct paired vertical map in source-strip
   coordinates. The output-to-source map applies the smooth offset as
   `source_y += f(source_x)`, and the source-to-output point map applies the
   inverse as `source_y -= f(source_x)` before the affine forward map. It must
   not require iterative solving or dense nearest-grid inversion. Smooth control
-  generation must be deterministic and vectorized or cached on the fused map
-  object; it must not allocate a new random generator for every line/CP mapping
-  call.
+  generation/interpolation is allowed only while constructing the fused map
+  tensors; it must not run during line/control-point lookup.
 - Affine geometric shift is an output-space translation applied after scale/flip, not a source-space translation before scale. Combined shift+scale must keep image sampling, transformed line coordinates, and transformed control-point coordinates under that same composition.
 - Training line targets and debug line overlays are geometric coordinate products, not raster images. The line must be represented by strip/output pixel coordinates after the same geometric coordinate transform used for image sampling.
 - Transformed line/control-point coordinates are computed from cached
-  source-space line/control-point coordinates through the shared
-  source-to-output transform. Smooth-offset line/control-point mapping must not
-  invert the patch by dense output-grid nearest-neighbor search.
+  source-space line/control-point coordinates by bilinear lookup/interpolation
+  against the precomputed `forward_map_xy`. Smooth-offset line/control-point
+  mapping must not run smooth interpolation, evaluate affine transform formulas,
+  or invert the patch by dense output-grid nearest-neighbor search.
 - Line points and the control point for a patch must be transformed together in
-  one vectorized source-to-output call through the fused map object, then split
-  back into line and CP outputs.
+  one vectorized lookup call through the fused map object, then split back into
+  line and CP outputs.
 - When multiple strip-z offsets share the same CP source geometry and the same
   augmentation parameters, transformed line/control-point coordinates must be
   computed once and reused across those offsets.
