@@ -14,6 +14,9 @@ TensorBoard logging, checkpoints, prefetch, or runner inspection modes.
     samples/s.
   - `--profile`: enable stage timing and per-batch table output. It can be used
     alone or with `--benchmark`; with benchmark it profiles the benchmark run.
+  - `--load-only`: use the benchmark path but skip value/image augmentation,
+    image normalization, supervision building, model forward, backward, and
+    optimizer work.
 - Add a shared benchmark runner that:
   - uses the existing `FiberStrip2DLoader.load_batch` path;
   - performs the same image preparation, supervision building, forward,
@@ -30,6 +33,9 @@ TensorBoard logging, checkpoints, prefetch, or runner inspection modes.
 - Time model stages in `train.py`:
   - forward plus loss;
   - backward plus optimizer step.
+- Add an opt-in loader flag that disables value augmentation only for
+  load-only benchmark/profile runs. Normal training and visualization paths keep
+  applying value augmentation unchanged.
 - Print:
   - one table header followed by per-batch rows when profiling;
   - a final summary with total patches, elapsed wall time, patches/s, and
@@ -37,9 +43,10 @@ TensorBoard logging, checkpoints, prefetch, or runner inspection modes.
 
 ## Spec Update
 
-Update `planning/specs.md` to document `train.py --benchmark` and
-`train.py --profile`, including the fixed 100-batch default, skipped
-side-effects, patch-sample throughput unit, and profiled stage meanings.
+Update `planning/specs.md` to document `train.py --benchmark`,
+`train.py --profile`, and `train.py --load-only`, including the fixed
+100-batch default, skipped side-effects, patch-sample throughput unit, and
+profiled stage meanings.
 
 ## Docs Updates
 
@@ -51,6 +58,7 @@ the source of the profile stages.
 - Add focused tests using the existing fake local sampler:
   - loader profile collection records expected stage keys through `load_batch`;
   - benchmark mode returns a summary and does not create run directories.
+  - load-only benchmark skips image augmentation and model-stage timings.
 - Run:
   - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py`
   - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`

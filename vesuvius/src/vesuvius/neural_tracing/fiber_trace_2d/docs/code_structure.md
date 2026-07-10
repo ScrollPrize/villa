@@ -180,6 +180,10 @@ The important behavior is:
   loss, and backward plus optimizer step. Loader-side stage timings come from
   the shared `load_batch` / `build_strip_source` / `build_strip_patch_from_source`
   profile hooks, so profiling uses the same sampling path as normal training.
+- Supports `--load-only` on the benchmark path. It still performs deterministic
+  CP selection, CP-local source construction, coordinate augmentation, and
+  base-volume sampling, but skips value/image augmentation, normalization,
+  supervision construction, model forward, backward, and optimizer work.
 - Flattens `[control_point_sample, strip_z_offset]` into one patch batch for the
   model.
 - Computes direction targets from transformed line coordinates after geometric
@@ -292,6 +296,14 @@ Training benchmark/profile:
   - `bw_step`: backward pass plus optimizer step.
 - Benchmark/profile mode intentionally does not create a run directory or write
   checkpoints.
+- Add `--load-only` to isolate loader and volume-sampling cost:
+
+  ```bash
+  python -m vesuvius.neural_tracing.fiber_trace_2d.train config.json --profile --load-only
+  ```
+
+  In this mode `img_aug`, `fw`, and `bw_step` report zero because those stages
+  are intentionally skipped.
 
 Dataset entries must contain:
 

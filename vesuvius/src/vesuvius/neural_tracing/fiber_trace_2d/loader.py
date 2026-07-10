@@ -1148,6 +1148,7 @@ class FiberStrip2DLoader:
         device: torch.device,
         profile: dict[str, float] | None = None,
         load_image: bool = True,
+        apply_image_augmentation: bool = True,
     ) -> tuple[FiberStripSample, np.ndarray | None, np.ndarray | None, np.ndarray]:
         offset = float(self.strip_z_offsets[int(offset_index)])
         grid = self._offset_grid_from_source(source, offset)
@@ -1179,7 +1180,7 @@ class FiberStrip2DLoader:
                     for key, value in result.stats.items():
                         if isinstance(value, (int, float)):
                             profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
-            if params is not None:
+            if params is not None and apply_image_augmentation:
                 with _ProfileBlock(profile, "value_augmentation", device):
                     image_t, valid_t = apply_value_augmentation(
                         image,
@@ -1221,6 +1222,7 @@ class FiberStrip2DLoader:
         *,
         sample_mode: str = "random",
         profile: dict[str, float] | None = None,
+        apply_image_augmentation: bool = True,
     ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
         device = resolve_torch_device(self.config.augment.device) if self.config.augment.enabled else torch.device("cpu")
         source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode, profile=profile)
@@ -1241,6 +1243,7 @@ class FiberStrip2DLoader:
                 device=device,
                 profile=profile,
                 load_image=True,
+                apply_image_augmentation=apply_image_augmentation,
             )
             assert image is not None
             assert valid_mask is not None
@@ -1315,6 +1318,7 @@ class FiberStrip2DLoader:
         sample_mode: str = "random",
         sample_index_limit: int | None = None,
         profile: dict[str, float] | None = None,
+        apply_image_augmentation: bool = True,
     ) -> FiberStrip2DBatch:
         batch_size = self.config.batch_size if batch_size is None else int(batch_size)
         begin_zarr_cache_trace()
@@ -1340,7 +1344,12 @@ class FiberStrip2DLoader:
                         sample_images,
                         sample_coords,
                         sample_valids,
-                    ) = self.build_sample(current_sample_index, sample_mode=sample_mode, profile=profile)
+                    ) = self.build_sample(
+                        current_sample_index,
+                        sample_mode=sample_mode,
+                        profile=profile,
+                        apply_image_augmentation=apply_image_augmentation,
+                    )
                 except ValueError as exc:
                     self._load_batch_skipped_samples += 1
                     if self._load_batch_skipped_samples <= 10:

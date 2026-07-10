@@ -1129,9 +1129,16 @@ def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch
     loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
     attempted: list[int] = []
 
-    def build_sample(sample_index: int, *, sample_mode: str = "random", profile=None):
+    def build_sample(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile=None,
+        apply_image_augmentation: bool = True,
+    ):
         del sample_mode
         del profile
+        del apply_image_augmentation
         attempted.append(int(sample_index))
         record, record_index, control_index = loader.descriptor_for_sample_index(sample_index)
         sample = SimpleNamespace(
@@ -1702,6 +1709,40 @@ def test_training_benchmark_reports_patch_throughput_without_run_dir(tmp_path: P
     assert summary.patches == 6
     assert summary.patches_per_second > 0.0
     assert "coord_gen" in summary.stage_ms_per_patch
+    assert not (tmp_path / "runs").exists()
+
+
+def test_training_load_only_benchmark_skips_image_aug_and_model_work(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "load_only",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    summary = run_benchmark(
+        config_path,
+        sampler_factory=_test_sampler_factory,
+        batches=2,
+        profile=True,
+        load_only=True,
+    )
+
+    assert summary.batches == 2
+    assert summary.patches == 6
+    assert summary.stage_ms_per_patch["loading"] >= 0.0
+    assert summary.stage_ms_per_patch["image_aug"] == 0.0
+    assert summary.stage_ms_per_patch["fw"] == 0.0
+    assert summary.stage_ms_per_patch["bw_step"] == 0.0
     assert not (tmp_path / "runs").exists()
 
 

@@ -262,6 +262,7 @@ def run_benchmark(
     sampler_factory: SamplerFactory | None = None,
     batches: int = 100,
     profile: bool = False,
+    load_only: bool = False,
 ) -> _BenchmarkSummary:
     if int(batches) <= 0:
         raise ValueError("benchmark batches must be > 0")
@@ -270,15 +271,18 @@ def run_benchmark(
     loader_config = load_config(config_path)
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
     device = resolve_torch_device(training.device)
-    model = FiberStripDirectionNet(
-        FiberStripDirectionModelConfig(
-            in_channels=1,
-            hidden_channels=training.model_hidden_channels,
-            depth=training.model_depth,
-        )
-    ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
-    model.train()
+    model: FiberStripDirectionNet | None = None
+    optimizer: torch.optim.Optimizer | None = None
+    if not load_only:
+        model = FiberStripDirectionNet(
+            FiberStripDirectionModelConfig(
+                in_channels=1,
+                hidden_channels=training.model_hidden_channels,
+                depth=training.model_depth,
+            )
+        ).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate)
+        model.train()
 
     sample_mode = "random"
     stage_totals = {key: 0.0 for key in ("coord_gen", "coord_aug", "loading", "image_aug", "fw", "bw_step")}
@@ -299,27 +303,31 @@ def run_benchmark(
             sample_mode=sample_mode,
             sample_index_limit=training.max_sample_index,
             profile=loader_profile if profile else None,
+            apply_image_augmentation=not load_only,
         )
 
         images_np, valid_np = _flatten_batch(batch)
         patch_count = int(images_np.shape[0])
-        images = _prepare_images(images_np, valid_np, device=device)
-        supervision = build_direction_supervision(batch.samples, valid_np, device=device)
-
-        optimizer.zero_grad(set_to_none=True)
         train_profile: dict[str, float] = {}
-        _sync_device(device)
-        fw_start = time.perf_counter()
-        outputs = model(images)
-        loss = direction_mse_loss(outputs, supervision)
-        _sync_device(device)
-        train_profile["fw"] = (time.perf_counter() - fw_start) * 1000.0
+        if not load_only:
+            assert model is not None
+            assert optimizer is not None
+            images = _prepare_images(images_np, valid_np, device=device)
+            supervision = build_direction_supervision(batch.samples, valid_np, device=device)
 
-        bw_start = time.perf_counter()
-        loss.backward()
-        optimizer.step()
-        _sync_device(device)
-        train_profile["bw_step"] = (time.perf_counter() - bw_start) * 1000.0
+            optimizer.zero_grad(set_to_none=True)
+            _sync_device(device)
+            fw_start = time.perf_counter()
+            outputs = model(images)
+            loss = direction_mse_loss(outputs, supervision)
+            _sync_device(device)
+            train_profile["fw"] = (time.perf_counter() - fw_start) * 1000.0
+
+            bw_start = time.perf_counter()
+            loss.backward()
+            optimizer.step()
+            _sync_device(device)
+            train_profile["bw_step"] = (time.perf_counter() - bw_start) * 1000.0
 
         batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000.0
         stages = _benchmark_stage_totals(loader_profile, train_profile)
@@ -831,6 +839,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Print benchmark/training-stage timing rows and per-patch summary for the 100-batch benchmark run",
     )
     parser.add_argument(
+        "--load-only",
+        action="store_true",
+        help="Run the 100-batch benchmark loader path only, skipping image augmentation and model training work",
+    )
+    parser.add_argument(
         "--prefetch-steps",
         type=int,
         default=None,
@@ -856,9 +869,9 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError as exc:
             parser.error(str(exc))
         return
-    if args.benchmark or args.profile:
+    if args.benchmark or args.profile or args.load_only:
         try:
-            run_benchmark(args.config, batches=100, profile=bool(args.profile))
+            run_benchmark(args.config, batches=100, profile=bool(args.profile), load_only=bool(args.load_only))
         except ValueError as exc:
             parser.error(str(exc))
         return
