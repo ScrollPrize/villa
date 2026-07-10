@@ -158,6 +158,9 @@ The important behavior is:
   augmentation.
 - Logs scalars/images to TensorBoard and writes `current.pt` / `best.pt`
   snapshots under the run directory.
+- When `test_datasets` is configured, evaluates a fixed deterministic held-out
+  batch at `training.test_interval` and uses test loss for current/best
+  snapshots.
 
 `configs/loader_example.json`
 
@@ -173,6 +176,8 @@ The important behavior is:
 Top-level keys used by `load_config`:
 
 - `datasets`: non-empty list of dataset entries.
+- `test_datasets`: optional non-empty list of held-out dataset entries using
+  the same schema as `datasets`.
 - `batch_size`: number of control-point samples per loaded batch.
 - `patch_shape_hw`: `[height, width]` output patch size.
 - `strip_z_offset_count`: number of parallel strip-z offsets per sample.
@@ -195,6 +200,11 @@ Training keys:
 - `scalar_log_interval`: TensorBoard scalar/console interval.
 - `tensorboard_image_interval`: TensorBoard batch-image interval.
 - `checkpoint_interval`: interval for writing `snapshots/current.pt`.
+- `test_interval`: interval for deterministic held-out evaluation and, when
+  `test_datasets` is configured, current snapshot writes.
+- `test_control_points`: number of deterministic held-out CP samples per test
+  evaluation.
+- `test_start_sample_index`: deterministic held-out sample start index.
 - `control_points_per_step`: deterministic CP samples per step; default `4`.
 - `device`: `auto`, `cpu`, or a torch device string.
 - `tensorboard_enabled`: set false for smoke tests without TensorBoard.
@@ -386,6 +396,9 @@ The trainer logs:
 - cache hit/download diagnostics where available;
 - `train/batch_direction_overlay` images showing the transformed centerline
   behind one short network-predicted direction segment at the transformed CP.
+- when `test_datasets` is configured, `test/loss_direction`,
+  `test/supervision_samples`, test cache diagnostics, and
+  `test/batch_direction_overlay` at test evaluation steps.
 
 Console progress prints use the same loss/supervision/load summary for every
 step whose deterministic control-point sample range starts before sample index
@@ -397,6 +410,12 @@ Snapshots are written under:
 <run_dir>/snapshots/current.pt
 <run_dir>/snapshots/best.pt
 ```
+
+With `test_datasets`, `current.pt` is written at step 1, every
+`training.test_interval`, and the final step; `best.pt` tracks the lowest
+observed test loss. Without `test_datasets`, snapshots keep the train-only
+behavior: `current.pt` follows `training.checkpoint_interval`, and `best.pt`
+tracks the lowest observed training loss.
 
 ## Prefetch
 

@@ -47,6 +47,7 @@
 - Augment contact sheets draw a final visualization-only thin vertical marker at the transformed control-point coordinate for each patch, leaving a small gap around the CP pixel itself.
 - Augment contact-sheet cells include a top label band naming the shown augmentation; labels must not overlay image pixels.
 - Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.
+- Optional top-level `test_datasets` uses the same dataset-entry schema as `datasets`; when present it defines a separate deterministic test loader while reusing the rest of the loader configuration.
 - Strip-frame normals are sampled only through the Lasagna manifest `grad_mag`, `nx`, and `ny` channels.
 - Normal batch loading samples random control points deterministically from the configured seed.
 - The tester/runner loads a batch from a specified deterministic control-point sample index.
@@ -86,9 +87,11 @@
 - Each loaded strip sample carries the transformed control-point output-pixel coordinate. V0 direction supervision is limited to the eight neighboring pixels around that rounded transformed control-point location, filtered by image validity and patch bounds.
 - The V0 loss compares predicted and target encoded channels directly with MSE over those CP-local samples; raw signed `(dx,dy)` regression and `abs(dot)` losses are not the V0 training representation.
 - Training creates a run directory from `training.run_path` and `training.run_name` plus a date string.
-- TensorBoard logging writes the training config JSON as text, direction-loss scalars, timing/cache diagnostics, and batch direction overlay images at configured intervals. Batch direction overlays show the transformed fiber centerline as context and one short network-predicted direction segment at the transformed CP; they do not draw CP-neighborhood supervision boxes or extra CP markers.
+- Training config keys include `test_interval`, `test_control_points`, and `test_start_sample_index` for deterministic test evaluation when `test_datasets` is configured.
+- Test evaluation runs at step 1, every `training.test_interval`, and the final step when `test_datasets` is configured. It always loads the fixed range starting at `training.test_start_sample_index` with `training.test_control_points`, so the same held-out CP samples are compared across time.
+- TensorBoard logging writes the training config JSON as text, direction-loss scalars, timing/cache diagnostics, and batch direction overlay images at configured intervals. Batch direction overlays show the transformed fiber centerline as context and one short network-predicted direction segment at the transformed CP; they do not draw CP-neighborhood supervision boxes or extra CP markers. When `test_datasets` is configured, TensorBoard also logs `test/loss_direction`, `test/supervision_samples`, test cache diagnostics, and a `test/batch_direction_overlay` image at test evaluation steps.
 - Console training progress prints every step covering the first 100 deterministic control-point sample indices, then falls back to `training.scalar_log_interval`.
-- Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`; best is the lowest observed training loss until validation is added.
+- Training writes snapshots under `<run_dir>/snapshots/current.pt` and `<run_dir>/snapshots/best.pt`. With `test_datasets`, current snapshots are written at the test evaluation cadence and best is selected by lowest observed test loss. Without `test_datasets`, current snapshots use `training.checkpoint_interval` and best is selected by lowest observed training loss.
 - The runner is `python -m vesuvius.neural_tracing.fiber_trace_2d.runner`.
 - Augment contact sheets are exported with `--augment-vis --export-dir <dir>`.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.

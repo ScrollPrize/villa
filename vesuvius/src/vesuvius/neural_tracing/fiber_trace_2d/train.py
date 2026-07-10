@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,9 @@ class FiberStripTrainingConfig:
     scalar_log_interval: int = 100
     tensorboard_image_interval: int = 1000
     checkpoint_interval: int = 1000
+    test_interval: int = 1000
+    test_control_points: int = 4
+    test_start_sample_index: int = 0
     train_control_points_per_step: int = 4
     device: str = "auto"
     tensorboard_enabled: bool = True
@@ -61,6 +64,9 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
         scalar_log_interval=max(1, int(get("scalar_log_interval", 100))),
         tensorboard_image_interval=max(1, int(get("tensorboard_image_interval", 1000))),
         checkpoint_interval=max(1, int(get("checkpoint_interval", 1000))),
+        test_interval=max(1, int(get("test_interval", get("checkpoint_interval", 1000)))),
+        test_control_points=max(1, int(get("test_control_points", get("control_points_per_step", 4)))),
+        test_start_sample_index=max(0, int(get("test_start_sample_index", 0))),
         train_control_points_per_step=max(1, int(get("control_points_per_step", get("control_points", 4)))),
         device=str(get("device", "auto")),
         tensorboard_enabled=bool(get("tensorboard_enabled", True)),
@@ -72,6 +78,17 @@ def _training_config_from_raw(raw: dict[str, Any]) -> FiberStripTrainingConfig:
     if not math.isfinite(config.learning_rate) or config.learning_rate <= 0.0:
         raise ValueError("training.learning_rate must be positive and finite")
     return config
+
+
+def _test_loader_config_from_raw(
+    raw: dict[str, Any], loader_config: Any
+) -> Any | None:
+    test_datasets = raw.get("test_datasets")
+    if test_datasets is None:
+        return None
+    if not isinstance(test_datasets, list) or not test_datasets:
+        raise ValueError("'test_datasets' must be a non-empty list when provided")
+    return replace(loader_config, datasets=tuple(dict(entry) for entry in test_datasets))
 
 
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
@@ -148,6 +165,39 @@ def _compute_batch_loss(
     outputs = model(images)
     loss = direction_mse_loss(outputs, supervision)
     return loss, outputs, supervision
+
+
+@dataclass(frozen=True)
+class _EvalResult:
+    loss: float
+    supervision_samples: int
+    batch: FiberStrip2DBatch
+    outputs: torch.Tensor
+
+
+def _evaluate_fixed_batch(
+    model: FiberStripDirectionNet,
+    loader: FiberStrip2DLoader,
+    *,
+    device: torch.device,
+    start_sample_index: int,
+    batch_size: int,
+) -> _EvalResult:
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        batch = loader.load_batch(start_sample_index, batch_size=batch_size)
+        loss, outputs, supervision = _compute_batch_loss(model, batch, device=device)
+        loss_value = float(loss.detach().cpu().item())
+        outputs_cpu = outputs.detach().cpu()
+    if was_training:
+        model.train()
+    return _EvalResult(
+        loss=loss_value,
+        supervision_samples=int(supervision.target.shape[0]),
+        batch=batch,
+        outputs=outputs_cpu,
+    )
 
 
 def _cache_scalars(cache_stats: Any | None) -> dict[str, float]:
@@ -274,11 +324,13 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     loss: float,
     raw_config: dict[str, Any],
+    metric_name: str = "loss",
 ) -> None:
     torch.save(
         {
             "step": int(step),
             "loss": float(loss),
+            "metric_name": str(metric_name),
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": _json_safe(raw_config),
@@ -296,6 +348,12 @@ def run_training(
     training = _training_config_from_raw(raw_config)
     loader_config = load_config(config_path)
     loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
+    test_loader = (
+        None
+        if test_loader_config is None
+        else FiberStrip2DLoader(test_loader_config, sampler_factory=sampler_factory)
+    )
     expected_patches = int(training.train_control_points_per_step) * int(loader_config.strip_z_offset_count)
     if expected_patches != 64:
         print(
@@ -321,8 +379,9 @@ def run_training(
         writer.add_text("config/json", json.dumps(_json_safe(raw_config), indent=2, sort_keys=True), 0)
     print(f"fiber_trace_2d train run_dir={run_dir}", flush=True)
 
-    best_loss = float("inf")
+    best_metric = float("inf")
     last_loss = float("nan")
+    last_test_loss = float("nan")
     try:
         for step in range(1, training.max_steps + 1):
             start_sample_index = (step - 1) * int(training.train_control_points_per_step)
@@ -337,6 +396,20 @@ def run_training(
             optimizer.step()
             loss_value = float(loss.detach().cpu().item())
             last_loss = loss_value
+            should_test = (
+                test_loader is not None
+                and (step == 1 or step % training.test_interval == 0 or step == training.max_steps)
+            )
+            test_result = None
+            if should_test:
+                test_result = _evaluate_fixed_batch(
+                    model,
+                    test_loader,
+                    device=device,
+                    start_sample_index=training.test_start_sample_index,
+                    batch_size=training.test_control_points,
+                )
+                last_test_loss = test_result.loss
 
             if writer is not None and (step == 1 or step % training.scalar_log_interval == 0):
                 writer.add_scalar("train/loss_direction", loss_value, step)
@@ -344,43 +417,74 @@ def run_training(
                 writer.add_scalar("timing/load_ms", load_ms, step)
                 for key, value in _cache_scalars(batch.cache_stats).items():
                     writer.add_scalar(key, value, step)
+            if writer is not None and test_result is not None:
+                writer.add_scalar("test/loss_direction", test_result.loss, step)
+                writer.add_scalar("test/supervision_samples", test_result.supervision_samples, step)
+                for key, value in _cache_scalars(test_result.batch.cache_stats).items():
+                    writer.add_scalar(f"test_{key}", value, step)
             if writer is not None and (step == 1 or step % training.tensorboard_image_interval == 0):
                 writer.add_image("train/batch_direction_overlay", _make_training_visualization(batch, outputs), step)
-            if step == 1 or step % training.checkpoint_interval == 0 or step == training.max_steps:
+            if writer is not None and test_result is not None:
+                writer.add_image(
+                    "test/batch_direction_overlay",
+                    _make_training_visualization(test_result.batch, test_result.outputs),
+                    step,
+                )
+
+            should_save_current = (
+                bool(should_test)
+                if test_loader is not None
+                else (step == 1 or step % training.checkpoint_interval == 0 or step == training.max_steps)
+            )
+            if should_save_current:
+                checkpoint_loss = test_result.loss if test_result is not None else loss_value
+                checkpoint_metric = "test/loss_direction" if test_result is not None else "train/loss_direction"
                 _save_checkpoint(
                     snapshots / "current.pt",
                     step=step,
                     model=model,
                     optimizer=optimizer,
-                    loss=loss_value,
+                    loss=checkpoint_loss,
                     raw_config=raw_config,
+                    metric_name=checkpoint_metric,
                 )
-            if loss_value < best_loss:
-                best_loss = loss_value
-                _save_checkpoint(
-                    snapshots / "best.pt",
-                    step=step,
-                    model=model,
-                    optimizer=optimizer,
-                    loss=loss_value,
-                    raw_config=raw_config,
-                )
+            if test_loader is None or test_result is not None:
+                metric_value = test_result.loss if test_result is not None else loss_value
+                metric_name = "test/loss_direction" if test_result is not None else "train/loss_direction"
+                if metric_value < best_metric:
+                    best_metric = metric_value
+                    _save_checkpoint(
+                        snapshots / "best.pt",
+                        step=step,
+                        model=model,
+                        optimizer=optimizer,
+                        loss=metric_value,
+                        raw_config=raw_config,
+                        metric_name=metric_name,
+                    )
             if _should_print_training_step(
                 step,
                 scalar_log_interval=training.scalar_log_interval,
                 start_sample_index=start_sample_index,
                 sample_count=training.train_control_points_per_step,
             ):
+                test_part = "" if test_result is None else f" test_loss_direction={test_result.loss:.6f}"
                 print(
                     f"step={step} loss_direction={loss_value:.6f} "
-                    f"supervision_samples={int(supervision.target.shape[0])} load_ms={load_ms:.1f}",
+                    f"supervision_samples={int(supervision.target.shape[0])}{test_part} "
+                    f"load_ms={load_ms:.1f}",
                     flush=True,
                 )
     finally:
         if writer is not None:
             writer.flush()
             writer.close()
-    print(f"fiber_trace_2d train complete step={training.max_steps} loss_direction={last_loss:.6f}", flush=True)
+    test_complete = "" if math.isnan(last_test_loss) else f" test_loss_direction={last_test_loss:.6f}"
+    print(
+        f"fiber_trace_2d train complete step={training.max_steps} "
+        f"loss_direction={last_loss:.6f}{test_complete}",
+        flush=True,
+    )
     return run_dir
 
 

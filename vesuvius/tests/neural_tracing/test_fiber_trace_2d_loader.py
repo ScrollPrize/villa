@@ -36,6 +36,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.loader import (
 from vesuvius.neural_tracing.fiber_trace_2d.train import (
     _draw_predicted_cp_direction,
     _should_print_training_step,
+    _test_loader_config_from_raw,
+    _training_config_from_raw,
     prefetch_training,
     run_training,
 )
@@ -1019,6 +1021,43 @@ def test_training_prefetch_rejects_negative_steps(tmp_path: Path) -> None:
         prefetch_training(config_path, prefetch_steps=-1, sampler_factory=_test_sampler_factory)
 
 
+def test_training_config_parses_test_settings() -> None:
+    config = _training_config_from_raw(
+        {
+            "training": {
+                "test_interval": 17,
+                "test_control_points": 3,
+                "test_start_sample_index": 11,
+            }
+        }
+    )
+
+    assert config.test_interval == 17
+    assert config.test_control_points == 3
+    assert config.test_start_sample_index == 11
+
+
+def test_test_datasets_replace_training_datasets_for_loader_config(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    train_fiber = raw["datasets"][0]["fiber_paths"][0]
+    test_fiber = _write_fiber(tmp_path / "test_fiber.json", points=[[5.0, 22.0, 22.0], [15.0, 22.0, 22.0]])
+    raw["test_datasets"] = [
+        {
+            **raw["datasets"][0],
+            "fiber_paths": [str(test_fiber)],
+        }
+    ]
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loader_config = load_config(config_path)
+    test_config = _test_loader_config_from_raw(raw, loader_config)
+
+    assert test_config is not None
+    assert loader_config.datasets[0]["fiber_paths"] == [train_fiber]
+    assert test_config.datasets[0]["fiber_paths"] == [str(test_fiber)]
+
+
 def test_lasagna_direction_encoding_is_forward_backward_ambiguous() -> None:
     directions = torch.tensor(
         [
@@ -1141,3 +1180,37 @@ def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:
 
     assert (run_dir / "snapshots" / "current.pt").is_file()
     assert (run_dir / "snapshots" / "best.pt").is_file()
+
+
+def test_training_with_test_dataset_uses_test_interval_for_snapshots(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    test_fiber = _write_fiber(tmp_path / "heldout_fiber.json", points=[[8.0, 24.0, 24.0], [18.0, 24.0, 24.0]])
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["test_datasets"] = [
+        {
+            **raw["datasets"][0],
+            "fiber_paths": [str(test_fiber)],
+        }
+    ]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "test_interval",
+        "max_steps": 2,
+        "control_points_per_step": 1,
+        "test_interval": 2,
+        "test_control_points": 1,
+        "test_start_sample_index": 0,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+
+    current = torch.load(run_dir / "snapshots" / "current.pt", map_location="cpu", weights_only=False)
+    best = torch.load(run_dir / "snapshots" / "best.pt", map_location="cpu", weights_only=False)
+    assert current["step"] == 2
+    assert current["metric_name"] == "test/loss_direction"
+    assert best["metric_name"] == "test/loss_direction"
