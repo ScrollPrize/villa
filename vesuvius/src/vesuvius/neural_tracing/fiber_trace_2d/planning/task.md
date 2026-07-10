@@ -12,6 +12,9 @@ Implement the `planning/todo.md` item "median of TTA for tracing":
   sign that points more than 90 degrees away from the previous step direction.
 - Add a separate `--med-tta` flag. With `--line-trace-vis`, it should add a
   third visualization column after the reference-only trace and the TTA flock.
+- Use one shared TTA scheme for both the flock and median TTA: a configurable
+  count of random combined geometric augmentations sampled from the regular
+  training augmentation ranges, defaulting to 100.
 - Follow-up cleanup: remove hardcoded CPU coordinate generation from
   non-prefetch loader/runner paths. Prefetch may stay CPU-pinned for dependency
   generation.

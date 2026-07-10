@@ -10,10 +10,12 @@ import torch
 import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
+    FiberStripAugmentParams,
     limit_augmentation_rows,
     overlay_line_coords_rgb,
     random_combined_augmentation,
     resolve_torch_device,
+    source_coordinate_grid_for_output,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.direction import (
     decode_lasagna_direction_xy,
@@ -303,8 +305,9 @@ class _TtaDirectionField:
     name: str
     direction_xy: np.ndarray
     valid_mask: np.ndarray
-    matrix_ref_to_tta: np.ndarray
-    matrix_tta_to_ref: np.ndarray
+    matrix_ref_to_tta: np.ndarray | None = None
+    matrix_tta_to_ref: np.ndarray | None = None
+    source_xy_grid: np.ndarray | None = None
 
 
 def _trace_tta_matrix(
@@ -361,6 +364,23 @@ def _transform_direction_xy(direction_xy: np.ndarray, matrix: np.ndarray) -> np.
     return (transformed / norm).astype(np.float32)
 
 
+def _geometric_only_params(params: FiberStripAugmentParams) -> FiberStripAugmentParams:
+    return FiberStripAugmentParams(
+        shift_x=params.shift_x,
+        shift_y=params.shift_y,
+        rotation_degrees=params.rotation_degrees,
+        shear_x=params.shear_x,
+        shear_y=params.shear_y,
+        scale=params.scale,
+        smooth_offset=params.smooth_offset,
+        smooth_offset_stride=params.smooth_offset_stride,
+        smooth_offset_seed=params.smooth_offset_seed,
+        flip_x=params.flip_x,
+        flip_y=params.flip_y,
+        noise_seed=params.noise_seed,
+    )
+
+
 def _orient_direction_to_previous(direction_xy: np.ndarray, previous_xy: np.ndarray) -> np.ndarray | None:
     direction = np.asarray(direction_xy, dtype=np.float32)
     previous = np.asarray(previous_xy, dtype=np.float32)
@@ -377,6 +397,122 @@ def _orient_direction_to_previous(direction_xy: np.ndarray, previous_xy: np.ndar
     if float(np.dot(unit, previous_unit)) < 0.0:
         return None
     return unit.astype(np.float32)
+
+
+def _nearest_tta_point_for_reference(source_xy_grid: np.ndarray, point_xy: np.ndarray) -> np.ndarray | None:
+    source = np.asarray(source_xy_grid, dtype=np.float32)
+    point = np.asarray(point_xy, dtype=np.float32)
+    if source.ndim != 3 or source.shape[2] != 2 or point.shape != (2,):
+        raise ValueError("source_xy_grid must have shape H,W,2 and point_xy must have shape (2,)")
+    finite = np.isfinite(source).all(axis=2)
+    if not bool(finite.any()) or not bool(np.isfinite(point).all()):
+        return None
+    delta = source - point.reshape(1, 1, 2)
+    dist2 = np.sum(delta * delta, axis=2)
+    dist2 = np.where(finite, dist2, np.inf)
+    flat_index = int(np.argmin(dist2))
+    best = float(dist2.reshape(-1)[flat_index])
+    if not np.isfinite(best) or best > 4.0:
+        return None
+    y, x = np.unravel_index(flat_index, dist2.shape)
+    return np.asarray([float(x), float(y)], dtype=np.float32)
+
+
+def _source_grid_direction_to_reference(source_xy_grid: np.ndarray, point_xy: np.ndarray, direction_xy: np.ndarray) -> np.ndarray | None:
+    source = np.asarray(source_xy_grid, dtype=np.float32)
+    point = np.asarray(point_xy, dtype=np.float32)
+    direction = np.asarray(direction_xy, dtype=np.float32)
+    if source.ndim != 3 or source.shape[2] != 2 or point.shape != (2,) or direction.shape != (2,):
+        raise ValueError("source_xy_grid must have shape H,W,2 and point/direction must have shape (2,)")
+    height, width = source.shape[:2]
+    x = int(round(float(point[0])))
+    y = int(round(float(point[1])))
+    if x < 0 or y < 0 or x >= width or y >= height:
+        return None
+    x0 = max(0, x - 1)
+    x1 = min(width - 1, x + 1)
+    y0 = max(0, y - 1)
+    y1 = min(height - 1, y + 1)
+    if x0 == x1 or y0 == y1:
+        return None
+    local = source[[y, y, y0, y1], [x0, x1, x, x]]
+    if not bool(np.isfinite(local).all()):
+        return None
+    dsource_dx = (source[y, x1] - source[y, x0]) / np.float32(x1 - x0)
+    dsource_dy = (source[y1, x] - source[y0, x]) / np.float32(y1 - y0)
+    transformed = dsource_dx * direction[0] + dsource_dy * direction[1]
+    norm = float(np.linalg.norm(transformed))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return None
+    return (transformed / norm).astype(np.float32)
+
+
+def _source_grid_point_to_reference(source_xy_grid: np.ndarray, point_xy: np.ndarray) -> np.ndarray | None:
+    source = np.asarray(source_xy_grid, dtype=np.float32)
+    point = np.asarray(point_xy, dtype=np.float32)
+    if source.ndim != 3 or source.shape[2] != 2 or point.shape != (2,):
+        raise ValueError("source_xy_grid must have shape H,W,2 and point_xy must have shape (2,)")
+    height, width = source.shape[:2]
+    x = float(point[0])
+    y = float(point[1])
+    if not np.isfinite(x) or not np.isfinite(y) or x < 0.0 or y < 0.0 or x > float(width - 1) or y > float(height - 1):
+        return None
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    if not bool(np.isfinite(source[[y0, y0, y1, y1], [x0, x1, x0, x1]]).all()):
+        return None
+    tx = np.float32(x - float(x0))
+    ty = np.float32(y - float(y0))
+    top = source[y0, x0] * (1.0 - tx) + source[y0, x1] * tx
+    bottom = source[y1, x0] * (1.0 - tx) + source[y1, x1] * tx
+    return (top * (1.0 - ty) + bottom * ty).astype(np.float32)
+
+
+def _reference_direction_to_source_grid_direction(
+    source_xy_grid: np.ndarray,
+    point_xy: np.ndarray,
+    reference_direction_xy: np.ndarray,
+) -> np.ndarray | None:
+    source = np.asarray(source_xy_grid, dtype=np.float32)
+    point = np.asarray(point_xy, dtype=np.float32)
+    direction = np.asarray(reference_direction_xy, dtype=np.float32)
+    if source.ndim != 3 or source.shape[2] != 2 or point.shape != (2,) or direction.shape != (2,):
+        raise ValueError("source_xy_grid must have shape H,W,2 and point/direction must have shape (2,)")
+    height, width = source.shape[:2]
+    x = int(round(float(point[0])))
+    y = int(round(float(point[1])))
+    if x < 0 or y < 0 or x >= width or y >= height:
+        return None
+    x0 = max(0, x - 1)
+    x1 = min(width - 1, x + 1)
+    y0 = max(0, y - 1)
+    y1 = min(height - 1, y + 1)
+    if x0 == x1 or y0 == y1:
+        return None
+    local = source[[y, y, y0, y1], [x0, x1, x, x]]
+    if not bool(np.isfinite(local).all()):
+        return None
+    dsource_dx = (source[y, x1] - source[y, x0]) / np.float32(x1 - x0)
+    dsource_dy = (source[y1, x] - source[y0, x]) / np.float32(y1 - y0)
+    jacobian = np.stack([dsource_dx, dsource_dy], axis=1).astype(np.float32)
+    transformed = np.linalg.pinv(jacobian).astype(np.float32) @ direction
+    norm = float(np.linalg.norm(transformed))
+    if not np.isfinite(norm) or norm <= 1.0e-6:
+        return None
+    return (transformed / norm).astype(np.float32)
+
+
+def _source_grid_points_to_reference(source_xy_grid: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
+    points = np.asarray(points_xy, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points_xy must have shape N,2")
+    mapped = [_source_grid_point_to_reference(source_xy_grid, point) for point in points]
+    finite = [point for point in mapped if point is not None]
+    if not finite:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.stack(finite, axis=0).astype(np.float32)
 
 
 def _warp_patch_by_matrix(
@@ -413,6 +549,46 @@ def _warp_patch_by_matrix(
     warped = F.grid_sample(image_t, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
     warped_valid = F.grid_sample(valid_t, grid, mode="nearest", padding_mode="zeros", align_corners=True)[0, 0] > 0.5
     return warped.numpy().astype(np.float32), warped_valid.numpy().astype(bool)
+
+
+def _warp_patch_by_augment_params(
+    image: np.ndarray,
+    valid_mask: np.ndarray,
+    params: FiberStripAugmentParams,
+    *,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    arr = np.asarray(image, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if arr.ndim != 2 or valid.shape != arr.shape:
+        raise ValueError("image and valid_mask must be matching 2D arrays")
+    height, width = arr.shape
+    source_xy = source_coordinate_grid_for_output(
+        height,
+        width,
+        height,
+        width,
+        _geometric_only_params(params),
+        device=device,
+    )
+    if width > 1:
+        grid_x = source_xy[..., 0] * (2.0 / float(width - 1)) - 1.0
+    else:
+        grid_x = torch.zeros_like(source_xy[..., 0])
+    if height > 1:
+        grid_y = source_xy[..., 1] * (2.0 / float(height - 1)) - 1.0
+    else:
+        grid_y = torch.zeros_like(source_xy[..., 1])
+    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+    image_t = torch.as_tensor(arr, dtype=torch.float32, device=device).view(1, 1, height, width)
+    valid_t = torch.as_tensor(valid.astype(np.float32), dtype=torch.float32, device=device).view(1, 1, height, width)
+    warped = F.grid_sample(image_t, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
+    warped_valid = F.grid_sample(valid_t, grid, mode="nearest", padding_mode="zeros", align_corners=True)[0, 0] > 0.5
+    return (
+        warped.detach().cpu().numpy().astype(np.float32),
+        warped_valid.detach().cpu().numpy().astype(bool),
+        source_xy.detach().cpu().numpy().astype(np.float32),
+    )
 
 
 def _line_trace_tta_entries(shape_hw: tuple[int, int], loader: FiberStrip2DLoader) -> list[tuple[str, np.ndarray]]:
@@ -497,11 +673,25 @@ def _sample_tta_direction_in_reference(
 ) -> np.ndarray | None:
     candidates: list[np.ndarray] = []
     for field in fields:
-        tta_point = _transform_points_xy(point_xy, field.matrix_ref_to_tta)[0]
+        if field.source_xy_grid is not None:
+            tta_point = _nearest_tta_point_for_reference(field.source_xy_grid, point_xy)
+            if tta_point is None:
+                continue
+        elif field.matrix_ref_to_tta is not None:
+            tta_point = _transform_points_xy(point_xy, field.matrix_ref_to_tta)[0]
+        else:
+            raise ValueError(f"TTA field {field.name!r} has no point transform")
         sampled = _bilinear_direction_sample(field.direction_xy, tta_point, valid_mask=field.valid_mask)
         if sampled is None:
             continue
-        sampled_ref = _transform_direction_xy(sampled, field.matrix_tta_to_ref)
+        if field.source_xy_grid is not None:
+            sampled_ref = _source_grid_direction_to_reference(field.source_xy_grid, tta_point, sampled)
+            if sampled_ref is None:
+                continue
+        elif field.matrix_tta_to_ref is not None:
+            sampled_ref = _transform_direction_xy(sampled, field.matrix_tta_to_ref)
+        else:
+            raise ValueError(f"TTA field {field.name!r} has no orientation transform")
         oriented = _orient_direction_to_previous(sampled_ref, previous_xy)
         if oriented is not None:
             candidates.append(oriented)
@@ -571,6 +761,7 @@ def _export_line_trace_vis(
     step_px: float,
     rf_margin_px: float | None,
     med_tta: bool = False,
+    line_trace_tta_count: int = 100,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -602,23 +793,32 @@ def _export_line_trace_vis(
     flock_overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.35, thickness=1)
     flock_overlay = _overlay_polyline_rgb(flock_overlay, traced_line, color_rgba=(0, 255, 0, 220), thickness=1)
     tta_rows: list[str] = []
-    tta_fields: list[_TtaDirectionField] = []
-    for tta_name, matrix in _line_trace_tta_entries(image.shape, loader):
+    random_tta_fields: list[_TtaDirectionField] = []
+    tta_count = max(0, int(line_trace_tta_count))
+    for variant_index in range(tta_count):
+        params = _geometric_only_params(random_combined_augmentation(loader.config.augment, sample_index, variant_index))
+        tta_name = f"random_{variant_index:03d}"
         try:
-            tta_image, tta_valid = _warp_patch_by_matrix(image, valid_mask, matrix)
-            tta_cp = _transform_points_xy(cp_xy, matrix)[0]
-            tta_tangent = _transform_direction_xy(tangent_xy, matrix)
+            tta_image, tta_valid, source_xy_grid = _warp_patch_by_augment_params(
+                image,
+                valid_mask,
+                params,
+                device=device,
+            )
+            tta_cp = _nearest_tta_point_for_reference(source_xy_grid, cp_xy)
+            if tta_cp is None:
+                raise ValueError("could not invert CP into TTA patch")
+            tta_tangent = _reference_direction_to_source_grid_direction(source_xy_grid, tta_cp, tangent_xy)
+            if tta_tangent is None:
+                raise ValueError("could not transform tangent into TTA patch")
             tta_direction = _predict_direction_field(model, tta_image, tta_valid, device=device)
-            if med_tta:
-                tta_fields.append(
-                    _TtaDirectionField(
-                        name=tta_name,
-                        direction_xy=tta_direction,
-                        valid_mask=tta_valid,
-                        matrix_ref_to_tta=matrix,
-                        matrix_tta_to_ref=np.linalg.inv(matrix).astype(np.float32),
-                    )
-                )
+            field = _TtaDirectionField(
+                name=tta_name,
+                direction_xy=tta_direction,
+                valid_mask=tta_valid,
+                source_xy_grid=source_xy_grid,
+            )
+            random_tta_fields.append(field)
             tta_trace = _trace_direction_line(
                 tta_direction,
                 tta_cp,
@@ -627,7 +827,7 @@ def _export_line_trace_vis(
                 step_px=step_px,
                 rf_margin_px=margin,
             )
-            trace_back = _transform_points_xy(tta_trace, np.linalg.inv(matrix))
+            trace_back = _source_grid_points_to_reference(source_xy_grid, tta_trace)
             flock_overlay = _overlay_polyline_rgb(
                 flock_overlay,
                 trace_back,
@@ -641,6 +841,7 @@ def _export_line_trace_vis(
 
     overlays = [single_overlay, flock_overlay]
     med_trace: np.ndarray | None = None
+    med_tta_fields_count = 0
     if med_tta:
         identity = np.eye(3, dtype=np.float32)
         med_fields = [
@@ -651,8 +852,9 @@ def _export_line_trace_vis(
                 matrix_ref_to_tta=identity,
                 matrix_tta_to_ref=identity,
             ),
-            *tta_fields,
         ]
+        med_fields.extend(random_tta_fields)
+        med_tta_fields_count = len(med_fields)
         med_trace = _trace_median_tta_direction_line(
             med_fields,
             cp_xy,
@@ -685,6 +887,8 @@ def _export_line_trace_vis(
         f"rf_margin_px={margin:.3f}",
         f"trace_points={int(traced_line.shape[0])}",
         f"med_tta={bool(med_tta)}",
+        f"line_trace_tta_count={int(line_trace_tta_count)}",
+        f"med_tta_fields={int(med_tta_fields_count)}",
         f"med_tta_trace_points={int(med_trace.shape[0]) if med_trace is not None else 0}",
         "tta_traces:",
         *tta_rows,
@@ -982,6 +1186,8 @@ def main() -> None:
     parser.add_argument("--dir-vis", action="store_true")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--line-trace-step", type=float, default=4.0)
+    parser.add_argument("--line-trace-tta-count", type=int, default=100)
+    parser.add_argument("--med-tta-count", type=int, default=None)
     parser.add_argument("--line-trace-rf-margin", type=float, default=None)
     args = parser.parse_args()
 
@@ -1026,6 +1232,9 @@ def main() -> None:
             step_px=args.line_trace_step,
             rf_margin_px=args.line_trace_rf_margin,
             med_tta=args.med_tta,
+            line_trace_tta_count=(
+                args.line_trace_tta_count if args.med_tta_count is None else args.med_tta_count
+            ),
         )
         return
 

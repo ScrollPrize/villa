@@ -10,13 +10,16 @@ view unless `--med-tta` is supplied.
 ## Plan
 
 - Add `runner.py --med-tta` as an option for `--line-trace-vis`.
-- Reuse the existing deterministic line-trace TTA transforms: flips, 90 degree
-  rotations, and configured shift extremes.
+- Replace the fixed line-trace TTA transforms with one shared random geometric
+  TTA scheme for both the flock and median trace. The scheme samples a
+  configurable number of random combined augmentations from the regular
+  training geometric ranges, defaulting to 100.
 - Add a small internal representation for a TTA direction field containing:
   predicted direction image, validity mask, reference-to-TTA transform, and
   TTA-to-reference inverse transform.
-- Build median-TTA direction fields by running the checkpointed model on the
-  reference patch and each existing TTA-warped patch.
+- Build TTA direction fields by running the checkpointed model on each random
+  geometric TTA-warped patch. The flock traces and median-TTA trace must use the
+  same generated field list.
 - Implement reference-space median tracing:
   - for each step, transform the current reference point into every TTA field;
   - bilinearly sample the decoded ambiguous direction field in that TTA space;
@@ -36,8 +39,9 @@ view unless `--med-tta` is supplied.
 
 ## Spec Update
 
-Update `planning/specs.md` to document `--med-tta`, reference-space per-step
-median-TTA tracing, ambiguous sign handling, the optional third JPG column, and
+Update `planning/specs.md` to document `--med-tta`, `--line-trace-tta-count`,
+reference-space per-step median-TTA tracing, ambiguous sign handling, the
+optional third JPG column, the shared random geometric TTA scheme, and
 configured-device coord generation for non-prefetch paths.
 
 ## Docs Updates

@@ -44,7 +44,12 @@ a pretraining stage that does not require control points at all - but does benef
 # V0.1 gt self-refinement
 
 - the augmentations gives us a bit of room to try self-refinement of the gt because the gt itself is quite errorneous
-- 
+- we want to allow to correct the gt using inferred values then supervise a larger weight against the refined gt and a smaller against the original gt (basically its just the calibration)
+- implementation:
+    - use two dir losses - gt and gt_mod
+    - gt_mod is initialized as gt
+    - at each training step we adjust gt_mod towards the inferered direction (by some small step - lets do 1 degree for now)
+    - vis additionaly the gt_mod as another short line (sliglty longer than model output and behind it - and diff color of course)
         
 # V1 - short refinement self-supervision
 

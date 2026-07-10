@@ -54,6 +54,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _direction_field_overlay_rgb,
     _export_augment_contact_sheet,
     _line_trace_tta_entries,
+    _nearest_tta_point_for_reference,
+    _reference_direction_to_source_grid_direction,
+    _source_grid_direction_to_reference,
     _transform_points_xy,
     _trace_direction_line,
     _trace_median_tta_direction_line,
@@ -229,6 +232,29 @@ def test_line_trace_tta_point_transforms_round_trip() -> None:
         warped = _transform_points_xy(points, matrix)
         restored = _transform_points_xy(warped, np.linalg.inv(matrix))
         assert np.allclose(restored, points, atol=1.0e-5)
+
+
+def test_line_trace_random_tta_source_grid_maps_points_and_directions() -> None:
+    source_xy = np.zeros((9, 9, 2), dtype=np.float32)
+    yy, xx = np.indices((9, 9), dtype=np.float32)
+    source_xy[..., 0] = xx - 1.0
+    source_xy[..., 1] = yy
+
+    tta_point = _nearest_tta_point_for_reference(source_xy, np.asarray([4.0, 4.0], dtype=np.float32))
+    assert tta_point is not None
+    assert np.allclose(tta_point, [5.0, 4.0])
+
+    tta_direction = _reference_direction_to_source_grid_direction(
+        source_xy,
+        tta_point,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+    )
+    assert tta_direction is not None
+    assert np.allclose(tta_direction, [1.0, 0.0])
+
+    reference_direction = _source_grid_direction_to_reference(source_xy, tta_point, tta_direction)
+    assert reference_direction is not None
+    assert np.allclose(reference_direction, [1.0, 0.0])
 
 
 def test_median_tta_trace_uses_reference_space_directions() -> None:

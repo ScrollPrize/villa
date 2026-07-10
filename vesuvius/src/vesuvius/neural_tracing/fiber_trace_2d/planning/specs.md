@@ -117,9 +117,10 @@
 - The line tracer bilinearly samples the decoded per-pixel direction field, flips sampled directions as needed to maintain forward/backward sign continuity, and steps in strip-pixel coordinates.
 - The line tracer stops when the next point would enter the configured receptive-field border margin, when the sampled direction is invalid, or when image validity around the bilinear sample is insufficient. By default the receptive-field margin is `1 + 2 * model_depth`, matching the radius of the V0 ResNet's 3x3 input projection plus two 3x3 convolutions per residual block; `--line-trace-rf-margin` can override it for inspection.
 - The default line-trace step is `4.0` strip-image pixels and can be overridden with `--line-trace-step`.
-- Line-tracing inspection writes `line_trace_vis.jpg` as a two-column image: the first column is the original transformed strip line plus the unaugmented direction-traced line, and the second column is the same original patch with a flock of traces from fixed test-time augmentations inverse-warped back into original patch coordinates.
-- Line-trace test-time augmentations are deterministic inspection-only patch-space transforms: horizontal flip, vertical flip, both flips, 90/180/270 degree rotations, and shifts by configured `augment_shift_x` and `augment_shift_y` in both signs.
-- Line-trace TTA runs the model and tracer in augmented patch coordinates, then inverse-transforms traced points back into original patch coordinates before drawing. It writes per-TTA trace counts to `line_trace_summary.txt`.
+- Line-tracing inspection writes `line_trace_vis.jpg` as a two-column image by default: the first column is the original transformed strip line plus the unaugmented direction-traced line, and the second column is the same original patch with a flock of traces from random combined geometric test-time augmentations inverse-warped back into original patch coordinates.
+- Line-trace test-time augmentations are deterministic per `sample_index` and are sampled from the regular training geometric augmentation ranges: shift, rotation, shear, scale, smooth offset, and flips. Value-only augmentations are not applied for line tracing.
+- `--line-trace-tta-count` controls the number of random geometric TTA variants and defaults to `100`. `--med-tta-count` is accepted as a compatibility alias for the same count.
+- Line-trace TTA runs the model and tracer in augmented patch coordinates, then uses the augmentation source-coordinate grid to inverse-map traced points back into original patch coordinates before drawing. It writes per-TTA trace counts to `line_trace_summary.txt`.
 - `--line-trace-vis --med-tta` adds a third `line_trace_vis.jpg` column for
   median test-time augmentation tracing. Median TTA traces in the unaugmented
   reference patch space; at each trace step it transforms the current reference
@@ -127,8 +128,9 @@
   ambiguous directions there, transforms orientations back to reference space,
   keeps only the ambiguous sign aligned within 90 degrees of the previous
   reference-space step direction, then takes and normalizes the component-wise
-  median direction before stepping. `line_trace_summary.txt` records
-  `med_tta=true` and the median trace point count.
+  median direction before stepping. The median trace uses the same random TTA
+  field list as the flock column. `line_trace_summary.txt` records
+  `med_tta=true`, `line_trace_tta_count`, and the median trace point count.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.

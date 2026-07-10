@@ -148,13 +148,16 @@ The important behavior is:
   field margin of `1 + 2 * model_depth`, and writes
   `line_trace_vis.jpg` plus `line_trace_summary.txt`.
 - The line-trace JPG normally has two columns: the unaugmented trace view, then
-  the original patch with a flock of traces from fixed test-time augmentations
-  inverse-warped back into original patch coordinates.
+  the original patch with a flock of traces from random combined geometric
+  training-style test-time augmentations inverse-warped back into original
+  patch coordinates. `--line-trace-tta-count` controls the TTA count and
+  defaults to 100.
 - `--line-trace-vis --med-tta` adds a third column. That trace stays in the
-  original patch space and, at each step, samples the reference and TTA
-  direction fields, inverse-warps TTA orientations back to the original patch
-  frame, resolves the ambiguous direction sign against the previous step, and
-  steps along the normalized median direction.
+  original patch space and uses the same random TTA direction fields as the
+  flock column. At each step it samples the reference and TTA direction fields,
+  inverse-warps TTA orientations back to the original patch frame, resolves the
+  ambiguous direction sign against the previous step, and steps along the
+  normalized median direction.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, runs the checkpointed direction model, decodes the
