@@ -990,6 +990,9 @@ def _print_timing_table(rows: list[tuple[str, dict[str, float]]], totals: dict[s
     for name, timing in rows:
         print(name.ljust(16) + "".join(f"{timing.get(key, 0.0):13.1f}" for key in keys))
     print("total".ljust(16) + "".join(f"{totals.get(key, 0.0):13.1f}" for key in keys))
+    row_count = len(rows)
+    if row_count > 0:
+        print("avg/patch".ljust(16) + "".join(f"{totals.get(key, 0.0) / row_count:13.1f}" for key in keys))
     volume_stats = {
         key.removeprefix("volume_stat_"): value
         for key, value in totals.items()
@@ -999,39 +1002,6 @@ def _print_timing_table(rows: list[tuple[str, dict[str, float]]], totals: dict[s
         print(
             "fiber_trace_2d volume sampler stats: "
             + " ".join(f"{key}={value:.0f}" for key, value in sorted(volume_stats.items()))
-        )
-
-
-def _image_stats(image: np.ndarray, valid_mask: np.ndarray, image_u8: np.ndarray) -> dict[str, float]:
-    arr = np.asarray(image, dtype=np.float32)
-    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(arr)
-    out: dict[str, float] = {
-        "valid": float(np.count_nonzero(valid)),
-        "u8_nonzero": float(np.count_nonzero(np.asarray(image_u8))),
-    }
-    if bool(valid.any()):
-        values = arr[valid]
-        out["min"] = float(values.min())
-        out["max"] = float(values.max())
-        out["mean"] = float(values.mean())
-    else:
-        out["min"] = 0.0
-        out["max"] = 0.0
-        out["mean"] = 0.0
-    return out
-
-
-def _print_image_stats(rows: list[tuple[str, dict[str, float]]]) -> None:
-    print("fiber_trace_2d augment-vis image stats")
-    print("name".ljust(16) + f"{'valid':>10}{'min':>12}{'max':>12}{'mean':>12}{'u8_nz':>10}")
-    for name, stats in rows:
-        print(
-            name.ljust(16)
-            + f"{stats.get('valid', 0.0):10.0f}"
-            + f"{stats.get('min', 0.0):12.3f}"
-            + f"{stats.get('max', 0.0):12.3f}"
-            + f"{stats.get('mean', 0.0):12.3f}"
-            + f"{stats.get('u8_nonzero', 0.0):10.0f}"
         )
 
 
@@ -1099,7 +1069,6 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
     first_sample = None
     timing_rows: list[tuple[str, dict[str, float]]] = []
     timing_totals: dict[str, float] = {}
-    image_stat_rows: list[tuple[str, dict[str, float]]] = []
     source_profile: dict[str, float] = {}
     # Build the deterministic sample-order cache outside augment-vis profiling.
     # The first random descriptor lookup sorts the whole CP order for this pass;
@@ -1131,7 +1100,6 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
             with _Timer() as to_u8_timer:
                 image_u8 = _to_u8_image(aug_image, aug_valid)
             timing["to_u8"] = to_u8_timer.elapsed_ms
-            image_stat_rows.append((name, _image_stats(aug_image, aug_valid, image_u8)))
             with _Timer() as overlay_timer:
                 overlay = overlay_line_coords_rgb(image_u8, line_xy, opacity=0.5, thickness=1)
                 overlay = _draw_cp_crosshair(overlay, sample.control_point_xy)
@@ -1166,7 +1134,6 @@ def _export_augment_contact_sheet(loader: FiberStrip2DLoader, sample_index: int,
         (out / "augment_summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
     timing_totals["write_summary"] = summary_timer.elapsed_ms
     _print_timing_table(timing_rows, timing_totals)
-    _print_image_stats(image_stat_rows)
     print(
         "fiber_trace_2d output timings: "
         f"write_contact_sheet={timing_totals['write_contact_sheet']:.1f}ms "

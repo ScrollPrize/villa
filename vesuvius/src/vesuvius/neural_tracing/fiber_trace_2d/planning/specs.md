@@ -47,7 +47,7 @@
 - Image/value augmentations after Zarr loading run as torch tensor operations on the configured device.
 - Augment visualization uses raw clipped image values and must not apply percentile or per-cell normalization.
 - The augment visualization mode renders a three-row JPG contact sheet: lower-limit examples, upper-limit examples, and random combined training-style examples.
-- Augment visualization prints timing and raw image-stat diagnostics, including per-cell valid pixel count and raw min/max/mean, so invalid sampling and display-scale issues are distinguishable.
+- Augment visualization prints timing diagnostics with per-entry rows plus total and average-per-patch summaries.
 - Augment contact sheets draw the transformed fiber-line coordinates at 50 percent opacity with fixed drawing thickness.
 - Augment contact sheets draw a final visualization-only thin vertical marker at the transformed control-point coordinate for each patch, leaving a small gap around the CP pixel itself.
 - Augment contact-sheet cells include a top label band naming the shown augmentation; labels must not overlay image pixels.

@@ -82,10 +82,10 @@ config:
 PYTHONPATH=$SRC/volume-cartographer/build/python-bindings/python:$SRC/vesuvius/src:$SRC python -m vesuvius.neural_tracing.fiber_trace_2d.runner $SRC/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --export-dir ./ --sample-index 1 --augment-vis
 ```
 
-The runner prints startup timings, per-augmentation timings, volume sampler
-stats, and raw image stats. For the blocking sampler fix, the first
-`unaugmented` row must have nonzero valid pixels and should match `noise_min`
-and `blur_min`.
+The runner prints startup timings, per-augmentation timings with total and
+average-per-patch summaries, and volume sampler stats. For the blocking sampler
+fix, the first `unaugmented` patch should visibly match `noise_min` and
+`blur_min`.
 
 ## Fiber Trace 2D Training Command
 

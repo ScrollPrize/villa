@@ -139,7 +139,8 @@ The important behavior is:
   when available. Prefetch dependency generation is intentionally CPU-only.
 - Its prefetch mode is sample-count oriented:
   `--prefetch --prefetch-samples <control-point-samples>`.
-- Prints augment-visualization timing rows and raw image stats.
+- Prints augment-visualization timing rows with total and average-per-patch
+  summaries.
 - Provides `--line-trace-vis --checkpoint <snapshot> --export-dir <dir>` for
   V0.1 patch line-tracing inspection. This mode loads the deterministic
   center side-strip patch for `--sample-index`, runs the checkpointed direction
@@ -608,9 +609,8 @@ It also prints:
 
 - timing table with `descriptor`, `line_window`, `lasagna_normals`,
   `strip_coords`, `coord_augmentation`, `volume_sample`, `value_augmentation`,
-  `line_coords`, `to_u8`, and `overlay`;
-- volume sampler stats;
-- raw image stats per contact-sheet cell.
+  `line_coords`, `to_u8`, and `overlay`, plus total and `avg/patch` rows;
+- volume sampler stats.
 
 ## Batch Export
 

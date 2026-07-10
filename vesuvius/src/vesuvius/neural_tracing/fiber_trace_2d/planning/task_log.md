@@ -1,19 +1,15 @@
-# Task Log: Augment-Vis Timing Cleanup
+# Task Log: Coordinate Tensor Boundary Cleanup
 
-## Implementation Notes
+## Planning Notes
 
-- Added an unprofiled `descriptor_for_sample_index()` call before augment-vis
-  source timing so first-use deterministic sample-order cache construction is
-  not charged to the `descriptor` or first-row `total` timing.
-- Left loader-side profiling unchanged for training/profile paths.
-
-## Deviations
-
-- None.
+- Current torch strip-grid construction converts dense coordinates and valid
+  masks back to NumPy immediately in `strip_geometry.py`.
+- Loader geometric augmentation then converts those arrays back to torch and
+  returns NumPy again before VC3D coordinate sampling.
+- The planned cleanup keeps coordinate tensors in torch through source-grid,
+  strip-z offset, geometric augmentation, and line/CP coordinate generation,
+  then converts once at explicit NumPy consumers.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/runner.py`
-  passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 69 tests.
+- Not run yet; this turn produced the plan for review.
