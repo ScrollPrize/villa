@@ -2,6 +2,9 @@
 
 ## 2026-07-10
 
+- Cached fused 2D strip augmentation transform constants/smooth controls,
+  batched line+CP mapping, and reused transform/line mappings across matching
+  strip-z offset patches.
 - Added paired forward/backward strip augmentation transforms and routed
   smooth line/CP mapping through direct source-coordinate forward/backward
   point transforms instead of iterative or dense nearest-grid inversion.

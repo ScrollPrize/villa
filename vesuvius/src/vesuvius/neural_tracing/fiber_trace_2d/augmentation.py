@@ -227,6 +227,31 @@ def _cubic_interp_1d(values: torch.Tensor, positions: torch.Tensor) -> torch.Ten
     )
 
 
+def _smooth_offset_controls(
+    width: int,
+    *,
+    amplitude: float,
+    stride: float,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    amplitude = float(amplitude)
+    stride = max(float(stride), 1.0)
+    control_count = max(2, int(math.ceil(max(int(width) - 1, 1) / stride)) + 3)
+    if amplitude == 0.0:
+        return torch.zeros((control_count,), dtype=torch.float32, device=device)
+    idx = torch.arange(control_count, dtype=torch.float64, device=device)
+    seed_f = float(int(seed) & 0x7FFFFFFF)
+    # Stateless deterministic LCG-style hash in tensor form. This avoids a
+    # torch.Generator allocation in hot augmentation paths.
+    hashed = torch.remainder(idx * 1103515245.0 + seed_f * 12345.0 + 67890.0, 2147483647.0)
+    hashed = torch.remainder(hashed * 1103515245.0 + 12345.0, 2147483647.0)
+    controls = (hashed / 2147483647.0 * 2.0 - 1.0) * abs(amplitude)
+    if amplitude < 0.0:
+        controls = -controls
+    return controls.to(dtype=torch.float32)
+
+
 def smooth_offset_field(
     height: int,
     width: int,
@@ -237,17 +262,14 @@ def smooth_offset_field(
     device: torch.device,
 ) -> torch.Tensor:
     amplitude = float(amplitude)
-    if amplitude == 0.0:
-        return torch.zeros((int(height), int(width)), dtype=torch.float32, device=device)
     stride = max(float(stride), 1.0)
-    control_count = max(2, int(math.ceil(max(int(width) - 1, 1) / stride)) + 3)
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(seed))
-    controls = (torch.rand(control_count, dtype=torch.float32, device=device, generator=generator) * 2.0 - 1.0) * abs(
-        amplitude
+    controls = _smooth_offset_controls(
+        int(width),
+        amplitude=amplitude,
+        stride=stride,
+        seed=int(seed),
+        device=device,
     )
-    if amplitude < 0.0:
-        controls = -controls
     x = torch.arange(int(width), dtype=torch.float32, device=device) / stride + 1.0
     offsets = _cubic_interp_1d(controls, x)
     return offsets.view(1, int(width)).expand(int(height), int(width))
@@ -262,17 +284,14 @@ def _smooth_offset_values(
     seed: int,
 ) -> torch.Tensor:
     amplitude = float(amplitude)
-    if amplitude == 0.0:
-        return torch.zeros_like(output_x, dtype=torch.float32)
     stride = max(float(stride), 1.0)
-    control_count = max(2, int(math.ceil(max(int(output_width) - 1, 1) / stride)) + 3)
-    generator = torch.Generator(device=output_x.device)
-    generator.manual_seed(int(seed))
-    controls = (torch.rand(control_count, dtype=torch.float32, device=output_x.device, generator=generator) * 2.0 - 1.0) * abs(
-        amplitude
+    controls = _smooth_offset_controls(
+        int(output_width),
+        amplitude=amplitude,
+        stride=stride,
+        seed=int(seed),
+        device=output_x.device,
     )
-    if amplitude < 0.0:
-        controls = -controls
     positions = output_x.to(dtype=torch.float32) / stride + 1.0
     return _cubic_interp_1d(controls, positions)
 
@@ -283,6 +302,36 @@ class StripAugmentTransform:
     source_shape_hw: tuple[int, int]
     params: FiberStripAugmentParams
     device: torch.device
+
+    def __post_init__(self) -> None:
+        source_width = int(self.source_shape_hw[1])
+        output_width = int(self.output_shape_hw[1])
+        source_height = int(self.source_shape_hw[0])
+        output_height = int(self.output_shape_hw[0])
+        source_center = ((float(source_width) - 1.0) * 0.5, (float(source_height) - 1.0) * 0.5)
+        output_center = ((float(output_width) - 1.0) * 0.5, (float(output_height) - 1.0) * 0.5)
+        angle = math.radians(float(self.params.rotation_degrees))
+        shear_x = float(self.params.shear_x)
+        shear_y = float(self.params.shear_y)
+        object.__setattr__(self, "_source_center", source_center)
+        object.__setattr__(self, "_output_center", output_center)
+        object.__setattr__(self, "_cos_a", math.cos(angle))
+        object.__setattr__(self, "_sin_a", math.sin(angle))
+        object.__setattr__(self, "_scale", max(float(self.params.scale), 1.0e-6))
+        object.__setattr__(self, "_shear_x", shear_x)
+        object.__setattr__(self, "_shear_y", shear_y)
+        object.__setattr__(self, "_shear_det", 1.0 - shear_x * shear_y)
+        object.__setattr__(
+            self,
+            "_smooth_controls",
+            _smooth_offset_controls(
+                source_width,
+                amplitude=float(self.params.smooth_offset),
+                stride=float(self.params.smooth_offset_stride),
+                seed=int(self.params.smooth_offset_seed),
+                device=self.device,
+            ),
+        )
 
     @property
     def output_height(self) -> int:
@@ -302,28 +351,25 @@ class StripAugmentTransform:
 
     @property
     def output_center_x(self) -> float:
-        return (float(self.output_width) - 1.0) * 0.5
+        return float(self._output_center[0])
 
     @property
     def output_center_y(self) -> float:
-        return (float(self.output_height) - 1.0) * 0.5
+        return float(self._output_center[1])
 
     @property
     def source_center_x(self) -> float:
-        return (float(self.source_width) - 1.0) * 0.5
+        return float(self._source_center[0])
 
     @property
     def source_center_y(self) -> float:
-        return (float(self.source_height) - 1.0) * 0.5
+        return float(self._source_center[1])
 
     def _smooth_offsets_at_source_x(self, source_x: torch.Tensor) -> torch.Tensor:
-        return _smooth_offset_values(
-            source_x,
-            self.source_width,
-            amplitude=float(self.params.smooth_offset),
-            stride=float(self.params.smooth_offset_stride),
-            seed=int(self.params.smooth_offset_seed),
-        )
+        if float(self.params.smooth_offset) == 0.0:
+            return torch.zeros_like(source_x, dtype=torch.float32)
+        positions = source_x.to(dtype=torch.float32) / max(float(self.params.smooth_offset_stride), 1.0) + 1.0
+        return _cubic_interp_1d(self._smooth_controls, positions)
 
     def output_to_source_points(self, output_xy: torch.Tensor) -> torch.Tensor:
         points = torch.as_tensor(output_xy, dtype=torch.float32, device=self.device)
@@ -334,18 +380,14 @@ class StripAugmentTransform:
             x = -x
         if self.params.flip_y:
             y = -y
-        scale = max(float(self.params.scale), 1.0e-6)
-        x = x / scale
-        y = y / scale
+        x = x / self._scale
+        y = y / self._scale
 
-        x_sheared = x + float(self.params.shear_x) * y
-        y_sheared = y + float(self.params.shear_y) * x
+        x_sheared = x + self._shear_x * y
+        y_sheared = y + self._shear_y * x
 
-        angle = math.radians(float(self.params.rotation_degrees))
-        cos_a = math.cos(angle)
-        sin_a = math.sin(angle)
-        src_x = cos_a * x_sheared - sin_a * y_sheared + self.source_center_x
-        src_y = sin_a * x_sheared + cos_a * y_sheared + self.source_center_y
+        src_x = self._cos_a * x_sheared - self._sin_a * y_sheared + self.source_center_x
+        src_y = self._sin_a * x_sheared + self._cos_a * y_sheared + self.source_center_y
         if float(self.params.smooth_offset) != 0.0:
             src_y = src_y + self._smooth_offsets_at_source_x(src_x)
         return torch.stack([src_x, src_y], dim=-1).to(dtype=torch.float32)
@@ -360,23 +402,19 @@ class StripAugmentTransform:
         u = src_x - self.source_center_x
         v = src_y - self.source_center_y
 
-        angle = math.radians(float(self.params.rotation_degrees))
-        cos_a = math.cos(angle)
-        sin_a = math.sin(angle)
-        x_sheared = cos_a * u + sin_a * v
-        y_sheared = -sin_a * u + cos_a * v
+        x_sheared = self._cos_a * u + self._sin_a * v
+        y_sheared = -self._sin_a * u + self._cos_a * v
 
-        shear_x = float(self.params.shear_x)
-        shear_y = float(self.params.shear_y)
-        det = 1.0 - shear_x * shear_y
+        shear_x = self._shear_x
+        shear_y = self._shear_y
+        det = self._shear_det
         if abs(det) <= 1.0e-6:
             return torch.full(points.shape, float("nan"), dtype=torch.float32, device=self.device)
         x = (x_sheared - shear_x * y_sheared) / det
         y = (-shear_y * x_sheared + y_sheared) / det
 
-        scale = max(float(self.params.scale), 1.0e-6)
-        x = x * scale
-        y = y * scale
+        x = x * self._scale
+        y = y * self._scale
         if self.params.flip_x:
             x = -x
         if self.params.flip_y:

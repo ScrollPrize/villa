@@ -6,8 +6,8 @@
 - [x] Create current `task.md`.
 - [x] Create current `task_plan.md`.
 - [x] Update `planning/specs.md` with fused-map performance requirements.
-- [ ] Implement cached fused transform internals.
-- [ ] Batch line+CP source-to-output mapping.
-- [ ] Reuse transformed line/CP across shared strip-z offsets where applicable.
-- [ ] Update docs/changelog/task log after implementation.
-- [ ] Run focused validation.
+- [x] Implement cached fused transform internals.
+- [x] Batch line+CP source-to-output mapping.
+- [x] Reuse transformed line/CP across shared strip-z offsets where applicable.
+- [x] Update docs/changelog/task log after implementation.
+- [x] Run focused validation.

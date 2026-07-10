@@ -446,6 +446,7 @@ def _resample_coord_tensors_like_augmentation(
     *,
     output_shape_hw: tuple[int, int],
     device: torch.device,
+    transform: Any | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     coords_t = coords_zyx.to(device=device, dtype=torch.float32)
     valid_bool = valid_mask.to(device=device, dtype=torch.bool)
@@ -454,14 +455,17 @@ def _resample_coord_tensors_like_augmentation(
         raise ValueError("coords_zyx must have shape H,W,3")
     source_height, source_width = int(coords_t.shape[0]), int(coords_t.shape[1])
     height, width = (int(v) for v in output_shape_hw)
-    pixel_coords = source_coordinate_grid_for_output(
-        height,
-        width,
-        source_height,
-        source_width,
-        params,
-        device=device,
-    )
+    if transform is None:
+        pixel_coords = source_coordinate_grid_for_output(
+            height,
+            width,
+            source_height,
+            source_width,
+            params,
+            device=device,
+        )
+    else:
+        pixel_coords = transform.output_to_source_grid()
     x = pixel_coords[..., 0]
     y = pixel_coords[..., 1]
     if source_width > 1:
@@ -1361,22 +1365,25 @@ class FiberStrip2DLoader:
         params: FiberStripAugmentParams | None,
         *,
         device: torch.device,
+        transform: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if params is None:
             return (
                 source.source_line_xy.to(device=device, dtype=torch.float32),
                 source.source_control_point_xy.to(device=device, dtype=torch.float32),
             )
-        transform = strip_augment_transform(
-            self.config.patch_shape_hw,
-            source.source_shape_hw,
-            params,
-            device=device,
-        )
-        line_xy = transform.source_to_output_points(source.source_line_xy.to(device=device, dtype=torch.float32))
-        control_point_xy = transform.source_to_output_points(
-            source.source_control_point_xy.to(device=device, dtype=torch.float32).view(1, 2)
-        )[0]
+        if transform is None:
+            transform = strip_augment_transform(
+                self.config.patch_shape_hw,
+                source.source_shape_hw,
+                params,
+                device=device,
+            )
+        source_line_xy = source.source_line_xy.to(device=device, dtype=torch.float32)
+        source_control_point_xy = source.source_control_point_xy.to(device=device, dtype=torch.float32).view(1, 2)
+        mapped = transform.source_to_output_points(torch.cat([source_line_xy, source_control_point_xy], dim=0))
+        line_xy = mapped[:-1]
+        control_point_xy = mapped[-1]
         if line_xy.numel() != 0:
             height, width = self.config.patch_shape_hw
             line_xy = line_xy[
@@ -1398,12 +1405,21 @@ class FiberStrip2DLoader:
         profile: dict[str, float] | None = None,
         load_image: bool = True,
         apply_image_augmentation: bool = True,
+        line_and_cp_xy: tuple[torch.Tensor, torch.Tensor] | None = None,
+        augment_transform: Any | None = None,
     ) -> tuple[FiberStripSample, np.ndarray | None, np.ndarray | None, np.ndarray]:
         offset = float(self.strip_z_offsets[int(offset_index)])
         grid = self._offset_grid_from_source(source, offset)
         coords_zyx_t = grid.coords_zyx
         valid_mask_t = grid.valid_mask
         if params is not None:
+            if augment_transform is None:
+                augment_transform = strip_augment_transform(
+                    self.config.patch_shape_hw,
+                    source.source_shape_hw,
+                    params,
+                    device=device,
+                )
             with _ProfileBlock(profile, "coord_augmentation", device):
                 coords_zyx_t, valid_mask_t = _resample_coord_tensors_like_augmentation(
                     coords_zyx_t,
@@ -1411,13 +1427,18 @@ class FiberStrip2DLoader:
                     params,
                     output_shape_hw=self.config.patch_shape_hw,
                     device=device,
+                    transform=augment_transform,
                 )
-        with _ProfileBlock(profile, "line_coords", device):
-            line_xy_t, control_point_xy_t = self._line_and_cp_xy_for_params(
-                source,
-                params,
-                device=device,
-            )
+        if line_and_cp_xy is None:
+            with _ProfileBlock(profile, "line_coords", device):
+                line_xy_t, control_point_xy_t = self._line_and_cp_xy_for_params(
+                    source,
+                    params,
+                    device=device,
+                    transform=augment_transform,
+                )
+        else:
+            line_xy_t, control_point_xy_t = line_and_cp_xy
         coords_zyx = _as_numpy_float32(coords_zyx_t)
         valid_mask = _as_numpy_bool(valid_mask_t)
         line_xy = _as_numpy_float32(line_xy_t)
@@ -1483,12 +1504,35 @@ class FiberStrip2DLoader:
         coords: list[np.ndarray] = []
         valids: list[np.ndarray] = []
         samples: list[FiberStripSample] = []
+        line_and_cp_cache: dict[FiberStripAugmentParams | None, tuple[torch.Tensor, torch.Tensor]] = {}
+        transform_cache: dict[FiberStripAugmentParams, Any] = {}
         for offset_index, _ in enumerate(self.strip_z_offsets):
             params = (
                 random_combined_augmentation(self.config.augment, sample_index, offset_index)
                 if self.config.augment.enabled
                 else None
             )
+            augment_transform = None
+            if params is not None:
+                augment_transform = transform_cache.get(params)
+                if augment_transform is None:
+                    augment_transform = strip_augment_transform(
+                        self.config.patch_shape_hw,
+                        source.source_shape_hw,
+                        params,
+                        device=device,
+                    )
+                    transform_cache[params] = augment_transform
+            line_and_cp_xy = line_and_cp_cache.get(params)
+            if line_and_cp_xy is None:
+                with _ProfileBlock(profile, "line_coords", device):
+                    line_and_cp_xy = self._line_and_cp_xy_for_params(
+                        source,
+                        params,
+                        device=device,
+                        transform=augment_transform,
+                    )
+                line_and_cp_cache[params] = line_and_cp_xy
             sample, image, valid_mask, _ = self.build_strip_patch_from_source(
                 source,
                 offset_index,
@@ -1497,6 +1541,8 @@ class FiberStrip2DLoader:
                 profile=profile,
                 load_image=True,
                 apply_image_augmentation=apply_image_augmentation,
+                line_and_cp_xy=line_and_cp_xy,
+                augment_transform=augment_transform,
             )
             assert image is not None
             assert valid_mask is not None

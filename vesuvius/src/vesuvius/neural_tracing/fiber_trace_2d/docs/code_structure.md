@@ -79,7 +79,8 @@ The important behavior is:
 - Provides `StripAugmentTransform`, the shared paired transform for geometric
   augmentation. Its output-to-source map produces sampling grids; its
   source-to-output point map transforms cached source-space line and CP
-  coordinates.
+  coordinates. The transform object caches shape/parameter/device constants and
+  smooth-offset controls for reuse by grid and point mapping.
 - Exposes torch-native transformed line/control-point coordinate helpers for
   loader internals, with NumPy wrappers kept for public/debug callers.
 - Affine shift is composed as an output-space translation after scale/flip, and
@@ -89,6 +90,10 @@ The important behavior is:
   line-coordinate mapping, and debug line overlays. Smooth line/CP mapping uses
   direct source-coordinate forward/backward maps rather than iterative solves
   or dense nearest-grid inversion.
+- Loader patch construction reuses one transform object for coordinate
+  augmentation and line/CP mapping. Line points and the CP are mapped together
+  in one batched source-to-output call, and shared line/CP results can be reused
+  across strip-z offsets with identical augmentation params.
 - Value augmentation runs as torch tensor operations on the configured device:
   brightness, contrast, gamma, noise, and separable Gaussian blur.
 - Debug line overlays are drawn only as the final visualization step. The line

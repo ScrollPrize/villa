@@ -11,6 +11,7 @@ import torch
 import zarr
 
 import vesuvius.neural_tracing.fiber_trace_2d.augmentation as augment_module
+import vesuvius.neural_tracing.fiber_trace_2d.loader as loader_module
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     FiberStripAugmentConfig,
     FiberStripAugmentParams,
@@ -861,6 +862,31 @@ def test_strip_augment_transform_smooth_round_trip_is_direct() -> None:
     assert torch.allclose(round_tripped, source_points, atol=1.0e-4)
 
 
+def test_strip_augment_transform_caches_smooth_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    original = augment_module._smooth_offset_controls
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(augment_module, "_smooth_offset_controls", counted)
+    transform = strip_augment_transform(
+        (21, 21),
+        (31, 31),
+        FiberStripAugmentParams(smooth_offset=2.0, smooth_offset_stride=4.0, smooth_offset_seed=5),
+        device=torch.device("cpu"),
+    )
+    source_points = torch.tensor([[15.0, 15.0], [12.0, 13.0]], dtype=torch.float32)
+
+    transform.source_to_output_points(source_points)
+    transform.source_to_output_points(source_points)
+    transform.output_to_source_points(torch.tensor([[10.0, 10.0]], dtype=torch.float32))
+
+    assert calls == 1
+
+
 def test_line_augmentation_returns_coordinates_not_mask() -> None:
     line = transformed_centerline_coords(
         (5, 5),
@@ -1130,6 +1156,100 @@ def test_augmented_center_patch_loads_one_zarr_sample(
     assert line.ndim == 2
     assert line.shape[1] == 2
     assert sample.strip_z_offset == 0.0
+
+
+def test_augmented_patch_reuses_one_transform_for_coords_and_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
+    original_factory = loader_module.strip_augment_transform
+    calls = 0
+
+    def counted_factory(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_factory(*args, **kwargs)
+
+    monkeypatch.setattr(loader_module, "strip_augment_transform", counted_factory)
+
+    loader.build_augmented_center_strip_patch(
+        0,
+        params,
+        device=torch.device("cpu"),
+    )
+
+    assert calls == 1
+
+
+def test_loader_maps_augmented_line_and_cp_in_one_batched_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    source = loader.build_strip_source(0, device=torch.device("cpu"), use_augmentation_envelope=True)
+    params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
+    original_factory = loader_module.strip_augment_transform
+    call_shapes: list[tuple[int, ...]] = []
+
+    class CountingTransform:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def source_to_output_points(self, points):
+            call_shapes.append(tuple(points.shape))
+            return self._wrapped.source_to_output_points(points)
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+    def counted_factory(*args, **kwargs):
+        return CountingTransform(original_factory(*args, **kwargs))
+
+    monkeypatch.setattr(loader_module, "strip_augment_transform", counted_factory)
+
+    line_xy, cp_xy = loader._line_and_cp_xy_for_params(
+        source,
+        params,
+        device=torch.device("cpu"),
+    )
+
+    assert call_shapes == [(int(source.source_line_xy.shape[0]) + 1, 2)]
+    assert line_xy.ndim == 2
+    assert line_xy.shape[1] == 2
+    assert cp_xy.shape == (2,)
+
+
+def test_build_sample_reuses_line_and_cp_for_shared_params(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    calls = 0
+    original = loader._line_and_cp_xy_for_params
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(loader, "_line_and_cp_xy_for_params", counted)
+
+    samples, images, coords, valids = loader.build_sample(0, sample_mode="flat")
+
+    assert calls == 1
+    assert len(samples) == len(loader.strip_z_offsets)
+    assert images.shape[0] == len(loader.strip_z_offsets)
+    assert coords.shape[0] == len(loader.strip_z_offsets)
+    assert valids.shape[0] == len(loader.strip_z_offsets)
 
 
 def test_identity_equivalent_augment_vis_entries_match(tmp_path: Path) -> None:
