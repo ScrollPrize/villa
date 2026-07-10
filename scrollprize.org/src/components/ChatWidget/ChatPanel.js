@@ -1,11 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import MarkdownLite from "./MarkdownLite";
 
-const EXAMPLES = [
-  "How do I get started?",
-  "What prizes are open?",
-  "Can I use the scroll data commercially?",
-];
+const EXAMPLES = ["How do I get started?", "What prizes are open?"];
 
 const MOBILE_QUERY = "(max-width: 996px)";
 const INPUT_MAX_HEIGHT = 104; // 4 lines x 20px + 24px padding
@@ -186,7 +182,15 @@ export default function ChatPanel({
             </div>
             <p className="vc-chat-empty__hint">
               Ask about the Vesuvius Challenge — answers come from this
-              site&rsquo;s content.
+              site&rsquo;s content and may be out of date. Join the{" "}
+              <a
+                href="https://discord.gg/uTfNwwecCQ"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Discord community
+              </a>{" "}
+              for the latest information!
             </p>
             {EXAMPLES.map((q) => (
               <button

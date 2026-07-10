@@ -41,6 +41,22 @@
   cursor: pointer;
   transition: background-color 0.15s, border-color 0.15s, bottom 0.3s ease;
 }
+/* Desktop: a much more prominent entry point (owner request). Mobile keeps
+   the compact pill so it stays clear of thumbs, sticker, and footer. */
+@media (min-width: 997px) {
+  .vc-chat-trigger {
+    gap: 10px;
+    min-height: 56px;
+    padding: 16px 24px;
+    font-size: 1rem;
+    right: calc(28px + env(safe-area-inset-right));
+    bottom: calc(28px + env(safe-area-inset-bottom));
+  }
+  .vc-chat-trigger svg {
+    width: 20px;
+    height: 20px;
+  }
+}
 .vc-chat-trigger:hover {
   background: var(--vc-raised);
 }
@@ -234,6 +250,7 @@
 }
 /* Body-link grammar (spec §3): text color + soft ember underline. */
 .vc-chat-msg--assistant a,
+.vc-chat-empty__hint a,
 .vc-chat-error a {
   color: var(--vc-text);
   text-decoration: underline;
@@ -242,11 +259,13 @@
   text-underline-offset: 2px;
 }
 .vc-chat-msg--assistant a:hover,
+.vc-chat-empty__hint a:hover,
 .vc-chat-error a:hover {
   color: var(--vc-accent);
   text-decoration-color: var(--vc-accent);
 }
 .vc-chat-msg--assistant a:focus-visible,
+.vc-chat-empty__hint a:focus-visible,
 .vc-chat-error a:focus-visible {
   outline: 2px solid var(--vc-accent);
   outline-offset: 2px;

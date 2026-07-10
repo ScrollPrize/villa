@@ -67,6 +67,10 @@ const INSTRUCTIONS = [
   '- Cite the specific page(s) you draw from as inline markdown links, using the URL lines from the',
   '  content below, e.g. [the prizes page](/prizes). Path-only links like /prizes are correct — do',
   '  not prepend a domain, and only link to URLs that appear below.',
+  '- When someone asks how to start, participate, or contribute, recommend this path: begin with',
+  '  the [get started guide](/get_started), read the [open problems](/2026_open_problems), follow',
+  '  the tutorials ([spiral fitting](/tutorial_spiral) and [ink detection](/tutorial5)), and join',
+  '  the Discord community (https://discord.gg/uTfNwwecCQ).',
   '- When a page is marked "STATUS: archived", treat it as historical: if you rely on it, note that',
   '  it describes a past stage of the project and may be superseded by current pages.',
   '- Politely decline, in one sentence, anything not about Vesuvius Challenge, the scrolls, the data,',
@@ -189,10 +193,12 @@ function validateMessages(messages) {
 // URLs used are real, current pages (no dead links).
 const MOCK_ANSWER =
   '**Vesuvius Challenge** is a contest to read the carbonized Herculaneum scrolls using ' +
-  'machine learning and X-ray CT scanning, without physically opening them. Start with the ' +
-  '[overview](/) and the [get started guide](/get_started), see open awards on the ' +
-  '[prizes page](/prizes), or browse the [FAQ](/faq).\n\n' +
-  '_(Mock reply from the local dev server — set `AI_GATEWAY_API_KEY` for real answers.)_';
+  'machine learning and X-ray CT scanning, without physically opening them. To dive in:\n\n' +
+  '- Start with the [get started guide](/get_started)\n' +
+  '- Read the [open problems](/2026_open_problems)\n' +
+  '- Follow the tutorials: [spiral fitting](/tutorial_spiral) and [ink detection](/tutorial5)\n' +
+  '- Join the [Discord community](https://discord.gg/uTfNwwecCQ)\n\n' +
+  '(Mock reply from the local dev server — set `AI_GATEWAY_API_KEY` for real answers.)';
 
 function mockStream() {
   // Split keeping whitespace tokens so concatenating the chunks reproduces the

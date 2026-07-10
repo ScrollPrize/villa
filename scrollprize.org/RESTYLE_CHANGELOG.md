@@ -353,6 +353,13 @@ Owner brief: shrink the hero, convey "volcano → scroll → unwrap", compact th
 
 **Files:** `scripts/{genChatCorpus.js,devChatServer.mjs}`, `api/chat.mjs`, `api/_lib/{handler,rateLimit}.mjs`, `src/theme/Root.js`, `src/components/ChatWidget/{index,ChatPanel,MarkdownLite}.js`, `src/css/chat.css`, `docusaurus.config.js`, `vercel.json`, `package.json`, `.gitignore`.
 
+## C40 — chat assistant: owner review round
+
+- **Getting-started guidance**: the system prompt (and the mock answer) now recommends a canonical path — [get started](/get_started) → [open problems](/2026_open_problems) → tutorials ([spiral fitting](/tutorial_spiral), [ink detection](/tutorial5)) → join Discord.
+- **Empty state**: "Can I use the scroll data commercially?" chip removed (2 chips remain); hint now reads "…answers come from this site's content and may be out of date. Join the Discord community for the latest information!" with a live Discord link (hint links get the body-link grammar).
+- **Trigger**: much larger on desktop ≥997px (56px tall, 1rem label, 20px glyph, 28px inset); mobile keeps the compact 44px pill.
+**Files:** `api/_lib/handler.mjs`, `src/components/ChatWidget/ChatPanel.js`, `src/css/chat.css`.
+
 ## Baseline (pre-restyle, recorded 2026-07-03)
 
 - `yarn build` green; 82 sitemap routes all HTTP 200.
