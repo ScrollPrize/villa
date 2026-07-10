@@ -69,8 +69,10 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _score_trace2cp,
     _source_grid_direction_to_reference,
     _transform_points_xy,
+    _trace2cp_tta_params,
     _trace_direction_line,
     _trace_direction_line_to_target,
+    _trace_median_tta_direction_line_to_target,
     _trace_median_tta_direction_line,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
@@ -296,6 +298,72 @@ def test_trace2cp_one_way_trace_stops_at_target_column() -> None:
     assert reason == "target_column"
     assert np.allclose(line[:, 1], 4.0)
     assert np.isclose(line[0, 0], 2.0)
+    assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:
+    params = FiberStripAugmentParams(
+        shift_x=3.0,
+        shift_y=4.0,
+        rotation_degrees=17.0,
+        shear_x=0.25,
+        shear_y=-0.5,
+        scale=1.8,
+        smooth_offset=2.5,
+        smooth_offset_stride=8.0,
+        smooth_offset_seed=123,
+        flip_x=True,
+        flip_y=True,
+        brightness=0.5,
+        contrast=2.0,
+        gamma=0.25,
+        noise_std=0.75,
+        blur_sigma=1.5,
+    )
+
+    filtered = _trace2cp_tta_params(params)
+
+    assert filtered.shift_x == pytest.approx(3.0)
+    assert filtered.shift_y == pytest.approx(0.0)
+    assert filtered.scale == pytest.approx(1.0)
+    assert filtered.rotation_degrees == pytest.approx(17.0)
+    assert filtered.shear_x == pytest.approx(0.25)
+    assert filtered.shear_y == pytest.approx(-0.5)
+    assert filtered.smooth_offset == pytest.approx(2.5)
+    assert filtered.flip_x is True
+    assert filtered.flip_y is True
+    assert filtered.brightness == pytest.approx(0.0)
+    assert filtered.contrast == pytest.approx(1.0)
+    assert filtered.gamma == pytest.approx(1.0)
+    assert filtered.noise_std == pytest.approx(0.0)
+    assert filtered.blur_sigma == pytest.approx(0.0)
+
+
+def test_trace2cp_median_tta_trace_stops_at_target_column() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    identity = np.eye(3, dtype=np.float32)
+    fields = [
+        _TtaDirectionField(
+            name="reference",
+            direction_xy=field,
+            valid_mask=np.ones((9, 9), dtype=bool),
+            matrix_ref_to_tta=identity,
+            matrix_tta_to_ref=identity,
+        )
+    ]
+
+    line, reason = _trace_median_tta_direction_line_to_target(
+        fields,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([6.0, 4.0], dtype=np.float32),
+        shape_hw=(9, 9),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert np.allclose(line[:, 1], 4.0)
     assert np.isclose(line[-1, 0], 6.0)
 
 

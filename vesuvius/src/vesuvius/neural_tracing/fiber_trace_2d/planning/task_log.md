@@ -14,20 +14,23 @@ Implemented:
   a Lasagna/VC3D-style segment strip, and samples the center strip-z image.
 - Added runner helpers for one-way trace-to-target-column tracing and
   normalized trace2cp scoring.
+- Added trace2cp geometric TTA support: deterministic random TTAs reuse the
+  training geometric ranges but force y-shift to zero and scale to one, then
+  inverse-map traces back into the reference segment strip before scoring.
+- Added `--med-tta` support for trace2cp median-direction TTA tracing.
 - Added `--trace2cp-vis`, `--trace2cp-target-offset`, and
   `--trace2cp-target-cp-index` to `runner.py`.
 - `--trace2cp-vis` now writes `trace2cp_vis.jpg`,
-  `trace2cp_summary.txt`, and prints a concise score/status line to stdout.
+  `trace2cp_summary.txt`, and prints a concise aggregate score/status line to
+  stdout.
 - Updated `planning/specs.md`, `docs/code_structure.md`,
   `planning/changelog.md`, and `planning/status.md`.
 
 Deviation:
 
-- The plan mentioned optional trace2cp TTA. V1 intentionally implements the
-  unaugmented trace2cp metric only, matching the plan's conservative option.
 - The plan mentioned a full CLI/export monkeypatch test. This pass added
-  focused metric and segment validation in the existing test file; full CLI
-  export coverage remains a useful follow-up if runner CLI behavior grows.
+  focused metric, segment, and TTA validation in the existing test file; full
+  CLI export coverage remains a useful follow-up if runner CLI behavior grows.
 
 Validation:
 
@@ -41,4 +44,4 @@ Result: passed.
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
 ```
 
-Result: `100 passed in 4.63s`.
+Result after completing trace2cp TTA: `102 passed in 5.58s`.

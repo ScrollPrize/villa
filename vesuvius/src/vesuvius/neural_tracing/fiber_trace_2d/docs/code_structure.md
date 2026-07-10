@@ -219,9 +219,18 @@ The important behavior is:
 - `--trace2cp-vis` loads a side-strip segment spanning both CPs, runs the same
   decoded direction-field model as line tracing, traces one direction from the
   start CP toward the target CP, and scores the y-error where the trace reaches
-  the target CP x-column. It writes `trace2cp_vis.jpg`, writes
-  `trace2cp_summary.txt`, and prints the normalized `0..1` score plus raw pixel
-  error and trace status to stdout.
+  the target CP x-column.
+- Trace2CP also runs deterministic random geometric test-time augmentations
+  controlled by `--line-trace-tta-count`. These use the training geometric
+  ranges except y-shift is forced to zero and scale to one. Each TTA trace is
+  inverse-mapped back to the reference segment strip before scoring. The stdout
+  score is the median over the base trace and successfully scored TTA traces.
+- `--trace2cp-vis --med-tta` adds a median-direction TTA trace column, using
+  the same reference/TTA direction-field median stepping scheme as
+  `--line-trace-vis --med-tta` but stopping at the target CP x-column.
+- Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
+  the aggregate normalized `0..1` score plus raw pixel error, base score, TTA
+  success count, and trace status to stdout.
 - Provides `--dir-vis --checkpoint <snapshot> --export-dir <dir>` for
   direction-field inspection. This mode loads the same deterministic center
   side-strip patch, runs the checkpointed direction model, decodes the

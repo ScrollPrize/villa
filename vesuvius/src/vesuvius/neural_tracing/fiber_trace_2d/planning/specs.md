@@ -253,7 +253,7 @@
   construction as CP-local patches, but anchors the start CP at an explicit
   strip x-coordinate so the target CP lies in the same image at its arc-length
   column. It does not use the neural-tracing 3D crop loader.
-- Trace2CP V1 samples the center strip-z image only, runs the checkpointed
+- Trace2CP samples the center strip-z image only, runs the checkpointed
   direction model, decodes the Lasagna ambiguous two-cos-channel output, and
   traces one direction from the start CP toward the target CP. The trace uses
   `--line-trace-step` and the line-trace receptive-field margin default
@@ -267,13 +267,24 @@
   reach the target column. The denominator is the target CP's distance to the
   nearest usable vertical strip edge after the receptive-field margin is
   excluded.
+- Trace2CP runs deterministic random geometric test-time augmentations using
+  `--line-trace-tta-count`, default `100`. It samples from the regular
+  training geometric augmentation ranges but forces y-shift to zero and scale
+  to one for long-strip target-column semantics.
+- Trace2CP TTA traces are run in augmented patch coordinates, inverse-mapped
+  back into the reference segment strip, and scored only in that reference
+  coordinate system. The printed aggregate score is the median over the base
+  trace score and all successfully mapped/scored TTA trace scores.
+- `--trace2cp-vis --med-tta` adds a median-direction TTA trace column. The
+  median trace is stepped in the reference segment strip by sampling the
+  reference and TTA direction fields, mapping TTA directions back to reference
+  coordinates, resolving ambiguous signs against the previous step, and using
+  the normalized component-wise median direction.
 - Trace2CP writes `trace2cp_vis.jpg`, writes `trace2cp_summary.txt`, and prints
   a concise stdout line with sample index, fiber path, start/target CP indices,
-  normalized score, raw y error in pixels, target x-column, and trace status.
-- Trace2CP TTA is not part of the V1 runner command. Future TTA support must
-  score only after inverse-mapping traces back into the reference segment strip
-  and must exclude y-shift and scale unless their target-column semantics are
-  explicitly defined.
+  aggregate normalized score, aggregate raw y error in pixels, base score,
+  TTA success count, target x-column, and trace status. The summary file also
+  records per-TTA score/status rows and median-TTA score/status when requested.
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.

@@ -391,6 +391,23 @@ def _geometric_only_params(params: FiberStripAugmentParams) -> FiberStripAugment
     )
 
 
+def _trace2cp_tta_params(params: FiberStripAugmentParams) -> FiberStripAugmentParams:
+    return FiberStripAugmentParams(
+        shift_x=params.shift_x,
+        shift_y=0.0,
+        rotation_degrees=params.rotation_degrees,
+        shear_x=params.shear_x,
+        shear_y=params.shear_y,
+        scale=1.0,
+        smooth_offset=params.smooth_offset,
+        smooth_offset_stride=params.smooth_offset_stride,
+        smooth_offset_seed=params.smooth_offset_seed,
+        flip_x=params.flip_x,
+        flip_y=params.flip_y,
+        noise_seed=params.noise_seed,
+    )
+
+
 def _orient_direction_to_previous(direction_xy: np.ndarray, previous_xy: np.ndarray) -> np.ndarray | None:
     direction = np.asarray(direction_xy, dtype=np.float32)
     previous = np.asarray(previous_xy, dtype=np.float32)
@@ -762,6 +779,52 @@ def _trace_median_tta_direction_line(
     return np.stack(combined, axis=0).astype(np.float32)
 
 
+def _trace_median_tta_direction_line_to_target(
+    fields: list[_TtaDirectionField],
+    start_xy: np.ndarray,
+    target_xy: np.ndarray,
+    *,
+    shape_hw: tuple[int, int],
+    step_px: float = 1.0,
+    rf_margin_px: float = 5.0,
+    max_steps: int | None = None,
+) -> tuple[np.ndarray, str]:
+    if not fields:
+        raise ValueError("fields must contain at least the reference direction field")
+    start = np.asarray(start_xy, dtype=np.float32)
+    target = np.asarray(target_xy, dtype=np.float32)
+    if start.shape != (2,) or target.shape != (2,):
+        raise ValueError("start_xy and target_xy must have shape (2,)")
+    delta = target - start
+    delta_norm = float(np.linalg.norm(delta))
+    if not np.isfinite(delta_norm) or delta_norm <= 1.0e-6:
+        raise ValueError("trace2cp start and target points must be distinct")
+    step = max(float(step_px), 1.0e-3)
+    if max_steps is None:
+        max_steps = int(np.ceil(np.hypot(*shape_hw) / step)) + 2
+    current = start.astype(np.float32)
+    previous = (delta / delta_norm).astype(np.float32)
+    points = [current.copy()]
+    target_x = float(target[0])
+    for _ in range(int(max_steps)):
+        if not _inside_trace_margin(current, shape_hw, rf_margin_px):
+            return np.stack(points, axis=0).astype(np.float32), "rf_margin"
+        sampled = _sample_tta_direction_in_reference(fields, current, previous)
+        if sampled is None:
+            return np.stack(points, axis=0).astype(np.float32), "invalid_direction"
+        next_point = current + sampled * np.float32(step)
+        if not _inside_trace_margin(next_point, shape_hw, rf_margin_px):
+            return np.stack(points, axis=0).astype(np.float32), "rf_margin"
+        points.append(next_point.astype(np.float32))
+        previous_x = float(current[0])
+        next_x = float(next_point[0])
+        if (previous_x - target_x) == 0.0 or (previous_x - target_x) * (next_x - target_x) <= 0.0:
+            return np.stack(points, axis=0).astype(np.float32), "target_column"
+        current = next_point.astype(np.float32)
+        previous = sampled.astype(np.float32)
+    return np.stack(points, axis=0).astype(np.float32), "max_steps"
+
+
 def _trace_direction_line_to_target(
     direction_xy: np.ndarray,
     start_xy: np.ndarray,
@@ -1078,6 +1141,8 @@ def _export_trace2cp_vis(
     rf_margin_px: float | None,
     target_offset: int,
     target_cp_index: int | None,
+    med_tta: bool = False,
+    line_trace_tta_count: int = 100,
 ) -> None:
     out = Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -1112,7 +1177,7 @@ def _export_trace2cp_vis(
         termination_reason=reason,
     )
     image_u8 = _to_u8_image(image, valid_mask)
-    overlay = _draw_trace2cp_overlay(
+    base_overlay = _draw_trace2cp_overlay(
         image_u8,
         line_xy=sample.line_xy,
         trace_xy=traced_line,
@@ -1120,7 +1185,122 @@ def _export_trace2cp_vis(
         target_xy=target_xy,
         result=result,
     )
-    _write_jpg(out / "trace2cp_vis.jpg", overlay)
+
+    flock_overlay = overlay_line_coords_rgb(image_u8, sample.line_xy, opacity=0.35, thickness=1)
+    flock_overlay = _overlay_polyline_rgb(flock_overlay, traced_line, color_rgba=(0, 255, 0, 220), thickness=1)
+    flock_overlay = _draw_cp_crosshair(flock_overlay, start_xy)
+    tta_rows: list[str] = []
+    tta_scores: list[float] = []
+    tta_errors: list[float] = []
+    random_tta_fields: list[_TtaDirectionField] = []
+    tta_count = max(0, int(line_trace_tta_count))
+    for variant_index in range(tta_count):
+        params = _trace2cp_tta_params(
+            random_combined_augmentation(loader.config.augment, sample_index, variant_index)
+        )
+        tta_name = f"random_{variant_index:03d}"
+        try:
+            tta_image, tta_valid, source_xy_grid = _warp_patch_by_augment_params(
+                image,
+                valid_mask,
+                params,
+                device=device,
+            )
+            tta_start = _nearest_tta_point_for_reference(source_xy_grid, start_xy)
+            tta_target = _nearest_tta_point_for_reference(source_xy_grid, target_xy)
+            if tta_start is None or tta_target is None:
+                raise ValueError("could not map start/target CP into TTA patch")
+            tta_direction = _predict_direction_field(model, tta_image, tta_valid, device=device)
+            field = _TtaDirectionField(
+                name=tta_name,
+                direction_xy=tta_direction,
+                valid_mask=tta_valid,
+                source_xy_grid=source_xy_grid,
+            )
+            random_tta_fields.append(field)
+            tta_trace, tta_reason = _trace_direction_line_to_target(
+                tta_direction,
+                tta_start,
+                tta_target,
+                valid_mask=tta_valid,
+                step_px=step_px,
+                rf_margin_px=margin,
+            )
+            trace_back = _source_grid_points_to_reference(source_xy_grid, tta_trace)
+            tta_result = _score_trace2cp(
+                trace_back,
+                target_xy,
+                shape_hw=image.shape,
+                rf_margin_px=margin,
+                termination_reason=tta_reason,
+            )
+            tta_scores.append(float(tta_result.score))
+            tta_errors.append(float(tta_result.raw_y_error_px))
+            flock_overlay = _overlay_polyline_rgb(
+                flock_overlay,
+                trace_back,
+                color_rgba=(64, 224, 255, 120),
+                thickness=1,
+            )
+            tta_rows.append(
+                f"{tta_name}: score={tta_result.score:.8f} raw_y_error_px={tta_result.raw_y_error_px:.6f} "
+                f"points={int(trace_back.shape[0])} reached={tta_result.reached_target_column} reason={tta_result.reason}"
+            )
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            tta_rows.append(f"{tta_name}: skipped={exc}")
+    aggregate_scores = [float(result.score), *tta_scores]
+    aggregate_errors = [float(result.raw_y_error_px), *tta_errors]
+    aggregate_score = float(np.median(np.asarray(aggregate_scores, dtype=np.float64)))
+    aggregate_error = float(np.median(np.asarray(aggregate_errors, dtype=np.float64)))
+
+    med_trace: np.ndarray | None = None
+    med_result: _Trace2CpResult | None = None
+    med_reason = ""
+    if med_tta:
+        identity = np.eye(3, dtype=np.float32)
+        med_fields = [
+            _TtaDirectionField(
+                name="reference",
+                direction_xy=direction_xy,
+                valid_mask=np.asarray(valid_mask, dtype=bool),
+                matrix_ref_to_tta=identity,
+                matrix_tta_to_ref=identity,
+            ),
+            *random_tta_fields,
+        ]
+        med_trace, med_reason = _trace_median_tta_direction_line_to_target(
+            med_fields,
+            start_xy,
+            target_xy,
+            shape_hw=image.shape,
+            step_px=step_px,
+            rf_margin_px=margin,
+        )
+        med_result = _score_trace2cp(
+            med_trace,
+            target_xy,
+            shape_hw=image.shape,
+            rf_margin_px=margin,
+            termination_reason=med_reason,
+        )
+
+    overlays = [base_overlay, flock_overlay]
+    if med_trace is not None and med_result is not None:
+        med_overlay = _draw_trace2cp_overlay(
+            image_u8,
+            line_xy=sample.line_xy,
+            trace_xy=med_trace,
+            start_xy=start_xy,
+            target_xy=target_xy,
+            result=med_result,
+        )
+        med_overlay = _overlay_polyline_rgb(med_overlay, med_trace, color_rgba=(255, 220, 64, 230), thickness=1)
+        overlays.append(med_overlay)
+    combined = np.zeros((image_u8.shape[0], image_u8.shape[1] * len(overlays), 3), dtype=np.uint8)
+    for index, overlay in enumerate(overlays):
+        x0 = image_u8.shape[1] * index
+        combined[:, x0 : x0 + image_u8.shape[1], :] = overlay
+    _write_jpg(out / "trace2cp_vis.jpg", combined)
     summary = [
         f"sample_index={sample_index}",
         f"checkpoint={Path(checkpoint_path).expanduser().resolve()}",
@@ -1135,19 +1315,31 @@ def _export_trace2cp_vis(
         f"step_px={float(step_px):.3f}",
         f"rf_margin_px={margin:.3f}",
         f"trace_points={int(traced_line.shape[0])}",
+        f"trace2cp_aggregate_score={aggregate_score:.8f}",
+        f"trace2cp_aggregate_raw_y_error_px={aggregate_error:.6f}",
         f"trace2cp_score={result.score:.8f}",
         f"raw_y_error_px={result.raw_y_error_px:.6f}",
         f"target_x={result.target_x:.6f}",
         f"trace_y_at_target_x={result.trace_y_at_target_x:.6f}",
         f"reached_target_column={result.reached_target_column}",
         f"termination_reason={result.reason}",
+        f"line_trace_tta_count={int(line_trace_tta_count)}",
+        f"trace2cp_tta_success_count={len(tta_scores)}",
+        f"trace2cp_tta_skipped_count={tta_count - len(tta_scores)}",
+        f"med_tta={bool(med_tta)}",
+        f"med_tta_score={med_result.score:.8f}" if med_result is not None else "med_tta_score=nan",
+        f"med_tta_raw_y_error_px={med_result.raw_y_error_px:.6f}" if med_result is not None else "med_tta_raw_y_error_px=nan",
+        f"med_tta_reason={med_reason}" if med_result is not None else "med_tta_reason=",
+        "tta_traces:",
+        *tta_rows,
     ]
     (out / "trace2cp_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
     print(
         "trace2cp "
         f"sample_index={sample_index} fiber_path={sample.fiber_path} "
         f"start_cp={sample.start_control_point_index} target_cp={sample.target_control_point_index} "
-        f"score={result.score:.8f} raw_y_error_px={result.raw_y_error_px:.6f} "
+        f"score={aggregate_score:.8f} raw_y_error_px={aggregate_error:.6f} "
+        f"base_score={result.score:.8f} tta_success={len(tta_scores)}/{tta_count} "
         f"target_x={result.target_x:.3f} reached={result.reached_target_column} reason={result.reason}"
     )
     print(f"exported trace2cp_vis.jpg and trace2cp_summary.txt to {out}")
@@ -1585,6 +1777,10 @@ def main() -> None:
             rf_margin_px=args.line_trace_rf_margin,
             target_offset=args.trace2cp_target_offset,
             target_cp_index=args.trace2cp_target_cp_index,
+            med_tta=args.med_tta,
+            line_trace_tta_count=(
+                args.line_trace_tta_count if args.med_tta_count is None else args.med_tta_count
+            ),
         )
         return
 
