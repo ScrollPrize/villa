@@ -716,10 +716,20 @@ export function Landing() {
                 aria-label={`${gpDaysLeft} days to the $1,000,000 Grand Prize deadline`}
               >
                 <span className="vc-hero__countdown-label">
-                  $1M Grand Prize deadline
+                  $1,000,000 Grand Prize
                 </span>
-                <span className="vc-hero__countdown-value vc-nums">
-                  {gpDaysLeft} days
+                <span className="vc-hero__countdown-row">
+                  <span className="vc-hero__countdown-value vc-nums">
+                    {gpDaysLeft}
+                  </span>
+                  <span className="vc-hero__countdown-unit">
+                    days
+                    <br />
+                    left
+                  </span>
+                </span>
+                <span className="vc-hero__countdown-date">
+                  deadline June 25th, 2027
                 </span>
               </a>
             )}

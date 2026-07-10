@@ -253,15 +253,16 @@
   gap: 12px;
 }
 
-/* Grand Prize countdown chip — floats over the volcano, top right. */
+/* Grand Prize countdown — a dramatic day-count lockup over the volcano. */
 .vc-landing a.vc-hero__countdown {
   display: inline-flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 8px 14px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 14px 20px 12px;
   border: 1px solid var(--vc-accent);
   border-radius: var(--vc-r-card);
-  background: color-mix(in srgb, var(--vc-bg) 82%, transparent);
+  background: color-mix(in srgb, var(--vc-bg) 78%, transparent);
   -webkit-backdrop-filter: blur(6px);
   backdrop-filter: blur(6px);
   text-decoration: none;
@@ -269,20 +270,45 @@
 }
 .vc-landing a.vc-hero__countdown:hover {
   text-decoration: none;
-  background: color-mix(in srgb, var(--vc-bg) 92%, transparent);
+  background: color-mix(in srgb, var(--vc-bg) 90%, transparent);
 }
 .vc-landing .vc-hero__countdown-label {
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.07em;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--vc-text-dim);
+  color: var(--vc-text);
+}
+.vc-landing .vc-hero__countdown-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 .vc-landing .vc-hero__countdown-value {
   font-family: var(--vc-mono);
-  font-size: 15px;
+  font-size: 3rem;
   font-weight: 700;
+  line-height: 1;
   color: var(--vc-accent);
+  letter-spacing: -0.02em;
+}
+.vc-landing .vc-hero__countdown-unit {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--vc-accent);
+}
+.vc-landing .vc-hero__countdown-date {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--vc-text-dim);
+}
+@media (max-width: 996px) {
+  .vc-landing .vc-hero__countdown-value {
+    font-size: 2rem;
+  }
 }
 @media (min-width: 997px) {
   .vc-landing .vc-hero__content {
