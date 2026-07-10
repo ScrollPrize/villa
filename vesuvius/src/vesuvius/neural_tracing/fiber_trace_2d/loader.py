@@ -59,7 +59,12 @@ from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampler, m
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
-_STRIP_COORD_CACHE_VERSION = "fiber_strip_2d_source_v2"
+_STRIP_COORD_CACHE_VERSION = "fiber_strip_2d_source_v3"
+_STRIP_COORD_CACHE_KEY_VERSION = "fiber_strip_2d_source_v2"
+_SUPPORTED_STRIP_COORD_CACHE_VERSIONS = {
+    _STRIP_COORD_CACHE_KEY_VERSION,
+    _STRIP_COORD_CACHE_VERSION,
+}
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,17 @@ class _StripSource:
     grid: FiberStripGridTorch
     source_line_xy: torch.Tensor
     source_control_point_xy: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PreparedStripSample:
+    source: _StripSource
+    params_by_offset: list[FiberStripAugmentParams | None]
+    offset_grids: list[FiberStripGridTorch]
+    coords_zyx: np.ndarray
+    valid_mask: np.ndarray
+    line_xy_by_offset: list[np.ndarray]
+    control_point_xy_by_offset: list[np.ndarray]
 
 
 @dataclass
@@ -1210,7 +1226,7 @@ class FiberStrip2DLoader:
             return None
         cp_xyz = np.asarray(record.fiber.control_points_xyz[control_point_index], dtype=np.float64)
         family_key = _stable_digest(
-            _STRIP_COORD_CACHE_VERSION,
+            _STRIP_COORD_CACHE_KEY_VERSION,
             record.volume_path,
             record.volume_scale,
             f"{record.volume_spacing_base:.12g}",
@@ -1271,7 +1287,7 @@ class FiberStrip2DLoader:
             return None
         try:
             with np.load(path, allow_pickle=False) as data:
-                if str(data["version"].item()) != _STRIP_COORD_CACHE_VERSION:
+                if str(data["version"].item()) not in _SUPPORTED_STRIP_COORD_CACHE_VERSIONS:
                     return None
                 cached_shape = tuple(int(v) for v in data["source_shape_hw"].tolist())
                 if cached_shape[0] < int(source_shape_hw[0]) or cached_shape[1] < int(source_shape_hw[1]):
@@ -1280,16 +1296,21 @@ class FiberStrip2DLoader:
                     return None
                 frame = FiberStripFrame(
                     tangent_xyz=np.asarray(data["frame_tangent_xyz"], dtype=np.float32),
-                    side_xyz=np.asarray(data["frame_side_xyz"], dtype=np.float32),
-                    mesh_normal_xyz=np.asarray(data["frame_mesh_normal_xyz"], dtype=np.float32),
+                        side_xyz=np.asarray(data["frame_side_xyz"], dtype=np.float32),
+                        mesh_normal_xyz=np.asarray(data["frame_mesh_normal_xyz"], dtype=np.float32),
+                    )
+                coords_zyx = torch.as_tensor(np.asarray(data["coords_zyx"], dtype=np.float32), device=device)
+                offset_axis_zyx = torch.as_tensor(
+                    np.asarray(data["offset_axis_zyx"], dtype=np.float32),
+                    device=device,
                 )
                 grid = FiberStripGridTorch(
-                    coords_xyz=torch.as_tensor(np.asarray(data["coords_xyz"], dtype=np.float32), device=device),
-                    coords_zyx=torch.as_tensor(np.asarray(data["coords_zyx"], dtype=np.float32), device=device),
+                    coords_xyz=coords_zyx[..., (2, 1, 0)].contiguous(),
+                    coords_zyx=coords_zyx,
                     valid_mask=torch.as_tensor(np.asarray(data["valid_mask"], dtype=bool), device=device),
                     frame=frame,
-                    offset_axis_xyz=torch.as_tensor(np.asarray(data["offset_axis_xyz"], dtype=np.float32), device=device),
-                    offset_axis_zyx=torch.as_tensor(np.asarray(data["offset_axis_zyx"], dtype=np.float32), device=device),
+                    offset_axis_xyz=offset_axis_zyx[..., (2, 1, 0)].contiguous(),
+                    offset_axis_zyx=offset_axis_zyx,
                 )
                 source_line_xy = torch.as_tensor(np.asarray(data["source_line_xy"], dtype=np.float32), device=device)
                 source_control_point_xy = torch.as_tensor(
@@ -1329,10 +1350,8 @@ class FiberStrip2DLoader:
                     version=np.asarray(_STRIP_COORD_CACHE_VERSION),
                     source_shape_hw=np.asarray(source_shape_hw, dtype=np.int64),
                     center_offset=np.asarray(float(center_offset), dtype=np.float64),
-                    coords_xyz=_as_numpy_float32(grid.coords_xyz),
                     coords_zyx=_as_numpy_float32(grid.coords_zyx),
                     valid_mask=_as_numpy_bool(grid.valid_mask),
-                    offset_axis_xyz=_as_numpy_float32(grid.offset_axis_xyz),
                     offset_axis_zyx=_as_numpy_float32(grid.offset_axis_zyx),
                     source_line_xy=_as_numpy_float32(source_line_xy),
                     source_control_point_xy=_as_numpy_float32(source_control_point_xy),
@@ -1609,14 +1628,13 @@ class FiberStrip2DLoader:
         grid = self._offset_grid_from_source(source, offset)
         return _as_numpy_float32(grid.coords_zyx), _as_numpy_bool(grid.valid_mask)
 
-    def build_sample(
+    def _prepare_sample(
         self,
         sample_index: int,
         *,
         sample_mode: str = "random",
         profile: dict[str, float] | None = None,
-        apply_image_augmentation: bool = True,
-    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
+    ) -> _PreparedStripSample:
         device = resolve_torch_device(self.config.augment.device)
         source = self.build_strip_source(sample_index, device=device, sample_mode=sample_mode, profile=profile)
         params_by_offset: list[FiberStripAugmentParams | None] = [
@@ -1702,32 +1720,53 @@ class FiberStrip2DLoader:
 
         coords_zyx_np = _as_numpy_float32(coords_zyx_t)
         valid_mask_np = _as_numpy_bool(valid_mask_t)
-        with _ProfileBlock(profile, "volume_sample"):
-            result = source.record.sampler.sample_coord_batch(coords_zyx_np, valid_mask_np)
-            images_np = np.asarray(result.image, dtype=np.float32)
-            valids_np = np.asarray(result.valid_mask, dtype=bool)
-            if images_np.shape != valid_mask_np.shape:
-                raise ValueError(
-                    "batched sampler returned incompatible image shape: "
-                    f"shape={images_np.shape} expected={valid_mask_np.shape}"
-                )
-            if valids_np.shape != valid_mask_np.shape:
-                raise ValueError(
-                    "batched sampler returned incompatible valid-mask shape: "
-                    f"shape={valids_np.shape} expected={valid_mask_np.shape}"
-                )
-            if profile is not None:
-                for key, value in result.stats.items():
-                    if isinstance(value, (int, float)):
-                        profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
+        line_xy_by_offset: list[np.ndarray] = []
+        control_point_xy_by_offset: list[np.ndarray] = []
+        for offset_index, _ in enumerate(self.strip_z_offsets):
+            params = params_by_offset[offset_index]
+            line_xy_t, control_point_xy_t = line_and_cp_cache[params]
+            line_xy_by_offset.append(_as_numpy_float32(line_xy_t))
+            control_point_xy_by_offset.append(_as_numpy_float32(control_point_xy_t))
+        return _PreparedStripSample(
+            source=source,
+            params_by_offset=params_by_offset,
+            offset_grids=offset_grids,
+            coords_zyx=coords_zyx_np,
+            valid_mask=valid_mask_np,
+            line_xy_by_offset=line_xy_by_offset,
+            control_point_xy_by_offset=control_point_xy_by_offset,
+        )
+
+    def _finish_prepared_sample(
+        self,
+        prepared: _PreparedStripSample,
+        images_np: np.ndarray,
+        valids_np: np.ndarray,
+        *,
+        apply_image_augmentation: bool,
+        profile: dict[str, float] | None = None,
+    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
+        device = resolve_torch_device(self.config.augment.device)
+        source = prepared.source
+        coords_zyx_np = np.asarray(prepared.coords_zyx, dtype=np.float32)
+        images_np = np.asarray(images_np, dtype=np.float32)
+        valids_np = np.asarray(valids_np, dtype=bool)
+        if images_np.shape != prepared.valid_mask.shape:
+            raise ValueError(
+                "batched sampler returned incompatible image shape: "
+                f"shape={images_np.shape} expected={prepared.valid_mask.shape}"
+            )
+        if valids_np.shape != prepared.valid_mask.shape:
+            raise ValueError(
+                "batched sampler returned incompatible valid-mask shape: "
+                f"shape={valids_np.shape} expected={prepared.valid_mask.shape}"
+            )
         images: list[np.ndarray] = []
         valids: list[np.ndarray] = []
         samples: list[FiberStripSample] = []
         for offset_index, offset in enumerate(self.strip_z_offsets):
-            params = params_by_offset[offset_index]
-            line_xy_t, control_point_xy_t = line_and_cp_cache[params]
-            line_xy = _as_numpy_float32(line_xy_t)
-            control_point_xy = _as_numpy_float32(control_point_xy_t)
+            line_xy = prepared.line_xy_by_offset[offset_index]
+            control_point_xy = prepared.control_point_xy_by_offset[offset_index]
             coords_zyx = coords_zyx_np[offset_index]
             image = images_np[offset_index]
             sampled_valid = valids_np[offset_index]
@@ -1741,7 +1780,7 @@ class FiberStrip2DLoader:
                 strip_z_offset=float(offset),
                 coords_zyx=coords_zyx,
                 valid_mask=sampled_valid,
-                frame=offset_grids[offset_index].frame,
+                frame=prepared.offset_grids[offset_index].frame,
                 line_xy=line_xy,
                 control_point_xy=control_point_xy,
             )
@@ -1749,7 +1788,7 @@ class FiberStrip2DLoader:
             valids.append(sampled_valid)
             samples.append(sample)
         if self.config.augment.enabled and apply_image_augmentation:
-            value_params = [value_only_params(params) for params in params_by_offset if params is not None]
+            value_params = [value_only_params(params) for params in prepared.params_by_offset if params is not None]
             value_aug_before = 0.0 if profile is None else profile.get("value_aug_batch", 0.0)
             with _ProfileBlock(profile, "value_aug_batch", device):
                 image_t, valid_t = apply_value_augmentation_batch(
@@ -1769,6 +1808,31 @@ class FiberStrip2DLoader:
             np.stack(images, axis=0),
             coords_zyx_np,
             np.stack(valids, axis=0),
+        )
+
+    def build_sample(
+        self,
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile: dict[str, float] | None = None,
+        apply_image_augmentation: bool = True,
+    ) -> tuple[list[FiberStripSample], np.ndarray, np.ndarray, np.ndarray]:
+        prepared = self._prepare_sample(sample_index, sample_mode=sample_mode, profile=profile)
+        with _ProfileBlock(profile, "volume_sample"):
+            result = prepared.source.record.sampler.sample_coord_batch(prepared.coords_zyx, prepared.valid_mask)
+            images_np = np.asarray(result.image, dtype=np.float32)
+            valids_np = np.asarray(result.valid_mask, dtype=bool)
+            if profile is not None:
+                for key, value in result.stats.items():
+                    if isinstance(value, (int, float)):
+                        profile[f"volume_stat_{key}"] = profile.get(f"volume_stat_{key}", 0.0) + float(value)
+        return self._finish_prepared_sample(
+            prepared,
+            images_np,
+            valids_np,
+            apply_image_augmentation=apply_image_augmentation,
+            profile=profile,
         )
 
     def build_center_strip_patch(

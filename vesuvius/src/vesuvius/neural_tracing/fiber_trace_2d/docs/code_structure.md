@@ -150,7 +150,10 @@ The important behavior is:
   `strip_coord_cache_dir`. Cache hits skip local line-window normal sampling and
   source-grid construction; larger cached source grids are center-cropped for
   smaller requests. Cached entries also contain source-space line and
-  control-point pixel coordinates for unaugmented patch use.
+  control-point pixel coordinates for unaugmented patch use. New cache payloads
+  store zyx coordinates and the zyx offset axis only; xyz tensors are derived
+  from those when needed so cache reads avoid redundant arrays while remaining
+  compatible with supported older cache entries.
 - Keeps source grids, strip-z offset grids, geometric coordinate augmentation,
   and transformed line/control-point coordinates as torch tensors until an
   explicit consumer needs NumPy.

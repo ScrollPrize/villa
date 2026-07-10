@@ -49,7 +49,11 @@
 - Strip-coordinate cache writes use unique temporary files in the cache
   directory followed by atomic rename. Corrupt or incompatible entries are
   treated as misses and regenerated through the normal Lasagna/strip-coordinate
-  path. Cache version changes intentionally ignore previous cache files.
+  path. The current payload stores the zyx source coordinates, valid mask,
+  zyx offset axis, source-space line/CP pixels, and strip frame; xyz arrays are
+  derived from zyx when needed instead of stored redundantly. The cache key
+  remains compatible with the previous source-cache identity so existing
+  entries are reused where their payload version is supported.
 - Image loading samples base-volume Zarr values from explicit coordinates.
 - Training/export coordinate sampling uses the VC3D blocking coordinate sampler: required chunks are collected and fetched/decoded before sampling, so a cold cache miss must not become an invalid output pixel.
 - Interactive/progressive VC3D `tryGetChunk` semantics are not acceptable for this loader path because they can queue I/O and return an all-invalid first sample.

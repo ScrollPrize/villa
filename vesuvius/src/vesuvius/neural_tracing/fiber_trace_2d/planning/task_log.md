@@ -17,23 +17,37 @@
   warm descriptor lookups.
 - `random_order` setup time is folded into the profile descriptor total so cold
   first-batch setup remains visible.
+- Strip-coordinate cache payload loading now avoids redundant cached xyz arrays:
+  supported older entries are still accepted, but the loader reads zyx
+  coordinates/offset axes and derives xyz tensors from them when needed.
 
 ## Deviations
 
 - No behavior changes were made to coordinate generation, augmentation,
   sampling, labels, model, or prefetch.
-- No local VC3D/data profile run was performed in this environment; validation
-  used compile checks and the focused test suite.
+- A trial that batched all accepted CP volume sampling into one VC3D call per
+  batch reduced summed worker sampling time but made warm wall time slower
+  because it serialized sampling after coordinate preparation. That change was
+  reverted; the final code keeps per-worker VC3D sampling.
 
 ## Validation
 
 ```bash
 python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py
+PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_2d.train /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/configs/loader_example.json --benchmark --load-only --profile
 ```
 
 Result:
 
 ```text
-93 passed in 4.02s
+93 passed in 3.82s
+benchmark: 6400 patches, 13742.6 ms, 465.71 patches/s
+```
+
+Reference measurements while debugging on the same command/data:
+
+```text
+baseline reproduced before the final cache/read cleanup: 14546.5 ms, 439.97 patches/s
+final: 13742.6 ms, 465.71 patches/s
 ```

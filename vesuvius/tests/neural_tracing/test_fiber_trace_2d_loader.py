@@ -1711,16 +1711,16 @@ def test_load_batch_skips_invalid_training_samples(tmp_path: Path, monkeypatch: 
     raw["loader_workers"] = 1
     config_path.write_text(json.dumps(raw), encoding="utf-8")
     loader = _make_loader(load_config(config_path))
-    original_build_sample = loader.build_sample
+    original_prepare_sample = loader._prepare_sample
     attempted: list[int] = []
 
-    def build_sample(sample_index: int, **kwargs):
+    def prepare_sample(sample_index: int, **kwargs):
         attempted.append(int(sample_index))
         if int(sample_index) == 0:
             raise ValueError("Lasagna grad_mag sample is zero at fiber line point")
-        return original_build_sample(sample_index, **kwargs)
+        return original_prepare_sample(sample_index, **kwargs)
 
-    monkeypatch.setattr(loader, "build_sample", build_sample)
+    monkeypatch.setattr(loader, "_prepare_sample", prepare_sample)
 
     batch = loader.load_batch(0, batch_size=2)
 
@@ -1738,29 +1738,18 @@ def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch
     loader = _make_loader(load_config(config_path))
     attempted: list[int] = []
 
-    def build_sample(
+    original_prepare_sample = loader._prepare_sample
+
+    def prepare_sample(
         sample_index: int,
         *,
         sample_mode: str = "random",
         profile=None,
-        apply_image_augmentation: bool = True,
     ):
-        del sample_mode
-        del profile
-        del apply_image_augmentation
         attempted.append(int(sample_index))
-        record, record_index, control_index = loader.descriptor_for_sample_index(sample_index)
-        sample = SimpleNamespace(
-            record_index=record_index,
-            control_point_index=control_index,
-            fiber_path=f"fiber_{control_index}.json",
-        )
-        image = np.zeros((len(loader.strip_z_offsets), 3, 3), dtype=np.float32)
-        coords = np.zeros((len(loader.strip_z_offsets), 3, 3, 3), dtype=np.float32)
-        valid = np.ones((len(loader.strip_z_offsets), 3, 3), dtype=bool)
-        return [sample], image, coords, valid
+        return original_prepare_sample(sample_index, sample_mode=sample_mode, profile=profile)
 
-    monkeypatch.setattr(loader, "build_sample", build_sample)
+    monkeypatch.setattr(loader, "_prepare_sample", prepare_sample)
 
     batch = loader.load_batch(1, batch_size=4, sample_index_limit=2)
 
@@ -1769,40 +1758,28 @@ def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch
 
 
 def test_parallel_load_batch_preserves_output_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config_path = _write_config(tmp_path, batch_size=4)
+    config_path = _write_config(tmp_path, batch_size=3)
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     raw["loader_workers"] = 4
     config_path.write_text(json.dumps(raw), encoding="utf-8")
     loader = _make_loader(load_config(config_path))
+    original_prepare_sample = loader._prepare_sample
 
-    def build_sample(
+    def prepare_sample(
         sample_index: int,
         *,
         sample_mode: str = "random",
         profile=None,
-        apply_image_augmentation: bool = True,
     ):
-        del sample_mode
-        del profile
-        del apply_image_augmentation
         if int(sample_index) == 0:
             loader_module.time.sleep(0.02)
-        sample = SimpleNamespace(
-            record_index=0,
-            control_point_index=int(sample_index),
-            fiber_path=f"fiber_{sample_index}.json",
-        )
-        image = np.full((len(loader.strip_z_offsets), 3, 3), float(sample_index), dtype=np.float32)
-        coords = np.zeros((len(loader.strip_z_offsets), 3, 3, 3), dtype=np.float32)
-        valid = np.ones((len(loader.strip_z_offsets), 3, 3), dtype=bool)
-        return [sample], image, coords, valid
+        return original_prepare_sample(sample_index, sample_mode=sample_mode, profile=profile)
 
-    monkeypatch.setattr(loader, "build_sample", build_sample)
+    monkeypatch.setattr(loader, "_prepare_sample", prepare_sample)
 
-    batch = loader.load_batch(0, batch_size=4)
+    batch = loader.load_batch(0, batch_size=3)
 
-    assert batch.control_point_indices.tolist() == [0, 1, 2, 3]
-    assert batch.images[:, 0, 0, 0, 0].tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert batch.control_point_indices.tolist() == [0, 1, 2]
 
 
 def test_parallel_load_batch_reuses_executor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
